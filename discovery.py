@@ -10,7 +10,7 @@ from typing import Any, Callable, Generator
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike,
-	Module,
+	Module, _is_covered_by, _overlaps,
 )
 
 class CompilerModule( Module ):
@@ -819,13 +819,18 @@ class Discovery( ast.NodeVisitor ):
 			is_abstract = is_abstract,
 			is_move = is_move,
 			is_private = is_private,
+			is_overload = is_overload,
 		)
 		self._parse_type_params( node.type_params, fn )
-		fn.resolve = self._make_function_resolver( fn, module, class_obj )
 
 		scope = self.scope_stack[-1]
 		existing = scope.names.get( fn.stem )
 
+		# group membership is settled before the resolver is created (below) so
+		# it can be threaded straight into the closure, the same way module/
+		# class_obj already are - no separate back-reference field needed on
+		# Function itself.
+		group: Overload|None = None
 		if is_overload or isinstance( existing, Overload ):
 			if isinstance( existing, Overload ):
 				group = existing
@@ -845,6 +850,10 @@ class Discovery( ast.NodeVisitor ):
 				group.stubs.append( fn )
 			else:
 				group.implementations.append( fn )
+
+		fn.resolve = self._make_function_resolver( fn, module, class_obj, group )
+
+		if group is not None:
 			return group
 
 		scope.add_name( fn.stem, fn )
@@ -860,7 +869,59 @@ class Discovery( ast.NodeVisitor ):
 			and body[0].value.value is Ellipsis
 		)
 
-	def _make_function_resolver( self, fn: Function, module: Module, class_obj: ClassLike|None ) -> Callable[[],None]:
+	def _bind_overload_stub( self, stub: Function, group: Overload ) -> None:
+		# a stub has no body of its own - it must resolve to exactly one plain
+		# (non-@overload) implementation whose accepted types, at every
+		# parameter position, are a superset of what the stub declares
+		candidates: list[Function] = []
+		for impl in group.implementations:
+			if impl.is_overload:
+				continue
+			if impl.resolve is not None:
+				impl.resolve()
+			if _is_covered_by( stub, impl ):
+				candidates.append( impl )
+		assert len( candidates ) == 1, (
+			f'{stub.qualname}: ambiguous overload binding - matches {[c.qualname for c in candidates]}'
+			if candidates else
+			f'{stub.qualname}: no implementation covers this @overload signature'
+		)
+		stub.bound_to = candidates[0]
+
+	def _check_overload_shadowing( self, fn: Function, group: Overload ) -> None:
+		# all @overload-decorated members (stubs and real-bodied ones alike)
+		# are tried first-match, in declaration order, at a call site - if an
+		# earlier one's domain already fully covers fn's domain, fn can never
+		# be reached. only checks "am I shadowed by something earlier" - the
+		# reciprocal gets covered when that earlier member's own resolve runs
+		overload_members = sorted(
+			[ *group.stubs, *( f for f in group.implementations if f.is_overload ) ],
+			key = lambda f: f.line,
+		)
+		for earlier in overload_members:
+			if earlier is fn or earlier.line >= fn.line:
+				continue
+			if earlier.resolve is not None:
+				earlier.resolve()
+			assert not _is_covered_by( fn, earlier ), (
+				f'{fn.qualname} (line {fn.line}) is shadowed by {earlier.qualname} (line {earlier.line}) - '
+				f'unreachable, every type it declares is already handled by the earlier overload'
+			)
+
+	def _check_overload_ambiguity( self, fn: Function, group: Overload ) -> None:
+		# plain (non-@overload) implementations must be pairwise distinguishable
+		# by parameter type - any overlap is ambiguous regardless of whether a
+		# call ever actually exercises it
+		for other in group.implementations:
+			if other is fn or other.is_overload:
+				continue
+			if other.resolve is not None:
+				other.resolve()
+			assert not _overlaps( fn, other ), (
+				f'{fn.qualname} and {other.qualname} are ambiguous - their parameter types overlap'
+			)
+
+	def _make_function_resolver( self, fn: Function, module: Module, class_obj: ClassLike|None, group: Overload|None = None ) -> Callable[[],None]:
 		def resolve() -> None:
 			with self.module_context( module ):
 				with ( self.scope_context( class_obj ) if class_obj is not None else nullcontext() ):
@@ -906,5 +967,17 @@ class Discovery( ast.NodeVisitor ):
 
 						fn.parameters = parameters
 						fn.return_type = self.visit( fn.node.returns ) if fn.node.returns is not None else self.get_none_type()
+			# set self done *before* touching any overload siblings below - a
+			# sibling's own resolve may need to cross-check back against fn,
+			# and seeing fn.resolve is None already tells it not to re-enter
+			# this closure (see _make_value_resolver for the same pattern)
 			fn.resolve = None
+			if group is not None:
+				if fn in group.stubs:
+					self._bind_overload_stub( fn, group )
+					self._check_overload_shadowing( fn, group )
+				elif fn.is_overload:
+					self._check_overload_shadowing( fn, group )
+				else:
+					self._check_overload_ambiguity( fn, group )
 		return resolve

@@ -8,7 +8,7 @@ import unittest
 import discovery
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
-	Function, Variable, Specialization, Move,
+	Function, Variable, Specialization, Move, ConditionalDispatch,
 )
 
 logger = logging.getLogger( __name__ )
@@ -856,13 +856,14 @@ class OverloadTests( unittest.TestCase ):
 
 	def test_stub_plus_plain_implementation( self ) -> None:
 		# mirrors builtins.Result.unwrap_or: one @overload stub (no real
-		# body) declaring the public signature, one plain implementation
+		# body) declaring the public signature, one plain implementation whose
+		# accepted type (i32|usize) covers everything the stub declares (i32)
 		mod = self._import( '''
 class Foo:
 	@overload
 	def unwrap_or( self, default: i32 ) -> i32:
 		...
-	def unwrap_or( self, default: usize ) -> usize:
+	def unwrap_or( self, default: i32|usize ) -> i32|usize:
 		return default
 ''' )
 		foo = mod.get_local( 'Foo' )
@@ -873,9 +874,11 @@ class Foo:
 		self.assertEqual( len( group.implementations ), 1 )
 
 		group.stubs[0].resolve()
-		group.implementations[0].resolve()
+		if group.implementations[0].resolve is not None: # binding may already have cross-resolved it
+			group.implementations[0].resolve()
 		self.assertIsNone( group.stubs[0].resolve )
 		self.assertIsNone( group.implementations[0].resolve )
+		self.assertIs( group.stubs[0].bound_to, group.implementations[0] )
 
 	def test_two_real_implementations_distinct_params( self ) -> None:
 		# mirrors builtins.str.from_cstr: two @overload defs, both with
@@ -919,6 +922,325 @@ class Foo:
 		group = foo.get_local( 'bar' )
 		self.assertIn( group, foo.methods )
 		self.assertEqual( len( foo.methods ), 1 ) # not duplicated per overload member
+
+
+class OverloadWellFormednessTests( unittest.TestCase ):
+	''' binding (@overload stub -> plain implementation) and the well-formedness checks - all triggered from Function.resolve() '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_worked_example_bindings( self ) -> None:
+		# foo#1..foo#4 from the design conversation: two stubs, two plain
+		# implementations, each stub binds to exactly one implementation
+		mod = self._import( '''
+class int: pass
+class str: pass
+class bytes: pass
+
+@overload
+def foo( x: int ) -> None:
+	...
+
+@overload
+def foo( x: str = '' ) -> None:
+	...
+
+def foo( x: int|None = None ) -> None:
+	pass
+
+def foo( x: str|bytes ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'foo' )
+		self.assertEqual( len( group.stubs ), 2 )
+		self.assertEqual( len( group.implementations ), 2 )
+		foo1, foo2 = group.stubs
+		foo3, foo4 = group.implementations
+
+		foo1.resolve()
+		if foo2.resolve is not None:
+			foo2.resolve()
+		self.assertIs( foo1.bound_to, foo3 )
+		self.assertIs( foo2.bound_to, foo4 )
+
+	def test_stub_covered_by_nothing_errors( self ) -> None:
+		mod = self._import( '''
+class bool: pass
+class int: pass
+class str: pass
+
+@overload
+def foo( x: bool ) -> None:
+	...
+
+def foo( x: int ) -> None:
+	pass
+
+def foo( x: str ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'foo' )
+		with self.assertRaises( AssertionError ):
+			group.stubs[0].resolve()
+
+	def test_overlapping_plain_implementations_error( self ) -> None:
+		# ambiguity between plain implementations is detected purely by
+		# resolving them - no call site involved
+		mod = self._import( '''
+class int: pass
+class str: pass
+
+@overload
+def foo( x: int ) -> None:
+	...
+
+def foo( x: str ) -> None:
+	pass
+
+def foo( x: str ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'foo' )
+		with self.assertRaises( AssertionError ):
+			group.implementations[0].resolve()
+
+	def test_shadowed_stub_errors( self ) -> None:
+		# an earlier stub's str|bytes fully covers the later stub's str -
+		# the later one can never be reached (first-match always picks the
+		# earlier one first)
+		mod = self._import( '''
+class str: pass
+class bytes: pass
+
+@overload
+def foo( x: str|bytes ) -> None:
+	...
+
+@overload
+def foo( x: str ) -> None:
+	...
+
+def foo( x: str|bytes ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'foo' )
+		with self.assertRaises( AssertionError ):
+			group.stubs[1].resolve()
+
+	def test_shadowed_by_real_bodied_overload_errors( self ) -> None:
+		# shadowing applies across stubs and real-bodied @overload members
+		# alike, not just stub-vs-stub - both are tried first-match together
+		mod = self._import( '''
+class str: pass
+class bytes: pass
+
+@overload
+def foo( x: str|bytes ) -> None:
+	pass
+
+@overload
+def foo( x: str ) -> None:
+	...
+
+def foo( x: str|bytes ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'foo' )
+		with self.assertRaises( AssertionError ):
+			group.stubs[0].resolve()
+
+	def test_real_bodied_overload_group_unaffected( self ) -> None:
+		# str.from_cstr-style: two @overload arms, different arity, no stub,
+		# no plain fallback - regression check that the new checks don't
+		# false-positive on this existing pattern (different arity means
+		# _is_covered_by/_overlaps are trivially False for this pair)
+		mod = self._import( '''
+class int: pass
+class str: pass
+
+class Foo:
+	@overload
+	@staticmethod
+	def make( a: int, b: str ) -> int:
+		return a
+
+	@overload
+	@staticmethod
+	def make( a: str ) -> int:
+		return 0
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		group = foo.get_local( 'make' )
+		self.assertEqual( len( group.stubs ), 0 )
+		self.assertEqual( len( group.implementations ), 2 )
+		for fn in group.implementations:
+			fn.resolve()
+		self.assertIsNone( group.implementations[0].resolve )
+		self.assertIsNone( group.implementations[1].resolve )
+
+
+class OverloadCallResolutionTests( unittest.TestCase ):
+	''' Overload.resolve_call - pure function of types, no AST/call-site involved, so this is testable ahead of stage 2 '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def _worked_example( self ):
+		mod = self._import( '''
+class bool: pass
+class int: pass
+class str: pass
+class bytes: pass
+
+@overload
+def foo( x: int ) -> None:
+	...
+
+@overload
+def foo( x: str = '' ) -> None:
+	...
+
+def foo( x: int|None = None ) -> None:
+	pass
+
+def foo( x: str|bytes ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'foo' )
+		foo3, foo4 = group.implementations
+		return (
+			group, foo3, foo4,
+			mod.get_local( 'bool' ), mod.get_local( 'int' ), mod.get_local( 'str' ), mod.get_local( 'bytes' ),
+		)
+
+	def test_int_resolves_via_first_stub( self ) -> None:
+		group, foo3, foo4, bool_cls, int_cls, str_cls, bytes_cls = self._worked_example()
+		branches, default = group.resolve_call( [ int_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, foo3 )
+
+	def test_str_resolves_via_second_stub( self ) -> None:
+		group, foo3, foo4, bool_cls, int_cls, str_cls, bytes_cls = self._worked_example()
+		branches, default = group.resolve_call( [ str_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, foo4 )
+
+	def test_none_falls_through_to_unique_implementation( self ) -> None:
+		group, foo3, foo4, bool_cls, int_cls, str_cls, bytes_cls = self._worked_example()
+		branches, default = group.resolve_call( [ self.discovery.get_none_type() ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, foo3 )
+
+	def test_bytes_falls_through_to_unique_implementation( self ) -> None:
+		group, foo3, foo4, bool_cls, int_cls, str_cls, bytes_cls = self._worked_example()
+		branches, default = group.resolve_call( [ bytes_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, foo4 )
+
+	def test_union_argument_produces_conditional_dispatch( self ) -> None:
+		group, foo3, foo4, bool_cls, int_cls, str_cls, bytes_cls = self._worked_example()
+		union = self.discovery._get_or_create_union( [ int_cls, bytes_cls ] )
+		branches, default = group.resolve_call( [ union ], {} )
+		self.assertEqual( len( branches ), 1 )
+		self.assertIs( default, foo4 )
+		self.assertIs( branches[0].function, foo3 )
+		self.assertEqual( len( branches[0].conditions ), 1 )
+		param, expected = branches[0].conditions[0]
+		self.assertIs( param, foo3.parameters[0] )
+		self.assertIs( expected, int_cls )
+
+	def test_uncovered_type_errors( self ) -> None:
+		group, foo3, foo4, bool_cls, int_cls, str_cls, bytes_cls = self._worked_example()
+		with self.assertRaises( AssertionError ):
+			group.resolve_call( [ bool_cls ], {} )
+
+	def test_kwargs_match_differently_named_parameters( self ) -> None:
+		mod = self._import( '''
+class int: pass
+class str: pass
+
+@overload
+def f( a: int ) -> None:
+	...
+
+@overload
+def f( b: str ) -> None:
+	...
+
+def f( a: int ) -> None:
+	pass
+
+def f( b: str ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'f' )
+		int_impl, str_impl = group.implementations
+		int_cls = mod.get_local( 'int' )
+		str_cls = mod.get_local( 'str' )
+
+		branches, default = group.resolve_call( [], { 'a': int_cls } )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, int_impl )
+
+		branches, default = group.resolve_call( [], { 'b': str_cls } )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, str_impl )
+
+	def test_omitted_parameter_with_default_still_matches( self ) -> None:
+		mod = self._import( '''
+class int: pass
+class str: pass
+
+@overload
+def f( a: int, b: str = '' ) -> None:
+	...
+
+def f( a: int, b: str = '' ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'f' )
+		impl = group.implementations[0]
+		int_cls = mod.get_local( 'int' )
+
+		branches, default = group.resolve_call( [ int_cls ], {} ) # 'b' entirely omitted
+		self.assertEqual( branches, [] )
+		self.assertIs( default, impl )
+
+	def test_multi_parameter_cartesian_product( self ) -> None:
+		mod = self._import( '''
+class int: pass
+class str: pass
+
+@overload
+def pair( a: int, b: int ) -> None:
+	...
+
+def pair( a: int, b: int ) -> None:
+	pass
+def pair( a: int, b: str ) -> None:
+	pass
+def pair( a: str, b: int ) -> None:
+	pass
+def pair( a: str, b: str ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'pair' )
+		p_ii, p_is, p_si, p_ss = group.implementations
+		int_cls = mod.get_local( 'int' )
+		str_cls = mod.get_local( 'str' )
+		union = self.discovery._get_or_create_union( [ int_cls, str_cls ] )
+
+		branches, default = group.resolve_call( [ union, union ], {} )
+		target_ids = { id( b.function ) for b in branches } | { id( default ) }
+		self.assertEqual( target_ids, { id( p_ii ), id( p_is ), id( p_si ), id( p_ss ) })
 
 
 class CompilerTargetTests( unittest.TestCase ):
@@ -1021,7 +1343,9 @@ class RealLibSmokeTest( unittest.TestCase ):
 		group = result_cls.get_local( 'unwrap_or' )
 		self.assertIsInstance( group, Overload )
 		for fn in ( *group.stubs, *group.implementations ):
-			fn.resolve()
+			if fn.resolve is not None: # binding/ambiguity checks may already have cross-resolved a sibling
+				fn.resolve()
+		self.assertIs( group.stubs[0].bound_to, group.implementations[0] )
 
 	def test_str_from_cstr_overload_resolves( self ) -> None:
 		str_cls = self.builtins_mod.get_local( 'str' )
