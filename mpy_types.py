@@ -43,6 +43,25 @@ class Variable( Name ):
 	# "is this resolved" is just `var.resolve is None`.
 	resolve: Callable[[],None]|None = None
 
+@dataclass( kw_only = True )
+class Parameter( Variable ):
+	'''
+	a single function parameter. the kind flags mirror Python's own
+	call-site rules (at most one of is_vararg/is_kwarg, mutually exclusive
+	with is_posonly/is_kwonly) - stage 2 needs them plus `default` to bind
+	keyword/optional call-site arguments down to positional ones.
+	'''
+	is_posonly: bool = False
+	is_kwonly: bool = False
+	is_vararg: bool = False # *args
+	is_kwarg: bool = False # **kwargs
+	default: ast.expr|None = None # unresolved - stage 2's concern, same as Function.node's body
+
+@dataclass( kw_only = True )
+class Move( Type ):
+	''' `move[T]` in annotation position - ownership of a T is transferred into this binding rather than borrowed/copied. The CFG uses this to know the source binding must be invalidated after the transfer. '''
+	inner: Type
+
 
 class ScopeMixin:
 	'''
@@ -67,7 +86,12 @@ class ScopeMixin:
 
 @dataclass( kw_only = True )
 class RCClass( Type, ScopeMixin ): # normal ref-counted class
-	# TODO FIXME: base class for subclassing
+	# base is resolved eagerly at class-creation time, same as type_params -
+	# Python itself requires a base class to already exist when the `class
+	# Foo(Base):` statement runs, so there's no forward-reference case to
+	# defer here. Multiple inheritance is a compile error (see discovery.py),
+	# so this is a single pointer, not a list/MRO.
+	base: 'RCClass|None' = None
 	type_params: list[TypeVar]|None = None # if not None, this is a generic class
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
@@ -116,7 +140,7 @@ class Function( Type, ScopeMixin ):
 	cls: ClassLike|None
 	node: ast.FunctionDef # whole def - node.args/.returns resolved lazily, node.body untouched until IR generation
 	type_params: list[TypeVar]|None = None # if not None, this is a generic function (e.g. def alloc[T](...))
-	parameters: list[Variable]|None = None
+	parameters: list[Parameter]|None = None
 	return_type: Type|None = None
 	names: dict[str,Name] = field( default_factory = dict )
 	# None means already resolved; otherwise call it to populate

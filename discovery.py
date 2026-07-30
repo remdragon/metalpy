@@ -8,7 +8,7 @@ from typing import Any, Callable, Generator
 
 # local imports
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike,
 	Module,
 )
@@ -103,11 +103,12 @@ class Discovery( ast.NodeVisitor ):
 		self.scope_stack: list[Module|ClassLike|Function] = []
 
 		# dedup caches for compound types built from other types on the fly
-		# (anonymous unions, generic specializations) - never looked up by
-		# qualname from outside, only reused when the exact same combination
-		# is seen again
+		# (anonymous unions, generic specializations, move[T] wrappers) - never
+		# looked up by qualname from outside, only reused when the exact same
+		# combination is seen again
 		self._unions: dict[str,TaggedUnion] = {}
 		self._specializations: dict[str,Specialization] = {}
+		self._moves: dict[str,Move] = {}
 
 		if import_builtins:
 			self.builtins = self.import_name( 'builtins' )
@@ -134,12 +135,12 @@ class Discovery( ast.NodeVisitor ):
 			popped = self.module_stack.pop()
 			assert popped == module
 
-	def import_file( self, filename: Path, scope: str|None = None ) -> Module:
+	def import_file( self, filename: Path, scope: str|None = None, package: str|None = None ) -> Module:
 		with filename.open( 'r' ) as f:
 			code = f.read()
-		return self.import_code( code, filename, scope )
+		return self.import_code( code, filename, scope, package = package )
 
-	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
+	def import_code( self, code: str, filename: Path, scope: str|None = None, package: str|None = None ) -> Module:
 		# NOTE: builtins starts off None and we import builtins when we first instanciate this class
 		# that way builtins exists whenever we are ready to parse any other code besides builtins
 		stem = filename.stem if filename else ''
@@ -152,19 +153,20 @@ class Discovery( ast.NodeVisitor ):
 			intrinsics = self.get_intrinsics(),
 			builtins = self.builtins.names if self.builtins else None,
 		)
+		if package is not None:
+			# register before scanning the body: if this module (transitively)
+			# imports itself, that import_name() call must find this same
+			# (still being scanned) Module here instead of recursing forever
+			self.modules[package] = module
 		with self.module_context( module ):
 			tree = ast.parse( code )
-			self._scan_body( tree.body )
+			# scope_stack[-1] (the module) owns this body - every statement is
+			# dispatched through self.visit(), which registers what it finds
+			# immediately (structurally) and defers only the deep internals
+			for node in tree.body:
+				self.visit( node )
 
 		return module
-
-	def _scan_body( self, body: list[ast.stmt] ) -> None:
-		# scope_stack[-1] is whatever scope owns this body (a Module or a
-		# class) - every statement is dispatched through self.visit(), which
-		# registers what it finds immediately (structurally) and defers only
-		# the deep internals (see class docstring)
-		for node in body:
-			self.visit( node )
 
 	def import_name( self,
 		package: str,
@@ -172,10 +174,8 @@ class Discovery( ast.NodeVisitor ):
 		if package == 'compiler':
 			return self.compiler_module
 
-		#print( f'{package=}' )
-		noisy = False
-		#if package == 'codecs':
-		#	noisy = True
+		if mod := self.modules.get( package, None ):
+			return mod
 
 		relpath = package.replace( '.', '/' )
 		looked: list[str] = []
@@ -185,26 +185,14 @@ class Discovery( ast.NodeVisitor ):
 			if path.is_dir():
 				stem = '__init__'
 				qualname = f'{package}.{stem}'
-				if noisy:
-					print( f'{str(path)!r}.is_dir=True, {stem=} {qualname=}' )
 			else:
 				stem = path.stem
 				path = path.parent
 				qualname = '.'.join([ package.rpartition( '.' )[0], stem ]).lstrip( '.' )
-				#assert False, f'{package=} {name=} -> {path=} {stem=} {qualname=}'
-			if mod := self.modules.get( package, None ):
-				return mod
 			for suffix in suffixes:
 				filename = path / f'{stem}{suffix}'
-				if noisy:
-					print( f'trying {str(filename)!r}' )
 				if filename.is_file():
-					if noisy:
-						print( f'{str(filename)!r}.is_file()=True' )
-					#assert False, f'{filename=} {package=} {scope=}'
-					mod = self.import_file( filename, scope = qualname.rpartition( '.' )[0] )
-					self.modules[package] = mod
-					return mod
+					return self.import_file( filename, scope = qualname.rpartition( '.' )[0], package = package )
 				else:
 					looked.append( str( filename ))
 		e = FileNotFoundError( package )
@@ -254,10 +242,12 @@ class Discovery( ast.NodeVisitor ):
 
 	def find_name( self, name: str, ctx: ast.AST ) -> Name:
 		mod = self.module_stack[-1]
+		# mod.builtins is already the target module's names dict (see
+		# import_code) - not a Module needing a further .names unwrap
 		builtins = mod.builtins
 		for scope in itertools.chain(
 			[ scope.names for scope in self.scope_stack[::-1] ],
-			[ builtins.names if builtins else {} ],
+			[ builtins if builtins else {} ],
 			[ mod.intrinsics ],
 		):
 			assert isinstance( scope, dict ), f'invalid {scope=}'
@@ -354,7 +344,16 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization:
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move:
+		# move[T] is compiler syntax, not a real generic lookup - recognized
+		# textually here the same way @move is recognized textually as a
+		# decorator name in _parse_function, rather than resolved through
+		# find_name like an ordinary generic base would be
+		if isinstance( node.value, ast.Name ) and node.value.id == 'move':
+			assert not isinstance( node.slice, ast.Tuple ), f'move[...] takes exactly one type argument: {ast.unparse(node)}'
+			inner = self.visit( node.slice )
+			return self._get_or_create_move( inner )
+
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
 		assert type_params, f'{base.qualname} is not generic, cannot subscript it'
@@ -367,6 +366,20 @@ class Discovery( ast.NodeVisitor ):
 
 		args = [ self.visit( arg_node ) for arg_node in arg_nodes ]
 		return self._get_or_create_specialization( base, args )
+
+	def _get_or_create_move( self, inner: Type ) -> Move:
+		key = f'move[{inner.qualname}]'
+		if mv := self._moves.get( key ):
+			return mv
+		mv = Move(
+			stem = key,
+			qualname = key,
+			file = inner.file,
+			line = inner.line,
+			inner = inner,
+		)
+		self._moves[key] = mv
+		return mv
 
 	def _get_or_create_specialization( self, base: Type, args: list[Type] ) -> Specialization:
 		key = f'{base.qualname}[{",".join( a.qualname for a in args )}]'
@@ -491,9 +504,12 @@ class Discovery( ast.NodeVisitor ):
 		return resolve
 
 	def _register_enum_member( self, cls: CEnum, node: ast.Assign ) -> None:
-		# self-contained (just integer literals / the '_' auto-increment
-		# sentinel) - nothing forward-reference-sensitive, so this resolves
-		# immediately, no .resolve needed
+		# only reached from inside cls's own .resolve (see _make_class_resolver)
+		# - so registration is deferred along with the rest of the class body.
+		# once that runs, members are self-contained
+		# (just integer literals / the '_' auto-increment sentinel), so
+		# there's nothing forward-reference-sensitive left needing a further
+		# per-member .resolve
 		assert len( node.targets ) == 1, f'multiple targets unsupported in {cls.qualname}: {ast.unparse(node)}'
 		target = node.targets[0]
 		assert isinstance( target, ast.Name ), f'enum member target must be a Name, not {target=} in {cls.qualname}'
@@ -586,7 +602,9 @@ class Discovery( ast.NodeVisitor ):
 		def resolve() -> None:
 			with self.module_context( module ):
 				with self.scope_context( class_obj ):
-					self._scan_body( body )
+					# scope_stack[-1] (class_obj) owns this body - see import_code()
+					for node in body:
+						self.visit( node )
 			class_obj.resolve = None
 		return resolve
 
@@ -683,12 +701,22 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 		)
-		if node.bases:
-			print( f'WARNING: subclassing not implemented yet ({qualname} wants to subclass {node.bases[0]})' )
+		assert len( node.bases ) <= 1, (
+			f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})'
+		)
 		assert not node.keywords, f'class {qualname} cannot have keywords ({node.keywords!r})'
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
+
+		if node.bases:
+			# resolved eagerly, in the enclosing scope, exactly like Python
+			# itself requires the base to already exist when this statement runs
+			base = self.visit( node.bases[0] )
+			assert isinstance( base, RCClass ), (
+				f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)'
+			)
+			class_obj.base = base
 
 		self._parse_type_params( node.type_params, class_obj )
 		
@@ -829,23 +857,45 @@ class Discovery( ast.NodeVisitor ):
 			with self.module_context( module ):
 				with ( self.scope_context( class_obj ) if class_obj is not None else nullcontext() ):
 					with self.scope_context( fn ):
-						parameters: list[Variable] = []
-						for arg in fn.node.args.args:
+						args = fn.node.args
+						parameters: list[Parameter] = []
+
+						def add_param( arg: ast.arg, default: ast.expr|None, **kind: bool ) -> None:
 							if arg.arg == 'self' and not fn.is_static:
-								continue
+								return
 							if arg.arg == 'cls' and fn.is_classmethod:
-								continue
+								return
 							assert arg.annotation is not None, f'{fn.qualname} parameter {arg.arg!r} has no type annotation'
-							param_type = self.visit( arg.annotation )
-							param = Variable(
+							param = Parameter(
 								stem = arg.arg,
 								qualname = self._get_qualname( arg.arg ),
 								file = fn.file,
 								line = fn.line,
-								type = param_type,
+								type = self.visit( arg.annotation ),
+								default = default,
+								**kind,
 							)
 							parameters.append( param )
 							fn.add_name( param.stem, param )
+
+						# `defaults` applies to the trailing N of posonlyargs+args
+						# combined (an ast-module quirk) - left-pad with None so
+						# every positional param lines up with its own default
+						# (or lack of one)
+						positional = [ *args.posonlyargs, *args.args ]
+						defaults = [ None ] * ( len( positional ) - len( args.defaults )) + list( args.defaults )
+						for i, arg in enumerate( positional ):
+							add_param( arg, defaults[i], is_posonly = i < len( args.posonlyargs ))
+
+						if args.vararg is not None:
+							add_param( args.vararg, None, is_vararg = True )
+
+						for arg, default in zip( args.kwonlyargs, args.kw_defaults ):
+							add_param( arg, default, is_kwonly = True )
+
+						if args.kwarg is not None:
+							add_param( args.kwarg, None, is_kwarg = True )
+
 						fn.parameters = parameters
 						fn.return_type = self.visit( fn.node.returns ) if fn.node.returns is not None else self.get_none_type()
 			fn.resolve = None

@@ -1,13 +1,14 @@
 # stdlib imports
 import logging
 from pathlib import Path
+import tempfile
 import unittest
 
 # local imports
 import discovery
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
-	Function, Variable, Specialization,
+	Function, Variable, Specialization, Move,
 )
 
 logger = logging.getLogger( __name__ )
@@ -96,9 +97,14 @@ class ShallowScanTests( unittest.TestCase ):
 	global is discoverable by name right away. A class's own body (its
 	attributes/methods) is a different story - like a function's parameters
 	or a variable's type, it stays behind .resolve until something actually
-	needs it (the one exception is type_params, parsed eagerly since external
-	code subscripting a generic class needs it before that class's own
-	resolve() ever runs).
+	needs it. exceptions, all parsed eagerly at class-creation time:
+		* type_params, since external code subscripting a generic class
+		  needs it before that class's own resolve() ever runs
+		* a shallow scan for nested inner classes
+		* base (single inheritance only - see InheritanceTests), since
+		  Python itself requires the base to already exist when the
+		  `class Foo(Base):` statement runs, so there's no forward
+		  reference to defer
 	'''
 
 	def setUp( self ) -> None:
@@ -563,6 +569,284 @@ def foo() -> i32[i32]:
 			fn.resolve()
 
 
+class InheritanceTests( unittest.TestCase ):
+	''' single inheritance only - RCClass.base is resolved eagerly, at class-creation time, same as type_params (see ShallowScanTests) '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_single_base_resolved_eagerly( self ) -> None:
+		mod = self._import( '''
+class Base:
+	pass
+
+class Derived( Base ):
+	pass
+''' )
+		base = mod.get_local( 'Base' )
+		derived = mod.get_local( 'Derived' )
+		self.assertIsInstance( derived, RCClass )
+		self.assertIs( derived.base, base ) # resolved before derived.resolve() ever runs
+		self.assertIsNotNone( derived.resolve ) # but derived's own body is still deferred
+
+	def test_no_base_leaves_base_none( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	pass
+''' )
+		self.assertIsNone( mod.get_local( 'Foo' ).base )
+
+	def test_multiple_inheritance_errors( self ) -> None:
+		with self.assertRaises( AssertionError ):
+			self._import( '''
+class A:
+	pass
+
+class B:
+	pass
+
+class C( A, B ):
+	pass
+''' )
+
+	def test_subclassing_non_rcclass_errors( self ) -> None:
+		with self.assertRaises( AssertionError ):
+			self._import( '''
+@cstruct
+class Point:
+	x: i32
+
+class Foo( Point ):
+	pass
+''' )
+
+
+class FunctionParameterTests( unittest.TestCase ):
+	''' full ast.arguments coverage - stage 2 needs the kind flags plus `default` to bind keyword/optional call-site arguments down to positional ones '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_positional_only( self ) -> None:
+		mod = self._import( '''
+def foo( x: i32, / ) -> None:
+	pass
+''' )
+		foo = mod.get_local( 'foo' )
+		foo.resolve()
+		self.assertEqual( len( foo.parameters ), 1 )
+		p = foo.parameters[0]
+		self.assertEqual( p.stem, 'x' )
+		self.assertTrue( p.is_posonly )
+		self.assertFalse( p.is_kwonly or p.is_vararg or p.is_kwarg )
+		self.assertIsNone( p.default )
+
+	def test_default_value_captured_unresolved( self ) -> None:
+		mod = self._import( '''
+def foo( x: i32 = 1 ) -> None:
+	pass
+''' )
+		foo = mod.get_local( 'foo' )
+		foo.resolve()
+		p = foo.parameters[0]
+		self.assertIsNotNone( p.default ) # raw ast.expr - stage 2's concern to evaluate, same as fn.node's body
+		self.assertEqual( p.default.value, 1 )
+
+	def test_keyword_only_with_and_without_default( self ) -> None:
+		mod = self._import( '''
+def foo( *, x: i32, y: usize = 2 ) -> None:
+	pass
+''' )
+		foo = mod.get_local( 'foo' )
+		foo.resolve()
+		x, y = foo.parameters
+		self.assertTrue( x.is_kwonly )
+		self.assertIsNone( x.default )
+		self.assertTrue( y.is_kwonly )
+		self.assertIsNotNone( y.default )
+
+	def test_vararg_and_kwarg( self ) -> None:
+		mod = self._import( '''
+def foo( *args: i32, **kwargs: usize ) -> None:
+	pass
+''' )
+		foo = mod.get_local( 'foo' )
+		foo.resolve()
+		args, kwargs = foo.parameters
+		self.assertEqual( args.stem, 'args' )
+		self.assertTrue( args.is_vararg )
+		self.assertIs( args.type, self.discovery.get_intrinsics()['i32'] )
+		self.assertEqual( kwargs.stem, 'kwargs' )
+		self.assertTrue( kwargs.is_kwarg )
+		self.assertIs( kwargs.type, self.discovery.get_intrinsics()['usize'] )
+
+	def test_mixed_signature_full_shape( self ) -> None:
+		mod = self._import( '''
+def foo( a: i32, /, b: i32 = 1, *args: i32, c: i32, d: i32 = 2, **kwargs: i32 ) -> None:
+	pass
+''' )
+		foo = mod.get_local( 'foo' )
+		foo.resolve()
+		self.assertEqual( [ p.stem for p in foo.parameters ], [ 'a', 'b', 'args', 'c', 'd', 'kwargs' ])
+		a, b, args, c, d, kwargs = foo.parameters
+		self.assertTrue( a.is_posonly )
+		self.assertIsNone( a.default )
+		self.assertFalse( b.is_posonly )
+		self.assertIsNotNone( b.default )
+		self.assertTrue( args.is_vararg )
+		self.assertTrue( c.is_kwonly )
+		self.assertIsNone( c.default )
+		self.assertTrue( d.is_kwonly )
+		self.assertIsNotNone( d.default )
+		self.assertTrue( kwargs.is_kwarg )
+
+	def test_self_and_cls_still_skipped_alongside_other_kinds( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	def bar( self, *, x: i32 ) -> None:
+		pass
+
+	@classmethod
+	def make( cls, *args: i32 ) -> None:
+		pass
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		bar = foo.get_local( 'bar' )
+		bar.resolve()
+		self.assertEqual( [ p.stem for p in bar.parameters ], [ 'x' ])
+
+		make = foo.get_local( 'make' )
+		make.resolve()
+		self.assertEqual( [ p.stem for p in make.parameters ], [ 'args' ])
+
+
+class MoveTypeTests( unittest.TestCase ):
+	''' move[T] in annotation position - recognized textually (like @move) rather than resolved through find_name, so it works even though `move` is never a real bound name anywhere '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_move_wraps_inner_type( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	pass
+
+def consume( x: move[Foo] ) -> None:
+	pass
+''' )
+		fn = mod.get_local( 'consume' )
+		fn.resolve()
+		p = fn.parameters[0]
+		self.assertIsInstance( p.type, Move )
+		self.assertIs( p.type.inner, mod.get_local( 'Foo' ))
+
+	def test_move_dedups_to_identical_object( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	pass
+
+def consume( x: move[Foo] ) -> None:
+	pass
+
+def consume2( y: move[Foo] ) -> None:
+	pass
+''' )
+		consume = mod.get_local( 'consume' )
+		consume2 = mod.get_local( 'consume2' )
+		consume.resolve()
+		consume2.resolve()
+		self.assertIs( consume.parameters[0].type, consume2.parameters[0].type )
+
+	def test_move_multiple_args_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	pass
+
+class Bar:
+	pass
+
+def consume( x: move[Foo, Bar] ) -> None:
+	pass
+''' )
+		fn = mod.get_local( 'consume' )
+		with self.assertRaises( AssertionError ):
+			fn.resolve()
+
+	def test_move_decorator_flag_on_function( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@move
+	def release( self ) -> None:
+		pass
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		release = foo.get_local( 'release' )
+		self.assertTrue( release.is_move )
+
+
+class UnsupportedDecoratorTests( unittest.TestCase ):
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_property_is_not_yet_supported( self ) -> None:
+		# intentionally unimplemented for now, deferred until other problems
+		# are solved (see Discovery/ARCHITECTURE.md discussion) - this test
+		# just locks in that it fails loudly rather than silently doing the
+		# wrong thing, so implementing it later is a deliberate decision.
+		# @property lives inside the class body, which is itself deferred
+		# behind .resolve() (see ShallowScanTests), so the error only
+		# surfaces once something actually asks for it
+		mod = self._import( '''
+class Foo:
+	@property
+	def bar( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		with self.assertRaises( AssertionError ):
+			foo.resolve()
+
+
+class CircularImportTests( unittest.TestCase ):
+	'''
+	regression: import_name() used to register a module in self.modules only
+	after its body had been fully scanned, so a re-entrant import (A imports
+	B imports A) recursed forever instead of resolving back to the (still
+	being scanned) module
+	'''
+
+	def test_mutually_importing_modules_resolve_without_recursing( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( 'import b\nclass A:\n\tpass\n' )
+			( root / 'b.py' ).write_text( 'import a\nclass B:\n\tpass\n' )
+
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			mod_a = disco.import_name( 'a' )
+			mod_b = disco.modules['b']
+
+			self.assertIsInstance( mod_a.get_local( 'A' ), RCClass )
+			self.assertIsInstance( mod_b.get_local( 'B' ), RCClass )
+			# each module's `import` of the other resolved back to the same
+			# (partially-scanned-at-the-time) Module object, not a duplicate
+			self.assertIs( mod_b.get_local( 'a' ), mod_a )
+			self.assertIs( mod_a.get_local( 'b' ), mod_b )
+
+
 class OverloadTests( unittest.TestCase ):
 	def setUp( self ) -> None:
 		self.discovery = discovery.Discovery( import_builtins = False )
@@ -746,12 +1030,14 @@ class RealLibSmokeTest( unittest.TestCase ):
 		group = str_cls.get_local( 'from_cstr' )
 		self.assertIsInstance( group, Overload )
 		self.assertEqual( len( group.implementations ), 2 )
-		# only resolving implementations[0] (buf/length) here: implementations[1]
-		# takes `src: move[bytearray]` - `move[T]` as a subscriptable ownership
-		# annotation isn't a type the discovery type system models yet, and
-		# that's out of scope for this pass
-		group.implementations[0].resolve()
+		group.implementations[0].resolve() # buf/length
 		self.assertIsNone( group.implementations[0].resolve )
+
+		group.implementations[1].resolve() # src: move[bytearray]
+		self.assertIsNone( group.implementations[1].resolve )
+		src = group.implementations[1].parameters[0]
+		self.assertIsInstance( src.type, Move )
+		self.assertIs( src.type.inner, self.builtins_mod.get_local( 'bytearray' ))
 
 	def test_bytearray_resolves( self ) -> None:
 		ba_cls = self.builtins_mod.get_local( 'bytearray' )
@@ -775,6 +1061,18 @@ class RealLibSmokeTest( unittest.TestCase ):
 		self.assertNotIsInstance( cstrlen, Overload )
 		cstrlen.resolve()
 		self.assertIsNone( cstrlen.resolve )
+
+	def test_codecs_ascii_subclasses_codec( self ) -> None:
+		# lib/codecs/ascii.py (and cp437/latin1/utf8) declare `class ascii(
+		# Codec):` - the motivating real-world case for RCClass.base. Not
+		# reached by the plain `import_builtins=True` walk (codecs/__init__.py
+		# only imports these from inside a function body, which discovery
+		# never scans), so import it explicitly.
+		ascii_mod = self.discovery.import_name( 'codecs.ascii' )
+		codecs_mod = self.discovery.modules['codecs']
+		ascii_cls = ascii_mod.get_local( 'ascii' )
+		self.assertIsInstance( ascii_cls, RCClass )
+		self.assertIs( ascii_cls.base, codecs_mod.get_local( 'Codec' ))
 
 
 if __name__ == '__main__':
