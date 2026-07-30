@@ -1074,6 +1074,24 @@ class RealLibSmokeTest( unittest.TestCase ):
 		self.assertIsInstance( ascii_cls, RCClass )
 		self.assertIs( ascii_cls.base, codecs_mod.get_local( 'Codec' ))
 
+	def test_transitively_imported_module_gets_working_builtins( self ) -> None:
+		# regression: Discovery used to keep builtins on a dedicated
+		# self.builtins attribute, only assigned after import_name('builtins')
+		# fully returned - so codecs/sys/etc (imported from *inside*
+		# builtins/__init__.py's own body, while that assignment was still
+		# pending) permanently got Module.builtins=None, and any bare
+		# builtin-type reference in them (e.g. Codec.encode's `s: str`)
+		# couldn't resolve. now builtins is looked up from self.modules,
+		# which already has 'builtins' registered by this point (see
+		# import_code)
+		codecs_mod = self.discovery.modules['codecs']
+		self.assertTrue( codecs_mod.builtins )
+		codec = codecs_mod.get_local( 'Codec' )
+		codec.resolve()
+		encode = codec.get_local( 'encode' )
+		encode.resolve()
+		self.assertIs( encode.parameters[0].type, self.builtins_mod.get_local( 'str' ))
+
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG, force = True )

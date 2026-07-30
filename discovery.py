@@ -75,7 +75,6 @@ class Discovery( ast.NodeVisitor ):
 	'''
 	log_unhandled: bool = False
 
-	builtins: dict[str,Name]|None = None
 	_intrinsics: dict[str,Name]|None = None
 	_none_type: Scalar|None = None
 
@@ -111,7 +110,10 @@ class Discovery( ast.NodeVisitor ):
 		self._moves: dict[str,Move] = {}
 
 		if import_builtins:
-			self.builtins = self.import_name( 'builtins' )
+			# just for the side effect of populating self.modules['builtins'] -
+			# import_code() looks it up from there directly (see below), so
+			# nothing needs to be kept here on the Discovery instance itself
+			self.import_name( 'builtins' )
 
 	@contextmanager
 	def scope_context( self, scope: Module|ClassLike|Function ) -> Generator[None,None,None]:
@@ -141,17 +143,23 @@ class Discovery( ast.NodeVisitor ):
 		return self.import_code( code, filename, scope, package = package )
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None, package: str|None = None ) -> Module:
-		# NOTE: builtins starts off None and we import builtins when we first instanciate this class
-		# that way builtins exists whenever we are ready to parse any other code besides builtins
 		stem = filename.stem if filename else ''
 		qualname = ( f'{scope}.{stem}' if scope else stem )
+		# looked up from self.modules, not a dedicated Discovery.builtins
+		# attribute - self.modules['builtins'] is registered (see below)
+		# before builtins' own body is scanned, so this is already there by
+		# the time anything builtins itself transitively imports (codecs,
+		# sys, ...) gets to this point. while builtins is still being
+		# imported for the first time ever, this is None - correct, since
+		# builtins doesn't need a fallback to itself
+		builtins_mod = self.modules.get( 'builtins' )
 		module = Module(
 			stem = stem,
 			qualname = qualname,
 			file = filename,
 			line = None,
 			intrinsics = self.get_intrinsics(),
-			builtins = self.builtins.names if self.builtins else None,
+			builtins = builtins_mod.names if builtins_mod else None,
 		)
 		if package is not None:
 			# register before scanning the body: if this module (transitively)
