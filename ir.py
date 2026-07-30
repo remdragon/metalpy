@@ -181,6 +181,11 @@ class JumpIfTrue( Instruction ):
 class Call( Instruction ):
 	dest: Temp|None # None for a call whose result is discarded
 	target: Function
+	# the bound instance for a method call (self/cls are excluded from
+	# Function.parameters entirely - see discovery.py's _make_function_resolver
+	# - so there's nothing in args/kwargs to carry it). None for a free
+	# function, staticmethod, or classmethod call.
+	receiver: Operand|None = None
 	args: list[Operand]
 	kwargs: dict[str,Operand]
 

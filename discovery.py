@@ -97,6 +97,7 @@ class Discovery( ast.NodeVisitor ):
 			builtins = None,
 		)
 		self.modules: dict[str,Module] = {}
+		self.main: Function|None = None
 
 		self.module_stack: list[Module] = []
 		self.scope_stack: list[Module|ClassLike|Function] = []
@@ -454,6 +455,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = self._get_qualname( node.target.id ),
 			file = module.file,
 			line = node.lineno,
+			init = node.value,
 		)
 		var_obj.resolve = self._make_annotation_resolver( var_obj, node.annotation, module, scope )
 		scope.add_name( var_obj.stem, var_obj )
@@ -487,6 +489,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = self._get_qualname( target.id ),
 			file = module.file,
 			line = node.lineno,
+			init = node.value,
 		)
 		var_obj.resolve = self._make_value_resolver( var_obj, node.value, module, scope )
 		scope.add_name( var_obj.stem, var_obj )
@@ -821,6 +824,8 @@ class Discovery( ast.NodeVisitor ):
 			is_private = is_private,
 			is_overload = is_overload,
 		)
+		if node.name == 'main':
+			self.main = fn
 		self._parse_type_params( node.type_params, fn )
 
 		scope = self.scope_stack[-1]

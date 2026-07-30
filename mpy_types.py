@@ -49,6 +49,10 @@ class Variable( Name ):
 	# it to populate .type, after which it sets itself back to None. Checking
 	# "is this resolved" is just `var.resolve is None`.
 	resolve: Callable[[],None]|None = None
+	# the initializer expression, unresolved (stage 2's concern, same as
+	# Function.node's body) - None for a declaration with no initializer
+	# (e.g. a bare `x: i32` class attribute)
+	init: ast.expr|None = None
 
 @dataclass( kw_only = True )
 class Parameter( Variable ):

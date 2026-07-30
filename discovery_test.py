@@ -1417,6 +1417,28 @@ class RealLibSmokeTest( unittest.TestCase ):
 		self.assertIs( encode.parameters[0].type, self.builtins_mod.get_local( 'str' ))
 
 
+class MainSymbolTests( unittest.TestCase ):
+	''' Discovery.main gives stage 2 an easy way to find the entry point (see compiler.py's Compiler.run) '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def test_no_main_defined( self ) -> None:
+		self.discovery.import_code( '''
+def not_main() -> None:
+	pass
+''', Path( '__main__.py' ), scope = None )
+		self.assertIsNone( self.discovery.main )
+
+	def test_main_gets_set( self ) -> None:
+		self.discovery.import_code( '''
+def main() -> None:
+	pass
+''', Path( '__main__.py' ), scope = None )
+		self.assertIsInstance( self.discovery.main, Function )
+		self.assertEqual( self.discovery.main.qualname, 'main' )
+
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG, force = True )
 	unittest.main()
