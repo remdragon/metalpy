@@ -6,15 +6,26 @@ from typing import Callable
 # local imports:
 import ir
 from discovery import Discovery
+from errors import CompileError
 from mpy_types import (
-	Type, Variable, Parameter, Function, Overload, ClassLike, Module,
+	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
 	Specialization, TaggedUnion,
 )
 
-_BINOP_OPCODES: dict[type,type] = {
+_BINOP_WRAP_OPCODES: dict[type,type] = {
 	ast.Add: ir.AddWrap,
 	ast.Sub: ir.SubWrap,
 	ast.Mult: ir.MulWrap,
+}
+_BINOP_CHECK_OPCODES: dict[type,type] = {
+	ast.Add: ir.AddCheck,
+	ast.Sub: ir.SubCheck,
+	ast.Mult: ir.MulCheck,
+}
+_BINOP_SATURATE_OPCODES: dict[type,type] = {
+	ast.Add: ir.AddSaturate,
+	ast.Sub: ir.SubSaturate,
+	ast.Mult: ir.MulSaturate,
 }
 
 class Lowering:
@@ -30,6 +41,33 @@ class Lowering:
 	Whenever a Function, ClassLike, or module-level Variable is discovered as
 	a dependency, `schedule` is called immediately at the point of discovery -
 	there's no separate dependency-scanning pass.
+
+	Errors report through self.discovery.errors, the same collector stage 1
+	uses (self.discovery.fail()/fail_loc()) - see _lower_stmt's caller in
+	lower_function for the recovery boundary (one bad statement doesn't stop
+	the rest of that function's body from being lowered).
+
+	Arithmetic (+/-/*) defaults to Check mode (AddCheck/SubCheck/MulCheck,
+	producing Result[T,OverflowError]) everywhere - there is no unchecked
+	default. A Check op is immediately followed by an OrReturn (like
+	Result.or_return()'s own semantics: propagate the error, continue with
+	the unwrapped value), which requires the enclosing function to actually
+	return Result[_,OverflowError] - using plain arithmetic in a function
+	that can't propagate that error is a compile error, unless one of the
+	arithmetic-mode with-blocks below is used instead. self._arithmetic_mode
+	is a stack of (kind, extra) pairs, pushed/popped by _stmt_With:
+		('wrap', None)      - `with compiler.wrap_arithmetic:` - plain
+		                       AddWrap/SubWrap/MulWrap, no Result involved
+		('saturate', None)  - `with compiler.saturate_arithmetic:` - plain
+		                       AddSaturate/SubSaturate/MulSaturate, likewise
+		('check', None)     - the default (see above) - Check + OrReturn
+		('check', errmsg)   - `with compiler.panic_arithmetic(errmsg):` -
+		                       still Check-mode ops, but consumed with
+		                       Unwrap(errmsg) instead of OrReturn, so (unlike
+		                       the bare default) this does NOT require the
+		                       enclosing function to return Result[_,
+		                       OverflowError] - Unwrap panics, it never
+		                       needs anywhere to propagate to
 	'''
 
 	def __init__( self, discovery: Discovery, schedule: Callable[[Function|ClassLike|Variable],None] ) -> None:
@@ -42,6 +80,7 @@ class Lowering:
 		self._temp_id = 0
 		self._pending_temps: list[ir.Temp] = []
 		self._current_fn = fn
+		self._arithmetic_mode: list[tuple[str,object]] = [ ( 'check', None ) ]
 
 		with self.discovery.module_context( module ):
 			with ( self.discovery.scope_context( fn.cls ) if fn.cls is not None else nullcontext() ):
@@ -62,7 +101,14 @@ class Lowering:
 
 					self._emit( ir.FuncStart( name = fn.qualname, params = fn.parameters or [], return_type = fn.return_type ))
 					for stmt in fn.node.body:
-						self._lower_stmt( stmt )
+						# one bad statement doesn't stop the rest of this
+						# function's body from being lowered (and error-collected) -
+						# mirrors discovery.py's per-.resolve()/per-top-level-statement
+						# recovery boundaries
+						try:
+							self._lower_stmt( stmt )
+						except CompileError:
+							continue
 					self._emit( ir.FuncEnd( name = fn.qualname ))
 
 		return self._instructions
@@ -73,6 +119,7 @@ class Lowering:
 		self._temp_id = 0
 		self._pending_temps = []
 		self._current_fn = None
+		self._arithmetic_mode = [ ( 'check', None ) ]
 
 		with self.discovery.module_context( module ):
 			if var.init is not None:
@@ -93,7 +140,7 @@ class Lowering:
 		for module in self.discovery.modules.values():
 			if module.file == unit.file:
 				return module
-		assert False, f'no module found owning {unit.qualname} (file={unit.file})'
+		self.discovery.fail_loc( f'no module found owning {unit.qualname} (file={unit.file})', unit.file, unit.line )
 
 	# --- dependency scheduling -----------------------------------------------
 
@@ -125,12 +172,22 @@ class Lowering:
 	# --- statements ------------------------------------------------------------
 
 	def _lower_stmt( self, node: ast.stmt ) -> None:
+		# _pending_temps is shared/mutable rather than passed explicitly, so a
+		# statement whose own handler recursively lowers nested statements
+		# (currently only _stmt_With) must not let those nested calls' own
+		# resets/flushes clobber this call's view of it - save/restore around
+		# the whole thing, same idea as scope_context's stack push/pop
+		outer_pending = self._pending_temps
 		self._pending_temps = []
-		method = getattr( self, f'_stmt_{node.__class__.__name__}', None )
-		assert method is not None, f'unsupported statement: {ast.unparse(node)}'
-		method( node )
-		for t in reversed( self._pending_temps ):
-			self._emit( ir.DeleteTemp( temp = t ))
+		try:
+			method = getattr( self, f'_stmt_{node.__class__.__name__}', None )
+			if method is None:
+				self.discovery.fail( f'unsupported statement: {ast.unparse(node)}', node )
+			method( node )
+			for t in reversed( self._pending_temps ):
+				self._emit( ir.DeleteTemp( temp = t ))
+		finally:
+			self._pending_temps = outer_pending
 
 	def _stmt_Return( self, node: ast.Return ) -> None:
 		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
@@ -147,7 +204,8 @@ class Lowering:
 		pass
 
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
-		assert isinstance( node.target, ast.Name ), f'unsupported AnnAssign target: {ast.unparse(node)}'
+		if not isinstance( node.target, ast.Name ):
+			self.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
 		fn = self._current_fn
 		var_type = self.discovery.visit( node.annotation )
 		var = Variable(
@@ -164,11 +222,13 @@ class Lowering:
 			self._emit( ir.Assign( dest = var, src = operand ))
 
 	def _stmt_Assign( self, node: ast.Assign ) -> None:
-		assert len( node.targets ) == 1, f'multiple assignment targets not supported: {ast.unparse(node)}'
+		if len( node.targets ) != 1:
+			self.discovery.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
 		target = node.targets[0]
 		if isinstance( target, ast.Name ):
 			existing = self.discovery.find_name( target.id, node )
-			assert isinstance( existing, Variable ), f'{target.id!r} is not a variable, cannot assign to it'
+			if not isinstance( existing, Variable ):
+				self.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 			operand = self._lower_expr( node.value, existing.type )
 			self._emit( ir.Assign( dest = existing, src = operand ))
 		elif isinstance( target, ast.Attribute ):
@@ -182,28 +242,87 @@ class Lowering:
 			operand = self._lower_expr( node.value, None )
 			self._emit( ir.SetItem( obj = obj, index = index, value = operand ))
 		else:
-			assert False, f'unsupported Assign target: {ast.unparse(node)}'
+			self.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 
 	def _stmt_Expr( self, node: ast.Expr ) -> None:
-		assert isinstance( node.value, ast.Call ), f'unsupported expression statement: {ast.unparse(node)}'
+		if not isinstance( node.value, ast.Call ):
+			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
+
+	def _stmt_With( self, node: ast.With ) -> None:
+		# only the three arithmetic-mode context managers are supported so
+		# far - errdefer and anything else stay "not yet supported", same
+		# posture as everywhere else in this module
+		if len( node.items ) != 1 or node.items[0].optional_vars is not None:
+			self.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
+		context_expr = node.items[0].context_expr
+
+		if self._is_compiler_attr( context_expr, 'wrap_arithmetic' ):
+			mode = ( 'wrap', None )
+		elif self._is_compiler_attr( context_expr, 'saturate_arithmetic' ):
+			mode = ( 'saturate', None )
+		elif self._is_compiler_panic_arithmetic_call( context_expr ):
+			if len( context_expr.args ) != 1 or context_expr.keywords:
+				self.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(node)}', node )
+			str_cls = self.discovery.find_name( 'str', node )
+			errmsg = self._lower_expr( context_expr.args[0], str_cls )
+			mode = ( 'check', errmsg )
+		else:
+			self.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
+
+		self._arithmetic_mode.append( mode )
+		try:
+			for stmt in node.body:
+				# same per-statement recovery boundary as the top-level loop
+				# in lower_function - one bad statement inside the with-block
+				# doesn't stop the rest of it from being lowered
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+		finally:
+			self._arithmetic_mode.pop()
+
+	def _is_compiler_attr( self, node: ast.expr, attr: str ) -> bool:
+		# textual recognition, same as discovery.py's _is_compiler_target_call -
+		# `compiler` is a special pseudo-module (Discovery.compiler_module),
+		# not something with a real .names dict to resolve this through
+		return (
+			isinstance( node, ast.Attribute )
+			and node.attr == attr
+			and isinstance( node.value, ast.Name )
+			and node.value.id == 'compiler'
+		)
+
+	def _is_compiler_panic_arithmetic_call( self, node: ast.expr ) -> bool:
+		return (
+			isinstance( node, ast.Call )
+			and isinstance( node.func, ast.Attribute )
+			and node.func.attr == 'panic_arithmetic'
+			and isinstance( node.func.value, ast.Name )
+			and node.func.value.id == 'compiler'
+		)
 
 	# --- expressions -----------------------------------------------------------
 
 	def _lower_expr( self, node: ast.expr, expected_type: Type|None ) -> ir.Operand:
 		method = getattr( self, f'_expr_{node.__class__.__name__}', None )
-		assert method is not None, f'unsupported expression: {ast.unparse(node)}'
+		if method is None:
+			self.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
 		return method( node, expected_type )
 
 	def _expr_Name( self, node: ast.Name, expected_type: Type|None ) -> ir.Operand:
 		name = self.discovery.find_name( node.id, node )
-		assert isinstance( name, Variable ), f'{node.id!r} is not a value, cannot use it as an expression'
+		if not isinstance( name, Variable ):
+			self.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
 		return name
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
-		assert expected_type is not None, (
-			f'cannot infer the type of literal {node.value!r} - no expected type available from context ({ast.unparse(node)})'
-		)
+		if expected_type is None:
+			self.discovery.fail(
+				f'cannot infer the type of literal {node.value!r} - no expected type available from context ({ast.unparse(node)})',
+				node,
+			)
 		return ir.Const( type = expected_type, value = node.value )
 
 	def _expr_Attribute( self, node: ast.Attribute, expected_type: Type|None ) -> ir.Operand:
@@ -214,7 +333,8 @@ class Lowering:
 		return dest
 
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
-		assert expected_type is not None, f'cannot infer the result type of {ast.unparse(node)} - no expected type available from context'
+		if expected_type is None:
+			self.discovery.fail( f'cannot infer the result type of {ast.unparse(node)} - no expected type available from context', node )
 		obj = self._lower_expr( node.value, None )
 		index = self._lower_expr( node.slice, None )
 		dest = self._new_temp( expected_type )
@@ -224,9 +344,17 @@ class Lowering:
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		return self._lower_call( node, expected_type, want_result = True )
 
+	_OPCODES_BY_KIND = {
+		'wrap': _BINOP_WRAP_OPCODES,
+		'saturate': _BINOP_SATURATE_OPCODES,
+		'check': _BINOP_CHECK_OPCODES,
+	}
+
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
-		opcode = _BINOP_OPCODES.get( type( node.op ))
-		assert opcode is not None, f'unsupported binary operator: {ast.unparse(node)}'
+		kind, extra = self._arithmetic_mode[-1]
+		opcode = self._OPCODES_BY_KIND[kind].get( type( node.op ))
+		if opcode is None:
+			self.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
 
 		left_is_const = isinstance( node.left, ast.Constant )
 		right_is_const = isinstance( node.right, ast.Constant )
@@ -240,57 +368,144 @@ class Lowering:
 			left = self._lower_expr( node.left, expected_type )
 			right = self._lower_expr( node.right, expected_type or left.type )
 
-		dest = self._new_temp( expected_type or left.type )
-		self._emit( opcode( dest = dest, left = left, right = right ))
-		return dest
+		result_type = expected_type or left.type
+
+		if kind in ( 'wrap', 'saturate' ):
+			dest = self._new_temp( result_type )
+			self._emit( opcode( dest = dest, left = left, right = right ))
+			return dest
+
+		# check mode (the default - see the class docstring): the op itself
+		# produces Result[result_type,OverflowError]. How that Result gets
+		# consumed depends on `extra`: the default (extra is None) uses
+		# OrReturn, mirroring Result.or_return()'s own semantics, and needs
+		# somewhere for the error to propagate to; `with
+		# compiler.panic_arithmetic(msg):` (extra is the lowered msg operand)
+		# uses Unwrap instead, which panics immediately and so has no such
+		# requirement
+		result_cls, overflow_cls = self._lookup_result_and_overflow_types( node )
+		if extra is None:
+			# validated before anything gets emitted - a mid-statement
+			# failure here must not leave partial instructions behind for
+			# the per-statement recovery boundary to silently keep
+			self._require_result_return( node, result_cls, overflow_cls )
+		check_type = self.discovery._get_or_create_specialization( result_cls, [ result_type, overflow_cls ] )
+		check_dest = self._new_temp( check_type )
+		self._emit( opcode( dest = check_dest, left = left, right = right ))
+		unwrapped = self._new_temp( result_type )
+		if extra is None:
+			self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
+		else:
+			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra ))
+		return unwrapped
+
+	def _lookup_result_and_overflow_types( self, node: ast.AST ) -> tuple[ClassLike,ClassLike]:
+		result_cls = self.discovery.find_name( 'Result', node )
+		overflow_cls = self.discovery.find_name( 'OverflowError', node )
+		return result_cls, overflow_cls
+
+	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, overflow_cls: ClassLike ) -> None:
+		fn = self._current_fn
+		return_type = fn.return_type if fn is not None else None
+		ok = (
+			fn is not None
+			and isinstance( return_type, Specialization )
+			and return_type.base is result_cls
+			and len( return_type.args ) == 2
+			and return_type.args[1] is overflow_cls
+		)
+		if not ok:
+			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
+			self.discovery.fail(
+				f'checked arithmetic requires the enclosing function to return Result[_,OverflowError] ({where}) - '
+				f'wrap this in `with compiler.wrap_arithmetic:`, `with compiler.saturate_arithmetic:`, '
+				f'or `with compiler.panic_arithmetic(...):` instead',
+				node,
+			)
 
 	# --- shared helpers ----------------------------------------------------------
 
+	def _ensure_resolved( self, obj: object ) -> None:
+		# a class's own .names dict (methods/attributes) stays empty until
+		# its .resolve() runs - deferred just like a Function's parameters -
+		# and unlike a Function/global reference (scheduled onto the work
+		# queue, resolved whenever it's eventually dequeued), an attribute or
+		# method lookup needs the answer immediately, mid-statement, so this
+		# can't wait for the queue to get there on its own
+		resolve = getattr( obj, 'resolve', None )
+		if resolve is not None:
+			resolve()
+
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
+		self._ensure_resolved( owner_type )
 		names = getattr( owner_type, 'names', None )
-		assert isinstance( names, dict ), f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})'
+		if not isinstance( names, dict ):
+			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 		found = names.get( attr )
-		assert isinstance( found, Variable ), f'{owner_type.qualname if owner_type else "?"} has no attribute {attr!r}'
-		if found.resolve is not None:
-			found.resolve()
+		if not isinstance( found, Variable ):
+			self.discovery.fail( f'{owner_type.qualname if owner_type else "?"} has no attribute {attr!r}', ctx )
+		self._ensure_resolved( found )
 		return found
 
+	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
+		# a *silent* probe: is this expression a compile-time-resolvable
+		# namespace path (a free function, or Class.staticmethod/classmethod
+		# reached by class name)? Mirrors discovery.py's own
+		# visit_Name/visit_Attribute (find_name + .names traversal), but
+		# deliberately doesn't call self.discovery.fail() for "this base has
+		# no .names" - that's an expected, normal outcome here (it means
+		# _resolve_callee should fall back to receiver-based resolution, e.g.
+		# `some_local.method()`), not a real error to record. A genuinely
+		# undefined identifier (find_name failing outright) is still a real
+		# error either way, so that's left to report/unwind normally.
+		if isinstance( node, ast.Name ):
+			return self.discovery.find_name( node.id, node )
+		if isinstance( node, ast.Attribute ):
+			base = self._try_resolve_namespace( node.value )
+			if base is None:
+				return None
+			self._ensure_resolved( base )
+			names = getattr( base, 'names', None )
+			if not isinstance( names, dict ):
+				return None
+			return names.get( node.attr )
+		return None
+
 	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload,ir.Operand|None]:
-		# try resolving the whole callee expression as a compile-time namespace
-		# path first (a free function, or Class.staticmethod/classmethod
-		# reached by class name) - this is exactly discovery.py's own
-		# visit_Name/visit_Attribute (find_name + .names traversal), which
-		# raises AssertionError the moment it hits something with no .names
-		# (a Variable/Parameter - a runtime value, not a namespace)
-		try:
-			namespace_result = self.discovery.visit( func_node )
-		except AssertionError:
-			namespace_result = None
+		namespace_result = self._try_resolve_namespace( func_node )
 		if isinstance( namespace_result, ( Function, Overload )):
 			return namespace_result, None
 
-		assert isinstance( func_node, ast.Attribute ), f'cannot call {ast.unparse(func_node)}'
+		if not isinstance( func_node, ast.Attribute ):
+			self.discovery.fail( f'cannot call {ast.unparse(func_node)}', func_node )
 		receiver = self._lower_expr( func_node.value, None )
 		target = self._attr_lookup_callable( receiver.type, func_node.attr, func_node )
 		return target, receiver
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
+		self._ensure_resolved( owner_type )
 		names = getattr( owner_type, 'names', None )
-		assert isinstance( names, dict ), f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})'
+		if not isinstance( names, dict ):
+			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 		found = names.get( attr )
-		assert isinstance( found, ( Function, Overload )), f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}'
+		if not isinstance( found, ( Function, Overload )):
+			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
 		return found
 
 	def _match_call_args( self, target: Function, call: ast.Call ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
-		assert not any( isinstance( a, ast.Starred ) for a in call.args ), f'*args not supported yet: {ast.unparse(call)}'
-		assert not any( kw.arg is None for kw in call.keywords ), f'**kwargs not supported yet: {ast.unparse(call)}'
+		if any( isinstance( a, ast.Starred ) for a in call.args ):
+			self.discovery.fail( f'*args not supported yet: {ast.unparse(call)}', call )
+		if any( kw.arg is None for kw in call.keywords ):
+			self.discovery.fail( f'**kwargs not supported yet: {ast.unparse(call)}', call )
 		positional_params = [ p for p in target.parameters if not p.is_vararg and not p.is_kwarg and not p.is_kwonly ]
-		assert len( call.args ) <= len( positional_params ), f'too many positional arguments: {ast.unparse(call)}'
+		if len( call.args ) > len( positional_params ):
+			self.discovery.fail( f'too many positional arguments: {ast.unparse(call)}', call )
 		positional = list( zip( positional_params, call.args ))
 		keyword: list[tuple[Parameter,ast.expr]] = []
 		for kw in call.keywords:
 			param = next(( p for p in target.parameters if p.stem == kw.arg and not p.is_vararg and not p.is_kwarg ), None )
-			assert param is not None, f'{target.qualname} has no parameter {kw.arg!r}'
+			if param is None:
+				self.discovery.fail( f'{target.qualname} has no parameter {kw.arg!r}', call )
 			keyword.append(( param, kw.value ))
 		return positional, keyword
 
@@ -302,18 +517,27 @@ class Lowering:
 		if isinstance( target, Overload ):
 			# bare literal arguments have no unambiguous expected type before
 			# a specific implementation is chosen - unsupported for now (see
-			# _expr_Constant's assertion), same posture as the multi-branch
-			# case below
+			# _expr_Constant), same posture as the multi-branch case below
 			args = [ self._lower_expr( a, None ) for a in node.args ]
-			assert not any( kw.arg is None for kw in node.keywords ), f'**kwargs not supported yet: {ast.unparse(node)}'
+			if any( kw.arg is None for kw in node.keywords ):
+				self.discovery.fail( f'**kwargs not supported yet: {ast.unparse(node)}', node )
 			kwargs = { kw.arg: self._lower_expr( kw.value, None ) for kw in node.keywords }
 			arg_types = [ op.type for op in args ]
 			kwarg_types = { name: op.type for name, op in kwargs.items() }
-			branches, resolved = target.resolve_call( arg_types, kwarg_types )
-			assert not branches, (
-				f'{target.qualname}: multi-branch overload dispatch is not supported yet ({ast.unparse(node)}) - '
-				f'this needs TaggedUnion tag-check IR, which does not exist yet'
-			)
+			try:
+				branches, resolved = target.resolve_call( arg_types, kwarg_types )
+			except CompileError as e:
+				# resolve_call is a pure function of types with no
+				# AST/Discovery reference by design - it raises unrecorded,
+				# this is where a location actually gets attached and it
+				# lands in the collector
+				self.discovery.fail( str( e ), node )
+			if branches:
+				self.discovery.fail(
+					f'{target.qualname}: multi-branch overload dispatch is not supported yet ({ast.unparse(node)}) - '
+					f'this needs TaggedUnion tag-check IR, which does not exist yet',
+					node,
+				)
 			target = resolved
 		else:
 			if target.resolve is not None:

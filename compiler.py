@@ -7,6 +7,7 @@ import threading
 # local imports:
 import ir
 from discovery import Discovery
+from errors import CompileError
 from lowering import Lowering
 from mpy_types import Module, Function, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum
 
@@ -77,14 +78,21 @@ class Compiler:
 		self.queue.put( unit )
 
 	def run( self ) -> None:
-		assert self.disco.main is not None, 'no main() found'
+		if self.disco.main is None:
+			self.disco.errors.error( 'no main() found', file = None, line = None )
+			return
 		self._enqueue( self.disco.main )
 		while True:
 			try:
 				unit = self.queue.get_nowait()
 			except queue.Empty:
 				break
-			self._lower( unit )
+			# one broken symbol doesn't stop the rest of the work queue from
+			# draining - mirrors the recovery boundaries in discovery.py/lowering.py
+			try:
+				self._lower( unit )
+			except CompileError:
+				continue
 
 	def _lower( self, unit: CompileUnit ) -> CompiledUnit:
 		if isinstance( unit, Function ):

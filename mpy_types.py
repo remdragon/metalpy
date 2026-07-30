@@ -5,6 +5,9 @@ import itertools
 from pathlib import Path
 from typing import Callable, Union
 
+# local imports:
+from errors import CompileError
+
 @dataclass( kw_only = True )
 class Name:
 	stem: str # local name like 'str' instead of 'builtins.str'
@@ -190,6 +193,8 @@ def _is_covered_by( narrow: Function, wide: Function ) -> bool:
 	and for @overload-vs-@overload shadowing (is a later one entirely dead
 	code because an earlier one already covers everything it declares).
 	'''
+	if narrow.parameters is None or wide.parameters is None:
+		return False # one of them failed to resolve - can't reason about coverage
 	if len( narrow.parameters ) != len( wide.parameters ):
 		return False
 	return all(
@@ -199,6 +204,8 @@ def _is_covered_by( narrow: Function, wide: Function ) -> bool:
 
 def _overlaps( a: Function, b: Function ) -> bool:
 	''' some concrete call could satisfy both `a` and `b` simultaneously. Used for plain-implementation-vs-plain-implementation ambiguity. '''
+	if a.parameters is None or b.parameters is None:
+		return False # one of them failed to resolve - can't reason about overlap
 	if len( a.parameters ) != len( b.parameters ):
 		return False
 	return all(
@@ -288,11 +295,17 @@ class Overload( Type ):
 				if binds( member, assignment ):
 					return self._target( member ), member
 			matches = [ p for p in plains if binds( p, assignment ) ]
-			assert len( matches ) == 1, (
-				f'{self.qualname}: ambiguous call for {assignment!r} - matches {[m.qualname for m in matches]}'
-				if matches else
-				f'{self.qualname}: no overload matches argument types {assignment!r}'
-			)
+			if len( matches ) != 1:
+				# no location available here - resolve_call is a pure function
+				# of types, deliberately with no AST/Discovery reference (see
+				# the class docstring) - raised unrecorded, left to whichever
+				# caller has location context (lowering.py's _lower_call) to
+				# record via Discovery.fail()
+				raise CompileError(
+					f'{self.qualname}: ambiguous call for {assignment!r} - matches {[m.qualname for m in matches]}'
+					if matches else
+					f'{self.qualname}: no overload matches argument types {assignment!r}'
+				)
 			return matches[0], matches[0]
 
 		resolved: list[tuple[dict,Function]] = []

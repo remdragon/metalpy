@@ -34,7 +34,8 @@ def main() -> None:
 	foo( 3 )
 
 def foo( x: i32 ) -> None:
-	echo( x + 1 )
+	with compiler.wrap_arithmetic:
+		echo( x + 1 )
 	return
 
 def echo( x: i32 ) -> None:
@@ -178,8 +179,8 @@ def main() -> None:
 	x: int|str
 	foo( x )
 ''', Path( '__main__.py' ), scope = None )
-		with self.assertRaises( AssertionError ):
-			self.compiler.run()
+		self.compiler.run()
+		self.assertTrue( self.discovery.errors.errors )
 
 class LocalVariableTests( CompilerTestCase ):
 	def test_annassign_then_reassign( self ) -> None:
@@ -195,6 +196,31 @@ def main() -> None:
 		self.assertIs( assigns[0].dest, assigns[1].dest )
 		self.assertEqual( assigns[0].src, ir.Const( type = assigns[0].dest.type, value = 1 ))
 		self.assertEqual( assigns[1].src, ir.Const( type = assigns[0].dest.type, value = 2 ))
+
+class ErrorRecoveryTests( CompilerTestCase ):
+	def test_broken_statement_does_not_block_sibling_statements_or_functions( self ) -> None:
+		# 'broken's one statement fails (a bare name expression isn't
+		# supported) - lower_function's own per-statement recovery boundary
+		# means 'broken' still gets lowered (just missing that statement,
+		# FuncStart/FuncEnd only) rather than being dropped entirely, and
+		# 'fine' - unrelated - isn't affected at all
+		self._run( '''
+def broken() -> None:
+	undefined_name
+
+def fine() -> None:
+	pass
+
+def main() -> None:
+	broken()
+	fine()
+''' )
+		names = self._function_names()
+		self.assertIn( 'main', names )
+		self.assertIn( '__main__.fine', names )
+		self.assertIn( '__main__.broken', names )
+		self.assertEqual( [ type( i ).__name__ for i in self._instructions_for( '__main__.broken' ) ], [ 'FuncStart', 'FuncEnd' ] )
+		self.assertTrue( self.discovery.errors.errors )
 
 if __name__ == '__main__':
 	unittest.main()

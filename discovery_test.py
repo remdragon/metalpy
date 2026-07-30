@@ -6,6 +6,7 @@ import unittest
 
 # local imports
 import discovery
+from errors import CompileError
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
 	Function, Variable, Specialization, Move, ConditionalDispatch,
@@ -69,9 +70,9 @@ class ImportTests( unittest.TestCase ):
 		disco1 = MockDiscovery.new_test( 'codecs' )
 		disco1.import_code( 'from .. import utf8', Path( '__irrelevant__.py' ), scope = 'codecs.utf8' )
 
-		with self.assertRaises( AssertionError ):
-			disco1 = MockDiscovery.new_test( 'codecs' )
-			disco1.import_code( 'from . import utf8', Path( '__irrelevant__.py' ), scope = None )
+		disco1 = MockDiscovery.new_test( 'codecs' )
+		disco1.import_code( 'from . import utf8', Path( '__irrelevant__.py' ), scope = None )
+		self.assertTrue( disco1.errors.errors )
 
 		disco1 = MockDiscovery.new_test( 'codecs' )
 		disco1.import_code( 'from . import utf8', Path( '__irrelevant__.py' ), scope = 'codecs' )
@@ -399,8 +400,8 @@ def foo() -> i32:
 X = foo()
 ''' )
 		x = mod.get_local( 'X' )
-		with self.assertRaises( AssertionError ):
-			x.resolve()
+		x.resolve()
+		self.assertIn( 'add an annotation instead', self.discovery.errors.errors[0] )
 
 	def test_resolve_global_bare_assign_references_another_global( self ) -> None:
 		# X hasn't been resolved yet when Y.resolve() runs - must resolve
@@ -556,8 +557,8 @@ def make_result() -> Result[i32]:
 	pass
 ''' )
 		fn = mod.get_local( 'make_result' )
-		with self.assertRaises( AssertionError ):
-			fn.resolve()
+		fn.resolve()
+		self.assertIn( 'expects 2 type argument', self.discovery.errors.errors[0] )
 
 	def test_non_generic_subscript_errors( self ) -> None:
 		mod = self._import( '''
@@ -565,8 +566,8 @@ def foo() -> i32[i32]:
 	pass
 ''' )
 		fn = mod.get_local( 'foo' )
-		with self.assertRaises( AssertionError ):
-			fn.resolve()
+		fn.resolve()
+		self.assertIn( 'is not generic', self.discovery.errors.errors[0] )
 
 
 class InheritanceTests( unittest.TestCase ):
@@ -600,8 +601,7 @@ class Foo:
 		self.assertIsNone( mod.get_local( 'Foo' ).base )
 
 	def test_multiple_inheritance_errors( self ) -> None:
-		with self.assertRaises( AssertionError ):
-			self._import( '''
+		self._import( '''
 class A:
 	pass
 
@@ -611,10 +611,10 @@ class B:
 class C( A, B ):
 	pass
 ''' )
+		self.assertIn( 'multiple inheritance', self.discovery.errors.errors[0] )
 
 	def test_subclassing_non_rcclass_errors( self ) -> None:
-		with self.assertRaises( AssertionError ):
-			self._import( '''
+		self._import( '''
 @cstruct
 class Point:
 	x: i32
@@ -622,6 +622,7 @@ class Point:
 class Foo( Point ):
 	pass
 ''' )
+		self.assertIn( 'cannot subclass', self.discovery.errors.errors[0] )
 
 
 class FunctionParameterTests( unittest.TestCase ):
@@ -779,8 +780,8 @@ def consume( x: move[Foo, Bar] ) -> None:
 	pass
 ''' )
 		fn = mod.get_local( 'consume' )
-		with self.assertRaises( AssertionError ):
-			fn.resolve()
+		fn.resolve()
+		self.assertIn( 'exactly one type argument', self.discovery.errors.errors[0] )
 
 	def test_move_decorator_flag_on_function( self ) -> None:
 		mod = self._import( '''
@@ -817,8 +818,8 @@ class Foo:
 		return 1
 ''' )
 		foo = mod.get_local( 'Foo' )
-		with self.assertRaises( AssertionError ):
-			foo.resolve()
+		foo.resolve()
+		self.assertIn( 'unsupported function decorator', self.discovery.errors.errors[0] )
 
 
 class CircularImportTests( unittest.TestCase ):
@@ -984,8 +985,8 @@ def foo( x: str ) -> None:
 	pass
 ''' )
 		group = mod.get_local( 'foo' )
-		with self.assertRaises( AssertionError ):
-			group.stubs[0].resolve()
+		group.stubs[0].resolve()
+		self.assertIn( 'no implementation covers', self.discovery.errors.errors[0] )
 
 	def test_overlapping_plain_implementations_error( self ) -> None:
 		# ambiguity between plain implementations is detected purely by
@@ -1005,8 +1006,8 @@ def foo( x: str ) -> None:
 	pass
 ''' )
 		group = mod.get_local( 'foo' )
-		with self.assertRaises( AssertionError ):
-			group.implementations[0].resolve()
+		group.implementations[0].resolve()
+		self.assertIn( 'ambiguous', self.discovery.errors.errors[0] )
 
 	def test_shadowed_stub_errors( self ) -> None:
 		# an earlier stub's str|bytes fully covers the later stub's str -
@@ -1028,8 +1029,8 @@ def foo( x: str|bytes ) -> None:
 	pass
 ''' )
 		group = mod.get_local( 'foo' )
-		with self.assertRaises( AssertionError ):
-			group.stubs[1].resolve()
+		group.stubs[1].resolve()
+		self.assertIn( 'shadowed', self.discovery.errors.errors[0] )
 
 	def test_shadowed_by_real_bodied_overload_errors( self ) -> None:
 		# shadowing applies across stubs and real-bodied @overload members
@@ -1050,8 +1051,8 @@ def foo( x: str|bytes ) -> None:
 	pass
 ''' )
 		group = mod.get_local( 'foo' )
-		with self.assertRaises( AssertionError ):
-			group.stubs[0].resolve()
+		group.stubs[0].resolve()
+		self.assertIn( 'shadowed', self.discovery.errors.errors[0] )
 
 	def test_real_bodied_overload_group_unaffected( self ) -> None:
 		# str.from_cstr-style: two @overload arms, different arity, no stub,
@@ -1158,8 +1159,12 @@ def foo( x: str|bytes ) -> None:
 		self.assertIs( expected, int_cls )
 
 	def test_uncovered_type_errors( self ) -> None:
+		# resolve_call is a pure function of types with no Discovery reference
+		# by design (see mpy_types.py) - it raises CompileError directly,
+		# unrecorded; a real call site (lowering.py) attaches location and
+		# records it via Discovery.fail() before it would surface here
 		group, foo3, foo4, bool_cls, int_cls, str_cls, bytes_cls = self._worked_example()
-		with self.assertRaises( AssertionError ):
+		with self.assertRaises( CompileError ):
 			group.resolve_call( [ bool_cls ], {} )
 
 	def test_kwargs_match_differently_named_parameters( self ) -> None:
@@ -1437,6 +1442,56 @@ def main() -> None:
 ''', Path( '__main__.py' ), scope = None )
 		self.assertIsInstance( self.discovery.main, Function )
 		self.assertEqual( self.discovery.main.qualname, 'main' )
+
+
+class ErrorCollectionTests( unittest.TestCase ):
+	''' errors record into Discovery.errors and processing continues at the nearest recovery boundary, instead of raising uncaught '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_two_independent_top_level_errors_both_collected( self ) -> None:
+		# each bad decorator fires during the immediate (non-deferred) part of
+		# ClassDef scanning - confirms import_code's per-top-level-statement
+		# recovery boundary collects both instead of stopping at the first
+		mod = self._import( '''
+@nonsense_decorator_one
+class Foo:
+	pass
+
+@nonsense_decorator_two
+class Bar:
+	pass
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 2 )
+		self.assertIn( 'nonsense_decorator_one', self.discovery.errors.errors[0] )
+		self.assertIn( 'nonsense_decorator_two', self.discovery.errors.errors[1] )
+		# neither class made it far enough to be registered - both decorators
+		# are checked before _parse_ClassDef_RCClass's scope.add_name() runs
+		self.assertIsNone( mod.get_local( 'Foo' ))
+		self.assertIsNone( mod.get_local( 'Bar' ))
+
+	def test_broken_function_does_not_taint_sibling_resolution( self ) -> None:
+		mod = self._import( '''
+def broken( x ) -> None:
+	pass
+
+def fine( x: i32 ) -> i32:
+	return x
+''' )
+		broken = mod.get_local( 'broken' )
+		fine = mod.get_local( 'fine' )
+		broken.resolve()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'no type annotation', self.discovery.errors.errors[0] )
+
+		fine.resolve()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 ) # unchanged - fine resolved cleanly
+		self.assertIsNone( fine.resolve )
+		self.assertEqual( len( fine.parameters ), 1 )
 
 
 if __name__ == '__main__':

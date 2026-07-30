@@ -4,9 +4,10 @@ from contextlib import contextmanager, nullcontext
 import itertools
 import platform
 from pathlib import Path
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, NoReturn
 
 # local imports
+from errors import CompileError, ErrorCollector
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike,
@@ -69,9 +70,17 @@ class Discovery( ast.NodeVisitor ):
 	the class itself is created, invoked whenever something actually needs
 	to know what's inside. `.resolve is None` means already resolved (or
 	never needed resolving). The one exception is a generic's `type_params`,
-	parsed eagerly at creation time - external code subscripting a class as
-	a generic (`Result[i32,usize]`) needs to see it before that class's own
-	`.resolve()` has ever run.
+	parsed eagerly at creation time - external code subscripting this class
+	as a generic (`Result[i32,usize]`) needs to see it before this class's
+	own `.resolve()` has ever run.
+
+	Errors: user-code problems (unsupported syntax, missing annotations,
+	duplicate names, ...) are reported through self.errors (an
+	ErrorCollector) via self.fail()/self.fail_loc() rather than raising
+	uncaught - see _resolve_guarded and the try/except around the
+	module/class body scan loops for where processing picks back up
+	afterward. A handful of asserts stay plain asserts where noted - those
+	guard invariants that malformed *source* can never actually trigger.
 	'''
 	log_unhandled: bool = False
 
@@ -98,6 +107,7 @@ class Discovery( ast.NodeVisitor ):
 		)
 		self.modules: dict[str,Module] = {}
 		self.main: Function|None = None
+		self.errors = ErrorCollector()
 
 		self.module_stack: list[Module] = []
 		self.scope_stack: list[Module|ClassLike|Function] = []
@@ -115,6 +125,30 @@ class Discovery( ast.NodeVisitor ):
 			# import_code() looks it up from there directly (see below), so
 			# nothing needs to be kept here on the Discovery instance itself
 			self.import_name( 'builtins' )
+
+	# --- error reporting -----------------------------------------------------
+
+	def fail( self, message: str, node: ast.AST ) -> NoReturn:
+		file = self.module_stack[-1].file if self.module_stack else None
+		self.errors.fail( message, file, getattr( node, 'lineno', None ))
+
+	def fail_loc( self, message: str, file: Path|None, line: int|None ) -> NoReturn:
+		self.errors.fail( message, file, line )
+
+	def _resolve_guarded( self, target: 'Function|ClassLike|Variable', body: Callable[[],None] ) -> None:
+		# the shared recovery boundary every .resolve() closure runs through -
+		# a CompileError raised (and already recorded) anywhere inside body()
+		# is swallowed here so the caller that triggered this resolve() just
+		# gets a partially-resolved object back instead of an uncaught
+		# exception. target.resolve is always cleared afterward (even on
+		# failure) so a broken symbol is only ever attempted once, not
+		# re-attempted (and re-erroring) every time something references it
+		try:
+			body()
+		except CompileError:
+			pass
+		finally:
+			target.resolve = None
 
 	@contextmanager
 	def scope_context( self, scope: Module|ClassLike|Function ) -> Generator[None,None,None]:
@@ -171,9 +205,15 @@ class Discovery( ast.NodeVisitor ):
 			tree = ast.parse( code )
 			# scope_stack[-1] (the module) owns this body - every statement is
 			# dispatched through self.visit(), which registers what it finds
-			# immediately (structurally) and defers only the deep internals
+			# immediately (structurally) and defers only the deep internals.
+			# one bad top-level statement doesn't stop the rest of the module
+			# from being scanned - see _resolve_guarded for the same idea
+			# applied to individual symbols' .resolve()
 			for node in tree.body:
-				self.visit( node )
+				try:
+					self.visit( node )
+				except CompileError:
+					continue
 
 		return module
 
@@ -259,12 +299,10 @@ class Discovery( ast.NodeVisitor ):
 			[ builtins if builtins else {} ],
 			[ mod.intrinsics ],
 		):
-			assert isinstance( scope, dict ), f'invalid {scope=}'
+			assert isinstance( scope, dict ), f'invalid {scope=}' # internal invariant - every scope on the stack always has a .names dict
 			if name_obj := scope.get( name ):
 				return name_obj
-		e = NameError( name )
-		e.add_note( f'{str(mod.file)}:{ctx.lineno}' )
-		raise e
+		self.fail( f'name {name!r} is not defined', ctx )
 
 	def visit( self, node: ast.AST ) -> Any:
 		method = f'visit_{node.__class__.__name__}'
@@ -283,9 +321,9 @@ class Discovery( ast.NodeVisitor ):
 	# and inspects whatever comes back.
 
 	def visit_Name( self, node: ast.Name ) -> Name:
-		assert isinstance( node.ctx, ast.Load ), f'invalid context on {node=}'
+		assert isinstance( node.ctx, ast.Load ), f'invalid context on {node=}' # internal invariant - Load is the only context an expression-position Name can have
 		name = self.find_name( node.id, node )
-		assert isinstance( name, Name ), f'invalid {name=} from {node=}'
+		assert isinstance( name, Name ), f'invalid {name=} from {node=}' # internal invariant - every scope entry is a Name
 		return name
 
 	def visit_Constant( self, node: ast.Constant ) -> Type:
@@ -304,19 +342,22 @@ class Discovery( ast.NodeVisitor ):
 		elif isinstance( value, str ):
 			name = 'str'
 		else:
-			assert False, f'cannot resolve type of constant {value!r}'
+			self.fail( f'cannot resolve type of constant {value!r}', node )
 		return self.find_name( name, node )
 
 	def visit_Attribute( self, node: ast.Attribute ) -> Name:
 		base = self.visit( node.value )
 		names = getattr( base, 'names', None )
-		assert isinstance( names, dict ), f'{base!r} has no members, cannot look up {node.attr!r}'
+		if not isinstance( names, dict ):
+			self.fail( f'{base!r} has no members, cannot look up {node.attr!r}', node )
 		name_obj = names.get( node.attr )
-		assert name_obj is not None, f'{base.qualname} has no member {node.attr!r}'
+		if name_obj is None:
+			self.fail( f'{base.qualname} has no member {node.attr!r}', node )
 		return name_obj
 
 	def visit_BinOp( self, node: ast.BinOp ) -> TaggedUnion:
-		assert isinstance( node.op, ast.BitOr ), f'unsupported binary operator in type position: {ast.unparse(node)}'
+		if not isinstance( node.op, ast.BitOr ):
+			self.fail( f'unsupported binary operator in type position: {ast.unparse(node)}', node )
 		operand_nodes = self._flatten_union( node )
 		operands = [ self.visit( operand ) for operand in operand_nodes ]
 		return self._get_or_create_union( operands )
@@ -359,19 +400,20 @@ class Discovery( ast.NodeVisitor ):
 		# decorator name in _parse_function, rather than resolved through
 		# find_name like an ordinary generic base would be
 		if isinstance( node.value, ast.Name ) and node.value.id == 'move':
-			assert not isinstance( node.slice, ast.Tuple ), f'move[...] takes exactly one type argument: {ast.unparse(node)}'
+			if isinstance( node.slice, ast.Tuple ):
+				self.fail( f'move[...] takes exactly one type argument: {ast.unparse(node)}', node )
 			inner = self.visit( node.slice )
 			return self._get_or_create_move( inner )
 
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
-		assert type_params, f'{base.qualname} is not generic, cannot subscript it'
+		if not type_params:
+			self.fail( f'{base.qualname} is not generic, cannot subscript it', node )
 
 		slice_node = node.slice
 		arg_nodes = slice_node.elts if isinstance( slice_node, ast.Tuple ) else [ slice_node ]
-		assert len( arg_nodes ) == len( type_params ), (
-			f'{base.qualname} expects {len(type_params)} type argument(s), got {len(arg_nodes)}'
-		)
+		if len( arg_nodes ) != len( type_params ):
+			self.fail( f'{base.qualname} expects {len(type_params)} type argument(s), got {len(arg_nodes)}', node )
 
 		args = [ self.visit( arg_node ) for arg_node in arg_nodes ]
 		return self._get_or_create_specialization( base, args )
@@ -414,7 +456,10 @@ class Discovery( ast.NodeVisitor ):
 		# import foo.bar as baz -> Import(names=[alias(name='foo.bar', asname='baz')])
 		scope = self.scope_stack[-1]
 		for alias in node.names:
-			mod = self.import_name( alias.name )
+			try:
+				mod = self.import_name( alias.name )
+			except FileNotFoundError as e:
+				self.fail( str( e ), node )
 			scope.add_name( alias.asname or alias.name, mod )
 
 	def visit_ImportFrom( self, node: ast.ImportFrom ) -> None:
@@ -428,26 +473,31 @@ class Discovery( ast.NodeVisitor ):
 		parts: list[str] = []
 		if node.level:
 			parts.extend( self.module_stack[-1].qualname.split( '.' )[:-node.level] )
-			assert parts, f'unable to relative import from here: {node=} {self.module_stack[-1].qualname=} {self.module_stack[-1].file=}'
+			if not parts:
+				self.fail( f'unable to relative import from here: {node=} {self.module_stack[-1].qualname=} {self.module_stack[-1].file=}', node )
 		if node.module:
 			parts.append( node.module )
 		package = '.'.join( parts )
 		#print( f'{package=}' )
 		scope = self.scope_stack[-1]
-		mod = self.import_name( package )
+		try:
+			mod = self.import_name( package )
+		except FileNotFoundError as e:
+			self.fail( str( e ), node )
 		if not mod:
-			raise NameError( package )
+			self.fail( f'module {package!r} not found', node )
 		for alias in node.names:
 			#print( f'{self.module_stack[-1].qualname=} {package=} {node.level=} {node.module=} {alias.name=}' )
 			item = mod.names.get( alias.name )
 			if not item:
-				raise NameError( f'module {package} does not export {alias}' )
+				self.fail( f'module {package} does not export {alias.name!r}', node )
 			scope.add_name( alias.asname or alias.name, item )
 
 	# --- globals / attributes ---------------------------------------------------------------
 
 	def visit_AnnAssign( self, node: ast.AnnAssign ) -> Variable:
-		assert isinstance( node.target, ast.Name ), f'unsupported AnnAssign target {node.target!r}'
+		if not isinstance( node.target, ast.Name ):
+			self.fail( f'unsupported AnnAssign target {node.target!r}', node )
 		module = self.module_stack[-1]
 		scope = self.scope_stack[-1]
 		var_obj = Variable(
@@ -464,11 +514,12 @@ class Discovery( ast.NodeVisitor ):
 		return var_obj
 
 	def _make_annotation_resolver( self, var_obj: Variable, annotation: ast.expr, module: Module, scope: Module|ClassLike|Function ) -> Callable[[],None]:
-		def resolve() -> None:
+		def body() -> None:
 			with self.module_context( module ):
 				with ( self.scope_context( scope ) if scope is not module else nullcontext() ):
 					var_obj.type = self.visit( annotation )
-			var_obj.resolve = None
+		def resolve() -> None:
+			self._resolve_guarded( var_obj, body )
 		return resolve
 
 	def visit_Assign( self, node: ast.Assign ) -> Name|None:
@@ -480,9 +531,11 @@ class Discovery( ast.NodeVisitor ):
 		# this stage does not parse function bodies, so this is either a
 		# global variable or a class attribute with no annotation - its type
 		# defers to whatever self.visit() resolves the rvalue expression to
-		assert len( node.targets ) == 1, f'multiple assignment targets not supported: {ast.unparse(node)}'
+		if len( node.targets ) != 1:
+			self.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
 		target = node.targets[0]
-		assert isinstance( target, ast.Name ), f'unsupported Assign target {target!r}'
+		if not isinstance( target, ast.Name ):
+			self.fail( f'unsupported Assign target {target!r}', node )
 		module = self.module_stack[-1]
 		var_obj = Variable(
 			stem = target.id,
@@ -498,20 +551,20 @@ class Discovery( ast.NodeVisitor ):
 		return var_obj
 
 	def _make_value_resolver( self, var_obj: Variable, value: ast.expr, module: Module, scope: Module|ClassLike|Function ) -> Callable[[],None]:
-		def resolve() -> None:
+		def body() -> None:
 			with self.module_context( module ):
 				with ( self.scope_context( scope ) if scope is not module else nullcontext() ):
 					resolved = self.visit( value )
-			assert isinstance( resolved, Name ), (
-				f'cannot resolve type of {ast.unparse(value)} (add an annotation instead)'
-			)
+			if not isinstance( resolved, Name ):
+				self.fail( f'cannot resolve type of {ast.unparse(value)} (add an annotation instead)', value )
 			if isinstance( resolved, Variable ):
 				if resolved.resolve is not None: # e.g. `Y = X` where X hasn't been resolved yet
 					resolved.resolve()
 				var_obj.type = resolved.type
 			else:
 				var_obj.type = resolved
-			var_obj.resolve = None
+		def resolve() -> None:
+			self._resolve_guarded( var_obj, body )
 		return resolve
 
 	def _register_enum_member( self, cls: CEnum, node: ast.Assign ) -> None:
@@ -521,25 +574,30 @@ class Discovery( ast.NodeVisitor ):
 		# (just integer literals / the '_' auto-increment sentinel), so
 		# there's nothing forward-reference-sensitive left needing a further
 		# per-member .resolve
-		assert len( node.targets ) == 1, f'multiple targets unsupported in {cls.qualname}: {ast.unparse(node)}'
+		if len( node.targets ) != 1:
+			self.fail( f'multiple targets unsupported in {cls.qualname}: {ast.unparse(node)}', node )
 		target = node.targets[0]
-		assert isinstance( target, ast.Name ), f'enum member target must be a Name, not {target=} in {cls.qualname}'
+		if not isinstance( target, ast.Name ):
+			self.fail( f'enum member target must be a Name, not {target=} in {cls.qualname}', node )
 		key = target.id
 		value_expr = node.value
 		if isinstance( value_expr, ast.Name ) and value_expr.id == '_':
 			value: int|None = None
 		else:
-			assert isinstance( value_expr, ast.Constant ), (
-				f"enum key {cls.qualname}.{key} must be '_' or an integer constant, not {value_expr=}"
-			)
+			if not isinstance( value_expr, ast.Constant ):
+				self.fail( f"enum key {cls.qualname}.{key} must be '_' or an integer constant, not {value_expr=}", node )
 			value = value_expr.value
-			assert isinstance( value, int ), f'enum key {cls.qualname}.{key} value must be an integer, not {value_expr.value=}'
+			if not isinstance( value, int ):
+				self.fail( f'enum key {cls.qualname}.{key} value must be an integer, not {value_expr.value=}', node )
 		if value is None:
 			value = cls.next_auto
-		assert value not in cls.values, (
-			f'enum {cls.qualname} has duplicated value {value!r} from both {cls.qualname}.{key} and {cls.qualname}.{cls.values[value]}'
-		)
-		assert key not in cls.members, f'enum {cls.qualname}.{key} is duplicated'
+		if value in cls.values:
+			self.fail(
+				f'enum {cls.qualname} has duplicated value {value!r} from both {cls.qualname}.{key} and {cls.qualname}.{cls.values[value]}',
+				node,
+			)
+		if key in cls.members:
+			self.fail( f'enum {cls.qualname}.{key} is duplicated', node )
 		cls.members[key] = value
 		cls.values[value] = key
 		cls.next_auto = value + 1
@@ -557,15 +615,18 @@ class Discovery( ast.NodeVisitor ):
 				case 'cunion':
 					return self._parse_ClassDef_CUnion( node, qualname )
 				case 'enum':
-					assert isinstance( decorator, ast.Call ), f'invalid @enum {decorator=}'
-					assert len( decorator.args ) == 1, f'@enum decorator must have exactly 1 argument'
+					if not isinstance( decorator, ast.Call ):
+						self.fail( f'invalid @enum {decorator=}', node )
+					if len( decorator.args ) != 1:
+						self.fail( '@enum decorator must have exactly 1 argument', node )
 					value_type = self.visit( decorator.args[0] )
-					assert isinstance( value_type, Scalar ), f'invalid @enum {value_type=} (must be a scalar like i32)'
+					if not isinstance( value_type, Scalar ):
+						self.fail( f'invalid @enum {value_type=} (must be a scalar like i32)', node )
 					return self._parse_ClassDef_CEnum( node, qualname, value_type )
 				case 'union':
 					return self._parse_ClassDef_TaggedUnion( node, qualname )
 				case _:
-					assert False, f'unsupported class decorator {ast.unparse(decorator)} in {qualname}'
+					self.fail( f'unsupported class decorator {ast.unparse(decorator)} in {qualname}', node )
 
 		# if we get here, no decorators means this is a normal RC'd class object
 		return self._parse_ClassDef_RCClass( node, qualname )
@@ -582,9 +643,12 @@ class Discovery( ast.NodeVisitor ):
 			return
 		owner.type_params = []
 		for type_param in type_params:
-			assert isinstance( type_param, ast.TypeVar ), f'unsupported {type_param=} in {owner.qualname}'
-			assert type_param.bound is None, f'TypeVar(bound=not None) not supported in {owner.qualname}'
-			assert type_param.default_value is None, f'TypeVar(default_value=not None) not supported in {owner.qualname}'
+			if not isinstance( type_param, ast.TypeVar ):
+				self.fail( f'unsupported {type_param=} in {owner.qualname}', type_param )
+			if type_param.bound is not None:
+				self.fail( f'TypeVar(bound=not None) not supported in {owner.qualname}', type_param )
+			if type_param.default_value is not None:
+				self.fail( f'TypeVar(default_value=not None) not supported in {owner.qualname}', type_param )
 			tv = TypeVar(
 				stem = type_param.name,
 				qualname = f'{owner.qualname}.{type_param.name}',
@@ -593,30 +657,36 @@ class Discovery( ast.NodeVisitor ):
 			)
 			owner.type_params.append( tv )
 			owner.add_name( type_param.name, tv )
-	
+
 	def _shallow_class_body_scan( self,
 		class_obj: ClassLike,
 		body: list[ast.AST],
 	) -> tuple[list[ast.AST],Callable[[],None]]:
 		# we only do a minimal scan of class bodies for nested inner class definitions
-		# we don't want to process attributes or functions yet because we haven't finished collecting type information yet
+		# we don't want to process attributes or functions yet because we haven't finished collecting type information yet.
+		# one bad nested class doesn't stop the rest of this class's shallow
+		# scan, same as import_code's top-level statement loop
 		with self.scope_context( class_obj ):
 			unprocessed: list[ast.AST] = []
 			for node in body:
 				if isinstance( node, ast.ClassDef ):
-					self.visit( node )
+					try:
+						self.visit( node )
+					except CompileError:
+						continue
 				else:
 					unprocessed.append( node )
 			return unprocessed
 
 	def _make_class_resolver( self, class_obj: ClassLike, body: list[ast.stmt], module: Module ) -> Callable[[],None]:
-		def resolve() -> None:
+		def body_fn() -> None:
 			with self.module_context( module ):
 				with self.scope_context( class_obj ):
 					# scope_stack[-1] (class_obj) owns this body - see import_code()
 					for node in body:
 						self.visit( node )
-			class_obj.resolve = None
+		def resolve() -> None:
+			self._resolve_guarded( class_obj, body_fn )
 		return resolve
 
 	def _parse_ClassDef_CEnum( self, node: ast.ClassDef, qualname: str, value_type: Scalar ) -> CEnum:
@@ -628,8 +698,10 @@ class Discovery( ast.NodeVisitor ):
 			line = node.lineno,
 			value_type = value_type,
 		)
-		assert not node.bases, f'@enum {qualname} cannot have a base classes ({node.bases!r})'
-		assert not node.keywords, f'@enum {qualname} cannot have keywords ({node.keywords!r})'
+		if node.bases:
+			self.fail( f'@enum {qualname} cannot have a base classes ({node.bases!r})', node )
+		if node.keywords:
+			self.fail( f'@enum {qualname} cannot have keywords ({node.keywords!r})', node )
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
@@ -648,8 +720,10 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 		)
-		assert not node.bases, f'@cstruct {qualname} cannot have a base classes ({node.bases!r})'
-		assert not node.keywords, f'@cstruct {qualname} cannot have keywords ({node.keywords!r})'
+		if node.bases:
+			self.fail( f'@cstruct {qualname} cannot have a base classes ({node.bases!r})', node )
+		if node.keywords:
+			self.fail( f'@cstruct {qualname} cannot have keywords ({node.keywords!r})', node )
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
@@ -670,8 +744,10 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 		)
-		assert not node.bases, f'@cunion {qualname} cannot have a base classes ({node.bases!r})'
-		assert not node.keywords, f'@cunion {qualname} cannot have keywords ({node.keywords!r})'
+		if node.bases:
+			self.fail( f'@cunion {qualname} cannot have a base classes ({node.bases!r})', node )
+		if node.keywords:
+			self.fail( f'@cunion {qualname} cannot have keywords ({node.keywords!r})', node )
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
@@ -692,8 +768,10 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 		)
-		assert not node.bases, f'@union {qualname} cannot have a base classes ({node.bases!r})'
-		assert not node.keywords, f'@union {qualname} cannot have keywords ({node.keywords!r})'
+		if node.bases:
+			self.fail( f'@union {qualname} cannot have a base classes ({node.bases!r})', node )
+		if node.keywords:
+			self.fail( f'@union {qualname} cannot have keywords ({node.keywords!r})', node )
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
@@ -712,10 +790,13 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 		)
-		assert len( node.bases ) <= 1, (
-			f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})'
-		)
-		assert not node.keywords, f'class {qualname} cannot have keywords ({node.keywords!r})'
+		if len( node.bases ) > 1:
+			self.fail(
+				f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})',
+				node,
+			)
+		if node.keywords:
+			self.fail( f'class {qualname} cannot have keywords ({node.keywords!r})', node )
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
@@ -724,13 +805,12 @@ class Discovery( ast.NodeVisitor ):
 			# resolved eagerly, in the enclosing scope, exactly like Python
 			# itself requires the base to already exist when this statement runs
 			base = self.visit( node.bases[0] )
-			assert isinstance( base, RCClass ), (
-				f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)'
-			)
+			if not isinstance( base, RCClass ):
+				self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)', node )
 			class_obj.base = base
 
 		self._parse_type_params( node.type_params, class_obj )
-		
+
 		unresolved = self._shallow_class_body_scan( class_obj, node.body )
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
@@ -745,7 +825,7 @@ class Discovery( ast.NodeVisitor ):
 		return self._parse_function( node, class_obj )
 
 	def visit_AsyncFunctionDef( self, node: ast.AsyncFunctionDef ) -> None:
-		raise SyntaxError( 'async functions not supported' )
+		self.fail( 'async functions not supported', node )
 
 	def _is_compiler_target_call( self, decorator: ast.expr ) -> bool:
 		return (
@@ -771,7 +851,7 @@ class Discovery( ast.NodeVisitor ):
 			return not self._target_value_matches( node.operand, active_value )
 		if isinstance( node, ast.Tuple ):
 			return any( self._target_value_matches( elt, active_value ) for elt in node.elts )
-		assert False, f'unsupported compiler.target(...) value: {ast.unparse(node)}'
+		self.fail( f'unsupported compiler.target(...) value: {ast.unparse(node)}', node )
 
 	def _parse_function(
 		self,
@@ -807,7 +887,7 @@ class Discovery( ast.NodeVisitor ):
 				case 'private':
 					is_private = True
 				case _:
-					assert False, f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}'
+					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
 
 		module = self.module_stack[-1]
 		fn = Function(
@@ -840,7 +920,8 @@ class Discovery( ast.NodeVisitor ):
 			if isinstance( existing, Overload ):
 				group = existing
 			else:
-				assert existing is None, f'{qualname} redefines {existing!r} as an overload group'
+				if existing is not None:
+					self.fail( f'{qualname} redefines {existing!r} as an overload group', node )
 				group = Overload(
 					stem = fn.stem,
 					qualname = qualname,
@@ -886,11 +967,13 @@ class Discovery( ast.NodeVisitor ):
 				impl.resolve()
 			if _is_covered_by( stub, impl ):
 				candidates.append( impl )
-		assert len( candidates ) == 1, (
-			f'{stub.qualname}: ambiguous overload binding - matches {[c.qualname for c in candidates]}'
-			if candidates else
-			f'{stub.qualname}: no implementation covers this @overload signature'
-		)
+		if len( candidates ) != 1:
+			self.fail_loc(
+				f'{stub.qualname}: ambiguous overload binding - matches {[c.qualname for c in candidates]}'
+				if candidates else
+				f'{stub.qualname}: no implementation covers this @overload signature',
+				stub.file, stub.line,
+			)
 		stub.bound_to = candidates[0]
 
 	def _check_overload_shadowing( self, fn: Function, group: Overload ) -> None:
@@ -908,10 +991,12 @@ class Discovery( ast.NodeVisitor ):
 				continue
 			if earlier.resolve is not None:
 				earlier.resolve()
-			assert not _is_covered_by( fn, earlier ), (
-				f'{fn.qualname} (line {fn.line}) is shadowed by {earlier.qualname} (line {earlier.line}) - '
-				f'unreachable, every type it declares is already handled by the earlier overload'
-			)
+			if _is_covered_by( fn, earlier ):
+				self.fail_loc(
+					f'{fn.qualname} (line {fn.line}) is shadowed by {earlier.qualname} (line {earlier.line}) - '
+					f'unreachable, every type it declares is already handled by the earlier overload',
+					fn.file, fn.line,
+				)
 
 	def _check_overload_ambiguity( self, fn: Function, group: Overload ) -> None:
 		# plain (non-@overload) implementations must be pairwise distinguishable
@@ -922,12 +1007,11 @@ class Discovery( ast.NodeVisitor ):
 				continue
 			if other.resolve is not None:
 				other.resolve()
-			assert not _overlaps( fn, other ), (
-				f'{fn.qualname} and {other.qualname} are ambiguous - their parameter types overlap'
-			)
+			if _overlaps( fn, other ):
+				self.fail_loc( f'{fn.qualname} and {other.qualname} are ambiguous - their parameter types overlap', fn.file, fn.line )
 
 	def _make_function_resolver( self, fn: Function, module: Module, class_obj: ClassLike|None, group: Overload|None = None ) -> Callable[[],None]:
-		def resolve() -> None:
+		def body() -> None:
 			with self.module_context( module ):
 				with ( self.scope_context( class_obj ) if class_obj is not None else nullcontext() ):
 					with self.scope_context( fn ):
@@ -939,7 +1023,8 @@ class Discovery( ast.NodeVisitor ):
 								return
 							if arg.arg == 'cls' and fn.is_classmethod:
 								return
-							assert arg.annotation is not None, f'{fn.qualname} parameter {arg.arg!r} has no type annotation'
+							if arg.annotation is None:
+								self.fail( f'{fn.qualname} parameter {arg.arg!r} has no type annotation', arg )
 							param = Parameter(
 								stem = arg.arg,
 								qualname = self._get_qualname( arg.arg ),
@@ -975,7 +1060,10 @@ class Discovery( ast.NodeVisitor ):
 			# set self done *before* touching any overload siblings below - a
 			# sibling's own resolve may need to cross-check back against fn,
 			# and seeing fn.resolve is None already tells it not to re-enter
-			# this closure (see _make_value_resolver for the same pattern)
+			# this closure (see _make_value_resolver for the same pattern).
+			# _resolve_guarded (see resolve() below) clears it again
+			# afterward too, harmlessly - that's just the safety net for the
+			# case this never got here at all (an error above this point)
 			fn.resolve = None
 			if group is not None:
 				if fn in group.stubs:
@@ -985,4 +1073,6 @@ class Discovery( ast.NodeVisitor ):
 					self._check_overload_shadowing( fn, group )
 				else:
 					self._check_overload_ambiguity( fn, group )
+		def resolve() -> None:
+			self._resolve_guarded( fn, body )
 		return resolve

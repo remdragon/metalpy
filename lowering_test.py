@@ -102,21 +102,50 @@ class Tests( unittest.TestCase ):
 
 	# --- arithmetic ---------------------------------------------------------
 
-	def test_binop_add_sub_mult( self ) -> None:
+	def test_binop_without_arithmetic_context_is_a_compile_error( self ) -> None:
+		# arithmetic defaults to Check mode (Result[T,OverflowError]) - see
+		# the Lowering class docstring - and main() returns None, which can't
+		# propagate that error, so plain `a + 1` here is a compile error
+		# rather than silently falling back to wrapping
 		code = '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
 			'def main() -> None:',
 			'	a: i32 = 1',
 			'	b: i32 = a + 1',
-			'	c: i32 = a - 1',
-			'	d: i32 = a * 2',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertIn( 'wrap_arithmetic', self.discovery.errors.errors[0] )
+		# lower_function's per-statement recovery boundary skips just the
+		# failing statement - b is never assigned, everything else is fine
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+
+	def test_binop_wrap_arithmetic_context( self ) -> None:
+		# with compiler.wrap_arithmetic: switches Add/Sub/Mult back to the
+		# plain Wrap opcodes, no Result/OrReturn involved - the with
+		# statement itself contributes no instructions of its own
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	with compiler.wrap_arithmetic:',
+			'		b: i32 = a + 1',
+			'		c: i32 = a - 1',
+			'		d: i32 = a * 2',
 			'	return',
 		])
 		i32 = self.discovery.get_intrinsics()['i32']
 		none_type = self.discovery.get_none_type()
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
-		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = i32 )
-		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 4, type = i32 )
-		d = Variable( stem = 'd', qualname = 'main.d', file = Path( '__test__.py' ), line = 5, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 5, type = i32 )
+		d = Variable( stem = 'd', qualname = 'main.d', file = Path( '__test__.py' ), line = 6, type = i32 )
 		# temp numbering is per-function (not per-statement), so each new
 		# statement's temp continues where the last one left off
 		t0 = ir.Temp( type = i32, id = 0 )
@@ -141,18 +170,185 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
-	def test_binop_literal_on_left( self ) -> None:
-		# expected type flows from whichever side is NOT the bare literal
+	def test_binop_check_mode_emits_or_return( self ) -> None:
+		# a function OTHER than main (main can never return Result, since it
+		# takes no arguments to be called with the error) that returns
+		# Result[None,OverflowError] - every Check op is immediately followed
+		# by an OrReturn (Result.or_return()'s own semantics), consuming the
+		# Result and continuing with the unwrapped i32 value
+		code = '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def checked() -> Result[None,OverflowError]:',
+			'	a: i32 = 1',
+			'	b: i32 = a + 1',
+			'	c: i32 = a - 1',
+			'	d: i32 = a * 2',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+		overflow_cls = mod.get_local( 'OverflowError' )
+		result_cls = mod.get_local( 'Result' )
+		if result_cls.resolve is not None:
+			result_cls.resolve()
+		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
+
+		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 8, type = i32 )
+		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 9, type = i32 )
+		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 10, type = i32 )
+		d = Variable( stem = 'd', qualname = '__test__.checked.d', file = Path( '__test__.py' ), line = 11, type = i32 )
+
+		t0 = ir.Temp( type = result_i32_overflow, id = 0 ) # AddCheck's Result
+		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via OrReturn
+		t2 = ir.Temp( type = result_i32_overflow, id = 2 ) # SubCheck's Result
+		t3 = ir.Temp( type = i32, id = 3 )
+		t4 = ir.Temp( type = result_i32_overflow, id = 4 ) # MulCheck's Result
+		t5 = ir.Temp( type = i32, id = 5 )
+
+		fn = self.compiler._lower( checked_fn )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.AddCheck( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t1 ),
+			ir.OrReturn( dest = t1, value = t0 ),
+			ir.Assign( dest = b, src = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.DeclareTemp( temp = t2 ),
+			ir.SubCheck( dest = t2, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t3 ),
+			ir.OrReturn( dest = t3, value = t2 ),
+			ir.Assign( dest = c, src = t3 ),
+			ir.DeleteTemp( temp = t3 ),
+			ir.DeleteTemp( temp = t2 ),
+			ir.DeclareTemp( temp = t4 ),
+			ir.MulCheck( dest = t4, left = a, right = ir.Const( type = i32, value = 2 )),
+			ir.DeclareTemp( temp = t5 ),
+			ir.OrReturn( dest = t5, value = t4 ),
+			ir.Assign( dest = d, src = t5 ),
+			ir.DeleteTemp( temp = t5 ),
+			ir.DeleteTemp( temp = t4 ),
+			ir.FuncEnd( name = '__test__.checked' ),
+		])
+
+	def test_binop_saturate_arithmetic_context( self ) -> None:
+		# with compiler.saturate_arithmetic: - same shape as wrap_arithmetic,
+		# just the *Saturate opcodes instead - no Result/OrReturn involved
+		# either, so this works fine inside main() too
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
-			'	b: i32 = 1 + a',
+			'	with compiler.saturate_arithmetic:',
+			'		b: i32 = a + 1',
+			'		c: i32 = a - 1',
+			'		d: i32 = a * 2',
 			'	return',
 		])
 		i32 = self.discovery.get_intrinsics()['i32']
 		none_type = self.discovery.get_none_type()
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
-		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 5, type = i32 )
+		d = Variable( stem = 'd', qualname = 'main.d', file = Path( '__test__.py' ), line = 6, type = i32 )
+		t0 = ir.Temp( type = i32, id = 0 )
+		t1 = ir.Temp( type = i32, id = 1 )
+		t2 = ir.Temp( type = i32, id = 2 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.AddSaturate( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = b, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.DeclareTemp( temp = t1 ),
+			ir.SubSaturate( dest = t1, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = c, src = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeclareTemp( temp = t2 ),
+			ir.MulSaturate( dest = t2, left = a, right = ir.Const( type = i32, value = 2 )),
+			ir.Assign( dest = d, src = t2 ),
+			ir.DeleteTemp( temp = t2 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_binop_panic_arithmetic_context( self ) -> None:
+		# with compiler.panic_arithmetic(msg): - still Check-mode ops
+		# (Result[T,OverflowError]), but consumed with Unwrap(errmsg=msg)
+		# instead of OrReturn - unlike the bare default, this does NOT
+		# require the enclosing function to return Result[_,OverflowError],
+		# since Unwrap panics rather than needing anywhere to propagate to -
+		# main() works fine here
+		code = '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'class str: pass',
+			'',
+			'def main() -> None:',
+			'	a: i32 = 1',
+			"	with compiler.panic_arithmetic( 'bad arithmetic' ):",
+			'		b: i32 = a + 1',
+			'	return',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		str_cls = mod.get_local( 'str' )
+		overflow_cls = mod.get_local( 'OverflowError' )
+		result_cls = mod.get_local( 'Result' )
+		if result_cls.resolve is not None:
+			result_cls.resolve()
+		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
+
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 10, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 12, type = i32 )
+		t0 = ir.Temp( type = result_i32_overflow, id = 0 ) # AddCheck's Result
+		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via Unwrap
+
+		fn = self._lower_main()
+		self._assert_ir( fn, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.AddCheck( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t1 ),
+			ir.Unwrap( dest = t1, value = t0, errmsg = ir.Const( type = str_cls, value = 'bad arithmetic' )),
+			ir.Assign( dest = b, src = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_binop_literal_on_left( self ) -> None:
+		# expected type flows from whichever side is NOT the bare literal -
+		# wrapped in wrap_arithmetic just to sidestep the Check-mode/Result
+		# requirement, unrelated to what this test actually checks
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	with compiler.wrap_arithmetic:',
+			'		b: i32 = 1 + a',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
 		t0 = ir.Temp( type = i32, id = 0 )
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
