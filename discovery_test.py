@@ -92,11 +92,13 @@ class ImportTests( unittest.TestCase ):
 
 class ShallowScanTests( unittest.TestCase ):
 	'''
-	a module or class body is scanned exactly once, immediately: every
-	class/function/global/attribute it directly contains is discoverable by
-	name right away. What's still deferred is each individual function's
-	parameters/return type and each individual variable's type - .resolve is
-	not None until something calls it.
+	a module body is scanned immediately: every top-level class/function/
+	global is discoverable by name right away. A class's own body (its
+	attributes/methods) is a different story - like a function's parameters
+	or a variable's type, it stays behind .resolve until something actually
+	needs it (the one exception is type_params, parsed eagerly since external
+	code subscripting a generic class needs it before that class's own
+	resolve() ever runs).
 	'''
 
 	def setUp( self ) -> None:
@@ -116,7 +118,7 @@ class Foo:
 		self.assertEqual( foo.attributes, [] )
 		self.assertEqual( foo.methods, [] )
 
-	def test_class_attribute_and_method_registered_immediately_but_deferred( self ) -> None:
+	def test_class_body_deferred_until_resolved( self ) -> None:
 		mod = self._import( '''
 class Foo:
 	x: i32
@@ -124,19 +126,61 @@ class Foo:
 		return self.x
 ''' )
 		foo = mod.get_local( 'Foo' )
+		self.assertEqual( foo.attributes, [] ) # body not scanned yet
+		self.assertEqual( foo.methods, [] )
+		self.assertIsNone( foo.get_local( 'x' ))
+		self.assertIsNone( foo.get_local( 'bar' ))
+		self.assertIsNotNone( foo.resolve )
+
+		foo.resolve()
+		self.assertIsNone( foo.resolve )
+
 		self.assertEqual( len( foo.attributes ), 1 )
 		x = foo.attributes[0]
 		self.assertEqual( x.stem, 'x' )
-		self.assertIsNone( x.type ) # deferred
+		self.assertIsNone( x.type ) # the attribute's own type is still deferred
 		self.assertIsNotNone( x.resolve )
 
 		bar = foo.get_local( 'bar' )
 		self.assertIsInstance( bar, Function )
-		self.assertIsNone( bar.parameters ) # deferred
+		self.assertIsNone( bar.parameters ) # the method's own params are still deferred
 		self.assertIsNotNone( bar.resolve )
 		self.assertIn( bar, foo.methods )
 
-	def test_cstruct_and_cunion_with_generics( self ) -> None:
+	def test_nested_class_registered_immediately( self ) -> None:
+		# regression: a class's own body was made to scan lazily behind
+		# .resolve, which accidentally swept up nested class defs too - but
+		# those need to be discoverable by name (Outer.Inner) right away,
+		# just like top-level classes, since other code may reference them
+		# before Outer.resolve() ever runs
+		mod = self._import( '''
+class Outer:
+	class Inner:
+		y: i32
+	x: i32
+''' )
+		outer = mod.get_local( 'Outer' )
+		self.assertIsInstance( outer, RCClass )
+		self.assertIsNotNone( outer.resolve ) # outer's own body still deferred
+
+		inner = outer.get_local( 'Inner' )
+		self.assertIsInstance( inner, RCClass )
+		self.assertEqual( inner.qualname, '__main__.Outer.Inner' )
+		self.assertIsNotNone( inner.resolve ) # inner's own body deferred too
+		self.assertEqual( inner.attributes, [] )
+
+		self.assertIsNone( outer.get_local( 'x' )) # non-class members still deferred
+
+		outer.resolve()
+		self.assertIsNone( outer.resolve )
+		self.assertEqual( [ a.stem for a in outer.attributes ], [ 'x' ]) # Inner isn't an attribute
+		self.assertIs( outer.get_local( 'Inner' ), inner )
+
+		inner.resolve()
+		self.assertIsNone( inner.resolve )
+		self.assertEqual( [ a.stem for a in inner.attributes ], [ 'y' ])
+
+	def test_cstruct_and_cunion_type_params_available_before_resolve( self ) -> None:
 		mod = self._import( '''
 @cstruct
 class Box[T]:
@@ -148,6 +192,7 @@ class Overlap[T]:
 ''' )
 		box = mod.get_local( 'Box' )
 		self.assertIsInstance( box, CStruct )
+		self.assertIsNotNone( box.resolve ) # body itself is still deferred
 		self.assertEqual( len( box.type_params ), 1 )
 		self.assertEqual( box.type_params[0].stem, 'T' )
 		self.assertIs( box.get_local( 'T' ), box.type_params[0] )
@@ -156,20 +201,21 @@ class Overlap[T]:
 		self.assertIsInstance( overlap, CUnion )
 		self.assertEqual( overlap.type_params[0].stem, 'T' )
 
-	def test_cenum_resolves_immediately( self ) -> None:
-		# enum bodies are self-contained (integer literals / '_') so nothing
-		# about them needs to stay deferred
+	def test_cenum_members_deferred_until_resolved( self ) -> None:
 		mod = self._import( '''
 @enum( i32 )
 class Color:
 	Red = 0
-	Green = _
-	Blue = 5
-	Purple = _
+	Green = 1
 ''' )
 		color = mod.get_local( 'Color' )
 		self.assertIsInstance( color, CEnum )
-		self.assertEqual( color.members, { 'Red': 0, 'Green': 1, 'Blue': 5, 'Purple': 6 })
+		self.assertEqual( color.members, {} ) # deferred
+		self.assertIsNotNone( color.resolve )
+
+		color.resolve()
+		self.assertEqual( color.members, { 'Red': 0, 'Green': 1 })
+		self.assertIsNone( color.resolve )
 
 	def test_tagged_union_declared( self ) -> None:
 		# regression: _parse_ClassDef_TaggedUnion used to not exist at all,
@@ -182,8 +228,12 @@ class IntOrSize:
 ''' )
 		iu = mod.get_local( 'IntOrSize' )
 		self.assertIsInstance( iu, TaggedUnion )
+		self.assertEqual( iu.attributes, [] ) # deferred
+		self.assertIsNotNone( iu.resolve )
+
+		iu.resolve()
 		self.assertEqual( [ a.stem for a in iu.attributes ], [ 'v_int', 'v_size' ])
-		self.assertIsNone( iu.attributes[0].type ) # deferred
+		self.assertIsNone( iu.attributes[0].type ) # the variant's own type is still deferred
 
 	def test_function( self ) -> None:
 		mod = self._import( '''
@@ -245,13 +295,48 @@ def foo() -> None:
 		foo.resolve()
 		self.assertIs( foo.return_type, self.discovery.get_none_type() )
 
+	def test_resolve_class_reveals_attributes_and_method_skeletons( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	x: i32
+	def bar( self ) -> i32:
+		return self.x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIsNone( foo.resolve )
+		self.assertEqual( [ a.stem for a in foo.attributes ], [ 'x' ])
+
+		bar = foo.get_local( 'bar' )
+		self.assertIsInstance( bar, Function )
+		self.assertFalse( bar.resolve is None ) # method skeleton only - params stay deferred
+
+		bar.resolve()
+		self.assertEqual( bar.parameters, [] ) # self was skipped
+
+	def test_resolve_cenum_body( self ) -> None:
+		mod = self._import( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Green = _
+	Blue = 5
+	Purple = _
+''' )
+		color = mod.get_local( 'Color' )
+		color.resolve()
+		self.assertIsNone( color.resolve )
+		self.assertEqual( color.members, { 'Red': 0, 'Green': 1, 'Blue': 5, 'Purple': 6 })
+
 	def test_resolve_method_skips_self( self ) -> None:
 		mod = self._import( '''
 class Foo:
 	def bar( self, x: i32 ) -> None:
 		pass
 ''' )
-		bar = mod.get_local( 'Foo' ).get_local( 'bar' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		bar = foo.get_local( 'bar' )
 		bar.resolve()
 		self.assertEqual( [ p.stem for p in bar.parameters ], [ 'x' ])
 
@@ -262,7 +347,9 @@ class Foo:
 	def make( cls, x: i32 ) -> None:
 		pass
 ''' )
-		make = mod.get_local( 'Foo' ).get_local( 'make' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		make = foo.get_local( 'make' )
 		make.resolve()
 		self.assertEqual( [ p.stem for p in make.parameters ], [ 'x' ])
 
@@ -271,7 +358,9 @@ class Foo:
 class Foo:
 	x: i32
 ''' )
-		x = mod.get_local( 'Foo' ).attributes[0]
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		x = foo.attributes[0]
 		x.resolve()
 		self.assertIsNone( x.resolve )
 		self.assertIs( x.type, self.discovery.get_intrinsics()['i32'] )
@@ -493,6 +582,7 @@ class Foo:
 		return default
 ''' )
 		foo = mod.get_local( 'Foo' )
+		foo.resolve()
 		group = foo.get_local( 'unwrap_or' )
 		self.assertIsInstance( group, Overload )
 		self.assertEqual( len( group.stubs ), 1 )
@@ -519,6 +609,7 @@ class Foo:
 		return 0
 ''' )
 		foo = mod.get_local( 'Foo' )
+		foo.resolve()
 		group = foo.get_local( 'from_thing' )
 		self.assertIsInstance( group, Overload )
 		self.assertEqual( len( group.stubs ), 0 )
@@ -540,6 +631,7 @@ class Foo:
 		return x
 ''' )
 		foo = mod.get_local( 'Foo' )
+		foo.resolve()
 		group = foo.get_local( 'bar' )
 		self.assertIn( group, foo.methods )
 		self.assertEqual( len( foo.methods ), 1 ) # not duplicated per overload member
@@ -613,9 +705,11 @@ class Stdout:
 	def write( self ) -> None:
 		pass
 ''', { 'os': 'windows' })
-		write = mod.get_local( 'Stdout' ).get_local( 'write' )
+		stdout = mod.get_local( 'Stdout' )
+		stdout.resolve()
+		write = stdout.get_local( 'write' )
 		self.assertIsInstance( write, Function )
-		self.assertEqual( len( mod.get_local( 'Stdout' ).methods ), 1 )
+		self.assertEqual( len( stdout.methods ), 1 )
 
 
 class RealLibSmokeTest( unittest.TestCase ):
@@ -628,6 +722,7 @@ class RealLibSmokeTest( unittest.TestCase ):
 	def test_result_plain_method_resolves( self ) -> None:
 		result_cls = self.builtins_mod.get_local( 'Result' )
 		self.assertIsInstance( result_cls, CStruct )
+		result_cls.resolve()
 
 		ok = result_cls.get_local( 'Ok' )
 		self.assertIsInstance( ok, Function )
@@ -638,6 +733,7 @@ class RealLibSmokeTest( unittest.TestCase ):
 
 	def test_result_unwrap_or_overload_resolves( self ) -> None:
 		result_cls = self.builtins_mod.get_local( 'Result' )
+		result_cls.resolve()
 		group = result_cls.get_local( 'unwrap_or' )
 		self.assertIsInstance( group, Overload )
 		for fn in ( *group.stubs, *group.implementations ):
@@ -646,6 +742,7 @@ class RealLibSmokeTest( unittest.TestCase ):
 	def test_str_from_cstr_overload_resolves( self ) -> None:
 		str_cls = self.builtins_mod.get_local( 'str' )
 		self.assertIsInstance( str_cls, RCClass )
+		str_cls.resolve()
 		group = str_cls.get_local( 'from_cstr' )
 		self.assertIsInstance( group, Overload )
 		self.assertEqual( len( group.implementations ), 2 )
@@ -659,6 +756,7 @@ class RealLibSmokeTest( unittest.TestCase ):
 	def test_bytearray_resolves( self ) -> None:
 		ba_cls = self.builtins_mod.get_local( 'bytearray' )
 		self.assertIsInstance( ba_cls, RCClass )
+		ba_cls.resolve()
 		# not resolving release(): its return annotation references a bare
 		# `OwnershipError` name that lib/builtins/__init__.py never actually
 		# imports (only `sys.OwnershipError` exists) - a pre-existing gap in

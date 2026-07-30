@@ -60,14 +60,18 @@ class Discovery( ast.NodeVisitor ):
 		That's a problem to solve after metalpy is proven viable and starts getting
 		used for projects large enough for that capability to be important.
 
-	A module or class body is scanned exactly once, immediately, when it's
-	encountered - every class/function/global it directly contains is
-	registered right away (that's just "this name exists, in this scope",
-	structural information). What's genuinely deferred is each individual
-	function's parameters/return type and each individual variable's type:
-	those get a `.resolve` callable instead, invoked whenever something
-	actually needs that answer. `.resolve is None` means already resolved (or
-	never needed resolving).
+	A module body is scanned immediately: every top-level class/function/
+	global it directly contains is registered right away (that's just "this
+	name exists, in this scope"), so cross-references anywhere in the program
+	can always find each other regardless of source order. A class's own
+	body is a different story - like a function's parameters or a variable's
+	type, scanning it is deferred behind a `.resolve` callable set up when
+	the class itself is created, invoked whenever something actually needs
+	to know what's inside. `.resolve is None` means already resolved (or
+	never needed resolving). The one exception is a generic's `type_params`,
+	parsed eagerly at creation time - external code subscripting a class as
+	a generic (`Result[i32,usize]`) needs to see it before that class's own
+	`.resolve()` has ever run.
 	'''
 	log_unhandled: bool = False
 
@@ -562,6 +566,29 @@ class Discovery( ast.NodeVisitor ):
 			)
 			owner.type_params.append( tv )
 			owner.add_name( type_param.name, tv )
+	
+	def _shallow_class_body_scan( self,
+		class_obj: ClassLike,
+		body: list[ast.AST],
+	) -> tuple[list[ast.AST],Callable[[],None]]:
+		# we only do a minimal scan of class bodies for nested inner class definitions
+		# we don't want to process attributes or functions yet because we haven't finished collecting type information yet
+		with self.scope_context( class_obj ):
+			unprocessed: list[ast.AST] = []
+			for node in body:
+				if isinstance( node, ast.ClassDef ):
+					self.visit( node )
+				else:
+					unprocessed.append( node )
+			return unprocessed
+
+	def _make_class_resolver( self, class_obj: ClassLike, body: list[ast.stmt], module: Module ) -> Callable[[],None]:
+		def resolve() -> None:
+			with self.module_context( module ):
+				with self.scope_context( class_obj ):
+					self._scan_body( body )
+			class_obj.resolve = None
+		return resolve
 
 	def _parse_ClassDef_CEnum( self, node: ast.ClassDef, qualname: str, value_type: Scalar ) -> CEnum:
 		module = self.module_stack[-1]
@@ -578,8 +605,9 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		with self.scope_context( class_obj ):
-			self._scan_body( node.body )
+		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+
+		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
 		return class_obj
 
@@ -599,8 +627,9 @@ class Discovery( ast.NodeVisitor ):
 
 		self._parse_type_params( node.type_params, class_obj )
 
-		with self.scope_context( class_obj ):
-			self._scan_body( node.body )
+		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+
+		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
 		return class_obj
 
@@ -620,8 +649,9 @@ class Discovery( ast.NodeVisitor ):
 
 		self._parse_type_params( node.type_params, class_obj )
 
-		with self.scope_context( class_obj ):
-			self._scan_body( node.body )
+		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+
+		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
 		return class_obj
 
@@ -639,8 +669,9 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		with self.scope_context( class_obj ):
-			self._scan_body( node.body )
+		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+
+		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
 		return class_obj
 
@@ -660,9 +691,10 @@ class Discovery( ast.NodeVisitor ):
 		scope.add_name( class_obj.stem, class_obj )
 
 		self._parse_type_params( node.type_params, class_obj )
+		
+		unresolved = self._shallow_class_body_scan( class_obj, node.body )
 
-		with self.scope_context( class_obj ):
-			self._scan_body( node.body )
+		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
 		return class_obj
 

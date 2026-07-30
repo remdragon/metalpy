@@ -58,17 +58,21 @@ class ScopeMixin:
 	def get_local( self, name: str ) -> Name|None:
 		return self.names.get( name )
 
+# a class's own body scan (revealing its attribute/method *names*) is
+# deferred behind .resolve, exactly like a Function's parameters or a
+# Variable's type - nothing about a class's members is known until something
+# calls it. type_params is the one exception: it's parsed eagerly, at
+# creation time, because external code subscripting this class as a generic
+# (Result[i32,usize]) needs to see it before this class's own .resolve ever runs.
+
 @dataclass( kw_only = True )
 class RCClass( Type, ScopeMixin ): # normal ref-counted class
 	# TODO FIXME: base class for subclassing
-	# a class's own body is scanned immediately/synchronously when it's
-	# parsed (attribute/method *names* are structural, not deferred) - only
-	# each individual attribute's type / method's parameters defer further,
-	# via that member's own .resolve
 	type_params: list[TypeVar]|None = None # if not None, this is a generic class
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
+	resolve: Callable[[],None]|None = None
 
 @dataclass( kw_only = True )
 class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
@@ -76,6 +80,7 @@ class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
+	resolve: Callable[[],None]|None = None
 
 @dataclass( kw_only = True )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:
@@ -83,12 +88,16 @@ class CUnion( Type, ScopeMixin ): # @cunion class Foo:
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
+	resolve: Callable[[],None]|None = None
 
 @dataclass( kw_only = True )
 class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backing type for synthesized anonymous unions (X|Y)
-	# each variant is an attribute: name -> type
+	# each variant is an attribute: name -> type. Synthesized anonymous
+	# unions are built fully-formed directly (never deferred, resolve stays
+	# None); a user-declared @union's variants defer like any other class body.
 	attributes: list[Variable] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
+	resolve: Callable[[],None]|None = None
 
 @dataclass( kw_only = True )
 class CEnum( Type, ScopeMixin ): # @enum class Foo:
@@ -97,6 +106,7 @@ class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	members: dict[str,int] = field( default_factory = dict )
 	values: dict[int,str] = field( default_factory = dict )
 	names: dict[str,Name] = field( default_factory = dict )
+	resolve: Callable[[],None]|None = None
 
 # anything that can own methods/be a Function's .cls
 ClassLike = Union[ RCClass, CStruct, CUnion, TaggedUnion, CEnum ]
