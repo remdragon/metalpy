@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import queue
+import threading
 
 # local imports:
 import ir
@@ -20,6 +21,7 @@ class LoweredGlobal:
 	instructions: list[ir.Instruction]
 
 CompileUnit = Function|ClassLike|Variable
+CompiledUnit = LoweredFunction|ClassLike|LoweredGlobal
 
 class Compiler:
 	'''
@@ -43,6 +45,7 @@ class Compiler:
 
 		self.queue: queue.Queue = queue.Queue()
 		self._seen: set[int] = set()
+		self._seen_lock = threading.Lock()
 
 		self.functions: list[LoweredFunction] = []
 		self.rcclasses: list[RCClass] = []
@@ -67,9 +70,10 @@ class Compiler:
 		return module
 
 	def _enqueue( self, unit: CompileUnit ) -> None:
-		if id( unit ) in self._seen:
-			return
-		self._seen.add( id( unit ))
+		with self._seen_lock:
+			if id( unit ) in self._seen:
+				return
+			self._seen.add( id( unit ))
 		self.queue.put( unit )
 
 	def run( self ) -> None:
@@ -82,37 +86,46 @@ class Compiler:
 				break
 			self._lower( unit )
 
-	def _lower( self, unit: CompileUnit ) -> None:
+	def _lower( self, unit: CompileUnit ) -> CompiledUnit:
 		if isinstance( unit, Function ):
 			if unit.resolve is not None:
 				unit.resolve()
 			instructions = self.lowering.lower_function( unit )
-			self.functions.append( LoweredFunction( function = unit, instructions = instructions ))
+			lf = LoweredFunction( function = unit, instructions = instructions )
+			self.functions.append( lf )
+			return lf
 		elif isinstance( unit, RCClass ):
 			if unit.resolve is not None:
 				unit.resolve()
 			if unit.base is not None:
 				self._enqueue( unit.base )
 			self.rcclasses.append( unit )
+			return unit
 		elif isinstance( unit, CStruct ):
 			if unit.resolve is not None:
 				unit.resolve()
 			self.cstructs.append( unit )
+			return unit
 		elif isinstance( unit, CUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
 			self.cunions.append( unit )
+			return unit
 		elif isinstance( unit, TaggedUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
 			self.tagged_unions.append( unit )
+			return unit
 		elif isinstance( unit, CEnum ):
 			if unit.resolve is not None:
 				unit.resolve()
 			self.cenums.append( unit )
+			return unit
 		elif isinstance( unit, Variable ):
 			instructions = self.lowering.lower_global( unit )
-			self.globals.append( LoweredGlobal( variable = unit, instructions = instructions ))
+			lg = LoweredGlobal( variable = unit, instructions = instructions )
+			self.globals.append( lg )
+			return lg
 		else:
 			assert False, f'unsupported compile unit: {unit!r}'
 

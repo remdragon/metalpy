@@ -7,7 +7,8 @@ from typing import Callable
 import ir
 from discovery import Discovery
 from mpy_types import (
-	Type, Variable, Parameter, Function, Overload, ClassLike, Module, Specialization, TaggedUnion,
+	Type, Variable, Parameter, Function, Overload, ClassLike, Module,
+	Specialization, TaggedUnion,
 )
 
 _BINOP_OPCODES: dict[type,type] = {
@@ -250,6 +251,8 @@ class Lowering:
 		assert isinstance( names, dict ), f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})'
 		found = names.get( attr )
 		assert isinstance( found, Variable ), f'{owner_type.qualname if owner_type else "?"} has no attribute {attr!r}'
+		if found.resolve is not None:
+			found.resolve()
 		return found
 
 	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload,ir.Operand|None]:

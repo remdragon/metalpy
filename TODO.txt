@@ -1,0 +1,24 @@
+lowering:
+	if statements
+	for x in range( ... ):
+	while statements
+	break/continue
+	defer/errdefer handling
+		defer/errdefer inside a loop requires a list to register every hit
+		new syntax to bind variables in a loop:
+			while True:
+				f = open( ... )
+				with defer( f ): # binds this specific f
+					f.close()
+	match statement support
+	exclude compile time calculations:
+		if compiler.target.os == 'windows': ...
+		if True: ...
+		match compiler.target.bits: ...
+
+emitter:
+	C support (target C11)
+		msvc on windows
+			on Windows, specifically exclude the crt unless an @extern( 'c', ... ) is compiled
+				(metalpy stdlib tries hard to avoid extern "c")
+		gcc on other
