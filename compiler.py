@@ -3,25 +3,24 @@ from pathlib import Path
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Module, NameRegistry
+from mpy_types import Module
 
 class Compiler:
 	def __init__( self, disco: Discovery ) -> None:
 		self.disco = disco
-	
+
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
 		return self.disco.import_code( code, filename, scope )
-	
+
 	def import_file( self, filename: Path, scope: str|None = None ) -> Module:
 		return self.disco.import_file( filename, scope )
 
 if __name__ == '__main__':
 	Discovery.log_unhandled = False # enable for discovery debugging
-	
+
 	TROUBLESHOOT_IMPORT = False
 
-	registry = NameRegistry()
-	disco = Discovery( registry, import_builtins = not TROUBLESHOOT_IMPORT )
+	disco = Discovery( import_builtins = not TROUBLESHOOT_IMPORT )
 	c = Compiler( disco )
 
 	if TROUBLESHOOT_IMPORT:
@@ -45,8 +44,5 @@ class Foo:
 	print( '' )
 	print( 'module names:' )
 	for name, obj in m.names.items():
-		print( f'	{name!r} -> {obj.stem!r} -> {obj.qualname!r}' )
-	print( '' )
-	print( 'compiler global namespace:' )
-	for name, obj in registry.items():
-		print( f'	{name!r} -> {obj.stem!r} -> {obj.qualname!r}' )
+		pending = getattr( obj, 'resolve', None ) is not None
+		print( f'	{name!r} -> {obj.stem!r} -> {obj.qualname!r}{" (unresolved)" if pending else ""}' )

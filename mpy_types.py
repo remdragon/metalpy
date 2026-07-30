@@ -1,22 +1,17 @@
 # stdlib imports:
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-import threading
-from typing import Iterator
+from typing import Callable, Union
 
 @dataclass( kw_only = True )
 class Name:
 	stem: str # local name like 'str' instead of 'builtins.str'
 	qualname: str # fully qualified name: 'builtins.str' instead of 'str'
-	
+
 	# we don't always know where a name is defined the first time we see it:
 	file: Path|None
 	line: int|None
-
-@dataclass( kw_only = True )
-class UnresolvedName( Name ):
-	resolution: Name|None = None
 
 @dataclass( kw_only = True )
 class Type( Name ):
@@ -24,109 +19,128 @@ class Type( Name ):
 
 @dataclass( kw_only = True )
 class Scalar( Type ):
-	''' isize, usize, i32, u32, etc '''
+	'''
+	isize, usize, i32, u32, etc - also used for generic pointer intrinsics
+	(Ptr, ConstPtr), which is why type_params exists here too
+	'''
+	type_params: list['TypeVar']|None = None
+
+@dataclass( kw_only = True )
+class TypeVar( Type ):
+	''' a placeholder for one of a generic's type parameters, e.g. T in class Result[T,E] '''
+
+@dataclass( kw_only = True )
+class Specialization( Type ):
+	''' a generic base type applied to concrete (or still-typevar) type arguments, e.g. Result[i32,IntError] '''
+	base: Type
+	args: list[Type]
 
 @dataclass( kw_only = True )
 class Variable( Name ):
-	type: Type # we always (?) know a variable's type ( although it may be an UnresolvedType )
+	type: Type|None = None
+	# None means already resolved (or never needed resolving); otherwise call
+	# it to populate .type, after which it sets itself back to None. Checking
+	# "is this resolved" is just `var.resolve is None`.
+	resolve: Callable[[],None]|None = None
 
 
-@dataclass( kw_only = True )
-class RCClass( Type ): # normal ref-counted class
-	# TODO FIXME: base class for subclassing
-	type_params: list[str]|None # if not None, this is a generic class
-	attributes: list[Variable]
-	methods: list[Function]
+class ScopeMixin:
+	'''
+	shared shape for anything that owns a local namespace (Module, the various
+	class kinds, Function) - not a dataclass itself (no fields of its own) so it
+	can't interfere with dataclass field collection on whatever it's mixed into.
+	'''
 	names: dict[str,Name]
-	body: list[ast.AST]|None
-	
+
 	def add_name( self, name: str, name_obj: Name ) -> None:
 		self.names[name] = name_obj
 
-@dataclass( kw_only = True )
-class CStruct( Type ): # @cstruct class Foo:
-	body: list[ast.AST]|None
+	def get_local( self, name: str ) -> Name|None:
+		return self.names.get( name )
 
 @dataclass( kw_only = True )
-class CUnion( Type ): # @cunion class Foo:
-	body: list[ast.AST]|None
+class RCClass( Type, ScopeMixin ): # normal ref-counted class
+	# TODO FIXME: base class for subclassing
+	# a class's own body is scanned immediately/synchronously when it's
+	# parsed (attribute/method *names* are structural, not deferred) - only
+	# each individual attribute's type / method's parameters defer further,
+	# via that member's own .resolve
+	type_params: list[TypeVar]|None = None # if not None, this is a generic class
+	attributes: list[Variable] = field( default_factory = list )
+	methods: list['Function|Overload'] = field( default_factory = list )
+	names: dict[str,Name] = field( default_factory = dict )
 
 @dataclass( kw_only = True )
-class TaggedUnion( Type ): # @union class Foo:
-	body: list[ast.AST]|None
+class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
+	type_params: list[TypeVar]|None = None
+	attributes: list[Variable] = field( default_factory = list )
+	methods: list['Function|Overload'] = field( default_factory = list )
+	names: dict[str,Name] = field( default_factory = dict )
 
 @dataclass( kw_only = True )
-class CEnum( Type ): # @enum class Foo:
+class CUnion( Type, ScopeMixin ): # @cunion class Foo:
+	type_params: list[TypeVar]|None = None
+	attributes: list[Variable] = field( default_factory = list )
+	methods: list['Function|Overload'] = field( default_factory = list )
+	names: dict[str,Name] = field( default_factory = dict )
+
+@dataclass( kw_only = True )
+class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backing type for synthesized anonymous unions (X|Y)
+	# each variant is an attribute: name -> type
+	attributes: list[Variable] = field( default_factory = list )
+	names: dict[str,Name] = field( default_factory = dict )
+
+@dataclass( kw_only = True )
+class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	value_type: Type
 	next_auto: int = 0
-	members: dict[str,int|None]
-	values: dict[int|None,str]
-	body: list[ast.AST]|None
+	members: dict[str,int] = field( default_factory = dict )
+	values: dict[int,str] = field( default_factory = dict )
+	names: dict[str,Name] = field( default_factory = dict )
+
+# anything that can own methods/be a Function's .cls
+ClassLike = Union[ RCClass, CStruct, CUnion, TaggedUnion, CEnum ]
 
 @dataclass( kw_only = True )
-class Function( Type ):
-	cls: RCClass|None
-	parameters: list[Variable]
-	return_type: Type|None
-	body_ast: list[ast.stmt]
-	names: dict[str,Name]
-	
-	def add_name( self, name: str, name_obj: Name ) -> None:
-		self.names[name] = name_obj
+class Function( Type, ScopeMixin ):
+	cls: ClassLike|None
+	node: ast.FunctionDef # whole def - node.args/.returns resolved lazily, node.body untouched until IR generation
+	type_params: list[TypeVar]|None = None # if not None, this is a generic function (e.g. def alloc[T](...))
+	parameters: list[Variable]|None = None
+	return_type: Type|None = None
+	names: dict[str,Name] = field( default_factory = dict )
+	# None means already resolved; otherwise call it to populate
+	# parameters/return_type, after which it sets itself back to None
+	resolve: Callable[[],None]|None = None
+
+	is_static: bool = False
+	is_classmethod: bool = False
+	is_abstract: bool = False
+	is_move: bool = False
+	is_private: bool = False
 
 @dataclass( kw_only = True )
 class Overload( Type ):
-	cls: RCClass|None = None
+	'''
+	stands in for a Function when multiple defs share a name in the same scope.
+
+	stubs: @overload-decorated defs with no real body - signature-only,
+	never actually called; implementations: real bodies, either one plain
+	(non-@overload) fallback that every stub maps to, or several
+	@overload-decorated ones distinguished by their own parameters.
+
+	NOTE: call-site dispatch (given argument types, which implementation
+	applies) is deliberately not implemented here - that's a call-expression-
+	compilation concern for stage 2 IR generation, not discovery. Nothing
+	about the group itself is deferred (its members list is complete the
+	moment it's built) - each member Function still has its own .resolve.
+	'''
+	cls: ClassLike|None = None
+	stubs: list[Function] = field( default_factory = list )
+	implementations: list[Function] = field( default_factory = list )
 
 @dataclass( kw_only = True )
-class Module( Name ):
+class Module( Name, ScopeMixin ):
 	intrinsics: dict[str,Name]
 	builtins: dict[str,Name]|None
-	names: dict[str,Name]
-	
-	def add_name( self, name: str, name_obj: Name ) -> None:
-		#print( f'adding {self.qualname}.{name}' )
-		self.names[name] = name_obj
-
-@dataclass( kw_only = True )
-class PendingTypeInference( Type ):
-	resolution: Type|None = None
-
-class NameRegistry:
-	def __init__( self ) -> None:
-		self._registry: dict[str,Name] = {}
-		self.unresolved_names: dict[str,Name] = {}
-		self._lock = threading.RLock()
-	
-	def get_or_create( self, *, qualname: str ) -> Name:
-		# Fast read check
-		if name_obj := self._registry.get( qualname, None ):
-			return name_obj
-		
-		with self._lock:
-			# Double-check inside lock to guarantee single instance
-			if ( name_obj := self._registry.get( qualname )) is None:
-				self._registry[qualname] = name_obj = UnresolvedName(
-					stem = qualname.rpartition( '.' )[2],
-					qualname = qualname,
-					file = None, # unknown yet
-					line = None, # unknown yet
-				)
-				self.unresolved_names[qualname] = name_obj
-			return name_obj
-	
-	def resolve( self, real_name: Name ) -> Name:
-		with self._lock:
-			name_obj = self.get_or_create( qualname = real_name.qualname )
-			if isinstance( name_obj, UnresolvedName ):
-				if name_obj.resolution is None:
-					name_obj.resolution = real_name
-				else:
-					# TODO FIXME: the following can probably be triggered by creating 2 Foo objects, may need to be a compile error
-					assert real_name == name_obj.resolution, f'name object mismatch: {real_name=} vs {name_obj.resolution=}'
-				self._registry[real_name.qualname] = real_name
-				self.unresolved_names.pop( real_name.qualname, None )
-			return name_obj
-	
-	def items( self ) -> Iterator[tuple[str,Name]]:
-		return self._registry.items()
+	names: dict[str,Name] = field( default_factory = dict )
