@@ -1099,6 +1099,28 @@ class Lowering:
 
 		self.discovery.fail( f'unsupported unary operator: {ast.unparse(node)}', node )
 
+	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:
+		# short-circuit and/or: evaluate operands left to right, each into
+		# the same dest temp, stopping early (jump to end) as soon as the
+		# result is already decided - `and` stops on the first falsy
+		# operand, `or` stops on the first truthy one. Needed by match's
+		# nested pattern tests (an outer tag check AND, only if that
+		# passes, an inner tag check on the payload - reading the payload
+		# before confirming the outer tag would be reading the wrong
+		# union member's storage)
+		bool_cls = self.discovery.find_name( 'bool', node )
+		is_and = isinstance( node.op, ast.And )
+		end_label = self._new_label( 'booland' if is_and else 'boolor' )
+		dest = self._new_temp( bool_cls )
+		for i, value_node in enumerate( node.values ):
+			operand = self._lower_expr( value_node, bool_cls )
+			self._emit( ir.Assign( dest = dest, src = operand ))
+			if i < len( node.values ) - 1:
+				jump_opcode = ir.JumpIfFalse if is_and else ir.JumpIfTrue
+				self._emit( jump_opcode( cond = dest, target = end_label ))
+		self._emit( ir.Label( name = end_label ))
+		return dest
+
 	_CMP_OPCODES: dict[type,'ir.CmpOp'] = {
 		ast.Eq: ir.CmpOp.EQ,
 		ast.NotEq: ir.CmpOp.NE,

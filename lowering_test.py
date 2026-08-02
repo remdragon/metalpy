@@ -1096,6 +1096,82 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'unsupported comparison operator', self.discovery.errors.errors[0] )
 
+	# --- boolean operators (and/or) -------------------------------------------
+
+	def test_boolop_and_shape( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	b: bool',
+			'	c: bool = a and b',
+			'	return',
+		])
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = bool_cls )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = bool_cls )
+		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 4, type = bool_cls )
+		t0 = ir.Temp( type = bool_cls, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Assign( dest = t0, src = a ),
+			ir.JumpIfFalse( cond = t0, target = '__booland_0__' ),
+			ir.Assign( dest = t0, src = b ),
+			ir.Label( name = '__booland_0__' ),
+			ir.Assign( dest = c, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_boolop_or_shape( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	b: bool',
+			'	c: bool = a or b',
+			'	return',
+		])
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = bool_cls )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = bool_cls )
+		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 4, type = bool_cls )
+		t0 = ir.Temp( type = bool_cls, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Assign( dest = t0, src = a ),
+			ir.JumpIfTrue( cond = t0, target = '__boolor_0__' ),
+			ir.Assign( dest = t0, src = b ),
+			ir.Label( name = '__boolor_0__' ),
+			ir.Assign( dest = c, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_boolop_and_short_circuits_on_first_falsy( self ) -> None:
+		# three operands: only the first two should ever be lowered/jumped
+		# on if the first is falsy at runtime - but since this is static
+		# lowering (not interpretation), what we can actually verify is the
+		# STATIC shape: two JumpIfFalse checks (one per non-last operand)
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	b: bool',
+			'	c: bool',
+			'	d: bool = a and b and c',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 2 )
+		self.assertEqual( kinds.count( 'Label' ), 1 )
+
 	# --- if statements ---------------------------------------------------------
 
 	def test_if_without_else_shape( self ) -> None:
