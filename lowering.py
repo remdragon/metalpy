@@ -409,6 +409,9 @@ class Lowering:
 			return
 		if isinstance( node.value, ast.Constant ) and isinstance( node.value.value, str ):
 			return # a docstring (or any other bare string literal used as a statement) - a no-op, same as _stmt_Pass
+		if self._is_compiler_early_return_call( node.value ):
+			self._lower_compiler_early_return( node.value )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -468,6 +471,60 @@ class Lowering:
 			and isinstance( node.func.value, ast.Name )
 			and node.func.value.id == 'compiler'
 		)
+
+	def _is_compiler_early_return_call( self, node: ast.expr ) -> bool:
+		return (
+			isinstance( node, ast.Call )
+			and isinstance( node.func, ast.Attribute )
+			and node.func.attr == 'early_return'
+			and isinstance( node.func.value, ast.Name )
+			and node.func.value.id == 'compiler'
+		)
+
+	def _lower_compiler_early_return( self, node: ast.Call ) -> None:
+		# compiler.early_return(err) - a same-function early bailout: usable
+		# anywhere inside a function that itself returns Result[_,_], to
+		# return Result.Err(err) immediately without writing the boilerplate
+		# out by hand. Desugars to `return Result.Err(err)` and delegates to
+		# _stmt_Return so it reuses the epilogue-vs-plain-Return split (and
+		# errdefer's is_err() epilogue check, which already treats any
+		# Result.Err landing in the return slot uniformly, not just the
+		# OrJump path) rather than duplicating either.
+		#
+		# NOTE: Result.or_return()'s own written body uses this same call
+		# (`compiler.early_return(self._payload.err)`), but that body is
+		# never actually lowered as a real function - it's a spec, not
+		# compilable code, because it would need this to trigger a return
+		# in ITS CALLER's scope, not or_return()'s own (or_return's declared
+		# return type is bare T, not Result[T,E] - `return Result.Err(...)`
+		# from inside it could never type-check there). or_return() calls
+		# are instead recognized and expanded directly at the call site -
+		# see _lower_or_return.
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.early_return(...) takes exactly one argument: {ast.unparse(node)}', node )
+		fn = self._current_fn
+		return_type = fn.return_type if fn is not None else None
+		result_cls = self.discovery.find_name( 'Result', node )
+		ok = (
+			fn is not None
+			and isinstance( return_type, Specialization )
+			and return_type.base is result_cls
+			and len( return_type.args ) == 2
+		)
+		if not ok:
+			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
+			self.discovery.fail( f'compiler.early_return(...) requires the enclosing function to return Result[_,_] ({where})', node )
+
+		err_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+			args = [ node.args[0] ],
+			keywords = [],
+		)
+		ast.copy_location( err_call, node )
+		ast.fix_missing_locations( err_call )
+		return_stmt = ast.Return( value = err_call )
+		ast.copy_location( return_stmt, node )
+		self._stmt_Return( return_stmt )
 
 	# --- defer/errdefer ----------------------------------------------------------
 
@@ -1017,6 +1074,32 @@ class Lowering:
 			return None
 		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
 
+	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
+
+	def _lower_or_return( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
+		# <result_expr>.or_return() is recognized textually here rather than
+		# ever actually calling Result.or_return's own declared body
+		# (`if self.is_err(): compiler.early_return(self._payload.err)` /
+		# `return self._payload.ok`) - that body is written as a spec of the
+		# intended behavior, not something literally compilable: it needs to
+		# trigger a `return Result.Err(...)` in ITS CALLER's scope, not its
+		# own (or_return's own declared return type is bare T, not
+		# Result[T,E], so `return Result.Err(...)` from inside it could
+		# never type-check there - see compiler.early_return's own comment).
+		# This expands directly to the same OrReturn/OrJump primitives
+		# checked-arithmetic already uses for exactly the same "propagate
+		# the error to the enclosing function, continue with the unwrapped
+		# value" shape - no new IR needed, and Result.or_return is never
+		# scheduled/lowered as a real function as a result.
+		if node.args or node.keywords:
+			self.discovery.fail( f'or_return() takes no arguments: {ast.unparse(node)}', node )
+		if not ( isinstance( receiver.type, Specialization ) and len( receiver.type.args ) == 2 ):
+			self.discovery.fail( f'or_return() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		result_type, error_cls = receiver.type.args
+		self._require_result_return( node, receiver.type.base, error_cls, self._OR_RETURN_ALTERNATIVES )
+		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
+		return unwrapped if want_result else None
+
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		allocate_dest = self._try_lower_allocate_call( node, expected_type )
 		if allocate_dest is None:
@@ -1027,6 +1110,9 @@ class Lowering:
 		target, receiver = self._resolve_callee( node.func )
 		if receiver is not None:
 			self.schedule( receiver.type )
+
+		if isinstance( target, Function ) and target.stem == 'or_return' and target.cls is self.discovery.find_name( 'Result', node ):
+			return self._lower_or_return( node, receiver, want_result )
 
 		if isinstance( target, Overload ):
 			# bare literal arguments have no unambiguous expected type before

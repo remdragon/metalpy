@@ -366,6 +366,147 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = '__test__.checked' ),
 		])
 
+	def test_or_return_call_expands_to_or_return_ir_at_call_site( self ) -> None:
+		# <result_expr>.or_return() is recognized at the call site and
+		# expanded directly to OrReturn - Result.or_return's own declared
+		# body (`return self.x` here) is never itself scheduled/lowered as
+		# a Call target, since it would need to return from ITS CALLER, not
+		# itself (see _lower_or_return's own comment)
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'	def or_return( self ) -> T:',
+			'		return self.x',
+			'',
+			'def get_result() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def foo() -> Result[i32,MyError]:',
+			'	v: i32 = get_result().or_return()',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+		foo_fn = mod.get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		result_cls = mod.get_local( 'Result' )
+		myerror_cls = mod.get_local( 'MyError' )
+		if result_cls.resolve is not None:
+			result_cls.resolve()
+		result_i32_myerror = self.discovery._get_or_create_specialization( result_cls, [ i32, myerror_cls ] )
+
+		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 14, type = i32 )
+		t0 = ir.Temp( type = result_i32_myerror, id = 0 ) # get_result()'s Result
+		t1 = ir.Temp( type = i32, id = 1 )                # unwrapped via OrReturn
+
+		fn = self.compiler._lower( foo_fn )
+		get_result_fn = mod.get_local( 'get_result' )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = '__test__.foo', params = [], return_type = foo_fn.return_type ),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Call( dest = t0, target = get_result_fn, receiver = None, args = [], kwargs = {} ),
+			ir.DeclareTemp( temp = t1 ),
+			ir.OrReturn( dest = t1, value = t0 ),
+			ir.Assign( dest = v, src = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.FuncEnd( name = '__test__.foo' ),
+		])
+		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
+
+	def test_or_return_outside_result_returning_function_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'	def or_return( self ) -> T:',
+			'		return self.x',
+			'',
+			'def get_result() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def foo() -> None:',
+			'	v: i32 = get_result().or_return()',
+			'	return',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertIn( 'or_return', self.discovery.errors.errors[0] )
+
+	def test_compiler_early_return_desugars_to_return_result_err( self ) -> None:
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'	@staticmethod',
+			'	def Err( e: E ) -> Result[T,E]:',
+			'		return Result.__allocate__( x = 0 )',
+			'',
+			'def foo() -> Result[i32,MyError]:',
+			'	compiler.early_return( MyError() )',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+		foo_fn = mod.get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		result_cls = mod.get_local( 'Result' )
+		myerror_cls = mod.get_local( 'MyError' )
+		if result_cls.resolve is not None:
+			result_cls.resolve()
+		err_fn = result_cls.get_local( 'Err' )
+		if err_fn.resolve is not None:
+			err_fn.resolve()
+		result_i32_myerror = self.discovery._get_or_create_specialization( result_cls, [ i32, myerror_cls ] )
+
+		t0 = ir.Temp( type = err_fn.parameters[0].type, id = 0 ) # MyError()'s Allocate - typed as Err's own `e: E` param (generic monomorphization doesn't exist yet, so this stays the bare TypeVar, not MyError)
+		t1 = ir.Temp( type = result_i32_myerror, id = 1 )  # Result.Err(...)'s Call
+
+		fn = self.compiler._lower( foo_fn )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = '__test__.foo', params = [], return_type = foo_fn.return_type ),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Allocate( dest = t0, cls = myerror_cls, fields = {} ),
+			ir.DeclareTemp( temp = t1 ),
+			ir.Call( dest = t1, target = err_fn, receiver = None, args = [ t0 ], kwargs = {} ),
+			ir.Return( value = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.FuncEnd( name = '__test__.foo' ),
+		])
+
+	def test_compiler_early_return_outside_result_returning_function_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'def foo() -> None:',
+			'	compiler.early_return( MyError() )',
+			'	return',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertIn( 'compiler.early_return', self.discovery.errors.errors[0] )
+
 	def test_binop_saturate_arithmetic_context( self ) -> None:
 		# with compiler.saturate_arithmetic: - same shape as wrap_arithmetic,
 		# just the *Saturate opcodes instead - no Result/OrReturn involved
