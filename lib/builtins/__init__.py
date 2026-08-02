@@ -377,31 +377,26 @@ def print( msg: str, end: str = '\n' ) -> None:
 	if end:
 		sys.stdout.write( end )
 
-# real functions for now, each forwarding to that type's own __len__ - TODO:
-# once @inline exists (see TODO.txt), these should become @inline so len(x)
-# compiles down to the same code as x.__len__() directly, no call overhead.
-# no @overload needed - these are pairwise distinct by parameter type, same
-# as str.from_cstr's two variants.
+# a single generic function now that bare-call monomorphization can infer T
+# from the argument (see lowering.py's _lower_inferred_generic_call) - a real
+# Call for now, forwarding to whatever T's own __len__ is; TODO once @inline
+# exists (see TODO.txt): this should become @inline so len(x) compiles down
+# to the same code as x.__len__() directly, no call overhead.
 #
-# no move[bytearray] overload: len() only borrows and never consumes its
-# argument, so the plain bytearray overload below already covers a call
-# site holding a move[bytearray] local (e.g. str.from_cstr's
-# len(src)) - a separate move[bytearray] parameter would instead take
-# ownership and decref it, leaving src unusable by the code right after
-# (its own src.release() call) - see TODO.txt for the eventual generic
-# len[T](t: T) -> t.__len__() form, blocked on monomorphization not
-# existing yet.
+# len(x) where x: bytes|bytearray (bytes.__init__'s len(copy_from)) works
+# through this too: T is inferred as the WHOLE union type, and t.__len__()
+# inside the monomorphized body resolves via receiver narrowing
+# (_resolve_union_receiver_members) - bytes.__len__/bytearray.__len__ agree
+# on usize, so this isn't even a new case, just two existing fixes composing.
+#
+# len(src) where src: move[bytearray] (str.from_cstr/bytes.from_bytearray)
+# is still broken - a known, separate, already-tracked gap (see TODO.txt's
+# incref/decref/move[T] note: Move has no .names at all, so ANY method/attr
+# access through a move[T]-typed value fails, not just this one)
 #
 # slice[T]'s own length accessor is named .len(), not __len__() (see
-# slice[T].len() above) - a generic `def len[T](x: slice[T])` overload
-# member for it is deliberately not included here yet: it's a different,
-# unverified case (a generic parameter type mixed into a plain-implementation
-# overload group) from the concrete types below, not just another line
-def len( x: str ) -> usize:
-	return x.__len__()
-
-def len( x: bytes ) -> usize:
-	return x.__len__()
-
-def len( x: bytearray ) -> usize:
-	return x.__len__()
+# slice[T].len() above) - len(arr) at a slice[T] call site (e.g.
+# bisect.py's bisect_right) still doesn't resolve, and isn't fixed by this:
+# T would infer fine, but slice[T] itself has no __len__, only .len()
+def len[T]( t: T ) -> usize:
+	return t.__len__()

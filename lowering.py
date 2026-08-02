@@ -1831,26 +1831,92 @@ class Lowering:
 		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
-	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# sys.alloc[u8](...) - explicit generic instantiation. Matches call
 		# args against the MONOMORPHIZED signature (so a literal argument's
 		# expected type is already concrete, e.g. usize for alloc[u8]'s
-		# count - not the abstract, unsubstituted one) and schedules the
-		# Specialization itself as the compile unit (see
-		# _monomorphized_function/compiler.py's own handling of it)
+		# count - not the abstract, unsubstituted one)
 		monomorphized = self._monomorphized_function( spec )
 		positional, keyword = self._match_call_args( monomorphized, node )
 		args = [ self._lower_expr( expr, param.type ) for param, expr in positional ]
 		kwargs = { param.stem: self._lower_expr( expr, param.type ) for param, expr in keyword }
+		return self._emit_generic_call( spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
+
+	def _lower_inferred_generic_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# a BARE call to a generic function (mylen(a), no explicit [T]) -
+		# unlike _lower_generic_function_call, there's no already-concrete
+		# Specialization to match args against yet: T has to be inferred
+		# FROM the arguments themselves first. Args are lowered once with no
+		# expected type (a bare TypeVar parameter can't offer a real literal
+		# hint anyway - a literal argument at such a position correctly
+		# fails via _expr_Constant's own "cannot infer" error, same as any
+		# other call with no usable expected type), then each declared
+		# parameter type is unified against that argument's real lowered
+		# type (_unify_type_param) to solve for target's own type params -
+		# the inverse of _substitute_type_params, which already handles
+		# substituting a SOLVED binding through arbitrarily nested
+		# Specializations (list[T] etc), so unification mirrors that same
+		# recursive shape instead of only handling a bare `t: T` parameter
+		if target.resolve is not None:
+			target.resolve()
+		positional, keyword = self._match_call_args( target, node )
+		args = [ self._lower_expr( expr, None ) for _param, expr in positional ]
+		kwargs = { param.stem: self._lower_expr( expr, None ) for param, expr in keyword }
+
+		bindings: dict[int,Type] = {} # id(TypeVar) -> the concrete Type it was inferred as
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._unify_type_param( target, param.type, operand.type, bindings, node )
+		for param, _expr in keyword:
+			self._unify_type_param( target, param.type, kwargs[param.stem].type, bindings, node )
+
+		missing = [ tv.stem for tv in target.type_params or [] if id( tv ) not in bindings ]
+		if missing:
+			self.discovery.fail(
+				f'{target.qualname}[...]: cannot infer type parameter(s) {", ".join(missing)} from these arguments - '
+				f'call it explicitly as {target.qualname}[...](...) instead: {ast.unparse(node)}',
+				node,
+			)
+		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
+		spec = self.discovery._get_or_create_specialization( target, inferred_args )
+		monomorphized = self._monomorphized_function( spec )
+		return self._emit_generic_call( spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
+
+	def _unify_type_param( self, target: Function, declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST ) -> None:
+		if declared is None or actual is None:
+			return
+		if any( declared is tv for tv in target.type_params or [] ):
+			existing = bindings.get( id( declared ) )
+			if existing is not None and existing is not actual:
+				self.discovery.fail(
+					f'{target.qualname}[...]: type parameter {declared.stem!r} is inferred as both '
+					f'{existing.qualname} and {actual.qualname} by different arguments: {ast.unparse(node)}',
+					node,
+				)
+			bindings[ id( declared ) ] = actual
+			return
+		if isinstance( declared, Specialization ) and isinstance( actual, Specialization ) and declared.base is actual.base:
+			for d_arg, a_arg in zip( declared.args, actual.args ):
+				self._unify_type_param( target, d_arg, a_arg, bindings, node )
+		# else: this parameter position doesn't mention any of target's own
+		# type params (a concrete parameter, or a nested type whose base
+		# doesn't even match the argument's) - nothing to infer here. Not an
+		# error by itself: a genuine argument-type mismatch isn't checked
+		# anywhere yet (no general type-checking pass exists), same as
+		# every other call site in this file today
+
+	def _emit_generic_call( self, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# schedules the Specialization itself as the compile unit (see
+		# _monomorphized_function/compiler.py's own handling of it), shared
+		# tail for both the explicit Name[T](...) and inferred call paths
 		self.schedule( spec )
 		self.schedule( monomorphized.return_type )
 		for param in monomorphized.parameters or []:
 			self.schedule( param.type )
 		if want_result:
 			dest = self._new_temp( expected_type or monomorphized.return_type )
-			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = None, args = args, kwargs = kwargs ))
+			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
 			return dest
-		self._emit( ir.Call( dest = None, target = monomorphized, receiver = None, args = args, kwargs = kwargs ))
+		self._emit( ir.Call( dest = None, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
 		return None
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -1877,7 +1943,10 @@ class Lowering:
 			return self._lower_or_return( node, receiver, want_result )
 
 		if isinstance( target, Specialization ) and isinstance( target.base, Function ):
-			return self._lower_generic_function_call( node, target, expected_type, want_result )
+			return self._lower_generic_function_call( node, target, receiver, expected_type, want_result )
+
+		if isinstance( target, Function ) and target.type_params:
+			return self._lower_inferred_generic_call( node, target, receiver, expected_type, want_result )
 
 		if isinstance( target, Overload ):
 			# a bare literal argument has no type of its own before a

@@ -1,19 +1,4 @@
 lowering:
-	[resolved] method calls on a union-typed receiver weren't resolved at all:
-		bytes.__init__ (lib/builtins/__init__.py) did
-			copy_from.get_const_ptr() where copy_from: bytes|bytearray -
-		get_const_ptr isn't overloaded (each of bytes/bytearray just has its
-		own real, unrelated method), so this wasn't an overload_resolution.py-
-		style problem at all - fixed by narrowing the receiver via a
-		synthesized tag-check (same GetAttr/Cmp/JumpIfFalse machinery match
-		statements/dispatch already use, no new IR needed - confirmed this
-		requires nothing beyond what already existed) before .get_const_ptr()
-		is looked up, since the union type itself has no .names entry for it.
-		See lowering.py's _resolve_union_receiver_members/_lower_union_receiver_call.
-		Also fixed in passing: a real @union class declaring any real method
-		crashed at discovery time (class_obj.methods.append(fn) assumed every
-		ClassLike had a .methods list; TaggedUnion never did) - mpy_types.py's
-		TaggedUnion now has one, matching RCClass/CStruct/CUnion.
 	possible future improvement: union-receiver dispatch currently requires
 		every leaf's method to share the exact same return type, or it's a
 		compile error (see _resolve_union_receiver_members in lowering.py).
@@ -30,24 +15,41 @@ lowering:
 		I incorrectly put "x is Foo" when checking if a variable was a certain type
 		in Python, "is" is a "same identity" check.
 		we need to replace that incorrect usage with either "type(x) is Foo" or "instanceof( x, Foo )"
-	generic function monomorphization: calling a method on a value whose
-		declared type is a bare (unbound) TypeVar always fails today
-		("TypeVar(...) has no members, cannot look up '...'") - a generic
-		function's body is only ever lowered once, with its own type params
-		left abstract; nothing substitutes the concrete argument type into
-		the body per call site. Confirmed via a direct repro:
-			def mylen[T]( t: T ) -> usize:
-				return t.__len__()
-		blocks lib/builtins/__init__.py's len() from being the single
-		generic `def len[T](t: T) -> usize: return t.__len__()` it should
-		eventually be (currently a handful of concrete-type overloads
-		instead - see that file's own comment above them) - and see also
-		"list class" below for the emitter-level echo of the same gap
+	[resolved] generic function monomorphization for BARE calls: calling a
+		method on a value whose declared type was a bare (unbound) TypeVar
+		used to always fail ("TypeVar(...) has no members, cannot look up
+		'...'") - a generic function's body was only ever lowered once, with
+		its own type params left abstract; nothing substituted the concrete
+		argument type into the body per call site (Phase 7's monomorphization
+		only covered the EXPLICIT Name[T](...) spelling, e.g. sys.alloc[u8]).
+		Fixed via argument-type inference at bare call sites (mylen(a), no
+		[T] needed) - lowering.py's _lower_inferred_generic_call unifies each
+		declared parameter type against the actual lowered argument type
+		(_unify_type_param) to solve for T, then routes through the same
+		monomorphization Phase 7 already built. Supports one level of
+		nesting too (list[T]/Box[T]/Ptr[T]-style parameters unify through
+		Specialization.args, not just a bare `t: T` parameter) since list[T]/
+		dict[K,V] are foundational enough to need this soon, not speculative.
+		A parameter position that doesn't mention any of the function's own
+		type params is just skipped (not an error - no general argument-type
+		checking exists anywhere yet); an unconstrained or conflicting type
+		param is a clear compile error either way.
+		lib/builtins/__init__.py's len() is now migrated to the single
+		generic `def len[T](t: T) -> usize: return t.__len__()` this
+		unblocked - including len(copy_from) where copy_from: bytes|bytearray
+		(bytes.__init__), which infers T as the WHOLE union type and then
+		resolves t.__len__() through the union-receiver-narrowing fix above,
+		two independent fixes composing with no extra code needed. Still
+		broken, unaffected by this fix (separate, already-tracked gaps):
+		len(src) where src: move[bytearray] (Move has no .names at all - see
+		incref/decref/move[T] below) and len(arr) where arr: slice[T]
+		(slice[T]'s accessor is named .len(), not __len__() - T infers fine,
+		there's just no __len__ to find)
 	@inline decorator: a function marked @inline should compile down to its
 		body spliced directly at each call site (no real Call/FuncStart/
-		FuncEnd for it) - lib/builtins/__init__.py's len() overloads are
-		meant to become @inline once this exists, so len(x) costs exactly
-		what x.__len__() would and no more
+		FuncEnd for it) - lib/builtins/__init__.py's len() is meant to become
+		@inline once this exists, so len(x) costs exactly what x.__len__()
+		would and no more
 	incref/decref
 		part of this: remodel move[T]/Move properly. It's currently a Type
 		wrapper (mpy_types.Move, holding .inner), which is wrong - move[T]

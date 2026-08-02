@@ -1296,16 +1296,18 @@ class RealLibSmokeTest( unittest.TestCase ):
 		self.assertIsInstance( ok.return_type, Specialization )
 		self.assertIs( ok.return_type.base, result_cls )
 
-	def test_len_overload_group_resolves( self ) -> None:
-		group = self.builtins_mod.get_local( 'len' )
-		self.assertIsInstance( group, Overload )
-		self.assertEqual( len( group.stubs ), 0 )
-		self.assertEqual( len( group.implementations ), 3 )
-		for fn in group.implementations:
-			if fn.resolve is not None:
-				fn.resolve()
-		param_types = sorted( fn.parameters[0].type.stem for fn in group.implementations )
-		self.assertEqual( param_types, [ 'bytearray', 'bytes', 'str' ])
+	def test_len_is_a_single_generic_function( self ) -> None:
+		# len() used to be 3 concrete overloads (str/bytes/bytearray) -
+		# migrated to the single generic def len[T](t: T) once bare-call
+		# monomorphization could infer T (see lowering.py's
+		# _lower_inferred_generic_call)
+		fn = self.builtins_mod.get_local( 'len' )
+		self.assertIsInstance( fn, Function )
+		if fn.resolve is not None:
+			fn.resolve()
+		self.assertEqual( len( fn.type_params ), 1 )
+		self.assertEqual( fn.type_params[0].stem, 'T' )
+		self.assertIs( fn.parameters[0].type, fn.type_params[0] )
 
 	def test_result_unwrap_or_overload_resolves( self ) -> None:
 		result_cls = self.builtins_mod.get_local( 'Result' )

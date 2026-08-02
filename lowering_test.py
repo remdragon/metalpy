@@ -1781,6 +1781,79 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'is not a type', self.discovery.errors.errors[0] )
 
+	# --- bare-call generic function type inference ------------------------------
+
+	def test_generic_function_call_infers_type_arg_from_argument( self ) -> None:
+		# mylen(a), no explicit [T] - T must be inferred from a's own type
+		code = '\n'.join([
+			'class A:',
+			'	def __len__( self ) -> usize:',
+			'		return 5',
+			'',
+			'def mylen[T]( t: T ) -> usize:',
+			'	return t.__len__()',
+			'',
+			'def main() -> usize:',
+			'	a: A',
+			'	return mylen( a )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.target.qualname, '__test__.mylen[__test__.A]' )
+
+	def test_generic_function_call_infers_type_arg_through_one_level_of_nesting( self ) -> None:
+		# unwrap(b) where b: Box[i32] - T isn't the parameter's own declared
+		# type (that's Box[T], a Specialization), so this has to unify one
+		# level deep (same base, pair up args) to find T=i32
+		code = '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'',
+			'def unwrap[T]( b: Box[T] ) -> T:',
+			'	return b.v',
+			'',
+			'def main() -> i32:',
+			'	b: Box[i32]',
+			'	return unwrap( b )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.target.qualname, '__test__.unwrap[intrinsics.i32]' )
+		i32 = self.discovery.get_intrinsics()['i32']
+		self.assertEqual( call.target.return_type, i32 )
+
+	def test_generic_function_call_cannot_infer_type_arg_is_a_compile_error( self ) -> None:
+		# T never appears in any parameter position - nothing to infer it
+		# from, and no explicit [T] was given either
+		code = '\n'.join([
+			'def make[T]() -> usize:',
+			'	return 0',
+			'',
+			'def main() -> usize:',
+			'	return make()',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'cannot infer type parameter', self.discovery.errors.errors[0] )
+
+	def test_generic_function_call_conflicting_inference_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def pair[T]( a: T, b: T ) -> usize:',
+			'	return 0',
+			'',
+			'def main() -> usize:',
+			'	x: i32',
+			'	y: u8',
+			'	return pair( x, y )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'inferred as both', self.discovery.errors.errors[0] )
+
 	# --- compiler.sizeof(T) ----------------------------------------------------
 
 	def test_compiler_sizeof_folds_to_const( self ) -> None:
