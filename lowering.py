@@ -1540,6 +1540,49 @@ class Lowering:
 			keyword.append(( param, kw.value ))
 		return positional, keyword
 
+	# stems of intrinsic types a Python literal of this exact type could
+	# plausibly be lowered as - deliberately coarse (no int-range/value
+	# validation exists anywhere yet, see _expr_Constant), just enough to
+	# rule out a string literal matching an i32 parameter and vice versa.
+	# `type(value) is X`, not isinstance - bool is an int subclass in
+	# Python, and ast.Constant.value is only ever bool|int|str|bytes|None
+	_LITERAL_COMPATIBLE_STEMS: dict[type,tuple[str,...]] = {
+		bool: ( 'bool', ),
+		int: ( 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'i128', 'u128', 'isize', 'usize' ),
+		str: ( 'str', ),
+		bytes: ( 'bytes', ),
+	}
+
+	def _lower_overload_arg( self, expr: ast.expr, position: int|None, kw_name: str|None, candidates: list[Function], node: ast.AST ) -> ir.Operand:
+		if not isinstance( expr, ast.Constant ):
+			return self._lower_expr( expr, None )
+		compatible_stems = self._LITERAL_COMPATIBLE_STEMS.get( type( expr.value ) )
+		if compatible_stems is None:
+			return self._lower_expr( expr, None ) # a None literal, or something else - falls through to _expr_Constant's own "cannot infer" error, same as before
+
+		candidate_types: list[Type] = []
+		for fn in candidates:
+			if fn.parameters is None:
+				continue
+			param = (
+				fn.parameters[position] if position is not None and position < len( fn.parameters ) else
+				next( ( p for p in fn.parameters if p.stem == kw_name ), None )
+			)
+			if param is None or param.type is None or getattr( param.type, 'stem', None ) not in compatible_stems:
+				continue
+			if not any( t is param.type for t in candidate_types ):
+				candidate_types.append( param.type )
+
+		if len( candidate_types ) == 1:
+			return self._lower_expr( expr, candidate_types[0] )
+		if len( candidate_types ) > 1:
+			self.discovery.fail(
+				f'ambiguous literal argument {ast.unparse(expr)} - matches more than one overload candidate type '
+				f'({", ".join( t.qualname for t in candidate_types )}): {ast.unparse(node)}',
+				node,
+			)
+		return self._lower_expr( expr, None ) # no candidate's parameter type is even plausible for this literal's kind - falls through to the existing error
+
 	def _lower_allocate_fields( self, target_cls: ClassLike, node: ast.Call, expected_type: Type|None, label: str ) -> ir.Temp:
 		# shared by both callers of ir.Allocate (Class.__allocate__(...) and
 		# bare ClassName(...) sugar for the no-__init__ case) - everything
@@ -1777,13 +1820,21 @@ class Lowering:
 			return self._lower_generic_function_call( node, target, expected_type, want_result )
 
 		if isinstance( target, Overload ):
-			# bare literal arguments have no unambiguous expected type before
-			# a specific implementation is chosen - unsupported for now (see
-			# _expr_Constant), same posture as the multi-branch case below
-			args = [ self._lower_expr( a, None ) for a in node.args ]
+			# a bare literal argument has no type of its own before a
+			# specific implementation is chosen - _lower_overload_arg tries
+			# each candidate's declared parameter type at that position,
+			# using it unambiguously if exactly one is even plausible for
+			# the literal's own kind (a string literal never plausibly
+			# matches an i32 parameter, etc.) and failing clearly rather
+			# than guessing if more than one genuinely could
+			candidates = [ *target.stubs, *target.implementations ]
+			for fn in candidates:
+				if fn.resolve is not None:
+					fn.resolve()
+			args = [ self._lower_overload_arg( a, i, None, candidates, node ) for i, a in enumerate( node.args ) ]
 			if any( kw.arg is None for kw in node.keywords ):
 				self.discovery.fail( f'**kwargs not supported yet: {ast.unparse(node)}', node )
-			kwargs = { kw.arg: self._lower_expr( kw.value, None ) for kw in node.keywords }
+			kwargs = { kw.arg: self._lower_overload_arg( kw.value, None, kw.arg, candidates, node ) for kw in node.keywords }
 			arg_types = [ op.type for op in args ]
 			kwarg_types = { name: op.type for name, op in kwargs.items() }
 			try:

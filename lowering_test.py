@@ -1500,6 +1500,87 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'v_A', getattrs )
 		self.assertIn( 'v_B', getattrs )
 
+	# --- bare literal arguments to overloaded calls -----------------------------
+
+	def test_overload_literal_arg_resolves_via_unique_candidate_type( self ) -> None:
+		code = '\n'.join([
+			'class str: pass',
+			'',
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: str ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( 5 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		i32 = self.discovery.get_intrinsics()['i32']
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.args, [ ir.Const( type = i32, value = 5 ) ] )
+
+	def test_overload_literal_arg_string_kind_only_matches_str_candidate( self ) -> None:
+		code = '\n'.join([
+			'class str: pass',
+			'',
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: str ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( "hi" )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		str_cls = self.discovery.modules['__test__'].get_local( 'str' )
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.args, [ ir.Const( type = str_cls, value = 'hi' ) ] )
+
+	def test_overload_literal_arg_ambiguous_between_candidates_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: u8 ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( 5 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'ambiguous literal argument', self.discovery.errors.errors[0] )
+
+	def test_overload_literal_kwarg_resolves_by_name( self ) -> None:
+		code = '\n'.join([
+			'class str: pass',
+			'',
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: str ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( x = 5 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		i32 = self.discovery.get_intrinsics()['i32']
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.kwargs, { 'x': ir.Const( type = i32, value = 5 ) } )
+
 	# --- generic function monomorphization (Name[T](...)) ----------------------
 
 	def test_generic_function_call_monomorphizes( self ) -> None:
