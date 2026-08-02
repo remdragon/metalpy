@@ -1,12 +1,13 @@
 import compiler
 
-@enum( i32 )
-class OwnershipError:
-	SharedReference = 0
-	AlreadyBorrowed = 1
-	UseAfterFree = 2
-	DanglingReference = 3
-	Other = _
+@union
+class OwnershipError[T]:
+	SharedReference: T
+	# NOTE: the following aren't used and are left-overs from OwnershipError being an @enum
+	#AlreadyBorrowed = 1
+	#UseAfterFree = 2
+	#DanglingReference = 3
+	#Other = _
 
 def alloc[T]( count: usize ) -> Ptr[T]:
 	with compiler.panic_arithmetic( 'allocation size overflow' ):
@@ -14,6 +15,8 @@ def alloc[T]( count: usize ) -> Ptr[T]:
 	ptr = _alloc( byte_count )
 	if ptr is None:
 		panic( 'out of memory' )
+	if compiler.target.debug:
+		memzero( ptr, count )
 	return ptr
 
 # ---------------------------------------------------------------------------

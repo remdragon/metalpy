@@ -1,4 +1,5 @@
 lowering:
+	incref/decref
 	if statements
 	for x in range( ... ):
 	while statements
@@ -10,11 +11,202 @@ lowering:
 				f = open( ... )
 				with defer( f ): # binds this specific f
 					f.close()
+		*NOTE* for now we are not supporting defer/errdefer in loops
 	match statement support
 	exclude compile time calculations:
 		if compiler.target.os == 'windows': ...
 		if True: ...
 		match compiler.target.bits: ...
+	compiler error if:
+		function parameter is a Move[T] but call-site doesn't specify move(x)
+			i.e. [Mm]ove must be declared on both sides so there's no confusion
+
+			def foo( x: Move[int] ) -> None:
+				...
+			y: int = ...
+			foo( y ) # compile error, foo(x=) is Move[T], call-site must pass move(t)
+
+			def foo( x: int ) -> None:
+				...
+			y: int = ...
+			foo( move( y )) # compile error, foo(x=) is not Move[T], call-site cannot be move(t)
+
+		this requirement doesn't exist (yet?) for @move
+			but maybe one of these wouldn't be too ugly:
+				ptr := move(src).release().unwrap_or()
+				ptr := move(src.release)().unwrap_or()
+				ptr := bytearray.release( move(src) ).unwrap_or()
+			maybe there's other syntax?
+			its rare that I'll use @move, but I'm more concerned about
+				consistent and coherent language syntax here
+	union disambiguation:
+		unions need to have a lowering wrapper to represent the currently understood type.
+
+		P.S. Shouldn't TaggedUnion.leaves() cache its results?
+
+		The CFG will need to track unions as Union|UnionView
+
+		class TaggedUnion( Type ):
+			...
+			def view_is_type( self, type: Type ) -> UnionView|None:
+				leaves = self.leaves()
+				if type not in leaves:
+					raise CompilationError( f"redundant type check, {type!r} can't be in {leaves!r}" )
+				return UnionView( union = self, types = set([ type ]))
+
+			def view_not_type( self, type: Type ) -> UnionView|None:
+				leaves = self.leaves()
+				if type not in leaves:
+					raise CompilationError( f"redundant type check, {type!r} can't be in {leaves!r}" )
+				leaves.remove( type )
+				return UnionView(
+					union = self,
+					types = leaves,
+				)
+
+		class UnionView( Type ):
+			union: TaggedUnion
+			leaves: set[Type]
+
+			def view_is_type( self, type: Type ) -> UnionView|None:
+				if type not in self.leaves:
+					raise CompilationError( f"redundant type check, {type!r} can't be in {leaves!r}" )
+				return UnionView( union = self.union, leaves = set([ type ]))
+
+			def view_not_type( self, type: Type ) -> UnionView|None:
+				if type not in self.leaves:
+					raise CompilationError( f"redundant type check, {type!r} can't be in {leaves!r}" )
+				new_leaves = self.leaves.clone()
+				new_leaves.remove( type )
+				return UnionView( self.union, new_leaves )
+		
+		this structure will allow the CFG to track the currently understand type of a tagged union
+		as it passes through a match or ifelse tree
+
+		def foo( x: int|str|bytes ) -> None:
+			if x is int: # (int|str|bytes).view_is_type(int) -> UnionView( union = int|str|bytes, leaves = [ int ])
+				print( x ) # translates to print( x.v_int )
+			# the false branch of the if above triggers type translation: x` = (int|str|bytes).view_not_type(int) -> UnionView( union = int|str|bytes, leaves = [ str, bytes ])
+			elif x is str: # UnionView( union = int|str|None, leaves = [ str, bytes ]).view_is_type(str) -> UnionView( union = int|str|bytes, leaves = [ str ])
+				print( x ) # translates to print( x.v_str )
+			# the false branch of the elif above triggers type translation: x`` = UnionView(...).view_not_type(str)
+			else: # at this point we have a single-type UnionView
+				print( x ) # translates to print( x.v_bytes )
+
+			# at this point, we've exited the if-else-chain, the UnionView is discarded and x is int|str|bytes again
+
+			# the next example is a wrinkle on the above logic.
+
+			if x is int:
+				return
+				# because this branch of the if can't fall out,
+				# x's type is permanently UnionView.view_not_type(int) for the rest of the function
+			elif x is str:
+				print( x )
+				# this branch falls out of the if, so it doesn't permanently modify x's type
+			else:
+				print( x )
+				# this branch also falls out of the if, so it doesn't modify x's type
+
+			# here outside the if, x is now permanently UnionView( union = int|str|bytes, leaves = [ str, bytes ])
+			# for the rest of this function
+
+			if x is int: # this is a compilation error, because the current UnionView already excludes int
+				...
+
+			'''
+			implementation thoughts...
+			while the CFG is stepping through an IF or MATCH, it needs to calculate a variable's state transitions.
+			For example, when testing an if condition that is a type check:
+				true_type = X.view_is_type( TYPE )
+				else_type = X.view_not_type( TYPE )
+				exit_type = X
+
+			then, if its discovered the if body can't fall out, exit_type = else_type
+
+			type transitions also need to be calculated inside expressions because of short-circuiting:
+
+			def foo( x: int|None ) -> None:
+				if x is int and x < 4: # this is okay because in the 2nd half of the "and", x is UnionView( ..., leaves = [ int ])
+					...
+			'''
+			
+
+	opportunistic union emission
+		when a union is used, we need to generate IR to reach through it to the
+			underlying code.
+		note that we disambiguate directly in generated code when doing things directly
+		with the union, but if we call a method on a union object, we attempt to auto-generate
+		a method that does the disambigutation for us. If the method isn't available on all types
+		or has incompatible function signatures, it will be caught when it gets resolved and lowered,
+		so we don't have to do any special type checking when actually generating the automatic
+		union methods
+
+		For this code example, assume:
+			@union
+			class IntStr:
+				v_int: int
+				v_str: str
+		
+		P.S. this is *not* a specification for how to name automatic unions in C, that is not
+			in scope for the lowering stage.
+		P.P.S. through the examples below, I use TAG_INT and TAG_STR, this is not a specification,
+			just a placeholder for the actual values that will be generated to represent each member
+
+		this:
+			a: IntStr = 'foo'
+		becomes:
+			a = IntStr.v_str( 'foo' )
+		this:
+			if isinstance( a, int ):
+				print( a )
+		becomes:
+			if a.tag == IntStr.TAG_INT:
+				print( a.v_int )
+		this:
+			print( a )
+		becomes:
+			print( a.__str__() )
+		and auto-generates the following wrapper if it doesn't already exist:
+			class IntStr:
+				def __str__( self ) -> str:
+					match self.tag:
+						case IntStr.TAG_INT:
+							return self.v_int.__str__()
+						case IntStr.TAG_STR:
+							return self.v_str.__str__()
+						case _:
+							sys.panic( 'system invariant, invalid union tag' )
+
+	generators:
+		def range( count: int ) -> Iterator[int]:
+			i: int = 0
+			while i < count:
+				yield i
+				i += 1
+
+		# alternate implementation for performance reasons:
+		def range( count: usize ) -> Iterator[usize]:
+			with compiler.wrap_arithmetic: # wrap is most performant and this algo is guaranteed safe
+				i: usize = 0
+				while i < count:
+					yield i
+					i += 1
+
+		implementing generators is going to be interesting.
+		we have to translate the code into a state machine
+		the function epilogue will have to be put into the state machine's __del__() function
+
+		do we need to handle errors? For example, what about the following?
+
+		def foo() -> Result[None,OverflowError]:
+			total: u16 = 0
+			for i in range( u16( 10_000 )):
+				total += i # this will eventually overflow
+
+		the question is... the generator needs to be told to exit, but we don't support exceptions
+		maybe a yield statement gets an implicit or_return and a generator must return a result?
+		but if it returns a Result, how does that interact with its Iterator or Generator return type?
 
 emitter:
 	C support (target C11)
@@ -22,3 +214,123 @@ emitter:
 			on Windows, specifically exclude the crt unless an @extern( 'c', ... ) is compiled
 				(metalpy stdlib tries hard to avoid extern "c")
 		gcc on other
+
+finish building ZoneInfo class
+	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
+
+str class:
+	missing helper methods like:
+		.startswith()
+		.endswith()
+		.partition()
+		.find()
+		.index()
+		.upper()
+		.lower()
+		.split()
+		.join()
+		.format()
+		.isalnum()
+		.isalpha()
+		.isascii()
+		.isdecimal()
+		.isdigit()
+		.isidentifier()
+		.islower()
+		.isnumeric()
+		.isprintable()
+		.isspace()
+		.istitle()
+		.isupper()
+		.ljust()
+		.lstrip()
+		.removeprefix()
+		.removesuffix()
+		.replace()
+		.rfind()
+		.rindex()
+		.rjust()
+		.rpartition()
+		.rsplit()
+		.rstrip()
+		.startswith()
+		.swapcase()
+		.title()
+		.translate()
+		.zfill()
+
+datetime class
+
+timedelta class
+
+list class
+	first-draft implementation
+
+	I'm fairly certain this code isn't thread-safe
+
+	generic list[T] method calls (e.g. xs.append(...)) fail in emitter.py's
+		_transpile_call ("could not resolve receiver class 'list[i32]' for
+		.append(...)") - method resolution for a monomorphized generic
+		instantiation isn't wired up yet (surfaced 2026-07-28 while
+		stress-testing the STMT IR-op removal, unrelated to that change)
+
+dict class
+	first-draft implementation, WIP
+
+int class
+	first-draft implementation
+	
+	from_str() needs to be replaced with @overload def __init__( s: str ) -> Result[int,IntError]
+	
+	clone() should probably be @private _clone()
+
+	clone() (line ~155) compares new_digits against an undefined name `empty` -
+		presumably meant a null-pointer check; never actually built/tested
+		before now (dead code path - surfaced 2026-07-28 while stress-testing
+		the STMT IR-op removal, unrelated to that change)
+	
+	to_i32() should probably be __i32__() to match python conversion method naming conventions
+		class i32:
+			def __init__( self, i: int ) -> Result[i32,IntError]: ...
+		then users can type things like: i32( foo ).or_return()
+		
+		this example is just explanatory since i32 is a compiler intrinsic, but as long as i32.__init__() knows to call object.__i32__() it should work fine
+
+implement str.format
+
+f-string support
+
+File class
+
+io interfaces ( stdin, stdout, stderr )
+	sys.stdout: minimal Windows-only write() exists (lib/sys.py's _Stdout),
+	enough for print(). Still missing: a real stream object (buffering, flush,
+	read), stdin, stderr (panic() currently bypasses a real stderr stream
+	entirely - see lib/sys.py's panic() comment), and the POSIX side of all of
+	the above (only @compiler.target(os='windows') is implemented).
+
+socket class
+
+threading
+
+other issues:
+	any encoding: str parameter needs to be replaced with a codec: Codec parameter
+
+* On Windows targets, we need to call SetConsoleOutputCP(CP_UTF8) as part of the startup
+	sequence. We can squeeze it into entry_point() if that exists, but where would we put
+	it if the crt gets included?
+
+* python stores a string's length as a separate variable instead of calculating it on the fly
+	maybe we can cache the result so we only have to calculate it once?
+	
+	class str:
+		usize __len = UINT32_MAX
+		
+		def __len__( self ) -> usize:
+			if self.__len == u32.max:
+				self.__len = ...
+			return self.__len
+	
+	FYI for string constants in the executable, might as well store their length since they
+	can be calculated at compile time
+

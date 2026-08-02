@@ -1,4 +1,4 @@
-from codecs import Codec
+from codecs import Codec, CodecError
 from codecs.utf8 import utf8
 import compiler
 import sys
@@ -99,8 +99,8 @@ class bytes:
 					__data = ptr,
 					__len = length,
 				)
-			case Result.Err( _ ):
-				return bytes( src )
+			case Result.Err( OwnershipError.SharedReference( src2 )):
+				return bytes( src2 )
 	
 	def __len__( self ) -> usize:
 		return self.__len
@@ -129,33 +129,28 @@ class bytearray:
 	
 	def __len__( self ) -> usize:
 		if compiler.target.debug:
-			global BYTEARRAY_INVALID
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__len__() called after release()'
 		return self.__len
 	
 	def get_ptr( self ) -> Ptr[u8]:
 		if compiler.target.debug:
-			global BYTEARRAY_INVALID
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.get_ptr() called after release()'
 		return self.__data
 	
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		if compiler.target.debug:
-			global BYTEARRAY_INVALID
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.get_const_ptr() called after release()'
 		return self.__data
 	
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		if compiler.target.debug:
-			global BYTEARRAY_INVALID
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.decode() called after release()'
 		return codec.decode( self )
 	
 	@move
 	def release( self ) -> Result[Ptr[u8],OwnershipError]:
-		global BYTEARRAY_INVALID
 		if compiler.refcount( self ) != 1:
-			return Result.Err( OwnershipError.SharedReference )
+			return Result.Err( OwnershipError.SharedReference( self ))
 		ptr = self.__data
 		self.__len = 0
 		self.__cap = 0
@@ -163,91 +158,88 @@ class bytearray:
 		return Result.Ok( ptr )
 	
 	def __del__( self ) -> None:
-		global BYTEARRAY_INVALID
 		if self.__data != BYTEARRAY_INVALID: # this can happen if release() is called and successful
 			sys.free( self.__data )
 
 class str:
 	__data: ConstPtr[u8]
-
-	# UTF-8 encoded byte count - NOT what len(s)/__len__ reports (that's the
-	# Unicode code point count, matching real Python semantics). Named __cap
-	# rather than __len specifically so nothing internal can casually
-	# confuse the two again; see byte_len() for the public accessor.
-	__cap: usize
-
+	
+	__byte_size: usize # the number of bytes (code units) include the zero-terminater
+	
 	def __init__( self, copy_from: str ) -> None:
-		self.__cap = copy_from.__cap
-		with compiler.wrap_arithmetic:
-			# NOTE: this would only wrap if self.__cap == usize.max which would only happen in memory corruption scenarios
-			alloc_size = self.__cap + 1
-		data: Ptr[u8] = sys.alloc[u8]( alloc_size )
-		sys.memcpy( data, copy_from.__data, alloc_size )
-		data[self.__cap] = 0
+		self.__byte_size = copy_from.__byte_size
+		data: Ptr[u8] = sys.alloc[u8]( self.__byte_size )
+		sys.memcpy( data, copy_from.__data, self.__byte_size )
 		self.__data = data
-
+	
 	def __del__( self ) -> None:
 		sys.free( self.__data )
-
+	
 	def __add__( self, other: str ) -> Result[str,OverflowError]:
-		new_len: usize = self.__cap + other.__cap
-		new_buf: Ptr[u8] = sys.alloc[u8]( new_len + 1 )
-		sys.memcpy( new_buf, self.__data, self.__cap )
-		sys.memcpy( new_buf.add( self.__cap ), other.__data, other.__cap )
-		new_buf.add( new_len ).write( 0 )
+		self_len = self.__byte_size - 1
+		new_byte_size: usize = self_len + other.__byte_size
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_byte_size )
+		errdefer( sys.free( new_buf ))
+
+		sys.memcpy( new_buf, self.__data, self_len )
+		sys.memcpy( new_buf + self_len, other.__data, other.__byte_size )
 		
-		return Result.Ok( str._from_owned_cstr( new_buf, new_len ))
+		return str._from_owned_cstr( new_buf, new_len )
 	
 	@staticmethod
 	def concat( parts: slice[str] ) -> Result[str,OverflowError]:
-		new_len: usize = 0
+		new_size: usize = 1 # for the zero terminator
 		i: usize = 0
 		count: usize = parts.len()
 		for i in range( count ):
-			part: str = parts.get_assert( i )
-			new_len += part.__cap
+			part: str = parts[i]
+			new_size += part.__byte_size - 1
 		
-		new_buf: Ptr[u8] = sys.alloc[u8]( new_len + 1 )
-		with errdefer:
-			sys.free( new_buf )
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		errdefer( sys.free( new_buf ))
 		offset: usize = 0
 		
 		for i in range( count ):
-			part: str = parts.get_assert( i )
-			part_len: usize = part.__cap
-			memcpy( new_buf.add( offset ), part.__data, part_len )
+			part: str = parts[i]
+			part_len: usize = part.__byte_size - 1
+			memcpy( new_buf + offset, part.__data, part_len )
 			offset += part_len
 		
-		new_buf.add( new_len ).write( 0 ) # guarantee null termination
+		new_buf[offset] = 0 # guarantee null termination
 		
-		return Result.Ok( str._from_owned_cstr( new_buf, new_len ))
+		return str._from_owned_cstr( new_buf, new_size )
 	
 	def encode( self, codec: Codec = utf8 ) -> Result[bytes,CodecError]:
 		return codec.encode( self )
 	
-	@overload
 	@staticmethod
-	def from_cstr( buf: ConstPtr[u8], length: usize ) -> str:
+	def from_cstr( buf: ConstPtr[u8], size_including_zero_terminator: usize ) -> Result[str,CodecError]:
+		'''
+		build a str from a raw pointer.
+		'''
 		with compiler.panic_arithmetic( 'invalid str length' ):
-			new_buf: Ptr[u8] = sys.alloc[u8]( length + 1 )
-		sys.memcpy( new_buf, buf, length )
-		new_buf.add( length ).write( 0 ) # guarantee null termination
+			new_buf: Ptr[u8] = sys.alloc[u8]( size_including_zero_terminator )
+		errdefer( sys.free( new_buf ))
 		
-		return Result.Ok( str._from_owned_cstr( new_buf, length ))
+		sys.memcpy( new_buf, buf, size_including_zero_terminator )
+		
+		if new_buf[size_including_zero_terminator-1]:
+			return Result.Err( CodecError( 'utf-8', 'missing null terminator' ))
+		
+		return str._from_owned_cstr( new_buf, size_including_zero_terminator )
 	
-	@overload
 	@staticmethod
-	def from_cstr( src: move[bytearray] ) -> str:
-		length: usize = len( src )
+	def from_cstr( src: move[bytearray] ) -> Result[str,CodecError]:
+		byte_size: usize = len( src )
+		
 		match src.release():
 			case Result.Ok( ptr ):
-				return str.__allocate__(
-					__data = ptr,
-					__cap = length,
-				)
-			case Result.Err( _ ):
-				# must copy because we don't have exclusive ownership of src:
-				return str.from_cstr( src.get_ptr(), length )
+				return str._from_owned_cstr( ptr, byte_size )
+			case Result.Err( OwnershipError.SharedReference( src2 )):
+				# must copy because we didn't have exclusive ownership of src
+				# but now the release failed and src isn't usable anymore because of @move
+				# e is a OwnershipError.SharedReference, which carries the object back to us
+				return str.from_cstr( src2.get_const_ptr(), byte_size )
 	
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
@@ -255,25 +247,34 @@ class str:
 	def get_cstr( self ) -> ConstPtr[u8]:
 		return self.__data
 	
-	def byte_len( self ) -> usize:
+	def byte_size( self ) -> usize:
 		# The UTF-8 encoded byte count - what most internal stdlib code
 		# actually wants (buffer sizing, memcpy counts, ...), as opposed to
 		# len(s)/__len__ below (Unicode code point count, matching real
 		# Python semantics for len() on a str).
-		return self.__cap
+		# this function returns the size of byte including the zero terminator
+		return self.__byte_size
+	
+	def byte_len( self ) -> usize:
+		with compiler.saturate_arithmetic: # __byte_size can't be 0 because an empty str still has '\0'
+			return self.__byte_size - 1
 	
 	def __len__( self ) -> usize:
 		# Unicode code point count (real Python len(s) semantics) - counts
 		# bytes that are NOT UTF-8 continuation bytes (top two bits != 0b10).
-		# count/i are bounded by __cap (an existing buffer's length in bytes,
+		# count/i are bounded by __byte_len (an existing buffer's length in bytes,
 		# already itself usize-representable), so they can't actually overflow -
 		# panic_arithmetic documents that invariant rather than forcing every
 		# caller through Result[usize,OverflowError] for something impossible.
 		count: usize = 0
 		i: usize = 0
-		with compiler.panic_arithmetic( 'bounded by __cap, cannot overflow' ):
-			while i < self.__cap:
+		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow' ):
+			assert self.__byte_size > 0, 'byte_size must be > 0'
+			byte_len: usize = self.__byte_size - 1
+			while i < byte_len:
 				c: u8 = self.__data[i]
+				if not c:
+					return count
 				if ( c & 0xC0 ) != 0x80:
 					count += 1
 				i += 1
@@ -281,14 +282,84 @@ class str:
 	
 	@private
 	@staticmethod
-	def _from_owned_cstr( ptr: Ptr[u8], length: usize ) -> str:
+	def _from_owned_cstr( ptr: Ptr[u8], byte_size_including_zero_terminator: usize ) -> Result[str,CodecError]:
 		# NOTE: a 0-byte before the end of the string is valid utf-8, so we
 		# can't use cstrlen() here, we can only check to make sure the terminating 0 exists where expected
-		if ptr[length] != 0:
-			sys.panic( 'bad cstr' )
+		if byte_size_including_zero_terminator == 0:
+			return Result.Err( CodecError( 'utf-8', 'empty buffer' ))
+		byte_len: usize = byte_size_including_zero_terminator - 1
+		if ptr[byte_len] != 0:
+			return Result.Err( CodecError( 'utf-8', 'missing 0-terminator' ))
+		
+		# walk through ptr and confirm valid utf-8 encoding or return CodecError
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow ' ):
+			while i < byte_len:
+				byte1 = ptr[i]
+				
+				# 1-byte sequence (ASCII): 0xxxxxxx
+				if (byte1 & 0x80) == 0x00:
+					i += 1
+					continue
+				
+				# unexpected continuation byte as a leading byte
+				if (byte1 & 0xC0) == 0x80:
+					return Result.Err( CodecError( 'utf-8', 'Unexpected continuation byte as leading byte' ))
+				
+				# 2-byte sequence: 110xxxxx 10xxxxxx
+				elif (byte1 & 0xE0) == 0xC0:
+					if i + 1 >= byte_len:
+						return Result.Err( CodecError( 'utf-8', 'Truncated 2-byte sequence' ))
+					# Overlong encoding check: code point must be >= U+0080
+					if byte1 < 0xC2:
+						return Result.Err( CodecError( 'utf-8', 'Overlong 2-byte encoding' ))
+					byte2 = ptr[i + 1]
+					if (byte2 & 0xC0) != 0x80:
+						return Result.Err( CodecError( 'utf-8', 'Invalid continuation byte in 2-byte sequence' ))
+					i += 2
+
+				# 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
+				elif (byte1 & 0xF0) == 0xE0:
+					if i + 2 >= byte_len:
+						return Result.Err( CodecError( 'utf-8', 'Truncated 3-byte sequence' ))
+					byte2 = ptr[i + 1]
+					byte3 = ptr[i + 2]
+					# Overlong encoding check: code point must be >= U+0800
+					if byte1 == 0xE0 and byte2 < 0xA0:
+						return Result.Err( CodecError( 'utf-8', 'Overlong 3-byte encoding' ))
+					if (byte2 & 0xC0) != 0x80 or (byte3 & 0xC0) != 0x80:
+						return Result.Err( CodecError( 'utf-8', 'Invalid continuation byte in 3-byte sequence' ))
+					# Surrogate halves validation: U+D800..U+DFFF are invalid
+					if byte1 == 0xED and byte2 >= 0xA0:
+						return Result.Err( CodecError( 'utf-8', 'UTF-16 surrogate half' ))
+					i += 3
+
+				# 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+				elif (byte1 & 0xF8) == 0xF0:
+					if i + 3 >= byte_len:
+						return Result.Err( CodecError( 'utf-8', 'Truncated 4-byte sequence' ))
+					byte2 = ptr[i + 1]
+					byte3 = ptr[i + 2]
+					byte4 = ptr[i + 3]
+					# Overlong encoding check: code point must be >= U+10000
+					if byte1 == 0xF0 and byte2 < 0x90:
+						return Result.Err( CodecError( 'utf-8', 'Overlong 4-byte encoding' ))
+					if (byte2 & 0xC0) != 0x80 or (byte3 & 0xC0) != 0x80 or (byte4 & 0xC0) != 0x80:
+						return Result.Err( CodecError( 'utf-8', 'Invalid continuation byte in 4-byte sequence' ))
+					# Maximum Unicode code point check: cannot exceed U+10FFFF
+					if byte1 == 0xF4 and byte2 >= 0x90:
+						return Result.Err( CodecError( 'utf-8', 'Code point exceeds maximum valid Unicode (U+10FFFF)' ))
+					if byte1 > 0xF4:
+						return Result.Err( CodecError( 'utf-8', 'Code point exceeds maximum valid Unicode (sequence prefix > 0xF4)' ))
+					i += 4
+
+				# Invalid leading bytes (0xF5..0xFF)
+				else:
+					return Result.Err( CodecError( 'utf-8', 'Invalid leading byte' ))
+		
 		s: str = str.__allocate__(
 			__data = ptr,
-			__cap = length,
+			__byte_size = byte_size_including_zero_terminator,
 		)
 		return s
 

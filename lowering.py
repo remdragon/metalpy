@@ -145,8 +145,6 @@ class Lowering:
 	# --- dependency scheduling -----------------------------------------------
 
 	def _schedule_type_deps( self, t: Type|None ) -> None:
-		if t is None:
-			return
 		if isinstance( t, ClassLike ):
 			self.schedule( t )
 		elif isinstance( t, Specialization ):
