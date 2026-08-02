@@ -1178,6 +1178,246 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( kinds.count( 'Label' ), 4 )
 		self.assertEqual( kinds.count( 'Assign' ), 3 )
 
+	# --- loops (while / for / break / continue) -----------------------------
+
+	def test_while_shape( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	while a:',
+			'		x: i32 = 1',
+			'	return',
+		])
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = bool_cls )
+		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 4, type = i32 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Label( name = '__while_start_0__' ),
+			ir.JumpIfFalse( cond = a, target = '__while_end_1__' ),
+			ir.Assign( dest = x, src = ir.Const( type = i32, value = 1 )),
+			ir.Jump( target = '__while_start_0__' ),
+			ir.Label( name = '__while_end_1__' ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_while_else_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	while a:',
+			'		pass',
+			'	else:',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'while/else', self.discovery.errors.errors[0] )
+
+	def test_break_outside_loop_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	break',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'break outside a loop', self.discovery.errors.errors[0] )
+
+	def test_continue_outside_loop_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	continue',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'continue outside a loop', self.discovery.errors.errors[0] )
+
+	def test_break_and_continue_target_the_innermost_loop( self ) -> None:
+		# a break/continue inside a nested inner while must target the
+		# inner loop's own labels, not the outer loop's - and once the
+		# inner loop's lowering finishes, the outer loop's labels become
+		# active again for anything after it in the outer body
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	b: bool',
+			'	while a:',
+			'		while b:',
+			'			break',
+			'			continue',
+			'		break',
+			'		continue',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		jumps = [ instr for instr in fn.instructions if isinstance( instr, ir.Jump ) ]
+		# order in the instruction stream: inner break, inner continue, the
+		# inner while's own back-edge, outer break, outer continue, the
+		# outer while's own back-edge
+		inner_break, inner_continue, _inner_back_edge, outer_break, outer_continue, _outer_back_edge = jumps
+		self.assertNotEqual( inner_break.target, outer_break.target )
+		self.assertNotEqual( inner_continue.target, outer_continue.target )
+		self.assertNotEqual( inner_break.target, inner_continue.target ) # inner break -> inner end label, inner continue -> inner start label
+
+	def test_for_target_must_be_a_plain_name( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	xs: i32',
+			'	for xs[0] in range( 3 ):',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'plain name', self.discovery.errors.errors[0] )
+
+	def test_for_range_single_arg_shape( self ) -> None:
+		# for i in range(count): reuses `i` if it already exists (matching
+		# lib/builtins/__init__.py's str.concat, which pre-declares
+		# `i: usize = 0` before its own for loop), and defaults the implicit
+		# start=0 to usize when declaring a fresh target
+		code = '\n'.join([
+			'def main() -> None:',
+			'	count: usize = 5',
+			'	for i in range( count ):',
+			'		x: usize = i',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'Label' ), 3 ) # start, continue, end
+		self.assertEqual( kinds.count( 'Cmp' ), 1 )
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 1 )
+		self.assertEqual( kinds.count( 'AddWrap' ), 1 ) # the hidden increment - always AddWrap, regardless of ambient arithmetic mode
+		self.assertEqual( kinds.count( 'Jump' ), 1 ) # the back-edge to start
+		i_var = self.discovery.modules['__test__'].get_local( 'main' ).get_local( 'i' )
+		usize = self.discovery.get_intrinsics()['usize']
+		self.assertEqual( i_var.type, usize )
+
+	def test_for_range_two_arg_form( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: usize = 1',
+			'	b: usize = 5',
+			'	for i in range( a, b ):',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		usize = self.discovery.get_intrinsics()['usize']
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = usize )
+		# the initial bind (`i = a`) is the first Assign after main.b's own Assign
+		assigns = [ instr for instr in fn.instructions if isinstance( instr, ir.Assign ) ]
+		self.assertEqual( assigns[2].dest.stem, 'i' )
+		self.assertEqual( assigns[2].src, a )
+
+	def test_for_range_rejects_three_args( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	for i in range( 0, 5, 2 ):',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '1 or 2 arguments', self.discovery.errors.errors[0] )
+
+	def test_for_over_indexable_shape( self ) -> None:
+		# for v in <obj>: where obj's type declares both __len__ and
+		# __getitem__ desugars to a counter-based while, reusing
+		# _expr_Subscript's own __getitem__ resolution (with its Result
+		# auto-unwrap) for the per-iteration bind
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	_len: usize',
+			'',
+			'	def __len__( self ) -> usize:',
+			'		return self._len',
+			'',
+			'	def __getitem__( self, i: usize ) -> i32:',
+			'		return 1',
+			'',
+			'def main( b: Box ) -> None:',
+			'	for v in b:',
+			'		x: i32 = v',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'Call' ), 2 ) # __len__() once, __getitem__(i) once per compiled iteration-body
+		self.assertEqual( kinds.count( 'Label' ), 3 )
+		self.assertEqual( kinds.count( 'AddWrap' ), 1 )
+		# Result.or_return-flavored auto-unwrap only fires when __getitem__
+		# actually returns a Result - this Box's __getitem__ returns plain
+		# i32, so no OrReturn/OrJump should appear
+		self.assertNotIn( 'OrReturn', kinds )
+		self.assertNotIn( 'OrJump', kinds )
+
+	def test_for_over_indexable_missing_dunders_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class Box:',
+			'	pass',
+			'',
+			'def main( b: Box ) -> None:',
+			'	for v in b:',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '__len__', self.discovery.errors.errors[0] )
+		self.assertIn( '__getitem__', self.discovery.errors.errors[0] )
+
+	def test_subscript_with_getitem_resolves_and_consumes_result( self ) -> None:
+		# obj[i] is sugar for obj.__getitem__(i).or_return() whenever
+		# __getitem__ can fail (mirrors slice.__getitem__'s real signature,
+		# Result[T,IndexError])
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
+			'		return Result.__allocate__( x = self.y )',
+			'',
+			'def foo( b: Box, i: usize ) -> Result[i32,MyError]:',
+			'	v: i32 = b[i]',
+			'	return Result.Err( MyError() )',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		fn = self.compiler._lower( foo_fn )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'OrReturn', kinds )
+		# Box.__getitem__'s own real body (calling Box.__allocate__/Result.__allocate__
+		# from inside itself) is unaffected - only the *call site* `b[i]` goes
+		# through this new path, not Box.__getitem__'s own internals
+		getitem_errors = [ e for e in self.discovery.errors.errors if 'b[i]' in e or '__getitem__' in e ]
+		self.assertEqual( getitem_errors, [] )
+
 	def test_if_body_recovery_boundary_does_not_stop_orelse( self ) -> None:
 		# one bad statement inside the if-body doesn't prevent orelse (or
 		# anything after the if) from still being lowered - same recovery

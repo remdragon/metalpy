@@ -129,6 +129,7 @@ class Lowering:
 		self._current_fn = fn
 		self._arithmetic_mode: list[tuple[str,object]] = [ ( 'check', None ) ]
 		self._loop_depth = 0
+		self._loop_labels: list[tuple[str,str]] = [] # stack of (continue_label, break_label), innermost last
 		self._in_deferred_body = False
 		self._defer_blocks: list[_DeferBlock] = []
 		self._needs_epilogue = self._function_needs_epilogue( fn.node.body )
@@ -233,6 +234,7 @@ class Lowering:
 		# single expression, not a statement body reachable through
 		# _lower_stmt) - reset for consistency/safety only, never touched here
 		self._loop_depth = 0
+		self._loop_labels = []
 		self._in_deferred_body = False
 		self._defer_blocks: list[_DeferBlock] = []
 		self._needs_epilogue = False
@@ -609,22 +611,28 @@ class Lowering:
 		# marks the block "armed" so the epilogue knows to replay it
 		self._emit( ir.Assign( dest = flag, src = ir.Const( type = bool_cls, value = True )))
 
-	# --- loops (recognition only - no control-flow IR yet) -----------------------
-
-	def _stmt_For( self, node: ast.For ) -> None:
-		self._lower_loop_body( node.body )
-		self.discovery.fail( 'for loop control flow is not yet supported', node )
+	# --- loops ---------------------------------------------------------------
 
 	def _stmt_While( self, node: ast.While ) -> None:
-		self._lower_loop_body( node.body )
-		self.discovery.fail( 'while loop control flow is not yet supported', node )
+		if node.orelse:
+			self.discovery.fail( 'while/else is not supported', node )
+		bool_cls = self.discovery.find_name( 'bool', node )
+		start_label = self._new_label( 'while_start' )
+		end_label = self._new_label( 'while_end' )
+		# the test is positioned right after start_label (re-lowered here
+		# once, but the resulting instructions physically sit inside the
+		# repeated block, same as _stmt_If's test) so it's genuinely
+		# re-evaluated every time the bottom Jump loops back
+		self._emit( ir.Label( name = start_label ))
+		test = self._lower_expr( node.test, bool_cls )
+		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
+		self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label )
+		self._emit( ir.Jump( target = start_label ))
+		self._emit( ir.Label( name = end_label ))
 
-	def _lower_loop_body( self, body: list[ast.stmt] ) -> None:
-		# pushed so nested defer/errdefer (at any depth) gets rejected, and
-		# the body still lowers through the normal statement machinery - so
-		# this is reusable once real loop control-flow IR exists, it's only
-		# the loop's own iteration/branching that's missing
+	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str ) -> None:
 		self._loop_depth += 1
+		self._loop_labels.append(( continue_label, break_label ))
 		try:
 			for stmt in body:
 				try:
@@ -632,7 +640,214 @@ class Lowering:
 				except CompileError:
 					continue
 		finally:
+			self._loop_labels.pop()
 			self._loop_depth -= 1
+
+	def _stmt_Break( self, node: ast.Break ) -> None:
+		if not self._loop_labels:
+			self.discovery.fail( 'break outside a loop', node )
+		_, break_label = self._loop_labels[-1]
+		self._emit( ir.Jump( target = break_label ))
+
+	def _stmt_Continue( self, node: ast.Continue ) -> None:
+		if not self._loop_labels:
+			self.discovery.fail( 'continue outside a loop', node )
+		continue_label, _ = self._loop_labels[-1]
+		self._emit( ir.Jump( target = continue_label ))
+
+	def _synth_name( self, stem: str, node: ast.AST ) -> ast.Name:
+		n = ast.Name( id = stem, ctx = ast.Load() )
+		ast.copy_location( n, node )
+		return n
+
+	def _declare_hidden_local( self, stem: str, type: Type, node: ast.AST ) -> Variable:
+		# compiler-synthesized locals (for-loop scaffolding: the once-
+		# evaluated iterable, its length, the hidden index counter) - real
+		# named Variables (not anonymous Temps) registered into the
+		# function's flat names dict, the same way `self` gets synthesized
+		# in lower_function, so synthetic ast.Name references to them
+		# resolve normally through the existing _expr_Name/_stmt_Assign
+		# machinery instead of duplicating it
+		fn = self._current_fn
+		var = Variable( stem = stem, qualname = f'{fn.qualname}.{stem}', file = fn.file, line = getattr( node, 'lineno', None ), type = type )
+		fn.add_name( stem, var )
+		self.schedule( type )
+		return var
+
+	def _find_method( self, owner_type: Type|None, name: str ) -> Function|None:
+		# a non-failing probe, unlike _attr_lookup_callable - "this type has
+		# no such method" is a normal, expected outcome for callers here
+		# (for loop iterability checks, __getitem__'s raw-GetItem fallback),
+		# not a real error to report
+		self._ensure_resolved( owner_type )
+		names = getattr( owner_type, 'names', None )
+		found = names.get( name ) if isinstance( names, dict ) else None
+		return found if isinstance( found, Function ) else None
+
+	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str ) -> ir.Operand:
+		# if `value` is itself a Result[T,E], auto-consume it via the same
+		# OrReturn/OrJump propagation or_return()/checked arithmetic use -
+		# unlike _lower_or_return, a non-Result value is passed through
+		# unchanged rather than rejected, since not every method this is
+		# used for (__getitem__, __len__) is necessarily fallible. Uses
+		# find_name_or_none (not find_name) - unlike every other Result
+		# lookup in this file, this one runs speculatively for ANY value,
+		# so a program that never defines Result at all (or hasn't
+		# imported builtins) must not hard-fail here just because this
+		# particular value happens not to be Result-shaped
+		result_cls = self.discovery.find_name_or_none( 'Result' )
+		if result_cls is None or not ( isinstance( value.type, Specialization ) and value.type.base is result_cls and len( value.type.args ) == 2 ):
+			return value
+		result_type, error_cls = value.type.args
+		self._require_result_return( node, value.type.base, error_cls, alternatives )
+		return self._consume_checked_result( value, result_type, extra = None )
+
+	def _bind_loop_target( self, target: ast.Name, default_type: Type, value_expr: ast.expr, node: ast.AST ) -> Variable:
+		# mirrors _stmt_Assign's Name-target "reuse existing, else infer/
+		# declare" rule (`for i in range(count):` reuses `i` if a variable
+		# of that name already exists - e.g. str.concat in lib/builtins/
+		# __init__.py pre-declares `i: usize = 0` before its own for loop)
+		# - except a fresh declaration falls back to `default_type` instead
+		# of failing outright, since value_expr may be a bare literal
+		# (range()'s implicit start=0) with no type of its own to infer from
+		existing = self.discovery.find_name_or_none( target.id )
+		if existing is not None and not isinstance( existing, Variable ):
+			self.discovery.fail( f'{target.id!r} is not a variable, cannot use it as a for loop target', node )
+		expected = existing.type if existing is not None else default_type
+		operand = self._lower_expr( value_expr, expected )
+		if existing is not None:
+			self._emit( ir.Assign( dest = existing, src = operand ))
+			return existing
+		fn = self._current_fn
+		var = Variable( stem = target.id, qualname = f'{fn.qualname}.{target.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type )
+		fn.add_name( var.stem, var )
+		self.schedule( var.type )
+		self._emit( ir.Assign( dest = var, src = operand ))
+		return var
+
+	def _is_range_call( self, node: ast.expr ) -> bool:
+		# range(...) is textually recognized as compiler sugar, same as
+		# compiler.wrap_arithmetic/defer/etc. - there's no real range()
+		# function (TODO.txt: a real range()/Iterator needs the generator
+		# state-machine transform, which doesn't exist yet). This covers
+		# exactly the 1-2 arg counting-loop shape real lib/ code already
+		# uses (str.concat's `for i in range(count):`)
+		return isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range'
+
+	_FOR_LOOP_ALTERNATIVES = 'call .__len__()/.__getitem__() directly and consume their Result yourself instead'
+
+	def _stmt_For( self, node: ast.For ) -> None:
+		if not isinstance( node.target, ast.Name ):
+			self.discovery.fail( f'for loop target must be a plain name: {ast.unparse(node)}', node )
+		if node.orelse:
+			self.discovery.fail( 'for/else is not supported', node )
+		if self._is_range_call( node.iter ):
+			self._lower_for_range( node )
+		else:
+			self._lower_for_over_indexable( node )
+
+	def _lower_for_range( self, node: ast.For ) -> None:
+		call = node.iter
+		if call.keywords:
+			self.discovery.fail( f'range(...) does not support keyword arguments: {ast.unparse(call)}', call )
+		if len( call.args ) == 1:
+			start_expr = ast.Constant( value = 0 )
+			ast.copy_location( start_expr, call )
+			stop_expr = call.args[0]
+		elif len( call.args ) == 2:
+			start_expr, stop_expr = call.args
+		else:
+			self.discovery.fail( f'range(...) supports 1 or 2 arguments only (no step yet): {ast.unparse(call)}', call )
+
+		usize_cls = self.discovery.get_intrinsics()['usize']
+		bool_cls = self.discovery.find_name( 'bool', node )
+
+		target_var = self._bind_loop_target( node.target, usize_cls, start_expr, node )
+
+		stop_operand = self._lower_expr( stop_expr, usize_cls )
+		stop_var = self._declare_hidden_local( f'__for_stop_{self._label_id}', usize_cls, node )
+		self._emit( ir.Assign( dest = stop_var, src = stop_operand ))
+
+		start_label = self._new_label( 'for_start' )
+		continue_label = self._new_label( 'for_continue' )
+		end_label = self._new_label( 'for_end' )
+
+		self._emit( ir.Label( name = start_label ))
+		test = ast.Compare( left = self._synth_name( target_var.stem, node ), ops = [ ast.Lt() ], comparators = [ self._synth_name( stop_var.stem, node ) ] )
+		ast.copy_location( test, node )
+		cond = self._lower_expr( test, bool_cls )
+		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
+
+		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label )
+
+		self._emit( ir.Label( name = continue_label ))
+		# the increment is a compiler-synthesized implementation detail of
+		# the loop, not user-written arithmetic - it's structurally
+		# guaranteed safe (target_var < stop_var strictly before every
+		# increment), so it bypasses the ambient arithmetic-mode policy
+		# entirely (AddWrap directly) rather than imposing a
+		# Result[_,OverflowError]/wrap_arithmetic/etc. requirement on
+		# ordinary for-loops
+		incr = self._new_temp( usize_cls )
+		self._emit( ir.AddWrap( dest = incr, left = target_var, right = ir.Const( type = usize_cls, value = 1 ) ))
+		self._emit( ir.Assign( dest = target_var, src = incr ))
+		self._emit( ir.Jump( target = start_label ))
+		self._emit( ir.Label( name = end_label ))
+
+	def _lower_for_over_indexable( self, node: ast.For ) -> None:
+		usize_cls = self.discovery.get_intrinsics()['usize']
+		bool_cls = self.discovery.find_name( 'bool', node )
+
+		obj = self._lower_expr( node.iter, None )
+		len_fn = self._find_method( obj.type, '__len__' )
+		getitem_fn = self._find_method( obj.type, '__getitem__' )
+		missing = [ name for name, fn in (( '__len__', len_fn ), ( '__getitem__', getitem_fn )) if fn is None ]
+		if missing:
+			self.discovery.fail( f'for loop needs {" and ".join(missing)} on {obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}', node )
+
+		unique = self._label_id
+		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
+		self._emit( ir.Assign( dest = obj_var, src = obj ))
+
+		self._ensure_resolved( len_fn )
+		self.schedule( len_fn.return_type )
+		len_dest = self._new_temp( len_fn.return_type )
+		self._emit( ir.Call( dest = len_dest, target = len_fn, receiver = obj_var, args = [], kwargs = {} ))
+		len_operand = self._maybe_consume_result( node, len_dest, self._FOR_LOOP_ALTERNATIVES )
+		len_var = self._declare_hidden_local( f'__for_len_{unique}', len_operand.type, node )
+		self._emit( ir.Assign( dest = len_var, src = len_operand ))
+
+		index_var = self._declare_hidden_local( f'__for_index_{unique}', usize_cls, node )
+		self._emit( ir.Assign( dest = index_var, src = ir.Const( type = usize_cls, value = 0 ) ))
+
+		start_label = self._new_label( 'for_start' )
+		continue_label = self._new_label( 'for_continue' )
+		end_label = self._new_label( 'for_end' )
+
+		self._emit( ir.Label( name = start_label ))
+		test = ast.Compare( left = self._synth_name( index_var.stem, node ), ops = [ ast.Lt() ], comparators = [ self._synth_name( len_var.stem, node ) ] )
+		ast.copy_location( test, node )
+		cond = self._lower_expr( test, bool_cls )
+		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
+
+		subscript = ast.Subscript(
+			value = self._synth_name( obj_var.stem, node ),
+			slice = self._synth_name( index_var.stem, node ),
+			ctx = ast.Load(),
+		)
+		ast.copy_location( subscript, node )
+		bind = ast.Assign( targets = [ node.target ], value = subscript )
+		ast.copy_location( bind, node )
+		self._stmt_Assign( bind )
+
+		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label )
+
+		self._emit( ir.Label( name = continue_label ))
+		incr = self._new_temp( usize_cls )
+		self._emit( ir.AddWrap( dest = incr, left = index_var, right = ir.Const( type = usize_cls, value = 1 ) ))
+		self._emit( ir.Assign( dest = index_var, src = incr ))
+		self._emit( ir.Jump( target = start_label ))
+		self._emit( ir.Label( name = end_label ))
 
 	def _stmt_If( self, node: ast.If ) -> None:
 		bool_cls = self.discovery.find_name( 'bool', node )
@@ -687,14 +902,33 @@ class Lowering:
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
 		return dest
 
+	_SUBSCRIPT_ALTERNATIVES = 'call .__getitem__(...) directly and consume its Result yourself instead'
+
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
-		if expected_type is None:
-			self.discovery.fail( f'cannot infer the result type of {ast.unparse(node)} - no expected type available from context', node )
 		obj = self._lower_expr( node.value, None )
-		index = self._lower_expr( node.slice, None )
-		dest = self._new_temp( expected_type )
-		self._emit( ir.GetItem( dest = dest, obj = obj, index = index ))
-		return dest
+		getitem_fn = self._find_method( obj.type, '__getitem__' )
+		if getitem_fn is None:
+			# no real __getitem__ declared (raw pointers, or any other type
+			# that doesn't define subscript access as a method) - falls
+			# back to the flat GetItem opcode, unconditionally
+			if expected_type is None:
+				self.discovery.fail( f'cannot infer the result type of {ast.unparse(node)} - no expected type available from context', node )
+			index = self._lower_expr( node.slice, None )
+			dest = self._new_temp( expected_type )
+			self._emit( ir.GetItem( dest = dest, obj = obj, index = index ))
+			return dest
+
+		# a real __getitem__ - call it like any other method, then if it
+		# returns Result[T,E] (slice.__getitem__'s own real signature, e.g.),
+		# auto-consume it exactly like or_return()/checked arithmetic do:
+		# `obj[i]` reads as sugar for `obj.__getitem__(i).or_return()`
+		# whenever __getitem__ can fail
+		self._ensure_resolved( getitem_fn )
+		self.schedule( getitem_fn.return_type )
+		index = self._lower_expr( node.slice, getitem_fn.parameters[0].type )
+		call_dest = self._new_temp( getitem_fn.return_type )
+		self._emit( ir.Call( dest = call_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
+		return self._maybe_consume_result( node, call_dest, self._SUBSCRIPT_ALTERNATIVES )
 
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		return self._lower_call( node, expected_type, want_result = True )
