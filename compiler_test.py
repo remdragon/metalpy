@@ -170,6 +170,52 @@ def main() -> None:
 ''' )
 		self.assertIn( '__main__.Foo', [ cls.qualname for cls in self.compiler.rcclasses ] )
 
+class FunctionSchedulingViaEnsureResolvedTests( CompilerTestCase ):
+	''' _lower_call and _emit_is_err_check both schedule their call target
+	through _ensure_resolved rather than a separate explicit self.schedule(...)
+	call - these confirm the call target still actually ends up lowered by a
+	full Compiler.run(), not just resolved for the immediate lookup '''
+
+	def test_plain_call_target_is_scheduled( self ) -> None:
+		self._run( '''
+def main() -> None:
+	helper()
+
+def helper() -> None:
+	pass
+''' )
+		self.assertEqual( self._function_names(), [ 'main', '__main__.helper' ] )
+
+	def test_errdefer_is_err_call_target_is_scheduled( self ) -> None:
+		# _emit_is_err_check resolves+schedules Result.is_err purely as a side
+		# effect of building the epilogue - is_err is never called from user
+		# source at all, so it's the one call site here self.schedule() can't
+		# be reached via the ordinary _lower_call path
+		self._run( '''
+class bool: pass
+class OverflowError: pass
+
+@cstruct
+class Result[T,E]:
+	def is_err( self ) -> bool:
+		pass
+	@staticmethod
+	def Err( e: E ) -> Result[T,E]:
+		pass
+
+def checked( e: OverflowError ) -> Result[None,OverflowError]:
+	with errdefer:
+		pass
+	return Result.Err( e )
+
+def main() -> None:
+	e: OverflowError
+	checked( e )
+''' )
+		names = self._function_names()
+		self.assertIn( '__main__.checked', names )
+		self.assertTrue( any( name.endswith( 'Result.is_err' ) for name in names ), names )
+
 class OverloadCallSiteTests( CompilerTestCase ):
 	def test_unconditional_target_schedules_only_that_target( self ) -> None:
 		self._run( '''

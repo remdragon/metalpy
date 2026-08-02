@@ -191,9 +191,7 @@ class Lowering:
 	def _emit_is_err_check( self, node: ast.AST ) -> ir.Temp:
 		bool_cls = self.discovery.find_name( 'bool', node )
 		is_err_fn = self._attr_lookup_callable( self._return_value_var.type, 'is_err', node )
-		if is_err_fn.resolve is not None:
-			is_err_fn.resolve()
-		self.schedule( is_err_fn )
+		self._ensure_resolved( is_err_fn )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Call( dest = dest, target = is_err_fn, receiver = self._return_value_var, args = [], kwargs = {} ))
 		return dest
@@ -643,25 +641,40 @@ class Lowering:
 	# --- shared helpers ----------------------------------------------------------
 
 	def _ensure_resolved( self, obj: object ) -> None:
-		# a class's own .names dict (methods/attributes) stays empty until
-		# its .resolve() runs - deferred just like a Function's parameters -
-		# and unlike a Function/global reference (scheduled onto the work
-		# queue, resolved whenever it's eventually dequeued), an attribute or
-		# method lookup needs the answer immediately, mid-statement, so this
-		# can't wait for the queue to get there on its own.
+		# resolving (populating .names/.parameters/whatever) needs to happen
+		# immediately, mid-statement, for whoever's asking - unlike a plain
+		# schedule() call, which just queues obj for whenever the work queue
+		# gets to it, this can't wait.
 		#
-		# also schedules obj itself (when it's a Type - ClassLike/
-		# Specialization/TaggedUnion; anything else is a harmless no-op via
-		# _schedule_type_deps) - a type only ever reached as the owner of an
-		# attribute/method lookup (e.g. the middle Inner of o.inner.value,
-		# never itself bound to an annotated variable or passed as a typed
-		# argument) previously had its .names resolved for the lookup but was
-		# never added to the compiler's own output lists, so stage 3 would
-		# silently never emit it
+		# also schedules obj itself, for every kind this is ever called on
+		# that's actually a valid CompileUnit-in-waiting:
+		#  - Function checked first, since Function is itself a Type
+		#    subclass - without this it would fall through to the branch
+		#    below and (correctly) do nothing, silently leaving whoever calls
+		#    this to schedule it by hand instead (which is exactly what
+		#    _lower_call and _emit_is_err_check used to do)
+		#  - anything else that's a Type - ClassLike/Specialization/
+		#    TaggedUnion get scheduled via _schedule_type_deps; Scalar/
+		#    TypeVar are a harmless no-op there. A type only ever reached as
+		#    the owner of an attribute/method lookup (e.g. the middle Inner
+		#    of o.inner.value, never itself bound to an annotated variable or
+		#    passed as a typed argument) previously had its .names resolved
+		#    for the lookup but was never added to the compiler's own output
+		#    lists, so stage 3 would silently never emit it
+		#
+		# deliberately NOT unconditional for every obj this is ever called
+		# with: a bare Variable (a class field/parameter/local, not
+		# necessarily a schedulable global - nothing distinguishes them at
+		# the type level) or a Module (walked as an intermediate step by
+		# _try_resolve_namespace, e.g. the `sys` in `sys.alloc(...)`) are
+		# never valid CompileUnits - scheduling either would corrupt
+		# compiler.globals or crash Compiler._lower's catch-all outright
 		resolve = getattr( obj, 'resolve', None )
 		if resolve is not None:
 			resolve()
-		if isinstance( obj, Type ):
+		if isinstance( obj, Function ):
+			self.schedule( obj )
+		elif isinstance( obj, Type ):
 			self._schedule_type_deps( obj )
 
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
@@ -767,9 +780,9 @@ class Lowering:
 					node,
 				)
 			target = resolved
+			self._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
 		else:
-			if target.resolve is not None:
-				target.resolve()
+			self._ensure_resolved( target )
 			positional, keyword = self._match_call_args( target, node )
 			args = [ self._lower_expr( expr, param.type ) for param, expr in positional ]
 			kwargs = { param.stem: self._lower_expr( expr, param.type ) for param, expr in keyword }
@@ -777,7 +790,6 @@ class Lowering:
 		self._schedule_type_deps( target.return_type )
 		for param in target.parameters or []:
 			self._schedule_type_deps( param.type )
-		self.schedule( target )
 
 		if want_result:
 			dest = self._new_temp( expected_type or target.return_type )
