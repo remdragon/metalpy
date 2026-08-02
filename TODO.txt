@@ -43,6 +43,9 @@ lowering:
 					f.close()
 		*NOTE* for now we are not supporting defer/errdefer in loops
 	match statement support
+	compile time expression resolution:
+		expressions that can be resolved at compile time should be.
+		<code>x: i32 = 1 + 1</code> should lower as <code>x: i32 = 2</code>
 	exclude compile time calculations:
 		if compiler.target.os == 'windows': ...
 		if True: ...

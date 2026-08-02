@@ -270,6 +270,20 @@ class Discovery( ast.NodeVisitor ):
 				file = None,
 				line = None,
 			)
+			# a distinct marker from None/NoneType, not an alias for it - a
+			# function declared -> NoReturn behaves exactly like -> None to
+			# lowering today (no return value to stow/propagate), but stays
+			# a separate, inspectable Scalar so a future emitter can tell
+			# the two apart (e.g. to emit C's _Noreturn/[[noreturn]] so the
+			# C compiler doesn't warn about a function that never returns,
+			# like sys.panic()) - see lowering.py's own none_type-adjacent
+			# checks, which treat this identically to NoneType for now
+			intrinsics['NoReturn'] = Scalar(
+				stem = 'NoReturn',
+				qualname = 'intrinsics.NoReturn',
+				file = None,
+				line = None,
+			)
 			for name in [ 'Ptr', 'ConstPtr' ]: # generic pointer intrinsics: Ptr[T], ConstPtr[T]
 				tv = TypeVar(
 					stem = 'T',

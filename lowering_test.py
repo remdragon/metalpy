@@ -853,6 +853,210 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'unsupported unary operator', self.discovery.errors.errors[0] )
 
+	# --- comparisons ---------------------------------------------------------
+
+	def test_compare_eq_emits_cmp( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: bool = a == 1',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = bool_cls )
+		t0 = ir.Temp( type = bool_cls, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Cmp( dest = t0, op = ir.CmpOp.EQ, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = b, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_compare_all_ops_map_to_the_right_cmpop( self ) -> None:
+		cases = [
+			( '==', ir.CmpOp.EQ ),
+			( '!=', ir.CmpOp.NE ),
+			( '<', ir.CmpOp.LT ),
+			( '<=', ir.CmpOp.LE ),
+			( '>', ir.CmpOp.GT ),
+			( '>=', ir.CmpOp.GE ),
+		]
+		i32 = self.discovery.get_intrinsics()['i32']
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		for py_op, expected_cmpop in cases:
+			with self.subTest( op = py_op ):
+				disco = Discovery( import_builtins = False )
+				comp = Compiler( disco )
+				comp.import_code( '\n'.join([
+					'def main() -> None:',
+					'	a: i32 = 1',
+					f'	b: bool = a {py_op} 1',
+					'	return',
+				]), filename = Path( '__test__.py' ))
+				fn = comp._lower( disco.main )
+				cmp_instr = next( i for i in fn.instructions if isinstance( i, ir.Cmp ))
+				self.assertEqual( cmp_instr.op, expected_cmpop )
+
+	def test_compare_literal_on_left( self ) -> None:
+		# expected type flows from whichever side is NOT the bare literal -
+		# mirrors test_binop_literal_on_left
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: bool = 1 < a',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = bool_cls )
+		t0 = ir.Temp( type = bool_cls, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Cmp( dest = t0, op = ir.CmpOp.LT, left = ir.Const( type = i32, value = 1 ), right = a ),
+			ir.Assign( dest = b, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_compare_chained_is_not_yet_supported( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: bool = 0 < a < 2',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'chained comparisons are not yet supported', self.discovery.errors.errors[0] )
+
+	def test_compare_is_not_supported( self ) -> None:
+		# `is`/`is not` are reserved for eventual tagged-union type
+		# narrowing (see TODO.txt), not a plain identity comparison -
+		# deliberately left unsupported rather than guessed at
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: bool = a is None',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'unsupported comparison operator', self.discovery.errors.errors[0] )
+
+	# --- if statements ---------------------------------------------------------
+
+	def test_if_without_else_shape( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	if a:',
+			'		b: i32 = 1',
+			'	return',
+		])
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = bool_cls )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.JumpIfFalse( cond = a, target = '__if_else_0__' ),
+			ir.Assign( dest = b, src = ir.Const( type = i32, value = 1 )),
+			ir.Label( name = '__if_else_0__' ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_if_with_else_shape( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	if a:',
+			'		b: i32 = 1',
+			'	else:',
+			'		b: i32 = 2',
+			'	return',
+		])
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = bool_cls )
+		b_then = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		b_else = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 6, type = i32 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.JumpIfFalse( cond = a, target = '__if_else_0__' ),
+			ir.Assign( dest = b_then, src = ir.Const( type = i32, value = 1 )),
+			ir.Jump( target = '__if_end_1__' ),
+			ir.Label( name = '__if_else_0__' ),
+			ir.Assign( dest = b_else, src = ir.Const( type = i32, value = 2 )),
+			ir.Label( name = '__if_end_1__' ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_if_elif_else_chains_via_nested_orelse( self ) -> None:
+		# elif is just a nested If inside orelse in the AST - confirms it
+		# "just works" through the same recursive _lower_stmt dispatch, no
+		# special-casing needed
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	c: bool',
+			'	if a:',
+			'		x: i32 = 1',
+			'	elif c:',
+			'		x: i32 = 2',
+			'	else:',
+			'		x: i32 = 3',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		# outer if and the nested elif-as-If each have their own orelse (the
+		# elif chain, and its own else respectively), so each contributes
+		# its own else-Label + end-Label + skip-Jump pair - two JumpIfFalse
+		# (one per test), three Assigns (one per branch), two Jumps and
+		# four Labels (one else + one end, per level)
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 2 )
+		self.assertEqual( kinds.count( 'Jump' ), 2 )
+		self.assertEqual( kinds.count( 'Label' ), 4 )
+		self.assertEqual( kinds.count( 'Assign' ), 3 )
+
+	def test_if_body_recovery_boundary_does_not_stop_orelse( self ) -> None:
+		# one bad statement inside the if-body doesn't prevent orelse (or
+		# anything after the if) from still being lowered - same recovery
+		# boundary as everywhere else
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: bool',
+			'	if a:',
+			'		x: i32 = undefined_name',
+			'	else:',
+			'		b: i32 = 2',
+			'	c: i32 = 3',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertTrue( any( "'undefined_name' is not defined" in e for e in self.discovery.errors.errors ))
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'Assign' ), 2 ) # b and c, both still lowered
+
 	# --- calls ---------------------------------------------------------------
 
 	def test_call_free_function_positional_and_keyword( self ) -> None:
@@ -1217,6 +1421,45 @@ class Tests( unittest.TestCase ):
 			ir.Label( name = '__defer_skip_0__' ),
 			ir.Return( value = None ),
 			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_noreturn_function_epilogue_has_no_return_value_var( self ) -> None:
+		# NoReturn behaves exactly like None for the epilogue's own return-
+		# value machinery - no __return_value stowing, plain Return(None)
+		code = '\n'.join([
+			'class bool: pass',
+			'',
+			'def cleanup() -> None:',
+			'	pass',
+			'',
+			'def die() -> NoReturn:',
+			'	with defer:',
+			'		cleanup()',
+		])
+		mod = self._import( code )
+		bool_cls = mod.get_local( 'bool' )
+		cleanup_fn = mod.get_local( 'cleanup' )
+		if cleanup_fn.resolve is not None:
+			cleanup_fn.resolve()
+		die_fn = mod.get_local( 'die' )
+		if die_fn.resolve is not None:
+			die_fn.resolve()
+		noreturn_cls = self.discovery.get_intrinsics()['NoReturn']
+		flag0 = Variable( stem = '__defer_flag_0', qualname = '__test__.die.__defer_flag_0', file = Path( '__test__.py' ), line = 7, type = bool_cls )
+
+		fn = self.compiler._lower( die_fn )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = '__test__.die', params = [], return_type = noreturn_cls ),
+			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
+			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
+			# falls off the end of the body (no explicit return) straight
+			# into the epilogue - no Jump needed, it's placed right after
+			ir.Label( name = '__epilogue__' ),
+			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_0__' ),
+			ir.Call( dest = None, target = cleanup_fn, args = [], kwargs = {} ),
+			ir.Label( name = '__defer_skip_0__' ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = '__test__.die' ),
 		])
 
 	def test_errdefer_epilogue_shape_with_no_triggering_error( self ) -> None:

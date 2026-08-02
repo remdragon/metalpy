@@ -124,6 +124,7 @@ class Lowering:
 		module = self._find_module_for( fn )
 		self._instructions: list[ir.Instruction] = []
 		self._temp_id = 0
+		self._label_id = 0
 		self._pending_temps: list[ir.Temp] = []
 		self._current_fn = fn
 		self._arithmetic_mode: list[tuple[str,object]] = [ ( 'check', None ) ]
@@ -151,9 +152,10 @@ class Lowering:
 					self.schedule( fn.return_type )
 
 					none_type = self.discovery.get_none_type()
+					noreturn_type = self.discovery.get_intrinsics()['NoReturn']
 					self._return_value_var = (
 						Variable( stem = '__return_value', qualname = f'{fn.qualname}.__return_value', file = fn.file, line = fn.line, type = fn.return_type )
-						if self._needs_epilogue and fn.return_type is not none_type
+						if self._needs_epilogue and fn.return_type not in ( none_type, noreturn_type )
 						else None
 					)
 
@@ -223,6 +225,7 @@ class Lowering:
 		module = self._find_module_for( var )
 		self._instructions = []
 		self._temp_id = 0
+		self._label_id = 0
 		self._pending_temps = []
 		self._current_fn = None
 		self._arithmetic_mode = [ ( 'check', None ) ]
@@ -267,6 +270,11 @@ class Lowering:
 		self._pending_temps.append( temp )
 		self._emit( ir.DeclareTemp( temp = temp ))
 		return temp
+
+	def _new_label( self, prefix: str ) -> str:
+		label = f'__{prefix}_{self._label_id}__'
+		self._label_id += 1
+		return label
 
 	# --- statements ------------------------------------------------------------
 
@@ -569,6 +577,29 @@ class Lowering:
 		finally:
 			self._loop_depth -= 1
 
+	def _stmt_If( self, node: ast.If ) -> None:
+		bool_cls = self.discovery.find_name( 'bool', node )
+		test = self._lower_expr( node.test, bool_cls )
+		else_label = self._new_label( 'if_else' )
+		self._emit( ir.JumpIfFalse( cond = test, target = else_label ))
+		for stmt in node.body:
+			try:
+				self._lower_stmt( stmt )
+			except CompileError:
+				continue
+		if node.orelse:
+			end_label = self._new_label( 'if_end' )
+			self._emit( ir.Jump( target = end_label ))
+			self._emit( ir.Label( name = else_label ))
+			for stmt in node.orelse:
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+			self._emit( ir.Label( name = end_label ))
+		else:
+			self._emit( ir.Label( name = else_label ))
+
 	# --- expressions -----------------------------------------------------------
 
 	def _lower_expr( self, node: ast.expr, expected_type: Type|None ) -> ir.Operand:
@@ -769,6 +800,51 @@ class Lowering:
 			return self._consume_checked_result( check_dest, result_type, extra )
 
 		self.discovery.fail( f'unsupported unary operator: {ast.unparse(node)}', node )
+
+	_CMP_OPCODES: dict[type,'ir.CmpOp'] = {
+		ast.Eq: ir.CmpOp.EQ,
+		ast.NotEq: ir.CmpOp.NE,
+		ast.Lt: ir.CmpOp.LT,
+		ast.LtE: ir.CmpOp.LE,
+		ast.Gt: ir.CmpOp.GT,
+		ast.GtE: ir.CmpOp.GE,
+	}
+
+	def _expr_Compare( self, node: ast.Compare, expected_type: Type|None ) -> ir.Operand:
+		# ast.Is/IsNot/In/NotIn are deliberately not handled here - `is`/
+		# `is not` are reserved for eventual tagged-union type narrowing
+		# (see TODO.txt's union disambiguation section: `if x is int:`),
+		# not a plain identity Cmp, and `in`/`not in` need a real container
+		# protocol that doesn't exist yet - guessing at either would bake in
+		# the wrong semantics
+		if len( node.ops ) != 1 or len( node.comparators ) != 1:
+			self.discovery.fail( f'chained comparisons are not yet supported: {ast.unparse(node)}', node )
+		cmp_op = self._CMP_OPCODES.get( type( node.ops[0] ))
+		if cmp_op is None:
+			self.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
+
+		right_node = node.comparators[0]
+		left_is_const = isinstance( node.left, ast.Constant )
+		right_is_const = isinstance( right_node, ast.Constant )
+		# unlike _expr_BinOp, expected_type here is the comparison's own
+		# result type (bool) - unrelated to what type the operands
+		# themselves should be lowered as, so it's never passed to either
+		# side, only used (below) as one operand's own type inferred from
+		# the other
+		if left_is_const and not right_is_const:
+			right = self._lower_expr( right_node, None )
+			left = self._lower_expr( node.left, right.type )
+		elif right_is_const and not left_is_const:
+			left = self._lower_expr( node.left, None )
+			right = self._lower_expr( right_node, left.type )
+		else:
+			left = self._lower_expr( node.left, None )
+			right = self._lower_expr( right_node, None )
+
+		bool_cls = self.discovery.find_name( 'bool', node )
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
+		return dest
 
 	# --- shared helpers ----------------------------------------------------------
 

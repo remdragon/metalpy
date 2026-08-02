@@ -329,6 +329,23 @@ def foo( x: bool ) -> bool:
 		self.assertIs( foo.parameters[0].type, bool_cls )
 		self.assertIs( foo.return_type, bool_cls )
 
+	def test_noreturn_is_an_intrinsic_distinct_from_none( self ) -> None:
+		# a distinct marker, not an alias for NoneType - functionally
+		# identical to None for lowering today (no return value), but kept
+		# separate so a future emitter can tell "never returns" (e.g.
+		# sys.panic()) apart from "returns nothing", to emit C's own
+		# _Noreturn/[[noreturn]] and avoid a false "missing return" warning
+		mod = self._import( '''
+def foo() -> NoReturn:
+	pass
+''' )
+		foo = mod.get_local( 'foo' )
+		foo.resolve()
+		noreturn_cls = self.discovery.get_intrinsics()['NoReturn']
+		none_type = self.discovery.get_none_type()
+		self.assertIs( foo.return_type, noreturn_cls )
+		self.assertIsNot( noreturn_cls, none_type )
+
 	def test_resolve_function_no_return_annotation_is_none_type( self ) -> None:
 		mod = self._import( '''
 def foo() -> None:
