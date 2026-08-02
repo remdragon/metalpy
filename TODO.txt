@@ -378,3 +378,6 @@ auto-global:
 		if g > 0:
 			g -= 1
 
+assert_arithmetic:
+	compiler.target.debug -> panic_arithmetic
+	compiler.target.release -> wrap_arithmetic

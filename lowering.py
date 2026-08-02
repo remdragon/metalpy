@@ -23,16 +23,34 @@ _BINOP_WRAP_OPCODES: dict[type,type] = {
 	ast.Add: ir.AddWrap,
 	ast.Sub: ir.SubWrap,
 	ast.Mult: ir.MulWrap,
+	ast.LShift: ir.ShlWrap,
 }
 _BINOP_CHECK_OPCODES: dict[type,type] = {
 	ast.Add: ir.AddCheck,
 	ast.Sub: ir.SubCheck,
 	ast.Mult: ir.MulCheck,
+	ast.LShift: ir.ShlCheck,
 }
 _BINOP_SATURATE_OPCODES: dict[type,type] = {
 	ast.Add: ir.AddSaturate,
 	ast.Sub: ir.SubSaturate,
 	ast.Mult: ir.MulSaturate,
+	ast.LShift: ir.ShlSaturate,
+}
+# always checked against ZeroDivisionError - unlike Add/Sub/Mult/Shl, there's
+# no wrapped/saturated variant of division, so this is independent of the
+# active arithmetic mode (see _expr_BinOp)
+_DIV_MOD_OPCODES: dict[type,type] = {
+	ast.FloorDiv: ir.Div, # no float type exists in this language (see ir.py) - '/' (ast.Div) is deliberately left unsupported rather than guessing what it should mean
+	ast.Mod: ir.Mod,
+}
+# no overflow concept at all - always a single opcode, regardless of the
+# active arithmetic mode (see _expr_BinOp)
+_BITWISE_OPCODES: dict[type,type] = {
+	ast.BitAnd: ir.BitAnd,
+	ast.BitOr: ir.BitOr,
+	ast.BitXor: ir.BitXor,
+	ast.RShift: ir.Shr,
 }
 
 class Lowering:
@@ -351,6 +369,27 @@ class Lowering:
 		else:
 			self.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 
+	def _stmt_AugAssign( self, node: ast.AugAssign ) -> None:
+		# desugars x += y to x = x + y (reusing whatever arithmetic mode is
+		# active, exactly like a hand-written x = x + y would) - only for a
+		# bare Name target: this reads the target once (via the synthesized
+		# BinOp) and writes it once (via the synthesized Assign), which is
+		# only safe because a Name lookup has no side effects. An Attribute/
+		# Subscript target's object/index expression would need evaluating
+		# twice under this same desugaring (once to read, once to resolve
+		# the write) - a real correctness risk (e.g. get_obj().x += 1 would
+		# call get_obj() twice) - so those are left unsupported for now
+		# rather than silently introducing a double-evaluation bug
+		if not isinstance( node.target, ast.Name ):
+			self.discovery.fail( f'unsupported AugAssign target: {ast.unparse(node)}', node )
+		read = ast.Name( id = node.target.id, ctx = ast.Load() )
+		ast.copy_location( read, node.target )
+		binop = ast.BinOp( left = read, op = node.op, right = node.value )
+		ast.copy_location( binop, node )
+		assign = ast.Assign( targets = [ node.target ], value = binop )
+		ast.copy_location( assign, node )
+		self._stmt_Assign( assign )
+
 	def _stmt_Expr( self, node: ast.Expr ) -> None:
 		defer_kind = self._defer_kind_of_call( node.value )
 		if defer_kind is not None:
@@ -577,12 +616,29 @@ class Lowering:
 		'saturate': _BINOP_SATURATE_OPCODES,
 		'check': _BINOP_CHECK_OPCODES,
 	}
+	_UNARY_NEG_OPCODES_BY_KIND = {
+		'wrap': ir.NegWrap,
+		'saturate': ir.NegSaturate,
+		'check': ir.NegCheck,
+	}
+
+	_ARITHMETIC_ALTERNATIVES = (
+		'wrap this in `with compiler.wrap_arithmetic:`, `with compiler.saturate_arithmetic:`, '
+		'or `with compiler.panic_arithmetic(...):` instead'
+	)
+	# the primary, expected path for division is the same as any other
+	# Check-mode op: the enclosing function returns Result[_,
+	# ZeroDivisionError] and the Result propagates via OrReturn/OrJump - no
+	# panic involved, and this is what happens even inside wrap_arithmetic/
+	# saturate_arithmetic (there's no wrapped/saturated division opcode, so
+	# those modes don't change division's checked-ness at all). This message
+	# only fires when that requirement ISN'T met - panic_arithmetic is the
+	# one remaining alternative to changing the return type, not a default
+	_DIVISION_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
 
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
+		op_type = type( node.op )
 		kind, extra = self._arithmetic_mode[-1]
-		opcode = self._OPCODES_BY_KIND[kind].get( type( node.op ))
-		if opcode is None:
-			self.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
 
 		left_is_const = isinstance( node.left, ast.Constant )
 		right_is_const = isinstance( node.right, ast.Constant )
@@ -598,6 +654,28 @@ class Lowering:
 
 		result_type = expected_type or left.type
 
+		if op_type in _BITWISE_OPCODES:
+			# no overflow concept - always a single opcode, independent of
+			# the active wrap/check/saturate arithmetic mode (that only
+			# governs Add/Sub/Mult/Shl)
+			dest = self._new_temp( result_type )
+			self._emit( _BITWISE_OPCODES[op_type]( dest = dest, left = left, right = right ))
+			return dest
+
+		if op_type in _DIV_MOD_OPCODES:
+			# always checked against ZeroDivisionError, independent of the
+			# active arithmetic mode - but still honors panic_arithmetic's
+			# own errmsg (extra) for how the Result gets consumed, exactly
+			# like Check-mode Add/Sub/Mult/Shl below
+			result_cls, error_cls = self._lookup_result_and_error_types( node, 'ZeroDivisionError' )
+			if extra is None:
+				self._require_result_return( node, result_cls, error_cls, self._DIVISION_ALTERNATIVES )
+			return self._emit_checked_binop( _DIV_MOD_OPCODES[op_type], left, right, result_type, result_cls, error_cls, extra )
+
+		opcode = self._OPCODES_BY_KIND[kind].get( op_type )
+		if opcode is None:
+			self.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
+
 		if kind in ( 'wrap', 'saturate' ):
 			dest = self._new_temp( result_type )
 			self._emit( opcode( dest = dest, left = left, right = right ))
@@ -611,15 +689,24 @@ class Lowering:
 		# compiler.panic_arithmetic(msg):` (extra is the lowered msg operand)
 		# uses Unwrap instead, which panics immediately and so has no such
 		# requirement
-		result_cls, overflow_cls = self._lookup_result_and_overflow_types( node )
+		result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
 		if extra is None:
 			# validated before anything gets emitted - a mid-statement
 			# failure here must not leave partial instructions behind for
 			# the per-statement recovery boundary to silently keep
-			self._require_result_return( node, result_cls, overflow_cls )
-		check_type = self.discovery._get_or_create_specialization( result_cls, [ result_type, overflow_cls ] )
+			self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
+		return self._emit_checked_binop( opcode, left, right, result_type, result_cls, overflow_cls, extra )
+
+	def _emit_checked_binop( self, opcode: type, left: ir.Operand, right: ir.Operand, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
+		check_type = self.discovery._get_or_create_specialization( result_cls, [ result_type, error_cls ] )
 		check_dest = self._new_temp( check_type )
 		self._emit( opcode( dest = check_dest, left = left, right = right ))
+		return self._consume_checked_result( check_dest, result_type, extra )
+
+	def _consume_checked_result( self, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
+		# shared by both binop (AddCheck/.../Div/Mod) and unary (NegCheck)
+		# Check-mode ops - see _expr_BinOp's own comment on the OrReturn/
+		# OrJump/Unwrap split
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
 			if self._needs_epilogue:
@@ -630,12 +717,12 @@ class Lowering:
 			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra ))
 		return unwrapped
 
-	def _lookup_result_and_overflow_types( self, node: ast.AST ) -> tuple[ClassLike,ClassLike]:
+	def _lookup_result_and_error_types( self, node: ast.AST, error_name: str ) -> tuple[ClassLike,ClassLike]:
 		result_cls = self.discovery.find_name( 'Result', node )
-		overflow_cls = self.discovery.find_name( 'OverflowError', node )
-		return result_cls, overflow_cls
+		error_cls = self.discovery.find_name( error_name, node )
+		return result_cls, error_cls
 
-	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, overflow_cls: ClassLike ) -> None:
+	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, alternatives: str ) -> None:
 		fn = self._current_fn
 		return_type = fn.return_type if fn is not None else None
 		ok = (
@@ -643,16 +730,45 @@ class Lowering:
 			and isinstance( return_type, Specialization )
 			and return_type.base is result_cls
 			and len( return_type.args ) == 2
-			and return_type.args[1] is overflow_cls
+			and return_type.args[1] is error_cls
 		)
 		if not ok:
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
-				f'checked arithmetic requires the enclosing function to return Result[_,OverflowError] ({where}) - '
-				f'wrap this in `with compiler.wrap_arithmetic:`, `with compiler.saturate_arithmetic:`, '
-				f'or `with compiler.panic_arithmetic(...):` instead',
+				f'this requires the enclosing function to return Result[_,{error_cls.stem}] ({where}) - {alternatives}',
 				node,
 			)
+
+	def _expr_UnaryOp( self, node: ast.UnaryOp, expected_type: Type|None ) -> ir.Operand:
+		# `not` (ast.Not) is deliberately not handled here - there's no
+		# boolean-negation opcode in ir.py yet (unlike Invert/Neg*), and
+		# adding one is a real design decision, not just wiring up an
+		# existing primitive like the rest of this method does
+		operand = self._lower_expr( node.operand, expected_type )
+		result_type = expected_type or operand.type
+
+		if isinstance( node.op, ast.Invert ):
+			# no overflow concept, same posture as the non-Shl bitwise binops
+			dest = self._new_temp( result_type )
+			self._emit( ir.Invert( dest = dest, operand = operand ))
+			return dest
+
+		if isinstance( node.op, ast.USub ):
+			kind, extra = self._arithmetic_mode[-1]
+			opcode = self._UNARY_NEG_OPCODES_BY_KIND[kind]
+			if kind in ( 'wrap', 'saturate' ):
+				dest = self._new_temp( result_type )
+				self._emit( opcode( dest = dest, operand = operand ))
+				return dest
+			result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
+			if extra is None:
+				self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
+			check_type = self.discovery._get_or_create_specialization( result_cls, [ result_type, overflow_cls ] )
+			check_dest = self._new_temp( check_type )
+			self._emit( opcode( dest = check_dest, operand = operand ))
+			return self._consume_checked_result( check_dest, result_type, extra )
+
+		self.discovery.fail( f'unsupported unary operator: {ast.unparse(node)}', node )
 
 	# --- shared helpers ----------------------------------------------------------
 

@@ -113,6 +113,62 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_augassign_desugars_to_binop_and_assign( self ) -> None:
+		# x += 1 lowers exactly like a hand-written x = x + 1 would - same
+		# AddWrap/Assign shape, honoring the active arithmetic mode
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 1',
+			'	with compiler.wrap_arithmetic:',
+			'		x += 2',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 2, type = i32 )
+		t0 = ir.Temp( type = i32, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = x, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.AddWrap( dest = t0, left = x, right = ir.Const( type = i32, value = 2 )),
+			ir.Assign( dest = x, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_augassign_to_undeclared_name_fails( self ) -> None:
+		# can't read from something that was never declared - the
+		# synthesized BinOp's own Name lookup fails naturally, same as any
+		# other read of an undefined name
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x += 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( "name 'x' is not defined", self.discovery.errors.errors[0] )
+
+	def test_augassign_attribute_target_unsupported( self ) -> None:
+		# left unsupported deliberately - the object expression would need
+		# to be evaluated twice under the x = x + y desugaring (once to
+		# read the current value, once to resolve the write target), a real
+		# correctness risk for anything with side effects
+		code = '\n'.join([
+			'class Foo:',
+			'	x: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	f.x += 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'unsupported AugAssign target', self.discovery.errors.errors[0] )
+
 	def test_bare_assign_to_new_name_infers_type_from_rhs( self ) -> None:
 		# no annotation at all - x's type comes from y's, same as if it had
 		# been written `x: i32 = y`
@@ -429,6 +485,373 @@ class Tests( unittest.TestCase ):
 			ir.Return( value = None ),
 			ir.FuncEnd( name = 'main' ),
 		])
+
+	def test_binop_bitwise_ops_are_unconditional( self ) -> None:
+		# no overflow concept for &/|/^/>> - always a single opcode,
+		# independent of arithmetic mode (works fine in main() with no
+		# wrap/check/saturate context at all, unlike +/-/*)
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 6',
+			'	b: i32 = a & 3',
+			'	c: i32 = a | 3',
+			'	d: i32 = a ^ 3',
+			'	e: i32 = a >> 1',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = i32 )
+		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 4, type = i32 )
+		d = Variable( stem = 'd', qualname = 'main.d', file = Path( '__test__.py' ), line = 5, type = i32 )
+		e = Variable( stem = 'e', qualname = 'main.e', file = Path( '__test__.py' ), line = 6, type = i32 )
+		t0 = ir.Temp( type = i32, id = 0 )
+		t1 = ir.Temp( type = i32, id = 1 )
+		t2 = ir.Temp( type = i32, id = 2 )
+		t3 = ir.Temp( type = i32, id = 3 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 6 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.BitAnd( dest = t0, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.Assign( dest = b, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.DeclareTemp( temp = t1 ),
+			ir.BitOr( dest = t1, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.Assign( dest = c, src = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeclareTemp( temp = t2 ),
+			ir.BitXor( dest = t2, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.Assign( dest = d, src = t2 ),
+			ir.DeleteTemp( temp = t2 ),
+			ir.DeclareTemp( temp = t3 ),
+			ir.Shr( dest = t3, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = e, src = t3 ),
+			ir.DeleteTemp( temp = t3 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_binop_shl_respects_arithmetic_mode( self ) -> None:
+		# << shares Add/Sub/Mult's wrap/check/saturate mode split (it CAN
+		# overflow, unlike the other bitwise ops) - wrap_arithmetic here just
+		# sidesteps the Check-mode/Result requirement, same as
+		# test_binop_literal_on_left
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	with compiler.wrap_arithmetic:',
+			'		b: i32 = a << 2',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		t0 = ir.Temp( type = i32, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.ShlWrap( dest = t0, left = a, right = ir.Const( type = i32, value = 2 )),
+			ir.Assign( dest = b, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_binop_floordiv_and_mod_check_mode_emits_or_return( self ) -> None:
+		# mirrors test_binop_check_mode_emits_or_return, but against
+		# ZeroDivisionError instead of OverflowError, and independent of
+		# arithmetic mode (there's no wrapped/saturated division)
+		code = '\n'.join([
+			'class ZeroDivisionError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def checked() -> Result[None,ZeroDivisionError]:',
+			'	a: i32 = 10',
+			'	b: i32 = a // 3',
+			'	c: i32 = a % 3',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+		zerodiv_cls = mod.get_local( 'ZeroDivisionError' )
+		result_cls = mod.get_local( 'Result' )
+		if result_cls.resolve is not None:
+			result_cls.resolve()
+		result_i32_zerodiv = self.discovery._get_or_create_specialization( result_cls, [ i32, zerodiv_cls ] )
+
+		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 8, type = i32 )
+		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 9, type = i32 )
+		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 10, type = i32 )
+
+		t0 = ir.Temp( type = result_i32_zerodiv, id = 0 ) # Div's Result
+		t1 = ir.Temp( type = i32, id = 1 )                # unwrapped via OrReturn
+		t2 = ir.Temp( type = result_i32_zerodiv, id = 2 ) # Mod's Result
+		t3 = ir.Temp( type = i32, id = 3 )
+
+		fn = self.compiler._lower( checked_fn )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 10 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Div( dest = t0, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.DeclareTemp( temp = t1 ),
+			ir.OrReturn( dest = t1, value = t0 ),
+			ir.Assign( dest = b, src = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.DeclareTemp( temp = t2 ),
+			ir.Mod( dest = t2, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.DeclareTemp( temp = t3 ),
+			ir.OrReturn( dest = t3, value = t2 ),
+			ir.Assign( dest = c, src = t3 ),
+			ir.DeleteTemp( temp = t3 ),
+			ir.DeleteTemp( temp = t2 ),
+			ir.FuncEnd( name = '__test__.checked' ),
+		])
+
+	def test_binop_floordiv_without_zerodivision_result_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class ZeroDivisionError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: i32 = a // 1',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertIn( 'Result[_,ZeroDivisionError]', self.discovery.errors.errors[0] )
+		self.assertIn( 'panic_arithmetic', self.discovery.errors.errors[0] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+
+	def test_binop_floordiv_inside_wrap_arithmetic_still_requires_result_and_uses_or_return( self ) -> None:
+		# there's no wrapped/saturated division - being inside
+		# wrap_arithmetic/saturate_arithmetic must NOT silently let division
+		# through unchecked, and must NOT silently panic either. It stays a
+		# real Result[T,ZeroDivisionError] dependency, caught at compile
+		# time if the enclosing function can't propagate it, and consumed
+		# via the normal OrReturn/OrJump path - panic only ever happens
+		# inside an explicit panic_arithmetic block (see
+		# test_binop_floordiv_without_zerodivision_result_is_a_compile_error
+		# for the rejection case, and the panic case is covered by
+		# test_binop_floordiv_and_mod_check_mode_emits_or_return's sibling
+		# panic_arithmetic tests elsewhere in this class)
+		code = '\n'.join([
+			'class ZeroDivisionError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def checked() -> Result[None,ZeroDivisionError]:',
+			'	a: i32 = 10',
+			'	with compiler.wrap_arithmetic:',
+			'		b: i32 = a // 3',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+
+		fn = self.compiler._lower( checked_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'Div', kinds )
+		self.assertIn( 'OrReturn', kinds )
+		self.assertNotIn( 'Unwrap', kinds ) # no panic - wrap_arithmetic doesn't imply panic_arithmetic
+
+	def test_binop_floordiv_is_a_compile_error_in_every_non_panic_mode( self ) -> None:
+		# division's Result[_,ZeroDivisionError] dependency can't be
+		# sidestepped by any mode except panic_arithmetic - default (no
+		# context) is already covered by
+		# test_binop_floordiv_without_zerodivision_result_is_a_compile_error;
+		# this confirms wrap_arithmetic and saturate_arithmetic don't offer
+		# an escape hatch either, since neither has a wrapped/saturated
+		# division opcode to fall back to
+		for context in ( 'compiler.wrap_arithmetic', 'compiler.saturate_arithmetic' ):
+			with self.subTest( context = context ):
+				code = '\n'.join([
+					'class ZeroDivisionError: pass',
+					'',
+					'@cstruct',
+					'class Result[T,E]:',
+					'	pass',
+					'',
+					'def main() -> None:', # -> None, not Result[_,ZeroDivisionError]
+					'	a: i32 = 1',
+					f'	with {context}:',
+					'		b: i32 = a // 1',
+					'	return',
+				])
+				disco = Discovery( import_builtins = False )
+				comp = Compiler( disco )
+				comp.import_code( code, filename = Path( '__test__.py' ))
+				fn = comp._lower( disco.main )
+				self.assertIn( 'Result[_,ZeroDivisionError]', disco.errors.errors[0] )
+				self.assertIn( 'panic_arithmetic', disco.errors.errors[0] )
+				kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+				self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+
+	def test_binop_true_div_remains_unsupported( self ) -> None:
+		# '/' (ast.Div) is deliberately not mapped to anything - there's no
+		# float type in this language, and no real lib/ usage of '/' to
+		# infer an intended meaning from (only '//'/'%' are used)
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: i32 = a / 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'unsupported binary operator', self.discovery.errors.errors[0] )
+
+	def test_unaryop_invert_is_unconditional( self ) -> None:
+		# ~ has no overflow concept - always a single opcode, works fine in
+		# main() with no arithmetic context at all, same as the non-Shl
+		# bitwise binops
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: i32 = ~a',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = i32 )
+		t0 = ir.Temp( type = i32, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Invert( dest = t0, operand = a ),
+			ir.Assign( dest = b, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_unaryop_neg_wrap_arithmetic_context( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	with compiler.wrap_arithmetic:',
+			'		b: i32 = -a',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		t0 = ir.Temp( type = i32, id = 0 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.NegWrap( dest = t0, operand = a ),
+			ir.Assign( dest = b, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_unaryop_neg_check_mode_emits_or_return( self ) -> None:
+		# mirrors test_binop_check_mode_emits_or_return - default (Check)
+		# mode negation produces Result[T,OverflowError], immediately
+		# consumed via OrReturn
+		code = '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def checked() -> Result[None,OverflowError]:',
+			'	a: i32 = 1',
+			'	b: i32 = -a',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+		overflow_cls = mod.get_local( 'OverflowError' )
+		result_cls = mod.get_local( 'Result' )
+		if result_cls.resolve is not None:
+			result_cls.resolve()
+		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
+
+		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 8, type = i32 )
+		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 9, type = i32 )
+
+		t0 = ir.Temp( type = result_i32_overflow, id = 0 ) # NegCheck's Result
+		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via OrReturn
+
+		fn = self.compiler._lower( checked_fn )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
+			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.DeclareTemp( temp = t0 ),
+			ir.NegCheck( dest = t0, operand = a ),
+			ir.DeclareTemp( temp = t1 ),
+			ir.OrReturn( dest = t1, value = t0 ),
+			ir.Assign( dest = b, src = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.FuncEnd( name = '__test__.checked' ),
+		])
+
+	def test_unaryop_neg_without_arithmetic_context_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: i32 = -a',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertIn( 'wrap_arithmetic', self.discovery.errors.errors[0] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+
+	def test_unaryop_not_remains_unsupported( self ) -> None:
+		# no boolean-negation opcode exists in ir.py yet - flagged as a
+		# separate, real design decision rather than guessed at here
+		code = '\n'.join([
+			'class bool: pass',
+			'',
+			'def main() -> None:',
+			'	a: bool',
+			'	b: bool = not a',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'unsupported unary operator', self.discovery.errors.errors[0] )
 
 	# --- calls ---------------------------------------------------------------
 
