@@ -1,5 +1,35 @@
 lowering:
+	generic function monomorphization: calling a method on a value whose
+		declared type is a bare (unbound) TypeVar always fails today
+		("TypeVar(...) has no members, cannot look up '...'") - a generic
+		function's body is only ever lowered once, with its own type params
+		left abstract; nothing substitutes the concrete argument type into
+		the body per call site. Confirmed via a direct repro:
+			def mylen[T]( t: T ) -> usize:
+				return t.__len__()
+		blocks lib/builtins/__init__.py's len() from being the single
+		generic `def len[T](t: T) -> usize: return t.__len__()` it should
+		eventually be (currently a handful of concrete-type overloads
+		instead - see that file's own comment above them) - and see also
+		"list class" below for the emitter-level echo of the same gap
+	@inline decorator: a function marked @inline should compile down to its
+		body spliced directly at each call site (no real Call/FuncStart/
+		FuncEnd for it) - lib/builtins/__init__.py's len() overloads are
+		meant to become @inline once this exists, so len(x) costs exactly
+		what x.__len__() would and no more
 	incref/decref
+		part of this: remodel move[T]/Move properly. It's currently a Type
+		wrapper (mpy_types.Move, holding .inner), which is wrong - move[T]
+		is an ownership status (OWNED vs BORROWED) on a binding, not a
+		distinct type from T. As a Type wrapper, a move[T]-typed value can't
+		satisfy a plain T-typed parameter anywhere today, including overload
+		matching (confirmed: len(src) where src: move[bytearray] fails to
+		match `def len(x: bytearray)` with "no overload matches argument
+		types" - Move.leaves() falls back to Type.leaves()'s default
+		[self], never exposing bytearray itself). The fix belongs here, with
+		real ownership tracking, not as a standalone .leaves() override -
+		that would make ownership invisible to matching entirely (an owned
+		vs. borrowed overload pair would incorrectly collide as ambiguous)
 	if statements
 	for x in range( ... ):
 	while statements
@@ -333,4 +363,18 @@ other issues:
 	
 	FYI for string constants in the executable, might as well store their length since they
 	can be calculated at compile time
+
+auto-global:
+	g: usize = 0
+	
+	def foo() -> None:
+		if g > 0: # this READ binds to the global variable
+			g -= 1 # compile error, trying to modify a auto-bound global variable (use the global keyword)
+	
+	If the user wants to do something like this, they must use the global keyword:
+	
+	def foo() -> None:
+		global g
+		if g > 0:
+			g -= 1
 

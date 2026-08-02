@@ -314,6 +314,21 @@ def foo( x: i32, y: usize ) -> i32:
 		self.assertIs( foo.parameters[1].type, intrinsics['usize'] )
 		self.assertIs( foo.return_type, intrinsics['i32'] )
 
+	def test_bool_is_an_intrinsic( self ) -> None:
+		# not a fixed-width integer, but resolved the exact same way as
+		# i32/usize/etc - available in any module with no import, since
+		# ir.py's own Const.value already treats bool as a first-class
+		# IR-level concept, same tier as the numeric scalars
+		mod = self._import( '''
+def foo( x: bool ) -> bool:
+	return x
+''' )
+		foo = mod.get_local( 'foo' )
+		foo.resolve()
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		self.assertIs( foo.parameters[0].type, bool_cls )
+		self.assertIs( foo.return_type, bool_cls )
+
 	def test_resolve_function_no_return_annotation_is_none_type( self ) -> None:
 		mod = self._import( '''
 def foo() -> None:
@@ -1426,6 +1441,17 @@ class RealLibSmokeTest( unittest.TestCase ):
 		self.assertIsNone( ok.resolve )
 		self.assertIsInstance( ok.return_type, Specialization )
 		self.assertIs( ok.return_type.base, result_cls )
+
+	def test_len_overload_group_resolves( self ) -> None:
+		group = self.builtins_mod.get_local( 'len' )
+		self.assertIsInstance( group, Overload )
+		self.assertEqual( len( group.stubs ), 0 )
+		self.assertEqual( len( group.implementations ), 3 )
+		for fn in group.implementations:
+			if fn.resolve is not None:
+				fn.resolve()
+		param_types = sorted( fn.parameters[0].type.stem for fn in group.implementations )
+		self.assertEqual( param_types, [ 'bytearray', 'bytes', 'str' ])
 
 	def test_result_unwrap_or_overload_resolves( self ) -> None:
 		result_cls = self.builtins_mod.get_local( 'Result' )

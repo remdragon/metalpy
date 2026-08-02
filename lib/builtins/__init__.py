@@ -6,6 +6,14 @@ from .__list import list
 from .__dict import dict
 from .__int import int
 
+# markers with no payload of their own - Check-mode arithmetic (AddCheck/
+# SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
+# Result[T,ZeroDivisionError] purely as a tag (see ir.py's own comments on
+# those opcodes); slice.__getitem__ raises IndexError the same way
+class OverflowError: pass
+class ZeroDivisionError: pass
+class IndexError: pass
+
 @cunion
 class ResultPayload[T,E]:
 	ok: T
@@ -99,7 +107,7 @@ class bytes:
 					__data = ptr,
 					__len = length,
 				)
-			case Result.Err( OwnershipError.SharedReference( src2 )):
+			case Result.Err( sys.OwnershipError.SharedReference( src2 )):
 				return bytes( src2 )
 	
 	def __len__( self ) -> usize:
@@ -148,9 +156,9 @@ class bytearray:
 		return codec.decode( self )
 	
 	@move
-	def release( self ) -> Result[Ptr[u8],OwnershipError]:
+	def release( self ) -> Result[Ptr[u8],sys.OwnershipError]:
 		if compiler.refcount( self ) != 1:
-			return Result.Err( OwnershipError.SharedReference( self ))
+			return Result.Err( sys.OwnershipError.SharedReference( self ))
 		ptr = self.__data
 		self.__len = 0
 		self.__cap = 0
@@ -184,7 +192,7 @@ class str:
 		sys.memcpy( new_buf, self.__data, self_len )
 		sys.memcpy( new_buf + self_len, other.__data, other.__byte_size )
 		
-		return str._from_owned_cstr( new_buf, new_len )
+		return str._from_owned_cstr( new_buf, new_byte_size )
 	
 	@staticmethod
 	def concat( parts: slice[str] ) -> Result[str,OverflowError]:
@@ -202,7 +210,7 @@ class str:
 		for i in range( count ):
 			part: str = parts[i]
 			part_len: usize = part.__byte_size - 1
-			memcpy( new_buf + offset, part.__data, part_len )
+			sys.memcpy( new_buf + offset, part.__data, part_len )
 			offset += part_len
 		
 		new_buf[offset] = 0 # guarantee null termination
@@ -235,7 +243,7 @@ class str:
 		match src.release():
 			case Result.Ok( ptr ):
 				return str._from_owned_cstr( ptr, byte_size )
-			case Result.Err( OwnershipError.SharedReference( src2 )):
+			case Result.Err( sys.OwnershipError.SharedReference( src2 )):
 				# must copy because we didn't have exclusive ownership of src
 				# but now the release failed and src isn't usable anymore because of @move
 				# e is a OwnershipError.SharedReference, which carries the object back to us
@@ -368,3 +376,32 @@ def print( msg: str, end: str = '\n' ) -> None:
 	sys.stdout.write( msg )
 	if end:
 		sys.stdout.write( end )
+
+# real functions for now, each forwarding to that type's own __len__ - TODO:
+# once @inline exists (see TODO.txt), these should become @inline so len(x)
+# compiles down to the same code as x.__len__() directly, no call overhead.
+# no @overload needed - these are pairwise distinct by parameter type, same
+# as str.from_cstr's two variants.
+#
+# no move[bytearray] overload: len() only borrows and never consumes its
+# argument, so the plain bytearray overload below already covers a call
+# site holding a move[bytearray] local (e.g. str.from_cstr's
+# len(src)) - a separate move[bytearray] parameter would instead take
+# ownership and decref it, leaving src unusable by the code right after
+# (its own src.release() call) - see TODO.txt for the eventual generic
+# len[T](t: T) -> t.__len__() form, blocked on monomorphization not
+# existing yet.
+#
+# slice[T]'s own length accessor is named .len(), not __len__() (see
+# slice[T].len() above) - a generic `def len[T](x: slice[T])` overload
+# member for it is deliberately not included here yet: it's a different,
+# unverified case (a generic parameter type mixed into a plain-implementation
+# overload group) from the concrete types below, not just another line
+def len( x: str ) -> usize:
+	return x.__len__()
+
+def len( x: bytes ) -> usize:
+	return x.__len__()
+
+def len( x: bytearray ) -> usize:
+	return x.__len__()

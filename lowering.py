@@ -283,10 +283,14 @@ class Lowering:
 		pass
 
 	def _stmt_Global( self, node: ast.Global ) -> None:
-		# a no-op: this language requires an explicit AnnAssign to introduce a
-		# new local, so an unannotated Assign to a name never shadows a global
-		# in the first place - find_name's scope chain already falls through
-		# to the module scope on its own
+		# a no-op: an unannotated Assign to a name that already exists
+		# anywhere in the scope chain (local, enclosing, or global) always
+		# reassigns that same one - find_name_or_none's scope chain already
+		# falls through to the module scope on its own, so there's never a
+		# separate shadowing local to opt out of. It only introduces a new
+		# local when the name is unbound everywhere in the chain (see
+		# _stmt_Assign's inference branch), which by definition has nothing
+		# to shadow
 		pass
 
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
@@ -312,11 +316,28 @@ class Lowering:
 			self.discovery.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
 		target = node.targets[0]
 		if isinstance( target, ast.Name ):
-			existing = self.discovery.find_name( target.id, node )
-			if not isinstance( existing, Variable ):
-				self.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
-			operand = self._lower_expr( node.value, existing.type )
-			self._emit( ir.Assign( dest = existing, src = operand ))
+			existing = self.discovery.find_name_or_none( target.id )
+			if existing is not None:
+				if not isinstance( existing, Variable ):
+					self.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
+				operand = self._lower_expr( node.value, existing.type )
+				self._emit( ir.Assign( dest = existing, src = operand ))
+			else:
+				# first assignment to a name with no prior declaration - same
+				# as an AnnAssign, but the type is inferred from the RHS
+				# instead of coming from an explicit annotation
+				operand = self._lower_expr( node.value, None )
+				fn = self._current_fn
+				var = Variable(
+					stem = target.id,
+					qualname = f'{fn.qualname}.{target.id}',
+					file = fn.file,
+					line = node.lineno,
+					type = operand.type,
+				)
+				fn.add_name( var.stem, var )
+				self.schedule( var.type )
+				self._emit( ir.Assign( dest = var, src = operand ))
 		elif isinstance( target, ast.Attribute ):
 			obj = self._lower_expr( target.value, None )
 			attr_var = self._attr_lookup( obj.type, target.attr, target )
@@ -339,6 +360,8 @@ class Lowering:
 			ast.copy_location( single_stmt, node )
 			self._register_defer_block( is_err_only = ( defer_kind == 'errdefer' ), body = [ single_stmt ], node = node )
 			return
+		if isinstance( node.value, ast.Constant ) and isinstance( node.value.value, str ):
+			return # a docstring (or any other bare string literal used as a statement) - a no-op, same as _stmt_Pass
 		if not isinstance( node.value, ast.Call ):
 			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -519,6 +542,7 @@ class Lowering:
 		name = self.discovery.find_name( node.id, node )
 		if not isinstance( name, Variable ):
 			self.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
+		self._ensure_resolved( name ) # a global read only by bare name (never via an annotation/attribute chain) still needs its own resolve+schedule - Compiler._enqueue ignores this for a non-global (field/parameter/local) Variable
 		return name
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:

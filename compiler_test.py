@@ -252,6 +252,19 @@ def main() -> None:
 		self.compiler.run()
 		self.assertIn( 'X', [ g.variable.stem for g in self.compiler.globals ] )
 
+	def test_global_read_only_by_bare_name_is_still_lowered( self ) -> None:
+		# _expr_Name used to just look the Variable up and hand it back
+		# without ever calling _ensure_resolved on it - a global reached only
+		# by plain reference (never via an annotation/attribute chain
+		# elsewhere) would silently never make it into compiler.globals
+		self._run( '''
+X: i32 = 1
+
+def main() -> None:
+	y: i32 = X
+''' )
+		self.assertIn( 'X', [ g.variable.stem for g in self.compiler.globals ] )
+
 	def test_specialization_decomposes_into_base_and_each_arg( self ) -> None:
 		base = RCClass( stem = 'Result', qualname = '__main__.Result', file = None, line = None )
 		arg1 = RCClass( stem = 'Ok', qualname = '__main__.Ok', file = None, line = None )
@@ -267,6 +280,48 @@ def main() -> None:
 		self.assertTrue( any( q is arg2 for q in queued ))
 
 class OverloadCallSiteTests( CompilerTestCase ):
+	def test_len_style_plain_overload_group_dispatches_by_argument_type( self ) -> None:
+		# mirrors the real lib/builtins/__init__.py len() shape: a free
+		# function with no @overload anywhere, one plain implementation per
+		# concrete type, dispatched purely by the call's own argument type
+		self._run( '''
+class usize: pass
+
+class Foo:
+	def __len__( self ) -> usize:
+		return 1
+
+class Bar:
+	def __len__( self ) -> usize:
+		return 2
+
+def len( x: Foo ) -> usize:
+	return x.__len__()
+
+def len( x: Bar ) -> usize:
+	return x.__len__()
+
+def main() -> None:
+	f: Foo
+	b: Bar
+	x: usize = len( f )
+	y: usize = len( b )
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# each len(...) call site picks a *distinct* implementation (both
+		# share the same qualname - they're only distinguishable by object
+		# identity/their own parameter type) - confirm both actually got
+		# scheduled+lowered, and that each one's own body calls the right
+		# receiver's __len__, not the other one's
+		len_fns = [ f for f in self.compiler.functions if f.function.stem == 'len' ]
+		self.assertEqual( len( len_fns ), 2 )
+		receiver_classes = sorted( lf.function.parameters[0].type.stem for lf in len_fns )
+		self.assertEqual( receiver_classes, [ 'Bar', 'Foo' ])
+		for lf in len_fns:
+			expected_receiver_cls = lf.function.parameters[0].type.stem
+			call = next( i for i in lf.instructions if isinstance( i, ir.Call ))
+			self.assertEqual( call.target.qualname, f'__main__.{expected_receiver_cls}.__len__' )
+
 	def test_unconditional_target_schedules_only_that_target( self ) -> None:
 		self._run( '''
 class int: pass

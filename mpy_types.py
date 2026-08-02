@@ -91,7 +91,15 @@ class Parameter( Variable ):
 
 @dataclass( kw_only = True )
 class Move( Type ):
-	''' `move[T]` in annotation position - ownership of a T is transferred into this binding rather than borrowed/copied. The CFG uses this to know the source binding must be invalidated after the transfer. '''
+	''' `move[T]` in annotation position - ownership of a T is transferred into this binding rather than borrowed/copied. The CFG uses this to know the source binding must be invalidated after the transfer.
+
+	NOTE: this is modeled as a Type wrapper for now, which is arguably wrong -
+	see TODO.txt: move[T] is really an ownership status (OWNED vs BORROWED)
+	on a binding, not a distinct type from T itself. A move[T]-typed value
+	currently can't satisfy a plain T-typed parameter anywhere (including
+	overload matching) as a result - left alone rather than patched around
+	(e.g. by overriding .leaves()) since the real fix belongs with the
+	CFG/incref-decref ownership-tracking work, not a standalone tweak here. '''
 	inner: Type
 
 

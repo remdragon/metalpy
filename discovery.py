@@ -258,6 +258,18 @@ class Discovery( ast.NodeVisitor ):
 					file = None,
 					line = None,
 				)
+			# not a fixed-width integer, but the same tier as the numeric
+			# scalars above rather than a lib/-defined class: ir.py's own
+			# Const.value (bool|int|str|bytes|None) already treats it as a
+			# first-class IR-level concept, and it's needed everywhere
+			# comparisons/is_ok()/is_err()/defer's flag Variable are lowered,
+			# regardless of which module is being compiled
+			intrinsics['bool'] = Scalar(
+				stem = 'bool',
+				qualname = 'intrinsics.bool',
+				file = None,
+				line = None,
+			)
 			for name in [ 'Ptr', 'ConstPtr' ]: # generic pointer intrinsics: Ptr[T], ConstPtr[T]
 				tv = TypeVar(
 					stem = 'T',
@@ -289,7 +301,7 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1].qualname
 		return f'{scope}.{name}' if scope else name
 
-	def find_name( self, name: str, ctx: ast.AST ) -> Name:
+	def find_name_or_none( self, name: str ) -> Name|None:
 		mod = self.module_stack[-1]
 		# mod.builtins is already the target module's names dict (see
 		# import_code) - not a Module needing a further .names unwrap
@@ -302,7 +314,13 @@ class Discovery( ast.NodeVisitor ):
 			assert isinstance( scope, dict ), f'invalid {scope=}' # internal invariant - every scope on the stack always has a .names dict
 			if name_obj := scope.get( name ):
 				return name_obj
-		self.fail( f'name {name!r} is not defined', ctx )
+		return None
+
+	def find_name( self, name: str, ctx: ast.AST ) -> Name:
+		found = self.find_name_or_none( name )
+		if found is None:
+			self.fail( f'name {name!r} is not defined', ctx )
+		return found
 
 	def visit( self, node: ast.AST ) -> Any:
 		method = f'visit_{node.__class__.__name__}'

@@ -67,6 +67,19 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_docstring_statement_is_a_no_op( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			"	'''this is a docstring'''",
+			'	return',
+		])
+		none_type = self.discovery.get_none_type()
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
 	# --- locals: AnnAssign / Assign ----------------------------------------
 
 	def test_annassign_without_initializer( self ) -> None:
@@ -99,6 +112,62 @@ class Tests( unittest.TestCase ):
 			ir.Return( value = None ),
 			ir.FuncEnd( name = 'main' ),
 		])
+
+	def test_bare_assign_to_new_name_infers_type_from_rhs( self ) -> None:
+		# no annotation at all - x's type comes from y's, same as if it had
+		# been written `x: i32 = y`
+		code = '\n'.join([
+			'def main() -> None:',
+			'	y: i32 = 1',
+			'	x = y',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		y = Variable( stem = 'y', qualname = 'main.y', file = Path( '__test__.py' ), line = 2, type = i32 )
+		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 3, type = i32 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = y, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = x, src = y ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_inferred_local_can_be_reassigned_afterward( self ) -> None:
+		# the first bare `x = y` introduces x via inference; the second is a
+		# plain reassignment of that same Variable, not a second declaration
+		code = '\n'.join([
+			'def main() -> None:',
+			'	y: i32 = 1',
+			'	x = y',
+			'	x = y',
+			'	return',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		y = Variable( stem = 'y', qualname = 'main.y', file = Path( '__test__.py' ), line = 2, type = i32 )
+		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 3, type = i32 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = y, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = x, src = y ),
+			ir.Assign( dest = x, src = y ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_bare_assign_of_uninferrable_literal_still_fails( self ) -> None:
+		# a bare literal has no type of its own to infer from - same
+		# limitation _expr_Constant already has for any other context
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x = 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'cannot infer the type', self.discovery.errors.errors[0] )
 
 	# --- arithmetic ---------------------------------------------------------
 
