@@ -622,6 +622,307 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	# --- defer/errdefer --------------------------------------------------------
+
+	def test_defer_rejected_inside_a_for_loop( self ) -> None:
+		code = '\n'.join([
+			'def cleanup() -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	for i in range( 3 ):',
+			'		defer( cleanup() )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'not allowed inside a loop' in e for e in self.discovery.errors.errors ))
+
+	def test_errdefer_rejected_inside_a_while_loop( self ) -> None:
+		code = '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def checked() -> Result[None,OverflowError]:',
+			'	while True:',
+			'		with errdefer:',
+			'			pass',
+		])
+		mod = self._import( code )
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+		self.compiler._lower( checked_fn )
+		self.assertTrue( any( 'not allowed inside a loop' in e for e in self.discovery.errors.errors ))
+
+	def test_defer_rejected_when_nested_inside_another_defer( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'',
+			'def cleanup() -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	with defer:',
+			'		with defer:',
+			'			cleanup()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'nested inside another defer' in e for e in self.discovery.errors.errors ))
+
+	def test_errdefer_rejected_when_function_does_not_return_result( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def main() -> None:', # -> None, not Result[_,_] - errdefer isn't legal here
+			'	with errdefer:',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'requires the enclosing function to return Result' in e for e in self.discovery.errors.errors ))
+
+	def test_defer_epilogue_shape( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'',
+			'def cleanup() -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	with defer:',
+			'		cleanup()',
+			'	return',
+		])
+		mod = self._import( code )
+		bool_cls = mod.get_local( 'bool' )
+		cleanup_fn = mod.get_local( 'cleanup' )
+		if cleanup_fn.resolve is not None:
+			cleanup_fn.resolve()
+		none_type = self.discovery.get_none_type()
+		flag0 = Variable( stem = '__defer_flag_0', qualname = 'main.__defer_flag_0', file = Path( '__test__.py' ), line = 7, type = bool_cls )
+
+		fn = self._lower_main()
+		self._assert_ir( fn, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
+			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
+			ir.Jump( target = '__epilogue__' ),
+			ir.Label( name = '__epilogue__' ),
+			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_0__' ),
+			ir.Call( dest = None, target = cleanup_fn, args = [], kwargs = {} ),
+			ir.Label( name = '__defer_skip_0__' ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_errdefer_epilogue_shape_with_no_triggering_error( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	def is_err( self ) -> bool:',
+			'		pass',
+			'',
+			'def checked() -> Result[None,OverflowError]:',
+			'	with errdefer:',
+			'		pass',
+		])
+		mod = self._import( code )
+		bool_cls = mod.get_local( 'bool' )
+		result_cls = mod.get_local( 'Result' )
+		if result_cls.resolve is not None:
+			result_cls.resolve()
+		is_err_fn = result_cls.get_local( 'is_err' )
+		if is_err_fn.resolve is not None:
+			is_err_fn.resolve()
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+
+		flag0 = Variable( stem = '__defer_flag_0', qualname = '__test__.checked.__defer_flag_0', file = Path( '__test__.py' ), line = 10, type = bool_cls )
+		return_value_var = Variable( stem = '__return_value', qualname = '__test__.checked.__return_value', file = Path( '__test__.py' ), line = 9, type = checked_fn.return_type )
+		is_err_temp = ir.Temp( type = bool_cls, id = 0 )
+
+		fn = self.compiler._lower( checked_fn )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
+			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
+			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
+			ir.Label( name = '__epilogue__' ),
+			ir.DeclareTemp( temp = is_err_temp ),
+			ir.Call( dest = is_err_temp, target = is_err_fn, receiver = return_value_var, args = [], kwargs = {} ),
+			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_0__' ),
+			ir.JumpIfFalse( cond = is_err_temp, target = '__defer_skip_0__' ),
+			ir.Label( name = '__defer_skip_0__' ),
+			ir.DeleteTemp( temp = is_err_temp ),
+			ir.Return( value = return_value_var ),
+			ir.FuncEnd( name = '__test__.checked' ),
+		])
+
+	def test_errdefer_with_checked_arithmetic_emits_or_jump( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	def is_err( self ) -> bool:',
+			'		pass',
+			'',
+			'def checked() -> Result[None,OverflowError]:',
+			'	with errdefer:',
+			'		pass',
+			'	a: i32 = 1',
+			'	b: i32 = a + 1',
+		])
+		mod = self._import( code )
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+		fn = self.compiler._lower( checked_fn )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'AddCheck', kinds )
+		self.assertIn( 'OrJump', kinds )
+		self.assertNotIn( 'OrReturn', kinds )
+		# epilogue's errdefer guard is the two-JumpIfFalse (flag, then is_err()) shape, back to back
+		jump_if_false_indices = [ i for i, instr in enumerate( fn.instructions ) if isinstance( instr, ir.JumpIfFalse ) ]
+		self.assertEqual( len( jump_if_false_indices ), 2 )
+		self.assertEqual( jump_if_false_indices[1], jump_if_false_indices[0] + 1 )
+
+	def test_explicit_err_return_still_stows_and_jumps( self ) -> None:
+		# the specific gap the is_err()-based design fixes over a separate
+		# error-flag: a plain `return Result.Err(...)` never touches OrJump at
+		# all, but still needs to stow+jump so the epilogue's .is_err() check
+		# (which inspects the stowed value itself) catches it too
+		code = '\n'.join([
+			'class bool: pass',
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	def is_err( self ) -> bool:',
+			'		pass',
+			'	@staticmethod',
+			'	def Err( e: E ) -> Result[T,E]:',
+			'		pass',
+			'',
+			'def checked( e: OverflowError ) -> Result[None,OverflowError]:',
+			'	with errdefer:',
+			'		pass',
+			'	return Result.Err( e )',
+		])
+		mod = self._import( code )
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+		fn = self.compiler._lower( checked_fn )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'Return' ), 1 ) # only the epilogue's, not one at the return statement's own position
+		self.assertIn( 'Jump', kinds )
+		call_index = kinds.index( 'Call' ) # Result.Err(e)
+		jump_index = kinds.index( 'Jump' )
+		return_index = kinds.index( 'Return' )
+		self.assertLess( call_index, jump_index ) # stowed before jumping
+		self.assertLess( jump_index, return_index ) # jumps to, rather than falls into, the epilogue
+
+	def test_two_defers_replay_in_reverse_order( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'',
+			'def cleanup_a() -> None:',
+			'	pass',
+			'',
+			'def cleanup_b() -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	with defer:',
+			'		cleanup_a()',
+			'	with defer:',
+			'		cleanup_b()',
+			'	return',
+		])
+		mod = self._import( code )
+		cleanup_a = mod.get_local( 'cleanup_a' )
+		cleanup_b = mod.get_local( 'cleanup_b' )
+		fn = self._lower_main()
+		calls = [ instr for instr in fn.instructions if isinstance( instr, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 )
+		self.assertIs( calls[0].target, cleanup_b ) # last-registered runs first
+		self.assertIs( calls[1].target, cleanup_a )
+
+	def test_call_form_matches_with_block_form( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	def is_err( self ) -> bool:',
+			'		pass',
+			'',
+			'def cleanup() -> None:',
+			'	pass',
+			'',
+			'def checked_with() -> Result[None,OverflowError]:',
+			'	with errdefer:',
+			'		cleanup()',
+			'',
+			'def checked_call() -> Result[None,OverflowError]:',
+			'	errdefer( cleanup() )',
+		])
+		mod = self._import( code )
+		fn_with = mod.get_local( 'checked_with' )
+		fn_call = mod.get_local( 'checked_call' )
+		if fn_with.resolve is not None:
+			fn_with.resolve()
+		if fn_call.resolve is not None:
+			fn_call.resolve()
+		lowered_with = self.compiler._lower( fn_with )
+		lowered_call = self.compiler._lower( fn_call )
+		kinds_with = [ type( i ).__name__ for i in lowered_with.instructions ]
+		kinds_call = [ type( i ).__name__ for i in lowered_call.instructions ]
+		self.assertEqual( kinds_with, kinds_call )
+
+	def test_no_defer_still_uses_plain_return_and_or_return( self ) -> None:
+		# regression check - a function with no defer/errdefer at all still
+		# gets the pre-epilogue shape exactly as before, no Jump/Label anywhere
+		code = '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	pass',
+			'',
+			'def checked() -> Result[None,OverflowError]:',
+			'	a: i32 = 1',
+			'	b: i32 = a + 1',
+		])
+		mod = self._import( code )
+		checked_fn = mod.get_local( 'checked' )
+		if checked_fn.resolve is not None:
+			checked_fn.resolve()
+		fn = self.compiler._lower( checked_fn )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'OrReturn', kinds )
+		self.assertNotIn( 'OrJump', kinds )
+		self.assertNotIn( 'Jump', kinds )
+		self.assertNotIn( 'Label', kinds )
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

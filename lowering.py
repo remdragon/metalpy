@@ -1,6 +1,7 @@
 # stdlib imports:
 import ast
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Callable
 
 # local imports:
@@ -11,6 +12,12 @@ from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
 	Specialization, TaggedUnion,
 )
+
+@dataclass( kw_only = True )
+class _DeferBlock:
+	is_err_only: bool # True for errdefer, False for plain defer
+	flag: Variable # bool local, False until control passes the defer/errdefer statement
+	instructions: list['ir.Instruction'] # captured at registration time, replayed in the epilogue
 
 _BINOP_WRAP_OPCODES: dict[type,type] = {
 	ast.Add: ir.AddWrap,
@@ -68,6 +75,22 @@ class Lowering:
 		                       enclosing function to return Result[_,
 		                       OverflowError] - Unwrap panics, it never
 		                       needs anywhere to propagate to
+
+	defer/errdefer (SYNTAX.md section 3, either `defer(expr)`/`errdefer(expr)`
+	as a single statement or `with defer:`/`with errdefer:` for several) move
+	their body to the function's epilogue - a Label placed right after the
+	body, reached either by falling off the end or by every `return`/checked-
+	arithmetic-error-path jumping there once any defer/errdefer is active
+	(self._needs_epilogue - named generically, since a future decref-insertion
+	pass will need to trigger the exact same machinery, not just defer). Each
+	block gets a bool flag (False until control passes its registration
+	point) and is replayed in reverse registration order, guarded by that
+	flag; errdefer blocks are additionally guarded by calling .is_err() on
+	the function's own stowed return value (always a Result wherever errdefer
+	is legal) - not a separate signal, so it also covers a plain `return
+	Result.Err(x)`, not just the implicit OrJump path. defer/errdefer are
+	rejected inside a loop (self._loop_depth) or nested inside each other
+	(self._in_deferred_body) - see _register_defer_block.
 	'''
 
 	def __init__( self, discovery: Discovery, schedule: Callable[[Function|ClassLike|Variable],None] ) -> None:
@@ -81,6 +104,11 @@ class Lowering:
 		self._pending_temps: list[ir.Temp] = []
 		self._current_fn = fn
 		self._arithmetic_mode: list[tuple[str,object]] = [ ( 'check', None ) ]
+		self._loop_depth = 0
+		self._in_deferred_body = False
+		self._defer_blocks: list[_DeferBlock] = []
+		self._needs_epilogue = self._function_needs_epilogue( fn.node.body )
+		self._epilogue_label = '__epilogue__'
 
 		with self.discovery.module_context( module ):
 			with ( self.discovery.scope_context( fn.cls ) if fn.cls is not None else nullcontext() ):
@@ -99,7 +127,15 @@ class Lowering:
 						self._schedule_type_deps( param.type )
 					self._schedule_type_deps( fn.return_type )
 
+					none_type = self.discovery.get_none_type()
+					self._return_value_var = (
+						Variable( stem = '__return_value', qualname = f'{fn.qualname}.__return_value', file = fn.file, line = fn.line, type = fn.return_type )
+						if self._needs_epilogue and fn.return_type is not none_type
+						else None
+					)
+
 					self._emit( ir.FuncStart( name = fn.qualname, params = fn.parameters or [], return_type = fn.return_type ))
+					body_start = len( self._instructions )
 					for stmt in fn.node.body:
 						# one bad statement doesn't stop the rest of this
 						# function's body from being lowered (and error-collected) -
@@ -109,9 +145,58 @@ class Lowering:
 							self._lower_stmt( stmt )
 						except CompileError:
 							continue
+
+					if self._needs_epilogue:
+						self._emit_epilogue( fn, none_type, body_start )
+
 					self._emit( ir.FuncEnd( name = fn.qualname ))
 
 		return self._instructions
+
+	def _emit_epilogue( self, fn: Function, none_type: Type, body_start: int ) -> None:
+		# flag inits have to run before *any* code that could set them -
+		# easiest to guarantee by splicing them in right after FuncStart
+		# rather than tracking every branch that could reach a defer statement
+		flag_inits = [
+			ir.Assign( dest = block.flag, src = ir.Const( type = block.flag.type, value = False ))
+			for block in self._defer_blocks
+		]
+		self._instructions[body_start:body_start] = flag_inits
+
+		# falling off the end of the body (no explicit final `return`) reaches
+		# this Label naturally, with no extra jump needed, since it's placed
+		# immediately after the body - same for every `return`/OrJump, which
+		# jumped here explicitly instead of exiting directly
+		self._pending_temps = []
+		self._emit( ir.Label( name = self._epilogue_label ))
+
+		is_err_temp = None
+		if any( block.is_err_only for block in self._defer_blocks ):
+			is_err_temp = self._emit_is_err_check( fn.node )
+
+		for i, block in enumerate( reversed( self._defer_blocks )):
+			skip_label = f'__defer_skip_{i}__'
+			self._emit( ir.JumpIfFalse( cond = block.flag, target = skip_label ))
+			if block.is_err_only:
+				self._emit( ir.JumpIfFalse( cond = is_err_temp, target = skip_label ))
+			for instr in block.instructions:
+				self._emit( instr )
+			self._emit( ir.Label( name = skip_label ))
+
+		for t in reversed( self._pending_temps ):
+			self._emit( ir.DeleteTemp( temp = t ))
+		return_value = self._return_value_var if fn.return_type is not none_type else None
+		self._emit( ir.Return( value = return_value ))
+
+	def _emit_is_err_check( self, node: ast.AST ) -> ir.Temp:
+		bool_cls = self.discovery.find_name( 'bool', node )
+		is_err_fn = self._attr_lookup_callable( self._return_value_var.type, 'is_err', node )
+		if is_err_fn.resolve is not None:
+			is_err_fn.resolve()
+		self.schedule( is_err_fn )
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Call( dest = dest, target = is_err_fn, receiver = self._return_value_var, args = [], kwargs = {} ))
+		return dest
 
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self._find_module_for( var )
@@ -120,6 +205,14 @@ class Lowering:
 		self._pending_temps = []
 		self._current_fn = None
 		self._arithmetic_mode = [ ( 'check', None ) ]
+		# defer/errdefer/loops can't appear in a global initializer (it's a
+		# single expression, not a statement body reachable through
+		# _lower_stmt) - reset for consistency/safety only, never touched here
+		self._loop_depth = 0
+		self._in_deferred_body = False
+		self._defer_blocks: list[_DeferBlock] = []
+		self._needs_epilogue = False
+		self._return_value_var = None
 
 		with self.discovery.module_context( module ):
 			if var.init is not None:
@@ -189,7 +282,12 @@ class Lowering:
 
 	def _stmt_Return( self, node: ast.Return ) -> None:
 		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
-		self._emit( ir.Return( value = value ))
+		if self._needs_epilogue:
+			if self._return_value_var is not None and value is not None:
+				self._emit( ir.Assign( dest = self._return_value_var, src = value ))
+			self._emit( ir.Jump( target = self._epilogue_label ))
+		else:
+			self._emit( ir.Return( value = value ))
 
 	def _stmt_Pass( self, node: ast.Pass ) -> None:
 		pass
@@ -243,17 +341,27 @@ class Lowering:
 			self.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 
 	def _stmt_Expr( self, node: ast.Expr ) -> None:
+		defer_kind = self._defer_kind_of_call( node.value )
+		if defer_kind is not None:
+			if len( node.value.args ) != 1 or node.value.keywords:
+				self.discovery.fail( f'{defer_kind}(...) takes exactly one argument: {ast.unparse(node)}', node )
+			single_stmt = ast.Expr( value = node.value.args[0] )
+			ast.copy_location( single_stmt, node )
+			self._register_defer_block( is_err_only = ( defer_kind == 'errdefer' ), body = [ single_stmt ], node = node )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
 
 	def _stmt_With( self, node: ast.With ) -> None:
-		# only the three arithmetic-mode context managers are supported so
-		# far - errdefer and anything else stay "not yet supported", same
-		# posture as everywhere else in this module
 		if len( node.items ) != 1 or node.items[0].optional_vars is not None:
 			self.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
 		context_expr = node.items[0].context_expr
+
+		defer_kind = self._defer_kind_of_with( context_expr )
+		if defer_kind is not None:
+			self._register_defer_block( is_err_only = ( defer_kind == 'errdefer' ), body = node.body, node = node )
+			return
 
 		if self._is_compiler_attr( context_expr, 'wrap_arithmetic' ):
 			mode = ( 'wrap', None )
@@ -300,6 +408,114 @@ class Lowering:
 			and isinstance( node.func.value, ast.Name )
 			and node.func.value.id == 'compiler'
 		)
+
+	# --- defer/errdefer ----------------------------------------------------------
+
+	def _defer_kind_of_with( self, node: ast.expr ) -> str|None:
+		# `with defer:` / `with errdefer:` - bare names, unlike the
+		# compiler.-prefixed arithmetic-mode context managers
+		if isinstance( node, ast.Name ) and node.id in ( 'defer', 'errdefer' ):
+			return node.id
+		return None
+
+	def _defer_kind_of_call( self, node: ast.expr ) -> str|None:
+		# `defer( expr )` / `errdefer( expr )` - the single-statement call form
+		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id in ( 'defer', 'errdefer' ):
+			return node.func.id
+		return None
+
+	def _function_needs_epilogue( self, body: list[ast.stmt] ) -> bool:
+		# a simple AST-level pre-scan (not real lowering) - has to be known
+		# before lowering a single statement, since every `return` in the
+		# function must behave uniformly (see the class docstring)
+		for stmt in body:
+			for node in ast.walk( stmt ):
+				if isinstance( node, ast.With ) and len( node.items ) == 1 and self._defer_kind_of_with( node.items[0].context_expr ):
+					return True
+				if isinstance( node, ast.Expr ) and self._defer_kind_of_call( node.value ):
+					return True
+		return False
+
+	def _register_defer_block( self, is_err_only: bool, body: list[ast.stmt], node: ast.AST ) -> None:
+		kind = 'errdefer' if is_err_only else 'defer'
+		if self._loop_depth > 0:
+			self.discovery.fail( f'{kind} is not allowed inside a loop - call another function and {kind} inside that instead', node )
+		if self._in_deferred_body:
+			self.discovery.fail( f'{kind} cannot be nested inside another defer/errdefer', node )
+
+		fn = self._current_fn
+		if is_err_only:
+			result_cls = self.discovery.find_name( 'Result', node )
+			return_type = fn.return_type if fn is not None else None
+			ok = (
+				fn is not None
+				and isinstance( return_type, Specialization )
+				and return_type.base is result_cls
+				and len( return_type.args ) == 2
+			)
+			if not ok:
+				where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
+				self.discovery.fail( f'errdefer requires the enclosing function to return Result[_,_] ({where})', node )
+
+		bool_cls = self.discovery.find_name( 'bool', node )
+		index = len( self._defer_blocks )
+		flag = Variable(
+			stem = f'__defer_flag_{index}',
+			qualname = f'{fn.qualname}.__defer_flag_{index}',
+			file = fn.file,
+			line = getattr( node, 'lineno', None ),
+			type = bool_cls,
+		)
+
+		# capture the body's instructions instead of emitting them inline -
+		# they run later, in the epilogue, not at the with-statement's own
+		# position. Lowering happens here, once, right now (not re-lowered at
+		# replay time) so identifier resolution and dependency scheduling only
+		# ever happen once, same as any other statement
+		outer_instructions = self._instructions
+		outer_in_deferred_body = self._in_deferred_body
+		self._instructions = []
+		self._in_deferred_body = True
+		try:
+			for stmt in body:
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+			captured = self._instructions
+		finally:
+			self._instructions = outer_instructions
+			self._in_deferred_body = outer_in_deferred_body
+
+		self._defer_blocks.append( _DeferBlock( is_err_only = is_err_only, flag = flag, instructions = captured ))
+		# this is what actually runs at the with-statement's/call's position -
+		# marks the block "armed" so the epilogue knows to replay it
+		self._emit( ir.Assign( dest = flag, src = ir.Const( type = bool_cls, value = True )))
+
+	# --- loops (recognition only - no control-flow IR yet) -----------------------
+
+	def _stmt_For( self, node: ast.For ) -> None:
+		self._lower_loop_body( node.body )
+		self.discovery.fail( 'for loop control flow is not yet supported', node )
+
+	def _stmt_While( self, node: ast.While ) -> None:
+		self._lower_loop_body( node.body )
+		self.discovery.fail( 'while loop control flow is not yet supported', node )
+
+	def _lower_loop_body( self, body: list[ast.stmt] ) -> None:
+		# pushed so nested defer/errdefer (at any depth) gets rejected, and
+		# the body still lowers through the normal statement machinery - so
+		# this is reusable once real loop control-flow IR exists, it's only
+		# the loop's own iteration/branching that's missing
+		self._loop_depth += 1
+		try:
+			for stmt in body:
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+		finally:
+			self._loop_depth -= 1
 
 	# --- expressions -----------------------------------------------------------
 
@@ -392,7 +608,10 @@ class Lowering:
 		self._emit( opcode( dest = check_dest, left = left, right = right ))
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
-			self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
+			if self._needs_epilogue:
+				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = self._epilogue_label, return_slot = self._return_value_var ))
+			else:
+				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
 		else:
 			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra ))
 		return unwrapped
@@ -434,9 +653,15 @@ class Lowering:
 		if resolve is not None:
 			resolve()
 
+	def _unwrap_specialization( self, t: Type|None ) -> Type|None:
+		# a Specialization (e.g. Result[None,OverflowError]) has no .names of
+		# its own - methods/attributes live on the generic base (Result[T,E])
+		return t.base if isinstance( t, Specialization ) else t
+
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
-		self._ensure_resolved( owner_type )
-		names = getattr( owner_type, 'names', None )
+		lookup_type = self._unwrap_specialization( owner_type )
+		self._ensure_resolved( lookup_type )
+		names = getattr( lookup_type, 'names', None )
 		if not isinstance( names, dict ):
 			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 		found = names.get( attr )
@@ -481,8 +706,9 @@ class Lowering:
 		return target, receiver
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
-		self._ensure_resolved( owner_type )
-		names = getattr( owner_type, 'names', None )
+		lookup_type = self._unwrap_specialization( owner_type )
+		self._ensure_resolved( lookup_type )
+		names = getattr( lookup_type, 'names', None )
 		if not isinstance( names, dict ):
 			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 		found = names.get( attr )

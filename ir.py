@@ -173,6 +173,23 @@ class OrReturn( Instruction ): # Result.or_return(): Err -> return Err from the 
 		return f'OrReturn( dest={self.dest!r}, value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class OrJump( Instruction ):
+	''' like OrReturn, but jumps to an epilogue label instead of returning
+	directly - used once the current function has any defer/errdefer active.
+	Its (opaque, stage-3-implemented) error branch stows Result::Err(...)
+	into return_slot and jumps to target instead of returning; its success
+	branch (dest = payload) is identical to OrReturn's. errdefer doesn't need
+	a separate signal for "was this an error exit" - the epilogue checks
+	return_slot's own tag directly (via .is_err()), which this naturally sets. '''
+	dest: Temp
+	value: Operand # a Result[T,E]
+	target: str # epilogue label
+	return_slot: Variable|None # where the wrapped error gets stowed before jumping; None if the function returns None
+
+	def test_repr( self ) -> str:
+		return f'OrJump( dest={self.dest!r}, value={self.value!r}, target={self.target!r}, return_slot={self.return_slot!r} )'
+
+@dataclass( kw_only = True )
 class Unwrap( Instruction ): # Result.unwrap(errmsg): Err -> panic(errmsg); Ok -> dest = payload
 	dest: Temp
 	value: Operand # a Result[T,E]
