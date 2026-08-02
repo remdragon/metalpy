@@ -323,6 +323,21 @@ list class
 
 	I'm fairly certain this code isn't thread-safe
 
+	slice[T] (builtins/__init__.py) is a borrowed view (_ptr/__len only, no
+		owning storage) - any function that snapshots a slice's .len() once
+		and then indexes it across multiple statements (e.g. str.concat's
+		two `for i in range(count): part = parts.get_unchecked(i)` loops)
+		is reading through a pointer that another thread could be mutating
+		or freeing concurrently, even though get_unchecked's own bound
+		(i < count) can never itself be violated. Fixing this for real needs
+		either an owned-copy path (slice[T].clone() -> list[T], or similar -
+		but slice has no allocator/capacity of its own to build that from,
+		and list[T] has no constructor that takes a slice/iterable either)
+		or real ownership/borrow tracking that proves the slice can't be
+		mutated for the duration of the call - this is really the same
+		unsolved problem as incref/decref/move[T] above, not a one-off bug
+		in str.concat specifically
+
 	generic list[T] method calls (e.g. xs.append(...)) fail in emitter.py's
 		_transpile_call ("could not resolve receiver class 'list[i32]' for
 		.append(...)") - method resolution for a monomorphized generic
