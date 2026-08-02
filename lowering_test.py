@@ -1435,6 +1435,71 @@ class Tests( unittest.TestCase ):
 		getattr_ok = next( i for i in fn.instructions if isinstance( i, ir.GetAttr ) and i.attr == 'ok' )
 		self.assertEqual( getattr_ok.dest.type, i32 )
 
+	# --- multi-branch overload dispatch (ConditionalDispatch) -----------------
+
+	def test_conditional_dispatch_shape( self ) -> None:
+		# a union-typed argument (x: A|B) makes foo(x) ambiguous at compile
+		# time - resolve_call returns real branches, lowered here as a
+		# runtime tag check (on the synthesized anonymous union) picking
+		# between the two real implementations
+		code = '\n'.join([
+			'class A: pass',
+			'class B: pass',
+			'',
+			'def foo( v: A ) -> None:',
+			'	pass',
+			'',
+			'def foo( v: B ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	x: A|B',
+			'	foo( x )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'Cmp' ), 1 )
+		self.assertEqual( kinds.count( 'Call' ), 2 ) # one per possible target - only one runs at runtime
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 1 )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertTrue( all( c.target.qualname == '__test__.foo' for c in calls )) # both overload members share the same qualname
+		self.assertEqual( len( { id( c.target ) for c in calls } ), 2 ) # but are two DIFFERENT Function objects (distinct implementations)
+
+	def test_conditional_dispatch_unwraps_union_argument_to_concrete_leaf( self ) -> None:
+		# the Call emitted for each branch must pass the UNWRAPPED concrete
+		# value (via data.v_<leaf>), not the raw union operand - foo(v: A)
+		# expects a real A, not an A|B
+		code = '\n'.join([
+			'class A: pass',
+			'class B: pass',
+			'',
+			'def foo( v: A ) -> None:',
+			'	pass',
+			'',
+			'def foo( v: B ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	x: A|B',
+			'	foo( x )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		a_cls = self.discovery.modules['__test__'].get_local( 'A' )
+		b_cls = self.discovery.modules['__test__'].get_local( 'B' )
+		call_arg_types = [ c.args[0].type for c in calls ]
+		self.assertTrue( any( t is a_cls for t in call_arg_types ))
+		self.assertTrue( any( t is b_cls for t in call_arg_types )) # not the A|B union type
+		getattrs = [ i.attr for i in fn.instructions if isinstance( i, ir.GetAttr ) ]
+		self.assertIn( 'v_A', getattrs )
+		self.assertIn( 'v_B', getattrs )
+
 	# --- loops (while / for / break / continue) -----------------------------
 
 	def test_while_shape( self ) -> None:

@@ -10,7 +10,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CUnion, TypeVar,
+	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch,
 )
 
 @dataclass( kw_only = True )
@@ -1629,11 +1629,7 @@ class Lowering:
 				# lands in the collector
 				self.discovery.fail( str( e ), node )
 			if branches:
-				self.discovery.fail(
-					f'{target.qualname}: multi-branch overload dispatch is not supported yet ({ast.unparse(node)}) - '
-					f'this needs TaggedUnion tag-check IR, which does not exist yet',
-					node,
-				)
+				return self._lower_conditional_dispatch( node, branches, resolved, args, kwargs, expected_type, want_result )
 			target = resolved
 			self._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
 		else:
@@ -1653,3 +1649,89 @@ class Lowering:
 		else:
 			self._emit( ir.Call( dest = None, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return None
+
+	def _lower_conditional_dispatch( self, node: ast.Call, branches: list[ConditionalDispatch], default: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# a union-typed argument's runtime tag decides which overload
+		# implementation actually runs (e.g. len(copy_from) where
+		# copy_from: bytes|bytearray resolves to two candidates, bytes and
+		# bytearray). Reuses the same tag/data/v_<member> machinery match
+		# statements use (_tagged_union_storage) - branches are tried in
+		# priority order, falling through to `default` (no test needed -
+		# it's whatever's left once every more specific branch is excluded)
+		self._ensure_resolved( default )
+		for branch in branches:
+			self._ensure_resolved( branch.function )
+
+		dest = self._new_temp( expected_type or default.return_type ) if want_result else None
+		end_label = self._new_label( 'dispatch_end' )
+		for branch in branches:
+			next_label = self._new_label( 'dispatch_next' )
+			test = self._lower_dispatch_test( node, branch.function, branch.conditions, args, kwargs )
+			self._emit( ir.JumpIfFalse( cond = test, target = next_label ))
+			self._emit_dispatch_call( branch.function, args, kwargs, dest, want_result )
+			self._emit( ir.Jump( target = end_label ))
+			self._emit( ir.Label( name = next_label ))
+		self._emit_dispatch_call( default, args, kwargs, dest, want_result )
+		self._emit( ir.Label( name = end_label ))
+		return dest
+
+	def _lower_dispatch_test( self, node: ast.AST, target: Function, conditions: list[tuple[Parameter,Type]], args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> ir.Operand:
+		# narrowed to exactly one condition per branch for now - every real
+		# branch this has ever needed to handle (len(x: bytes|bytearray))
+		# only ever varies on a single argument; combining multiple
+		# conditions would need the same short-circuit AND _expr_BoolOp
+		# already does, just directly in IR since these operands are
+		# already lowered - not implemented until real code needs it
+		if len( conditions ) != 1:
+			self.discovery.fail( f'{target.qualname}: conditional dispatch on more than one argument is not yet supported: {ast.unparse(node)}', node )
+		param, leaf_type = conditions[0]
+		operand = self._dispatch_operand_for_param( node, target, param, args, kwargs )
+		if not isinstance( operand.type, TaggedUnion ):
+			self.discovery.fail( f'{target.qualname}: conditional dispatch on a non-union argument: {ast.unparse(node)}', node )
+		member = next( ( attr for attr in operand.type.attributes if attr.type is leaf_type ), None )
+		if member is None:
+			self.discovery.fail( f'{target.qualname}: {leaf_type.qualname if leaf_type else "?"} is not a member of {operand.type.qualname}', node )
+		tag_attr, _data_attr, _payload_cls, tags = self._tagged_union_storage( operand.type )
+		tag_dest = self._new_temp( tag_attr.type )
+		self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = tag_attr.stem ))
+		bool_cls = self.discovery.find_name( 'bool', node )
+		cmp_dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] ) ))
+		return cmp_dest
+
+	def _dispatch_operand_for_param( self, node: ast.AST, target: Function, param: Parameter, args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> ir.Operand:
+		if param.stem in kwargs:
+			return kwargs[param.stem]
+		index = next( ( i for i, p in enumerate( target.parameters or [] ) if p is param ), None )
+		if index is not None and index < len( args ):
+			return args[index]
+		self.discovery.fail( f'{target.qualname}: cannot locate the call-site argument for parameter {param.stem!r}', node )
+
+	def _emit_dispatch_call( self, target: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], dest: ir.Temp|None, want_result: bool ) -> None:
+		params = target.parameters or []
+		unwrapped_args = [ self._maybe_unwrap_union_arg( a, p.type ) for a, p in zip( args, params ) ]
+		unwrapped_kwargs = {
+			name: self._maybe_unwrap_union_arg( value, next( p for p in params if p.stem == name ).type )
+			for name, value in kwargs.items()
+		}
+		self.schedule( target.return_type )
+		for p in params:
+			self.schedule( p.type )
+		self._emit( ir.Call( dest = dest if want_result else None, target = target, receiver = None, args = unwrapped_args, kwargs = unwrapped_kwargs ))
+
+	def _maybe_unwrap_union_arg( self, operand: ir.Operand, target_type: Type|None ) -> ir.Operand:
+		# a union-typed call-site argument (copy_from: bytes|bytearray)
+		# must be unwrapped to the concrete leaf type the chosen branch's
+		# parameter actually declares before it can be passed as a real
+		# argument - mirrors match's own payload extraction
+		if target_type is None or operand.type is target_type or not isinstance( operand.type, TaggedUnion ):
+			return operand
+		member = next( ( attr for attr in operand.type.attributes if attr.type is target_type ), None )
+		if member is None:
+			return operand
+		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( operand.type )
+		payload_dest = self._new_temp( payload_cls )
+		self._emit( ir.GetAttr( dest = payload_dest, obj = operand, attr = data_attr.stem ))
+		dest = self._new_temp( target_type )
+		self._emit( ir.GetAttr( dest = dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+		return dest

@@ -347,7 +347,11 @@ def main() -> None:
 		# the whole group and never the stub (stubs have no body to lower)
 		self.assertEqual( len( names ), 2 )
 
-	def test_multi_branch_dispatch_is_not_yet_supported( self ) -> None:
+	def test_multi_branch_dispatch_resolves_via_runtime_tag_check( self ) -> None:
+		# a union-typed argument (x: int|str) makes foo(x) ambiguous at
+		# compile time - resolve_call returns real ConditionalDispatch
+		# branches, which now lower to a runtime tag check (ir.Cmp against
+		# the synthesized anonymous union's tag) rather than failing
 		self.compiler.import_code( '''
 class int: pass
 class str: pass
@@ -371,7 +375,11 @@ def main() -> None:
 	foo( x )
 ''', Path( '__main__.py' ), scope = None )
 		self.compiler.run()
-		self.assertTrue( self.discovery.errors.errors )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		instructions = self._instructions_for( 'main' )
+		kinds = [ type( i ).__name__ for i in instructions ]
+		self.assertIn( 'Cmp', kinds )
+		self.assertEqual( kinds.count( 'Call' ), 2 ) # one per possible target (the branch + the default) - only one runs at runtime
 
 class LocalVariableTests( CompilerTestCase ):
 	def test_annassign_then_reassign( self ) -> None:
