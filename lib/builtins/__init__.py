@@ -200,15 +200,15 @@ class str:
 		i: usize = 0
 		count: usize = parts.len()
 		for i in range( count ):
-			part: str = parts[i]
+			part: str = parts.get_unchecked( i )
 			new_size += part.__byte_size - 1
-		
+
 		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
 		errdefer( sys.free( new_buf ))
 		offset: usize = 0
-		
+
 		for i in range( count ):
-			part: str = parts[i]
+			part: str = parts.get_unchecked( i )
 			part_len: usize = part.__byte_size - 1
 			sys.memcpy( new_buf + offset, part.__data, part_len )
 			offset += part_len
