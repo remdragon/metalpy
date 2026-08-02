@@ -159,6 +159,7 @@ class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backin
 	# each variant is an attribute: name -> type. Synthesized anonymous
 	# unions are built fully-formed directly (never deferred, resolve stays
 	# None); a user-declared @union's variants defer like any other class body.
+	type_params: list[TypeVar]|None = None # if not None, this is a generic union (e.g. @union class Foo[T]:)
 	attributes: list[Variable] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None

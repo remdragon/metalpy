@@ -10,7 +10,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization,
+	Specialization, TaggedUnion, CUnion,
 )
 
 @dataclass( kw_only = True )
@@ -119,6 +119,13 @@ class Lowering:
 	def __init__( self, discovery: Discovery, schedule: Callable[[object],None] ) -> None:
 		self.discovery = discovery
 		self.schedule = schedule
+		# synthesized __tag/__payload storage per TaggedUnion, memoized by
+		# id() - built lazily the first time a union is constructed/matched
+		# against, but shared thereafter so every reference (Allocate,
+		# GetAttr, across unrelated functions) points at the same objects.
+		# Persists for the whole Lowering instance's lifetime, unlike
+		# lower_function's per-function state
+		self._union_storage: dict[int,tuple[Variable,Variable,CUnion,dict[str,int]]] = {}
 
 	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
 		module = self._find_module_for( fn )
@@ -1308,6 +1315,81 @@ class Lowering:
 			return None
 		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
 
+	def _tagged_union_storage( self, union: TaggedUnion ) -> tuple[Variable,Variable,CUnion,dict[str,int]]:
+		# every TaggedUnion (a user-declared @union class, or a synthesized
+		# anonymous X|Y) gets a real runtime representation synthesized here
+		# on first use: `tag: u8` (each member's ordinal, by declaration
+		# order) + `data: <synthesized CUnion>` (one v_<member>-prefixed
+		# field per member, only one ever meaningfully set at a time - the
+		# v_ prefix avoids a member name colliding with something else in
+		# that payload struct). This is exactly what builtins.Result already
+		# hand-writes (_tag: u8 + _payload: ResultPayload[T,E]) - Result
+		# itself stays hand-rolled (it's a @cstruct, not a TaggedUnion, and
+		# match/dispatch special-case it directly - see _lower_or_return's
+		# own comment on why compiler.early_return couldn't just be reused
+		# for or_return() either), this generalizes the same shape for
+		# every *real* union instead. Memoized in self._union_storage so
+		# every reference (construction, match, dispatch, across unrelated
+		# functions) points at the same tag/data/payload-class objects.
+		cached = self._union_storage.get( id( union ) )
+		if cached is not None:
+			return cached
+		self._ensure_resolved( union )
+		for attr in union.attributes:
+			self._ensure_resolved( attr )
+		u8_cls = self.discovery.get_intrinsics()['u8']
+		tag_attr = Variable( stem = 'tag', qualname = f'{union.qualname}.tag', file = union.file, line = union.line, type = u8_cls )
+		payload_fields = [
+			Variable( stem = f'v_{attr.stem}', qualname = f'{union.qualname}.data.v_{attr.stem}', file = attr.file, line = attr.line, type = attr.type )
+			for attr in union.attributes
+		]
+		payload_cls = CUnion(
+			stem = f'{union.stem}$data',
+			qualname = f'{union.qualname}$data',
+			file = union.file,
+			line = union.line,
+			attributes = payload_fields,
+			names = { f.stem: f for f in payload_fields },
+		)
+		data_attr = Variable( stem = 'data', qualname = f'{union.qualname}.data', file = union.file, line = union.line, type = payload_cls )
+		tags = { attr.stem: i for i, attr in enumerate( union.attributes ) }
+		result = ( tag_attr, data_attr, payload_cls, tags )
+		self._union_storage[ id( union ) ] = result
+		return result
+
+	def _try_lower_union_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
+		# TaggedUnionName.MemberName(value) - a compiler-synthesized
+		# pseudo-constructor, same spirit as .__allocate__()/bare
+		# ClassName(...): TaggedUnion members are plain Variables in
+		# .names (discovery.py parses `SharedReference: T` inside a @union
+		# body the same way it parses any CStruct/CUnion field), never real
+		# declared Functions, so this can never be found via the ordinary
+		# _resolve_callee/_attr_lookup_callable path either. Builds the
+		# `tag`/`data` storage from _tagged_union_storage and emits two
+		# Allocates: the payload union (one field set - v_<member>), then
+		# the union instance itself (tag + data)
+		if not isinstance( node.func, ast.Attribute ):
+			return None
+		union = self._try_resolve_namespace( node.func.value )
+		if not isinstance( union, TaggedUnion ):
+			return None
+		self._ensure_resolved( union )
+		member = next( ( attr for attr in union.attributes if attr.stem == node.func.attr ), None )
+		if member is None:
+			return None # not a real member name - fall through, let the normal call path report whatever error fits (e.g. "not callable")
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'{union.qualname}.{member.stem}(...) takes exactly one positional argument: {ast.unparse(node)}', node )
+		self._ensure_resolved( member )
+
+		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( union )
+		value = self._lower_expr( node.args[0], member.type )
+		payload_dest = self._new_temp( payload_cls )
+		self._emit( ir.Allocate( dest = payload_dest, cls = payload_cls, fields = { f'v_{member.stem}': value } ))
+
+		dest = self._new_temp( expected_type or union )
+		self._emit( ir.Allocate( dest = dest, cls = union, fields = { tag_attr.stem: ir.Const( type = tag_attr.type, value = tags[member.stem] ), data_attr.stem: payload_dest } ))
+		return dest
+
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
 
 	def _lower_or_return( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
@@ -1338,6 +1420,8 @@ class Lowering:
 		allocate_dest = self._try_lower_allocate_call( node, expected_type )
 		if allocate_dest is None:
 			allocate_dest = self._try_lower_construct_call( node, expected_type )
+		if allocate_dest is None:
+			allocate_dest = self._try_lower_union_construct_call( node, expected_type )
 		if allocate_dest is not None:
 			return allocate_dest if want_result else None
 

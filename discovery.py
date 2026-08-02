@@ -672,7 +672,7 @@ class Discovery( ast.NodeVisitor ):
 			return decorator.func.id
 		return None
 
-	def _parse_type_params( self, type_params: list[ast.type_param], owner: RCClass|CStruct|CUnion|Function ) -> None:
+	def _parse_type_params( self, type_params: list[ast.type_param], owner: RCClass|CStruct|CUnion|TaggedUnion|Function ) -> None:
 		if not type_params:
 			return
 		owner.type_params = []
@@ -809,6 +809,8 @@ class Discovery( ast.NodeVisitor ):
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
+
+		self._parse_type_params( node.type_params, class_obj )
 
 		unresolved = self._shallow_class_body_scan( class_obj, node.body )
 

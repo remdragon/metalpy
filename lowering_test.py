@@ -1757,6 +1757,84 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'missing field', self.discovery.errors.errors[0] )
 		self.assertIn( 'y', self.discovery.errors.errors[0] )
 
+	# --- TaggedUnion construction (Foo.Member(value)) ------------------------
+
+	def test_union_member_construct_emits_tag_and_payload_allocate( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'	Baz: usize',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		foo_cls = self.discovery.modules['__test__'].get_local( 'Foo' )
+		allocates = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) ]
+		self.assertEqual( len( allocates ), 2 )
+		payload_alloc, union_alloc = allocates
+		self.assertEqual( payload_alloc.cls.stem, 'Foo$data' )
+		self.assertEqual( set( payload_alloc.fields.keys() ), { 'v_Bar' } )
+		self.assertIs( union_alloc.cls, foo_cls )
+		self.assertEqual( set( union_alloc.fields.keys() ), { 'tag', 'data' } )
+		self.assertEqual( union_alloc.fields['tag'], ir.Const( type = self.discovery.get_intrinsics()['u8'], value = 0 ))
+		self.assertIs( union_alloc.fields['data'], payload_alloc.dest )
+
+	def test_union_member_construct_tag_is_declaration_order( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'	Baz: usize',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Baz( 7 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		union_alloc = next( i for i in fn.instructions if isinstance( i, ir.Allocate ) and i.cls.stem == 'Foo' )
+		self.assertEqual( union_alloc.fields['tag'], ir.Const( type = self.discovery.get_intrinsics()['u8'], value = 1 ))
+
+	def test_union_member_construct_wrong_arg_count_rejected( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Bar( 1, 2 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'exactly one positional argument', self.discovery.errors.errors[0] )
+
+	def test_union_storage_is_memoized_across_constructions( self ) -> None:
+		# construction elsewhere in the same function (or a different one)
+		# must reference the SAME synthesized tag/data/payload-class objects
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'',
+			'def main() -> None:',
+			'	a: Foo = Foo.Bar( 1 )',
+			'	b: Foo = Foo.Bar( 2 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		payload_allocs = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) and i.cls.stem == 'Foo$data' ]
+		self.assertEqual( len( payload_allocs ), 2 )
+		self.assertIs( payload_allocs[0].cls, payload_allocs[1].cls )
+
 	# --- attributes / subscripts --------------------------------------------
 
 	def test_getattr_setattr( self ) -> None:
