@@ -940,7 +940,90 @@ class Lowering:
 			keyword.append(( param, kw.value ))
 		return positional, keyword
 
+	def _lower_allocate_fields( self, target_cls: ClassLike, node: ast.Call, expected_type: Type|None, label: str ) -> ir.Temp:
+		# shared by both callers of ir.Allocate (Class.__allocate__(...) and
+		# bare ClassName(...) sugar for the no-__init__ case) - everything
+		# past "which class, and is this call form even allowed here" is
+		# identical field-matching/emission logic. `label` is just how the
+		# call reads in error messages (".__allocate__(...)" vs "(...)"), so
+		# existing callers' error text doesn't change.
+		if node.args:
+			self.discovery.fail( f'{target_cls.qualname}{label} takes keyword arguments only: {ast.unparse(node)}', node )
+		if any( kw.arg is None for kw in node.keywords ):
+			self.discovery.fail( f'**kwargs not supported for {target_cls.qualname}{label}: {ast.unparse(node)}', node )
+
+		self._ensure_resolved( target_cls )
+		for attr in target_cls.attributes:
+			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _attr_lookup's found.resolve
+		declared = { attr.stem: attr for attr in target_cls.attributes }
+		given = { kw.arg for kw in node.keywords }
+		missing = declared.keys() - given
+		if missing:
+			self.discovery.fail( f'{target_cls.qualname}{label} is missing field(s): {", ".join(sorted(missing))}', node )
+		extra = given - declared.keys()
+		if extra:
+			self.discovery.fail( f'{target_cls.qualname}{label} has no field(s): {", ".join(sorted(extra))}', node )
+
+		fields: dict[str,ir.Operand] = {}
+		for kw in node.keywords:
+			field = declared[kw.arg]
+			fields[kw.arg] = self._lower_expr( kw.value, field.type )
+
+		dest = self._new_temp( expected_type or target_cls )
+		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
+		return dest
+
+	def _try_lower_allocate_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
+		# Class.__allocate__(field=value, ...) - a compiler-synthesized
+		# pseudo-method (SYNTAX.md: "strictly private... can only be called
+		# from methods inside the same class"), not a real declared method,
+		# so it can never be found via the ordinary _resolve_callee/
+		# _attr_lookup_callable path (it's never in any class's .names) -
+		# recognized textually here instead, same spirit as defer/errdefer
+		# and the arithmetic-mode with-blocks. Returns None (not an error)
+		# when this doesn't look like a __allocate__ call at all, so the
+		# caller falls through to the normal call path and reports whatever
+		# error is actually appropriate (e.g. "not callable")
+		if not ( isinstance( node.func, ast.Attribute ) and node.func.attr == '__allocate__' ):
+			return None
+		target_cls = self._try_resolve_namespace( node.func.value )
+		if not isinstance( target_cls, ClassLike ):
+			return None
+
+		fn = self._current_fn
+		if fn is None or fn.cls is not target_cls:
+			self.discovery.fail(
+				f'{target_cls.qualname}.__allocate__(...) is private - only callable from a method of {target_cls.qualname} itself',
+				node,
+			)
+		return self._lower_allocate_fields( target_cls, node, expected_type, '.__allocate__(...)' )
+
+	def _try_lower_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
+		# bare ClassName(field=value, ...) - SYNTAX.md sugar: allocate, then
+		# call __init__() if declared, wrapping the result in Result[Foo,E]
+		# when __init__ can fail and dropping the refcount to 0 (skipping
+		# __del__) on failure. None of the __init__-invocation/failure-
+		# cleanup machinery exists yet (needs refcounting/CFG), but a class
+		# with no __init__ at all has no such path to support - construction
+		# there degrades to exactly __allocate__, so that narrower case can
+		# be supported now. A class WITH __init__ falls through (returns
+		# None) to the normal call path, which reports "not callable" until
+		# __init__ invocation is implemented.
+		target_cls = self._try_resolve_namespace( node.func )
+		if not isinstance( target_cls, ClassLike ):
+			return None
+		self._ensure_resolved( target_cls )
+		if '__init__' in target_cls.names:
+			return None
+		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
+
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		allocate_dest = self._try_lower_allocate_call( node, expected_type )
+		if allocate_dest is None:
+			allocate_dest = self._try_lower_construct_call( node, expected_type )
+		if allocate_dest is not None:
+			return allocate_dest if want_result else None
+
 		target, receiver = self._resolve_callee( node.func )
 		if receiver is not None:
 			self.schedule( receiver.type )

@@ -7,7 +7,7 @@ import unittest
 from compiler import Compiler, LoweredFunction
 from discovery import Discovery
 import ir
-from mpy_types import Variable
+from mpy_types import Variable, Specialization
 
 logger = logging.getLogger( __name__ )
 
@@ -1175,6 +1175,206 @@ class Tests( unittest.TestCase ):
 			ir.Return( value = None ),
 			ir.FuncEnd( name = 'main' ),
 		])
+
+	# --- object construction (Class.__allocate__) ---------------------------
+
+	def test_allocate_emits_allocate_instruction( self ) -> None:
+		# Class.__allocate__(...) is a compiler-synthesized pseudo-method,
+		# never in any class's .names - recognized textually in
+		# _try_lower_allocate_call, same spirit as defer/errdefer
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'	y: i32',
+			'',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Foo:',
+			'		return Foo.__allocate__( x = v, y = 2 )',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		i32 = self.discovery.get_intrinsics()['i32']
+		v = make_fn.parameters[0]
+		t0 = ir.Temp( type = foo_cls, id = 0 )
+
+		fn = self.compiler._lower( make_fn )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = make_fn.qualname, params = [ v ], return_type = foo_cls ),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Allocate( dest = t0, cls = foo_cls, fields = { 'x': v, 'y': ir.Const( type = i32, value = 2 ) } ),
+			ir.Return( value = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.FuncEnd( name = make_fn.qualname ),
+		])
+
+	def test_allocate_dest_type_uses_expected_type_when_given( self ) -> None:
+		# res: Foo[i32] = Foo.__allocate__(...) - the annotation's
+		# specialization is the dest temp's type, not the bare generic class
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo[T]:',
+			'	x: T',
+			'',
+			'	@staticmethod',
+			'	def make( v: T ) -> Foo[T]:',
+			'		res: Foo[T] = Foo.__allocate__( x = v )',
+			'		return res',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		fn = self.compiler._lower( make_fn )
+		allocate_instr = next( i for i in fn.instructions if isinstance( i, ir.Allocate ))
+		self.assertIsInstance( allocate_instr.dest.type, Specialization )
+		self.assertIs( allocate_instr.dest.type.base, foo_cls )
+
+	def test_allocate_external_call_is_rejected( self ) -> None:
+		# strictly private per SYNTAX.md - only callable from a method of
+		# the same class
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.__allocate__( x = 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'is private', self.discovery.errors.errors[0] )
+
+	def test_allocate_missing_field_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'	y: i32',
+			'',
+			'	@staticmethod',
+			'	def make() -> Foo:',
+			'		return Foo.__allocate__( x = 1 )',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		self.compiler._lower( make_fn )
+		self.assertIn( 'missing field', self.discovery.errors.errors[0] )
+		self.assertIn( 'y', self.discovery.errors.errors[0] )
+
+	def test_allocate_extra_field_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'',
+			'	@staticmethod',
+			'	def make() -> Foo:',
+			'		return Foo.__allocate__( x = 1, z = 2 )',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		self.compiler._lower( make_fn )
+		self.assertIn( 'no field', self.discovery.errors.errors[0] )
+		self.assertIn( 'z', self.discovery.errors.errors[0] )
+
+	def test_allocate_positional_args_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'',
+			'	@staticmethod',
+			'	def make() -> Foo:',
+			'		return Foo.__allocate__( 1 )',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		self.compiler._lower( make_fn )
+		self.assertIn( 'keyword arguments only', self.discovery.errors.errors[0] )
+
+	def test_bare_construct_emits_allocate_instruction_when_no_init( self ) -> None:
+		# ClassName(field=value, ...) with no __init__ declared degrades to
+		# exactly __allocate__ (SYNTAX.md's __init__-invocation/failure-
+		# wrapping path is future work) - and unlike .__allocate__(...), it's
+		# public: callable from outside the class entirely, not just its
+		# own methods.
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'	y: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo( x = 1, y = 2 )',
+			'	return',
+		])
+		mod = self._import( code )
+		fn = self._lower_main()
+		foo_cls = mod.get_local( 'Foo' )
+		i32 = self.discovery.get_intrinsics()['i32']
+		allocate_instr = next( i for i in fn.instructions if isinstance( i, ir.Allocate ))
+		self.assertIs( allocate_instr.cls, foo_cls )
+		self.assertEqual( allocate_instr.fields, {
+			'x': ir.Const( type = i32, value = 1 ),
+			'y': ir.Const( type = i32, value = 2 ),
+		})
+
+	def test_bare_construct_with_init_declared_is_not_yet_supported( self ) -> None:
+		# a class WITH __init__ falls through to the normal call path -
+		# construction via __init__ needs Result-wrapping/refcount-on-
+		# failure cleanup that doesn't exist yet, so this must NOT silently
+		# degrade to a plain __allocate__ (that would skip __init__ entirely)
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'',
+			'	def __init__( self ) -> None:',
+			'		return',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo( x = 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'cannot call', self.discovery.errors.errors[0] )
+
+	def test_bare_construct_missing_field_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'	y: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo( x = 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'missing field', self.discovery.errors.errors[0] )
+		self.assertIn( 'y', self.discovery.errors.errors[0] )
 
 	# --- attributes / subscripts --------------------------------------------
 

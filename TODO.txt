@@ -30,6 +30,28 @@ lowering:
 		real ownership tracking, not as a standalone .leaves() override -
 		that would make ownership invisible to matching entirely (an owned
 		vs. borrowed overload pair would incorrectly collide as ambiguous)
+	
+	additional NoReturn semantics:
+		previously I stated NoReturn is just a None with a flag for the emitter.
+		I was incorrect.
+		
+		A return statement in a NoReturn function should be a compile error:
+		
+			def die() -> NoReturn
+				return
+		
+		Additionally, we need dead code detection. The following print statement
+		is unreachable because die() is NoReturn. It should be a compile error,
+		but I'm guessing this will be dependent on the CFG being implemented first:
+		
+			def foo() -> None:
+				die()
+				print( 'hello' )
+	
+	builtins.Result was written before @union was scoped, so it is implemented as
+		@cunion+@cstruct. Result needs to be simplified to a @union so ResultPayload
+		can be eliminated.
+	
 	if statements
 	for x in range( ... ):
 	while statements
