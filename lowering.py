@@ -20,6 +20,19 @@ class _DeferBlock:
 	flag: Variable # bool local, False until control passes the defer/errdefer statement
 	instructions: list['ir.Instruction'] # captured at registration time, replayed in the epilogue
 
+@dataclass( kw_only = True )
+class _ReceiverDispatch:
+	''' `_resolve_callee`'s answer when an attribute call's receiver is a
+	union type and the attribute isn't found on the union itself (e.g.
+	copy_from.get_const_ptr() where copy_from: bytes|bytearray) - each leaf
+	type has its own unrelated method under this name, so unlike Overload
+	(one shared Function, resolved by argument types) there's no single
+	target Function here at all, just one per leaf, picked by the
+	RECEIVER's own runtime tag. See _lower_union_receiver_call. '''
+	union: TaggedUnion
+	attr: str
+	per_leaf: list[tuple[Variable,Function]] # (union.attributes member, that leaf's resolved method)
+
 _BINOP_WRAP_OPCODES: dict[type,type] = {
 	ast.Add: ir.AddWrap,
 	ast.Sub: ir.SubWrap,
@@ -1501,7 +1514,7 @@ class Lowering:
 			return self.discovery._get_or_create_specialization( base, args )
 		return None
 
-	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization,ir.Operand|None]:
+	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization|_ReceiverDispatch,ir.Operand|None]:
 		namespace_result = self._try_resolve_namespace( func_node )
 		if isinstance( namespace_result, ( Function, Overload )):
 			return namespace_result, None
@@ -1511,8 +1524,51 @@ class Lowering:
 		if not isinstance( func_node, ast.Attribute ):
 			self.discovery.fail( f'cannot call {ast.unparse(func_node)}', func_node )
 		receiver = self._lower_expr( func_node.value, None )
+		if isinstance( receiver.type, TaggedUnion ):
+			self._ensure_resolved( receiver.type )
+			direct = receiver.type.names.get( func_node.attr )
+			if not isinstance( direct, ( Function, Overload )):
+				return self._resolve_union_receiver_members( receiver.type, func_node.attr, func_node ), receiver
 		target = self._attr_lookup_callable( receiver.type, func_node.attr, func_node )
 		return target, receiver
+
+	def _resolve_union_receiver_members( self, union: TaggedUnion, attr: str, ctx: ast.AST ) -> _ReceiverDispatch:
+		# the union itself has no .names entry for attr (an anonymous X|Y
+		# union never does; a real @union class only reaches here if it
+		# doesn't declare attr as a real method of its own) - so each leaf
+		# type's own, unrelated method under this name has to be looked up
+		# individually instead, then dispatched on the receiver's runtime tag
+		per_leaf: list[tuple[Variable,Function]] = []
+		for member in union.attributes:
+			if member.resolve is not None:
+				member.resolve()
+			found = self._attr_lookup_callable( member.type, attr, ctx )
+			if not isinstance( found, Function ):
+				self.discovery.fail(
+					f'{member.type.qualname if member.type else "?"}.{attr} is an overload group - calling an overloaded '
+					f'method through a union receiver is not supported yet: {ast.unparse(ctx)}',
+					ctx,
+				)
+			self._ensure_resolved( found ) # need .return_type/.parameters populated for the signature-consistency check just below
+			per_leaf.append(( member, found ))
+
+		reference = per_leaf[0][1]
+		for member, fn in per_leaf[1:]:
+			if fn.return_type is not reference.return_type:
+				self.discovery.fail(
+					f'{union.qualname}.{attr}(...): leaf implementations disagree on return type '
+					f'({reference.cls.qualname if reference.cls else "?"}.{attr} -> '
+					f'{reference.return_type.qualname if reference.return_type else "None"}, '
+					f'{member.type.qualname if member.type else "?"}.{attr} -> '
+					f'{fn.return_type.qualname if fn.return_type else "None"})',
+					ctx,
+				)
+			if len( fn.parameters or [] ) != len( reference.parameters or [] ):
+				self.discovery.fail(
+					f'{union.qualname}.{attr}(...): leaf implementations have differing parameter counts, not supported yet',
+					ctx,
+				)
+		return _ReceiverDispatch( union = union, attr = attr, per_leaf = per_leaf )
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
 		self._ensure_resolved( owner_type ) # Specialization.resolve/.names passthrough to .base - no unwrap needed
@@ -1814,6 +1870,9 @@ class Lowering:
 		if receiver is not None:
 			self.schedule( receiver.type )
 
+		if isinstance( target, _ReceiverDispatch ):
+			return self._lower_union_receiver_call( node, target, receiver, expected_type, want_result )
+
 		if isinstance( target, Function ) and target.stem == 'or_return' and target.cls is self.discovery.find_name( 'Result', node ):
 			return self._lower_or_return( node, receiver, want_result )
 
@@ -1948,4 +2007,46 @@ class Lowering:
 		self._emit( ir.GetAttr( dest = payload_dest, obj = operand, attr = data_attr.stem ))
 		dest = self._new_temp( target_type )
 		self._emit( ir.GetAttr( dest = dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+		return dest
+
+	def _lower_union_receiver_call( self, node: ast.Call, dispatch: _ReceiverDispatch, receiver: ir.Operand, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# copy_from.get_const_ptr() where copy_from: bytes|bytearray - unlike
+		# _lower_conditional_dispatch (one shared Function, a union-typed
+		# ARGUMENT unwrapped per branch), each leaf here has its own
+		# unrelated method under this name, so what's dispatched on is the
+		# RECEIVER's own tag instead - same tag/data/v_<member> machinery
+		# match statements and dispatch already use (_tagged_union_storage),
+		# just no shared target Function to reuse ConditionalDispatch with
+		reference = dispatch.per_leaf[0][1]
+		for _member, fn in dispatch.per_leaf:
+			self._ensure_resolved( fn )
+		positional, keyword = self._match_call_args( reference, node )
+		args = [ self._lower_expr( expr, param.type ) for param, expr in positional ]
+		kwargs = { param.stem: self._lower_expr( expr, param.type ) for param, expr in keyword }
+
+		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( dispatch.union )
+		bool_cls = self.discovery.find_name( 'bool', node )
+		dest = self._new_temp( expected_type or reference.return_type ) if want_result else None
+		end_label = self._new_label( 'recv_dispatch_end' )
+		for i, ( member, fn ) in enumerate( dispatch.per_leaf ):
+			is_last = i == len( dispatch.per_leaf ) - 1
+			if not is_last:
+				next_label = self._new_label( 'recv_dispatch_next' )
+				tag_dest = self._new_temp( tag_attr.type )
+				self._emit( ir.GetAttr( dest = tag_dest, obj = receiver, attr = tag_attr.stem ))
+				cmp_dest = self._new_temp( bool_cls )
+				self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] )))
+				self._emit( ir.JumpIfFalse( cond = cmp_dest, target = next_label ))
+			payload_dest = self._new_temp( payload_cls )
+			self._emit( ir.GetAttr( dest = payload_dest, obj = receiver, attr = data_attr.stem ))
+			narrowed = self._new_temp( member.type )
+			self._emit( ir.GetAttr( dest = narrowed, obj = payload_dest, attr = f'v_{member.stem}' ))
+			self.schedule( fn.return_type )
+			for p in fn.parameters or []:
+				self.schedule( p.type )
+			self._emit( ir.Call( dest = dest, target = fn, receiver = narrowed, args = args, kwargs = kwargs ))
+			if not is_last:
+				self._emit( ir.Jump( target = end_label ))
+				self._emit( ir.Label( name = next_label ))
+		self._emit( ir.Label( name = end_label ))
 		return dest

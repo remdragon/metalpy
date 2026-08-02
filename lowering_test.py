@@ -1533,6 +1533,85 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( len( calls ), 2 ) # exactly bytes and bytearray - never a third for strlike
 		self.assertTrue( all( c.target.parameters[0].type is not strlike_cls for c in calls ))
 
+	# --- union-typed receiver method calls (receiver narrowing) ---------------
+
+	def test_union_receiver_call_dispatches_per_leaf( self ) -> None:
+		# mirrors lib/builtins/__init__.py's real copy_from.get_const_ptr()
+		# shape (copy_from: bytes|bytearray) - get_const_ptr isn't an
+		# @overload group, each leaf just has its own unrelated method under
+		# this name, so it's the RECEIVER's own tag that has to be checked,
+		# not any argument's
+		code = '\n'.join([
+			'class A:',
+			'	def get( self ) -> i32:',
+			'		return 1',
+			'',
+			'class B:',
+			'	def get( self ) -> i32:',
+			'		return 2',
+			'',
+			'def main() -> None:',
+			'	x: A|B',
+			'	x.get()',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'Cmp' ), 1 )
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 1 )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 )
+		a_cls = self.discovery.modules['__test__'].get_local( 'A' )
+		b_cls = self.discovery.modules['__test__'].get_local( 'B' )
+		receiver_types = [ c.receiver.type for c in calls ]
+		self.assertIn( a_cls, receiver_types )
+		self.assertIn( b_cls, receiver_types ) # narrowed to the concrete leaf, never the raw A|B union
+		self.assertEqual( len( { id( c.target ) for c in calls } ), 2 ) # A.get and B.get are distinct Functions
+
+	def test_union_receiver_call_mismatched_return_type_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class A:',
+			'	def get( self ) -> i32:',
+			'		return 1',
+			'',
+			'class B:',
+			'	def get( self ) -> bool:',
+			'		return True',
+			'',
+			'def main() -> None:',
+			'	x: A|B',
+			'	x.get()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'disagree on return type', self.discovery.errors.errors[0] )
+
+	def test_union_receiver_call_prefers_a_real_method_declared_on_the_union_itself( self ) -> None:
+		# a real @union class CAN declare its own real method - that wins
+		# outright, with no receiver-narrowing dispatch synthesized at all
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'	Baz: i32',
+			'	def get( self ) -> i32:',
+			'		return 0',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	f.get()',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertIs( calls[0].receiver.type, self.discovery.modules['__test__'].get_local( 'Foo' ))
+
 	# --- bare literal arguments to overloaded calls -----------------------------
 
 	def test_overload_literal_arg_resolves_via_unique_candidate_type( self ) -> None:

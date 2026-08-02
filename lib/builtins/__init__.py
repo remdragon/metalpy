@@ -95,7 +95,7 @@ class bytes:
 	def __init__( self, copy_from: bytes|bytearray ) -> None:
 		self.__len = len( copy_from )
 		data = sys.alloc[u8]( self.__len )
-		sys.memcpy( data, copy_from.get_ptr(), self.__len )
+		sys.memcpy( data, copy_from.get_const_ptr(), self.__len )
 		self.__data = data
 	
 	@staticmethod
