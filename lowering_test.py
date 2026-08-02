@@ -1254,6 +1254,187 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( kinds.count( 'Label' ), 4 )
 		self.assertEqual( kinds.count( 'Assign' ), 3 )
 
+	# --- match statements ------------------------------------------------------
+
+	def test_match_union_shape( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'	Baz: usize',
+			'',
+			'def get() -> Foo:',
+			'	return Foo.Bar( 5 )',
+			'',
+			'def main() -> None:',
+			'	f: Foo = get()',
+			'	match f:',
+			'		case Foo.Bar( x ):',
+			'			y: i32 = x',
+			'		case Foo.Baz( z ):',
+			'			w: usize = z',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		# one Cmp per case (tag == ordinal), one GetAttr per case for the
+		# payload's `data` field plus one more for the specific `v_member`
+		# field (2 each), one JumpIfFalse per case's if, one else-Label,
+		# one Jump+Label for the if/elif split
+		self.assertEqual( kinds.count( 'Cmp' ), 2 )
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 4 ) # 2 booland short-circuits + 2 if-tests
+
+	def test_match_union_construction_and_extraction_round_trip( self ) -> None:
+		# construct with one member, match should take that member's arm
+		# and correctly extract its value (verified via the field names/
+		# types actually referenced, not by literally executing the IR)
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	match f:',
+			'		case Foo.Bar( x ):',
+			'			y: i32 = x',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		getattrs = [ i for i in fn.instructions if isinstance( i, ir.GetAttr ) ]
+		self.assertEqual( [ g.attr for g in getattrs ], [ 'tag', 'data', 'v_Bar' ] )
+
+	def test_match_result_ok_err_shape( self ) -> None:
+		# Result.Ok/Result.Err are special-cased directly (is_ok()/is_err()
+		# + _payload.ok/._payload.err) rather than routed through
+		# _tagged_union_storage, since Result predates @union and isn't a
+		# real TaggedUnion
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cunion',
+			'class ResultPayload[T,E]:',
+			'	ok: T',
+			'	err: E',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	_payload: ResultPayload[T,E]',
+			'	_tag: u8',
+			'',
+			'	@staticmethod',
+			'	def Ok( val: T ) -> Result[T,E]:',
+			'		return Result.__allocate__( _payload = ResultPayload( ok = val ), _tag = 0 )',
+			'',
+			'	def is_ok( self ) -> bool:',
+			'		return self._tag == 0',
+			'',
+			'	def is_err( self ) -> bool:',
+			'		return self._tag == 1',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def main() -> None:',
+			'	r: Result[i32,MyError] = get()',
+			'	match r:',
+			'		case Result.Ok( v ):',
+			'			x: i32 = v',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'Call', kinds ) # is_ok()
+		getattrs = [ i for i in fn.instructions if isinstance( i, ir.GetAttr ) ]
+		self.assertEqual( [ g.attr for g in getattrs ], [ '_payload', 'ok' ] )
+
+	def test_match_wildcard_binds_whole_subject( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	match f:',
+			'		case whatever:',
+			'			pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_match_guard_is_not_yet_supported( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	match f:',
+			'		case Foo.Bar( x ) if x > 0:',
+			'			pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'guards', self.discovery.errors.errors[0] )
+
+	def test_match_unknown_member_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Foo:',
+			'	Bar: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	match f:',
+			'		case Foo.NotAMember( x ):',
+			'			pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'has no member', self.discovery.errors.errors[0] )
+
+	# --- generic field-type substitution (_attr_lookup) -----------------------
+
+	def test_attr_lookup_substitutes_generic_field_type_through_specialization( self ) -> None:
+		# Result[T,E]'s _payload field is declared using Result's OWN
+		# type params (ResultPayload[T,E]) - accessing it through a
+		# concrete Result[i32,MyError] must substitute T->i32, E->MyError,
+		# not return the bare TypeVars
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cunion',
+			'class Payload[T,E]:',
+			'	ok: T',
+			'	err: E',
+			'',
+			'@cstruct',
+			'class Holder[T,E]:',
+			'	payload: Payload[T,E]',
+			'',
+			'def main( h: Holder[i32,MyError] ) -> None:',
+			'	x: i32 = h.payload.ok',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		i32 = self.discovery.get_intrinsics()['i32']
+		getattr_ok = next( i for i in fn.instructions if isinstance( i, ir.GetAttr ) and i.attr == 'ok' )
+		self.assertEqual( getattr_ok.dest.type, i32 )
+
 	# --- loops (while / for / break / continue) -----------------------------
 
 	def test_while_shape( self ) -> None:

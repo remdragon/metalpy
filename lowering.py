@@ -1,7 +1,7 @@
 # stdlib imports:
 import ast
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 # local imports:
@@ -10,7 +10,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CUnion,
+	Specialization, TaggedUnion, CUnion, TypeVar,
 )
 
 @dataclass( kw_only = True )
@@ -879,6 +879,116 @@ class Lowering:
 		else:
 			self._emit( ir.Label( name = else_label ))
 
+	def _stmt_Match( self, node: ast.Match ) -> None:
+		# desugars to a synthesized if/elif chain (one arm per case, in
+		# source order), delegating to _stmt_If for the actual branching -
+		# each arm's test is built by _match_pattern below. The subject is
+		# lowered exactly once into a hidden local (same technique as the
+		# for-loop's scaffolding: a real named Variable registered into the
+		# function's own scope, so the synthesized per-case AST can
+		# reference it by name repeatedly with no re-evaluation risk)
+		subj = self._lower_expr( node.subject, None )
+		subj_var = self._declare_hidden_local( f'__match_subj_{self._label_id}', subj.type, node )
+		self._emit( ir.Assign( dest = subj_var, src = subj ))
+		subj_name = self._synth_name( subj_var.stem, node )
+
+		chain: ast.If|None = None
+		tail: ast.If|None = None
+		for case in node.cases:
+			if case.guard is not None:
+				self.discovery.fail( f'match guards (case ... if ...) are not yet supported: {ast.unparse(case.pattern)}', node )
+			test, binds = self._match_pattern( subj_name, subj_var.type, case.pattern, node )
+			arm = ast.If( test = test, body = [ *binds, *case.body ], orelse = [] )
+			ast.copy_location( arm, node )
+			if chain is None:
+				chain = arm
+			else:
+				tail.orelse = [ arm ]
+			tail = arm
+
+		if chain is not None:
+			self._stmt_If( chain )
+
+	def _match_pattern( self, subj_expr: ast.expr, subj_type: Type|None, pattern: ast.pattern, node: ast.AST ) -> tuple[ast.expr,list[ast.stmt]]:
+		# returns (test_expr, binding_stmts): test_expr is a boolean AST
+		# expression (lowered later, via the enclosing synthesized If, with
+		# bool_cls as its expected type) that's True iff subj_expr matches
+		# pattern; binding_stmts are synthesized Assign statements for
+		# whatever names the pattern introduces - only valid once test_expr
+		# has evaluated True, so the caller must place them inside the
+		# resulting if-body, never unconditionally
+		if isinstance( pattern, ast.MatchAs ) and pattern.pattern is None:
+			# a bare name (or `_` - Python parses a wildcard the same way,
+			# with name=None) - matches anything unconditionally; binds the
+			# whole subject if a name was actually given
+			test = ast.Constant( value = True )
+			ast.copy_location( test, node )
+			if pattern.name is None:
+				return test, []
+			bind = ast.Assign( targets = [ ast.Name( id = pattern.name, ctx = ast.Store() ) ], value = subj_expr )
+			ast.copy_location( bind, node )
+			return test, [ bind ]
+
+		if not isinstance( pattern, ast.MatchClass ):
+			self.discovery.fail( f'unsupported match pattern: {ast.unparse(pattern)}', node )
+		if pattern.kwd_patterns or len( pattern.patterns ) != 1:
+			self.discovery.fail( f'match patterns support exactly one positional sub-pattern: {ast.unparse(pattern)}', node )
+		if not isinstance( pattern.cls, ast.Attribute ):
+			self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
+
+		owner = self._try_resolve_namespace( pattern.cls.value )
+		result_cls = self.discovery.find_name_or_none( 'Result' )
+		if result_cls is not None and owner is result_cls and pattern.cls.attr in ( 'Ok', 'Err' ):
+			# Result.Ok(...)/Result.Err(...) - Result isn't a real
+			# TaggedUnion (it predates @union being scoped - see
+			# lowering.py's other Result-specific comments), so this is
+			# special-cased the same way .or_return() is: reuses is_ok()/
+			# is_err() and the real _payload.ok/_payload.err fields
+			# directly instead of routing through _tagged_union_storage
+			is_ok = pattern.cls.attr == 'Ok'
+			if not ( isinstance( subj_type, Specialization ) and subj_type.base is result_cls and len( subj_type.args ) == 2 ):
+				self.discovery.fail( f'{ast.unparse(pattern.cls)}(...) pattern used against a non-Result subject: {ast.unparse(pattern)}', node )
+			ok_type, err_type = subj_type.args
+			test = ast.Call(
+				func = ast.Attribute( value = subj_expr, attr = ( 'is_ok' if is_ok else 'is_err' ), ctx = ast.Load() ),
+				args = [], keywords = [],
+			)
+			ast.copy_location( test, node )
+			payload_expr = ast.Attribute(
+				value = ast.Attribute( value = subj_expr, attr = '_payload', ctx = ast.Load() ),
+				attr = ( 'ok' if is_ok else 'err' ),
+				ctx = ast.Load(),
+			)
+			ast.copy_location( payload_expr, node )
+			inner_test, inner_binds = self._match_pattern( payload_expr, ok_type if is_ok else err_type, pattern.patterns[0], node )
+			combined = ast.BoolOp( op = ast.And(), values = [ test, inner_test ] )
+			ast.copy_location( combined, node )
+			return combined, inner_binds
+
+		if isinstance( owner, TaggedUnion ):
+			self._ensure_resolved( owner )
+			member = next( ( attr for attr in owner.attributes if attr.stem == pattern.cls.attr ), None )
+			if member is None:
+				self.discovery.fail( f'{owner.qualname} has no member {pattern.cls.attr!r}: {ast.unparse(pattern)}', node )
+			self._ensure_resolved( member )
+			tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( owner )
+			tag_expr = ast.Attribute( value = subj_expr, attr = tag_attr.stem, ctx = ast.Load() )
+			ast.copy_location( tag_expr, node )
+			test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
+			ast.copy_location( test, node )
+			payload_expr = ast.Attribute(
+				value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
+				attr = f'v_{member.stem}',
+				ctx = ast.Load(),
+			)
+			ast.copy_location( payload_expr, node )
+			inner_test, inner_binds = self._match_pattern( payload_expr, member.type, pattern.patterns[0], node )
+			combined = ast.BoolOp( op = ast.And(), values = [ test, inner_test ] )
+			ast.copy_location( combined, node )
+			return combined, inner_binds
+
+		self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
+
 	# --- expressions -----------------------------------------------------------
 
 	def _lower_expr( self, node: ast.expr, expected_type: Type|None ) -> ir.Operand:
@@ -1196,7 +1306,40 @@ class Lowering:
 		if not isinstance( found, Variable ):
 			self.discovery.fail( f'{owner_type.qualname if owner_type else "?"} has no attribute {attr!r}', ctx )
 		self._ensure_resolved( found )
-		return found
+		return self._substituted_field( found, owner_type )
+
+	def _substituted_field( self, found: Variable, owner_type: Type|None ) -> Variable:
+		# a field declared using its owning generic class's own type params
+		# (e.g. Result[T,E]'s `_payload: ResultPayload[T,E]`) is stored ONCE,
+		# unsubstituted, on the class itself - accessing it through a
+		# concrete Specialization (Result[Ptr[u8],OwnershipError]) must
+		# substitute T/E with that Specialization's own args, or every
+		# access sees the bare TypeVars regardless of which instantiation it
+		# went through (this was invisible before match statements: nothing
+		# previously read a generic field's type this way - checked-
+		# arithmetic/or_return() consume a Result's payload via a dedicated
+		# opcode on the whole Result value, never by synthesizing a literal
+		# `.field` AST and lowering it)
+		type_params = getattr( getattr( owner_type, 'base', None ), 'type_params', None )
+		if not isinstance( owner_type, Specialization ) or not type_params:
+			return found
+		substituted_type = self._substitute_type_params( found.type, type_params, owner_type.args )
+		if substituted_type is found.type:
+			return found
+		return replace( found, type = substituted_type ) # a shallow copy - `found` is the SAME shared Variable object for every access of this field, regardless of specialization, so this must not mutate it in place
+
+	def _substitute_type_params( self, t: Type|None, type_params: list[TypeVar], args: list[Type] ) -> Type|None:
+		if isinstance( t, TypeVar ):
+			for param, arg in zip( type_params, args ):
+				if t is param:
+					return arg
+			return t
+		if isinstance( t, Specialization ):
+			substituted_args = [ self._substitute_type_params( a, type_params, args ) for a in t.args ]
+			if all( sa is a for sa, a in zip( substituted_args, t.args )):
+				return t
+			return self.discovery._get_or_create_specialization( t.base, substituted_args )
+		return t
 
 	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
 		# a *silent* probe: is this expression a compile-time-resolvable
@@ -1374,6 +1517,19 @@ class Lowering:
 			names = { f.stem: f for f in payload_fields },
 		)
 		data_attr = Variable( stem = 'data', qualname = f'{union.qualname}.data', file = union.file, line = union.line, type = payload_cls )
+		# register into union.names (NOT .attributes - that list backs
+		# .leaves(), which must still only reflect the real union members
+		# for overload/type matching) so ordinary GetAttr resolution
+		# (_attr_lookup, used by _expr_Attribute for synthesized `subj.tag`/
+		# `subj.data` AST) can actually find them
+		for synthesized in ( tag_attr, data_attr ):
+			existing = union.names.get( synthesized.stem )
+			if existing is not None and existing is not synthesized:
+				self.discovery.fail_loc(
+					f'{union.qualname} already declares a member named {synthesized.stem!r}, which collides with the compiler-synthesized union storage field of the same name',
+					union.file, union.line,
+				)
+			union.names[synthesized.stem] = synthesized
 		tags = { attr.stem: i for i, attr in enumerate( union.attributes ) }
 		result = ( tag_attr, data_attr, payload_cls, tags )
 		self._union_storage[ id( union ) ] = result

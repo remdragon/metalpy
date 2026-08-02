@@ -51,7 +51,33 @@ lowering:
 	builtins.Result was written before @union was scoped, so it is implemented as
 		@cunion+@cstruct. Result needs to be simplified to a @union so ResultPayload
 		can be eliminated.
-	
+
+	generic TaggedUnion member substitution: lowering.py's _attr_lookup now
+		substitutes a field's declared type through a Specialization's args
+		(fixes e.g. Result[i32,MyError]._payload correctly reading as
+		ResultPayload[i32,MyError], not the bare ResultPayload[T,E]) - but
+		this only covers ordinary field access. A match `case` pattern's
+		bound name, when it comes from a *generic* TaggedUnion member (e.g.
+		`case sys.OwnershipError.SharedReference(x):` where OwnershipError
+		is `@union class OwnershipError[T]:`), still gets the member's bare
+		unsubstituted TypeVar as its type, because match resolves the
+		pattern's owner class from the case syntax itself (`sys.OwnershipError`,
+		never subscripted - match patterns can't spell `[T]`) rather than from
+		the subject's own concrete type. Confirmed via repro: `x.get_const_ptr()`
+		fails ("TypeVar T has no members") when x is bound from a generic
+		union member, even though a plain Result payload works fine now, and
+		even though just binding x without using it works fine too. Fixing
+		this for real needs _tagged_union_storage to be aware of which
+		Specialization the match subject actually has (not just the bare
+		union class it's memoized by) so it can synthesize/select a
+		correctly-substituted payload type per instantiation - directly
+		relevant to str.from_cstr's `case Result.Err(sys.OwnershipError.
+		SharedReference(src2)): ... src2.get_const_ptr()` (lib/builtins/
+		__init__.py), which is ALSO still blocked today by the separate
+		move[T]/Move.leaves() gap noted above (len(src) where src:
+		move[bytearray] doesn't resolve), so this doesn't block anything
+		that would otherwise compile yet
+
 	if statements
 	for x in range( ... ):
 	while statements
