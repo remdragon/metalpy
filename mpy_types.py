@@ -45,6 +45,19 @@ class Specialization( Type ):
 	base: Type
 	args: list[Type]
 
+	# a Specialization has no members of its own - a generic's methods/
+	# attributes live entirely on its base (e.g. Result[T,E]'s .is_err lives
+	# on Result, not on any particular Result[i32,Err]) - these passthroughs
+	# let callers (lowering.py's _ensure_resolved/_attr_lookup*) treat a
+	# Specialization exactly like any other Type without unwrapping it first
+	@property
+	def resolve( self ) -> Callable[[],None]|None:
+		return getattr( self.base, 'resolve', None )
+
+	@property
+	def names( self ) -> dict[str,Name]|None:
+		return getattr( self.base, 'names', None )
+
 @dataclass( kw_only = True )
 class Variable( Name ):
 	type: Type|None = None

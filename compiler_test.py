@@ -130,6 +130,46 @@ def main() -> None:
 		self.assertEqual( call.target.qualname, '__main__.Foo.bump' )
 		self.assertIsNotNone( call.receiver )
 
+	def test_class_reached_only_as_an_intermediate_attribute_chain_link_is_scheduled( self ) -> None:
+		# Inner never appears as its own parameter/return/local-variable
+		# annotation anywhere - the only way to learn it exists at all is by
+		# resolving Outer.inner's field type while chasing o.inner.value.
+		# _attr_lookup used to resolve() the owner type (so the lookup itself
+		# succeeds) without ever scheduling it, so Inner would silently never
+		# make it into compiler.rcclasses even though get_value depends on it
+		self._run( '''
+class Inner:
+	value: i32
+
+class Outer:
+	inner: Inner
+
+def get_value( o: Outer ) -> i32:
+	return o.inner.value
+
+def main() -> None:
+	o: Outer
+	x: i32 = get_value( o )
+''' )
+		rcclass_names = [ cls.qualname for cls in self.compiler.rcclasses ]
+		self.assertIn( '__main__.Outer', rcclass_names )
+		self.assertIn( '__main__.Inner', rcclass_names )
+
+	def test_class_reached_only_via_a_staticmethod_call_is_scheduled( self ) -> None:
+		# same gap, different path: Foo is never used as a parameter/return/
+		# local-variable type anywhere - the only way to reach it is resolving
+		# it while walking the Foo.make() namespace path in _try_resolve_namespace
+		self._run( '''
+class Foo:
+	@staticmethod
+	def make() -> i32:
+		return 1
+
+def main() -> None:
+	x: i32 = Foo.make()
+''' )
+		self.assertIn( '__main__.Foo', [ cls.qualname for cls in self.compiler.rcclasses ] )
+
 class OverloadCallSiteTests( CompilerTestCase ):
 	def test_unconditional_target_schedules_only_that_target( self ) -> None:
 		self._run( '''

@@ -648,20 +648,25 @@ class Lowering:
 		# and unlike a Function/global reference (scheduled onto the work
 		# queue, resolved whenever it's eventually dequeued), an attribute or
 		# method lookup needs the answer immediately, mid-statement, so this
-		# can't wait for the queue to get there on its own
+		# can't wait for the queue to get there on its own.
+		#
+		# also schedules obj itself (when it's a Type - ClassLike/
+		# Specialization/TaggedUnion; anything else is a harmless no-op via
+		# _schedule_type_deps) - a type only ever reached as the owner of an
+		# attribute/method lookup (e.g. the middle Inner of o.inner.value,
+		# never itself bound to an annotated variable or passed as a typed
+		# argument) previously had its .names resolved for the lookup but was
+		# never added to the compiler's own output lists, so stage 3 would
+		# silently never emit it
 		resolve = getattr( obj, 'resolve', None )
 		if resolve is not None:
 			resolve()
-
-	def _unwrap_specialization( self, t: Type|None ) -> Type|None:
-		# a Specialization (e.g. Result[None,OverflowError]) has no .names of
-		# its own - methods/attributes live on the generic base (Result[T,E])
-		return t.base if isinstance( t, Specialization ) else t
+		if isinstance( obj, Type ):
+			self._schedule_type_deps( obj )
 
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
-		lookup_type = self._unwrap_specialization( owner_type )
-		self._ensure_resolved( lookup_type )
-		names = getattr( lookup_type, 'names', None )
+		self._ensure_resolved( owner_type ) # Specialization.resolve/.names passthrough to .base - no unwrap needed
+		names = getattr( owner_type, 'names', None )
 		if not isinstance( names, dict ):
 			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 		found = names.get( attr )
@@ -706,9 +711,8 @@ class Lowering:
 		return target, receiver
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
-		lookup_type = self._unwrap_specialization( owner_type )
-		self._ensure_resolved( lookup_type )
-		names = getattr( lookup_type, 'names', None )
+		self._ensure_resolved( owner_type ) # Specialization.resolve/.names passthrough to .base - no unwrap needed
+		names = getattr( owner_type, 'names', None )
 		if not isinstance( names, dict ):
 			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 		found = names.get( attr )
