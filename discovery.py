@@ -916,11 +916,11 @@ class Discovery( ast.NodeVisitor ):
 		# class_obj already are - no separate back-reference field needed on
 		# Function itself.
 		group: Overload|None = None
-		if is_overload or isinstance( existing, Overload ):
+		if is_overload or isinstance( existing, ( Overload, Function )):
 			if isinstance( existing, Overload ):
 				group = existing
 			else:
-				if existing is not None:
+				if existing is not None and not isinstance( existing, Function ):
 					self.fail( f'{qualname} redefines {existing!r} as an overload group', node )
 				group = Overload(
 					stem = fn.stem,
@@ -932,6 +932,21 @@ class Discovery( ast.NodeVisitor ):
 				scope.add_name( fn.stem, group )
 				if class_obj is not None:
 					class_obj.methods.append( group )
+				if isinstance( existing, Function ):
+					# existing was itself a plain (non-@overload) def, parsed
+					# before any sibling gave this name a reason to become a
+					# group - fold it in as this group's first implementation
+					# rather than losing it to add_name's overwrite below.
+					# Its resolver closure was built back when group was still
+					# None (parsing is a single forward pass, so existing.resolve
+					# is guaranteed not to have run yet) - rebuild it now that
+					# group actually exists, so existing's own resolve() also
+					# runs _check_overload_ambiguity against its new siblings,
+					# the same as every other plain implementation does.
+					group.implementations.append( existing )
+					if class_obj is not None:
+						class_obj.methods.remove( existing )
+					existing.resolve = self._make_function_resolver( existing, module, class_obj, group )
 			if is_overload and self._is_stub_body( node.body ):
 				group.stubs.append( fn )
 			else:

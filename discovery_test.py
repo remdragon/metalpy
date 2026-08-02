@@ -924,6 +924,52 @@ class Foo:
 		self.assertIn( group, foo.methods )
 		self.assertEqual( len( foo.methods ), 1 ) # not duplicated per overload member
 
+	def test_two_plain_implementations_with_no_overload_decorator_form_a_group( self ) -> None:
+		# mirrors the real builtins.str.from_cstr: neither def is @overload -
+		# their distinct arities alone are enough to make them unambiguous, so
+		# no @overload is needed anywhere for this to be legal
+		mod = self._import( '''
+class Foo:
+	@staticmethod
+	def from_thing( buf: i32, length: usize ) -> i32:
+		return buf
+
+	@staticmethod
+	def from_thing( src: usize ) -> i32:
+		return 0
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		group = foo.get_local( 'from_thing' )
+		self.assertIsInstance( group, Overload )
+		self.assertEqual( len( group.stubs ), 0 )
+		self.assertEqual( len( group.implementations ), 2 )
+		self.assertIn( group, foo.methods )
+		self.assertEqual( len( foo.methods ), 1 ) # first def's own methods-entry was folded into the group, not left dangling
+
+		for fn in group.implementations:
+			if fn.resolve is not None: # resolving one cross-resolves its sibling too, via the ambiguity check
+				fn.resolve()
+		self.assertEqual( [ p.stem for p in group.implementations[0].parameters ], [ 'buf', 'length' ])
+		self.assertEqual( [ p.stem for p in group.implementations[1].parameters ], [ 'src' ])
+
+	def test_module_level_plain_redefinition_forms_a_group( self ) -> None:
+		# same as above, but at module scope rather than inside a class - the
+		# group-formation path isn't class_obj-specific
+		mod = self._import( '''
+class usize: pass
+class str: pass
+
+def parse( x: usize ) -> usize:
+	return x
+
+def parse( x: str ) -> usize:
+	return 0
+''' )
+		group = mod.get_local( 'parse' )
+		self.assertIsInstance( group, Overload )
+		self.assertEqual( len( group.implementations ), 2 )
+
 
 class OverloadWellFormednessTests( unittest.TestCase ):
 	''' binding (@overload stub -> plain implementation) and the well-formedness checks - all triggered from Function.resolve() '''
@@ -1006,6 +1052,24 @@ def foo( x: str ) -> None:
 	pass
 ''' )
 		group = mod.get_local( 'foo' )
+		group.implementations[0].resolve()
+		self.assertIn( 'ambiguous', self.discovery.errors.errors[0] )
+
+	def test_overlapping_plain_implementations_error_with_no_overload_decorator_at_all( self ) -> None:
+		# same ambiguity, but with zero @overload decorators anywhere - group
+		# formation itself (not just the well-formedness check) must trigger
+		# purely off the plain redefinition
+		mod = self._import( '''
+class str: pass
+
+def foo( x: str ) -> None:
+	pass
+
+def foo( x: str ) -> None:
+	pass
+''' )
+		group = mod.get_local( 'foo' )
+		self.assertIsInstance( group, Overload )
 		group.implementations[0].resolve()
 		self.assertIn( 'ambiguous', self.discovery.errors.errors[0] )
 
@@ -1359,10 +1423,11 @@ class RealLibSmokeTest( unittest.TestCase ):
 		group = str_cls.get_local( 'from_cstr' )
 		self.assertIsInstance( group, Overload )
 		self.assertEqual( len( group.implementations ), 2 )
-		group.implementations[0].resolve() # buf/length
+		group.implementations[0].resolve() # buf/length; cross-resolves its sibling too, as a side effect of the ambiguity check
 		self.assertIsNone( group.implementations[0].resolve )
 
-		group.implementations[1].resolve() # src: move[bytearray]
+		if group.implementations[1].resolve is not None: # src: move[bytearray]
+			group.implementations[1].resolve()
 		self.assertIsNone( group.implementations[1].resolve )
 		src = group.implementations[1].parameters[0]
 		self.assertIsInstance( src.type, Move )
