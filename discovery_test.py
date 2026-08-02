@@ -268,6 +268,27 @@ Y = 2
 		self.assertIsNone( y.type )
 		self.assertIsNotNone( x.resolve )
 		self.assertIsNotNone( y.resolve )
+		self.assertTrue( x.is_global )
+		self.assertTrue( y.is_global )
+
+	def test_class_attribute_is_not_flagged_as_a_global( self ) -> None:
+		# Variable.is_global is what lets Compiler._enqueue tell a genuine
+		# module-level global apart from a class attribute - both go through
+		# the exact same visit_AnnAssign/visit_Assign code, distinguished only
+		# by whether scope_stack[-1] is the module itself
+		mod = self._import( '''
+class Foo:
+	x: i32
+	y = 2
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		x = foo.get_local( 'x' )
+		y = foo.get_local( 'y' )
+		self.assertIsInstance( x, Variable )
+		self.assertIsInstance( y, Variable )
+		self.assertFalse( x.is_global )
+		self.assertFalse( y.is_global )
 
 
 class DeferredResolutionTests( unittest.TestCase ):

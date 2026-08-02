@@ -9,7 +9,7 @@ import ir
 from discovery import Discovery
 from errors import CompileError
 from lowering import Lowering
-from mpy_types import Module, Function, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum
+from mpy_types import Module, Function, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization
 
 @dataclass( kw_only = True )
 class LoweredFunction:
@@ -33,6 +33,17 @@ class Compiler:
 	Scheduling goes through a stdlib queue.Queue (already thread-safe) even
 	though nothing here is threaded yet - run() just drains it with a plain
 	get_nowait() loop until queue.Empty.
+
+	_enqueue is the single place that decides what a "dependency" actually
+	means - lowering.py hands it anything it comes across (a Function, a
+	class, a Variable, a Specialization, even a Module walked mid-namespace-
+	lookup) without needing to know which of those are real compile units.
+	A Specialization decomposes into its base + each type arg (recursively -
+	Result[Result[i32,E1],E2] schedules i32/E1/E2 too); anything that isn't a
+	Function, a ClassLike, or a genuinely module-level Variable
+	(Variable.is_global - the same class also represents class attributes
+	and lowering.py's own local variables, neither a standalone unit) is
+	silently ignored rather than enqueued.
 
 	Compiled objects are organized by concrete kind (functions, rcclasses,
 	cstructs, ...) as they're lowered, rather than being collated after the
@@ -70,7 +81,20 @@ class Compiler:
 		self.disco.modules[module.qualname] = module
 		return module
 
-	def _enqueue( self, unit: CompileUnit ) -> None:
+	def _enqueue( self, unit: object ) -> None:
+		if isinstance( unit, Specialization ):
+			self._enqueue( unit.base )
+			for arg in unit.args:
+				self._enqueue( arg )
+			return
+		if not isinstance( unit, ( Function, ClassLike )) and not ( isinstance( unit, Variable ) and unit.is_global ):
+			# not a real compile unit: a Module (walked mid-namespace-lookup,
+			# e.g. the `sys` in `sys.alloc(...)`), a class field/parameter/
+			# local Variable, a bare Scalar/TypeVar, an Overload group itself
+			# (only a resolved member is ever actually compiled) - all
+			# harmless to just drop here rather than every caller having to
+			# know not to pass them in the first place
+			return
 		with self._seen_lock:
 			if id( unit ) in self._seen:
 				return
@@ -130,6 +154,8 @@ class Compiler:
 			self.cenums.append( unit )
 			return unit
 		elif isinstance( unit, Variable ):
+			if unit.resolve is not None:
+				unit.resolve()
 			instructions = self.lowering.lower_global( unit )
 			lg = LoweredGlobal( variable = unit, instructions = instructions )
 			self.globals.append( lg )

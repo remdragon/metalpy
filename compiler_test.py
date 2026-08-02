@@ -6,6 +6,7 @@ import unittest
 import ir
 from discovery import Discovery
 from compiler import Compiler
+from mpy_types import Module, Variable, RCClass, Specialization
 
 class CompilerTestCase( unittest.TestCase ):
 	def setUp( self ) -> None:
@@ -215,6 +216,55 @@ def main() -> None:
 		names = self._function_names()
 		self.assertIn( '__main__.checked', names )
 		self.assertTrue( any( name.endswith( 'Result.is_err' ) for name in names ), names )
+
+class EnqueueFilteringTests( CompilerTestCase ):
+	''' lowering.py's _ensure_resolved hands _enqueue literally anything it
+	comes across, unconditionally - these are the direct, white-box checks
+	that _enqueue itself is the one drawing the line: real compile units get
+	queued, a Specialization decomposes into its schedulable pieces, and
+	everything else is silently dropped rather than corrupting compiler.
+	globals or crashing on drain '''
+
+	def test_module_is_silently_ignored( self ) -> None:
+		fake_module = Module( stem = 'fake', qualname = 'fake', file = None, line = None, intrinsics = {}, builtins = None )
+		self.compiler._enqueue( fake_module )
+		self.assertTrue( self.compiler.queue.empty())
+
+	def test_none_is_silently_ignored( self ) -> None:
+		self.compiler._enqueue( None )
+		self.assertTrue( self.compiler.queue.empty())
+
+	def test_non_global_variable_is_silently_ignored( self ) -> None:
+		field = Variable( stem = 'x', qualname = 'Foo.x', file = None, line = None, is_global = False )
+		self.compiler._enqueue( field )
+		self.assertTrue( self.compiler.queue.empty())
+
+	def test_global_variable_is_enqueued_and_lowered( self ) -> None:
+		self._run( '''
+X: i32 = 1
+
+def main() -> None:
+	pass
+''' )
+		x = self.discovery.modules['__main__'].get_local( 'X' )
+		self.assertTrue( x.is_global )
+		self.compiler._enqueue( x )
+		self.compiler.run()
+		self.assertIn( 'X', [ g.variable.stem for g in self.compiler.globals ] )
+
+	def test_specialization_decomposes_into_base_and_each_arg( self ) -> None:
+		base = RCClass( stem = 'Result', qualname = '__main__.Result', file = None, line = None )
+		arg1 = RCClass( stem = 'Ok', qualname = '__main__.Ok', file = None, line = None )
+		arg2 = RCClass( stem = 'Err', qualname = '__main__.Err', file = None, line = None )
+		spec = Specialization( stem = 'Result[Ok,Err]', qualname = '__main__.Result[Ok,Err]', file = None, line = None, base = base, args = [ arg1, arg2 ] )
+		self.compiler._enqueue( spec )
+		queued = []
+		while not self.compiler.queue.empty():
+			queued.append( self.compiler.queue.get_nowait())
+		self.assertEqual( len( queued ), 3 )
+		self.assertTrue( any( q is base for q in queued ))
+		self.assertTrue( any( q is arg1 for q in queued ))
+		self.assertTrue( any( q is arg2 for q in queued ))
 
 class OverloadCallSiteTests( CompilerTestCase ):
 	def test_unconditional_target_schedules_only_that_target( self ) -> None:

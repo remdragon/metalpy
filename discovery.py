@@ -506,6 +506,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			init = node.value,
+			is_global = scope is module,
 		)
 		var_obj.resolve = self._make_annotation_resolver( var_obj, node.annotation, module, scope )
 		scope.add_name( var_obj.stem, var_obj )
@@ -543,6 +544,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			init = node.value,
+			is_global = scope is module,
 		)
 		var_obj.resolve = self._make_value_resolver( var_obj, node.value, module, scope )
 		scope.add_name( var_obj.stem, var_obj )

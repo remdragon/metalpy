@@ -69,6 +69,11 @@ class Variable( Name ):
 	# Function.node's body) - None for a declaration with no initializer
 	# (e.g. a bare `x: i32` class attribute)
 	init: ast.expr|None = None
+	# True only for a genuine module-level global - the same Variable class
+	# also represents class attributes and (stage 2's own, lowering.py-built)
+	# local variables, neither of which is a standalone compile unit; this is
+	# what lets Compiler._enqueue tell them apart without a separate lookup
+	is_global: bool = False
 
 @dataclass( kw_only = True )
 class Parameter( Variable ):
