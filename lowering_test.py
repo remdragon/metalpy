@@ -1500,6 +1500,67 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'v_A', getattrs )
 		self.assertIn( 'v_B', getattrs )
 
+	# --- compiler.sizeof(T) ----------------------------------------------------
+
+	def test_compiler_sizeof_folds_to_const( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: usize = compiler.sizeof( u32 )',
+			'	return',
+		])
+		usize = self.discovery.get_intrinsics()['usize']
+		none_type = self.discovery.get_none_type()
+		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 2, type = usize )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = x, src = ir.Const( type = usize, value = 4 ) ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_compiler_sizeof_each_intrinsic( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: usize = compiler.sizeof( u8 )',
+			'	b: usize = compiler.sizeof( i64 )',
+			'	c: usize = compiler.sizeof( bool )',
+			'	d: usize = compiler.sizeof( Ptr )', # bare, unsubscripted - Ptr[u8] needs generic-subscript resolution (separate item)
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		consts = [ i.src.value for i in fn.instructions if isinstance( i, ir.Assign ) ]
+		self.assertEqual( consts, [ 1, 8, 1, 8 ] )
+
+	def test_compiler_sizeof_typevar_is_rejected( self ) -> None:
+		# calling foo() unspecialized (never through foo[u8](...)) leaves T
+		# an abstract, unbound TypeVar in its own body - sizeof needs a
+		# concrete type
+		code = '\n'.join([
+			'def foo[T]() -> None:',
+			'	x: usize = compiler.sizeof( T )',
+			'	return',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertIn( 'unbound generic type parameter', self.discovery.errors.errors[0] )
+
+	def test_compiler_sizeof_class_is_not_yet_supported( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> None:',
+			'	x: usize = compiler.sizeof( Foo )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'is not supported yet', self.discovery.errors.errors[0] )
+
 	# --- loops (while / for / break / continue) -----------------------------
 
 	def test_while_shape( self ) -> None:

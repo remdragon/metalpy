@@ -481,6 +481,51 @@ class Lowering:
 			and node.func.value.id == 'compiler'
 		)
 
+	def _is_compiler_sizeof_call( self, node: ast.expr ) -> bool:
+		return (
+			isinstance( node, ast.Call )
+			and isinstance( node.func, ast.Attribute )
+			and node.func.attr == 'sizeof'
+			and isinstance( node.func.value, ast.Name )
+			and node.func.value.id == 'compiler'
+		)
+
+	# byte size for every intrinsic scalar this target model actually has a
+	# fixed size for - matches this compiler's own intrinsics (see
+	# discovery.py's get_intrinsics()). Real user classes have no known size
+	# yet (no field-layout computation exists - that's an emitter concern),
+	# so compiler.sizeof(SomeClass) stays unsupported until then
+	_INTRINSIC_BYTE_SIZES: dict[str,int] = {
+		'i8': 1, 'u8': 1, 'i16': 2, 'u16': 2, 'i32': 4, 'u32': 4,
+		'i64': 8, 'u64': 8, 'i128': 16, 'u128': 16,
+		'isize': 8, 'usize': 8, 'bool': 1,
+		'Ptr': 8, 'ConstPtr': 8,
+	}
+
+	def _lower_compiler_sizeof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.sizeof(T) is a compile-time constant whenever T is
+		# already concrete - it folds directly to an ir.Const, no runtime
+		# computation involved. T is a TYPE reference, not a value, so its
+		# argument is resolved via _try_resolve_namespace (same as a
+		# generic call's own [T] argument), not _lower_expr (which would
+		# reject it - "not a value" - since a bare type isn't a Variable)
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.sizeof(...) takes exactly one type argument: {ast.unparse(node)}', node )
+		target_type = self._try_resolve_namespace( node.args[0] )
+		if target_type is None:
+			self.discovery.fail( f'compiler.sizeof(...) argument must be a type: {ast.unparse(node)}', node )
+		if isinstance( target_type, TypeVar ):
+			self.discovery.fail(
+				f'compiler.sizeof({target_type.stem}) requires a concrete type - {target_type.qualname} is still an '
+				f'unbound generic type parameter here (call the enclosing function through an explicit specialization, e.g. foo[SomeType](...))',
+				node,
+			)
+		size = self._INTRINSIC_BYTE_SIZES.get( getattr( target_type, 'stem', None ) )
+		if size is None:
+			self.discovery.fail( f'compiler.sizeof({target_type.qualname}) is not supported yet - only intrinsic scalar types have a known compile-time size', node )
+		usize_cls = self.discovery.get_intrinsics()['usize']
+		return ir.Const( type = expected_type or usize_cls, value = size )
+
 	def _is_compiler_early_return_call( self, node: ast.expr ) -> bool:
 		return (
 			isinstance( node, ast.Call )
@@ -1595,6 +1640,10 @@ class Lowering:
 		return unwrapped if want_result else None
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		if self._is_compiler_sizeof_call( node ):
+			result = self._lower_compiler_sizeof( node, expected_type )
+			return result if want_result else None
+
 		allocate_dest = self._try_lower_allocate_call( node, expected_type )
 		if allocate_dest is None:
 			allocate_dest = self._try_lower_construct_call( node, expected_type )
