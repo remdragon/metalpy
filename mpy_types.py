@@ -1,12 +1,8 @@
 # stdlib imports:
 import ast
 from dataclasses import dataclass, field
-import itertools
 from pathlib import Path
 from typing import Callable, Union
-
-# local imports:
-from errors import CompileError
 
 @dataclass( kw_only = True )
 class Name:
@@ -258,123 +254,15 @@ class Overload( Type ):
 	member's .is_overload is True even though it lives in .implementations -
 	see discovery.py's well-formedness checks, which treat "@overload members"
 	as stubs + these combined, ordered by declaration line).
+
+	Resolving an actual call (deciding which member(s) a given call site's
+	argument types dispatch to) lives in overload_resolution.py, not here -
+	see overload_resolution.resolve_call( group.stubs, group.implementations,
+	args, kwargs, qualname = group.qualname ).
 	'''
 	cls: ClassLike|None = None
 	stubs: list[Function] = field( default_factory = list )
 	implementations: list[Function] = field( default_factory = list )
-
-	def _overload_members( self ) -> list[Function]:
-		return sorted( [ *self.stubs, *( f for f in self.implementations if f.is_overload ) ], key = lambda f: f.line )
-
-	def _plains( self ) -> list[Function]:
-		return [ f for f in self.implementations if not f.is_overload ]
-
-	def _target( self, member: Function ) -> Function:
-		return member.bound_to if member in self.stubs else member
-
-	def resolve_call( self, args: list[Type], kwargs: dict[str,Type] ) -> tuple[list[ConditionalDispatch],Function]:
-		'''
-		given a call's argument types (positional and/or keyword - different
-		variants may name their own parameters differently), returns either a
-		single unconditional target (`([], fn)`) or an ordered list of runtime
-		conditions to check before falling through to the trailing default
-		Function. Pure function of types - no AST/call-site involved, so this
-		is fully unit-testable ahead of stage 2 (which will supply the actual
-		call-site argument types).
-		'''
-		for fn in ( *self.stubs, *self.implementations ):
-			if fn.resolve is not None:
-				fn.resolve()
-
-		slots: list[tuple[int|str,list[Type]]] = (
-			[ ( i, arg.leaves() ) for i, arg in enumerate( args ) ]
-			+ [ ( name, typ.leaves() ) for name, typ in kwargs.items() ]
-		)
-		keys = [ key for key, _ in slots ]
-		leaf_lists = [ leaves for _, leaves in slots ]
-
-		def binds( candidate: Function, assignment: dict ) -> bool:
-			covered_stems: set[str] = set()
-			for key, leaf in assignment.items():
-				if isinstance( key, int ):
-					if key >= len( candidate.parameters ):
-						return False
-					param = candidate.parameters[key]
-				else:
-					param = next( ( p for p in candidate.parameters if p.stem == key ), None )
-					if param is None:
-						return False
-				if not _leaf_is_accepted( leaf, param.type ):
-					return False
-				covered_stems.add( param.stem )
-			return all( param.stem in covered_stems or param.default is not None for param in candidate.parameters )
-
-		overload_members = self._overload_members()
-		plains = self._plains()
-		# priority order a real call site would check candidates in - stubs
-		# and real-bodied @overload members first-match (in declaration
-		# order), plain implementations last. Used purely to rank *targets*
-		# below, not to decide which one wins for a given assignment.
-		priority = { id( m ): i for i, m in enumerate([ *overload_members, *plains ]) }
-
-		def resolve_one( assignment: dict ) -> tuple[Function,Function]:
-			for member in overload_members:
-				if binds( member, assignment ):
-					return self._target( member ), member
-			matches = [ p for p in plains if binds( p, assignment ) ]
-			if len( matches ) != 1:
-				# no location available here - resolve_call is a pure function
-				# of types, deliberately with no AST/Discovery reference (see
-				# the class docstring) - raised unrecorded, left to whichever
-				# caller has location context (lowering.py's _lower_call) to
-				# record via Discovery.fail()
-				raise CompileError(
-					f'{self.qualname}: ambiguous call for {assignment!r} - matches {[m.qualname for m in matches]}'
-					if matches else
-					f'{self.qualname}: no overload matches argument types {assignment!r}'
-				)
-			return matches[0], matches[0]
-
-		resolved: list[tuple[dict,Function]] = []
-		target_rank: dict[int,int] = {} # id(target) -> best (lowest) priority rank it was ever reached through
-		for combo in itertools.product( *leaf_lists ):
-			assignment = dict( zip( keys, combo ))
-			target, matched_via = resolve_one( assignment )
-			resolved.append(( assignment, target ))
-			rank = priority[ id( matched_via ) ]
-			target_rank[ id( target ) ] = min( rank, target_rank.get( id( target ), rank ))
-
-		distinct_targets: list[Function] = []
-		for _, target in resolved:
-			if not any( target is t for t in distinct_targets ):
-				distinct_targets.append( target )
-		# order by resolution priority (stub-matched targets are more specific
-		# "special cases" and come first; a target only ever reached via the
-		# plain-implementation fallback is the most general case, so it sorts
-		# last and becomes the trailing default below) rather than by whatever
-		# incidental order the leaf decomposition happened to enumerate in
-		distinct_targets.sort( key = lambda t: target_rank[ id( t ) ] )
-
-		if len( distinct_targets ) == 1:
-			return ( [], distinct_targets[0] )
-
-		default = distinct_targets[-1]
-		branches: list[ConditionalDispatch] = []
-		for target in distinct_targets[:-1]:
-			own = [ a for a, t in resolved if t is target ]
-			others = [ a for a, t in resolved if t is not target ]
-			conditions: list[tuple[Parameter,Type]] = []
-			for key in keys:
-				own_leaves = [ a[key] for a in own ]
-				if any( leaf is not own_leaves[0] for leaf in own_leaves[1:] ):
-					continue # this slot still varies within this branch - can't be a single-value condition
-				shared_leaf = own_leaves[0]
-				if any( o[key] is not shared_leaf for o in others ):
-					param = target.parameters[key] if isinstance( key, int ) else next( p for p in target.parameters if p.stem == key )
-					conditions.append(( param, shared_leaf ))
-			branches.append( ConditionalDispatch( conditions = conditions, function = target ))
-
-		return ( branches, default )
 
 @dataclass( kw_only = True )
 class Module( Name, ScopeMixin ):

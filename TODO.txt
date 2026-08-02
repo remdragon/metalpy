@@ -149,6 +149,21 @@ lowering:
 	
 	need to fix asap:
 		already-tracked gaps (sys.alloc[u8], and its cascading "data not defined" consequence
+		[resolved - generic function monomorphization (Name[T](...) call syntax)
+			now compiles sys.alloc[u8](...) as its own distinct unit; see
+			bytes.__init__'s data = sys.alloc[u8](self.__len) line, which now
+			lowers cleanly]
+
+	method calls on a union-typed receiver aren't resolved at all:
+		bytes.__init__ (lib/builtins/__init__.py) does
+			copy_from.get_ptr() where copy_from: bytes|bytearray - get_ptr isn't
+		overloaded (each of bytes/bytearray just has its own real, unrelated
+		method), so this isn't an overload_resolution.py-style problem at all -
+		it needs the receiver narrowed (via tag-check, same machinery match
+		statements/dispatch already use) before .get_ptr() can even be looked
+		up, since the union type itself has no .names entry for it. Newly
+		surfaced (not newly introduced) - this line was never reached before
+		since sys.alloc[u8] on the line above it used to fail first
 	claude commented "this needs TaggedUnion tag-check IR, which does not exist yet"
 		Claude is a little confused here. IR only sees C structs, so if
 		you have:

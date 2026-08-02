@@ -12,6 +12,7 @@ from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
 	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch,
 )
+import overload_resolution
 
 @dataclass( kw_only = True )
 class _DeferBlock:
@@ -1838,7 +1839,7 @@ class Lowering:
 			arg_types = [ op.type for op in args ]
 			kwarg_types = { name: op.type for name, op in kwargs.items() }
 			try:
-				branches, resolved = target.resolve_call( arg_types, kwarg_types )
+				branches, resolved = overload_resolution.resolve_call( target.stubs, target.implementations, arg_types, kwarg_types, qualname = target.qualname )
 			except CompileError as e:
 				# resolve_call is a pure function of types with no
 				# AST/Discovery reference by design - it raises unrecorded,
@@ -1883,8 +1884,7 @@ class Lowering:
 		end_label = self._new_label( 'dispatch_end' )
 		for branch in branches:
 			next_label = self._new_label( 'dispatch_next' )
-			test = self._lower_dispatch_test( node, branch.function, branch.conditions, args, kwargs )
-			self._emit( ir.JumpIfFalse( cond = test, target = next_label ))
+			self._lower_dispatch_tests( node, branch.function, branch.conditions, args, kwargs, next_label )
 			self._emit_dispatch_call( branch.function, args, kwargs, dest, want_result )
 			self._emit( ir.Jump( target = end_label ))
 			self._emit( ir.Label( name = next_label ))
@@ -1892,29 +1892,26 @@ class Lowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
-	def _lower_dispatch_test( self, node: ast.AST, target: Function, conditions: list[tuple[Parameter,Type]], args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> ir.Operand:
-		# narrowed to exactly one condition per branch for now - every real
-		# branch this has ever needed to handle (len(x: bytes|bytearray))
-		# only ever varies on a single argument; combining multiple
-		# conditions would need the same short-circuit AND _expr_BoolOp
-		# already does, just directly in IR since these operands are
-		# already lowered - not implemented until real code needs it
-		if len( conditions ) != 1:
-			self.discovery.fail( f'{target.qualname}: conditional dispatch on more than one argument is not yet supported: {ast.unparse(node)}', node )
-		param, leaf_type = conditions[0]
-		operand = self._dispatch_operand_for_param( node, target, param, args, kwargs )
-		if not isinstance( operand.type, TaggedUnion ):
-			self.discovery.fail( f'{target.qualname}: conditional dispatch on a non-union argument: {ast.unparse(node)}', node )
-		member = next( ( attr for attr in operand.type.attributes if attr.type is leaf_type ), None )
-		if member is None:
-			self.discovery.fail( f'{target.qualname}: {leaf_type.qualname if leaf_type else "?"} is not a member of {operand.type.qualname}', node )
-		tag_attr, _data_attr, _payload_cls, tags = self._tagged_union_storage( operand.type )
-		tag_dest = self._new_temp( tag_attr.type )
-		self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = tag_attr.stem ))
+	def _lower_dispatch_tests( self, node: ast.AST, target: Function, conditions: list[tuple[Parameter,Type]], args: list[ir.Operand], kwargs: dict[str,ir.Operand], next_label: str ) -> None:
+		# a branch's conditions are ANDed together - emits one Cmp +
+		# JumpIfFalse per condition, all targeting next_label, which is
+		# already a short-circuit AND with no combined boolean value to
+		# build at all (same trick _expr_BoolOp uses, just directly in IR
+		# since these operands are already lowered)
 		bool_cls = self.discovery.find_name( 'bool', node )
-		cmp_dest = self._new_temp( bool_cls )
-		self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] ) ))
-		return cmp_dest
+		for param, leaf_type in conditions:
+			operand = self._dispatch_operand_for_param( node, target, param, args, kwargs )
+			if not isinstance( operand.type, TaggedUnion ):
+				self.discovery.fail( f'{target.qualname}: conditional dispatch on a non-union argument: {ast.unparse(node)}', node )
+			member = next( ( attr for attr in operand.type.attributes if attr.type is leaf_type ), None )
+			if member is None:
+				self.discovery.fail( f'{target.qualname}: {leaf_type.qualname if leaf_type else "?"} is not a member of {operand.type.qualname}', node )
+			tag_attr, _data_attr, _payload_cls, tags = self._tagged_union_storage( operand.type )
+			tag_dest = self._new_temp( tag_attr.type )
+			self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = tag_attr.stem ))
+			cmp_dest = self._new_temp( bool_cls )
+			self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] ) ))
+			self._emit( ir.JumpIfFalse( cond = cmp_dest, target = next_label ))
 
 	def _dispatch_operand_for_param( self, node: ast.AST, target: Function, param: Parameter, args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> ir.Operand:
 		if param.stem in kwargs:

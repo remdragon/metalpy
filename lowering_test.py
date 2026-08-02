@@ -1500,6 +1500,39 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'v_A', getattrs )
 		self.assertIn( 'v_B', getattrs )
 
+	def test_conditional_dispatch_never_considers_a_candidate_unrelated_to_the_argument( self ) -> None:
+		# mirrors lib/builtins/__init__.py's real len() shape: three plain
+		# candidates (str/bytes/bytearray), called with a NARROWER union
+		# (bytes|bytearray) that doesn't include str at all - the emitted
+		# IR must never reference len(x:str), not just "correctly not call
+		# it at runtime" - it should never even be scheduled/considered
+		code = '\n'.join([
+			'class strlike: pass',
+			'class bytes: pass',
+			'class bytearray: pass',
+			'',
+			'def flen( x: strlike ) -> None:',
+			'	pass',
+			'',
+			'def flen( x: bytes ) -> None:',
+			'	pass',
+			'',
+			'def flen( x: bytearray ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	x: bytes|bytearray',
+			'	flen( x )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		strlike_cls = self.discovery.modules['__test__'].get_local( 'strlike' )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 ) # exactly bytes and bytearray - never a third for strlike
+		self.assertTrue( all( c.target.parameters[0].type is not strlike_cls for c in calls ))
+
 	# --- bare literal arguments to overloaded calls -----------------------------
 
 	def test_overload_literal_arg_resolves_via_unique_candidate_type( self ) -> None:
