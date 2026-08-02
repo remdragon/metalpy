@@ -1,4 +1,164 @@
 lowering:
+	Claude removed a test, but this code should absolutely fail in some way.
+		class A: pass
+		class B: pass
+		
+		def foo( v: A, w: A ) -> None:
+			pass
+		
+		def foo( v: B, w: B ) -> None:
+			pass
+		
+		def main() -> None:
+			x: A|B
+			y: A|B
+			foo( x, y )
+			return
+		
+		looking closer at how mypy handles this situation I find the following:
+			1) @overload methods are typing only, they must not have bodies
+			2) @overloads must be matched exactly. In the above example, mypy
+				rejects it because neither overload takes A|B
+		
+		I can only draw the conclusion that metalpy's function overloading is a little different
+			than Python and I think metalpy's greater flexibility is a bonus, but now
+			I have to figure out how to handle this conflict.
+		
+		To make a long story short, the real issue with this code is that its possible that
+		either or none of the functions could match, depending on the types of x and y.
+		So, what to do when there's no match?
+		
+		I think its possible to make this a compile time error, but its going to be a little
+		complicated. Maybe this is where Claude's suggestion about cartesian products
+		comes into play? In the runtime disambiguation, if the check for foo(A,A) fails,
+		then we know that (x:A|B,y:A|B) is either (x:B,y:A|B) or (x:A|B,y:B). by tracking
+		all possible type states, we can figure out if there's a possibility that no
+		types will match during a runtime dispatch and therefore kick it out as a compile error.
+		
+		Let's look at an example that should compile:
+		
+		class A: pass
+		class B: pass
+		
+		def foo( v: A, w: A ) -> None:
+			pass
+		
+		def foo( v: B, w: B ) -> None:
+			pass
+		
+		def foo( v: A|B, w: A|B ) -> None:
+			pass
+		
+		def main() -> None:
+			x: A|B
+			y: A|B
+			foo( x, y )
+			return
+		
+		When checking foo(A,A):
+			(x:A|B,y:A|B) -> either x isn't A or y isn't A, this produces 2 states:
+				if x != A:
+					next (x:B,y:A|B)
+				elif y != A:
+					next (x:A,y:B)
+				else:
+					schedule foo(A,A) (it is reachable)
+		
+		When checking foo(B,B):
+			we are tracking 2 states now, which becomes 4 states (but 2 get eliminated immediately)
+			(x:B,y:A|B) ->
+				if x != B:
+					drop (this is impossible)
+				elif y != B:
+					next (x:B,y:A)
+				else:
+					schedule foo(B,B) (it is reachable)
+			(x:A|B,y:B) ->
+				if x != B:
+					next (x:A,y:B)
+				elif y != B:
+					drop (this is impossible)
+				else:
+					schedule foo(B,B) (it is reachable)
+		When checking foo(A|B,A|B):
+			we still only have 2 states, need to check both:
+			(x:B,y:A) ->
+				if x != A|B:
+					drop (this is impossible)
+				elif y != A|B:
+					drop (this is impossible)
+				else:
+					schedule foo(A|B,A|B) (it is unavoidable)
+			(x:A,y:B) ->
+				(we don't even analyze this because the first pattern matched unconditionally
+		
+		Note the above logic is how I worked through the type checking, but the runtime logic
+		will be simpler:
+		
+		if instanceof( x, A ) and instanceof( y, A ):
+			foo[A,A]( x, y )
+		elif instanceof( x, B ) and instance( y, B ):
+			foo[B,B]( x, y )
+		else:
+			foo[A|B,A|B]( x, y )
+		
+		Let's go back to the example that should fail to compile:
+		
+		class A: pass
+		class B: pass
+		def foo( v: A, w: A ) -> None:
+			pass
+		def foo( v: B, w: B ) -> None:
+			pass
+		def main() -> None:
+			x: A|B
+			y: A|B
+			foo( x, y )
+			return
+		
+		checking foo(A,A):
+			(x:A|B,y:A|B) ->
+				if x != A:
+					next (x:B,y:A|B)
+				elif y != A:
+					next (x:A,y:B)
+				else:
+					schedule foo(A,A) (it is reachable)
+		
+		checking foo(B,B):
+			(x:B,y:A|B) ->
+				if x == B -> (x:B,y:A|B)
+					if y == B -> (x:B,y:B)
+						schedule foo(B,B)
+					else -> (x:B,y:A)
+						next (x:B,y:A) *********************
+				else -> (x:_,y:A|B)
+					drop (this is impossible)
+			(x:A,y:B) ->
+				if x == B ->
+					drop (this is impossible)
+				else -> (x:A,y:B)
+					next (x:A,y:B) **************************
+		
+		I had to switch to if-else trees in the foo(B,B) case to really understand
+		the type resolution flow. The reason this fails to compile is because after
+		evaluating the last possible function, we are still have one or more
+		unmatched parameter type possibilities:
+			(x:B,y:A),
+			(x:A,y:B)
+	
+	need to fix asap:
+		already-tracked gaps (sys.alloc[u8], and its cascading "data not defined" consequence
+	claude commented "this needs TaggedUnion tag-check IR, which does not exist yet"
+		Claude is a little confused here. IR only sees C structs, so if
+		you have:
+			def foo( x: int|str ):
+				if instanceof( x, int ):
+					print( x ) # this lowers to IR as something like CALL( 'print', [ 'x.v_int' ])
+	incorrect "is" usage:
+		I incorrectly put "x is Foo" when checking if a variable was a certain type
+		in Python, "is" is a "same identity" check.
+		we need to replace that incorrect usage with "instanceof( x, Foo )"
 	generic function monomorphization: calling a method on a value whose
 		declared type is a bare (unbound) TypeVar always fails today
 		("TypeVar(...) has no members, cannot look up '...'") - a generic
