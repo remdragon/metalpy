@@ -21,7 +21,7 @@ class LoweredGlobal:
 	variable: Variable
 	instructions: list[ir.Instruction]
 
-CompileUnit = Function|ClassLike|Variable
+CompileUnit = Function|ClassLike|Variable|Specialization # Specialization only ever wraps a generic Function here - a class Specialization never reaches _lower directly, see _enqueue
 CompiledUnit = LoweredFunction|ClassLike|LoweredGlobal
 
 class Compiler:
@@ -83,6 +83,19 @@ class Compiler:
 
 	def _enqueue( self, unit: object ) -> None:
 		if isinstance( unit, Specialization ):
+			if isinstance( unit.base, Function ):
+				# an explicit generic function instantiation (sys.alloc[u8])
+				# monomorphizes - unlike a class Specialization (whose
+				# methods stay shared/unspecialized, so only the base class
+				# + type args need scheduling), this IS a real, distinct
+				# compile unit in its own right: queued directly rather
+				# than decomposed
+				with self._seen_lock:
+					if id( unit ) in self._seen:
+						return
+					self._seen.add( id( unit ))
+				self.queue.put( unit )
+				return
 			self._enqueue( unit.base )
 			for arg in unit.args:
 				self._enqueue( arg )
@@ -119,7 +132,12 @@ class Compiler:
 				continue
 
 	def _lower( self, unit: CompileUnit ) -> CompiledUnit:
-		if isinstance( unit, Function ):
+		if isinstance( unit, Specialization ) and isinstance( unit.base, Function ):
+			monomorphized, instructions = self.lowering.lower_function_specialization( unit )
+			lf = LoweredFunction( function = monomorphized, instructions = instructions )
+			self.functions.append( lf )
+			return lf
+		elif isinstance( unit, Function ):
 			if unit.resolve is not None:
 				unit.resolve()
 			instructions = self.lowering.lower_function( unit )

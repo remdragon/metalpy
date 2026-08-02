@@ -126,6 +126,13 @@ class Lowering:
 		# Persists for the whole Lowering instance's lifetime, unlike
 		# lower_function's per-function state
 		self._union_storage: dict[int,tuple[Variable,Variable,CUnion,dict[str,int]]] = {}
+		# monomorphized Function copies (T substituted with a concrete
+		# type), memoized by id(Specialization) - discovery._get_or_create_
+		# specialization already dedupes the Specialization itself by its
+		# qualname key, so every call to the same instantiation (sys.
+		# alloc[u8], from anywhere) reuses the SAME monomorphized Function
+		# object, not a fresh copy per call site
+		self._monomorphized: dict[int,Function] = {}
 
 	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
 		module = self._find_module_for( fn )
@@ -1386,6 +1393,54 @@ class Lowering:
 			return self.discovery._get_or_create_specialization( t.base, substituted_args )
 		return t
 
+	def _monomorphized_function( self, spec: Specialization ) -> Function:
+		# a distinct compiled unit per explicit generic instantiation
+		# (sys.alloc[u8] vs sys.alloc[u32] are two separate functions, each
+		# with T bound to a concrete type throughout - not a shared
+		# unspecialized body the way a generic CLASS's methods stay today).
+		# Built by copying the base Function with every generic-facing
+		# field substituted: qualname (so FuncStart/Call get sys.alloc[u8],
+		# not the shared sys.alloc), parameters/return_type (via
+		# _substitute_type_params), and names (T's own entry replaced with
+		# the concrete arg, so ordinary name lookups - including
+		# compiler.sizeof(T) - resolve it correctly while lowering fn.node.
+		# body, which is otherwise untouched/shared AST). Memoized by
+		# id(spec) - discovery._get_or_create_specialization already
+		# dedupes the Specialization itself, so this only ever builds one
+		# copy per distinct instantiation
+		cached = self._monomorphized.get( id( spec ) )
+		if cached is not None:
+			return cached
+		base = spec.base
+		if base.resolve is not None:
+			base.resolve()
+		type_params = base.type_params or []
+		substituted_params = [
+			replace( p, type = self._substitute_type_params( p.type, type_params, spec.args ) )
+			for p in ( base.parameters or [] )
+		]
+		substituted_return = self._substitute_type_params( base.return_type, type_params, spec.args )
+		substituted_names = dict( base.names )
+		for tv, arg in zip( type_params, spec.args ):
+			substituted_names[tv.stem] = arg
+		for p in substituted_params:
+			substituted_names[p.stem] = p
+		monomorphized = replace(
+			base,
+			qualname = spec.qualname,
+			parameters = substituted_params,
+			return_type = substituted_return,
+			names = substituted_names,
+			type_params = None,
+			resolve = None,
+		)
+		self._monomorphized[ id( spec ) ] = monomorphized
+		return monomorphized
+
+	def lower_function_specialization( self, spec: Specialization ) -> tuple[Function,list[ir.Instruction]]:
+		monomorphized = self._monomorphized_function( spec )
+		return monomorphized, self.lower_function( monomorphized )
+
 	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
 		# a *silent* probe: is this expression a compile-time-resolvable
 		# namespace path (a free function, or Class.staticmethod/classmethod
@@ -1408,11 +1463,48 @@ class Lowering:
 			if not isinstance( names, dict ):
 				return None
 			return names.get( node.attr )
+		if isinstance( node, ast.Subscript ):
+			# Name[T](...) / Attribute[T](...) - explicit generic
+			# instantiation of a *function* (sys.alloc[u8]), which
+			# monomorphizes (a distinct compiled unit per instantiation -
+			# see _monomorphized_function) rather than the anonymous-union
+			# runtime-tag-checkable approach _get_or_create_union uses for
+			# X|Y. Only meaningful when the base is itself a generic
+			# Function; a generic CLASS reached this way (Foo[i32], used as
+			# a type annotation, not a call) is handled entirely by
+			# discovery.py's own visit_Subscript instead - this method is
+			# lowering-only namespace-path resolution
+			base = self._try_resolve_namespace( node.value )
+			if not isinstance( base, Function ) or not base.type_params:
+				return None
+			# resolve (populate .parameters/.type_params), but deliberately
+			# NOT via _ensure_resolved - that also unconditionally
+			# schedules its argument, which would incorrectly compile the
+			# shared, unspecialized base function too (T never gets bound
+			# there - see _monomorphized_function). Only the Specialization
+			# this returns gets scheduled, by the caller (_lower_call)
+			if base.resolve is not None:
+				base.resolve()
+			arg_nodes = node.slice.elts if isinstance( node.slice, ast.Tuple ) else [ node.slice ]
+			if len( arg_nodes ) != len( base.type_params ):
+				self.discovery.fail(
+					f'{base.qualname}[...] expects {len(base.type_params)} type argument(s), got {len(arg_nodes)}: {ast.unparse(node)}',
+					node,
+				)
+			args: list[Type] = []
+			for a in arg_nodes:
+				resolved = self._try_resolve_namespace( a )
+				if not isinstance( resolved, Type ):
+					self.discovery.fail( f'{base.qualname}[...] argument is not a type: {ast.unparse(a)}', node )
+				args.append( resolved )
+			return self.discovery._get_or_create_specialization( base, args )
 		return None
 
-	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload,ir.Operand|None]:
+	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization,ir.Operand|None]:
 		namespace_result = self._try_resolve_namespace( func_node )
 		if isinstance( namespace_result, ( Function, Overload )):
+			return namespace_result, None
+		if isinstance( namespace_result, Specialization ) and isinstance( namespace_result.base, Function ):
 			return namespace_result, None
 
 		if not isinstance( func_node, ast.Attribute ):
@@ -1639,6 +1731,28 @@ class Lowering:
 		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
+	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# sys.alloc[u8](...) - explicit generic instantiation. Matches call
+		# args against the MONOMORPHIZED signature (so a literal argument's
+		# expected type is already concrete, e.g. usize for alloc[u8]'s
+		# count - not the abstract, unsubstituted one) and schedules the
+		# Specialization itself as the compile unit (see
+		# _monomorphized_function/compiler.py's own handling of it)
+		monomorphized = self._monomorphized_function( spec )
+		positional, keyword = self._match_call_args( monomorphized, node )
+		args = [ self._lower_expr( expr, param.type ) for param, expr in positional ]
+		kwargs = { param.stem: self._lower_expr( expr, param.type ) for param, expr in keyword }
+		self.schedule( spec )
+		self.schedule( monomorphized.return_type )
+		for param in monomorphized.parameters or []:
+			self.schedule( param.type )
+		if want_result:
+			dest = self._new_temp( expected_type or monomorphized.return_type )
+			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = None, args = args, kwargs = kwargs ))
+			return dest
+		self._emit( ir.Call( dest = None, target = monomorphized, receiver = None, args = args, kwargs = kwargs ))
+		return None
+
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		if self._is_compiler_sizeof_call( node ):
 			result = self._lower_compiler_sizeof( node, expected_type )
@@ -1658,6 +1772,9 @@ class Lowering:
 
 		if isinstance( target, Function ) and target.stem == 'or_return' and target.cls is self.discovery.find_name( 'Result', node ):
 			return self._lower_or_return( node, receiver, want_result )
+
+		if isinstance( target, Specialization ) and isinstance( target.base, Function ):
+			return self._lower_generic_function_call( node, target, expected_type, want_result )
 
 		if isinstance( target, Overload ):
 			# bare literal arguments have no unambiguous expected type before

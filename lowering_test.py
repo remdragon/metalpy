@@ -1500,6 +1500,94 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'v_A', getattrs )
 		self.assertIn( 'v_B', getattrs )
 
+	# --- generic function monomorphization (Name[T](...)) ----------------------
+
+	def test_generic_function_call_monomorphizes( self ) -> None:
+		code = '\n'.join([
+			'def alloc[T]( count: usize ) -> usize:',
+			'	with compiler.wrap_arithmetic:',
+			'		return count * compiler.sizeof( T )',
+			'',
+			'def main() -> None:',
+			'	x: usize = alloc[u32]( 10 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.target.qualname, '__test__.alloc[intrinsics.u32]' )
+		usize = self.discovery.get_intrinsics()['usize']
+		self.assertEqual( call.target.return_type, usize )
+
+	def test_generic_function_specializations_are_memoized( self ) -> None:
+		# two call sites specializing the same [T] the same way must
+		# schedule/reference the SAME monomorphized Function object, not a
+		# fresh copy each time - otherwise it'd get compiled twice
+		code = '\n'.join([
+			'def alloc[T]( count: usize ) -> usize:',
+			'	with compiler.wrap_arithmetic:',
+			'		return count * compiler.sizeof( T )',
+			'',
+			'def main() -> None:',
+			'	a: usize = alloc[u32]( 10 )',
+			'	b: usize = alloc[u32]( 20 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 )
+		self.assertIs( calls[0].target, calls[1].target )
+
+	def test_generic_function_call_distinguishes_different_specializations( self ) -> None:
+		code = '\n'.join([
+			'def alloc[T]( count: usize ) -> usize:',
+			'	with compiler.wrap_arithmetic:',
+			'		return count * compiler.sizeof( T )',
+			'',
+			'def main() -> None:',
+			'	a: usize = alloc[u32]( 10 )',
+			'	b: usize = alloc[u8]( 10 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 )
+		self.assertIsNot( calls[0].target, calls[1].target )
+		self.assertEqual( calls[0].target.qualname, '__test__.alloc[intrinsics.u32]' )
+		self.assertEqual( calls[1].target.qualname, '__test__.alloc[intrinsics.u8]' )
+
+	def test_generic_function_call_wrong_type_arg_count_rejected( self ) -> None:
+		code = '\n'.join([
+			'def alloc[T]( count: usize ) -> usize:',
+			'	return count',
+			'',
+			'def main() -> None:',
+			'	x: usize = alloc[u32,u8]( 10 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'expects 1 type argument', self.discovery.errors.errors[0] )
+
+	def test_generic_function_call_non_type_arg_rejected( self ) -> None:
+		code = '\n'.join([
+			'def alloc[T]( count: usize ) -> usize:',
+			'	return count',
+			'',
+			'def main() -> None:',
+			'	y: usize = 1',
+			'	x: usize = alloc[y]( 10 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'is not a type', self.discovery.errors.errors[0] )
+
 	# --- compiler.sizeof(T) ----------------------------------------------------
 
 	def test_compiler_sizeof_folds_to_const( self ) -> None:

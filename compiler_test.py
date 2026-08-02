@@ -381,6 +381,22 @@ def main() -> None:
 		self.assertIn( 'Cmp', kinds )
 		self.assertEqual( kinds.count( 'Call' ), 2 ) # one per possible target (the branch + the default) - only one runs at runtime
 
+	def test_generic_function_call_schedules_only_the_specialization( self ) -> None:
+		# alloc[u32](...) must compile exactly one function - the
+		# monomorphized alloc[u32] - never the shared, unspecialized alloc
+		# itself (T never gets bound there, so it can't actually compile)
+		self._run( '''
+def alloc[T]( count: usize ) -> usize:
+	with compiler.wrap_arithmetic:
+		return count * compiler.sizeof( T )
+
+def main() -> None:
+	x: usize = alloc[u32]( 10 )
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		names = self._function_names()
+		self.assertEqual( set( names ), { 'main', '__main__.alloc[intrinsics.u32]' } )
+
 class LocalVariableTests( CompilerTestCase ):
 	def test_annassign_then_reassign( self ) -> None:
 		self._run( '''
