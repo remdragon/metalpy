@@ -180,7 +180,10 @@ class CFGState:
 
 	# --- IF/ELSE/ENDIF -----------------------------------------------------
 
-	def merge_if( self, entry_bindings: Bindings, true_end: Bindings, false_end: Bindings, ctx: str ) -> tuple[list[ir.Instruction],list[ir.Instruction],list[str]]:
+	def merge_if(
+		self, entry_bindings: Bindings, true_end: Bindings, false_end: Bindings, ctx: str,
+		*, true_terminates: bool = False, false_terminates: bool = False,
+	) -> tuple[list[ir.Instruction],list[ir.Instruction],list[str]]:
 		''' called after lowering.py has already restore()'d back to the
 		if's own entry snapshot (so self.bindings/self._epilogue_stack are
 		clean of whatever either branch speculatively pushed) - compares
@@ -197,10 +200,69 @@ class CFGState:
 		surviving OWNED/COPY binding - both branches always push their OWN
 		entry when creating the same-named binding fresh, and only one of
 		the two ever actually runs, so those speculative entries must
-		never both survive onto the real stack. '''
+		never both survive onto the real stack.
+
+		true_terminates/false_terminates (return/break/continue as that
+		branch's own last statement - lowering.py's call site decides)
+		mark a branch that never reaches the join point at all. This
+		matters because return_()/unwind_to() deliberately don't mutate
+		bindings (each exit is independent, no code follows it on that
+		path) - so a terminating branch's OWN _end snapshot still looks
+		like a perfectly ordinary, still-live set of bindings, exactly as
+		if it had fallen through. Comparing it against the other branch
+		here would either raise a bogus indeterminate-state error, or
+		(worse, silently) re-push a duplicate epilogue entry for a binding
+		that the other, non-terminating branch also still owns - a real
+		double-decref at whatever exit runs next. When exactly one branch
+		terminates, only the survivor's own _end state can possibly reach
+		the join, so it wins outright, no comparison/error-checking
+		needed - there's only one live path down to here. When both
+		terminate, nothing reaches the join (any code after the if is
+		unreachable - full dead-code detection is future work, see
+		TODO.txt), so nothing survives either.
+
+		A survivor whose entry is IDENTICAL (by object identity) to
+		entry_bindings' own entry for that name is already correctly
+		sitting on the stack - lowering.py already restore()'d back to
+		entry_snapshot before calling this, and restore() only truncates
+		the stack/resets the bindings dict, it never touches the Epilogue
+		objects already-live entries point to. assign()'s own discipline
+		(reuse the same entry for as long as a name stays continuously
+		tracked, even across a move-then-reassign's cancel/uncancel cycle
+		- only push genuinely fresh when the name wasn't tracked at all
+		beforehand) guarantees that identity check is reliable: pushing
+		AGAIN here for an unchanged/merely-replaced survivor would give it
+		a second, duplicate live entry - the same double-decref bug as the
+		terminates case above, just via the ordinary two-branch path
+		instead (an if/else where a local declared before it survives
+		untouched, the single most common shape there is). Only a name
+		that's genuinely new to the stack (never in entry_bindings, or
+		re-pushed after being del'd and reassigned) needs a real push. '''
 		true_instructions: list[ir.Instruction] = []
 		false_instructions: list[ir.Instruction] = []
 		removed: list[str] = []
+
+		def reestablish( name: str, binding: _Binding, already_live: bool ) -> None:
+			if binding.state in ( OwnState.OWNED, OwnState.COPY ):
+				if already_live:
+					self.bindings[name] = binding
+				else:
+					self._push( binding.operand, binding.type, binding.state )
+			else:
+				self.bindings[name] = _Binding( operand = binding.operand, type = binding.type, state = binding.state, entry = None )
+
+		if true_terminates or false_terminates:
+			survivor = None
+			if true_terminates and not false_terminates:
+				survivor = false_end
+			elif false_terminates and not true_terminates:
+				survivor = true_end
+			if survivor is not None:
+				for name, binding in survivor.items():
+					prior = entry_bindings.get( name )
+					already_live = prior is not None and prior.entry is binding.entry
+					reestablish( name, binding, already_live )
+			return true_instructions, false_instructions, removed
 		for name in set( true_end ) | set( false_end ):
 			in_true = name in true_end
 			in_false = name in false_end
@@ -210,11 +272,13 @@ class CFGState:
 						f"{ctx}: {name!r} is in an indeterminate state after the if - "
 						f"{true_end[name].state.value} on one branch, {false_end[name].state.value} on the other"
 					)
-				binding = true_end[name]
-				if binding.state in ( OwnState.OWNED, OwnState.COPY ):
-					self._push( binding.operand, binding.type, binding.state )
-				else:
-					self.bindings[name] = _Binding( operand = binding.operand, type = binding.type, state = binding.state, entry = None )
+				prior = entry_bindings.get( name )
+				already_live = (
+					prior is not None
+					and prior.entry is true_end[name].entry
+					and prior.entry is false_end[name].entry
+				)
+				reestablish( name, true_end[name], already_live )
 				continue
 			if name in entry_bindings:
 				raise CompileError(
@@ -427,6 +491,30 @@ class CFGState:
 		if t is None:
 			return []
 		return self._decref_instructions( t, temp )
+
+	# --- struct/union field construction (Allocate) -----------------------------
+
+	def field_value( self, t: Type, operand: ir.Operand, *, is_alias: bool ) -> list[ir.Instruction]:
+		''' called for a value being embedded into a freshly-constructed
+		struct/union field (Class.__allocate__(...)/bare ClassName(...)/a
+		TaggedUnion member construction) - an aliasing reference (an existing
+		binding's current value) gets its own independent Incref, since the
+		new field is a distinct, possibly longer-lived holder of the same
+		reference; a fresh value (Call/Allocate result) is already an owned
+		handoff, needing none - mirrors assign()'s own is_alias distinction
+		exactly. Deliberately does NOT touch self.bindings/the epilogue stack
+		- struct/union FIELDS themselves are still untracked (see the module
+		docstring's v1 scope cut: no per-field decref on the container's own
+		teardown, since no emitter/codegen consumes Decref for real yet).
+		This only prevents the SOURCE binding's own ordinary decref (at its
+		own scope exit) from leaving the embedded copy under-refcounted -
+		confirmed against bytearray.release()'s `Result.Err(
+		OwnershipError.SharedReference( self ))`: this increfs self, then
+		release()'s own epilogue decrefs self as usual - net zero, and the
+		returned payload's reference is never the "already decremented" one. '''
+		if not is_alias:
+			return []
+		return self._incref_instructions( t, operand )
 
 	# --- move[T] call arguments ------------------------------------------------
 

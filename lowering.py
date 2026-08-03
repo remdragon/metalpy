@@ -1102,6 +1102,13 @@ class Lowering:
 				continue
 		true_captured = self._instructions
 		true_end = dict( self._cfg.bindings )
+		# return/break/continue as a branch's own last statement means
+		# that branch never reaches the if's join point at all - see
+		# merge_if()'s own comment on why that has to be treated
+		# differently from an ordinary falling-through branch (full
+		# terminator/dead-code analysis for anything deeper - nested ifs
+		# that both terminate, etc - is future work, not attempted here)
+		true_terminates = bool( node.body ) and isinstance( node.body[-1], ( ast.Return, ast.Break, ast.Continue ))
 
 		if node.orelse:
 			self._cfg.restore( entry_snapshot )
@@ -1113,14 +1120,19 @@ class Lowering:
 					continue
 			false_captured = self._instructions
 			false_end = dict( self._cfg.bindings )
+			false_terminates = bool( node.orelse ) and isinstance( node.orelse[-1], ( ast.Return, ast.Break, ast.Continue ))
 		else:
 			false_captured = []
 			false_end = dict( entry_snapshot.bindings )
+			false_terminates = False
 
 		self._cfg.restore( entry_snapshot )
 		self._instructions = outer_instructions
 		try:
-			true_extra, false_extra, removed = self._cfg.merge_if( entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname )
+			true_extra, false_extra, removed = self._cfg.merge_if(
+				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
+				true_terminates = true_terminates, false_terminates = false_terminates,
+			)
 		except CompileError as e:
 			self.discovery.fail( str( e ), node )
 		for name in removed:
@@ -1905,7 +1917,17 @@ class Lowering:
 		fields: dict[str,ir.Operand] = {}
 		for kw in node.keywords:
 			field = declared[kw.arg]
-			fields[kw.arg] = self._lower_expr( kw.value, field.type )
+			value = self._lower_expr( kw.value, field.type )
+			# value.type, not field.type: field.type is the FIELD's declared
+			# type, which stays an unsubstituted TypeVar for any field whose
+			# type depends on a class's own type params (class methods are
+			# never monomorphized per-specialization - see compiler.py's
+			# _enqueue) - value.type is always the operand's real, concrete
+			# type regardless, since only concrete values ever actually get
+			# lowered
+			for instr in self._cfg.field_value( value.type, value, is_alias = self._is_aliasing_expr( kw.value )):
+				self._emit( instr )
+			fields[kw.arg] = value
 
 		dest = self._new_temp( expected_type or target_cls )
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
@@ -2036,6 +2058,13 @@ class Lowering:
 
 		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( union )
 		value = self._lower_expr( node.args[0], member.type )
+		# value.type, not member.type - see _lower_allocate_fields's identical comment:
+		# a generic union's member type (e.g. OwnershipError[T]'s `SharedReference:
+		# T`) stays an unsubstituted TypeVar when the union is referenced bare
+		# (sys.OwnershipError, not sys.OwnershipError[bytearray]) - value.type is
+		# always the operand's real, concrete type regardless
+		for instr in self._cfg.field_value( value.type, value, is_alias = self._is_aliasing_expr( node.args[0] )):
+			self._emit( instr )
 		payload_dest = self._new_temp( payload_cls )
 		self._emit( ir.Allocate( dest = payload_dest, cls = payload_cls, fields = { f'v_{member.stem}': value } ))
 

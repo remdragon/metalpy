@@ -205,6 +205,53 @@ class AssignTests( CFGTestBase ):
 		self.state.assign( x, t, is_alias = False )
 		self.assertEqual( self.state.delete_temp( t ), [] ) # ownership transferred into x, not a second owner
 
+# --- struct/union field construction (Allocate) -------------------------------
+
+class FieldValueTests( CFGTestBase ):
+
+	def setUp( self ) -> None:
+		super().setUp()
+		self._import( 'class Foo: pass\ndef foo() -> None:\n\tpass\n' )
+		self.foo_cls = self._module.get_local( 'Foo' )
+		self.state = self._state( self._fn( 'foo' ))
+
+	def _local( self, stem: str ):
+		return Variable( stem = stem, qualname = f'foo.{stem}', file = None, line = None, type = self.foo_cls )
+
+	def test_aliasing_field_value_increfs( self ) -> None:
+		x = self._local( 'x' )
+		self.state.assign( x, self._new_temp( self.foo_cls ), is_alias = False )
+		instrs = self.state.field_value( self.foo_cls, x, is_alias = True )
+		self.assertEqual( self._kinds( instrs ), ['Incref'] )
+		self.assertIs( instrs[0].value, x )
+		# stateless - doesn't touch bindings/the epilogue stack
+		self.assertEqual( len( self.state._epilogue_stack ), 1 )
+		self.assertEqual( self.state.bindings['x'].state, cfg.OwnState.OWNED )
+
+	def test_fresh_field_value_is_a_noop( self ) -> None:
+		t = self._new_temp( self.foo_cls )
+		instrs = self.state.field_value( self.foo_cls, t, is_alias = False )
+		self.assertEqual( instrs, [] )
+
+	def test_non_rc_field_value_is_a_noop_even_if_aliasing( self ) -> None:
+		i32 = self.discovery.get_intrinsics()['i32']
+		x = Variable( stem = 'x', qualname = 'foo.x', file = None, line = None, type = i32 )
+		instrs = self.state.field_value( i32, x, is_alias = True )
+		self.assertEqual( instrs, [] )
+
+	def test_borrowed_source_embedded_in_field_still_increfs( self ) -> None:
+		# mirrors Result.Ok(val)'s own body embedding a plain (BORROWED)
+		# parameter into ResultPayload(ok=val) - field_value() doesn't
+		# require OWNED/COPY like move() does, since embedding is meant to
+		# behave like an ordinary aliasing read (an independent Incref),
+		# not an ownership transfer
+		self._import( 'class Foo: pass\ndef foo( x: Foo ) -> None:\n\tpass\n' )
+		state = self._state( self._fn( 'foo' ))
+		param = self._fn( 'foo' ).parameters[0]
+		self.assertEqual( state.bindings['x'].state, cfg.OwnState.BORROWED )
+		instrs = state.field_value( param.type, param, is_alias = True )
+		self.assertEqual( self._kinds( instrs ), ['Incref'] )
+
 # --- move[T] call arguments ------------------------------------------------
 
 class MoveTests( CFGTestBase ):
@@ -365,6 +412,56 @@ def foo() -> None:
 		with self.assertRaises( CompileError ) as ctx:
 			self.state.merge_if( entry.bindings, true_end, false_end, 'foo' )
 		self.assertIn( "only one branch", str( ctx.exception ))
+
+	def test_preexisting_local_untouched_by_both_branches_is_not_duplicated( self ) -> None:
+		# the actual bug: a local declared BEFORE the if, left completely
+		# untouched by both branches - restore() already puts its one real
+		# entry back on the stack before merge_if() ever runs; the old
+		# unconditional self._push() here duplicated it, producing a real
+		# double-decref at whatever exit ran next (the single most common
+		# if/else shape there is)
+		y = self._local( 'y' )
+		self.state.assign( y, self._new_temp( self.foo_cls ), is_alias = False )
+		entry = self.state.snapshot()
+		true_end = dict( self.state.bindings ) # untouched
+		false_end = dict( self.state.bindings ) # untouched
+		true_instrs, false_instrs, removed = self.state.merge_if( entry.bindings, true_end, false_end, 'foo' )
+		self.assertEqual( true_instrs, [] )
+		self.assertEqual( false_instrs, [] )
+		self.assertEqual( removed, [] )
+		self.assertEqual( len( self.state._epilogue_stack ), 1 ) # still exactly one entry, not two
+		self.assertIs( self.state.bindings['y'].entry, entry.bindings['y'].entry )
+
+	def test_true_terminates_false_survives_no_comparison_needed( self ) -> None:
+		# if cond: takeown(move(s)); return  (no else) - s is MOVED on the
+		# terminating true branch but still OWNED on the surviving false
+		# branch. Must NOT be treated as foo1's indeterminate-state
+		# mismatch - the true branch never reaches the join at all, so
+		# only the false branch's own ending state matters
+		s = self._local( 's' )
+		self.state.assign( s, self._new_temp( self.foo_cls ), is_alias = False )
+		entry = self.state.snapshot()
+		self.state.move( s, target_qualname = 'takeown', param_stem = 'x' )
+		true_end = dict( self.state.bindings )
+		self.state.restore( entry )
+		false_end = dict( entry.bindings ) # no else - untouched
+		true_instrs, false_instrs, removed = self.state.merge_if(
+			entry.bindings, true_end, false_end, 'foo', true_terminates = True,
+		)
+		self.assertEqual( true_instrs, [] )
+		self.assertEqual( false_instrs, [] )
+		self.assertEqual( removed, [] )
+		self.assertEqual( self.state.bindings['s'].state, cfg.OwnState.OWNED ) # false branch's own state wins
+		self.assertEqual( len( self.state._epilogue_stack ), 1 ) # reused, not duplicated
+		self.assertIs( self.state.bindings['s'].entry, entry.bindings['s'].entry )
+
+	def test_both_branches_terminate_nothing_survives( self ) -> None:
+		true_instrs, false_instrs, removed = self.state.merge_if(
+			{}, {}, {}, 'foo', true_terminates = True, false_terminates = True,
+		)
+		self.assertEqual( true_instrs, [] )
+		self.assertEqual( false_instrs, [] )
+		self.assertEqual( removed, [] )
 
 # --- loops ---------------------------------------------------------------
 

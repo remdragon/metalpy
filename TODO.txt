@@ -125,22 +125,84 @@ lowering:
 			if" case, and against real lib/ code (bytes/bytearray/str's
 			__init__/from_bytearray/release/__add__ all lower cleanly).
 
+			[resolved - v1, follow-up] struct/union field CONSTRUCTION
+				(Class.__allocate__(...)/bare ClassName(...)/a TaggedUnion
+				member construction, e.g. SharedReference(self)) now correctly
+				increfs an aliasing RC value embedded into a fresh field -
+				cfg.field_value(), called from lowering.py's
+				_lower_allocate_fields and _try_lower_union_construct_call.
+				Fixes bytearray.release()'s own SharedReference(self) case
+				exactly: self is increfed at the embed site, then decref'd as
+				usual by release()'s own epilogue at return - net zero, and the
+				returned payload's reference is never the "already decremented"
+				one. Mirrors assign()'s own is_alias -> Incref rule, deliberately
+				NOT move[T]'s ownership-transfer rule (which would incorrectly
+				reject Result.Ok(val)-style generic passthrough of a BORROWED
+				value into a field). Uses the embedded VALUE's own concrete type
+				for the RC check, not the field's declared type, since a
+				generic union/struct's field type stays an unsubstituted TypeVar
+				whenever it's referenced bare (sys.OwnershipError, not
+				sys.OwnershipError[bytearray]) - see the still-open "generic
+				TaggedUnion member substitution" gap further down, which this
+				sidesteps rather than fixes.
+
+				Still out of scope: SetAttr/SetItem storing an RC value into an
+				EXISTING struct/union instance's field (only fresh construction
+				is covered); the receiving struct/union's own eventual
+				teardown decref'ing its owned RC fields (moot for now - no
+				emitter/codegen consumes Decref for real yet, see below).
+
+			[resolved - v1, follow-up] merge_if() had a real, pre-existing
+				double-decref bug, found while verifying the field_value() fix
+				above end-to-end against bytearray.release()'s SECOND return
+				path (the success case) - NOT something this session's changes
+				introduced, present since the original cfg.py/_stmt_If
+				integration (commit c5c3d30) and never exercised by the
+				existing test suite:
+				1) merge_if()'s "both branches end in the same state" path
+					unconditionally pushed a FRESH epilogue entry for every
+					surviving OWNED/COPY binding - including a binding that
+					already existed, untouched, before the if. But restore()
+					(called by _stmt_If right before merge_if()) already puts
+					that binding's ORIGINAL entry back on the stack unchanged -
+					so the plain, extremely common shape `y = Foo(); if cond:
+					... else: ...; use(y)` got TWO live entries for y, a genuine
+					double-decref at whatever exit ran next. Fixed by only
+					pushing when the survivor's entry doesn't already match (by
+					identity) what entry_bindings itself points to - reusing the
+					same entry lowering.py already restored, matching assign()'s
+					own "reuse the entry for a name as long as it stays tracked"
+					discipline.
+				2) separately, a branch ending in return/break/continue was
+					still being compared against the other branch as if it fell
+					through to the join (return_()/unwind_to() deliberately
+					don't mutate bindings - "no code follows it on that path" -
+					so a terminating branch's own _end snapshot still looks like
+					an ordinary live binding set). This either raised a bogus
+					indeterminate-state error or silently re-pushed a duplicate
+					entry for a binding the OTHER, non-terminating branch also
+					still owns. Fixed by detecting node.body[-1]/node.orelse[-1]
+					being Return/Break/Continue in _stmt_If and passing
+					true_terminates/false_terminates to merge_if(): when exactly
+					one branch terminates, only the survivor's own ending state
+					reaches the join at all, no comparison needed; when both
+					terminate, nothing survives (code after is unreachable - full
+					dead-code detection is still future work).
+				Both fixed in cfg.py's merge_if() (identity-based entry reuse +
+				terminates handling) with cfg_test.py coverage; re-verified
+				bytearray.release() end-to-end - both return paths now emit
+				exactly one Decref(self) each, full 308-test suite green.
+
+				Separately noticed but NOT fixed (flagged for a decision, not
+				attempted): a function with NO defer/errdefer that falls off
+				the end without an explicit final `return` never calls
+				_emit_epilogue at all (lower_function only calls it when
+				_needs_epilogue, which is purely a defer/errdefer check) - so
+				OWNED/COPY locals never get decref'd on that specific fall-off
+				path. Distinct from the "known gaps" leak below (this is named
+				locals, not just fresh temps).
+
 			Known gaps, all deliberate scope cuts for v1, not oversights:
-			- struct/union FIELD ownership is untouched (SetAttr/SetItem storing
-				an RC value into a field isn't tracked at all) - this is CONCRETELY
-				WRONG for bytearray.release()'s own error path today: `return
-				Result.Err( OwnershipError.SharedReference( self ))` embeds self
-				into the Err payload (a plain Allocate as far as cfg.py can see,
-				same as any struct field write), but self is STILL "returned"
-				only in the sense that the WRAPPER is returned - cfg.py doesn't
-				know self got logically moved into that wrapper, so it decrefs
-				self anyway before the Return, leaving the returned SharedReference
-				holding a reference that's already been decremented. Fixing this
-				needs the real struct-field-ownership tracking this pass
-				deliberately deferred - not safe to paper over with a narrower
-				patch, since the same shape (embedding an owned/moved value into
-				an Allocate that's then returned/stored) recurs anywhere a Result
-				payload or tagged-union member wraps an RC value.
 			- defer/errdefer combined with ANY reference-counted local or
 				parameter is rejected outright (CompileError) rather than
 				attempted - every explicit return in a defer-using function
