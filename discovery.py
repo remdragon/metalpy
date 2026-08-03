@@ -551,9 +551,12 @@ class Discovery( ast.NodeVisitor ):
 
 	# --- globals / attributes ---------------------------------------------------------------
 
-	def visit_AnnAssign( self, node: ast.AnnAssign ) -> Variable:
+	def visit_AnnAssign( self, node: ast.AnnAssign ) -> Variable|None:
 		if not isinstance( node.target, ast.Name ):
 			self.fail( f'unsupported AnnAssign target {node.target!r}', node )
+		if isinstance( node.annotation, ast.Name ) and node.annotation.id == 'TypeAlias':
+			self._parse_type_alias( node )
+			return None
 		module = self.module_stack[-1]
 		scope = self.scope_stack[-1]
 		var_obj = Variable(
@@ -569,6 +572,31 @@ class Discovery( ast.NodeVisitor ):
 		if hasattr( scope, 'attributes' ):
 			scope.attributes.append( var_obj )
 		return var_obj
+
+	def _parse_type_alias( self, node: ast.AnnAssign ) -> None:
+		# X: TypeAlias = <type-expr> - TypeAlias is a compiler-recognized
+		# sigil, not a real resolvable name (no `from typing import
+		# TypeAlias` needed - recognized purely by AST shape in
+		# visit_AnnAssign, same posture as compiler.target/compiler.sizeof).
+		# X becomes a genuine alias - the SAME Type object <type-expr>
+		# resolves to, registered directly under X's own name - not a new
+		# nominal type and not a Variable, matching what TypeAlias means in
+		# real Python. Resolved eagerly, right here, unlike an ordinary
+		# AnnAssign's deferred _make_annotation_resolver - deliberately
+		# simple for now: no forward-referencing a class/alias declared
+		# later in the same file. lib/windows/kernel32.py's real motivating
+		# case (`HANDLE: TypeAlias = Ptr[None]`) only references an
+		# always-available intrinsic, so this covers it; a fully general
+		# (deferred, forward-referencing) version is future work if a real
+		# case ever needs one
+		assert isinstance( node.target, ast.Name ) # already checked by visit_AnnAssign
+		if node.value is None:
+			self.fail( f'TypeAlias declaration needs a value: {ast.unparse(node)}', node )
+		aliased = self.visit( node.value )
+		if not isinstance( aliased, Type ):
+			self.fail( f'TypeAlias value must be a type expression: {ast.unparse(node)}', node )
+		scope = self.scope_stack[-1]
+		scope.add_name( node.target.id, aliased )
 
 	def _make_annotation_resolver( self, var_obj: Variable, annotation: ast.expr, module: Module, scope: Module|ClassLike|Function ) -> Callable[[],None]:
 		def body() -> None:

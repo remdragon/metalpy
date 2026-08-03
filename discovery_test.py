@@ -1515,6 +1515,53 @@ def RtlAllocateHeap() -> Ptr[u8]:
 		self.assertIsNone( mod.get_local( 'RtlAllocateHeap' )) # excluded by @compiler.target( os = not 'windows' )
 
 
+class TypeAliasTests( unittest.TestCase ):
+	def _import( self, code: str ) -> tuple[discovery.Discovery, Module]:
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( code, Path( '__main__.py' ), scope = None )
+		return disco, mod
+
+	def test_alias_resolves_to_the_same_type_object( self ) -> None:
+		disco, mod = self._import( '''
+HANDLE: TypeAlias = Ptr[None]
+
+def foo( h: HANDLE ) -> HANDLE:
+	return h
+''' )
+		fn = mod.get_local( 'foo' )
+		fn.resolve()
+		handle = mod.get_local( 'HANDLE' )
+		self.assertIs( handle, fn.parameters[0].type )
+		self.assertIs( handle, fn.return_type )
+
+	def test_alias_is_not_a_variable( self ) -> None:
+		disco, mod = self._import( '''
+HANDLE: TypeAlias = Ptr[None]
+''' )
+		self.assertNotIsInstance( mod.get_local( 'HANDLE' ), Variable )
+
+	def test_no_value_is_a_compile_error( self ) -> None:
+		# AnnAssign with no value (`HANDLE: TypeAlias` alone) is legal
+		# Python syntax but meaningless for an alias - there's nothing to
+		# alias to
+		disco, mod = self._import( 'HANDLE: TypeAlias\n' )
+		self.assertTrue( any( 'needs a value' in e for e in disco.errors.errors ))
+
+	def test_non_type_value_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+some_var: i32 = 5
+HANDLE: TypeAlias = some_var
+''' )
+		self.assertTrue( any( 'must be a type expression' in e for e in disco.errors.errors ))
+
+	def test_no_import_needed( self ) -> None:
+		# TypeAlias is recognized purely by AST shape (like compiler.target/
+		# compiler.sizeof) - no `from typing import TypeAlias` required,
+		# matching lib/windows/kernel32.py's real, import-free usage
+		disco, mod = self._import( 'HANDLE: TypeAlias = Ptr[None]\n' )
+		self.assertEqual( disco.errors.errors, [] )
+
+
 class RealLibSmokeTest( unittest.TestCase ):
 	''' confirms discovery no longer crashes on the actual example library, not just synthetic snippets '''
 
