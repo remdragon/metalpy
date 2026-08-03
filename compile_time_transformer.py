@@ -226,3 +226,15 @@ def transform_function_body( body: list[ast.stmt], active_target: dict[str,objec
 	container = ast.Module( body = list( body ), type_ignores = [] )
 	_ConstFolder( active_target ).generic_visit( container )
 	return container.body
+
+
+def transform_expr( node: ast.expr, active_target: dict[str,object] ) -> ast.expr:
+	''' single-expression sibling of transform_function_body - for contexts
+	that lower a bare expression rather than a statement list (a global
+	variable's or a class attribute's own initializer - see discovery.py's
+	visit_Assign/visit_AnnAssign, which fold Variable.init through this the
+	same way function bodies already fold through transform_function_body) '''
+	wrapper = ast.Expr( value = node )
+	ast.copy_location( wrapper, node )
+	folded = transform_function_body( [ wrapper ], active_target )
+	return folded[0].value

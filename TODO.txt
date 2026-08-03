@@ -361,12 +361,73 @@ lowering:
 		sys.panic()'s entire error-reporting path (previously unreachable)
 		now resolves and lowers too (_write_stderr_cstr, str.get_cstr,
 		str.byte_len, _exit_process, and their own windows/ntdll and
-		windows/kernel32 @extern dependencies). The repro now hits yet
-		ANOTHER, unrelated wall: `u32(-11)`-style scalar constructor calls
-		("cannot call u32" - lib/sys.py's _Stdout.write() and
-		lib/windows/kernel32.py's STD_OUTPUT_HANDLE etc. all do this) -
-		calling a builtin scalar type as a constructor/cast isn't supported
-		yet. Not chased here.
+		windows/kernel32 @extern dependencies). The repro then hit yet
+		another wall - `u32(-11)`-style scalar constructor calls ("cannot
+		call u32") - now resolved, see below.
+	[resolved] Scalar-to-Scalar casts (`u32(x)` construction-sugar,
+		`compiler.cast(T, x)`): rather than hard-coding conversion pairs as
+		bespoke dispatch in lowering.py, `Scalar` (mpy_types.py - i32/u32/
+		u8/usize/bool/etc, previously a bare dataclass) gained real method-
+		hosting (ScopeMixin + names: dict, same as RCClass/CStruct/...).
+		discovery.py's visit_Assign recognizes `SomeScalar.method = some_
+		function` as a compiler sigil (same posture as TypeAlias/compiler.
+		target - no new syntax, eager resolution), registering directly into
+		the shared intrinsic's own .names - this is the foundation for any
+		FUTURE non-Scalar cast source (a class defining its own __u32__),
+		not exercised by the two real call sites below.
+		The actual conversion logic lives in one place, _lower_scalar_cast,
+		shared by both `compiler.cast(T, x)` (a new intrinsic, same AST-
+		recognition posture as compiler.sizeof/compiler.refcount) and `T(x)`
+		construction-sugar (_try_lower_scalar_construct_call, a new sibling
+		to _try_lower_construct_call - NOT routed through it, since that
+		function's Allocate/self/RC-fallible-construction machinery is
+		meaningless for a scalar). Splits on literal-vs-not, the same axis
+		this codebase already treats as meaningful everywhere else: a
+		literal argument always succeeds via two's-complement bit-
+		reinterpretation (decided at compile time, no Result) - `u32(-11)`
+		reinterpreted as u32 is exactly the well-defined value real WinAPI
+		constants like STD_OUTPUT_HANDLE rely on. A non-literal argument
+		respects the EXISTING self._arithmetic_mode stack (new ir.CastWrap/
+		CastCheck/CastSaturate, mirroring NegWrap/NegCheck/NegSaturate
+		exactly, reusing _require_result_return/_consume_checked_result
+		unchanged) - default Check mode returns Result[T,OverflowError],
+		same as any other checked arithmetic. When the cast source's type
+		ISN'T a Scalar (a future RCClass), _try_lower_scalar_construct_call
+		falls back to dunder dispatch (operand.type's own __u32__, found via
+		the now-generically-duck-typed _find_method) - this is where the
+		Scalar.names foundation actually earns its keep, not for numeric-
+		to-numeric pairs where one compiler primitive already covers every
+		combination uniformly.
+		A second, more general bug surfaced and got fixed along the way:
+		compile_time_transformer folding was NEVER applied to a global
+		variable's or a class attribute's own initializer (only function
+		bodies, via _make_function_resolver) - so `STD_ERROR_HANDLE: u32 =
+		u32(-12)` (the actual real call site) never got `-12` folded from
+		UnaryOp(USub,Constant) into a bare Constant at all. Original fix
+		attempt was a workaround inside lowering.py's cast logic (re-fold
+		defensively, right where the literal check needed it) - correctly
+		flagged as inconsistent with fixing things at the right layer: the
+		real fix is compile_time_transformer.transform_expr (new, a single-
+		expression sibling of transform_function_body) wired into discovery.
+		py's visit_Assign/visit_AnnAssign directly, exactly mirroring how
+		function bodies already get folded. Benefits more than casts - ANY
+		compile-time-foldable global/attribute initializer (`X: i32 = 1+1`)
+		now folds too, and since visit_AnnAssign is shared by module globals
+		AND class-body attribute defaults, both get this for free.
+		Verified end to end: the `bytearray(4)` repro's "cannot call u32"
+		errors (lib/sys.py's _Stdout.write, lib/windows/kernel32.py's
+		STD_OUTPUT_HANDLE/STD_ERROR_HANDLE/etc, all real) are gone -
+		required adding `with compiler.wrap_arithmetic:` around _Stdout.
+		write's and _write_stderr_cstr's own WriteFile(...) calls (both
+		-> None, can't propagate Check mode's default Result), a small real
+		lib/sys.py source change. The repro now hits yet ANOTHER,
+		completely unrelated wall: `compiler.addrof(...)` was never
+		implemented anywhere in lowering.py at all ("'compiler' is not a
+		value, cannot use it as an expression") - this was always broken,
+		just never reached before (the same WriteFile(...) call's OWN
+		u32(length) argument used to fail first, aborting the statement
+		before compiler.addrof(written), a later argument in the same
+		call, was ever lowered). Not chased here.
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion

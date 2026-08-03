@@ -559,12 +559,18 @@ class Discovery( ast.NodeVisitor ):
 			return None
 		module = self.module_stack[-1]
 		scope = self.scope_stack[-1]
+		# folded eagerly, same as a function body (_make_function_resolver) -
+		# a global/attribute initializer is a bare expression, never
+		# otherwise passed through compile_time_transformer at all, so
+		# without this `X: u32 = u32(-11)` (a real WinAPI-style constant)
+		# would never see its own compile-time-constant argument folded
+		init = compile_time_transformer.transform_expr( node.value, self.active_target ) if node.value is not None else None
 		var_obj = Variable(
 			stem = node.target.id,
 			qualname = self._get_qualname( node.target.id ),
 			file = module.file,
 			line = node.lineno,
-			init = node.value,
+			init = init,
 			is_global = scope is module,
 		)
 		var_obj.resolve = self._make_annotation_resolver( var_obj, node.annotation, module, scope )
@@ -619,18 +625,38 @@ class Discovery( ast.NodeVisitor ):
 		if len( node.targets ) != 1:
 			self.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
 		target = node.targets[0]
+		if isinstance( target, ast.Attribute ):
+			base = self.visit( target.value )
+			if isinstance( base, Scalar ):
+				# `usize.__u32__ = some_function` - a compiler-recognized
+				# sigil (like TypeAlias/compiler.target), not ordinary
+				# attribute assignment: registers a real method directly
+				# into the shared intrinsic Scalar's own .names, resolved
+				# eagerly (the RHS function must already be def'd earlier
+				# in the same file, same top-to-bottom limitation
+				# _parse_type_alias already has)
+				value = self.visit( node.value )
+				if not isinstance( value, Function ):
+					self.fail( f'{ast.unparse(target)} = ... must assign a function: {ast.unparse(node)}', node )
+				base.add_name( target.attr, value )
+				return None
+			# anything else with an Attribute target falls through to the
+			# ordinary failure below, unchanged
 		if not isinstance( target, ast.Name ):
 			self.fail( f'unsupported Assign target {target!r}', node )
 		module = self.module_stack[-1]
+		# folded eagerly, same as a function body (_make_function_resolver) -
+		# see the identical comment on visit_AnnAssign
+		init = compile_time_transformer.transform_expr( node.value, self.active_target )
 		var_obj = Variable(
 			stem = target.id,
 			qualname = self._get_qualname( target.id ),
 			file = module.file,
 			line = node.lineno,
-			init = node.value,
+			init = init,
 			is_global = scope is module,
 		)
-		var_obj.resolve = self._make_value_resolver( var_obj, node.value, module, scope )
+		var_obj.resolve = self._make_value_resolver( var_obj, init, module, scope )
 		scope.add_name( var_obj.stem, var_obj )
 		if hasattr( scope, 'attributes' ):
 			scope.attributes.append( var_obj )

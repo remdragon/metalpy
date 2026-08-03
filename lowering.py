@@ -11,7 +11,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch, Move, RCClass,
+	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
 
@@ -858,6 +858,15 @@ class Lowering:
 			and node.func.value.id == 'compiler'
 		)
 
+	def _is_compiler_cast_call( self, node: ast.expr ) -> bool:
+		return (
+			isinstance( node, ast.Call )
+			and isinstance( node.func, ast.Attribute )
+			and node.func.attr == 'cast'
+			and isinstance( node.func.value, ast.Name )
+			and node.func.value.id == 'compiler'
+		)
+
 	# byte size for every intrinsic scalar this target model actually has a
 	# fixed size for - matches this compiler's own intrinsics (see
 	# discovery.py's get_intrinsics()). Real user classes have no known size
@@ -923,6 +932,65 @@ class Lowering:
 		dest = self._new_temp( expected_type or usize_cls )
 		self._emit( ir.RefCount( dest = dest, value = value ))
 		return dest
+
+	def _lower_scalar_cast( self, target_type: Scalar, source: ast.expr|ir.Operand, node: ast.AST ) -> ir.Operand:
+		# shared by compiler.cast(T, x) and T(x) construction-sugar - the
+		# one place the actual Scalar-to-Scalar conversion logic lives.
+		# `source` is EITHER an unlowered ast.expr (a bare literal - always
+		# succeeds via bit-reinterpretation, decided at compile time, no
+		# Result involved - -11 reinterpreted as u32 is exactly the
+		# well-defined two's-complement value real WinAPI constants like
+		# STD_OUTPUT_HANDLE rely on) OR an already-lowered ir.Operand (a
+		# real runtime value, where "does this fit" is a genuine runtime
+		# question - respects self._arithmetic_mode exactly like +/-/*
+		# already do, reusing the same Check/Wrap/Saturate/panic_arithmetic
+		# machinery, not a separate concept)
+		if isinstance( source, ast.expr ):
+			return self._lower_expr( source, target_type )
+		operand = source
+		kind, extra = self._arithmetic_mode[-1]
+		opcode = self._CAST_OPCODES_BY_KIND[kind]
+		if kind in ( 'wrap', 'saturate' ):
+			dest = self._new_temp( target_type )
+			self._emit( opcode( dest = dest, operand = operand ))
+			return dest
+		result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
+		if extra is None:
+			self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
+		check_type = self.discovery._get_or_create_specialization( result_cls, [ target_type, overflow_cls ] )
+		check_dest = self._new_temp( check_type )
+		self._emit( opcode( dest = check_dest, operand = operand ))
+		return self._consume_checked_result( check_dest, target_type, extra )
+
+	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.cast(T, x) - T is a TYPE reference (resolved via
+		# _try_resolve_namespace, same as compiler.sizeof's argument, not
+		# _lower_expr), x is a real value. The call's own target type is
+		# always authoritative for the result - unlike an ordinary literal,
+		# an explicit cast overrides whatever the ambient expected_type is
+		if len( node.args ) != 2 or node.keywords:
+			self.discovery.fail( f'compiler.cast(...) takes exactly two arguments: {ast.unparse(node)}', node )
+		target_type = self._try_resolve_namespace( node.args[0] )
+		if target_type is None:
+			self.discovery.fail( f'compiler.cast(...) first argument must be a type: {ast.unparse(node)}', node )
+		if isinstance( target_type, TypeVar ):
+			self.discovery.fail(
+				f'compiler.cast({target_type.stem}, ...) requires a concrete type - {target_type.qualname} is still an '
+				f'unbound generic type parameter here (call the enclosing function through an explicit specialization, e.g. foo[SomeType](...))',
+				node,
+			)
+		if not isinstance( target_type, Scalar ):
+			self.discovery.fail( f'compiler.cast({target_type.qualname}, ...) is not supported yet - only Scalar-to-Scalar casts are, for now', node )
+		value_node = node.args[1]
+		if isinstance( value_node, ast.Constant ):
+			return self._lower_scalar_cast( target_type, value_node, node )
+		value = self._lower_expr( value_node, None )
+		if not isinstance( value.type, Scalar ):
+			self.discovery.fail(
+				f'compiler.cast(...) second argument must be a scalar value, not {value.type.qualname if value.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		return self._lower_scalar_cast( target_type, value, node )
 
 	def _is_compiler_early_return_call( self, node: ast.expr ) -> bool:
 		return (
@@ -1602,6 +1670,11 @@ class Lowering:
 		'wrap': ir.NegWrap,
 		'saturate': ir.NegSaturate,
 		'check': ir.NegCheck,
+	}
+	_CAST_OPCODES_BY_KIND = {
+		'wrap': ir.CastWrap,
+		'saturate': ir.CastSaturate,
+		'check': ir.CastCheck,
 	}
 
 	_ARITHMETIC_ALTERNATIVES = (
@@ -2525,6 +2598,44 @@ class Lowering:
 		self._emit( ir.Allocate( dest = dest, cls = union, fields = { tag_attr.stem: ir.Const( type = tag_attr.type, value = tags[member.stem] ), data_attr.stem: payload_dest } ))
 		return dest
 
+	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
+		# ScalarName(x) - Python's own int(x)/float(x)-style constructor-as-
+		# cast idiom. Deliberately NOT routed through _try_lower_construct_call
+		# (ClassLike-only: its Allocate/self/RC-fallible-construction machinery
+		# is meaningless for a scalar - no self to allocate, no attributes, no
+		# refcounting)
+		target_cls = self._try_resolve_namespace( node.func )
+		if not isinstance( target_cls, Scalar ):
+			return None
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'{target_cls.qualname}(...) takes exactly one argument: {ast.unparse(node)}', node )
+		arg_node = node.args[0]
+		if isinstance( arg_node, ast.Constant ):
+			return self._lower_scalar_cast( target_cls, arg_node, node )
+		operand = self._lower_expr( arg_node, None )
+		if isinstance( operand.type, Scalar ):
+			# the real motivating case (u32(s.byte_len())) - same
+			# arithmetic-mode-respecting logic compiler.cast(...) uses, no
+			# dunder dispatch needed: one compiler primitive already
+			# covers every Scalar-to-Scalar pair uniformly
+			return self._lower_scalar_cast( target_cls, operand, node )
+		# a non-Scalar source (e.g. an RCClass) - this is where library-
+		# authored extensibility (Scalar.names, see discovery.py's
+		# visit_Assign) actually earns its keep: a future
+		# `SomeClass.__u32__(self) -> u32: ...` is dispatched here exactly
+		# like any other method call
+		dunder = self._find_method( operand.type, f'__{target_cls.stem}__' )
+		if dunder is None:
+			self.discovery.fail(
+				f'{operand.type.qualname if operand.type else "?"} has no __{target_cls.stem}__ method - cannot convert to {target_cls.qualname}: {ast.unparse(node)}',
+				node,
+			)
+		self._ensure_resolved( dunder )
+		self.schedule( dunder.return_type )
+		dest = self._new_temp( expected_type or dunder.return_type )
+		self._emit( ir.Call( dest = dest, target = dunder, receiver = operand, args = [], kwargs = {} ))
+		return dest
+
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
 
 	def _lower_or_return( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
@@ -2660,11 +2771,17 @@ class Lowering:
 			result = self._lower_compiler_refcount( node, expected_type )
 			return result if want_result else None
 
+		if self._is_compiler_cast_call( node ):
+			result = self._lower_compiler_cast( node, expected_type )
+			return result if want_result else None
+
 		allocate_dest = self._try_lower_allocate_call( node, expected_type )
 		if allocate_dest is None:
 			allocate_dest = self._try_lower_construct_call( node, expected_type )
 		if allocate_dest is None:
 			allocate_dest = self._try_lower_union_construct_call( node, expected_type )
+		if allocate_dest is None:
+			allocate_dest = self._try_lower_scalar_construct_call( node, expected_type )
 		if allocate_dest is not None:
 			return allocate_dest if want_result else None
 

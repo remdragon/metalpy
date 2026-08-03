@@ -165,6 +165,10 @@ class NegWrap( UnaryOp ): pass
 class NegCheck( UnaryOp ): pass # dest.type is Result[T,OverflowError]
 class NegSaturate( UnaryOp ): pass
 
+class CastWrap( UnaryOp ): pass
+class CastCheck( UnaryOp ): pass # dest.type is Result[T,OverflowError]
+class CastSaturate( UnaryOp ): pass
+
 # Result-consuming ops - Check-mode arithmetic and Div/Mod hand back a
 # Result[T,OverflowError] rather than panicking inline. These mirror the real
 # methods already defined on builtins.Result (or_return, unwrap, unwrap_or in

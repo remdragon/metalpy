@@ -23,13 +23,31 @@ class Type( Name ):
 		# primitives below) to treat "a union" and "a plain type" uniformly.
 		return [ self ]
 
+class ScopeMixin:
+	'''
+	shared shape for anything that owns a local namespace (Module, the various
+	class kinds, Function) - not a dataclass itself (no fields of its own) so it
+	can't interfere with dataclass field collection on whatever it's mixed into.
+	'''
+	names: dict[str,Name]
+
+	def add_name( self, name: str, name_obj: Name ) -> None:
+		self.names[name] = name_obj
+
+	def get_local( self, name: str ) -> Name|None:
+		return self.names.get( name )
+
 @dataclass( kw_only = True )
-class Scalar( Type ):
+class Scalar( Type, ScopeMixin ):
 	'''
 	isize, usize, i32, u32, etc - also used for generic pointer intrinsics
-	(Ptr, ConstPtr), which is why type_params exists here too
+	(Ptr, ConstPtr), which is why type_params exists here too. names is
+	populated by library source (`usize.__u32__ = some_function` - see
+	discovery.py's visit_Assign) rather than a parsed class body, since
+	intrinsic scalars aren't declared from any real source file
 	'''
 	type_params: list['TypeVar']|None = None
+	names: dict[str,Name] = field( default_factory = dict )
 
 @dataclass( kw_only = True )
 class TypeVar( Type ):
@@ -108,21 +126,6 @@ class Copy( Type ):
 	binding is completely unaffected. See TODO.txt/RC MANAGEMENT.md for
 	the CFG work this exists for. '''
 	inner: Type
-
-
-class ScopeMixin:
-	'''
-	shared shape for anything that owns a local namespace (Module, the various
-	class kinds, Function) - not a dataclass itself (no fields of its own) so it
-	can't interfere with dataclass field collection on whatever it's mixed into.
-	'''
-	names: dict[str,Name]
-
-	def add_name( self, name: str, name_obj: Name ) -> None:
-		self.names[name] = name_obj
-
-	def get_local( self, name: str ) -> Name|None:
-		return self.names.get( name )
 
 # a class's own body scan (revealing its attribute/method *names*) is
 # deferred behind .resolve, exactly like a Function's parameters or a

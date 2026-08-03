@@ -170,5 +170,27 @@ class MatchSimplificationTests( unittest.TestCase ):
 		self.assertEqual( _fold( src, { 'bits': 64 } ), expected )
 
 
+class TransformExprTests( unittest.TestCase ):
+	''' the single-expression sibling of transform_function_body - used by
+	discovery.py's visit_Assign/visit_AnnAssign to fold a global/attribute
+	initializer, a context that never lowers a statement list at all '''
+
+	def _fold_expr( self, src: str, active_target: dict[str,object] ) -> str:
+		node = ast.parse( src, mode = 'eval' ).body
+		return ast.unparse( ctt.transform_expr( node, active_target ))
+
+	def test_binop_folds( self ) -> None:
+		self.assertEqual( self._fold_expr( '1 + 1', {} ), '2' )
+
+	def test_unary_minus_on_constant_folds( self ) -> None:
+		self.assertEqual( self._fold_expr( '-12', {} ), '-12' )
+
+	def test_compiler_target_substitution_folds( self ) -> None:
+		self.assertEqual( self._fold_expr( "compiler.target.os == 'windows'", { 'os': 'windows' } ), 'True' )
+
+	def test_non_foldable_expr_returned_unchanged( self ) -> None:
+		self.assertEqual( self._fold_expr( 'some_call()', {} ), 'some_call()' )
+
+
 if __name__ == '__main__':
 	unittest.main()

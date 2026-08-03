@@ -132,7 +132,7 @@ class BinOpFamilyTests( IRTestCase ):
 				self.assertIsNot( instr.dest.type, self.result_i32_overflow )
 
 class UnaryOpFamilyTests( IRTestCase ):
-	UNARYOPS = [ ir.Invert, ir.NegWrap, ir.NegCheck, ir.NegSaturate ]
+	UNARYOPS = [ ir.Invert, ir.NegWrap, ir.NegCheck, ir.NegSaturate, ir.CastWrap, ir.CastCheck, ir.CastSaturate ]
 
 	def test_same_class_same_fields_equal( self ) -> None:
 		for cls in self.UNARYOPS:

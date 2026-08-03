@@ -30,7 +30,13 @@ class _Stdout:
 	def write( self, s: str ) -> None:
 		from windows.kernel32 import GetStdHandle, WriteFile, STD_OUTPUT_HANDLE
 		written: u32 = 0
-		WriteFile( GetStdHandle( STD_OUTPUT_HANDLE ), s.get_cstr(), u32( s.byte_len() ), compiler.addrof( written ), None )
+		# u32(s.byte_len()) is a real narrowing cast (usize -> u32) - this
+		# function returns None, so it can't propagate Check mode's default
+		# Result[u32,OverflowError]; a write() call writing >4GB in one
+		# syscall isn't a real scenario, so wrap (silent truncation) is the
+		# pragmatic choice here, same as any C caller of WriteFile would make
+		with compiler.wrap_arithmetic:
+			WriteFile( GetStdHandle( STD_OUTPUT_HANDLE ), s.get_cstr(), u32( s.byte_len() ), compiler.addrof( written ), None )
 
 	@compiler.target( os = not 'windows' )
 	def write( self, s: str ) -> None:
@@ -140,7 +146,11 @@ def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:
 	handle = GetStdHandle( STD_ERROR_HANDLE )
 	if handle != 0 and handle != -1:
 		written: u32 = 0
-		WriteFile( handle, msg, u32( length ), compiler.addrof( written ), None )
+		# see _Stdout.write's identical comment - u32(length) is a real
+		# narrowing cast (usize -> u32); this function returns None, so it
+		# can't propagate Check mode's Result[u32,OverflowError]
+		with compiler.wrap_arithmetic:
+			WriteFile( handle, msg, u32( length ), compiler.addrof( written ), None )
 
 @compiler.target( os = not 'windows' )
 def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:

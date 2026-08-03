@@ -1444,6 +1444,36 @@ def foo() -> None:
 		self.assertEqual( len( fn.node.body ), 1 )
 		self.assertEqual( ast.unparse( fn.node.body[0] ), 'a = 1' )
 
+	def test_annassign_global_initializer_folded_eagerly( self ) -> None:
+		# a global's own initializer is a bare expression, never otherwise
+		# passed through compile_time_transformer at all (unlike a function
+		# body) - visit_AnnAssign folds it directly, matching the real
+		# lib/windows/kernel32.py case (STD_ERROR_HANDLE: u32 = u32(-12))
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( 'X: i32 = 1 + 1\n', Path( '__main__.py' ), scope = None )
+		import ast
+		self.assertEqual( ast.unparse( mod.get_local( 'X' ).init ), '2' )
+
+	def test_assign_global_initializer_folded_eagerly( self ) -> None:
+		# same, for the un-annotated Assign form (visit_Assign)
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( 'X = 1 + 1\n', Path( '__main__.py' ), scope = None )
+		import ast
+		self.assertEqual( ast.unparse( mod.get_local( 'X' ).init ), '2' )
+
+	def test_class_attribute_default_folded_eagerly( self ) -> None:
+		# visit_AnnAssign is shared by module globals AND class-body
+		# attribute defaults - both benefit from the same fix
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( '''
+class Foo:
+	a: i32 = 1 + 1
+''', Path( '__main__.py' ), scope = None )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		import ast
+		self.assertEqual( ast.unparse( foo.get_local( 'a' ).init ), '2' )
+
 
 class ExternDecoratorTests( unittest.TestCase ):
 	def _import( self, code: str ) -> tuple[discovery.Discovery, Module]:
@@ -1560,6 +1590,55 @@ HANDLE: TypeAlias = some_var
 		# matching lib/windows/kernel32.py's real, import-free usage
 		disco, mod = self._import( 'HANDLE: TypeAlias = Ptr[None]\n' )
 		self.assertEqual( disco.errors.errors, [] )
+
+
+class ScalarMethodRegistrationTests( unittest.TestCase ):
+	''' `Scalar.method = some_function` - see visit_Assign - the foundation
+	future scalar behavior (e.g. a non-Scalar cast source's __u32__ dunder,
+	see lowering.py's _try_lower_scalar_construct_call) is meant to build on '''
+
+	def _import( self, code: str ) -> tuple[discovery.Discovery, Module]:
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( code, Path( '__main__.py' ), scope = None )
+		return disco, mod
+
+	def test_registers_into_the_shared_intrinsic( self ) -> None:
+		disco, mod = self._import( '''
+def my_func( x: usize ) -> u32:
+	return 1
+
+usize.__u32__ = my_func
+''' )
+		self.assertEqual( disco.errors.errors, [] )
+		usize_cls = disco.get_intrinsics()['usize']
+		registered = usize_cls.names.get( '__u32__' )
+		self.assertIsInstance( registered, Function )
+		self.assertEqual( registered.stem, 'my_func' )
+
+	def test_forward_reference_ordering_fails( self ) -> None:
+		# same top-to-bottom limitation as TypeAlias - the RHS function must
+		# already be def'd earlier in the same file
+		disco, mod = self._import( '''
+usize.__u32__ = my_func
+
+def my_func( x: usize ) -> u32:
+	return 1
+''' )
+		self.assertTrue( any( "not defined" in e or "cannot resolve" in e for e in disco.errors.errors ))
+
+	def test_non_scalar_attribute_target_unaffected( self ) -> None:
+		disco, mod = self._import( '''
+class Foo: pass
+Foo.bar = 5
+''' )
+		self.assertTrue( any( 'unsupported Assign target' in e for e in disco.errors.errors ))
+
+	def test_rhs_not_a_function_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+some_var: i32 = 5
+usize.__u32__ = some_var
+''' )
+		self.assertTrue( any( 'must assign a function' in e for e in disco.errors.errors ))
 
 
 class RealLibSmokeTest( unittest.TestCase ):

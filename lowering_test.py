@@ -3686,6 +3686,113 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( len( calls ), 1 )
 		self.assertIs( calls[0].target, mod.get_local( 'malloc' ))
 
+	# --- Scalar-to-Scalar casts (u32(...) construction-sugar / compiler.cast) --
+
+	def test_negative_literal_cast_is_a_bare_const( self ) -> None:
+		# a negative literal specifically (not just a positive one) - u32(-11)
+		# parses as UnaryOp(USub, Constant(11)), so this also exercises that
+		# compile_time_transformer folds it before lowering.py ever sees it
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: u32 = u32( -11 )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		kinds = [ type( i ).__name__ for i in lowered.instructions ]
+		self.assertNotIn( 'Call', kinds )
+		self.assertNotIn( 'CastWrap', kinds )
+		self.assertNotIn( 'CastCheck', kinds )
+		assign = next( i for i in lowered.instructions if isinstance( i, ir.Assign ))
+		self.assertEqual( assign.src, ir.Const( type = self.discovery.get_intrinsics()['u32'], value = -11 ))
+
+	def test_non_literal_cast_default_check_mode( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'def f( s: usize ) -> Result[u32,OverflowError]:',
+			'	x = u32( s )',
+			'	return Result.Ok( x )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'f' ))
+		kinds = [ type( i ).__name__ for i in lowered.instructions ]
+		self.assertIn( 'CastCheck', kinds )
+		self.assertIn( 'OrReturn', kinds )
+
+	def test_non_literal_cast_without_result_return_is_a_compile_error( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class OverflowError: pass',
+			'',
+			'def f( s: usize ) -> None:',
+			'	x = u32( s )',
+		])
+		mod = self._import( code )
+		self.compiler._lower( mod.get_local( 'f' ))
+		self.assertTrue( any( 'requires the enclosing function to return Result' in e for e in self.discovery.errors.errors ))
+
+	def test_wrap_arithmetic_cast_has_no_result( self ) -> None:
+		code = '\n'.join([
+			'def f( s: usize ) -> u32:',
+			'	with compiler.wrap_arithmetic:',
+			'		return u32( s )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'f' ))
+		kinds = [ type( i ).__name__ for i in lowered.instructions ]
+		self.assertIn( 'CastWrap', kinds )
+		self.assertNotIn( 'CastCheck', kinds )
+		self.assertNotIn( 'OrReturn', kinds )
+
+	def test_compiler_cast_shares_the_same_lowering_as_construction_sugar( self ) -> None:
+		code = '\n'.join([
+			'def f( s: usize ) -> u32:',
+			'	with compiler.wrap_arithmetic:',
+			'		return compiler.cast( u32, s )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'f' ))
+		kinds = [ type( i ).__name__ for i in lowered.instructions ]
+		self.assertIn( 'CastWrap', kinds )
+
+	def test_non_scalar_source_without_dunder_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Bar: pass',
+			'',
+			'def f() -> u32:',
+			'	b = Bar()',
+			'	return u32( b )',
+		])
+		mod = self._import( code )
+		self.compiler._lower( mod.get_local( 'f' ))
+		self.assertTrue( any( 'has no __u32__ method' in e for e in self.discovery.errors.errors ))
+
+	def test_non_scalar_source_with_dunder_dispatches_to_it( self ) -> None:
+		code = '\n'.join([
+			'class Foo:',
+			'	def __u32__( self ) -> u32:',
+			'		return 5',
+			'',
+			'def f() -> u32:',
+			'	x = Foo()',
+			'	return u32( x )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'f' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].target.stem, '__u32__' )
+
+	def test_wrong_arity_is_a_compile_error( self ) -> None:
+		for call in ( 'u32()', 'u32( 1, 2 )' ):
+			with self.subTest( call = call ):
+				code = '\n'.join([
+					'def main() -> None:',
+					f'	x = {call}',
+				])
+				mod = self._import( code )
+				self.compiler._lower( mod.get_local( 'main' ))
+				self.assertTrue( any( 'takes exactly one argument' in e for e in self.discovery.errors.errors ))
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()
