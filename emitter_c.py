@@ -561,6 +561,17 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 		op = _member_access_operator( instr.obj.type )
 		return [ f'\t({_emit_operand(instr.obj)}){op}{instr.attr} = {_emit_operand(instr.value)};' ]
 
+	if isinstance( instr, ir.GetItem ):
+		# only ever reached for a raw pointer with no real __getitem__ (see
+		# lowering.py's _expr_Subscript) - Ptr[T]/ConstPtr[T] are plain C
+		# pointers (c_type), so C's own subscript operator applies directly
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)})[{_emit_operand(instr.index)}];' ]
+	if isinstance( instr, ir.SetItem ):
+		return [ f'\t({_emit_operand(instr.obj)})[{_emit_operand(instr.index)}] = {_emit_operand(instr.value)};' ]
+
+	if isinstance( instr, ir.AddrOf ):
+		return [ f'\t{_emit_operand(instr.dest)} = &{_emit_operand(instr.value)};' ]
+
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
 			raise NotImplementedError( 'ir.Allocate for RCClass is Phase 3 work (needs sys.alloc[T]/header construction)' )
@@ -650,7 +661,18 @@ def emit_cunion( cls: CUnion ) -> str:
 	return _struct_or_union_body( mangle_type( cls ), 'union', attrs )
 
 def emit_cenum( cls: CEnum ) -> str:
-	raise NotImplementedError( 'emit_cenum: Phase 2 work' )
+	# not a real C `enum` - .value_type can be any scalar width (u32/i32 seen
+	# in real lib/ code), and C's own `enum` underlying type is
+	# implementation-defined/usually int-only (see the plan's type-mapping
+	# table) - a typedef of the real value type plus one static const per
+	# member reproduces the same "named integer constant" semantics without
+	# that portability trap
+	name = mangle_type( cls )
+	value_ctype = c_type( cls.value_type )
+	lines = [ f'typedef {value_ctype} {name};' ]
+	for key, value in cls.members.items():
+		lines.append( f'static const {name} {name}${key} = {value};' )
+	return '\n'.join( lines )
 
 def emit_tagged_union( union: TaggedUnion ) -> str:
 	raise NotImplementedError( 'emit_tagged_union: Phase 5 work' )
@@ -716,9 +738,8 @@ def emit_c( compiler: Compiler ) -> str:
 	# pass 1: forward declarations (opaque RCClass tags, full CEnum bodies,
 	# full CStruct/CUnion/TaggedUnion bodies in dependency order, function
 	# prototypes)
-	for cls in compiler.cenums:
-		if not cls.type_params:
-			parts.append( emit_cenum( cls ))
+	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
+		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))
 	for lf in compiler.functions:
 		parts.append( emit_function( lf, prototype_only = True ))

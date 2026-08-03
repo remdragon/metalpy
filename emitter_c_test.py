@@ -11,7 +11,7 @@ import emitter_c
 from compiler import Compiler
 from discovery import Discovery
 from mpy_types import (
-	CStruct, Function, Parameter, RCClass, Scalar, Specialization, TaggedUnion, Variable,
+	CEnum, CStruct, Function, Parameter, RCClass, Scalar, Specialization, TaggedUnion, Variable,
 )
 
 def _scalar( stem: str, qualname: str|None = None ) -> Scalar:
@@ -87,6 +87,30 @@ class CTypeTests( unittest.TestCase ):
 	def test_cstruct_is_a_value( self ) -> None:
 		cls = CStruct( stem = 'Foo', qualname = '__main__.Foo', file = None, line = None )
 		self.assertEqual( emitter_c.c_type( cls ), 'struct __main__$Foo' )
+
+# CEnum member-VALUE expressions (Color.Red used as a real runtime value) are
+# a pre-existing lowering.py gap, not something this phase chases - see the
+# plan's own grounding facts ("CEnum never being referenced by real
+# lowering.py output today"). emit_cenum itself is still real, testable work
+# (decision 1's per-unit philosophy) - built and verified directly against a
+# hand-built CEnum object, same as MangleTypeTests/CTypeTests above, rather
+# than through a full compiler.run() that has no way to produce a real value
+# of the enum's type yet.
+class EmitCEnumTests( unittest.TestCase ):
+	def _color( self ) -> CEnum:
+		cls = CEnum( stem = 'Color', qualname = '__main__.Color', file = None, line = None, value_type = _scalar( 'u32' ))
+		cls.members = { 'Red': 0, 'Green': 1 }
+		cls.values = { 0: 'Red', 1: 'Green' }
+		return cls
+
+	def test_typedef_line( self ) -> None:
+		src = emitter_c.emit_cenum( self._color() )
+		self.assertIn( 'typedef uint32_t __main__$Color;', src )
+
+	def test_one_static_const_per_member( self ) -> None:
+		src = emitter_c.emit_cenum( self._color() )
+		self.assertIn( 'static const __main__$Color __main__$Color$Red = 0;', src )
+		self.assertIn( 'static const __main__$Color __main__$Color$Green = 1;', src )
 
 class CompilerTestCase( unittest.TestCase ):
 	def setUp( self ) -> None:
@@ -241,6 +265,60 @@ def main() -> i32:
 		self.assertIn( '__builtin_add_overflow', src )
 		self.assertIn( '_tag == 1', src )
 
+_POINT_FIXTURE = '\n'.join([
+	'@cstruct',
+	'class Point:',
+	'	x: i32',
+	'	y: i32',
+	'',
+	'	@staticmethod',
+	'	def make( x: i32, y: i32 ) -> Point:',
+	'		return Point.__allocate__( x = x, y = y )',
+])
+
+class EmitCStructConstructTests( CompilerTestCase ):
+	def test_construct_and_read_back( self ) -> None:
+		self._run( _POINT_FIXTURE + '\n' + '\n'.join([
+			'def main() -> i32:',
+			'	p: Point = Point.make( 1, 2 )',
+			'	with compiler.wrap_arithmetic:', # sidesteps needing a Result[i32,OverflowError] fixture - default Check mode isn't what this test is about
+			'		return p.x + p.y',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		src = emitter_c.emit_function( main_lf )
+		self.assertIn( '.x', src )
+		self.assertIn( '.y', src )
+		point_cls = next( cls for cls in self.compiler.cstructs if cls.qualname == '__main__.Point' )
+		struct_src = emitter_c.emit_cstruct( point_cls )
+		self.assertIn( 'struct __main__$Point {', struct_src )
+		self.assertIn( 'int32_t x;', struct_src )
+		self.assertIn( 'int32_t y;', struct_src )
+
+class EmitPointerOpsTests( CompilerTestCase ):
+	def test_addrof_getitem_setitem( self ) -> None:
+		# SetItem's RHS is lowered with expected_type=None (see lowering.py's
+		# _stmt_Assign Subscript-target branch) - a bare literal can't be
+		# inferred there, same as lowering_test.py's own test_getitem_setitem,
+		# so an already-typed local (`seven`) sidesteps that, matching the
+		# established convention rather than working around it here
+		self._run( '''
+def main() -> None:
+	x: u8 = 5
+	i: usize = 0
+	seven: u8 = 7
+	p: Ptr[u8] = compiler.addrof( x )
+	p[i] = seven
+	y: u8 = p[i]
+	return
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		src = emitter_c.emit_function( main_lf )
+		self.assertIn( '= &main$x;', src ) # AddrOf
+		self.assertIn( '[main$i] = main$seven;', src ) # SetItem
+		self.assertIn( '(main$p)[main$i];', src ) # GetItem
+
 CLANG = shutil.which( 'clang' ) or r'C:\Program Files\LLVM\bin\clang.exe'
 
 @unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
@@ -299,6 +377,52 @@ def main() -> i32:
 			'def main() -> None:',
 			'	foo()',
 		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_cenum_typedef_and_member_reference_compiles( self ) -> None:
+		# Phase 2 milestone: "WindowsError/ErrnoError declared + one member
+		# referenced, compiles clean" - built directly from emit_cenum's own
+		# per-unit output (decision 1) rather than through a full
+		# compiler.run(), since CEnum member-VALUE expressions (Color.Red
+		# used as a real value) are a pre-existing lowering.py gap, not
+		# emitter_c.py scope - see EmitCEnumTests' own comment and the
+		# plan's grounding facts ("CEnum never being referenced by real
+		# lowering.py output today"). This still proves the emitted
+		# typedef+consts are real, valid C - "one member referenced" here
+		# means the generated static const symbol itself, used from a
+		# plain C harness.
+		color = CEnum( stem = 'Color', qualname = '__main__.Color', file = None, line = None, value_type = _scalar( 'u32' ))
+		color.members = { 'Red': 0, 'Green': 1 }
+		color.values = { 0: 'Red', 1: 'Green' }
+		harness = '\n'.join([
+			'#include <stdint.h>',
+			emitter_c.emit_cenum( color ),
+			'int main( void ) {',
+			'\treturn (int)__main__$Color$Red;',
+			'}',
+		])
+		self._assert_compiles( harness )
+
+	def test_cstruct_construct_and_read_back_compiles( self ) -> None:
+		self._run( _POINT_FIXTURE + '\n' + '\n'.join([
+			'def main() -> i32:',
+			'	p: Point = Point.make( 1, 2 )',
+			'	with compiler.wrap_arithmetic:', # sidesteps needing a Result[i32,OverflowError] fixture - default Check mode isn't what this test is about
+			'		return p.x + p.y',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_addrof_getitem_setitem_compiles( self ) -> None:
+		self._run( '''
+def main() -> None:
+	x: u8 = 5
+	i: usize = 0
+	seven: u8 = 7
+	p: Ptr[u8] = compiler.addrof( x )
+	p[i] = seven
+	y: u8 = p[i]
+	return
+''' )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 if __name__ == '__main__':

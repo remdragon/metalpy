@@ -747,7 +747,7 @@ emitter:
 		construction, __del__ synthesis, TaggedUnion, @extern/AddrOf/
 		string literals, module globals).
 
-	Phase 1 (in progress): DeclareTemp/DeleteTemp/Assign (incl. inline
+	[resolved] Phase 1: DeclareTemp/DeleteTemp/Assign (incl. inline
 		local-variable declaration - locals have no DeclareTemp-style IR of
 		their own, unlike temps; the emitter declares one at each local's
 		first Assign), the full BinOp/UnaryOp arithmetic families (Wrap via
@@ -870,6 +870,58 @@ emitter:
 		ResultPayload[i32,OverflowError] structs, OrReturn, and Result.Ok's
 		own monomorphized body - through clang -std=c11 -Wall -Wextra -c
 		with zero errors/warnings. Full suite: 446 tests, 0 failures.
+
+	[resolved] Phase 2: CStruct/CUnion/CEnum, Ptr[T]/ConstPtr[T]. CStruct/
+		CUnion construction (ir.Allocate) and Ptr[T]/ConstPtr[T] c_type
+		mapping already existed from Phase 1's own work (Result.Ok's body
+		needed the former, the type table needed the latter) - added:
+		- emit_cenum(): a CEnum is NOT emitted as a real C `enum` (C's own
+			enum underlying type is implementation-defined/usually int-only,
+			but a CEnum's .value_type can be any scalar width - u32/i32 both
+			seen in real lib/ code) - instead a `typedef <value_ctype>
+			<mangled>;` plus one `static const <mangled> <mangled>$<Member> =
+			<value>;` per member, matching the plan's own type-mapping table.
+		- ir.GetItem/ir.SetItem: only ever reached for a raw pointer with no
+			real __getitem__ (lowering.py's _expr_Subscript flat-GetItem
+			fallback) - Ptr[T]/ConstPtr[T] are plain C pointers already, so
+			C's own [] operator applies directly, no special-casing needed.
+		- ir.AddrOf: `dest = &value;` - straightforward now that
+			compiler.addrof(x) itself was already implemented (session before
+			this one).
+		Real bug found + fixed along the way: emit_c()'s forward-declare pass
+		crashed on `cls.type_params` for every CEnum in compiler.cenums -
+		CEnum (mpy_types.py) has no type_params field at all (it's never
+		generic, unlike every other ClassLike kind) - this had simply never
+		fired before since nothing had ever scheduled a CEnum. Fixed by
+		dropping the (nonsensical for CEnum) check entirely.
+		Real, pre-existing lowering.py gap surfaced (not fixed here, out of
+		this phase's scope - same posture as the plan's own grounding facts
+		noting "CEnum never being referenced by real lowering.py output
+		today"): CEnum member VALUE expressions (Color.Red used as a real
+		runtime value, e.g. lib/builtins/__errors.py's `OSError.
+		FileNotFoundError`) don't lower at all - CEnum stores its members in
+		.members/.values (plain int dicts), never in .names as Variables, so
+		_attr_lookup's `isinstance(found, Variable)` check can never succeed
+		for one; _expr_Name would also reject the bare CEnum class name
+		itself (not a Variable). No compiler.reinterpret_cast[T](...)
+		intrinsic exists yet either (referenced in lib/builtins/__dict.py's
+		source but never implemented in lowering.py), which would have been
+		the only other way to synthesize a real CEnum-typed value from
+		source today. emit_cenum() itself is still fully real, tested
+		directly against a hand-built CEnum object (decision 1's per-unit
+		testing philosophy) and verified to compile clean through clang
+		standalone - the gap is entirely about producing a VALUE of that
+		type from metalpy source, not about the C declaration/definition
+		emit_cenum() itself produces.
+		Verified end to end (emitter_c_test.py's RealCompileTests): a
+		synthetic @cstruct Point constructed via a staticmethod factory +
+		field read-back (GetAttr x2), AddrOf + SetItem + GetItem against a
+		Ptr[u8], and emit_cenum()'s own typedef+consts output (wrapped in a
+		minimal harness, since no real program can produce a CEnum value
+		yet) all compile clean through clang -std=c11 -Wall -Wextra -c.
+		Full suite: 453 tests, 0 failures.
+		Next: Phase 3 (RCClass layout, sys.alloc[T] construction, Incref/
+		Decref/RefCount, attribute access) - see the plan file.
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
