@@ -42,7 +42,11 @@ def GetDynamicTimeZoneInformation(
 ) -> u32:
 	...
 
-@extern('kernel32', 'GetProcessHeap')
+@extern( 'kernel32', 'GetLastError' )
+def GetLastError() -> u32:
+	...
+
+@extern( 'kernel32', 'GetProcessHeap' )
 def GetProcessHeap() -> HANDLE:
 	...
 

@@ -2,9 +2,10 @@ from codecs import Codec, CodecError
 from codecs.utf8 import utf8
 import compiler
 import sys
-from .__list import list
 from .__dict import dict
+from .__errors import OSError
 from .__int import int
+from .__list import list
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
 # SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
