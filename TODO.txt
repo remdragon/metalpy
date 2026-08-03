@@ -262,11 +262,13 @@ lowering:
 		confirmed via the same `bytearray(4)` full-compile attempt, both
 		unrelated to @compiler.target: `is`/`is not` comparison operators
 		aren't supported ("unsupported comparison operator: ptr is None" -
-		see "incorrect is usage" above), and `from windows.ntdll import
-		RtlZeroMemory` / `from windows.kernel32 import HeapAlloc,
-		GetProcessHeap`-style FFI imports fail because lib/windows/ doesn't
-		exist yet as a real stub module in this repo (a content gap, not a
-		compiler one).
+		see "incorrect is usage" above), and lowering.py has no
+		_stmt_ImportFrom handler at all - `from windows.ntdll import
+		RtlZeroMemory` inside sys.py's memzero() fails with "unsupported
+		statement", even though lib/windows/ntdll.py is a real, already-
+		written @extern stub module (RtlZeroMemory IS declared there) - this
+		is a genuine lowering.py gap (no in-function `from X import Y`
+		support at all, on any platform), not a missing-library one.
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion
