@@ -233,6 +233,17 @@ class FieldValueTests( CFGTestBase ):
 		instrs = self.state.field_value( self.foo_cls, t, is_alias = False )
 		self.assertEqual( instrs, [] )
 
+	def test_fresh_field_value_untracks_the_temp( self ) -> None:
+		# ownership transfers into the field, not a second independent
+		# owner - mirrors assign()'s own Temp-untracking branch. Without
+		# this, a fresh_temp()-registered temp embedded into a field would
+		# still look "pending" to its own statement's DeleteTemp, decref'ing
+		# the very value just handed into the field
+		t = self._new_temp( self.foo_cls )
+		self.state.fresh_temp( t, self.foo_cls )
+		self.state.field_value( self.foo_cls, t, is_alias = False )
+		self.assertEqual( self.state.delete_temp( t ), [] )
+
 	def test_non_rc_field_value_is_a_noop_even_if_aliasing( self ) -> None:
 		i32 = self.discovery.get_intrinsics()['i32']
 		x = Variable( stem = 'x', qualname = 'foo.x', file = None, line = None, type = i32 )

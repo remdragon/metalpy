@@ -1,130 +1,42 @@
 lowering:
 	CFG:
 
-		[resolved - v1] implemented as cfg.py, a live state machine lowering.py
-			calls into at the exact points it already visits things (see the
-			approved plan, declarative-greeting-parnas.md, and RC MANAGEMENT.md
-			for the full design this follows: a single _epilogue_stack unifying
-			RC decref with defer/errdefer's existing replay concept, pure LIFO
-			order, scope determined structurally with no reference-scan needed).
-			Verified against every worked example above (foo1-foo5) plus your
-			explicit "both branches construct the same name, survives past the
-			if" case, and against real lib/ code (bytes/bytearray/str's
-			__init__/from_bytearray/release/__add__ all lower cleanly).
+		v1 (cfg.py, a live state machine lowering.py calls into at the exact
+		points it already visits things - see declarative-greeting-parnas.md
+		and RC MANAGEMENT.md for the design) is implemented, including
+		struct/union field construction's Incref-on-alias handling, the
+		merge_if() double-decref fixes, the fall-off-the-end epilogue fix,
+		return rejected inside a defer/errdefer body (nonsensical there -
+		the body replays inline at the epilogue, not at its own position),
+		and the fresh-RC-value leak (fresh_temp()/delete_temp() now wired
+		in centrally: _emit() registers any Call/Allocate's dest as fresh,
+		_lower_stmt's own per-statement DeleteTemp loop decrefs whatever's
+		still registered when a temp's expression-scoped lifetime ends -
+		covers every Call/Allocate site at once rather than needing each
+		hunted down individually; field_value() also untracks a fresh
+		temp embedded into a field, mirroring assign()'s same discipline).
+		Pending/known gaps only, below:
 
-			[resolved - v1, follow-up] struct/union field CONSTRUCTION
-				(Class.__allocate__(...)/bare ClassName(...)/a TaggedUnion
-				member construction, e.g. SharedReference(self)) now correctly
-				increfs an aliasing RC value embedded into a fresh field -
-				cfg.field_value(), called from lowering.py's
-				_lower_allocate_fields and _try_lower_union_construct_call.
-				Fixes bytearray.release()'s own SharedReference(self) case
-				exactly: self is increfed at the embed site, then decref'd as
-				usual by release()'s own epilogue at return - net zero, and the
-				returned payload's reference is never the "already decremented"
-				one. Mirrors assign()'s own is_alias -> Incref rule, deliberately
-				NOT move[T]'s ownership-transfer rule (which would incorrectly
-				reject Result.Ok(val)-style generic passthrough of a BORROWED
-				value into a field). Uses the embedded VALUE's own concrete type
-				for the RC check, not the field's declared type, since a
-				generic union/struct's field type stays an unsubstituted TypeVar
-				whenever it's referenced bare (sys.OwnershipError, not
-				sys.OwnershipError[bytearray]) - see the still-open "generic
-				TaggedUnion member substitution" gap further down, which this
-				sidesteps rather than fixes.
-
-				Still out of scope: SetAttr/SetItem storing an RC value into an
-				EXISTING struct/union instance's field (only fresh construction
-				is covered); the receiving struct/union's own eventual
-				teardown decref'ing its owned RC fields (moot for now - no
-				emitter/codegen consumes Decref for real yet, see below).
-
-			[resolved - v1, follow-up] merge_if() had a real, pre-existing
-				double-decref bug, found while verifying the field_value() fix
-				above end-to-end against bytearray.release()'s SECOND return
-				path (the success case) - NOT something this session's changes
-				introduced, present since the original cfg.py/_stmt_If
-				integration (commit c5c3d30) and never exercised by the
-				existing test suite:
-				1) merge_if()'s "both branches end in the same state" path
-					unconditionally pushed a FRESH epilogue entry for every
-					surviving OWNED/COPY binding - including a binding that
-					already existed, untouched, before the if. But restore()
-					(called by _stmt_If right before merge_if()) already puts
-					that binding's ORIGINAL entry back on the stack unchanged -
-					so the plain, extremely common shape `y = Foo(); if cond:
-					... else: ...; use(y)` got TWO live entries for y, a genuine
-					double-decref at whatever exit ran next. Fixed by only
-					pushing when the survivor's entry doesn't already match (by
-					identity) what entry_bindings itself points to - reusing the
-					same entry lowering.py already restored, matching assign()'s
-					own "reuse the entry for a name as long as it stays tracked"
-					discipline.
-				2) separately, a branch ending in return/break/continue was
-					still being compared against the other branch as if it fell
-					through to the join (return_()/unwind_to() deliberately
-					don't mutate bindings - "no code follows it on that path" -
-					so a terminating branch's own _end snapshot still looks like
-					an ordinary live binding set). This either raised a bogus
-					indeterminate-state error or silently re-pushed a duplicate
-					entry for a binding the OTHER, non-terminating branch also
-					still owns. Fixed by detecting node.body[-1]/node.orelse[-1]
-					being Return/Break/Continue in _stmt_If and passing
-					true_terminates/false_terminates to merge_if(): when exactly
-					one branch terminates, only the survivor's own ending state
-					reaches the join at all, no comparison needed; when both
-					terminate, nothing survives (code after is unreachable - full
-					dead-code detection is still future work).
-				Both fixed in cfg.py's merge_if() (identity-based entry reuse +
-				terminates handling) with cfg_test.py coverage; re-verified
-				bytearray.release() end-to-end - both return paths now emit
-				exactly one Decref(self) each, full 308-test suite green.
-
-			[resolved - v1, follow-up] a function with NO defer/errdefer that
-				falls off the end without an explicit final `return` never
-				called _emit_epilogue at all (lower_function only called it
-				when _needs_epilogue, which is purely a defer/errdefer check) -
-				so OWNED/COPY locals never got decref'd on that specific
-				fall-off path (distinct from the fresh-temp leak below - this
-				was named locals). Fixed with a narrow, deliberately-not-full-
-				terminator-analysis check (_body_may_fall_off_the_end, same
-				scope-cut spirit as _stmt_If's own true_terminates/
-				false_terminates detection: true whenever the function's own
-				top-level body doesn't literally end in a `return` statement -
-				an if/loop/etc that ACTUALLY always returns via some deeper
-				path is a false positive, but that just makes the resulting
-				fall-off unwind+Return dead code, never executed, not wrong).
-				lower_function now emits self._cfg.return_(None) + ir.Return
-				for that case whenever fn.return_type is none_type (mirroring
-				Python's own implicit `return None` semantics - NoReturn
-				falling off the end stays exactly as unvalidated as before,
-				see "additional NoReturn semantics" further down; a non-None
-				return type falling off the end was already producing
-				incomplete IR before this fix and still does - a separate,
-				pre-existing "missing return statement" validation gap, not
-				attempted here). One existing test's expectation updated
-				(compiler_test.py - a broken statement's -> None function now
-				correctly gets FuncStart/Return/FuncEnd instead of just
-				FuncStart/FuncEnd). Full 308-test suite green.
-
-			Known gaps, all deliberate scope cuts for v1, not oversights:
-			- defer/errdefer combined with ANY reference-counted local or
-				parameter is rejected outright (CompileError) rather than
-				attempted - every explicit return in a defer-using function
-				funnels through ONE shared epilogue (existing _DeferBlock
-				machinery, untouched by this pass), so per-return-specific RC
-				decref content can't be correctly placed there without either the
-				full unified-stack-with-flags design from the plan (not built
-				this pass) or risking a decref of something not actually alive on
-				that particular path. No real lib/ code combines these today.
-			- a genuinely fresh RC value that's never assigned to a name or
-				directly returned (e.g. `foo( SomeClass() )`, passed as a call
-				argument and immediately discarded) isn't decref'd - a leak, not
-				a double-free, and not reachable by any current lib/ code (every
-				real construction is assigned or returned directly) - cfg.py's
-				fresh_temp()/delete_temp() hooks exist and are tested for this,
-				just never invoked from lowering.py yet (would need touching
-				every Allocate/Call dest-creation site individually).
+		- defer/errdefer combined with ANY reference-counted local or
+			parameter (aside from a bare `return` inside the defer body
+			itself, now rejected) is rejected outright (CompileError) rather
+			than attempted - every explicit return in a defer-using function
+			funnels through ONE shared epilogue (existing _DeferBlock
+			machinery, untouched by this pass), so per-return-specific RC
+			decref content can't be correctly placed there without either the
+			full unified-stack-with-flags design from the plan (not built
+			this pass) or risking a decref of something not actually alive on
+			that particular path. No real lib/ code combines these today.
+		- struct/union FIELD ownership beyond fresh construction: SetAttr/
+			SetItem storing an RC value into an EXISTING instance's field
+			isn't tracked at all, and a struct/union's own eventual teardown
+			doesn't decref its owned RC fields (moot for now - no emitter/
+			codegen consumes Decref for real yet).
+		- a non-None-returning function that falls off the end without an
+			explicit `return` on every path produces incomplete IR (missing
+			the final Return) - no "missing return statement" validation
+			exists yet. NoReturn falling off the end is similarly
+			unvalidated (see "additional NoReturn semantics" below).
 
 	possible future improvement: union-receiver dispatch currently requires
 		every leaf's method to share the exact same return type, or it's a
@@ -142,11 +54,13 @@ lowering:
 		I incorrectly put "x is Foo" when checking if a variable was a certain type
 		in Python, "is" is a "same identity" check.
 		we need to replace that incorrect usage with either "type(x) is Foo" or "instanceof( x, Foo )"
-	Still broken, unaffected by this fix (separate, already-tracked gaps):
+	Still broken, unaffected by this fix (separate, already-tracked gap):
 		len(src) where src: move[bytearray] (Move has no .names at all - see
-		incref/decref/move[T] below) and len(arr) where arr: slice[T]
-		(slice[T]'s accessor is named .len(), not __len__() - T infers fine,
-		there's just no __len__ to find)
+		incref/decref/move[T] below) - confirmed still reproduces:
+		"Move(...) has no members, cannot look up '__len__'".
+		[resolved] len(arr) where arr: slice[T] - slice[T] now declares
+		__len__ directly (lib/builtins/__init__.py), not the .len() this
+		note originally described - confirmed compiles clean.
 	@inline decorator: a function marked @inline should compile down to its
 		body spliced directly at each call site (no real Call/FuncStart/
 		FuncEnd for it) - lib/builtins/__init__.py's len() is meant to become

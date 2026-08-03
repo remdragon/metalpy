@@ -332,6 +332,21 @@ class Lowering:
 	# --- temp/instruction bookkeeping ----------------------------------------
 
 	def _emit( self, instr: ir.Instruction ) -> None:
+		# a Call/Allocate's dest is always a genuinely fresh, owned value
+		# from the caller's perspective (same rule _is_aliasing_expr already
+		# encodes for Call; Allocate is fresh by definition) - registering it
+		# here, centrally, at the exact moment it's actually emitted, is what
+		# guarantees every one of these sites is covered instead of needing
+		# individual fresh_temp() calls hunted down at each of the many
+		# places that build a Call/Allocate (plain calls, generic calls,
+		# conditional dispatch, union-receiver dispatch, struct/union
+		# construction, ...). Gated on self._current_fn - lower_global()
+		# never constructs a CFGState at all, and self._cfg would otherwise
+		# be whatever function was lowered most recently (this Lowering
+		# instance is reused across units), a strictly worse outcome than
+		# just skipping it for globals
+		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
+			self._cfg.fresh_temp( instr.dest, instr.dest.type )
 		self._instructions.append( instr )
 
 	def _new_temp( self, t: Type ) -> ir.Temp:
@@ -362,11 +377,33 @@ class Lowering:
 				self.discovery.fail( f'unsupported statement: {ast.unparse(node)}', node )
 			method( node )
 			for t in reversed( self._pending_temps ):
+				# a temp genuinely fresh_temp()-registered (see _emit) and
+				# never consumed by assign()/return_()/move()/field_value()
+				# along the way (e.g. `foo( SomeClass() )` where SomeClass()
+				# is passed into a plain, non-move[T] parameter - nothing
+				# ever untracks it) still needs its own decref right here,
+				# at the natural end of the temporary's own expression-scoped
+				# lifetime. A no-op for every already-consumed temp (already
+				# untracked by whichever hook consumed it) and every non-RC
+				# temp (never registered in the first place)
+				for instr in self._cfg.delete_temp( t ):
+					self._emit( instr )
 				self._emit( ir.DeleteTemp( temp = t ))
 		finally:
 			self._pending_temps = outer_pending
 
 	def _stmt_Return( self, node: ast.Return ) -> None:
+		if self._in_deferred_body:
+			# a defer/errdefer body's code runs later, replayed inline at the
+			# epilogue (see _register_defer_block) - a `return` inside it
+			# doesn't have a sensible meaning (it's not really executing at
+			# this point in the function, and jumping to __epilogue__ from
+			# CODE ALREADY INSIDE the epilogue replay is nonsensical). Same
+			# check _register_defer_block already applies to nested defer/
+			# errdefer, catches nested cases too (return inside an if/while
+			# inside the defer body) since _in_deferred_body stays set for
+			# the whole capture, not just the top-level statement
+			self.discovery.fail( f'return is not allowed inside a defer/errdefer body: {ast.unparse(node)}', node )
 		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
 		if self._needs_epilogue:
 			# every return in a defer/errdefer-using function funnels

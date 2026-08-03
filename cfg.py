@@ -511,10 +511,21 @@ class CFGState:
 		confirmed against bytearray.release()'s `Result.Err(
 		OwnershipError.SharedReference( self ))`: this increfs self, then
 		release()'s own epilogue decrefs self as usual - net zero, and the
-		returned payload's reference is never the "already decremented" one. '''
-		if not is_alias:
-			return []
-		return self._incref_instructions( t, operand )
+		returned payload's reference is never the "already decremented" one.
+
+		A fresh (is_alias=False) operand that's a Temp gets untracked here,
+		mirroring assign()'s own "ownership transfers into dest, not a
+		second independent owner" discipline for exactly the same reason:
+		fresh_temp()-registered temps (see lowering.py's _emit) otherwise
+		still look "pending" to their own statement's DeleteTemp, which
+		would decref the very value that was just handed into this field -
+		a double-decref alongside whatever (currently nonexistent) teardown
+			the receiving struct/union eventually gets. '''
+		if is_alias:
+			return self._incref_instructions( t, operand )
+		if isinstance( operand, ir.Temp ):
+			self._temp_states.pop( operand.id, None )
+		return []
 
 	# --- move[T] call arguments ------------------------------------------------
 

@@ -2932,6 +2932,36 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertTrue( any( 'nested inside another defer' in e for e in self.discovery.errors.errors ))
 
+	def test_return_rejected_inside_a_defer_body( self ) -> None:
+		code = '\n'.join([
+			'class bool: pass',
+			'',
+			'def main() -> None:',
+			'	with defer:',
+			'		return',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'return is not allowed inside a defer/errdefer body' in e for e in self.discovery.errors.errors ))
+
+	def test_return_rejected_inside_a_defer_body_even_when_nested( self ) -> None:
+		# _in_deferred_body stays set for the whole capture, not just the
+		# top-level statement - a return buried inside an if inside the
+		# defer body must be caught too
+		code = '\n'.join([
+			'class bool: pass',
+			'',
+			'def main( cond: bool ) -> None:',
+			'	with defer:',
+			'		if cond:',
+			'			return',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'return is not allowed inside a defer/errdefer body' in e for e in self.discovery.errors.errors ))
+
 	def test_errdefer_rejected_when_function_does_not_return_result( self ) -> None:
 		code = '\n'.join([
 			'class bool: pass',
@@ -3064,6 +3094,11 @@ class Tests( unittest.TestCase ):
 			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_0__' ),
 			ir.JumpIfFalse( cond = is_err_temp, target = '__defer_skip_0__' ),
 			ir.Label( name = '__defer_skip_0__' ),
+			# this test's own `class bool: pass` fixture is a plain
+			# (RCClass) class, same as any undecorated class - is_err_temp
+			# is genuinely fresh_temp()-tracked and gets its own Decref here,
+			# unrelated to the real intrinsic bool used everywhere else
+			ir.Decref( value = is_err_temp ),
 			ir.DeleteTemp( temp = is_err_temp ),
 			ir.Return( value = return_value_var ),
 			ir.FuncEnd( name = '__test__.checked' ),
@@ -3218,6 +3253,80 @@ class Tests( unittest.TestCase ):
 		self.assertNotIn( 'OrJump', kinds )
 		self.assertNotIn( 'Jump', kinds )
 		self.assertNotIn( 'Label', kinds )
+
+	# --- fresh RC value leak (fresh_temp()/delete_temp() integration) --------
+
+	def test_fresh_rc_value_passed_as_plain_argument_gets_decrefd( self ) -> None:
+		# foo( SomeClass() ) - the fresh temp SomeClass() produces is never
+		# assigned to a name, returned, moved, or embedded in a field (use's
+		# own parameter is plain, not move[T]) - it still needs its own
+		# decref right where its expression-scoped lifetime naturally ends
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def use( x: Foo ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	use( Foo() )',
+		])
+		mod = self._import( code )
+		fn = mod.get_local( 'main' )
+		if fn.resolve is not None:
+			fn.resolve()
+		lowered = self.compiler._lower( fn )
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		self.assertEqual( kinds.count( 'Decref' ), 1 )
+		# the Decref must land right before the temp's own DeleteTemp -
+		# the Call itself (using the still-live temp as an argument) comes
+		# first
+		decref_i = kinds.index( 'Decref' )
+		self.assertEqual( kinds[decref_i - 1], 'Call' )
+		self.assertEqual( kinds[decref_i + 1], 'DeleteTemp' )
+
+	def test_fresh_rc_value_assigned_to_a_name_is_not_double_decrefd( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> None:',
+			'	x: Foo = Foo()',
+			'	print( x )',
+		])
+		mod = self._import( code )
+		fn = mod.get_local( 'main' )
+		if fn.resolve is not None:
+			fn.resolve()
+		lowered = self.compiler._lower( fn )
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		# exactly one Decref (x's own, at the fall-off epilogue) - none for
+		# the temp Foo() produced, which assign() already untracks once it's
+		# consumed into x
+		self.assertEqual( kinds.count( 'Decref' ), 1 )
+
+	def test_fresh_rc_value_embedded_in_a_field_is_not_double_decrefd( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'class Wrapper:',
+			'	inner: Foo',
+			'',
+			'	@staticmethod',
+			'	def make() -> None:',
+			'		w = Wrapper.__allocate__( inner = Foo() )',
+			'		print( w )',
+		])
+		mod = self._import( code )
+		wrapper_cls = mod.get_local( 'Wrapper' )
+		if wrapper_cls.resolve is not None:
+			wrapper_cls.resolve()
+		fn = next( m for m in wrapper_cls.methods if getattr( m, 'stem', None ) == 'make' )
+		if fn.resolve is not None:
+			fn.resolve()
+		lowered = self.compiler._lower( fn )
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		# exactly one Decref (w's own, at the fall-off epilogue) - none for
+		# the temp Foo() produced, which field_value() now untracks once
+		# it's embedded into inner
+		self.assertEqual( kinds.count( 'Decref' ), 1 )
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
