@@ -238,5 +238,22 @@ class AllocateRefcountTests( IRTestCase ):
 		self.assertNotEqual( incref, decref )
 		self.assertIs( incref.value, dest )
 
+class AddrOfTests( IRTestCase ):
+	def test_addrof_repr_and_equality( self ) -> None:
+		ptr_i32 = Specialization(
+			stem = 'intrinsics.Ptr[intrinsics.i32]',
+			qualname = 'intrinsics.Ptr[intrinsics.i32]',
+			file = None,
+			line = None,
+			base = _scalar( 'Ptr' ),
+			args = [ self.i32 ],
+		)
+		local = Variable( stem = 'written', qualname = '__main__.f.written', file = None, line = None, type = self.i32 )
+		dest = ir.Temp( type = ptr_i32, id = 0 )
+		addrof = ir.AddrOf( dest = dest, value = local )
+		self.assertEqual( addrof, ir.AddrOf( dest = dest, value = local ))
+		self.assertEqual( addrof.test_repr(), f'AddrOf( dest={dest!r}, value={local!r} )' )
+		self.assertIs( addrof.value, local )
+
 if __name__ == '__main__':
 	unittest.main()

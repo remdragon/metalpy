@@ -427,7 +427,31 @@ lowering:
 		just never reached before (the same WriteFile(...) call's OWN
 		u32(length) argument used to fail first, aborting the statement
 		before compiler.addrof(written), a later argument in the same
-		call, was ever lowered). Not chased here.
+		call, was ever lowered). Now resolved, see below.
+	[resolved] `compiler.addrof(x) -> Ptr[T]` (SYNTAX.md's C `&x` escape
+		hatch, used for out-parameters like WriteFile's
+		lpNumberOfBytesWritten): recognized purely by AST shape in
+		lowering.py (same `compiler.<attr>(...)` posture as sizeof/
+		refcount/cast - no discovery.py involvement). New ir.AddrOf(dest,
+		value), mirroring ir.RefCount's exact shape. The one real
+		validation: the argument must be a bare `ast.Name`, not an
+		arbitrary expression - matches both SYNTAX.md's "local variable"
+		wording and C's own lvalue-only restriction on `&`; _expr_Name
+		already only ever resolves to a Variable (never a Temp), so this
+		is what actually enforces it (compiler.addrof(x.field) correctly
+		still fails, same message, since a field has no address to take
+		with no field-layout computation existing yet). dest's type is
+		Ptr[value.type], built via the same
+		discovery._get_or_create_specialization(...) helper Result[T,E]
+		checked-arithmetic types already use.
+		Verified end to end: the `bytearray(4)` repro now compiles
+		fully clean end to end via compiler.run() - zero errors, and
+		extern_libs now includes kernel32's WriteFile/GetStdHandle
+		(confirming _write_stderr_cstr's compiler.addrof(written) call
+		was actually reached and lowered), on top of the
+		RtlZeroMemory/RtlExitUserProcess/HeapAlloc/GetProcessHeap already
+		verified in earlier passes. This was the last known gap in that
+		repro.
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion

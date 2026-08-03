@@ -933,6 +933,37 @@ class Lowering:
 		self._emit( ir.RefCount( dest = dest, value = value ))
 		return dest
 
+	def _is_compiler_addrof_call( self, node: ast.expr ) -> bool:
+		return (
+			isinstance( node, ast.Call )
+			and isinstance( node.func, ast.Attribute )
+			and node.func.attr == 'addrof'
+			and isinstance( node.func.value, ast.Name )
+			and node.func.value.id == 'compiler'
+		)
+
+	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
+		# must be a bare local variable/parameter name (matches SYNTAX.md's
+		# "local variable" wording and C's own lvalue-only restriction on
+		# &), not an arbitrary expression. _expr_Name already only ever
+		# resolves to a Variable (never a Temp), so requiring the argument's
+		# AST shape to be ast.Name is what actually enforces this - lowering
+		# it via _lower_expr like any other value would silently accept e.g.
+		# compiler.addrof(x.field), which has no address to take here (no
+		# field-layout computation exists yet - that's an emitter concern)
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.addrof(...) takes exactly one argument: {ast.unparse(node)}', node )
+		arg_node = node.args[0]
+		if not isinstance( arg_node, ast.Name ):
+			self.discovery.fail( f'compiler.addrof(...) argument must be a bare local variable, not {ast.unparse(node)}', node )
+		value = self._lower_expr( arg_node, None )
+		ptr_cls = self.discovery.get_intrinsics()['Ptr']
+		ptr_type = self.discovery._get_or_create_specialization( ptr_cls, [ value.type ] )
+		dest = self._new_temp( expected_type or ptr_type )
+		self._emit( ir.AddrOf( dest = dest, value = value ))
+		return dest
+
 	def _lower_scalar_cast( self, target_type: Scalar, source: ast.expr|ir.Operand, node: ast.AST ) -> ir.Operand:
 		# shared by compiler.cast(T, x) and T(x) construction-sugar - the
 		# one place the actual Scalar-to-Scalar conversion logic lives.
@@ -2773,6 +2804,10 @@ class Lowering:
 
 		if self._is_compiler_cast_call( node ):
 			result = self._lower_compiler_cast( node, expected_type )
+			return result if want_result else None
+
+		if self._is_compiler_addrof_call( node ):
+			result = self._lower_compiler_addrof( node, expected_type )
 			return result if want_result else None
 
 		allocate_dest = self._try_lower_allocate_call( node, expected_type )

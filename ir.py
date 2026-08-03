@@ -316,6 +316,14 @@ class RefCount( Instruction ): # compiler.refcount(x) - reads x's current header
 		return f'RefCount( dest={self.dest!r}, value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class AddrOf( Instruction ): # compiler.addrof(x) - yields &x, x a local variable/parameter
+	dest: Temp
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'AddrOf( dest={self.dest!r}, value={self.value!r} )'
+
+@dataclass( kw_only = True )
 class Return( Instruction ):
 	value: Operand|None
 	

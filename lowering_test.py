@@ -2123,6 +2123,45 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'takes exactly one argument', self.discovery.errors.errors[0] )
 
+	# --- compiler.addrof(x) --------------------------------------------------
+
+	def test_compiler_addrof_emits_addrof_instruction( self ) -> None:
+		code = '\n'.join([
+			'def main() -> Ptr[u32]:',
+			'	written: u32 = 0',
+			'	return compiler.addrof( written )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		addrofs = [ i for i in fn.instructions if isinstance( i, ir.AddrOf ) ]
+		self.assertEqual( len( addrofs ), 1 )
+		u32 = self.discovery.get_intrinsics()['u32']
+		ptr_cls = self.discovery.get_intrinsics()['Ptr']
+		expected_ptr_type = self.discovery._get_or_create_specialization( ptr_cls, [ u32 ] )
+		self.assertIs( addrofs[0].dest.type, expected_ptr_type )
+		self.assertEqual( addrofs[0].value.type, u32 )
+
+	def test_compiler_addrof_non_name_argument_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> Ptr[u32]:',
+			'	written: u32 = 0',
+			'	return compiler.addrof( written + 1 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'bare local variable', self.discovery.errors.errors[0] )
+
+	def test_compiler_addrof_wrong_arg_count_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> Ptr[u32]:',
+			'	written: u32 = 0',
+			'	return compiler.addrof()',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'takes exactly one argument', self.discovery.errors.errors[0] )
+
 	# --- loops (while / for / break / continue) -----------------------------
 
 	def test_while_shape( self ) -> None:
