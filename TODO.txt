@@ -1,3 +1,10 @@
+Claude said "generic struct specializations like Result[i32,OverflowError] are never independently scheduled anywhere in compiler.py's output — only the unspecialized generic (Result) appears in compiler.cstructs. The emitter has to discover and synthesize each concrete specialization itself. Implementing that now since Phase 1's own Check-mode milestone depends on it."
+	this logic needs to get moved where it belongs, which isn't emitter_c.py
+
+review how Claude generates C code from local variables, I think emitter_c.py
+might be doing too much work. We may need new IR to tell the emitter when to
+create local variables.
+
 sys._Stdout.write():
 	these are just stubs, but there are real issues here that need to be solved
 	before we can create the real File I/O interfaces for stdlib
@@ -781,24 +788,88 @@ emitter:
 		Call.target - a real object reference, not a name the emitter has
 		to know/invent). The emitter has zero special knowledge of "panic" -
 		it just calls whatever Function the IR handed it.
-		KNOWN GAP, found via this work, NOT chased here (needs its own
-		lowering.py/discovery.py design pass): generic CLASS methods are
-		never monomorphized. lowering.py already monomorphizes generic FREE
-		functions on call (_monomorphized_function/lower_function_
-		specialization - sys.alloc[u8] etc.), but a generic class's own
-		methods (Result.Ok/.Err/.is_ok/.is_err) are scheduled and lowered
-		with their parameters/return_type still literally holding the
-		class's own unbound TypeVars (T, E) - which have no C representation
-		at all. No existing test caught this because the whole suite only
-		ever asserted on IR *shape* (duck-typed - doesn't care whether a
-		type is concrete) until this emitter work needed a REAL concrete C
-		type out of a generic method's own signature for the first time.
-		Confirmed via a direct repro (see emitter_c_test.py's
-		test_default_check_mode_arithmetic_compiles, marked
-		@unittest.expectedFailure with the full explanation inline rather
-		than deleted or silently worked around - once the real fix lands
-		this test should start failing its expectedFailure, i.e. flip to an
-		unexpected pass, which is the signal to remove the decorator).
+		[resolved] generic CLASS methods are now monomorphized, same as
+		generic FREE functions already were. lowering.py previously only
+		monomorphized generic free functions on call (_monomorphized_
+		function/lower_function_specialization - sys.alloc[u8] etc.) - a
+		generic class's own methods (Result.Ok/.Err/.is_ok/.is_err) were
+		scheduled and lowered with their parameters/return_type still
+		literally holding the class's own unbound TypeVars (T, E), which
+		have no C representation at all. No existing test caught this
+		because the whole suite only ever asserted on IR *shape* (duck-
+		typed - doesn't care whether a type is concrete) until this emitter
+		work needed a REAL concrete C type out of a generic method's own
+		signature for the first time.
+		Fix, entirely in lowering.py/compiler.py (per explicit direction -
+		this doesn't belong in the emitter):
+		- _monomorphized_function (already existed, for free functions)
+			now also handles a Function whose OWN type_params is empty but
+			whose .cls IS generic (Result.Ok's genericity is inherited from
+			Result, not declared on Ok itself) - substitutes against
+			base.cls.type_params instead, and the monomorphized copy's own
+			.cls becomes the concrete class Specialization too (so e.g. an
+			instance method's self ends up typed Result[i32,E], not the
+			abstract Result).
+		- new _lower_class_generic_method_call, wired into _lower_call's
+			existing dispatch chain: if the receiver's own type already IS
+			a concrete Specialization of the method's class (some_result.
+			is_ok()), reuses it directly - no receiver (Result.Ok(y), a
+			static/classmethod reached via bare class name) infers the
+			class's type args the same way _lower_inferred_generic_call
+			already infers a free function's own params, PLUS unifies
+			expected_type against the method's still-abstract return type
+			FIRST (needed since E never appears in Ok's own parameter list
+			at all, and even T needs to be resolved before a bare literal
+			argument like Result.Ok(5) can be lowered - a raw TypeVar can't
+			serve as _expr_Constant's expected type).
+		- new Lowering.monomorphize_class: gives a concrete generic class
+			specialization (Result[i32,OverflowError]) its own real struct/
+			union layout (substituted .attributes, same _substitute_type_
+			params helper) - compiler.py's _enqueue now schedules a
+			ClassLike-based Specialization directly (mirroring the existing
+			Function-based branch, previously always decomposed into base+
+			args and never independently compiled) and _lower dispatches it
+			to monomorphize_class, landing the result straight in compiler.
+			cstructs/.cunions/.tagged_unions/.rcclasses - the emitter needs
+			zero specialization-discovery logic of its own now (an earlier,
+			wrong attempt at this lived in emitter_c.py itself - see git
+			history - moved here instead, per explicit correction).
+		- _lower_allocate_fields fixes (both real, both needed for
+			Result.Ok's own body - `Result.__allocate__(_payload=
+			ResultPayload(ok=val), ...)` - to lower correctly from inside a
+			monomorphized method): the private-__allocate__-access check
+			now compares against fn.cls's own .base when fn.cls is a
+			Specialization (previously a false-positive "is private" error,
+			identity-comparing a concrete Specialization against the shared
+			AST body's always-abstract class reference); declared field
+			types are now substituted against the ambient concrete class
+			specialization too (reusing the existing _substituted_field
+			helper - previously ResultPayload(ok=val)'s own inferred
+			payload-union specialization stayed abstract); and the
+			construction's own dest.type now gets an explicit schedule()
+			call (a concrete Specialization inferred purely from context,
+			e.g. ResultPayload[i32,OverflowError], that nothing else would
+			ever otherwise schedule).
+		- emitter_c.py: removed the (now entirely superseded)
+			_collect_specializations/emit_specialization machinery: added a
+			small topological sort over CStruct/CUnion/TaggedUnion bodies
+			(matched by qualname, not object identity - a field's own type
+			is a Specialization object, distinct from but qualname-equal to
+			the monomorphized ClassLike copy sitting in compiler.cunions/
+			etc.) so a struct/union embedded BY VALUE as another's field
+			(Result[i32,E] embeds ResultPayload[i32,E] by value) is always
+			fully defined first - RCClass fields never need this, always
+			pointers, forward-declared via an opaque tag instead (Phase 3);
+			also added minimal ir.Allocate support for CStruct/CUnion (a
+			C11 designated-initializer compound literal) - Result.Ok's own
+			real body needed it to compile.
+		Verified end to end: emitter_c_test.py's
+		test_default_check_mode_arithmetic_compiles (previously marked
+		@unittest.expectedFailure, now a real passing test) compiles
+		Result.Ok(y) - AddCheck, the synthesized Result[i32,OverflowError]/
+		ResultPayload[i32,OverflowError] structs, OrReturn, and Result.Ok's
+		own monomorphized body - through clang -std=c11 -Wall -Wextra -c
+		with zero errors/warnings. Full suite: 446 tests, 0 failures.
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml

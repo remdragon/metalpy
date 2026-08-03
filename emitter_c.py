@@ -1,20 +1,20 @@
 # stdlib imports:
-import dataclasses
 import re
 
 # local imports:
 import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from mpy_types import (
-	ClassLike, CEnum, CStruct, CUnion, Copy, Function, Move, Parameter,
-	RCClass, Scalar, Specialization, TaggedUnion, Type, TypeVar, Variable,
+	CEnum, ClassLike, CStruct, CUnion, Copy, Function, Move,
+	RCClass, Scalar, Specialization, TaggedUnion, Type, Variable,
 )
 
 # stage 3: turns a fully-lowered Compiler's output into C11 source. Pure
-# translation - by the time emit_c() runs, every real dependency is already
-# discovered/scheduled/lowered (see ARCHITECTURE.md's stage split); this
-# module does no further discovery of its own, with ONE deliberate exception
-# - see _collect_specializations()'s own docstring.
+# translation - by the time emit_c() runs, every real dependency (including
+# every concrete generic specialization, e.g. Result[i32,OverflowError] -
+# see Lowering.monomorphize_class) is already discovered/scheduled/lowered
+# (see ARCHITECTURE.md's stage split); this module does no further discovery
+# of its own.
 
 # verbatim from C_EMITTER.md - avoids any Windows-CRT (msvcrt) dependency
 # from metalpy's own stdlib output; atomic because __del__ can run on any
@@ -181,116 +181,16 @@ def c_type( t: Type|None ) -> str:
 def _is_noreturn( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem == 'NoReturn'
 
-# --- generic specialization discovery/synthesis -------------------------------
+# --- struct/union body emission -------------------------------------------
 #
-# compiler.py's _enqueue() deliberately never schedules a ClassLike
-# Specialization as its own compile unit (only a Function-based one is - see
-# _enqueue's own comment) - only the unspecialized generic base (e.g. bare
-# `Result`) ends up in compiler.cstructs/.cunions/.tagged_unions/.rcclasses.
-# A concrete specialization like Result[i32,OverflowError] therefore never
-# appears anywhere in Compiler's own output lists, even though real IR
-# (AddCheck's own dest.type, a Call's argument types, ...) references it
-# constantly. The emitter has to find every one of these itself by walking
-# the already-lowered IR/type graph, then synthesize each one's C struct/
-# union body by substituting the generic's own type_params with that
-# Specialization's concrete args - this is translation, not new discovery
-# (nothing here decides SET of types is used, only surfaces objects the
-# rest of the compiler already built and is holding onto).
-
-def _substitute( t: Type, mapping: dict[int,Type], discovery ) -> Type:
-	if isinstance( t, TypeVar ):
-		return mapping.get( id( t ), t )
-	if isinstance( t, Specialization ):
-		new_args = [ _substitute( a, mapping, discovery ) for a in t.args ]
-		if all( a is b for a, b in zip( new_args, t.args )):
-			return t
-		return discovery._get_or_create_specialization( t.base, new_args )
-	return t # Scalar/RCClass/CStruct/CUnion/TaggedUnion/CEnum/Move/Copy - Move/Copy
-	         # substitution isn't needed here: they never appear as a class
-	         # attribute's own type, only a Parameter's, which this function
-	         # (used solely for attribute-type substitution) never sees
-
-def _substitute_type( t: Type, spec: Specialization, discovery ) -> Type:
-	type_params = getattr( spec.base, 'type_params', None ) or []
-	mapping = { id( tp ): arg for tp, arg in zip( type_params, spec.args ) }
-	return _substitute( t, mapping, discovery )
-
-def _iter_types_in_value( val ):
-	if isinstance( val, ( ir.Temp, ir.Const, Variable )):
-		if val.type is not None:
-			yield val.type
-	elif isinstance( val, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization, Scalar, Move, Copy )):
-		yield val
-	elif isinstance( val, dict ):
-		for v in val.values():
-			yield from _iter_types_in_value( v )
-	elif isinstance( val, ( list, tuple )):
-		for v in val:
-			yield from _iter_types_in_value( v )
-
-def _iter_operand_types_in_instruction( instr: ir.Instruction ):
-	for f in dataclasses.fields( instr ):
-		yield from _iter_types_in_value( getattr( instr, f.name ))
-
-def _is_concrete( t: Type ) -> bool:
-	# a Specialization can be genuinely abstract, not a real instantiation -
-	# e.g. a generic class's OWN methods routinely declare things like
-	# `-> Result[T,E]` referring to the enclosing class's still-unbound type
-	# params (Result.Ok/.Err's own return type annotation is exactly this).
-	# discovery.py's _get_or_create_specialization builds a real
-	# Specialization object for that self-referential expression too - it
-	# just isn't a CONCRETE one, and must never be mistaken for one here
-	# (substituting through it would leak an unresolved TypeVar into a real
-	# struct field - confirmed via a real repro against this exact fixture)
-	if isinstance( t, TypeVar ):
-		return False
-	if isinstance( t, Specialization ):
-		return all( _is_concrete( a ) for a in t.args )
-	if isinstance( t, ( Move, Copy )):
-		return _is_concrete( t.inner )
-	return True
-
-def _collect_specializations( compiler: Compiler ) -> list[Specialization]:
-	discovery = compiler.disco
-	found: dict[str,Specialization] = {}
-
-	def visit( t: Type|None ) -> None:
-		if t is None:
-			return
-		if isinstance( t, ( Move, Copy )):
-			visit( t.inner )
-			return
-		if isinstance( t, Specialization ):
-			if isinstance( t.base, ( CStruct, CUnion, TaggedUnion )) and _is_concrete( t ) and t.qualname not in found:
-				found[t.qualname] = t
-				for attr in t.base.attributes:
-					visit( _substitute_type( attr.type, t, discovery ))
-			# RCClass-based Specializations are Phase 3+ work (generic
-			# RCClass construction needs the same sys.alloc[T]/header
-			# machinery real RCClass construction does) - deliberately not
-			# collected here; c_type() still names them correctly (a
-			# pointer), just without a body, matching "not exercised by
-			# anything yet" rather than silently mis-handling it
-			for a in t.args:
-				visit( a )
-			return
-		# plain ClassLike/Scalar/TypeVar/CEnum: nothing further to recurse
-		# into here - their own .attributes are walked via the root loop below
-
-	for lf in compiler.functions:
-		fn = lf.function
-		visit( fn.return_type )
-		for p in ( fn.parameters or [] ):
-			visit( p.type )
-		for instr in lf.instructions:
-			for t in _iter_operand_types_in_instruction( instr ):
-				visit( t )
-	for cls_list in ( compiler.rcclasses, compiler.cstructs, compiler.cunions, compiler.tagged_unions ):
-		for cls in cls_list:
-			for attr in cls.attributes:
-				visit( attr.type )
-
-	return list( found.values() )
+# A concrete generic class specialization (Result[i32,OverflowError]) is a
+# real compile unit by the time this module ever sees it - lowering.py's
+# Lowering.monomorphize_class (invoked from compiler.py's own _lower
+# dispatch whenever it schedules a ClassLike-based Specialization) already
+# substituted its .attributes and gave it a concrete qualname, landing it
+# directly in compiler.cstructs/.cunions/.tagged_unions/.rcclasses like any
+# other class. This module never has to independently rediscover or
+# resynthesize one - it just walks those lists (see emit_c below).
 
 def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]] ) -> str:
 	lines = [ f'{keyword} {name} {{' ]
@@ -298,13 +198,6 @@ def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]]
 		lines.append( f'\t{c_type(field_type)} {field_name};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
-
-def emit_specialization( spec: Specialization, discovery ) -> str:
-	base = spec.base
-	attrs = [ ( attr.stem, _substitute_type( attr.type, spec, discovery )) for attr in base.attributes ]
-	name = mangle_type( spec )
-	keyword = _class_keyword( base )
-	return _struct_or_union_body( name, keyword, attrs )
 
 # --- functions -----------------------------------------------------------
 
@@ -668,6 +561,21 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 		op = _member_access_operator( instr.obj.type )
 		return [ f'\t({_emit_operand(instr.obj)}){op}{instr.attr} = {_emit_operand(instr.value)};' ]
 
+	if isinstance( instr, ir.Allocate ):
+		if isinstance( instr.cls, RCClass ):
+			raise NotImplementedError( 'ir.Allocate for RCClass is Phase 3 work (needs sys.alloc[T]/header construction)' )
+		# CStruct/CUnion - plain value construction, no header/no heap
+		# allocation at all (see the grounding facts in the plan) - a C11
+		# designated-initializer compound literal covers both (a union
+		# with more than one field given would be a real error, but
+		# nothing here re-validates that - discovery/lowering already did)
+		ctype = c_type( instr.dest.type )
+		dest = _emit_operand( instr.dest )
+		if not instr.fields:
+			return [ f'\t{dest} = ({ctype}){{0}};' ] # empty {} isn't valid standard C11
+		field_inits = ', '.join( f'.{name} = {_emit_operand(value)}' for name, value in instr.fields.items() )
+		return [ f'\t{dest} = ({ctype}){{ {field_inits} }};' ]
+
 	if isinstance( instr, ir.OrReturn ):
 		return _emit_or_return( instr, function )
 	if isinstance( instr, ir.OrJump ):
@@ -750,6 +658,52 @@ def emit_tagged_union( union: TaggedUnion ) -> str:
 def emit_global( g: LoweredGlobal ) -> str:
 	raise NotImplementedError( 'emit_global: Phase 7 work' )
 
+def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
+	# CStruct/CUnion/TaggedUnion bodies, topologically sorted on by-value-
+	# embedded fields (Result[i32,E] embeds ResultPayload[i32,E] BY VALUE -
+	# C requires the payload's full definition before it can be used as a
+	# struct member, unlike an RCClass field, which is always a pointer and
+	# never forces an ordering - an opaque forward-declared tag is enough
+	# for that). Generic (type_params is not None) classes are skipped
+	# entirely - only their concrete Specializations (already separate
+	# entries in these same lists, see Lowering.monomorphize_class) have a
+	# real C representation.
+	classes: list[ClassLike] = (
+		[ c for c in compiler.cstructs if not c.type_params ]
+		+ [ c for c in compiler.cunions if not c.type_params ]
+		+ [ c for c in compiler.tagged_unions if not c.type_params ]
+	)
+	# matched by qualname, not object identity: a field's own type is
+	# whatever Specialization object substitution produced (e.g.
+	# ResultPayload[i32,OverflowError]), which is a DIFFERENT object from
+	# the monomorphized ClassLike copy sitting in compiler.cunions - the
+	# two are deliberately given the same qualname (monomorphize_class sets
+	# qualname = spec.qualname) precisely so callers can bridge the two
+	# this way
+	by_qualname = { c.qualname: c for c in classes }
+	visited: set[str] = set()
+	ordered: list[ClassLike] = []
+	def visit( cls: ClassLike ) -> None:
+		if cls.qualname in visited:
+			return
+		visited.add( cls.qualname )
+		for attr in cls.attributes:
+			dep = by_qualname.get( getattr( attr.type, 'qualname', None ))
+			if dep is not None:
+				visit( dep )
+		ordered.append( cls )
+	for cls in classes:
+		visit( cls )
+	parts = []
+	for cls in ordered:
+		if isinstance( cls, CUnion ):
+			parts.append( emit_cunion( cls ))
+		elif isinstance( cls, TaggedUnion ):
+			parts.append( emit_tagged_union( cls ))
+		else:
+			parts.append( emit_cstruct( cls ))
+	return parts
+
 # --- whole-program driver ------------------------------------------------
 
 def emit_c( compiler: Compiler ) -> str:
@@ -759,26 +713,13 @@ def emit_c( compiler: Compiler ) -> str:
 	reason to split output across files. '''
 	parts: list[str] = [ PROLOGUE ]
 
-	specializations = _collect_specializations( compiler )
-
-	# pass 1: forward declarations (opaque RCClass tags, full CEnum/CStruct/
-	# CUnion/TaggedUnion bodies in dependency order, function prototypes).
-	# Generic (type_params is not None) classes have no C representation of
-	# their own - only their concrete Specializations (collected above) do.
+	# pass 1: forward declarations (opaque RCClass tags, full CEnum bodies,
+	# full CStruct/CUnion/TaggedUnion bodies in dependency order, function
+	# prototypes)
 	for cls in compiler.cenums:
 		if not cls.type_params:
 			parts.append( emit_cenum( cls ))
-	for cls in compiler.cstructs:
-		if not cls.type_params:
-			parts.append( emit_cstruct( cls ))
-	for cls in compiler.cunions:
-		if not cls.type_params:
-			parts.append( emit_cunion( cls ))
-	for union in compiler.tagged_unions:
-		if not union.type_params:
-			parts.append( emit_tagged_union( union ))
-	for spec in specializations:
-		parts.append( emit_specialization( spec, compiler.disco ))
+	parts.extend( _emit_value_type_bodies( compiler ))
 	for lf in compiler.functions:
 		parts.append( emit_function( lf, prototype_only = True ))
 

@@ -148,6 +148,16 @@ class Lowering:
 		# alloc[u8], from anywhere) reuses the SAME monomorphized Function
 		# object, not a fresh copy per call site
 		self._monomorphized: dict[int,Function] = {}
+		# monomorphized ClassLike copies (a generic class's OWN .attributes
+		# with type_params substituted, for a concrete Specialization like
+		# Result[i32,OverflowError]) - memoized by id(Specialization), same
+		# discipline as _monomorphized above. This is what actually gives a
+		# concrete generic specialization a real compile unit/output-list
+		# entry (compiler.py's _lower dispatches a ClassLike-based
+		# Specialization here) - stage 3 (the emitter) never has to
+		# independently rediscover/synthesize one, it just walks
+		# compiler.cstructs/.cunions/.tagged_unions/.rcclasses like anything else
+		self._monomorphized_classes: dict[int,ClassLike] = {}
 		# resolved lazily, the first time panic_arithmetic mode's Unwrap
 		# actually needs it (see _consume_checked_result) - cached so a
 		# program using panic_arithmetic in multiple places only resolves
@@ -2037,7 +2047,21 @@ class Lowering:
 		base = spec.base
 		if base.resolve is not None:
 			base.resolve()
-		type_params = base.type_params or []
+		type_params = base.type_params
+		substituted_cls = base.cls
+		if not type_params and base.cls is not None and base.cls.type_params:
+			# base's own genericity is inherited from its enclosing generic
+			# CLASS (Result.Ok/.Err/.is_ok/... referencing Result's own
+			# T,E) rather than declared on the function itself (sys.
+			# alloc[T]) - substitute against the class's type params
+			# instead, and the method's own .cls must become the concrete
+			# class specialization too (so e.g. an instance method's self
+			# ends up typed as Result[i32,E], not the abstract Result -
+			# see lower_function's own self-synthesis, which reads fn.cls
+			# directly)
+			type_params = base.cls.type_params
+			substituted_cls = self.discovery._get_or_create_specialization( base.cls, spec.args )
+		type_params = type_params or []
 		substituted_params = [
 			replace( p, type = self._substitute_type_params( p.type, type_params, spec.args ) )
 			for p in ( base.parameters or [] )
@@ -2051,6 +2075,7 @@ class Lowering:
 		monomorphized = replace(
 			base,
 			qualname = spec.qualname,
+			cls = substituted_cls,
 			parameters = substituted_params,
 			return_type = substituted_return,
 			names = substituted_names,
@@ -2063,6 +2088,47 @@ class Lowering:
 	def lower_function_specialization( self, spec: Specialization ) -> tuple[Function,list[ir.Instruction]]:
 		monomorphized = self._monomorphized_function( spec )
 		return monomorphized, self.lower_function( monomorphized )
+
+	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
+		# gives a concrete generic class specialization (Result[i32,
+		# OverflowError]) a real, independent struct/union layout - a
+		# shallow copy of the base class with .attributes' own type_params
+		# substituted via the SAME _substitute_type_params helper
+		# _monomorphized_function already uses. compiler.py's _lower calls
+		# this for every ClassLike-based Specialization it schedules
+		# (see _enqueue), so the result lands directly in compiler.
+		# cstructs/.cunions/.tagged_unions/.rcclasses - stage 3 (the
+		# emitter) never has to independently rediscover/resynthesize a
+		# concrete specialization itself, it just walks those lists like
+		# any other compile unit. .methods/.names are copied through
+		# UNCHANGED (still referencing the class's abstract, un-monomorphized
+		# Function objects) - method lookup keeps working exactly as today
+		# (Specialization.names passes through to .base.names), and each
+		# individual method call gets its OWN on-demand monomorphization via
+		# _monomorphized_function/_lower_class_generic_method_call, not
+		# eagerly here.
+		cached = self._monomorphized_classes.get( id( spec ) )
+		if cached is not None:
+			return cached
+		base = spec.base
+		if base.resolve is not None:
+			base.resolve()
+		for attr in base.attributes:
+			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _lower_allocate_fields's own identical resolve loop
+		type_params = base.type_params or []
+		substituted_attrs = [
+			replace( attr, type = self._substitute_type_params( attr.type, type_params, spec.args ))
+			for attr in base.attributes
+		]
+		monomorphized = replace(
+			base,
+			qualname = spec.qualname,
+			attributes = substituted_attrs,
+			type_params = None,
+			resolve = None,
+		)
+		self._monomorphized_classes[ id( spec ) ] = monomorphized
+		return monomorphized
 
 	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
 		# a *silent* probe: is this expression a compile-time-resolvable
@@ -2305,7 +2371,21 @@ class Lowering:
 		self._ensure_resolved( target_cls )
 		for attr in target_cls.attributes:
 			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _attr_lookup's found.resolve
-		declared = { attr.stem: attr for attr in target_cls.attributes }
+		# target_cls is always the ABSTRACT class (resolved via
+		# _try_resolve_namespace on the shared, unspecialized AST body's
+		# own `Result.__allocate__` reference - see _try_lower_allocate_call)
+		# even from inside a monomorphized generic-class method
+		# (Result.Ok's own body, whose self._current_fn.cls IS the
+		# concrete Result[i32,E]) - substitute target_cls's own field
+		# types against that concrete specialization when one's available,
+		# same as _substituted_field already does for ordinary attribute
+		# reads (_expr_Attribute), or ResultPayload(ok=val)'s own expected
+		# _payload type here would stay abstract (T,E) forever
+		fn_cls = self._current_fn.cls if self._current_fn is not None else None
+		if isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls:
+			declared = { attr.stem: self._substituted_field( attr, fn_cls ) for attr in target_cls.attributes }
+		else:
+			declared = { attr.stem: attr for attr in target_cls.attributes }
 		given = { kw.arg for kw in node.keywords }
 		missing = declared.keys() - given
 		if isinstance( target_cls, CUnion ):
@@ -2362,6 +2442,15 @@ class Lowering:
 			fields[name] = value
 
 		dest = self._new_temp( expected_type or target_cls )
+		# dest.type can be a concrete Specialization (ResultPayload[i32,
+		# OverflowError], inferred from the substituted field type this
+		# construction call is being assigned into - see the field.type
+		# comment above) even though target_cls itself (this call's own
+		# bare `ResultPayload` reference) is always the abstract base - the
+		# concrete Specialization needs its own explicit schedule() here,
+		# same as _emit_generic_call already does for a generic FUNCTION's
+		# own monomorphized return type; nothing else would ever schedule it
+		self.schedule( dest.type )
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
 		return dest
 
@@ -2383,7 +2472,15 @@ class Lowering:
 			return None
 
 		fn = self._current_fn
-		if fn is None or fn.cls is not target_cls:
+		# fn.cls is the CONCRETE class specialization for a monomorphized
+		# generic-class method (Result.Ok's own fn.cls is Result[i32,E],
+		# not bare Result - see _monomorphized_function's substituted_cls),
+		# while target_cls (resolved from the shared, unspecialized AST
+		# body's own `Result.__allocate__` reference) is always the
+		# abstract base - compare against fn.cls's own base in that case
+		fn_cls = fn.cls if fn is not None else None
+		fn_base_cls = fn_cls.base if isinstance( fn_cls, Specialization ) else fn_cls
+		if fn is None or fn_base_cls is not target_cls:
 			self.discovery.fail(
 				f'{target_cls.qualname}.__allocate__(...) is private - only callable from a method of {target_cls.qualname} itself',
 				node,
@@ -2724,9 +2821,9 @@ class Lowering:
 
 		bindings: dict[int,Type] = {} # id(TypeVar) -> the concrete Type it was inferred as
 		for ( param, _expr ), operand in zip( positional, args ):
-			self._unify_type_param( target, param.type, operand.type, bindings, node )
+			self._unify_type_param( target.type_params or [], param.type, operand.type, bindings, node, target.qualname )
 		for param, _expr in keyword:
-			self._unify_type_param( target, param.type, kwargs[param.stem].type, bindings, node )
+			self._unify_type_param( target.type_params or [], param.type, kwargs[param.stem].type, bindings, node, target.qualname )
 
 		missing = [ tv.stem for tv in target.type_params or [] if id( tv ) not in bindings ]
 		if missing:
@@ -2740,14 +2837,20 @@ class Lowering:
 		monomorphized = self._monomorphized_function( spec )
 		return self._emit_generic_call( spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
-	def _unify_type_param( self, target: Function, declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST ) -> None:
+	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST, context_qualname: str ) -> None:
+		# generalized over an explicit type_params list (rather than always
+		# reading target.type_params) so this same unification shared by
+		# both a generic FREE function's own type params (_lower_inferred_
+		# generic_call) and a generic CLASS's type params (_lower_class_
+		# generic_method_call - Result.Ok/.Err reached with no receiver to
+		# read a concrete Specialization's args from directly)
 		if declared is None or actual is None:
 			return
-		if any( declared is tv for tv in target.type_params or [] ):
+		if any( declared is tv for tv in type_params ):
 			existing = bindings.get( id( declared ) )
 			if existing is not None and existing is not actual:
 				self.discovery.fail(
-					f'{target.qualname}[...]: type parameter {declared.stem!r} is inferred as both '
+					f'{context_qualname}(...): type parameter {declared.stem!r} is inferred as both '
 					f'{existing.qualname} and {actual.qualname} by different arguments: {ast.unparse(node)}',
 					node,
 				)
@@ -2755,13 +2858,13 @@ class Lowering:
 			return
 		if isinstance( declared, Specialization ) and isinstance( actual, Specialization ) and declared.base is actual.base:
 			for d_arg, a_arg in zip( declared.args, actual.args ):
-				self._unify_type_param( target, d_arg, a_arg, bindings, node )
-		# else: this parameter position doesn't mention any of target's own
-		# type params (a concrete parameter, or a nested type whose base
-		# doesn't even match the argument's) - nothing to infer here. Not an
-		# error by itself: a genuine argument-type mismatch isn't checked
-		# anywhere yet (no general type-checking pass exists), same as
-		# every other call site in this file today
+				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
+		# else: this parameter position doesn't mention any of type_params
+		# (a concrete parameter, or a nested type whose base doesn't even
+		# match the argument's) - nothing to infer here. Not an error by
+		# itself: a genuine argument-type mismatch isn't checked anywhere
+		# yet (no general type-checking pass exists), same as every other
+		# call site in this file today
 
 	def _emit_generic_call( self, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# schedules the Specialization itself as the compile unit (see
@@ -2777,6 +2880,77 @@ class Lowering:
 			return dest
 		self._emit( ir.Call( dest = None, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
 		return None
+
+	def _lower_class_generic_method_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# a method whose genericity is inherited from its enclosing class
+		# (Result.Ok/.Err/.is_ok/.is_err/... referencing Result's own T,E)
+		# rather than declared on the method itself (unlike sys.alloc[T]) -
+		# target.type_params is empty, but target.cls.type_params isn't.
+		# The class's own concrete type args have to be pinned down before
+		# this can be treated like any other generic call, two ways:
+		if target.resolve is not None:
+			target.resolve()
+		cls = target.cls
+		class_type_params = cls.type_params or [] if cls is not None else []
+
+		if receiver is not None and isinstance( receiver.type, Specialization ) and receiver.type.base is cls:
+			# the receiver's own type already IS a concrete specialization
+			# of target.cls (some_result.is_ok() where some_result: Result
+			# [i32,OverflowError]) - no inference needed at all, this is
+			# just an ordinary generic call once the Specialization exists
+			method_spec = self.discovery._get_or_create_specialization( target, receiver.type.args )
+			return self._lower_generic_function_call( node, method_spec, receiver, expected_type, want_result )
+
+		# no receiver (a static/classmethod reached via bare class name,
+		# e.g. Result.Ok(y)), or a receiver that doesn't already pin the
+		# class's args - infer them the same way _lower_inferred_generic_
+		# call infers a free function's own type params, with one addition:
+		# unify expected_type against the method's still-abstract return
+		# type FIRST, before lowering any argument - Result.Ok(val: T) ->
+		# Result[T,E] never mentions E in its own parameter list at all
+		# (only inferable from context), and even T needs to be known
+		# BEFORE a bare literal argument (Result.Ok(5)) can be lowered at
+		# all (_expr_Constant needs a real expected type, not a raw
+		# TypeVar) - unlike a free generic function, where a literal
+		# argument at an inferred position is simply unsupported (see
+		# _lower_inferred_generic_call's own comment), the surrounding
+		# expected_type is usually enough to resolve every class type
+		# param here without needing the arguments' own types at all
+		bindings: dict[int,Type] = {}
+		if expected_type is not None:
+			self._unify_type_param( class_type_params, target.return_type, expected_type, bindings, node, target.qualname )
+
+		positional, keyword = self._match_call_args( target, node )
+		partial_args = [ bindings.get( id( tv ), tv ) for tv in class_type_params ]
+		args = [
+			self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
+			for param, expr in positional
+		]
+		kwargs = {
+			param.stem: self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
+			for param, expr in keyword
+		}
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._apply_move_hook( param, operand, target.qualname )
+		for param, _expr in keyword:
+			self._apply_move_hook( param, kwargs[param.stem], target.qualname )
+
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._unify_type_param( class_type_params, param.type, operand.type, bindings, node, target.qualname )
+		for param, _expr in keyword:
+			self._unify_type_param( class_type_params, param.type, kwargs[param.stem].type, bindings, node, target.qualname )
+
+		missing = [ tv.stem for tv in class_type_params if id( tv ) not in bindings ]
+		if missing:
+			self.discovery.fail(
+				f'{target.qualname}(...): cannot infer {cls.qualname if cls else "?"} type parameter(s) '
+				f'{", ".join(missing)} from these arguments or the surrounding expected type: {ast.unparse(node)}',
+				node,
+			)
+		cls_args = [ bindings[id(tv)] for tv in class_type_params ]
+		method_spec = self.discovery._get_or_create_specialization( target, cls_args )
+		monomorphized = self._monomorphized_function( method_spec )
+		return self._emit_generic_call( method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		match self._is_compiler_call( node ):
@@ -2821,6 +2995,9 @@ class Lowering:
 
 		if isinstance( target, Function ) and target.type_params:
 			return self._lower_inferred_generic_call( node, target, receiver, expected_type, want_result )
+
+		if isinstance( target, Function ) and not target.type_params and target.cls is not None and target.cls.type_params:
+			return self._lower_class_generic_method_call( node, target, receiver, expected_type, want_result )
 
 		if isinstance( target, Overload ):
 			# a bare literal argument has no type of its own before a

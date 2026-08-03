@@ -92,16 +92,37 @@ class Compiler:
 		if isinstance( unit, Specialization ):
 			if isinstance( unit.base, Function ):
 				# an explicit generic function instantiation (sys.alloc[u8])
-				# monomorphizes - unlike a class Specialization (whose
-				# methods stay shared/unspecialized, so only the base class
-				# + type args need scheduling), this IS a real, distinct
-				# compile unit in its own right: queued directly rather
-				# than decomposed
+				# monomorphizes - a real, distinct compile unit in its own
+				# right: queued directly rather than decomposed
 				with self._seen_lock:
 					if id( unit ) in self._seen:
 						return
 					self._seen.add( id( unit ))
 				self.queue.put( unit )
+				return
+			if isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
+				# a concrete generic CLASS specialization (Result[i32,
+				# OverflowError]) - also queued directly (mirroring the
+				# Function-based branch above), giving it its own real
+				# struct/union layout via Lowering.monomorphize_class (see
+				# _lower below), so it lands in compiler.cstructs/.cunions/
+				# .tagged_unions/.rcclasses just like any other compile
+				# unit - a future emitter never has to independently
+				# rediscover/resynthesize a concrete specialization itself.
+				# Unlike the Function case, its own concrete type ARGS are
+				# also independently enqueued here: a generic function's
+				# args get scheduled incidentally via its own body/
+				# signature (_emit_generic_call's explicit schedule()
+				# calls), but a class specialization's substituted field
+				# types (Result[i32,OverflowError]'s own OverflowError, for
+				# instance) have no equivalent "body" to walk for that
+				with self._seen_lock:
+					if id( unit ) in self._seen:
+						return
+					self._seen.add( id( unit ))
+				self.queue.put( unit )
+				for arg in unit.args:
+					self._enqueue( arg )
 				return
 			self._enqueue( unit.base )
 			for arg in unit.args:
@@ -144,6 +165,19 @@ class Compiler:
 			lf = LoweredFunction( function = monomorphized, instructions = instructions )
 			self.functions.append( lf )
 			return lf
+		elif isinstance( unit, Specialization ) and isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
+			monomorphized = self.lowering.monomorphize_class( unit )
+			if isinstance( monomorphized, RCClass ):
+				if monomorphized.base is not None:
+					self._enqueue( monomorphized.base )
+				self.rcclasses.append( monomorphized )
+			elif isinstance( monomorphized, CStruct ):
+				self.cstructs.append( monomorphized )
+			elif isinstance( monomorphized, CUnion ):
+				self.cunions.append( monomorphized )
+			elif isinstance( monomorphized, TaggedUnion ):
+				self.tagged_unions.append( monomorphized )
+			return monomorphized
 		elif isinstance( unit, Function ):
 			if unit.resolve is not None:
 				unit.resolve()

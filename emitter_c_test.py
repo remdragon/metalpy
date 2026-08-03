@@ -148,11 +148,17 @@ def main() -> None:
 		self.assertIn( 'int main( void ) {', src ) # then defined
 
 # shared by every test needing Result[T,E] - matches lowering_test.py's own
-# _RESULT_FIXTURE exactly (self-contained snippet, not a real lib/ import -
+# _RESULT_FIXTURE (self-contained snippet, not a real lib/ import -
 # established convention for CompilerTestCase-style tests, see
-# compiler_test.py)
+# compiler_test.py), with one deliberate difference: OverflowError is a
+# @cstruct here, not a plain (RCClass) class like lowering_test.py's own
+# fixture - RCClass struct/header emission is Phase 3 work, not built yet,
+# and OverflowError's own kind is incidental to what THESE tests are
+# actually verifying (Check-mode arithmetic/Result specialization
+# synthesis/OrReturn), so it's kept within what Phase 1 actually covers
 _RESULT_FIXTURE = '\n'.join([
 	'class bool: pass',
+	'@cstruct',
 	'class OverflowError: pass',
 	'',
 	'@cunion',
@@ -181,12 +187,15 @@ _RESULT_FIXTURE = '\n'.join([
 ])
 
 class SpecializationSynthesisTests( CompilerTestCase ):
-	def test_result_specialization_gets_a_real_struct_body( self ) -> None:
-		# compiler.py's own _enqueue() never schedules a ClassLike
-		# Specialization as its own compile unit (see emitter_c.py's
-		# _collect_specializations docstring) - Result[i32,OverflowError]
-		# never appears in compiler.cstructs, only bare Result does. This
-		# confirms the emitter finds and synthesizes it anyway.
+	def test_result_specialization_is_a_real_compiler_cstructs_entry( self ) -> None:
+		# a concrete generic class specialization (Result[i32,
+		# OverflowError]) is a real compile unit by the time it reaches
+		# this module - lowering.py's Lowering.monomorphize_class (wired
+		# through compiler.py's own _enqueue/_lower, NOT emitter_c.py -
+		# stage 3 does no discovery of its own) already substituted its
+		# .attributes and gave it a concrete qualname, landing it directly
+		# in compiler.cstructs alongside the (still-abstract, correctly
+		# excluded from emission) bare Result.
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def main() -> Result[i32,OverflowError]:',
 			'	with compiler.wrap_arithmetic:',
@@ -194,11 +203,11 @@ class SpecializationSynthesisTests( CompilerTestCase ):
 			'	return Result.Ok( x )',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
-		specs = emitter_c._collect_specializations( self.compiler )
-		names = [ s.qualname for s in specs ]
+		names = [ cls.qualname for cls in self.compiler.cstructs ]
 		self.assertIn( '__main__.Result[intrinsics.i32,__main__.OverflowError]', names )
-		spec = next( s for s in specs if s.qualname == '__main__.Result[intrinsics.i32,__main__.OverflowError]' )
-		src = emitter_c.emit_specialization( spec, self.discovery )
+		spec_cls = next( cls for cls in self.compiler.cstructs if cls.qualname == '__main__.Result[intrinsics.i32,__main__.OverflowError]' )
+		self.assertIsNone( spec_cls.type_params ) # concrete now, not generic
+		src = emitter_c.emit_cstruct( spec_cls )
 		self.assertIn( 'struct', src )
 		self.assertIn( '_tag;', src )
 		self.assertIn( '_payload;', src )
@@ -265,33 +274,30 @@ def main() -> i32:
 ''' )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
-	@unittest.expectedFailure
 	def test_default_check_mode_arithmetic_compiles( self ) -> None:
 		# Phase 1 milestone (b): default Check-mode arithmetic, proving
 		# AddCheck + the synthesized Result[i32,OverflowError] struct +
-		# OrReturn all compile clean together.
-		#
-		# KNOWN GAP (found via this exact test, real, pre-existing,
-		# discovered by this emitter work - not something to patch around
-		# here): Result.Ok(...)/.Err(...) are METHODS on a generic CStruct
-		# (Result[T,E]). lowering.py monomorphizes generic FREE functions
-		# on call (_monomorphized_function/lower_function_specialization -
-		# sys.alloc[u8] etc.) but never does the equivalent for a generic
-		# CLASS's own methods - Result.Ok's Function object is scheduled
-		# and lowered with its parameters/return_type still literally
-		# holding Result's own unbound TypeVars (T, E), which have no C
-		# representation at all. Existing tests never caught this because
-		# they only assert on IR *shape* (duck-typed, doesn't care whether
-		# a type is concrete) - this is the first thing to require REAL
-		# concrete types out of a generic method's own signature. Needs a
-		# real lowering.py/discovery.py fix (generic-method monomorphization,
-		# mirroring the existing generic-function path) before this can
-		# pass - out of scope for the emitter itself to work around.
+		# OrReturn all compile clean together. Also exercises generic-
+		# class-method monomorphization end to end (Result.Ok is a method
+		# on a generic CStruct - see lowering.py's _lower_class_generic_
+		# method_call/Lowering.monomorphize_class) - previously a real,
+		# documented gap (Result.Ok's parameters/return_type stayed
+		# literally TypeVar-typed, with no C representation at all), now
+		# resolved at the lowering.py/compiler.py level, not worked around
+		# in the emitter.
+		# main() itself always compiles to C's own `int main(void)`
+		# (see emit_function's entry-point special-case) - a realistic
+		# program never declares main() -> Result[...] (that wouldn't even
+		# make sense given main always returns int), so the Result-
+		# returning function under test is a separate, ordinary helper
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
-			'def main() -> Result[i32,OverflowError]:',
+			'def foo() -> Result[i32,OverflowError]:',
 			'	x: i32 = 1',
 			'	y: i32 = x + 1',
 			'	return Result.Ok( y )',
+			'',
+			'def main() -> None:',
+			'	foo()',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 

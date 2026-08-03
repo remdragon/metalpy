@@ -265,8 +265,16 @@ def main() -> None:
 ''' )
 		self.assertIn( 'X', [ g.variable.stem for g in self.compiler.globals ] )
 
-	def test_specialization_decomposes_into_base_and_each_arg( self ) -> None:
-		base = RCClass( stem = 'Result', qualname = '__main__.Result', file = None, line = None )
+	def test_classlike_specialization_is_queued_directly_plus_its_args( self ) -> None:
+		# a concrete generic CLASS specialization (Result[Ok,Err]) is a real
+		# compile unit in its own right now (see Lowering.monomorphize_class/
+		# compiler.py's own _lower dispatch) - queued directly, same as a
+		# Function-based Specialization already was, NOT decomposed away.
+		# Its own concrete args are ALSO independently enqueued (unlike the
+		# Function case) since a class specialization's substituted field
+		# types have no "body" of their own to walk for that - see _enqueue's
+		# own comment
+		base = RCClass( stem = 'Result', qualname = '__main__.Result', file = None, line = None, type_params = [] )
 		arg1 = RCClass( stem = 'Ok', qualname = '__main__.Ok', file = None, line = None )
 		arg2 = RCClass( stem = 'Err', qualname = '__main__.Err', file = None, line = None )
 		spec = Specialization( stem = 'Result[Ok,Err]', qualname = '__main__.Result[Ok,Err]', file = None, line = None, base = base, args = [ arg1, arg2 ] )
@@ -275,7 +283,7 @@ def main() -> None:
 		while not self.compiler.queue.empty():
 			queued.append( self.compiler.queue.get_nowait())
 		self.assertEqual( len( queued ), 3 )
-		self.assertTrue( any( q is base for q in queued ))
+		self.assertTrue( any( q is spec for q in queued ))
 		self.assertTrue( any( q is arg1 for q in queued ))
 		self.assertTrue( any( q is arg2 for q in queued ))
 

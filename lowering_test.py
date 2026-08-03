@@ -542,8 +542,9 @@ class Tests( unittest.TestCase ):
 			err_fn.resolve()
 		result_i32_myerror = self.discovery._get_or_create_specialization( result_cls, [ i32, myerror_cls ] )
 
-		t0 = ir.Temp( type = err_fn.parameters[0].type, id = 0 ) # MyError()'s Allocate - typed as Err's own `e: E` param (generic monomorphization doesn't exist yet, so this stays the bare TypeVar, not MyError)
+		t0 = ir.Temp( type = myerror_cls, id = 0 ) # MyError()'s Allocate - correctly typed as the concrete MyError now that generic-method monomorphization resolves Err's own `e: E` param, not the bare TypeVar
 		t1 = ir.Temp( type = result_i32_myerror, id = 1 )  # Result.Err(...)'s Call
+		monomorphized_err = self.discovery._get_or_create_specialization( err_fn, [ i32, myerror_cls ] )
 
 		fn = self.compiler._lower( foo_fn )
 		self._assert_ir( fn, [
@@ -551,9 +552,10 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t0 ),
 			ir.Allocate( dest = t0, cls = myerror_cls, fields = {} ),
 			ir.DeclareTemp( temp = t1 ),
-			ir.Call( dest = t1, target = err_fn, receiver = None, args = [ t0 ], kwargs = {} ),
+			ir.Call( dest = t1, target = self.compiler.lowering._monomorphized_function( monomorphized_err ), receiver = None, args = [ t0 ], kwargs = {} ),
 			ir.Return( value = t1 ),
 			ir.DeleteTemp( temp = t1 ),
+			ir.Decref( value = t0 ), # t0 is genuinely RCClass-typed now, so its cleanup correctly decrefs it - previously invisible to cfg.py while it was mistyped as the bare TypeVar
 			ir.DeleteTemp( temp = t0 ),
 			ir.FuncEnd( name = '__test__.foo' ),
 		])
