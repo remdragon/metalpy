@@ -205,9 +205,14 @@ class Unwrap( Instruction ): # Result.unwrap(errmsg): Err -> panic(errmsg); Ok -
 	dest: Temp
 	value: Operand # a Result[T,E]
 	errmsg: Operand
+	# the resolved sys.panic(message: str) -> NoReturn to call on the Err
+	# branch - a real Function reference (same posture as Call.target),
+	# not a name an emitter has to know/invent on its own. Populated by
+	# lowering.py's _consume_checked_result via Lowering._resolve_sys_panic
+	panic: Function
 
 	def test_repr( self ) -> str:
-		return f'Unwrap( dest={self.dest!r}, value={self.value!r}, errmsg={self.errmsg!r} )'
+		return f'Unwrap( dest={self.dest!r}, value={self.value!r}, errmsg={self.errmsg!r}, panic={self.panic.qualname!r} )'
 
 @dataclass( kw_only = True )
 class UnwrapOr( Instruction ): # Result.unwrap_or(default): Err -> dest = default; Ok -> dest = payload

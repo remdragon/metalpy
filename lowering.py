@@ -148,6 +148,30 @@ class Lowering:
 		# alloc[u8], from anywhere) reuses the SAME monomorphized Function
 		# object, not a fresh copy per call site
 		self._monomorphized: dict[int,Function] = {}
+		# resolved lazily, the first time panic_arithmetic mode's Unwrap
+		# actually needs it (see _consume_checked_result) - cached so a
+		# program using panic_arithmetic in multiple places only resolves
+		# sys.panic once
+		self._sys_panic_fn: Function|None = None
+
+	def _resolve_sys_panic( self ) -> Function:
+		# ir.Unwrap's Err branch needs to actually call something to
+		# terminate the program - that's sys.panic(message: str) -> NoReturn,
+		# a REAL library function, not an emitter-invented hook (an emitter
+		# has no business deciding what "panic" means - that's a language/
+		# stdlib decision, made here). Reached via discovery.import_name(...)
+		# rather than a user-namespace lookup, mirroring how Discovery.
+		# __init__ already force-imports 'builtins' regardless of whether
+		# user code ever imports it - a program using panic_arithmetic
+		# shouldn't need its own `import sys` for this to work
+		if self._sys_panic_fn is None:
+			module = self.discovery.import_name( 'sys' )
+			fn = module.get_local( 'panic' )
+			assert isinstance( fn, Function ), f'sys.panic is required by panic_arithmetic but was not found: {fn!r}'
+			if fn.resolve is not None:
+				fn.resolve()
+			self._sys_panic_fn = fn
+		return self._sys_panic_fn
 
 	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
 		module = self._find_module_for( fn )
@@ -1759,7 +1783,9 @@ class Lowering:
 			else:
 				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
 		else:
-			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra ))
+			panic_fn = self._resolve_sys_panic()
+			self.schedule( panic_fn )
+			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra, panic = panic_fn ))
 		return unwrapped
 
 	def _lookup_result_and_error_types( self, node: ast.AST, error_name: str ) -> tuple[ClassLike,ClassLike]:

@@ -147,6 +147,91 @@ def main() -> None:
 		self.assertIn( 'int main( void );', src ) # forward-declared
 		self.assertIn( 'int main( void ) {', src ) # then defined
 
+# shared by every test needing Result[T,E] - matches lowering_test.py's own
+# _RESULT_FIXTURE exactly (self-contained snippet, not a real lib/ import -
+# established convention for CompilerTestCase-style tests, see
+# compiler_test.py)
+_RESULT_FIXTURE = '\n'.join([
+	'class bool: pass',
+	'class OverflowError: pass',
+	'',
+	'@cunion',
+	'class ResultPayload[T,E]:',
+	'	ok: T',
+	'	err: E',
+	'',
+	'@cstruct',
+	'class Result[T,E]:',
+	'	_payload: ResultPayload[T,E]',
+	'	_tag: u8',
+	'',
+	'	@staticmethod',
+	'	def Ok( val: T ) -> Result[T,E]:',
+	'		return Result.__allocate__( _payload = ResultPayload( ok = val ), _tag = 0 )',
+	'',
+	'	@staticmethod',
+	'	def Err( err: E ) -> Result[T,E]:',
+	'		return Result.__allocate__( _payload = ResultPayload( err = err ), _tag = 1 )',
+	'',
+	'	def is_ok( self ) -> bool:',
+	'		return self._tag == 0',
+	'',
+	'	def is_err( self ) -> bool:',
+	'		return self._tag == 1',
+])
+
+class SpecializationSynthesisTests( CompilerTestCase ):
+	def test_result_specialization_gets_a_real_struct_body( self ) -> None:
+		# compiler.py's own _enqueue() never schedules a ClassLike
+		# Specialization as its own compile unit (see emitter_c.py's
+		# _collect_specializations docstring) - Result[i32,OverflowError]
+		# never appears in compiler.cstructs, only bare Result does. This
+		# confirms the emitter finds and synthesizes it anyway.
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+			'def main() -> Result[i32,OverflowError]:',
+			'	with compiler.wrap_arithmetic:',
+			'		x: i32 = 1',
+			'	return Result.Ok( x )',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		specs = emitter_c._collect_specializations( self.compiler )
+		names = [ s.qualname for s in specs ]
+		self.assertIn( '__main__.Result[intrinsics.i32,__main__.OverflowError]', names )
+		spec = next( s for s in specs if s.qualname == '__main__.Result[intrinsics.i32,__main__.OverflowError]' )
+		src = emitter_c.emit_specialization( spec, self.discovery )
+		self.assertIn( 'struct', src )
+		self.assertIn( '_tag;', src )
+		self.assertIn( '_payload;', src )
+
+class EmitArithmeticTests( CompilerTestCase ):
+	def test_wrap_arithmetic_smoke_test( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32 = 1
+		return x + 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		src = emitter_c.emit_function( main_lf )
+		self.assertNotIn( '__builtin', src ) # wrap mode must NOT use the overflow builtins
+
+	def test_default_check_mode_uses_result_and_or_return( self ) -> None:
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+			'def main() -> Result[i32,OverflowError]:',
+			'	x: i32 = 1',
+			'	y: i32 = x + 1',
+			'	return Result.Ok( y )',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		kinds = [ type( i ).__name__ for i in main_lf.instructions ]
+		self.assertIn( 'AddCheck', kinds )
+		self.assertIn( 'OrReturn', kinds )
+		src = emitter_c.emit_function( main_lf )
+		self.assertIn( '__builtin_add_overflow', src )
+		self.assertIn( '_tag == 1', src )
+
 CLANG = shutil.which( 'clang' ) or r'C:\Program Files\LLVM\bin\clang.exe'
 
 @unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
@@ -167,6 +252,47 @@ class RealCompileTests( CompilerTestCase ):
 def main() -> None:
 	return
 ''' )
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_wrap_arithmetic_smoke_test_compiles( self ) -> None:
+		# Phase 1 milestone (a): the first real smoke test, sidesteps
+		# Result plumbing entirely
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32 = 1
+		return x + 1
+''' )
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	@unittest.expectedFailure
+	def test_default_check_mode_arithmetic_compiles( self ) -> None:
+		# Phase 1 milestone (b): default Check-mode arithmetic, proving
+		# AddCheck + the synthesized Result[i32,OverflowError] struct +
+		# OrReturn all compile clean together.
+		#
+		# KNOWN GAP (found via this exact test, real, pre-existing,
+		# discovered by this emitter work - not something to patch around
+		# here): Result.Ok(...)/.Err(...) are METHODS on a generic CStruct
+		# (Result[T,E]). lowering.py monomorphizes generic FREE functions
+		# on call (_monomorphized_function/lower_function_specialization -
+		# sys.alloc[u8] etc.) but never does the equivalent for a generic
+		# CLASS's own methods - Result.Ok's Function object is scheduled
+		# and lowered with its parameters/return_type still literally
+		# holding Result's own unbound TypeVars (T, E), which have no C
+		# representation at all. Existing tests never caught this because
+		# they only assert on IR *shape* (duck-typed, doesn't care whether
+		# a type is concrete) - this is the first thing to require REAL
+		# concrete types out of a generic method's own signature. Needs a
+		# real lowering.py/discovery.py fix (generic-method monomorphization,
+		# mirroring the existing generic-function path) before this can
+		# pass - out of scope for the emitter itself to work around.
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+			'def main() -> Result[i32,OverflowError]:',
+			'	x: i32 = 1',
+			'	y: i32 = x + 1',
+			'	return Result.Ok( y )',
+		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 if __name__ == '__main__':

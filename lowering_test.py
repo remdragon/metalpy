@@ -649,6 +649,9 @@ class Tests( unittest.TestCase ):
 		if result_cls.resolve is not None:
 			result_cls.resolve()
 		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
+		# panic_arithmetic's Unwrap calls the REAL sys.panic - not an
+		# emitter-invented hook (see ir.Unwrap.panic / Lowering._resolve_sys_panic)
+		panic_fn = self.discovery.import_name( 'sys' ).get_local( 'panic' )
 
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 10, type = i32 )
 		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 12, type = i32 )
@@ -662,7 +665,7 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t0 ),
 			ir.AddCheck( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t1 ),
-			ir.Unwrap( dest = t1, value = t0, errmsg = ir.Const( type = str_cls, value = 'bad arithmetic' )),
+			ir.Unwrap( dest = t1, value = t0, errmsg = ir.Const( type = str_cls, value = 'bad arithmetic' ), panic = panic_fn ),
 			ir.Assign( dest = b, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),

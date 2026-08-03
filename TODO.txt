@@ -30,6 +30,24 @@ sys._Stdout.write():
 			3a) a real problem with this is sometimes documentation lies
 				about what errors a function can generate.
 	4) how is it done elsewhere, how have others solved this problem?
+	
+	Python defines OSError as "Base class for I/O related errors"
+		FileNotFoundError is a subclass of OSError
+	
+	Maybe something like this to minimic Python as close as possible, mapping
+	the most common errors as named types:
+	
+	@compiler.target( os = 'windows' )
+	@enum( u32 )
+	class OSError:
+		FileNotFoundError = ?
+		Other = _
+	
+	@compiler.target( os = not 'windows' )
+	@enum( i32 )
+	class OSError:
+		FileNotFoundError = ENOENT
+		Other = _
 
 lowering:
 	CFG:
@@ -721,6 +739,66 @@ emitter:
 		phase breakdown and the remaining phases (RCClass/sys.alloc[T]
 		construction, __del__ synthesis, TaggedUnion, @extern/AddrOf/
 		string literals, module globals).
+
+	Phase 1 (in progress): DeclareTemp/DeleteTemp/Assign (incl. inline
+		local-variable declaration - locals have no DeclareTemp-style IR of
+		their own, unlike temps; the emitter declares one at each local's
+		first Assign), the full BinOp/UnaryOp arithmetic families (Wrap via
+		the signed->unsigned-cast->cast-back idiom, since C's signed
+		overflow is UB not wraparound; Check via __builtin_add/sub/mul_
+		overflow, Shl's own check/saturate via a shift-back comparison since
+		no __builtin_shl_overflow exists; Saturate via sign-based MIN/MAX
+		clamping - i128/u128 saturate unsupported, no INT128_MIN/MAX macro
+		exists), Cmp, Label/Jump family, free-function Call, generic GetAttr/
+		SetAttr (dot vs -> decided by isinstance(obj.type, RCClass), same
+		rule c_type() already uses), OrReturn/OrJump (real conditional C
+		synthesized per-instruction - these ARE the branch, not pre-branched
+		IR), Unwrap/UnwrapOr.
+		Real gap found + fixed along the way: compiler.py's _enqueue() never
+		schedules a ClassLike Specialization as its own compile unit (only
+		Function-based ones are) - Result[i32,OverflowError] never appears
+		in compiler.cstructs, only bare Result does, even though real IR
+		(AddCheck's own dest.type, ...) references it constantly. Added
+		_collect_specializations()/emit_specialization() to emitter_c.py -
+		walks the already-lowered IR/type graph, finds every concrete
+		Specialization-of-ClassLike, synthesizes its struct/union body by
+		substituting the generic's type_params with that Specialization's
+		args. Had a real, now-fixed bug: a generic class's OWN methods
+		routinely declare things like `-> Result[T,E]` referencing the
+		enclosing class's still-unbound type params (Result.Ok/.Err's own
+		return annotation) - discovery.py builds a REAL Specialization
+		object for this too, which is NOT a concrete instantiation; treating
+		it as one leaked an unresolved TypeVar into a real struct field.
+		Fixed via _is_concrete() (recursively rejects any Specialization
+		whose args still contain a TypeVar).
+		Per explicit user direction: ir.Unwrap's Err-branch panic call is
+		wired to the REAL sys.panic(message: str) -> NoReturn, not an
+		emitter-invented placeholder - the connection is made in lowering.py
+		(Lowering._resolve_sys_panic(), mirroring how Discovery.__init__
+		already force-imports 'builtins' regardless of user code), which
+		resolves+schedules the real Function and hands it to ir.Unwrap
+		directly via a new `panic: Function` field (same posture as
+		Call.target - a real object reference, not a name the emitter has
+		to know/invent). The emitter has zero special knowledge of "panic" -
+		it just calls whatever Function the IR handed it.
+		KNOWN GAP, found via this work, NOT chased here (needs its own
+		lowering.py/discovery.py design pass): generic CLASS methods are
+		never monomorphized. lowering.py already monomorphizes generic FREE
+		functions on call (_monomorphized_function/lower_function_
+		specialization - sys.alloc[u8] etc.), but a generic class's own
+		methods (Result.Ok/.Err/.is_ok/.is_err) are scheduled and lowered
+		with their parameters/return_type still literally holding the
+		class's own unbound TypeVars (T, E) - which have no C representation
+		at all. No existing test caught this because the whole suite only
+		ever asserted on IR *shape* (duck-typed - doesn't care whether a
+		type is concrete) until this emitter work needed a REAL concrete C
+		type out of a generic method's own signature for the first time.
+		Confirmed via a direct repro (see emitter_c_test.py's
+		test_default_check_mode_arithmetic_compiles, marked
+		@unittest.expectedFailure with the full explanation inline rather
+		than deleted or silently worked around - once the real fix lands
+		this test should start failing its expectedFailure, i.e. flip to an
+		unexpected pass, which is the signal to remove the decorator).
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml

@@ -156,21 +156,23 @@ class ResultConsumingOpsTests( IRTestCase ):
 		x = Parameter( stem = 'x', qualname = '__main__.foo.x', file = None, line = None, type = self.i32 )
 		result_temp = ir.Temp( type = self.result_i32_overflow, id = 0 )
 		unwrapped = ir.Temp( type = self.i32, id = 1 )
+		panic_fn = _make_function( 'panic', 'sys.panic', [], self.none_type )
 
 		add_check = ir.AddCheck( dest = result_temp, left = x, right = ir.Const( type = self.i32, value = 1 ))
 		or_return = ir.OrReturn( dest = unwrapped, value = result_temp )
-		unwrap = ir.Unwrap( dest = unwrapped, value = result_temp, errmsg = ir.Const( type = self.str_type, value = 'overflow' ))
+		unwrap = ir.Unwrap( dest = unwrapped, value = result_temp, errmsg = ir.Const( type = self.str_type, value = 'overflow' ), panic = panic_fn )
 		unwrap_or = ir.UnwrapOr( dest = unwrapped, value = result_temp, default = ir.Const( type = self.i32, value = 0 ))
 
 		self.assertIs( add_check.dest.type, self.result_i32_overflow )
 		self.assertIs( or_return.value, result_temp )
 		self.assertIs( or_return.dest, unwrapped )
 		self.assertEqual( unwrap.errmsg, ir.Const( type = self.str_type, value = 'overflow' ))
+		self.assertIs( unwrap.panic, panic_fn )
 		self.assertEqual( unwrap_or.default, ir.Const( type = self.i32, value = 0 ))
 
 		# two independently-built consuming instructions over the same Result compare equal
 		self.assertEqual(
-			ir.Unwrap( dest = unwrapped, value = result_temp, errmsg = ir.Const( type = self.str_type, value = 'overflow' )),
+			ir.Unwrap( dest = unwrapped, value = result_temp, errmsg = ir.Const( type = self.str_type, value = 'overflow' ), panic = panic_fn ),
 			unwrap,
 		)
 
