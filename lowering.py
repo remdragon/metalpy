@@ -786,7 +786,7 @@ class Lowering:
 			return
 		if isinstance( node.value, ast.Constant ) and isinstance( node.value.value, str ):
 			return # a docstring (or any other bare string literal used as a statement) - a no-op, same as _stmt_Pass
-		if self._is_compiler_early_return_call( node.value ):
+		if self._is_compiler_call( node.value ) == 'early_return':
 			self._lower_compiler_early_return( node.value )
 			return
 		if not isinstance( node.value, ast.Call ):
@@ -803,11 +803,12 @@ class Lowering:
 			self._register_defer_block( is_err_only = ( defer_kind == 'errdefer' ), body = node.body, node = node )
 			return
 
-		if self._is_compiler_attr( context_expr, 'wrap_arithmetic' ):
+		attr = self._is_compiler_attr( context_expr )
+		if attr == 'wrap_arithmetic':
 			mode = ( 'wrap', None )
-		elif self._is_compiler_attr( context_expr, 'saturate_arithmetic' ):
+		elif attr == 'saturate_arithmetic':
 			mode = ( 'saturate', None )
-		elif self._is_compiler_panic_arithmetic_call( context_expr ):
+		elif self._is_compiler_call( context_expr ) == 'panic_arithmetic':
 			if len( context_expr.args ) != 1 or context_expr.keywords:
 				self.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(node)}', node )
 			str_cls = self.discovery.find_name( 'str', node )
@@ -829,43 +830,28 @@ class Lowering:
 		finally:
 			self._arithmetic_mode.pop()
 
-	def _is_compiler_attr( self, node: ast.expr, attr: str ) -> bool:
+	def _is_compiler_attr( self, node: ast.expr ) -> str|None:
 		# textual recognition, same as discovery.py's _is_compiler_target_call -
 		# `compiler` is a special pseudo-module (Discovery.compiler_module),
 		# not something with a real .names dict to resolve this through
-		return (
+		if (
 			isinstance( node, ast.Attribute )
-			and node.attr == attr
 			and isinstance( node.value, ast.Name )
 			and node.value.id == 'compiler'
-		)
+		):
+			return node.attr
+		return None
 
-	def _is_compiler_panic_arithmetic_call( self, node: ast.expr ) -> bool:
-		return (
+	def _is_compiler_call( self, node: ast.expr ) -> str|None:
+		if (
 			isinstance( node, ast.Call )
 			and isinstance( node.func, ast.Attribute )
-			and node.func.attr == 'panic_arithmetic'
 			and isinstance( node.func.value, ast.Name )
 			and node.func.value.id == 'compiler'
-		)
-
-	def _is_compiler_sizeof_call( self, node: ast.expr ) -> bool:
-		return (
-			isinstance( node, ast.Call )
-			and isinstance( node.func, ast.Attribute )
-			and node.func.attr == 'sizeof'
-			and isinstance( node.func.value, ast.Name )
-			and node.func.value.id == 'compiler'
-		)
-
-	def _is_compiler_cast_call( self, node: ast.expr ) -> bool:
-		return (
-			isinstance( node, ast.Call )
-			and isinstance( node.func, ast.Attribute )
-			and node.func.attr == 'cast'
-			and isinstance( node.func.value, ast.Name )
-			and node.func.value.id == 'compiler'
-		)
+		):
+			return node.func.attr
+		else:
+			return None
 
 	# byte size for every intrinsic scalar this target model actually has a
 	# fixed size for - matches this compiler's own intrinsics (see
@@ -903,15 +889,6 @@ class Lowering:
 		usize_cls = self.discovery.get_intrinsics()['usize']
 		return ir.Const( type = expected_type or usize_cls, value = size )
 
-	def _is_compiler_refcount_call( self, node: ast.expr ) -> bool:
-		return (
-			isinstance( node, ast.Call )
-			and isinstance( node.func, ast.Attribute )
-			and node.func.attr == 'refcount'
-			and isinstance( node.func.value, ast.Name )
-			and node.func.value.id == 'compiler'
-		)
-
 	def _lower_compiler_refcount( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.refcount(x) - unlike compiler.sizeof(T), x is a real
 		# VALUE (an RC object), not a type reference, so it's lowered via
@@ -932,15 +909,6 @@ class Lowering:
 		dest = self._new_temp( expected_type or usize_cls )
 		self._emit( ir.RefCount( dest = dest, value = value ))
 		return dest
-
-	def _is_compiler_addrof_call( self, node: ast.expr ) -> bool:
-		return (
-			isinstance( node, ast.Call )
-			and isinstance( node.func, ast.Attribute )
-			and node.func.attr == 'addrof'
-			and isinstance( node.func.value, ast.Name )
-			and node.func.value.id == 'compiler'
-		)
 
 	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
@@ -1022,15 +990,6 @@ class Lowering:
 				node,
 			)
 		return self._lower_scalar_cast( target_type, value, node )
-
-	def _is_compiler_early_return_call( self, node: ast.expr ) -> bool:
-		return (
-			isinstance( node, ast.Call )
-			and isinstance( node.func, ast.Attribute )
-			and node.func.attr == 'early_return'
-			and isinstance( node.func.value, ast.Name )
-			and node.func.value.id == 'compiler'
-		)
 
 	def _lower_compiler_early_return( self, node: ast.Call ) -> None:
 		# compiler.early_return(err) - a same-function early bailout: usable
@@ -2794,21 +2753,22 @@ class Lowering:
 		return None
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
-		if self._is_compiler_sizeof_call( node ):
-			result = self._lower_compiler_sizeof( node, expected_type )
-			return result if want_result else None
+		match self._is_compiler_call( node ):
+			case 'sizeof':
+				result = self._lower_compiler_sizeof( node, expected_type )
+				return result if want_result else None
 
-		if self._is_compiler_refcount_call( node ):
-			result = self._lower_compiler_refcount( node, expected_type )
-			return result if want_result else None
+			case 'refcount':
+				result = self._lower_compiler_refcount( node, expected_type )
+				return result if want_result else None
 
-		if self._is_compiler_cast_call( node ):
-			result = self._lower_compiler_cast( node, expected_type )
-			return result if want_result else None
+			case 'cast':
+				result = self._lower_compiler_cast( node, expected_type )
+				return result if want_result else None
 
-		if self._is_compiler_addrof_call( node ):
-			result = self._lower_compiler_addrof( node, expected_type )
-			return result if want_result else None
+			case 'addrof':
+				result = self._lower_compiler_addrof( node, expected_type )
+				return result if want_result else None
 
 		allocate_dest = self._try_lower_allocate_call( node, expected_type )
 		if allocate_dest is None:
