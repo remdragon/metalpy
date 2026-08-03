@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Generator, NoReturn
 
 # local imports
+import compile_time_transformer
 from errors import CompileError, ErrorCollector
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, Function, Overload,
@@ -30,11 +31,17 @@ _HOST_MACHINE_TO_TARGET_ARCH = {
 	'aarch64': 'arm64',
 }
 
-def _detect_active_target() -> dict[str,str]:
+def _detect_active_target() -> dict[str,object]:
 	os_name = _HOST_OS_TO_TARGET_OS.get( platform.system(), platform.system().lower() )
 	arch = _HOST_MACHINE_TO_TARGET_ARCH.get( platform.machine(), platform.machine() )
-	family = 'windows' if os_name == 'windows' else 'posix'
-	return { 'os': os_name, 'arch': arch, 'family': family, 'bits': '64' }
+	# family is one of SYNTAX.md's FamilySpec literals ('unix'/'windows'/
+	# 'wasm') - 'posix' is a *separate* bool field on TargetQuery, not a
+	# family value
+	family = 'windows' if os_name == 'windows' else 'unix'
+	# debug=True by default (matches sys.alloc()'s existing debug-only
+	# zeroing behavior) - overridable via Discovery(active_target=...) same
+	# as every other key, until a real CLI exposes a release-build flag
+	return { 'os': os_name, 'arch': arch, 'family': family, 'bits': 64, 'debug': True, 'posix': family == 'unix' }
 
 
 class Discovery( ast.NodeVisitor ):
@@ -90,7 +97,7 @@ class Discovery( ast.NodeVisitor ):
 	def __init__( self,
 		paths: list[Path]|None = None,
 		import_builtins: bool = True,
-		active_target: dict[str,str]|None = None,
+		active_target: dict[str,object]|None = None,
 	) -> None:
 		self.paths: list[Path] = list( paths ) if paths else []
 		if not self.paths:
@@ -655,10 +662,14 @@ class Discovery( ast.NodeVisitor ):
 
 	# --- classes ----------------------------------------------------------------
 
-	def visit_ClassDef( self, node: ast.ClassDef ) -> ClassLike:
+	def visit_ClassDef( self, node: ast.ClassDef ) -> ClassLike|None:
 		qualname = self._get_qualname( node.name )
 
 		for decorator in node.decorator_list or []:
+			if self._is_compiler_target_call( decorator ):
+				if not self._matches_active_target( decorator ):
+					return None # excluded for this target - not part of the type system at all
+				continue
 			decname = self._decorator_name( decorator )
 			match decname:
 				case 'cstruct':
@@ -897,8 +908,8 @@ class Discovery( ast.NodeVisitor ):
 				return False
 		return True
 
-	def _target_value_matches( self, node: ast.expr, active_value: str ) -> bool:
-		if isinstance( node, ast.Constant ) and isinstance( node.value, str ):
+	def _target_value_matches( self, node: ast.expr, active_value: object ) -> bool:
+		if isinstance( node, ast.Constant ):
 			return node.value == active_value
 		if isinstance( node, ast.UnaryOp ) and isinstance( node.op, ast.Not ):
 			return not self._target_value_matches( node.operand, active_value )
@@ -1080,6 +1091,11 @@ class Discovery( ast.NodeVisitor ):
 
 	def _make_function_resolver( self, fn: Function, module: Module, class_obj: ClassLike|None, group: Overload|None = None ) -> Callable[[],None]:
 		def body() -> None:
+			# Phase 2 of @compiler.target support (COMPILER-TARGET.md): fold
+			# compile-time-constant expressions/if/while before lowering.py
+			# ever walks this body - done once, here, rather than on every
+			# lowering attempt
+			fn.node.body = compile_time_transformer.transform_function_body( fn.node.body, self.active_target )
 			with self.module_context( module ):
 				with ( self.scope_context( class_obj ) if class_obj is not None else nullcontext() ):
 					with self.scope_context( fn ):

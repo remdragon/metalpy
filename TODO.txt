@@ -214,33 +214,59 @@ lowering:
 					f.close()
 		*NOTE* for now we are not supporting defer/errdefer in loops
 	match statement support
-	compile time expression resolution:
-		expressions that can be resolved at compile time should be.
-		<code>x: i32 = 1 + 1</code> should lower as <code>x: i32 = 2</code>
-	exclude compile time calculations:
-		if compiler.target.os == 'windows': ...
-		if True: ...
-		match compiler.target.bits: ...
-	@compiler.target(os=...)-decorated function selection isn't implemented
-		either (a related but distinct gap from the statement-level one just
-		above - this is picking between multiple @compiler.target(os=...)
-		DEF overloads of the same function, e.g. lib/sys.py's memzero()/
-		_alloc(), each with a real, different body per platform, not a
-		conditional expression inside one body). Confirmed via a real
-		attempted full compile of `bytearray(4)` (Bar()-with-__init__
-		construction verification, see the RCCLASS ATTRIBUTE LIFETIME.md
-		work): both the windows AND non-windows variants get scheduled/
-		lowered indiscriminately today, so `from windows.ntdll import
+	[resolved] compile time expression resolution / @compiler.target support
+		(see COMPILER-TARGET.md): compile_time_transformer.py (new file) is
+		an ast.NodeTransformer, run once per function body at discovery.py
+		resolve time (_make_function_resolver), that folds constant
+		BinOp/UnaryOp/BoolOp/Compare expressions (`1 + 1` -> `2`), generically
+		substitutes any `compiler.target.<key>` attribute chain from the same
+		active_target dict discovery.py's decorator filtering already uses
+		(not hardcoded to just `.os` - `.debug`/`.bits`/etc. all work too),
+		and simplifies `if`/`while` statements once their test becomes a
+		constant (`if True: A else: B` -> just A's statements spliced in,
+		`while False: ...` dropped entirely, `while True:` left as an
+		ordinary - correctly infinite - loop rather than synthesizing any
+		label/goto AST, since lowering.py's existing while-loop machinery
+		already handles a constant-true test fine). `@compiler.target(...)`
+		decorator filtering itself was ALREADY implemented for functions and
+		methods (long-standing, see CompilerTargetTests in discovery_test.py)
+		- the one real gap was classes: visit_ClassDef never checked for the
+		decorator at all, hitting "unsupported class decorator" - fixed to
+		mirror _parse_function's pattern (checked before dispatching to
+		@cstruct/@cunion/@enum/@union/plain-RCClass parsing).
+		Also fixed along the way: _target_value_matches only ever accepted
+		string constants, so `bits = 64` (int, matching SYNTAX.md's
+		BitsSpec) or `posix = True` (bool) never matched anything -
+		generalized to compare via `==` for any constant type.
+		_detect_active_target()'s bootstrap was also fixed: 'bits' is now
+		int 64 (was string '64'), 'family' is 'windows'/'unix' (was
+		'posix' - SYNTAX.md's FamilySpec is Literal['unix','windows','wasm'],
+		'posix' is its own separate bool field), and a 'debug' key (default
+		True) was added so lib/sys.py's and lib/builtins/__init__.py's
+		`if compiler.target.debug:` guards now fold/compile correctly.
+		Explicitly out of scope this pass (not in COMPILER-TARGET.md's
+		spec): `match compiler.target.bits: ...` constant-subject folding -
+		still compiles fine via the ordinary runtime match path, just
+		without the optimization. Also out of scope: class-body/attribute-
+		default-level folding (only function bodies are transformed, per
+		the doc's literal wording).
+		Correction to a stale note that used to live here: "@compiler.target
+		(os=...)-decorated function selection isn't implemented" was
+		WRONG - re-verified live (see compile_time_transformer_test.py /
+		discovery_test.py's CompilerTargetTests) that discovery.py already
+		correctly schedules only the target-matching definition, for
+		functions, methods, AND (now) classes; only one of lib/sys.py's
+		memzero()/_alloc() windows-vs-non-windows bodies is ever lowered.
+		The bare `compiler.target.debug` if-condition part of that old note
+		WAS real and is now fixed by this pass. What's still genuinely open,
+		confirmed via the same `bytearray(4)` full-compile attempt, both
+		unrelated to @compiler.target: `is`/`is not` comparison operators
+		aren't supported ("unsupported comparison operator: ptr is None" -
+		see "incorrect is usage" above), and `from windows.ntdll import
 		RtlZeroMemory` / `from windows.kernel32 import HeapAlloc,
-		GetProcessHeap` both fail (those modules don't exist in this
-		environment) regardless of target platform. Same repro also
-		surfaced two smaller, likely-unrelated gaps in lib/sys.py's
-		alloc()/_alloc(): `is`/`is not` comparison operators aren't
-		supported ("unsupported comparison operator: ptr is None"), and a
-		bare `compiler.target.debug` used directly as an if-condition
-		(rather than inside a `with compiler.panic_arithmetic(...):`-style
-		block) isn't recognized ("'compiler' is not a value, cannot use it
-		as an expression").
+		GetProcessHeap`-style FFI imports fail because lib/windows/ doesn't
+		exist yet as a real stub module in this repo (a content gap, not a
+		compiler one).
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion

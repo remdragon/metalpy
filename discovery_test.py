@@ -1349,6 +1349,101 @@ class Stdout:
 		self.assertIsInstance( write, Function )
 		self.assertEqual( len( stdout.methods ), 1 )
 
+	def test_matching_target_class_included( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( os = 'windows' )
+class Foo:
+	a: int
+''', { 'os': 'windows' })
+		self.assertIsInstance( mod.get_local( 'Foo' ), RCClass )
+
+	def test_non_matching_target_class_excluded( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( os = 'windows' )
+class Foo:
+	a: int
+''', { 'os': 'linux' })
+		self.assertIsNone( mod.get_local( 'Foo' ))
+
+	def test_same_named_classes_pick_one_winner( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( os = 'windows' )
+class Foo:
+	a: int
+
+@compiler.target( os = not 'windows' )
+class Foo:
+	b: int
+''', { 'os': 'linux' })
+		foo = mod.get_local( 'Foo' )
+		self.assertIsInstance( foo, RCClass )
+		foo.resolve()
+		self.assertIsNotNone( foo.get_local( 'b' ))
+		self.assertIsNone( foo.get_local( 'a' ))
+
+	def test_matching_target_cstruct_included( self ) -> None:
+		# the @compiler.target(...) filtering check has to run before
+		# visit_ClassDef dispatches on the OTHER decorators (@cstruct/
+		# @cunion/@enum/@union) - order in decorator_list shouldn't matter
+		disco, mod = self._import( '''
+@cstruct
+@compiler.target( os = 'windows' )
+class Foo:
+	a: int
+''', { 'os': 'windows' })
+		self.assertIsInstance( mod.get_local( 'Foo' ), CStruct )
+
+	def test_bits_int_value_matches( self ) -> None:
+		# regression: _target_value_matches used to only accept string
+		# constants, so an int literal like `bits = 64` (matching SYNTAX.md's
+		# BitsSpec = Literal[16,32,64]) never matched anything
+		disco, mod = self._import( '''
+@compiler.target( bits = 64 )
+def foo() -> i32:
+	pass
+''', { 'bits': 64 })
+		self.assertIsInstance( mod.get_local( 'foo' ), Function )
+
+	def test_posix_bool_value_matches( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( posix = True )
+def foo() -> i32:
+	pass
+''', { 'posix': True })
+		self.assertIsInstance( mod.get_local( 'foo' ), Function )
+
+	def test_debug_key_modeled_by_default( self ) -> None:
+		disco = discovery.Discovery( import_builtins = False )
+		self.assertIn( 'debug', disco.active_target )
+		self.assertIs( disco.active_target['debug'], True )
+
+	def test_family_is_unix_not_posix( self ) -> None:
+		# family is one of SYNTAX.md's FamilySpec literals ('unix'/'windows'/
+		# 'wasm') - 'posix' is a separate bool field, not a family value
+		disco = discovery.Discovery( import_builtins = False )
+		self.assertIn( disco.active_target['family'], ( 'unix', 'windows' ))
+
+
+class CompileTimeFoldingIntegrationTests( unittest.TestCase ):
+	''' confirms discovery.py actually invokes compile_time_transformer at
+	function-resolve time (see _make_function_resolver), not just that the
+	transformer works in isolation (compile_time_transformer_test.py) '''
+
+	def test_function_body_folded_on_resolve( self ) -> None:
+		disco = discovery.Discovery( import_builtins = False, active_target = { 'os': 'windows' } )
+		mod = disco.import_code( '''
+def foo() -> None:
+	if compiler.target.os == 'windows':
+		a = 1
+	else:
+		a = 2
+''', Path( '__main__.py' ), scope = None )
+		fn = mod.get_local( 'foo' )
+		fn.resolve()
+		import ast
+		self.assertEqual( len( fn.node.body ), 1 )
+		self.assertEqual( ast.unparse( fn.node.body[0] ), 'a = 1' )
+
 
 class RealLibSmokeTest( unittest.TestCase ):
 	''' confirms discovery no longer crashes on the actual example library, not just synthetic snippets '''
