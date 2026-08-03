@@ -601,6 +601,46 @@ class Lowering:
 			self._emit( instr )
 		del fn.names[target.id]
 
+	def _stmt_ImportFrom( self, node: ast.ImportFrom ) -> None:
+		# local (in-function) form of discovery.py's own visit_ImportFrom -
+		# function bodies are deliberately never walked by discovery.py's
+		# own visitor (see this class's docstring: "function bodies were
+		# deliberately left unvisited in stage 1"), so an import written
+		# inside a function body (lib/sys.py's memzero()/_alloc()/etc. -
+		# one FFI declaration per @compiler.target(os=...) branch) only
+		# ever reaches here, never discovery.py's version. Registered
+		# directly into the current function's own scope (add_name, same
+		# as a parameter) rather than resolved/scheduled eagerly - an
+		# unused import costs nothing, same posture as _expr_Name's lazy
+		# resolve-on-use
+		parts: list[str] = []
+		if node.level:
+			parts.extend( self.discovery.module_stack[-1].qualname.split( '.' )[:-node.level] )
+			if not parts:
+				self.discovery.fail( f'unable to relative import from here: {ast.unparse(node)}', node )
+		if node.module:
+			parts.append( node.module )
+		package = '.'.join( parts )
+		try:
+			mod = self.discovery.import_name( package )
+		except FileNotFoundError as e:
+			self.discovery.fail( str( e ), node )
+		if not mod:
+			self.discovery.fail( f'module {package!r} not found', node )
+		for alias in node.names:
+			item = mod.names.get( alias.name )
+			if item is None:
+				self.discovery.fail( f'module {package} does not export {alias.name!r}', node )
+			self._current_fn.add_name( alias.asname or alias.name, item )
+
+	def _stmt_Import( self, node: ast.Import ) -> None:
+		for alias in node.names:
+			try:
+				mod = self.discovery.import_name( alias.name )
+			except FileNotFoundError as e:
+				self.discovery.fail( str( e ), node )
+			self._current_fn.add_name( alias.asname or alias.name, mod )
+
 	def _is_aliasing_expr( self, node: ast.expr ) -> bool:
 		# does lowering `node` hand back a reference to a value that
 		# already exists independently (needing its own Incref if it's

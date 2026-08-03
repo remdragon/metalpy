@@ -3540,6 +3540,72 @@ class Tests( unittest.TestCase ):
 		self.compiler._lower( mod.get_local( 'main' ))
 		self.assertEqual( self.discovery.errors.errors, [] )
 
+	# --- local (in-function) imports ---------------------------------------
+
+	def test_from_import_makes_the_name_callable( self ) -> None:
+		# discovery.py's own visit_ImportFrom only ever runs at module/class
+		# scope (function bodies are deliberately never walked by discovery
+		# - see Lowering's own docstring) - this is the in-function form,
+		# _stmt_ImportFrom, exercised for real here via a second module
+		helper_mod = self.compiler.import_code( 'def helper() -> i32:\n\treturn 42\n', Path( 'helper.py' ))
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	from helper import helper as h',
+			'	return h()',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		helper_fn = helper_mod.get_local( 'helper' )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = i32 ),
+			ir.DeclareTemp( temp = ir.Temp( type = i32, id = 0 )),
+			ir.Call( dest = ir.Temp( type = i32, id = 0 ), target = helper_fn, receiver = None, args = [], kwargs = {} ),
+			ir.Return( value = ir.Temp( type = i32, id = 0 )),
+			ir.DeleteTemp( temp = ir.Temp( type = i32, id = 0 )),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_import_module_makes_it_addressable( self ) -> None:
+		helper_mod = self.compiler.import_code( 'def helper() -> i32:\n\treturn 42\n', Path( 'helper.py' ))
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	import helper',
+			'	return helper.helper()',
+		])
+		i32 = self.discovery.get_intrinsics()['i32']
+		helper_fn = helper_mod.get_local( 'helper' )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = i32 ),
+			ir.DeclareTemp( temp = ir.Temp( type = i32, id = 0 )),
+			ir.Call( dest = ir.Temp( type = i32, id = 0 ), target = helper_fn, receiver = None, args = [], kwargs = {} ),
+			ir.Return( value = ir.Temp( type = i32, id = 0 )),
+			ir.DeleteTemp( temp = ir.Temp( type = i32, id = 0 )),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_from_import_missing_name_is_a_compile_error( self ) -> None:
+		# _stmt_ImportFrom's CompileError is raised from within _lower_stmt's
+		# own per-statement dispatch, so lower_function's per-statement
+		# recovery boundary (try/except CompileError: continue) swallows it
+		# rather than propagating - only visible via discovery.errors.errors,
+		# same as check_self_escape's errors (see the self-escape tests above)
+		self.compiler.import_code( 'def helper() -> i32:\n\treturn 42\n', Path( 'helper.py' ))
+		code = '\n'.join([
+			'def main() -> None:',
+			'	from helper import nope',
+		])
+		mod = self._import( code )
+		self.compiler._lower( mod.get_local( 'main' ))
+		self.assertTrue( any( "does not export 'nope'" in e for e in self.discovery.errors.errors ))
+
+	def test_from_import_missing_module_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	from nonexistent_module import foo',
+		])
+		mod = self._import( code )
+		self.compiler._lower( mod.get_local( 'main' ))
+		self.assertTrue( any( 'nonexistent_module' in e for e in self.discovery.errors.errors ))
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

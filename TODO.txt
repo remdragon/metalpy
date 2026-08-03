@@ -269,16 +269,36 @@ lowering:
 		memzero()/_alloc() windows-vs-non-windows bodies is ever lowered.
 		The bare `compiler.target.debug` if-condition part of that old note
 		WAS real and is now fixed by this pass. What's still genuinely open,
-		confirmed via the same `bytearray(4)` full-compile attempt, both
+		confirmed via the same `bytearray(4)` full-compile attempt,
 		unrelated to @compiler.target: `is`/`is not` comparison operators
 		aren't supported ("unsupported comparison operator: ptr is None" -
-		see "incorrect is usage" above), and lowering.py has no
-		_stmt_ImportFrom handler at all - `from windows.ntdll import
-		RtlZeroMemory` inside sys.py's memzero() fails with "unsupported
-		statement", even though lib/windows/ntdll.py is a real, already-
-		written @extern stub module (RtlZeroMemory IS declared there) - this
-		is a genuine lowering.py gap (no in-function `from X import Y`
-		support at all, on any platform), not a missing-library one.
+		see "incorrect is usage" above).
+	[resolved] lowering.py had no _stmt_ImportFrom/_stmt_Import handler at
+		all - any `from X import Y` (or bare `import X`) written inside a
+		function body (not just windows-specific FFI - lib/sys.py's
+		memzero()/_alloc()/etc. use this pattern for every platform) failed
+		with "unsupported statement", since discovery.py's own
+		visit_ImportFrom only ever runs at module/class scope (function
+		bodies are deliberately never walked by discovery.py's visitor -
+		see Lowering's own docstring). Fixed by adding the local-scope
+		mirror directly to lowering.py: resolves the target module via
+		self.discovery.import_name(...) (same logic as discovery.py's
+		visit_ImportFrom - relative-level handling included) and registers
+		the imported name into the current function's own scope via
+		fn.add_name(...), lazily (no eager resolve/schedule - same posture
+		as an unused local).
+		This surfaced the NEXT layer down, not yet fixed: `@extern(...)`
+		(lib/crt.py's and lib/windows/{kernel32,ntdll}.py's FFI declaration
+		decorator, e.g. `@extern('c', 'malloc')`) isn't recognized as a
+		function decorator anywhere in discovery.py at all - confirmed via
+		the same `bytearray(4)` repro ("unsupported function decorator
+		@extern"). This had never been exercised by any test before now,
+		since nothing ever actually imported crt.py/windows/*.py until this
+		fix made `from crt import ...`/`from windows.ntdll import ...`
+		reach real import_name() calls for the first time. lib/windows/
+		ntdll.py and kernel32.py are real, already-written stub modules
+		(RtlZeroMemory/HeapAlloc/etc. all genuinely declared there) - this
+		is a discovery.py/codegen gap, not a missing-library one.
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion
