@@ -98,6 +98,17 @@ class Move( Type ):
 	CFG/incref-decref ownership-tracking work, not a standalone tweak here. '''
 	inner: Type
 
+@dataclass( kw_only = True )
+class Copy( Type ):
+	''' `copy[T]` in annotation position - the callee wants its own
+	independent reference (an explicit INCREF in its own prologue, a
+	matching DECREF at its own exit), regardless of whatever the caller
+	already holds. Unlike move[T], this is a unilateral request: no
+	call-site marker is needed/allowed (SYNTAX.md) - the caller's own
+	binding is completely unaffected. See TODO.txt/RC MANAGEMENT.md for
+	the CFG work this exists for. '''
+	inner: Type
+
 
 class ScopeMixin:
 	'''

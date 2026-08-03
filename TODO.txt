@@ -1,4 +1,119 @@
 lowering:
+	CFG:
+		metalpy needs a CFG so that it can know when to emit incref/decref IR ops.
+		Therefore it needs to track the status of RC variables as they pass through
+		a function.
+		when a variable is created, it is starts off with a status OWNED.
+		A parameter (with no ownership annotations) in a function starts off
+			with a status of BORROWED. this is because by default we do not
+			incref parameters passed to a function, and the receiving function
+			doesn't decref borrowed parameters.
+		It's possible to transfer ownership of a reference to a function.
+			This is done on parameters using a handshake:
+				<code>
+				def foo( move[str] s ) -> None:
+					...
+				foo( move( s ))
+				</code>
+				Notice that both the function definition and the callsite must agree that the variable is being moved
+			This is done on self with @move:
+				<code>
+				class Foo:
+					@move
+					def release( self ) -> Result[Ptr[u8],OwnershipError.SharedReference[Foo]]:
+						...
+				</code>
+			Both mechanisms above transition the variable's state to MOVED.
+			Any attempt to reference a variable in a MOVED state is a compile error.
+			A MOVED variable doesn't need a DECREF.
+			P.S. I really wish there was a way to apply the move() requirement to
+			a self parameter too, but I can't find a clean clear unambiguous syntax.
+				This doesn't work because it looks like we're moving self before calling release()
+					move(self).release()
+				this doesn't work because it looks like we're moving the function
+					move(self.release)()
+				this doesn't work because it looks like a type specification:
+					self[move].release()
+		Sometimes you explicitly want to make sure a parameter gets incref/decref treatment.
+		One anticipated need for this is threading, though I haven't spec'd that yet.
+			This only needs to be indicated on the function parameter:
+				<code>
+				def foo( copy[str] s ) -> None:
+					...
+				foo( s )
+			A parameter declared copy[T] starts off with a state of COPY
+				I'm not sure we need to distinguish between COPY and OWNED.
+				we can experiment with dropping the COPY state.
+		unnamed temporary variables created by an expression need to be DECREF
+			when the expression falls out of scope.
+			This needs to happen at the same time that ir.DeleteTemp() is emitted.
+			deleted variables can be assigned a state of MOVED.
+			we can experiment with removing the variables out of the CFG state if
+				that doesn't created a problem with state consistency.
+		when a variable is done, it will have a state of either OWNED, BORROWED, COPY, or MOVED.
+			only OWNED/COPY need a DECREF.
+			BORROWED variable reference is held by the calling function
+			MOVED variable has either had its reference ownership sent somewhere else,
+				or it was already DECREF'd.
+		The critical piece of functionality needed by the CFG is to make sure
+			that INCREF/DECREF gets emitted exactly where needed and to generate
+			a compile error if thats not possible.
+		anonymous unions:
+			anonymous unions must INCREF/DECREF as appropriate. This means that
+			it may be necessary to emit a typecheck.
+			<code>
+			def foo( x: copy[str|i32] ):
+				# function prologue IR pseudo-code:
+				if x.tag == _u_i32_str.TAG_str:
+					INCREF(x.v_str)
+				# function epilogue IR pseudo-code:
+				if x.tag == _u_i32_str.TAG_str:
+					DECREF(x.v_str)
+			</code>
+			# NOTE that all RC objects have the same header:
+			<code>
+			def foo( x: str|int ):
+				# function prologue IR pseudo-code:
+				INCREF(x.v_int) # no if needed because all members of Union[int,str] are RC
+				# function epilogue IR pseudo-code:
+				DECREF(x.v_int) # same reasoning
+		Some examples:
+			<code>
+			def takeown( x: move[T] ):
+				pass
+			
+			def foo1( s: move[str] ):
+				if 'foo' in s:
+					takeown( s ) # transition s from OWNED to MOVED
+				# <<< compile error - s is in an indeterminate state after the if
+				# the true branch transitions s from OWNED to MOVED
+				# but the else branch leaves it in OWNED
+				print( s )
+			
+			def foo2( s: str ):
+				takeown( s ) # compile error - cannot move(T) a BORROWED reference
+			
+			# this next example illustrates that the CFG might have to make 2 passes
+			# on loop bodies, to make sure ownership isn't violated like the following
+			# example definitely would because s is the same object in the 2nd pass
+			def foo3( s: copy[str] ):
+				# NOTE: s gets INCREF in function prologue - not at call-site
+				while 'foo' in s:
+					takeown( s ) # compile error - cannot move(T) a possibly MOVED reference
+			
+			# the following example shouldn't be a problem because s2 is a different
+			variable in each pass of the loop:
+			def foo4( s: str ):
+				for s2 in s.split( ',' ):
+					takeown( s2 )
+			
+			def foo5( s: str ): # s=BORROWED
+				s2 = s # s2 is a copy of s, so s=BORROWED, s2=OWNED or COPY. IR( ASSIGN(s2,s); INCREF(s2) )
+				
+				# epilogue:
+				DECREF(s2)
+			</code>
+	
 	possible future improvement: union-receiver dispatch currently requires
 		every leaf's method to share the exact same return type, or it's a
 		compile error (see _resolve_union_receiver_members in lowering.py).
@@ -15,32 +130,7 @@ lowering:
 		I incorrectly put "x is Foo" when checking if a variable was a certain type
 		in Python, "is" is a "same identity" check.
 		we need to replace that incorrect usage with either "type(x) is Foo" or "instanceof( x, Foo )"
-	[resolved] generic function monomorphization for BARE calls: calling a
-		method on a value whose declared type was a bare (unbound) TypeVar
-		used to always fail ("TypeVar(...) has no members, cannot look up
-		'...'") - a generic function's body was only ever lowered once, with
-		its own type params left abstract; nothing substituted the concrete
-		argument type into the body per call site (Phase 7's monomorphization
-		only covered the EXPLICIT Name[T](...) spelling, e.g. sys.alloc[u8]).
-		Fixed via argument-type inference at bare call sites (mylen(a), no
-		[T] needed) - lowering.py's _lower_inferred_generic_call unifies each
-		declared parameter type against the actual lowered argument type
-		(_unify_type_param) to solve for T, then routes through the same
-		monomorphization Phase 7 already built. Supports one level of
-		nesting too (list[T]/Box[T]/Ptr[T]-style parameters unify through
-		Specialization.args, not just a bare `t: T` parameter) since list[T]/
-		dict[K,V] are foundational enough to need this soon, not speculative.
-		A parameter position that doesn't mention any of the function's own
-		type params is just skipped (not an error - no general argument-type
-		checking exists anywhere yet); an unconstrained or conflicting type
-		param is a clear compile error either way.
-		lib/builtins/__init__.py's len() is now migrated to the single
-		generic `def len[T](t: T) -> usize: return t.__len__()` this
-		unblocked - including len(copy_from) where copy_from: bytes|bytearray
-		(bytes.__init__), which infers T as the WHOLE union type and then
-		resolves t.__len__() through the union-receiver-narrowing fix above,
-		two independent fixes composing with no extra code needed. Still
-		broken, unaffected by this fix (separate, already-tracked gaps):
+	Still broken, unaffected by this fix (separate, already-tracked gaps):
 		len(src) where src: move[bytearray] (Move has no .names at all - see
 		incref/decref/move[T] below) and len(arr) where arr: slice[T]
 		(slice[T]'s accessor is named .len(), not __len__() - T infers fine,

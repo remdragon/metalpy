@@ -65,12 +65,13 @@ class Result[T,E]:
 			return self._payload.ok
 		return default
 
+
 @cstruct
 class slice[T]:
 	_ptr: ConstPtr[T]
 	__len: usize
 	
-	def len( self ) -> usize:
+	def __len__( self ) -> usize:
 		return self.__len
 	
 	def get_unchecked( self, index: usize ) -> T:
@@ -86,6 +87,7 @@ class slice[T]:
 		if index >= self.__len:
 			sys.panic( 'bad slice index' )
 		return self.get_unchecked( index )
+
 
 class bytes:
 	__data: ConstPtr[u8]

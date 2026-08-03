@@ -9,7 +9,7 @@ from typing import Any, Callable, Generator, NoReturn
 # local imports
 from errors import CompileError, ErrorCollector
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike,
 	Module, _is_covered_by, _overlaps,
 )
@@ -119,6 +119,7 @@ class Discovery( ast.NodeVisitor ):
 		self._unions: dict[str,TaggedUnion] = {}
 		self._specializations: dict[str,Specialization] = {}
 		self._moves: dict[str,Move] = {}
+		self._copies: dict[str,Copy] = {}
 
 		if import_builtins:
 			# just for the side effect of populating self.modules['builtins'] -
@@ -426,16 +427,18 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move:
-		# move[T] is compiler syntax, not a real generic lookup - recognized
-		# textually here the same way @move is recognized textually as a
-		# decorator name in _parse_function, rather than resolved through
-		# find_name like an ordinary generic base would be
-		if isinstance( node.value, ast.Name ) and node.value.id == 'move':
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy:
+		# move[T]/copy[T] are compiler syntax, not a real generic lookup -
+		# recognized textually here the same way @move is recognized
+		# textually as a decorator name in _parse_function, rather than
+		# resolved through find_name like an ordinary generic base would be
+		if isinstance( node.value, ast.Name ) and node.value.id in ( 'move', 'copy' ):
 			if isinstance( node.slice, ast.Tuple ):
-				self.fail( f'move[...] takes exactly one type argument: {ast.unparse(node)}', node )
+				self.fail( f'{node.value.id}[...] takes exactly one type argument: {ast.unparse(node)}', node )
 			inner = self.visit( node.slice )
-			return self._get_or_create_move( inner )
+			if node.value.id == 'move':
+				return self._get_or_create_move( inner )
+			return self._get_or_create_copy( inner )
 
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
@@ -463,6 +466,20 @@ class Discovery( ast.NodeVisitor ):
 		)
 		self._moves[key] = mv
 		return mv
+
+	def _get_or_create_copy( self, inner: Type ) -> Copy:
+		key = f'copy[{inner.qualname}]'
+		if cp := self._copies.get( key ):
+			return cp
+		cp = Copy(
+			stem = key,
+			qualname = key,
+			file = inner.file,
+			line = inner.line,
+			inner = inner,
+		)
+		self._copies[key] = cp
+		return cp
 
 	def _get_or_create_specialization( self, base: Type, args: list[Type] ) -> Specialization:
 		key = f'{base.qualname}[{",".join( a.qualname for a in args )}]'

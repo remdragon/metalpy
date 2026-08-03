@@ -102,7 +102,7 @@ class Result[T, E]:
 * `move[T]`: Explicit ownership transfer; invalidates the caller's binding.
 * `copy[T]`: Forced refcount increment/decrement on call boundary.
 
-	callsite must move(t) a move[T] parameter and must copy(t) a copy[T] parameter
+	callsite must move(t) a move[T] parameter. This isn't needed for copy[T] parameters
 
 ### Method Ownership Transfers (`@move`)
 The `@move` decorator on a method invalidates the instance (`self`) on invocation and transfers ownership to the method execution context.

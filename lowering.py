@@ -10,7 +10,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch,
+	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch, Move,
 )
 import overload_resolution
 
@@ -1595,7 +1595,36 @@ class Lowering:
 			if param is None:
 				self.discovery.fail( f'{target.qualname} has no parameter {kw.arg!r}', call )
 			keyword.append(( param, kw.value ))
+		positional = [ ( param, self._check_move_argument( target, param, expr, call )) for param, expr in positional ]
+		keyword = [ ( param, self._check_move_argument( target, param, expr, call )) for param, expr in keyword ]
 		return positional, keyword
+
+	def _check_move_argument( self, target: Function, param: Parameter, expr: ast.expr, call: ast.Call ) -> ast.expr:
+		# both sides of a move[T] parameter must agree, checked here (once,
+		# for every _match_call_args caller - plain calls, generic calls,
+		# both explicit-subscript and inferred) rather than downstream:
+		# move(x) and plain x lower to an identical Operand once past this
+		# point, so this is the only place that can still tell them apart.
+		# Unwraps a valid move(expr) down to expr - callers only ever see
+		# the real argument expression from here on
+		is_move_call = isinstance( expr, ast.Call ) and isinstance( expr.func, ast.Name ) and expr.func.id == 'move'
+		if isinstance( param.type, Move ):
+			if not is_move_call:
+				self.discovery.fail(
+					f"{target.qualname}: parameter {param.stem!r} is move[{param.type.inner.qualname}] - "
+					f"call site must pass move({ast.unparse(expr)}): {ast.unparse(call)}",
+					call,
+				)
+			if len( expr.args ) != 1 or expr.keywords:
+				self.discovery.fail( f'move(...) takes exactly one argument: {ast.unparse(expr)}', call )
+			return expr.args[0]
+		if is_move_call:
+			self.discovery.fail(
+				f"{target.qualname}: parameter {param.stem!r} is not move[T] - "
+				f"call site must not wrap it in move(...): {ast.unparse(call)}",
+				call,
+			)
+		return expr
 
 	# stems of intrinsic types a Python literal of this exact type could
 	# plausibly be lowered as - deliberately coarse (no int-range/value

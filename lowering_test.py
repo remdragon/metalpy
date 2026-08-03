@@ -1854,6 +1854,60 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'inferred as both', self.discovery.errors.errors[0] )
 
+	# --- move(x) call-site syntax must agree with a move[T] parameter ---------
+
+	def test_move_parameter_without_call_site_wrapper_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def takeown( x: move[Foo] ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	takeown( f )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'must pass move(f)', self.discovery.errors.errors[0] )
+
+	def test_plain_parameter_with_move_call_site_wrapper_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def takeown( x: Foo ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	takeown( move( f ))',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'is not move[T]', self.discovery.errors.errors[0] )
+
+	def test_move_parameter_with_matching_call_site_wrapper_lowers_cleanly( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def takeown( x: move[Foo] ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	takeown( move( f ))',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		f_cls = self.discovery.modules['__test__'].get_local( 'Foo' )
+		self.assertIs( calls[0].args[0].type, f_cls ) # move(f) unwraps to the real f, not a leftover call expression
+
 	# --- compiler.sizeof(T) ----------------------------------------------------
 
 	def test_compiler_sizeof_folds_to_const( self ) -> None:
