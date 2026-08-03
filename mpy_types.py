@@ -210,6 +210,14 @@ class Function( Type, ScopeMixin ):
 	is_move: bool = False
 	is_private: bool = False
 
+	# @extern('lib', 'symbol') - a foreign call signature declaration (body
+	# must be a stub - see discovery.py's _is_stub_body). extern_lib is the
+	# .lib/.so name to link against, except the literal 'c' which means the
+	# platform C runtime rather than a real file on disk. Both None for an
+	# ordinary function
+	extern_lib: str|None = None
+	extern_symbol: str|None = None
+
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
 

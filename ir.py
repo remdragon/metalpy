@@ -32,9 +32,16 @@ class FuncStart( Instruction ):
 	name: str
 	params: list[Parameter]
 	return_type: Type|None
+	# @extern('lib','symbol') (see mpy_types.Function) - both None for an
+	# ordinary function. A future emitter declares this as a foreign call
+	# signature (no body follows - see lowering.py's lower_function) rather
+	# than defining it
+	extern_lib: str|None = None
+	extern_symbol: str|None = None
 
 	def test_repr( self ) -> str:
-		return f'FuncStart( name={self.name!r}, params={self.params!r}, return_type={self.return_type!r} )'
+		extern = f', extern_lib={self.extern_lib!r}, extern_symbol={self.extern_symbol!r}' if self.extern_lib is not None else ''
+		return f'FuncStart( name={self.name!r}, params={self.params!r}, return_type={self.return_type!r}{extern} )'
 
 @dataclass( kw_only = True )
 class FuncEnd( Instruction ):

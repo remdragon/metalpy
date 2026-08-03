@@ -3606,6 +3606,44 @@ class Tests( unittest.TestCase ):
 		self.compiler._lower( mod.get_local( 'main' ))
 		self.assertTrue( any( 'nonexistent_module' in e for e in self.discovery.errors.errors ))
 
+	# --- @extern(lib, symbol) -----------------------------------------------
+
+	def test_extern_function_lowers_to_a_bare_signature( self ) -> None:
+		# no body to lower (discovery.py already required a stub - see
+		# _is_stub_body) - just FuncStart(extern_lib=...)/FuncEnd, no CFG/
+		# epilogue/locals machinery in between
+		code = '\n'.join([
+			"@extern( 'c', 'malloc' )",
+			'def malloc( size: usize ) -> Ptr[u8]:',
+			'	...',
+			'',
+			'def main() -> None:',
+			'	p = malloc( 4 )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'malloc' ))
+		self.assertEqual( len( lowered.instructions ), 2 )
+		start, end = lowered.instructions
+		self.assertIsInstance( start, ir.FuncStart )
+		self.assertEqual( start.extern_lib, 'c' )
+		self.assertEqual( start.extern_symbol, 'malloc' )
+		self.assertIsInstance( end, ir.FuncEnd )
+
+	def test_extern_function_is_callable_like_any_other( self ) -> None:
+		code = '\n'.join([
+			"@extern( 'c', 'malloc' )",
+			'def malloc( size: usize ) -> Ptr[u8]:',
+			'	...',
+			'',
+			'def main() -> None:',
+			'	p = malloc( 4 )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertIs( calls[0].target, mod.get_local( 'malloc' ))
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

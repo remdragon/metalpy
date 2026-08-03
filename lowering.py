@@ -156,6 +156,17 @@ class Lowering:
 		self._label_id = 0
 		self._pending_temps: list[ir.Temp] = []
 		self._current_fn = fn
+		if fn.extern_lib is not None:
+			# @extern(lib, symbol) - a foreign call signature declaration,
+			# not a real body to lower (discovery.py already required a
+			# stub body - see _is_stub_body). No CFG/epilogue/locals
+			# machinery applies here at all - just the bare signature, for
+			# a future emitter to declare rather than define. Compiler._lower
+			# is what actually registers the library dependency (see its
+			# extern_libs bookkeeping) - this only has to emit the shape
+			self._emit( ir.FuncStart( name = fn.qualname, params = fn.parameters or [], return_type = fn.return_type, extern_lib = fn.extern_lib, extern_symbol = fn.extern_symbol ))
+			self._emit( ir.FuncEnd( name = fn.qualname ))
+			return self._instructions
 		self._arithmetic_mode: list[tuple[str,object]] = [ ( 'check', None ) ]
 		self._loop_depth = 0
 		self._loop_labels: list[tuple[str,str]] = [] # stack of (continue_label, break_label), innermost last

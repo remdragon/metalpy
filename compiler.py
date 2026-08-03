@@ -66,6 +66,13 @@ class Compiler:
 		self.tagged_unions: list[TaggedUnion] = []
 		self.cenums: list[CEnum] = []
 		self.globals: list[LoweredGlobal] = []
+		# @extern('lib', 'symbol') dependencies, registered as each extern
+		# function is lowered (see _lower's Function branch below) - lib
+		# name -> the symbols pulled from it. 'c' means the platform C
+		# runtime specifically, not a real .lib/.so on disk (see
+		# mpy_types.Function.extern_lib) - a future emitter/linker's call
+		# on what to do with that, not this registry's
+		self.extern_libs: dict[str,set[str]] = {}
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
 		module = self.disco.import_code( code, filename, scope )
@@ -141,6 +148,8 @@ class Compiler:
 			if unit.resolve is not None:
 				unit.resolve()
 			instructions = self.lowering.lower_function( unit )
+			if unit.extern_lib is not None:
+				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
 			lf = LoweredFunction( function = unit, instructions = instructions )
 			self.functions.append( lf )
 			return lf

@@ -287,18 +287,45 @@ lowering:
 		the imported name into the current function's own scope via
 		fn.add_name(...), lazily (no eager resolve/schedule - same posture
 		as an unused local).
-		This surfaced the NEXT layer down, not yet fixed: `@extern(...)`
-		(lib/crt.py's and lib/windows/{kernel32,ntdll}.py's FFI declaration
-		decorator, e.g. `@extern('c', 'malloc')`) isn't recognized as a
-		function decorator anywhere in discovery.py at all - confirmed via
-		the same `bytearray(4)` repro ("unsupported function decorator
-		@extern"). This had never been exercised by any test before now,
-		since nothing ever actually imported crt.py/windows/*.py until this
-		fix made `from crt import ...`/`from windows.ntdll import ...`
-		reach real import_name() calls for the first time. lib/windows/
-		ntdll.py and kernel32.py are real, already-written stub modules
-		(RtlZeroMemory/HeapAlloc/etc. all genuinely declared there) - this
-		is a discovery.py/codegen gap, not a missing-library one.
+		This surfaced the NEXT layer down: `@extern(...)` (lib/crt.py's and
+		lib/windows/{kernel32,ntdll}.py's FFI declaration decorator, e.g.
+		`@extern('c', 'malloc')`) wasn't recognized as a function decorator
+		anywhere in discovery.py at all - confirmed via the same
+		`bytearray(4)` repro ("unsupported function decorator @extern").
+		Had never been exercised by any test before, since nothing ever
+		actually imported crt.py/windows/*.py until the ImportFrom fix made
+		`from crt import ...`/`from windows.ntdll import ...` reach real
+		import_name() calls for the first time.
+	[resolved] @extern('lib', 'symbol') FFI declaration support: recognized
+		in discovery.py's _parse_function decorator loop (mpy_types.Function
+		gained extern_lib/extern_symbol fields), requiring exactly 2 string-
+		literal positional args and a stub body (`...` - reuses the existing
+		_is_stub_body check @overload stubs already use). 'lib' is the
+		.lib/.so name to link against, except the literal 'c' which means
+		the platform C runtime specifically - that distinction is left for
+		a future emitter/linker to act on, not parsed specially here.
+		lowering.py's lower_function short-circuits for an extern function
+		(no CFG/epilogue/locals machinery applies - there's no real body,
+		just the declared signature): emits a bare FuncStart(extern_lib=...,
+		extern_symbol=...)/FuncEnd pair, matching ir.FuncStart's two new
+		optional fields. Per explicit request, lowering an extern function
+		now also registers a dependency on its library: Compiler gained
+		extern_libs: dict[str,set[str]] (lib name -> symbols pulled from
+		it), populated in _lower's Function branch at the moment each
+		extern function is actually lowered (never-called externs, like
+		lib/windows/kernel32.py's DynamicTimeZoneInformation-only helpers,
+		correctly never register - same "only what's actually scheduled"
+		posture as everything else Compiler tracks).
+		Verified end to end: the `bytearray(4)` repro now successfully
+		resolves and lowers RtlZeroMemory/HeapAlloc/GetProcessHeap (real
+		FFI declarations in lib/windows/ntdll.py and kernel32.py) and
+		registers extern_libs = {'ntdll': {'RtlZeroMemory'}, 'kernel32':
+		{'HeapAlloc', 'GetProcessHeap'}}. That repro now surfaces yet
+		ANOTHER, unrelated layer: lib/windows/kernel32.py:1 declares
+		`HANDLE: TypeAlias = Ptr[None]` - `typing.TypeAlias`-annotated
+		module-level type aliases aren't supported at all ("name 'TypeAlias'
+		is not defined" / "'Ptr' is not a value, cannot use it as an
+		expression"). Not chased here - a real, separate feature.
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion

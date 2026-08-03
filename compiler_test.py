@@ -438,5 +438,36 @@ def main() -> None:
 		self.assertEqual( [ type( i ).__name__ for i in self._instructions_for( '__main__.broken' ) ], [ 'FuncStart', 'Return', 'FuncEnd' ] )
 		self.assertTrue( self.discovery.errors.errors )
 
+class ExternLibraryDependencyTests( CompilerTestCase ):
+	def test_called_extern_functions_register_their_library( self ) -> None:
+		self._run( '''
+@extern( 'c', 'malloc' )
+def malloc( size: usize ) -> Ptr[u8]:
+	...
+
+@extern( 'c', 'free' )
+def free( ptr: Ptr[u8] ) -> None:
+	...
+
+@extern( 'kernel32', 'HeapAlloc' )
+def HeapAlloc( h: usize, flags: u32, size: usize ) -> Ptr[u8]:
+	...
+
+def main() -> None:
+	p = malloc( 4 )
+	free( p )
+''' )
+		# HeapAlloc is declared but never called - never scheduled/lowered,
+		# so it never registers, matching how any other unused Function is
+		# quietly dropped by _enqueue's filtering
+		self.assertEqual( self.compiler.extern_libs, { 'c': { 'malloc', 'free' } } )
+
+	def test_no_extern_calls_leaves_the_registry_empty( self ) -> None:
+		self._run( '''
+def main() -> None:
+	pass
+''' )
+		self.assertEqual( self.compiler.extern_libs, {} )
+
 if __name__ == '__main__':
 	unittest.main()

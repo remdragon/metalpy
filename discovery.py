@@ -917,6 +917,21 @@ class Discovery( ast.NodeVisitor ):
 			return any( self._target_value_matches( elt, active_value ) for elt in node.elts )
 		self.fail( f'unsupported compiler.target(...) value: {ast.unparse(node)}', node )
 
+	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str]:
+		# @extern('lib', 'symbol') - a foreign call signature declaration.
+		# 'lib' is the .lib/.so name to link against, except the literal
+		# 'c' which means the platform C runtime rather than a real file on
+		# disk - that distinction is a future emitter/linker's job to act
+		# on, not this parse step's
+		if not isinstance( decorator, ast.Call ) or len( decorator.args ) != 2 or decorator.keywords:
+			self.fail( f'@extern(lib, symbol) requires exactly 2 positional arguments: {ast.unparse(decorator)}', node )
+		lib_arg, symbol_arg = decorator.args
+		if not ( isinstance( lib_arg, ast.Constant ) and isinstance( lib_arg.value, str )):
+			self.fail( f'@extern(...) lib name must be a string literal: {ast.unparse(decorator)}', node )
+		if not ( isinstance( symbol_arg, ast.Constant ) and isinstance( symbol_arg.value, str )):
+			self.fail( f'@extern(...) symbol name must be a string literal: {ast.unparse(decorator)}', node )
+		return lib_arg.value, symbol_arg.value
+
 	def _parse_function(
 		self,
 		node: ast.FunctionDef,
@@ -931,6 +946,8 @@ class Discovery( ast.NodeVisitor ):
 		is_abstract = False
 		is_move = False
 		is_private = False
+		extern_lib: str|None = None
+		extern_symbol: str|None = None
 		for decorator in node.decorator_list or []:
 			if self._is_compiler_target_call( decorator ):
 				if not self._matches_active_target( decorator ):
@@ -950,8 +967,13 @@ class Discovery( ast.NodeVisitor ):
 					is_move = True
 				case 'private':
 					is_private = True
+				case 'extern':
+					extern_lib, extern_symbol = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
 					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
+
+		if extern_lib is not None and not self._is_stub_body( node.body ):
+			self.fail( f'@extern function {qualname} must have a stub body (...) - it declares a foreign call signature, not a real implementation', node )
 
 		module = self.module_stack[-1]
 		fn = Function(
@@ -967,6 +989,8 @@ class Discovery( ast.NodeVisitor ):
 			is_move = is_move,
 			is_private = is_private,
 			is_overload = is_overload,
+			extern_lib = extern_lib,
+			extern_symbol = extern_symbol,
 		)
 		if node.name == 'main':
 			self.main = fn

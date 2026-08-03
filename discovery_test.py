@@ -1445,6 +1445,76 @@ def foo() -> None:
 		self.assertEqual( ast.unparse( fn.node.body[0] ), 'a = 1' )
 
 
+class ExternDecoratorTests( unittest.TestCase ):
+	def _import( self, code: str ) -> tuple[discovery.Discovery, Module]:
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( code, Path( '__main__.py' ), scope = None )
+		return disco, mod
+
+	def test_extern_lib_and_symbol_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'c', 'malloc' )
+def malloc( size: usize ) -> Ptr[u8]:
+	...
+''' )
+		fn = mod.get_local( 'malloc' )
+		fn.resolve()
+		self.assertEqual( fn.extern_lib, 'c' )
+		self.assertEqual( fn.extern_symbol, 'malloc' )
+
+	def test_ordinary_function_has_no_extern_fields( self ) -> None:
+		disco, mod = self._import( '''
+def foo() -> None:
+	pass
+''' )
+		fn = mod.get_local( 'foo' )
+		self.assertIsNone( fn.extern_lib )
+		self.assertIsNone( fn.extern_symbol )
+
+	def test_non_stub_body_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'c', 'malloc' )
+def malloc( size: usize ) -> Ptr[u8]:
+	return None
+''' )
+		self.assertTrue( any( 'must have a stub body' in e for e in disco.errors.errors ))
+
+	def test_wrong_arg_count_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'c' )
+def malloc( size: usize ) -> Ptr[u8]:
+	...
+''' )
+		self.assertTrue( any( 'requires exactly 2 positional arguments' in e for e in disco.errors.errors ))
+
+	def test_non_string_arg_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'c', 123 )
+def malloc( size: usize ) -> Ptr[u8]:
+	...
+''' )
+		self.assertTrue( any( 'symbol name must be a string literal' in e for e in disco.errors.errors ))
+
+	def test_combines_with_compiler_target_regardless_of_order( self ) -> None:
+		disco = discovery.Discovery( import_builtins = False, active_target = { 'os': 'windows' } )
+		mod = disco.import_code( '''
+@compiler.target( os = 'windows' )
+@extern( 'kernel32', 'HeapAlloc' )
+def HeapAlloc() -> Ptr[u8]:
+	...
+
+@extern( 'ntdll', 'RtlAllocateHeap' )
+@compiler.target( os = not 'windows' )
+def RtlAllocateHeap() -> Ptr[u8]:
+	...
+''', Path( '__main__.py' ), scope = None )
+		heap_alloc = mod.get_local( 'HeapAlloc' )
+		self.assertIsInstance( heap_alloc, Function )
+		heap_alloc.resolve()
+		self.assertEqual( heap_alloc.extern_lib, 'kernel32' )
+		self.assertIsNone( mod.get_local( 'RtlAllocateHeap' )) # excluded by @compiler.target( os = not 'windows' )
+
+
 class RealLibSmokeTest( unittest.TestCase ):
 	''' confirms discovery no longer crashes on the actual example library, not just synthetic snippets '''
 
