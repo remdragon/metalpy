@@ -349,6 +349,24 @@ class Lowering:
 		# to shadow
 		pass
 
+	def _stmt_Delete( self, node: ast.Delete ) -> None:
+		# del x - ends a local's lifetime early (see TODO.txt/RC MANAGEMENT.md:
+		# a local created inside one arm of an if can be referenced only
+		# within that arm unless it's del'd before the arm exits, matching
+		# the other arm's "never created it either" state). Only a single
+		# bare local name is supported - not del a.b, del a[i], or multiple
+		# targets. Removing it from fn.names is enough on its own to make a
+		# later reference fail (find_name won't find it) - the actual
+		# Decref emission is cfg.py's job, wired in alongside its other hooks
+		if len( node.targets ) != 1 or not isinstance( node.targets[0], ast.Name ):
+			self.discovery.fail( f'del only supports a single local variable name: {ast.unparse(node)}', node )
+		target = node.targets[0]
+		fn = self._current_fn
+		existing = fn.names.get( target.id )
+		if not isinstance( existing, Variable ):
+			self.discovery.fail( f'{target.id!r} is not a local variable, cannot del it', node )
+		del fn.names[target.id]
+
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
 		if not isinstance( node.target, ast.Name ):
 			self.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )

@@ -225,6 +225,75 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'cannot infer the type', self.discovery.errors.errors[0] )
 
+	# --- del statement -----------------------------------------------------
+
+	def test_del_removes_local_from_scope( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	del f',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_del_then_reference_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def takeref( x: Foo ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	del f',
+			'	takeref( f )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( "'f' is not defined", self.discovery.errors.errors[0] )
+
+	def test_del_nonexistent_name_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	del nonexistent',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'is not a local variable', self.discovery.errors.errors[0] )
+
+	def test_del_multiple_targets_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i32 = 1',
+			'	b: i32 = 2',
+			'	del a, b',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'single local variable name', self.discovery.errors.errors[0] )
+
+	def test_del_then_redeclare_is_a_fresh_binding( self ) -> None:
+		# x = 'foo'; del x; x = 'bar' is two independent bindings that
+		# happen to reuse the name - allowed for now (detecting/flagging
+		# this as likely-confusing reuse is documented future work)
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 1',
+			'	del x',
+			'	x: i32 = 2',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	# --- arithmetic ---------------------------------------------------------
 
 	def test_binop_without_arithmetic_context_is_a_compile_error( self ) -> None:
