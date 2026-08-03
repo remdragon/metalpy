@@ -1,118 +1,5 @@
 lowering:
 	CFG:
-		metalpy needs a CFG so that it can know when to emit incref/decref IR ops.
-		Therefore it needs to track the status of RC variables as they pass through
-		a function.
-		when a variable is created, it is starts off with a status OWNED.
-		A parameter (with no ownership annotations) in a function starts off
-			with a status of BORROWED. this is because by default we do not
-			incref parameters passed to a function, and the receiving function
-			doesn't decref borrowed parameters.
-		It's possible to transfer ownership of a reference to a function.
-			This is done on parameters using a handshake:
-				<code>
-				def foo( move[str] s ) -> None:
-					...
-				foo( move( s ))
-				</code>
-				Notice that both the function definition and the callsite must agree that the variable is being moved
-			This is done on self with @move:
-				<code>
-				class Foo:
-					@move
-					def release( self ) -> Result[Ptr[u8],OwnershipError.SharedReference[Foo]]:
-						...
-				</code>
-			Both mechanisms above transition the variable's state to MOVED.
-			Any attempt to reference a variable in a MOVED state is a compile error.
-			A MOVED variable doesn't need a DECREF.
-			P.S. I really wish there was a way to apply the move() requirement to
-			a self parameter too, but I can't find a clean clear unambiguous syntax.
-				This doesn't work because it looks like we're moving self before calling release()
-					move(self).release()
-				this doesn't work because it looks like we're moving the function
-					move(self.release)()
-				this doesn't work because it looks like a type specification:
-					self[move].release()
-		Sometimes you explicitly want to make sure a parameter gets incref/decref treatment.
-		One anticipated need for this is threading, though I haven't spec'd that yet.
-			This only needs to be indicated on the function parameter:
-				<code>
-				def foo( copy[str] s ) -> None:
-					...
-				foo( s )
-			A parameter declared copy[T] starts off with a state of COPY
-				I'm not sure we need to distinguish between COPY and OWNED.
-				we can experiment with dropping the COPY state.
-		unnamed temporary variables created by an expression need to be DECREF
-			when the expression falls out of scope.
-			This needs to happen at the same time that ir.DeleteTemp() is emitted.
-			deleted variables can be assigned a state of MOVED.
-			we can experiment with removing the variables out of the CFG state if
-				that doesn't created a problem with state consistency.
-		when a variable is done, it will have a state of either OWNED, BORROWED, COPY, or MOVED.
-			only OWNED/COPY need a DECREF.
-			BORROWED variable reference is held by the calling function
-			MOVED variable has either had its reference ownership sent somewhere else,
-				or it was already DECREF'd.
-		The critical piece of functionality needed by the CFG is to make sure
-			that INCREF/DECREF gets emitted exactly where needed and to generate
-			a compile error if thats not possible.
-		anonymous unions:
-			anonymous unions must INCREF/DECREF as appropriate. This means that
-			it may be necessary to emit a typecheck.
-			<code>
-			def foo( x: copy[str|i32] ):
-				# function prologue IR pseudo-code:
-				if x.tag == _u_i32_str.TAG_str:
-					INCREF(x.v_str)
-				# function epilogue IR pseudo-code:
-				if x.tag == _u_i32_str.TAG_str:
-					DECREF(x.v_str)
-			</code>
-			# NOTE that all RC objects have the same header:
-			<code>
-			def foo( x: str|int ):
-				# function prologue IR pseudo-code:
-				INCREF(x.v_int) # no if needed because all members of Union[int,str] are RC
-				# function epilogue IR pseudo-code:
-				DECREF(x.v_int) # same reasoning
-		Some examples:
-			<code>
-			def takeown( x: move[T] ):
-				pass
-			
-			def foo1( s: move[str] ):
-				if 'foo' in s:
-					takeown( s ) # transition s from OWNED to MOVED
-				# <<< compile error - s is in an indeterminate state after the if
-				# the true branch transitions s from OWNED to MOVED
-				# but the else branch leaves it in OWNED
-				print( s )
-			
-			def foo2( s: str ):
-				takeown( s ) # compile error - cannot move(T) a BORROWED reference
-			
-			# this next example illustrates that the CFG might have to make 2 passes
-			# on loop bodies, to make sure ownership isn't violated like the following
-			# example definitely would because s is the same object in the 2nd pass
-			def foo3( s: copy[str] ):
-				# NOTE: s gets INCREF in function prologue - not at call-site
-				while 'foo' in s:
-					takeown( s ) # compile error - cannot move(T) a possibly MOVED reference
-			
-			# the following example shouldn't be a problem because s2 is a different
-			variable in each pass of the loop:
-			def foo4( s: str ):
-				for s2 in s.split( ',' ):
-					takeown( s2 )
-			
-			def foo5( s: str ): # s=BORROWED
-				s2 = s # s2 is a copy of s, so s=BORROWED, s2=OWNED or COPY. IR( ASSIGN(s2,s); INCREF(s2) )
-
-				# epilogue:
-				DECREF(s2)
-			</code>
 
 		[resolved - v1] implemented as cfg.py, a live state machine lowering.py
 			calls into at the exact points it already visits things (see the
@@ -193,14 +80,32 @@ lowering:
 				bytearray.release() end-to-end - both return paths now emit
 				exactly one Decref(self) each, full 308-test suite green.
 
-				Separately noticed but NOT fixed (flagged for a decision, not
-				attempted): a function with NO defer/errdefer that falls off
-				the end without an explicit final `return` never calls
-				_emit_epilogue at all (lower_function only calls it when
-				_needs_epilogue, which is purely a defer/errdefer check) - so
-				OWNED/COPY locals never get decref'd on that specific fall-off
-				path. Distinct from the "known gaps" leak below (this is named
-				locals, not just fresh temps).
+			[resolved - v1, follow-up] a function with NO defer/errdefer that
+				falls off the end without an explicit final `return` never
+				called _emit_epilogue at all (lower_function only called it
+				when _needs_epilogue, which is purely a defer/errdefer check) -
+				so OWNED/COPY locals never got decref'd on that specific
+				fall-off path (distinct from the fresh-temp leak below - this
+				was named locals). Fixed with a narrow, deliberately-not-full-
+				terminator-analysis check (_body_may_fall_off_the_end, same
+				scope-cut spirit as _stmt_If's own true_terminates/
+				false_terminates detection: true whenever the function's own
+				top-level body doesn't literally end in a `return` statement -
+				an if/loop/etc that ACTUALLY always returns via some deeper
+				path is a false positive, but that just makes the resulting
+				fall-off unwind+Return dead code, never executed, not wrong).
+				lower_function now emits self._cfg.return_(None) + ir.Return
+				for that case whenever fn.return_type is none_type (mirroring
+				Python's own implicit `return None` semantics - NoReturn
+				falling off the end stays exactly as unvalidated as before,
+				see "additional NoReturn semantics" further down; a non-None
+				return type falling off the end was already producing
+				incomplete IR before this fix and still does - a separate,
+				pre-existing "missing return statement" validation gap, not
+				attempted here). One existing test's expectation updated
+				(compiler_test.py - a broken statement's -> None function now
+				correctly gets FuncStart/Return/FuncEnd instead of just
+				FuncStart/FuncEnd). Full 308-test suite green.
 
 			Known gaps, all deliberate scope cuts for v1, not oversights:
 			- defer/errdefer combined with ANY reference-counted local or

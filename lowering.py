@@ -219,6 +219,19 @@ class Lowering:
 
 					if self._needs_epilogue:
 						self._emit_epilogue( fn, none_type, body_start )
+					elif fn.return_type is none_type and self._body_may_fall_off_the_end( fn.node.body ):
+						# no defer/errdefer, so _emit_epilogue never runs at all -
+						# but falling off the end without an explicit `return` is
+						# still a real exit (implicit `return None`, same as
+						# Python), and every OWNED/COPY local still live at that
+						# point still needs its normal decref. Every explicit
+						# `return` already does this itself (see _stmt_Return's
+						# own else branch) - this only covers the specific case
+						# nothing else does: reaching the function's closing brace
+						# with no `return` at all
+						for instr in self._cfg.return_( None ):
+							self._emit( instr )
+						self._emit( ir.Return( value = None ))
 
 					self._emit( ir.FuncEnd( name = fn.qualname ))
 
@@ -749,6 +762,19 @@ class Lowering:
 				if isinstance( node, ast.Expr ) and self._defer_kind_of_call( node.value ):
 					return True
 		return False
+
+	def _body_may_fall_off_the_end( self, body: list[ast.stmt] ) -> bool:
+		# a simple, deliberately narrow check (not full terminator analysis -
+		# same "future work" scope cut as _stmt_If's own true_terminates/
+		# false_terminates detection): true whenever the LAST top-level
+		# statement isn't itself a `return` (an empty body, or one ending in
+		# a plain statement/if/loop/etc, could all still fall through to the
+		# function's own closing brace). A body that's actually unreachable
+		# past this point (both branches of a trailing if already return,
+		# a trailing `while True:` with no break, ...) is a false positive -
+		# harmless, since the resulting fall-off unwind+Return is then
+		# genuinely dead code, never executed
+		return not body or not isinstance( body[-1], ast.Return )
 
 	def _register_defer_block( self, is_err_only: bool, body: list[ast.stmt], node: ast.AST ) -> None:
 		kind = 'errdefer' if is_err_only else 'defer'

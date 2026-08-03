@@ -416,9 +416,10 @@ class ErrorRecoveryTests( CompilerTestCase ):
 	def test_broken_statement_does_not_block_sibling_statements_or_functions( self ) -> None:
 		# 'broken's one statement fails (a bare name expression isn't
 		# supported) - lower_function's own per-statement recovery boundary
-		# means 'broken' still gets lowered (just missing that statement,
-		# FuncStart/FuncEnd only) rather than being dropped entirely, and
-		# 'fine' - unrelated - isn't affected at all
+		# means 'broken' still gets lowered (just missing that statement -
+		# FuncStart/[fall-off Return]/FuncEnd, since its -> None body has
+		# nothing left that ends in an explicit `return`) rather than being
+		# dropped entirely, and 'fine' - unrelated - isn't affected at all
 		self._run( '''
 def broken() -> None:
 	undefined_name
@@ -434,7 +435,7 @@ def main() -> None:
 		self.assertIn( 'main', names )
 		self.assertIn( '__main__.fine', names )
 		self.assertIn( '__main__.broken', names )
-		self.assertEqual( [ type( i ).__name__ for i in self._instructions_for( '__main__.broken' ) ], [ 'FuncStart', 'FuncEnd' ] )
+		self.assertEqual( [ type( i ).__name__ for i in self._instructions_for( '__main__.broken' ) ], [ 'FuncStart', 'Return', 'FuncEnd' ] )
 		self.assertTrue( self.discovery.errors.errors )
 
 if __name__ == '__main__':
