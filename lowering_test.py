@@ -1969,6 +1969,48 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'is not supported yet', self.discovery.errors.errors[0] )
 
+	# --- compiler.refcount(x) ---------------------------------------------------
+
+	def test_compiler_refcount_emits_refcount_instruction( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> usize:',
+			'	f: Foo',
+			'	return compiler.refcount( f )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		refcounts = [ i for i in fn.instructions if isinstance( i, ir.RefCount ) ]
+		self.assertEqual( len( refcounts ), 1 )
+		usize = self.discovery.get_intrinsics()['usize']
+		self.assertEqual( refcounts[0].dest.type, usize )
+		f_cls = self.discovery.modules['__test__'].get_local( 'Foo' )
+		self.assertIs( refcounts[0].value.type, f_cls )
+
+	def test_compiler_refcount_on_non_rc_value_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> usize:',
+			'	x: i32 = 1',
+			'	return compiler.refcount( x )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'reference-counted value', self.discovery.errors.errors[0] )
+
+	def test_compiler_refcount_wrong_arg_count_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> usize:',
+			'	f: Foo',
+			'	return compiler.refcount()',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'takes exactly one argument', self.discovery.errors.errors[0] )
+
 	# --- loops (while / for / break / continue) -----------------------------
 
 	def test_while_shape( self ) -> None:

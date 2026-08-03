@@ -10,7 +10,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch, Move,
+	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch, Move, RCClass,
 )
 import overload_resolution
 
@@ -546,6 +546,36 @@ class Lowering:
 			self.discovery.fail( f'compiler.sizeof({target_type.qualname}) is not supported yet - only intrinsic scalar types have a known compile-time size', node )
 		usize_cls = self.discovery.get_intrinsics()['usize']
 		return ir.Const( type = expected_type or usize_cls, value = size )
+
+	def _is_compiler_refcount_call( self, node: ast.expr ) -> bool:
+		return (
+			isinstance( node, ast.Call )
+			and isinstance( node.func, ast.Attribute )
+			and node.func.attr == 'refcount'
+			and isinstance( node.func.value, ast.Name )
+			and node.func.value.id == 'compiler'
+		)
+
+	def _lower_compiler_refcount( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.refcount(x) - unlike compiler.sizeof(T), x is a real
+		# VALUE (an RC object), not a type reference, so it's lowered via
+		# _lower_expr like any other argument. A genuine runtime read (the
+		# header's current count), not a compile-time constant - deliberately
+		# opaque at this level (ir.RefCount), same spirit as Incref/Decref;
+		# what it actually reads is a codegen/emitter concern, not this pass's
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.refcount(...) takes exactly one argument: {ast.unparse(node)}', node )
+		value = self._lower_expr( node.args[0], None )
+		if not isinstance( value.type, RCClass ):
+			self.discovery.fail(
+				f'compiler.refcount(...) argument must be a reference-counted value, not '
+				f'{value.type.qualname if value.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		usize_cls = self.discovery.get_intrinsics()['usize']
+		dest = self._new_temp( expected_type or usize_cls )
+		self._emit( ir.RefCount( dest = dest, value = value ))
+		return dest
 
 	def _is_compiler_early_return_call( self, node: ast.expr ) -> bool:
 		return (
@@ -1951,6 +1981,10 @@ class Lowering:
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		if self._is_compiler_sizeof_call( node ):
 			result = self._lower_compiler_sizeof( node, expected_type )
+			return result if want_result else None
+
+		if self._is_compiler_refcount_call( node ):
+			result = self._lower_compiler_refcount( node, expected_type )
 			return result if want_result else None
 
 		allocate_dest = self._try_lower_allocate_call( node, expected_type )

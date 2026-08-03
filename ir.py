@@ -297,6 +297,14 @@ class Decref( Instruction ):
 		return f'Decref( value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class RefCount( Instruction ): # compiler.refcount(x) - reads x's current header refcount
+	dest: Temp
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'RefCount( dest={self.dest!r}, value={self.value!r} )'
+
+@dataclass( kw_only = True )
 class Return( Instruction ):
 	value: Operand|None
 	
