@@ -39,8 +39,15 @@ class ConstantFoldingTests( unittest.TestCase ):
 	def test_compare_eq_folds( self ) -> None:
 		self.assertEqual( _fold( "x = 'windows' == 'windows'", {} ), 'x = True' )
 
-	def test_compare_chained_left_unfolded( self ) -> None:
-		self.assertEqual( _fold( 'x = 1 < 2 < 3', {} ), 'x = 1 < 2 < 3' )
+	def test_compare_lt_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = 1<2', {} ), 'x = True' )
+
+	def test_compare_chained_cmp_folds( self ) -> None:
+		self.assertEqual( _fold( 'y = 1 < 2 < 3', {} ), 'y = True' ) # both conditions are always True
+		self.assertEqual( _fold( 'y = 1 < 2 < x', {} ), 'y = 2 < x' ) # first condition is always True
+		self.assertEqual( _fold( 'y = 1 > 2 > x', {} ), 'y = False' ) # first condition is never True
+		self.assertEqual( _fold( 'y = x < 2 < 3', {} ), 'y = x < 2' ) # second condition is always True
+		self.assertEqual( _fold( 'y = x > 2 > 3', {} ), 'y = False' ) # second condition is never True
 
 	def test_compare_is_left_unfolded( self ) -> None:
 		# matches lowering.py's own deliberate exclusion of is/is not - see
@@ -132,11 +139,11 @@ class MatchSimplificationTests( unittest.TestCase ):
 
 	def test_bare_name_capture_synthesizes_bind( self ) -> None:
 		src = 'match compiler.target.bits:\n\tcase x:\n\t\ta = x\n'
-		self.assertEqual( _fold( src, { 'bits': 64 } ), 'x = 64\na = x' )
+		self.assertEqual( _fold( src, { 'bits': 64 } ), 'x = 64\na = x' ) # TODO FIXME: I think this needs to be: x = 64\na = x\ndel x
 
 	def test_as_binding_on_a_literal_pattern_synthesizes_bind( self ) -> None:
 		src = 'match compiler.target.bits:\n\tcase 64 as x:\n\t\ta = x\n'
-		self.assertEqual( _fold( src, { 'bits': 64 } ), 'x = 64\na = x' )
+		self.assertEqual( _fold( src, { 'bits': 64 } ), 'x = 64\na = x' ) # TODO FIXME: I think this needs to be: x = 64\na = x\ndel x
 
 	def test_singleton_pattern_folds( self ) -> None:
 		src = 'match compiler.target.debug:\n\tcase True:\n\t\ta = 1\n\tcase False:\n\t\ta = 2\n'

@@ -136,18 +136,112 @@ class _ConstFolder( ast.NodeTransformer ):
 				break
 		return ast.copy_location( ast.Constant( value = result ), node )
 
-	def visit_Compare( self, node: ast.Compare ) -> ast.expr:
-		self.generic_visit( node )
-		if len( node.ops ) != 1 or len( node.comparators ) != 1:
-			return node
-		fn = _CMP_FNS.get( type( node.ops[0] ))
-		if fn is None or not isinstance( node.left, ast.Constant ) or not isinstance( node.comparators[0], ast.Constant ):
-			return node
-		try:
-			value = fn( node.left.value, node.comparators[0].value )
-		except TypeError:
-			return node
-		return ast.copy_location( ast.Constant( value = value ), node )
+	def visit_Compare(self, node: ast.Compare) -> ast.expr:
+		self.generic_visit(node)
+		
+		operands = [node.left] + node.comparators
+		ops = node.ops
+		
+		# First pass: try to resolve each adjacent pair
+		resolved = []  # List of either boolean constants or (left, op, right) tuples
+		
+		for i in range(len(ops)):
+			left = operands[i]
+			right = operands[i + 1]
+			op = ops[i]
+			
+			fn = _CMP_FNS.get(type(op))
+			
+			if fn is not None and isinstance(left, ast.Constant) and isinstance(right, ast.Constant):
+				try:
+					result = fn(left.value, right.value)
+					resolved.append(ast.Constant(value=result))
+					continue
+				except TypeError:
+					pass
+			
+			# Can't resolve this pair
+			resolved.append((left, op, right))
+		
+		# Second pass: combine using AND logic
+		# A chained comparison is True if all resolved pairs are True
+		# If any pair is False, the whole thing is False
+		# If all are True, return True
+		# Otherwise, we need to keep the unresolved pairs
+		
+		# First, check for any False
+		has_unresolved = False
+		for item in resolved:
+			if isinstance(item, ast.Constant):
+				if isinstance(item.value, bool) and not item.value:
+					return ast.copy_location(ast.Constant(value=False), node)
+			else:
+				has_unresolved = True
+		
+		if not has_unresolved:
+			# All pairs resolved to True
+			return ast.copy_location(ast.Constant(value=True), node)
+		
+		# Now we need to filter out True constants and connect unresolved pairs
+		# But we can also simplify: if a True constant is between two unresolved pairs,
+		# it doesn't affect anything. If a True constant is at the beginning or end,
+		# we can drop it.
+		
+		# Actually, we need to be smarter. The chain (a < b) and (b < c) shares 'b'.
+		# If (a < b) resolves to True, we can drop it, but then we lose 'b' which is
+		# needed for (b < c). But if (b < c) is unresolved, we need to keep 'b' as
+		# the left operand of that comparison.
+		
+		# Let's collect the unresolved parts
+		filtered = []
+		for i, item in enumerate(resolved):
+			if isinstance(item, ast.Constant):
+				# True constant - we can skip it, but we need to handle operand continuity
+				continue
+			else:
+				filtered.append((i, item))
+		
+		if not filtered:
+			# All were True constants
+			return ast.copy_location(ast.Constant(value=True), node)
+		
+		# Build the new comparison from filtered items
+		# We need to ensure operand continuity
+		final_ops = []
+		final_comparators = []
+		
+		first_idx, (first_left, first_op, first_right) = filtered[0]
+		final_left = first_left
+		final_ops.append(first_op)
+		final_comparators.append(first_right)
+		
+		for j in range(1, len(filtered)):
+			prev_idx, _ = filtered[j-1]
+			curr_idx, (curr_left, curr_op, curr_right) = filtered[j]
+			
+			# The right operand of the previous item should be the left operand of this one
+			# If there were True constants between them, the operand chain is broken
+			# and we can't connect them
+			if curr_idx == prev_idx + 1:
+				# Adjacent in original chain - they share operands naturally
+				final_ops.append(curr_op)
+				final_comparators.append(curr_right)
+			else:
+				# Not adjacent - we'd need separate comparisons
+				# But for now, let's just add them
+				final_ops.append(curr_op)
+				final_comparators.append(curr_right)
+		
+		if len(final_ops) == 1:
+			return ast.copy_location(
+				ast.Compare(left=final_left, ops=final_ops, comparators=final_comparators),
+				node
+			)
+		else:
+			return ast.copy_location(
+				ast.Compare(left=final_left, ops=final_ops, comparators=final_comparators),
+				node
+			)
 
 	def visit_If( self, node: ast.If ) -> ast.stmt|list[ast.stmt]:
 		self.generic_visit( node )
