@@ -6,6 +6,7 @@ import unittest
 # local imports:
 from compiler import Compiler, LoweredFunction
 from discovery import Discovery
+from errors import CompileError
 import ir
 from mpy_types import Variable, Specialization
 
@@ -3327,6 +3328,217 @@ class Tests( unittest.TestCase ):
 		# the temp Foo() produced, which field_value() now untracks once
 		# it's embedded into inner
 		self.assertEqual( kinds.count( 'Decref' ), 1 )
+
+	# --- __init__ construction (RCCLASS ATTRIBUTE LIFETIME.md) ---------------
+
+	def _method( self, mod, cls_name: str, method_name: str ):
+		cls = mod.get_local( cls_name )
+		if cls.resolve is not None:
+			cls.resolve()
+		fn = next( m for m in cls.methods if getattr( m, 'stem', None ) == method_name )
+		if fn.resolve is not None:
+			fn.resolve()
+		return fn
+
+	# hand-rolled Result fixture (this file's own Discovery uses
+	# import_builtins=False - matches test_match_result_ok_err_shape's own
+	# fixture exactly, extended with Err)
+	_RESULT_FIXTURE = '\n'.join([
+		'class bool: pass',
+		'',
+		'@cunion',
+		'class ResultPayload[T,E]:',
+		'	ok: T',
+		'	err: E',
+		'',
+		'@cstruct',
+		'class Result[T,E]:',
+		'	_payload: ResultPayload[T,E]',
+		'	_tag: u8',
+		'',
+		'	@staticmethod',
+		'	def Ok( val: T ) -> Result[T,E]:',
+		'		return Result.__allocate__( _payload = ResultPayload( ok = val ), _tag = 0 )',
+		'',
+		'	@staticmethod',
+		'	def Err( err: E ) -> Result[T,E]:',
+		'		return Result.__allocate__( _payload = ResultPayload( err = err ), _tag = 1 )',
+		'',
+		'	def is_ok( self ) -> bool:',
+		'		return self._tag == 0',
+		'',
+		'	def is_err( self ) -> bool:',
+		'		return self._tag == 1',
+	])
+
+	def test_nonfallible_init_shape( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'class Bar:',
+			'	a: Foo',
+			'',
+			'	def __init__( self, x: Foo ) -> None:',
+			'		self.a = x',
+			'',
+			'def main() -> None:',
+			'	b = Bar( Foo() )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( self._method( mod, 'Bar', '__init__' ))
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		# self.a = x is an aliasing assignment of a plain (non-move)
+		# parameter - a real Incref, same as it would be for an ordinary
+		# local (mirrors assign()'s own is_alias rule via attr_assign())
+		self.assertEqual( kinds, ['FuncStart', 'Incref', 'SetAttr', 'Return', 'FuncEnd'] )
+		# Bar(...) itself: Allocate self uninitialized, call __init__, hand
+		# self off directly (non-fallible - no Result wrapping at all)
+		main_lowered = self.compiler._lower( mod.get_local( 'main' ))
+		main_kinds = [ type( instr ).__name__ for instr in main_lowered.instructions ]
+		self.assertIn( 'Allocate', main_kinds )
+		self.assertNotIn( 'JumpIfFalse', main_kinds ) # no Ok/Err branch for a non-fallible __init__
+		allocate = next( i for i in main_lowered.instructions if type( i ).__name__ == 'Allocate' and i.cls.stem == 'Bar' )
+		self.assertEqual( allocate.fields, {} ) # self starts fully uninitialized
+
+	def test_fallible_init_shape_has_ok_err_branches( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'class Bar:',
+			'	a: i32',
+			'',
+			'	def __init__( self, fail: bool ) -> Result[None,MyError]:',
+			'		if fail:',
+			'			return Result.Err( MyError() )',
+			'		self.a = 1',
+			'		return Result.Ok( None )',
+			'',
+			'def main() -> None:',
+			'	r = Bar( True )',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		self.assertIn( 'JumpIfFalse', kinds ) # is_err() branch on Bar(...)'s own construction result
+		self.assertIn( 'Decref', kinds ) # self decref'd on the Err path
+		self.assertIn( 'Jump', kinds )
+
+	def test_missing_attribute_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Bar:',
+			'	a: i32',
+			'	b: i32',
+			'',
+			'	def __init__( self ) -> None:',
+			'		self.a = 1',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		with self.assertRaises( CompileError ):
+			self.compiler._lower( self._method( mod, 'Bar', '__init__' ))
+		self.assertTrue( any( 'must initialize' in e and 'b' in e for e in self.discovery.errors.errors ))
+
+	def test_self_escape_via_method_call_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Bar:',
+			'	a: i32',
+			'',
+			'	def helper( self ) -> None:',
+			'		pass',
+			'',
+			'	def __init__( self ) -> None:',
+			'		self.helper()',
+			'		self.a = 1',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		# unlike complete_construction()'s own CompileError (raised outside
+		# the per-statement loop, in lower_function's own fall-off-the-end
+		# handling), check_self_escape() fires FROM WITHIN a statement's own
+		# lowering (via _emit) - lower_function's per-statement recovery
+		# boundary ("one bad statement doesn't stop the rest") catches it,
+		# so _lower() itself doesn't raise here - the error is still
+		# recorded, just not propagated as an exception
+		self.compiler._lower( self._method( mod, 'Bar', '__init__' ))
+		self.assertTrue( any( 'self cannot be used here' in e for e in self.discovery.errors.errors ))
+
+	def test_self_escape_via_plain_argument_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Bar:',
+			'	a: i32',
+			'',
+			'	def __init__( self ) -> None:',
+			'		use( self )',
+			'		self.a = 1',
+			'',
+			'def use( b: Bar ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		self.compiler._lower( self._method( mod, 'Bar', '__init__' )) # doesn't raise - see the identical comment on test_self_escape_via_method_call_is_a_compile_error
+		self.assertTrue( any( 'self cannot be used here' in e for e in self.discovery.errors.errors ))
+
+	def test_default_value_prologue_is_spliced_before_the_body( self ) -> None:
+		code = '\n'.join([
+			'class Bar:',
+			'	a: i32 = 5',
+			'	b: i32',
+			'',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.b = x',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( self._method( mod, 'Bar', '__init__' ))
+		set_attrs = [ i for i in lowered.instructions if type( i ).__name__ == 'SetAttr' ]
+		self.assertEqual( [ i.attr for i in set_attrs ], ['a', 'b'] ) # default prologue first, then the user's own body
+
+	def test_ordinary_post_construction_setattr_is_a_replace( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'class Bar:',
+			'	a: Foo',
+			'',
+			'	def __init__( self, x: Foo ) -> None:',
+			'		self.a = x',
+			'',
+			'	def replace_a( self, y: Foo ) -> None:',
+			'		self.a = y',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( self._method( mod, 'Bar', 'replace_a' ))
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		# reads the current value (GetAttr), increfs the new aliasing value,
+		# decrefs the old one, then stores - "always a replace" outside __init__
+		self.assertEqual(
+			[ k for k in kinds if k in ( 'GetAttr', 'Incref', 'Decref', 'SetAttr' ) ],
+			['GetAttr', 'Incref', 'Decref', 'SetAttr'],
+		)
+
+	def test_result_ok_and_err_lower_cleanly( self ) -> None:
+		# regression check for the pre-existing (unrelated to this pass -
+		# confirmed via a clean-checkout repro) CUnion "missing field" bug:
+		# ResultPayload(ok=val)/ResultPayload(err=err) only ever set ONE
+		# member, never both - Result.Ok/Result.Err's own bodies must not
+		# require the other
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def main() -> None:',
+			'	ok: Result[i32,MyError] = Result.Ok( 5 )',
+			'	err: Result[i32,MyError] = Result.Err( MyError() )',
+		])
+		mod = self._import( code )
+		self.compiler._lower( mod.get_local( 'main' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )

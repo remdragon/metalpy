@@ -607,5 +607,116 @@ def foo() -> None:
 		state.move( x, target_qualname = 'takeown', param_stem = 'p' )
 		self.assertEqual( state.return_( None ), [] )
 
+# --- self construction (__init__) -----------------------------------------
+
+class ConstructionTests( CFGTestBase ):
+
+	def setUp( self ) -> None:
+		super().setUp()
+		self._import( '''
+class Foo: pass
+
+class Bar:
+	a: Foo
+	b: Foo
+	n: i32
+
+def bar( self_obj: Bar ) -> None:
+	pass
+''' )
+		self.bar_cls = self._module.get_local( 'Bar' )
+		if self.bar_cls.resolve is not None:
+			self.bar_cls.resolve()
+		for attr in self.bar_cls.attributes:
+			if attr.resolve is not None:
+				attr.resolve()
+		self.a_attr, self.b_attr, self.n_attr = self.bar_cls.attributes
+		self.state = self._state( self._fn( 'bar' ))
+		self.self_param = self._fn( 'bar' ).parameters[0]
+		self.state.enter_construction( self.self_param, self.bar_cls.attributes )
+
+	def test_attr_assign_fresh_rc_pushes_entry_no_incref( self ) -> None:
+		instrs = self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		self.assertEqual( instrs, [] )
+		self.assertIn( 'self.a', self.state.bindings )
+		self.assertEqual( len( self.state._epilogue_stack ), 1 )
+
+	def test_attr_assign_aliasing_increfs( self ) -> None:
+		# a's own fresh value aliased into b (two DIFFERENT attributes, no
+		# prior binding for b) - a fresh assign, just with is_alias=True
+		src = self._new_temp( self.a_attr.type )
+		self.state.attr_assign( self.a_attr, src, is_alias = False )
+		instrs = self.state.attr_assign( self.b_attr, src, is_alias = True )
+		self.assertEqual( self._kinds( instrs ), ['Incref'] )
+		self.assertIs( instrs[0].value, src )
+
+	def test_attr_assign_replace_decrefs_old_reuses_entry( self ) -> None:
+		self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		instrs = self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		self.assertEqual( self._kinds( instrs ), ['Decref'] )
+		self.assertEqual( len( self.state._epilogue_stack ), 1 ) # reused, not a second entry
+
+	def test_attr_assign_non_rc_is_tracked_with_no_instructions( self ) -> None:
+		i32 = self.discovery.get_intrinsics()['i32']
+		instrs = self.state.attr_assign( self.n_attr, ir.Const( type = i32, value = 1 ), is_alias = False )
+		self.assertEqual( instrs, [] )
+		self.assertIn( 'self.n', self.state.bindings )
+		self.assertEqual( len( self.state._epilogue_stack ), 0 ) # no entry - nothing to decref, ever
+
+	def test_complete_construction_succeeds_and_cancels_entries_without_decref( self ) -> None:
+		self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		self.state.attr_assign( self.b_attr, self._new_temp( self.b_attr.type ), is_alias = False )
+		self.state.attr_assign( self.n_attr, ir.Const( type = self.discovery.get_intrinsics()['i32'], value = 0 ), is_alias = False )
+		self.state.complete_construction( 'Bar.__init__' )
+		for entry in self.state._epilogue_stack:
+			self.assertTrue( entry.cancelled )
+		# the epilogue's own unwind (ordinary return_()) emits nothing for
+		# the now-cancelled attribute entries - ownership transferred into
+		# the now-complete self, no decref
+		self.assertEqual( self.state.return_( None ), [] )
+
+	def test_complete_construction_raises_when_an_attribute_is_missing( self ) -> None:
+		self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		with self.assertRaises( CompileError ) as ctx:
+			self.state.complete_construction( 'Bar.__init__' )
+		self.assertIn( 'b', str( ctx.exception ))
+		self.assertIn( 'n', str( ctx.exception ))
+
+	def test_check_self_escape_is_a_noop_outside_construction( self ) -> None:
+		self._import( 'class Foo: pass\ndef foo() -> None:\n\tpass\n' )
+		state = self._state( self._fn( 'foo' ))
+		state.check_self_escape( self._new_temp( self.bar_cls ), 'foo' ) # no raise - nothing under construction
+
+	def test_check_self_escape_raises_before_all_attributes_initialized( self ) -> None:
+		self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		with self.assertRaises( CompileError ) as ctx:
+			self.state.check_self_escape( self.self_param, 'Bar.__init__' )
+		self.assertIn( 'b', str( ctx.exception ))
+
+	def test_check_self_escape_is_fine_for_a_different_operand( self ) -> None:
+		other = self._new_temp( self.a_attr.type )
+		self.state.check_self_escape( other, 'Bar.__init__' ) # not self - no raise regardless of construction state
+
+	def test_check_self_escape_allows_self_once_all_attributes_initialized( self ) -> None:
+		self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		self.state.attr_assign( self.b_attr, self._new_temp( self.b_attr.type ), is_alias = False )
+		self.state.attr_assign( self.n_attr, ir.Const( type = self.discovery.get_intrinsics()['i32'], value = 0 ), is_alias = False )
+		self.state.check_self_escape( self.self_param, 'Bar.__init__' ) # no raise - already complete, even before complete_construction() itself runs
+
+	def test_attr_replace_increfs_new_and_decrefs_old( self ) -> None:
+		old = self._new_temp( self.a_attr.type )
+		new = self._new_temp( self.a_attr.type )
+		instrs = self.state.attr_replace( self.a_attr.type, old, new, is_alias = True )
+		self.assertEqual( self._kinds( instrs ), ['Incref', 'Decref'] )
+		self.assertIs( instrs[0].value, new )
+		self.assertIs( instrs[1].value, old )
+
+	def test_attr_replace_fresh_new_value_only_decrefs_old( self ) -> None:
+		old = self._new_temp( self.a_attr.type )
+		new = self._new_temp( self.a_attr.type )
+		instrs = self.state.attr_replace( self.a_attr.type, old, new, is_alias = False )
+		self.assertEqual( self._kinds( instrs ), ['Decref'] )
+		self.assertIs( instrs[0].value, old )
+
 if __name__ == '__main__':
 	unittest.main()

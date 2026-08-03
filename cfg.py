@@ -123,6 +123,8 @@ class CFGState:
 		self.bindings: Bindings = {}
 		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
 		self.prologue_instructions: list[ir.Instruction] = []
+		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
+		self._construction_required: list[Variable] = [] # __init__'s own attributes that must all be initialized before self can escape/construction can complete
 		for param in fn.parameters or []:
 			self._enter_parameter( param )
 
@@ -163,10 +165,26 @@ class CFGState:
 		else:
 			self.bindings[self_param.stem] = _Binding( operand = self_param, type = self_param.type, state = OwnState.BORROWED, entry = None )
 
-	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState ) -> Epilogue:
+	def enter_construction( self, self_param: Variable, required: list[Variable] ) -> None:
+		''' called instead of enter_self() when lowering __init__
+		specifically (see RCCLASS ATTRIBUTE LIFETIME.md and the approved
+		plan) - self is never @move for __init__ (construction transfers
+		each ATTRIBUTE's ownership into self as it's set, not self's own
+		identity), so this is just enter_self(is_move=False) plus recording
+		`required` (the class's own declared attributes - not yet base-
+		class-aware, see the plan's "forward-compatibility with
+		subclassing" note) for check_self_escape()/complete_construction()
+		to consult. Every attribute starts UNTRACKED (absent from bindings)
+		until its own first attr_assign() - exactly like an unassigned
+		local, no separate "uninitialized" state needed. '''
+		self.enter_self( self_param, is_move = False )
+		self._construction_self = self_param
+		self._construction_required = required
+
+	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None ) -> Epilogue:
 		entry = Epilogue( instructions = self._decref_instructions( type_for_decref, operand ), operand = operand )
 		self._epilogue_stack.append( entry )
-		self.bindings[operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
+		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
 
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
@@ -477,6 +495,57 @@ class CFGState:
 			self._push( dest, dest.type, OwnState.OWNED )
 		return instructions
 
+	def attr_assign( self, attr: Variable, src: ir.Operand, *, is_alias: bool ) -> list[ir.Instruction]:
+		''' self.<attr> = value, inside __init__ specifically - mirrors
+		assign()'s own fresh/replace logic almost exactly, but deliberately
+		does NOT early-exit for a non-RC attr.type the way assign() does:
+		complete_construction() needs to know an attribute was assigned
+		even when it never needs a decref (e.g. a plain `a: int`), so every
+		attribute is tracked here regardless of RC-ness - only the
+		Incref/Decref emission itself stays gated on rc_leaves(). Tracked
+		under a 'self.'-prefixed key (not attr.stem directly) so it can
+		never collide with an ordinary local of the same base name (e.g.
+		`def __init__(self, a): self.a = a` - a real, common pattern). '''
+		key = f'self.{attr.stem}'
+		is_rc = bool( rc_leaves( attr.type ))
+		instructions: list[ir.Instruction] = []
+		if is_rc:
+			if is_alias:
+				instructions += self._incref_instructions( attr.type, src )
+			elif isinstance( src, ir.Temp ):
+				self._temp_states.pop( src.id, None )
+		existing = self.bindings.get( key )
+		if existing is not None and existing.entry is not None:
+			if is_rc and existing.state in ( OwnState.OWNED, OwnState.COPY ):
+				instructions += self._decref_instructions( attr.type, attr )
+			existing.entry.cancelled = False
+			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = existing.entry )
+		elif is_rc:
+			self._push( attr, attr.type, OwnState.OWNED, key = key )
+		else:
+			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
+		return instructions
+
+	def attr_replace( self, t: Type, old: ir.Operand, new: ir.Operand, *, is_alias: bool ) -> list[ir.Instruction]:
+		''' self.<attr> = value, OUTSIDE __init__ construction - "an
+		RCClass is always complete, so setting an attribute is always a
+		replace" (RCCLASS ATTRIBUTE LIFETIME.md). Unlike attr_assign(),
+		this never touches self.bindings/the epilogue stack - struct/union
+		field CONTENTS aren't tracked across statements at all (see the
+		module docstring's v1 scope cut), so there's no existing binding
+		to look up here. lowering.py always reads the field's CURRENT
+		value fresh (a GetAttr) and hands it here as `old`, unconditionally
+		decref'd; `new` gets field_value()'s own is_alias treatment. Bumps
+		`new` first, same as assign()'s own ordering - safe even if `old`
+		and `new` happen to already alias the same object. '''
+		instructions: list[ir.Instruction] = []
+		if is_alias:
+			instructions += self._incref_instructions( t, new )
+		elif isinstance( new, ir.Temp ):
+			self._temp_states.pop( new.id, None )
+		instructions += self._decref_instructions( t, old )
+		return instructions
+
 	def fresh_temp( self, temp: ir.Temp, t: Type ) -> None:
 		''' called right after lowering.py emits the Allocate/Call that
 		produced `temp` holding a fresh RC value - registers it so a later
@@ -569,3 +638,51 @@ class CFGState:
 			instructions = self._decref_instructions( binding.type, variable )
 		binding.entry.cancelled = True
 		return instructions
+
+	# --- self construction (__init__) -------------------------------------
+
+	def check_self_escape( self, operand: ir.Operand, ctx: str ) -> None:
+		''' called (see lowering.py's _emit) for every operand of a newly
+		emitted instruction EXCEPT GetAttr.obj/SetAttr.obj - self can only
+		be used as the receiver of `self.attr` until every required
+		attribute is initialized. Per your answer: no calling methods on
+		self, no passing it anywhere else (Call receiver/argument, Assign
+		src, Return value, Allocate field value, SetItem value) until then
+		- release builds don't zero memory (see sys.alloc's debug-only
+		zeroing), so a callee reading an uninitialized field would be
+		genuine garbage, not just logically wrong. Flow-sensitive, not a
+		one-time flag: re-checked fresh against current bindings every
+		call, so self is allowed to escape as soon as every attribute
+		happens to be set, even before __init__'s own return is reached.
+		A no-op outside __init__ (self._construction_self is None) or for
+		any operand that isn't literally self. '''
+		if self._construction_self is None or operand is not self._construction_self:
+			return
+		missing = [ attr.stem for attr in self._construction_required if f'self.{attr.stem}' not in self.bindings ]
+		if missing:
+			raise CompileError(
+				f"{ctx}: self cannot be used here until {', '.join(missing)} "
+				f"{'is' if len(missing) == 1 else 'are'} initialized - only self.<attr> is allowed "
+				f"inside __init__ before construction completes"
+			)
+
+	def complete_construction( self, ctx: str ) -> None:
+		''' called on __init__'s SUCCESS path (fall-off, plain return, or
+		Result.Ok(...) for a fallible __init__) - BEFORE the ordinary
+		return_() unwind that follows. Raises CompileError listing any
+		required attribute still missing from bindings; otherwise cancels
+		every attribute binding's epilogue entry WITHOUT decref (ownership
+		transfers into the now-complete self, mirroring move()'s own
+		cancel-without-decref mechanism), so return_() only touches real
+		locals afterward, never the attributes that just became part of
+		self. Not called on a fallible __init__'s Result.Err(...) path -
+		there, incomplete state is expected/legal, and the ordinary
+		return_() unwind is exactly the desired cleanup (decref whichever
+		attributes WERE set - "clean up any that were initialized"). '''
+		missing = [ attr.stem for attr in self._construction_required if f'self.{attr.stem}' not in self.bindings ]
+		if missing:
+			raise CompileError( f"{ctx}: __init__ must initialize {', '.join(missing)} before returning" )
+		for attr in self._construction_required:
+			binding = self.bindings[f'self.{attr.stem}']
+			if binding.entry is not None:
+				binding.entry.cancelled = True

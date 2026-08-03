@@ -173,9 +173,18 @@ class Lowering:
 					# means it was never made resolvable at all. The method
 					# body obviously needs it, so it's synthesized here,
 					# lowering-only, the moment we start lowering a method body
+					# RCCLASS ATTRIBUTE LIFETIME.md / the approved plan - scoped
+					# to non-subclassed RCClasses only (fn.cls.base is None):
+					# subclassing/super()/attribute visibility aren't real
+					# features yet, independent of this
+					self._construction_self: Variable | None = None
+					self._construction_fallible = False
 					if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
 						self_param = Parameter( stem = 'self', qualname = f'{fn.qualname}.self', file = fn.file, line = fn.line, type = fn.cls )
 						fn.add_name( 'self', self_param )
+						if fn.stem == '__init__' and isinstance( fn.cls, RCClass ) and fn.cls.base is None:
+							self._construction_self = self_param
+							self._construction_fallible = self._init_fallibility( fn )
 
 					for param in fn.parameters or []:
 						self.schedule( param.type )
@@ -202,10 +211,16 @@ class Lowering:
 						new_label = self._new_label,
 						union_storage = self._tagged_union_storage,
 					)
-					if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
+					if self._construction_self is not None:
+						for attr in fn.cls.attributes:
+							self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _lower_allocate_fields's identical loop
+						self._cfg.enter_construction( self_param, fn.cls.attributes )
+					elif fn.cls is not None and not fn.is_static and not fn.is_classmethod:
 						self._cfg.enter_self( self_param, is_move = fn.is_move )
 					for instr in self._cfg.prologue_instructions:
 						self._emit( instr )
+					if self._construction_self is not None:
+						self._emit_construction_defaults( fn.cls, self_param, module )
 					body_start = len( self._instructions )
 					for stmt in fn.node.body:
 						# one bad statement doesn't stop the rest of this
@@ -218,6 +233,8 @@ class Lowering:
 							continue
 
 					if self._needs_epilogue:
+						if self._construction_self is not None:
+							self._complete_construction_or_fail( fn )
 						self._emit_epilogue( fn, none_type, body_start )
 					elif fn.return_type is none_type and self._body_may_fall_off_the_end( fn.node.body ):
 						# no defer/errdefer, so _emit_epilogue never runs at all -
@@ -228,7 +245,12 @@ class Lowering:
 						# `return` already does this itself (see _stmt_Return's
 						# own else branch) - this only covers the specific case
 						# nothing else does: reaching the function's closing brace
-						# with no `return` at all
+						# with no `return` at all. Falling off the end of a
+						# non-fallible __init__ (return_type is always none_type
+						# for it) is its success path - every required attribute
+						# must be initialized here too
+						if self._construction_self is not None:
+							self._complete_construction_or_fail( fn )
 						for instr in self._cfg.return_( None ):
 							self._emit( instr )
 						self._emit( ir.Return( value = None ))
@@ -290,6 +312,70 @@ class Lowering:
 		self._emit( ir.Call( dest = dest, target = is_err_fn, receiver = self._return_value_var, args = [], kwargs = {} ))
 		return dest
 
+	# --- __init__ construction (RCCLASS ATTRIBUTE LIFETIME.md) -----------------
+
+	def _init_fallibility( self, fn: Function ) -> bool:
+		''' __init__ must return None (non-fallible) or Result[None,E]
+		(fallible - per SYNTAX.md, Foo(...) then returns Result[Foo,E]) -
+		anything else is a compile error, checked as soon as __init__
+		itself is lowered, independent of whether/where it's ever
+		constructed from. '''
+		none_type = self.discovery.get_none_type()
+		if fn.return_type is none_type:
+			return False
+		result_cls = self.discovery.find_name( 'Result', fn.node )
+		ok = (
+			isinstance( fn.return_type, Specialization )
+			and fn.return_type.base is result_cls
+			and len( fn.return_type.args ) == 2
+			and fn.return_type.args[0] is none_type
+		)
+		if not ok:
+			self.discovery.fail(
+				f'{fn.qualname} must return None or Result[None,_], got '
+				f'{fn.return_type.qualname if fn.return_type else None}',
+				fn.node,
+			)
+		return True
+
+	def _emit_construction_defaults( self, cls: RCClass, self_param: Variable, module: Module ) -> None:
+		''' every defaulted attribute (attr.init is not None) gets an
+		unconditional prologue assignment before __init__'s own
+		user-written body runs - a later `self.a = ...` in the body (if
+		any) then becomes an ordinary attr_assign() replace, decref-ing
+		the just-created default. Lowered in the CLASS's own scope, not
+		__init__'s - a default expression can reference other class-level
+		names, but self isn't in scope for it, matching ordinary Python
+		class-body semantics. '''
+		for attr in cls.attributes:
+			if attr.init is None:
+				continue
+			with self.discovery.module_context( module ):
+				with self.discovery.scope_context( cls ):
+					default_value = self._lower_expr( attr.init, attr.type )
+			for instr in self._cfg.attr_assign( attr, default_value, is_alias = self._is_aliasing_expr( attr.init )):
+				self._emit( instr )
+			self._emit( ir.SetAttr( obj = self_param, attr = attr.stem, value = default_value ))
+
+	def _complete_construction_or_fail( self, fn: Function ) -> None:
+		try:
+			self._cfg.complete_construction( fn.qualname )
+		except CompileError as e:
+			self.discovery.fail_loc( str( e ), fn.file, fn.line )
+
+	def _is_result_err_call( self, node: ast.expr | None ) -> bool:
+		# `return Result.Err(...)` - textually recognized, same spirit as
+		# _defer_kind_of_call/_defer_kind_of_with - deliberately not
+		# attempting deeper type-level inference (see _stmt_Return's own
+		# comment on why anything else defaults to "requires completeness")
+		return (
+			isinstance( node, ast.Call )
+			and isinstance( node.func, ast.Attribute )
+			and node.func.attr == 'Err'
+			and isinstance( node.func.value, ast.Name )
+			and node.func.value.id == 'Result'
+		)
+
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self._find_module_for( var )
 		self._instructions = []
@@ -320,10 +406,11 @@ class Lowering:
 
 	# --- module lookup ------------------------------------------------------
 
-	def _find_module_for( self, unit: Function|Variable ) -> Module:
-		# Function/Variable.file is always set to their owning module's .file
-		# (see discovery.py's _parse_function/visit_AnnAssign/visit_Assign) -
-		# neither retains a direct back-reference to the Module itself
+	def _find_module_for( self, unit: Function|Variable|ClassLike ) -> Module:
+		# Function/Variable/ClassLike.file is always set to their owning
+		# module's .file (see discovery.py's _parse_function/visit_AnnAssign/
+		# visit_Assign/_parse_ClassDef_*) - none of them retain a direct
+		# back-reference to the Module itself
 		for module in self.discovery.modules.values():
 			if module.file == unit.file:
 				return module
@@ -347,7 +434,42 @@ class Lowering:
 		# just skipping it for globals
 		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
 			self._cfg.fresh_temp( instr.dest, instr.dest.type )
+		if self._current_fn is not None:
+			self._check_self_escape_in( instr )
 		self._instructions.append( instr )
+
+	def _check_self_escape_in( self, instr: ir.Instruction ) -> None:
+		# self can only be used as the receiver of `self.attr`
+		# (GetAttr.obj/SetAttr.obj, deliberately excluded here) until
+		# __init__ finishes constructing it - see cfg.check_self_escape().
+		# Checking every OTHER operand field centrally, at emission time,
+		# covers every site that could hand self off somewhere it shouldn't
+		# without hunting each one down individually - same centralization
+		# fresh_temp() already uses above. A no-op outside __init__
+		# (check_self_escape() itself short-circuits when nothing's under
+		# construction) - the instruction-type gate below also means this
+		# never touches self._cfg before it exists (FuncStart, emitted
+		# before CFGState is constructed, matches none of these types)
+		operands: list[ir.Operand] = []
+		if isinstance( instr, ir.Call ):
+			if instr.receiver is not None:
+				operands.append( instr.receiver )
+			operands += instr.args
+			operands += instr.kwargs.values()
+		elif isinstance( instr, ir.Assign ):
+			operands.append( instr.src )
+		elif isinstance( instr, ir.Return ):
+			if instr.value is not None:
+				operands.append( instr.value )
+		elif isinstance( instr, ir.SetItem ):
+			operands.append( instr.value )
+		elif isinstance( instr, ir.Allocate ):
+			operands += instr.fields.values()
+		for operand in operands:
+			try:
+				self._cfg.check_self_escape( operand, self._current_fn.qualname )
+			except CompileError as e:
+				self.discovery.fail_loc( str( e ), self._current_fn.file, self._current_fn.line )
 
 	def _new_temp( self, t: Type ) -> ir.Temp:
 		temp = ir.Temp( type = t, id = self._temp_id )
@@ -405,6 +527,20 @@ class Lowering:
 			# the whole capture, not just the top-level statement
 			self.discovery.fail( f'return is not allowed inside a defer/errdefer body: {ast.unparse(node)}', node )
 		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
+		if self._construction_self is not None:
+			# every return in a non-fallible __init__ is unconditionally
+			# success (construction_fallible is False, so the `and` below
+			# short-circuits) - no legal way to signal failure. In a
+			# fallible one, only a return whose value is textually
+			# Result.Err(...) is the failure path (partial init expected/
+			# legal there, cleaned up normally by the ordinary return_()
+			# unwind below - "clean up any that were initialized"); every
+			# other shape (Result.Ok(...), or anything else - deliberately
+			# not attempting deeper type-level inference here) requires
+			# full initialization
+			is_success = not ( self._construction_fallible and self._is_result_err_call( node.value ))
+			if is_success:
+				self._complete_construction_or_fail( self._current_fn )
 		if self._needs_epilogue:
 			# every return in a defer/errdefer-using function funnels
 			# through the SAME shared epilogue (_emit_epilogue) - RC decref
@@ -540,6 +676,24 @@ class Lowering:
 			obj = self._lower_expr( target.value, None )
 			attr_var = self._attr_lookup( obj.type, target.attr, target )
 			operand = self._lower_expr( node.value, attr_var.type )
+			if self._construction_self is not None and obj is self._construction_self:
+				# self.<attr> = value, inside __init__ construction itself -
+				# tracked for definite-assignment/self-escape purposes (see
+				# RCCLASS ATTRIBUTE LIFETIME.md and cfg.attr_assign())
+				for instr in self._cfg.attr_assign( attr_var, operand, is_alias = self._is_aliasing_expr( node.value )):
+					self._emit( instr )
+			elif cfg.rc_leaves( attr_var.type ):
+				# ordinary SetAttr on an already-constructed instance -
+				# "an RCClass is always complete, so setting an attribute
+				# is always a replace" (RCCLASS ATTRIBUTE LIFETIME.md).
+				# cfg.py doesn't track arbitrary struct instances' field
+				# CONTENTS across statements (v1 scope cut - see cfg.py's
+				# module docstring), so the current value is always read
+				# fresh here rather than consulted from any tracked state
+				old = self._new_temp( attr_var.type )
+				self._emit( ir.GetAttr( dest = old, obj = obj, attr = target.attr ))
+				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self._is_aliasing_expr( node.value )):
+					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = target.attr, value = operand ))
 		elif isinstance( target, ast.Subscript ):
 			obj = self._lower_expr( target.value, None )
@@ -1971,16 +2125,48 @@ class Lowering:
 		declared = { attr.stem: attr for attr in target_cls.attributes }
 		given = { kw.arg for kw in node.keywords }
 		missing = declared.keys() - given
-		if missing:
-			self.discovery.fail( f'{target_cls.qualname}{label} is missing field(s): {", ".join(sorted(missing))}', node )
+		if isinstance( target_cls, CUnion ):
+			# a union's whole point - only ONE member is ever meaningfully
+			# set at a time (see _tagged_union_storage's identical comment
+			# on the synthesized TaggedUnion payload CUnion) - "every OTHER
+			# field is missing" isn't an error here the way it is for an
+			# ordinary struct/class, unlike ResultPayload(ok=val) never
+			# giving err. Pre-existing gap, confirmed unrelated to this
+			# pass (reproduces on a clean checkout: Result.Ok(...)/
+			# Result.Err(...)'s own bodies were never actually exercised
+			# through a full Compiler.run() before, so this went unnoticed)
+			if len( given ) != 1:
+				self.discovery.fail( f'{target_cls.qualname}{label} takes exactly one field (only one union member is ever set): {ast.unparse(node)}', node )
+		else:
+			truly_missing = sorted( name for name in missing if declared[name].init is None )
+			if truly_missing:
+				self.discovery.fail( f'{target_cls.qualname}{label} is missing field(s): {", ".join(truly_missing)}', node )
 		extra = given - declared.keys()
 		if extra:
 			self.discovery.fail( f'{target_cls.qualname}{label} has no field(s): {", ".join(sorted(extra))}', node )
 
+		given_by_name = { kw.arg: kw.value for kw in node.keywords }
+		# a CUnion only ever builds the ONE given member - the other
+		# declared fields aren't "defaulted", they're simply not part of
+		# this particular construction at all (unlike an ordinary struct/
+		# class, where every field always exists)
+		fields_to_build = { name: declared[name] for name in given_by_name } if isinstance( target_cls, CUnion ) else declared
 		fields: dict[str,ir.Operand] = {}
-		for kw in node.keywords:
-			field = declared[kw.arg]
-			value = self._lower_expr( kw.value, field.type )
+		for name, field in fields_to_build.items():
+			if name in given_by_name:
+				expr = given_by_name[name]
+				value = self._lower_expr( expr, field.type )
+			else:
+				# omitted at the call site, but declared with a default
+				# (`field.init`, already confirmed not None by truly_missing
+				# above) - lowered in the CLASS's own scope, not the caller's,
+				# matching ordinary Python class-body scoping (a default
+				# expression can reference other class-level names, but not
+				# anything local to whoever's constructing this instance)
+				expr = field.init
+				with self.discovery.module_context( self._find_module_for( target_cls )):
+					with self.discovery.scope_context( target_cls ):
+						value = self._lower_expr( expr, field.type )
 			# value.type, not field.type: field.type is the FIELD's declared
 			# type, which stays an unsubstituted TypeVar for any field whose
 			# type depends on a class's own type params (class methods are
@@ -1988,9 +2174,9 @@ class Lowering:
 			# _enqueue) - value.type is always the operand's real, concrete
 			# type regardless, since only concrete values ever actually get
 			# lowered
-			for instr in self._cfg.field_value( value.type, value, is_alias = self._is_aliasing_expr( kw.value )):
+			for instr in self._cfg.field_value( value.type, value, is_alias = self._is_aliasing_expr( expr )):
 				self._emit( instr )
-			fields[kw.arg] = value
+			fields[name] = value
 
 		dest = self._new_temp( expected_type or target_cls )
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
@@ -2021,24 +2207,134 @@ class Lowering:
 			)
 		return self._lower_allocate_fields( target_cls, node, expected_type, '.__allocate__(...)' )
 
-	def _try_lower_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
-		# bare ClassName(field=value, ...) - SYNTAX.md sugar: allocate, then
-		# call __init__() if declared, wrapping the result in Result[Foo,E]
-		# when __init__ can fail and dropping the refcount to 0 (skipping
-		# __del__) on failure. None of the __init__-invocation/failure-
-		# cleanup machinery exists yet (needs refcounting/CFG), but a class
-		# with no __init__ at all has no such path to support - construction
-		# there degrades to exactly __allocate__, so that narrower case can
-		# be supported now. A class WITH __init__ falls through (returns
-		# None) to the normal call path, which reports "not callable" until
-		# __init__ invocation is implemented.
+	def _try_lower_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
+		# bare ClassName(...) - SYNTAX.md sugar. A class with no __init__ at
+		# all degrades to exactly __allocate__ (field=value sugar). A class
+		# WITH __init__: allocate self uninitialized, call __init__ with
+		# the call site's own arguments (__init__'s OWN parameter list, NOT
+		# the field=value sugar), wrap the result in Result[Foo,E] when
+		# __init__ is fallible, dropping self's own refcount (but not
+		# calling __del__) on Err - see RCCLASS ATTRIBUTE LIFETIME.md and
+		# the approved plan. Scoped to non-subclassed RCClasses only,
+		# matching lower_function's own scope check for __init__ itself.
 		target_cls = self._try_resolve_namespace( node.func )
 		if not isinstance( target_cls, ClassLike ):
 			return None
 		self._ensure_resolved( target_cls )
-		if '__init__' in target_cls.names:
+		init = target_cls.names.get( '__init__' )
+		if init is None:
+			return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
+		if not isinstance( target_cls, RCClass ):
+			# __init__ on a @cstruct/@cunion/@enum - not supported yet
+			# (attribute lifetime tracking is scoped to RCClass, matching
+			# RCCLASS ATTRIBUTE LIFETIME.md's own title) - falls through to
+			# the normal call path, same "not callable" as always
 			return None
-		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
+		if not isinstance( init, Function ):
+			self.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
+		if target_cls.base is not None:
+			self.discovery.fail(
+				f'{target_cls.qualname}(...): __init__ invocation is only supported for classes with no base class yet: {ast.unparse(node)}',
+				node,
+			)
+		self._ensure_resolved( init )
+
+		self_temp = self._new_temp( target_cls )
+		self._emit( ir.Allocate( dest = self_temp, cls = target_cls, fields = {} ))
+
+		positional, keyword = self._match_call_args( init, node )
+		args = []
+		for param, expr in positional:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, init.qualname )
+			args.append( operand )
+		kwargs = {}
+		for param, expr in keyword:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, init.qualname )
+			kwargs[param.stem] = operand
+		self.schedule( init.return_type )
+		for param in init.parameters or []:
+			self.schedule( param.type )
+
+		if not self._init_fallibility( init ):
+			self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
+			return self_temp
+		return self._emit_fallible_construction( node, target_cls, init, self_temp, args, kwargs, expected_type )
+
+	def _emit_fallible_construction(
+		self, node: ast.Call, target_cls: RCClass, init: Function, self_temp: ir.Temp,
+		args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None,
+	) -> ir.Operand:
+		# __init__ is fallible (Result[None,E]) - Foo(...) becomes
+		# Result[Foo,E] (SYNTAX.md). The actual Ok/Err wrapping reuses REAL
+		# Result.Ok/Result.Err call-lowering (via synthesized AST
+		# referencing hidden locals - _declare_hidden_local, the same
+		# technique the for-loop scaffolding already uses) rather than
+		# hand-building ResultPayload's own internal shape here - only the
+		# branch structure itself (and self_temp's own decref on Err, not
+		# expressible as source syntax) is raw IR, mirroring
+		# _lower_conditional_dispatch's own style
+		init_result = self._new_temp( init.return_type )
+		self._emit( ir.Call( dest = init_result, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
+
+		unique = self._label_id
+		self_var = self._declare_hidden_local( f'__ctor_self_{unique}', target_cls, node )
+		for instr in self._cfg.assign( self_var, self_temp, is_alias = False ):
+			self._emit( instr )
+		self._emit( ir.Assign( dest = self_var, src = self_temp ))
+
+		result_var = self._declare_hidden_local( f'__ctor_result_{unique}', init.return_type, node )
+		for instr in self._cfg.assign( result_var, init_result, is_alias = False ):
+			self._emit( instr )
+		self._emit( ir.Assign( dest = result_var, src = init_result ))
+
+		error_cls = init.return_type.args[1]
+		result_cls = self.discovery.find_name( 'Result', node )
+		outer_result_type = expected_type or self.discovery._get_or_create_specialization( result_cls, [ target_cls, error_cls ] )
+		dest_var = self._declare_hidden_local( f'__ctor_dest_{unique}', outer_result_type, node )
+
+		is_err_fn = self._attr_lookup_callable( init.return_type, 'is_err', node )
+		self._ensure_resolved( is_err_fn )
+		bool_cls = self.discovery.find_name( 'bool', node )
+		is_err_temp = self._new_temp( bool_cls )
+		self._emit( ir.Call( dest = is_err_temp, target = is_err_fn, receiver = result_var, args = [], kwargs = {} ))
+
+		err_label = self._new_label( 'ctor_err' )
+		end_label = self._new_label( 'ctor_end' )
+		self._emit( ir.JumpIfFalse( cond = is_err_temp, target = err_label ))
+
+		# Ok branch: self is fully constructed - hand it off
+		ok_expr = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+			args = [ ast.Name( id = self_var.stem, ctx = ast.Load() ) ], keywords = [],
+		)
+		ast.copy_location( ok_expr, node )
+		ok_value = self._lower_expr( ok_expr, outer_result_type )
+		for instr in self._cfg.assign( dest_var, ok_value, is_alias = False ):
+			self._emit( instr )
+		self._emit( ir.Assign( dest = dest_var, src = ok_value ))
+		self._emit( ir.Jump( target = end_label ))
+
+		# Err branch: self never became valid - drop its own refcount
+		# (but __del__ is never invoked on it - SYNTAX.md), propagate the
+		# same error, re-wrapped for THIS construction's own Result[Foo,E]
+		self._emit( ir.Label( name = err_label ))
+		self._emit( ir.Decref( value = self_var ))
+		err_expr = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+			args = [ ast.Attribute(
+				value = ast.Attribute( value = ast.Name( id = result_var.stem, ctx = ast.Load() ), attr = '_payload', ctx = ast.Load() ),
+				attr = 'err', ctx = ast.Load(),
+			) ], keywords = [],
+		)
+		ast.copy_location( err_expr, node )
+		err_value = self._lower_expr( err_expr, outer_result_type )
+		for instr in self._cfg.assign( dest_var, err_value, is_alias = False ):
+			self._emit( instr )
+		self._emit( ir.Assign( dest = dest_var, src = err_value ))
+		self._emit( ir.Label( name = end_label ))
+		return dest_var
 
 	def _tagged_union_storage( self, union: TaggedUnion ) -> tuple[Variable,Variable,CUnion,dict[str,int]]:
 		# every TaggedUnion (a user-declared @union class, or a synthesized

@@ -15,6 +15,79 @@ lowering:
 		covers every Call/Allocate site at once rather than needing each
 		hunted down individually; field_value() also untracks a fresh
 		temp embedded into a field, mirroring assign()'s same discipline).
+		RCClass attribute lifetime / __init__ construction (see RCCLASS
+		ATTRIBUTE LIFETIME.md and the approved plan) is also implemented,
+		scoped to non-subclassed RCClasses:
+		- ClassName(...) for a class declaring __init__ now actually works
+			(previously always "not callable" - _try_lower_construct_call
+			just bailed). Allocates self uninitialized, calls __init__ with
+			its own parameter list (not the field=value sugar), wraps the
+			result in Result[Foo,E] when __init__ is fallible
+			(Result[None,E]), drops self's own refcount (not __del__) on
+			Err - matches SYNTAX.md's own spec exactly.
+		- each attribute is tracked via cfg.attr_assign() - a thin extension
+			of assign()'s own fresh/replace logic, keyed by a 'self.'-
+			prefixed name so it can never collide with a same-named local
+			parameter (def __init__(self, a): self.a = a). Unlike locals,
+			every attribute is tracked regardless of RC-ness (definite-
+			assignment matters even for a plain `a: int`), and
+			complete_construction() (called on every success-path return -
+			AST-shape Result.Ok(...)/Result.Err(...) recognition, same
+			spirit as defer/errdefer's own textual recognition, decides
+			success vs failure for a fallible __init__) requires every
+			attribute present, then cancels their entries WITHOUT decref
+			(ownership transfers into the now-complete self, mirroring
+			move()'s cancel mechanism) before the ordinary return_() unwind
+			runs. A fallible __init__'s Err path skips this - incomplete
+			state is expected there, and the ordinary unwind correctly
+			decrefs whichever attributes were actually set.
+		- self cannot be used as a Call receiver/argument, Assign src,
+			Return value, Allocate field value, or SetItem value until every
+			attribute is initialized (self.attr - GetAttr/SetAttr.obj - is
+			the one exception) - release builds don't zero memory (see
+			sys.alloc's debug-only zeroing), so a method reading an
+			uninitialized field would be genuine garbage, not just logically
+			wrong. Enforced centrally in _emit(), same technique as
+			fresh_temp()'s own registration.
+		- default attribute values (already-existing Variable.init, both
+			AnnAssign and bare Assign forms) get an unconditional prologue
+			assignment before __init__'s own body runs, lowered in the
+			class's own scope (self isn't in scope for a default
+			expression, matching Python's own class-body semantics) -
+			also fixed _lower_allocate_fields's own "missing field(s)"
+			check to fall back to a default there too, for the plain
+			__allocate__()/no-__init__ construction path.
+		- ordinary (non-__init__) SetAttr on an already-constructed
+			instance is "always a replace" (RCCLASS ATTRIBUTE LIFETIME.md) -
+			cfg.attr_replace(), reading the field's current value fresh via
+			GetAttr (field CONTENTS still aren't tracked across statements,
+			see below) since there's no tracked binding to consult. This is
+			the concrete resolution of the "SetAttr storing an RC value
+			into an existing field isn't tracked" half of the gap noted
+			below - SetItem and a struct's own teardown remain open.
+		- found and fixed a real, pre-existing, unrelated bug along the way
+			(confirmed via a clean-checkout repro): _lower_allocate_fields's
+			"every field required" check doesn't apply to a CUnion (only
+			ONE member is ever meaningfully set - ResultPayload(ok=val)
+			never gives err) - Result.Ok/Result.Err's own bodies had never
+			actually been exercised through a full Compiler.run() before,
+			so this went unnoticed until __init__'s own fallible-
+			construction path became the first thing to do so.
+
+		Explicitly out of scope for this pass (subclassing isn't a real
+		feature yet at all, independent of this - RCClass.base is stored
+		but _attr_lookup/_find_method never walk it, super()/
+		super.__init__() don't exist anywhere, attribute visibility is
+		enforced nowhere except one hardcoded __allocate__() check): the
+		Foo1/Foo2/Foo3 inheritance examples in RCCLASS ATTRIBUTE
+		LIFETIME.md, and __init__ on a @cstruct/@cunion/@enum (falls
+		through to the ordinary "not callable" error, same as always).
+
+		A real full-compile attempt (`bytearray(4)`) surfaced unrelated,
+		pre-existing gaps in lib/sys.py, deliberately not chased here -
+		see "@compiler.target(os=...)-decorated function selection isn't
+		implemented" further down.
+
 		Pending/known gaps only, below:
 
 		- defer/errdefer combined with ANY reference-counted local or
@@ -27,11 +100,12 @@ lowering:
 			full unified-stack-with-flags design from the plan (not built
 			this pass) or risking a decref of something not actually alive on
 			that particular path. No real lib/ code combines these today.
-		- struct/union FIELD ownership beyond fresh construction: SetAttr/
-			SetItem storing an RC value into an EXISTING instance's field
-			isn't tracked at all, and a struct/union's own eventual teardown
-			doesn't decref its owned RC fields (moot for now - no emitter/
-			codegen consumes Decref for real yet).
+		- struct/union FIELD ownership: [resolved] ordinary SetAttr on an
+			already-constructed instance is now a tracked replace (see
+			above) - still open: SetItem storing an RC value into an
+			existing container isn't tracked at all, and a struct/union's
+			own eventual teardown doesn't decref its owned RC fields (moot
+			for now - no emitter/codegen consumes Decref for real yet).
 		- a non-None-returning function that falls off the end without an
 			explicit `return` on every path produces incomplete IR (missing
 			the final Return) - no "missing return statement" validation
@@ -147,6 +221,26 @@ lowering:
 		if compiler.target.os == 'windows': ...
 		if True: ...
 		match compiler.target.bits: ...
+	@compiler.target(os=...)-decorated function selection isn't implemented
+		either (a related but distinct gap from the statement-level one just
+		above - this is picking between multiple @compiler.target(os=...)
+		DEF overloads of the same function, e.g. lib/sys.py's memzero()/
+		_alloc(), each with a real, different body per platform, not a
+		conditional expression inside one body). Confirmed via a real
+		attempted full compile of `bytearray(4)` (Bar()-with-__init__
+		construction verification, see the RCCLASS ATTRIBUTE LIFETIME.md
+		work): both the windows AND non-windows variants get scheduled/
+		lowered indiscriminately today, so `from windows.ntdll import
+		RtlZeroMemory` / `from windows.kernel32 import HeapAlloc,
+		GetProcessHeap` both fail (those modules don't exist in this
+		environment) regardless of target platform. Same repro also
+		surfaced two smaller, likely-unrelated gaps in lib/sys.py's
+		alloc()/_alloc(): `is`/`is not` comparison operators aren't
+		supported ("unsupported comparison operator: ptr is None"), and a
+		bare `compiler.target.debug` used directly as an if-condition
+		(rather than inside a `with compiler.panic_arithmetic(...):`-style
+		block) isn't recognized ("'compiler' is not a value, cannot use it
+		as an expression").
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion
