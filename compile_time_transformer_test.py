@@ -103,5 +103,72 @@ class WhileSimplificationTests( unittest.TestCase ):
 		self.assertEqual( _fold( 'while cond:\n\tfoo()', {} ), 'while cond:\n    foo()' )
 
 
+class MatchSimplificationTests( unittest.TestCase ):
+	_SRC = (
+		'match compiler.target.bits:\n'
+		'\tcase 32:\n'
+		'\t\ta = 1\n'
+		'\tcase 64:\n'
+		'\t\ta = 2\n'
+		'\tcase _:\n'
+		'\t\ta = 3\n'
+	)
+
+	def test_matching_literal_case_wins( self ) -> None:
+		self.assertEqual( _fold( self._SRC, { 'bits': 32 } ), 'a = 1' )
+		self.assertEqual( _fold( self._SRC, { 'bits': 64 } ), 'a = 2' )
+
+	def test_wildcard_case_is_the_fallback( self ) -> None:
+		self.assertEqual( _fold( self._SRC, { 'bits': 16 } ), 'a = 3' )
+
+	def test_no_matching_case_and_no_wildcard_drops_statement_entirely( self ) -> None:
+		src = "match compiler.target.os:\n\tcase 'windows':\n\t\ta = 1\n"
+		self.assertEqual( _fold( src, { 'os': 'linux' } ), '' )
+
+	def test_or_pattern_folds( self ) -> None:
+		src = 'match compiler.target.bits:\n\tcase 32 | 64:\n\t\ta = 1\n\tcase _:\n\t\ta = 2\n'
+		self.assertEqual( _fold( src, { 'bits': 64 } ), 'a = 1' )
+		self.assertEqual( _fold( src, { 'bits': 16 } ), 'a = 2' )
+
+	def test_bare_name_capture_synthesizes_bind( self ) -> None:
+		src = 'match compiler.target.bits:\n\tcase x:\n\t\ta = x\n'
+		self.assertEqual( _fold( src, { 'bits': 64 } ), 'x = 64\na = x' )
+
+	def test_as_binding_on_a_literal_pattern_synthesizes_bind( self ) -> None:
+		src = 'match compiler.target.bits:\n\tcase 64 as x:\n\t\ta = x\n'
+		self.assertEqual( _fold( src, { 'bits': 64 } ), 'x = 64\na = x' )
+
+	def test_singleton_pattern_folds( self ) -> None:
+		src = 'match compiler.target.debug:\n\tcase True:\n\t\ta = 1\n\tcase False:\n\t\ta = 2\n'
+		self.assertEqual( _fold( src, { 'debug': False } ), 'a = 2' )
+
+	def test_guard_true_keeps_case( self ) -> None:
+		src = 'match compiler.target.bits:\n\tcase 64 if True:\n\t\ta = 1\n\tcase _:\n\t\ta = 2\n'
+		self.assertEqual( _fold( src, { 'bits': 64 } ), 'a = 1' )
+
+	def test_guard_false_skips_to_next_case( self ) -> None:
+		src = 'match compiler.target.bits:\n\tcase 64 if False:\n\t\ta = 1\n\tcase _:\n\t\ta = 2\n'
+		self.assertEqual( _fold( src, { 'bits': 64 } ), 'a = 2' )
+
+	def test_non_constant_guard_bails_on_whole_statement( self ) -> None:
+		# the subject itself still substitutes (compiler.target.bits -> 64,
+		# same generic substitution as everywhere else) even though the
+		# match structure can't collapse since `cond`'s truth isn't known
+		src = 'match compiler.target.bits:\n\tcase 64 if cond:\n\t\ta = 1\n\tcase _:\n\t\ta = 2\n'
+		expected = 'match 64:\n    case 64 if cond:\n        a = 1\n    case _:\n        a = 2'
+		self.assertEqual( _fold( src, { 'bits': 64 } ), expected )
+
+	def test_non_constant_subject_left_alone( self ) -> None:
+		src = 'match some_runtime_value:\n\tcase 1:\n\t\ta = 1\n'
+		self.assertEqual( _fold( src, {} ), src.strip( '\n' ).replace( '\t', '    ' ))
+
+	def test_matchclass_pattern_bails_on_whole_statement( self ) -> None:
+		# MatchClass/MatchSequence/MatchMapping/MatchStar aren't attempted -
+		# bail rather than guess (subject still substitutes, same as above)
+		src = 'match compiler.target.bits:\n\tcase Foo(x):\n\t\ta = 1\n\tcase _:\n\t\ta = 2\n'
+		expected = 'match 64:\n    case Foo(x):\n        a = 1\n    case _:\n        a = 2'
+		self.assertEqual( _fold( src, { 'bits': 64 } ), expected )
+
+
 if __name__ == '__main__':
 	unittest.main()

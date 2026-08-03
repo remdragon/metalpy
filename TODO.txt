@@ -244,12 +244,22 @@ lowering:
 		'posix' is its own separate bool field), and a 'debug' key (default
 		True) was added so lib/sys.py's and lib/builtins/__init__.py's
 		`if compiler.target.debug:` guards now fold/compile correctly.
-		Explicitly out of scope this pass (not in COMPILER-TARGET.md's
-		spec): `match compiler.target.bits: ...` constant-subject folding -
-		still compiles fine via the ordinary runtime match path, just
-		without the optimization. Also out of scope: class-body/attribute-
-		default-level folding (only function bodies are transformed, per
-		the doc's literal wording).
+		`match compiler.target.bits: case 32: ... case 64: ... case _: ...`
+		now folds too (visit_Match + _match_pattern): a fully-constant
+		subject picks the first matching case (MatchValue/MatchSingleton/
+		MatchOr/MatchAs - bare name and `as` captures get a synthesized
+		`name = <value>` prologue assignment since the match statement
+		itself is gone), everything else is dropped. This is more than an
+		optimization here - lowering.py's own _stmt_Match doesn't implement
+		MatchValue/MatchSingleton/MatchOr at all (only MatchAs/MatchClass),
+		so folding is what makes matching against an int/bool/str literal
+		compile at all today. A non-constant subject, an unresolvable
+		guard, or a MatchClass/MatchSequence/MatchMapping/MatchStar pattern
+		anywhere leaves the whole match statement untouched (safe fallback
+		to the ordinary runtime match path).
+		Still out of scope: class-body/attribute-default-level folding
+		(only function bodies are transformed, per the doc's literal
+		wording).
 		Correction to a stale note that used to live here: "@compiler.target
 		(os=...)-decorated function selection isn't implemented" was
 		WRONG - re-verified live (see compile_time_transformer_test.py /

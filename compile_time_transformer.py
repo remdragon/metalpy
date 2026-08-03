@@ -15,6 +15,17 @@ is left as an ordinary (correctly infinite) loop - lowering.py's existing
 while-loop machinery already handles a constant-true test fine, so there's
 no separate "unroll into a label+goto" step to build.
 
+`match` statements with a fully-constant subject (`match compiler.target.bits:`)
+are simplified the same way: the first case whose pattern matches the
+subject wins, its body is spliced in (any `as`/bare-name capture the
+winning pattern introduces is preceded by a synthesized `name = <value>`
+assignment, since the match statement itself is gone and can no longer
+bind it), and every other case is dropped. This is more than just an
+optimization for match - lowering.py's own _stmt_Match doesn't implement
+MatchValue/MatchSingleton/MatchOr patterns at all yet (only MatchAs and
+MatchClass - see its docstring), so folding is what makes
+`match compiler.target.bits: case 32: ...` compile at all today.
+
 Deliberately NOT folded, matching lowering.py's own scope cuts so this
 stays consistent with what the language actually supports:
 - `is`/`is not`/`in`/`not in` (ast.Is/IsNot/In/NotIn) - lowering.py's
@@ -22,9 +33,12 @@ stays consistent with what the language actually supports:
   pass shouldn't invent identity/containment semantics on the side.
 - chained comparisons (`a < b < c`) - same "not yet supported" boundary as
   _expr_Compare.
-- `match` statements with a constant subject - not part of this pass's
-  scope (COMPILER-TARGET.md only specifies if/while); still compiles fine
-  via the ordinary runtime match path, just without this optimization.
+- match patterns other than MatchValue/MatchSingleton/MatchOr/MatchAs
+  (MatchClass/MatchSequence/MatchMapping/MatchStar) - a non-constant
+  subject, an unresolvable guard, or one of these pattern shapes anywhere
+  in a `match` statement leaves the WHOLE statement untouched (safe
+  default: falls through to the ordinary runtime match path, same as if
+  this pass didn't exist).
 '''
 
 # stdlib imports:
@@ -146,6 +160,63 @@ class _ConstFolder( ast.NodeTransformer ):
 		if isinstance( node.test, ast.Constant ) and not node.test.value:
 			return [] # never runs, even once - dropped entirely
 		return node # a constant-true test is left as an ordinary (correctly infinite) while loop
+
+	def visit_Match( self, node: ast.Match ) -> ast.stmt|list[ast.stmt]:
+		self.generic_visit( node )
+		if not isinstance( node.subject, ast.Constant ):
+			return node
+		value = node.subject.value
+		for case in node.cases:
+			result = self._match_pattern( case.pattern, value )
+			if result is None:
+				return node # unresolvable pattern shape somewhere - bail on the whole statement, stay safe
+			matched, bindings = result
+			if not matched:
+				continue
+			if case.guard is not None:
+				if not isinstance( case.guard, ast.Constant ):
+					return node # can't tell if this case actually fires without evaluating the guard
+				if not case.guard.value:
+					continue
+			prologue = [ self._bind_stmt( name, bound_value, node ) for name, bound_value in bindings ]
+			return prologue + case.body
+		return [] # no case matched - same as Python's own match falling through with no effect
+
+	def _bind_stmt( self, name: str, value: object, node: ast.AST ) -> ast.Assign:
+		assign = ast.Assign( targets = [ ast.Name( id = name, ctx = ast.Store() ) ], value = ast.Constant( value = value ))
+		return ast.copy_location( assign, node )
+
+	def _match_pattern( self, pattern: ast.pattern, value: object ) -> tuple[bool,list[tuple[str,object]]]|None:
+		''' returns (matched, bindings) for a pattern tested against a known
+		compile-time value, or None if this pattern shape can't be resolved
+		at compile time (MatchClass/MatchSequence/MatchMapping/MatchStar) '''
+		if isinstance( pattern, ast.MatchAs ):
+			if pattern.pattern is None:
+				# a bare name (or `_` - Python parses a wildcard the same
+				# way, with name=None) - matches unconditionally
+				return ( True, [] if pattern.name is None else [ ( pattern.name, value ) ] )
+			inner = self._match_pattern( pattern.pattern, value )
+			if inner is None:
+				return None
+			matched, bindings = inner
+			if matched and pattern.name is not None:
+				bindings = [ *bindings, ( pattern.name, value ) ]
+			return ( matched, bindings )
+		if isinstance( pattern, ast.MatchOr ):
+			for sub in pattern.patterns:
+				result = self._match_pattern( sub, value )
+				if result is None:
+					return None
+				if result[0]:
+					return result
+			return ( False, [] )
+		if isinstance( pattern, ast.MatchValue ):
+			if not isinstance( pattern.value, ast.Constant ):
+				return None
+			return ( pattern.value.value == value, [] )
+		if isinstance( pattern, ast.MatchSingleton ):
+			return ( value is pattern.value, [] )
+		return None
 
 
 def transform_function_body( body: list[ast.stmt], active_target: dict[str,object] ) -> list[ast.stmt]:
