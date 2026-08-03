@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 
 # local imports:
+import cfg
 import ir
 from discovery import Discovery
 from errors import CompileError
@@ -189,6 +190,22 @@ class Lowering:
 					)
 
 					self._emit( ir.FuncStart( name = fn.qualname, params = fn.parameters or [], return_type = fn.return_type ))
+					# constructed AFTER FuncStart - CFGState's own prologue
+					# building (a copy[T] union parameter's tag-gated Incref)
+					# can call new_temp, which immediately emits its own
+					# DeclareTemp, so FuncStart must already be in the stream
+					bool_cls = self.discovery.get_intrinsics()['bool']
+					self._cfg = cfg.CFGState(
+						fn,
+						bool_type = bool_cls,
+						new_temp = self._new_temp,
+						new_label = self._new_label,
+						union_storage = self._tagged_union_storage,
+					)
+					if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
+						self._cfg.enter_self( self_param, is_move = fn.is_move )
+					for instr in self._cfg.prologue_instructions:
+						self._emit( instr )
 					body_start = len( self._instructions )
 					for stmt in fn.node.body:
 						# one bad statement doesn't stop the rest of this
@@ -238,7 +255,17 @@ class Lowering:
 			self._emit( ir.Label( name = skip_label ))
 
 		for t in reversed( self._pending_temps ):
+			for instr in self._cfg.delete_temp( t ):
+				self._emit( instr )
 			self._emit( ir.DeleteTemp( temp = t ))
+		# covers the fall-off-the-end path specifically (no explicit return
+		# reached this point) - every explicit return already checked this
+		# itself in _stmt_Return, before jumping here
+		if self._cfg.return_( None ):
+			self.discovery.fail_loc(
+				'defer/errdefer combined with reference-counted locals/parameters is not supported yet (see TODO.txt)',
+				fn.file, fn.line,
+			)
 		return_value = self._return_value_var if fn.return_type is not none_type else None
 		self._emit( ir.Return( value = return_value ))
 
@@ -329,10 +356,29 @@ class Lowering:
 	def _stmt_Return( self, node: ast.Return ) -> None:
 		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
 		if self._needs_epilogue:
+			# every return in a defer/errdefer-using function funnels
+			# through the SAME shared epilogue (_emit_epilogue) - RC decref
+			# there necessarily uses whatever's live at the END of the
+			# whole function body, not this specific return's own live set
+			# (which could genuinely differ - an early return before some
+			# later local exists). Rather than risk decref'ing something
+			# not actually alive on this path, this combination is
+			# rejected outright for now - see TODO.txt. cfg.return_() is
+			# still called (not just skipped) so the check is exact: only
+			# functions that would ACTUALLY need an RC decref here trip it
+			cfg_instructions = self._cfg.return_( value )
+			if cfg_instructions:
+				self.discovery.fail(
+					'defer/errdefer combined with reference-counted locals/parameters is not supported yet '
+					f'(see TODO.txt): {ast.unparse(node)}',
+					node,
+				)
 			if self._return_value_var is not None and value is not None:
 				self._emit( ir.Assign( dest = self._return_value_var, src = value ))
 			self._emit( ir.Jump( target = self._epilogue_label ))
 		else:
+			for instr in self._cfg.return_( value ):
+				self._emit( instr )
 			self._emit( ir.Return( value = value ))
 
 	def _stmt_Pass( self, node: ast.Pass ) -> None:
@@ -365,7 +411,29 @@ class Lowering:
 		existing = fn.names.get( target.id )
 		if not isinstance( existing, Variable ):
 			self.discovery.fail( f'{target.id!r} is not a local variable, cannot del it', node )
+		for instr in self._cfg.deleted( existing ):
+			self._emit( instr )
 		del fn.names[target.id]
+
+	def _is_aliasing_expr( self, node: ast.expr ) -> bool:
+		# does lowering `node` hand back a reference to a value that
+		# already exists independently (needing its own Incref if it's
+		# stored into a new binding), vs a genuinely fresh value (Allocate,
+		# or a Call - always a fresh owned handoff, whether the callee's
+		# own body built it via Allocate or received it as an alias
+		# itself, since a well-behaved callee already accounts for that on
+		# its own side)? Name/Attribute reads are the only currently-
+		# supported expression forms that alias existing state -
+		# BinOp/BoolOp/Compare/Constant/UnaryOp never produce RC values at
+		# all, and Call is always fresh from the caller's perspective.
+		# ast.Subscript is deliberately NOT included here even though it
+		# looks like a read: _expr_Subscript's dominant path (a real
+		# __getitem__) is a Call underneath (fresh), and its other path
+		# (raw ir.GetItem, genuinely aliasing a container element) isn't
+		# reachable by any real code yet - no indexable container exists
+		# yet (list[T]/dict[K,V] are still first-draft/WIP per TODO.txt) -
+		# revisit this once one does
+		return isinstance( node, ( ast.Name, ast.Attribute ))
 
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
 		if not isinstance( node.target, ast.Name ):
@@ -383,6 +451,8 @@ class Lowering:
 		self.schedule( var_type )
 		if node.value is not None:
 			operand = self._lower_expr( node.value, var_type )
+			for instr in self._cfg.assign( var, operand, is_alias = self._is_aliasing_expr( node.value )):
+				self._emit( instr )
 			self._emit( ir.Assign( dest = var, src = operand ))
 
 	def _stmt_Assign( self, node: ast.Assign ) -> None:
@@ -395,6 +465,8 @@ class Lowering:
 				if not isinstance( existing, Variable ):
 					self.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 				operand = self._lower_expr( node.value, existing.type )
+				for instr in self._cfg.assign( existing, operand, is_alias = self._is_aliasing_expr( node.value )):
+					self._emit( instr )
 				self._emit( ir.Assign( dest = existing, src = operand ))
 			else:
 				# first assignment to a name with no prior declaration - same
@@ -411,6 +483,8 @@ class Lowering:
 				)
 				fn.add_name( var.stem, var )
 				self.schedule( var.type )
+				for instr in self._cfg.assign( var, operand, is_alias = self._is_aliasing_expr( node.value )):
+					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
 		elif isinstance( target, ast.Attribute ):
 			obj = self._lower_expr( target.value, None )
@@ -747,13 +821,21 @@ class Lowering:
 		self._emit( ir.Label( name = start_label ))
 		test = self._lower_expr( node.test, bool_cls )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
-		self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label )
+		loop_snapshot = self._cfg.snapshot()
+		self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		try:
+			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
+		for instr in back_edge_instructions:
+			self._emit( instr )
+		self._cfg.restore( loop_snapshot )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
-	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str ) -> None:
+	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> None:
 		self._loop_depth += 1
-		self._loop_labels.append(( continue_label, break_label ))
+		self._loop_labels.append(( continue_label, break_label, loop_snapshot ))
 		try:
 			for stmt in body:
 				try:
@@ -767,13 +849,17 @@ class Lowering:
 	def _stmt_Break( self, node: ast.Break ) -> None:
 		if not self._loop_labels:
 			self.discovery.fail( 'break outside a loop', node )
-		_, break_label = self._loop_labels[-1]
+		_, break_label, loop_snapshot = self._loop_labels[-1]
+		for instr in self._cfg.unwind_to( loop_snapshot ):
+			self._emit( instr )
 		self._emit( ir.Jump( target = break_label ))
 
 	def _stmt_Continue( self, node: ast.Continue ) -> None:
 		if not self._loop_labels:
 			self.discovery.fail( 'continue outside a loop', node )
-		continue_label, _ = self._loop_labels[-1]
+		continue_label, _, loop_snapshot = self._loop_labels[-1]
+		for instr in self._cfg.unwind_to( loop_snapshot ):
+			self._emit( instr )
 		self._emit( ir.Jump( target = continue_label ))
 
 	def _synth_name( self, stem: str, node: ast.AST ) -> ast.Name:
@@ -899,7 +985,15 @@ class Lowering:
 		cond = self._lower_expr( test, bool_cls )
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
-		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label )
+		loop_snapshot = self._cfg.snapshot()
+		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		try:
+			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
+		for instr in back_edge_instructions:
+			self._emit( instr )
+		self._cfg.restore( loop_snapshot )
 
 		self._emit( ir.Label( name = continue_label ))
 		# the increment is a compiler-synthesized implementation detail of
@@ -951,6 +1045,12 @@ class Lowering:
 		cond = self._lower_expr( test, bool_cls )
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
+		# the snapshot is taken here, BEFORE the loop target's own binding -
+		# that binding (e.g. `s2 = obj[index]`) happens fresh every
+		# iteration, exactly like any other loop-body statement (matches
+		# foo4: a value reassigned each iteration is expected to be stable
+		# across the back edge, not confined-and-torn-down)
+		loop_snapshot = self._cfg.snapshot()
 		subscript = ast.Subscript(
 			value = self._synth_name( obj_var.stem, node ),
 			slice = self._synth_name( index_var.stem, node ),
@@ -961,7 +1061,14 @@ class Lowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label )
+		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		try:
+			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
+		for instr in back_edge_instructions:
+			self._emit( instr )
+		self._cfg.restore( loop_snapshot )
 
 		self._emit( ir.Label( name = continue_label ))
 		incr = self._new_temp( usize_cls )
@@ -975,20 +1082,62 @@ class Lowering:
 		test = self._lower_expr( node.test, bool_cls )
 		else_label = self._new_label( 'if_else' )
 		self._emit( ir.JumpIfFalse( cond = test, target = else_label ))
+
+		# each branch is lowered into its OWN captured instruction list
+		# (same technique _register_defer_block already uses) rather than
+		# appended directly - a local confined to just one branch needs its
+		# own Decref spliced into THAT branch's own code specifically
+		# (before its own exit to the join point), never at the shared
+		# join point both branches reach, since it only exists on that one
+		# path. Known ahead of time only after BOTH branches have been
+		# explored (merge_if, below), so neither branch's own instructions
+		# can be emitted directly as they're lowered
+		entry_snapshot = self._cfg.snapshot()
+		outer_instructions = self._instructions
+		self._instructions = []
 		for stmt in node.body:
 			try:
 				self._lower_stmt( stmt )
 			except CompileError:
 				continue
+		true_captured = self._instructions
+		true_end = dict( self._cfg.bindings )
+
 		if node.orelse:
-			end_label = self._new_label( 'if_end' )
-			self._emit( ir.Jump( target = end_label ))
-			self._emit( ir.Label( name = else_label ))
+			self._cfg.restore( entry_snapshot )
+			self._instructions = []
 			for stmt in node.orelse:
 				try:
 					self._lower_stmt( stmt )
 				except CompileError:
 					continue
+			false_captured = self._instructions
+			false_end = dict( self._cfg.bindings )
+		else:
+			false_captured = []
+			false_end = dict( entry_snapshot.bindings )
+
+		self._cfg.restore( entry_snapshot )
+		self._instructions = outer_instructions
+		try:
+			true_extra, false_extra, removed = self._cfg.merge_if( entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
+		for name in removed:
+			del self._current_fn.names[name]
+
+		for instr in true_captured:
+			self._emit( instr )
+		for instr in true_extra:
+			self._emit( instr )
+		if node.orelse:
+			end_label = self._new_label( 'if_end' )
+			self._emit( ir.Jump( target = end_label ))
+			self._emit( ir.Label( name = else_label ))
+			for instr in false_captured:
+				self._emit( instr )
+			for instr in false_extra:
+				self._emit( instr )
 			self._emit( ir.Label( name = end_label ))
 		else:
 			self._emit( ir.Label( name = else_label ))
@@ -1674,6 +1823,18 @@ class Lowering:
 			)
 		return expr
 
+	def _apply_move_hook( self, param: Parameter, operand: ir.Operand, target_qualname: str ) -> None:
+		# the semantic half of move[T] - _check_move_argument (run earlier,
+		# inside _match_call_args) already validated the call-site syntax
+		# agrees; this is where the argument's OWN ownership state actually
+		# transitions, once its real Operand exists (needs the lowered
+		# value, not just the AST expr) - shared by every _match_call_args
+		# caller (plain calls, both generic call flavors, union-receiver
+		# dispatch), called right after each argument is lowered
+		if isinstance( param.type, Move ):
+			for instr in self._cfg.move( operand, target_qualname = target_qualname, param_stem = param.stem ):
+				self._emit( instr )
+
 	# stems of intrinsic types a Python literal of this exact type could
 	# plausibly be lowered as - deliberately coarse (no int-range/value
 	# validation exists anywhere yet, see _expr_Constant), just enough to
@@ -1915,8 +2076,16 @@ class Lowering:
 		# count - not the abstract, unsubstituted one)
 		monomorphized = self._monomorphized_function( spec )
 		positional, keyword = self._match_call_args( monomorphized, node )
-		args = [ self._lower_expr( expr, param.type ) for param, expr in positional ]
-		kwargs = { param.stem: self._lower_expr( expr, param.type ) for param, expr in keyword }
+		args = []
+		for param, expr in positional:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, monomorphized.qualname )
+			args.append( operand )
+		kwargs = {}
+		for param, expr in keyword:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, monomorphized.qualname )
+			kwargs[param.stem] = operand
 		return self._emit_generic_call( spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_inferred_generic_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -1939,6 +2108,10 @@ class Lowering:
 		positional, keyword = self._match_call_args( target, node )
 		args = [ self._lower_expr( expr, None ) for _param, expr in positional ]
 		kwargs = { param.stem: self._lower_expr( expr, None ) for param, expr in keyword }
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._apply_move_hook( param, operand, target.qualname )
+		for param, _expr in keyword:
+			self._apply_move_hook( param, kwargs[param.stem], target.qualname )
 
 		bindings: dict[int,Type] = {} # id(TypeVar) -> the concrete Type it was inferred as
 		for ( param, _expr ), operand in zip( positional, args ):
@@ -2062,8 +2235,16 @@ class Lowering:
 		else:
 			self._ensure_resolved( target )
 			positional, keyword = self._match_call_args( target, node )
-			args = [ self._lower_expr( expr, param.type ) for param, expr in positional ]
-			kwargs = { param.stem: self._lower_expr( expr, param.type ) for param, expr in keyword }
+			args = []
+			for param, expr in positional:
+				operand = self._lower_expr( expr, param.type )
+				self._apply_move_hook( param, operand, target.qualname )
+				args.append( operand )
+			kwargs = {}
+			for param, expr in keyword:
+				operand = self._lower_expr( expr, param.type )
+				self._apply_move_hook( param, operand, target.qualname )
+				kwargs[param.stem] = operand
 
 		self.schedule( target.return_type )
 		for param in target.parameters or []:
@@ -2171,8 +2352,16 @@ class Lowering:
 		for _member, fn in dispatch.per_leaf:
 			self._ensure_resolved( fn )
 		positional, keyword = self._match_call_args( reference, node )
-		args = [ self._lower_expr( expr, param.type ) for param, expr in positional ]
-		kwargs = { param.stem: self._lower_expr( expr, param.type ) for param, expr in keyword }
+		args = []
+		for param, expr in positional:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, dispatch.union.qualname )
+			args.append( operand )
+		kwargs = {}
+		for param, expr in keyword:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, dispatch.union.qualname )
+			kwargs[param.stem] = operand
 
 		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( dispatch.union )
 		bool_cls = self.discovery.find_name( 'bool', node )

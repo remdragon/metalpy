@@ -109,11 +109,56 @@ lowering:
 			
 			def foo5( s: str ): # s=BORROWED
 				s2 = s # s2 is a copy of s, so s=BORROWED, s2=OWNED or COPY. IR( ASSIGN(s2,s); INCREF(s2) )
-				
+
 				# epilogue:
 				DECREF(s2)
 			</code>
-	
+
+		[resolved - v1] implemented as cfg.py, a live state machine lowering.py
+			calls into at the exact points it already visits things (see the
+			approved plan, declarative-greeting-parnas.md, and RC MANAGEMENT.md
+			for the full design this follows: a single _epilogue_stack unifying
+			RC decref with defer/errdefer's existing replay concept, pure LIFO
+			order, scope determined structurally with no reference-scan needed).
+			Verified against every worked example above (foo1-foo5) plus your
+			explicit "both branches construct the same name, survives past the
+			if" case, and against real lib/ code (bytes/bytearray/str's
+			__init__/from_bytearray/release/__add__ all lower cleanly).
+
+			Known gaps, all deliberate scope cuts for v1, not oversights:
+			- struct/union FIELD ownership is untouched (SetAttr/SetItem storing
+				an RC value into a field isn't tracked at all) - this is CONCRETELY
+				WRONG for bytearray.release()'s own error path today: `return
+				Result.Err( OwnershipError.SharedReference( self ))` embeds self
+				into the Err payload (a plain Allocate as far as cfg.py can see,
+				same as any struct field write), but self is STILL "returned"
+				only in the sense that the WRAPPER is returned - cfg.py doesn't
+				know self got logically moved into that wrapper, so it decrefs
+				self anyway before the Return, leaving the returned SharedReference
+				holding a reference that's already been decremented. Fixing this
+				needs the real struct-field-ownership tracking this pass
+				deliberately deferred - not safe to paper over with a narrower
+				patch, since the same shape (embedding an owned/moved value into
+				an Allocate that's then returned/stored) recurs anywhere a Result
+				payload or tagged-union member wraps an RC value.
+			- defer/errdefer combined with ANY reference-counted local or
+				parameter is rejected outright (CompileError) rather than
+				attempted - every explicit return in a defer-using function
+				funnels through ONE shared epilogue (existing _DeferBlock
+				machinery, untouched by this pass), so per-return-specific RC
+				decref content can't be correctly placed there without either the
+				full unified-stack-with-flags design from the plan (not built
+				this pass) or risking a decref of something not actually alive on
+				that particular path. No real lib/ code combines these today.
+			- a genuinely fresh RC value that's never assigned to a name or
+				directly returned (e.g. `foo( SomeClass() )`, passed as a call
+				argument and immediately discarded) isn't decref'd - a leak, not
+				a double-free, and not reachable by any current lib/ code (every
+				real construction is assigned or returned directly) - cfg.py's
+				fresh_temp()/delete_temp() hooks exist and are tested for this,
+				just never invoked from lowering.py yet (would need touching
+				every Allocate/Call dest-creation site individually).
+
 	possible future improvement: union-receiver dispatch currently requires
 		every leaf's method to share the exact same return type, or it's a
 		compile error (see _resolve_union_receiver_members in lowering.py).

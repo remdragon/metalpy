@@ -328,8 +328,9 @@ def foo() -> None:
 		self.state.assign( x_false, self._new_temp( self.foo_cls ), is_alias = False )
 		false_end = dict( self.state.bindings )
 		self.state.restore( entry )
-		instrs, removed = self.state.merge_if( entry.bindings, true_end, false_end, 'foo' )
-		self.assertEqual( instrs, [] )
+		true_instrs, false_instrs, removed = self.state.merge_if( entry.bindings, true_end, false_end, 'foo' )
+		self.assertEqual( true_instrs, [] )
+		self.assertEqual( false_instrs, [] )
 		self.assertEqual( removed, [] )
 		self.assertIn( 'x', self.state.bindings )
 		self.assertEqual( self.state.bindings['x'].state, cfg.OwnState.OWNED )
@@ -337,15 +338,18 @@ def foo() -> None:
 
 	def test_local_confined_to_one_branch_is_torn_down_at_endif( self ) -> None:
 		# if cond: z = Foo() (no else, z never used again) - fine per your
-		# clarification, torn down right here with no error
+		# clarification, torn down right here with no error. Its decref
+		# must land in the TRUE branch's own instructions specifically (it
+		# only exists on that path), never the false branch's
 		entry = self.state.snapshot()
 		z = self._local( 'z' )
 		self.state.assign( z, self._new_temp( self.foo_cls ), is_alias = False )
 		true_end = dict( self.state.bindings )
 		false_end = dict( entry.bindings )
-		instrs, removed = self.state.merge_if( entry.bindings, true_end, false_end, 'foo' )
-		self.assertEqual( self._kinds( instrs ), ['Decref'] )
-		self.assertIs( instrs[0].value, z )
+		true_instrs, false_instrs, removed = self.state.merge_if( entry.bindings, true_end, false_end, 'foo' )
+		self.assertEqual( self._kinds( true_instrs ), ['Decref'] )
+		self.assertIs( true_instrs[0].value, z )
+		self.assertEqual( false_instrs, [] )
 		self.assertEqual( removed, ['z'] )
 
 	def test_preexisting_binding_confined_to_one_branch_is_an_error( self ) -> None:
@@ -457,6 +461,16 @@ class ReturnTests( CFGTestBase ):
 		instrs = self.state.return_( x )
 		self.assertEqual( self._kinds( instrs ), ['Decref'] )
 		self.assertIs( instrs[0].value, y )
+
+	def test_returning_a_bare_fresh_temp_untracks_it( self ) -> None:
+		# return SomeClass() - never assigned to a name, so DeleteTemp would
+		# otherwise (wrongly) decref the exact value we just handed to the
+		# caller
+		t = self._new_temp( self.foo_cls )
+		self.state.fresh_temp( t, self.foo_cls )
+		instrs = self.state.return_( t )
+		self.assertEqual( instrs, [] )
+		self.assertEqual( self.state.delete_temp( t ), [] ) # no double decref
 
 	def test_multiple_returns_get_independent_decref_sets( self ) -> None:
 		x = self._local( 'x' )

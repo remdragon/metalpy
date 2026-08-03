@@ -145,6 +145,24 @@ class CFGState:
 		elif rc_leaves( param.type ):
 			self.bindings[param.stem] = _Binding( operand = param, type = param.type, state = OwnState.BORROWED, entry = None )
 
+	def enter_self( self, self_param: Variable, *, is_move: bool ) -> None:
+		''' `self` is excluded from fn.parameters entirely (see discovery.py's
+		_make_function_resolver) and only synthesized by lowering.py once
+		it starts lowering a method body - called separately from __init__
+		for exactly that reason. A @move-decorated method's self starts
+		OWNED (same reasoning as a move[T] parameter - confirmed by tracing
+		bytearray.release(), which never manually frees self; an ordinary
+		Decref at its own exit, possibly invoking __del__, is correct
+		because __del__ already guards the double-free via the
+		BYTEARRAY_INVALID sentinel, unrelated to this). Otherwise BORROWED,
+		like any other plain parameter - self is never copy[T]. '''
+		if not rc_leaves( self_param.type ):
+			return
+		if is_move:
+			self._push( self_param, self_param.type, OwnState.OWNED )
+		else:
+			self.bindings[self_param.stem] = _Binding( operand = self_param, type = self_param.type, state = OwnState.BORROWED, entry = None )
+
 	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState ) -> Epilogue:
 		entry = Epilogue( instructions = self._decref_instructions( type_for_decref, operand ), operand = operand )
 		self._epilogue_stack.append( entry )
@@ -162,21 +180,26 @@ class CFGState:
 
 	# --- IF/ELSE/ENDIF -----------------------------------------------------
 
-	def merge_if( self, entry_bindings: Bindings, true_end: Bindings, false_end: Bindings, ctx: str ) -> tuple[list[ir.Instruction],list[str]]:
+	def merge_if( self, entry_bindings: Bindings, true_end: Bindings, false_end: Bindings, ctx: str ) -> tuple[list[ir.Instruction],list[ir.Instruction],list[str]]:
 		''' called after lowering.py has already restore()'d back to the
 		if's own entry snapshot (so self.bindings/self._epilogue_stack are
 		clean of whatever either branch speculatively pushed) - compares
 		the two branches' own ending snapshots (false_end is just
 		entry_bindings again if there was no `else`) and either raises
 		CompileError (a binding in an indeterminate state - foo1) or
-		returns (instructions to emit right here, names to remove from
-		fn.names for a binding confined to whichever one branch created
-		it). Re-establishes exactly one epilogue entry per surviving
-		OWNED/COPY binding - both branches always push their OWN entry
-		when creating the same-named binding fresh, and only one of the
-		two ever actually runs, so those speculative entries must never
-		both survive onto the real stack. '''
-		instructions: list[ir.Instruction] = []
+		returns (true-branch-only instructions, false-branch-only
+		instructions, names to remove from fn.names). The two instruction
+		lists are returned SEPARATELY, not combined, and MUST be spliced
+		into that one branch's own captured code (before its own exit to
+		the join point) - a binding confined to one branch only exists on
+		that one path, so its teardown can't run at the shared join point
+		reached by both. Re-establishes exactly one epilogue entry per
+		surviving OWNED/COPY binding - both branches always push their OWN
+		entry when creating the same-named binding fresh, and only one of
+		the two ever actually runs, so those speculative entries must
+		never both survive onto the real stack. '''
+		true_instructions: list[ir.Instruction] = []
+		false_instructions: list[ir.Instruction] = []
 		removed: list[str] = []
 		for name in set( true_end ) | set( false_end ):
 			in_true = name in true_end
@@ -200,12 +223,16 @@ class CFGState:
 				)
 			# fresh on exactly one branch, never existed before the if -
 			# fine (per your clarification: confined to that branch, no
-			# matching assignment needed on the other) - tear it down here
+			# matching assignment needed on the other) - tear it down
+			# inside THAT branch's own code only
 			binding = true_end[name] if in_true else false_end[name]
-			if binding.state in ( OwnState.OWNED, OwnState.COPY ):
-				instructions += self._decref_instructions( binding.type, binding.operand )
+			decref = self._decref_instructions( binding.type, binding.operand ) if binding.state in ( OwnState.OWNED, OwnState.COPY ) else []
+			if in_true:
+				true_instructions += decref
+			else:
+				false_instructions += decref
 			removed.append( name )
-		return instructions, removed
+		return true_instructions, false_instructions, removed
 
 	# --- loops ---------------------------------------------------------------
 
@@ -266,11 +293,18 @@ class CFGState:
 		function's own fall-off-the-end. Skips whichever entry IS the
 		returned value itself (ownership transfers to the caller, matched
 		by identity - the same Variable/Temp object _lower_expr already
-		returned for the `return` expression). Doesn't mutate state -
-		lowering.py doesn't need it to (each return is independent, no
-		code follows it on that path). Flag-guarded (defer/errdefer)
+		returned for the `return` expression). Doesn't mutate .bindings/the
+		stack (lowering.py doesn't need it to - each return is independent,
+		no code follows it on that path) EXCEPT for one thing: if the
+		returned value is itself a bare fresh temp (`return SomeClass()`,
+		never assigned to a name), it untracks that temp from
+		_temp_states - otherwise the DeleteTemp _lower_stmt's own wrapper
+		emits for it right after this statement would decref the very
+		value we just handed to the caller. Flag-guarded (defer/errdefer)
 		entries are handled by lowering.py's existing epilogue machinery,
 		not here - see the Integration section of the plan. '''
+		if isinstance( returned_operand, ir.Temp ):
+			self._temp_states.pop( returned_operand.id, None )
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack ):
 			if entry.cancelled or entry.is_flag_guarded:
