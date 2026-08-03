@@ -321,8 +321,7 @@ def main() -> None:
 
 CLANG = shutil.which( 'clang' ) or r'C:\Program Files\LLVM\bin\clang.exe'
 
-@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
-class RealCompileTests( CompilerTestCase ):
+class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			src_path = Path( tmp ) / 'generated.c'
@@ -334,6 +333,8 @@ class RealCompileTests( CompilerTestCase ):
 			)
 			self.assertEqual( result.returncode, 0, f'clang failed:\nstdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
 
+@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+class RealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 	def test_empty_main_compiles( self ) -> None:
 		self._run( '''
 def main() -> None:
@@ -423,6 +424,83 @@ def main() -> None:
 	y: u8 = p[i]
 	return
 ''' )
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+# routing RCClass construction through the REAL sys.alloc[T] means sys.alloc's
+# own body actually gets lowered end to end (unlike every other fixture in
+# this file, which never touches real lib/ code) - the real lib/sys.py's own
+# alloc[T] pulls in Windows/CRT externs, panic, and a synthesized Ptr[u8]|None
+# TaggedUnion (Phase 5 work, not built yet), none of which is what THIS phase
+# is actually testing. A self-contained sys.py fixture (a temp-directory
+# Discovery search path, not the real lib/) keeps this phase scoped to what
+# it says: RCClass layout + the sys.alloc[T] calling convention, not "make
+# the entire current (and still actively evolving - see TODO.txt) real
+# stdlib compile."
+_SYS_ALLOC_FIXTURE = '\n'.join([
+	'def alloc[T]( count: usize ) -> Ptr[T]:',
+	'	with compiler.wrap_arithmetic:', # sidesteps needing a Result[usize,OverflowError] fixture - default Check mode isn't what this phase is testing
+	'		byte_count: usize = count * compiler.sizeof( T )',
+	'	return _test_raw_alloc[T]( byte_count )',
+	'',
+	"@extern( 'c', '_metalpy_test_alloc' )", # a fictitious symbol name - avoids any collision with clang's own builtin knowledge of real allocator names like malloc
+	'def _test_raw_alloc[T]( size: usize ) -> Ptr[T]:',
+	'	...',
+])
+
+class RCClassTestCase( CompilerTestCase ):
+	def setUp( self ) -> None:
+		self._tmpdir = tempfile.TemporaryDirectory()
+		self.addCleanup( self._tmpdir.cleanup )
+		tmp_path = Path( self._tmpdir.name )
+		( tmp_path / 'sys.py' ).write_text( _SYS_ALLOC_FIXTURE, encoding = 'utf-8' )
+		self.discovery = Discovery( paths = [ tmp_path ], import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+_FOO_FIXTURE = '\n'.join([
+	'class Foo:',
+	'	x: i32',
+	'',
+	'	@staticmethod',
+	'	def make( v: i32 ) -> Foo:',
+	'		return Foo.__allocate__( x = v )',
+])
+
+class RCClassConstructTests( RCClassTestCase ):
+	def test_construct_read_back_and_refcount( self ) -> None:
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'def main() -> None:',
+			'	foo: Foo = Foo.make( 1 )',
+			'	bar: Foo = foo', # aliasing - exercises Incref
+			'	rc: usize = compiler.refcount( bar )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		src = emitter_c.emit_function( main_lf )
+		self.assertIn( 'retain_object', src ) # bar = foo aliasing
+		self.assertIn( 'release_object', src ) # epilogue decref(s) for foo/bar going out of scope
+		self.assertIn( '->header.ref_count', src ) # compiler.refcount(bar)
+		foo_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Foo' )
+		struct_src = emitter_c.emit_rcclass( foo_cls )
+		self.assertIn( 'struct __main__$Foo {', struct_src )
+		self.assertIn( 'ObjectHeader header;', struct_src )
+		self.assertIn( 'int32_t x;', struct_src )
+
+@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
+	def test_construct_read_back_and_refcount_compiles( self ) -> None:
+		# Phase 3 milestone: synthetic class Foo: x: i32 constructed, field
+		# read back, compiler.refcount(x) called - compiles clean. Not
+		# leak-free by design yet (release_object is called with a NULL
+		# destructor - Phase 4 fills it in), only compile-clean, per the plan
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'def main() -> i32:',
+			'	foo: Foo = Foo.make( 1 )',
+			'	bar: Foo = foo',
+			'	rc: usize = compiler.refcount( bar )',
+			'	with compiler.wrap_arithmetic:',
+			'		return bar.x',
+		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 if __name__ == '__main__':

@@ -329,6 +329,19 @@ class AddrOf( Instruction ): # compiler.addrof(x) - yields &x, x a local variabl
 		return f'AddrOf( dest={self.dest!r}, value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no field-layout
+	# algorithm exists in this compiler (nor should one - that's the C
+	# compiler's job), so unlike an intrinsic scalar's sizeof (which folds
+	# straight to ir.Const), this stays a real instruction: the emitter emits
+	# a literal C `sizeof(...)` expression, letting the target C compiler
+	# compute the real, field-layout-dependent size
+	dest: Temp
+	type: Type
+
+	def test_repr( self ) -> str:
+		return f'SizeOf( dest={self.dest!r}, type={self.type.qualname!r} )'
+
+@dataclass( kw_only = True )
 class Return( Instruction ):
 	value: Operand|None
 	

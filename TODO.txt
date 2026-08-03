@@ -920,8 +920,78 @@ emitter:
 		minimal harness, since no real program can produce a CEnum value
 		yet) all compile clean through clang -std=c11 -Wall -Wextra -c.
 		Full suite: 453 tests, 0 failures.
-		Next: Phase 3 (RCClass layout, sys.alloc[T] construction, Incref/
-		Decref/RefCount, attribute access) - see the plan file.
+
+	[resolved] Phase 3: RCClass layout, sys.alloc[T] construction, Incref/
+		Decref/RefCount, attribute access. GetAttr/SetAttr for RCClass
+		already worked (isinstance(obj.type, RCClass) already picked '->'
+		since Phase 1 - the same rule c_type() uses). Added:
+		- emit_rcclass(): ObjectHeader is the automatic first member of
+			every RCClass C struct (explicit user decision - see the plan's
+			Context section), followed by the class's own fields, walking
+			the base chain first (base fields before derived - .attributes
+			only ever holds a class's OWN declared fields, discovery.py
+			never merges a base's own attributes in).
+		- ir.Allocate for RCClass: calls the mangled sys.alloc[dest.type]
+			C function (built from the same qualname formula discovery.
+			_get_or_create_specialization uses - no lookup needed, just the
+			string), sets ->header.ref_count = 1 (fresh allocation is
+			immediately owned by dest - starting at 0 would underflow the
+			first Decref), then field-assigns via ->.
+		- ir.Incref/ir.Decref: retain_object/release_object. Decref passes
+			a NULL destructor for now - not leak-free by design yet (Phase 4
+			wires in the real one).
+		- ir.RefCount: reads ->header.ref_count directly (C11 atomics
+			support a plain read as an implicit atomic_load).
+		- ir.SizeOf (new IR instruction, ir.py): compiler.sizeof(T) for a
+			real class-like T can't fold to a Python int the way an
+			intrinsic scalar's size does (no field-layout algorithm exists
+			in this compiler, nor should one - that's the C compiler's own
+			job) - stays a real instruction, letting the emitter defer to a
+			literal C `sizeof(...)` expression.
+		Real bug found + fixed along the way: c_type()'s Ptr[T]/ConstPtr[T]
+			mapping recursed through c_type() itself for T's inner spelling,
+			which auto-promotes a bare RCClass to a pointer (struct Foo*) -
+			so Ptr[Foo] was incorrectly mapping to `struct Foo**` (double
+			pointer) instead of `struct Foo*`. Invisible before this phase
+			(nothing had ever mapped Ptr[RCClass] through c_type() before -
+			sys.alloc[T]'s own real return type is exactly this case).
+			Fixed via a new _value_spelling() helper (T's own bare value
+			representation - struct Foo even for an RCClass, not struct
+			Foo* - used by both Ptr[T]'s inner type and ir.SizeOf), which
+			also means sys.alloc[Foo]'s real C return type (struct Foo*) is
+			now representationally IDENTICAL to Foo's own c_type() spelling -
+			no cast needed at the ir.Allocate call site, exactly as the plan
+			intended ("reinterprets the returned cls* ... no real cast").
+		Prerequisites (lowering.py, their own reasoning before the emitter
+			work): _lower_compiler_sizeof extended to emit ir.SizeOf for a
+			real ClassLike T instead of failing ("not supported yet");
+			Lowering._resolve_sys_alloc() (mirrors _resolve_sys_panic) +
+			_lower_allocate_fields's RCClass branch now schedules
+			Specialization(sys.alloc, [dest.type]) - guarantees sys.alloc[
+			Foo] is a real, lowered compile unit by the time the emitter
+			needs to call it, same posture as the panic-wiring precedent
+			from Phase 1.
+		Verification note: routing RCClass construction through sys.alloc[T]
+			means sys.alloc's OWN body actually gets lowered end to end -
+			the REAL lib/sys.py's alloc[T] pulls in Windows/CRT externs,
+			sys.panic, and a synthesized Ptr[u8]|None TaggedUnion (Phase 5
+			work, not built yet), none of which this phase is testing, and
+			lib/sys.py is also under active, unrelated revision right now
+			(see the sys._Stdout.write() notes elsewhere in this file). Used
+			a small self-contained sys.py fixture instead (a temp-directory
+			Discovery search path, not the real lib/) - same posture as
+			every other fixture in this file (_RESULT_FIXTURE, _POINT_
+			FIXTURE), keeping this phase scoped to what it actually says:
+			the RCClass layout + sys.alloc[T] calling convention, not "make
+			the entire current real stdlib compile."
+		Verified end to end: a synthetic class Foo: x: i32 constructed via
+			a staticmethod factory (routed through the fixture's own
+			sys.alloc[Foo]), an aliasing assignment (Incref), field read-
+			back, compiler.refcount(), and the epilogue's own Decrefs (both
+			foo and bar going out of scope) - all compile clean through
+			clang -std=c11 -Wall -Wextra -c. Full suite: 457 tests, 0
+			failures.
+		Next: Phase 4 (__del__/destructor synthesis) - see the plan file.
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml

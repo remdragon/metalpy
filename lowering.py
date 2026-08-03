@@ -11,7 +11,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CUnion, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
+	Specialization, TaggedUnion, CStruct, CUnion, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
 
@@ -163,6 +163,10 @@ class Lowering:
 		# program using panic_arithmetic in multiple places only resolves
 		# sys.panic once
 		self._sys_panic_fn: Function|None = None
+		# same discipline as _sys_panic_fn - resolved lazily the first time
+		# an RCClass gets constructed (see _lower_allocate_fields's RCClass
+		# branch)
+		self._sys_alloc_fn: Function|None = None
 
 	def _resolve_sys_panic( self ) -> Function:
 		# ir.Unwrap's Err branch needs to actually call something to
@@ -182,6 +186,22 @@ class Lowering:
 				fn.resolve()
 			self._sys_panic_fn = fn
 		return self._sys_panic_fn
+
+	def _resolve_sys_alloc( self ) -> Function:
+		# an RCClass's own memory comes from the SAME allocation path every
+		# other real allocation in the language already goes through -
+		# sys.alloc[T](count: usize) -> Ptr[T] - not a separate/parallel
+		# allocator the emitter invents for RCClass alone (this was an
+		# explicit user decision - see the plan's Context section). Reached
+		# via discovery.import_name(...), same posture as _resolve_sys_panic
+		if self._sys_alloc_fn is None:
+			module = self.discovery.import_name( 'sys' )
+			fn = module.get_local( 'alloc' )
+			assert isinstance( fn, Function ), f'sys.alloc is required for RCClass construction but was not found: {fn!r}'
+			if fn.resolve is not None:
+				fn.resolve()
+			self._sys_alloc_fn = fn
+		return self._sys_alloc_fn
 
 	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
 		module = self._find_module_for( fn )
@@ -917,11 +937,26 @@ class Lowering:
 				f'unbound generic type parameter here (call the enclosing function through an explicit specialization, e.g. foo[SomeType](...))',
 				node,
 			)
-		size = self._INTRINSIC_BYTE_SIZES.get( getattr( target_type, 'stem', None ) )
-		if size is None:
-			self.discovery.fail( f'compiler.sizeof({target_type.qualname}) is not supported yet - only intrinsic scalar types have a known compile-time size', node )
 		usize_cls = self.discovery.get_intrinsics()['usize']
-		return ir.Const( type = expected_type or usize_cls, value = size )
+		size = self._INTRINSIC_BYTE_SIZES.get( getattr( target_type, 'stem', None ) )
+		if size is not None:
+			return ir.Const( type = expected_type or usize_cls, value = size )
+		# a real class-like type (RCClass/CStruct/CUnion/TaggedUnion, or a
+		# concrete Specialization of one) - no field-layout algorithm exists
+		# in this compiler (nor should one - that's the C compiler's own
+		# job), so unlike an intrinsic scalar's sizeof, this can't fold to a
+		# Python int here. Stays a real ir.SizeOf instruction instead - the
+		# emitter emits a literal C `sizeof(...)` expression, letting the
+		# target C compiler compute the real, layout-dependent size (needed
+		# by sys.alloc[T]'s own body, e.g. sys.alloc[SomeRCClass](1) for
+		# RCClass construction - see _lower_allocate_fields's RCClass branch)
+		base = target_type.base if isinstance( target_type, Specialization ) else target_type
+		if not isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion )):
+			self.discovery.fail( f'compiler.sizeof({target_type.qualname}) is not supported yet - only intrinsic scalar types and real classes have a known size', node )
+		self.schedule( target_type )
+		dest = self._new_temp( expected_type or usize_cls )
+		self._emit( ir.SizeOf( dest = dest, type = target_type ))
+		return dest
 
 	def _lower_compiler_refcount( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.refcount(x) - unlike compiler.sizeof(T), x is a real
@@ -2451,6 +2486,16 @@ class Lowering:
 		# same as _emit_generic_call already does for a generic FUNCTION's
 		# own monomorphized return type; nothing else would ever schedule it
 		self.schedule( dest.type )
+		if isinstance( target_cls, RCClass ):
+			# guarantees sys.alloc[dest.type] is a real, lowered compile unit
+			# by the time the emitter sees this ir.Allocate - the emitter
+			# independently synthesizes the call to it (mangled qualname,
+			# same convention as everything else), so this has to actually
+			# exist regardless of whether the user's own program ever wrote
+			# `import sys` (mirrors _resolve_sys_panic's identical posture)
+			sys_alloc_fn = self._resolve_sys_alloc()
+			alloc_spec = self.discovery._get_or_create_specialization( sys_alloc_fn, [ dest.type ])
+			self.schedule( alloc_spec )
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
 		return dest
 

@@ -150,7 +150,7 @@ def c_type( t: Type|None ) -> str:
 	if isinstance( t, Specialization ):
 		base = t.base
 		if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
-			inner = c_type( t.args[0] )
+			inner = _value_spelling( t.args[0] )
 			return f'{inner}*' if base.stem == 'Ptr' else f'const {inner}*'
 		if isinstance( base, RCClass ):
 			return f'struct {mangle_type(t)}*'
@@ -180,6 +180,24 @@ def c_type( t: Type|None ) -> str:
 
 def _is_noreturn( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem == 'NoReturn'
+
+def _value_spelling( t: Type ) -> str:
+	''' the C spelling of T's OWN VALUE representation - unlike c_type(),
+	which auto-promotes a bare RCClass reference to a pointer (struct Foo*,
+	since a variable/field of RCClass type is always a pointer everywhere
+	else), this returns the bare struct body type (struct Foo) even for an
+	RCClass. Needed wherever C already provides one level of indirection on
+	its own and c_type()'s auto-pointering would double it up:
+	Ptr[T]/ConstPtr[T]'s inner T (T* must stay a single pointer even when T
+	is an RCClass - sys.alloc[Foo]'s own real return type), and sizeof(T)
+	(sizeof(struct Foo), never sizeof(struct Foo*) - see ir.SizeOf's
+	handling in _emit_instruction). '''
+	if isinstance( t, ( Move, Copy )):
+		return _value_spelling( t.inner )
+	base = t.base if isinstance( t, Specialization ) else t
+	if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion )):
+		return f'{_class_keyword(base)} {mangle_type(t)}'
+	return c_type( t ) # scalars/CEnum - value and reference spelling are identical
 
 # --- struct/union body emission -------------------------------------------
 #
@@ -572,9 +590,52 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 	if isinstance( instr, ir.AddrOf ):
 		return [ f'\t{_emit_operand(instr.dest)} = &{_emit_operand(instr.value)};' ]
 
+	if isinstance( instr, ir.SizeOf ):
+		# a real class-like type's size is whatever the C compiler itself
+		# computes for its struct/union body (sizeof(struct Foo), never
+		# sizeof(struct Foo*) - _value_spelling gives the bare body type
+		# even for an RCClass) - no field-layout algorithm exists earlier
+		# in this compiler, nor should one
+		return [ f'\t{_emit_operand(instr.dest)} = sizeof({_value_spelling(instr.type)});' ]
+
+	if isinstance( instr, ir.Incref ):
+		return [ f'\tretain_object( &({_emit_operand(instr.value)})->header );' ]
+	if isinstance( instr, ir.Decref ):
+		# NULL destructor for now - not leak-free by design yet (Phase 4
+		# wires in the real one: the user's own __del__ plus cascading
+		# decref for any RC-typed fields)
+		return [ f'\trelease_object( &({_emit_operand(instr.value)})->header, NULL );' ]
+	if isinstance( instr, ir.RefCount ):
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.value)})->header.ref_count;' ]
+
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
-			raise NotImplementedError( 'ir.Allocate for RCClass is Phase 3 work (needs sys.alloc[T]/header construction)' )
+			# routed through sys.alloc[dest.type] - the SAME allocation path
+			# every other real allocation in the language goes through, not
+			# an emitter-invented allocator (explicit user decision - see
+			# the plan's Context section). lowering.py's _lower_allocate_
+			# fields already guarantees this exact Specialization is
+			# scheduled+lowered (Lowering._resolve_sys_alloc) - its mangled
+			# qualname is built the same way discovery._get_or_create_
+			# specialization builds every Specialization's own qualname
+			# (base.qualname + bracketed, comma-joined arg qualnames), so
+			# no lookup is needed here, just the same string formula.
+			# Ptr[T]'s c_type mapping uses _value_spelling for its own inner
+			# T (see c_type's Ptr/ConstPtr branch), so sys.alloc[Foo]'s real
+			# C return type is ALREADY struct Foo* - representationally
+			# identical to dest's own type, no cast needed.
+			dest_type = instr.dest.type
+			alloc_name = mangle_qualname( f'sys.alloc[{dest_type.qualname}]' )
+			dest = _emit_operand( instr.dest )
+			lines = [ f'\t{dest} = {alloc_name}( 1 );' ]
+			# freshly allocated = owned by dest immediately (lowering.py
+			# never emits an Incref for the temp an Allocate itself produces)
+			# - starting the header at 0 would underflow the very first
+			# paired Decref
+			lines.append( f'\t({dest})->header.ref_count = 1;' )
+			for name, value in instr.fields.items():
+				lines.append( f'\t({dest})->{name} = {_emit_operand(value)};' )
+			return lines
 		# CStruct/CUnion - plain value construction, no header/no heap
 		# allocation at all (see the grounding facts in the plan) - a C11
 		# designated-initializer compound literal covers both (a union
@@ -650,7 +711,29 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 # --- classes / globals -----------------------------------------------------
 
 def emit_rcclass( cls: RCClass ) -> str:
-	raise NotImplementedError( 'emit_rcclass: Phase 3 work' )
+	# ObjectHeader is the automatic first member of every RCClass C struct
+	# (explicit user decision - see the plan's Context section) - this is
+	# what lets sys.alloc[Foo]'s own generic byte-count allocation double as
+	# the real object allocator: the header is just part of the struct's
+	# own layout, sized by the same sizeof(struct Foo) as every other field.
+	# Base-class fields (if any) come first, most-derived last - .attributes
+	# only ever holds a class's OWN declared fields (discovery.py never
+	# merges a base's own attributes in), so the base chain has to be
+	# walked and flattened here.
+	chain: list[RCClass] = []
+	node: RCClass|None = cls
+	while node is not None:
+		chain.append( node )
+		node = node.base
+	attrs: list[tuple[str,Type]] = []
+	for base_cls in reversed( chain ):
+		attrs.extend( ( attr.stem, attr.type ) for attr in base_cls.attributes )
+	name = mangle_type( cls )
+	lines = [ f'struct {name} {{', '\tObjectHeader header;' ]
+	for field_name, field_type in attrs:
+		lines.append( f'\t{c_type(field_type)} {field_name};' )
+	lines.append( '};' )
+	return '\n'.join( lines )
 
 def emit_cstruct( cls: CStruct ) -> str:
 	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]

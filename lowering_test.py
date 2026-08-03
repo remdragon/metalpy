@@ -1,6 +1,7 @@
 # stdlib imports:
 import logging
 from pathlib import Path
+import queue as queue_module
 import unittest
 
 # local imports:
@@ -8,7 +9,7 @@ from compiler import Compiler, LoweredFunction
 from discovery import Discovery
 from errors import CompileError
 import ir
-from mpy_types import Variable, Specialization
+from mpy_types import Variable, Specialization, Function
 
 logger = logging.getLogger( __name__ )
 
@@ -2074,7 +2075,12 @@ class Tests( unittest.TestCase ):
 		self.compiler._lower( foo_fn )
 		self.assertIn( 'unbound generic type parameter', self.discovery.errors.errors[0] )
 
-	def test_compiler_sizeof_class_is_not_yet_supported( self ) -> None:
+	def test_compiler_sizeof_rcclass_emits_sizeof_instruction( self ) -> None:
+		# unlike an intrinsic scalar (folds straight to ir.Const - no
+		# field-layout algorithm exists in this compiler, nor should one -
+		# that's the C compiler's own job), a real class-like type stays a
+		# genuine ir.SizeOf instruction, letting the emitter defer to a
+		# literal C `sizeof(...)` expression
 		code = '\n'.join([
 			'class Foo: pass',
 			'',
@@ -2082,9 +2088,15 @@ class Tests( unittest.TestCase ):
 			'	x: usize = compiler.sizeof( Foo )',
 			'	return',
 		])
-		self._import( code )
-		self._lower_main()
-		self.assertIn( 'is not supported yet', self.discovery.errors.errors[0] )
+		mod = self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		sizeofs = [ i for i in fn.instructions if isinstance( i, ir.SizeOf ) ]
+		self.assertEqual( len( sizeofs ), 1 )
+		foo_cls = mod.get_local( 'Foo' )
+		self.assertIs( sizeofs[0].type, foo_cls )
+		usize = self.discovery.get_intrinsics()['usize']
+		self.assertIs( sizeofs[0].dest.type, usize )
 
 	# --- compiler.refcount(x) ---------------------------------------------------
 
@@ -2581,6 +2593,44 @@ class Tests( unittest.TestCase ):
 			ir.DeleteTemp( temp = t0 ),
 			ir.FuncEnd( name = make_fn.qualname ),
 		])
+
+	def test_rcclass_allocate_schedules_sys_alloc_specialization( self ) -> None:
+		# an RCClass's own memory must come through the SAME allocation path
+		# every other real allocation in the language goes through -
+		# sys.alloc[T] - not an emitter-invented allocator (explicit user
+		# decision, see the plan's Context section). This guarantees
+		# sys.alloc[Foo] is a real, schedulable compile unit by the time the
+		# emitter needs to independently synthesize a call to it. Unlike
+		# test_allocate_emits_allocate_instruction (a @cstruct - no header/
+		# allocator involved at all), Foo here is a plain (RCClass) class
+		code = '\n'.join([
+			'class Foo:',
+			'	x: i32',
+			'',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Foo:',
+			'		return Foo.__allocate__( x = v )',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		self.compiler._lower( make_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		queued = []
+		while True:
+			try:
+				queued.append( self.compiler.queue.get_nowait() )
+			except queue_module.Empty:
+				break
+		alloc_specs = [
+			u for u in queued
+			if isinstance( u, Specialization ) and isinstance( u.base, Function ) and u.base.qualname == 'sys.alloc'
+		]
+		self.assertEqual( len( alloc_specs ), 1 )
+		self.assertEqual( alloc_specs[0].args, [ foo_cls ] )
 
 	def test_allocate_dest_type_uses_expected_type_when_given( self ) -> None:
 		# res: Foo[i32] = Foo.__allocate__(...) - the annotation's

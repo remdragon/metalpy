@@ -257,5 +257,14 @@ class AddrOfTests( IRTestCase ):
 		self.assertEqual( addrof.test_repr(), f'AddrOf( dest={dest!r}, value={local!r} )' )
 		self.assertIs( addrof.value, local )
 
+class SizeOfTests( IRTestCase ):
+	def test_sizeof_repr_and_equality( self ) -> None:
+		usize = _scalar( 'usize' )
+		dest = ir.Temp( type = usize, id = 0 )
+		sizeof = ir.SizeOf( dest = dest, type = self.overflow_error )
+		self.assertEqual( sizeof, ir.SizeOf( dest = dest, type = self.overflow_error ))
+		self.assertEqual( sizeof.test_repr(), f"SizeOf( dest={dest!r}, type={self.overflow_error.qualname!r} )" )
+		self.assertIs( sizeof.type, self.overflow_error )
+
 if __name__ == '__main__':
 	unittest.main()
