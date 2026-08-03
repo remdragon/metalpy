@@ -1784,14 +1784,15 @@ class Lowering:
 	}
 
 	def _expr_Compare( self, node: ast.Compare, expected_type: Type|None ) -> ir.Operand:
-		# ast.Is/IsNot/In/NotIn are deliberately not handled here - `is`/
-		# `is not` are reserved for eventual tagged-union type narrowing
-		# (see TODO.txt's union disambiguation section: `if x is int:`),
-		# not a plain identity Cmp, and `in`/`not in` need a real container
-		# protocol that doesn't exist yet - guessing at either would bake in
-		# the wrong semantics
+		# ast.In/NotIn are deliberately not handled here - `in`/`not in`
+		# need a real container protocol that doesn't exist yet, guessing
+		# would bake in the wrong semantics. ast.Is/IsNot ARE handled (see
+		# _lower_is_comparison) - identity happens to coincide with value
+		# equality for every value kind this language has today
 		if len( node.ops ) != 1 or len( node.comparators ) != 1:
 			self.discovery.fail( f'chained comparisons are not yet supported: {ast.unparse(node)}', node )
+		if isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
+			return self._lower_is_comparison( node, negate = isinstance( node.ops[0], ast.IsNot ))
 		cmp_op = self._CMP_OPCODES.get( type( node.ops[0] ))
 		if cmp_op is None:
 			self.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
@@ -1815,6 +1816,48 @@ class Lowering:
 			right = self._lower_expr( right_node, None )
 
 		bool_cls = self.discovery.find_name( 'bool', node )
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
+		return dest
+
+	def _lower_is_comparison( self, node: ast.Compare, negate: bool ) -> ir.Operand:
+		# `is`/`is not` mean real Python identity - for every value kind
+		# this language has today (scalars, pointers, RC handles) identity
+		# coincides with value equality, so this is plain Cmp EQ/NE...
+		# UNLESS one side is a bare `None` literal being compared against a
+		# TaggedUnion-typed value (T|None, e.g. sys._alloc()'s
+		# Ptr[u8]|None) - there, "is None" means "the active member is
+		# NoneType", which needs a tag check (the same _tagged_union_storage
+		# machinery match statements/conditional dispatch already use), not
+		# a flat Cmp against a synthesized None operand of union type
+		# (which wouldn't correspond to any real runtime representation)
+		bool_cls = self.discovery.find_name( 'bool', node )
+		cmp_op = ir.CmpOp.NE if negate else ir.CmpOp.EQ
+		left_node, right_node = node.left, node.comparators[0]
+		left_is_none = isinstance( left_node, ast.Constant ) and left_node.value is None
+		right_is_none = isinstance( right_node, ast.Constant ) and right_node.value is None
+
+		if left_is_none and right_is_none:
+			return ir.Const( type = bool_cls, value = not negate ) # `None is None` / `None is not None` - degenerate, but not a crash
+
+		if left_is_none or right_is_none:
+			other = self._lower_expr( right_node if left_is_none else left_node, None )
+			if isinstance( other.type, TaggedUnion ):
+				none_member = next( ( attr for attr in other.type.attributes if attr.type is self.discovery.get_none_type() ), None )
+				if none_member is None:
+					self.discovery.fail( f'{other.type.qualname} has no None member: {ast.unparse(node)}', node )
+				tag_attr, _data_attr, _payload_cls, tags = self._tagged_union_storage( other.type )
+				tag_dest = self._new_temp( tag_attr.type )
+				self._emit( ir.GetAttr( dest = tag_dest, obj = other, attr = tag_attr.stem ))
+				dest = self._new_temp( bool_cls )
+				self._emit( ir.Cmp( dest = dest, op = cmp_op, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[none_member.stem] ) ))
+				return dest
+			dest = self._new_temp( bool_cls )
+			self._emit( ir.Cmp( dest = dest, op = cmp_op, left = other, right = ir.Const( type = other.type, value = None ) ))
+			return dest
+
+		left = self._lower_expr( left_node, None )
+		right = self._lower_expr( right_node, left.type )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
 		return dest

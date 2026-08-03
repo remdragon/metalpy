@@ -1152,19 +1152,61 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'chained comparisons are not yet supported', self.discovery.errors.errors[0] )
 
-	def test_compare_is_not_supported( self ) -> None:
-		# `is`/`is not` are reserved for eventual tagged-union type
-		# narrowing (see TODO.txt), not a plain identity comparison -
-		# deliberately left unsupported rather than guessed at
+	def test_compare_is_between_plain_values_is_identity_equality( self ) -> None:
+		# no distinct object-identity concept exists yet for scalars - `is`
+		# coincides with `==` for the value kinds this language has today
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
-			'	b: bool = a is None',
-			'	return',
+			'	b: bool = a is 1',
+			'	c: bool = a is not 1',
 		])
-		self._import( code )
-		self._lower_main()
-		self.assertIn( 'unsupported comparison operator', self.discovery.errors.errors[0] )
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
+		self.assertEqual( [ c.op for c in cmp_instrs ], [ ir.CmpOp.EQ, ir.CmpOp.NE ] )
+		self.assertFalse( any( isinstance( i, ir.GetAttr ) for i in lowered.instructions )) # plain scalars - no tag involved
+
+	def test_compare_is_none_on_tagged_union_emits_a_tag_check( self ) -> None:
+		# `x is None` where x: Foo|None (a real TaggedUnion, e.g.
+		# sys._alloc()'s Ptr[u8]|None) means "the active member is
+		# NoneType" - a tag check via the same _tagged_union_storage
+		# machinery match/conditional-dispatch already use, NOT a flat Cmp
+		# against a synthesized None operand of union type (which wouldn't
+		# correspond to any real runtime representation)
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def get() -> Foo|None:',
+			'	return None',
+			'',
+			'def main() -> None:',
+			'	x = get()',
+			'	b: bool = x is None',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		get_attr = next( i for i in lowered.instructions if isinstance( i, ir.GetAttr ) and i.attr == 'tag' )
+		x_var = mod.get_local( 'main' ).names['x']
+		self.assertIs( get_attr.obj, x_var ) # x is lowered exactly once, not re-evaluated
+		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
+		self.assertTrue( any( c.op == ir.CmpOp.EQ for c in cmp_instrs ))
+
+	def test_compare_is_not_none_on_tagged_union_uses_ne( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def get() -> Foo|None:',
+			'	return None',
+			'',
+			'def main() -> None:',
+			'	x = get()',
+			'	b: bool = x is not None',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
+		self.assertTrue( any( c.op == ir.CmpOp.NE for c in cmp_instrs ))
 
 	# --- boolean operators (and/or) -------------------------------------------
 

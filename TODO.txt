@@ -268,11 +268,9 @@ lowering:
 		functions, methods, AND (now) classes; only one of lib/sys.py's
 		memzero()/_alloc() windows-vs-non-windows bodies is ever lowered.
 		The bare `compiler.target.debug` if-condition part of that old note
-		WAS real and is now fixed by this pass. What's still genuinely open,
-		confirmed via the same `bytearray(4)` full-compile attempt,
-		unrelated to @compiler.target: `is`/`is not` comparison operators
-		aren't supported ("unsupported comparison operator: ptr is None" -
-		see "incorrect is usage" above).
+		WAS real and is now fixed by this pass (see also the separate
+		`is`/`is not` fix further down, resolving the other blocker this
+		same repro surfaced).
 	[resolved] lowering.py had no _stmt_ImportFrom/_stmt_Import handler at
 		all - any `from X import Y` (or bare `import X`) written inside a
 		function body (not just windows-specific FFI - lib/sys.py's
@@ -338,13 +336,37 @@ lowering:
 		case only references an always-available intrinsic (Ptr), so this
 		covers it; a fully general (deferred, forward-referencing) version
 		is future work if a real case ever needs one.
-		Verified end to end: the `bytearray(4)` repro now gets all the way
-		down to ONE remaining error - `is`/`is not` comparison operators
-		(lib/sys.py:16's `if ptr is None:`), already tracked above under
-		"incorrect is usage" - every other layer this repro has surfaced
-		since RCCLASS ATTRIBUTE LIFETIME.md (compiler.target filtering,
-		compile-time folding, local imports, @extern, TypeAlias) is now
-		resolved.
+		Verified end to end: the `bytearray(4)` repro then got down to ONE
+		remaining error - `is`/`is not` comparison operators (lib/sys.py:16's
+		`if ptr is None:`) - now also resolved, see below.
+	[resolved] `is`/`is not` comparison operators: _expr_Compare now handles
+		ast.Is/IsNot (previously deliberately unhandled - see the "incorrect
+		is usage" note above, which is a DIFFERENT, still-open issue: past
+		misuse of `is` for isinstance-style checks like `x is Foo`, which
+		still correctly fails today since a class name still isn't a valid
+		expression operand). For every value kind this language has today
+		(scalars, pointers, RC handles) identity coincides with value
+		equality, so plain `x is y` lowers as an ordinary Cmp EQ/NE - EXCEPT
+		comparing against a bare `None` literal when the other side's type
+		is a TaggedUnion (T|None, e.g. sys._alloc()'s Ptr[u8]|None): there,
+		`is None` means "the active member is NoneType", which needs a tag
+		check (the exact same _tagged_union_storage machinery match
+		statements/conditional dispatch already use - GetAttr the tag,
+		Cmp it against the NoneType member's tag value), not a flat Cmp
+		against a synthesized None operand of union type (which wouldn't
+		correspond to any real runtime representation - this was the
+		reason `is`/`is not` were left unimplemented in the first place).
+		Verified end to end: the `bytearray(4)` repro's `ptr is None` check
+		now lowers correctly and unblocks a lot more than that one line -
+		sys.panic()'s entire error-reporting path (previously unreachable)
+		now resolves and lowers too (_write_stderr_cstr, str.get_cstr,
+		str.byte_len, _exit_process, and their own windows/ntdll and
+		windows/kernel32 @extern dependencies). The repro now hits yet
+		ANOTHER, unrelated wall: `u32(-11)`-style scalar constructor calls
+		("cannot call u32" - lib/sys.py's _Stdout.write() and
+		lib/windows/kernel32.py's STD_OUTPUT_HANDLE etc. all do this) -
+		calling a builtin scalar type as a constructor/cast isn't supported
+		yet. Not chased here.
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion
