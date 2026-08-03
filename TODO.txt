@@ -1,3 +1,36 @@
+sys._Stdout.write():
+	these are just stubs, but there are real issues here that need to be solved
+	before we can create the real File I/O interfaces for stdlib
+	
+	1) Windows returns an u32 for bytes written, crt an isize
+	2) Windows refers to GetLastError() for failures, Linux errno
+	3) the comment Claude generated for "writing >4GB in one syscall
+	   isn't a real scenario" just isn't acceptable, especially since
+	   we can work around the issue without generating a panic. a user
+	   might create a very simple app to copy a video or iso or virtual
+	   machine disk image, and they may naively just read the entire file
+	   into memory (or memory map it), then tell the OS to write the whole
+	   thing out to its destination. So yes this is a real scenario even
+	   if it may not be an efficient way to accomplish what they want.
+	   an unnecessary panic or silently doing the wrong thing, is just
+	   bad engineering.
+	
+	What is the right way to create a cross-os design?
+	
+	1a) Do we just return a heavy int object for bytes written?
+		I don't like requiring a memory allocation here
+	1b) Do we always return a u32 (since errors are handled separately)
+		we can "cap" the numbers of bytes to write in the crt code
+		to the maximum value a u32 can represent
+	2) Do we loop until all bytes are written or an error occurs?
+		2a) users might want to implement their own loop retry logic
+			(do we need both high-level and low-level interfaces because of this)
+	3) Do we convert OS specific errors into metalpy native
+		errors that can represent OS's generically?
+			3a) a real problem with this is sometimes documentation lies
+				about what errors a function can generate.
+	4) how is it done elsewhere, how have others solved this problem?
+
 lowering:
 	CFG:
 
@@ -649,6 +682,45 @@ emitter:
 			on Windows, specifically exclude the crt unless an @extern( 'c', ... ) is compiled
 				(metalpy stdlib tries hard to avoid extern "c")
 		gcc on other
+
+	[resolved - phase 0 of C_EMITTER.md's design] emitter_c.py (new file):
+		phased implementation, plan at (session-local) declarative-greeting-
+		parnas.md - Phase 0 landed: mangle_qualname()/mangle_type() (name
+		mangling - dots -> $, generic Specialization brackets/commas ->
+		$$g$/$$/'', synthesized anonymous unions -> the doc's own $__u...
+		scheme, reverse-engineered precisely from its worked example - see
+		emitter_c.py's own docstring for why the doc's literal example is
+		stale on member ordering but the formula itself is verified
+		correct), c_type() (the full scalar/Ptr/ConstPtr/Move/Copy/RCClass/
+		CStruct/CUnion/TaggedUnion/CEnum -> C type-mapping table - i128/u128
+		map unconditionally to __int128/unsigned __int128 with no MSVC-
+		compatibility check, per explicit user decision - a program using
+		these against cl.exe fails to compile there on its own, same as any
+		other backend limitation), the 3-pass emission ordering skeleton,
+		and emit_function()/emit_c() covering just enough IR (FuncStart/
+		Return/FuncEnd) to compile an empty `main() -> None: pass`-shaped
+		program end-to-end through clang.exe (`-std=c11 -Wall -Wextra -c`,
+		confirmed zero errors/warnings).
+		Real, load-bearing discovery made during this phase (not just
+		scaffolding): discovery.py reserves the bare, unqualified name
+		'main' exclusively for the program's entry point ("there can be
+		only one" - discovery.py:994-995), regardless of which module
+		declares it - confirmed by a real compile attempt (my first
+		assumption, that main() gets an ordinary module-qualified qualname
+		like every other function, was wrong and caused a real clang error:
+		"'main' must return 'int'" when the emitted C tried to declare it
+		`void`). This means metalpy's main() is meant to become C's own
+		real `int main(void)` entry point DIRECTLY - no trampoline needed.
+		emit_function() special-cases this: the entry point's C signature
+		is always `int main(void)` regardless of its declared metalpy
+		return type (-> None), and a bare `return;`/fall-through becomes
+		`return 0;`. Every other function keeps its ordinary declared
+		return type and module-qualified, mangled name.
+		Next: Phase 1 (scalars, control flow, arithmetic incl. Result-
+		consuming ops, plain calls) - see the plan file for the full
+		phase breakdown and the remaining phases (RCClass/sys.alloc[T]
+		construction, __del__ synthesis, TaggedUnion, @extern/AddrOf/
+		string literals, module globals).
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
