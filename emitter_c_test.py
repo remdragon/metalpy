@@ -826,6 +826,33 @@ class RCClassConstructTests( RCClassTestCase ):
 		self.assertIn( 'ObjectHeader $header;', struct_src )
 		self.assertIn( 'int32_t x;', struct_src )
 
+	def test_init_construction_schedules_sys_alloc_for_the_constructed_class( self ) -> None:
+		# regression test: _try_lower_construct_call's own ir.Allocate (the
+		# real __init__ path, as opposed to _lower_allocate_fields's field=
+		# value sugar above) never scheduled sys.alloc[TargetClass]/sys.free/
+		# __del__ at all - confirmed via a full compiler.run(), sys.alloc[Bar]
+		# was simply absent from compiler.functions, only sys.alloc[Foo] (the
+		# unrelated field sub-expression, which DOES go through
+		# _lower_allocate_fields) showed up
+		self._run( '\n'.join([
+			'class Foo: pass',
+			'class Bar:',
+			'	a: Foo',
+			'	def __init__( self, x: Foo ) -> None:',
+			'		self.a = x',
+			'',
+			'def main() -> None:',
+			'	b = Bar( Foo() )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		alloc_specializations = [
+			f.function.qualname for f in self.compiler.functions
+			if f.function.qualname.startswith( 'sys.alloc[' )
+		]
+		self.assertIn( 'sys.alloc[__main__.Bar]', alloc_specializations )
+		self.assertIn( 'sys.alloc[__main__.Foo]', alloc_specializations )
+
 	def test_user_field_named_header_does_not_collide( self ) -> None:
 		# the automatic ObjectHeader member is named $header, not header -
 		# '$' can never appear in a real metalpy identifier, so a user class
@@ -1026,6 +1053,26 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 			'	rc: usize = compiler.refcount( bar )',
 			'	with compiler.wrap_arithmetic:',
 			'		return bar.x',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_init_construction_compiles( self ) -> None:
+		# real-compile confirmation for the sys.alloc/free/__del__ scheduling
+		# fix in _try_lower_construct_call (see RCClassConstructTests'
+		# identical-purpose, IR-level test) - a real __init__ (not the
+		# __allocate__ field=value sugar every other fixture in this class
+		# uses) must actually emit clang-clean C, not just schedule the
+		# right compile units
+		self._run( '\n'.join([
+			'class Foo: pass',
+			'class Bar:',
+			'	a: Foo',
+			'	def __init__( self, x: Foo ) -> None:',
+			'		self.a = x',
+			'',
+			'def main() -> None:',
+			'	b = Bar( Foo() )',
+			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 

@@ -2400,34 +2400,40 @@ class Lowering:
 		# own monomorphized return type; nothing else would ever schedule it
 		self.schedule( dest.type )
 		if isinstance( target_cls, RCClass ):
-			# guarantees sys.alloc[dest.type] is a real, lowered compile unit
-			# by the time the emitter sees this ir.Allocate - the emitter
-			# independently synthesizes the call to it (mangled qualname,
-			# same convention as everything else), so this has to actually
-			# exist regardless of whether the user's own program ever wrote
-			# `import sys` (same posture as _resolve_sys_function's own doc)
-			sys_alloc_fn = self._resolve_sys_function( 'alloc' )
-			alloc_spec = self.discovery._get_or_create_specialization( sys_alloc_fn, [ dest.type ])
-			self.schedule( alloc_spec )
-			# every constructed RCClass needs its own destructor eventually
-			# synthesized by the emitter (emit_c walks compiler.rcclasses,
-			# one destructor function per entry - see emitter_c.py's Phase 4
-			# work) - that destructor calls sys.free on the object's own
-			# backing memory and, if the class declares one, the user's own
-			# __del__ - both need to already be real, lowered compile units
-			# by the time the emitter needs to call them. Triggered at
-			# CONSTRUCTION time (same as sys.alloc above), not merely when
-			# the class is referenced as a type - scheduling this for every
-			# bare type annotation would drag in sys.free's own transitive
-			# dependencies (real HeapFree/crt free externs) for classes that
-			# are never actually instantiated
-			sys_free_fn = self._resolve_sys_function( 'free' )
-			self.schedule( sys_free_fn )
-			del_fn = target_cls.get_local( '__del__' ) # target_cls is always the abstract base - methods aren't re-specialized per Specialization (Specialization.names passes through to .base.names)
-			if isinstance( del_fn, Function ):
-				self.schedule( del_fn )
+			self._schedule_rcclass_construction( target_cls, dest.type )
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
 		return dest
+
+	def _schedule_rcclass_construction( self, target_cls: RCClass, concrete_type: Type ) -> None:
+		# guarantees sys.alloc[concrete_type] is a real, lowered compile unit
+		# by the time the emitter sees the resulting ir.Allocate - the
+		# emitter independently synthesizes the call to it (mangled
+		# qualname, same convention as everything else), so this has to
+		# actually exist regardless of whether the user's own program ever
+		# wrote `import sys` (same posture as _resolve_sys_function's own
+		# doc). Shared by _lower_allocate_fields (the no-__init__/field=value
+		# path) and _try_lower_construct_call (the real __init__ path) -
+		# both eventually emit an ir.Allocate for a real RCClass and need
+		# identical scheduling
+		sys_alloc_fn = self._resolve_sys_function( 'alloc' )
+		alloc_spec = self.discovery._get_or_create_specialization( sys_alloc_fn, [ concrete_type ])
+		self.schedule( alloc_spec )
+		# every constructed RCClass needs its own destructor eventually
+		# synthesized by the emitter (emit_c walks compiler.rcclasses, one
+		# destructor function per entry - see emitter_c.py's Phase 4 work) -
+		# that destructor calls sys.free on the object's own backing memory
+		# and, if the class declares one, the user's own __del__ - both need
+		# to already be real, lowered compile units by the time the emitter
+		# needs to call them. Triggered at CONSTRUCTION time (same as
+		# sys.alloc above), not merely when the class is referenced as a
+		# type - scheduling this for every bare type annotation would drag
+		# in sys.free's own transitive dependencies (real HeapFree/crt free
+		# externs) for classes that are never actually instantiated
+		sys_free_fn = self._resolve_sys_function( 'free' )
+		self.schedule( sys_free_fn )
+		del_fn = target_cls.get_local( '__del__' ) # target_cls is always the abstract base - methods aren't re-specialized per Specialization (Specialization.names passes through to .base.names)
+		if isinstance( del_fn, Function ):
+			self.schedule( del_fn )
 
 	def _try_lower_allocate_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
 		# Class.__allocate__(field=value, ...) - a compiler-synthesized
@@ -2495,6 +2501,7 @@ class Lowering:
 		self._ensure_resolved( init )
 
 		self_temp = self._new_temp( target_cls )
+		self._schedule_rcclass_construction( target_cls, self_temp.type )
 		self._emit( ir.Allocate( dest = self_temp, cls = target_cls, fields = {} ))
 
 		positional, keyword = self._match_call_args( init, node )
