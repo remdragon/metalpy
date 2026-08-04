@@ -601,10 +601,14 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 	if isinstance( instr, ir.Incref ):
 		return [ f'\tretain_object( &({_emit_operand(instr.value)})->$header );' ]
 	if isinstance( instr, ir.Decref ):
-		# NULL destructor for now - not leak-free by design yet (Phase 4
-		# wires in the real one: the user's own __del__ plus cascading
-		# decref for any RC-typed fields)
-		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header, NULL );' ]
+		# instr.value.type is always concrete RCClass-typed by the time the
+		# emitter sees a bare Decref (cfg.py's own union-handling already
+		# expands any TaggedUnion-typed Incref/Decref into a tag-gated
+		# GetAttr+Cmp+Jump*+Incref/Decref sequence at the IR level - see the
+		# plan's grounding facts) - its own synthesized destructor (see
+		# emit_rcclass_destructor) is always the right one to reference
+		destructor_name = _rcclass_destructor_name( instr.value.type )
+		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header, {destructor_name} );' ]
 	if isinstance( instr, ir.RefCount ):
 		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.value)})->$header.ref_count;' ]
 
@@ -615,7 +619,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 			# an emitter-invented allocator (explicit user decision - see
 			# the plan's Context section). lowering.py's _lower_allocate_
 			# fields already guarantees this exact Specialization is
-			# scheduled+lowered (Lowering._resolve_sys_alloc) - its mangled
+			# scheduled+lowered (Lowering._resolve_sys_function('alloc')) - its mangled
 			# qualname is built the same way discovery._get_or_create_
 			# specialization builds every Specialization's own qualname
 			# (base.qualname + bracketed, comma-joined arg qualnames), so
@@ -654,7 +658,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 		return _emit_or_jump( instr )
 	if isinstance( instr, ir.Unwrap ):
 		# instr.panic is a real, already-resolved sys.panic Function
-		# reference (see ir.Unwrap's own docstring / Lowering._resolve_sys_panic)
+		# reference (see ir.Unwrap's own docstring / Lowering._resolve_sys_function)
 		# - this module has zero special knowledge of "panic", it just calls
 		# whatever Function the IR handed it, the same as any other ir.Call
 		value = _emit_operand( instr.value )
@@ -739,6 +743,60 @@ def emit_rcclass( cls: RCClass ) -> str:
 	for field_name, field_type in attrs:
 		lines.append( f'\t{c_type(field_type)} {field_name};' )
 	lines.append( '};' )
+	return '\n'.join( lines )
+
+def _rcclass_destructor_name( cls: Type ) -> str:
+	# $$ (not a single $) - a single $ is exactly what mangle_qualname's own
+	# '.'->'$' rule would ALSO produce for a real user method named e.g.
+	# __destructor__ (class Foo: def __destructor__(self): ... mangles to
+	# ...Foo$__destructor__, a genuine one-$ collision) - since no real
+	# dotted qualname ever mangles to two CONSECUTIVE '$' from a plain
+	# (non-generic-bracket) suffix, $$ is what actually guarantees this
+	# can't collide with any real declared method, the same spirit as
+	# emit_rcclass's own $header
+	return f'{mangle_type(cls)}$$__destructor__'
+
+def emit_rcclass_destructor( cls: RCClass ) -> str:
+	# the void(*)(void*) release_object needs - pure emitter-side synthesis
+	# (no compiler stage recognizes __del__ specially, and there's no IR
+	# stream backing a synthesized destructor body - this module has to
+	# build the C text directly, unlike every other emit_* function here).
+	# Order: the class's own __del__ runs FIRST (as an ordinary function
+	# call, not inlined - fields are still fully valid at this point),
+	# THEN cascading decref into directly RC-typed fields (base fields
+	# before derived, matching emit_rcclass's own field ordering), THEN
+	# sys.free on the object's own backing memory.
+	name = _rcclass_destructor_name( cls )
+	ctype = c_type( cls )
+	lines = [
+		f'static void {name}( void* __obj ) {{',
+		f'\t{ctype} self = ({ctype})__obj;',
+	]
+	del_fn = cls.get_local( '__del__' )
+	if isinstance( del_fn, Function ):
+		lines.append( f'\t{mangle_qualname(del_fn.qualname)}( self );' )
+	chain: list[RCClass] = []
+	node: RCClass|None = cls
+	while node is not None:
+		chain.append( node )
+		node = node.base
+	for base_cls in reversed( chain ):
+		for attr in base_cls.attributes:
+			field_base = attr.type.base if isinstance( attr.type, Specialization ) else attr.type
+			if not isinstance( field_base, RCClass ):
+				# a TaggedUnion-typed field with RC leaves needs the same
+				# tag-gated shape cfg.py builds at the IR level, not handled
+				# here yet (TaggedUnion emission itself is later-phase work -
+				# see emit_tagged_union) - same "compiles clean, not
+				# necessarily leak-free yet" posture Phase 3 already
+				# established for the NULL-destructor placeholder this
+				# function replaces
+				continue
+			field_destructor = _rcclass_destructor_name( attr.type )
+			lines.append( f'\trelease_object( &(self->{attr.stem})->$header, {field_destructor} );' )
+	sys_free_name = mangle_qualname( 'sys.free' )
+	lines.append( f'\t{sys_free_name}( ( void* )self );' )
+	lines.append( '}' )
 	return '\n'.join( lines )
 
 def emit_cstruct( cls: CStruct ) -> str:
@@ -832,16 +890,30 @@ def emit_c( compiler: Compiler ) -> str:
 	parts.extend( _emit_value_type_bodies( compiler ))
 	for lf in compiler.functions:
 		parts.append( emit_function( lf, prototype_only = True ))
+	# a destructor is referenced by NAME (a function pointer value passed to
+	# release_object), never just called directly - unlike a struct tag,
+	# that needs a real prototype in scope first, and unlike an ordinary
+	# Function, nothing else already provides one (destructors have no
+	# backing Function/LoweredFunction entry at all - pure emitter-side
+	# synthesis, see emit_rcclass_destructor)
+	for cls in compiler.rcclasses:
+		if not cls.type_params:
+			parts.append( f'static void {_rcclass_destructor_name(cls)}( void* obj );' )
 
 	# pass 2: full RCClass struct bodies (every other tag already exists)
 	for cls in compiler.rcclasses:
 		if not cls.type_params:
 			parts.append( emit_rcclass( cls ))
 
-	# pass 3: global definitions, then full function bodies
+	# pass 3: global definitions, then full function bodies, then
+	# destructor bodies (need the struct's own full definition from pass 2
+	# to dereference self->field)
 	for g in compiler.globals:
 		parts.append( emit_global( g ))
 	for lf in compiler.functions:
 		parts.append( emit_function( lf ))
+	for cls in compiler.rcclasses:
+		if not cls.type_params:
+			parts.append( emit_rcclass_destructor( cls ))
 
 	return '\n\n'.join( part for part in parts if part ) + '\n'

@@ -1,14 +1,3 @@
-Explore how we avoid a conflict when an RCClass defines a 'header' attribute,
-we need to make sure that doesn't conflict with RCClass's automatic ObjectHeader.
-	Maybe we need to rename it to $header?
-
-	[resolved] emit_rcclass() now emits the automatic member as $header, not
-		header - '$' can never appear in a real metalpy identifier (not a
-		legal character there), so a user class field literally named
-		`header` can no longer collide with it. Every emitter_c.py site that
-		reads/writes it (ir.Allocate/Incref/Decref/RefCount) updated to
-		match. Test: emitter_c_test.py's test_user_field_named_header_does_
-		not_collide (a class Foo: header: i32 constructs/compiles clean).
 
 lowering's _resolve_sys_panic and _resolve_sys_alloc() exhibit multiple design
 	flaws. 1) they are also almost identical in their implementation.
@@ -18,6 +7,16 @@ lowering's _resolve_sys_panic and _resolve_sys_alloc() exhibit multiple design
 lowering's lower_function() and lower_global() have a large
 	amount of shared initialization that need to happen. This
 	shared initialization needs to be moved to a helper function
+
+lowering's lower_function is still using _needs_epilogue and _epilogue_label.
+	It mistakenly emits jumps to _epilogue_label in a couple places when it
+	should jump to self._cfg.current_epilogue_label() which should return
+	the label from it's _epilogue_stack[-1] or None if there's no epilogue
+	yet.
+	* also, _function_needs_epilogue() comment is wrong, an early return
+	in a function might not need an epilogue, but a later one might. This
+	whole function needs to go away because CFG is now the holder of truth
+	for this at any moment.
 
 review how Claude generates C code from local variables, I think emitter_c.py
 might be doing too much work. We may need new IR to tell the emitter when to
@@ -1010,6 +1009,67 @@ emitter:
 			clang -std=c11 -Wall -Wextra -c. Full suite: 457 tests, 0
 			failures.
 		Next: Phase 4 (__del__/destructor synthesis) - see the plan file.
+
+	[resolved] Phase 4: __del__/destructor synthesis. Pure emitter-side
+		synthesis - no compiler stage recognizes __del__ specially, and
+		there's no IR stream backing a synthesized destructor body (unlike
+		every other emit_* function in emitter_c.py, which translates a
+		real IR/Function/ClassLike object). For each non-generic RCClass in
+		compiler.rcclasses, emit_rcclass_destructor() builds a
+		`static void <mangled>$$__destructor__( void* obj )` function
+		(named with $$, not a single $ - a single $ is exactly what a real
+		user method named __destructor__ would ALSO mangle to; no real
+		dotted qualname ever produces two consecutive $ from a plain
+		non-generic suffix, so $$ is what actually guarantees no collision,
+		same spirit as $header): casts obj to the real struct pointer type,
+		calls the class's own __del__ FIRST if declared (as an ordinary
+		function call, not inlined - fields are still fully valid at this
+		point), THEN cascades a decref into every directly RC-typed field
+		(base fields before derived, referencing each field class's own
+		destructor by name), THEN calls sys.free on the object's own
+		backing memory. release_object's own call sites (ir.Decref) now
+		reference the value's real destructor instead of the Phase 3 NULL
+		placeholder. Destructor prototypes are forward-declared in pass 1
+		(referenced as a function-pointer VALUE, not just called - needs a
+		prototype in scope, unlike a struct tag); bodies land in pass 3
+		(need the struct's own full definition from pass 2 to dereference
+		self->field).
+		KNOWN GAP (documented, not chased this phase): a TaggedUnion-typed
+		field with RC leaves needs the same tag-gated shape cfg.py builds
+		at the IR level - skipped for now (TaggedUnion emission itself,
+		emit_tagged_union, is still Phase 5 work) - same "compiles clean,
+		not necessarily leak-free yet" posture Phase 3's own NULL-
+		destructor placeholder already established. Nested RC content
+		inside a by-value CStruct/CUnion field is similarly out of scope.
+		Prerequisites (lowering.py):
+		- refactored _resolve_sys_panic/_resolve_sys_alloc (near-identical
+			implementations, flagged as a design flaw) into one shared
+			_resolve_sys_function(name) helper backed by a dict cache.
+		- _lower_allocate_fields's RCClass branch now ALSO schedules
+			sys.free and the class's own __del__ (if declared) at
+			CONSTRUCTION time, right next to the existing sys.alloc
+			scheduling - NOT merely whenever the class is referenced as a
+			type (tried that first: compiler.py's _lower, where an RCClass
+			becomes a compile unit, seemed like the natural single choke
+			point, but it fires for every bare type annotation too, even
+			one that's never actually constructed - a real test regression
+			surfaced this: scheduling sys.free's own transitive real-lib
+			dependencies (HeapFree/GetProcessHeap) for a `class int: pass`
+			fixture that's never instantiated inflated an unrelated
+			overload-dispatch test's expected function count from 2 to 5).
+			Construction-time scheduling avoids this: any RC-typed field's
+			value is only ever reachable by having been constructed (or
+			aliased from something constructed) somewhere in the program,
+			so cascading-decref's own destructor references are always
+			backed by a real, scheduled destructor by the time the emitter
+			needs them.
+		Verified end to end via clang -std=c11 -Wall -Wextra -c: a class
+			with a user __del__ freeing an owned Ptr[None] (proving __del__
+			runs before sys.free), and a class with an RC-typed field and
+			no user __del__ (proving cascading decref alone). Full suite:
+			462 tests, 0 failures.
+		Next: Phase 5 (TaggedUnion - real @union and synthesized,
+			NoneType-as-member) - see the plan file.
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml

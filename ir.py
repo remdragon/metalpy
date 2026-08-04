@@ -208,7 +208,7 @@ class Unwrap( Instruction ): # Result.unwrap(errmsg): Err -> panic(errmsg); Ok -
 	# the resolved sys.panic(message: str) -> NoReturn to call on the Err
 	# branch - a real Function reference (same posture as Call.target),
 	# not a name an emitter has to know/invent on its own. Populated by
-	# lowering.py's _consume_checked_result via Lowering._resolve_sys_panic
+	# lowering.py's _consume_checked_result via Lowering._resolve_sys_function
 	panic: Function
 
 	def test_repr( self ) -> str:

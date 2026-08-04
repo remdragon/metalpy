@@ -653,7 +653,7 @@ class Tests( unittest.TestCase ):
 			result_cls.resolve()
 		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
 		# panic_arithmetic's Unwrap calls the REAL sys.panic - not an
-		# emitter-invented hook (see ir.Unwrap.panic / Lowering._resolve_sys_panic)
+		# emitter-invented hook (see ir.Unwrap.panic / Lowering._resolve_sys_function)
 		panic_fn = self.discovery.import_name( 'sys' ).get_local( 'panic' )
 
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 10, type = i32 )

@@ -436,7 +436,7 @@ def main() -> None:
 # it says: RCClass layout + the sys.alloc[T] calling convention, not "make
 # the entire current (and still actively evolving - see TODO.txt) real
 # stdlib compile."
-_SYS_ALLOC_FIXTURE = '\n'.join([
+_SYS_FIXTURE = '\n'.join([
 	'def alloc[T]( count: usize ) -> Ptr[T]:',
 	'	with compiler.wrap_arithmetic:', # sidesteps needing a Result[usize,OverflowError] fixture - default Check mode isn't what this phase is testing
 	'		byte_count: usize = count * compiler.sizeof( T )',
@@ -445,6 +445,13 @@ _SYS_ALLOC_FIXTURE = '\n'.join([
 	"@extern( 'c', '_metalpy_test_alloc' )", # a fictitious symbol name - avoids any collision with clang's own builtin knowledge of real allocator names like malloc
 	'def _test_raw_alloc[T]( size: usize ) -> Ptr[T]:',
 	'	...',
+	'',
+	'def free( ptr: Ptr[None] ) -> None:',
+	'	_test_raw_free( ptr )',
+	'',
+	"@extern( 'c', '_metalpy_test_free' )",
+	'def _test_raw_free( ptr: Ptr[None] ) -> None:',
+	'	...',
 ])
 
 class RCClassTestCase( CompilerTestCase ):
@@ -452,7 +459,7 @@ class RCClassTestCase( CompilerTestCase ):
 		self._tmpdir = tempfile.TemporaryDirectory()
 		self.addCleanup( self._tmpdir.cleanup )
 		tmp_path = Path( self._tmpdir.name )
-		( tmp_path / 'sys.py' ).write_text( _SYS_ALLOC_FIXTURE, encoding = 'utf-8' )
+		( tmp_path / 'sys.py' ).write_text( _SYS_FIXTURE, encoding = 'utf-8' )
 		self.discovery = Discovery( paths = [ tmp_path ], import_builtins = False )
 		self.compiler = Compiler( self.discovery )
 
@@ -507,6 +514,82 @@ class RCClassConstructTests( RCClassTestCase ):
 		struct_src = emitter_c.emit_rcclass( foo_cls )
 		self.assertIn( 'ObjectHeader $header;', struct_src )
 		self.assertIn( 'int32_t header;', struct_src )
+
+_OWNER_FIXTURE = '\n'.join([
+	'import sys',
+	'',
+	'class Owner:',
+	'	ptr: Ptr[None]',
+	'',
+	'	@staticmethod',
+	'	def make( p: Ptr[None] ) -> Owner:',
+	'		return Owner.__allocate__( ptr = p )',
+	'',
+	'	def __del__( self ) -> None:',
+	'		sys.free( self.ptr )',
+])
+
+_BOX_FIXTURE = _FOO_FIXTURE + '\n' + '\n'.join([
+	'',
+	'class Box:',
+	'	inner: Foo',
+	'',
+	'	@staticmethod',
+	'	def make( f: Foo ) -> Box:',
+	'		return Box.__allocate__( inner = f )',
+])
+
+class RCClassDestructorTests( RCClassTestCase ):
+	def test_del_method_is_called_from_synthesized_destructor( self ) -> None:
+		self._run( _OWNER_FIXTURE + '\n' + '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 0',
+			'	p: Ptr[None] = compiler.addrof( x )',
+			'	o: Owner = Owner.make( p )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		owner_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Owner' )
+		destructor_src = emitter_c.emit_rcclass_destructor( owner_cls )
+		self.assertIn( '__main__$Owner$__del__( self );', destructor_src )
+		self.assertIn( 'sys$free( ( void* )self );', destructor_src )
+		# __del__ runs BEFORE sys.free - fields must still be valid when it runs
+		self.assertLess( destructor_src.index( '__del__' ), destructor_src.index( 'sys$free' ))
+
+	def test_rcclass_field_cascades_decref_with_no_user_del( self ) -> None:
+		self._run( _BOX_FIXTURE + '\n' + '\n'.join([
+			'def main() -> None:',
+			'	f: Foo = Foo.make( 1 )',
+			'	b: Box = Box.make( f )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		box_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Box' )
+		destructor_src = emitter_c.emit_rcclass_destructor( box_cls )
+		self.assertNotIn( '__del__', destructor_src ) # Box declares none
+		self.assertIn( 'release_object( &(self->inner)->$header, __main__$Foo$$__destructor__ );', destructor_src )
+		self.assertIn( 'sys$free( ( void* )self );', destructor_src )
+
+@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
+	def test_del_method_compiles( self ) -> None:
+		self._run( _OWNER_FIXTURE + '\n' + '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 0',
+			'	p: Ptr[None] = compiler.addrof( x )',
+			'	o: Owner = Owner.make( p )',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_rcclass_field_cascading_decref_compiles( self ) -> None:
+		self._run( _BOX_FIXTURE + '\n' + '\n'.join([
+			'def main() -> None:',
+			'	f: Foo = Foo.make( 1 )',
+			'	b: Box = Box.make( f )',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 @unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
 class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):

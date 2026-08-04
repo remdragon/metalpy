@@ -158,50 +158,33 @@ class Lowering:
 		# independently rediscover/synthesize one, it just walks
 		# compiler.cstructs/.cunions/.tagged_unions/.rcclasses like anything else
 		self._monomorphized_classes: dict[int,ClassLike] = {}
-		# resolved lazily, the first time panic_arithmetic mode's Unwrap
-		# actually needs it (see _consume_checked_result) - cached so a
-		# program using panic_arithmetic in multiple places only resolves
-		# sys.panic once
-		self._sys_panic_fn: Function|None = None
-		# same discipline as _sys_panic_fn - resolved lazily the first time
-		# an RCClass gets constructed (see _lower_allocate_fields's RCClass
-		# branch)
-		self._sys_alloc_fn: Function|None = None
+		# resolved lazily, the first time something actually needs a given
+		# real sys.<name> library function (sys.panic for panic_arithmetic's
+		# Unwrap, sys.alloc/sys.free for RCClass construction/destruction) -
+		# cached per name so a program needing the same one in multiple
+		# places only resolves it once (see _resolve_sys_function)
+		self._sys_functions: dict[str,Function] = {}
 
-	def _resolve_sys_panic( self ) -> Function:
-		# ir.Unwrap's Err branch needs to actually call something to
-		# terminate the program - that's sys.panic(message: str) -> NoReturn,
-		# a REAL library function, not an emitter-invented hook (an emitter
-		# has no business deciding what "panic" means - that's a language/
-		# stdlib decision, made here). Reached via discovery.import_name(...)
-		# rather than a user-namespace lookup, mirroring how Discovery.
-		# __init__ already force-imports 'builtins' regardless of whether
-		# user code ever imports it - a program using panic_arithmetic
-		# shouldn't need its own `import sys` for this to work
-		if self._sys_panic_fn is None:
-			module = self.discovery.import_name( 'sys' )
-			fn = module.get_local( 'panic' )
-			assert isinstance( fn, Function ), f'sys.panic is required by panic_arithmetic but was not found: {fn!r}'
-			if fn.resolve is not None:
-				fn.resolve()
-			self._sys_panic_fn = fn
-		return self._sys_panic_fn
-
-	def _resolve_sys_alloc( self ) -> Function:
-		# an RCClass's own memory comes from the SAME allocation path every
-		# other real allocation in the language already goes through -
-		# sys.alloc[T](count: usize) -> Ptr[T] - not a separate/parallel
-		# allocator the emitter invents for RCClass alone (this was an
-		# explicit user decision - see the plan's Context section). Reached
-		# via discovery.import_name(...), same posture as _resolve_sys_panic
-		if self._sys_alloc_fn is None:
-			module = self.discovery.import_name( 'sys' )
-			fn = module.get_local( 'alloc' )
-			assert isinstance( fn, Function ), f'sys.alloc is required for RCClass construction but was not found: {fn!r}'
-			if fn.resolve is not None:
-				fn.resolve()
-			self._sys_alloc_fn = fn
-		return self._sys_alloc_fn
+	def _resolve_sys_function( self, name: str ) -> Function:
+		# every place stage 2 needs to call into a REAL stdlib function
+		# rather than inventing emitter-side behavior goes through here -
+		# an emitter has no business deciding what "panic" or "how memory
+		# gets freed" means, that's a language/stdlib decision, made here.
+		# Reached via discovery.import_name(...) rather than a user-
+		# namespace lookup, mirroring how Discovery.__init__ already force-
+		# imports 'builtins' regardless of whether user code ever imports
+		# it - a program needing one of these shouldn't need its own
+		# `import sys` for it to work
+		cached = self._sys_functions.get( name )
+		if cached is not None:
+			return cached
+		module = self.discovery.import_name( 'sys' )
+		fn = module.get_local( name )
+		assert isinstance( fn, Function ), f'sys.{name} is required but was not found: {fn!r}'
+		if fn.resolve is not None:
+			fn.resolve()
+		self._sys_functions[name] = fn
+		return fn
 
 	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
 		module = self._find_module_for( fn )
@@ -1828,7 +1811,7 @@ class Lowering:
 			else:
 				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
 		else:
-			panic_fn = self._resolve_sys_panic()
+			panic_fn = self._resolve_sys_function( 'panic' )
 			self.schedule( panic_fn )
 			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra, panic = panic_fn ))
 		return unwrapped
@@ -2492,10 +2475,27 @@ class Lowering:
 			# independently synthesizes the call to it (mangled qualname,
 			# same convention as everything else), so this has to actually
 			# exist regardless of whether the user's own program ever wrote
-			# `import sys` (mirrors _resolve_sys_panic's identical posture)
-			sys_alloc_fn = self._resolve_sys_alloc()
+			# `import sys` (same posture as _resolve_sys_function's own doc)
+			sys_alloc_fn = self._resolve_sys_function( 'alloc' )
 			alloc_spec = self.discovery._get_or_create_specialization( sys_alloc_fn, [ dest.type ])
 			self.schedule( alloc_spec )
+			# every constructed RCClass needs its own destructor eventually
+			# synthesized by the emitter (emit_c walks compiler.rcclasses,
+			# one destructor function per entry - see emitter_c.py's Phase 4
+			# work) - that destructor calls sys.free on the object's own
+			# backing memory and, if the class declares one, the user's own
+			# __del__ - both need to already be real, lowered compile units
+			# by the time the emitter needs to call them. Triggered at
+			# CONSTRUCTION time (same as sys.alloc above), not merely when
+			# the class is referenced as a type - scheduling this for every
+			# bare type annotation would drag in sys.free's own transitive
+			# dependencies (real HeapFree/crt free externs) for classes that
+			# are never actually instantiated
+			sys_free_fn = self._resolve_sys_function( 'free' )
+			self.schedule( sys_free_fn )
+			del_fn = target_cls.get_local( '__del__' ) # target_cls is always the abstract base - methods aren't re-specialized per Specialization (Specialization.names passes through to .base.names)
+			if isinstance( del_fn, Function ):
+				self.schedule( del_fn )
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
 		return dest
 
