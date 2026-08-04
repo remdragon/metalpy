@@ -2176,6 +2176,26 @@ class Tests( unittest.TestCase ):
 		f_cls = self.discovery.modules['__test__'].get_local( 'Foo' )
 		self.assertIs( refcounts[0].value.type, f_cls )
 
+	def test_compiler_refcount_on_a_generic_rcclass_specialization( self ) -> None:
+		# regression test: a generic RCClass's own Specialization (Box[i32])
+		# isn't an RCClass instance itself - unwrapping to its abstract
+		# .base is required or a genuinely refcounted value is wrongly
+		# rejected whenever its declared type happens to be a concrete
+		# generic instantiation
+		code = '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'',
+			'def main() -> usize:',
+			'	b: Box[i32] = Box( v = 1 )',
+			'	return compiler.refcount( b )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		refcounts = [ i for i in fn.instructions if isinstance( i, ir.RefCount ) ]
+		self.assertEqual( len( refcounts ), 1 )
+
 	def test_compiler_refcount_on_non_rc_value_is_a_compile_error( self ) -> None:
 		code = '\n'.join([
 			'def main() -> usize:',

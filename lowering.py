@@ -955,7 +955,13 @@ class Lowering:
 		if len( node.args ) != 1 or node.keywords:
 			self.discovery.fail( f'compiler.refcount(...) takes exactly one argument: {ast.unparse(node)}', node )
 		value = self._lower_expr( node.args[0], None )
-		if not isinstance( value.type, RCClass ):
+		# a generic RCClass's own Specialization (Box[i32]) isn't an RCClass
+		# INSTANCE itself (Specialization has no base-class relationship of
+		# its own, see mpy_types.py) - unwrap to its abstract .base first, or
+		# a real refcounted value would wrongly be rejected here whenever its
+		# declared type happens to be a concrete generic instantiation
+		value_cls = value.type.base if isinstance( value.type, Specialization ) else value.type
+		if not isinstance( value_cls, RCClass ):
 			self.discovery.fail(
 				f'compiler.refcount(...) argument must be a reference-counted value, not '
 				f'{value.type.qualname if value.type else "?"}: {ast.unparse(node)}',
