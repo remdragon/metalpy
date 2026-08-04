@@ -1008,14 +1008,7 @@ class Lowering:
 			return self._lower_expr( source, target_type )
 		operand = source
 		opcode, extra = self._arithmetic_mode[-1].GetCast()
-		if not opcode.checked_error:
-			dest = self._new_temp( target_type )
-			self._emit( opcode( dest = dest, operand = operand ))
-			return dest
-		result_cls, overflow_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
-		if extra is None:
-			self._require_result_return( node, result_cls, overflow_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
-		return self._emit_checked_op( opcode, { 'operand': operand }, target_type, result_cls, overflow_cls, extra )
+		return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
 
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.cast(T, x) - T is a TYPE reference (resolved via
@@ -1709,29 +1702,39 @@ class Lowering:
 		result_type = expected_type or left.type
 
 		opcode, extra = self._arithmetic_mode[-1].GetBinOp( node )
+		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
+
+	def _lower_arithmetic_op( self, node: ast.AST, opcode: type|None, extra: ir.Operand|None, result_type: Type, operand_kwargs: dict, kind: str ) -> ir.Operand:
+		# shared by _lower_scalar_cast/_expr_BinOp/_expr_UnaryOp - each just
+		# resolves its own (opcode, extra) via the active ArithmeticMode's
+		# GetCast/GetBinOp/GetUnaryOp and hands them here along with its own
+		# operand shape (cast/USub take a single `operand`, BinOp takes
+		# `left`/`right`). `kind` is only used for the unsupported-operator
+		# message below - _lower_scalar_cast's GetCast() never actually
+		# returns None (every mode defines a cast opcode), so that branch is
+		# unreachable from there, but harmless to share
 		if opcode is None:
-			self.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
-		if opcode.checked_error:
-			# check mode (the default - see the class docstring): the op itself
-			# produces Result[result_type,OverflowError|ZeroDivisionError]. How that Result gets
-			# consumed depends on `extra`: the default (extra is None) uses
-			# OrReturn, mirroring Result.or_return()'s own semantics, and needs
-			# somewhere for the error to propagate to; `with
-			# compiler.panic_arithmetic(msg):` (extra is the lowered msg operand)
-			# uses Unwrap instead, which panics immediately and so has no such
-			# requirement
-			result_cls, error_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
-			if extra is None:
-				# validated before anything gets emitted - a mid-statement
-				# failure here must not leave partial instructions behind for
-				# the per-statement recovery boundary to silently keep
-				self._require_result_return( node, result_cls, error_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
-			return self._emit_checked_op( opcode, { 'left': left, 'right': right }, result_type, result_cls, error_cls, extra )
-		else:
-			# wrap/saturate or no overflow concept:
+			self.discovery.fail( f'unsupported {kind} operator: {ast.unparse(node)}', node )
+		if not opcode.checked_error:
+			# wrap/saturate, or no overflow concept at all (bitwise/Invert)
 			dest = self._new_temp( result_type )
-			self._emit( opcode( dest = dest, left = left, right = right ))
+			self._emit( opcode( dest = dest, **operand_kwargs ))
 			return dest
+		# check mode (the default - see the class docstring): the op itself
+		# produces Result[result_type,<opcode.checked_error>]. How that
+		# Result gets consumed depends on `extra`: the default (extra is
+		# None) uses OrReturn, mirroring Result.or_return()'s own semantics,
+		# and needs somewhere for the error to propagate to; `with
+		# compiler.panic_arithmetic(msg):` (extra is the lowered msg
+		# operand) uses Unwrap instead, which panics immediately and so has
+		# no such requirement
+		result_cls, error_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
+		if extra is None:
+			# validated before anything gets emitted - a mid-statement
+			# failure here must not leave partial instructions behind for
+			# the per-statement recovery boundary to silently keep
+			self._require_result_return( node, result_cls, error_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
+		return self._emit_checked_op( opcode, operand_kwargs, result_type, result_cls, error_cls, extra )
 
 	def _emit_checked_op( self, opcode: type, operand_kwargs: dict, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
 		# shared by Check-mode binops (Add/Sub/Mult/Shl/Div/Mod), USub, and
@@ -1790,17 +1793,7 @@ class Lowering:
 		result_type = expected_type or operand.type
 
 		opcode, extra = self._arithmetic_mode[-1].GetUnaryOp( node )
-		if opcode is None:
-			self.discovery.fail( f'unsupported unary operator: {ast.unparse(node)}', node )
-		if opcode.checked_error:
-			result_cls, overflow_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
-			if extra is None:
-				self._require_result_return( node, result_cls, overflow_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
-			return self._emit_checked_op( opcode, { 'operand': operand }, result_type, result_cls, overflow_cls, extra )
-		else:
-			dest = self._new_temp( result_type )
-			self._emit( opcode( dest = dest, operand = operand ))
-			return dest
+		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'operand': operand }, 'unary' )
 
 	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:
 		# short-circuit and/or: evaluate operands left to right, each into
