@@ -1,7 +1,7 @@
 # stdlib imports:
 import ast
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Callable
 
 # local imports:
@@ -14,19 +14,8 @@ from mpy_types import (
 	Specialization, TaggedUnion, CStruct, CUnion, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
-
-@dataclass( kw_only = True )
-class _ReceiverDispatch:
-	''' `_resolve_callee`'s answer when an attribute call's receiver is a
-	union type and the attribute isn't found on the union itself (e.g.
-	copy_from.get_const_ptr() where copy_from: bytes|bytearray) - each leaf
-	type has its own unrelated method under this name, so unlike Overload
-	(one shared Function, resolved by argument types) there's no single
-	target Function here at all, just one per leaf, picked by the
-	RECEIVER's own runtime tag. See _lower_union_receiver_call. '''
-	union: TaggedUnion
-	attr: str
-	per_leaf: list[tuple[Variable,Function]] # (union.attributes member, that leaf's resolved method)
+from union_storage import UnionStorage, ReceiverDispatch as _ReceiverDispatch
+from monomorphize import Monomorphizer
 
 _BINOP_WRAP_OPCODES: dict[type,type] = {
 	ast.Add: ir.AddWrap,
@@ -140,25 +129,12 @@ class Lowering:
 		# against, but shared thereafter so every reference (Allocate,
 		# GetAttr, across unrelated functions) points at the same objects.
 		# Persists for the whole Lowering instance's lifetime, unlike
-		# lower_function's per-function state
-		self._union_storage: dict[int,tuple[Variable,Variable,CUnion,dict[str,int]]] = {}
-		# monomorphized Function copies (T substituted with a concrete
-		# type), memoized by id(Specialization) - discovery._get_or_create_
-		# specialization already dedupes the Specialization itself by its
-		# qualname key, so every call to the same instantiation (sys.
-		# alloc[u8], from anywhere) reuses the SAME monomorphized Function
-		# object, not a fresh copy per call site
-		self._monomorphized: dict[int,Function] = {}
-		# monomorphized ClassLike copies (a generic class's OWN .attributes
-		# with type_params substituted, for a concrete Specialization like
-		# Result[i32,OverflowError]) - memoized by id(Specialization), same
-		# discipline as _monomorphized above. This is what actually gives a
-		# concrete generic specialization a real compile unit/output-list
-		# entry (compiler.py's _lower dispatches a ClassLike-based
-		# Specialization here) - stage 3 (the emitter) never has to
-		# independently rediscover/synthesize one, it just walks
-		# compiler.cstructs/.cunions/.tagged_unions/.rcclasses like anything else
-		self._monomorphized_classes: dict[int,ClassLike] = {}
+		# lower_function's per-function state - see union_storage.py
+		self._union_storage = UnionStorage( discovery, schedule )
+		# monomorphized Function/ClassLike copies (type params substituted
+		# with concrete types), each memoized by id(Specialization) - see
+		# monomorphize.py
+		self._monomorphizer = Monomorphizer( discovery, schedule, self._union_storage )
 		# resolved lazily, the first time something actually needs a given
 		# real sys.<name> library function (sys.panic for panic_arithmetic's
 		# Unwrap, sys.alloc/sys.free for RCClass construction/destruction) -
@@ -267,7 +243,7 @@ class Lowering:
 						bool_type = bool_cls,
 						new_temp = self._new_temp,
 						new_label = self._new_label,
-						union_storage = self._tagged_union_storage,
+						union_storage = self._union_storage.get,
 					)
 					if self._construction_self is not None:
 						for attr in fn.cls.attributes:
@@ -453,18 +429,22 @@ class Lowering:
 		except CompileError as e:
 			self.discovery.fail_loc( str( e ), fn.file, fn.line )
 
-	def _is_result_err_call( self, node: ast.expr | None ) -> bool:
+	def _is_result_err_call( self, node: ast.expr | None ) -> str|None:
 		# `return Result.Err(...)` - textually recognized, same spirit as
 		# _defer_kind_of_call/_defer_kind_of_with - deliberately not
 		# attempting deeper type-level inference (see _stmt_Return's own
-		# comment on why anything else defaults to "requires completeness")
-		return (
+		# comment on why anything else defaults to "requires completeness").
+		# Returns the discriminant ('Result.Err') rather than a bare bool,
+		# matching every other textual recognizer in this file
+		if (
 			isinstance( node, ast.Call )
 			and isinstance( node.func, ast.Attribute )
 			and node.func.attr == 'Err'
 			and isinstance( node.func.value, ast.Name )
 			and node.func.value.id == 'Result'
-		)
+		):
+			return 'Result.Err'
+		return None
 
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self._find_module_for( var )
@@ -627,7 +607,7 @@ class Lowering:
 			# other shape (Result.Ok(...), or anything else - deliberately
 			# not attempting deeper type-level inference here) requires
 			# full initialization
-			is_success = not ( self._construction_fallible and self._is_result_err_call( node.value ))
+			is_success = not ( self._construction_fallible and self._is_result_err_call( node.value ) is not None )
 			if is_success:
 				self._complete_construction_or_fail( self._current_fn )
 		label = self._cfg.current_epilogue_label( value )
@@ -1032,10 +1012,7 @@ class Lowering:
 		result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
 		if extra is None:
 			self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
-		check_type = self.discovery._get_or_create_specialization( result_cls, [ target_type, overflow_cls ] )
-		check_dest = self._new_temp( check_type )
-		self._emit( opcode( dest = check_dest, operand = operand ))
-		return self._consume_checked_result( check_dest, target_type, extra )
+		return self._emit_checked_op( opcode, { 'operand': operand }, target_type, result_cls, overflow_cls, extra )
 
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.cast(T, x) - T is a TYPE reference (resolved via
@@ -1323,14 +1300,18 @@ class Lowering:
 		self._emit( ir.Assign( dest = var, src = operand ))
 		return var
 
-	def _is_range_call( self, node: ast.expr ) -> bool:
+	def _is_range_call( self, node: ast.expr ) -> str|None:
 		# range(...) is textually recognized as compiler sugar, same as
 		# compiler.wrap_arithmetic/defer/etc. - there's no real range()
 		# function (TODO.txt: a real range()/Iterator needs the generator
 		# state-machine transform, which doesn't exist yet). This covers
 		# exactly the 1-2 arg counting-loop shape real lib/ code already
-		# uses (str.concat's `for i in range(count):`)
-		return isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range'
+		# uses (str.concat's `for i in range(count):`). Returns the
+		# discriminant ('range') rather than a bare bool, matching every
+		# other textual recognizer in this file
+		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range':
+			return 'range'
+		return None
 
 	_FOR_LOOP_ALTERNATIVES = 'call .__len__()/.__getitem__() directly and consume their Result yourself instead'
 
@@ -1339,7 +1320,7 @@ class Lowering:
 			self.discovery.fail( f'for loop target must be a plain name: {ast.unparse(node)}', node )
 		if node.orelse:
 			self.discovery.fail( 'for/else is not supported', node )
-		if self._is_range_call( node.iter ):
+		if self._is_range_call( node.iter ) is not None:
 			self._lower_for_range( node )
 		else:
 			self._lower_for_over_indexable( node )
@@ -1615,7 +1596,7 @@ class Lowering:
 			if member is None:
 				self.discovery.fail( f'{owner.qualname} has no member {pattern.cls.attr!r}: {ast.unparse(pattern)}', node )
 			self._ensure_resolved( member )
-			tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( owner )
+			tag_attr, data_attr, payload_cls, tags = self._union_storage.get( owner )
 			tag_expr = ast.Attribute( value = subj_expr, attr = tag_attr.stem, ctx = ast.Load() )
 			ast.copy_location( tag_expr, node )
 			test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
@@ -1724,21 +1705,36 @@ class Lowering:
 	# one remaining alternative to changing the return type, not a default
 	_DIVISION_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
 
+	def _lower_binary_operands( self, left_node: ast.expr, right_node: ast.expr, expected_type: Type|None, *, infer_right_from_left: bool = True ) -> tuple[ir.Operand,ir.Operand]:
+		# shared by _expr_BinOp and _expr_Compare: a bare literal constant on
+		# either side has no type of its own to offer, so the non-constant
+		# side is lowered first and its own inferred type used as the
+		# constant's expected_type instead. `infer_right_from_left` captures
+		# the one real difference between the two callers when NEITHER side
+		# is constant: _expr_BinOp still hints the right operand with the
+		# left operand's own inferred type (expected_type or left.type) - but
+		# _expr_Compare's expected_type is the comparison's own result type
+		# (bool), unrelated to the operands, and never cross-hints one
+		# operand from the other outside the constant branches above
+		left_is_const = isinstance( left_node, ast.Constant )
+		right_is_const = isinstance( right_node, ast.Constant )
+		if left_is_const and not right_is_const:
+			right = self._lower_expr( right_node, expected_type )
+			left = self._lower_expr( left_node, right.type )
+		elif right_is_const and not left_is_const:
+			left = self._lower_expr( left_node, expected_type )
+			right = self._lower_expr( right_node, left.type )
+		else:
+			left = self._lower_expr( left_node, expected_type )
+			right_hint = ( expected_type or left.type ) if infer_right_from_left else expected_type
+			right = self._lower_expr( right_node, right_hint )
+		return left, right
+
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
 		op_type = type( node.op )
 		kind, extra = self._arithmetic_mode[-1]
 
-		left_is_const = isinstance( node.left, ast.Constant )
-		right_is_const = isinstance( node.right, ast.Constant )
-		if left_is_const and not right_is_const:
-			right = self._lower_expr( node.right, expected_type )
-			left = self._lower_expr( node.left, right.type )
-		elif right_is_const and not left_is_const:
-			left = self._lower_expr( node.left, expected_type )
-			right = self._lower_expr( node.right, left.type )
-		else:
-			left = self._lower_expr( node.left, expected_type )
-			right = self._lower_expr( node.right, expected_type or left.type )
+		left, right = self._lower_binary_operands( node.left, node.right, expected_type )
 
 		result_type = expected_type or left.type
 
@@ -1758,7 +1754,7 @@ class Lowering:
 			result_cls, error_cls = self._lookup_result_and_error_types( node, 'ZeroDivisionError' )
 			if extra is None:
 				self._require_result_return( node, result_cls, error_cls, self._DIVISION_ALTERNATIVES )
-			return self._emit_checked_binop( _DIV_MOD_OPCODES[op_type], left, right, result_type, result_cls, error_cls, extra )
+			return self._emit_checked_op( _DIV_MOD_OPCODES[op_type], { 'left': left, 'right': right }, result_type, result_cls, error_cls, extra )
 
 		opcode = self._OPCODES_BY_KIND[kind].get( op_type )
 		if opcode is None:
@@ -1783,12 +1779,15 @@ class Lowering:
 			# failure here must not leave partial instructions behind for
 			# the per-statement recovery boundary to silently keep
 			self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
-		return self._emit_checked_binop( opcode, left, right, result_type, result_cls, overflow_cls, extra )
+		return self._emit_checked_op( opcode, { 'left': left, 'right': right }, result_type, result_cls, overflow_cls, extra )
 
-	def _emit_checked_binop( self, opcode: type, left: ir.Operand, right: ir.Operand, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
+	def _emit_checked_op( self, opcode: type, operand_kwargs: dict, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
+		# shared by Check-mode binops (Add/Sub/Mult/Shl/Div/Mod), USub, and
+		# scalar casts - operand_kwargs is however the specific opcode names
+		# its operand(s) (left/right for a binop, operand for USub/cast)
 		check_type = self.discovery._get_or_create_specialization( result_cls, [ result_type, error_cls ] )
 		check_dest = self._new_temp( check_type )
-		self._emit( opcode( dest = check_dest, left = left, right = right ))
+		self._emit( opcode( dest = check_dest, **operand_kwargs ))
 		return self._consume_checked_result( check_dest, result_type, extra )
 
 	def _consume_checked_result( self, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
@@ -1854,10 +1853,7 @@ class Lowering:
 			result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
 			if extra is None:
 				self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
-			check_type = self.discovery._get_or_create_specialization( result_cls, [ result_type, overflow_cls ] )
-			check_dest = self._new_temp( check_type )
-			self._emit( opcode( dest = check_dest, operand = operand ))
-			return self._consume_checked_result( check_dest, result_type, extra )
+			return self._emit_checked_op( opcode, { 'operand': operand }, result_type, result_cls, overflow_cls, extra )
 
 		self.discovery.fail( f'unsupported unary operator: {ast.unparse(node)}', node )
 
@@ -1907,22 +1903,12 @@ class Lowering:
 			self.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
 
 		right_node = node.comparators[0]
-		left_is_const = isinstance( node.left, ast.Constant )
-		right_is_const = isinstance( right_node, ast.Constant )
 		# unlike _expr_BinOp, expected_type here is the comparison's own
 		# result type (bool) - unrelated to what type the operands
 		# themselves should be lowered as, so it's never passed to either
 		# side, only used (below) as one operand's own type inferred from
 		# the other
-		if left_is_const and not right_is_const:
-			right = self._lower_expr( right_node, None )
-			left = self._lower_expr( node.left, right.type )
-		elif right_is_const and not left_is_const:
-			left = self._lower_expr( node.left, None )
-			right = self._lower_expr( right_node, left.type )
-		else:
-			left = self._lower_expr( node.left, None )
-			right = self._lower_expr( right_node, None )
+		left, right = self._lower_binary_operands( node.left, right_node, None, infer_right_from_left = False )
 
 		bool_cls = self.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
@@ -1936,7 +1922,7 @@ class Lowering:
 		# UNLESS one side is a bare `None` literal being compared against a
 		# TaggedUnion-typed value (T|None, e.g. sys._alloc()'s
 		# Ptr[u8]|None) - there, "is None" means "the active member is
-		# NoneType", which needs a tag check (the same _tagged_union_storage
+		# NoneType", which needs a tag check (the same UnionStorage.get
 		# machinery match statements/conditional dispatch already use), not
 		# a flat Cmp against a synthesized None operand of union type
 		# (which wouldn't correspond to any real runtime representation)
@@ -1955,7 +1941,7 @@ class Lowering:
 				none_member = next( ( attr for attr in other.type.attributes if attr.type is self.discovery.get_none_type() ), None )
 				if none_member is None:
 					self.discovery.fail( f'{other.type.qualname} has no None member: {ast.unparse(node)}', node )
-				tag_attr, _data_attr, _payload_cls, tags = self._tagged_union_storage( other.type )
+				tag_attr, _data_attr, _payload_cls, tags = self._union_storage.get( other.type )
 				tag_dest = self._new_temp( tag_attr.type )
 				self._emit( ir.GetAttr( dest = tag_dest, obj = other, attr = tag_attr.stem ))
 				dest = self._new_temp( bool_cls )
@@ -1997,20 +1983,20 @@ class Lowering:
 		base = owner_type.base if isinstance( owner_type, Specialization ) else owner_type
 		if isinstance( base, TaggedUnion ) and attr in ( 'tag', 'data' ) and base.names.get( attr ) is None:
 			# tag/data are synthesized lazily, the first time the union is
-			# actually constructed or matched against (_tagged_union_storage)
+			# actually constructed or matched against (UnionStorage.get)
 			# - a method reading self.tag/self.data directly (e.g. Result.
 			# is_ok()) could be scheduled/lowered before anything else in
 			# THIS compilation ever triggers that synthesis (the work queue
 			# has no ordering guarantee) - trigger it here too, lazily, the
 			# moment it's actually needed
-			self._tagged_union_storage( base )
+			self._union_storage.get( base )
 		if attr == 'data' and isinstance( base, TaggedUnion ) and isinstance( owner_type, Specialization ):
 			# `data`'s real storage type is monomorphize_class's own
 			# substituted, per-specialization payload_cls (concrete field
 			# types, own qualname) - NOT reachable through the ordinary
 			# _substituted_field path below, since Specialization.names
 			# always passes through to base.names (the shared, ABSTRACT
-			# TypeVar-typed payload_cls _tagged_union_storage synthesizes on
+			# TypeVar-typed payload_cls UnionStorage.get synthesizes on
 			# base itself). A method body reading self.data directly (e.g.
 			# Result.unwrap's `return self.data.v_Ok`) needs THIS concrete
 			# one, or the abstract one leaks through as a real, TypeVar-
@@ -2030,186 +2016,20 @@ class Lowering:
 		return self._substituted_field( found, owner_type )
 
 	def _substituted_field( self, found: Variable, owner_type: Type|None ) -> Variable:
-		# a field declared using its owning generic class's own type params
-		# (e.g. Result[T,E]'s synthesized `data: Result$data[T,E]`) is stored ONCE,
-		# unsubstituted, on the class itself - accessing it through a
-		# concrete Specialization (Result[Ptr[u8],OwnershipError]) must
-		# substitute T/E with that Specialization's own args, or every
-		# access sees the bare TypeVars regardless of which instantiation it
-		# went through (this was invisible before match statements: nothing
-		# previously read a generic field's type this way - checked-
-		# arithmetic/or_return() consume a Result's payload via a dedicated
-		# opcode on the whole Result value, never by synthesizing a literal
-		# `.field` AST and lowering it)
-		type_params = getattr( getattr( owner_type, 'base', None ), 'type_params', None )
-		if not isinstance( owner_type, Specialization ) or not type_params:
-			return found
-		substituted_type = self._substitute_type_params( found.type, type_params, owner_type.args )
-		if substituted_type is found.type:
-			return found
-		return replace( found, type = substituted_type ) # a shallow copy - `found` is the SAME shared Variable object for every access of this field, regardless of specialization, so this must not mutate it in place
+		return self._monomorphizer.substituted_field( found, owner_type )
 
 	def _substitute_type_params( self, t: Type|None, type_params: list[TypeVar], args: list[Type] ) -> Type|None:
-		if isinstance( t, TypeVar ):
-			for param, arg in zip( type_params, args ):
-				if t is param:
-					return arg
-			return t
-		if isinstance( t, Specialization ):
-			substituted_args = [ self._substitute_type_params( a, type_params, args ) for a in t.args ]
-			if all( sa is a for sa, a in zip( substituted_args, t.args )):
-				return t
-			return self.discovery._get_or_create_specialization( t.base, substituted_args )
-		if isinstance( t, TaggedUnion ) and t.file is None:
-			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
-			# _get_or_create_union - file is None only for these, never for
-			# a real, user-declared @union class, which must stay identity-
-			# based/never rebuilt this way) can mention a type param directly
-			# in one of its own leaves (e.g. Result[T,E].unwrap_or's own
-			# declared `T|None` return type) - substitute each leaf and
-			# rebuild through the same canonicalizing constructor so the
-			# result is the same shared, memoized union any other T|None
-			# reference resolves to, not a fresh one-off copy
-			leaf_types = [ attr.type for attr in t.attributes ]
-			substituted_leaves = [ self._substitute_type_params( lt, type_params, args ) for lt in leaf_types ]
-			if all( sl is lt for sl, lt in zip( substituted_leaves, leaf_types )):
-				return t
-			return self.discovery._get_or_create_union( substituted_leaves )
-		return t
+		return self._monomorphizer.substitute_type_params( t, type_params, args )
 
 	def _monomorphized_function( self, spec: Specialization ) -> Function:
-		# a distinct compiled unit per explicit generic instantiation
-		# (sys.alloc[u8] vs sys.alloc[u32] are two separate functions, each
-		# with T bound to a concrete type throughout - not a shared
-		# unspecialized body the way a generic CLASS's methods stay today).
-		# Built by copying the base Function with every generic-facing
-		# field substituted: qualname (so FuncStart/Call get sys.alloc[u8],
-		# not the shared sys.alloc), parameters/return_type (via
-		# _substitute_type_params), and names (T's own entry replaced with
-		# the concrete arg, so ordinary name lookups - including
-		# compiler.sizeof(T) - resolve it correctly while lowering fn.node.
-		# body, which is otherwise untouched/shared AST). Memoized by
-		# id(spec) - discovery._get_or_create_specialization already
-		# dedupes the Specialization itself, so this only ever builds one
-		# copy per distinct instantiation
-		cached = self._monomorphized.get( id( spec ) )
-		if cached is not None:
-			return cached
-		base = spec.base
-		if base.resolve is not None:
-			base.resolve()
-		type_params = base.type_params
-		substituted_cls = base.cls
-		if not type_params and base.cls is not None and base.cls.type_params:
-			# base's own genericity is inherited from its enclosing generic
-			# CLASS (Result.Ok/.Err/.is_ok/... referencing Result's own
-			# T,E) rather than declared on the function itself (sys.
-			# alloc[T]) - substitute against the class's type params
-			# instead, and the method's own .cls must become the concrete
-			# class specialization too (so e.g. an instance method's self
-			# ends up typed as Result[i32,E], not the abstract Result -
-			# see lower_function's own self-synthesis, which reads fn.cls
-			# directly)
-			type_params = base.cls.type_params
-			substituted_cls = self.discovery._get_or_create_specialization( base.cls, spec.args )
-		type_params = type_params or []
-		substituted_params = [
-			replace( p, type = self._substitute_type_params( p.type, type_params, spec.args ) )
-			for p in ( base.parameters or [] )
-		]
-		substituted_return = self._substitute_type_params( base.return_type, type_params, spec.args )
-		substituted_names = dict( base.names )
-		for tv, arg in zip( type_params, spec.args ):
-			substituted_names[tv.stem] = arg
-		for p in substituted_params:
-			substituted_names[p.stem] = p
-		monomorphized = replace(
-			base,
-			qualname = spec.qualname,
-			cls = substituted_cls,
-			parameters = substituted_params,
-			return_type = substituted_return,
-			names = substituted_names,
-			type_params = None,
-			resolve = None,
-		)
-		self._monomorphized[ id( spec ) ] = monomorphized
-		return monomorphized
+		return self._monomorphizer.monomorphized_function( spec )
 
 	def lower_function_specialization( self, spec: Specialization ) -> tuple[Function,list[ir.Instruction]]:
 		monomorphized = self._monomorphized_function( spec )
 		return monomorphized, self.lower_function( monomorphized )
 
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
-		# gives a concrete generic class specialization (Result[i32,
-		# OverflowError]) a real, independent struct/union layout - a
-		# shallow copy of the base class with .attributes' own type_params
-		# substituted via the SAME _substitute_type_params helper
-		# _monomorphized_function already uses. compiler.py's _lower calls
-		# this for every ClassLike-based Specialization it schedules
-		# (see _enqueue), so the result lands directly in compiler.
-		# cstructs/.cunions/.tagged_unions/.rcclasses - stage 3 (the
-		# emitter) never has to independently rediscover/resynthesize a
-		# concrete specialization itself, it just walks those lists like
-		# any other compile unit. .methods/.names are copied through
-		# UNCHANGED (still referencing the class's abstract, un-monomorphized
-		# Function objects) - method lookup keeps working exactly as today
-		# (Specialization.names passes through to .base.names), and each
-		# individual method call gets its OWN on-demand monomorphization via
-		# _monomorphized_function/_lower_class_generic_method_call, not
-		# eagerly here.
-		cached = self._monomorphized_classes.get( id( spec ) )
-		if cached is not None:
-			return cached
-		base = spec.base
-		if base.resolve is not None:
-			base.resolve()
-		for attr in base.attributes:
-			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _lower_allocate_fields's own identical resolve loop
-		type_params = base.type_params or []
-		substituted_attrs = [
-			replace( attr, type = self._substitute_type_params( attr.type, type_params, spec.args ))
-			for attr in base.attributes
-		]
-		extra: dict = {}
-		if isinstance( base, TaggedUnion ):
-			# base.names['tag']/['data'] (synthesized by _tagged_union_storage)
-			# are SHARED across every specialization of a generic union - the
-			# abstract base's own payload_cls carries bare TypeVar fields
-			# (v_Ok: T, v_Err: E), never a real emittable C type. A plain
-			# replace() would leave THIS specialization's own .names pointing
-			# at that same abstract, TypeVar-typed object - give it its own
-			# substituted payload_cls (own qualname, so it doesn't collide
-			# with the abstract's or a sibling specialization's), scheduled
-			# here since (mirroring _tagged_union_storage's own identical
-			# comment on the abstract case) nothing else would ever reach it
-			# on its own.
-			_tag_attr, data_attr, payload_cls, _tags = self._tagged_union_storage( base )
-			substituted_payload_fields = [
-				replace( f, type = self._substitute_type_params( f.type, type_params, spec.args ))
-				for f in payload_cls.attributes
-			]
-			substituted_payload_cls = CUnion(
-				stem = payload_cls.stem,
-				qualname = f'{spec.qualname}$data',
-				file = payload_cls.file,
-				line = payload_cls.line,
-				attributes = substituted_payload_fields,
-				names = { f.stem: f for f in substituted_payload_fields },
-			)
-			self.schedule( substituted_payload_cls )
-			extra['names'] = dict( base.names )
-			extra['names']['data'] = replace( data_attr, type = substituted_payload_cls )
-		monomorphized = replace(
-			base,
-			qualname = spec.qualname,
-			attributes = substituted_attrs,
-			type_params = None,
-			resolve = None,
-			**extra,
-		)
-		self._monomorphized_classes[ id( spec ) ] = monomorphized
-		return monomorphized
+		return self._monomorphizer.monomorphize_class( spec )
 
 	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
 		# a *silent* probe: is this expression a compile-time-resolvable
@@ -2471,7 +2291,7 @@ class Lowering:
 		missing = declared.keys() - given
 		if isinstance( target_cls, CUnion ):
 			# a union's whole point - only ONE member is ever meaningfully
-			# set at a time (see _tagged_union_storage's identical comment
+			# set at a time (see UnionStorage.get's identical comment
 			# on the synthesized TaggedUnion payload CUnion) - "every OTHER
 			# field is missing" isn't an error here the way it is for an
 			# ordinary struct/class, unlike ResultPayload(ok=val) never
@@ -2724,75 +2544,6 @@ class Lowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest_var
 
-	def _tagged_union_storage( self, union: TaggedUnion ) -> tuple[Variable,Variable,CUnion,dict[str,int]]:
-		# every TaggedUnion (a user-declared @union class, or a synthesized
-		# anonymous X|Y) gets a real runtime representation synthesized here
-		# on first use: `tag: u8` (each member's ordinal, by declaration
-		# order) + `data: <synthesized CUnion>` (one v_<member>-prefixed
-		# field per member, only one ever meaningfully set at a time - the
-		# v_ prefix avoids a member name colliding with something else in
-		# that payload struct). builtins.Result is itself an ordinary
-		# @union (Ok/Err members) and goes through this exact same path -
-		# only or_return() stays specially recognized (see
-		# _lower_or_return's own comment on why compiler.early_return
-		# couldn't just be reused for it). Memoized in self._union_storage so
-		# every reference (construction, match, dispatch, across unrelated
-		# functions) points at the same tag/data/payload-class objects.
-		cached = self._union_storage.get( id( union ) )
-		if cached is not None:
-			return cached
-		self._ensure_resolved( union )
-		for attr in union.attributes:
-			self._ensure_resolved( attr )
-		u8_cls = self.discovery.get_intrinsics()['u8']
-		tag_attr = Variable( stem = 'tag', qualname = f'{union.qualname}.tag', file = union.file, line = union.line, type = u8_cls )
-		payload_fields = [
-			Variable( stem = f'v_{attr.stem}', qualname = f'{union.qualname}.data.v_{attr.stem}', file = attr.file, line = attr.line, type = attr.type )
-			for attr in union.attributes
-		]
-		payload_cls = CUnion(
-			stem = f'{union.stem}$data',
-			qualname = f'{union.qualname}$data',
-			file = union.file,
-			line = union.line,
-			attributes = payload_fields,
-			names = { f.stem: f for f in payload_fields },
-		)
-		data_attr = Variable( stem = 'data', qualname = f'{union.qualname}.data', file = union.file, line = union.line, type = payload_cls )
-		# register into union.names (NOT .attributes - that list backs
-		# .leaves(), which must still only reflect the real union members
-		# for overload/type matching) so ordinary GetAttr resolution
-		# (_attr_lookup, used by _expr_Attribute for synthesized `subj.tag`/
-		# `subj.data` AST) can actually find them
-		for synthesized in ( tag_attr, data_attr ):
-			existing = union.names.get( synthesized.stem )
-			if existing is not None and existing is not synthesized:
-				self.discovery.fail_loc(
-					f'{union.qualname} already declares a member named {synthesized.stem!r}, which collides with the compiler-synthesized union storage field of the same name',
-					union.file, union.line,
-				)
-			union.names[synthesized.stem] = synthesized
-		tags = { attr.stem: i for i, attr in enumerate( union.attributes ) }
-		# payload_cls (the synthesized CUnion backing `data`) needs its own
-		# explicit schedule() here - unlike the outer TaggedUnion itself
-		# (already scheduled by every caller reaching this point), nothing
-		# else would ever schedule payload_cls on its own, since it's never
-		# directly named anywhere in user code, only reached through
-		# union.names['data'].type - without this, a real TaggedUnion could
-		# be scheduled/emitted (the outer struct) while the CUnion its own
-		# `data` field embeds BY VALUE never lands in compiler.cunions,
-		# leaving that field's type incomplete. Skipped when `union` is
-		# itself still generic (type_params set, i.e. this is the abstract
-		# base of something like Result[T,E]): payload_fields carry bare
-		# TypeVars in that case, not a real emittable C type - only a
-		# CONCRETE specialization's own substituted payload_cls (built by
-		# monomorphize_class below) is ever a real compile unit.
-		if not union.type_params:
-			self.schedule( payload_cls )
-		result = ( tag_attr, data_attr, payload_cls, tags )
-		self._union_storage[ id( union ) ] = result
-		return result
-
 	def _try_lower_union_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
 		# TaggedUnionName.MemberName(value) - a compiler-synthesized
 		# pseudo-constructor, same spirit as .__allocate__()/bare
@@ -2801,7 +2552,7 @@ class Lowering:
 		# body the same way it parses any CStruct/CUnion field), never real
 		# declared Functions, so this can never be found via the ordinary
 		# _resolve_callee/_attr_lookup_callable path either. Builds the
-		# `tag`/`data` storage from _tagged_union_storage and emits two
+		# `tag`/`data` storage from UnionStorage.get and emits two
 		# Allocates: the payload union (one field set - v_<member>), then
 		# the union instance itself (tag + data)
 		if not isinstance( node.func, ast.Attribute ):
@@ -2817,11 +2568,11 @@ class Lowering:
 			self.discovery.fail( f'{union.qualname}.{member.stem}(...) takes exactly one positional argument: {ast.unparse(node)}', node )
 		self._ensure_resolved( member )
 
-		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( union )
+		tag_attr, data_attr, payload_cls, tags = self._union_storage.get( union )
 		member_type = member.type
 		# a GENERIC union's own payload_cls AND member types (from the
 		# abstract base above) carry bare TypeVar fields, never real
-		# emittable/lowerable types (see _tagged_union_storage's own
+		# emittable/lowerable types (see UnionStorage.get's own
 		# comment) - when expected_type pins this construction to a
 		# concrete specialization (Result[u32,OverflowError]), use THAT
 		# specialization's own substituted payload type AND member type
@@ -2927,23 +2678,38 @@ class Lowering:
 		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
+	def _lower_call_args( self, target: Function, node: ast.Call ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
+		# shared by the plain call path (_lower_call's own else branch) and
+		# _lower_generic_function_call: lowers positional/keyword args
+		# straight against target's own already-concrete declared parameter
+		# types, applying each param's move hook as it goes. NOT reused by
+		# _lower_inferred_generic_call or _lower_class_generic_method_call -
+		# both of those still need to INFER target's type params before a
+		# parameter type is concrete enough to lower an argument against (in
+		# _lower_inferred_generic_call's case, args are lowered with no
+		# expected type at all, and move hooks apply in a separate pass
+		# afterward instead), so forcing them through this helper would
+		# change what expected_type each argument actually gets
+		positional, keyword = self._match_call_args( target, node )
+		args = []
+		for param, expr in positional:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, target.qualname )
+			args.append( operand )
+		kwargs = {}
+		for param, expr in keyword:
+			operand = self._lower_expr( expr, param.type )
+			self._apply_move_hook( param, operand, target.qualname )
+			kwargs[param.stem] = operand
+		return args, kwargs
+
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# sys.alloc[u8](...) - explicit generic instantiation. Matches call
 		# args against the MONOMORPHIZED signature (so a literal argument's
 		# expected type is already concrete, e.g. usize for alloc[u8]'s
 		# count - not the abstract, unsubstituted one)
 		monomorphized = self._monomorphized_function( spec )
-		positional, keyword = self._match_call_args( monomorphized, node )
-		args = []
-		for param, expr in positional:
-			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, monomorphized.qualname )
-			args.append( operand )
-		kwargs = {}
-		for param, expr in keyword:
-			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, monomorphized.qualname )
-			kwargs[param.stem] = operand
+		args, kwargs = self._lower_call_args( monomorphized, node )
 		return self._emit_generic_call( spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_inferred_generic_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -3122,15 +2888,20 @@ class Lowering:
 				result = self._lower_compiler_addrof( node, expected_type )
 				return result if want_result else None
 
-		allocate_dest = self._try_lower_allocate_call( node, expected_type )
-		if allocate_dest is None:
-			allocate_dest = self._try_lower_construct_call( node, expected_type )
-		if allocate_dest is None:
-			allocate_dest = self._try_lower_union_construct_call( node, expected_type )
-		if allocate_dest is None:
-			allocate_dest = self._try_lower_scalar_construct_call( node, expected_type )
-		if allocate_dest is not None:
-			return allocate_dest if want_result else None
+		# each recognizer returns None (not an error) when this call doesn't
+		# match its own construction-sugar shape at all, falling through to
+		# the next; a real error inside a matched shape (e.g. a malformed
+		# __allocate__ call) still raises/records normally
+		construction_recognizers = (
+			self._try_lower_allocate_call,
+			self._try_lower_construct_call,
+			self._try_lower_union_construct_call,
+			self._try_lower_scalar_construct_call,
+		)
+		for recognizer in construction_recognizers:
+			allocate_dest = recognizer( node, expected_type )
+			if allocate_dest is not None:
+				return allocate_dest if want_result else None
 
 		target, receiver = self._resolve_callee( node.func )
 		if receiver is not None:
@@ -3231,17 +3002,7 @@ class Lowering:
 			self._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
 		else:
 			self._ensure_resolved( target )
-			positional, keyword = self._match_call_args( target, node )
-			args = []
-			for param, expr in positional:
-				operand = self._lower_expr( expr, param.type )
-				self._apply_move_hook( param, operand, target.qualname )
-				args.append( operand )
-			kwargs = {}
-			for param, expr in keyword:
-				operand = self._lower_expr( expr, param.type )
-				self._apply_move_hook( param, operand, target.qualname )
-				kwargs[param.stem] = operand
+			args, kwargs = self._lower_call_args( target, node )
 
 		self.schedule( target.return_type )
 		for param in target.parameters or []:
@@ -3260,7 +3021,7 @@ class Lowering:
 		# implementation actually runs (e.g. len(copy_from) where
 		# copy_from: bytes|bytearray resolves to two candidates, bytes and
 		# bytearray). Reuses the same tag/data/v_<member> machinery match
-		# statements use (_tagged_union_storage) - branches are tried in
+		# statements use (UnionStorage.get) - branches are tried in
 		# priority order, falling through to `default` (no test needed -
 		# it's whatever's left once every more specific branch is excluded)
 		self._ensure_resolved( default )
@@ -3293,7 +3054,7 @@ class Lowering:
 			member = next( ( attr for attr in operand.type.attributes if attr.type is leaf_type ), None )
 			if member is None:
 				self.discovery.fail( f'{target.qualname}: {leaf_type.qualname if leaf_type else "?"} is not a member of {operand.type.qualname}', node )
-			tag_attr, _data_attr, _payload_cls, tags = self._tagged_union_storage( operand.type )
+			tag_attr, _data_attr, _payload_cls, tags = self._union_storage.get( operand.type )
 			tag_dest = self._new_temp( tag_attr.type )
 			self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = tag_attr.stem ))
 			cmp_dest = self._new_temp( bool_cls )
@@ -3330,7 +3091,7 @@ class Lowering:
 		member = next( ( attr for attr in operand.type.attributes if attr.type is target_type ), None )
 		if member is None:
 			return operand
-		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( operand.type )
+		tag_attr, data_attr, payload_cls, tags = self._union_storage.get( operand.type )
 		payload_dest = self._new_temp( payload_cls )
 		self._emit( ir.GetAttr( dest = payload_dest, obj = operand, attr = data_attr.stem ))
 		dest = self._new_temp( target_type )
@@ -3343,7 +3104,7 @@ class Lowering:
 		# ARGUMENT unwrapped per branch), each leaf here has its own
 		# unrelated method under this name, so what's dispatched on is the
 		# RECEIVER's own tag instead - same tag/data/v_<member> machinery
-		# match statements and dispatch already use (_tagged_union_storage),
+		# match statements and dispatch already use (UnionStorage.get),
 		# just no shared target Function to reuse ConditionalDispatch with
 		reference = dispatch.per_leaf[0][1]
 		for _member, fn in dispatch.per_leaf:
@@ -3360,7 +3121,7 @@ class Lowering:
 			self._apply_move_hook( param, operand, dispatch.union.qualname )
 			kwargs[param.stem] = operand
 
-		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( dispatch.union )
+		tag_attr, data_attr, payload_cls, tags = self._union_storage.get( dispatch.union )
 		bool_cls = self.discovery.find_name( 'bool', node )
 		dest = self._new_temp( expected_type or reference.return_type ) if want_result else None
 		end_label = self._new_label( 'recv_dispatch_end' )
