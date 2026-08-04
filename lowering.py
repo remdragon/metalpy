@@ -387,13 +387,8 @@ class Lowering:
 		none_type = self.discovery.get_none_type()
 		if fn.return_type is none_type:
 			return False
-		result_cls = self.discovery.find_name( 'Result', fn.node )
-		ok = (
-			isinstance( fn.return_type, Specialization )
-			and fn.return_type.base is result_cls
-			and len( fn.return_type.args ) == 2
-			and fn.return_type.args[0] is none_type
-		)
+		shape = self._result_shape( fn.return_type )
+		ok = shape is not None and shape[0] is none_type
 		if not ok:
 			self.discovery.fail(
 				f'{fn.qualname} must return None or Result[None,_], got '
@@ -953,13 +948,7 @@ class Lowering:
 		if len( node.args ) != 1 or node.keywords:
 			self.discovery.fail( f'compiler.refcount(...) takes exactly one argument: {ast.unparse(node)}', node )
 		value = self._lower_expr( node.args[0], None )
-		# a generic RCClass's own Specialization (Box[i32]) isn't an RCClass
-		# INSTANCE itself (Specialization has no base-class relationship of
-		# its own, see mpy_types.py) - unwrap to its abstract .base first, or
-		# a real refcounted value would wrongly be rejected here whenever its
-		# declared type happens to be a concrete generic instantiation
-		value_cls = value.type.base if isinstance( value.type, Specialization ) else value.type
-		if not isinstance( value_cls, RCClass ):
+		if not self._is_RC( value.type ):
 			self.discovery.fail(
 				f'compiler.refcount(...) argument must be a reference-counted value, not '
 				f'{value.type.qualname if value.type else "?"}: {ast.unparse(node)}',
@@ -1063,13 +1052,7 @@ class Lowering:
 			self.discovery.fail( f'compiler.early_return(...) takes exactly one argument: {ast.unparse(node)}', node )
 		fn = self._current_fn
 		return_type = fn.return_type if fn is not None else None
-		result_cls = self.discovery.find_name( 'Result', node )
-		ok = (
-			fn is not None
-			and isinstance( return_type, Specialization )
-			and return_type.base is result_cls
-			and len( return_type.args ) == 2
-		)
+		ok = fn is not None and self._result_shape( return_type ) is not None
 		if not ok:
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail( f'compiler.early_return(...) requires the enclosing function to return Result[_,_] ({where})', node )
@@ -1122,14 +1105,8 @@ class Lowering:
 
 		fn = self._current_fn
 		if is_err_only:
-			result_cls = self.discovery.find_name( 'Result', node )
 			return_type = fn.return_type if fn is not None else None
-			ok = (
-				fn is not None
-				and isinstance( return_type, Specialization )
-				and return_type.base is result_cls
-				and len( return_type.args ) == 2
-			)
+			ok = fn is not None and self._result_shape( return_type ) is not None
 			if not ok:
 				where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 				self.discovery.fail( f'errdefer requires the enclosing function to return Result[_,_] ({where})', node )
@@ -1266,10 +1243,10 @@ class Lowering:
 		# so a program that never defines Result at all (or hasn't
 		# imported builtins) must not hard-fail here just because this
 		# particular value happens not to be Result-shaped
-		result_cls = self.discovery.find_name_or_none( 'Result' )
-		if result_cls is None or not ( isinstance( value.type, Specialization ) and value.type.base is result_cls and len( value.type.args ) == 2 ):
+		shape = self._result_shape( value.type )
+		if shape is None:
 			return value
-		result_type, error_cls = value.type.args
+		result_type, error_cls = shape
 		self._require_result_return( node, value.type.base, error_cls, alternatives )
 		return self._consume_checked_result( value, result_type, extra = None )
 
@@ -1960,6 +1937,27 @@ class Lowering:
 		members = self.monomorphize_class( t ).attributes if isinstance( t, Specialization ) else base.attributes
 		return base, members
 
+	def _result_shape( self, t: Type|None ) -> tuple[Type,Type]|None:
+		''' (T, E) if `t` is Result[T,E], else None - checks base identity
+		against the real Result class (via find_name_or_none, so a program
+		that never defines/imports Result doesn't hard-fail just because
+		this ran speculatively), not just "some 2-arg Specialization",
+		which is not tight enough (Result is not the only generic class
+		that could ever have exactly two type args). '''
+		result_cls = self.discovery.find_name_or_none( 'Result' )
+		if result_cls is None or not ( isinstance( t, Specialization ) and t.base is result_cls and len( t.args ) == 2 ):
+			return None
+		return t.args[0], t.args[1]
+
+	def _is_RC( self, t: Type|None ) -> bool:
+		''' true if `t` is an RCClass, possibly wrapped in a Specialization -
+		a generic RCClass's own concrete instantiation (Box[i32]) isn't an
+		RCClass instance itself (Specialization has no base-class
+		relationship of its own, see mpy_types.py), but is still
+		reference-counted the same as any other RCClass. '''
+		base = t.base if isinstance( t, Specialization ) else t
+		return isinstance( base, RCClass )
+
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
 		# _ensure_resolved is the one place a Specialization gets swapped for
 		# its real, substituted ClassLike - owner_type past this point is
@@ -2486,18 +2484,14 @@ class Lowering:
 		# fallible __init__ (b: Box[i32] = Box(1)) - but for a FALLIBLE one,
 		# Box(...) itself becomes Result[Box[i32],E] (SYNTAX.md), so the
 		# surrounding annotation is r: Result[Box[i32],MyError], one level
-		# removed from target_cls. Peek through a Result[_,_] wrapper
-		# speculatively (find_name_or_none, not find_name - same posture as
-		# _maybe_consume_result: a program that never defines/imports Result
-		# at all must not hard-fail here just because this particular
-		# construction happens not to be Result-shaped)
+		# removed from target_cls. Peek through a Result[_,_] wrapper via
+		# _result_shape, which speculatively no-ops (rather than hard-
+		# failing) when this particular construction isn't Result-shaped
+		# at all, same posture as _maybe_consume_result
 		pinning_type = expected_type
-		result_cls = self.discovery.find_name_or_none( 'Result' )
-		if (
-			isinstance( expected_type, Specialization ) and result_cls is not None
-			and expected_type.base is result_cls and len( expected_type.args ) == 2
-		):
-			pinning_type = expected_type.args[0]
+		shape = self._result_shape( expected_type )
+		if shape is not None:
+			pinning_type = shape[0]
 		if isinstance( pinning_type, Specialization ) and pinning_type.base is target_cls:
 			for tv, arg in zip( class_type_params, pinning_type.args ):
 				bindings[ id( tv ) ] = arg
@@ -2736,9 +2730,10 @@ class Lowering:
 		# scheduled/lowered as a real function as a result.
 		if node.args or node.keywords:
 			self.discovery.fail( f'or_return() takes no arguments: {ast.unparse(node)}', node )
-		if not ( isinstance( receiver.type, Specialization ) and len( receiver.type.args ) == 2 ):
+		shape = self._result_shape( receiver.type )
+		if shape is None:
 			self.discovery.fail( f'or_return() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
-		result_type, error_cls = receiver.type.args
+		result_type, error_cls = shape
 		self._require_result_return( node, receiver.type.base, error_cls, self._OR_RETURN_ALTERNATIVES )
 		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
 		return unwrapped if want_result else None

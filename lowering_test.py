@@ -2497,6 +2497,46 @@ class Tests( unittest.TestCase ):
 		getitem_errors = [ e for e in self.discovery.errors.errors if 'b[i]' in e or '__getitem__' in e ]
 		self.assertEqual( getitem_errors, [] )
 
+	def test_subscript_with_getitem_returning_non_result_two_arg_generic_is_not_consumed( self ) -> None:
+		# _maybe_consume_result (Stage 4: now routed through _result_shape)
+		# must check the Specialization's own base identity against the
+		# real Result class, not just "some Specialization with 2 args" -
+		# Pair[T,U] here has the same shape (2 type args) as Result[T,E]
+		# but is a completely different class, and must pass through
+		# unconsumed rather than wrongly being treated as fallible
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Pair[T,U]:',
+			'	x: T',
+			'	y: U',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, i: usize ) -> Pair[i32,MyError]:',
+			'		return Pair.__allocate__( x = self.y, y = MyError() )',
+			'',
+			'def foo( b: Box, i: usize ) -> Pair[i32,MyError]:',
+			'	v: Pair[i32,MyError] = b[i]',
+			'	return v',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		fn = self.compiler._lower( foo_fn )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'OrReturn', kinds )
+		self.assertNotIn( 'OrJump', kinds )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_if_body_recovery_boundary_does_not_stop_orelse( self ) -> None:
 		# one bad statement inside the if-body doesn't prevent orelse (or
 		# anything after the if) from still being lowered - same recovery
