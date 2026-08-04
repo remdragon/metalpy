@@ -1,5 +1,23 @@
-Claude said "generic struct specializations like Result[i32,OverflowError] are never independently scheduled anywhere in compiler.py's output — only the unspecialized generic (Result) appears in compiler.cstructs. The emitter has to discover and synthesize each concrete specialization itself. Implementing that now since Phase 1's own Check-mode milestone depends on it."
-	this logic needs to get moved where it belongs, which isn't emitter_c.py
+Explore how we avoid a conflict when an RCClass defines a 'header' attribute,
+we need to make sure that doesn't conflict with RCClass's automatic ObjectHeader.
+	Maybe we need to rename it to $header?
+
+	[resolved] emit_rcclass() now emits the automatic member as $header, not
+		header - '$' can never appear in a real metalpy identifier (not a
+		legal character there), so a user class field literally named
+		`header` can no longer collide with it. Every emitter_c.py site that
+		reads/writes it (ir.Allocate/Incref/Decref/RefCount) updated to
+		match. Test: emitter_c_test.py's test_user_field_named_header_does_
+		not_collide (a class Foo: header: i32 constructs/compiles clean).
+
+lowering's _resolve_sys_panic and _resolve_sys_alloc() exhibit multiple design
+	flaws. 1) they are also almost identical in their implementation.
+	2) These dependencies need to be detected and automatically resolved by
+	resolver methods in discovery if possible.
+
+lowering's lower_function() and lower_global() have a large
+	amount of shared initialization that need to happen. This
+	shared initialization needs to be moved to a helper function
 
 review how Claude generates C code from local variables, I think emitter_c.py
 might be doing too much work. We may need new IR to tell the emitter when to

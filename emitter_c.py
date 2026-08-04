@@ -599,14 +599,14 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 		return [ f'\t{_emit_operand(instr.dest)} = sizeof({_value_spelling(instr.type)});' ]
 
 	if isinstance( instr, ir.Incref ):
-		return [ f'\tretain_object( &({_emit_operand(instr.value)})->header );' ]
+		return [ f'\tretain_object( &({_emit_operand(instr.value)})->$header );' ]
 	if isinstance( instr, ir.Decref ):
 		# NULL destructor for now - not leak-free by design yet (Phase 4
 		# wires in the real one: the user's own __del__ plus cascading
 		# decref for any RC-typed fields)
-		return [ f'\trelease_object( &({_emit_operand(instr.value)})->header, NULL );' ]
+		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header, NULL );' ]
 	if isinstance( instr, ir.RefCount ):
-		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.value)})->header.ref_count;' ]
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.value)})->$header.ref_count;' ]
 
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
@@ -632,7 +632,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 			# never emits an Incref for the temp an Allocate itself produces)
 			# - starting the header at 0 would underflow the very first
 			# paired Decref
-			lines.append( f'\t({dest})->header.ref_count = 1;' )
+			lines.append( f'\t({dest})->$header.ref_count = 1;' )
 			for name, value in instr.fields.items():
 				lines.append( f'\t({dest})->{name} = {_emit_operand(value)};' )
 			return lines
@@ -716,6 +716,12 @@ def emit_rcclass( cls: RCClass ) -> str:
 	# what lets sys.alloc[Foo]'s own generic byte-count allocation double as
 	# the real object allocator: the header is just part of the struct's
 	# own layout, sized by the same sizeof(struct Foo) as every other field.
+	# Named $header, not header - a real metalpy field can never contain
+	# '$' (not a legal character in a Python/metalpy identifier), so this
+	# is guaranteed collision-free against a user class that itself
+	# declares a field named `header` (mangle_qualname already relies on
+	# the same GCC/Clang '$'-in-identifiers extension everywhere else in
+	# this module's output, so this is nothing new).
 	# Base-class fields (if any) come first, most-derived last - .attributes
 	# only ever holds a class's OWN declared fields (discovery.py never
 	# merges a base's own attributes in), so the base chain has to be
@@ -729,7 +735,7 @@ def emit_rcclass( cls: RCClass ) -> str:
 	for base_cls in reversed( chain ):
 		attrs.extend( ( attr.stem, attr.type ) for attr in base_cls.attributes )
 	name = mangle_type( cls )
-	lines = [ f'struct {name} {{', '\tObjectHeader header;' ]
+	lines = [ f'struct {name} {{', '\tObjectHeader $header;' ]
 	for field_name, field_type in attrs:
 		lines.append( f'\t{c_type(field_type)} {field_name};' )
 	lines.append( '};' )

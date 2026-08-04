@@ -479,12 +479,34 @@ class RCClassConstructTests( RCClassTestCase ):
 		src = emitter_c.emit_function( main_lf )
 		self.assertIn( 'retain_object', src ) # bar = foo aliasing
 		self.assertIn( 'release_object', src ) # epilogue decref(s) for foo/bar going out of scope
-		self.assertIn( '->header.ref_count', src ) # compiler.refcount(bar)
+		self.assertIn( '->$header.ref_count', src ) # compiler.refcount(bar)
 		foo_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Foo' )
 		struct_src = emitter_c.emit_rcclass( foo_cls )
 		self.assertIn( 'struct __main__$Foo {', struct_src )
-		self.assertIn( 'ObjectHeader header;', struct_src )
+		self.assertIn( 'ObjectHeader $header;', struct_src )
 		self.assertIn( 'int32_t x;', struct_src )
+
+	def test_user_field_named_header_does_not_collide( self ) -> None:
+		# the automatic ObjectHeader member is named $header, not header -
+		# '$' can never appear in a real metalpy identifier, so a user class
+		# declaring its own field named `header` can't collide with it
+		self._run( '\n'.join([
+			'class Foo:',
+			'	header: i32',
+			'',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Foo:',
+			'		return Foo.__allocate__( header = v )',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.make( 1 )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		foo_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Foo' )
+		struct_src = emitter_c.emit_rcclass( foo_cls )
+		self.assertIn( 'ObjectHeader $header;', struct_src )
+		self.assertIn( 'int32_t header;', struct_src )
 
 @unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
 class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
