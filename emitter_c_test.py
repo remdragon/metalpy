@@ -510,6 +510,24 @@ def main() -> None:
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
+	def test_scalar_casts_in_every_arithmetic_mode_compile( self ) -> None:
+		# CastWrap/CastCheck/CastSaturate (compiler.cast(...)/T(x) sugar) -
+		# CastWrap is already exercised end to end by the Phase 6 milestone
+		# (RealCompileTests further down), this covers the other two modes
+		# directly
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+			'def foo() -> Result[u32,OverflowError]:',
+			'	x: usize = 300',
+			'	with compiler.saturate_arithmetic:',
+			'		y: u8 = u8( x )', # narrowing, out of range - clamps to 255
+			'	z: u32 = compiler.cast( u32, x )', # default Check mode
+			'	return Result.Ok( z )',
+			'',
+			'def main() -> None:',
+			'	foo()',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
 # routing RCClass construction through the REAL sys.alloc[T] means sys.alloc's
 # own body actually gets lowered end to end (unlike every other fixture in
 # this file, which never touches real lib/ code) - the real lib/sys.py's own
@@ -689,6 +707,126 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 			'	rc: usize = compiler.refcount( bar )',
 			'	with compiler.wrap_arithmetic:',
 			'		return bar.x',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+# str/bytes literal static-baking (Phase 6) is detected via the REAL
+# qualname 'builtins.str'/'builtins.bytes' (see the plan's grounding facts) -
+# unlike every other fixture in this file, this means the fixture class
+# actually needs to live under a module literally named 'builtins', not
+# just __main__ (Discovery.import_name('builtins') searches self.paths the
+# same way any other import does). A minimal, self-contained builtins.py
+# (not the real, actively-evolving lib/builtins/__init__.py) keeps this
+# scoped to what Phase 6 is actually testing, same posture as every other
+# fixture here.
+_BUILTINS_STR_FIXTURE = '\n'.join([
+	'class str:',
+	'	__data: ConstPtr[u8]',
+	'	__byte_size: usize',
+	'',
+	'	def get_data( self ) -> ConstPtr[u8]:',
+	'		return self.__data',
+	'',
+	'	def get_len( self ) -> usize:',
+	'		return self.__byte_size',
+])
+
+class BuiltinsStrTestCase( CompilerTestCase ):
+	def setUp( self ) -> None:
+		self._tmpdir = tempfile.TemporaryDirectory()
+		self.addCleanup( self._tmpdir.cleanup )
+		tmp_path = Path( self._tmpdir.name )
+		( tmp_path / 'builtins.py' ).write_text( _BUILTINS_STR_FIXTURE, encoding = 'utf-8' )
+		self.discovery = Discovery( paths = [ tmp_path ], import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+class StringLiteralTests( BuiltinsStrTestCase ):
+	def test_literal_baked_as_static_immortal_object( self ) -> None:
+		self._run( '\n'.join([
+			'def take_str( s: str ) -> None:',
+			'	return',
+			'',
+			'def main() -> None:',
+			'	take_str( \'hello\' )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( 'static const uint8_t __literal_', src )
+		self.assertIn( 'static struct builtins$str __literal_', src )
+		self.assertIn( '.ref_count = METALPY_IMMORTAL_REFCOUNT', src )
+		self.assertIn( '104, 101, 108, 108, 111, 0', src ) # 'hello' + NUL, per str's own __byte_size convention
+		self.assertIn( '.__byte_size = 6', src )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		main_src = emitter_c.emit_function( main_lf )
+		self.assertRegex( main_src, r'__main__\$take_str\( &__literal_[0-9a-f]+ \);' )
+		# str is never dynamically constructed here (only baked as an
+		# immortal literal) - no destructor should be emitted for it at all
+		# (release_object always skips an immortal object's destructor call,
+		# so the function would just be unreachable dead code that still
+		# has to compile - simplest to not emit it, see
+		# _rcclass_was_constructed)
+		self.assertNotIn( '$__destructor__', src )
+
+	def test_identical_literal_used_twice_shares_one_static_definition( self ) -> None:
+		self._run( '\n'.join([
+			'def take_str( s: str ) -> None:',
+			'	return',
+			'',
+			'def main() -> None:',
+			'	take_str( \'same\' )',
+			'	take_str( \'same\' )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertEqual( src.count( 'static struct builtins$str __literal_' ), 1 )
+
+@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+class StringLiteralRealCompileTests( _ClangCompileMixin, BuiltinsStrTestCase ):
+	def test_literal_passed_to_a_function_compiles( self ) -> None:
+		self._run( '\n'.join([
+			'def take_str( s: str ) -> None:',
+			'	return',
+			'',
+			'def main() -> None:',
+			'	take_str( \'hello\' )',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_extern_addrof_method_call_and_literal_together_compiles( self ) -> None:
+		# Phase 6 milestone: mirrors lib/sys.py's own real _Stdout.write
+		# shape (a WinAPI-style extern call, an AddrOf out-param, and a
+		# string literal argument) without depending on its actively-
+		# evolving Result/OSError/module-global machinery (Phase 7 work) -
+		# same posture as every other real-lib-shaped fixture in this file.
+		# Also exercises two gaps this test surfaced and fixed along the
+		# way: method calls with a real receiver (s.get_data()) and
+		# compiler.cast(...)/T(x) scalar casts (u32(s.get_len())) had never
+		# been implemented in the emitter at all before this.
+		self._run( '\n'.join([
+			"@extern( 'kernel32', 'WriteFile' )",
+			'def _test_write_file(',
+			'	handle: Ptr[None],',
+			'	buffer: ConstPtr[u8],',
+			'	count: u32,',
+			'	written: Ptr[u32],',
+			'	overlapped: Ptr[None],',
+			') -> bool:',
+			'	...',
+			'',
+			'def write_message( s: str ) -> bool:',
+			'	handle_target: u32 = 0',
+			'	written: u32 = 0',
+			'	overlapped_target: u32 = 0',
+			'	handle: Ptr[None] = compiler.addrof( handle_target )',
+			'	overlapped: Ptr[None] = compiler.addrof( overlapped_target )',
+			'	with compiler.wrap_arithmetic:',
+			'		return _test_write_file( handle, s.get_data(), u32( s.get_len() ), compiler.addrof( written ), overlapped )',
+			'',
+			'def main() -> bool:',
+			"	return write_message( 'hello' )",
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 

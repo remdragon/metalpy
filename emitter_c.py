@@ -1,4 +1,6 @@
 # stdlib imports:
+import dataclasses
+import hashlib
 import re
 
 # local imports:
@@ -311,7 +313,17 @@ def _emit_const( c: ir.Const ) -> str:
 		return str( c.value )
 	if c.value is None:
 		return '' # NoneType constant - only ever a placeholder operand (e.g. `is None` comparisons), never emitted as a standalone value
-	raise NotImplementedError( f'_emit_const: unsupported constant {c!r} - str/bytes literal static-baking is later-phase work' )
+	if isinstance( c.value, ( str, bytes )):
+		# a str/bytes literal is RCClass-typed (_expr_Constant lowers it
+		# directly to ir.Const(type=<builtins.str-or-bytes RCClass>,
+		# value=...) - see the plan's grounding facts) - str/bytes are
+		# always pointers (like any RCClass), so the operand text here is
+		# the ADDRESS of a static, immortal object _emit_string_literals
+		# bakes elsewhere in the translation unit, not an inline value
+		if not ( isinstance( c.type, RCClass ) and c.type.qualname in _STRING_LITERAL_RCCLASS_QUALNAMES ):
+			raise NotImplementedError( f'_emit_const: {c.value!r} needs an RCClass type from {sorted(_STRING_LITERAL_RCCLASS_QUALNAMES)}, got {c.type!r}' )
+		return f'&{_string_literal_name(c.type.qualname, c.value)}'
+	raise NotImplementedError( f'_emit_const: unsupported constant {c!r}' )
 
 # --- arithmetic -----------------------------------------------------------
 
@@ -467,6 +479,56 @@ def _emit_neg( instr ) -> list[str]:
 		'\t}',
 	]
 
+_CAST_MODE = { ir.CastWrap: 'wrap', ir.CastCheck: 'check', ir.CastSaturate: 'saturate' }
+
+def _emit_cast( instr ) -> list[str]:
+	# compiler.cast(T, x) / T(x) construction-sugar (lowering.py's shared
+	# _lower_scalar_cast) - a scalar-to-scalar conversion, mode-respecting
+	# same as +/-/* already are
+	mode = _CAST_MODE[type(instr)]
+	operand = _emit_operand( instr.operand )
+	target_type = instr.dest.type if mode != 'check' else instr.dest.type.args[0]
+	stem = target_type.stem if isinstance( target_type, Scalar ) else None
+	ctype = c_type( target_type )
+	if mode == 'wrap':
+		# C's own integer conversion rules ARE wrap semantics for an
+		# out-of-range value (well-defined, no UB, unlike an ARITHMETIC
+		# operation on a signed type triggering signed-overflow UB) - a
+		# plain cast is all this needs, no unsigned-roundtrip trick required
+		dest = _emit_operand( instr.dest )
+		return [ f'\t{dest} = ({ctype})({operand});' ]
+	if stem not in _SATURATE_LIMITS:
+		raise NotImplementedError( f'{mode} cast to {stem!r} is not supported yet (no MIN/MAX for i128/u128)' )
+	min_c, max_c = _SATURATE_LIMITS[stem]
+	# promoted to __int128 for the range comparison - every scalar width
+	# this compiler supports OTHER than i128/u128 themselves (excluded
+	# just above) fits inside __int128 without loss, sidestepping the
+	# usual signed/unsigned-pairing headache a same-width comparison
+	# would otherwise need (source and target can differ in both width
+	# AND signedness - e.g. i32 -> u8, or u64 -> i16)
+	if mode == 'saturate':
+		dest = _emit_operand( instr.dest )
+		return [
+			'\t{',
+			f'\t\t__int128 __wide = (__int128)({operand});',
+			f'\t\t{dest} = ( __wide < (__int128)({min_c}) ) ? {min_c} : ( __wide > (__int128)({max_c}) ) ? {max_c} : ({ctype})({operand});',
+			'\t}',
+		]
+	# check
+	dest = f't{instr.dest.id}'
+	return [
+		'\t{',
+		f'\t\t__int128 __wide = (__int128)({operand});',
+		f'\t\tbool __overflow = ( __wide < (__int128)({min_c}) ) || ( __wide > (__int128)({max_c}) );',
+		'\t\tif ( __overflow ) {',
+		f'\t\t\t{dest}._tag = 1;',
+		'\t\t} else {',
+		f'\t\t\t{dest}._tag = 0;',
+		f'\t\t\t{dest}._payload.ok = ({ctype})({operand});',
+		'\t\t}',
+		'\t}',
+	]
+
 # --- comparisons / control flow / calls / member access -----------------------
 
 _CMP_SYMBOLS = {
@@ -587,6 +649,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 		return [ f'\t{_emit_operand(instr.dest)} = ~({_emit_operand(instr.operand)});' ]
 	if type( instr ) in _NEG_MODE:
 		return _emit_neg( instr )
+	if type( instr ) in _CAST_MODE:
+		return _emit_cast( instr )
 
 	if isinstance( instr, ir.Cmp ):
 		symbol = _CMP_SYMBOLS[instr.op]
@@ -602,10 +666,15 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 		return [ f'\tif ( {_emit_operand(instr.cond)} ) goto {_c_label(instr.target)};' ]
 
 	if isinstance( instr, ir.Call ):
-		if instr.receiver is not None:
-			raise NotImplementedError( '_emit_instruction: method calls (Call.receiver) are Phase 3+ work' )
+		# a method call (instr.receiver is not None) is just an ordinary C
+		# function call with self prepended as the first argument - _has_self/
+		# _function_prototype already synthesize the matching `self`
+		# PARAMETER this way for the callee's own definition (there's no
+		# dot-call syntax here, this is C, not C++), and _emit_call_args
+		# already prepends instr.receiver the same way
 		target_name = mangle_qualname( instr.target.qualname )
-		call_expr = f'{target_name}( {", ".join(_emit_call_args(instr))} )' if instr.args or instr.kwargs else f'{target_name}()'
+		has_args = instr.receiver is not None or instr.args or instr.kwargs
+		call_expr = f'{target_name}( {", ".join(_emit_call_args(instr))} )' if has_args else f'{target_name}()'
 		if instr.dest is not None:
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
 		return [ f'\t{call_expr};' ]
@@ -837,6 +906,95 @@ def emit_rcclass_destructor( cls: RCClass ) -> str:
 	lines.append( '}' )
 	return '\n'.join( lines )
 
+# --- string/bytes literal static-baking -----------------------------------
+#
+# a str/bytes literal is RCClass-typed, like any other instance of those
+# classes - but unlike everything else this module bakes into C, it isn't
+# built by any real IR (ir.Allocate/sys.alloc/etc.) - _expr_Constant folds
+# it directly to ir.Const(type=<RCClass>, value=...) at lowering time (see
+# the plan's grounding facts). The emitter special-cases these two specific
+# classes (detected by qualname) and bakes a static, immortal object
+# (header.ref_count = METALPY_IMMORTAL_REFCOUNT - never freed, matches every
+# other string constant's lifetime in a real C program) matching that
+# class's REAL field layout, mirroring lib/builtins's own current __data/
+# __byte_size (str) and __data/__len (bytes) shape - same posture as
+# Result's own hand-rolled ._tag/._payload field names being hardcoded
+# throughout lowering.py/cfg.py already, not a new kind of coupling.
+_STRING_LITERAL_RCCLASS_QUALNAMES = { 'builtins.str', 'builtins.bytes' }
+_STRING_LITERAL_FIELDS = {
+	'builtins.str': ( '__data', '__byte_size', True ), # True: __byte_size includes a trailing NUL (lib/builtins's own str.__byte_size comment)
+	'builtins.bytes': ( '__data', '__len', False ),
+}
+
+def _string_literal_name( qualname: str, value: str|bytes ) -> str:
+	# deterministic and content-derived (not a counter/registry) so
+	# _emit_const stays a pure function - every reference to the SAME
+	# literal (anywhere in the program) independently computes the SAME
+	# name, and _emit_string_literals (below) is what actually guarantees
+	# each distinct one is only ever DEFINED once
+	payload = value if isinstance( value, bytes ) else value.encode( 'utf-8' )
+	digest = hashlib.sha256( f'{qualname}:'.encode() + payload ).hexdigest()[:16]
+	return f'__literal_{digest}'
+
+def _emit_one_string_literal( qualname: str, value: str|bytes ) -> list[str]:
+	data_field, len_field, nul_terminate = _STRING_LITERAL_FIELDS[qualname]
+	payload = value.encode( 'utf-8' ) if isinstance( value, str ) else value
+	data_bytes = payload + ( b'\x00' if nul_terminate else b'' )
+	name = _string_literal_name( qualname, value )
+	data_name = f'{name}$data'
+	byte_list = ', '.join( str( b ) for b in data_bytes ) if data_bytes else '0'
+	struct_name = mangle_qualname( qualname )
+	return [
+		f'static const uint8_t {data_name}[] = {{ {byte_list} }};',
+		f'static struct {struct_name} {name} = {{',
+		f'\t.$header = {{ .ref_count = METALPY_IMMORTAL_REFCOUNT }},',
+		f'\t.{_field_name(data_field)} = {data_name},',
+		f'\t.{_field_name(len_field)} = {len(data_bytes)},',
+		'};',
+	]
+
+def _emit_string_literals( compiler: Compiler ) -> list[str]:
+	# a program-wide collection pass, since C requires each static object
+	# defined exactly once - walks every function's instructions looking
+	# for a str/bytes-valued ir.Const, deduplicating by (qualname, value)
+	# (the same pair _string_literal_name derives its name from, so two
+	# occurrences of the identical literal anywhere in the program share
+	# one static definition)
+	seen: set[tuple[str,str|bytes]] = set()
+	parts: list[str] = []
+	for lf in compiler.functions:
+		for instr in lf.instructions:
+			for op in _iter_instruction_operands( instr ):
+				if not ( isinstance( op, ir.Const ) and isinstance( op.value, ( str, bytes ) )):
+					continue
+				if not ( isinstance( op.type, RCClass ) and op.type.qualname in _STRING_LITERAL_RCCLASS_QUALNAMES ):
+					continue
+				key = ( op.type.qualname, op.value )
+				if key in seen:
+					continue
+				seen.add( key )
+				parts.append( '\n'.join( _emit_one_string_literal( *key )))
+	return parts
+
+def _iter_instruction_operands( instr: ir.Instruction ) -> list[ir.Operand]:
+	# every Operand reachable from any field on this instruction - generic
+	# over dataclasses.fields() (rather than a hand-picked list of field
+	# names like 'value'/'left'/'right') so this can't silently miss a
+	# shape some OTHER instruction kind uses for the same purpose (Assign's
+	# src, GetAttr's obj, GetItem's index, ...) - a missed site here would
+	# be a real latent bug (_emit_const would reference a static object
+	# _emit_string_literals never actually defined)
+	operands: list[ir.Operand] = []
+	for f in dataclasses.fields( instr ):
+		value = getattr( instr, f.name )
+		if isinstance( value, ( ir.Const, ir.Temp, Variable )):
+			operands.append( value )
+		elif isinstance( value, list ):
+			operands.extend( v for v in value if isinstance( v, ( ir.Const, ir.Temp, Variable )))
+		elif isinstance( value, dict ):
+			operands.extend( v for v in value.values() if isinstance( v, ( ir.Const, ir.Temp, Variable )))
+	return operands
+
 def emit_cstruct( cls: CStruct ) -> str:
 	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]
 	return _struct_or_union_body( mangle_type( cls ), 'struct', attrs )
@@ -935,6 +1093,26 @@ def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 
 # --- whole-program driver ------------------------------------------------
 
+def _rcclass_was_constructed( cls: RCClass, compiler: Compiler ) -> bool:
+	# a class landing in compiler.rcclasses does NOT by itself mean an
+	# instance was ever actually heap-allocated - a bare parameter/local
+	# type annotation (x: Foo) schedules the CLASS the same way construction
+	# does (see lowering.py's own var-type scheduling), independent of
+	# whether .__allocate__()/sys.alloc[Foo] was ever reached. A class only
+	# EVER needs a real destructor if sys.alloc[cls] itself was scheduled
+	# (Lowering._lower_allocate_fields's RCClass branch - the one and only
+	# place that happens), which is also exactly the trigger that already
+	# schedules sys.free/__del__ for it - so this is the precise signal for
+	# "will release_object's own function-pointer argument ever actually be
+	# invoked for this class." Classes that are only ever baked as an
+	# immortal string/bytes literal (never dynamically constructed) are the
+	# motivating case: release_object skips an immortal object's destructor
+	# call entirely at runtime, so the destructor function itself doesn't
+	# need to exist (and its own body's sys.free call, needed unconditionally
+	# by every OTHER real destructor, was never scheduled either).
+	alloc_qualname = f'sys.alloc[{cls.qualname}]'
+	return any( lf.function.qualname == alloc_qualname for lf in compiler.functions )
+
 def emit_c( compiler: Compiler ) -> str:
 	''' single C11 translation unit - see the plan's "three-pass emission
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
@@ -945,6 +1123,24 @@ def emit_c( compiler: Compiler ) -> str:
 	# pass 1: forward declarations (opaque RCClass tags, full CEnum bodies,
 	# full CStruct/CUnion/TaggedUnion bodies in dependency order, function
 	# prototypes)
+	#
+	# the opaque RCClass tags have to come FIRST, before anything else -
+	# a bare `struct Foo` tag mentioned for the very first time INSIDE a
+	# function prototype's PARAMETER LIST gets C's own "function prototype
+	# scope" (ISO C11 6.2.1p4), a SEPARATE type from the real file-scope
+	# struct Foo{...} defined later in pass 2, even though they're spelled
+	# identically - confirmed via a real clang error ("conflicting types
+	# for ...", "will not be visible outside of this function") once a
+	# class was used as a plain parameter type before its own body was
+	# ever emitted (every earlier RCClass milestone happened to dodge this
+	# by only ever having a class appear in a RETURN type first, which
+	# sits outside the parameter list and doesn't trigger the rule -
+	# dumb luck, not a real guarantee). An explicit bare `struct Foo;` at
+	# file scope, before any prototype, forces the tag to already be a
+	# real file-scope type by the time anything references it.
+	for cls in compiler.rcclasses:
+		if not cls.type_params:
+			parts.append( f'struct {mangle_type(cls)};' )
 	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
 		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))
@@ -957,7 +1153,7 @@ def emit_c( compiler: Compiler ) -> str:
 	# backing Function/LoweredFunction entry at all - pure emitter-side
 	# synthesis, see emit_rcclass_destructor)
 	for cls in compiler.rcclasses:
-		if not cls.type_params:
+		if not cls.type_params and _rcclass_was_constructed( cls, compiler ):
 			parts.append( f'static void {_rcclass_destructor_name(cls)}( void* obj );' )
 
 	# pass 2: full RCClass struct bodies (every other tag already exists)
@@ -965,15 +1161,18 @@ def emit_c( compiler: Compiler ) -> str:
 		if not cls.type_params:
 			parts.append( emit_rcclass( cls ))
 
-	# pass 3: global definitions, then full function bodies, then
+	# pass 3: string/bytes literal static objects (need str/bytes's own
+	# full RCClass body from pass 2 first) and global definitions, then
+	# full function bodies (which may reference either by address), then
 	# destructor bodies (need the struct's own full definition from pass 2
 	# to dereference self->field)
+	parts.extend( _emit_string_literals( compiler ))
 	for g in compiler.globals:
 		parts.append( emit_global( g ))
 	for lf in compiler.functions:
 		parts.append( emit_function( lf ))
 	for cls in compiler.rcclasses:
-		if not cls.type_params:
+		if not cls.type_params and _rcclass_was_constructed( cls, compiler ):
 			parts.append( emit_rcclass_destructor( cls ))
 
 	return '\n\n'.join( part for part in parts if part ) + '\n'

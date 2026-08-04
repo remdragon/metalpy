@@ -1169,6 +1169,118 @@ emitter:
 		Next: Phase 6 (@extern, AddrOf, string/bytes literal static-baking)
 			- see the plan file.
 
+	[resolved] Phase 6: @extern/AddrOf verification + string/bytes literal
+		static-baking. @extern and AddrOf themselves needed no new code
+		(already real since Phases 1/2) - this phase's only genuinely new
+		emitter work was str/bytes literal support: a str/bytes value is
+		RCClass-typed like any other instance of those classes, but unlike
+		everything else this module bakes into C, no real IR builds it
+		(_expr_Constant folds it directly to ir.Const(type=<RCClass>,
+		value=...) at lowering time). Detected via the REAL qualname
+		('builtins.str'/'builtins.bytes'), baked as a static, immortal
+		object (header.ref_count = METALPY_IMMORTAL_REFCOUNT, matching
+		lib/builtins's own current __data/__byte_size (str) and __data/
+		__len (bytes) field layout - same posture as Result's own hand-
+		rolled ._tag/._payload names being hardcoded throughout lowering.py/
+		cfg.py already). A program-wide collection pass (_emit_string_
+		literals, walking every function's instructions via a new,
+		dataclasses.fields()-generic _iter_instruction_operands - NOT a
+		hand-picked field-name list, which would risk silently missing a
+		shape some instruction kind uses that another doesn't) finds and
+		dedupes every distinct (qualname, value) literal, since C requires
+		each static object defined exactly once; _emit_const itself stays
+		a PURE function by deriving the static object's own name
+		deterministically from a content hash rather than needing a mutable
+		registry threaded through every _emit_operand call site.
+		This phase's own milestone test (a synthetic WriteFile-shaped
+		fixture mirroring lib/sys.py's real _Stdout.write, without its
+		actively-evolving Result/OSError/module-global machinery) surfaced
+		FOUR more real, previously-latent gaps, none actually specific to
+		string literals - just never exercised by any earlier phase's own
+		fixtures:
+		1) compiler.py's bare RCClass/CStruct/CUnion/TaggedUnion branches
+			in _lower never resolved each attribute's own .type (only the
+			class's own top-level .resolve() - attribute types are lazily
+			resolved separately, same as everywhere else in this compiler).
+			Invisible before now because every earlier RCClass fixture was
+			always constructed via .__allocate__ somewhere, which resolves
+			attributes as a side effect (_lower_allocate_fields's own loop)
+			- str here is only ever referenced as a parameter type/literal,
+			never constructed. Fixed by adding the identical per-attribute
+			resolve loop already used by monomorphize_class (the
+			Specialization branch) to the four bare branches too.
+		2) A bare `struct Foo` tag mentioned for the very first time INSIDE
+			a function prototype's PARAMETER LIST gets C's own "function
+			prototype scope" (ISO C11 6.2.1p4) - a separate type from the
+			real file-scope struct Foo{...} defined later, even spelled
+			identically (confirmed via a real clang "conflicting types"
+			error). Every earlier RCClass milestone happened to dodge this
+			by only ever having a class appear in a RETURN type first
+			(outside the parameter list, doesn't trigger the rule) - dumb
+			luck, not a real guarantee. Fixed with an explicit bare
+			`struct Foo;` forward declaration at file scope for every
+			RCClass, before any prototype - exactly what the plan's own
+			original Phase 3 text called for and this session had
+			previously (wrongly) judged unnecessary.
+		3) Every RCClass landing in compiler.rcclasses got an unconditional
+			destructor + sys.free reference, even one that's NEVER actually
+			heap-constructed (only used as an immortal literal, or merely
+			referenced as a bare type annotation) - sys.free itself is only
+			ever scheduled at CONSTRUCTION time (Phase 4's own fix), so an
+			unconstructed class's destructor referenced an undeclared
+			sys$free, a real clang error. Fixed with _rcclass_was_constructed
+			(checks whether sys.alloc[cls] itself was ever scheduled+
+			lowered - the precise signal for "will this destructor's
+			function pointer ever actually be invoked," since
+			release_object skips an immortal object's destructor call
+			entirely) gating destructor emission entirely, rather than
+			trying to ALSO schedule sys.free/__del__ unconditionally
+			(tried that too - it's what actually caused Phase 4's own
+			construction-time-scheduling fix in the first place, so
+			reverting to unconditional scheduling here would have
+			reintroduced that exact regression for real-lib-shaped tests).
+		4) Two entire instruction kinds had NO emitter support at all,
+			discovered only because this phase's milestone was the FIRST
+			one to actually need them:
+			- ir.Call with a real receiver (obj.method(...), as opposed to
+				a static method like Foo.make(...)) - _emit_call_args
+				already correctly prepended the receiver as the first
+				argument, but _emit_instruction unconditionally raised
+				NotImplementedError the moment instr.receiver was set at
+				all, and separately, the empty-arg-list check driving
+				`f()` vs `f( args )` didn't account for a receiver-only
+				call (obj.method(), zero real arguments) either. Both
+				fixed - a method call is just an ordinary C function call
+				with self prepended, no dot-call syntax involved (this is
+				C, not C++).
+			- ir.CastWrap/CastCheck/CastSaturate (compiler.cast(...)/T(x)
+				sugar) were declared in ir.py back when Phase 1 emitter
+				work was still ongoing but never actually implemented in
+				emitter_c.py at all. CastWrap is a plain C cast (integer
+				conversion is already well-defined/wrap-semantics in C,
+				unlike arithmetic on signed types - no unsigned-roundtrip
+				trick needed here, unlike Wrap-mode +/-/*). CastCheck/
+				CastSaturate both need a genuine range check against the
+				target type's min/max, which (unlike arithmetic's
+				__builtin_*_overflow) has no builtin to reach for - done
+				by promoting the operand to __int128 for the comparison
+				(safe for every scalar width this compiler supports other
+				than i128/u128 themselves, which are excluded the same way
+				Saturate-mode arithmetic already excludes them - no
+				INT128_MIN/MAX macro exists), sidestepping the signed/
+				unsigned-pairing matrix a same-width comparison would
+				otherwise need (source and target can differ in both width
+				AND signedness, e.g. i32 -> u8 or u64 -> i16).
+		Verified end to end via clang -std=c11 -Wall -Wextra -c: a bare
+			string literal passed to a function; the combined WriteFile-
+			shaped milestone (extern + AddrOf out-param + a real method
+			call + a scalar cast + a string literal, all together); and
+			CastCheck/CastSaturate directly. Full suite: 471 tests, 0
+			failures.
+		Next: Phase 7 (remainder - confirm defer/errdefer + generics need
+			no new work; module globals) - see the plan file. This is the
+			FINAL phase.
+
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
 

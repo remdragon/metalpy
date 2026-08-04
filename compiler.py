@@ -190,6 +190,8 @@ class Compiler:
 		elif isinstance( unit, RCClass ):
 			if unit.resolve is not None:
 				unit.resolve()
+			for attr in unit.attributes: # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's identical loop; monomorphize_class already does this for the Specialization branch above, but a bare (non-generic) class landing here directly never went through that
+				self.lowering._ensure_resolved( attr )
 			if unit.base is not None:
 				self._enqueue( unit.base )
 			self.rcclasses.append( unit )
@@ -197,16 +199,22 @@ class Compiler:
 		elif isinstance( unit, CStruct ):
 			if unit.resolve is not None:
 				unit.resolve()
+			for attr in unit.attributes:
+				self.lowering._ensure_resolved( attr )
 			self.cstructs.append( unit )
 			return unit
 		elif isinstance( unit, CUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
+			for attr in unit.attributes:
+				self.lowering._ensure_resolved( attr )
 			self.cunions.append( unit )
 			return unit
 		elif isinstance( unit, TaggedUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
+			for attr in unit.attributes:
+				self.lowering._ensure_resolved( attr )
 			self.tagged_unions.append( unit )
 			return unit
 		elif isinstance( unit, CEnum ):
