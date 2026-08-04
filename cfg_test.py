@@ -146,6 +146,33 @@ def foo( x: copy[Foo|Bar] ) -> None:
 		state = self._state( self._fn( 'foo' ))
 		self.assertEqual( self._kinds( state.prologue_instructions ), ['GetAttr', 'GetAttr', 'Incref'] )
 
+	def test_enter_self_on_generic_rcclass_specialization_is_tracked( self ) -> None:
+		# regression test: self typed as a concrete generic RCClass
+		# Specialization (Box[i32]) must still be recognized as RC-managed by
+		# is_rc/rc_leaves - a Specialization isn't an RCClass INSTANCE itself,
+		# so before the unwrap fix, enter_self's own `if not rc_leaves(
+		# self_param.type): return` silently skipped tracking self's lifecycle
+		# entirely for every generic-class instance method
+		self._import( '''
+class Box[T]:
+	v: T
+	def get( self ) -> T:
+		return self.v
+''' )
+		box_cls = self._module.get_local( 'Box' )
+		if box_cls.resolve is not None:
+			box_cls.resolve()
+		get_fn = box_cls.get_local( 'get' )
+		if get_fn.resolve is not None:
+			get_fn.resolve()
+		i32_cls = self.discovery.get_intrinsics()['i32']
+		spec = self.discovery._get_or_create_specialization( box_cls, [ i32_cls ] )
+		self_param = Variable( stem = 'self', qualname = f'{get_fn.qualname}.self', file = None, line = None, type = spec )
+		state = self._state( get_fn )
+		state.enter_self( self_param, is_move = False )
+		self.assertIn( 'self', state.bindings )
+		self.assertEqual( state.bindings['self'].state, cfg.OwnState.BORROWED )
+
 # --- assign: fresh / alias / replace ------------------------------------------
 
 class AssignTests( CFGTestBase ):

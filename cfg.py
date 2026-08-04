@@ -6,7 +6,7 @@ from typing import Callable
 # local imports:
 import ir
 from errors import CompileError
-from mpy_types import Type, Variable, Parameter, Function, RCClass, TaggedUnion, CUnion, Move, Copy
+from mpy_types import Type, Variable, Parameter, Function, RCClass, TaggedUnion, CUnion, Move, Copy, Specialization
 
 '''
 Ownership tracking for automatic INCREF/DECREF placement - see TODO.txt's
@@ -50,14 +50,20 @@ class OwnState( Enum ):
 	MOVED = 'moved'
 
 def is_rc( t: Type ) -> bool:
-	return isinstance( t, RCClass )
+	# a concrete generic RCClass instantiation (Box[i32]) is a Specialization,
+	# not an RCClass instance itself - unwrap first, or every generic-class/
+	# generic-union instance method's own `self` (already typed as a
+	# Specialization) would wrongly look untracked here
+	base = t.base if isinstance( t, Specialization ) else t
+	return isinstance( base, RCClass )
 
 def rc_leaves( t: Type ) -> list[Type]:
 	# a TaggedUnion's RC-relevant leaves specifically - str|i32 needs a
 	# tag-gated incref (only str); str|int (both RC) needs none of that,
 	# unconditional instead
-	if isinstance( t, TaggedUnion ):
-		return [ leaf for leaf in t.leaves() if is_rc( leaf ) ]
+	base = t.base if isinstance( t, Specialization ) else t
+	if isinstance( base, TaggedUnion ):
+		return [ leaf for leaf in base.leaves() if is_rc( leaf ) ]
 	return [ t ] if is_rc( t ) else []
 
 UnionStorage = Callable[[TaggedUnion], tuple[Variable,Variable,CUnion,dict[str,int]]]
