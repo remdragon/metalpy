@@ -853,6 +853,142 @@ class RCClassConstructTests( RCClassTestCase ):
 		self.assertIn( 'sys.alloc[__main__.Bar]', alloc_specializations )
 		self.assertIn( 'sys.alloc[__main__.Foo]', alloc_specializations )
 
+	def test_generic_init_construction_two_instantiations_are_independent( self ) -> None:
+		# Stage 3b: two different concrete instantiations of the same
+		# generic RCClass's __init__ get their own independent, correctly-
+		# substituted compiled bodies - not a single shared, abstract one
+		# (which could never emit correct C for more than one concrete type)
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, v: T ) -> None:',
+			'		self.v = v',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box( 1 )',
+			'	c: Box[u32]',
+			'	c = Box( 2 )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		box_rcclasses = [ cls.qualname for cls in self.compiler.rcclasses if cls.qualname.startswith( '__main__.Box' ) ]
+		self.assertEqual( sorted( box_rcclasses ), [ '__main__.Box[intrinsics.i32]', '__main__.Box[intrinsics.u32]' ]) # exactly one each, no abstract Box, no duplicates
+		init_fns = { f.function.qualname: f for f in self.compiler.functions if f.function.qualname.startswith( '__main__.Box.__init__' ) }
+		self.assertEqual( set( init_fns.keys() ), { '__main__.Box.__init__[intrinsics.i32]', '__main__.Box.__init__[intrinsics.u32]' })
+		i32_setattr = next( i for i in init_fns['__main__.Box.__init__[intrinsics.i32]'].instructions if isinstance( i, ir.SetAttr ))
+		u32_setattr = next( i for i in init_fns['__main__.Box.__init__[intrinsics.u32]'].instructions if isinstance( i, ir.SetAttr ))
+		self.assertEqual( i32_setattr.value.type.qualname, 'intrinsics.i32' ) # substituted, not a shared bare T
+		self.assertEqual( u32_setattr.value.type.qualname, 'intrinsics.u32' )
+
+	def test_generic_init_construction_infers_type_args_from_arguments( self ) -> None:
+		# Stage 3b: no expected_type annotation pinning the concrete args -
+		# infer from __init__'s own arguments instead (mirrors
+		# _lower_class_generic_method_call's identical inference for
+		# Result.Ok(val)), not just "always require an annotation"
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, v: T ) -> None:',
+			'		self.v = v',
+			'',
+			'def main() -> None:',
+			'	x: i32 = 5',
+			'	b = Box( x )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIn( '__main__.Box[intrinsics.i32]', [ cls.qualname for cls in self.compiler.rcclasses ])
+
+	def test_generic_init_construction_defaults_still_apply( self ) -> None:
+		# exercises lower_function's own construction-self setup: fn.cls is
+		# a Specialization for a monomorphized generic __init__ (see
+		# Lowering.lower_function's own unwrap-for-isinstance-checks fix) -
+		# a non-generic field with a class-level default must still get its
+		# default applied BEFORE __init__'s own body runs, same as a plain
+		# non-generic RCClass's own construction defaults
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	count: i32 = 0',
+			'	def __init__( self, v: T ) -> None:',
+			'		self.v = v',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box( 1 )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		init_fn = next( f for f in self.compiler.functions if f.function.qualname == '__main__.Box.__init__[intrinsics.i32]' )
+		setattrs = [ i for i in init_fn.instructions if isinstance( i, ir.SetAttr ) ]
+		self.assertEqual( [ i.attr for i in setattrs ], [ 'count', 'v' ]) # default applied before __init__'s own body
+
+	def test_generic_init_construction_pins_type_args_through_fallible_wrapping( self ) -> None:
+		# regression test: for a FALLIBLE __init__, expected_type here is
+		# Result[Box[i32],MyError] (SYNTAX.md's own fallible-construction
+		# wrapping), not Box[i32] directly - the pinning check has to see
+		# through that one level of Result[_,_] wrapping (find_name_or_none,
+		# not find_name - a program that never defines Result at all must
+		# not hard-fail here), or it silently falls back to argument-based
+		# inference and - a separate, narrower pre-existing gap this
+		# surfaced along the way (_expr_Constant accepts a still-abstract
+		# TypeVar as an expected_type without complaint) - builds a
+		# nonsensical Box[Box.T] instead of Box[i32]
+		self._run( '\n'.join([
+			'@cstruct',
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'	def is_ok( self ) -> bool:',
+			'		return self.tag == 0',
+			'	def is_err( self ) -> bool:',
+			'		return self.tag == 1',
+			'',
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, v: T ) -> Result[None,MyError]:',
+			'		self.v = v',
+			'		return Result.Ok( None )',
+			'',
+			'def main() -> None:',
+			'	r: Result[Box[i32],MyError] = Box( 1 )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# the annotation alone (r: Result[Box[i32],MyError]) schedules
+		# Box[intrinsics.i32] regardless of whether the constructor call
+		# itself resolved correctly, so check the CALL's own target instead -
+		# this is what actually failed before the fix (target was
+		# Box.__init__[Box.T], not Box.__init__[intrinsics.i32])
+		init_fns = [ f.function.qualname for f in self.compiler.functions if f.function.qualname.startswith( '__main__.Box.__init__' ) ]
+		self.assertEqual( init_fns, [ '__main__.Box.__init__[intrinsics.i32]' ])
+
+	def test_generic_init_construction_uninferable_type_args_is_a_clear_error( self ) -> None:
+		# T genuinely never appears in __init__'s own parameter list here, so
+		# nothing could ever bind it - a clean "cannot infer" error, not a
+		# crash or a silently-wrong result. (A bare literal AT an inferred
+		# position, e.g. Box(5) where __init__ takes v: T, is a narrower,
+		# pre-existing gap this construction path inherits unchanged from
+		# _lower_class_generic_method_call's identical inference branch:
+		# _expr_Constant only rejects expected_type is None, not "still an
+		# unresolved TypeVar" - it silently builds a nonsensical Box[T]
+		# rather than failing. Not introduced by this work and not fixed
+		# here - same posture as the other documented-not-fixed gaps this
+		# session found.)
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, other: i32 ) -> None:',
+			'		pass',
+			'',
+			'def main() -> None:',
+			'	b = Box( 5 )',
+			'	return',
+		]))
+		self.assertTrue( any( 'cannot infer' in e for e in self.discovery.errors.errors ))
+
 	def test_user_field_named_header_does_not_collide( self ) -> None:
 		# the automatic ObjectHeader member is named $header, not header -
 		# '$' can never appear in a real metalpy identifier, so a user class
@@ -1072,6 +1208,28 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 			'',
 			'def main() -> None:',
 			'	b = Bar( Foo() )',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_generic_init_construction_compiles( self ) -> None:
+		# real-compile confirmation for Stage 3b (generic RCClass __init__
+		# construction) - caught a real, separate emitter_c.py bug on the
+		# way here: _member_access_operator checked isinstance(obj_type,
+		# RCClass) without unwrapping Specialization, so a monomorphized
+		# generic method's own `self` (typed as a Specialization) emitted
+		# `.` instead of `->` for every field access - self.v = v produced
+		# `(self).v = v` instead of `(self)->v = v`, a real clang error
+		# ("member reference type ... is a pointer; did you mean '->'?"),
+		# not just a scheduling gap
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, v: T ) -> None:',
+			'		self.v = v',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box( 1 )',
 			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))

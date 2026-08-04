@@ -560,7 +560,13 @@ _CMP_SYMBOLS = {
 }
 
 def _member_access_operator( obj_type: Type|None ) -> str:
-	return '->' if isinstance( obj_type, RCClass ) else '.'
+	# a concrete generic RCClass instantiation (Box[i32]) is a Specialization,
+	# not an RCClass instance itself - unwrap first, or a monomorphized
+	# generic method's own `self` (already typed as a Specialization) would
+	# wrongly emit `.` (value access) instead of `->` (every RCClass
+	# instance is always accessed through a pointer in C)
+	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
+	return '->' if isinstance( base, RCClass ) else '.'
 
 def _emit_call_args( instr: ir.Call ) -> list[str]:
 	params = instr.target.parameters or []

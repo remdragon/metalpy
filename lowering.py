@@ -209,7 +209,16 @@ class Lowering:
 					if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
 						self_param = Parameter( stem = 'self', qualname = f'{fn.qualname}.self', file = fn.file, line = fn.line, type = fn.cls )
 						fn.add_name( 'self', self_param )
-						if fn.stem == '__init__' and isinstance( fn.cls, RCClass ) and fn.cls.base is None:
+						# fn.cls may be a Specialization for a monomorphized
+						# generic-class __init__ (see Lowering._lower_generic_
+						# construction_args) - unwrap to the real RCClass for
+						# the isinstance/.base checks below and the field list
+						# construction needs further down. NOTE: RCClass.base
+						# means "parent class in an inheritance chain" while
+						# Specialization.base means "the generic template" -
+						# not the same thing, don't conflate them
+						self_cls = self._ensure_resolved( fn.cls ) if isinstance( fn.cls, Specialization ) else fn.cls
+						if fn.stem == '__init__' and isinstance( self_cls, RCClass ) and self_cls.base is None:
 							self._construction_self = self_param
 							self._construction_fallible = self._init_fallibility( fn )
 
@@ -246,15 +255,15 @@ class Lowering:
 						union_storage = self._union_storage.get,
 					)
 					if self._construction_self is not None:
-						for attr in fn.cls.attributes:
+						for attr in self_cls.attributes:
 							self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _lower_allocate_fields's identical loop
-						self._cfg.enter_construction( self_param, fn.cls.attributes )
+						self._cfg.enter_construction( self_param, self_cls.attributes )
 					elif fn.cls is not None and not fn.is_static and not fn.is_classmethod:
 						self._cfg.enter_self( self_param, is_move = fn.is_move )
 					for instr in self._cfg.prologue_instructions:
 						self._emit( instr )
 					if self._construction_self is not None:
-						self._emit_construction_defaults( fn.cls, self_param, module )
+						self._emit_construction_defaults( self_cls, self_param, module )
 					body_start = len( self._instructions )
 					for stmt in fn.node.body:
 						# one bad statement doesn't stop the rest of this
@@ -2481,7 +2490,11 @@ class Lowering:
 		target_cls = self._try_resolve_namespace( node.func )
 		if not isinstance( target_cls, ClassLike ):
 			return None
-		self._ensure_resolved( target_cls )
+		# resolve (populate .names/.attributes) WITHOUT scheduling yet - a
+		# generic target_cls must never itself become a real compile unit
+		# (see below); only a concrete Specialization should
+		if target_cls.resolve is not None:
+			target_cls.resolve()
 		init = target_cls.names.get( '__init__' )
 		if init is None:
 			return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
@@ -2498,23 +2511,30 @@ class Lowering:
 				f'{target_cls.qualname}(...): __init__ invocation is only supported for classes with no base class yet: {ast.unparse(node)}',
 				node,
 			)
-		self._ensure_resolved( init )
 
-		self_temp = self._new_temp( target_cls )
+		if target_cls.type_params:
+			self_type, init, args, kwargs = self._lower_generic_construction_args( node, target_cls, init, expected_type )
+		else:
+			self.schedule( target_cls )
+			self._ensure_resolved( init )
+			self_type = target_cls
+			args, kwargs = self._lower_call_args( init, node )
+
+		# self_temp.type is self_type (target_cls itself, or the
+		# Specialization for a generic construction) - NEVER a bare
+		# monomorphized ClassLike object floating free of any Specialization
+		# wrapper, or scheduling it again anywhere else (e.g. sys.alloc[T]'s
+		# own substituted return type, exactly T) would register it a
+		# second time outside the Specialization dedup path. ir.Allocate's
+		# own `cls`, unlike self_temp.type, is always the ABSTRACT target_cls
+		# regardless - the emitter only uses it for an RCClass-vs-not check,
+		# never to read field layout (real field VALUES are already in
+		# `fields`, and the mangled alloc name comes from dest.type, not cls
+		# - see emitter_c.py's own ir.Allocate handling)
+		self_temp = self._new_temp( self_type )
 		self._schedule_rcclass_construction( target_cls, self_temp.type )
 		self._emit( ir.Allocate( dest = self_temp, cls = target_cls, fields = {} ))
 
-		positional, keyword = self._match_call_args( init, node )
-		args = []
-		for param, expr in positional:
-			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, init.qualname )
-			args.append( operand )
-		kwargs = {}
-		for param, expr in keyword:
-			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, init.qualname )
-			kwargs[param.stem] = operand
 		self.schedule( init.return_type )
 		for param in init.parameters or []:
 			self.schedule( param.type )
@@ -2522,10 +2542,78 @@ class Lowering:
 		if not self._init_fallibility( init ):
 			self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
 			return self_temp
-		return self._emit_fallible_construction( node, target_cls, init, self_temp, args, kwargs, expected_type )
+		return self._emit_fallible_construction( node, self_type, init, self_temp, args, kwargs, expected_type )
+
+	def _lower_generic_construction_args( self, node: ast.Call, target_cls: RCClass, init: Function, expected_type: Type|None ) -> tuple[RCClass|Specialization,Function,list[ir.Operand],dict[str,ir.Operand]]:
+		# Box(...) where Box is generic: target_cls's own concrete type args
+		# have to be pinned down before __init__ can be called - same two-
+		# phase strategy _lower_class_generic_method_call's own inference
+		# branch uses (unify from expected_type first, then refine from the
+		# lowered arguments' own types), since a class constructor's type
+		# params are exactly as inferable as a generic method's - working
+		# against __init__'s ABSTRACT parameter list throughout (substituting
+		# per-parameter via _substitute_type_params) because the concrete,
+		# monomorphized __init__ isn't available until the args are already
+		# resolved
+		if init.resolve is not None:
+			init.resolve()
+		class_type_params = target_cls.type_params or []
+		bindings: dict[int,Type] = {}
+		# expected_type pins target_cls's own args directly for a non-
+		# fallible __init__ (b: Box[i32] = Box(1)) - but for a FALLIBLE one,
+		# Box(...) itself becomes Result[Box[i32],E] (SYNTAX.md), so the
+		# surrounding annotation is r: Result[Box[i32],MyError], one level
+		# removed from target_cls. Peek through a Result[_,_] wrapper
+		# speculatively (find_name_or_none, not find_name - same posture as
+		# _maybe_consume_result: a program that never defines/imports Result
+		# at all must not hard-fail here just because this particular
+		# construction happens not to be Result-shaped)
+		pinning_type = expected_type
+		result_cls = self.discovery.find_name_or_none( 'Result' )
+		if (
+			isinstance( expected_type, Specialization ) and result_cls is not None
+			and expected_type.base is result_cls and len( expected_type.args ) == 2
+		):
+			pinning_type = expected_type.args[0]
+		if isinstance( pinning_type, Specialization ) and pinning_type.base is target_cls:
+			for tv, arg in zip( class_type_params, pinning_type.args ):
+				bindings[ id( tv ) ] = arg
+
+		positional, keyword = self._match_call_args( init, node )
+		partial_args = [ bindings.get( id( tv ), tv ) for tv in class_type_params ]
+		args = [
+			self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
+			for param, expr in positional
+		]
+		kwargs = {
+			param.stem: self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
+			for param, expr in keyword
+		}
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._apply_move_hook( param, operand, init.qualname )
+		for param, _expr in keyword:
+			self._apply_move_hook( param, kwargs[param.stem], init.qualname )
+
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._unify_type_param( class_type_params, param.type, operand.type, bindings, node, target_cls.qualname )
+		for param, _expr in keyword:
+			self._unify_type_param( class_type_params, param.type, kwargs[param.stem].type, bindings, node, target_cls.qualname )
+
+		missing = [ tv.stem for tv in class_type_params if id( tv ) not in bindings ]
+		if missing:
+			self.discovery.fail(
+				f'{target_cls.qualname}(...): cannot infer type parameter(s) {", ".join(missing)} from these arguments or the surrounding expected type: {ast.unparse(node)}',
+				node,
+			)
+		concrete_args = [ bindings[id(tv)] for tv in class_type_params ]
+		cls_spec = self.discovery._get_or_create_specialization( target_cls, concrete_args )
+		init_spec = self.discovery._get_or_create_specialization( init, concrete_args )
+		self._ensure_resolved( cls_spec ) # also populates init_spec.monomorphized as a side effect - same (init, concrete_args) key monomorphize_class's own method-substitution loop uses
+		monomorphized_init = self._ensure_resolved( init_spec )
+		return cls_spec, monomorphized_init, args, kwargs
 
 	def _emit_fallible_construction(
-		self, node: ast.Call, target_cls: RCClass, init: Function, self_temp: ir.Temp,
+		self, node: ast.Call, concrete_cls: RCClass|Specialization, init: Function, self_temp: ir.Temp,
 		args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None,
 	) -> ir.Operand:
 		# __init__ is fallible (Result[None,E]) - Foo(...) becomes
@@ -2541,7 +2629,7 @@ class Lowering:
 		self._emit( ir.Call( dest = init_result, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
 
 		unique = self._label_id
-		self_var = self._declare_hidden_local( f'__ctor_self_{unique}', target_cls, node )
+		self_var = self._declare_hidden_local( f'__ctor_self_{unique}', concrete_cls, node )
 		for instr in self._cfg.assign( self_var, self_temp, is_alias = False ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = self_var, src = self_temp ))
@@ -2553,7 +2641,7 @@ class Lowering:
 
 		error_cls = init.return_type.args[1]
 		result_cls = self.discovery.find_name( 'Result', node )
-		outer_result_type = expected_type or self.discovery._get_or_create_specialization( result_cls, [ target_cls, error_cls ] )
+		outer_result_type = expected_type or self.discovery._get_or_create_specialization( result_cls, [ concrete_cls, error_cls ] )
 		dest_var = self._declare_hidden_local( f'__ctor_dest_{unique}', outer_result_type, node )
 
 		is_err_fn = self._attr_lookup_callable( init.return_type, 'is_err', node )
