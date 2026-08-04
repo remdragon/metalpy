@@ -1198,6 +1198,37 @@ class Tests( unittest.TestCase ):
 		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
 		self.assertTrue( any( c.op == ir.CmpOp.EQ for c in cmp_instrs ))
 
+	def test_compare_is_none_on_a_generic_union_specialization_emits_a_tag_check( self ) -> None:
+		# regression test: unlike Foo|None above (a synthesized anonymous
+		# union, always a real TaggedUnion), a value typed as a SPECIALIZATION
+		# of a user-declared generic @union (Maybe[A]) has no .attributes of
+		# its own and isn't a TaggedUnion instance itself - `x is None` here
+		# must still see past the wrapper to find the real None member and
+		# emit the same tag check, not silently fall through to a bogus flat
+		# Cmp against a None-typed Const (see _tagged_union_shape)
+		code = '\n'.join([
+			'class A: pass',
+			'',
+			'@union',
+			'class Maybe[T]:',
+			'	Some: T',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	x: Maybe[A]',
+			'	b: bool = x is None',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		get_attr = next( i for i in lowered.instructions if isinstance( i, ir.GetAttr ) and i.attr == 'tag' )
+		x_var = mod.get_local( 'main' ).names['x']
+		self.assertIs( get_attr.obj, x_var )
+		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
+		self.assertEqual( len( cmp_instrs ), 1 )
+		self.assertEqual( cmp_instrs[0].op, ir.CmpOp.EQ )
+		self.assertEqual( cmp_instrs[0].right.value, 1 ) # Nothing is member ordinal 1 (Some is 0)
+
 	def test_compare_is_not_none_on_tagged_union_uses_ne( self ) -> None:
 		code = '\n'.join([
 			'class Foo: pass',
@@ -1670,6 +1701,49 @@ class Tests( unittest.TestCase ):
 		receiver_types = [ c.receiver.type for c in calls ]
 		self.assertIn( a_cls, receiver_types )
 		self.assertIn( b_cls, receiver_types ) # narrowed to the concrete leaf, never the raw A|B union
+		self.assertEqual( len( { id( c.target ) for c in calls } ), 2 ) # A.get and B.get are distinct Functions
+
+	def test_union_receiver_call_dispatches_per_leaf_on_a_generic_union_specialization( self ) -> None:
+		# regression test: same shape as test_union_receiver_call_dispatches_
+		# per_leaf, but the receiver is a SPECIALIZATION of a user-declared
+		# generic @union (Choice[A,B]), not a synthesized anonymous union -
+		# Specialization has no .attributes of its own and isn't a
+		# TaggedUnion instance itself, so finding "get isn't declared on
+		# Choice itself, fall back to each leaf's own get" needs to see past
+		# the wrapper (see _tagged_union_shape) rather than mistakenly
+		# reporting `get` as not found at all
+		code = '\n'.join([
+			'class A:',
+			'	def get( self ) -> i32:',
+			'		return 1',
+			'',
+			'class B:',
+			'	def get( self ) -> i32:',
+			'		return 2',
+			'',
+			'@union',
+			'class Choice[T,U]:',
+			'	First: T',
+			'	Second: U',
+			'',
+			'def main() -> None:',
+			'	x: Choice[A,B]',
+			'	x.get()',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertEqual( kinds.count( 'Cmp' ), 1 )
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 1 )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 )
+		a_cls = self.discovery.modules['__test__'].get_local( 'A' )
+		b_cls = self.discovery.modules['__test__'].get_local( 'B' )
+		receiver_types = [ c.receiver.type for c in calls ]
+		self.assertIn( a_cls, receiver_types )
+		self.assertIn( b_cls, receiver_types ) # narrowed to the concrete leaf, never the raw Choice[A,B] specialization
 		self.assertEqual( len( { id( c.target ) for c in calls } ), 2 ) # A.get and B.get are distinct Functions
 
 	def test_union_receiver_call_mismatched_return_type_is_a_compile_error( self ) -> None:

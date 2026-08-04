@@ -1937,11 +1937,13 @@ class Lowering:
 
 		if left_is_none or right_is_none:
 			other = self._lower_expr( right_node if left_is_none else left_node, None )
-			if isinstance( other.type, TaggedUnion ):
-				none_member = next( ( attr for attr in other.type.attributes if attr.type is self.discovery.get_none_type() ), None )
+			shape = self._tagged_union_shape( other.type )
+			if shape is not None:
+				base, members = shape
+				none_member = next( ( attr for attr in members if attr.type is self.discovery.get_none_type() ), None )
 				if none_member is None:
 					self.discovery.fail( f'{other.type.qualname} has no None member: {ast.unparse(node)}', node )
-				tag_attr, _data_attr, _payload_cls, tags = self._union_storage.get( other.type )
+				tag_attr, _data_attr, _payload_cls, tags = self._union_storage.get( base )
 				tag_dest = self._new_temp( tag_attr.type )
 				self._emit( ir.GetAttr( dest = tag_dest, obj = other, attr = tag_attr.stem ))
 				dest = self._new_temp( bool_cls )
@@ -1977,6 +1979,29 @@ class Lowering:
 		if resolve is not None:
 			resolve()
 		self.schedule( obj )
+
+	def _tagged_union_shape( self, t: Type|None ) -> tuple[TaggedUnion,list[Variable]]|None:
+		''' `t` may be a Specialization wrapping a generic @union (a concrete
+		MyOption[i32], not the shared anonymous-union case - substituting a
+		TypeVar-mentioning leaf there already rebuilds a real TaggedUnion
+		directly, see Monomorphizer.substitute_type_params's own TaggedUnion
+		branch). Specialization itself has no .attributes of its own (see
+		mpy_types.py), and a generic member's own declared type (e.g.
+		`Some: T`) is a bare TypeVar until substituted against t's own args -
+		an identity comparison against a real, concrete type could never
+		match without this. Returns (ABSTRACT base, substituted member list)
+		or None if t isn't a TaggedUnion (possibly Specialization-wrapped) at
+		all. The ABSTRACT base, not a monomorphized copy, is what
+		UnionStorage.get needs - tag/payload identity is SHARED across every
+		specialization of a generic union (see UnionStorage.get's own
+		comment), so looking it up against a monomorphized copy would
+		synthesize a second, non-canonical tag/payload rather than reusing
+		the real one. '''
+		base = t.base if isinstance( t, Specialization ) else t
+		if not isinstance( base, TaggedUnion ):
+			return None
+		members = self.monomorphize_class( t ).attributes if isinstance( t, Specialization ) else base.attributes
+		return base, members
 
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
 		self._ensure_resolved( owner_type ) # Specialization.resolve/.names passthrough to .base - no unwrap needed
@@ -2100,22 +2125,28 @@ class Lowering:
 		if not isinstance( func_node, ast.Attribute ):
 			self.discovery.fail( f'cannot call {ast.unparse(func_node)}', func_node )
 		receiver = self._lower_expr( func_node.value, None )
-		if isinstance( receiver.type, TaggedUnion ):
-			self._ensure_resolved( receiver.type )
-			direct = receiver.type.names.get( func_node.attr )
+		shape = self._tagged_union_shape( receiver.type )
+		if shape is not None:
+			base, members = shape
+			self._ensure_resolved( base )
+			direct = base.names.get( func_node.attr )
 			if not isinstance( direct, ( Function, Overload )):
-				return self._resolve_union_receiver_members( receiver.type, func_node.attr, func_node ), receiver
+				return self._resolve_union_receiver_members( base, members, func_node.attr, func_node ), receiver
 		target = self._attr_lookup_callable( receiver.type, func_node.attr, func_node )
 		return target, receiver
 
-	def _resolve_union_receiver_members( self, union: TaggedUnion, attr: str, ctx: ast.AST ) -> _ReceiverDispatch:
+	def _resolve_union_receiver_members( self, union: TaggedUnion, members: list[Variable], attr: str, ctx: ast.AST ) -> _ReceiverDispatch:
 		# the union itself has no .names entry for attr (an anonymous X|Y
 		# union never does; a real @union class only reaches here if it
 		# doesn't declare attr as a real method of its own) - so each leaf
 		# type's own, unrelated method under this name has to be looked up
-		# individually instead, then dispatched on the receiver's runtime tag
+		# individually instead, then dispatched on the receiver's runtime tag.
+		# `members` is already substituted against the receiver's own
+		# concrete args when it's a generic union (see _tagged_union_shape) -
+		# a generic leaf's declared type (e.g. `Some: T`) is a bare TypeVar
+		# otherwise, which has no attribute lookup of its own to speak of
 		per_leaf: list[tuple[Variable,Function]] = []
-		for member in union.attributes:
+		for member in members:
 			if member.resolve is not None:
 				member.resolve()
 			found = self._attr_lookup_callable( member.type, attr, ctx )
@@ -3049,12 +3080,14 @@ class Lowering:
 		bool_cls = self.discovery.find_name( 'bool', node )
 		for param, leaf_type in conditions:
 			operand = self._dispatch_operand_for_param( node, target, param, args, kwargs )
-			if not isinstance( operand.type, TaggedUnion ):
+			shape = self._tagged_union_shape( operand.type )
+			if shape is None:
 				self.discovery.fail( f'{target.qualname}: conditional dispatch on a non-union argument: {ast.unparse(node)}', node )
-			member = next( ( attr for attr in operand.type.attributes if attr.type is leaf_type ), None )
+			base, members = shape
+			member = next( ( attr for attr in members if attr.type is leaf_type ), None )
 			if member is None:
 				self.discovery.fail( f'{target.qualname}: {leaf_type.qualname if leaf_type else "?"} is not a member of {operand.type.qualname}', node )
-			tag_attr, _data_attr, _payload_cls, tags = self._union_storage.get( operand.type )
+			tag_attr, _data_attr, _payload_cls, tags = self._union_storage.get( base )
 			tag_dest = self._new_temp( tag_attr.type )
 			self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = tag_attr.stem ))
 			cmp_dest = self._new_temp( bool_cls )
@@ -3086,12 +3119,16 @@ class Lowering:
 		# must be unwrapped to the concrete leaf type the chosen branch's
 		# parameter actually declares before it can be passed as a real
 		# argument - mirrors match's own payload extraction
-		if target_type is None or operand.type is target_type or not isinstance( operand.type, TaggedUnion ):
+		if target_type is None or operand.type is target_type:
 			return operand
-		member = next( ( attr for attr in operand.type.attributes if attr.type is target_type ), None )
+		shape = self._tagged_union_shape( operand.type )
+		if shape is None:
+			return operand
+		base, members = shape
+		member = next( ( attr for attr in members if attr.type is target_type ), None )
 		if member is None:
 			return operand
-		tag_attr, data_attr, payload_cls, tags = self._union_storage.get( operand.type )
+		tag_attr, data_attr, payload_cls, tags = self._union_storage.get( base )
 		payload_dest = self._new_temp( payload_cls )
 		self._emit( ir.GetAttr( dest = payload_dest, obj = operand, attr = data_attr.stem ))
 		dest = self._new_temp( target_type )
