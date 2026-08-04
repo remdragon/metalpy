@@ -1,7 +1,7 @@
 # stdlib imports:
 from dataclasses import dataclass
 from enum import Enum
-from typing import Union
+from typing import ClassVar, Union
 
 # local imports:
 from mpy_types import Type, Variable, Parameter, ClassLike, Function
@@ -123,29 +123,39 @@ class BinOp( Instruction ):
 	left: Operand
 	right: Operand
 
+	# lowering support - a class-level tag, never per-instance data (see
+	# arithmetic_mode.py, the only reader): which error a Check-mode opcode's
+	# dest.type is Result[T,<checked_error>] against, or None for a plain
+	# (non-Result) opcode. ClassVar so subclasses can override it as a bare
+	# class attribute without it becoming a dataclass __init__ parameter
+	# whose default (None, from this base class) would otherwise shadow it
+	# on every instance
+	checked_error: ClassVar[str|None] = None
+
+	# test support:
 	def test_repr( self ) -> str:
 		# lives on the base class - every op x mode subclass below adds no
 		# fields of its own, so type(self).__name__ is all that needs to vary
 		return f'{type(self).__name__}( dest={self.dest!r}, left={self.left!r}, right={self.right!r} )'
 
 class AddWrap( BinOp ): pass
-class AddCheck( BinOp ): pass # dest.type is Result[T,OverflowError]
+class AddCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class AddSaturate( BinOp ): pass
 
 class SubWrap( BinOp ): pass
-class SubCheck( BinOp ): pass # dest.type is Result[T,OverflowError]
+class SubCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class SubSaturate( BinOp ): pass
 
 class MulWrap( BinOp ): pass
-class MulCheck( BinOp ): pass # dest.type is Result[T,OverflowError]
+class MulCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class MulSaturate( BinOp ): pass
 
 class ShlWrap( BinOp ): pass
-class ShlCheck( BinOp ): pass # dest.type is Result[T,OverflowError]
+class ShlCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class ShlSaturate( BinOp ): pass
 
-class Div( BinOp ): pass # dest.type is Result[T,ZeroDivisionError]
-class Mod( BinOp ): pass # dest.type is Result[T,ZeroDivisionError]
+class Div( BinOp ): checked_error = 'ZeroDivisionError' # dest.type is Result[T,ZeroDivisionError]
+class Mod( BinOp ): checked_error = 'ZeroDivisionError' # dest.type is Result[T,ZeroDivisionError]
 
 class BitAnd( BinOp ): pass
 class BitOr( BinOp ): pass
@@ -157,16 +167,20 @@ class UnaryOp( Instruction ):
 	dest: Temp
 	operand: Operand
 
+	# lowering support - see BinOp.checked_error above, same reasoning
+	checked_error: ClassVar[str|None] = None
+
+	# test support:
 	def test_repr( self ) -> str:
 		return f'{type(self).__name__}( dest={self.dest!r}, operand={self.operand!r} )'
 
 class Invert( UnaryOp ): pass
 class NegWrap( UnaryOp ): pass
-class NegCheck( UnaryOp ): pass # dest.type is Result[T,OverflowError]
+class NegCheck( UnaryOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class NegSaturate( UnaryOp ): pass
 
 class CastWrap( UnaryOp ): pass
-class CastCheck( UnaryOp ): pass # dest.type is Result[T,OverflowError]
+class CastCheck( UnaryOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class CastSaturate( UnaryOp ): pass
 
 # Result-consuming ops - Check-mode arithmetic and Div/Mod hand back a

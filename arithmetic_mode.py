@@ -1,0 +1,146 @@
+# stdlib imports:
+import ast
+from typing import Type as PyType
+
+# local imports:
+import ir
+
+'''
+self._arithmetic_mode (lowering.py) is a stack of these, pushed/popped by
+_stmt_With - see Lowering's own docstring for the with-block syntax each one
+corresponds to. Each mode answers the same question three ways (GetCast/
+GetUnaryOp/GetBinOp): given the AST node being lowered, which ir opcode
+implements it under this mode, and what extra operand (if any - only
+ArithmeticPanic ever supplies one) does a Check-mode opcode's Result get
+consumed with. Split out of both ir.py (a pure IR-shape module with no
+business inspecting `ast` nodes or picking opcodes) and lowering.py (per
+explicit request - anything ir.py doesn't need to know about doesn't need to
+live in lowering.py either).
+'''
+
+class ArithmeticMode:
+	def GetCast( self ) -> tuple[PyType[ir.UnaryOp],str|None]:
+		raise NotImplementedError()
+
+	def GetUnaryOp( self, node: ast.UnaryOp ) -> tuple[PyType[ir.UnaryOp]|None,str|None]:
+		if isinstance( node.op, ast.Invert ):
+			return ir.Invert, None
+		return None, None
+
+	def GetBinOp( self, node: ast.BinOp ) -> tuple[PyType[ir.BinOp]|None,str|None]:
+		# no overflow concept - always the same opcode, independent of the
+		# active arithmetic mode (that only governs Add/Sub/Mult/Shl/casts)
+		match type( node.op ):
+			case ast.BitAnd:
+				return ir.BitAnd, None
+			case ast.BitOr:
+				return ir.BitOr, None
+			case ast.BitXor:
+				return ir.BitXor, None
+			case ast.RShift:
+				return ir.Shr, None
+			case _:
+				return None, None
+
+class ArithmeticChecked( ArithmeticMode ):
+	''' `with compiler.panic_arithmetic(...):` is layered directly on top of
+	this one (ArithmeticPanic below) - same opcodes, the only difference is
+	what `extra` the Result gets consumed with '''
+	def GetCast( self ) -> tuple[PyType[ir.UnaryOp],str|None]:
+		return ir.CastCheck, None
+
+	def GetUnaryOp( self, node: ast.UnaryOp ) -> tuple[PyType[ir.UnaryOp]|None,str|None]:
+		if isinstance( node.op, ast.USub ):
+			return ir.NegCheck, None
+		return super().GetUnaryOp( node )
+
+	def GetBinOp( self, node: ast.BinOp ) -> tuple[PyType[ir.BinOp]|None,str|None]:
+		match type( node.op ):
+			case ast.Add:
+				return ir.AddCheck, None
+			case ast.Sub:
+				return ir.SubCheck, None
+			case ast.Mult:
+				return ir.MulCheck, None
+			case ast.LShift:
+				return ir.ShlCheck, None
+			case ast.FloorDiv:
+				# always checked against ZeroDivisionError, independent of
+				# the active arithmetic mode - there's no wrapped/saturated
+				# division opcode, so Div/Mod are the same in every mode
+				return ir.Div, None
+			case ast.Mod:
+				return ir.Mod, None
+			case _:
+				return super().GetBinOp( node )
+
+class ArithmeticWrap( ArithmeticMode ):
+	def GetCast( self ) -> tuple[PyType[ir.UnaryOp],str|None]:
+		return ir.CastWrap, None
+
+	def GetUnaryOp( self, node: ast.UnaryOp ) -> tuple[PyType[ir.UnaryOp]|None,str|None]:
+		if isinstance( node.op, ast.USub ):
+			return ir.NegWrap, None
+		return super().GetUnaryOp( node )
+
+	def GetBinOp( self, node: ast.BinOp ) -> tuple[PyType[ir.BinOp]|None,str|None]:
+		match type( node.op ):
+			case ast.Add:
+				return ir.AddWrap, None
+			case ast.Sub:
+				return ir.SubWrap, None
+			case ast.Mult:
+				return ir.MulWrap, None
+			case ast.LShift:
+				return ir.ShlWrap, None
+			case ast.FloorDiv:
+				return ir.Div, None # see ArithmeticChecked.GetBinOp
+			case ast.Mod:
+				return ir.Mod, None
+			case _:
+				return super().GetBinOp( node )
+
+class ArithmeticSaturate( ArithmeticMode ):
+	def GetCast( self ) -> tuple[PyType[ir.UnaryOp],str|None]:
+		return ir.CastSaturate, None
+
+	def GetUnaryOp( self, node: ast.UnaryOp ) -> tuple[PyType[ir.UnaryOp]|None,str|None]:
+		if isinstance( node.op, ast.USub ):
+			return ir.NegSaturate, None
+		return super().GetUnaryOp( node )
+
+	def GetBinOp( self, node: ast.BinOp ) -> tuple[PyType[ir.BinOp]|None,str|None]:
+		match type( node.op ):
+			case ast.Add:
+				return ir.AddSaturate, None
+			case ast.Sub:
+				return ir.SubSaturate, None
+			case ast.Mult:
+				return ir.MulSaturate, None
+			case ast.LShift:
+				return ir.ShlSaturate, None
+			case ast.FloorDiv:
+				return ir.Div, None # see ArithmeticChecked.GetBinOp
+			case ast.Mod:
+				return ir.Mod, None
+			case _:
+				return super().GetBinOp( node )
+
+class ArithmeticPanic( ArithmeticChecked ):
+	''' `with compiler.panic_arithmetic(errmsg):` - identical opcode choices
+	to the bare Check-mode default (ArithmeticChecked), just consumed with
+	Unwrap(errmsg) instead of OrReturn - see Lowering's own docstring '''
+	def __init__( self, extra: str|None = None ) -> None:
+		self.extra = extra
+
+	def GetCast( self ) -> tuple[PyType[ir.UnaryOp],str|None]:
+		opcode, _ = super().GetCast()
+		return opcode, self.extra
+
+	def GetUnaryOp( self, node: ast.UnaryOp ) -> tuple[PyType[ir.UnaryOp]|None,str|None]:
+		opcode, _ = super().GetUnaryOp( node )
+		return opcode, self.extra
+
+	def GetBinOp( self, node: ast.BinOp ) -> tuple[PyType[ir.BinOp]|None,str|None]:
+		opcode, _ = super().GetBinOp( node )
+		return opcode, self.extra

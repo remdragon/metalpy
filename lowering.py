@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Callable
 
 # local imports:
+import arithmetic_mode
 import cfg
 import ir
 from discovery import Discovery
@@ -17,39 +18,27 @@ import overload_resolution
 from union_storage import UnionStorage, ReceiverDispatch as _ReceiverDispatch
 from monomorphize import Monomorphizer
 
-_BINOP_WRAP_OPCODES: dict[type,type] = {
-	ast.Add: ir.AddWrap,
-	ast.Sub: ir.SubWrap,
-	ast.Mult: ir.MulWrap,
-	ast.LShift: ir.ShlWrap,
+# compile-error "here's what to do instead" text for a Check-mode opcode's
+# checked_error (ir.py's BinOp/UnaryOp.checked_error) - keyed by error name
+# rather than owned by ir.py itself, since these are lowering-level compiler
+# messages, not IR shape
+_ALTERNATIVES_BY_ERROR: dict[str,str] = {
+	'OverflowError': (
+		'wrap this in `with compiler.wrap_arithmetic:`, `with compiler.saturate_arithmetic:`, '
+		'or `with compiler.panic_arithmetic(...):` instead'
+	),
+	# the primary, expected path for division is the same as any other
+	# Check-mode op: the enclosing function returns Result[_,
+	# ZeroDivisionError] and the Result propagates via OrReturn/OrJump - no
+	# panic involved, and this is what happens even inside wrap_arithmetic/
+	# saturate_arithmetic (there's no wrapped/saturated variant of division,
+	# so those modes don't change division's checked-ness at all). This
+	# message only fires when that requirement ISN'T met - panic_arithmetic
+	# is the one remaining alternative to changing the return type, not a
+	# default
+	'ZeroDivisionError': 'wrap this in `with compiler.panic_arithmetic(...):` instead',
 }
-_BINOP_CHECK_OPCODES: dict[type,type] = {
-	ast.Add: ir.AddCheck,
-	ast.Sub: ir.SubCheck,
-	ast.Mult: ir.MulCheck,
-	ast.LShift: ir.ShlCheck,
-}
-_BINOP_SATURATE_OPCODES: dict[type,type] = {
-	ast.Add: ir.AddSaturate,
-	ast.Sub: ir.SubSaturate,
-	ast.Mult: ir.MulSaturate,
-	ast.LShift: ir.ShlSaturate,
-}
-# always checked against ZeroDivisionError - unlike Add/Sub/Mult/Shl, there's
-# no wrapped/saturated variant of division, so this is independent of the
-# active arithmetic mode (see _expr_BinOp)
-_DIV_MOD_OPCODES: dict[type,type] = {
-	ast.FloorDiv: ir.Div, # no float type exists in this language (see ir.py) - '/' (ast.Div) is deliberately left unsupported rather than guessing what it should mean
-	ast.Mod: ir.Mod,
-}
-# no overflow concept at all - always a single opcode, regardless of the
-# active arithmetic mode (see _expr_BinOp)
-_BITWISE_OPCODES: dict[type,type] = {
-	ast.BitAnd: ir.BitAnd,
-	ast.BitOr: ir.BitOr,
-	ast.BitXor: ir.BitXor,
-	ast.RShift: ir.Shr,
-}
+
 
 class Lowering:
 	'''
@@ -83,13 +72,13 @@ class Lowering:
 	return Result[_,OverflowError] - using plain arithmetic in a function
 	that can't propagate that error is a compile error, unless one of the
 	arithmetic-mode with-blocks below is used instead. self._arithmetic_mode
-	is a stack of (kind, extra) pairs, pushed/popped by _stmt_With:
-		('wrap', None)      - `with compiler.wrap_arithmetic:` - plain
+	is a stack of ArithmeticMode objects, pushed/popped by _stmt_With:
+		ArithmeticWrap       - `with compiler.wrap_arithmetic:` - plain
 		                       AddWrap/SubWrap/MulWrap, no Result involved
-		('saturate', None)  - `with compiler.saturate_arithmetic:` - plain
+		ArithmeticSaturate   - `with compiler.saturate_arithmetic:` - plain
 		                       AddSaturate/SubSaturate/MulSaturate, likewise
-		('check', None)     - the default (see above) - Check + OrReturn
-		('check', errmsg)   - `with compiler.panic_arithmetic(errmsg):` -
+		ArithmeticChecked    - the default (see above) - Check + OrReturn
+		ArithmeticPanic      - `with compiler.panic_arithmetic(errmsg):` -
 		                       still Check-mode ops, but consumed with
 		                       Unwrap(errmsg) instead of OrReturn, so (unlike
 		                       the bare default) this does NOT require the
@@ -181,7 +170,7 @@ class Lowering:
 			self._emit( ir.FuncStart( name = fn.qualname, params = fn.parameters or [], return_type = fn.return_type, extern_lib = fn.extern_lib, extern_symbol = fn.extern_symbol ))
 			self._emit( ir.FuncEnd( name = fn.qualname ))
 			return self._instructions
-		self._arithmetic_mode: list[tuple[str,object]] = [ ( 'check', None ) ]
+		self._arithmetic_mode: list[arithmetic_mode.ArithmeticMode] = [ arithmetic_mode.ArithmeticChecked() ]
 		self._loop_depth = 0
 		self._loop_labels: list[tuple[str,str]] = [] # stack of (continue_label, break_label), innermost last
 		self._in_deferred_body = False
@@ -462,7 +451,7 @@ class Lowering:
 		self._label_id = 0
 		self._pending_temps = []
 		self._current_fn = None
-		self._arithmetic_mode = [ ( 'check', None ) ]
+		self._arithmetic_mode = [ arithmetic_mode.ArithmeticChecked() ]
 		# defer/errdefer/loops can't appear in a global initializer (it's a
 		# single expression, not a statement body reachable through
 		# _lower_stmt) - reset for consistency/safety only, never touched here
@@ -868,15 +857,15 @@ class Lowering:
 
 		attr = self._is_compiler_attr( context_expr )
 		if attr == 'wrap_arithmetic':
-			mode = ( 'wrap', None )
+			mode: arithmetic_mode.ArithmeticMode = arithmetic_mode.ArithmeticWrap()
 		elif attr == 'saturate_arithmetic':
-			mode = ( 'saturate', None )
+			mode = arithmetic_mode.ArithmeticSaturate()
 		elif self._is_compiler_call( context_expr ) == 'panic_arithmetic':
 			if len( context_expr.args ) != 1 or context_expr.keywords:
 				self.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(node)}', node )
 			str_cls = self.discovery.find_name( 'str', node )
 			errmsg = self._lower_expr( context_expr.args[0], str_cls )
-			mode = ( 'check', errmsg )
+			mode = arithmetic_mode.ArithmeticPanic( errmsg )
 		else:
 			self.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
 
@@ -1018,15 +1007,14 @@ class Lowering:
 		if isinstance( source, ast.expr ):
 			return self._lower_expr( source, target_type )
 		operand = source
-		kind, extra = self._arithmetic_mode[-1]
-		opcode = self._CAST_OPCODES_BY_KIND[kind]
-		if kind in ( 'wrap', 'saturate' ):
+		opcode, extra = self._arithmetic_mode[-1].GetCast()
+		if not opcode.checked_error:
 			dest = self._new_temp( target_type )
 			self._emit( opcode( dest = dest, operand = operand ))
 			return dest
-		result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
+		result_cls, overflow_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
 		if extra is None:
-			self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
+			self._require_result_return( node, result_cls, overflow_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
 		return self._emit_checked_op( opcode, { 'operand': operand }, target_type, result_cls, overflow_cls, extra )
 
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
@@ -1690,36 +1678,6 @@ class Lowering:
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		return self._lower_call( node, expected_type, want_result = True )
 
-	_OPCODES_BY_KIND = {
-		'wrap': _BINOP_WRAP_OPCODES,
-		'saturate': _BINOP_SATURATE_OPCODES,
-		'check': _BINOP_CHECK_OPCODES,
-	}
-	_UNARY_NEG_OPCODES_BY_KIND = {
-		'wrap': ir.NegWrap,
-		'saturate': ir.NegSaturate,
-		'check': ir.NegCheck,
-	}
-	_CAST_OPCODES_BY_KIND = {
-		'wrap': ir.CastWrap,
-		'saturate': ir.CastSaturate,
-		'check': ir.CastCheck,
-	}
-
-	_ARITHMETIC_ALTERNATIVES = (
-		'wrap this in `with compiler.wrap_arithmetic:`, `with compiler.saturate_arithmetic:`, '
-		'or `with compiler.panic_arithmetic(...):` instead'
-	)
-	# the primary, expected path for division is the same as any other
-	# Check-mode op: the enclosing function returns Result[_,
-	# ZeroDivisionError] and the Result propagates via OrReturn/OrJump - no
-	# panic involved, and this is what happens even inside wrap_arithmetic/
-	# saturate_arithmetic (there's no wrapped/saturated division opcode, so
-	# those modes don't change division's checked-ness at all). This message
-	# only fires when that requirement ISN'T met - panic_arithmetic is the
-	# one remaining alternative to changing the return type, not a default
-	_DIVISION_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
-
 	def _lower_binary_operands( self, left_node: ast.expr, right_node: ast.expr, expected_type: Type|None, *, infer_right_from_left: bool = True ) -> tuple[ir.Operand,ir.Operand]:
 		# shared by _expr_BinOp and _expr_Compare: a bare literal constant on
 		# either side has no type of its own to offer, so the non-constant
@@ -1746,55 +1704,34 @@ class Lowering:
 		return left, right
 
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
-		op_type = type( node.op )
-		kind, extra = self._arithmetic_mode[-1]
-
 		left, right = self._lower_binary_operands( node.left, node.right, expected_type )
 
 		result_type = expected_type or left.type
 
-		if op_type in _BITWISE_OPCODES:
-			# no overflow concept - always a single opcode, independent of
-			# the active wrap/check/saturate arithmetic mode (that only
-			# governs Add/Sub/Mult/Shl)
-			dest = self._new_temp( result_type )
-			self._emit( _BITWISE_OPCODES[op_type]( dest = dest, left = left, right = right ))
-			return dest
-
-		if op_type in _DIV_MOD_OPCODES:
-			# always checked against ZeroDivisionError, independent of the
-			# active arithmetic mode - but still honors panic_arithmetic's
-			# own errmsg (extra) for how the Result gets consumed, exactly
-			# like Check-mode Add/Sub/Mult/Shl below
-			result_cls, error_cls = self._lookup_result_and_error_types( node, 'ZeroDivisionError' )
-			if extra is None:
-				self._require_result_return( node, result_cls, error_cls, self._DIVISION_ALTERNATIVES )
-			return self._emit_checked_op( _DIV_MOD_OPCODES[op_type], { 'left': left, 'right': right }, result_type, result_cls, error_cls, extra )
-
-		opcode = self._OPCODES_BY_KIND[kind].get( op_type )
+		opcode, extra = self._arithmetic_mode[-1].GetBinOp( node )
 		if opcode is None:
 			self.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
-
-		if kind in ( 'wrap', 'saturate' ):
+		if opcode.checked_error:
+			# check mode (the default - see the class docstring): the op itself
+			# produces Result[result_type,OverflowError|ZeroDivisionError]. How that Result gets
+			# consumed depends on `extra`: the default (extra is None) uses
+			# OrReturn, mirroring Result.or_return()'s own semantics, and needs
+			# somewhere for the error to propagate to; `with
+			# compiler.panic_arithmetic(msg):` (extra is the lowered msg operand)
+			# uses Unwrap instead, which panics immediately and so has no such
+			# requirement
+			result_cls, error_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
+			if extra is None:
+				# validated before anything gets emitted - a mid-statement
+				# failure here must not leave partial instructions behind for
+				# the per-statement recovery boundary to silently keep
+				self._require_result_return( node, result_cls, error_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
+			return self._emit_checked_op( opcode, { 'left': left, 'right': right }, result_type, result_cls, error_cls, extra )
+		else:
+			# wrap/saturate or no overflow concept:
 			dest = self._new_temp( result_type )
 			self._emit( opcode( dest = dest, left = left, right = right ))
 			return dest
-
-		# check mode (the default - see the class docstring): the op itself
-		# produces Result[result_type,OverflowError]. How that Result gets
-		# consumed depends on `extra`: the default (extra is None) uses
-		# OrReturn, mirroring Result.or_return()'s own semantics, and needs
-		# somewhere for the error to propagate to; `with
-		# compiler.panic_arithmetic(msg):` (extra is the lowered msg operand)
-		# uses Unwrap instead, which panics immediately and so has no such
-		# requirement
-		result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
-		if extra is None:
-			# validated before anything gets emitted - a mid-statement
-			# failure here must not leave partial instructions behind for
-			# the per-statement recovery boundary to silently keep
-			self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
-		return self._emit_checked_op( opcode, { 'left': left, 'right': right }, result_type, result_cls, overflow_cls, extra )
 
 	def _emit_checked_op( self, opcode: type, operand_kwargs: dict, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
 		# shared by Check-mode binops (Add/Sub/Mult/Shl/Div/Mod), USub, and
@@ -1852,25 +1789,18 @@ class Lowering:
 		operand = self._lower_expr( node.operand, expected_type )
 		result_type = expected_type or operand.type
 
-		if isinstance( node.op, ast.Invert ):
-			# no overflow concept, same posture as the non-Shl bitwise binops
-			dest = self._new_temp( result_type )
-			self._emit( ir.Invert( dest = dest, operand = operand ))
-			return dest
-
-		if isinstance( node.op, ast.USub ):
-			kind, extra = self._arithmetic_mode[-1]
-			opcode = self._UNARY_NEG_OPCODES_BY_KIND[kind]
-			if kind in ( 'wrap', 'saturate' ):
-				dest = self._new_temp( result_type )
-				self._emit( opcode( dest = dest, operand = operand ))
-				return dest
-			result_cls, overflow_cls = self._lookup_result_and_error_types( node, 'OverflowError' )
+		opcode, extra = self._arithmetic_mode[-1].GetUnaryOp( node )
+		if opcode is None:
+			self.discovery.fail( f'unsupported unary operator: {ast.unparse(node)}', node )
+		if opcode.checked_error:
+			result_cls, overflow_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
 			if extra is None:
-				self._require_result_return( node, result_cls, overflow_cls, self._ARITHMETIC_ALTERNATIVES )
+				self._require_result_return( node, result_cls, overflow_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
 			return self._emit_checked_op( opcode, { 'operand': operand }, result_type, result_cls, overflow_cls, extra )
-
-		self.discovery.fail( f'unsupported unary operator: {ast.unparse(node)}', node )
+		else:
+			dest = self._new_temp( result_type )
+			self._emit( opcode( dest = dest, operand = operand ))
+			return dest
 
 	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:
 		# short-circuit and/or: evaluate operands left to right, each into
