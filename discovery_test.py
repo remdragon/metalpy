@@ -9,7 +9,7 @@ import discovery
 from errors import CompileError
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
-	Function, Variable, Specialization, Move, Copy, ConditionalDispatch,
+	Function, Variable, Specialization, Move, Copy, ConditionalDispatch, Scalar,
 )
 
 logger = logging.getLogger( __name__ )
@@ -1649,16 +1649,20 @@ class RealLibSmokeTest( unittest.TestCase ):
 		self.builtins_mod = self.discovery.modules['builtins']
 
 	def test_result_plain_method_resolves( self ) -> None:
+		# Result is a real @union (Ok/Err are TaggedUnion members, not
+		# hand-written staticmethods) - is_ok/is_err/or_return/unwrap/
+		# unwrap_or are the real, plain methods to check resolve correctly
 		result_cls = self.builtins_mod.get_local( 'Result' )
-		self.assertIsInstance( result_cls, CStruct )
+		self.assertIsInstance( result_cls, TaggedUnion )
 		result_cls.resolve()
+		self.assertEqual( [ attr.stem for attr in result_cls.attributes ], [ 'Ok', 'Err' ] )
 
-		ok = result_cls.get_local( 'Ok' )
-		self.assertIsInstance( ok, Function )
-		ok.resolve()
-		self.assertIsNone( ok.resolve )
-		self.assertIsInstance( ok.return_type, Specialization )
-		self.assertIs( ok.return_type.base, result_cls )
+		is_ok = result_cls.get_local( 'is_ok' )
+		self.assertIsInstance( is_ok, Function )
+		is_ok.resolve()
+		self.assertIsNone( is_ok.resolve )
+		self.assertIsInstance( is_ok.return_type, Scalar )
+		self.assertEqual( is_ok.return_type.stem, 'bool' )
 
 	def test_len_is_a_single_generic_function( self ) -> None:
 		# len() used to be 3 concrete overloads (str/bytes/bytearray) -

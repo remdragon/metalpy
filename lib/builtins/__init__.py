@@ -15,55 +15,34 @@ class OverflowError: pass
 class ZeroDivisionError: pass
 class IndexError: pass
 
-@cunion
-class ResultPayload[T,E]:
-	ok: T
-	err: E
-
-@cstruct
+@union
 class Result[T,E]:
-	_payload: ResultPayload[T,E]
-	_tag: u8
-	
-	@staticmethod
-	def Ok( val: T ) -> Result[T,E]:
-		res: Result[T,E] = Result.__allocate__(
-			_payload = ResultPayload( ok = val ),
-			_tag = 0,
-		)
-		return res
-	
-	@staticmethod
-	def Err( err: E ) -> Result[T,E]:
-		res: Result[T,E] = Result.__allocate__(
-			_payload = ResultPayload( err = err ),
-			_tag = 1,
-		)
-		return res
-	
+	Ok: T
+	Err: E
+
 	def is_ok( self ) -> bool:
-		return self._tag == 0
-	
+		return self.tag == 0
+
 	def is_err( self ) -> bool:
-		return self._tag == 1
-	
+		return self.tag == 1
+
 	def or_return( self ) -> T:
 		if self.is_err():
-			compiler.early_return( self._payload.err )
-		return self._payload.ok
-	
+			compiler.early_return( self.data.v_Err )
+		return self.data.v_Ok
+
 	def unwrap( self, errmsg: str ) -> T:
 		if self.is_ok():
-			return self._payload.ok
+			return self.data.v_Ok
 		sys.panic( errmsg )
-	
+
 	@overload
 	def unwrap_or( self, default: T ) -> T:
 		...
-	
+
 	def unwrap_or( self, default: T|None = None ) -> T|None:
 		if self.is_ok():
-			return self._payload.ok
+			return self.data.v_Ok
 		return default
 
 

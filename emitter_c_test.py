@@ -179,61 +179,51 @@ def main() -> None:
 # fixture - RCClass struct/header emission is Phase 3 work, not built yet,
 # and OverflowError's own kind is incidental to what THESE tests are
 # actually verifying (Check-mode arithmetic/Result specialization
-# synthesis/OrReturn), so it's kept within what Phase 1 actually covers
+# synthesis/OrReturn), so it's kept within what Phase 1 actually covers.
+# Result itself is a real @union (TaggedUnion), matching lib/builtins's own
+# current definition - Ok/Err construction and is_ok/is_err go through the
+# same generic union machinery any other @union does.
 _RESULT_FIXTURE = '\n'.join([
 	'@cstruct',
 	'class OverflowError: pass',
 	'',
-	'@cunion',
-	'class ResultPayload[T,E]:',
-	'	ok: T',
-	'	err: E',
-	'',
-	'@cstruct',
+	'@union',
 	'class Result[T,E]:',
-	'	_payload: ResultPayload[T,E]',
-	'	_tag: u8',
+	'\tOk: T',
+	'\tErr: E',
 	'',
-	'	@staticmethod',
-	'	def Ok( val: T ) -> Result[T,E]:',
-	'		return Result.__allocate__( _payload = ResultPayload( ok = val ), _tag = 0 )',
+	'\tdef is_ok( self ) -> bool:',
+	'\t\treturn self.tag == 0',
 	'',
-	'	@staticmethod',
-	'	def Err( err: E ) -> Result[T,E]:',
-	'		return Result.__allocate__( _payload = ResultPayload( err = err ), _tag = 1 )',
-	'',
-	'	def is_ok( self ) -> bool:',
-	'		return self._tag == 0',
-	'',
-	'	def is_err( self ) -> bool:',
-	'		return self._tag == 1',
+	'\tdef is_err( self ) -> bool:',
+	'\t\treturn self.tag == 1',
 ])
 
 class SpecializationSynthesisTests( CompilerTestCase ):
-	def test_result_specialization_is_a_real_compiler_cstructs_entry( self ) -> None:
+	def test_result_specialization_is_a_real_compiler_tagged_unions_entry( self ) -> None:
 		# a concrete generic class specialization (Result[i32,
 		# OverflowError]) is a real compile unit by the time it reaches
 		# this module - lowering.py's Lowering.monomorphize_class (wired
 		# through compiler.py's own _enqueue/_lower, NOT emitter_c.py -
 		# stage 3 does no discovery of its own) already substituted its
 		# .attributes and gave it a concrete qualname, landing it directly
-		# in compiler.cstructs alongside the (still-abstract, correctly
+		# in compiler.tagged_unions alongside the (still-abstract, correctly
 		# excluded from emission) bare Result.
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def main() -> Result[i32,OverflowError]:',
-			'	with compiler.wrap_arithmetic:',
-			'		x: i32 = 1',
-			'	return Result.Ok( x )',
+			'\twith compiler.wrap_arithmetic:',
+			'\t\tx: i32 = 1',
+			'\treturn Result.Ok( x )',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
-		names = [ cls.qualname for cls in self.compiler.cstructs ]
+		names = [ cls.qualname for cls in self.compiler.tagged_unions ]
 		self.assertIn( '__main__.Result[intrinsics.i32,__main__.OverflowError]', names )
-		spec_cls = next( cls for cls in self.compiler.cstructs if cls.qualname == '__main__.Result[intrinsics.i32,__main__.OverflowError]' )
+		spec_cls = next( cls for cls in self.compiler.tagged_unions if cls.qualname == '__main__.Result[intrinsics.i32,__main__.OverflowError]' )
 		self.assertIsNone( spec_cls.type_params ) # concrete now, not generic
-		src = emitter_c.emit_cstruct( spec_cls )
+		src = emitter_c.emit_tagged_union( spec_cls )
 		self.assertIn( 'struct', src )
-		self.assertIn( '_tag;', src )
-		self.assertIn( '_payload;', src )
+		self.assertIn( 'tag;', src )
+		self.assertIn( 'data;', src )
 
 class EmitArithmeticTests( CompilerTestCase ):
 	def test_wrap_arithmetic_smoke_test( self ) -> None:
@@ -262,7 +252,7 @@ def main() -> i32:
 		self.assertIn( 'OrReturn', kinds )
 		src = emitter_c.emit_function( main_lf )
 		self.assertIn( '__builtin_add_overflow', src )
-		self.assertIn( '_tag == 1', src )
+		self.assertIn( 'tag == 1', src )
 
 _POINT_FIXTURE = '\n'.join([
 	'@cstruct',
@@ -556,6 +546,46 @@ def main() -> None:
 			'def main() -> None:',
 			'	checked()',
 			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_generic_union_method_and_construction_arg_use_substituted_types( self ) -> None:
+		# regression test for two real bugs found verifying Result-as-@union
+		# (lib/builtins/__init__.py) against actual generic-union usage
+		# beyond _RESULT_FIXTURE's own minimal is_ok/is_err:
+		# (1) _attr_lookup didn't substitute a TaggedUnion's own
+		#     synthesized `data` field for a concrete specialization - a
+		#     method body reading `self.data.v_<member>` directly (e.g.
+		#     unwrap_ok below, mirroring Result.unwrap's real body) got the
+		#     ABSTRACT, shared, TypeVar-typed payload_cls, which then got
+		#     scheduled as a real but ill-typed compile unit the moment
+		#     anything read it.
+		# (2) _try_lower_union_construct_call didn't substitute the
+		#     expected_type used to lower `TaggedUnion.Member(<value>)`'s
+		#     own value expression - a Check-mode arithmetic expression
+		#     nested directly inside a union constructor call (e.g.
+		#     `Result.Ok(y + 1)`) got typed against the abstract member's
+		#     own bare TypeVar instead of the concrete specialization,
+		#     corrupting the Result[T,OverflowError] the arithmetic itself
+		#     needs to build into a bogus, unsubstituted one.
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+			'@union',
+			'class Box[T]:',
+			'\tFull: T',
+			'',
+			'\tdef unwrap_ok( self ) -> T:',
+			'\t\treturn self.data.v_Full',
+			'',
+			'def make_full( x: i32 ) -> Box[i32]:',
+			'\treturn Box.Full( x )',
+			'',
+			'def add_one( x: i32 ) -> Result[i32,OverflowError]:',
+			'\treturn Result.Ok( x + 1 )',
+			'',
+			'def main() -> None:',
+			'\tb = make_full( 10 )',
+			'\tv = b.unwrap_ok()',
+			'\tr = add_one( v )',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 

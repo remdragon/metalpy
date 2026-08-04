@@ -239,6 +239,26 @@ def _field_name( name: str ) -> str:
 	# treatment as any other name this module mangles
 	return mangle_qualname( name )
 
+def _result_tag_data_names( result_spec: Type ) -> tuple[str,str,str,str]:
+	''' (tag_field, data_field, ok_member_field, err_member_field) for a
+	Result[T,E]-shaped value - Result is a real @union like any other
+	(TaggedUnion), so this reads the actual field names Lowering.
+	_tagged_union_storage synthesized into its own .names['tag']/['data'],
+	the SAME shape emit_tagged_union/_emit_field_teardown already read,
+	rather than hardcoding '_tag'/'_payload.ok'/'_payload.err' the way this
+	module used to when Result predated @union. The Ok=0/Err=1 tag-VALUE
+	convention stays a literal assumption at every call site below (that's
+	inherent to what Check-mode arithmetic/OrReturn/Unwrap already mean,
+	per ir.py's own opcode semantics - not new hardcoding), only the field
+	NAMES are looked up dynamically here. '''
+	base = result_spec.base if isinstance( result_spec, Specialization ) else result_spec
+	assert isinstance( base, TaggedUnion ), f'{base!r}: Result must be a real @union'
+	tag_attr = base.names.get( 'tag' )
+	data_attr = base.names.get( 'data' )
+	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
+		f'{base.qualname}: _tagged_union_storage has not run yet - no real storage shape to read'
+	return _field_name( tag_attr.stem ), _field_name( data_attr.stem ), _field_name( 'v_Ok' ), _field_name( 'v_Err' )
+
 # --- struct/union body emission -------------------------------------------
 #
 # A concrete generic class specialization (Result[i32,OverflowError]) is a
@@ -358,15 +378,16 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 	builtin = _ARITH_BUILTIN[kind]
 	dest = f't{dest_temp_id}'
 	l, r = _emit_operand( left ), _emit_operand( right )
+	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( result_spec )
 	return [
 		'\t{',
 		f'\t\t{ctype} __tmp;',
 		f'\t\tbool __overflow = {builtin}( {l}, {r}, &__tmp );',
 		'\t\tif ( __overflow ) {',
-		f'\t\t\t{dest}._tag = 1;',
+		f'\t\t\t{dest}.{tag_f} = 1;',
 		'\t\t} else {',
-		f'\t\t\t{dest}._tag = 0;',
-		f'\t\t\t{dest}._payload.ok = __tmp;',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
 		'\t\t}',
 		'\t}',
 	]
@@ -409,15 +430,16 @@ def _emit_shl( instr ) -> list[str]:
 	if isinstance( instr, ir.ShlCheck ):
 		ctype = c_type( dest_type )
 		dest = f't{instr.dest.id}'
+		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 		return [
 			'\t{',
 			f'\t\t{ctype} __tmp = ({l}) << ({r});',
 			f'\t\tbool __overflow = ( __tmp >> ({r}) ) != ({l});',
 			'\t\tif ( __overflow ) {',
-			f'\t\t\t{dest}._tag = 1;',
+			f'\t\t\t{dest}.{tag_f} = 1;',
 			'\t\t} else {',
-			f'\t\t\t{dest}._tag = 0;',
-			f'\t\t\t{dest}._payload.ok = __tmp;',
+			f'\t\t\t{dest}.{tag_f} = 0;',
+			f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
 			'\t\t}',
 			'\t}',
 		]
@@ -466,15 +488,16 @@ def _emit_neg( instr ) -> list[str]:
 		]
 	# check
 	dest = f't{instr.dest.id}'
+	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 	return [
 		'\t{',
 		f'\t\t{ctype} __tmp;',
 		f'\t\tbool __overflow = __builtin_sub_overflow( ({ctype})0, ({operand}), &__tmp );',
 		'\t\tif ( __overflow ) {',
-		f'\t\t\t{dest}._tag = 1;',
+		f'\t\t\t{dest}.{tag_f} = 1;',
 		'\t\t} else {',
-		f'\t\t\t{dest}._tag = 0;',
-		f'\t\t\t{dest}._payload.ok = __tmp;',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
 		'\t\t}',
 		'\t}',
 	]
@@ -516,15 +539,16 @@ def _emit_cast( instr ) -> list[str]:
 		]
 	# check
 	dest = f't{instr.dest.id}'
+	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 	return [
 		'\t{',
 		f'\t\t__int128 __wide = (__int128)({operand});',
 		f'\t\tbool __overflow = ( __wide < (__int128)({min_c}) ) || ( __wide > (__int128)({max_c}) );',
 		'\t\tif ( __overflow ) {',
-		f'\t\t\t{dest}._tag = 1;',
+		f'\t\t\t{dest}.{tag_f} = 1;',
 		'\t\t} else {',
-		f'\t\t\t{dest}._tag = 0;',
-		f'\t\t\t{dest}._payload.ok = ({ctype})({operand});',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
 		'\t\t}',
 		'\t}',
 	]
@@ -631,12 +655,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		dest = f't{instr.dest.id}'
 		l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
 		symbol = '/' if isinstance( instr, ir.Div ) else '%'
+		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 		return [
 			f'\tif ( ({r}) == 0 ) {{',
-			f'\t\t{dest}._tag = 1;',
+			f'\t\t{dest}.{tag_f} = 1;',
 			'\t} else {',
-			f'\t\t{dest}._tag = 0;',
-			f'\t\t{dest}._payload.ok = ({l}) {symbol} ({r});',
+			f'\t\t{dest}.{tag_f} = 0;',
+			f'\t\t{dest}.{data_f}.{ok_f} = ({l}) {symbol} ({r});',
 			'\t}',
 		]
 
@@ -770,15 +795,17 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# whatever Function the IR handed it, the same as any other ir.Call
 		value = _emit_operand( instr.value )
 		panic_name = mangle_qualname( instr.panic.qualname )
+		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.value.type )
 		return [
-			f'\tif ( ({value})._tag == 1 ) {{',
+			f'\tif ( ({value}).{tag_f} == 1 ) {{',
 			f'\t\t{panic_name}( {_emit_operand(instr.errmsg)} );',
 			'\t}',
-			f'\t{_emit_operand(instr.dest)} = ({value})._payload.ok;',
+			f'\t{_emit_operand(instr.dest)} = ({value}).{data_f}.{ok_f};',
 		]
 	if isinstance( instr, ir.UnwrapOr ):
 		value = _emit_operand( instr.value )
-		return [ f'\t{_emit_operand(instr.dest)} = ( ({value})._tag == 1 ) ? {_emit_operand(instr.default)} : ({value})._payload.ok;' ]
+		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.value.type )
+		return [ f'\t{_emit_operand(instr.dest)} = ( ({value}).{tag_f} == 1 ) ? {_emit_operand(instr.default)} : ({value}).{data_f}.{ok_f};' ]
 
 	raise NotImplementedError( f'_emit_instruction: unsupported instruction {instr!r} (later-phase work)' )
 
@@ -789,34 +816,36 @@ def _emit_or_return( instr: ir.OrReturn, function: Function ) -> list[str]:
 	# sequence. A plain struct-copy return isn't legal C: the enclosing
 	# function's own Result[FnT,E] and `value`'s Result[ArithT,E] are
 	# DIFFERENT C struct tags even though E (and therefore the whole error
-	# payload's byte layout) is identical - only the ._payload.err MEMBER
-	# (itself always exactly type E on both sides) is copied across, not
-	# the whole struct.
+	# payload's byte layout) is identical - only the err member (itself
+	# always exactly type E on both sides) is copied across, not the whole
+	# struct.
 	value = _emit_operand( instr.value )
 	dest = _emit_operand( instr.dest )
 	return_type = function.return_type
 	ret_ctype = c_type( return_type )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.value.type )
 	return [
-		f'\tif ( ({value})._tag == 1 ) {{',
+		f'\tif ( ({value}).{tag_f} == 1 ) {{',
 		f'\t\t{ret_ctype} __err;',
-		'\t\t__err._tag = 1;',
-		f'\t\t__err._payload.err = ({value})._payload.err;',
+		f'\t\t__err.{tag_f} = 1;',
+		f'\t\t__err.{data_f}.{err_f} = ({value}).{data_f}.{err_f};',
 		'\t\treturn __err;',
 		'\t}',
-		f'\t{dest} = ({value})._payload.ok;',
+		f'\t{dest} = ({value}).{data_f}.{ok_f};',
 	]
 
 def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 	value = _emit_operand( instr.value )
 	dest = _emit_operand( instr.dest )
-	lines = [ f'\tif ( ({value})._tag == 1 ) {{' ]
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.value.type )
+	lines = [ f'\tif ( ({value}).{tag_f} == 1 ) {{' ]
 	if instr.return_slot is not None:
 		slot = _emit_operand( instr.return_slot )
-		lines.append( f'\t\t{slot}._tag = 1;' )
-		lines.append( f'\t\t{slot}._payload.err = ({value})._payload.err;' )
+		lines.append( f'\t\t{slot}.{tag_f} = 1;' )
+		lines.append( f'\t\t{slot}.{data_f}.{err_f} = ({value}).{data_f}.{err_f};' )
 	lines.append( f'\t\tgoto {_c_label(instr.target)};' )
 	lines.append( '\t}' )
-	lines.append( f'\t{dest} = ({value})._payload.ok;' )
+	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
 	return lines
 
 # --- classes / globals -----------------------------------------------------
@@ -892,10 +921,10 @@ def _emit_field_teardown( self_expr: str, field_type: Type ) -> list[str]:
 	# member's own tag says is live, mirroring cfg.py's own
 	# _tag_gated_refcount_instructions at the IR level) are all safe to
 	# recurse into this way. A bare CUnion has no discriminant of its own
-	# to consult - only the ENCLOSING context (e.g. Result's own hand-
-	# rolled _tag+_payload pairing) would know which member is live, and
-	# there's no general way to detect that pairing structurally from the
-	# union's own type alone - skipped, same "compiles clean, not
+	# to consult - only some ENCLOSING context (a sibling tag field the
+	# CUnion's own type has no knowledge of) could know which member is
+	# live, and there's no general way to detect that pairing structurally
+	# from the union's own type alone - skipped, same "compiles clean, not
 	# necessarily leak-free yet" posture Phase 3's own NULL-destructor
 	# placeholder already established for a narrower case.
 	if not _type_needs_teardown( field_type ):
@@ -973,9 +1002,9 @@ def emit_rcclass_destructor( cls: RCClass ) -> str:
 # (header.ref_count = METALPY_IMMORTAL_REFCOUNT - never freed, matches every
 # other string constant's lifetime in a real C program) matching that
 # class's REAL field layout, mirroring lib/builtins's own current __data/
-# __byte_size (str) and __data/__len (bytes) shape - same posture as
-# Result's own hand-rolled ._tag/._payload field names being hardcoded
-# throughout lowering.py/cfg.py already, not a new kind of coupling.
+# __byte_size (str) and __data/__len (bytes) shape - qualname-detection is
+# specific to str/bytes only, unrelated to how Result's own field names are
+# now derived dynamically (_result_tag_data_names) rather than hardcoded.
 _STRING_LITERAL_RCCLASS_QUALNAMES = { 'builtins.str', 'builtins.bytes' }
 _STRING_LITERAL_FIELDS = {
 	'builtins.str': ( '__data', '__byte_size', True ), # True: __byte_size includes a trailing NUL (lib/builtins's own str.__byte_size comment)

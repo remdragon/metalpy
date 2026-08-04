@@ -1078,7 +1078,7 @@ class Lowering:
 		# OrJump path) rather than duplicating either.
 		#
 		# NOTE: Result.or_return()'s own written body uses this same call
-		# (`compiler.early_return(self._payload.err)`), but that body is
+		# (`compiler.early_return(self.data.v_Err)`), but that body is
 		# never actually lowered as a real function - it's a spec, not
 		# compilable code, because it would need this to trigger a return
 		# in ITS CALLER's scope, not or_return()'s own (or_return's declared
@@ -1603,33 +1603,11 @@ class Lowering:
 			self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
 
 		owner = self._try_resolve_namespace( pattern.cls.value )
-		result_cls = self.discovery.find_name_or_none( 'Result' )
-		if result_cls is not None and owner is result_cls and pattern.cls.attr in ( 'Ok', 'Err' ):
-			# Result.Ok(...)/Result.Err(...) - Result isn't a real
-			# TaggedUnion (it predates @union being scoped - see
-			# lowering.py's other Result-specific comments), so this is
-			# special-cased the same way .or_return() is: reuses is_ok()/
-			# is_err() and the real _payload.ok/_payload.err fields
-			# directly instead of routing through _tagged_union_storage
-			is_ok = pattern.cls.attr == 'Ok'
-			if not ( isinstance( subj_type, Specialization ) and subj_type.base is result_cls and len( subj_type.args ) == 2 ):
-				self.discovery.fail( f'{ast.unparse(pattern.cls)}(...) pattern used against a non-Result subject: {ast.unparse(pattern)}', node )
-			ok_type, err_type = subj_type.args
-			test = ast.Call(
-				func = ast.Attribute( value = subj_expr, attr = ( 'is_ok' if is_ok else 'is_err' ), ctx = ast.Load() ),
-				args = [], keywords = [],
-			)
-			ast.copy_location( test, node )
-			payload_expr = ast.Attribute(
-				value = ast.Attribute( value = subj_expr, attr = '_payload', ctx = ast.Load() ),
-				attr = ( 'ok' if is_ok else 'err' ),
-				ctx = ast.Load(),
-			)
-			ast.copy_location( payload_expr, node )
-			inner_test, inner_binds = self._match_pattern( payload_expr, ok_type if is_ok else err_type, pattern.patterns[0], node )
-			combined = ast.BoolOp( op = ast.And(), values = [ test, inner_test ] )
-			ast.copy_location( combined, node )
-			return combined, inner_binds
+		# Result.Ok(...)/Result.Err(...) used to be special-cased here
+		# (Result predated @union being scoped, hand-rolled via is_ok()/
+		# is_err() + _payload.ok/_payload.err) - now that Result is a real
+		# @union, it falls through to the generic TaggedUnion branch below
+		# like any other union, with no special-casing needed at all
 
 		if isinstance( owner, TaggedUnion ):
 			self._ensure_resolved( owner )
@@ -2016,6 +1994,32 @@ class Lowering:
 
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
 		self._ensure_resolved( owner_type ) # Specialization.resolve/.names passthrough to .base - no unwrap needed
+		base = owner_type.base if isinstance( owner_type, Specialization ) else owner_type
+		if isinstance( base, TaggedUnion ) and attr in ( 'tag', 'data' ) and base.names.get( attr ) is None:
+			# tag/data are synthesized lazily, the first time the union is
+			# actually constructed or matched against (_tagged_union_storage)
+			# - a method reading self.tag/self.data directly (e.g. Result.
+			# is_ok()) could be scheduled/lowered before anything else in
+			# THIS compilation ever triggers that synthesis (the work queue
+			# has no ordering guarantee) - trigger it here too, lazily, the
+			# moment it's actually needed
+			self._tagged_union_storage( base )
+		if attr == 'data' and isinstance( base, TaggedUnion ) and isinstance( owner_type, Specialization ):
+			# `data`'s real storage type is monomorphize_class's own
+			# substituted, per-specialization payload_cls (concrete field
+			# types, own qualname) - NOT reachable through the ordinary
+			# _substituted_field path below, since Specialization.names
+			# always passes through to base.names (the shared, ABSTRACT
+			# TypeVar-typed payload_cls _tagged_union_storage synthesizes on
+			# base itself). A method body reading self.data directly (e.g.
+			# Result.unwrap's `return self.data.v_Ok`) needs THIS concrete
+			# one, or the abstract one leaks through as a real, TypeVar-
+			# carrying "compile unit" the moment something (_ensure_resolved,
+			# below) schedules whatever type this call returns.
+			monomorphized = self.monomorphize_class( owner_type )
+			concrete_data = monomorphized.names.get( 'data' )
+			if isinstance( concrete_data, Variable ):
+				return concrete_data
 		names = getattr( owner_type, 'names', None )
 		if not isinstance( names, dict ):
 			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
@@ -2027,7 +2031,7 @@ class Lowering:
 
 	def _substituted_field( self, found: Variable, owner_type: Type|None ) -> Variable:
 		# a field declared using its owning generic class's own type params
-		# (e.g. Result[T,E]'s `_payload: ResultPayload[T,E]`) is stored ONCE,
+		# (e.g. Result[T,E]'s synthesized `data: Result$data[T,E]`) is stored ONCE,
 		# unsubstituted, on the class itself - accessing it through a
 		# concrete Specialization (Result[Ptr[u8],OwnershipError]) must
 		# substitute T/E with that Specialization's own args, or every
@@ -2152,12 +2156,42 @@ class Lowering:
 			replace( attr, type = self._substitute_type_params( attr.type, type_params, spec.args ))
 			for attr in base.attributes
 		]
+		extra: dict = {}
+		if isinstance( base, TaggedUnion ):
+			# base.names['tag']/['data'] (synthesized by _tagged_union_storage)
+			# are SHARED across every specialization of a generic union - the
+			# abstract base's own payload_cls carries bare TypeVar fields
+			# (v_Ok: T, v_Err: E), never a real emittable C type. A plain
+			# replace() would leave THIS specialization's own .names pointing
+			# at that same abstract, TypeVar-typed object - give it its own
+			# substituted payload_cls (own qualname, so it doesn't collide
+			# with the abstract's or a sibling specialization's), scheduled
+			# here since (mirroring _tagged_union_storage's own identical
+			# comment on the abstract case) nothing else would ever reach it
+			# on its own.
+			_tag_attr, data_attr, payload_cls, _tags = self._tagged_union_storage( base )
+			substituted_payload_fields = [
+				replace( f, type = self._substitute_type_params( f.type, type_params, spec.args ))
+				for f in payload_cls.attributes
+			]
+			substituted_payload_cls = CUnion(
+				stem = payload_cls.stem,
+				qualname = f'{spec.qualname}$data',
+				file = payload_cls.file,
+				line = payload_cls.line,
+				attributes = substituted_payload_fields,
+				names = { f.stem: f for f in substituted_payload_fields },
+			)
+			self.schedule( substituted_payload_cls )
+			extra['names'] = dict( base.names )
+			extra['names']['data'] = replace( data_attr, type = substituted_payload_cls )
 		monomorphized = replace(
 			base,
 			qualname = spec.qualname,
 			attributes = substituted_attrs,
 			type_params = None,
 			resolve = None,
+			**extra,
 		)
 		self._monomorphized_classes[ id( spec ) ] = monomorphized
 		return monomorphized
@@ -2405,14 +2439,14 @@ class Lowering:
 			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _attr_lookup's found.resolve
 		# target_cls is always the ABSTRACT class (resolved via
 		# _try_resolve_namespace on the shared, unspecialized AST body's
-		# own `Result.__allocate__` reference - see _try_lower_allocate_call)
-		# even from inside a monomorphized generic-class method
-		# (Result.Ok's own body, whose self._current_fn.cls IS the
-		# concrete Result[i32,E]) - substitute target_cls's own field
-		# types against that concrete specialization when one's available,
-		# same as _substituted_field already does for ordinary attribute
-		# reads (_expr_Attribute), or ResultPayload(ok=val)'s own expected
-		# _payload type here would stay abstract (T,E) forever
+		# own `SomeGeneric.__allocate__` reference - see
+		# _try_lower_allocate_call) even from inside a monomorphized
+		# generic-class method, whose self._current_fn.cls IS the concrete
+		# specialization - substitute target_cls's own field types against
+		# that concrete specialization when one's available, same as
+		# _substituted_field already does for ordinary attribute reads
+		# (_expr_Attribute), or a generic field's expected type here would
+		# stay abstract (its own bare TypeVars) forever
 		fn_cls = self._current_fn.cls if self._current_fn is not None else None
 		if isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls:
 			declared = { attr.stem: self._substituted_field( attr, fn_cls ) for attr in target_cls.attributes }
@@ -2663,8 +2697,8 @@ class Lowering:
 		err_expr = ast.Call(
 			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
 			args = [ ast.Attribute(
-				value = ast.Attribute( value = ast.Name( id = result_var.stem, ctx = ast.Load() ), attr = '_payload', ctx = ast.Load() ),
-				attr = 'err', ctx = ast.Load(),
+				value = ast.Attribute( value = ast.Name( id = result_var.stem, ctx = ast.Load() ), attr = 'data', ctx = ast.Load() ),
+				attr = 'v_Err', ctx = ast.Load(),
 			) ], keywords = [],
 		)
 		ast.copy_location( err_expr, node )
@@ -2682,13 +2716,11 @@ class Lowering:
 		# order) + `data: <synthesized CUnion>` (one v_<member>-prefixed
 		# field per member, only one ever meaningfully set at a time - the
 		# v_ prefix avoids a member name colliding with something else in
-		# that payload struct). This is exactly what builtins.Result already
-		# hand-writes (_tag: u8 + _payload: ResultPayload[T,E]) - Result
-		# itself stays hand-rolled (it's a @cstruct, not a TaggedUnion, and
-		# match/dispatch special-case it directly - see _lower_or_return's
-		# own comment on why compiler.early_return couldn't just be reused
-		# for or_return() either), this generalizes the same shape for
-		# every *real* union instead. Memoized in self._union_storage so
+		# that payload struct). builtins.Result is itself an ordinary
+		# @union (Ok/Err members) and goes through this exact same path -
+		# only or_return() stays specially recognized (see
+		# _lower_or_return's own comment on why compiler.early_return
+		# couldn't just be reused for it). Memoized in self._union_storage so
 		# every reference (construction, match, dispatch, across unrelated
 		# functions) points at the same tag/data/payload-class objects.
 		cached = self._union_storage.get( id( union ) )
@@ -2734,8 +2766,14 @@ class Lowering:
 		# union.names['data'].type - without this, a real TaggedUnion could
 		# be scheduled/emitted (the outer struct) while the CUnion its own
 		# `data` field embeds BY VALUE never lands in compiler.cunions,
-		# leaving that field's type incomplete
-		self.schedule( payload_cls )
+		# leaving that field's type incomplete. Skipped when `union` is
+		# itself still generic (type_params set, i.e. this is the abstract
+		# base of something like Result[T,E]): payload_fields carry bare
+		# TypeVars in that case, not a real emittable C type - only a
+		# CONCRETE specialization's own substituted payload_cls (built by
+		# monomorphize_class below) is ever a real compile unit.
+		if not union.type_params:
+			self.schedule( payload_cls )
 		result = ( tag_attr, data_attr, payload_cls, tags )
 		self._union_storage[ id( union ) ] = result
 		return result
@@ -2765,7 +2803,29 @@ class Lowering:
 		self._ensure_resolved( member )
 
 		tag_attr, data_attr, payload_cls, tags = self._tagged_union_storage( union )
-		value = self._lower_expr( node.args[0], member.type )
+		member_type = member.type
+		# a GENERIC union's own payload_cls AND member types (from the
+		# abstract base above) carry bare TypeVar fields, never real
+		# emittable/lowerable types (see _tagged_union_storage's own
+		# comment) - when expected_type pins this construction to a
+		# concrete specialization (Result[u32,OverflowError]), use THAT
+		# specialization's own substituted payload type AND member type
+		# instead, same shape monomorphize_class already builds (and
+		# memoizes) for the outer union itself. Without this, `Result.Ok(x)`
+		# lowers its own argument (x) against the abstract member's bare
+		# TypeVar as the expected_type, corrupting any Check-mode
+		# arithmetic inside it (e.g. `Result.Ok(y + 1)`) into a bogus
+		# Result[T,OverflowError] specialization built from the WRONG,
+		# unsubstituted T.
+		if isinstance( expected_type, Specialization ) and expected_type.base is union:
+			monomorphized = self.monomorphize_class( expected_type )
+			concrete_data = monomorphized.names.get( 'data' )
+			if isinstance( concrete_data, Variable ):
+				payload_cls = concrete_data.type
+			concrete_member = next( ( attr for attr in monomorphized.attributes if attr.stem == member.stem ), None )
+			if concrete_member is not None:
+				member_type = concrete_member.type
+		value = self._lower_expr( node.args[0], member_type )
 		# value.type, not member.type - see _lower_allocate_fields's identical comment:
 		# a generic union's member type (e.g. OwnershipError[T]'s `SharedReference:
 		# T`) stays an unsubstituted TypeVar when the union is referenced bare
@@ -2831,8 +2891,8 @@ class Lowering:
 	def _lower_or_return( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
 		# <result_expr>.or_return() is recognized textually here rather than
 		# ever actually calling Result.or_return's own declared body
-		# (`if self.is_err(): compiler.early_return(self._payload.err)` /
-		# `return self._payload.ok`) - that body is written as a spec of the
+		# (`if self.is_err(): compiler.early_return(self.data.v_Err)` /
+		# `return self.data.v_Ok`) - that body is written as a spec of the
 		# intended behavior, not something literally compilable: it needs to
 		# trigger a `return Result.Err(...)` in ITS CALLER's scope, not its
 		# own (or_return's own declared return type is bare T, not

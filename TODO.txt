@@ -1424,6 +1424,99 @@ emitter:
 			field, and both together on the same class. Full suite: 481
 			tests, 0 failures.
 
+	[resolved] Result[T,E] redefined as a real @union, closing the "Result
+		needs to be simplified to a @union" note above (and Result's own
+		hand-rolled _payload/_tag shape, referenced by name throughout this
+		file, no longer exists). lib/builtins/__init__.py: replaced the old
+		`@cunion class ResultPayload[T,E]` + `@cstruct class Result[T,E]`
+		(hand-written Ok/Err staticmethods calling __allocate__) with a
+		plain `@union class Result[T,E]: Ok: T; Err: E`, plus is_ok/is_err/
+		or_return/unwrap/unwrap_or written as ordinary methods reading
+		self.tag/self.data.v_Ok/self.data.v_Err - Ok/Err construction and
+		match Result.Ok(...)/Err(...) patterns now go through the exact
+		same generic TaggedUnion machinery any other @union uses, no
+		special-casing left anywhere for Result's shape specifically. Only
+		.or_return() stays textually recognized (inherent - early-return-
+		from-caller can't be an ordinary compiled method body).
+		Two real, narrow gaps found and fixed along the way (a third,
+		unrelated one - overload resolution not substituting a generic
+		class's own type params when matching an @overload group's call
+		site, affecting Result.unwrap_or(default) on any concrete Result -
+		was found during verification and flagged as separate, deferred
+		work, not fixed here):
+		- lowering.py's _attr_lookup didn't trigger _tagged_union_storage
+			lazily for a bare self.tag/self.data read (e.g. from inside
+			Result.is_ok's own now-real body) - the work queue has no
+			ordering guarantee that something else already triggered the
+			synthesis first. Fixed by triggering it there too, the moment
+			it's actually needed.
+		- lowering.py's _match_pattern had a Result-only special-cased
+			branch (is_ok()/is_err() + ._payload.ok/.err) predating @union
+			being scoped - deleted; Result now falls through to the generic
+			TaggedUnion match branch like any other union.
+		- emitter_c.py hardcoded the literal C field names _tag/_payload.ok/
+			_payload.err in every Check-mode arithmetic/cast/div/mod/Unwrap/
+			UnwrapOr/OrReturn/OrJump emitter (everywhere a Result[T,E] value
+			is either built or consumed) - replaced with a new
+			_result_tag_data_names(result_spec) helper that reads the real,
+			synthesized tag/data field names dynamically instead.
+		- monomorphize_class (generic class specialization) didn't give a
+			TaggedUnion specialization (Result[i32,E], say) its OWN
+			substituted `data` field/payload_cls - it shared the ABSTRACT
+			base's own TypeVar-typed one (a plain replace() copies .names by
+			reference), which could then leak into compiler.cunions as a
+			real but ill-typed compile unit. Fixed: monomorphize_class now
+			builds a fresh, substituted payload_cls per specialization (own
+			qualname, scheduled explicitly, since nothing else would reach
+			it) and gives the specialization its own .names copy pointing
+			at it. _tagged_union_storage also stopped scheduling the
+			abstract, generic payload_cls at all (bare TypeVar fields, never
+			a real emittable type) - only a concrete specialization's own
+			substituted one is ever a real compile unit.
+		- lowering.py's _attr_lookup ALSO didn't substitute a TaggedUnion
+			specialization's own `data` field when read directly off a
+			concrete self (e.g. Result.unwrap's real `self.data.v_Ok`) -
+			Specialization.names passes through to the ABSTRACT base's
+			names, which only ever has the shared, unsubstituted payload_cls
+			monomorphize_class was just taught to stop leaking. Fixed by
+			delegating to monomorphize_class(owner_type) and reading its
+			substituted `data` field instead, whenever owner_type is a
+			concrete specialization.
+		- lowering.py's _try_lower_union_construct_call passed the
+			ABSTRACT member's own bare TypeVar as the expected_type when
+			lowering `UnionName.Member(<value>)`'s own value expression -
+			invisible for a plain value, but corrupting for a Check-mode
+			arithmetic expression nested directly inside it (`Result.Ok(y +
+			1)`: the arithmetic's own dest type got built from the
+			unsubstituted TypeVar, producing a bogus Result[T,OverflowError]
+			specialization). Fixed the same way as the `data` field above -
+			substitute the member's own type via monomorphize_class when
+			expected_type pins a concrete specialization.
+		- lowering.py's own _try_lower_construct_call (fallible __init__
+			chaining) hardcoded a synthesized `self._payload.err` AST
+			attribute access for the re-wrapped Err(...) case - updated to
+			`self.data.v_Err`, matching Result's new real shape.
+		Verified: full suite green (482 tests - 481 plus one new real-
+			compile regression test for the two monomorphize_class/
+			_attr_lookup/_try_lower_union_construct_call substitution gaps
+			above, using a second, Result-unrelated generic @union to prove
+			the fix generalizes). Also verified directly against the REAL
+			lib/builtins/__init__.py Result (not just the self-contained
+			test fixtures) via a real clang compile exercising construction,
+			is_ok/is_err, unwrap, or_return, and Check-mode arithmetic
+			across two different Result specializations together - compiles
+			clean. (A broader real lib/ end-to-end compile still hits
+			several unrelated, pre-existing gaps - a missing sys.alloc[T]
+			forward declaration, Result[_,ZeroDivisionError] not being
+			scheduled for panic-wrapped division, a missing argument in
+			lib/sys.py's WriteFile call - out of scope here, part of the
+			still-open "verify against the real lib/ tree end to end" item.)
+		Deferred, not part of this change: making it a compiler error to
+			put RC-class content in a bare @cunion (no discriminant of its
+			own - unsafe for the destructor to know which member is live).
+			Simpler now that ResultPayload no longer needs a name-based
+			exemption, but still real, separate future work.
+
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
 

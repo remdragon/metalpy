@@ -1427,32 +1427,18 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( [ g.attr for g in getattrs ], [ 'tag', 'data', 'v_Bar' ] )
 
 	def test_match_result_ok_err_shape( self ) -> None:
-		# Result.Ok/Result.Err are special-cased directly (is_ok()/is_err()
-		# + _payload.ok/._payload.err) rather than routed through
-		# _tagged_union_storage, since Result predates @union and isn't a
-		# real TaggedUnion
+		# Result is a real @union now - Result.Ok(...)/Err(...) match
+		# patterns are no longer special-cased at all, they fall through to
+		# the exact same generic TaggedUnion branch
+		# test_match_union_construction_and_extraction_round_trip already
+		# exercises above (tag/data.v_<member>, via _tagged_union_storage)
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
-			'@cunion',
-			'class ResultPayload[T,E]:',
-			'	ok: T',
-			'	err: E',
-			'',
-			'@cstruct',
+			'@union',
 			'class Result[T,E]:',
-			'	_payload: ResultPayload[T,E]',
-			'	_tag: u8',
-			'',
-			'	@staticmethod',
-			'	def Ok( val: T ) -> Result[T,E]:',
-			'		return Result.__allocate__( _payload = ResultPayload( ok = val ), _tag = 0 )',
-			'',
-			'	def is_ok( self ) -> bool:',
-			'		return self._tag == 0',
-			'',
-			'	def is_err( self ) -> bool:',
-			'		return self._tag == 1',
+			'	Ok: T',
+			'	Err: E',
 			'',
 			'def get() -> Result[i32,MyError]:',
 			'	return Result.Ok( 1 )',
@@ -1467,10 +1453,8 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertIn( 'Call', kinds ) # is_ok()
 		getattrs = [ i for i in fn.instructions if isinstance( i, ir.GetAttr ) ]
-		self.assertEqual( [ g.attr for g in getattrs ], [ '_payload', 'ok' ] )
+		self.assertEqual( [ g.attr for g in getattrs ], [ 'tag', 'data', 'v_Ok' ] )
 
 	def test_match_wildcard_binds_whole_subject( self ) -> None:
 		code = '\n'.join([
@@ -3537,29 +3521,16 @@ class Tests( unittest.TestCase ):
 	_RESULT_FIXTURE = '\n'.join([
 		'class bool: pass',
 		'',
-		'@cunion',
-		'class ResultPayload[T,E]:',
-		'	ok: T',
-		'	err: E',
-		'',
-		'@cstruct',
+		'@union',
 		'class Result[T,E]:',
-		'	_payload: ResultPayload[T,E]',
-		'	_tag: u8',
-		'',
-		'	@staticmethod',
-		'	def Ok( val: T ) -> Result[T,E]:',
-		'		return Result.__allocate__( _payload = ResultPayload( ok = val ), _tag = 0 )',
-		'',
-		'	@staticmethod',
-		'	def Err( err: E ) -> Result[T,E]:',
-		'		return Result.__allocate__( _payload = ResultPayload( err = err ), _tag = 1 )',
+		'	Ok: T',
+		'	Err: E',
 		'',
 		'	def is_ok( self ) -> bool:',
-		'		return self._tag == 0',
+		'		return self.tag == 0',
 		'',
 		'	def is_err( self ) -> bool:',
-		'		return self._tag == 1',
+		'		return self.tag == 1',
 	])
 
 	def test_nonfallible_init_shape( self ) -> None:
