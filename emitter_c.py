@@ -863,6 +863,72 @@ def _rcclass_destructor_name( cls: Type ) -> str:
 	# emit_rcclass's own $header
 	return f'{mangle_type(cls)}$$__destructor__'
 
+def _type_needs_teardown( t: Type ) -> bool:
+	# does tearing down a VALUE of this type require any action at all -
+	# generalizes cfg.py's own is_rc()/rc_leaves() to ALSO recurse into
+	# CStruct/TaggedUnion fields. cfg.py deliberately doesn't do that for
+	# LOCAL VARIABLE tracking (see its own "v1 deliberately doesn't reach
+	# into struct/union FIELDS" comment) - that's a separate, still-open
+	# limitation of the ownership-tracking model this doesn't touch. A
+	# destructor's own cascading walk is different: it already has to
+	# visit every field of the RCClass being torn down regardless, so
+	# finding RC leaves nested inside a by-value CStruct/TaggedUnion field
+	# is no extra structural work, just recursion.
+	base = t.base if isinstance( t, Specialization ) else t
+	if isinstance( base, RCClass ):
+		return True
+	if isinstance( base, ( CStruct, TaggedUnion )):
+		return any( _type_needs_teardown( attr.type ) for attr in base.attributes )
+	# CUnion has no discriminant of its own to safely recurse through (see
+	# _emit_field_teardown's own comment) - CEnum/Scalar/Ptr never need
+	# teardown at all
+	return False
+
+def _emit_field_teardown( self_expr: str, field_type: Type ) -> list[str]:
+	# recursively decrefs every RC leaf reachable from a VALUE at
+	# self_expr, without needing any external discriminant. RCClass
+	# (direct decref), CStruct (every field is always live - safe to walk
+	# unconditionally), and TaggedUnion (a tag-gated decref into whichever
+	# member's own tag says is live, mirroring cfg.py's own
+	# _tag_gated_refcount_instructions at the IR level) are all safe to
+	# recurse into this way. A bare CUnion has no discriminant of its own
+	# to consult - only the ENCLOSING context (e.g. Result's own hand-
+	# rolled _tag+_payload pairing) would know which member is live, and
+	# there's no general way to detect that pairing structurally from the
+	# union's own type alone - skipped, same "compiles clean, not
+	# necessarily leak-free yet" posture Phase 3's own NULL-destructor
+	# placeholder already established for a narrower case.
+	if not _type_needs_teardown( field_type ):
+		return []
+	base = field_type.base if isinstance( field_type, Specialization ) else field_type
+	if isinstance( base, RCClass ):
+		destructor = _rcclass_destructor_name( field_type )
+		return [ f'\trelease_object( &({self_expr})->$header, {destructor} );' ]
+	if isinstance( base, CStruct ):
+		lines: list[str] = []
+		for attr in base.attributes:
+			lines.extend( _emit_field_teardown( f'({self_expr}).{_field_name(attr.stem)}', attr.type ))
+		return lines
+	if isinstance( base, TaggedUnion ):
+		tag_attr = base.names.get( 'tag' )
+		data_attr = base.names.get( 'data' )
+		if not ( isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable )):
+			# _tagged_union_storage never actually ran for this union (no
+			# real construction/match anywhere reached it) - no real
+			# runtime storage shape exists to tear down at all
+			return []
+		lines = [ '\t{', f'\t\tuint8_t __tag = ({self_expr}).{_field_name(tag_attr.stem)};' ]
+		for i, member in enumerate( base.attributes ):
+			if not _type_needs_teardown( member.type ):
+				continue
+			member_expr = f'({self_expr}).{_field_name(data_attr.stem)}.{_field_name(f"v_{member.stem}")}'
+			lines.append( f'\t\tif ( __tag == {i} ) {{' )
+			lines.extend( f'\t{inner}' for inner in _emit_field_teardown( member_expr, member.type ))
+			lines.append( '\t\t}' )
+		lines.append( '\t}' )
+		return lines
+	return []
+
 def emit_rcclass_destructor( cls: RCClass ) -> str:
 	# the void(*)(void*) release_object needs - pure emitter-side synthesis
 	# (no compiler stage recognizes __del__ specially, and there's no IR
@@ -870,9 +936,10 @@ def emit_rcclass_destructor( cls: RCClass ) -> str:
 	# build the C text directly, unlike every other emit_* function here).
 	# Order: the class's own __del__ runs FIRST (as an ordinary function
 	# call, not inlined - fields are still fully valid at this point),
-	# THEN cascading decref into directly RC-typed fields (base fields
-	# before derived, matching emit_rcclass's own field ordering), THEN
-	# sys.free on the object's own backing memory.
+	# THEN cascading decref into every RC leaf reachable from a field
+	# (base fields before derived, matching emit_rcclass's own field
+	# ordering - see _emit_field_teardown for how deeply this recurses),
+	# THEN sys.free on the object's own backing memory.
 	name = _rcclass_destructor_name( cls )
 	ctype = c_type( cls )
 	lines = [
@@ -889,18 +956,7 @@ def emit_rcclass_destructor( cls: RCClass ) -> str:
 		node = node.base
 	for base_cls in reversed( chain ):
 		for attr in base_cls.attributes:
-			field_base = attr.type.base if isinstance( attr.type, Specialization ) else attr.type
-			if not isinstance( field_base, RCClass ):
-				# a TaggedUnion-typed field with RC leaves needs the same
-				# tag-gated shape cfg.py builds at the IR level - not
-				# replicated here yet (this function only ever emits a
-				# DIRECT decref, no tag dispatch) - same "compiles clean,
-				# not necessarily leak-free yet" posture Phase 3 already
-				# established for the NULL-destructor placeholder this
-				# function replaces
-				continue
-			field_destructor = _rcclass_destructor_name( attr.type )
-			lines.append( f'\trelease_object( &(self->{_field_name(attr.stem)})->$header, {field_destructor} );' )
+			lines.extend( _emit_field_teardown( f'self->{_field_name(attr.stem)}', attr.type ))
 	sys_free_name = mangle_qualname( 'sys.free' )
 	lines.append( f'\t{sys_free_name}( ( void* )self );' )
 	lines.append( '}' )

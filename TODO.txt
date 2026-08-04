@@ -1050,6 +1050,7 @@ emitter:
 		not necessarily leak-free yet" posture Phase 3's own NULL-
 		destructor placeholder already established. Nested RC content
 		inside a by-value CStruct/CUnion field is similarly out of scope.
+		[resolved after Phase 7, before linking work - see that entry below]
 		Prerequisites (lowering.py):
 		- refactored _resolve_sys_panic/_resolve_sys_alloc (near-identical
 			implementations, flagged as a design flaw) into one shared
@@ -1370,6 +1371,58 @@ emitter:
 			separate future work whenever lib/'s own currently-evolving
 			pieces (sys._Stdout.write's OSError design, module-level
 			globals like `stdout`, etc.) settle.
+
+	[resolved] Before moving on to linking: closed the destructor's own
+		two documented cascading-decref gaps (TaggedUnion-typed fields with
+		RC leaves; nested RC content inside a by-value CStruct field).
+		emit_rcclass_destructor's per-field walk now delegates to a new
+		_emit_field_teardown(self_expr, field_type), recursive over
+		whatever value sits at self_expr:
+		- RCClass: a direct release_object call, same as before.
+		- CStruct: every field is ALWAYS live (no discriminant needed,
+			unlike a union) - safe to walk its own .attributes
+			unconditionally and recurse, however deeply nested (a CStruct
+			inside a CStruct inside a CStruct all cascade correctly).
+		- TaggedUnion: a tag-gated decref built directly from the field's
+			own .names['tag']/['data'] shape (the same one emit_tagged_union
+			itself reads) - one `if (tag == N)` branch per member that
+			itself needs teardown (found via the same recursion, so a
+			union member that's ITSELF a CStruct/nested-TaggedUnion with
+			RC content cascades correctly too), no branch at all for a
+			member with nothing to tear down.
+		- bare CUnion: still skipped, deliberately. A union with no paired
+			discriminant (unlike a TaggedUnion's own .tag, or Result's
+			hand-rolled _tag+_payload pairing) has NO way to know which
+			member is actually live - decref'ing every member
+			unconditionally would be actively WRONG (double-free /
+			decref-garbage on whichever member isn't actually set), not
+			just incomplete. There's no general, structural way to detect
+			a "this CUnion field is paired with that sibling tag field"
+			relationship the way Result's own shape is hand-recognized
+			throughout this codebase - a real design question for whoever
+			needs this case (e.g. a bare Result[SomeRCClass,E] embedded
+			BY VALUE as another RCClass's own field), not something to
+			guess an answer to here.
+		A new _type_needs_teardown(t) decides whether ANY of this applies
+			at all before recursing - generalizes cfg.py's own is_rc()/
+			rc_leaves() to ALSO look inside CStruct/TaggedUnion fields.
+			This does NOT change cfg.py's own ownership-tracking model for
+			LOCAL VARIABLES (cfg.py's own top-of-file comment is explicit
+			that v1 deliberately never reaches into struct/union fields
+			for that - a separate, still-open limitation of the broader
+			ownership-tracking design, out of scope here). The destructor's
+			own cascading walk is a different problem: it already visits
+			every field of the RCClass being torn down regardless, so
+			finding RC leaves nested inside a by-value field is no extra
+			structural work, just recursion - it doesn't require teaching
+			cfg.py anything new about how LOCAL bindings are tracked.
+		Verified end to end via clang -std=c11 -Wall -Wextra -c: a class
+			with a TaggedUnion-typed field holding an RC-leaf member
+			(alongside a non-RC member, proving the tag actually
+			discriminates - only the RC member gets a branch at all), a
+			class with a by-value CStruct field nested-containing an RC
+			field, and both together on the same class. Full suite: 481
+			tests, 0 failures.
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml

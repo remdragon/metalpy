@@ -719,6 +719,64 @@ class RCClassDestructorTests( RCClassTestCase ):
 		self.assertIn( 'release_object( &(self->inner)->$header, __main__$Foo$$__destructor__ );', destructor_src )
 		self.assertIn( 'sys$free( ( void* )self );', destructor_src )
 
+	def test_taggedunion_field_cascades_a_tag_gated_decref( self ) -> None:
+		# a TaggedUnion-typed field with an RC-leaf member (MaybeFoo.Some)
+		# needs the same tag-gated shape cfg.py builds at the IR level for
+		# LOCAL bindings, reimplemented in raw C here since no IR backs a
+		# synthesized destructor body - the non-RC member (Nothing) needs
+		# no branch at all
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'@union',
+			'class MaybeFoo:',
+			'	Some: Foo',
+			'	Nothing: i32',
+			'',
+			'class Box:',
+			'	maybe: MaybeFoo',
+			'',
+			'	@staticmethod',
+			'	def make( f: Foo ) -> Box:',
+			'		return Box.__allocate__( maybe = MaybeFoo.Some( f ) )',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.make( 1 )',
+			'	b: Box = Box.make( f )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		box_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Box' )
+		destructor_src = emitter_c.emit_rcclass_destructor( box_cls )
+		self.assertIn( 'uint8_t __tag = (self->maybe).tag;', destructor_src )
+		self.assertIn( 'if ( __tag == 0 ) {', destructor_src )
+		self.assertIn( 'release_object( &((self->maybe).data.v_Some)->$header, __main__$Foo$$__destructor__ );', destructor_src )
+		self.assertNotIn( 'v_Nothing', destructor_src ) # the non-RC member needs no branch at all
+
+	def test_nested_cstruct_field_cascades_decref_into_its_own_fields( self ) -> None:
+		# a by-value CStruct field is always fully live (unlike a union, no
+		# discriminant needed) - safe to walk its own fields unconditionally,
+		# recursively, looking for further RC leaves
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'@cstruct',
+			'class Wrapper:',
+			'	inner: Foo',
+			'',
+			'class Box:',
+			'	w: Wrapper',
+			'',
+			'	@staticmethod',
+			'	def make( f: Foo ) -> Box:',
+			'		return Box.__allocate__( w = Wrapper( inner = f ) )',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.make( 1 )',
+			'	b: Box = Box.make( f )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		box_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Box' )
+		destructor_src = emitter_c.emit_rcclass_destructor( box_cls )
+		self.assertIn( 'release_object( &((self->w).inner)->$header, __main__$Foo$$__destructor__ );', destructor_src )
+
 @unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 	def test_del_method_compiles( self ) -> None:
@@ -736,6 +794,36 @@ class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 			'def main() -> None:',
 			'	f: Foo = Foo.make( 1 )',
 			'	b: Box = Box.make( f )',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_taggedunion_and_nested_cstruct_field_cascading_decref_compiles( self ) -> None:
+		# combines both: a TaggedUnion-typed field with an RC-leaf member,
+		# and a by-value CStruct field with its own nested RC field, on
+		# the SAME class, torn down together
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'@union',
+			'class MaybeFoo:',
+			'	Some: Foo',
+			'	Nothing: i32',
+			'',
+			'@cstruct',
+			'class Wrapper:',
+			'	inner: Foo',
+			'',
+			'class Box:',
+			'	maybe: MaybeFoo',
+			'	w: Wrapper',
+			'',
+			'	@staticmethod',
+			'	def make( f: Foo, g: Foo ) -> Box:',
+			'		return Box.__allocate__( maybe = MaybeFoo.Some( f ), w = Wrapper( inner = g ) )',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo.make( 1 )',
+			'	g: Foo = Foo.make( 2 )',
+			'	b: Box = Box.make( f, g )',
 			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
