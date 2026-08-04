@@ -16,12 +16,6 @@ from mpy_types import (
 import overload_resolution
 
 @dataclass( kw_only = True )
-class _DeferBlock:
-	is_err_only: bool # True for errdefer, False for plain defer
-	flag: Variable # bool local, False until control passes the defer/errdefer statement
-	instructions: list['ir.Instruction'] # captured at registration time, replayed in the epilogue
-
-@dataclass( kw_only = True )
 class _ReceiverDispatch:
 	''' `_resolve_callee`'s answer when an attribute call's receiver is a
 	union type and the attribute isn't found on the union itself (e.g.
@@ -116,19 +110,26 @@ class Lowering:
 
 	defer/errdefer (SYNTAX.md section 3, either `defer(expr)`/`errdefer(expr)`
 	as a single statement or `with defer:`/`with errdefer:` for several) move
-	their body to the function's epilogue - a Label placed right after the
-	body, reached either by falling off the end or by every `return`/checked-
-	arithmetic-error-path jumping there once any defer/errdefer is active
-	(self._needs_epilogue - named generically, since a future decref-insertion
-	pass will need to trigger the exact same machinery, not just defer). Each
-	block gets a bool flag (False until control passes its registration
-	point) and is replayed in reverse registration order, guarded by that
-	flag; errdefer blocks are additionally guarded by calling .is_err() on
-	the function's own stowed return value (always a Result wherever errdefer
-	is legal) - not a separate signal, so it also covers a plain `return
-	Result.Err(x)`, not just the implicit OrJump path. defer/errdefer are
-	rejected inside a loop (self._loop_depth) or nested inside each other
-	(self._in_deferred_body) - see _register_defer_block.
+	their body to the function's shared epilogue - each registration
+	(_register_defer_block) pushes a REAL cfg.Epilogue entry (cfg.py's
+	push_defer(), flag set) onto the exact same _epilogue_stack RC bindings
+	use, interleaved by declaration order with whatever locals surround it.
+	Every `return`/checked-arithmetic-error-path (self._cfg.current_epilogue_
+	label()) and the function's own fall-off-the-end funnel through
+	build_epilogue_ladder(), which replays the whole stack in reverse
+	(deepest/most-recently-pushed first) - a flag-guarded entry's own bool
+	flag (False until control passes its registration point) gates whether
+	it actually replays; errdefer entries are additionally guarded by
+	calling .is_err() on the function's own stowed return value (always a
+	Result wherever errdefer is legal) - not a separate signal, so it also
+	covers a plain `return Result.Err(x)`, not just the implicit OrJump
+	path. defer/errdefer are rejected inside a loop (self._loop_depth) or
+	nested inside each other (self._in_deferred_body) - see
+	_register_defer_block. A defer/errdefer registered inside an if-branch
+	must still be reachable from the function's own single shared epilogue
+	regardless of which branch (if either) actually armed it - cfg.py's
+	restore() special-cases flag-guarded entries to survive scope-exit
+	truncation for exactly this reason (see its own comment).
 	'''
 
 	def __init__( self, discovery: Discovery, schedule: Callable[[object],None] ) -> None:
@@ -208,9 +209,11 @@ class Lowering:
 		self._loop_depth = 0
 		self._loop_labels: list[tuple[str,str]] = [] # stack of (continue_label, break_label), innermost last
 		self._in_deferred_body = False
-		self._defer_blocks: list[_DeferBlock] = []
-		self._needs_epilogue = self._function_needs_epilogue( fn.node.body )
-		self._epilogue_label = '__epilogue__'
+		# just the flags, in registration order - enough to splice their
+		# `False` inits right after FuncStart (see _emit_epilogue). The
+		# defer/errdefer bodies themselves live as cfg.Epilogue entries on
+		# self._cfg's own _epilogue_stack (push_defer()), not here
+		self._defer_flags: list[Variable] = []
 
 		with self.discovery.module_context( module ):
 			with ( self.discovery.scope_context( fn.cls ) if fn.cls is not None else nullcontext() ):
@@ -240,9 +243,16 @@ class Lowering:
 
 					none_type = self.discovery.get_none_type()
 					noreturn_type = self.discovery.get_intrinsics()['NoReturn']
+					# eagerly created whenever it COULD be needed (whether it
+					# actually ends up referenced depends on whether any
+					# return ever routes through current_epilogue_label()/
+					# OrJump, only known once the body's actually lowered) -
+					# harmless when unused: a synthetic Variable, never added
+					# to fn.names, that simply never appears in any emitted
+					# instruction if nothing ever needs it
 					self._return_value_var = (
 						Variable( stem = '__return_value', qualname = f'{fn.qualname}.__return_value', file = fn.file, line = fn.line, type = fn.return_type )
-						if self._needs_epilogue and fn.return_type not in ( none_type, noreturn_type )
+						if fn.return_type not in ( none_type, noreturn_type )
 						else None
 					)
 
@@ -280,27 +290,39 @@ class Lowering:
 						except CompileError:
 							continue
 
-					if self._needs_epilogue:
-						if self._construction_self is not None:
-							self._complete_construction_or_fail( fn )
+					# reaching the closing brace with no explicit `return` on
+					# this path is __init__'s success path too - every
+					# required attribute must already be initialized here.
+					# Done BEFORE the branch below is even chosen: it cancels
+					# each attribute's own epilogue entry (ownership transfers
+					# into the now-complete self), which current_epilogue_label()
+					# below has to see already applied - otherwise a
+					# construction-only function with nothing else pending
+					# would wrongly look like it still has a live entry to
+					# jump to. A no-op whenever an explicit return already
+					# completed construction on every reachable path (see
+					# _stmt_Return's own identical call)
+					if self._construction_self is not None:
+						self._complete_construction_or_fail( fn )
+
+					if self._cfg.current_epilogue_label() is not None:
+						# some return (or OrJump) already jumped into the
+						# shared epilogue ladder (_stmt_Return/_consume_checked_
+						# result, via current_epilogue_label()), or nothing did
+						# but entries are still pending at the function's own
+						# closing brace (an implicit `return None`/fall-off
+						# reaching them the same way) - either way,
+						# build_epilogue_ladder() covers whatever's still
+						# pending, RC decrefs and defer/errdefer replays alike
 						self._emit_epilogue( fn, none_type, body_start )
 					elif fn.return_type is none_type and self._body_may_fall_off_the_end( fn.node.body ):
-						# no defer/errdefer, so _emit_epilogue never runs at all -
-						# but falling off the end without an explicit `return` is
-						# still a real exit (implicit `return None`, same as
-						# Python), and every OWNED/COPY local still live at that
-						# point still needs its normal decref. Every explicit
-						# `return` already does this itself (see _stmt_Return's
-						# own else branch) - this only covers the specific case
-						# nothing else does: reaching the function's closing brace
-						# with no `return` at all. Falling off the end of a
-						# non-fallible __init__ (return_type is always none_type
-						# for it) is its success path - every required attribute
-						# must be initialized here too
-						if self._construction_self is not None:
-							self._complete_construction_or_fail( fn )
-						for instr in self._cfg.return_( None ):
-							self._emit( instr )
+						# nothing pending to unwind - but falling off the end
+						# without an explicit `return` is still a real exit
+						# (implicit `return None`, same as Python). Every
+						# explicit `return` already does this itself (see
+						# _stmt_Return's own else branch) - this only covers
+						# the specific case nothing else does: reaching the
+						# function's closing brace with no `return` at all
 						self._emit( ir.Return( value = None ))
 
 					self._emit( ir.FuncEnd( name = fn.qualname ))
@@ -308,57 +330,53 @@ class Lowering:
 		return self._instructions
 
 	def _emit_epilogue( self, fn: Function, none_type: Type, body_start: int ) -> None:
+		# every return/OrJump/fall-off-the-end that has anything pending
+		# (self._cfg.current_epilogue_label() was not None) funnels through
+		# here exactly once, at the function's own closing brace -
+		# build_epilogue_ladder() replays the WHOLE stack (RC decrefs and
+		# defer/errdefer replays interleaved by declaration order, deepest/
+		# most-recently-pushed first)
+		#
 		# flag inits have to run before *any* code that could set them -
 		# easiest to guarantee by splicing them in right after FuncStart
 		# rather than tracking every branch that could reach a defer statement
 		flag_inits = [
-			ir.Assign( dest = block.flag, src = ir.Const( type = block.flag.type, value = False ))
-			for block in self._defer_blocks
+			ir.Assign( dest = flag, src = ir.Const( type = flag.type, value = False ))
+			for flag in self._defer_flags
 		]
 		self._instructions[body_start:body_start] = flag_inits
 
-		# falling off the end of the body (no explicit final `return`) reaches
-		# this Label naturally, with no extra jump needed, since it's placed
-		# immediately after the body - same for every `return`/OrJump, which
-		# jumped here explicitly instead of exiting directly
 		self._pending_temps = []
-		self._emit( ir.Label( name = self._epilogue_label ))
-
-		is_err_temp = None
-		if any( block.is_err_only for block in self._defer_blocks ):
-			is_err_temp = self._emit_is_err_check( fn.node )
-
-		for i, block in enumerate( reversed( self._defer_blocks )):
-			skip_label = f'__defer_skip_{i}__'
-			self._emit( ir.JumpIfFalse( cond = block.flag, target = skip_label ))
-			if block.is_err_only:
-				self._emit( ir.JumpIfFalse( cond = is_err_temp, target = skip_label ))
-			for instr in block.instructions:
-				self._emit( instr )
-			self._emit( ir.Label( name = skip_label ))
-
+		for instr in self._cfg.build_epilogue_ladder( lambda: self._build_is_err_check( fn.node )):
+			self._emit( instr )
 		for t in reversed( self._pending_temps ):
 			for instr in self._cfg.delete_temp( t ):
 				self._emit( instr )
 			self._emit( ir.DeleteTemp( temp = t ))
-		# covers the fall-off-the-end path specifically (no explicit return
-		# reached this point) - every explicit return already checked this
-		# itself in _stmt_Return, before jumping here
-		if self._cfg.return_( None ):
-			self.discovery.fail_loc(
-				'defer/errdefer combined with reference-counted locals/parameters is not supported yet (see TODO.txt)',
-				fn.file, fn.line,
-			)
 		return_value = self._return_value_var if fn.return_type is not none_type else None
 		self._emit( ir.Return( value = return_value ))
 
-	def _emit_is_err_check( self, node: ast.AST ) -> ir.Temp:
+	def _build_is_err_check( self, node: ast.AST ) -> tuple[list[ir.Instruction],ir.Temp]:
+		''' the DeclareTemp+Call that checks self._return_value_var.is_err(),
+		built as plain instructions rather than emitted directly - cfg.py's
+		_replay() (via this callback) decides exactly where they land. With
+		per-Epilogue labels, a single check computed once up front (the old
+		design, back when there was only ever one shared epilogue label)
+		wouldn't be reached by every jump that might need it - some land
+		deeper in the ladder, skipping past it entirely (see
+		build_epilogue_ladder()'s own comment) - so this is called fresh,
+		deliberately uncached, every time an errdefer entry's own replay
+		actually needs it. '''
 		bool_cls = self.discovery.find_name( 'bool', node )
 		is_err_fn = self._attr_lookup_callable( self._return_value_var.type, 'is_err', node )
 		self._ensure_resolved( is_err_fn )
-		dest = self._new_temp( bool_cls )
-		self._emit( ir.Call( dest = dest, target = is_err_fn, receiver = self._return_value_var, args = [], kwargs = {} ))
-		return dest
+		temp = ir.Temp( type = bool_cls, id = self._temp_id )
+		self._temp_id += 1
+		self._pending_temps.append( temp )
+		return [
+			ir.DeclareTemp( temp = temp ),
+			ir.Call( dest = temp, target = is_err_fn, receiver = self._return_value_var, args = [], kwargs = {} ),
+		], temp
 
 	# --- __init__ construction (RCCLASS ATTRIBUTE LIFETIME.md) -----------------
 
@@ -438,8 +456,7 @@ class Lowering:
 		self._loop_depth = 0
 		self._loop_labels = []
 		self._in_deferred_body = False
-		self._defer_blocks: list[_DeferBlock] = []
-		self._needs_epilogue = False
+		self._defer_flags: list[Variable] = []
 		self._return_value_var = None
 
 		with self.discovery.module_context( module ):
@@ -589,29 +606,25 @@ class Lowering:
 			is_success = not ( self._construction_fallible and self._is_result_err_call( node.value ))
 			if is_success:
 				self._complete_construction_or_fail( self._current_fn )
-		if self._needs_epilogue:
-			# every return in a defer/errdefer-using function funnels
-			# through the SAME shared epilogue (_emit_epilogue) - RC decref
-			# there necessarily uses whatever's live at the END of the
-			# whole function body, not this specific return's own live set
-			# (which could genuinely differ - an early return before some
-			# later local exists). Rather than risk decref'ing something
-			# not actually alive on this path, this combination is
-			# rejected outright for now - see TODO.txt. cfg.return_() is
-			# still called (not just skipped) so the check is exact: only
-			# functions that would ACTUALLY need an RC decref here trip it
-			cfg_instructions = self._cfg.return_( value )
-			if cfg_instructions:
-				self.discovery.fail(
-					'defer/errdefer combined with reference-counted locals/parameters is not supported yet '
-					f'(see TODO.txt): {ast.unparse(node)}',
-					node,
-				)
+		label = self._cfg.current_epilogue_label( value )
+		if label is not None:
+			# whatever's still pending (RC decrefs, defer/errdefer replays)
+			# gets unwound once, later, by the shared ladder every other
+			# return reaching this same label also jumps into
+			# (build_epilogue_ladder(), emitted at the function's own
+			# closing brace - see _emit_epilogue) - value has to survive
+			# the jump some other way than a direct ir.Return
 			if self._return_value_var is not None and value is not None:
 				self._emit( ir.Assign( dest = self._return_value_var, src = value ))
-			self._emit( ir.Jump( target = self._epilogue_label ))
+			self._emit( ir.Jump( target = label ))
 		else:
-			for instr in self._cfg.return_( value ):
+			# either nothing is pending, or `value` IS itself one of the
+			# still-live entries current_epilogue_label() can't route
+			# through a shared label (see its own comment) - unwind inline,
+			# right here, same as always. Still has to replay any pending
+			# defer/errdefer entries itself (return_() does this now too -
+			# they're just as "pending" as an RC decref from here)
+			for instr in self._cfg.return_( value, lambda: self._build_is_err_check( node )):
 				self._emit( instr )
 			self._emit( ir.Return( value = value ))
 
@@ -1090,18 +1103,6 @@ class Lowering:
 			return node.func.id
 		return None
 
-	def _function_needs_epilogue( self, body: list[ast.stmt] ) -> bool:
-		# a simple AST-level pre-scan (not real lowering) - has to be known
-		# before lowering a single statement, since every `return` in the
-		# function must behave uniformly (see the class docstring)
-		for stmt in body:
-			for node in ast.walk( stmt ):
-				if isinstance( node, ast.With ) and len( node.items ) == 1 and self._defer_kind_of_with( node.items[0].context_expr ):
-					return True
-				if isinstance( node, ast.Expr ) and self._defer_kind_of_call( node.value ):
-					return True
-		return False
-
 	def _body_may_fall_off_the_end( self, body: list[ast.stmt] ) -> bool:
 		# a simple, deliberately narrow check (not full terminator analysis -
 		# same "future work" scope cut as _stmt_If's own true_terminates/
@@ -1137,7 +1138,7 @@ class Lowering:
 				self.discovery.fail( f'errdefer requires the enclosing function to return Result[_,_] ({where})', node )
 
 		bool_cls = self.discovery.find_name( 'bool', node )
-		index = len( self._defer_blocks )
+		index = len( self._defer_flags )
 		flag = Variable(
 			stem = f'__defer_flag_{index}',
 			qualname = f'{fn.qualname}.__defer_flag_{index}',
@@ -1166,7 +1167,8 @@ class Lowering:
 			self._instructions = outer_instructions
 			self._in_deferred_body = outer_in_deferred_body
 
-		self._defer_blocks.append( _DeferBlock( is_err_only = is_err_only, flag = flag, instructions = captured ))
+		self._defer_flags.append( flag )
+		self._cfg.push_defer( captured, flag, is_err_only )
 		# this is what actually runs at the with-statement's/call's position -
 		# marks the block "armed" so the epilogue knows to replay it
 		self._emit( ir.Assign( dest = flag, src = ir.Const( type = bool_cls, value = True )))
@@ -1793,8 +1795,9 @@ class Lowering:
 		# OrJump/Unwrap split
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
-			if self._needs_epilogue:
-				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = self._epilogue_label, return_slot = self._return_value_var ))
+			label = self._cfg.current_epilogue_label()
+			if label is not None:
+				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
 			else:
 				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
 		else:

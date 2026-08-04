@@ -3142,11 +3142,11 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
-			ir.Jump( target = '__epilogue__' ),
-			ir.Label( name = '__epilogue__' ),
-			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_0__' ),
+			ir.Jump( target = '__epilogue_0__' ),
+			ir.Label( name = '__epilogue_0__' ),
+			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_1__' ),
 			ir.Call( dest = None, target = cleanup_fn, args = [], kwargs = {} ),
-			ir.Label( name = '__defer_skip_0__' ),
+			ir.Label( name = '__defer_skip_1__' ),
 			ir.Return( value = None ),
 			ir.FuncEnd( name = 'main' ),
 		])
@@ -3182,10 +3182,10 @@ class Tests( unittest.TestCase ):
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
 			# falls off the end of the body (no explicit return) straight
 			# into the epilogue - no Jump needed, it's placed right after
-			ir.Label( name = '__epilogue__' ),
-			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_0__' ),
+			ir.Label( name = '__epilogue_0__' ),
+			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_1__' ),
 			ir.Call( dest = None, target = cleanup_fn, args = [], kwargs = {} ),
-			ir.Label( name = '__defer_skip_0__' ),
+			ir.Label( name = '__defer_skip_1__' ),
 			ir.Return( value = None ),
 			ir.FuncEnd( name = '__test__.die' ),
 		])
@@ -3225,12 +3225,17 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
-			ir.Label( name = '__epilogue__' ),
+			ir.Label( name = '__epilogue_0__' ),
+			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_1__' ),
+			# the is_err() check is computed fresh, INSIDE the flag guard -
+			# with per-Epilogue labels a check computed once up front
+			# wouldn't be reached by every jump that might land elsewhere in
+			# the ladder (see cfg.py's _replay()), and skipping it entirely
+			# when the flag never armed is a nice side benefit
 			ir.DeclareTemp( temp = is_err_temp ),
 			ir.Call( dest = is_err_temp, target = is_err_fn, receiver = return_value_var, args = [], kwargs = {} ),
-			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_0__' ),
-			ir.JumpIfFalse( cond = is_err_temp, target = '__defer_skip_0__' ),
-			ir.Label( name = '__defer_skip_0__' ),
+			ir.JumpIfFalse( cond = is_err_temp, target = '__defer_skip_1__' ),
+			ir.Label( name = '__defer_skip_1__' ),
 			# this test's own `class bool: pass` fixture is a plain
 			# (RCClass) class, same as any undecorated class - is_err_temp
 			# is genuinely fresh_temp()-tracked and gets its own Decref here,
@@ -3239,6 +3244,44 @@ class Tests( unittest.TestCase ):
 			ir.DeleteTemp( temp = is_err_temp ),
 			ir.Return( value = return_value_var ),
 			ir.FuncEnd( name = '__test__.checked' ),
+		])
+
+	def test_only_use_cfg_epilogue_labels( self ):
+		code = '\n'.join([
+			'class int:',
+			'	def __init__( self, n: usize ) -> None:',
+			'		...',
+			'def foo( a: int ) -> None:',
+			'	if a > 10:',
+			'		return', # should be a straight return, no epilogue yet
+			'	b = a',
+			'	if a > 20:',
+			'		return', # should jump to b's decref epilogue label
+			'	c = a',
+			# fallthough return should jump to c's decref epilogue label
+			'',
+			'def main() -> None:',
+			'	foo( usize( 0 ))',
+		])
+		mod = self._import( code )
+		foo = mod.get_local( 'foo' )
+		lfoo = self.compiler._lower( foo )
+		# Label is filtered down to epilogue labels specifically - `if`
+		# lowering emits its own '__if_else_N__'/'__if_end_N__' Labels from
+		# the SAME shared label counter (interleaved with the epilogue's own
+		# '__epilogue_N__' ones), which aren't what this test is about
+		got = [
+			op for op in lfoo.instructions
+			if ( isinstance( op, ir.Label ) and op.name.startswith( '__epilogue' ))
+			or isinstance( op, ir.Jump )
+			or isinstance( op, ir.Return )
+		]
+		self.assertEqual( got, [
+			ir.Return( value = None ), # straight return, no epilogue yet
+			ir.Jump( target = '__epilogue_1__' ), # jumps straight to b's own cleanup, skipping c's (not alive yet on this path)
+			ir.Label( name = '__epilogue_3__' ), # clean up c
+			ir.Label( name = '__epilogue_1__' ), # clean up b - shared with the early return above
+			ir.Return( value = None ), # the function's one real Return, reached by fall-off-the-end
 		])
 
 	def test_errdefer_with_checked_arithmetic_emits_or_jump( self ) -> None:
@@ -3266,10 +3309,14 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'AddCheck', kinds )
 		self.assertIn( 'OrJump', kinds )
 		self.assertNotIn( 'OrReturn', kinds )
-		# epilogue's errdefer guard is the two-JumpIfFalse (flag, then is_err()) shape, back to back
+		# epilogue's errdefer guard is the two-JumpIfFalse (flag, then
+		# is_err()) shape - the is_err() check itself (DeclareTemp+Call)
+		# sits between them, computed fresh inside the flag guard rather
+		# than shared/hoisted (see cfg.py's _replay())
 		jump_if_false_indices = [ i for i, instr in enumerate( fn.instructions ) if isinstance( instr, ir.JumpIfFalse ) ]
 		self.assertEqual( len( jump_if_false_indices ), 2 )
-		self.assertEqual( jump_if_false_indices[1], jump_if_false_indices[0] + 1 )
+		between = fn.instructions[jump_if_false_indices[0] + 1:jump_if_false_indices[1]]
+		self.assertEqual( [ type( instr ).__name__ for instr in between ], ['DeclareTemp', 'Call'] )
 
 	def test_explicit_err_return_still_stows_and_jumps( self ) -> None:
 		# the specific gap the is_err()-based design fixes over a separate

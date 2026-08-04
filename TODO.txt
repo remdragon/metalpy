@@ -1,3 +1,24 @@
+can compile_time_transformer remove "unreachable through folding" code like this:
+	def foo1() -> bool:
+		print( 'hello' )
+		if True:
+			return
+		print( 'goodbye' ) # can this get removed by compile_time_transformer because of the unconditional return?
+
+can compile_time_transformer detect that a variable is only set once?
+	if so, it can recognize it as a constant and fold on it
+	
+	def foo2() -> bool:
+		s = 'hello' # s never changes...
+		if s == 'hello':
+			return True
+		return False
+	
+	if `s == 'hello'` can get folded, this whole thing would fold down to:
+	
+	def foo2():
+		return True
+
 lowering's _resolve_sys_function() feels like a design flaw.
 	can these dependencies be detected and automatically resolved by
 	resolver methods in discovery if possible?
@@ -5,16 +26,6 @@ lowering's _resolve_sys_function() feels like a design flaw.
 lowering's lower_function() and lower_global() have a large
 	amount of shared initialization that need to happen. This
 	shared initialization needs to be moved to a helper function
-
-lowering's lower_function is still using _needs_epilogue and _epilogue_label.
-	It mistakenly emits jumps to _epilogue_label in a couple places when it
-	should jump to self._cfg.current_epilogue_label() which should return
-	the label from it's _epilogue_stack[-1] or None if there's no epilogue
-	yet.
-	* also, _function_needs_epilogue() comment is wrong, an early return
-	in a function might not need an epilogue, but a later one might. This
-	whole function needs to go away because CFG is now the holder of truth
-	for this at any moment.
 
 review how Claude generates C code from local variables, I think emitter_c.py
 might be doing too much work. We may need new IR to tell the emitter when to

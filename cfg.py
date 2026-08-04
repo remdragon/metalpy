@@ -74,8 +74,10 @@ class Epilogue:
 	depth stay a stable, plain integer even though entries below the top
 	can be cancelled at arbitrary points - see move()/deleted(). '''
 	instructions: list[ir.Instruction]
+	name: str # this entry's own jump target - see current_epilogue_label()/build_epilogue_ladder()
 	operand: Variable | None = None # the RC binding this entry decrefs - None for defer/errdefer entries. Lets return_() skip decref'ing whatever's actually being returned, by identity
 	flag: Variable | None = None
+	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
 
 	@property
@@ -182,10 +184,24 @@ class CFGState:
 		self._construction_required = required
 
 	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None ) -> Epilogue:
-		entry = Epilogue( instructions = self._decref_instructions( type_for_decref, operand ), operand = operand )
+		entry = Epilogue( instructions = self._decref_instructions( type_for_decref, operand ), name = self._new_label( 'epilogue' ), operand = operand )
 		self._epilogue_stack.append( entry )
 		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
+
+	def push_defer( self, instructions: list[ir.Instruction], flag: Variable, is_err_only: bool ) -> None:
+		''' defer/errdefer's own replay, registered at the defer/errdefer
+		statement's own position (lowering.py emits the flag's own `= True`
+		Assign right after this call - that's what "armed" means at
+		runtime). Interleaved into the SAME _epilogue_stack RC bindings use,
+		by declaration order - build_epilogue_ladder() replays the whole
+		stack together, deepest first. Never touches self.bindings (there's
+		no name to look it up by - it's not a variable), so it's immune to
+		merge_if()'s dict-based reconciliation entirely; restore() below
+		gives it the different treatment it actually needs instead. '''
+		self._epilogue_stack.append( Epilogue(
+			instructions = instructions, name = self._new_label( 'epilogue' ), flag = flag, is_err_only = is_err_only,
+		))
 
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
 
@@ -193,8 +209,18 @@ class CFGState:
 		return _Snapshot( bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ))
 
 	def restore( self, snap: _Snapshot ) -> None:
+		''' truncates back to the snapshot's own depth for ordinary (RC)
+		entries - an if-branch's own locals are genuinely block-scoped, torn
+		down at the branch's own exit (merge_if handles that). A defer/
+		errdefer entry pushed since the snapshot is different: defer's
+		cleanup always runs at the FUNCTION's own shared epilogue, no matter
+		which branch (if any) armed it - the flag alone decides whether it
+		actually replays - so it has to survive this truncation instead of
+		being discarded with the branch's own locals. '''
 		self.bindings = dict( snap.bindings )
+		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
 		del self._epilogue_stack[snap.stack_depth:]
+		self._epilogue_stack += survivors
 
 	# --- IF/ELSE/ENDIF -----------------------------------------------------
 
@@ -369,31 +395,106 @@ class CFGState:
 
 	# --- return / fall-off-the-end --------------------------------------------
 
-	def return_( self, returned_operand: ir.Operand | None ) -> list[ir.Instruction]:
-		''' unwind the ENTIRE current stack (every RC binding still live,
-		function-wide) - called at each return statement and at the
-		function's own fall-off-the-end. Skips whichever entry IS the
-		returned value itself (ownership transfers to the caller, matched
-		by identity - the same Variable/Temp object _lower_expr already
-		returned for the `return` expression). Doesn't mutate .bindings/the
-		stack (lowering.py doesn't need it to - each return is independent,
-		no code follows it on that path) EXCEPT for one thing: if the
-		returned value is itself a bare fresh temp (`return SomeClass()`,
-		never assigned to a name), it untracks that temp from
-		_temp_states - otherwise the DeleteTemp _lower_stmt's own wrapper
-		emits for it right after this statement would decref the very
-		value we just handed to the caller. Flag-guarded (defer/errdefer)
-		entries are handled by lowering.py's existing epilogue machinery,
-		not here - see the Integration section of the plan. '''
+	def return_(
+		self, returned_operand: ir.Operand | None, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' = None,
+	) -> list[ir.Instruction]:
+		''' unwind the ENTIRE current stack (every RC binding still live and
+		every defer/errdefer entry still pending, function-wide) - called at
+		each return statement and at the function's own fall-off-the-end.
+		Skips whichever entry IS the returned value itself (ownership
+		transfers to the caller, matched by identity - the same Variable/
+		Temp object _lower_expr already returned for the `return`
+		expression) - a flag-guarded entry's own operand is always None, so
+		this never matches one of those. Doesn't mutate .bindings/the stack
+		(lowering.py doesn't need it to - each return is independent, no
+		code follows it on that path) EXCEPT for one thing: if the returned
+		value is itself a bare fresh temp (`return SomeClass()`, never
+		assigned to a name), it untracks that temp from _temp_states -
+		otherwise the DeleteTemp _lower_stmt's own wrapper emits for it
+		right after this statement would decref the very value we just
+		handed to the caller. get_is_err_check is only ever actually called
+		if an errdefer entry is genuinely live here - see _replay(). '''
 		if isinstance( returned_operand, ir.Temp ):
 			self._temp_states.pop( returned_operand.id, None )
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack ):
-			if entry.cancelled or entry.is_flag_guarded:
+			if entry.cancelled:
 				continue
 			if returned_operand is not None and entry.operand is returned_operand:
 				continue
-			instructions += entry.instructions
+			instructions += self._replay( entry, get_is_err_check )
+		return instructions
+
+	def current_epilogue_label( self, returned_operand: ir.Operand | None = None ) -> str | None:
+		''' the label a `return` (or the function's own fall-off-the-end)
+		should jump to instead of unwinding inline via return_() - the
+		topmost still-active entry's own name (skipping only cancelled ones -
+		e.g. a completed __init__'s own attribute entries, all cancelled by
+		complete_construction(), must never produce a pointless jump/Label
+		with nothing behind it; a flag-guarded entry is NOT skipped here,
+		unlike return_()'s own inline replay - it's always "active" in the
+		sense that something needs to check its flag, even if that check
+		then finds it wasn't armed), shared across every return that reaches
+		it (see build_epilogue_ladder()). None when nothing's left active (a
+		plain ir.Return is correct instead), OR when returned_operand is
+		itself one of the still-live RC entries ANYWHERE in the stack, not
+		just the top: the shared ladder can't skip just one entry for just
+		this one return (that's what return_()'s own "excludes the
+		returned binding" already handles) - inlining via return_() is the
+		only option there. '''
+		if returned_operand is not None and any(
+			not entry.cancelled and entry.operand is returned_operand
+			for entry in self._epilogue_stack
+		):
+			return None
+		for entry in reversed( self._epilogue_stack ):
+			if not entry.cancelled:
+				return entry.name
+		return None
+
+	def build_epilogue_ladder(
+		self, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' = None,
+	) -> list[ir.Instruction]:
+		''' the shared unwind sequence every return that used
+		current_epilogue_label() (and the function's own fall-off-the-end)
+		jumps into - one Label + that entry's own still-live replay per
+		pending entry (RC Decref, or a flag-guarded defer/errdefer replay -
+		see _replay()), deepest (most-recently-pushed) first, each falling
+		straight through into the next with no Jump needed. Cancelled
+		entries still get their own Label (current_epilogue_label() can
+		still point straight at one - see its own comment), just no
+		instructions. Callers append their own final ir.Return - cfg.py has
+		no notion of a function's return type or return-value slot. '''
+		instructions: list[ir.Instruction] = []
+		for entry in reversed( self._epilogue_stack ):
+			instructions.append( ir.Label( name = entry.name ))
+			if not entry.cancelled:
+				instructions += self._replay( entry, get_is_err_check )
+		return instructions
+
+	def _replay( self, entry: Epilogue, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' ) -> list[ir.Instruction]:
+		# a plain RC entry's instructions always run unconditionally (their
+		# liveness is already compile-time-exact - see the class docstring);
+		# a flag-guarded one is runtime-conditional instead - skip_label
+		# covers both "never armed" (flag) and, for errdefer specifically,
+		# "armed but this isn't the error path" (is_err). get_is_err_check
+		# is called FRESH here, inline, rather than once up front and
+		# shared - with per-Epilogue labels, different returns can jump
+		# into DIFFERENT points of the same ladder, so a check computed
+		# once outside any specific entry's own replay wouldn't be reached
+		# by every jump that might need it (a jump landing deeper in the
+		# ladder skips right past it). Called only when actually needed -
+		# is_err() is a real Call, not free
+		if not entry.is_flag_guarded:
+			return entry.instructions
+		skip_label = self._new_label( 'defer_skip' )
+		instructions = [ ir.JumpIfFalse( cond = entry.flag, target = skip_label ) ]
+		if entry.is_err_only:
+			is_err_instructions, is_err_temp = get_is_err_check()
+			instructions += is_err_instructions
+			instructions.append( ir.JumpIfFalse( cond = is_err_temp, target = skip_label ))
+		instructions += entry.instructions
+		instructions.append( ir.Label( name = skip_label ))
 		return instructions
 
 	# --- Incref/Decref emission, union-aware ------------------------------------
