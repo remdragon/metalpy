@@ -3219,6 +3219,14 @@ class Tests( unittest.TestCase ):
 		flag0 = Variable( stem = '__defer_flag_0', qualname = '__test__.checked.__defer_flag_0', file = Path( '__test__.py' ), line = 10, type = bool_cls )
 		return_value_var = Variable( stem = '__return_value', qualname = '__test__.checked.__return_value', file = Path( '__test__.py' ), line = 9, type = checked_fn.return_type )
 		is_err_temp = ir.Temp( type = bool_cls, id = 0 )
+		# is_err's genericity is inherited from Result's own class type
+		# params (like Result.Ok/.Err) - the receiver's type (Result[None,
+		# OverflowError]) already pins down the concrete args by the time
+		# _build_is_err_check runs, so the call target is the MONOMORPHIZED
+		# copy, not the bare is_err_fn (which has no real C struct body
+		# anywhere - only concrete specializations do)
+		is_err_spec = self.discovery._get_or_create_specialization( is_err_fn, checked_fn.return_type.args )
+		monomorphized_is_err = self.compiler.lowering._monomorphized_function( is_err_spec )
 
 		fn = self.compiler._lower( checked_fn )
 		self._assert_ir( fn, [
@@ -3233,7 +3241,7 @@ class Tests( unittest.TestCase ):
 			# the ladder (see cfg.py's _replay()), and skipping it entirely
 			# when the flag never armed is a nice side benefit
 			ir.DeclareTemp( temp = is_err_temp ),
-			ir.Call( dest = is_err_temp, target = is_err_fn, receiver = return_value_var, args = [], kwargs = {} ),
+			ir.Call( dest = is_err_temp, target = monomorphized_is_err, receiver = return_value_var, args = [], kwargs = {} ),
 			ir.JumpIfFalse( cond = is_err_temp, target = '__defer_skip_1__' ),
 			ir.Label( name = '__defer_skip_1__' ),
 			# this test's own `class bool: pass` fixture is a plain

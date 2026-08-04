@@ -576,7 +576,7 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	lines.append( '}' )
 	return '\n'.join( lines )
 
-def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: set[str] ) -> list[str]:
+def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declared: set[str] ) -> list[str]:
 	# FuncStart/FuncEnd carry no independent C text of their own - the
 	# surrounding prototype + braces (built from the LoweredFunction.function
 	# object, not these markers) already represent them; see emit_function
@@ -1033,8 +1033,50 @@ def emit_tagged_union( union: TaggedUnion ) -> str:
 	name = mangle_type( union )
 	return _struct_or_union_body( name, 'struct', [ ( tag_attr.stem, tag_attr.type ), ( data_attr.stem, data_attr.type ) ] )
 
+def _is_trivial_global_init( instructions: list[ir.Instruction] ) -> bool:
+	# Lowering.lower_global always produces a real IR instruction sequence
+	# (DeclareTemp/Call/Allocate/... as needed, ending in an Assign of the
+	# fully-computed value into the global itself) - "trivial" here means
+	# that sequence collapsed to nothing more than the terminal Assign, with
+	# a bare Const as its source (u32(-11)'s own bit-reinterpretation
+	# already folds to a Const at lowering time - no CastWrap instruction
+	# even gets emitted for a literal argument, see _lower_scalar_cast)
+	return (
+		len( instructions ) == 1
+		and isinstance( instructions[0], ir.Assign )
+		and isinstance( instructions[0].src, ir.Const )
+	)
+
 def emit_global( g: LoweredGlobal ) -> str:
-	raise NotImplementedError( 'emit_global: Phase 7 work' )
+	name = mangle_qualname( g.variable.qualname )
+	ctype = c_type( g.variable.type )
+	if _is_trivial_global_init( g.instructions ):
+		value = _emit_operand( g.instructions[0].src )
+		return f'{ctype} {name} = {value};'
+	# a non-trivial initializer (anything needing a real computation - an
+	# RCClass construction, an arithmetic expression, ...) flattens into a
+	# private init function, reusing _emit_instruction exactly like an
+	# ordinary function body does (function=None is safe here: lower_global
+	# never emits ir.Return/ir.OrReturn, the only two branches that read
+	# it - defer/errdefer/loops can't appear in a global initializer at all,
+	# see lower_global's own comment). Wiring this init function into a
+	# real process entry point is out of scope (linking-adjacent,
+	# C_EMITTER.md excludes it) - it just needs to exist and compile. The
+	# global itself gets a {0} zero initializer in the meantime - a valid
+	# C11 initializer for ANY type alike (ISO C11 6.7.9p11: a scalar
+	# initializer may be "optionally enclosed in braces"), matching the
+	# same convention ir.Allocate's own empty-fields branch already uses
+	init_name = f'__metalpy_init_{name}'
+	lines = [
+		f'{ctype} {name} = {{0}};',
+		'',
+		f'static void {init_name}( void ) {{',
+	]
+	declared: set[str] = set()
+	for instr in g.instructions:
+		lines.extend( _emit_instruction( instr, function = None, declared = declared ))
+	lines.append( '}' )
+	return '\n'.join( lines )
 
 def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 	# CStruct/CUnion/TaggedUnion bodies, topologically sorted on by-value-

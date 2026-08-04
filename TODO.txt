@@ -1281,6 +1281,96 @@ emitter:
 			no new work; module globals) - see the plan file. This is the
 			FINAL phase.
 
+	[resolved] Phase 7 (FINAL): confirm defer/errdefer + generics need no
+		new emitter work; module globals. Confirmed via real clang compiles
+		(not just IR-shape assertions): defer/errdefer already fully
+		desugars to plain Label/Jump/JumpIfFalse by stage 2, and explicit
+		generic-call syntax (identity[i32](5)) needs no new emitter code -
+		decision 3's uniform mangling, exercised repeatedly since Phases
+		3/5, already covers it.
+		Real new work: emit_global(). Lowering.lower_global already
+			produces a real IR instruction sequence for a global's own
+			initializer (ending in an Assign of the fully-computed value
+			into the global itself) - "trivial" (a bare literal like
+			kernel32.py's own real STD_OUTPUT_HANDLE: u32 = u32(-11) -
+			a literal argument to a scalar cast always folds to a Const at
+			lowering time, no CastWrap instruction even gets emitted) means
+			that sequence collapses to nothing but the terminal Assign(Const),
+			emitted as a real C static initializer directly. Anything else
+			(sys.py's own real stdout: _Stdout = _Stdout(), a genuine
+			RCClass construction) flattens the WHOLE instruction sequence
+			into a private static void __metalpy_init_<mangled>(void)
+			function, reusing _emit_instruction exactly like an ordinary
+			function body does (function=None is safe - lower_global never
+			emits ir.Return/ir.OrReturn, the only two branches that read
+			it, since defer/errdefer/loops can't appear in a global
+			initializer at all). The global itself gets a {0} zero
+			initializer in the meantime - valid C11 for ANY type alike
+			(6.7.9p11's "optionally enclosed in braces" allowance for a
+			scalar initializer, not just aggregates) - matching the same
+			convention ir.Allocate's own empty-fields branch already uses.
+			Wiring the init function into a real process entry point is
+			out of scope (linking-adjacent, C_EMITTER.md excludes it) - it
+			just needs to exist and compile, exactly as the plan's own
+			milestone wording says.
+		One real, previously-latent bug found while building the errdefer
+			confirm-only test (not module-globals work, but surfaced by
+			the SAME "push a real fixture all the way through clang"
+			discipline this whole plan has used throughout): errdefer's
+			own internal is_err() check (_build_is_err_check, which builds
+			the DeclareTemp+Call directly rather than going through the
+			ordinary _lower_call dispatch, since is_err() is never actually
+			written in user source) never monomorphized is_err against the
+			concrete Result[T,E] specialization actually in play - unlike
+			Result.Ok/.Err/ordinary is_err() calls written by hand, which
+			all correctly go through _lower_class_generic_method_call. The
+			ABSTRACT (never-emitted) Result.is_err ended up as the call
+			target, whose synthesized `self` parameter type has no real C
+			struct body anywhere (only concrete specializations do) - a
+			genuine "incomplete type"/"conflicting types" clang error.
+			Fixed by replicating _lower_class_generic_method_call's own
+			"receiver already concrete" branch directly in
+			_build_is_err_check (resolve-only, not _ensure_resolved, which
+			would ALSO incidentally schedule the wrong, abstract function
+			as a side effect - confirmed by a first attempt that emitted
+			BOTH the abstract and the correctly-monomorphized version side
+			by side, a "conflicting types" error of its own).
+		Also removed _RESULT_FIXTURE's own redundant `class bool: pass` -
+			shadowed the real bool intrinic (Discovery.find_name already
+			falls back to mod.intrinsics with no local declaration needed
+			at all), causing errdefer's OWN internal defer-flag/is_err-
+			result plumbing (which needs the REAL intrinsic bool for CFG-
+			internal machinery) to inconsistently mix a real C bool with a
+			bogus RCClass-typed "bool" pulled in by the fixture's own
+			(unnecessary) declaration - invisible before now since no
+			earlier _RESULT_FIXTURE-based test exercised errdefer at all.
+		Verified end to end via clang -std=c11 -Wall -Wextra -c: both
+			global-initializer shapes (trivial constant, RCClass
+			construction), defer, errdefer, and an explicit generic call.
+			Full suite: 478 tests, 0 failures.
+		THE C-EMITTER PLAN IS NOW COMPLETE (Phases 0-7). emitter_c.py turns
+			a fully-lowered Compiler's output into real, clang-verified C11
+			source, covering: scalars/control-flow/arithmetic/calls/Result
+			(Phase 1), CStruct/CUnion/CEnum/Ptr (Phase 2), RCClass layout +
+			sys.alloc[T] construction + Incref/Decref/RefCount (Phase 3),
+			__del__/destructor synthesis (Phase 4), TaggedUnion real+
+			synthesized + NoneType-as-member (Phase 5), @extern/AddrOf +
+			string/bytes literal static-baking (Phase 6), and module
+			globals (Phase 7). Known, documented, deliberately out-of-scope
+			gaps remain (see each phase's own entry above): TaggedUnion-
+			typed fields with RC leaves in a destructor's cascading decref;
+			nested RC content inside a by-value CStruct/CUnion field;
+			linking (no init-function-into-entry-point wiring, no linker
+			pragmas for @extern's own libraries - explicitly out of scope
+			per C_EMITTER.md throughout). Real lib/ verification (actually
+			compiling lib/sys.py, lib/windows/kernel32.py, lib/builtins/
+			__init__.py, etc. as they exist today, rather than the self-
+			contained fixtures this whole plan deliberately used instead)
+			was never part of this plan's own scope and remains real,
+			separate future work whenever lib/'s own currently-evolving
+			pieces (sys._Stdout.write's OSError design, module-level
+			globals like `stdout`, etc.) settle.
+
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
 

@@ -188,10 +188,16 @@ def helper() -> None:
 		self.assertEqual( self._function_names(), [ 'main', '__main__.helper' ] )
 
 	def test_errdefer_is_err_call_target_is_scheduled( self ) -> None:
-		# _emit_is_err_check resolves+schedules Result.is_err purely as a side
-		# effect of building the epilogue - is_err is never called from user
-		# source at all, so it's the one call site here self.schedule() can't
-		# be reached via the ordinary _lower_call path
+		# _build_is_err_check resolves+schedules Result.is_err purely as a
+		# side effect of building the epilogue - is_err is never called
+		# from user source at all, so it's the one call site here
+		# self.schedule() can't be reached via the ordinary _lower_call
+		# path. is_err's genericity is inherited from Result's own class
+		# type params (like Result.Ok/.Err) - the receiver's type already
+		# pins down the concrete args, so what actually gets scheduled is
+		# the MONOMORPHIZED copy (Result.is_err[...]), not the bare,
+		# never-emitted abstract Result.is_err (which has no real C struct
+		# body anywhere - only concrete specializations do)
 		self._run( '''
 class bool: pass
 class OverflowError: pass
@@ -215,7 +221,7 @@ def main() -> None:
 ''' )
 		names = self._function_names()
 		self.assertIn( '__main__.checked', names )
-		self.assertTrue( any( name.endswith( 'Result.is_err' ) for name in names ), names )
+		self.assertTrue( any( 'Result.is_err[' in name for name in names ), names )
 
 class EnqueueFilteringTests( CompilerTestCase ):
 	''' lowering.py's _ensure_resolved hands _enqueue literally anything it

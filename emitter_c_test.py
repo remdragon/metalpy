@@ -181,7 +181,6 @@ def main() -> None:
 # actually verifying (Check-mode arithmetic/Result specialization
 # synthesis/OrReturn), so it's kept within what Phase 1 actually covers
 _RESULT_FIXTURE = '\n'.join([
-	'class bool: pass',
 	'@cstruct',
 	'class OverflowError: pass',
 	'',
@@ -528,6 +527,54 @@ def main() -> None:
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
+	def test_defer_compiles( self ) -> None:
+		# Phase 7 (confirm-only): defer/errdefer already fully desugar to
+		# plain Label/Jump/JumpIfFalse by stage 2 (lowering.py replays the
+		# deferred body inline at the epilogue) - Phase 1's own coverage of
+		# those ops should already be sufficient, with zero new emitter
+		# code needed. Confirmed here by an actual real compile, not just
+		# an IR-shape assertion.
+		self._run( '\n'.join([
+			'def cleanup() -> None:',
+			'	return',
+			'',
+			'def main() -> None:',
+			'	defer( cleanup() )',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_errdefer_compiles( self ) -> None:
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+			'def cleanup() -> None:',
+			'	return',
+			'',
+			'def checked() -> Result[i32,OverflowError]:',
+			'	errdefer( cleanup() )',
+			'	return Result.Ok( 5 )',
+			'',
+			'def main() -> None:',
+			'	checked()',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_generic_specialization_naming_compiles( self ) -> None:
+		# Phase 7 (confirm-only): generic monomorphization naming is
+		# already covered by decision 3's uniform mangling, exercised
+		# repeatedly by Phases 3/5 already (sys.alloc[T], Result[T,E],
+		# ResultPayload[T,E]) - this just adds one direct, explicit-
+		# generic-call-syntax confirmation (Name[T](...), not just the
+		# inferred/bare-call path every other fixture already goes through)
+		self._run( '\n'.join([
+			'def identity[T]( x: T ) -> T:',
+			'	return x',
+			'',
+			'def main() -> i32:',
+			'	return identity[i32]( 5 )',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
 # routing RCClass construction through the REAL sys.alloc[T] means sys.alloc's
 # own body actually gets lowered end to end (unlike every other fixture in
 # this file, which never touches real lib/ code) - the real lib/sys.py's own
@@ -827,6 +874,77 @@ class StringLiteralRealCompileTests( _ClangCompileMixin, BuiltinsStrTestCase ):
 			'',
 			'def main() -> bool:',
 			"	return write_message( 'hello' )",
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+class EmitGlobalTests( CompilerTestCase ):
+	def test_trivial_global_is_a_real_static_initializer( self ) -> None:
+		# mirrors lib/windows/kernel32.py's own real STD_OUTPUT_HANDLE:
+		# u32 = u32(-11) - a literal argument to a scalar cast always folds
+		# to a bare Const at lowering time (_lower_scalar_cast never even
+		# emits a CastWrap instruction for it), so the global's own
+		# instruction sequence collapses to a single Assign(Const)
+		self._run( '\n'.join([
+			'STD_OUTPUT_HANDLE: u32 = u32( -11 )',
+			'',
+			'def main() -> None:',
+			'	x: u32 = STD_OUTPUT_HANDLE',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		g = self.compiler.globals[0]
+		src = emitter_c.emit_global( g )
+		self.assertEqual( src, 'uint32_t __main__$STD_OUTPUT_HANDLE = -11;' )
+		self.assertNotIn( '__metalpy_init', src ) # trivial - no init function needed
+
+class EmitGlobalRCClassTests( RCClassTestCase ):
+	def test_non_trivial_global_flattens_into_an_init_function( self ) -> None:
+		# mirrors lib/sys.py's own real stdout: _Stdout = _Stdout() - a
+		# real RCClass construction, needing a real init function (the
+		# global itself gets a {0} zero initializer in the meantime -
+		# wiring the init function into a real process entry point is out
+		# of scope, C_EMITTER.md excludes linking-adjacent work; it just
+		# needs to exist and compile, per the plan's own milestone wording)
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'g_foo: Foo = Foo.make( 1 )',
+			'',
+			'def main() -> None:',
+			'	x: Foo = g_foo',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		g = self.compiler.globals[0]
+		src = emitter_c.emit_global( g )
+		self.assertIn( 'struct __main__$Foo* __main__$g_foo = {0};', src )
+		self.assertIn( 'static void __metalpy_init___main__$g_foo( void ) {', src )
+		self.assertIn( '__main__$g_foo = t0;', src )
+
+@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
+	def test_trivial_global_compiles( self ) -> None:
+		self._run( '\n'.join([
+			'STD_OUTPUT_HANDLE: u32 = u32( -11 )',
+			'',
+			'def main() -> None:',
+			'	x: u32 = STD_OUTPUT_HANDLE',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+class EmitGlobalRCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
+	def test_non_trivial_global_compiles( self ) -> None:
+		# Phase 7 milestone: both global-initializer shapes compile clean -
+		# this is the RCClass-construction shape (mirrors lib/sys.py's own
+		# real stdout: _Stdout = _Stdout()), the trivial-constant shape is
+		# covered by EmitGlobalRealCompileTests above. This is the FINAL
+		# milestone of the whole C-emitter plan.
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'g_foo: Foo = Foo.make( 1 )',
+			'',
+			'def main() -> None:',
+			'	x: Foo = g_foo',
+			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 

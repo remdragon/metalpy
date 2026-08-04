@@ -369,7 +369,31 @@ class Lowering:
 		actually needs it. '''
 		bool_cls = self.discovery.find_name( 'bool', node )
 		is_err_fn = self._attr_lookup_callable( self._return_value_var.type, 'is_err', node )
-		self._ensure_resolved( is_err_fn )
+		# resolve only (NOT _ensure_resolved, which also unconditionally
+		# schedules is_err_fn as a compile unit) - is_err's genericity is
+		# inherited from Result's own class type params (same as Result.
+		# Ok/.Err/.is_ok - see _lower_class_generic_method_call's own
+		# identical "receiver already concrete" branch), so the ABSTRACT
+		# is_err_fn is never itself the right thing to schedule/call: its
+		# synthesized `self` parameter would be typed as bare Result, which
+		# has no real C struct body anywhere (only concrete specializations
+		# do) - a genuine "incomplete type" compile error confirmed via a
+		# real errdefer+clang round trip once _ensure_resolved's own
+		# incidental scheduling was scheduling BOTH the abstract AND the
+		# correctly-monomorphized version side by side
+		if is_err_fn.resolve is not None:
+			is_err_fn.resolve()
+		return_type = self._return_value_var.type
+		if isinstance( return_type, Specialization ) and return_type.base is is_err_fn.cls:
+			# the receiver's type (self._return_value_var, always a
+			# concrete Result[T,E] specialization by the time this runs)
+			# already pins down the concrete args, so this is just an
+			# ordinary monomorphization
+			method_spec = self.discovery._get_or_create_specialization( is_err_fn, return_type.args )
+			self.schedule( method_spec )
+			is_err_fn = self._monomorphized_function( method_spec )
+		else:
+			self.schedule( is_err_fn )
 		temp = ir.Temp( type = bool_cls, id = self._temp_id )
 		self._temp_id += 1
 		self._pending_temps.append( temp )
