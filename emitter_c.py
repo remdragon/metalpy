@@ -48,6 +48,13 @@ static inline void release_object( ObjectHeader* obj, void (*destructor)(void*) 
 }
 '''
 
+# NOT part of C_EMITTER.md's own verbatim prologue above - a synthesized
+# TaggedUnion payload's None member (e.g. Ptr[u8]|None) needs a real 1-byte
+# type (see the plan's type-mapping table); 'void' (c_type(NoneType)'s
+# spelling everywhere else) is not a legal struct/union member type
+_NONE_PLACEHOLDER_TYPE = 'MetalpyNone'
+_NONE_PLACEHOLDER_TYPEDEF = f'typedef unsigned char {_NONE_PLACEHOLDER_TYPE};'
+
 # --- name mangling -----------------------------------------------------------
 
 def mangle_qualname( qualname: str ) -> str:
@@ -86,6 +93,21 @@ def mangle_type( t: Type ) -> str:
 	if isinstance( t, TaggedUnion ) and t.file is None:
 		parts = [ '__u' ] + [ mangle_type( attr.type ) for attr in t.attributes ]
 		return '$' + '$$'.join( parts )
+	if isinstance( t, CUnion ) and t.file is None:
+		# Lowering._tagged_union_storage's own synthesized payload CUnion
+		# for an anonymous TaggedUnion (t.qualname directly embeds the
+		# outer union's raw '|'-joined qualname, e.g. 'intrinsics.NoneType|
+		# intrinsics.Ptr[intrinsics.u8]$data' - plain mangle_qualname would
+		# leave a literal '|' in the output, not a legal C identifier
+		# character). t.attributes are the v_<member>-prefixed payload
+		# fields, in the SAME order/types as the outer union's own
+		# .attributes, so the identical $__u... scheme reconstructs
+		# correctly straight from them - no reference to the outer
+		# TaggedUnion object needed here (only its type is ever synthesized
+		# with file=None; a real @union's own payload always inherits a
+		# real file/line, so this can't collide with a genuine user @cunion)
+		parts = [ '__u' ] + [ mangle_type( attr.type ) for attr in t.attributes ]
+		return '$' + '$$'.join( parts ) + '$data'
 	return mangle_qualname( t.qualname )
 
 def _c_label( name: str ) -> str:
@@ -199,6 +221,22 @@ def _value_spelling( t: Type ) -> str:
 		return f'{_class_keyword(base)} {mangle_type(t)}'
 	return c_type( t ) # scalars/CEnum - value and reference spelling are identical
 
+def _field_type_spelling( t: Type ) -> str:
+	if isinstance( t, Scalar ) and t.stem == 'NoneType':
+		return _NONE_PLACEHOLDER_TYPE
+	return c_type( t )
+
+def _field_name( name: str ) -> str:
+	# a REAL struct/class field (x: i32) is already a plain identifier, so
+	# mangle_qualname is a no-op there - but a TaggedUnion payload's
+	# synthesized field name (Lowering._tagged_union_storage's
+	# f'v_{attr.stem}') can be a full type-qualname fragment for a
+	# synthesized union member (Ptr[u8]|None's v_intrinsics.Ptr[intrinsics.u8],
+	# not a source identifier at all - there's no source identifier to have),
+	# which needs exactly the same '.'/'['/','/']' -> valid-C-identifier
+	# treatment as any other name this module mangles
+	return mangle_qualname( name )
+
 # --- struct/union body emission -------------------------------------------
 #
 # A concrete generic class specialization (Result[i32,OverflowError]) is a
@@ -213,7 +251,7 @@ def _value_spelling( t: Type ) -> str:
 def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]] ) -> str:
 	lines = [ f'{keyword} {name} {{' ]
 	for field_name, field_type in attrs:
-		lines.append( f'\t{c_type(field_type)} {field_name};' )
+		lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 
@@ -574,10 +612,10 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 
 	if isinstance( instr, ir.GetAttr ):
 		op = _member_access_operator( instr.obj.type )
-		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{instr.attr};' ]
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
 	if isinstance( instr, ir.SetAttr ):
 		op = _member_access_operator( instr.obj.type )
-		return [ f'\t({_emit_operand(instr.obj)}){op}{instr.attr} = {_emit_operand(instr.value)};' ]
+		return [ f'\t({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)} = {_emit_operand(instr.value)};' ]
 
 	if isinstance( instr, ir.GetItem ):
 		# only ever reached for a raw pointer with no real __getitem__ (see
@@ -638,7 +676,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 			# paired Decref
 			lines.append( f'\t({dest})->$header.ref_count = 1;' )
 			for name, value in instr.fields.items():
-				lines.append( f'\t({dest})->{name} = {_emit_operand(value)};' )
+				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )
 			return lines
 		# CStruct/CUnion - plain value construction, no header/no heap
 		# allocation at all (see the grounding facts in the plan) - a C11
@@ -649,7 +687,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function, declared: s
 		dest = _emit_operand( instr.dest )
 		if not instr.fields:
 			return [ f'\t{dest} = ({ctype}){{0}};' ] # empty {} isn't valid standard C11
-		field_inits = ', '.join( f'.{name} = {_emit_operand(value)}' for name, value in instr.fields.items() )
+		field_inits = ', '.join( f'.{_field_name(name)} = {_emit_operand(value)}' for name, value in instr.fields.items() )
 		return [ f'\t{dest} = ({ctype}){{ {field_inits} }};' ]
 
 	if isinstance( instr, ir.OrReturn ):
@@ -741,7 +779,7 @@ def emit_rcclass( cls: RCClass ) -> str:
 	name = mangle_type( cls )
 	lines = [ f'struct {name} {{', '\tObjectHeader $header;' ]
 	for field_name, field_type in attrs:
-		lines.append( f'\t{c_type(field_type)} {field_name};' )
+		lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 
@@ -785,15 +823,15 @@ def emit_rcclass_destructor( cls: RCClass ) -> str:
 			field_base = attr.type.base if isinstance( attr.type, Specialization ) else attr.type
 			if not isinstance( field_base, RCClass ):
 				# a TaggedUnion-typed field with RC leaves needs the same
-				# tag-gated shape cfg.py builds at the IR level, not handled
-				# here yet (TaggedUnion emission itself is later-phase work -
-				# see emit_tagged_union) - same "compiles clean, not
-				# necessarily leak-free yet" posture Phase 3 already
+				# tag-gated shape cfg.py builds at the IR level - not
+				# replicated here yet (this function only ever emits a
+				# DIRECT decref, no tag dispatch) - same "compiles clean,
+				# not necessarily leak-free yet" posture Phase 3 already
 				# established for the NULL-destructor placeholder this
 				# function replaces
 				continue
 			field_destructor = _rcclass_destructor_name( attr.type )
-			lines.append( f'\trelease_object( &(self->{attr.stem})->$header, {field_destructor} );' )
+			lines.append( f'\trelease_object( &(self->{_field_name(attr.stem)})->$header, {field_destructor} );' )
 	sys_free_name = mangle_qualname( 'sys.free' )
 	lines.append( f'\t{sys_free_name}( ( void* )self );' )
 	lines.append( '}' )
@@ -822,7 +860,20 @@ def emit_cenum( cls: CEnum ) -> str:
 	return '\n'.join( lines )
 
 def emit_tagged_union( union: TaggedUnion ) -> str:
-	raise NotImplementedError( 'emit_tagged_union: Phase 5 work' )
+	# a TaggedUnion's REAL runtime representation is synthesized lowering-
+	# side (Lowering._tagged_union_storage) as `tag: u8` + `data: <payload
+	# CUnion>`, registered into union.names - NOT union.attributes, which
+	# holds the LOGICAL members (Ok/Err, SharedReference/...) used for
+	# type-matching/.leaves(), never the actual storage shape. Guaranteed
+	# already populated by the time this runs: a TaggedUnion only ever
+	# becomes a real compile unit (lands in compiler.tagged_unions) via a
+	# construction or match site that already called _tagged_union_storage.
+	tag_attr = union.names.get( 'tag' )
+	data_attr = union.names.get( 'data' )
+	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
+		f'{union.qualname}: _tagged_union_storage has not run yet - no real storage shape to emit'
+	name = mangle_type( union )
+	return _struct_or_union_body( name, 'struct', [ ( tag_attr.stem, tag_attr.type ), ( data_attr.stem, data_attr.type ) ] )
 
 def emit_global( g: LoweredGlobal ) -> str:
 	raise NotImplementedError( 'emit_global: Phase 7 work' )
@@ -856,8 +907,17 @@ def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 		if cls.qualname in visited:
 			return
 		visited.add( cls.qualname )
-		for attr in cls.attributes:
-			dep = by_qualname.get( getattr( attr.type, 'qualname', None ))
+		if isinstance( cls, TaggedUnion ):
+			# a TaggedUnion's REAL by-value dependency is its synthesized
+			# `data` field (the payload CUnion) - .attributes holds the
+			# LOGICAL members (Ok/Err/...) instead, which aren't part of
+			# the actual C struct layout at all (see emit_tagged_union)
+			data_attr = cls.names.get( 'data' )
+			dep_types = [ data_attr.type ] if isinstance( data_attr, Variable ) else []
+		else:
+			dep_types = [ attr.type for attr in cls.attributes ]
+		for dep_type in dep_types:
+			dep = by_qualname.get( getattr( dep_type, 'qualname', None ))
 			if dep is not None:
 				visit( dep )
 		ordered.append( cls )
@@ -880,7 +940,7 @@ def emit_c( compiler: Compiler ) -> str:
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
 	program is already collected into one Compiler instance, so there's no
 	reason to split output across files. '''
-	parts: list[str] = [ PROLOGUE ]
+	parts: list[str] = [ PROLOGUE, _NONE_PLACEHOLDER_TYPEDEF ]
 
 	# pass 1: forward declarations (opaque RCClass tags, full CEnum bodies,
 	# full CStruct/CUnion/TaggedUnion bodies in dependency order, function

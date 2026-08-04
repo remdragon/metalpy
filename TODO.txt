@@ -1080,6 +1080,95 @@ emitter:
 		Next: Phase 5 (TaggedUnion - real @union and synthesized,
 			NoneType-as-member) - see the plan file.
 
+	[resolved] Phase 5: TaggedUnion (real @union + synthesized),
+		NoneType-as-member. emit_tagged_union() builds the REAL storage
+		shape (tag: u8 + data: <payload CUnion>, synthesized lowering-side
+		by Lowering._tagged_union_storage, registered in union.names - NOT
+		union.attributes, which holds the LOGICAL members like Ok/Err for
+		type-matching only, never the actual layout). ir.Allocate/GetAttr/
+		SetAttr needed NO new emitter work at all - both were already
+		generic enough (c_type's existing "outer TaggedUnion -> struct
+		<mangled>" mapping + the plain designated-initializer Allocate path
+		already covered TaggedUnion the same as CStruct/CUnion; match/tag-
+		check lowering already reduces to Phase 1's own Cmp/Jump*/Label, no
+		new control-flow ops needed either). _emit_value_type_bodies's
+		topo-sort updated to walk a TaggedUnion's synthesized `data` field
+		(the payload CUnion, embedded by value) as its real dependency,
+		instead of .attributes (which was never the right thing to walk
+		for a TaggedUnion in the first place - the logical members aren't
+		part of the actual struct layout at all).
+		Two real bugs found only once a SYNTHESIZED (anonymous) union
+			with a REAL member type was actually round-tripped through a
+			full compile (every union fixture up to this point was either
+			a real @union or trivially scalar-only):
+			1) Field names weren't sanitized at all - a REAL union member
+				(Bar: i32) has a clean stem, but a SYNTHESIZED union
+				member's Variable.stem is the member's own full type
+				qualname (discovery.py's _get_or_create_union sets
+				stem=t.stem, i.e. 'intrinsics.Ptr[intrinsics.u8]' for a
+				Ptr[u8] member - there's no source identifier to have),
+				so the payload CUnion's own f'v_{attr.stem}' field name
+				came out containing '.'/'['/']' - invalid C syntax. Fixed
+				with a new _field_name() helper (mangle_qualname applied
+				uniformly to every field/attr name this module emits -
+				GetAttr/SetAttr/Allocate.fields keys/struct-body field
+				names) - a no-op for any real identifier, so nothing
+				else's output changed.
+			2) mangle_type()'s fallback path (plain mangle_qualname) left
+				a literal '|' in a synthesized payload CUnion's own
+				mangled name, since Lowering._tagged_union_storage builds
+				payload_cls.qualname as f'{union.qualname}$data', directly
+				embedding the outer union's raw '|'-joined qualname - '|'
+				isn't in mangle_qualname's replacement table (nothing
+				before this ever mangled a Type whose qualname contained
+				one). Fixed by extending mangle_type() to recognize a
+				CUnion with file=None (the same synthesized-vs-real signal
+				already used for the outer TaggedUnion - a real @union's
+				own payload always inherits a real file/line) and
+				reconstruct the identical $__u... scheme directly from the
+				payload's own .attributes (v_<member> fields, same order/
+				types as the outer union's own .attributes) rather than
+				needing a reference to the outer union object at all.
+		Also added the NoneType-as-union-member 1-byte placeholder
+			(_NONE_PLACEHOLDER_TYPEDEF = 'typedef unsigned char
+			MetalpyNone;', emitted once per translation unit, NOT folded
+			into C_EMITTER.md's own verbatim PROLOGUE) - c_type(NoneType)
+			stays 'void' everywhere else (a legitimate return-type/pointee
+			spelling), but 'void' is not a legal struct/union member type;
+			a new _field_type_spelling() helper is what a synthesized
+			union's data payload actually uses for its field types.
+		Prerequisites (lowering.py, found while building the milestone
+			tests, both missing self.schedule(...) calls of the same shape
+			the plan's own decision 6 already called out for payload_cls):
+			- _tagged_union_storage now schedules payload_cls itself (only
+				the outer TaggedUnion was ever scheduled before - a real
+				TaggedUnion could be scheduled/emitted while the CUnion its
+				own `data` field embeds BY VALUE never landed in
+				compiler.cunions at all).
+			- _try_lower_union_construct_call (UnionName.Member(value))
+				now schedules dest.type too - nothing else would, for the
+				exact same reason _lower_allocate_fields already documents
+				for its own identical fix (a bare `return MyUnion.A(5)`
+				with no intervening annotated local doesn't go through
+				_stmt_AnnAssign's own scheduling either).
+		Unrelated compatibility fix bundled in: the user's own concurrent
+			commit (ade3044, moving intrinsic byte-size knowledge from
+			lowering.py into discovery.py) made mpy_types.Scalar.sizeof a
+			required field: ir_test.py's/emitter_c_test.py's own _scalar()
+			test helpers (which build raw Scalar objects directly, not
+			through Discovery.get_intrinsics()) needed sizeof= added.
+		Verified end to end via clang -std=c11 -Wall -Wextra -c: a
+			synthetic @union construct/match round trip (Foo.Bar(5)
+			matched back out), and the real, load-bearing shape every
+			allocation in the language ultimately runs through - a
+			Ptr[u8]|None-returning function consumed via `if x is None:`
+			(mirroring lib/sys.py's own real _alloc, via a self-contained
+			extern fixture rather than the real, still-evolving lib/sys.py
+			- same posture as every other real-lib-shaped fixture in this
+			file). Full suite: 466 tests, 0 failures.
+		Next: Phase 6 (@extern, AddrOf, string/bytes literal static-baking)
+			- see the plan file.
+
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
 

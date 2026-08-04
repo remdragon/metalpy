@@ -2702,6 +2702,16 @@ class Lowering:
 				)
 			union.names[synthesized.stem] = synthesized
 		tags = { attr.stem: i for i, attr in enumerate( union.attributes ) }
+		# payload_cls (the synthesized CUnion backing `data`) needs its own
+		# explicit schedule() here - unlike the outer TaggedUnion itself
+		# (already scheduled by every caller reaching this point), nothing
+		# else would ever schedule payload_cls on its own, since it's never
+		# directly named anywhere in user code, only reached through
+		# union.names['data'].type - without this, a real TaggedUnion could
+		# be scheduled/emitted (the outer struct) while the CUnion its own
+		# `data` field embeds BY VALUE never lands in compiler.cunions,
+		# leaving that field's type incomplete
+		self.schedule( payload_cls )
 		result = ( tag_attr, data_attr, payload_cls, tags )
 		self._union_storage[ id( union ) ] = result
 		return result
@@ -2743,6 +2753,14 @@ class Lowering:
 		self._emit( ir.Allocate( dest = payload_dest, cls = payload_cls, fields = { f'v_{member.stem}': value } ))
 
 		dest = self._new_temp( expected_type or union )
+		# dest.type can be a concrete Specialization (OwnershipError[bytearray],
+		# inferred from expected_type) even though `union` itself (this
+		# call's own bare UnionName.Member(...) reference) is always the
+		# abstract base - same as _lower_allocate_fields's identical
+		# comment/fix: nothing else would ever schedule it (a bare
+		# `return MyUnion.A(5)` with no intervening annotated local doesn't
+		# go through _stmt_AnnAssign's own self.schedule(var_type) either)
+		self.schedule( dest.type )
 		self._emit( ir.Allocate( dest = dest, cls = union, fields = { tag_attr.stem: ir.Const( type = tag_attr.type, value = tags[member.stem] ), data_attr.stem: payload_dest } ))
 		return dest
 

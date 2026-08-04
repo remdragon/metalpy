@@ -15,7 +15,7 @@ from mpy_types import (
 )
 
 def _scalar( stem: str, qualname: str|None = None ) -> Scalar:
-	return Scalar( stem = stem, qualname = qualname or f'intrinsics.{stem}', file = None, line = None )
+	return Scalar( stem = stem, qualname = qualname or f'intrinsics.{stem}', file = None, line = None, sizeof = 0 )
 
 class MangleQualnameTests( unittest.TestCase ):
 	def test_dots_become_dollars( self ) -> None:
@@ -72,8 +72,8 @@ class CTypeTests( unittest.TestCase ):
 		self.assertEqual( emitter_c.c_type( None ), 'void' )
 
 	def test_ptr_and_constptr_specializations( self ) -> None:
-		ptr_cls = Scalar( stem = 'Ptr', qualname = 'intrinsics.Ptr', file = None, line = None )
-		const_ptr_cls = Scalar( stem = 'ConstPtr', qualname = 'intrinsics.ConstPtr', file = None, line = None )
+		ptr_cls = Scalar( stem = 'Ptr', qualname = 'intrinsics.Ptr', file = None, line = None, sizeof = 8 )
+		const_ptr_cls = Scalar( stem = 'ConstPtr', qualname = 'intrinsics.ConstPtr', file = None, line = None, sizeof = 8 )
 		u8 = _scalar( 'u8' )
 		ptr_u8 = Specialization( stem = 'Ptr[u8]', qualname = 'intrinsics.Ptr[intrinsics.u8]', file = None, line = None, base = ptr_cls, args = [ u8 ] )
 		const_ptr_u8 = Specialization( stem = 'ConstPtr[u8]', qualname = 'intrinsics.ConstPtr[intrinsics.u8]', file = None, line = None, base = const_ptr_cls, args = [ u8 ] )
@@ -319,6 +319,51 @@ def main() -> None:
 		self.assertIn( '[main$i] = main$seven;', src ) # SetItem
 		self.assertIn( '(main$p)[main$i];', src ) # GetItem
 
+_UNION_FIXTURE = '\n'.join([
+	'@union',
+	'class Foo:',
+	'	Bar: i32',
+	'	Baz: usize',
+])
+
+class EmitTaggedUnionTests( CompilerTestCase ):
+	def test_construct_and_match_round_trip( self ) -> None:
+		# mirrors lowering_test.py's own test_match_union_construction_and_
+		# extraction_round_trip - construct with one member, match takes
+		# that arm, extracts the value. No new control-flow ops needed here
+		# (match/tag-check lowering already reduces to Phase 1's own
+		# Cmp/Jump*/Label) - this test mainly proves emit_tagged_union()
+		# itself (the outer tag+data struct) plus the synthesized payload
+		# CUnion both actually emit and compile
+		self._run( _UNION_FIXTURE + '\n' + '\n'.join([
+			'def main() -> i32:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	match f:',
+			'		case Foo.Bar( x ):',
+			'			return x',
+			'		case Foo.Baz( z ):',
+			'			with compiler.wrap_arithmetic:',
+			'				return z + 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		foo_union = next( u for u in self.compiler.tagged_unions if u.qualname == '__main__.Foo' )
+		union_src = emitter_c.emit_tagged_union( foo_union )
+		self.assertIn( 'struct __main__$Foo {', union_src )
+		self.assertIn( 'uint8_t tag;', union_src )
+		self.assertIn( 'union __main__$Foo$data data;', union_src )
+		payload_cls = next( c for c in self.compiler.cunions if c.qualname == '__main__.Foo$data' )
+		payload_src = emitter_c.emit_cunion( payload_cls )
+		self.assertIn( 'union __main__$Foo$data {', payload_src )
+		self.assertIn( 'int32_t v_Bar;', payload_src )
+		self.assertIn( 'uintptr_t v_Baz;', payload_src )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		src = emitter_c.emit_function( main_lf )
+		self.assertIn( '.tag = 0', src ) # Foo.Bar's ordinal
+		self.assertIn( '.v_Bar = ', src )
+		self.assertIn( ').tag;', src ) # the match's case Foo.Bar(...) tag read, compared against the ordinal separately
+		self.assertIn( '== (0)', src )
+
 CLANG = shutil.which( 'clang' ) or r'C:\Program Files\LLVM\bin\clang.exe'
 
 class _ClangCompileMixin:
@@ -424,6 +469,45 @@ def main() -> None:
 	y: u8 = p[i]
 	return
 ''' )
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_union_construct_and_match_compiles( self ) -> None:
+		# Phase 5 milestone (a): synthetic @union construct/match round trip
+		self._run( _UNION_FIXTURE + '\n' + '\n'.join([
+			'def main() -> i32:',
+			'	f: Foo = Foo.Bar( 5 )',
+			'	match f:',
+			'		case Foo.Bar( x ):',
+			'			return x',
+			'		case Foo.Baz( z ):',
+			'			with compiler.wrap_arithmetic:',
+			'				return z + 1',
+			'	return 0',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_ptr_or_none_return_and_is_none_check_compiles( self ) -> None:
+		# Phase 5 milestone (b): mirrors the real, load-bearing shape every
+		# allocation in the language ultimately runs through - lib/sys.py's
+		# own _alloc(size: usize) -> Ptr[u8]|None, consumed via `if ptr is
+		# None:`. A synthetic extern stands in for the real HeapAlloc/malloc
+		# call (same posture as every other fixture in this file - no real
+		# lib/ dependency needed to exercise this shape)
+		self._run( '\n'.join([
+			"@extern( 'c', '_metalpy_test_maybe_alloc' )",
+			'def _test_maybe_alloc( size: usize ) -> Ptr[u8]|None:',
+			'	...',
+			'',
+			'def alloc_or_none( size: usize ) -> Ptr[u8]|None:',
+			'	ptr = _test_maybe_alloc( size )',
+			'	return ptr',
+			'',
+			'def main() -> i32:',
+			'	p: Ptr[u8]|None = alloc_or_none( 4 )',
+			'	if p is None:',
+			'		return 0',
+			'	return 1',
+		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 # routing RCClass construction through the REAL sys.alloc[T] means sys.alloc's

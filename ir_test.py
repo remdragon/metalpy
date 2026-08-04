@@ -7,7 +7,7 @@ import ir
 from mpy_types import Scalar, RCClass, CStruct, Specialization, Parameter, Variable, Function
 
 def _scalar( stem: str, qualname: str|None = None ) -> Scalar:
-	return Scalar( stem = stem, qualname = qualname or f'intrinsics.{stem}', file = None, line = None )
+	return Scalar( stem = stem, qualname = qualname or f'intrinsics.{stem}', file = None, line = None, sizeof = 0 )
 
 def _fn_node() -> ast.FunctionDef:
 	return ast.parse( 'def f(): pass' ).body[0]
