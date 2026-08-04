@@ -3000,6 +3000,45 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_overload_call_on_generic_class_specialization_substitutes_class_type_params( self ) -> None:
+		# regression test: an @overload group declared inside a generic
+		# class (e.g. builtins.Result[T,E].unwrap_or's own `default: T`
+		# stub) must have the class's own type params substituted before
+		# candidate matching - overload_resolution.py's resolve_call is a
+		# pure function of types with no substitution logic of its own, so
+		# without this a real, concrete call-site argument type (i32) is
+		# compared directly against the abstract stub's own bare TypeVar T
+		# and never matches, failing with "no matching overload" even
+		# though it should resolve cleanly once T is bound to the
+		# receiver's own concrete specialization (mirrors
+		# _lower_class_generic_method_call's identical receiver-pins-a-
+		# specialization check for a single, non-overloaded generic method)
+		code = '\n'.join([
+			'@union',
+			'class Box[T]:',
+			'	Some: T',
+			'',
+			'	@overload',
+			'	def get_or( self, default: T ) -> T:',
+			'		...',
+			'	def get_or( self, default: T ) -> T:',
+			'		return self.data.v_Some',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box.Some( 5 )',
+			'	fallback: i32 = -1',
+			'	w: i32 = b.get_or( fallback )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'get_or' ]
+		self.assertEqual( len( calls ), 1 )
+		target = calls[0].target
+		i32 = self.discovery.get_intrinsics()['i32']
+		self.assertIs( target.parameters[0].type, i32 ) # substituted, not the abstract TypeVar T
+		self.assertIs( target.return_type, i32 )
+
 	# --- defer/errdefer --------------------------------------------------------
 
 	def test_defer_rejected_inside_a_for_loop( self ) -> None:

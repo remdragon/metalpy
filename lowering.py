@@ -2060,6 +2060,21 @@ class Lowering:
 			if all( sa is a for sa, a in zip( substituted_args, t.args )):
 				return t
 			return self.discovery._get_or_create_specialization( t.base, substituted_args )
+		if isinstance( t, TaggedUnion ) and t.file is None:
+			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
+			# _get_or_create_union - file is None only for these, never for
+			# a real, user-declared @union class, which must stay identity-
+			# based/never rebuilt this way) can mention a type param directly
+			# in one of its own leaves (e.g. Result[T,E].unwrap_or's own
+			# declared `T|None` return type) - substitute each leaf and
+			# rebuild through the same canonicalizing constructor so the
+			# result is the same shared, memoized union any other T|None
+			# reference resolves to, not a fresh one-off copy
+			leaf_types = [ attr.type for attr in t.attributes ]
+			substituted_leaves = [ self._substitute_type_params( lt, type_params, args ) for lt in leaf_types ]
+			if all( sl is lt for sl, lt in zip( substituted_leaves, leaf_types )):
+				return t
+			return self.discovery._get_or_create_union( substituted_leaves )
 		return t
 
 	def _monomorphized_function( self, spec: Specialization ) -> Function:
@@ -3154,8 +3169,54 @@ class Lowering:
 			kwargs = { kw.arg: self._lower_overload_arg( kw.value, None, kw.arg, candidates, node ) for kw in node.keywords }
 			arg_types = [ op.type for op in args ]
 			kwarg_types = { name: op.type for name, op in kwargs.items() }
+
+			# an @overload group declared inside a generic CLASS (e.g.
+			# Result[T,E].unwrap_or's `default: T` stub) still carries the
+			# class's own bare TypeVars on every member's .parameters -
+			# overload_resolution.py is a pure function of types with no
+			# substitution logic of its own (see its module docstring), so
+			# candidate matching there would otherwise compare a REAL,
+			# concrete call-site argument type (i32) against the abstract
+			# TypeVar T itself and never match. Substitute member-owned
+			# copies (parameters only - matching is all resolve_call needs
+			# them for) whenever the receiver's own type already pins a
+			# concrete specialization of this group's class, mirroring
+			# _lower_class_generic_method_call's identical receiver check
+			# for a single (non-overloaded) generic method.
+			group_cls = candidates[0].cls if candidates else None
+			group_type_params = group_cls.type_params or [] if group_cls is not None else []
+			cls_args: list[Type]|None = None
+			if group_type_params and receiver is not None and isinstance( receiver.type, Specialization ) and receiver.type.base is group_cls:
+				cls_args = receiver.type.args
+
+			def _for_matching( fn: Function ) -> Function:
+				if cls_args is None:
+					return fn
+				substituted_params = [
+					replace( p, type = self._substitute_type_params( p.type, group_type_params, cls_args ))
+					for p in ( fn.parameters or [] )
+				]
+				return replace( fn, parameters = substituted_params )
+
+			match_stubs = [ _for_matching( fn ) for fn in target.stubs ]
+			match_impls = [ _for_matching( fn ) for fn in target.implementations ]
+			# resolve_call's own "targets" dict maps a plain (non-stub)
+			# candidate to ITSELF - for a substituted copy, that's the
+			# SUBSTITUTED copy, a throwaway replace()'d object, never a real
+			# compile unit - map it back to the real, original Function
+			# resolve_call actually meant (a stub instead resolves via its
+			# own .bound_to, already the original, untouched by _for_matching)
+			original_by_id = { id( sub ): orig for orig, sub in zip( target.implementations, match_impls ) }
+
+			def _resolve_original( fn: Function ) -> Function:
+				original = original_by_id.get( id( fn ), fn )
+				if cls_args is not None and original.cls is group_cls:
+					method_spec = self.discovery._get_or_create_specialization( original, cls_args )
+					return self._monomorphized_function( method_spec )
+				return original
+
 			try:
-				branches, resolved = overload_resolution.resolve_call( target.stubs, target.implementations, arg_types, kwarg_types, qualname = target.qualname )
+				branches, resolved = overload_resolution.resolve_call( match_stubs, match_impls, arg_types, kwarg_types, qualname = target.qualname )
 			except CompileError as e:
 				# resolve_call is a pure function of types with no
 				# AST/Discovery reference by design - it raises unrecorded,
@@ -3163,8 +3224,10 @@ class Lowering:
 				# lands in the collector
 				self.discovery.fail( str( e ), node )
 			if branches:
+				branches = [ ConditionalDispatch( conditions = b.conditions, function = _resolve_original( b.function )) for b in branches ]
+				resolved = _resolve_original( resolved )
 				return self._lower_conditional_dispatch( node, branches, resolved, args, kwargs, expected_type, want_result )
-			target = resolved
+			target = _resolve_original( resolved )
 			self._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
 		else:
 			self._ensure_resolved( target )

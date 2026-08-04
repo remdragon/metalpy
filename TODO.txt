@@ -1517,6 +1517,64 @@ emitter:
 			Simpler now that ResultPayload no longer needs a name-based
 			exemption, but still real, separate future work.
 
+	[resolved] overload_resolution.py: an @overload group declared inside
+		a generic class (builtins.Result[T,E].unwrap_or's own `default: T`
+		stub, flagged during the Result-as-@union verification above) never
+		resolved through a concrete specialization - resolve_call is a
+		pure function of types with no substitution logic of its own (by
+		design - no Discovery/lowering.py reference anywhere in that
+		module), so candidate matching compared a call's real, concrete
+		argument type (i32) directly against the group's own abstract,
+		unsubstituted class TypeVar (T) and never matched ("no matching
+		overload", even though every ordinary, non-overloaded generic-class
+		method already substitutes correctly via _lower_class_generic_
+		method_call/_monomorphized_function).
+		Fixed in lowering.py's own _lower_call, at the Overload call site,
+			keeping overload_resolution.py itself untouched (still a pure
+			function of types): when the receiver's type already pins a
+			concrete specialization of the overload group's own class
+			(mirrors _lower_class_generic_method_call's identical check),
+			builds member-owned shallow copies of every stub/implementation
+			with ONLY .parameters substituted (all resolve_call's own
+			matching actually needs) and passes those in instead. Whatever
+			Function resolve_call decides on (via a stub's own .bound_to,
+			or a plain implementation reached directly) is mapped back to
+			the real, original Function afterward and monomorphized through
+			the same get_or_create_specialization + _monomorphized_function
+			pair the single-method path already uses - a substituted copy
+			is a throwaway matching aid only, never treated as if it were a
+			real, schedulable compile unit.
+		A prerequisite gap surfaced along the way: _substitute_type_params
+			didn't know how to substitute inside an ANONYMOUS union type
+			(T|None, synthesized by discovery.py's own _get_or_create_union
+			- distinct from a real, user-declared @union class, which stays
+			identity-based and is never rebuilt this way) - needed for
+			Result.unwrap_or's own declared `T|None` return type to
+			monomorphize correctly. Fixed by teaching it to substitute each
+			leaf and rebuild through the same canonicalizing constructor
+			(keyed off TaggedUnion.file is None, the one thing that
+			distinguishes an anonymous synthesized union from a real
+			declared class).
+		Verified: full suite green (484 tests). Real clang compile of a
+			second, Result-unrelated generic @union with an identical
+			@overload shape (both a minimal fixture and a RealCompileTests
+			entry) - compiles clean end to end. Result.unwrap_or itself
+			still doesn't compile end-to-end yet against a real i32
+			fallback argument - a SEPARATE, deeper, pre-existing gap where
+			a narrowing @overload stub's own declared return type (T) and
+			the underlying plain implementation actually called (whose real
+			declared return type is the wider T|None) disagree, and nothing
+			reconciles a call site's own dest type against the real target's
+			return type in that case - confirmed unrelated to candidate
+			matching (reproduces with the stub/impl declaring the exact
+			same return type removed from the picture) and to the Result-
+			as-@union work (reproduces with a plain, non-Result generic
+			RCClass too, via a completely different, also pre-existing gap:
+			a generic class's own __init__ is never monomorphized when
+			reached through plain ClassName(...) construction inside a
+			helper function). Both left as separate, still-open follow-up
+			work, not fixed here.
+
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
 

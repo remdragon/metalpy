@@ -605,6 +605,37 @@ def main() -> None:
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
+	def test_overload_call_on_generic_class_specialization_compiles( self ) -> None:
+		# regression test (see lowering_test.py's own identical-purpose
+		# test) for a real, pre-existing overload_resolution.py bug found
+		# while verifying Result-as-@union: candidate matching for an
+		# @overload group declared inside a generic class compared the
+		# call's real, concrete argument type directly against the
+		# group's own abstract, unsubstituted class TypeVar, so it never
+		# matched - affects real library code directly (builtins.Result
+		# [T,E].unwrap_or's own `default: T` stub). Uses a @union (not an
+		# RCClass) receiver deliberately - generic RCClass construction via
+		# plain ClassName(...) has its own, separate, unrelated gap (its
+		# __init__ never gets monomorphized when reached this way), not
+		# what this test is checking.
+		self._run( '\n'.join([
+			'@union',
+			'class Box[T]:',
+			'	Some: T',
+			'',
+			'	@overload',
+			'	def get_or( self, default: T ) -> T:',
+			'		...',
+			'	def get_or( self, default: T ) -> T:',
+			'		return self.data.v_Some',
+			'',
+			'def main() -> i32:',
+			'	b: Box[i32] = Box.Some( 5 )',
+			'	fallback: i32 = -1',
+			'	return b.get_or( fallback )',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
 # routing RCClass construction through the REAL sys.alloc[T] means sys.alloc's
 # own body actually gets lowered end to end (unlike every other fixture in
 # this file, which never touches real lib/ code) - the real lib/sys.py's own
