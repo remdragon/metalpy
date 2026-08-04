@@ -178,13 +178,26 @@ class Monomorphizer:
 		# compiler.cstructs/.cunions/.tagged_unions/.rcclasses - stage 3 (the
 		# emitter) never has to independently rediscover/resynthesize a
 		# concrete specialization itself, it just walks those lists like
-		# any other compile unit. .methods/.names are copied through
-		# UNCHANGED (still referencing the class's abstract, un-monomorphized
-		# Function objects) - method lookup keeps working exactly as today
-		# (Specialization.names passes through to .base.names), and each
-		# individual method call gets its OWN on-demand monomorphization via
-		# monomorphized_function/Lowering._lower_class_generic_method_call, not
-		# eagerly here.
+		# any other compile unit.
+		#
+		# .names is built into ONE substituted dict, covering both fields AND
+		# the class's own plain (non-Overload, no-own-type_params) methods -
+		# .names must never disagree with .attributes about what a field's
+		# own type is, which it silently did before this (only the TaggedUnion
+		# 'data' field ever got a substituted .names entry; every other
+		# field's .names entry stayed the stale, unsubstituted original,
+		# pointing at the same shared Variable every OTHER specialization's
+		# .names does too). A method is substituted via the exact same
+		# monomorphized_function this uses for an explicit generic call -
+		# just triggered here, once, memoized, instead of on demand per call
+		# site. Overload groups and methods with their OWN additional type
+		# params (beyond the class's) are left exactly as today (abstract,
+		# unsubstituted) - Lowering._lower_call's own hand-rolled
+		# substitution for the Overload branch already handles that
+		# correctly and independently; folding overload-group substitution
+		# in here too would need a substituted copy of each stub/impl, not
+		# just one Function - a separate, bigger piece of work, out of scope
+		# here.
 		cached = self._monomorphized_classes.get( id( spec ) )
 		if cached is not None:
 			return cached
@@ -193,24 +206,40 @@ class Monomorphizer:
 			base.resolve()
 		for attr in base.attributes:
 			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's own identical resolve loop
+		if isinstance( base, TaggedUnion ):
+			# tag/data are synthesized lazily, the first time the union is
+			# actually touched (UnionStorage.get) - trigger that BEFORE
+			# snapshotting base.names below, or the snapshot misses 'tag'
+			# entirely on a union that's never been constructed/matched
+			# against yet (this specialization would be the first reference)
+			self._union_storage.get( base )
 		type_params = base.type_params or []
 		substituted_attrs = [
 			replace( attr, type = self.substitute_type_params( attr.type, type_params, spec.args ))
 			for attr in base.attributes
 		]
+		substituted_names = dict( base.names )
+		for attr in substituted_attrs:
+			substituted_names[attr.stem] = attr
+		for member in base.methods:
+			if not isinstance( member, Function ) or member.type_params:
+				continue
+			method_spec = self.discovery._get_or_create_specialization( member, spec.args )
+			substituted_names[member.stem] = self.monomorphized_function( method_spec )
+
 		extra: dict = {}
 		if isinstance( base, TaggedUnion ):
-			# base.names['tag']/['data'] (synthesized by UnionStorage.get)
-			# are SHARED across every specialization of a generic union - the
-			# abstract base's own payload_cls carries bare TypeVar fields
-			# (v_Ok: T, v_Err: E), never a real emittable C type. A plain
-			# replace() would leave THIS specialization's own .names pointing
-			# at that same abstract, TypeVar-typed object - give it its own
-			# substituted payload_cls (own qualname, so it doesn't collide
-			# with the abstract's or a sibling specialization's), scheduled
-			# here since (mirroring UnionStorage.get's own identical
-			# comment on the abstract case) nothing else would ever reach it
-			# on its own.
+			# base.names['tag']/['data'] (synthesized by UnionStorage.get,
+			# already triggered above) are SHARED across every specialization
+			# of a generic union - the abstract base's own payload_cls
+			# carries bare TypeVar fields (v_Ok: T, v_Err: E), never a real
+			# emittable C type. A plain replace() would leave THIS
+			# specialization's own .names pointing at that same abstract,
+			# TypeVar-typed object - give it its own substituted payload_cls
+			# (own qualname, so it doesn't collide with the abstract's or a
+			# sibling specialization's), scheduled here since (mirroring
+			# UnionStorage.get's own identical comment on the abstract case)
+			# nothing else would ever reach it on its own.
 			_tag_attr, data_attr, payload_cls, _tags = self._union_storage.get( base )
 			substituted_payload_fields = [
 				replace( f, type = self.substitute_type_params( f.type, type_params, spec.args ))
@@ -225,12 +254,12 @@ class Monomorphizer:
 				names = { f.stem: f for f in substituted_payload_fields },
 			)
 			self.schedule( substituted_payload_cls )
-			extra['names'] = dict( base.names )
-			extra['names']['data'] = replace( data_attr, type = substituted_payload_cls )
+			substituted_names['data'] = replace( data_attr, type = substituted_payload_cls )
 		monomorphized = replace(
 			base,
 			qualname = spec.qualname,
 			attributes = substituted_attrs,
+			names = substituted_names,
 			type_params = None,
 			resolve = None,
 			**extra,
