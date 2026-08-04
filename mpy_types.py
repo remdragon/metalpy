@@ -46,6 +46,7 @@ class Scalar( Type, ScopeMixin ):
 	discovery.py's visit_Assign) rather than a parsed class body, since
 	intrinsic scalars aren't declared from any real source file
 	'''
+	sizeof: int
 	type_params: list['TypeVar']|None = None
 	names: dict[str,Name] = field( default_factory = dict )
 

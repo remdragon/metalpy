@@ -1,8 +1,6 @@
-
-lowering's _resolve_sys_panic and _resolve_sys_alloc() exhibit multiple design
-	flaws. 1) they are also almost identical in their implementation.
-	2) These dependencies need to be detected and automatically resolved by
-	resolver methods in discovery if possible.
+lowering's _resolve_sys_function() feels like a design flaw.
+	can these dependencies be detected and automatically resolved by
+	resolver methods in discovery if possible?
 
 lowering's lower_function() and lower_global() have a large
 	amount of shared initialization that need to happen. This

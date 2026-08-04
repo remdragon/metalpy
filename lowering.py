@@ -890,18 +890,6 @@ class Lowering:
 		else:
 			return None
 
-	# byte size for every intrinsic scalar this target model actually has a
-	# fixed size for - matches this compiler's own intrinsics (see
-	# discovery.py's get_intrinsics()). Real user classes have no known size
-	# yet (no field-layout computation exists - that's an emitter concern),
-	# so compiler.sizeof(SomeClass) stays unsupported until then
-	_INTRINSIC_BYTE_SIZES: dict[str,int] = {
-		'i8': 1, 'u8': 1, 'i16': 2, 'u16': 2, 'i32': 4, 'u32': 4,
-		'i64': 8, 'u64': 8, 'i128': 16, 'u128': 16,
-		'isize': 8, 'usize': 8, 'bool': 1,
-		'Ptr': 8, 'ConstPtr': 8,
-	}
-
 	def _lower_compiler_sizeof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.sizeof(T) is a compile-time constant whenever T is
 		# already concrete - it folds directly to an ir.Const, no runtime
@@ -921,8 +909,7 @@ class Lowering:
 				node,
 			)
 		usize_cls = self.discovery.get_intrinsics()['usize']
-		size = self._INTRINSIC_BYTE_SIZES.get( getattr( target_type, 'stem', None ) )
-		if size is not None:
+		if size := getattr( target_type, 'sizeof', None ):
 			return ir.Const( type = expected_type or usize_cls, value = size )
 		# a real class-like type (RCClass/CStruct/CUnion/TaggedUnion, or a
 		# concrete Specialization of one) - no field-layout algorithm exists

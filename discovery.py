@@ -259,12 +259,24 @@ class Discovery( ast.NodeVisitor ):
 	def get_intrinsics( self ) -> dict[str,Name]:
 		if self._intrinsics is None:
 			intrinsics: dict[str,Name] = {}
-			for name in [ 'isize', 'usize', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'i128', 'u128' ]:
+			
+			# TODO FIXME: make active_target.bits a requirement...
+			sizeof_bits = self.active_target.get( 'bits', 64 ) // 8
+			
+			for name, sizeof in [
+				( 'isize', sizeof_bits ), ( 'usize', sizeof_bits ),
+				( 'i8', 1 ), ( 'u8', 1 ),
+				( 'i16', 2 ), ( 'u16', 2 ),
+				( 'i32', 4 ), ( 'u32', 4 ),
+				( 'i64', 8 ), ( 'u64', 8 ),
+				( 'i128', 16 ), ( 'u128', 16 ),
+			]:
 				intrinsics[name] = Scalar(
 					stem = name,
 					qualname = f'intrinsics.{name}',
 					file = None,
 					line = None,
+					sizeof = sizeof,
 				)
 			# not a fixed-width integer, but the same tier as the numeric
 			# scalars above rather than a lib/-defined class: ir.py's own
@@ -277,6 +289,7 @@ class Discovery( ast.NodeVisitor ):
 				qualname = 'intrinsics.bool',
 				file = None,
 				line = None,
+				sizeof = 1,
 			)
 			# a distinct marker from None/NoneType, not an alias for it - a
 			# function declared -> NoReturn behaves exactly like -> None to
@@ -291,6 +304,7 @@ class Discovery( ast.NodeVisitor ):
 				qualname = 'intrinsics.NoReturn',
 				file = None,
 				line = None,
+				sizeof = 0, # TODO FIXME: NoReturn isn't a Scalar...
 			)
 			for name in [ 'Ptr', 'ConstPtr' ]: # generic pointer intrinsics: Ptr[T], ConstPtr[T]
 				tv = TypeVar(
@@ -304,6 +318,7 @@ class Discovery( ast.NodeVisitor ):
 					qualname = f'intrinsics.{name}',
 					file = None,
 					line = None,
+					sizeof = sizeof_bits,
 					type_params = [ tv ],
 				)
 			self._intrinsics = intrinsics
@@ -316,6 +331,7 @@ class Discovery( ast.NodeVisitor ):
 				qualname = 'intrinsics.NoneType',
 				file = None,
 				line = None,
+				sizeof = 0, # TODO FIXME: None isn't a Scalar
 			)
 		return self._none_type
 
