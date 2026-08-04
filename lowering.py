@@ -11,7 +11,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CStruct, CUnion, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
+	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
 from union_storage import UnionStorage, ReceiverDispatch as _ReceiverDispatch
@@ -1260,7 +1260,7 @@ class Lowering:
 		# no such method" is a normal, expected outcome for callers here
 		# (for loop iterability checks, __getitem__'s raw-GetItem fallback),
 		# not a real error to report
-		self._ensure_resolved( owner_type )
+		owner_type = self._ensure_resolved( owner_type )
 		names = getattr( owner_type, 'names', None )
 		found = names.get( name ) if isinstance( names, dict ) else None
 		return found if isinstance( found, Function ) else None
@@ -1967,7 +1967,7 @@ class Lowering:
 
 	# --- shared helpers ----------------------------------------------------------
 
-	def _ensure_resolved( self, obj: object ) -> None:
+	def _ensure_resolved( self, obj: object ) -> object:
 		# resolving (populating .names/.parameters/whatever) needs to happen
 		# immediately, mid-statement, for whoever's asking - unlike schedule(),
 		# which just queues obj for whenever the work queue gets to it, this
@@ -1980,11 +1980,30 @@ class Lowering:
 		# arg), and what to just quietly ignore (a Module walked mid-
 		# namespace-lookup, a class field/parameter/local Variable). Nothing
 		# here needs to know or duplicate that judgment - see Compiler's own
-		# docstring for the full list of what it does with each kind
+		# docstring for the full list of what it does with each kind.
+		#
+		# the SINGLE place a Specialization gets swapped for the real,
+		# substituted thing it stands in for: every caller MUST use the
+		# returned value, not the object passed in, or they see the abstract,
+		# unsubstituted base instead (Specialization.names/.resolve are raw
+		# passthroughs to it - see mpy_types.py). schedule() still gets the
+		# ORIGINAL Specialization (Compiler._enqueue dispatches on
+		# isinstance(unit, Specialization) to actually build/register the
+		# real compile unit) - only the return value here is swapped
 		resolve = getattr( obj, 'resolve', None )
 		if resolve is not None:
 			resolve()
 		self.schedule( obj )
+		if isinstance( obj, Specialization ):
+			if isinstance( obj.base, Function ):
+				return self._monomorphizer.monomorphized_function( obj )
+			if isinstance( obj.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				return self.monomorphize_class( obj )
+			# Scalar (Ptr[T]/ConstPtr[T], the intrinsic generic-pointer
+			# scalars - see mpy_types.py's Scalar) has no monomorphization
+			# support at all - .names/.resolve stay raw passthroughs to the
+			# abstract base, same as always
+		return obj
 
 	def _tagged_union_shape( self, t: Type|None ) -> tuple[TaggedUnion,list[Variable]]|None:
 		''' `t` may be a Specialization wrapping a generic @union (a concrete
@@ -2010,33 +2029,24 @@ class Lowering:
 		return base, members
 
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
-		self._ensure_resolved( owner_type ) # Specialization.resolve/.names passthrough to .base - no unwrap needed
-		base = owner_type.base if isinstance( owner_type, Specialization ) else owner_type
-		if isinstance( base, TaggedUnion ) and attr in ( 'tag', 'data' ) and base.names.get( attr ) is None:
+		# _ensure_resolved is the one place a Specialization gets swapped for
+		# its real, substituted ClassLike - owner_type past this point is
+		# never itself a Specialization, and its .names already has
+		# substituted field/method entries (see monomorphize.py), so no
+		# separate per-field substitution is needed here anymore
+		owner_type = self._ensure_resolved( owner_type )
+		if isinstance( owner_type, TaggedUnion ) and attr in ( 'tag', 'data' ) and owner_type.names.get( attr ) is None:
 			# tag/data are synthesized lazily, the first time the union is
-			# actually constructed or matched against (UnionStorage.get)
-			# - a method reading self.tag/self.data directly (e.g. Result.
-			# is_ok()) could be scheduled/lowered before anything else in
-			# THIS compilation ever triggers that synthesis (the work queue
-			# has no ordering guarantee) - trigger it here too, lazily, the
-			# moment it's actually needed
-			self._union_storage.get( base )
-		if attr == 'data' and isinstance( base, TaggedUnion ) and isinstance( owner_type, Specialization ):
-			# `data`'s real storage type is monomorphize_class's own
-			# substituted, per-specialization payload_cls (concrete field
-			# types, own qualname) - NOT reachable through the ordinary
-			# _substituted_field path below, since Specialization.names
-			# always passes through to base.names (the shared, ABSTRACT
-			# TypeVar-typed payload_cls UnionStorage.get synthesizes on
-			# base itself). A method body reading self.data directly (e.g.
-			# Result.unwrap's `return self.data.v_Ok`) needs THIS concrete
-			# one, or the abstract one leaks through as a real, TypeVar-
-			# carrying "compile unit" the moment something (_ensure_resolved,
-			# below) schedules whatever type this call returns.
-			monomorphized = self.monomorphize_class( owner_type )
-			concrete_data = monomorphized.names.get( 'data' )
-			if isinstance( concrete_data, Variable ):
-				return concrete_data
+			# actually constructed or matched against (UnionStorage.get) -
+			# only reachable here for a PLAIN (non-generic) union: a
+			# Specialization's own monomorphize_class already triggers this
+			# itself before anything reads its .names. A method reading
+			# self.tag/self.data directly (e.g. Result.is_ok()) could be
+			# scheduled/lowered before anything else in THIS compilation
+			# ever triggers that synthesis (the work queue has no ordering
+			# guarantee) - trigger it here too, lazily, the moment it's
+			# actually needed
+			self._union_storage.get( owner_type )
 		names = getattr( owner_type, 'names', None )
 		if not isinstance( names, dict ):
 			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
@@ -2044,7 +2054,7 @@ class Lowering:
 		if not isinstance( found, Variable ):
 			self.discovery.fail( f'{owner_type.qualname if owner_type else "?"} has no attribute {attr!r}', ctx )
 		self._ensure_resolved( found )
-		return self._substituted_field( found, owner_type )
+		return found
 
 	def _substituted_field( self, found: Variable, owner_type: Type|None ) -> Variable:
 		return self._monomorphizer.substituted_field( found, owner_type )
@@ -2184,7 +2194,7 @@ class Lowering:
 		return _ReceiverDispatch( union = union, attr = attr, per_leaf = per_leaf )
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
-		self._ensure_resolved( owner_type ) # Specialization.resolve/.names passthrough to .base - no unwrap needed
+		owner_type = self._ensure_resolved( owner_type ) # a Specialization owner is swapped for its real, substituted ClassLike/Function here
 		names = getattr( owner_type, 'names', None )
 		if not isinstance( names, dict ):
 			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
@@ -2841,27 +2851,21 @@ class Lowering:
 		# (Result.Ok/.Err/.is_ok/.is_err/... referencing Result's own T,E)
 		# rather than declared on the method itself (unlike sys.alloc[T]) -
 		# target.type_params is empty, but target.cls.type_params isn't.
-		# The class's own concrete type args have to be pinned down before
-		# this can be treated like any other generic call, two ways:
-		if target.resolve is not None:
-			target.resolve()
-		cls = target.cls
-		class_type_params = cls.type_params or [] if cls is not None else []
-
-		if receiver is not None and isinstance( receiver.type, Specialization ) and receiver.type.base is cls:
-			# the receiver's own type already IS a concrete specialization
-			# of target.cls (some_result.is_ok() where some_result: Result
-			# [i32,OverflowError]) - no inference needed at all, this is
-			# just an ordinary generic call once the Specialization exists
-			method_spec = self.discovery._get_or_create_specialization( target, receiver.type.args )
-			return self._lower_generic_function_call( node, method_spec, receiver, expected_type, want_result )
-
-		# no receiver (a static/classmethod reached via bare class name,
-		# e.g. Result.Ok(y)), or a receiver that doesn't already pin the
-		# class's args - infer them the same way _lower_inferred_generic_
-		# call infers a free function's own type params, with one addition:
-		# unify expected_type against the method's still-abstract return
-		# type FIRST, before lowering any argument - Result.Ok(val: T) ->
+		#
+		# only ever reached with NO receiver (a static/classmethod reached
+		# via bare class name, e.g. Result.Ok(y)) - a receiver whose own
+		# type already pins down cls's concrete args never gets here at all:
+		# _attr_lookup_callable already hands back an already-substituted
+		# Function for that case (see monomorphize.py/_ensure_resolved),
+		# whose own .cls is the concrete Specialization, not the abstract
+		# cls this dispatch condition (_lower_call) checks .type_params on -
+		# confirmed by instrumenting this branch and running the full test
+		# suite, not just by this reasoning alone. So the class's own
+		# concrete type args always have to be INFERRED here, the same way
+		# _lower_inferred_generic_call infers a free function's own type
+		# params, with one addition: unify expected_type against the
+		# method's still-abstract return type FIRST, before lowering any
+		# argument - Result.Ok(val: T) ->
 		# Result[T,E] never mentions E in its own parameter list at all
 		# (only inferable from context), and even T needs to be known
 		# BEFORE a bare literal argument (Result.Ok(5)) can be lowered at
@@ -2871,6 +2875,10 @@ class Lowering:
 		# _lower_inferred_generic_call's own comment), the surrounding
 		# expected_type is usually enough to resolve every class type
 		# param here without needing the arguments' own types at all
+		if target.resolve is not None:
+			target.resolve()
+		cls = target.cls
+		class_type_params = cls.type_params or [] if cls is not None else []
 		bindings: dict[int,Type] = {}
 		if expected_type is not None:
 			self._unify_type_param( class_type_params, target.return_type, expected_type, bindings, node, target.qualname )
@@ -2947,8 +2955,19 @@ class Lowering:
 		if isinstance( target, _ReceiverDispatch ):
 			return self._lower_union_receiver_call( node, target, receiver, expected_type, want_result )
 
-		if isinstance( target, Function ) and target.stem == 'or_return' and target.cls is self.discovery.find_name( 'Result', node ):
-			return self._lower_or_return( node, receiver, want_result )
+		if isinstance( target, Function ) and target.stem == 'or_return':
+			# target.cls is a Specialization, not bare Result, whenever the
+			# receiver already pinned concrete args (the common case, e.g.
+			# some_result.or_return() where some_result: Result[i32,E]) -
+			# unwrap before the identity check, or a concrete receiver's own
+			# or_return() would stop being recognized at all and fall
+			# through to actually CALLING Result.or_return's literal
+			# declared body, which is a spec of the intended behavior, not
+			# something literally compilable (see _lower_or_return's own
+			# comment)
+			target_cls_base = target.cls.base if isinstance( target.cls, Specialization ) else target.cls
+			if target_cls_base is self.discovery.find_name( 'Result', node ):
+				return self._lower_or_return( node, receiver, want_result )
 
 		if isinstance( target, Specialization ) and isinstance( target.base, Function ):
 			return self._lower_generic_function_call( node, target, receiver, expected_type, want_result )
@@ -2956,7 +2975,15 @@ class Lowering:
 		if isinstance( target, Function ) and target.type_params:
 			return self._lower_inferred_generic_call( node, target, receiver, expected_type, want_result )
 
-		if isinstance( target, Function ) and not target.type_params and target.cls is not None and target.cls.type_params:
+		# target.cls can legitimately BE a Specialization now (monomorphized_
+		# function sets a monomorphized method's own .cls to one) - Specialization
+		# has no .type_params of its own, so this must not read it directly;
+		# getattr's default (None/falsy) correctly means "not this branch",
+		# since a receiver that already pinned down concrete class args (the
+		# only way target.cls ends up a Specialization here) already went
+		# through _attr_lookup_callable's own substitution - nothing left to
+		# infer
+		if isinstance( target, Function ) and not target.type_params and target.cls is not None and getattr( target.cls, 'type_params', None ):
 			return self._lower_class_generic_method_call( node, target, receiver, expected_type, want_result )
 
 		if isinstance( target, Overload ):

@@ -59,6 +59,18 @@ class Specialization( Type ):
 	''' a generic base type applied to concrete (or still-typevar) type arguments, e.g. Result[i32,IntError] '''
 	base: Type
 	args: list[Type]
+	# populated by Monomorphizer.monomorphized_function/monomorphize_class
+	# the first time this Specialization is actually monomorphized - the
+	# real, substituted Function (if base is a Function) or ClassLike (if
+	# base is one) this Specialization stands in for. None until then; a
+	# self-caching slot in the same spirit as `resolve` below, except the
+	# substituted value itself is the cache rather than a callback, and it
+	# doesn't self-clear. Lives here (not a separate id(spec)-keyed side
+	# table) because a Specialization is already the canonical, memoized-
+	# by-qualname object for its own (base, args) pair (see discovery.py's
+	# _get_or_create_specialization) - every reference to the same
+	# instantiation shares this one cache for free
+	monomorphized: 'Function|ClassLike|None' = None
 
 	# a Specialization has no members of its own - a generic's methods/
 	# attributes live entirely on its base (e.g. Result[T,E]'s .is_err lives

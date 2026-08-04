@@ -199,6 +199,27 @@ _RESULT_FIXTURE = '\n'.join([
 	'\t\treturn self.tag == 1',
 ])
 
+_RESULT_FIXTURE_WITH_OR_RETURN = '\n'.join([
+	'@cstruct',
+	'class OverflowError: pass',
+	'',
+	'@union',
+	'class Result[T,E]:',
+	'\tOk: T',
+	'\tErr: E',
+	'',
+	'\tdef is_ok( self ) -> bool:',
+	'\t\treturn self.tag == 0',
+	'',
+	'\tdef is_err( self ) -> bool:',
+	'\t\treturn self.tag == 1',
+	'',
+	'\tdef or_return( self ) -> T:',
+	'\t\tif self.is_err():',
+	'\t\t\tcompiler.early_return( self.data.v_Err )',
+	'\t\treturn self.data.v_Ok',
+])
+
 class SpecializationSynthesisTests( CompilerTestCase ):
 	def test_result_specialization_is_a_real_compiler_tagged_unions_entry( self ) -> None:
 		# a concrete generic class specialization (Result[i32,
@@ -224,6 +245,108 @@ class SpecializationSynthesisTests( CompilerTestCase ):
 		self.assertIn( 'struct', src )
 		self.assertIn( 'tag;', src )
 		self.assertIn( 'data;', src )
+
+class GenericMethodDispatchTests( CompilerTestCase ):
+	''' Stage 2 of plans/fluttering-growing-chipmunk.md: a method call
+	through a receiver whose type already pins a concrete generic
+	Specialization must resolve to an already-substituted Function - not
+	the abstract one, and not by _lower_class_generic_method_call detecting
+	and re-substituting it per call site (that whole branch was proven
+	unreachable and removed). '''
+
+	def test_is_ok_on_concrete_result_receiver_is_monomorphized_once( self ) -> None:
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+			'def get() -> Result[i32,OverflowError]:',
+			'\treturn Result.Ok( 1 )',
+			'',
+			'def main() -> None:',
+			'\tr: Result[i32,OverflowError] = get()',
+			'\tif r.is_ok():',
+			'\t\tpass',
+			'\treturn',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		is_ok_fns = [ lf for lf in self.compiler.functions if lf.function.qualname.startswith( '__main__.Result.is_ok' ) ]
+		self.assertEqual( len( is_ok_fns ), 1 )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'is_ok' ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].receiver.type.qualname, '__main__.Result[intrinsics.i32,__main__.OverflowError]' )
+
+	def test_or_return_on_concrete_result_receiver_still_lowers_textually( self ) -> None:
+		# or_return() must never become a real compiled function or a real
+		# Call to one - Result.or_return's own declared body is a spec of
+		# the intended behavior, not literally compilable (see Lowering.
+		# _lower_or_return's own comment) - this is the exact regression
+		# the eager-substitution work risked: target.cls became a
+		# Specialization for a concrete receiver, breaking the `target.cls
+		# is Result` identity check _lower_call used to route here
+		self._run( _RESULT_FIXTURE_WITH_OR_RETURN + '\n' + '\n'.join([
+			'def get() -> Result[i32,OverflowError]:',
+			'\treturn Result.Ok( 1 )',
+			'',
+			'def main() -> Result[i32,OverflowError]:',
+			'\tr: Result[i32,OverflowError] = get()',
+			'\tv: i32 = r.or_return()',
+			'\treturn Result.Ok( v )',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertFalse( any( 'or_return' in lf.function.qualname for lf in self.compiler.functions ))
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		self.assertTrue( any( isinstance( i, ir.OrReturn ) for i in main_lf.instructions ))
+		self.assertFalse( any( isinstance( i, ir.Call ) and i.target.stem == 'or_return' for i in main_lf.instructions ))
+
+	def test_generic_rcclass_method_call_through_concrete_receiver_is_substituted( self ) -> None:
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'\tv: T',
+			'\tdef get( self ) -> T:',
+			'\t\treturn self.v',
+			'',
+			'def main() -> None:',
+			'\tb: Box[i32]',
+			'\tx = b.get()',
+			'\treturn',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		get_fns = [ lf for lf in self.compiler.functions if lf.function.qualname.startswith( '__main__.Box.get' ) ]
+		self.assertEqual( len( get_fns ), 1 )
+		self.assertEqual( get_fns[0].function.return_type.qualname, 'intrinsics.i32' ) # substituted, not bare T
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'get' ]
+		self.assertEqual( len( calls ), 1 )
+
+	def test_known_gap_union_receiver_dispatch_does_not_check_per_leaf_parameter_types( self ) -> None:
+		# documents a pre-existing gap, NOT fixed as part of this plan: a
+		# union mixing two DIFFERENT concrete instantiations of the same
+		# generic class (Box[i32]|Box[u32]) with a same-named method taking
+		# a generic-typed argument - the per-leaf consistency check only
+		# compares return-type identity and parameter COUNT, never
+		# per-position parameter TYPE, so this compiles with no error, and
+		# the SAME lowered argument operand (typed i32 here) is silently
+		# reused for BOTH leaves' Call, including the Box[u32] one that
+		# actually expects a u32. Before Stage 1/2 this couldn't happen at
+		# all - every leaf's method stayed abstract/bare-T, so there was
+		# nothing to disagree about
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'\tv: T',
+			'\tdef set( self, x: T ) -> None:',
+			'\t\tself.v = x',
+			'',
+			'def main() -> None:',
+			'\tb: Box[i32]|Box[u32]',
+			'\tx: i32 = 5',
+			'\tb.set( x )',
+			'\treturn',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] ) # no error today - this is the gap
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'set' ]
+		self.assertEqual( len( calls ), 2 )
+		# same operand passed to both, including the Box[u32] leaf that
+		# actually declares x: u32 - the mismatch nothing catches
+		self.assertIs( calls[0].args[0], calls[1].args[0] )
 
 class EmitArithmeticTests( CompilerTestCase ):
 	def test_wrap_arithmetic_smoke_test( self ) -> None:

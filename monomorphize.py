@@ -33,23 +33,12 @@ class Monomorphizer:
 		self.discovery = discovery
 		self.schedule = schedule
 		self._union_storage = union_storage
-		# monomorphized Function copies (T substituted with a concrete
-		# type), memoized by id(Specialization) - discovery._get_or_create_
-		# specialization already dedupes the Specialization itself by its
-		# qualname key, so every call to the same instantiation (sys.
-		# alloc[u8], from anywhere) reuses the SAME monomorphized Function
-		# object, not a fresh copy per call site
-		self._monomorphized: dict[int,Function] = {}
-		# monomorphized ClassLike copies (a generic class's OWN .attributes
-		# with type_params substituted, for a concrete Specialization like
-		# Result[i32,OverflowError]) - memoized by id(Specialization), same
-		# discipline as _monomorphized above. This is what actually gives a
-		# concrete generic specialization a real compile unit/output-list
-		# entry (compiler.py's _lower dispatches a ClassLike-based
-		# Specialization here) - stage 3 (the emitter) never has to
-		# independently rediscover/synthesize one, it just walks
-		# compiler.cstructs/.cunions/.tagged_unions/.rcclasses like anything else
-		self._monomorphized_classes: dict[int,ClassLike] = {}
+		# no separate memo tables here - the monomorphized result (Function
+		# or ClassLike, whichever matches spec.base's own kind) is cached
+		# directly on spec.monomorphized (see mpy_types.py's Specialization)
+		# since a Specialization is already the canonical, memoized-by-
+		# qualname object for its own (base, args) pair - every reference to
+		# the same instantiation, from anywhere, shares that one cache
 
 	def _ensure_resolved( self, obj: object ) -> None:
 		# same discipline as Lowering._ensure_resolved - duplicated here
@@ -119,13 +108,11 @@ class Monomorphizer:
 		# substitute_type_params), and names (T's own entry replaced with
 		# the concrete arg, so ordinary name lookups - including
 		# compiler.sizeof(T) - resolve it correctly while lowering fn.node.
-		# body, which is otherwise untouched/shared AST). Memoized by
-		# id(spec) - discovery._get_or_create_specialization already
-		# dedupes the Specialization itself, so this only ever builds one
-		# copy per distinct instantiation
-		cached = self._monomorphized.get( id( spec ) )
-		if cached is not None:
-			return cached
+		# body, which is otherwise untouched/shared AST). Memoized on
+		# spec.monomorphized - this only ever builds one copy per distinct
+		# instantiation
+		if spec.monomorphized is not None:
+			return spec.monomorphized
 		base = spec.base
 		if base.resolve is not None:
 			base.resolve()
@@ -164,7 +151,7 @@ class Monomorphizer:
 			type_params = None,
 			resolve = None,
 		)
-		self._monomorphized[ id( spec ) ] = monomorphized
+		spec.monomorphized = monomorphized
 		return monomorphized
 
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
@@ -198,9 +185,8 @@ class Monomorphizer:
 		# in here too would need a substituted copy of each stub/impl, not
 		# just one Function - a separate, bigger piece of work, out of scope
 		# here.
-		cached = self._monomorphized_classes.get( id( spec ) )
-		if cached is not None:
-			return cached
+		if spec.monomorphized is not None:
+			return spec.monomorphized
 		base = spec.base
 		if base.resolve is not None:
 			base.resolve()
@@ -264,5 +250,5 @@ class Monomorphizer:
 			resolve = None,
 			**extra,
 		)
-		self._monomorphized_classes[ id( spec ) ] = monomorphized
+		spec.monomorphized = monomorphized
 		return monomorphized
