@@ -170,7 +170,7 @@ def main() -> None:
 		result = cc.compile( src_path, obj_path, verbose = args.v )
 		if result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
-			print( result.stderr, file = sys.stderr )
+			print( result.stdout, file = sys.stderr )
 			if args.keep_c:
 				c_path = args.output or args.source.with_suffix( '.c' )
 				src_path.rename( c_path )

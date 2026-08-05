@@ -34,12 +34,16 @@ class CcTool:
 		if self.name == 'cl':
 			cmd = [ self.path, '/nologo', '/std:c11',
 				'/experimental:c11atomics',
-				'/W4', '-c', str( src ), '/Fo:', str( obj ) ]
+				'/W4', '-c', str( src ), f'/Fo:{obj}' ]
 		else:
 			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
-		return subprocess.run( cmd, capture_output = True, text = True )
+		return subprocess.run( cmd,
+			stdout = subprocess.PIPE,
+			stderr = subprocess.STDOUT,
+			text = True,
+		)
 
 	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False ) -> subprocess.CompletedProcess[bytes]:
 		''' link one or more .o files into an executable '''
@@ -51,7 +55,11 @@ class CcTool:
 			cmd = [ self.path ] + extra + obj_args + [ '-o', str( exe ) ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
-		return subprocess.run( cmd, capture_output = True, text = True )
+		return subprocess.run( cmd,
+			stdout = subprocess.PIPE,
+			stderr = subprocess.STDOUT,
+			text = True,
+		)
 
 
 def detect_cc() -> CcTool|None:

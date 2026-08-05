@@ -48,6 +48,88 @@ static inline void release_object( ObjectHeader* obj, void (*destructor)(void*) 
 		}
 	}
 }
+
+// metalpy arithmetic intrinsics — dispatch to compiler builtins (GCC/Clang)
+// or manual checks (MSVC). All metalpy scalars are <= 64 bits.
+#ifdef _MSC_VER
+typedef int64_t __metalpy_wideint;
+typedef uint64_t __metalpy_wideuint;
+
+// MSVC doesn't have __builtin_*_overflow — implement manually.
+// The emitter widens operands to int64_t/uint64_t before calling these,
+// so we only need per-signedness helpers for the widest type.
+static inline bool __metalpy_sadd_overflow(int64_t a, int64_t b, int64_t* r) {
+	*r = a + b;
+	return (a > 0 && b > 0 && *r < 0) || (a < 0 && b < 0 && *r > 0);
+}
+static inline bool __metalpy_uadd_overflow(uint64_t a, uint64_t b, uint64_t* r) {
+	*r = a + b;
+	return *r < a;
+}
+static inline bool __metalpy_ssub_overflow(int64_t a, int64_t b, int64_t* r) {
+	*r = a - b;
+	return (a >= 0 && b < 0 && *r < 0) || (a < 0 && b >= 0 && *r > 0);
+}
+static inline bool __metalpy_usub_overflow(uint64_t a, uint64_t b, uint64_t* r) {
+	*r = a - b;
+	return a < b;
+}
+static inline bool __metalpy_smul_overflow(int64_t a, int64_t b, int64_t* r) {
+	*r = a * b;
+	if (a == 0 || b == 0) return false;
+	if (a < 0) { a = -a; b = -b; }
+	return a > INT64_MAX / (b < 0 ? -b : b);
+}
+static inline bool __metalpy_umul_overflow(uint64_t a, uint64_t b, uint64_t* r) {
+	*r = a * b;
+	if (a == 0) return false;
+	return *r / a != b;
+}
+
+// _Generic dispatch: the emitter calls __metalpy_add_overflow(a,b,r)
+// where *r is a local of the concrete scalar type. This picks the right
+// signed/unsigned variant based on the type of *r.
+#define __metalpy_add_overflow(a,b,r) \
+	_Generic(*(r), \
+		uint64_t: __metalpy_uadd_overflow, \
+		uint32_t: __metalpy_uadd_overflow, \
+		uint16_t: __metalpy_uadd_overflow, \
+		uint8_t:  __metalpy_uadd_overflow, \
+		int64_t:  __metalpy_sadd_overflow, \
+		int32_t:  __metalpy_sadd_overflow, \
+		int16_t:  __metalpy_sadd_overflow, \
+		int8_t:   __metalpy_sadd_overflow  \
+	)(a,b,r)
+#define __metalpy_sub_overflow(a,b,r) \
+	_Generic(*(r), \
+		uint64_t: __metalpy_usub_overflow, \
+		uint32_t: __metalpy_usub_overflow, \
+		uint16_t: __metalpy_usub_overflow, \
+		uint8_t:  __metalpy_usub_overflow, \
+		int64_t:  __metalpy_ssub_overflow, \
+		int32_t:  __metalpy_ssub_overflow, \
+		int16_t:  __metalpy_ssub_overflow, \
+		int8_t:   __metalpy_ssub_overflow  \
+	)(a,b,r)
+#define __metalpy_mul_overflow(a,b,r) \
+	_Generic(*(r), \
+		uint64_t: __metalpy_umul_overflow, \
+		uint32_t: __metalpy_umul_overflow, \
+		uint16_t: __metalpy_umul_overflow, \
+		uint8_t:  __metalpy_umul_overflow, \
+		int64_t:  __metalpy_smul_overflow, \
+		int32_t:  __metalpy_smul_overflow, \
+		int16_t:  __metalpy_smul_overflow, \
+		int8_t:   __metalpy_smul_overflow  \
+	)(a,b,r)
+#else
+// GCC/Clang: use compiler builtins directly
+typedef __int128 __metalpy_wideint;
+typedef unsigned __int128 __metalpy_wideuint;
+#define __metalpy_add_overflow(a,b,r) __builtin_add_overflow(a,b,r)
+#define __metalpy_sub_overflow(a,b,r) __builtin_sub_overflow(a,b,r)
+#define __metalpy_mul_overflow(a,b,r) __builtin_mul_overflow(a,b,r)
+#endif
 '''
 
 # NOT part of C_EMITTER.md's own verbatim prologue above - a synthesized
@@ -147,7 +229,7 @@ _SCALAR_C_TYPES: dict[str,str] = {
 	# a program using these against a cl.exe backend fails to compile there
 	# on its own, same as any other backend-specific limitation (user's own
 	# explicit decision - see the plan's Context section)
-	'i128': '__int128', 'u128': 'unsigned __int128',
+	'i128': '__metalpy_wideint', 'u128': '__metalpy_wideuint',
 	'isize': 'intptr_t', 'usize': 'uintptr_t',
 	'bool': 'bool',
 }
@@ -399,7 +481,7 @@ _ARITH_BINOP_INFO: dict[type,tuple[str,str]] = {
 }
 _ARITH_SYMBOL = { 'add': '+', 'sub': '-', 'mul': '*' }
 _ARITH_BUILTIN = {
-	'add': '__builtin_add_overflow', 'sub': '__builtin_sub_overflow', 'mul': '__builtin_mul_overflow',
+	'add': '__metalpy_add_overflow', 'sub': '__metalpy_sub_overflow', 'mul': '__metalpy_mul_overflow',
 }
 _PLAIN_BITWISE_SYMBOL = { ir.BitAnd: '&', ir.BitOr: '|', ir.BitXor: '^', ir.Shr: '>>' }
 
@@ -527,7 +609,7 @@ def _emit_neg( instr ) -> list[str]:
 		return [
 			'\t{',
 			f'\t\t{ctype} __tmp;',
-			f'\t\tbool __overflow = __builtin_sub_overflow( ({ctype})0, ({operand}), &__tmp );',
+			f'\t\tbool __overflow = __metalpy_sub_overflow( ({ctype})0, ({operand}), &__tmp );',
 			f'\t\t{dest} = __overflow ? {max_c} : __tmp;', # negating MIN is the only way signed negation overflows, and it always overflows toward MAX
 			'\t}',
 		]
@@ -537,7 +619,7 @@ def _emit_neg( instr ) -> list[str]:
 	return [
 		'\t{',
 		f'\t\t{ctype} __tmp;',
-		f'\t\tbool __overflow = __builtin_sub_overflow( ({ctype})0, ({operand}), &__tmp );',
+		f'\t\tbool __overflow = __metalpy_sub_overflow( ({ctype})0, ({operand}), &__tmp );',
 		'\t\tif ( __overflow ) {',
 		f'\t\t\t{dest}.{tag_f} = 1;',
 		'\t\t} else {',
@@ -568,9 +650,9 @@ def _emit_cast( instr ) -> list[str]:
 	if stem not in _SATURATE_LIMITS:
 		raise NotImplementedError( f'{mode} cast to {stem!r} is not supported yet (no MIN/MAX for i128/u128)' )
 	min_c, max_c = _SATURATE_LIMITS[stem]
-	# promoted to __int128 for the range comparison - every scalar width
+	# promoted to __metalpy_wideint for the range comparison - every scalar width
 	# this compiler supports OTHER than i128/u128 themselves (excluded
-	# just above) fits inside __int128 without loss, sidestepping the
+	# just above) fits inside __metalpy_wideint without loss, sidestepping the
 	# usual signed/unsigned-pairing headache a same-width comparison
 	# would otherwise need (source and target can differ in both width
 	# AND signedness - e.g. i32 -> u8, or u64 -> i16)
@@ -578,8 +660,8 @@ def _emit_cast( instr ) -> list[str]:
 		dest = _emit_operand( instr.dest )
 		return [
 			'\t{',
-			f'\t\t__int128 __wide = (__int128)({operand});',
-			f'\t\t{dest} = ( __wide < (__int128)({min_c}) ) ? {min_c} : ( __wide > (__int128)({max_c}) ) ? {max_c} : ({ctype})({operand});',
+			f'\t\t__metalpy_wideint __wide = (__metalpy_wideint)({operand});',
+			f'\t\t{dest} = ( __wide < (__metalpy_wideint)({min_c}) ) ? {min_c} : ( __wide > (__metalpy_wideint)({max_c}) ) ? {max_c} : ({ctype})({operand});',
 			'\t}',
 		]
 	# check
@@ -587,8 +669,8 @@ def _emit_cast( instr ) -> list[str]:
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 	return [
 		'\t{',
-		f'\t\t__int128 __wide = (__int128)({operand});',
-		f'\t\tbool __overflow = ( __wide < (__int128)({min_c}) ) || ( __wide > (__int128)({max_c}) );',
+		f'\t\t__metalpy_wideint __wide = (__metalpy_wideint)({operand});',
+		f'\t\tbool __overflow = ( __wide < (__metalpy_wideint)({min_c}) ) || ( __wide > (__metalpy_wideint)({max_c}) );',
 		'\t\tif ( __overflow ) {',
 		f'\t\t\t{dest}.{tag_f} = 1;',
 		'\t\t} else {',

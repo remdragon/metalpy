@@ -63,8 +63,8 @@ class CTypeTests( unittest.TestCase ):
 	def test_scalar_widths( self ) -> None:
 		self.assertEqual( emitter_c.c_type( _scalar( 'i32' )), 'int32_t' )
 		self.assertEqual( emitter_c.c_type( _scalar( 'u64' )), 'uint64_t' )
-		self.assertEqual( emitter_c.c_type( _scalar( 'i128' )), '__int128' )
-		self.assertEqual( emitter_c.c_type( _scalar( 'u128' )), 'unsigned __int128' )
+		self.assertEqual( emitter_c.c_type( _scalar( 'i128' )), '__metalpy_wideint' )
+		self.assertEqual( emitter_c.c_type( _scalar( 'u128' )), '__metalpy_wideuint' )
 		self.assertEqual( emitter_c.c_type( _scalar( 'isize' )), 'intptr_t' )
 		self.assertEqual( emitter_c.c_type( _scalar( 'usize' )), 'uintptr_t' )
 		self.assertEqual( emitter_c.c_type( _scalar( 'bool', 'builtins.bool' )), 'bool' )
@@ -385,7 +385,7 @@ def main() -> i32:
 		self.assertIn( 'AddCheck', kinds )
 		self.assertIn( 'OrReturn', kinds )
 		src = emitter_c.emit_function( main_lf )
-		self.assertIn( '__builtin_add_overflow', src )
+		self.assertIn( '__metalpy_add_overflow', src )
 		self.assertIn( 'tag == 1', src )
 
 _POINT_FIXTURE = '\n'.join([
