@@ -150,13 +150,21 @@ class Lowering:
 		self._sys_functions[name] = fn
 		return fn
 
-	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
-		module = self._find_module_for( fn )
+	def _init_lowering_state( self, fn: Function | None ) -> None:
 		self._instructions: list[ir.Instruction] = []
 		self._temp_id = 0
 		self._label_id = 0
 		self._pending_temps: list[ir.Temp] = []
 		self._current_fn = fn
+		self._arithmetic_mode: list[arithmetic_mode.ArithmeticMode] = [ arithmetic_mode.ArithmeticChecked() ]
+		self._loop_depth = 0
+		self._loop_labels: list[tuple[str,str]] = []
+		self._in_deferred_body = False
+		self._defer_flags: list[Variable] = []
+		self._return_value_var = None
+
+	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
+		module = self._find_module_for( fn )
 		if fn.extern_lib is not None:
 			# @extern(lib, symbol) - a foreign call signature declaration,
 			# not a real body to lower (discovery.py already required a
@@ -165,18 +173,12 @@ class Lowering:
 			# a future emitter to declare rather than define. Compiler._lower
 			# is what actually registers the library dependency (see its
 			# extern_libs bookkeeping) - this only has to emit the shape
+			self._instructions: list[ir.Instruction] = []
+			self._current_fn = fn
 			self._emit( ir.FuncStart( name = fn.qualname, params = fn.parameters or [], return_type = fn.return_type, extern_lib = fn.extern_lib, extern_symbol = fn.extern_symbol ))
 			self._emit( ir.FuncEnd( name = fn.qualname ))
 			return self._instructions
-		self._arithmetic_mode: list[arithmetic_mode.ArithmeticMode] = [ arithmetic_mode.ArithmeticChecked() ]
-		self._loop_depth = 0
-		self._loop_labels: list[tuple[str,str]] = [] # stack of (continue_label, break_label), innermost last
-		self._in_deferred_body = False
-		# just the flags, in registration order - enough to splice their
-		# `False` inits right after FuncStart (see _emit_epilogue). The
-		# defer/errdefer bodies themselves live as cfg.Epilogue entries on
-		# self._cfg's own _epilogue_stack (push_defer()), not here
-		self._defer_flags: list[Variable] = []
+		self._init_lowering_state( fn )
 
 		with self.discovery.module_context( module ):
 			with ( self.discovery.scope_context( fn.cls ) if fn.cls is not None else nullcontext() ):
@@ -466,20 +468,7 @@ class Lowering:
 
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self._find_module_for( var )
-		self._instructions = []
-		self._temp_id = 0
-		self._label_id = 0
-		self._pending_temps = []
-		self._current_fn = None
-		self._arithmetic_mode = [ arithmetic_mode.ArithmeticChecked() ]
-		# defer/errdefer/loops can't appear in a global initializer (it's a
-		# single expression, not a statement body reachable through
-		# _lower_stmt) - reset for consistency/safety only, never touched here
-		self._loop_depth = 0
-		self._loop_labels = []
-		self._in_deferred_body = False
-		self._defer_flags: list[Variable] = []
-		self._return_value_var = None
+		self._init_lowering_state( None )
 
 		with self.discovery.module_context( module ):
 			if var.init is not None:
