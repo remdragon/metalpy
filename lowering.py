@@ -1899,10 +1899,6 @@ class Lowering:
 	def _monomorphized_function( self, spec: Specialization ) -> Function:
 		return self._monomorphizer.monomorphized_function( spec )
 
-	def lower_function_specialization( self, spec: Specialization ) -> tuple[Function,list[ir.Instruction]]:
-		monomorphized = self._monomorphized_function( spec )
-		return monomorphized, self.lower_function( monomorphized )
-
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
 		return self._monomorphizer.monomorphize_class( spec )
 
@@ -2834,7 +2830,20 @@ class Lowering:
 			if allocate_dest is not None:
 				return allocate_dest if want_result else None
 
-		target, receiver = self._resolve_callee( node.func )
+		# type_resolution.py's own generic-call resolution
+		# (_ReferenceResolver.visit_Call) may already have tagged this call
+		# with its resolved, monomorphized callee (an ordinary, concrete
+		# Function - never a Specialization) - when present, it's
+		# authoritative and skips _resolve_callee/the Specialization
+		# branches below entirely, so a call resolved there never touches
+		# Specialization on this side at all. Absent (any call that pass
+		# left untagged, generic or not) falls through to the exact same
+		# resolution this always did
+		resolved_callee = getattr( node, 'resolved_callee', None )
+		if resolved_callee is not None:
+			target, receiver = resolved_callee, None
+		else:
+			target, receiver = self._resolve_callee( node.func )
 		if receiver is not None:
 			self.schedule( receiver.type )
 

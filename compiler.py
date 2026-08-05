@@ -118,8 +118,10 @@ class Compiler:
 		if isinstance( unit, Specialization ) and isinstance( unit.base, Function ):
 			if unit.base.resolve is not None:
 				unit.base.resolve()
-			self.type_resolver.resolve_function_body( unit.base )
-			monomorphized, instructions = self.lowering.lower_function_specialization( unit )
+			self.type_resolver.resolve_function_body( unit.base ) # rewrites 1/2 against the abstract, shared-until-now body - see resolve_function_body's own docstring
+			monomorphized = self.type_resolver.ensure_resolved( unit ) # swaps the Specialization for its real, substituted Function - own deep-copied body (see Monomorphizer.monomorphized_function)
+			self.type_resolver.resolve_function_body( monomorphized ) # rewrite 3 (generic-call resolution) against THIS copy's own body, now that its own type params are concretely bound
+			instructions = self.lowering.lower_function( monomorphized )
 			lf = LoweredFunction( function = monomorphized, instructions = instructions )
 			self.functions.append( lf )
 			return lf

@@ -216,8 +216,8 @@ class TypeResolutionTests( unittest.TestCase ):
 	# --- idempotency --------------------------------------------------------
 
 	def test_resolve_function_body_is_idempotent( self ) -> None:
-		# a generic function's monomorphized copies all share the exact
-		# same fn.node - calling this twice must not double-rewrite it
+		# memoized by id(fn.node) - calling this twice against the same
+		# fn.node must not double-rewrite it
 		mod = self._import( '\n'.join([
 			'@union',
 			'class Maybe:',
@@ -232,3 +232,106 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.resolver.resolve_function_body( fn ) # second call, same fn.node
 		second = ast.unparse( fn.node )
 		self.assertEqual( first, second )
+
+	# --- generic function call resolution ------------------------------------
+
+	def _resolved_callees( self, fn ) -> list:
+		# every top-level expression-statement's own Call node, in order -
+		# every test below is a straight-line sequence of bare `foo(...)`
+		# statements, so this is enough to pull out node.resolved_callee
+		# (or None, for a call this pass declined to resolve) per statement
+		return [ getattr( stmt.value, 'resolved_callee', None ) for stmt in fn.node.body if isinstance( stmt, ast.Expr ) ]
+
+	def test_implicit_generic_call_tags_resolved_callee_per_argument_type( self ) -> None:
+		# the exact shape from ARCHITECTURE's own generic-function example -
+		# foo('hello') and foo(42) each get their own monomorphized foo,
+		# distinguished by argument type alone (no explicit foo[T])
+		mod = self._import( '\n'.join([
+			'class str: pass',
+			'class int: pass',
+			'',
+			'def foo[T]( t: T ) -> T:',
+			'	return t',
+			'',
+			'def main() -> None:',
+			"	foo( 'hello' )",
+			'	foo( 42 )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		str_callee, int_callee = self._resolved_callees( fn )
+		self.assertIsNotNone( str_callee )
+		self.assertIsNotNone( int_callee )
+		self.assertEqual( str_callee.qualname, '__test__.foo[__test__.str]' )
+		self.assertEqual( int_callee.qualname, '__test__.foo[__test__.int]' )
+		self.assertIsNot( str_callee, int_callee )
+		self.assertIsNot( str_callee.node, int_callee.node ) # independent, deep-copied bodies - not the shared abstract one
+
+	def test_explicit_generic_call_tags_resolved_callee( self ) -> None:
+		mod = self._import( '\n'.join([
+			'def identity[T]( x: T ) -> T:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	identity[i32]( 5 )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNotNone( callee )
+		self.assertEqual( callee.qualname, '__test__.identity[intrinsics.i32]' )
+
+	def test_repeated_call_with_same_inferred_type_reuses_the_same_callee( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class int: pass',
+			'',
+			'def identity[T]( x: T ) -> T:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	identity( 1 )',
+			'	identity( 2 )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		first, second = self._resolved_callees( fn )
+		self.assertIsNotNone( first )
+		self.assertIs( first, second )
+
+	def test_generic_call_on_receiver_local_is_left_untagged( self ) -> None:
+		# x.method() where x is a plain local - fn.names only gains local
+		# entries incrementally as LOWERING itself walks the body, which
+		# hasn't happened yet at this pre-lowering pass, so this pass can't
+		# (and shouldn't) resolve a receiver-based call at all; must not
+		# raise/report a spurious "not defined" error either - deferred
+		# entirely to lowering.py's own, unaffected receiver-call handling
+		mod = self._import( '\n'.join([
+			'class Foo:',
+			'	def method( self ) -> i32:',
+			'		return 1',
+			'',
+			'def main() -> None:',
+			'	x: Foo',
+			'	x.method()',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNone( callee )
+
+	def test_generic_call_with_uninferrable_argument_is_left_untagged( self ) -> None:
+		# T never appears in any parameter position - nothing for this
+		# pass to infer it from either, same as lowering's own eventual
+		# failure - left untagged (no error recorded HERE; lowering's own
+		# fallback is what actually reports it, unchanged)
+		mod = self._import( '\n'.join([
+			'def make[T]() -> i32:',
+			'	return 0',
+			'',
+			'def main() -> None:',
+			'	make()',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNone( callee )

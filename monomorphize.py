@@ -1,4 +1,5 @@
 # stdlib imports:
+import copy
 from dataclasses import replace
 from typing import Callable
 
@@ -108,9 +109,19 @@ class Monomorphizer:
 		# substitute_type_params), and names (T's own entry replaced with
 		# the concrete arg, so ordinary name lookups - including
 		# compiler.sizeof(T) - resolve it correctly while lowering fn.node.
-		# body, which is otherwise untouched/shared AST). Memoized on
-		# spec.monomorphized - this only ever builds one copy per distinct
-		# instantiation
+		# body). Memoized on spec.monomorphized - this only ever builds one
+		# copy per distinct instantiation.
+		#
+		# .node is deep-copied, not shared with base - every specialization
+		# gets its own independent body. This is what lets type_resolution.py's
+		# generic-call resolution (_ReferenceResolver.visit_Call) tag a
+		# DIFFERENT node.resolved_callee per specialization when this
+		# function's own body calls another generic function using its own
+		# T (e.g. foo[T]'s body calling bar(t: T) - which concrete bar to
+		# call depends on which T this copy was bound to, so the two
+		# specializations of foo genuinely need independent bodies, not a
+		# shared one interpreted two different ways - see resolve_function_
+		# body's own docstring in type_resolution.py, which relies on this)
 		if spec.monomorphized is not None:
 			return spec.monomorphized
 		base = spec.base
@@ -148,6 +159,7 @@ class Monomorphizer:
 			parameters = substituted_params,
 			return_type = substituted_return,
 			names = substituted_names,
+			node = copy.deepcopy( base.node ),
 			type_params = None,
 			resolve = None,
 		)
