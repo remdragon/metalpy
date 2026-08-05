@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 ast_explorer.py
+count_lines.py

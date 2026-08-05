@@ -19,16 +19,6 @@ can compile_time_transformer detect that a variable is only set once?
 	def foo2():
 		return True
 
-test_binop_panic_arithmetic_context (lowering_test.py) has a disabled check:
-	`self.assertEqual( self.discovery.errors.errors, [] )` is commented out
-	right after `fn = self._lower_main()` - re-enabling it fails with
-	"lib/sys.py:120: name 'str' is not defined" for `with compiler.
-	panic_arithmetic(...):`. Confirmed this predates the arithmetic-mode
-	refactor (same failure reproduces on master with the assertion added
-	back), so it's not a regression - but it's still a real, unfixed issue.
-	Needs investigation into why 'str' isn't resolved along whatever path
-	panic_arithmetic's Unwrap pulls in sys.panic.
-
 lowering's lower_function() and lower_global() have a large
 	amount of shared initialization that need to happen. This
 	shared initialization needs to be moved to a helper function

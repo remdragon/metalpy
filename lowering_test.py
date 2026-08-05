@@ -628,15 +628,8 @@ class Tests( unittest.TestCase ):
 		# require the enclosing function to return Result[_,OverflowError],
 		# since Unwrap panics rather than needing anywhere to propagate to -
 		# main() works fine here
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
-			'class OverflowError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	pass',
-			'',
-			'class str: pass',
-			'',
 			'def main() -> None:',
 			'	a: i32 = 1',
 			"	with compiler.panic_arithmetic( 'bad arithmetic' ):",
@@ -646,9 +639,10 @@ class Tests( unittest.TestCase ):
 		mod = self._import( code )
 		i32 = self.discovery.get_intrinsics()['i32']
 		none_type = self.discovery.get_none_type()
-		str_cls = mod.get_local( 'str' )
-		overflow_cls = mod.get_local( 'OverflowError' )
-		result_cls = mod.get_local( 'Result' )
+		builtins_mod = self.discovery.modules['builtins']
+		str_cls = builtins_mod.get_local( 'str' )
+		overflow_cls = builtins_mod.get_local( 'OverflowError' )
+		result_cls = builtins_mod.get_local( 'Result' )
 		if result_cls.resolve is not None:
 			result_cls.resolve()
 		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
@@ -656,12 +650,13 @@ class Tests( unittest.TestCase ):
 		# emitter-invented hook (see ir.Unwrap.panic / Lowering._resolve_sys_function)
 		panic_fn = self.discovery.import_name( 'sys' ).get_local( 'panic' )
 
-		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 10, type = i32 )
-		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 12, type = i32 )
+		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
 		t0 = ir.Temp( type = result_i32_overflow, id = 0 ) # AddCheck's Result
 		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via Unwrap
 
 		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_ir( fn, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
