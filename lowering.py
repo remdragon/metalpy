@@ -1525,7 +1525,15 @@ class Lowering:
 		name = self.discovery.find_name( node.id, node )
 		if not isinstance( name, Variable ):
 			self.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
-		self._ensure_resolved( name ) # a global read only by bare name (never via an annotation/attribute chain) still needs its own resolve+schedule - Compiler._enqueue ignores this for a non-global (field/parameter/local) Variable
+		self._ensure_resolved( name )
+		# when a pointer-typed local flows into a context expecting a
+		# differently-typed pointer (e.g. return ptr where ptr: Ptr[u8]
+		# but the function returns Ptr[T]), insert a CastWrap — in C all
+		# object pointers have the same representation, so this is safe
+		if expected_type is not None and name.type is not expected_type and self._is_ptr_specialization( name.type ) and self._is_ptr_specialization( expected_type ):
+			dest = self._new_temp( expected_type )
+			self._emit( ir.CastWrap( dest = dest, operand = name ))
+			return dest
 		return name
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
@@ -1878,6 +1886,11 @@ class Lowering:
 		return dest
 
 	# --- shared helpers ----------------------------------------------------------
+
+	def _is_ptr_specialization( self, t: Type|None ) -> bool:
+		return ( isinstance( t, Specialization )
+			and isinstance( t.base, Scalar )
+			and t.base.stem in ( 'Ptr', 'ConstPtr' ))
 
 	def _ensure_resolved( self, obj: object ) -> object:
 		# moved to TypeResolver.ensure_resolved (type_resolution.py) - kept
