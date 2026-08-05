@@ -1439,5 +1439,25 @@ class EmitGlobalRCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
+class WindowsTargetCTypeTests( unittest.TestCase ):
+	def test_invalid_handle_value_emits_with_pointer_cast( self ) -> None:
+		import ir
+		from mpy_types import Scalar, Specialization
+		ptr_none = Specialization(
+			stem = 'Ptr[NoneType]',
+			qualname = 'intrinsics.Ptr[intrinsics.NoneType]',
+			file = None, line = None,
+			base = Scalar( stem = 'Ptr', qualname = 'intrinsics.Ptr', file = None, line = None, sizeof = 8 ),
+			args = [ Scalar( stem = 'NoneType', qualname = 'intrinsics.NoneType', file = None, line = None, sizeof = 0 ) ],
+		)
+		c = ir.Const( type = ptr_none, value = -1 )
+		self.assertEqual( emitter_c._emit_const( c ), '(void*)-1' )
+
+	def test_null_literal_emits_zero_not_null( self ) -> None:
+		import ir
+		none_type = Scalar( stem = 'NoneType', qualname = 'intrinsics.NoneType', file = None, line = None, sizeof = 0 )
+		c = ir.Const( type = none_type, value = None )
+		self.assertEqual( emitter_c._emit_const( c ), '0' )
+
 if __name__ == '__main__':
 	unittest.main()

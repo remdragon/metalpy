@@ -359,6 +359,11 @@ def _emit_const( c: ir.Const ) -> str:
 	if isinstance( c.value, bool ):
 		return 'true' if c.value else 'false'
 	if isinstance( c.value, int ):
+		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast
+		if isinstance( c.type, Specialization ):
+			base = c.type.base
+			if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
+				return f'({c_type(c.type)}){c.value}'
 		return str( c.value )
 	if c.value is None:
 		return '0' # NOTE: we would like to put 'nullptr' or 'NULL' here but its causing issues
