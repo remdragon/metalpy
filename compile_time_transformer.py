@@ -94,6 +94,23 @@ class _ConstFolder( ast.NodeTransformer ):
 	def __init__( self, active_target: dict[str,object] ) -> None:
 		self.active_target = active_target
 
+	# --- class/function boundary visitors ---
+	# These deliberately do NOT descend into body or touch decorator_list.
+	# Top-level transform_stmt_list folds module-level if/while/match but
+	# stops at class/function boundaries - those bodies get their own
+	# transform_function_body call later (discovery.py _make_function_resolver).
+
+	def visit_ClassDef( self, node: ast.ClassDef ) -> ast.ClassDef:
+		return node
+
+	def visit_FunctionDef( self, node: ast.FunctionDef ) -> ast.FunctionDef:
+		return node
+
+	def visit_AsyncFunctionDef( self, node: ast.AsyncFunctionDef ) -> ast.AsyncFunctionDef:
+		return node
+
+	# --- expression / statement visitors ---
+
 	def visit_Attribute( self, node: ast.Attribute ) -> ast.expr:
 		key = _is_compiler_target_query( node )
 		if key is not None and key in self.active_target:
@@ -315,13 +332,25 @@ class _ConstFolder( ast.NodeTransformer ):
 		return None
 
 
-def transform_function_body( body: list[ast.stmt], active_target: dict[str,object] ) -> list[ast.stmt]:
-	# wrapping in a throwaway Module lets ast.NodeTransformer's own list-field
-	# splicing (visit_If/visit_While returning a list gets flattened into the
-	# parent's body list) do the work, instead of reimplementing it here
+def transform_stmt_list( body: list[ast.stmt], active_target: dict[str,object] ) -> list[ast.stmt]:
+	'''
+	Folds compile-time-constant expressions, if/while/match statements, and
+	compiler.target.<key> queries in a list of statements. Works on function
+	bodies, module-level statement lists, class bodies \u2014 anywhere a statement
+	list needs compile-time simplification before the rest of the pipeline sees it.
+	
+	Wrapping in a throwaway Module lets ast.NodeTransformer's own list-field
+	splicing (visit_If/visit_While returning a list gets flattened into the
+	parent's body list) do the work, instead of reimplementing it here.
+	'''
 	container = ast.Module( body = list( body ), type_ignores = [] )
 	_ConstFolder( active_target ).generic_visit( container )
 	return container.body
+
+
+def transform_function_body( body: list[ast.stmt], active_target: dict[str,object] ) -> list[ast.stmt]:
+	''' legacy name \u2014 just transform_stmt_list, kept for existing callers '''
+	return transform_stmt_list( body, active_target )
 
 
 def transform_expr( node: ast.expr, active_target: dict[str,object] ) -> ast.expr:

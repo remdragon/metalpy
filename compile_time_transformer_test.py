@@ -199,5 +199,52 @@ class TransformExprTests( unittest.TestCase ):
 		self.assertEqual( self._fold_expr( 'some_call()', {} ), 'some_call()' )
 
 
+class TopLevelFoldingTests( unittest.TestCase ):
+	''' top-level if/else folding: module-level `if compiler.target.os == ...`
+	blocks are folded by transform_stmt_list the same way function-body if
+	statements already were — this is the feature that lets lib/fs.py write a
+	single write_all body with a compile-time-conditional TypeAlias instead of
+	two @compiler.target overloads. '''
+
+	def _fold_top( self, src: str, active_target: dict[str,object] ) -> str:
+		body = ctt.transform_stmt_list( ast.parse( src ).body, active_target )
+		return '\n'.join( ast.unparse( stmt ) for stmt in body )
+
+	def test_constant_true_if_keeps_body( self ) -> None:
+		self.assertEqual( self._fold_top( 'if True:\n\ta = 1\nelse:\n\ta = 2', {} ), 'a = 1' )
+
+	def test_constant_false_if_keeps_else( self ) -> None:
+		self.assertEqual( self._fold_top( 'if False:\n\ta = 1\nelse:\n\ta = 2', {} ), 'a = 2' )
+
+	def test_constant_false_if_without_else_dropped( self ) -> None:
+		self.assertEqual( self._fold_top( 'if False:\n\ta = 1\nb = 2', {} ), 'b = 2' )
+
+	def test_compiler_target_condition_folds_top_level( self ) -> None:
+		src = "if compiler.target.os == 'windows':\n\ta = 1\nelse:\n\ta = 2"
+		self.assertEqual( self._fold_top( src, { 'os': 'windows' } ), 'a = 1' )
+		self.assertEqual( self._fold_top( src, { 'os': 'linux' } ), 'a = 2' )
+
+	def test_typealias_pattern_folds( self ) -> None:
+		''' the motivating case: compile-time conditional TypeAlias '''
+		src = (
+			"if compiler.target.os == 'windows':\n"
+			'\tFD: TypeAlias = 42\n'
+			'else:\n'
+			'\tFD: TypeAlias = 99\n'
+		)
+		self.assertEqual( self._fold_top( src, { 'os': 'windows' } ), 'FD: TypeAlias = 42' )
+		self.assertEqual( self._fold_top( src, { 'os': 'linux' } ), 'FD: TypeAlias = 99' )
+
+	def test_non_constant_if_left_untouched( self ) -> None:
+		src = 'if runtime_val:\n\ta = 1\nelse:\n\ta = 2'
+		self.assertEqual( self._fold_top( src, {} ).strip(), src.replace( '\t', '    ' ))
+
+	def test_folded_statement_lands_adjacent_to_unfolded_statement( self ) -> None:
+		''' after folding, the surviving statement appears in the correct
+		position relative to other top-level statements '''
+		src = "if True:\n\ta = 1\nb = 2"
+		self.assertEqual( self._fold_top( src, {} ), 'a = 1\nb = 2' )
+
+
 if __name__ == '__main__':
 	unittest.main()

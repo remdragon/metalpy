@@ -211,12 +211,15 @@ class Discovery( ast.NodeVisitor ):
 			self.modules[package] = module
 		with self.module_context( module ):
 			tree = ast.parse( code )
-			# scope_stack[-1] (the module) owns this body - every statement is
-			# dispatched through self.visit(), which registers what it finds
-			# immediately (structurally) and defers only the deep internals.
-			# one bad top-level statement doesn't stop the rest of the module
-			# from being scanned - see _resolve_guarded for the same idea
-			# applied to individual symbols' .resolve()
+			# fold compile-time-constant if/else/match at the top level before
+			# self.visit() sees any statement - this means a module-level
+			# `if compiler.target.os == 'windows': ...` collapses to just the
+			# matching branch, same as inside a function body (see
+			# compile_time_transformer.transform_stmt_list). one bad top-level
+			# statement doesn't stop the rest of the module from being scanned -
+			# see _resolve_guarded for the same idea applied to individual
+			# symbols' .resolve()
+			tree.body = compile_time_transformer.transform_stmt_list( tree.body, self.active_target )
 			for node in tree.body:
 				try:
 					self.visit( node )

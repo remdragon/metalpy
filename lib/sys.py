@@ -27,37 +27,15 @@ def alloc[T]( count: usize ) -> Ptr[T]:
 
 class _Stdout:
 	@compiler.target( os = 'windows' )
-	def write( self, s: str ) -> Result[u32,OSError]:
-		from windows.kernel32 import GetLastError, GetStdHandle, WriteFile, STD_OUTPUT_HANDLE
-		written: u32 = 0
-		# u32(s.byte_len()) is a real narrowing cast (usize -> u32) - this
-		# function returns None, so it can't propagate Check mode's default
-		# Result[u32,OverflowError]; a write() call writing >4GB in one
-		# syscall isn't a real scenario, so wrap (silent truncation) is the
-		# pragmatic choice here, same as any C caller of WriteFile would make
-		with compiler.wrap_arithmetic:
-			success: bool = WriteFile(
-				GetStdHandle( STD_OUTPUT_HANDLE ),
-				s.get_cstr(),
-				u32( s.byte_len() ),
-				compiler.addrof( written ),
-				None, # lpOverlapped
-			)
-			if success:
-				return Result.Ok( written )
-			else:
-				dw: u32 = GetLastError()
-				return Result.Err( OSError( dw ))
+	def write( self, s: str ) -> Result[None,OSError]:
+		from fs import write_all
+		from windows.kernel32 import GetStdHandle, STD_OUTPUT_HANDLE
+		return write_all( GetStdHandle( STD_OUTPUT_HANDLE ), s.get_cstr(), s.byte_len() )
 
 	@compiler.target( os = not 'windows' )
-	def write( self, s: str ) -> Result[isize,OSError]:
-		from crt import get_errno, write as _crt_write
-		written: isize = _crt_write( 1, s.get_cstr(), s.byte_len() ) # STDOUT_FILENO is 1
-		if written < isize( 0 ):
-			err = get_errno()
-			return Result.Err( OSError( err ))
-		else:
-			return Result.Ok( written )
+	def write( self, s: str ) -> Result[None,OSError]:
+		from fs import write_all
+		return write_all( 1, s.get_cstr(), s.byte_len() ) # STDOUT_FILENO is 1
 
 stdout: _Stdout = _Stdout()
 
