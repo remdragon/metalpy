@@ -11,7 +11,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
+	Specialization, TaggedUnion, CStruct, CUnion, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
 from type_resolution import TypeResolver
@@ -1524,94 +1524,6 @@ class Lowering:
 		else:
 			self._emit( ir.Label( name = else_label ))
 
-	def _stmt_Match( self, node: ast.Match ) -> None:
-		# desugars to a synthesized if/elif chain (one arm per case, in
-		# source order), delegating to _stmt_If for the actual branching -
-		# each arm's test is built by _match_pattern below. The subject is
-		# lowered exactly once into a hidden local (same technique as the
-		# for-loop's scaffolding: a real named Variable registered into the
-		# function's own scope, so the synthesized per-case AST can
-		# reference it by name repeatedly with no re-evaluation risk)
-		subj = self._lower_expr( node.subject, None )
-		subj_var = self._declare_hidden_local( f'__match_subj_{self._label_id}', subj.type, node )
-		self._emit( ir.Assign( dest = subj_var, src = subj ))
-		subj_name = self._synth_name( subj_var.stem, node )
-
-		chain: ast.If|None = None
-		tail: ast.If|None = None
-		for case in node.cases:
-			if case.guard is not None:
-				self.discovery.fail( f'match guards (case ... if ...) are not yet supported: {ast.unparse(case.pattern)}', node )
-			test, binds = self._match_pattern( subj_name, subj_var.type, case.pattern, node )
-			arm = ast.If( test = test, body = [ *binds, *case.body ], orelse = [] )
-			ast.copy_location( arm, node )
-			if chain is None:
-				chain = arm
-			else:
-				tail.orelse = [ arm ]
-			tail = arm
-
-		if chain is not None:
-			self._stmt_If( chain )
-
-	def _match_pattern( self, subj_expr: ast.expr, subj_type: Type|None, pattern: ast.pattern, node: ast.AST ) -> tuple[ast.expr,list[ast.stmt]]:
-		# returns (test_expr, binding_stmts): test_expr is a boolean AST
-		# expression (lowered later, via the enclosing synthesized If, with
-		# bool_cls as its expected type) that's True iff subj_expr matches
-		# pattern; binding_stmts are synthesized Assign statements for
-		# whatever names the pattern introduces - only valid once test_expr
-		# has evaluated True, so the caller must place them inside the
-		# resulting if-body, never unconditionally
-		if isinstance( pattern, ast.MatchAs ) and pattern.pattern is None:
-			# a bare name (or `_` - Python parses a wildcard the same way,
-			# with name=None) - matches anything unconditionally; binds the
-			# whole subject if a name was actually given
-			test = ast.Constant( value = True )
-			ast.copy_location( test, node )
-			if pattern.name is None:
-				return test, []
-			bind = ast.Assign( targets = [ ast.Name( id = pattern.name, ctx = ast.Store() ) ], value = subj_expr )
-			ast.copy_location( bind, node )
-			return test, [ bind ]
-
-		if not isinstance( pattern, ast.MatchClass ):
-			self.discovery.fail( f'unsupported match pattern: {ast.unparse(pattern)}', node )
-		if pattern.kwd_patterns or len( pattern.patterns ) != 1:
-			self.discovery.fail( f'match patterns support exactly one positional sub-pattern: {ast.unparse(pattern)}', node )
-		if not isinstance( pattern.cls, ast.Attribute ):
-			self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
-
-		owner = self._try_resolve_namespace( pattern.cls.value )
-		# Result.Ok(...)/Result.Err(...) used to be special-cased here
-		# (Result predated @union being scoped, hand-rolled via is_ok()/
-		# is_err() + _payload.ok/_payload.err) - now that Result is a real
-		# @union, it falls through to the generic TaggedUnion branch below
-		# like any other union, with no special-casing needed at all
-
-		if isinstance( owner, TaggedUnion ):
-			self._ensure_resolved( owner )
-			member = next( ( attr for attr in owner.attributes if attr.stem == pattern.cls.attr ), None )
-			if member is None:
-				self.discovery.fail( f'{owner.qualname} has no member {pattern.cls.attr!r}: {ast.unparse(pattern)}', node )
-			self._ensure_resolved( member )
-			tag_attr, data_attr, payload_cls, tags = self._union_storage.get( owner )
-			tag_expr = ast.Attribute( value = subj_expr, attr = tag_attr.stem, ctx = ast.Load() )
-			ast.copy_location( tag_expr, node )
-			test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
-			ast.copy_location( test, node )
-			payload_expr = ast.Attribute(
-				value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
-				attr = f'v_{member.stem}',
-				ctx = ast.Load(),
-			)
-			ast.copy_location( payload_expr, node )
-			inner_test, inner_binds = self._match_pattern( payload_expr, member.type, pattern.patterns[0], node )
-			combined = ast.BoolOp( op = ast.And(), values = [ test, inner_test ] )
-			ast.copy_location( combined, node )
-			return combined, inner_binds
-
-		self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
-
 	# --- expressions -----------------------------------------------------------
 
 	def _lower_expr( self, node: ast.expr, expected_type: Type|None ) -> ir.Operand:
@@ -1876,19 +1788,15 @@ class Lowering:
 			return ir.Const( type = bool_cls, value = not negate ) # `None is None` / `None is not None` - degenerate, but not a crash
 
 		if left_is_none or right_is_none:
+			# a TaggedUnion-typed operand (T|None) never reaches here anymore -
+			# type_resolution.py's _ReferenceResolver already rewrote that
+			# shape into a plain tag Eq/NotEq Compare before lowering ever
+			# saw this statement (see its own visit_Compare). What's left is
+			# a flat Cmp against a real None-typed Const - e.g. a raw
+			# Ptr[T]|None never actually applies (still a TaggedUnion), so in
+			# practice this is for whatever non-union type this language
+			# ever allows a bare `is None` against
 			other = self._lower_expr( right_node if left_is_none else left_node, None )
-			shape = self._tagged_union_shape( other.type )
-			if shape is not None:
-				base, members = shape
-				none_member = next( ( attr for attr in members if attr.type is self.discovery.get_none_type() ), None )
-				if none_member is None:
-					self.discovery.fail( f'{other.type.qualname} has no None member: {ast.unparse(node)}', node )
-				tag_attr, _data_attr, _payload_cls, tags = self._union_storage.get( base )
-				tag_dest = self._new_temp( tag_attr.type )
-				self._emit( ir.GetAttr( dest = tag_dest, obj = other, attr = tag_attr.stem ))
-				dest = self._new_temp( bool_cls )
-				self._emit( ir.Cmp( dest = dest, op = cmp_op, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[none_member.stem] ) ))
-				return dest
 			dest = self._new_temp( bool_cls )
 			self._emit( ir.Cmp( dest = dest, op = cmp_op, left = other, right = ir.Const( type = other.type, value = None ) ))
 			return dest

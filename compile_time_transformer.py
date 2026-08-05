@@ -21,9 +21,11 @@ subject wins, its body is spliced in (any `as`/bare-name capture the
 winning pattern introduces is preceded by a synthesized `name = <value>`
 assignment, since the match statement itself is gone and can no longer
 bind it), and every other case is dropped. This is more than just an
-optimization for match - lowering.py's own _stmt_Match doesn't implement
-MatchValue/MatchSingleton/MatchOr patterns at all yet (only MatchAs and
-MatchClass - see its docstring), so folding is what makes
+optimization for match - type_resolution.py's own _ReferenceResolver
+(which now rewrites every match statement into an if/elif/else chain
+before lowering.py ever sees one - see its own module docstring) doesn't
+implement MatchValue/MatchSingleton/MatchOr patterns at all yet (only
+MatchAs and MatchClass), so folding is what makes
 `match compiler.target.bits: case 32: ...` compile at all today.
 
 Deliberately NOT folded, matching lowering.py's own scope cuts so this

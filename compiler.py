@@ -116,6 +116,9 @@ class Compiler:
 
 	def _lower( self, unit: CompileUnit ) -> CompiledUnit:
 		if isinstance( unit, Specialization ) and isinstance( unit.base, Function ):
+			if unit.base.resolve is not None:
+				unit.base.resolve()
+			self.type_resolver.resolve_function_body( unit.base )
 			monomorphized, instructions = self.lowering.lower_function_specialization( unit )
 			lf = LoweredFunction( function = monomorphized, instructions = instructions )
 			self.functions.append( lf )
@@ -136,6 +139,7 @@ class Compiler:
 		elif isinstance( unit, Function ):
 			if unit.resolve is not None:
 				unit.resolve()
+			self.type_resolver.resolve_function_body( unit )
 			instructions = self.lowering.lower_function( unit )
 			if unit.extern_lib is not None:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )

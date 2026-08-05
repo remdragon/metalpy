@@ -115,27 +115,32 @@ stage 1 - discovery:
 			self.assertEqual( Foo.attributes, [] ) # no attributes
 			self.assertEqual( Foo.methods, [] ) # no methods
 
-stage 2 - compilation - convert function bodies into IR, type checking:
-	generate work queue containing only main() initially
-	process work queue until its empty:
+stage 2 - type resolution
+	* walk the tree from main and determine everything touched by main,
+		directly or indirectly, and finishing type resolution for
+		anything relevant to the final product
+	* convert anonymous unions into TaggedUnion operations
+		in order to look up an anonymous union, we have to canonicalize it to avoid conflicts and duplicates.
+			canonicalization is a two-pass effort:
+			1) lookup each name in its namespace and translate that to the qualname
+			2) sort all qualnames asciibetically
+				str|int -> builtins.int|builtins.str
+		schedule any anonymous unions that get touched by other scheduled artifacts
+		because we will be attaching anonymous union type information
+			by reference, not by name, we can cnames for the union type as they are created.
+			builtins.int|builtins.str --> $builtins$int$$builtins$str
+				$ prefix to distinguish it symbols coming from builtins.py
+		automatically generate and queue union function bodies into work queue as they are detected
+	
+	future work:
+		* move arithmetic mode logic here (transform ast tree)
+		* convert Specializations into full plain RCClasses
+
+stage 3 - lowering - convert function bodies into IR:
+	process every item emitted from stage 2 type resolution
 		decompose python AST into low-level IR
-			emit DECREF where necessary
+			emit INCREF/DECREF where necessary
 			defer/errdefer scheduling
-		schedule function's IR for compilation
-			also any referenced classes and global objects
-		queue any newly referenced functions into work queue for next pass
-		schedule anonymous unions
-			in order to look up an anonymous union, we have to canonicalize it to avoid conflicts and duplicates.
-				canonicalization is a two-pass effort:
-				1) lookup each name in its namespace and translate that to the qualname
-				2) sort all qualnames asciibetically
-					str|int -> builtins.int|builtins.str
-			schedule any anonymous unions that get touched by other scheduled artifacts
-			because we will be attaching anonymous union type information
-				by reference, not by name, we can cnames for the union type as they are created.
-				builtins.int|builtins.str --> $builtins$int$$builtins$str
-					$ prefix to distinguish it symbols coming from builtins.py
-			automatically generate and queue union function bodies into work queue as they are detected
 	
 	testable output:
 		IR sequences from functions
@@ -170,7 +175,7 @@ IR:
 		against registers/temporaries. This is so the emitter doesn't have to
 		try to figure that out later.
 
-stage 3 - IR optimization (map/reduce):
+stage 4 - IR optimization (map/reduce):
 	NOTE: all concept of @union is gone here, IR operates on values and pointers
 	
 	because low-level IR can sometimes generate suboptimal sequences, this stage
@@ -187,3 +192,7 @@ stage 5 - emitter:
 	
 	testable output:
 		generated C output
+
+stage 6 - linker:
+	this module is responsible for dealing with the inconsistencies between
+	different compilers to generate the final executable
