@@ -29,12 +29,14 @@ class CcTool:
 		self.name = name
 		self.path = path
 
-	def compile( self, src: Path, obj: Path, verbose: bool = False ) -> subprocess.CompletedProcess[bytes]:
+	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False ) -> subprocess.CompletedProcess[bytes]:
 		''' compile a single .c file to a .o object file '''
 		if self.name == 'cl':
 			cmd = [ self.path, '/nologo', '/std:c11',
 				'/experimental:c11atomics',
 				'/W4', '-c', str( src ), f'/Fo:{obj}' ]
+			if no_crt:
+				cmd += [ '/GS-' ]
 		else:
 			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
 		if verbose:
@@ -45,12 +47,14 @@ class CcTool:
 			text = True,
 		)
 
-	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False ) -> subprocess.CompletedProcess[bytes]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False ) -> subprocess.CompletedProcess[bytes]:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
 		if self.name == 'cl':
 			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
+			if no_crt:
+				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
 		else:
 			cmd = [ self.path ] + extra + obj_args + [ '-o', str( exe ) ]
 		if verbose:

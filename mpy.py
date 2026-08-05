@@ -69,34 +69,43 @@ def _build_active_target( args: argparse.Namespace ) -> dict[str,object]:
 
 def _print_dep_report( compiler: Compiler ) -> None:
 	'''
-	Print every FQDN that was lowered, grouped by kind.
-	Future: track which FQDN triggered each lowering (needs instrumentation
-	in TypeResolver/lowering.py to record scheduling provenance).
+	Print every FQDN that was lowered, grouped by kind, with the
+	FQDN that triggered each one.
 	'''
+	def _triggered( unit: object ) -> str:
+		# unwrap LoweredFunction -> Function, Specialization -> .base/.qualname
+		if hasattr( unit, 'function' ):
+			unit = unit.function
+		u = unit
+		if hasattr( u, 'base' ) and hasattr( u, 'qualname' ):
+			u = u.base if isinstance( u.base, object ) else u
+		t = compiler.type_resolver.triggered_by( unit )
+		return f' (via {t})' if t else ''
+
 	print( '\n=== dependency report ===' )
 	print( f'functions ({len(compiler.functions)}):' )
 	for lf in compiler.functions:
-		print( f'  {lf.function.qualname}' )
+		print( f'  {lf.function.qualname}{_triggered(lf.function)}' )
 	if compiler.rcclasses:
 		print( f'rcclasses ({len(compiler.rcclasses)}):' )
 		for cls in compiler.rcclasses:
-			print( f'  {cls.qualname}' )
+			print( f'  {cls.qualname}{_triggered(cls)}' )
 	if compiler.cstructs:
 		print( f'cstructs ({len(compiler.cstructs)}):' )
 		for cls in compiler.cstructs:
-			print( f'  {cls.qualname}' )
+			print( f'  {cls.qualname}{_triggered(cls)}' )
 	if compiler.cunions:
 		print( f'cunions ({len(compiler.cunions)}):' )
 		for cls in compiler.cunions:
-			print( f'  {cls.qualname}' )
+			print( f'  {cls.qualname}{_triggered(cls)}' )
 	if compiler.tagged_unions:
 		print( f'tagged_unions ({len(compiler.tagged_unions)}):' )
 		for cls in compiler.tagged_unions:
-			print( f'  {cls.qualname}' )
+			print( f'  {cls.qualname}{_triggered(cls)}' )
 	if compiler.cenums:
 		print( f'cenums ({len(compiler.cenums)}):' )
 		for cls in compiler.cenums:
-			print( f'  {cls.qualname}' )
+			print( f'  {cls.qualname}{_triggered(cls)}' )
 	if compiler.globals:
 		print( f'globals ({len(compiler.globals)}):' )
 		for g in compiler.globals:
@@ -145,9 +154,11 @@ def main() -> None:
 	# --- dep report ---
 	if args.dep_report:
 		_print_dep_report( compiler )
+		return
 
 	# --- stage 5: emit C ---
-	c_source = emitter_c.emit_c( compiler )
+	no_crt = 'c' not in compiler.extern_libs
+	c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
 
 	# --- -c: emit C source only ---
 	if args.c:
@@ -161,16 +172,15 @@ def main() -> None:
 	if cc is None:
 		_die( 'no C compiler found (try --cc or METALPY_CC)' )
 
-	# --- compile C → .o ---
 	with tempfile.TemporaryDirectory() as tmp:
 		src_path = Path( tmp ) / 'generated.c'
 		obj_path = Path( tmp ) / 'generated.o'
 		src_path.write_text( c_source, encoding = 'utf-8' )
 
-		result = cc.compile( src_path, obj_path, verbose = args.v )
-		if result.returncode != 0:
+		compile_result = cc.compile( src_path, obj_path, verbose = args.v, no_crt = no_crt )
+		if compile_result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
-			print( result.stdout, file = sys.stderr )
+			print( compile_result.stdout, file = sys.stderr )
 			if args.keep_c:
 				c_path = args.output or args.source.with_suffix( '.c' )
 				src_path.rename( c_path )
@@ -182,20 +192,19 @@ def main() -> None:
 		if active_target['os'] == 'windows' and exe_path.suffix != '.exe':
 			exe_path = exe_path.with_suffix( exe_path.suffix + '.exe' )
 		ldflags = args.ldflags
-		# auto-link every @extern library that was actually lowered.
-		# 'c' means the platform C runtime, already linked implicitly.
 		for lib in sorted( compiler.extern_libs ):
 			if lib == 'c':
 				continue
 			if lib not in ldflags:
-				ldflags = ldflags + f' -l{lib}' if ldflags else f'-l{lib}'
-		result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v )
-		if result.returncode != 0:
+				if active_target['os'] == 'windows':
+					flag = f'{lib}.lib'
+				else:
+					flag = f'-l{lib}'
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt )
+		if link_result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
-			if result.stdout:
-				print( result.stdout, file = sys.stderr )
-			if result.stderr:
-				print( result.stderr, file = sys.stderr )
+			print( link_result.stdout, file = sys.stderr )
 			if args.keep_c:
 				c_path = args.output or args.source.with_suffix( '.c' )
 				src_path.rename( c_path )

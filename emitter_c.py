@@ -130,7 +130,26 @@ typedef unsigned __int128 __metalpy_wideuint;
 #define __metalpy_sub_overflow(a,b,r) __builtin_sub_overflow(a,b,r)
 #define __metalpy_mul_overflow(a,b,r) __builtin_mul_overflow(a,b,r)
 #endif
+// Windows: call SetConsoleOutputCP(CP_UTF8) so Unicode print() works.
+// Called from main() on every Windows build, and from the custom entry
+// point (mainCRTStartup below) when the CRT is not linked.
+#ifdef _WIN32
+#define CP_UTF8 65001
+#ifdef _MSC_VER
+int __stdcall SetConsoleOutputCP(unsigned int);
+#pragma comment(linker, "/alternatename:__imp__SetConsoleOutputCP=__imp_SetConsoleOutputCP")
+#else
+int __stdcall SetConsoleOutputCP(unsigned int);
+#endif
+static void __metalpy_init( void ) {
+	SetConsoleOutputCP( CP_UTF8 );
+}
+#else
+static void __metalpy_init( void ) {}
+#endif
 '''
+
+
 
 # NOT part of C_EMITTER.md's own verbatim prologue above - a synthesized
 # TaggedUnion payload's None member (e.g. Ptr[u8]|None) needs a real 1-byte
@@ -1401,7 +1420,7 @@ def _rcclass_was_constructed( cls: RCClass, compiler: Compiler ) -> bool:
 	alloc_qualname = f'sys.alloc[{cls.qualname}]'
 	return any( lf.function.qualname == alloc_qualname for lf in compiler.functions )
 
-def emit_c( compiler: Compiler ) -> str:
+def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	''' single C11 translation unit - see the plan's "three-pass emission
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
 	program is already collected into one Compiler instance, so there's no
@@ -1460,9 +1479,28 @@ def emit_c( compiler: Compiler ) -> str:
 	for lf in compiler.functions:
 		# @extern functions have no body (only a ; declaration in pass 1)
 		if lf.function.extern_lib is None:
-			parts.append( emit_function( lf ))
+			src = emit_function( lf )
+			# Windows: prepend __metalpy_init() to main() so Unicode output
+			# is configured before any metalpy code runs
+			if _is_entry_point( lf.function ) and compiler.disco.active_target['os'] == 'windows':
+				src = src.replace( '{\n', '{\n\t__metalpy_init();\n', 1 )
+			parts.append( src )
 	for cls in compiler.rcclasses:
 		if not cls.type_params and _rcclass_was_constructed( cls, compiler ):
 			parts.append( emit_rcclass_destructor( cls ))
 
+	# custom entry point when CRT is not linked - the linker expects
+	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls
+	# __metalpy_init() then main() and exits cleanly via the process itself
+	if no_crt:
+		parts.append(
+			'#ifdef _WIN32\n'
+			'void __stdcall ExitProcess( unsigned int );\n'
+			'void mainCRTStartup( void ) {\n'
+			'\t__metalpy_init();\n'
+			'\tint __result = main();\n'
+			'\tExitProcess( (unsigned int)__result );\n'
+			'}\n'
+			'#endif'
+		)
 	return '\n\n'.join( part for part in parts if part ) + '\n'

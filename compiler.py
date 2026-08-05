@@ -91,6 +91,13 @@ class Compiler:
 		# queue now lives on type_resolver, see its own docstring
 		return self.type_resolver.queue
 
+	def _trigger_name( self, unit: CompileUnit ) -> str:
+		suffix = ''
+		if isinstance( unit, Specialization ):
+			suffix = f'[{", ".join( a.qualname for a in unit.args if hasattr( a, "qualname" ))}]'
+			unit = unit.base
+		return getattr( unit, 'qualname', str( unit )) + suffix
+
 	def _enqueue( self, unit: object ) -> None:
 		# thin delegate, kept for existing white-box tests and the two
 		# internal call sites below - the real scheduling logic ("what's a
@@ -107,6 +114,9 @@ class Compiler:
 			unit = self.type_resolver.next_unit()
 			if unit is None:
 				break
+			# record what's currently being lowered so schedule() can
+			# attribute newly-discovered dependencies to this unit
+			self.type_resolver._current_trigger = self._trigger_name( unit )
 			# one broken symbol doesn't stop the rest of the work queue from
 			# draining - mirrors the recovery boundaries in discovery.py/lowering.py
 			try:

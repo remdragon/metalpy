@@ -45,6 +45,10 @@ class TypeResolver:
 		# is reused by every monomorphized copy of a generic function (see
 		# resolve_function_body's own docstring)
 		self._body_resolved: set[int] = set()
+		# provenance tracking for --dep-report: id(unit) -> qualname of
+		# the unit being lowered at the time this one was scheduled
+		self._triggered_by: dict[int,str] = {}
+		self._current_trigger: str|None = None
 
 	def schedule( self, unit: object ) -> None:
 		# moved verbatim from Compiler._enqueue - lowering.py hands this
@@ -58,38 +62,27 @@ class TypeResolver:
 		# represents class attributes and lowering.py's own local
 		# variables, neither a standalone unit) is silently ignored rather
 		# than enqueued
+
+		def _record( self ) -> None:
+			if self._current_trigger is not None:
+				self._triggered_by[ id( unit ) ] = self._current_trigger
+
 		if isinstance( unit, Specialization ):
 			if isinstance( unit.base, Function ):
-				# an explicit generic function instantiation (sys.alloc[u8])
-				# monomorphizes - a real, distinct compile unit in its own
-				# right: queued directly rather than decomposed
 				with self._seen_lock:
 					if id( unit ) in self._seen:
 						return
 					self._seen.add( id( unit ))
 				self.queue.put( unit )
+				_record( self )
 				return
 			if isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
-				# a concrete generic CLASS specialization (Result[i32,
-				# OverflowError]) - also queued directly (mirroring the
-				# Function-based branch above), giving it its own real
-				# struct/union layout via Lowering.monomorphize_class (see
-				# Compiler._lower), so it lands in compiler.cstructs/.cunions/
-				# .tagged_unions/.rcclasses just like any other compile
-				# unit - a future emitter never has to independently
-				# rediscover/resynthesize a concrete specialization itself.
-				# Unlike the Function case, its own concrete type ARGS are
-				# also independently scheduled here: a generic function's
-				# args get scheduled incidentally via its own body/
-				# signature (_emit_generic_call's explicit schedule()
-				# calls), but a class specialization's substituted field
-				# types (Result[i32,OverflowError]'s own OverflowError, for
-				# instance) have no equivalent "body" to walk for that
 				with self._seen_lock:
 					if id( unit ) in self._seen:
 						return
 					self._seen.add( id( unit ))
 				self.queue.put( unit )
+				_record( self )
 				for arg in unit.args:
 					self.schedule( arg )
 				return
@@ -98,18 +91,16 @@ class TypeResolver:
 				self.schedule( arg )
 			return
 		if not isinstance( unit, ( Function, ClassLike )) and not ( isinstance( unit, Variable ) and unit.is_global ):
-			# not a real compile unit: a Module (walked mid-namespace-lookup,
-			# e.g. the `sys` in `sys.alloc(...)`), a class field/parameter/
-			# local Variable, a bare Scalar/TypeVar, an Overload group itself
-			# (only a resolved member is ever actually compiled) - all
-			# harmless to just drop here rather than every caller having to
-			# know not to pass them in the first place
 			return
 		with self._seen_lock:
 			if id( unit ) in self._seen:
 				return
 			self._seen.add( id( unit ))
 		self.queue.put( unit )
+		_record( self )
+
+	def triggered_by( self, unit: object ) -> str|None:
+		return self._triggered_by.get( id( unit ))
 
 	def next_unit( self ) -> object|None:
 		try:
