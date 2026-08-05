@@ -2710,6 +2710,16 @@ class Lowering:
 			operand = self._lower_expr( expr, param.type )
 			self._apply_move_hook( param, operand, target.qualname )
 			kwargs[param.stem] = operand
+		# fill in default values for any parameter that was not
+		# explicitly provided by the call site (e.g. print(msg,
+		# end='\n') called as print('hello') — end gets its
+		# default lowered here as if the caller had passed it)
+		given = { param.stem for param, _ in positional }
+		given.update( kwargs.keys() )
+		for param in target.parameters or []:
+			if param.stem not in given and param.default is not None:
+				default_operand = self._lower_expr( param.default, param.type )
+				kwargs[param.stem] = default_operand
 		return args, kwargs
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
