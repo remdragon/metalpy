@@ -2,7 +2,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 import queue
-import threading
 
 # local imports:
 import ir
@@ -10,6 +9,7 @@ from discovery import Discovery
 from errors import CompileError
 from lowering import Lowering
 from mpy_types import Module, Function, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization
+from type_resolution import TypeResolver
 
 @dataclass( kw_only = True )
 class LoweredFunction:
@@ -27,23 +27,18 @@ CompiledUnit = LoweredFunction|ClassLike|LoweredGlobal
 class Compiler:
 	'''
 	stage 2 driver: starting from Discovery.main, lowers one symbol at a
-	time, discovering everything that symbol touches and scheduling anything
-	not yet lowered, until nothing is left. See ARCHITECTURE.md lines 118-138.
+	time, until type_resolver's work queue is empty. See ARCHITECTURE.md
+	lines 118-138.
 
-	Scheduling goes through a stdlib queue.Queue (already thread-safe) even
-	though nothing here is threaded yet - run() just drains it with a plain
-	get_nowait() loop until queue.Empty.
-
-	_enqueue is the single place that decides what a "dependency" actually
-	means - lowering.py hands it anything it comes across (a Function, a
-	class, a Variable, a Specialization, even a Module walked mid-namespace-
-	lookup) without needing to know which of those are real compile units.
-	A Specialization decomposes into its base + each type arg (recursively -
-	Result[Result[i32,E1],E2] schedules i32/E1/E2 too); anything that isn't a
-	Function, a ClassLike, or a genuinely module-level Variable
-	(Variable.is_global - the same class also represents class attributes
-	and lowering.py's own local variables, neither a standalone unit) is
-	silently ignored rather than enqueued.
+	The work queue itself (a stdlib queue.Queue, already thread-safe even
+	though nothing here is threaded yet) and the "what's actually a
+	dependency worth scheduling" judgment both live on type_resolver
+	(type_resolution.py) now - lowering.py hands it anything it comes
+	across (a Function, a class, a Variable, a Specialization, even a
+	Module walked mid-namespace-lookup) without needing to know which of
+	those are real compile units; see TypeResolver.schedule's own
+	docstring. `queue`/`_enqueue` here are thin delegates kept for existing
+	callers/tests.
 
 	Compiled objects are organized by concrete kind (functions, rcclasses,
 	cstructs, ...) as they're lowered, rather than being collated after the
@@ -53,11 +48,12 @@ class Compiler:
 	'''
 	def __init__( self, disco: Discovery ) -> None:
 		self.disco = disco
-		self.lowering = Lowering( disco, schedule = self._enqueue )
-
-		self.queue: queue.Queue = queue.Queue()
-		self._seen: set[int] = set()
-		self._seen_lock = threading.Lock()
+		# type_resolver (type_resolution.py) owns the reachable-from-main
+		# work queue (previously built directly here) and the shared
+		# UnionStorage/Monomorphizer instances (previously built inside
+		# Lowering.__init__) - see its own docstring
+		self.type_resolver = TypeResolver( disco )
+		self.lowering = Lowering( disco, self.type_resolver )
 
 		self.functions: list[LoweredFunction] = []
 		self.rcclasses: list[RCClass] = []
@@ -88,59 +84,19 @@ class Compiler:
 		self.disco.modules[module.qualname] = module
 		return module
 
+	@property
+	def queue( self ) -> queue.Queue:
+		# thin delegate for existing white-box tests (compiler_test.py's
+		# EnqueueFilteringTests) that read the queue directly - the real
+		# queue now lives on type_resolver, see its own docstring
+		return self.type_resolver.queue
+
 	def _enqueue( self, unit: object ) -> None:
-		if isinstance( unit, Specialization ):
-			if isinstance( unit.base, Function ):
-				# an explicit generic function instantiation (sys.alloc[u8])
-				# monomorphizes - a real, distinct compile unit in its own
-				# right: queued directly rather than decomposed
-				with self._seen_lock:
-					if id( unit ) in self._seen:
-						return
-					self._seen.add( id( unit ))
-				self.queue.put( unit )
-				return
-			if isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
-				# a concrete generic CLASS specialization (Result[i32,
-				# OverflowError]) - also queued directly (mirroring the
-				# Function-based branch above), giving it its own real
-				# struct/union layout via Lowering.monomorphize_class (see
-				# _lower below), so it lands in compiler.cstructs/.cunions/
-				# .tagged_unions/.rcclasses just like any other compile
-				# unit - a future emitter never has to independently
-				# rediscover/resynthesize a concrete specialization itself.
-				# Unlike the Function case, its own concrete type ARGS are
-				# also independently enqueued here: a generic function's
-				# args get scheduled incidentally via its own body/
-				# signature (_emit_generic_call's explicit schedule()
-				# calls), but a class specialization's substituted field
-				# types (Result[i32,OverflowError]'s own OverflowError, for
-				# instance) have no equivalent "body" to walk for that
-				with self._seen_lock:
-					if id( unit ) in self._seen:
-						return
-					self._seen.add( id( unit ))
-				self.queue.put( unit )
-				for arg in unit.args:
-					self._enqueue( arg )
-				return
-			self._enqueue( unit.base )
-			for arg in unit.args:
-				self._enqueue( arg )
-			return
-		if not isinstance( unit, ( Function, ClassLike )) and not ( isinstance( unit, Variable ) and unit.is_global ):
-			# not a real compile unit: a Module (walked mid-namespace-lookup,
-			# e.g. the `sys` in `sys.alloc(...)`), a class field/parameter/
-			# local Variable, a bare Scalar/TypeVar, an Overload group itself
-			# (only a resolved member is ever actually compiled) - all
-			# harmless to just drop here rather than every caller having to
-			# know not to pass them in the first place
-			return
-		with self._seen_lock:
-			if id( unit ) in self._seen:
-				return
-			self._seen.add( id( unit ))
-		self.queue.put( unit )
+		# thin delegate, kept for existing white-box tests and the two
+		# internal call sites below - the real scheduling logic ("what's a
+		# dependency" judgment) moved to TypeResolver.schedule, see its own
+		# docstring
+		self.type_resolver.schedule( unit )
 
 	def run( self ) -> None:
 		if self.disco.main is None:
@@ -148,9 +104,8 @@ class Compiler:
 			return
 		self._enqueue( self.disco.main )
 		while True:
-			try:
-				unit = self.queue.get_nowait()
-			except queue.Empty:
+			unit = self.type_resolver.next_unit()
+			if unit is None:
 				break
 			# one broken symbol doesn't stop the rest of the work queue from
 			# draining - mirrors the recovery boundaries in discovery.py/lowering.py

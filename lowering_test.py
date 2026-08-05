@@ -1784,9 +1784,14 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
+		# Foo.Bar(5) is now ALSO an ordinary call (to the synthesized
+		# constructor, receiver=None) - the real assertion here is that
+		# f.get()'s own dispatch is a single, direct, receiver-based call
+		# to Foo's own real method, with no per-leaf narrowing synthesized
 		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
-		self.assertEqual( len( calls ), 1 )
-		self.assertIs( calls[0].receiver.type, self.discovery.modules['__test__'].get_local( 'Foo' ))
+		receiver_calls = [ c for c in calls if c.receiver is not None ]
+		self.assertEqual( len( receiver_calls ), 1 )
+		self.assertIs( receiver_calls[0].receiver.type, self.discovery.modules['__test__'].get_local( 'Foo' ))
 
 	# --- bare literal arguments to overloaded calls -----------------------------
 
@@ -2917,6 +2922,10 @@ class Tests( unittest.TestCase ):
 	# --- TaggedUnion construction (Foo.Member(value)) ------------------------
 
 	def test_union_member_construct_emits_tag_and_payload_allocate( self ) -> None:
+		# UnionName.Member(value) is now an ordinary call to a real,
+		# synthesized @staticmethod constructor (see union_storage.py's
+		# _build_member_constructor) - the tag/data Allocates live in THAT
+		# function's own body, not inline at the call site
 		code = '\n'.join([
 			'@union',
 			'class Foo:',
@@ -2928,10 +2937,13 @@ class Tests( unittest.TestCase ):
 			'	return',
 		])
 		self._import( code )
-		fn = self._lower_main()
+		main_fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		foo_cls = self.discovery.modules['__test__'].get_local( 'Foo' )
-		allocates = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) ]
+		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		ctor_lf = self.compiler._lower( calls[0].target )
+		allocates = [ i for i in ctor_lf.instructions if isinstance( i, ir.Allocate ) ]
 		self.assertEqual( len( allocates ), 2 )
 		payload_alloc, union_alloc = allocates
 		self.assertEqual( payload_alloc.cls.stem, 'Foo$data' )
@@ -2953,9 +2965,11 @@ class Tests( unittest.TestCase ):
 			'	return',
 		])
 		self._import( code )
-		fn = self._lower_main()
+		main_fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		union_alloc = next( i for i in fn.instructions if isinstance( i, ir.Allocate ) and i.cls.stem == 'Foo' )
+		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
+		ctor_lf = self.compiler._lower( calls[0].target )
+		union_alloc = next( i for i in ctor_lf.instructions if isinstance( i, ir.Allocate ) and i.cls.stem == 'Foo' )
 		self.assertEqual( union_alloc.fields['tag'], ir.Const( type = self.discovery.get_intrinsics()['u8'], value = 1 ))
 
 	def test_union_member_construct_wrong_arg_count_rejected( self ) -> None:
@@ -2970,11 +2984,12 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertIn( 'exactly one positional argument', self.discovery.errors.errors[0] )
+		self.assertIn( 'too many positional arguments', self.discovery.errors.errors[0] )
 
 	def test_union_storage_is_memoized_across_constructions( self ) -> None:
 		# construction elsewhere in the same function (or a different one)
 		# must reference the SAME synthesized tag/data/payload-class objects
+		# - both calls resolve to the exact same constructor Function too
 		code = '\n'.join([
 			'@union',
 			'class Foo:',
@@ -2986,11 +3001,14 @@ class Tests( unittest.TestCase ):
 			'	return',
 		])
 		self._import( code )
-		fn = self._lower_main()
+		main_fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		payload_allocs = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) and i.cls.stem == 'Foo$data' ]
-		self.assertEqual( len( payload_allocs ), 2 )
-		self.assertIs( payload_allocs[0].cls, payload_allocs[1].cls )
+		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 )
+		self.assertIs( calls[0].target, calls[1].target )
+		ctor_lf = self.compiler._lower( calls[0].target )
+		payload_allocs = [ i for i in ctor_lf.instructions if isinstance( i, ir.Allocate ) and i.cls.stem == 'Foo$data' ]
+		self.assertEqual( len( payload_allocs ), 1 )
 
 	# --- attributes / subscripts --------------------------------------------
 

@@ -1,10 +1,11 @@
 # stdlib imports:
+import ast
 from dataclasses import dataclass
 from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Variable, Function, TaggedUnion, CUnion
+from mpy_types import Variable, Parameter, Function, TaggedUnion, CUnion, Type
 
 '''
 Synthesizes and memoizes the real runtime representation of every TaggedUnion
@@ -26,6 +27,87 @@ class ReceiverDispatch:
 	union: TaggedUnion
 	attr: str
 	per_leaf: list[tuple[Variable,Function]] # (union.attributes member, that leaf's resolved method)
+
+def _build_member_constructor(
+	union: TaggedUnion, member: Variable, tag_value: int,
+	tag_attr: Variable, data_attr: Variable, payload_cls: CUnion, return_type: Type,
+) -> Function:
+	''' SYNTAX.md: `@union` expands into a struct wrapping a synthesized
+	payload CUnion "plus one @staticmethod constructor per variant"
+	(`ClassName.Variant(value)`) - synthesized here as a REAL Function with a
+	real AST body, registered into union.names[member.stem] (overwriting the
+	plain attribute-declaration Variable that's there from ordinary class-
+	body parsing - union.attributes, the logical member list .leaves() reads,
+	is untouched). This means `UnionName.Member(value)` is just an ordinary
+	call to a real staticmethod, resolved/monomorphized through lowering.py's
+	EXISTING generic call-lowering path - no union-specific construction code
+	needed there at all (this is what replaces the old, textually-recognized
+	`_try_lower_union_construct_call`).
+
+	Body: `return UnionName.__allocate__(tag=N, data=PayloadCls(v_Member=
+	value))`. The outer `.__allocate__()` is normally private (only callable
+	from a method of the same class - see Lowering._try_lower_allocate_call)
+	but is satisfied here because this Function's own `.cls` IS `union`. The
+	inner payload construction deliberately uses bare `PayloadCls(...)`
+	sugar instead of `.__allocate__()` - a CUnion has no `__init__`, so bare
+	construction has no privacy restriction at all (see
+	Lowering._try_lower_construct_call) - the exact same shape Result.Ok/
+	.Err's own hand-written bodies used before `@union` was scoped (see
+	TODO.txt).
+
+	`$union_cls`/`$payload_cls` are synthesized names with no real source
+	spelling (a `$` can't appear in a real identifier), registered directly
+	into this Function's own `.names` so ordinary namespace resolution
+	(Lowering._try_resolve_namespace, via Discovery.find_name) finds them on
+	the function's own scope without needing either class to have a
+	findable name anywhere - the only thing that matters for an ANONYMOUS
+	union (a synthesized X|Y, never spelled in source at all).
+
+	`return_type` is `union` itself when non-generic, or a Specialization of
+	`union` against its OWN type_params (e.g. Result[T,E], not bare Result)
+	when generic - mirroring exactly what a real hand-written `def Ok(value:
+	T) -> Result[T,E]:` would declare. This matters: Lowering._lower_class_
+	generic_method_call unifies expected_type against target.return_type to
+	solve the class's type params (Result.Ok(x) never mentions E in its own
+	parameter list at all) - a bare, unparameterized `union` return type has
+	no TypeVar anywhere in it for that unification to bind. '''
+	value_param = Parameter(
+		stem = 'value', qualname = f'{union.qualname}.{member.stem}.value',
+		file = union.file, line = union.line, type = member.type,
+	)
+	payload_call = ast.Call(
+		func = ast.Name( id = '$payload_cls', ctx = ast.Load() ),
+		args = [],
+		keywords = [ ast.keyword( arg = f'v_{member.stem}', value = ast.Name( id = 'value', ctx = ast.Load() )) ],
+	)
+	allocate_call = ast.Call(
+		func = ast.Attribute( value = ast.Name( id = '$union_cls', ctx = ast.Load() ), attr = '__allocate__', ctx = ast.Load() ),
+		args = [],
+		keywords = [
+			ast.keyword( arg = tag_attr.stem, value = ast.Constant( value = tag_value )),
+			ast.keyword( arg = data_attr.stem, value = payload_call ),
+		],
+	)
+	node = ast.FunctionDef(
+		name = member.stem,
+		args = ast.arguments( posonlyargs = [], args = [], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
+		body = [ ast.Return( value = allocate_call ) ],
+		decorator_list = [], returns = None, type_params = [],
+	)
+	node.lineno = union.line or 1
+	node.col_offset = 0
+	ast.fix_missing_locations( node )
+
+	fn = Function(
+		stem = member.stem, qualname = f'{union.qualname}.{member.stem}',
+		file = union.file, line = union.line,
+		cls = union, node = node, parameters = [ value_param ], return_type = return_type,
+		is_static = True, resolve = None,
+	)
+	fn.add_name( 'value', value_param )
+	fn.add_name( '$union_cls', union )
+	fn.add_name( '$payload_cls', payload_cls )
+	return fn
 
 class UnionStorage:
 	'''
@@ -99,6 +181,12 @@ class UnionStorage:
 				)
 			union.names[synthesized.stem] = synthesized
 		tags = { attr.stem: i for i, attr in enumerate( union.attributes ) }
+		ctor_return_type = (
+			self.discovery._get_or_create_specialization( union, union.type_params )
+			if union.type_params else union
+		)
+		for tag_value, attr in enumerate( union.attributes ):
+			union.names[attr.stem] = _build_member_constructor( union, attr, tag_value, tag_attr, data_attr, payload_cls, ctor_return_type )
 		# payload_cls (the synthesized CUnion backing `data`) needs its own
 		# explicit schedule() here - unlike the outer TaggedUnion itself
 		# (already scheduled by every caller reaching this point), nothing

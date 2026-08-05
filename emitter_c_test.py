@@ -469,10 +469,16 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 		self.assertIn( 'union __main__$Foo$data {', payload_src )
 		self.assertIn( 'int32_t v_Bar;', payload_src )
 		self.assertIn( 'uintptr_t v_Baz;', payload_src )
+		# Foo.Bar(5) is now an ordinary call to a real, synthesized
+		# @staticmethod constructor (see union_storage.py's
+		# _build_member_constructor) - the tag/payload assignment lives in
+		# THAT function's own emitted body, not inline in main
+		ctor_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == '__main__.Foo.Bar' )
+		ctor_src = emitter_c.emit_function( ctor_lf )
+		self.assertIn( '.tag = 0', ctor_src ) # Foo.Bar's ordinal
+		self.assertIn( '.v_Bar = ', ctor_src )
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		src = emitter_c.emit_function( main_lf )
-		self.assertIn( '.tag = 0', src ) # Foo.Bar's ordinal
-		self.assertIn( '.v_Bar = ', src )
 		self.assertIn( ').tag;', src ) # the match's case Foo.Bar(...) tag read, compared against the ordinal separately
 		self.assertIn( '== (0)', src )
 

@@ -2,7 +2,6 @@
 import ast
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Callable
 
 # local imports:
 import arithmetic_mode
@@ -15,8 +14,8 @@ from mpy_types import (
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
-from union_storage import UnionStorage, ReceiverDispatch as _ReceiverDispatch
-from monomorphize import Monomorphizer
+from type_resolution import TypeResolver
+from union_storage import ReceiverDispatch as _ReceiverDispatch
 
 # compile-error "here's what to do instead" text for a Check-mode opcode's
 # checked_error (ir.py's BinOp/UnaryOp.checked_error) - keyed by error name
@@ -110,20 +109,19 @@ class Lowering:
 	truncation for exactly this reason (see its own comment).
 	'''
 
-	def __init__( self, discovery: Discovery, schedule: Callable[[object],None] ) -> None:
+	def __init__( self, discovery: Discovery, type_resolver: 'TypeResolver' ) -> None:
 		self.discovery = discovery
-		self.schedule = schedule
-		# synthesized __tag/__payload storage per TaggedUnion, memoized by
-		# id() - built lazily the first time a union is constructed/matched
-		# against, but shared thereafter so every reference (Allocate,
-		# GetAttr, across unrelated functions) points at the same objects.
-		# Persists for the whole Lowering instance's lifetime, unlike
-		# lower_function's per-function state - see union_storage.py
-		self._union_storage = UnionStorage( discovery, schedule )
-		# monomorphized Function/ClassLike copies (type params substituted
-		# with concrete types), each memoized by id(Specialization) - see
-		# monomorphize.py
-		self._monomorphizer = Monomorphizer( discovery, schedule, self._union_storage )
+		# type_resolver (type_resolution.py) owns the reachable-from-main
+		# work queue and the shared UnionStorage/Monomorphizer instances -
+		# both already depended on nothing but Discovery and a `schedule`
+		# callback, so Lowering just borrows the SAME instances rather than
+		# building its own (see TypeResolver's own docstring). schedule/
+		# _union_storage/_monomorphizer keep their original names here since
+		# they're referenced throughout this file - only construction moved
+		self._type_resolver = type_resolver
+		self.schedule = type_resolver.schedule
+		self._union_storage = type_resolver.union_storage
+		self._monomorphizer = type_resolver.monomorphizer
 		# resolved lazily, the first time something actually needs a given
 		# real sys.<name> library function (sys.panic for panic_arithmetic's
 		# Unwrap, sys.alloc/sys.free for RCClass construction/destruction) -
@@ -210,6 +208,33 @@ class Lowering:
 						if fn.stem == '__init__' and isinstance( self_cls, RCClass ) and self_cls.base is None:
 							self._construction_self = self_param
 							self._construction_fallible = self._init_fallibility( fn )
+
+					if '$payload_cls' in fn.names:
+						# a synthesized union-member constructor (see
+						# union_storage.py's _build_member_constructor).
+						# $union_cls stays whatever UnionStorage.get() built
+						# at synthesis time - always the ABSTRACT union,
+						# which is exactly right: _lower_allocate_fields's
+						# own existing substitution (fn_cls.base is
+						# target_cls) already handles the OUTER
+						# .__allocate__() call correctly once fn.cls is a
+						# concrete Specialization, the same way a real
+						# hand-written method's body (always textually
+						# saying `Result.__allocate__`, never `Result[i32,
+						# E].__allocate__`) already relies on. $payload_cls
+						# is different: nothing substitutes a bare
+						# construct-call's OWN target class, so it's
+						# refreshed here to the CONCRETE, correctly-
+						# substituted payload class (built by
+						# monomorphize_class - see its own "fresh payload_cls
+						# per specialization" comment) whenever fn.cls is a
+						# Specialization - mirrors how self_cls above is
+						# also computed fresh per lowering call rather than
+						# baked in once
+						if isinstance( fn.cls, Specialization ):
+							concrete_union = self.monomorphize_class( fn.cls )
+							payload_cls = concrete_union.names['data'].type
+							fn.add_name( '$payload_cls', payload_cls )
 
 					for param in fn.parameters or []:
 						self.schedule( param.type )
@@ -1877,42 +1902,13 @@ class Lowering:
 	# --- shared helpers ----------------------------------------------------------
 
 	def _ensure_resolved( self, obj: object ) -> object:
-		# resolving (populating .names/.parameters/whatever) needs to happen
-		# immediately, mid-statement, for whoever's asking - unlike schedule(),
-		# which just queues obj for whenever the work queue gets to it, this
-		# can't wait.
-		#
-		# unconditionally hands obj to schedule() too - Compiler._enqueue is
-		# the single place that judges what's actually a compile unit worth
-		# queuing (Function, ClassLike, a genuinely module-level Variable),
-		# what decomposes into more of those (a Specialization's base + each
-		# arg), and what to just quietly ignore (a Module walked mid-
-		# namespace-lookup, a class field/parameter/local Variable). Nothing
-		# here needs to know or duplicate that judgment - see Compiler's own
-		# docstring for the full list of what it does with each kind.
-		#
-		# the SINGLE place a Specialization gets swapped for the real,
-		# substituted thing it stands in for: every caller MUST use the
-		# returned value, not the object passed in, or they see the abstract,
-		# unsubstituted base instead (Specialization.names/.resolve are raw
-		# passthroughs to it - see mpy_types.py). schedule() still gets the
-		# ORIGINAL Specialization (Compiler._enqueue dispatches on
-		# isinstance(unit, Specialization) to actually build/register the
-		# real compile unit) - only the return value here is swapped
-		resolve = getattr( obj, 'resolve', None )
-		if resolve is not None:
-			resolve()
-		self.schedule( obj )
-		if isinstance( obj, Specialization ):
-			if isinstance( obj.base, Function ):
-				return self._monomorphizer.monomorphized_function( obj )
-			if isinstance( obj.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
-				return self.monomorphize_class( obj )
-			# Scalar (Ptr[T]/ConstPtr[T], the intrinsic generic-pointer
-			# scalars - see mpy_types.py's Scalar) has no monomorphization
-			# support at all - .names/.resolve stay raw passthroughs to the
-			# abstract base, same as always
-		return obj
+		# moved to TypeResolver.ensure_resolved (type_resolution.py) - kept
+		# here as a thin delegate since this file calls it ~15 times and the
+		# behavior (resolve now + unconditionally schedule + swap a
+		# Specialization for its monomorphized form) is still exactly what
+		# every one of those call sites needs. See TypeResolver's own
+		# docstring for why this can't wait for schedule()'s work queue.
+		return self._type_resolver.ensure_resolved( obj )
 
 	def _tagged_union_shape( self, t: Type|None ) -> tuple[TaggedUnion,list[Variable]]|None:
 		''' `t` may be a Specialization wrapping a generic @union (a concrete
@@ -2020,6 +2016,16 @@ class Lowering:
 			if base is None:
 				return None
 			self._ensure_resolved( base )
+			if isinstance( base, TaggedUnion ):
+				# a union member's own constructor (Foo.Bar, the synthesized
+				# @staticmethod - see union_storage.py's _build_member_
+				# constructor) lives in base.names, same as tag/data - but
+				# unlike an ordinary class's real methods (already in .names
+				# from discovery.py's own class-body parsing), nothing
+				# guarantees UnionStorage.get() has actually run yet by the
+				# time a namespace path reaches here (same ordering hazard
+				# _attr_lookup's own tag/data trigger defends against below)
+				self._union_storage.get( base )
 			names = getattr( base, 'names', None )
 			if not isinstance( names, dict ):
 				return None
@@ -2260,7 +2266,37 @@ class Lowering:
 		# (_expr_Attribute), or a generic field's expected type here would
 		# stay abstract (its own bare TypeVars) forever
 		fn_cls = self._current_fn.cls if self._current_fn is not None else None
-		if isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls:
+		if isinstance( target_cls, TaggedUnion ):
+			# a TaggedUnion's REAL storage shape is tag+data (synthesized by
+			# UnionStorage.get(), registered in .names) - .attributes is the
+			# LOGICAL member list (Ok/Err), a completely different thing
+			# (used for .leaves()/type-matching, never for real field
+			# layout). .__allocate__(tag=.., data=..) - the shape the
+			# synthesized per-member constructor's own body uses (see
+			# union_storage.py's _build_member_constructor) - must validate
+			# against tag/data, not the logical members
+			if isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls:
+				# target_cls itself is always the ABSTRACT union (see the
+				# comment above on why bodies always reference it that way),
+				# so target_cls.names['data'].type would stay the ABSTRACT,
+				# unsubstituted payload_cls forever - substitute_field can't
+				# help here (a payload_cls is a plain CUnion, not a TypeVar/
+				# Specialization/anonymous-union shape it knows how to
+				# rebuild), so read tag/data from the MONOMORPHIZED copy
+				# instead (_ensure_resolved(fn_cls) is exactly monomorphize_
+				# class - see its own "fresh payload_cls per specialization"
+				# comment for why that copy's own data field is already
+				# correctly substituted)
+				concrete_union = self._ensure_resolved( fn_cls )
+				tag_field = concrete_union.names.get( 'tag' )
+				data_field = concrete_union.names.get( 'data' )
+			else:
+				tag_field = target_cls.names.get( 'tag' )
+				data_field = target_cls.names.get( 'data' )
+			assert isinstance( tag_field, Variable ) and isinstance( data_field, Variable ), \
+				f'{target_cls.qualname}: UnionStorage.get() has not run yet - no real tag/data storage to allocate'
+			declared = { tag_field.stem: tag_field, data_field.stem: data_field }
+		elif isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls:
 			declared = { attr.stem: self._substituted_field( attr, fn_cls ) for attr in target_cls.attributes }
 		else:
 			declared = { attr.stem: attr for attr in target_cls.attributes }
@@ -2603,76 +2639,6 @@ class Lowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest_var
 
-	def _try_lower_union_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
-		# TaggedUnionName.MemberName(value) - a compiler-synthesized
-		# pseudo-constructor, same spirit as .__allocate__()/bare
-		# ClassName(...): TaggedUnion members are plain Variables in
-		# .names (discovery.py parses `SharedReference: T` inside a @union
-		# body the same way it parses any CStruct/CUnion field), never real
-		# declared Functions, so this can never be found via the ordinary
-		# _resolve_callee/_attr_lookup_callable path either. Builds the
-		# `tag`/`data` storage from UnionStorage.get and emits two
-		# Allocates: the payload union (one field set - v_<member>), then
-		# the union instance itself (tag + data)
-		if not isinstance( node.func, ast.Attribute ):
-			return None
-		union = self._try_resolve_namespace( node.func.value )
-		if not isinstance( union, TaggedUnion ):
-			return None
-		self._ensure_resolved( union )
-		member = next( ( attr for attr in union.attributes if attr.stem == node.func.attr ), None )
-		if member is None:
-			return None # not a real member name - fall through, let the normal call path report whatever error fits (e.g. "not callable")
-		if len( node.args ) != 1 or node.keywords:
-			self.discovery.fail( f'{union.qualname}.{member.stem}(...) takes exactly one positional argument: {ast.unparse(node)}', node )
-		self._ensure_resolved( member )
-
-		tag_attr, data_attr, payload_cls, tags = self._union_storage.get( union )
-		member_type = member.type
-		# a GENERIC union's own payload_cls AND member types (from the
-		# abstract base above) carry bare TypeVar fields, never real
-		# emittable/lowerable types (see UnionStorage.get's own
-		# comment) - when expected_type pins this construction to a
-		# concrete specialization (Result[u32,OverflowError]), use THAT
-		# specialization's own substituted payload type AND member type
-		# instead, same shape monomorphize_class already builds (and
-		# memoizes) for the outer union itself. Without this, `Result.Ok(x)`
-		# lowers its own argument (x) against the abstract member's bare
-		# TypeVar as the expected_type, corrupting any Check-mode
-		# arithmetic inside it (e.g. `Result.Ok(y + 1)`) into a bogus
-		# Result[T,OverflowError] specialization built from the WRONG,
-		# unsubstituted T.
-		if isinstance( expected_type, Specialization ) and expected_type.base is union:
-			monomorphized = self.monomorphize_class( expected_type )
-			concrete_data = monomorphized.names.get( 'data' )
-			if isinstance( concrete_data, Variable ):
-				payload_cls = concrete_data.type
-			concrete_member = next( ( attr for attr in monomorphized.attributes if attr.stem == member.stem ), None )
-			if concrete_member is not None:
-				member_type = concrete_member.type
-		value = self._lower_expr( node.args[0], member_type )
-		# value.type, not member.type - see _lower_allocate_fields's identical comment:
-		# a generic union's member type (e.g. OwnershipError[T]'s `SharedReference:
-		# T`) stays an unsubstituted TypeVar when the union is referenced bare
-		# (sys.OwnershipError, not sys.OwnershipError[bytearray]) - value.type is
-		# always the operand's real, concrete type regardless
-		for instr in self._cfg.field_value( value.type, value, is_alias = self._is_aliasing_expr( node.args[0] )):
-			self._emit( instr )
-		payload_dest = self._new_temp( payload_cls )
-		self._emit( ir.Allocate( dest = payload_dest, cls = payload_cls, fields = { f'v_{member.stem}': value } ))
-
-		dest = self._new_temp( expected_type or union )
-		# dest.type can be a concrete Specialization (OwnershipError[bytearray],
-		# inferred from expected_type) even though `union` itself (this
-		# call's own bare UnionName.Member(...) reference) is always the
-		# abstract base - same as _lower_allocate_fields's identical
-		# comment/fix: nothing else would ever schedule it (a bare
-		# `return MyUnion.A(5)` with no intervening annotated local doesn't
-		# go through _stmt_AnnAssign's own self.schedule(var_type) either)
-		self.schedule( dest.type )
-		self._emit( ir.Allocate( dest = dest, cls = union, fields = { tag_attr.stem: ir.Const( type = tag_attr.type, value = tags[member.stem] ), data_attr.stem: payload_dest } ))
-		return dest
-
 	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
 		# ScalarName(x) - Python's own int(x)/float(x)-style constructor-as-
 		# cast idiom. Deliberately NOT routed through _try_lower_construct_call
@@ -2953,7 +2919,6 @@ class Lowering:
 		construction_recognizers = (
 			self._try_lower_allocate_call,
 			self._try_lower_construct_call,
-			self._try_lower_union_construct_call,
 			self._try_lower_scalar_construct_call,
 		)
 		for recognizer in construction_recognizers:
