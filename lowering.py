@@ -1625,7 +1625,12 @@ class Lowering:
 			# back to the flat GetItem opcode, unconditionally
 			if expected_type is None:
 				self.discovery.fail( f'cannot infer the result type of {ast.unparse(node)} - no expected type available from context', node )
-			index = self._lower_expr( node.slice, None )
+			# pointer subscript indices are always usize (pointer arithmetic
+			# is defined in terms of the pointer's own element size, not the
+			# index's runtime width) — give the index a concrete type so a
+			# bare literal 0 in e.g. `ptr[0]` doesn't fail type inference
+			index_type = self.discovery.get_intrinsics()['usize']
+			index = self._lower_expr( node.slice, index_type )
 			dest = self._new_temp( expected_type )
 			self._emit( ir.GetItem( dest = dest, obj = obj, index = index ))
 			return dest
