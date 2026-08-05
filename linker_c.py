@@ -29,37 +29,29 @@ class CcTool:
 		self.name = name
 		self.path = path
 
-	def compile( self, src: Path, obj: Path ) -> subprocess.CompletedProcess[bytes]:
+	def compile( self, src: Path, obj: Path, verbose: bool = False ) -> subprocess.CompletedProcess[bytes]:
 		''' compile a single .c file to a .o object file '''
 		if self.name == 'cl':
-			return subprocess.run(
-				[ self.path, '/nologo', '/std:c11',
-					'/experimental:c11atomics', # needed for C11 atomics support
-					'/W4', '-c', str( src ), '/Fo:', str( obj ) ],
-				capture_output = True, text = True,
-			)
+			cmd = [ self.path, '/nologo', '/std:c11',
+				'/experimental:c11atomics',
+				'/W4', '-c', str( src ), '/Fo:', str( obj ) ]
 		else:
-			return subprocess.run(
-				[ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ],
-				capture_output = True, text = True,
-			)
+			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
+		if verbose:
+			print( ' '.join( cmd ), file = sys.stderr )
+		return subprocess.run( cmd, capture_output = True, text = True )
 
-	def link( self, exe: Path, objs: list[Path] ) -> subprocess.CompletedProcess[bytes]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False ) -> subprocess.CompletedProcess[bytes]:
 		''' link one or more .o files into an executable '''
+		obj_args = [ str( o ) for o in objs ]
+		extra = ldflags.split() if ldflags else []
 		if self.name == 'cl':
-			obj_args: list[str] = []
-			for o in objs:
-				obj_args.append( str( o ))
-			return subprocess.run(
-				[ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args,
-				capture_output = True, text = True,
-			)
+			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
 		else:
-			obj_args = [ str( o ) for o in objs ]
-			return subprocess.run(
-				[ self.path ] + obj_args + [ '-o', str( exe ) ],
-				capture_output = True, text = True,
-			)
+			cmd = [ self.path ] + extra + obj_args + [ '-o', str( exe ) ]
+		if verbose:
+			print( ' '.join( cmd ), file = sys.stderr )
+		return subprocess.run( cmd, capture_output = True, text = True )
 
 
 def detect_cc() -> CcTool|None:

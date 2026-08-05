@@ -42,6 +42,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'C compiler override (clang/gcc/msvc, overrides METALPY_CC)' )
 	p.add_argument( '--dep-report', action = 'store_true',
 		help = 'print every lowered FQDN after compilation' )
+	p.add_argument( '-v', action = 'store_true',
+		help = 'verbose print all compiler/linker commands as they run' )
 	p.add_argument( '-c', action = 'store_true',
 		help = 'emit C source only, do not compile or link' )
 	p.add_argument( '--keep-c', action = 'store_true',
@@ -165,7 +167,7 @@ def main() -> None:
 		obj_path = Path( tmp ) / 'generated.o'
 		src_path.write_text( c_source, encoding = 'utf-8' )
 
-		result = cc.compile( src_path, obj_path )
+		result = cc.compile( src_path, obj_path, verbose = args.d )
 		if result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
 			print( result.stderr, file = sys.stderr )
@@ -177,10 +179,21 @@ def main() -> None:
 
 		# --- link .o → executable ---
 		exe_path = args.output or args.source.with_suffix( '' ).resolve()
-		result = cc.link( exe_path, [ obj_path ] )
+		ldflags = args.ldflags
+		# kernel32 is universal on Windows — auto-link when targeting it
+		if active_target['os'] == 'windows' and 'kernel32' not in ldflags:
+			ldflags = ldflags + ' -lkernel32' if ldflags else '-lkernel32'
+		result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.d )
 		if result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
-			print( result.stderr, file = sys.stderr )
+			if result.stdout:
+				print( result.stdout, file = sys.stderr )
+			if result.stderr:
+				print( result.stderr, file = sys.stderr )
+			if args.keep_c:
+				c_path = args.output or args.source.with_suffix( '.c' )
+				src_path.rename( c_path )
+				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
 
 		print( f'mpy: built {exe_path}' )
