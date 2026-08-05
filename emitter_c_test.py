@@ -1,7 +1,9 @@
 # stdlib imports:
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -482,21 +484,51 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 		self.assertIn( ').tag;', src ) # the match's case Foo.Bar(...) tag read, compared against the ordinal separately
 		self.assertIn( '== (0)', src )
 
-CLANG = shutil.which( 'clang' ) or r'C:\Program Files\LLVM\bin\clang.exe'
+METALPY_CC = os.environ.get( 'METALPY_CC', '' ).strip().lower()
+_CC: str|None = None
+if not _CC and METALPY_CC in ( 'clang', '' ):
+	_CC = shutil.which( 'clang' )
+if not _CC and METALPY_CC in ( 'gcc', '' ):
+	_CC = shutil.which( 'gcc' )
+if not _CC and METALPY_CC in ( 'msvc', '' ):
+	if os.environ.get( 'VCINSTALLDIR', None ):
+		_CC = 'cl'
+	else:
+		print( 'WARNING - vcvars64 not run - trying to auto-detect it (this is slow)', file = sys.stderr )
+		vswhere = Path( r'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' )
+		if vswhere.is_file():
+			args = [ str( vswhere ), '-latest', '-products', '*', '-all', '-find', r'VC\Auxiliary\Build\vcvars64.bat' ]
+			result = subprocess.run( args, capture_output = True, text = True )
+			vcvars64 = result.stdout.strip()
+			print( f'vcvars64 path={vcvars64}' )
+			output = subprocess.check_output( f'"{vcvars64}" && set', shell = True, text = True )
+			for line in output.splitlines():
+				if '=' in line:
+					k, _, v = line.partition( '=' )
+					os.environ[k] = v
+			_CC = 'cl'
 
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.obj'
+			obj_path = Path( tmp ) / 'generated.o'
 			src_path.write_text( c_source, encoding = 'utf-8' )
-			result = subprocess.run(
-				[ CLANG, '-std=c11', '-Wall', '-Wextra', '-c', str( src_path ), '-o', str( obj_path ) ],
-				capture_output = True, text = True,
-			)
-			self.assertEqual( result.returncode, 0, f'clang failed:\nstdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			if _CC == 'cl':
+				result = subprocess.run(
+					[ _CC, '/nologo', '/std:c11',
+						'/experimental:c11atomics', # needed for C11 atomics support
+						'/W4', '-c', str( src_path ), '/Fo:', str( obj_path ) ],
+					capture_output = True, text = True,
+				)
+			else:
+				result = subprocess.run(
+					[ _CC, '-std=c11', '-Wall', '-Wextra', '-c', str( src_path ), '-o', str( obj_path ) ],
+					capture_output = True, text = True,
+				)
+			self.assertEqual( result.returncode, 0, f'{_CC} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
 
-@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping real-compile verification' )
 class RealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 	def test_empty_main_compiles( self ) -> None:
 		self._run( '''
@@ -1130,7 +1162,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		destructor_src = emitter_c.emit_rcclass_destructor( box_cls )
 		self.assertIn( 'release_object( &((self->w).inner)->$header, __main__$Foo$$__destructor__ );', destructor_src )
 
-@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 	def test_del_method_compiles( self ) -> None:
 		self._run( _OWNER_FIXTURE + '\n' + '\n'.join([
@@ -1181,7 +1213,7 @@ class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
-@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 	def test_construct_read_back_and_refcount_compiles( self ) -> None:
 		# Phase 3 milestone: synthetic class Foo: x: i32 constructed, field
@@ -1312,7 +1344,7 @@ class StringLiteralTests( BuiltinsStrTestCase ):
 		src = emitter_c.emit_c( self.compiler )
 		self.assertEqual( src.count( 'static struct builtins$str __literal_' ), 1 )
 
-@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class StringLiteralRealCompileTests( _ClangCompileMixin, BuiltinsStrTestCase ):
 	def test_literal_passed_to_a_function_compiles( self ) -> None:
 		self._run( '\n'.join([
@@ -1402,7 +1434,7 @@ class EmitGlobalRCClassTests( RCClassTestCase ):
 		self.assertIn( 'static void __metalpy_init___main__$g_foo( void ) {', src )
 		self.assertIn( '__main__$g_foo = t0;', src )
 
-@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 	def test_trivial_global_compiles( self ) -> None:
 		self._run( '\n'.join([
@@ -1414,7 +1446,7 @@ class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
-@unittest.skipUnless( Path( CLANG ).exists(), 'clang.exe not found - skipping real-compile verification' )
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class EmitGlobalRCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 	def test_non_trivial_global_compiles( self ) -> None:
 		# Phase 7 milestone: both global-initializer shapes compile clean -
