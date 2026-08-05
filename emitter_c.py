@@ -346,12 +346,11 @@ def _function_prototype( function: Function ) -> str:
 	# symbol from the foreign library, not from this translation unit
 	if function.extern_lib is not None:
 		name = function.extern_symbol
-	else:
-		# @extern(lib, symbol) functions are declared with their raw C symbol
-	# name, not the metalpy-qualified name — the linker resolves the raw
-	# symbol from the foreign library, not from this translation unit
-	if function.extern_lib is not None:
-		name = function.extern_symbol
+		# generic @extern monomorphized to different pointer types
+		# share the same C symbol — use void* for all object pointers
+		# to avoid conflicting prototypes for the same symbol
+		if isinstance( ret, str ) and ret.endswith( '*' ):
+			ret = 'void*' if not ret.startswith( 'const' ) else 'const void*'
 	else:
 		name = mangle_qualname( function.qualname )
 	return f'{noreturn}{ret} {name}( {params_str} )'

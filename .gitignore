@@ -2,5 +2,7 @@
 __pycache__/
 *.pyc
 *.c
+*.o
+*.exe
 ast_explorer.py
 count_lines.py

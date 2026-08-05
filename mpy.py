@@ -178,11 +178,17 @@ def main() -> None:
 			sys.exit( 1 )
 
 		# --- link .o → executable ---
-		exe_path = args.output or args.source.with_suffix( '' ).resolve()
+		exe_path = (args.output or args.source.with_suffix( '' )).resolve()
+		if active_target['os'] == 'windows' and exe_path.suffix != '.exe':
+			exe_path = exe_path.with_suffix( exe_path.suffix + '.exe' )
 		ldflags = args.ldflags
-		# kernel32 is universal on Windows — auto-link when targeting it
-		if active_target['os'] == 'windows' and 'kernel32' not in ldflags:
-			ldflags = ldflags + ' -lkernel32' if ldflags else '-lkernel32'
+		# auto-link every @extern library that was actually lowered.
+		# 'c' means the platform C runtime, already linked implicitly.
+		for lib in sorted( compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if lib not in ldflags:
+				ldflags = ldflags + f' -l{lib}' if ldflags else f'-l{lib}'
 		result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v )
 		if result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
