@@ -7,15 +7,15 @@ can compile_time_transformer remove "unreachable through folding" code like this
 
 can compile_time_transformer detect that a variable is only set once?
 	if so, it can recognize it as a constant and fold on it
-	
+
 	def foo2() -> bool:
 		s = 'hello' # s never changes...
 		if s == 'hello':
 			return True
 		return False
-	
+
 	if `s == 'hello'` can get folded, this whole thing would fold down to:
-	
+
 	def foo2():
 		return True
 
@@ -29,10 +29,6 @@ test_binop_panic_arithmetic_context (lowering_test.py) has a disabled check:
 	Needs investigation into why 'str' isn't resolved along whatever path
 	panic_arithmetic's Unwrap pulls in sys.panic.
 
-lowering's _resolve_sys_function() feels like a design flaw.
-	can these dependencies be detected and automatically resolved by
-	resolver methods in discovery if possible?
-
 lowering's lower_function() and lower_global() have a large
 	amount of shared initialization that need to happen. This
 	shared initialization needs to be moved to a helper function
@@ -44,7 +40,7 @@ create local variables.
 sys._Stdout.write():
 	these are just stubs, but there are real issues here that need to be solved
 	before we can create the real File I/O interfaces for stdlib
-	
+
 	1) Windows returns an u32 for bytes written, crt an isize
 	2) Windows refers to GetLastError() for failures, Linux errno
 	3) the comment Claude generated for "writing >4GB in one syscall
@@ -57,9 +53,9 @@ sys._Stdout.write():
 	   if it may not be an efficient way to accomplish what they want.
 	   an unnecessary panic or silently doing the wrong thing, is just
 	   bad engineering.
-	
+
 	What is the right way to create a cross-os design?
-	
+
 	1a) Do we just return a heavy int object for bytes written?
 		I don't like requiring a memory allocation here
 	1b) Do we always return a u32 (since errors are handled separately)
@@ -73,19 +69,19 @@ sys._Stdout.write():
 			3a) a real problem with this is sometimes documentation lies
 				about what errors a function can generate.
 	4) how is it done elsewhere, how have others solved this problem?
-	
+
 	Python defines OSError as "Base class for I/O related errors"
 		FileNotFoundError is a subclass of OSError
-	
+
 	Maybe something like this to minimic Python as close as possible, mapping
 	the most common errors as named types:
-	
+
 	@compiler.target( os = 'windows' )
 	@enum( u32 )
 	class OSError:
 		FileNotFoundError = ?
 		Other = _
-	
+
 	@compiler.target( os = not 'windows' )
 	@enum( i32 )
 	class OSError:
@@ -95,111 +91,33 @@ sys._Stdout.write():
 lowering:
 	CFG:
 
-		v1 (cfg.py, a live state machine lowering.py calls into at the exact
-		points it already visits things - see declarative-greeting-parnas.md
-		and RC MANAGEMENT.md for the design) is implemented, including
-		struct/union field construction's Incref-on-alias handling, the
-		merge_if() double-decref fixes, the fall-off-the-end epilogue fix,
-		return rejected inside a defer/errdefer body (nonsensical there -
-		the body replays inline at the epilogue, not at its own position),
-		and the fresh-RC-value leak (fresh_temp()/delete_temp() now wired
-		in centrally: _emit() registers any Call/Allocate's dest as fresh,
-		_lower_stmt's own per-statement DeleteTemp loop decrefs whatever's
-		still registered when a temp's expression-scoped lifetime ends -
-		covers every Call/Allocate site at once rather than needing each
-		hunted down individually; field_value() also untracks a fresh
-		temp embedded into a field, mirroring assign()'s same discipline).
-		RCClass attribute lifetime / __init__ construction (see RCCLASS
-		ATTRIBUTE LIFETIME.md and the approved plan) is also implemented,
-		scoped to non-subclassed RCClasses:
-		- ClassName(...) for a class declaring __init__ now actually works
-			(previously always "not callable" - _try_lower_construct_call
-			just bailed). Allocates self uninitialized, calls __init__ with
-			its own parameter list (not the field=value sugar), wraps the
-			result in Result[Foo,E] when __init__ is fallible
-			(Result[None,E]), drops self's own refcount (not __del__) on
-			Err - matches SYNTAX.md's own spec exactly.
-		- each attribute is tracked via cfg.attr_assign() - a thin extension
-			of assign()'s own fresh/replace logic, keyed by a 'self.'-
-			prefixed name so it can never collide with a same-named local
-			parameter (def __init__(self, a): self.a = a). Unlike locals,
-			every attribute is tracked regardless of RC-ness (definite-
-			assignment matters even for a plain `a: int`), and
-			complete_construction() (called on every success-path return -
-			AST-shape Result.Ok(...)/Result.Err(...) recognition, same
-			spirit as defer/errdefer's own textual recognition, decides
-			success vs failure for a fallible __init__) requires every
-			attribute present, then cancels their entries WITHOUT decref
-			(ownership transfers into the now-complete self, mirroring
-			move()'s cancel mechanism) before the ordinary return_() unwind
-			runs. A fallible __init__'s Err path skips this - incomplete
-			state is expected there, and the ordinary unwind correctly
-			decrefs whichever attributes were actually set.
-		- self cannot be used as a Call receiver/argument, Assign src,
-			Return value, Allocate field value, or SetItem value until every
-			attribute is initialized (self.attr - GetAttr/SetAttr.obj - is
-			the one exception) - release builds don't zero memory (see
-			sys.alloc's debug-only zeroing), so a method reading an
-			uninitialized field would be genuine garbage, not just logically
-			wrong. Enforced centrally in _emit(), same technique as
-			fresh_temp()'s own registration.
-		- default attribute values (already-existing Variable.init, both
-			AnnAssign and bare Assign forms) get an unconditional prologue
-			assignment before __init__'s own body runs, lowered in the
-			class's own scope (self isn't in scope for a default
-			expression, matching Python's own class-body semantics) -
-			also fixed _lower_allocate_fields's own "missing field(s)"
-			check to fall back to a default there too, for the plain
-			__allocate__()/no-__init__ construction path.
-		- ordinary (non-__init__) SetAttr on an already-constructed
-			instance is "always a replace" (RCCLASS ATTRIBUTE LIFETIME.md) -
-			cfg.attr_replace(), reading the field's current value fresh via
-			GetAttr (field CONTENTS still aren't tracked across statements,
-			see below) since there's no tracked binding to consult. This is
-			the concrete resolution of the "SetAttr storing an RC value
-			into an existing field isn't tracked" half of the gap noted
-			below - SetItem and a struct's own teardown remain open.
-		- found and fixed a real, pre-existing, unrelated bug along the way
-			(confirmed via a clean-checkout repro): _lower_allocate_fields's
-			"every field required" check doesn't apply to a CUnion (only
-			ONE member is ever meaningfully set - ResultPayload(ok=val)
-			never gives err) - Result.Ok/Result.Err's own bodies had never
-			actually been exercised through a full Compiler.run() before,
-			so this went unnoticed until __init__'s own fallible-
-			construction path became the first thing to do so.
+		Explicitly out of scope so far (subclassing isn't a real feature yet
+		at all - RCClass.base is stored but _attr_lookup/_find_method never
+		walk it, super()/super.__init__() don't exist anywhere, attribute
+		visibility is enforced nowhere except one hardcoded __allocate__()
+		check): the Foo1/Foo2/Foo3 inheritance examples in RCCLASS ATTRIBUTE
+		LIFETIME.md, and __init__ on a @cstruct/@cunion/@enum (falls through
+		to the ordinary "not callable" error, same as always).
 
-		Explicitly out of scope for this pass (subclassing isn't a real
-		feature yet at all, independent of this - RCClass.base is stored
-		but _attr_lookup/_find_method never walk it, super()/
-		super.__init__() don't exist anywhere, attribute visibility is
-		enforced nowhere except one hardcoded __allocate__() check): the
-		Foo1/Foo2/Foo3 inheritance examples in RCCLASS ATTRIBUTE
-		LIFETIME.md, and __init__ on a @cstruct/@cunion/@enum (falls
-		through to the ordinary "not callable" error, same as always).
-
-		A real full-compile attempt (`bytearray(4)`) surfaced unrelated,
-		pre-existing gaps in lib/sys.py, deliberately not chased here -
-		see "@compiler.target(os=...)-decorated function selection isn't
-		implemented" further down.
-
-		Pending/known gaps only, below:
+		Pending/known gaps:
 
 		- defer/errdefer combined with ANY reference-counted local or
 			parameter (aside from a bare `return` inside the defer body
 			itself, now rejected) is rejected outright (CompileError) rather
 			than attempted - every explicit return in a defer-using function
 			funnels through ONE shared epilogue (existing _DeferBlock
-			machinery, untouched by this pass), so per-return-specific RC
-			decref content can't be correctly placed there without either the
-			full unified-stack-with-flags design from the plan (not built
-			this pass) or risking a decref of something not actually alive on
-			that particular path. No real lib/ code combines these today.
-		- struct/union FIELD ownership: [resolved] ordinary SetAttr on an
-			already-constructed instance is now a tracked replace (see
-			above) - still open: SetItem storing an RC value into an
-			existing container isn't tracked at all, and a struct/union's
-			own eventual teardown doesn't decref its owned RC fields (moot
-			for now - no emitter/codegen consumes Decref for real yet).
+			machinery), so per-return-specific RC decref content can't be
+			correctly placed there without either the full unified-stack-
+			with-flags design from the plan or risking a decref of something
+			not actually alive on that particular path. No real lib/ code
+			combines these today.
+		- struct/union FIELD ownership: ordinary SetAttr on an already-
+			constructed instance is a tracked replace, but SetItem storing an
+			RC value into an existing container isn't tracked at all, and a
+			struct/union's own eventual teardown doesn't decref its owned RC
+			fields when a field is merely overwritten mid-lifetime (as
+			opposed to the whole object being torn down, which the
+			destructor's own cascading-decref walk now handles).
 		- a non-None-returning function that falls off the end without an
 			explicit `return` on every path produces incomplete IR (missing
 			the final Return) - no "missing return statement" validation
@@ -226,9 +144,6 @@ lowering:
 		len(src) where src: move[bytearray] (Move has no .names at all - see
 		incref/decref/move[T] below) - confirmed still reproduces:
 		"Move(...) has no members, cannot look up '__len__'".
-		[resolved] len(arr) where arr: slice[T] - slice[T] now declares
-		__len__ directly (lib/builtins/__init__.py), not the .len() this
-		note originally described - confirmed compiles clean.
 	@inline decorator: a function marked @inline should compile down to its
 		body spliced directly at each call site (no real Call/FuncStart/
 		FuncEnd for it) - lib/builtins/__init__.py's len() is meant to become
@@ -247,27 +162,23 @@ lowering:
 		real ownership tracking, not as a standalone .leaves() override -
 		that would make ownership invisible to matching entirely (an owned
 		vs. borrowed overload pair would incorrectly collide as ambiguous)
-	
+
 	additional NoReturn semantics:
 		previously I stated NoReturn is just a None with a flag for the emitter.
 		I was incorrect.
-		
+
 		A return statement in a NoReturn function should be a compile error:
-		
+
 			def die() -> NoReturn
 				return
-		
+
 		Additionally, we need dead code detection. The following print statement
 		is unreachable because die() is NoReturn. It should be a compile error,
 		but I'm guessing this will be dependent on the CFG being implemented first:
-		
+
 			def foo() -> None:
 				die()
 				print( 'hello' )
-	
-	builtins.Result was written before @union was scoped, so it is implemented as
-		@cunion+@cstruct. Result needs to be simplified to a @union so ResultPayload
-		can be eliminated.
 
 	generic TaggedUnion member substitution: lowering.py's _attr_lookup now
 		substitutes a field's declared type through a Specialization's args
@@ -295,11 +206,7 @@ lowering:
 		move[bytearray] doesn't resolve), so this doesn't block anything
 		that would otherwise compile yet
 
-	if statements
-	for x in range( ... ):
-	while statements
-	break/continue
-	defer/errdefer handling
+		defer/errdefer handling
 		defer/errdefer inside a loop requires a list to register every hit
 		new syntax to bind variables in a loop:
 			while True:
@@ -307,245 +214,7 @@ lowering:
 				with defer( f ): # binds this specific f
 					f.close()
 		*NOTE* for now we are not supporting defer/errdefer in loops
-	match statement support
-	[resolved] compile time expression resolution / @compiler.target support
-		(see COMPILER-TARGET.md): compile_time_transformer.py (new file) is
-		an ast.NodeTransformer, run once per function body at discovery.py
-		resolve time (_make_function_resolver), that folds constant
-		BinOp/UnaryOp/BoolOp/Compare expressions (`1 + 1` -> `2`), generically
-		substitutes any `compiler.target.<key>` attribute chain from the same
-		active_target dict discovery.py's decorator filtering already uses
-		(not hardcoded to just `.os` - `.debug`/`.bits`/etc. all work too),
-		and simplifies `if`/`while` statements once their test becomes a
-		constant (`if True: A else: B` -> just A's statements spliced in,
-		`while False: ...` dropped entirely, `while True:` left as an
-		ordinary - correctly infinite - loop rather than synthesizing any
-		label/goto AST, since lowering.py's existing while-loop machinery
-		already handles a constant-true test fine). `@compiler.target(...)`
-		decorator filtering itself was ALREADY implemented for functions and
-		methods (long-standing, see CompilerTargetTests in discovery_test.py)
-		- the one real gap was classes: visit_ClassDef never checked for the
-		decorator at all, hitting "unsupported class decorator" - fixed to
-		mirror _parse_function's pattern (checked before dispatching to
-		@cstruct/@cunion/@enum/@union/plain-RCClass parsing).
-		Also fixed along the way: _target_value_matches only ever accepted
-		string constants, so `bits = 64` (int, matching SYNTAX.md's
-		BitsSpec) or `posix = True` (bool) never matched anything -
-		generalized to compare via `==` for any constant type.
-		_detect_active_target()'s bootstrap was also fixed: 'bits' is now
-		int 64 (was string '64'), 'family' is 'windows'/'unix' (was
-		'posix' - SYNTAX.md's FamilySpec is Literal['unix','windows','wasm'],
-		'posix' is its own separate bool field), and a 'debug' key (default
-		True) was added so lib/sys.py's and lib/builtins/__init__.py's
-		`if compiler.target.debug:` guards now fold/compile correctly.
-		`match compiler.target.bits: case 32: ... case 64: ... case _: ...`
-		now folds too (visit_Match + _match_pattern): a fully-constant
-		subject picks the first matching case (MatchValue/MatchSingleton/
-		MatchOr/MatchAs - bare name and `as` captures get a synthesized
-		`name = <value>` prologue assignment since the match statement
-		itself is gone), everything else is dropped. This is more than an
-		optimization here - lowering.py's own _stmt_Match doesn't implement
-		MatchValue/MatchSingleton/MatchOr at all (only MatchAs/MatchClass),
-		so folding is what makes matching against an int/bool/str literal
-		compile at all today. A non-constant subject, an unresolvable
-		guard, or a MatchClass/MatchSequence/MatchMapping/MatchStar pattern
-		anywhere leaves the whole match statement untouched (safe fallback
-		to the ordinary runtime match path).
-		Still out of scope: class-body/attribute-default-level folding
-		(only function bodies are transformed, per the doc's literal
-		wording).
-		Correction to a stale note that used to live here: "@compiler.target
-		(os=...)-decorated function selection isn't implemented" was
-		WRONG - re-verified live (see compile_time_transformer_test.py /
-		discovery_test.py's CompilerTargetTests) that discovery.py already
-		correctly schedules only the target-matching definition, for
-		functions, methods, AND (now) classes; only one of lib/sys.py's
-		memzero()/_alloc() windows-vs-non-windows bodies is ever lowered.
-		The bare `compiler.target.debug` if-condition part of that old note
-		WAS real and is now fixed by this pass (see also the separate
-		`is`/`is not` fix further down, resolving the other blocker this
-		same repro surfaced).
-	[resolved] lowering.py had no _stmt_ImportFrom/_stmt_Import handler at
-		all - any `from X import Y` (or bare `import X`) written inside a
-		function body (not just windows-specific FFI - lib/sys.py's
-		memzero()/_alloc()/etc. use this pattern for every platform) failed
-		with "unsupported statement", since discovery.py's own
-		visit_ImportFrom only ever runs at module/class scope (function
-		bodies are deliberately never walked by discovery.py's visitor -
-		see Lowering's own docstring). Fixed by adding the local-scope
-		mirror directly to lowering.py: resolves the target module via
-		self.discovery.import_name(...) (same logic as discovery.py's
-		visit_ImportFrom - relative-level handling included) and registers
-		the imported name into the current function's own scope via
-		fn.add_name(...), lazily (no eager resolve/schedule - same posture
-		as an unused local).
-		This surfaced the NEXT layer down: `@extern(...)` (lib/crt.py's and
-		lib/windows/{kernel32,ntdll}.py's FFI declaration decorator, e.g.
-		`@extern('c', 'malloc')`) wasn't recognized as a function decorator
-		anywhere in discovery.py at all - confirmed via the same
-		`bytearray(4)` repro ("unsupported function decorator @extern").
-		Had never been exercised by any test before, since nothing ever
-		actually imported crt.py/windows/*.py until the ImportFrom fix made
-		`from crt import ...`/`from windows.ntdll import ...` reach real
-		import_name() calls for the first time.
-	[resolved] @extern('lib', 'symbol') FFI declaration support: recognized
-		in discovery.py's _parse_function decorator loop (mpy_types.Function
-		gained extern_lib/extern_symbol fields), requiring exactly 2 string-
-		literal positional args and a stub body (`...` - reuses the existing
-		_is_stub_body check @overload stubs already use). 'lib' is the
-		.lib/.so name to link against, except the literal 'c' which means
-		the platform C runtime specifically - that distinction is left for
-		a future emitter/linker to act on, not parsed specially here.
-		lowering.py's lower_function short-circuits for an extern function
-		(no CFG/epilogue/locals machinery applies - there's no real body,
-		just the declared signature): emits a bare FuncStart(extern_lib=...,
-		extern_symbol=...)/FuncEnd pair, matching ir.FuncStart's two new
-		optional fields. Per explicit request, lowering an extern function
-		now also registers a dependency on its library: Compiler gained
-		extern_libs: dict[str,set[str]] (lib name -> symbols pulled from
-		it), populated in _lower's Function branch at the moment each
-		extern function is actually lowered (never-called externs, like
-		lib/windows/kernel32.py's DynamicTimeZoneInformation-only helpers,
-		correctly never register - same "only what's actually scheduled"
-		posture as everything else Compiler tracks).
-		Verified end to end: the `bytearray(4)` repro now successfully
-		resolves and lowers RtlZeroMemory/HeapAlloc/GetProcessHeap (real
-		FFI declarations in lib/windows/ntdll.py and kernel32.py) and
-		registers extern_libs = {'ntdll': {'RtlZeroMemory'}, 'kernel32':
-		{'HeapAlloc', 'GetProcessHeap'}}. That repro surfaced yet another,
-		unrelated layer (now also resolved, see below): lib/windows/
-		kernel32.py:1 declares `HANDLE: TypeAlias = Ptr[None]`.
-	[resolved] `X: TypeAlias = <type-expr>` support, implemented as a
-		compiler intrinsic: recognized purely by AST shape in
-		visit_AnnAssign (annotation is bare `ast.Name(id='TypeAlias')`) -
-		same posture as compiler.target/compiler.sizeof, no `from typing
-		import TypeAlias` needed (lib/windows/kernel32.py's real usage has
-		none). X becomes a genuine alias - the type-expression's own
-		resolved Type object, registered directly under X's name via
-		scope.add_name(...) - not a new nominal type and not a Variable.
-		Resolved eagerly, right there in visit_AnnAssign (unlike an
-		ordinary AnnAssign's deferred _make_annotation_resolver) - a
-		deliberate scope cut: no forward-referencing a class/alias
-		declared later in the same file. lib/windows/kernel32.py's real
-		case only references an always-available intrinsic (Ptr), so this
-		covers it; a fully general (deferred, forward-referencing) version
-		is future work if a real case ever needs one.
-		Verified end to end: the `bytearray(4)` repro then got down to ONE
-		remaining error - `is`/`is not` comparison operators (lib/sys.py:16's
-		`if ptr is None:`) - now also resolved, see below.
-	[resolved] `is`/`is not` comparison operators: _expr_Compare now handles
-		ast.Is/IsNot (previously deliberately unhandled - see the "incorrect
-		is usage" note above, which is a DIFFERENT, still-open issue: past
-		misuse of `is` for isinstance-style checks like `x is Foo`, which
-		still correctly fails today since a class name still isn't a valid
-		expression operand). For every value kind this language has today
-		(scalars, pointers, RC handles) identity coincides with value
-		equality, so plain `x is y` lowers as an ordinary Cmp EQ/NE - EXCEPT
-		comparing against a bare `None` literal when the other side's type
-		is a TaggedUnion (T|None, e.g. sys._alloc()'s Ptr[u8]|None): there,
-		`is None` means "the active member is NoneType", which needs a tag
-		check (the exact same _tagged_union_storage machinery match
-		statements/conditional dispatch already use - GetAttr the tag,
-		Cmp it against the NoneType member's tag value), not a flat Cmp
-		against a synthesized None operand of union type (which wouldn't
-		correspond to any real runtime representation - this was the
-		reason `is`/`is not` were left unimplemented in the first place).
-		Verified end to end: the `bytearray(4)` repro's `ptr is None` check
-		now lowers correctly and unblocks a lot more than that one line -
-		sys.panic()'s entire error-reporting path (previously unreachable)
-		now resolves and lowers too (_write_stderr_cstr, str.get_cstr,
-		str.byte_len, _exit_process, and their own windows/ntdll and
-		windows/kernel32 @extern dependencies). The repro then hit yet
-		another wall - `u32(-11)`-style scalar constructor calls ("cannot
-		call u32") - now resolved, see below.
-	[resolved] Scalar-to-Scalar casts (`u32(x)` construction-sugar,
-		`compiler.cast(T, x)`): rather than hard-coding conversion pairs as
-		bespoke dispatch in lowering.py, `Scalar` (mpy_types.py - i32/u32/
-		u8/usize/bool/etc, previously a bare dataclass) gained real method-
-		hosting (ScopeMixin + names: dict, same as RCClass/CStruct/...).
-		discovery.py's visit_Assign recognizes `SomeScalar.method = some_
-		function` as a compiler sigil (same posture as TypeAlias/compiler.
-		target - no new syntax, eager resolution), registering directly into
-		the shared intrinsic's own .names - this is the foundation for any
-		FUTURE non-Scalar cast source (a class defining its own __u32__),
-		not exercised by the two real call sites below.
-		The actual conversion logic lives in one place, _lower_scalar_cast,
-		shared by both `compiler.cast(T, x)` (a new intrinsic, same AST-
-		recognition posture as compiler.sizeof/compiler.refcount) and `T(x)`
-		construction-sugar (_try_lower_scalar_construct_call, a new sibling
-		to _try_lower_construct_call - NOT routed through it, since that
-		function's Allocate/self/RC-fallible-construction machinery is
-		meaningless for a scalar). Splits on literal-vs-not, the same axis
-		this codebase already treats as meaningful everywhere else: a
-		literal argument always succeeds via two's-complement bit-
-		reinterpretation (decided at compile time, no Result) - `u32(-11)`
-		reinterpreted as u32 is exactly the well-defined value real WinAPI
-		constants like STD_OUTPUT_HANDLE rely on. A non-literal argument
-		respects the EXISTING self._arithmetic_mode stack (new ir.CastWrap/
-		CastCheck/CastSaturate, mirroring NegWrap/NegCheck/NegSaturate
-		exactly, reusing _require_result_return/_consume_checked_result
-		unchanged) - default Check mode returns Result[T,OverflowError],
-		same as any other checked arithmetic. When the cast source's type
-		ISN'T a Scalar (a future RCClass), _try_lower_scalar_construct_call
-		falls back to dunder dispatch (operand.type's own __u32__, found via
-		the now-generically-duck-typed _find_method) - this is where the
-		Scalar.names foundation actually earns its keep, not for numeric-
-		to-numeric pairs where one compiler primitive already covers every
-		combination uniformly.
-		A second, more general bug surfaced and got fixed along the way:
-		compile_time_transformer folding was NEVER applied to a global
-		variable's or a class attribute's own initializer (only function
-		bodies, via _make_function_resolver) - so `STD_ERROR_HANDLE: u32 =
-		u32(-12)` (the actual real call site) never got `-12` folded from
-		UnaryOp(USub,Constant) into a bare Constant at all. Original fix
-		attempt was a workaround inside lowering.py's cast logic (re-fold
-		defensively, right where the literal check needed it) - correctly
-		flagged as inconsistent with fixing things at the right layer: the
-		real fix is compile_time_transformer.transform_expr (new, a single-
-		expression sibling of transform_function_body) wired into discovery.
-		py's visit_Assign/visit_AnnAssign directly, exactly mirroring how
-		function bodies already get folded. Benefits more than casts - ANY
-		compile-time-foldable global/attribute initializer (`X: i32 = 1+1`)
-		now folds too, and since visit_AnnAssign is shared by module globals
-		AND class-body attribute defaults, both get this for free.
-		Verified end to end: the `bytearray(4)` repro's "cannot call u32"
-		errors (lib/sys.py's _Stdout.write, lib/windows/kernel32.py's
-		STD_OUTPUT_HANDLE/STD_ERROR_HANDLE/etc, all real) are gone -
-		required adding `with compiler.wrap_arithmetic:` around _Stdout.
-		write's and _write_stderr_cstr's own WriteFile(...) calls (both
-		-> None, can't propagate Check mode's default Result), a small real
-		lib/sys.py source change. The repro now hits yet ANOTHER,
-		completely unrelated wall: `compiler.addrof(...)` was never
-		implemented anywhere in lowering.py at all ("'compiler' is not a
-		value, cannot use it as an expression") - this was always broken,
-		just never reached before (the same WriteFile(...) call's OWN
-		u32(length) argument used to fail first, aborting the statement
-		before compiler.addrof(written), a later argument in the same
-		call, was ever lowered). Now resolved, see below.
-	[resolved] `compiler.addrof(x) -> Ptr[T]` (SYNTAX.md's C `&x` escape
-		hatch, used for out-parameters like WriteFile's
-		lpNumberOfBytesWritten): recognized purely by AST shape in
-		lowering.py (same `compiler.<attr>(...)` posture as sizeof/
-		refcount/cast - no discovery.py involvement). New ir.AddrOf(dest,
-		value), mirroring ir.RefCount's exact shape. The one real
-		validation: the argument must be a bare `ast.Name`, not an
-		arbitrary expression - matches both SYNTAX.md's "local variable"
-		wording and C's own lvalue-only restriction on `&`; _expr_Name
-		already only ever resolves to a Variable (never a Temp), so this
-		is what actually enforces it (compiler.addrof(x.field) correctly
-		still fails, same message, since a field has no address to take
-		with no field-layout computation existing yet). dest's type is
-		Ptr[value.type], built via the same
-		discovery._get_or_create_specialization(...) helper Result[T,E]
-		checked-arithmetic types already use.
-		Verified end to end: the `bytearray(4)` repro now compiles
-		fully clean end to end via compiler.run() - zero errors, and
-		extern_libs now includes kernel32's WriteFile/GetStdHandle
-		(confirming _write_stderr_cstr's compiler.addrof(written) call
-		was actually reached and lowered), on top of the
-		RtlZeroMemory/RtlExitUserProcess/HeapAlloc/GetProcessHeap already
-		verified in earlier passes. This was the last known gap in that
-		repro.
+
 	compiler error if:
 		function parameter is a Move[T] but call-site doesn't specify move(x)
 			i.e. [Mm]ove must be declared on both sides so there's no confusion
@@ -608,7 +277,7 @@ lowering:
 				new_leaves = self.leaves.clone()
 				new_leaves.remove( type )
 				return UnionView( self.union, new_leaves )
-		
+
 		this structure will allow the CFG to track the currently understand type of a tagged union
 		as it passes through a match or ifelse tree
 
@@ -659,7 +328,7 @@ lowering:
 				if x is int and x < 4: # this is okay because in the 2nd half of the "and", x is UnionView( ..., leaves = [ int ])
 					...
 			'''
-			
+
 
 	opportunistic union emission
 		when a union is used, we need to generate IR to reach through it to the
@@ -676,7 +345,7 @@ lowering:
 			class IntStr:
 				v_int: int
 				v_str: str
-		
+
 		P.S. this is *not* a specification for how to name automatic unions in C, that is not
 			in scope for the lowering stage.
 		P.P.S. through the examples below, I use TAG_INT and TAG_STR, this is not a specification,
@@ -744,846 +413,62 @@ emitter:
 				(metalpy stdlib tries hard to avoid extern "c")
 		gcc on other
 
-	[resolved - phase 0 of C_EMITTER.md's design] emitter_c.py (new file):
-		phased implementation, plan at (session-local) declarative-greeting-
-		parnas.md - Phase 0 landed: mangle_qualname()/mangle_type() (name
-		mangling - dots -> $, generic Specialization brackets/commas ->
-		$$g$/$$/'', synthesized anonymous unions -> the doc's own $__u...
-		scheme, reverse-engineered precisely from its worked example - see
-		emitter_c.py's own docstring for why the doc's literal example is
-		stale on member ordering but the formula itself is verified
-		correct), c_type() (the full scalar/Ptr/ConstPtr/Move/Copy/RCClass/
-		CStruct/CUnion/TaggedUnion/CEnum -> C type-mapping table - i128/u128
-		map unconditionally to __int128/unsigned __int128 with no MSVC-
-		compatibility check, per explicit user decision - a program using
-		these against cl.exe fails to compile there on its own, same as any
-		other backend limitation), the 3-pass emission ordering skeleton,
-		and emit_function()/emit_c() covering just enough IR (FuncStart/
-		Return/FuncEnd) to compile an empty `main() -> None: pass`-shaped
-		program end-to-end through clang.exe (`-std=c11 -Wall -Wextra -c`,
-		confirmed zero errors/warnings).
-		Real, load-bearing discovery made during this phase (not just
-		scaffolding): discovery.py reserves the bare, unqualified name
-		'main' exclusively for the program's entry point ("there can be
-		only one" - discovery.py:994-995), regardless of which module
-		declares it - confirmed by a real compile attempt (my first
-		assumption, that main() gets an ordinary module-qualified qualname
-		like every other function, was wrong and caused a real clang error:
-		"'main' must return 'int'" when the emitted C tried to declare it
-		`void`). This means metalpy's main() is meant to become C's own
-		real `int main(void)` entry point DIRECTLY - no trampoline needed.
-		emit_function() special-cases this: the entry point's C signature
-		is always `int main(void)` regardless of its declared metalpy
-		return type (-> None), and a bare `return;`/fall-through becomes
-		`return 0;`. Every other function keeps its ordinary declared
-		return type and module-qualified, mangled name.
-		Next: Phase 1 (scalars, control flow, arithmetic incl. Result-
-		consuming ops, plain calls) - see the plan file for the full
-		phase breakdown and the remaining phases (RCClass/sys.alloc[T]
-		construction, __del__ synthesis, TaggedUnion, @extern/AddrOf/
-		string literals, module globals).
+	Known, deliberately-deferred gaps in emitter_c.py (the C11 emitter,
+		phases 0-7, is otherwise complete - covers scalars/control-flow/
+		arithmetic/calls/Result, CStruct/CUnion/CEnum/Ptr, RCClass layout +
+		sys.alloc[T] construction + Incref/Decref/RefCount, __del__/
+		destructor synthesis (including cascading decref through by-value
+		CStruct fields and TaggedUnion-typed fields with RC leaves),
+		TaggedUnion (real+synthesized) + NoneType-as-member, @extern/AddrOf +
+		string/bytes literal static-baking, and module globals):
 
-	[resolved] Phase 1: DeclareTemp/DeleteTemp/Assign (incl. inline
-		local-variable declaration - locals have no DeclareTemp-style IR of
-		their own, unlike temps; the emitter declares one at each local's
-		first Assign), the full BinOp/UnaryOp arithmetic families (Wrap via
-		the signed->unsigned-cast->cast-back idiom, since C's signed
-		overflow is UB not wraparound; Check via __builtin_add/sub/mul_
-		overflow, Shl's own check/saturate via a shift-back comparison since
-		no __builtin_shl_overflow exists; Saturate via sign-based MIN/MAX
-		clamping - i128/u128 saturate unsupported, no INT128_MIN/MAX macro
-		exists), Cmp, Label/Jump family, free-function Call, generic GetAttr/
-		SetAttr (dot vs -> decided by isinstance(obj.type, RCClass), same
-		rule c_type() already uses), OrReturn/OrJump (real conditional C
-		synthesized per-instruction - these ARE the branch, not pre-branched
-		IR), Unwrap/UnwrapOr.
-		Real gap found + fixed along the way: compiler.py's _enqueue() never
-		schedules a ClassLike Specialization as its own compile unit (only
-		Function-based ones are) - Result[i32,OverflowError] never appears
-		in compiler.cstructs, only bare Result does, even though real IR
-		(AddCheck's own dest.type, ...) references it constantly. Added
-		_collect_specializations()/emit_specialization() to emitter_c.py -
-		walks the already-lowered IR/type graph, finds every concrete
-		Specialization-of-ClassLike, synthesizes its struct/union body by
-		substituting the generic's type_params with that Specialization's
-		args. Had a real, now-fixed bug: a generic class's OWN methods
-		routinely declare things like `-> Result[T,E]` referencing the
-		enclosing class's still-unbound type params (Result.Ok/.Err's own
-		return annotation) - discovery.py builds a REAL Specialization
-		object for this too, which is NOT a concrete instantiation; treating
-		it as one leaked an unresolved TypeVar into a real struct field.
-		Fixed via _is_concrete() (recursively rejects any Specialization
-		whose args still contain a TypeVar).
-		Per explicit user direction: ir.Unwrap's Err-branch panic call is
-		wired to the REAL sys.panic(message: str) -> NoReturn, not an
-		emitter-invented placeholder - the connection is made in lowering.py
-		(Lowering._resolve_sys_panic(), mirroring how Discovery.__init__
-		already force-imports 'builtins' regardless of user code), which
-		resolves+schedules the real Function and hands it to ir.Unwrap
-		directly via a new `panic: Function` field (same posture as
-		Call.target - a real object reference, not a name the emitter has
-		to know/invent). The emitter has zero special knowledge of "panic" -
-		it just calls whatever Function the IR handed it.
-		[resolved] generic CLASS methods are now monomorphized, same as
-		generic FREE functions already were. lowering.py previously only
-		monomorphized generic free functions on call (_monomorphized_
-		function/lower_function_specialization - sys.alloc[u8] etc.) - a
-		generic class's own methods (Result.Ok/.Err/.is_ok/.is_err) were
-		scheduled and lowered with their parameters/return_type still
-		literally holding the class's own unbound TypeVars (T, E), which
-		have no C representation at all. No existing test caught this
-		because the whole suite only ever asserted on IR *shape* (duck-
-		typed - doesn't care whether a type is concrete) until this emitter
-		work needed a REAL concrete C type out of a generic method's own
-		signature for the first time.
-		Fix, entirely in lowering.py/compiler.py (per explicit direction -
-		this doesn't belong in the emitter):
-		- _monomorphized_function (already existed, for free functions)
-			now also handles a Function whose OWN type_params is empty but
-			whose .cls IS generic (Result.Ok's genericity is inherited from
-			Result, not declared on Ok itself) - substitutes against
-			base.cls.type_params instead, and the monomorphized copy's own
-			.cls becomes the concrete class Specialization too (so e.g. an
-			instance method's self ends up typed Result[i32,E], not the
-			abstract Result).
-		- new _lower_class_generic_method_call, wired into _lower_call's
-			existing dispatch chain: if the receiver's own type already IS
-			a concrete Specialization of the method's class (some_result.
-			is_ok()), reuses it directly - no receiver (Result.Ok(y), a
-			static/classmethod reached via bare class name) infers the
-			class's type args the same way _lower_inferred_generic_call
-			already infers a free function's own params, PLUS unifies
-			expected_type against the method's still-abstract return type
-			FIRST (needed since E never appears in Ok's own parameter list
-			at all, and even T needs to be resolved before a bare literal
-			argument like Result.Ok(5) can be lowered - a raw TypeVar can't
-			serve as _expr_Constant's expected type).
-		- new Lowering.monomorphize_class: gives a concrete generic class
-			specialization (Result[i32,OverflowError]) its own real struct/
-			union layout (substituted .attributes, same _substitute_type_
-			params helper) - compiler.py's _enqueue now schedules a
-			ClassLike-based Specialization directly (mirroring the existing
-			Function-based branch, previously always decomposed into base+
-			args and never independently compiled) and _lower dispatches it
-			to monomorphize_class, landing the result straight in compiler.
-			cstructs/.cunions/.tagged_unions/.rcclasses - the emitter needs
-			zero specialization-discovery logic of its own now (an earlier,
-			wrong attempt at this lived in emitter_c.py itself - see git
-			history - moved here instead, per explicit correction).
-		- _lower_allocate_fields fixes (both real, both needed for
-			Result.Ok's own body - `Result.__allocate__(_payload=
-			ResultPayload(ok=val), ...)` - to lower correctly from inside a
-			monomorphized method): the private-__allocate__-access check
-			now compares against fn.cls's own .base when fn.cls is a
-			Specialization (previously a false-positive "is private" error,
-			identity-comparing a concrete Specialization against the shared
-			AST body's always-abstract class reference); declared field
-			types are now substituted against the ambient concrete class
-			specialization too (reusing the existing _substituted_field
-			helper - previously ResultPayload(ok=val)'s own inferred
-			payload-union specialization stayed abstract); and the
-			construction's own dest.type now gets an explicit schedule()
-			call (a concrete Specialization inferred purely from context,
-			e.g. ResultPayload[i32,OverflowError], that nothing else would
-			ever otherwise schedule).
-		- emitter_c.py: removed the (now entirely superseded)
-			_collect_specializations/emit_specialization machinery: added a
-			small topological sort over CStruct/CUnion/TaggedUnion bodies
-			(matched by qualname, not object identity - a field's own type
-			is a Specialization object, distinct from but qualname-equal to
-			the monomorphized ClassLike copy sitting in compiler.cunions/
-			etc.) so a struct/union embedded BY VALUE as another's field
-			(Result[i32,E] embeds ResultPayload[i32,E] by value) is always
-			fully defined first - RCClass fields never need this, always
-			pointers, forward-declared via an opaque tag instead (Phase 3);
-			also added minimal ir.Allocate support for CStruct/CUnion (a
-			C11 designated-initializer compound literal) - Result.Ok's own
-			real body needed it to compile.
-		Verified end to end: emitter_c_test.py's
-		test_default_check_mode_arithmetic_compiles (previously marked
-		@unittest.expectedFailure, now a real passing test) compiles
-		Result.Ok(y) - AddCheck, the synthesized Result[i32,OverflowError]/
-		ResultPayload[i32,OverflowError] structs, OrReturn, and Result.Ok's
-		own monomorphized body - through clang -std=c11 -Wall -Wextra -c
-		with zero errors/warnings. Full suite: 446 tests, 0 failures.
-
-	[resolved] Phase 2: CStruct/CUnion/CEnum, Ptr[T]/ConstPtr[T]. CStruct/
-		CUnion construction (ir.Allocate) and Ptr[T]/ConstPtr[T] c_type
-		mapping already existed from Phase 1's own work (Result.Ok's body
-		needed the former, the type table needed the latter) - added:
-		- emit_cenum(): a CEnum is NOT emitted as a real C `enum` (C's own
-			enum underlying type is implementation-defined/usually int-only,
-			but a CEnum's .value_type can be any scalar width - u32/i32 both
-			seen in real lib/ code) - instead a `typedef <value_ctype>
-			<mangled>;` plus one `static const <mangled> <mangled>$<Member> =
-			<value>;` per member, matching the plan's own type-mapping table.
-		- ir.GetItem/ir.SetItem: only ever reached for a raw pointer with no
-			real __getitem__ (lowering.py's _expr_Subscript flat-GetItem
-			fallback) - Ptr[T]/ConstPtr[T] are plain C pointers already, so
-			C's own [] operator applies directly, no special-casing needed.
-		- ir.AddrOf: `dest = &value;` - straightforward now that
-			compiler.addrof(x) itself was already implemented (session before
-			this one).
-		Real bug found + fixed along the way: emit_c()'s forward-declare pass
-		crashed on `cls.type_params` for every CEnum in compiler.cenums -
-		CEnum (mpy_types.py) has no type_params field at all (it's never
-		generic, unlike every other ClassLike kind) - this had simply never
-		fired before since nothing had ever scheduled a CEnum. Fixed by
-		dropping the (nonsensical for CEnum) check entirely.
-		Real, pre-existing lowering.py gap surfaced (not fixed here, out of
-		this phase's scope - same posture as the plan's own grounding facts
-		noting "CEnum never being referenced by real lowering.py output
-		today"): CEnum member VALUE expressions (Color.Red used as a real
-		runtime value, e.g. lib/builtins/__errors.py's `OSError.
-		FileNotFoundError`) don't lower at all - CEnum stores its members in
-		.members/.values (plain int dicts), never in .names as Variables, so
-		_attr_lookup's `isinstance(found, Variable)` check can never succeed
-		for one; _expr_Name would also reject the bare CEnum class name
-		itself (not a Variable). No compiler.reinterpret_cast[T](...)
-		intrinsic exists yet either (referenced in lib/builtins/__dict.py's
-		source but never implemented in lowering.py), which would have been
-		the only other way to synthesize a real CEnum-typed value from
-		source today. emit_cenum() itself is still fully real, tested
-		directly against a hand-built CEnum object (decision 1's per-unit
-		testing philosophy) and verified to compile clean through clang
-		standalone - the gap is entirely about producing a VALUE of that
-		type from metalpy source, not about the C declaration/definition
-		emit_cenum() itself produces.
-		Verified end to end (emitter_c_test.py's RealCompileTests): a
-		synthetic @cstruct Point constructed via a staticmethod factory +
-		field read-back (GetAttr x2), AddrOf + SetItem + GetItem against a
-		Ptr[u8], and emit_cenum()'s own typedef+consts output (wrapped in a
-		minimal harness, since no real program can produce a CEnum value
-		yet) all compile clean through clang -std=c11 -Wall -Wextra -c.
-		Full suite: 453 tests, 0 failures.
-
-	[resolved] Phase 3: RCClass layout, sys.alloc[T] construction, Incref/
-		Decref/RefCount, attribute access. GetAttr/SetAttr for RCClass
-		already worked (isinstance(obj.type, RCClass) already picked '->'
-		since Phase 1 - the same rule c_type() uses). Added:
-		- emit_rcclass(): ObjectHeader is the automatic first member of
-			every RCClass C struct (explicit user decision - see the plan's
-			Context section), followed by the class's own fields, walking
-			the base chain first (base fields before derived - .attributes
-			only ever holds a class's OWN declared fields, discovery.py
-			never merges a base's own attributes in).
-		- ir.Allocate for RCClass: calls the mangled sys.alloc[dest.type]
-			C function (built from the same qualname formula discovery.
-			_get_or_create_specialization uses - no lookup needed, just the
-			string), sets ->header.ref_count = 1 (fresh allocation is
-			immediately owned by dest - starting at 0 would underflow the
-			first Decref), then field-assigns via ->.
-		- ir.Incref/ir.Decref: retain_object/release_object. Decref passes
-			a NULL destructor for now - not leak-free by design yet (Phase 4
-			wires in the real one).
-		- ir.RefCount: reads ->header.ref_count directly (C11 atomics
-			support a plain read as an implicit atomic_load).
-		- ir.SizeOf (new IR instruction, ir.py): compiler.sizeof(T) for a
-			real class-like T can't fold to a Python int the way an
-			intrinsic scalar's size does (no field-layout algorithm exists
-			in this compiler, nor should one - that's the C compiler's own
-			job) - stays a real instruction, letting the emitter defer to a
-			literal C `sizeof(...)` expression.
-		Real bug found + fixed along the way: c_type()'s Ptr[T]/ConstPtr[T]
-			mapping recursed through c_type() itself for T's inner spelling,
-			which auto-promotes a bare RCClass to a pointer (struct Foo*) -
-			so Ptr[Foo] was incorrectly mapping to `struct Foo**` (double
-			pointer) instead of `struct Foo*`. Invisible before this phase
-			(nothing had ever mapped Ptr[RCClass] through c_type() before -
-			sys.alloc[T]'s own real return type is exactly this case).
-			Fixed via a new _value_spelling() helper (T's own bare value
-			representation - struct Foo even for an RCClass, not struct
-			Foo* - used by both Ptr[T]'s inner type and ir.SizeOf), which
-			also means sys.alloc[Foo]'s real C return type (struct Foo*) is
-			now representationally IDENTICAL to Foo's own c_type() spelling -
-			no cast needed at the ir.Allocate call site, exactly as the plan
-			intended ("reinterprets the returned cls* ... no real cast").
-		Prerequisites (lowering.py, their own reasoning before the emitter
-			work): _lower_compiler_sizeof extended to emit ir.SizeOf for a
-			real ClassLike T instead of failing ("not supported yet");
-			Lowering._resolve_sys_alloc() (mirrors _resolve_sys_panic) +
-			_lower_allocate_fields's RCClass branch now schedules
-			Specialization(sys.alloc, [dest.type]) - guarantees sys.alloc[
-			Foo] is a real, lowered compile unit by the time the emitter
-			needs to call it, same posture as the panic-wiring precedent
-			from Phase 1.
-		Verification note: routing RCClass construction through sys.alloc[T]
-			means sys.alloc's OWN body actually gets lowered end to end -
-			the REAL lib/sys.py's alloc[T] pulls in Windows/CRT externs,
-			sys.panic, and a synthesized Ptr[u8]|None TaggedUnion (Phase 5
-			work, not built yet), none of which this phase is testing, and
-			lib/sys.py is also under active, unrelated revision right now
-			(see the sys._Stdout.write() notes elsewhere in this file). Used
-			a small self-contained sys.py fixture instead (a temp-directory
-			Discovery search path, not the real lib/) - same posture as
-			every other fixture in this file (_RESULT_FIXTURE, _POINT_
-			FIXTURE), keeping this phase scoped to what it actually says:
-			the RCClass layout + sys.alloc[T] calling convention, not "make
-			the entire current real stdlib compile."
-		Verified end to end: a synthetic class Foo: x: i32 constructed via
-			a staticmethod factory (routed through the fixture's own
-			sys.alloc[Foo]), an aliasing assignment (Incref), field read-
-			back, compiler.refcount(), and the epilogue's own Decrefs (both
-			foo and bar going out of scope) - all compile clean through
-			clang -std=c11 -Wall -Wextra -c. Full suite: 457 tests, 0
-			failures.
-		Next: Phase 4 (__del__/destructor synthesis) - see the plan file.
-
-	[resolved] Phase 4: __del__/destructor synthesis. Pure emitter-side
-		synthesis - no compiler stage recognizes __del__ specially, and
-		there's no IR stream backing a synthesized destructor body (unlike
-		every other emit_* function in emitter_c.py, which translates a
-		real IR/Function/ClassLike object). For each non-generic RCClass in
-		compiler.rcclasses, emit_rcclass_destructor() builds a
-		`static void <mangled>$$__destructor__( void* obj )` function
-		(named with $$, not a single $ - a single $ is exactly what a real
-		user method named __destructor__ would ALSO mangle to; no real
-		dotted qualname ever produces two consecutive $ from a plain
-		non-generic suffix, so $$ is what actually guarantees no collision,
-		same spirit as $header): casts obj to the real struct pointer type,
-		calls the class's own __del__ FIRST if declared (as an ordinary
-		function call, not inlined - fields are still fully valid at this
-		point), THEN cascades a decref into every directly RC-typed field
-		(base fields before derived, referencing each field class's own
-		destructor by name), THEN calls sys.free on the object's own
-		backing memory. release_object's own call sites (ir.Decref) now
-		reference the value's real destructor instead of the Phase 3 NULL
-		placeholder. Destructor prototypes are forward-declared in pass 1
-		(referenced as a function-pointer VALUE, not just called - needs a
-		prototype in scope, unlike a struct tag); bodies land in pass 3
-		(need the struct's own full definition from pass 2 to dereference
-		self->field).
-		KNOWN GAP (documented, not chased this phase): a TaggedUnion-typed
-		field with RC leaves needs the same tag-gated shape cfg.py builds
-		at the IR level - skipped for now (TaggedUnion emission itself,
-		emit_tagged_union, is still Phase 5 work) - same "compiles clean,
-		not necessarily leak-free yet" posture Phase 3's own NULL-
-		destructor placeholder already established. Nested RC content
-		inside a by-value CStruct/CUnion field is similarly out of scope.
-		[resolved after Phase 7, before linking work - see that entry below]
-		Prerequisites (lowering.py):
-		- refactored _resolve_sys_panic/_resolve_sys_alloc (near-identical
-			implementations, flagged as a design flaw) into one shared
-			_resolve_sys_function(name) helper backed by a dict cache.
-		- _lower_allocate_fields's RCClass branch now ALSO schedules
-			sys.free and the class's own __del__ (if declared) at
-			CONSTRUCTION time, right next to the existing sys.alloc
-			scheduling - NOT merely whenever the class is referenced as a
-			type (tried that first: compiler.py's _lower, where an RCClass
-			becomes a compile unit, seemed like the natural single choke
-			point, but it fires for every bare type annotation too, even
-			one that's never actually constructed - a real test regression
-			surfaced this: scheduling sys.free's own transitive real-lib
-			dependencies (HeapFree/GetProcessHeap) for a `class int: pass`
-			fixture that's never instantiated inflated an unrelated
-			overload-dispatch test's expected function count from 2 to 5).
-			Construction-time scheduling avoids this: any RC-typed field's
-			value is only ever reachable by having been constructed (or
-			aliased from something constructed) somewhere in the program,
-			so cascading-decref's own destructor references are always
-			backed by a real, scheduled destructor by the time the emitter
-			needs them.
-		Verified end to end via clang -std=c11 -Wall -Wextra -c: a class
-			with a user __del__ freeing an owned Ptr[None] (proving __del__
-			runs before sys.free), and a class with an RC-typed field and
-			no user __del__ (proving cascading decref alone). Full suite:
-			462 tests, 0 failures.
-		Next: Phase 5 (TaggedUnion - real @union and synthesized,
-			NoneType-as-member) - see the plan file.
-
-	[resolved] Phase 5: TaggedUnion (real @union + synthesized),
-		NoneType-as-member. emit_tagged_union() builds the REAL storage
-		shape (tag: u8 + data: <payload CUnion>, synthesized lowering-side
-		by Lowering._tagged_union_storage, registered in union.names - NOT
-		union.attributes, which holds the LOGICAL members like Ok/Err for
-		type-matching only, never the actual layout). ir.Allocate/GetAttr/
-		SetAttr needed NO new emitter work at all - both were already
-		generic enough (c_type's existing "outer TaggedUnion -> struct
-		<mangled>" mapping + the plain designated-initializer Allocate path
-		already covered TaggedUnion the same as CStruct/CUnion; match/tag-
-		check lowering already reduces to Phase 1's own Cmp/Jump*/Label, no
-		new control-flow ops needed either). _emit_value_type_bodies's
-		topo-sort updated to walk a TaggedUnion's synthesized `data` field
-		(the payload CUnion, embedded by value) as its real dependency,
-		instead of .attributes (which was never the right thing to walk
-		for a TaggedUnion in the first place - the logical members aren't
-		part of the actual struct layout at all).
-		Two real bugs found only once a SYNTHESIZED (anonymous) union
-			with a REAL member type was actually round-tripped through a
-			full compile (every union fixture up to this point was either
-			a real @union or trivially scalar-only):
-			1) Field names weren't sanitized at all - a REAL union member
-				(Bar: i32) has a clean stem, but a SYNTHESIZED union
-				member's Variable.stem is the member's own full type
-				qualname (discovery.py's _get_or_create_union sets
-				stem=t.stem, i.e. 'intrinsics.Ptr[intrinsics.u8]' for a
-				Ptr[u8] member - there's no source identifier to have),
-				so the payload CUnion's own f'v_{attr.stem}' field name
-				came out containing '.'/'['/']' - invalid C syntax. Fixed
-				with a new _field_name() helper (mangle_qualname applied
-				uniformly to every field/attr name this module emits -
-				GetAttr/SetAttr/Allocate.fields keys/struct-body field
-				names) - a no-op for any real identifier, so nothing
-				else's output changed.
-			2) mangle_type()'s fallback path (plain mangle_qualname) left
-				a literal '|' in a synthesized payload CUnion's own
-				mangled name, since Lowering._tagged_union_storage builds
-				payload_cls.qualname as f'{union.qualname}$data', directly
-				embedding the outer union's raw '|'-joined qualname - '|'
-				isn't in mangle_qualname's replacement table (nothing
-				before this ever mangled a Type whose qualname contained
-				one). Fixed by extending mangle_type() to recognize a
-				CUnion with file=None (the same synthesized-vs-real signal
-				already used for the outer TaggedUnion - a real @union's
-				own payload always inherits a real file/line) and
-				reconstruct the identical $__u... scheme directly from the
-				payload's own .attributes (v_<member> fields, same order/
-				types as the outer union's own .attributes) rather than
-				needing a reference to the outer union object at all.
-		Also added the NoneType-as-union-member 1-byte placeholder
-			(_NONE_PLACEHOLDER_TYPEDEF = 'typedef unsigned char
-			MetalpyNone;', emitted once per translation unit, NOT folded
-			into C_EMITTER.md's own verbatim PROLOGUE) - c_type(NoneType)
-			stays 'void' everywhere else (a legitimate return-type/pointee
-			spelling), but 'void' is not a legal struct/union member type;
-			a new _field_type_spelling() helper is what a synthesized
-			union's data payload actually uses for its field types.
-		Prerequisites (lowering.py, found while building the milestone
-			tests, both missing self.schedule(...) calls of the same shape
-			the plan's own decision 6 already called out for payload_cls):
-			- _tagged_union_storage now schedules payload_cls itself (only
-				the outer TaggedUnion was ever scheduled before - a real
-				TaggedUnion could be scheduled/emitted while the CUnion its
-				own `data` field embeds BY VALUE never landed in
-				compiler.cunions at all).
-			- _try_lower_union_construct_call (UnionName.Member(value))
-				now schedules dest.type too - nothing else would, for the
-				exact same reason _lower_allocate_fields already documents
-				for its own identical fix (a bare `return MyUnion.A(5)`
-				with no intervening annotated local doesn't go through
-				_stmt_AnnAssign's own scheduling either).
-		Unrelated compatibility fix bundled in: the user's own concurrent
-			commit (ade3044, moving intrinsic byte-size knowledge from
-			lowering.py into discovery.py) made mpy_types.Scalar.sizeof a
-			required field: ir_test.py's/emitter_c_test.py's own _scalar()
-			test helpers (which build raw Scalar objects directly, not
-			through Discovery.get_intrinsics()) needed sizeof= added.
-		Verified end to end via clang -std=c11 -Wall -Wextra -c: a
-			synthetic @union construct/match round trip (Foo.Bar(5)
-			matched back out), and the real, load-bearing shape every
-			allocation in the language ultimately runs through - a
-			Ptr[u8]|None-returning function consumed via `if x is None:`
-			(mirroring lib/sys.py's own real _alloc, via a self-contained
-			extern fixture rather than the real, still-evolving lib/sys.py
-			- same posture as every other real-lib-shaped fixture in this
-			file). Full suite: 466 tests, 0 failures.
-		Next: Phase 6 (@extern, AddrOf, string/bytes literal static-baking)
-			- see the plan file.
-
-	[resolved] Phase 6: @extern/AddrOf verification + string/bytes literal
-		static-baking. @extern and AddrOf themselves needed no new code
-		(already real since Phases 1/2) - this phase's only genuinely new
-		emitter work was str/bytes literal support: a str/bytes value is
-		RCClass-typed like any other instance of those classes, but unlike
-		everything else this module bakes into C, no real IR builds it
-		(_expr_Constant folds it directly to ir.Const(type=<RCClass>,
-		value=...) at lowering time). Detected via the REAL qualname
-		('builtins.str'/'builtins.bytes'), baked as a static, immortal
-		object (header.ref_count = METALPY_IMMORTAL_REFCOUNT, matching
-		lib/builtins's own current __data/__byte_size (str) and __data/
-		__len (bytes) field layout - same posture as Result's own hand-
-		rolled ._tag/._payload names being hardcoded throughout lowering.py/
-		cfg.py already). A program-wide collection pass (_emit_string_
-		literals, walking every function's instructions via a new,
-		dataclasses.fields()-generic _iter_instruction_operands - NOT a
-		hand-picked field-name list, which would risk silently missing a
-		shape some instruction kind uses that another doesn't) finds and
-		dedupes every distinct (qualname, value) literal, since C requires
-		each static object defined exactly once; _emit_const itself stays
-		a PURE function by deriving the static object's own name
-		deterministically from a content hash rather than needing a mutable
-		registry threaded through every _emit_operand call site.
-		This phase's own milestone test (a synthetic WriteFile-shaped
-		fixture mirroring lib/sys.py's real _Stdout.write, without its
-		actively-evolving Result/OSError/module-global machinery) surfaced
-		FOUR more real, previously-latent gaps, none actually specific to
-		string literals - just never exercised by any earlier phase's own
-		fixtures:
-		1) compiler.py's bare RCClass/CStruct/CUnion/TaggedUnion branches
-			in _lower never resolved each attribute's own .type (only the
-			class's own top-level .resolve() - attribute types are lazily
-			resolved separately, same as everywhere else in this compiler).
-			Invisible before now because every earlier RCClass fixture was
-			always constructed via .__allocate__ somewhere, which resolves
-			attributes as a side effect (_lower_allocate_fields's own loop)
-			- str here is only ever referenced as a parameter type/literal,
-			never constructed. Fixed by adding the identical per-attribute
-			resolve loop already used by monomorphize_class (the
-			Specialization branch) to the four bare branches too.
-		2) A bare `struct Foo` tag mentioned for the very first time INSIDE
-			a function prototype's PARAMETER LIST gets C's own "function
-			prototype scope" (ISO C11 6.2.1p4) - a separate type from the
-			real file-scope struct Foo{...} defined later, even spelled
-			identically (confirmed via a real clang "conflicting types"
-			error). Every earlier RCClass milestone happened to dodge this
-			by only ever having a class appear in a RETURN type first
-			(outside the parameter list, doesn't trigger the rule) - dumb
-			luck, not a real guarantee. Fixed with an explicit bare
-			`struct Foo;` forward declaration at file scope for every
-			RCClass, before any prototype - exactly what the plan's own
-			original Phase 3 text called for and this session had
-			previously (wrongly) judged unnecessary.
-		3) Every RCClass landing in compiler.rcclasses got an unconditional
-			destructor + sys.free reference, even one that's NEVER actually
-			heap-constructed (only used as an immortal literal, or merely
-			referenced as a bare type annotation) - sys.free itself is only
-			ever scheduled at CONSTRUCTION time (Phase 4's own fix), so an
-			unconstructed class's destructor referenced an undeclared
-			sys$free, a real clang error. Fixed with _rcclass_was_constructed
-			(checks whether sys.alloc[cls] itself was ever scheduled+
-			lowered - the precise signal for "will this destructor's
-			function pointer ever actually be invoked," since
-			release_object skips an immortal object's destructor call
-			entirely) gating destructor emission entirely, rather than
-			trying to ALSO schedule sys.free/__del__ unconditionally
-			(tried that too - it's what actually caused Phase 4's own
-			construction-time-scheduling fix in the first place, so
-			reverting to unconditional scheduling here would have
-			reintroduced that exact regression for real-lib-shaped tests).
-		4) Two entire instruction kinds had NO emitter support at all,
-			discovered only because this phase's milestone was the FIRST
-			one to actually need them:
-			- ir.Call with a real receiver (obj.method(...), as opposed to
-				a static method like Foo.make(...)) - _emit_call_args
-				already correctly prepended the receiver as the first
-				argument, but _emit_instruction unconditionally raised
-				NotImplementedError the moment instr.receiver was set at
-				all, and separately, the empty-arg-list check driving
-				`f()` vs `f( args )` didn't account for a receiver-only
-				call (obj.method(), zero real arguments) either. Both
-				fixed - a method call is just an ordinary C function call
-				with self prepended, no dot-call syntax involved (this is
-				C, not C++).
-			- ir.CastWrap/CastCheck/CastSaturate (compiler.cast(...)/T(x)
-				sugar) were declared in ir.py back when Phase 1 emitter
-				work was still ongoing but never actually implemented in
-				emitter_c.py at all. CastWrap is a plain C cast (integer
-				conversion is already well-defined/wrap-semantics in C,
-				unlike arithmetic on signed types - no unsigned-roundtrip
-				trick needed here, unlike Wrap-mode +/-/*). CastCheck/
-				CastSaturate both need a genuine range check against the
-				target type's min/max, which (unlike arithmetic's
-				__builtin_*_overflow) has no builtin to reach for - done
-				by promoting the operand to __int128 for the comparison
-				(safe for every scalar width this compiler supports other
-				than i128/u128 themselves, which are excluded the same way
-				Saturate-mode arithmetic already excludes them - no
-				INT128_MIN/MAX macro exists), sidestepping the signed/
-				unsigned-pairing matrix a same-width comparison would
-				otherwise need (source and target can differ in both width
-				AND signedness, e.g. i32 -> u8 or u64 -> i16).
-		Verified end to end via clang -std=c11 -Wall -Wextra -c: a bare
-			string literal passed to a function; the combined WriteFile-
-			shaped milestone (extern + AddrOf out-param + a real method
-			call + a scalar cast + a string literal, all together); and
-			CastCheck/CastSaturate directly. Full suite: 471 tests, 0
-			failures.
-		Next: Phase 7 (remainder - confirm defer/errdefer + generics need
-			no new work; module globals) - see the plan file. This is the
-			FINAL phase.
-
-	[resolved] Phase 7 (FINAL): confirm defer/errdefer + generics need no
-		new emitter work; module globals. Confirmed via real clang compiles
-		(not just IR-shape assertions): defer/errdefer already fully
-		desugars to plain Label/Jump/JumpIfFalse by stage 2, and explicit
-		generic-call syntax (identity[i32](5)) needs no new emitter code -
-		decision 3's uniform mangling, exercised repeatedly since Phases
-		3/5, already covers it.
-		Real new work: emit_global(). Lowering.lower_global already
-			produces a real IR instruction sequence for a global's own
-			initializer (ending in an Assign of the fully-computed value
-			into the global itself) - "trivial" (a bare literal like
-			kernel32.py's own real STD_OUTPUT_HANDLE: u32 = u32(-11) -
-			a literal argument to a scalar cast always folds to a Const at
-			lowering time, no CastWrap instruction even gets emitted) means
-			that sequence collapses to nothing but the terminal Assign(Const),
-			emitted as a real C static initializer directly. Anything else
-			(sys.py's own real stdout: _Stdout = _Stdout(), a genuine
-			RCClass construction) flattens the WHOLE instruction sequence
-			into a private static void __metalpy_init_<mangled>(void)
-			function, reusing _emit_instruction exactly like an ordinary
-			function body does (function=None is safe - lower_global never
-			emits ir.Return/ir.OrReturn, the only two branches that read
-			it, since defer/errdefer/loops can't appear in a global
-			initializer at all). The global itself gets a {0} zero
-			initializer in the meantime - valid C11 for ANY type alike
-			(6.7.9p11's "optionally enclosed in braces" allowance for a
-			scalar initializer, not just aggregates) - matching the same
-			convention ir.Allocate's own empty-fields branch already uses.
-			Wiring the init function into a real process entry point is
-			out of scope (linking-adjacent, C_EMITTER.md excludes it) - it
-			just needs to exist and compile, exactly as the plan's own
-			milestone wording says.
-		One real, previously-latent bug found while building the errdefer
-			confirm-only test (not module-globals work, but surfaced by
-			the SAME "push a real fixture all the way through clang"
-			discipline this whole plan has used throughout): errdefer's
-			own internal is_err() check (_build_is_err_check, which builds
-			the DeclareTemp+Call directly rather than going through the
-			ordinary _lower_call dispatch, since is_err() is never actually
-			written in user source) never monomorphized is_err against the
-			concrete Result[T,E] specialization actually in play - unlike
-			Result.Ok/.Err/ordinary is_err() calls written by hand, which
-			all correctly go through _lower_class_generic_method_call. The
-			ABSTRACT (never-emitted) Result.is_err ended up as the call
-			target, whose synthesized `self` parameter type has no real C
-			struct body anywhere (only concrete specializations do) - a
-			genuine "incomplete type"/"conflicting types" clang error.
-			Fixed by replicating _lower_class_generic_method_call's own
-			"receiver already concrete" branch directly in
-			_build_is_err_check (resolve-only, not _ensure_resolved, which
-			would ALSO incidentally schedule the wrong, abstract function
-			as a side effect - confirmed by a first attempt that emitted
-			BOTH the abstract and the correctly-monomorphized version side
-			by side, a "conflicting types" error of its own).
-		Also removed _RESULT_FIXTURE's own redundant `class bool: pass` -
-			shadowed the real bool intrinic (Discovery.find_name already
-			falls back to mod.intrinsics with no local declaration needed
-			at all), causing errdefer's OWN internal defer-flag/is_err-
-			result plumbing (which needs the REAL intrinsic bool for CFG-
-			internal machinery) to inconsistently mix a real C bool with a
-			bogus RCClass-typed "bool" pulled in by the fixture's own
-			(unnecessary) declaration - invisible before now since no
-			earlier _RESULT_FIXTURE-based test exercised errdefer at all.
-		Verified end to end via clang -std=c11 -Wall -Wextra -c: both
-			global-initializer shapes (trivial constant, RCClass
-			construction), defer, errdefer, and an explicit generic call.
-			Full suite: 478 tests, 0 failures.
-		THE C-EMITTER PLAN IS NOW COMPLETE (Phases 0-7). emitter_c.py turns
-			a fully-lowered Compiler's output into real, clang-verified C11
-			source, covering: scalars/control-flow/arithmetic/calls/Result
-			(Phase 1), CStruct/CUnion/CEnum/Ptr (Phase 2), RCClass layout +
-			sys.alloc[T] construction + Incref/Decref/RefCount (Phase 3),
-			__del__/destructor synthesis (Phase 4), TaggedUnion real+
-			synthesized + NoneType-as-member (Phase 5), @extern/AddrOf +
-			string/bytes literal static-baking (Phase 6), and module
-			globals (Phase 7). Known, documented, deliberately out-of-scope
-			gaps remain (see each phase's own entry above): TaggedUnion-
-			typed fields with RC leaves in a destructor's cascading decref;
-			nested RC content inside a by-value CStruct/CUnion field;
-			linking (no init-function-into-entry-point wiring, no linker
-			pragmas for @extern's own libraries - explicitly out of scope
-			per C_EMITTER.md throughout). Real lib/ verification (actually
-			compiling lib/sys.py, lib/windows/kernel32.py, lib/builtins/
-			__init__.py, etc. as they exist today, rather than the self-
-			contained fixtures this whole plan deliberately used instead)
-			was never part of this plan's own scope and remains real,
-			separate future work whenever lib/'s own currently-evolving
-			pieces (sys._Stdout.write's OSError design, module-level
-			globals like `stdout`, etc.) settle.
-
-	[resolved] Before moving on to linking: closed the destructor's own
-		two documented cascading-decref gaps (TaggedUnion-typed fields with
-		RC leaves; nested RC content inside a by-value CStruct field).
-		emit_rcclass_destructor's per-field walk now delegates to a new
-		_emit_field_teardown(self_expr, field_type), recursive over
-		whatever value sits at self_expr:
-		- RCClass: a direct release_object call, same as before.
-		- CStruct: every field is ALWAYS live (no discriminant needed,
-			unlike a union) - safe to walk its own .attributes
-			unconditionally and recurse, however deeply nested (a CStruct
-			inside a CStruct inside a CStruct all cascade correctly).
-		- TaggedUnion: a tag-gated decref built directly from the field's
-			own .names['tag']/['data'] shape (the same one emit_tagged_union
-			itself reads) - one `if (tag == N)` branch per member that
-			itself needs teardown (found via the same recursion, so a
-			union member that's ITSELF a CStruct/nested-TaggedUnion with
-			RC content cascades correctly too), no branch at all for a
-			member with nothing to tear down.
-		- bare CUnion: still skipped, deliberately. A union with no paired
-			discriminant (unlike a TaggedUnion's own .tag, or Result's
-			hand-rolled _tag+_payload pairing) has NO way to know which
-			member is actually live - decref'ing every member
-			unconditionally would be actively WRONG (double-free /
-			decref-garbage on whichever member isn't actually set), not
-			just incomplete. There's no general, structural way to detect
-			a "this CUnion field is paired with that sibling tag field"
-			relationship the way Result's own shape is hand-recognized
-			throughout this codebase - a real design question for whoever
-			needs this case (e.g. a bare Result[SomeRCClass,E] embedded
-			BY VALUE as another RCClass's own field), not something to
-			guess an answer to here.
-		A new _type_needs_teardown(t) decides whether ANY of this applies
-			at all before recursing - generalizes cfg.py's own is_rc()/
-			rc_leaves() to ALSO look inside CStruct/TaggedUnion fields.
-			This does NOT change cfg.py's own ownership-tracking model for
-			LOCAL VARIABLES (cfg.py's own top-of-file comment is explicit
-			that v1 deliberately never reaches into struct/union fields
-			for that - a separate, still-open limitation of the broader
-			ownership-tracking design, out of scope here). The destructor's
-			own cascading walk is a different problem: it already visits
-			every field of the RCClass being torn down regardless, so
-			finding RC leaves nested inside a by-value field is no extra
-			structural work, just recursion - it doesn't require teaching
-			cfg.py anything new about how LOCAL bindings are tracked.
-		Verified end to end via clang -std=c11 -Wall -Wextra -c: a class
-			with a TaggedUnion-typed field holding an RC-leaf member
-			(alongside a non-RC member, proving the tag actually
-			discriminates - only the RC member gets a branch at all), a
-			class with a by-value CStruct field nested-containing an RC
-			field, and both together on the same class. Full suite: 481
-			tests, 0 failures.
-
-	[resolved] Result[T,E] redefined as a real @union, closing the "Result
-		needs to be simplified to a @union" note above (and Result's own
-		hand-rolled _payload/_tag shape, referenced by name throughout this
-		file, no longer exists). lib/builtins/__init__.py: replaced the old
-		`@cunion class ResultPayload[T,E]` + `@cstruct class Result[T,E]`
-		(hand-written Ok/Err staticmethods calling __allocate__) with a
-		plain `@union class Result[T,E]: Ok: T; Err: E`, plus is_ok/is_err/
-		or_return/unwrap/unwrap_or written as ordinary methods reading
-		self.tag/self.data.v_Ok/self.data.v_Err - Ok/Err construction and
-		match Result.Ok(...)/Err(...) patterns now go through the exact
-		same generic TaggedUnion machinery any other @union uses, no
-		special-casing left anywhere for Result's shape specifically. Only
-		.or_return() stays textually recognized (inherent - early-return-
-		from-caller can't be an ordinary compiled method body).
-		Two real, narrow gaps found and fixed along the way (a third,
-		unrelated one - overload resolution not substituting a generic
-		class's own type params when matching an @overload group's call
-		site, affecting Result.unwrap_or(default) on any concrete Result -
-		was found during verification and flagged as separate, deferred
-		work, not fixed here):
-		- lowering.py's _attr_lookup didn't trigger _tagged_union_storage
-			lazily for a bare self.tag/self.data read (e.g. from inside
-			Result.is_ok's own now-real body) - the work queue has no
-			ordering guarantee that something else already triggered the
-			synthesis first. Fixed by triggering it there too, the moment
-			it's actually needed.
-		- lowering.py's _match_pattern had a Result-only special-cased
-			branch (is_ok()/is_err() + ._payload.ok/.err) predating @union
-			being scoped - deleted; Result now falls through to the generic
-			TaggedUnion match branch like any other union.
-		- emitter_c.py hardcoded the literal C field names _tag/_payload.ok/
-			_payload.err in every Check-mode arithmetic/cast/div/mod/Unwrap/
-			UnwrapOr/OrReturn/OrJump emitter (everywhere a Result[T,E] value
-			is either built or consumed) - replaced with a new
-			_result_tag_data_names(result_spec) helper that reads the real,
-			synthesized tag/data field names dynamically instead.
-		- monomorphize_class (generic class specialization) didn't give a
-			TaggedUnion specialization (Result[i32,E], say) its OWN
-			substituted `data` field/payload_cls - it shared the ABSTRACT
-			base's own TypeVar-typed one (a plain replace() copies .names by
-			reference), which could then leak into compiler.cunions as a
-			real but ill-typed compile unit. Fixed: monomorphize_class now
-			builds a fresh, substituted payload_cls per specialization (own
-			qualname, scheduled explicitly, since nothing else would reach
-			it) and gives the specialization its own .names copy pointing
-			at it. _tagged_union_storage also stopped scheduling the
-			abstract, generic payload_cls at all (bare TypeVar fields, never
-			a real emittable type) - only a concrete specialization's own
-			substituted one is ever a real compile unit.
-		- lowering.py's _attr_lookup ALSO didn't substitute a TaggedUnion
-			specialization's own `data` field when read directly off a
-			concrete self (e.g. Result.unwrap's real `self.data.v_Ok`) -
-			Specialization.names passes through to the ABSTRACT base's
-			names, which only ever has the shared, unsubstituted payload_cls
-			monomorphize_class was just taught to stop leaking. Fixed by
-			delegating to monomorphize_class(owner_type) and reading its
-			substituted `data` field instead, whenever owner_type is a
-			concrete specialization.
-		- lowering.py's _try_lower_union_construct_call passed the
-			ABSTRACT member's own bare TypeVar as the expected_type when
-			lowering `UnionName.Member(<value>)`'s own value expression -
-			invisible for a plain value, but corrupting for a Check-mode
-			arithmetic expression nested directly inside it (`Result.Ok(y +
-			1)`: the arithmetic's own dest type got built from the
-			unsubstituted TypeVar, producing a bogus Result[T,OverflowError]
-			specialization). Fixed the same way as the `data` field above -
-			substitute the member's own type via monomorphize_class when
-			expected_type pins a concrete specialization.
-		- lowering.py's own _try_lower_construct_call (fallible __init__
-			chaining) hardcoded a synthesized `self._payload.err` AST
-			attribute access for the re-wrapped Err(...) case - updated to
-			`self.data.v_Err`, matching Result's new real shape.
-		Verified: full suite green (482 tests - 481 plus one new real-
-			compile regression test for the two monomorphize_class/
-			_attr_lookup/_try_lower_union_construct_call substitution gaps
-			above, using a second, Result-unrelated generic @union to prove
-			the fix generalizes). Also verified directly against the REAL
-			lib/builtins/__init__.py Result (not just the self-contained
-			test fixtures) via a real clang compile exercising construction,
-			is_ok/is_err, unwrap, or_return, and Check-mode arithmetic
-			across two different Result specializations together - compiles
-			clean. (A broader real lib/ end-to-end compile still hits
-			several unrelated, pre-existing gaps - a missing sys.alloc[T]
-			forward declaration, Result[_,ZeroDivisionError] not being
-			scheduled for panic-wrapped division, a missing argument in
-			lib/sys.py's WriteFile call - out of scope here, part of the
-			still-open "verify against the real lib/ tree end to end" item.)
-		Deferred, not part of this change: making it a compiler error to
-			put RC-class content in a bare @cunion (no discriminant of its
-			own - unsafe for the destructor to know which member is live).
-			Simpler now that ResultPayload no longer needs a name-based
-			exemption, but still real, separate future work.
-
-	[resolved] overload_resolution.py: an @overload group declared inside
-		a generic class (builtins.Result[T,E].unwrap_or's own `default: T`
-		stub, flagged during the Result-as-@union verification above) never
-		resolved through a concrete specialization - resolve_call is a
-		pure function of types with no substitution logic of its own (by
-		design - no Discovery/lowering.py reference anywhere in that
-		module), so candidate matching compared a call's real, concrete
-		argument type (i32) directly against the group's own abstract,
-		unsubstituted class TypeVar (T) and never matched ("no matching
-		overload", even though every ordinary, non-overloaded generic-class
-		method already substitutes correctly via _lower_class_generic_
-		method_call/_monomorphized_function).
-		Fixed in lowering.py's own _lower_call, at the Overload call site,
-			keeping overload_resolution.py itself untouched (still a pure
-			function of types): when the receiver's type already pins a
-			concrete specialization of the overload group's own class
-			(mirrors _lower_class_generic_method_call's identical check),
-			builds member-owned shallow copies of every stub/implementation
-			with ONLY .parameters substituted (all resolve_call's own
-			matching actually needs) and passes those in instead. Whatever
-			Function resolve_call decides on (via a stub's own .bound_to,
-			or a plain implementation reached directly) is mapped back to
-			the real, original Function afterward and monomorphized through
-			the same get_or_create_specialization + _monomorphized_function
-			pair the single-method path already uses - a substituted copy
-			is a throwaway matching aid only, never treated as if it were a
-			real, schedulable compile unit.
-		A prerequisite gap surfaced along the way: _substitute_type_params
-			didn't know how to substitute inside an ANONYMOUS union type
-			(T|None, synthesized by discovery.py's own _get_or_create_union
-			- distinct from a real, user-declared @union class, which stays
-			identity-based and is never rebuilt this way) - needed for
-			Result.unwrap_or's own declared `T|None` return type to
-			monomorphize correctly. Fixed by teaching it to substitute each
-			leaf and rebuild through the same canonicalizing constructor
-			(keyed off TaggedUnion.file is None, the one thing that
-			distinguishes an anonymous synthesized union from a real
-			declared class).
-		Verified: full suite green (484 tests). Real clang compile of a
-			second, Result-unrelated generic @union with an identical
-			@overload shape (both a minimal fixture and a RealCompileTests
-			entry) - compiles clean end to end. Result.unwrap_or itself
-			still doesn't compile end-to-end yet against a real i32
-			fallback argument - a SEPARATE, deeper, pre-existing gap where
-			a narrowing @overload stub's own declared return type (T) and
-			the underlying plain implementation actually called (whose real
-			declared return type is the wider T|None) disagree, and nothing
+		- bare CUnion (no paired discriminant, unlike a TaggedUnion's own
+			.tag or Result's hand-rolled tag+payload pairing) has no general,
+			structural way to know which member is live, so the destructor's
+			cascading-decref walk deliberately skips it rather than risking a
+			double-free/decref-garbage on a member that isn't actually set.
+			Real open design question for whoever needs RC-class content
+			inside a bare @cunion (e.g. a bare Result[SomeRCClass,E] embedded
+			BY VALUE as another RCClass's own field) - could also just become
+			a compiler error disallowing RC content in a bare @cunion with no
+			discriminant at all, simpler now that ResultPayload no longer
+			needs a name-based exemption.
+		- CEnum member VALUE expressions (Color.Red used as a real runtime
+			value, e.g. lib/builtins/__errors.py's `OSError.
+			FileNotFoundError`) don't lower at all - CEnum stores its members
+			in .members/.values (plain int dicts), never in .names as
+			Variables, so _attr_lookup's `isinstance(found, Variable)` check
+			can never succeed for one; _expr_Name would also reject the bare
+			CEnum class name itself. No compiler.reinterpret_cast[T](...)
+			intrinsic exists yet either (referenced in lib/builtins/__dict.py's
+			source but never implemented in lowering.py), which would be the
+			only other way to synthesize a real CEnum-typed value from source
+			today.
+		- linking is entirely out of scope so far: no wiring of a module's
+			__metalpy_init_<global> functions into the real process entry
+			point, no linker pragmas/flags for an @extern function's own
+			declared library.
+		- real lib/ end-to-end verification (actually compiling lib/sys.py,
+			lib/windows/kernel32.py, lib/builtins/__init__.py etc. as they
+			exist today, rather than the self-contained fixtures the emitter
+			test suite uses) is still open, blocked partly on lib/sys.py's
+			own still-evolving File I/O design (see sys._Stdout.write() notes
+			above) and partly on specific known gaps surfaced by real compile
+			attempts: a missing sys.alloc[T] forward declaration, Result[_,
+			ZeroDivisionError] not being scheduled for panic-wrapped division,
+			and a missing argument in lib/sys.py's WriteFile call.
+		- overload resolution: a narrowing @overload stub's own declared
+			return type (T) and the underlying plain implementation actually
+			called (whose real declared return type is the wider T|None, e.g.
+			builtins.Result[T,E].unwrap_or) can disagree, and nothing
 			reconciles a call site's own dest type against the real target's
-			return type in that case - confirmed unrelated to candidate
-			matching (reproduces with the stub/impl declaring the exact
-			same return type removed from the picture) and to the Result-
-			as-@union work (reproduces with a plain, non-Result generic
-			RCClass too, via a completely different, also pre-existing gap:
-			a generic class's own __init__ is never monomorphized when
-			reached through plain ClassName(...) construction inside a
-			helper function). Both left as separate, still-open follow-up
-			work, not fixed here.
+			return type in that case. Confirmed unrelated to candidate
+			matching itself (reproduces with the stub/impl declaring the
+			exact same return type removed from the picture).
+		- a generic class's own __init__ is never monomorphized when reached
+			through plain ClassName(...) construction inside a helper
+			function (confirmed via a non-Result generic RCClass repro,
+			separate from the overload-resolution gap above).
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
@@ -1653,32 +538,30 @@ list class
 		unsolved problem as incref/decref/move[T] above, not a one-off bug
 		in str.concat specifically
 
-	generic list[T] method calls (e.g. xs.append(...)) fail in emitter.py's
-		_transpile_call ("could not resolve receiver class 'list[i32]' for
-		.append(...)") - method resolution for a monomorphized generic
-		instantiation isn't wired up yet (surfaced 2026-07-28 while
-		stress-testing the STMT IR-op removal, unrelated to that change)
+	generic list[T] method calls (e.g. xs.append(...)) used to fail in the
+		old emitter.py's _transpile_call ("could not resolve receiver class
+		'list[i32]' for .append(...)") - that emitter no longer exists
+		(replaced by emitter_c.py), and generic-class-method monomorphization
+		has since been implemented for the new pipeline, but this specific
+		case (a monomorphized generic list[T] instantiation's own method
+		resolution) hasn't been re-verified against it yet - needs a real
+		compile-through-clang check before this can be considered fixed
 
 dict class
 	first-draft implementation, WIP
 
 int class
 	first-draft implementation
-	
+
 	from_str() needs to be replaced with @overload def __init__( s: str ) -> Result[int,IntError]
-	
+
 	clone() should probably be @private _clone()
 
-	clone() (line ~155) compares new_digits against an undefined name `empty` -
-		presumably meant a null-pointer check; never actually built/tested
-		before now (dead code path - surfaced 2026-07-28 while stress-testing
-		the STMT IR-op removal, unrelated to that change)
-	
 	to_i32() should probably be __i32__() to match python conversion method naming conventions
 		class i32:
 			def __init__( self, i: int ) -> Result[i32,IntError]: ...
 		then users can type things like: i32( foo ).or_return()
-		
+
 		this example is just explanatory since i32 is a compiler intrinsic, but as long as i32.__init__() knows to call object.__i32__() it should work fine
 
 implement str.format
@@ -1707,27 +590,27 @@ other issues:
 
 * python stores a string's length as a separate variable instead of calculating it on the fly
 	maybe we can cache the result so we only have to calculate it once?
-	
+
 	class str:
 		usize __len = UINT32_MAX
-		
+
 		def __len__( self ) -> usize:
 			if self.__len == u32.max:
 				self.__len = ...
 			return self.__len
-	
+
 	FYI for string constants in the executable, might as well store their length since they
 	can be calculated at compile time
 
 auto-global:
 	g: usize = 0
-	
+
 	def foo() -> None:
 		if g > 0: # this READ binds to the global variable
 			g -= 1 # compile error, trying to modify a auto-bound global variable (use the global keyword)
-	
+
 	If the user wants to do something like this, they must use the global keyword:
-	
+
 	def foo() -> None:
 		global g
 		if g > 0:
