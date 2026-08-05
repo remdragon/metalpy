@@ -113,13 +113,13 @@ def panic( message: str ) -> NoReturn:
 # private helper functions:
 
 @compiler.target( os = 'windows' )
-def _alloc( size: usize ) -> Ptr[u8]|None:
+def _alloc( size: usize ) -> Ptr[u8]:
 	from windows.kernel32 import HeapAlloc, GetProcessHeap
 	ptr = HeapAlloc( GetProcessHeap(), 0, size )
 	return ptr
 
 @compiler.target( os = not 'windows' )
-def _alloc( size: usize ) -> Ptr[u8]|None:
+def _alloc( size: usize ) -> Ptr[u8]:
 	from crt import malloc
 	ptr = malloc( size )
 	return ptr
@@ -136,9 +136,9 @@ def _exit_process( code: u32 ) -> None:
 
 @compiler.target( os = 'windows' )
 def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:
-	from windows.kernel32 import GetStdHandle, WriteFile, STD_ERROR_HANDLE
+	from windows.kernel32 import GetStdHandle, WriteFile, STD_ERROR_HANDLE, INVALID_HANDLE_VALUE
 	handle = GetStdHandle( STD_ERROR_HANDLE )
-	if handle != 0 and handle != -1:
+	if handle != INVALID_HANDLE_VALUE:
 		written: u32 = 0
 		# see _Stdout.write's identical comment - u32(length) is a real
 		# narrowing cast (usize -> u32); this function returns None, so it

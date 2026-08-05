@@ -361,7 +361,7 @@ def _emit_const( c: ir.Const ) -> str:
 	if isinstance( c.value, int ):
 		return str( c.value )
 	if c.value is None:
-		return '' # NoneType constant - only ever a placeholder operand (e.g. `is None` comparisons), never emitted as a standalone value
+		return '0' # NOTE: we would like to put 'nullptr' or 'NULL' here but its causing issues
 	if isinstance( c.value, ( str, bytes )):
 		# a str/bytes literal is RCClass-typed (_expr_Constant lowers it
 		# directly to ir.Const(type=<builtins.str-or-bytes RCClass>,

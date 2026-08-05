@@ -1,3 +1,12 @@
+Because of anonymous unions, Ptr|None isn't actually a nullable pointer, its a tagged
+union that is always a value. The previous metalpy compiler special-case a |None
+with only a single element, but that's an ugly rack requiring a lot of extra code
+to manage. To fix it for now, Ptr/ConstPtr aren't guaranteed to be non-null.
+
+I would like for emitter_c.py's _emit_const() to emit 'nullptr' or at least 'NULL'
+for `c.value is None`, but that is causing problems. Low priority, but it would
+be nice to fix this at some point.
+
 can compile_time_transformer remove "unreachable through folding" code like this:
 	def foo1() -> bool:
 		print( 'hello' )
