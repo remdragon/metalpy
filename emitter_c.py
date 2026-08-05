@@ -341,7 +341,19 @@ def _function_prototype( function: Function ) -> str:
 		ret = 'void'
 	else:
 		ret = c_type( function.return_type )
-	name = mangle_qualname( function.qualname )
+	# @extern(lib, symbol) functions are declared with their raw C symbol
+	# name, not the metalpy-qualified name — the linker resolves the raw
+	# symbol from the foreign library, not from this translation unit
+	if function.extern_lib is not None:
+		name = function.extern_symbol
+	else:
+		# @extern(lib, symbol) functions are declared with their raw C symbol
+	# name, not the metalpy-qualified name — the linker resolves the raw
+	# symbol from the foreign library, not from this translation unit
+	if function.extern_lib is not None:
+		name = function.extern_symbol
+	else:
+		name = mangle_qualname( function.qualname )
 	return f'{noreturn}{ret} {name}( {params_str} )'
 
 def _emit_operand( op: ir.Operand ) -> str:
@@ -737,7 +749,11 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# PARAMETER this way for the callee's own definition (there's no
 		# dot-call syntax here, this is C, not C++), and _emit_call_args
 		# already prepends instr.receiver the same way
-		target_name = mangle_qualname( instr.target.qualname )
+		# @extern functions are called by their raw C symbol name
+		if instr.target.extern_lib is not None:
+			target_name = instr.target.extern_symbol
+		else:
+			target_name = mangle_qualname( instr.target.qualname )
 		has_args = instr.receiver is not None or instr.args or instr.kwargs
 		call_expr = f'{target_name}( {", ".join(_emit_call_args(instr))} )' if has_args else f'{target_name}()'
 		if instr.dest is not None:
@@ -1361,7 +1377,9 @@ def emit_c( compiler: Compiler ) -> str:
 	for g in compiler.globals:
 		parts.append( emit_global( g ))
 	for lf in compiler.functions:
-		parts.append( emit_function( lf ))
+		# @extern functions have no body (only a ; declaration in pass 1)
+		if lf.function.extern_lib is None:
+			parts.append( emit_function( lf ))
 	for cls in compiler.rcclasses:
 		if not cls.type_params and _rcclass_was_constructed( cls, compiler ):
 			parts.append( emit_rcclass_destructor( cls ))

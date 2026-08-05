@@ -167,7 +167,7 @@ def main() -> None:
 		obj_path = Path( tmp ) / 'generated.o'
 		src_path.write_text( c_source, encoding = 'utf-8' )
 
-		result = cc.compile( src_path, obj_path, verbose = args.d )
+		result = cc.compile( src_path, obj_path, verbose = args.v )
 		if result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
 			print( result.stderr, file = sys.stderr )
@@ -183,7 +183,7 @@ def main() -> None:
 		# kernel32 is universal on Windows — auto-link when targeting it
 		if active_target['os'] == 'windows' and 'kernel32' not in ldflags:
 			ldflags = ldflags + ' -lkernel32' if ldflags else '-lkernel32'
-		result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.d )
+		result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v )
 		if result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
 			if result.stdout:
