@@ -10,6 +10,7 @@ import unittest
 # local imports:
 import ir
 import emitter_c
+import linker_c
 from compiler import Compiler
 from discovery import Discovery
 from mpy_types import (
@@ -484,29 +485,7 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 		self.assertIn( ').tag;', src ) # the match's case Foo.Bar(...) tag read, compared against the ordinal separately
 		self.assertIn( '== (0)', src )
 
-METALPY_CC = os.environ.get( 'METALPY_CC', '' ).strip().lower()
-_CC: str|None = None
-if not _CC and METALPY_CC in ( 'clang', '' ):
-	_CC = shutil.which( 'clang' )
-if not _CC and METALPY_CC in ( 'gcc', '' ):
-	_CC = shutil.which( 'gcc' )
-if not _CC and METALPY_CC in ( 'msvc', '' ):
-	if os.environ.get( 'VCINSTALLDIR', None ):
-		_CC = 'cl'
-	else:
-		print( 'WARNING - vcvars64 not run - trying to auto-detect it (this is slow)', file = sys.stderr )
-		vswhere = Path( r'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' )
-		if vswhere.is_file():
-			args = [ str( vswhere ), '-latest', '-products', '*', '-all', '-find', r'VC\Auxiliary\Build\vcvars64.bat' ]
-			result = subprocess.run( args, capture_output = True, text = True )
-			vcvars64 = result.stdout.strip()
-			print( f'vcvars64 path={vcvars64}' )
-			output = subprocess.check_output( f'"{vcvars64}" && set', shell = True, text = True )
-			for line in output.splitlines():
-				if '=' in line:
-					k, _, v = line.partition( '=' )
-					os.environ[k] = v
-			_CC = 'cl'
+_CC = linker_c.detect_cc()
 
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
@@ -514,19 +493,8 @@ class _ClangCompileMixin:
 			src_path = Path( tmp ) / 'generated.c'
 			obj_path = Path( tmp ) / 'generated.o'
 			src_path.write_text( c_source, encoding = 'utf-8' )
-			if _CC == 'cl':
-				result = subprocess.run(
-					[ _CC, '/nologo', '/std:c11',
-						'/experimental:c11atomics', # needed for C11 atomics support
-						'/W4', '-c', str( src_path ), '/Fo:', str( obj_path ) ],
-					capture_output = True, text = True,
-				)
-			else:
-				result = subprocess.run(
-					[ _CC, '-std=c11', '-Wall', '-Wextra', '-c', str( src_path ), '-o', str( obj_path ) ],
-					capture_output = True, text = True,
-				)
-			self.assertEqual( result.returncode, 0, f'{_CC} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			result = _CC.compile( src_path, obj_path )
+			self.assertEqual( result.returncode, 0, f'{_CC.name} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping real-compile verification' )
 class RealCompileTests( _ClangCompileMixin, CompilerTestCase ):
