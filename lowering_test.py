@@ -4141,6 +4141,34 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_cenum_construction_lowers_to_underlying_value( self ) -> None:
+		import platform
+		match platform.system():
+			case 'Windows':
+				oserror_type_stem = 'u32'
+			case 'Linux':
+				oserror_type_stem = 'i32'
+			case _:
+				assert False, f'unsupported {platform.system()=}'
+		code = '\n'.join([
+			'import builtins',
+			f'def main() -> {oserror_type_stem}:',
+			'\tx: builtins.OSError = builtins.OSError( 42 )',
+			'\treturn x',
+		])
+		oserror_type = self.discovery.get_intrinsics()[oserror_type_stem]
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( i ).__name__ for i in fn.instructions ]
+		self.assertIn( 'Assign', kinds )
+		# verify the assign carries the value 42, typed as the enum itself
+		assign = next( i for i in fn.instructions if isinstance( i, ir.Assign ))
+		self.assertIsInstance( assign.src, ir.Const )
+		self.assertEqual( assign.src.value, 42 )
+		from mpy_types import CEnum
+		self.assertIsInstance( assign.src.type, CEnum )
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

@@ -1553,6 +1553,18 @@ class Lowering:
 				value = obj.members.get( attr )
 				if value is not None:
 					return ir.Const( type = obj.value_type, value = value )
+			# scope-like terminal (Module, RCClass, etc.) — look up the
+			# final attribute as a value directly, without recursing into
+			# _lower_expr (which would fail for `sys` when the base is a
+			# Module, since a Module is not a value expression). Covers
+			# `sys.stdout`, `sys.free`, `builtins.int`, etc. — any
+			# module-level Variable/Function/RCClass reached by dotted name.
+			names = getattr( obj, 'names', None )
+			if isinstance( names, dict ):
+				name_obj = names.get( attr )
+				if isinstance( name_obj, Variable ):
+					self._ensure_resolved( name_obj )
+					return name_obj
 		obj = self._lower_expr( node.value, None )
 		attr_var = self._attr_lookup( obj.type, node.attr, node )
 		dest = self._new_temp( attr_var.type )
@@ -2397,6 +2409,20 @@ class Lowering:
 		# the approved plan. Scoped to non-subclassed RCClasses only,
 		# matching lower_function's own scope check for __init__ itself.
 		target_cls = self._try_resolve_namespace( node.func )
+
+		# CEnum construction: EnumName(value) is a plain cast to the
+		# enum's underlying type — no allocation, no refcounting, just
+		# reinterpret the raw integer as the enum type. e.g. OSError(ENOENT)
+		if isinstance( target_cls, CEnum ):
+			if len( node.args ) != 1 or node.keywords:
+				self.discovery.fail( f'{target_cls.qualname}(...) takes exactly one positional argument: {ast.unparse(node)}', node )
+			self._ensure_resolved( target_cls )
+			# lower the argument directly — no arithmetic-mode semantics
+			# needed here; a CEnum has exactly the same runtime
+			# representation as its underlying type, so OSError(42) is
+			# just the value 42 with the enum type
+			return self._lower_expr( node.args[0], target_cls )
+
 		if not isinstance( target_cls, ClassLike ):
 			return None
 		# resolve (populate .names/.attributes) WITHOUT scheduling yet - a

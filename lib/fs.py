@@ -80,7 +80,7 @@ def write_all(
 	offset: ConstPtr[u8] = buf
 	while remaining > 0:
 		n: usize = write_raw( fd, offset, remaining ).or_return()
-		offset = offset.add( n )
 		with compiler.wrap_arithmetic:
+			offset = offset + n
 			remaining -= n
 	return Result.Ok( None )
