@@ -187,7 +187,8 @@ class Discovery( ast.NodeVisitor ):
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None, package: str|None = None ) -> Module:
 		stem = filename.stem if filename else ''
-		qualname = ( f'{scope}.{stem}' if scope else stem )
+		# __init__.py defines the package's own namespace, not a sub-module
+		qualname = scope if stem == '__init__' else ( f'{scope}.{stem}' if scope else stem )
 		# looked up from self.modules, not a dedicated Discovery.builtins
 		# attribute - self.modules['builtins'] is registered (see below)
 		# before builtins' own body is scanned, so this is already there by
@@ -547,7 +548,13 @@ class Discovery( ast.NodeVisitor ):
 		module = node.module or ''
 		parts: list[str] = []
 		if node.level:
-			parts.extend( self.module_stack[-1].qualname.split( '.' )[:-node.level] )
+			qualname = self.module_stack[-1].qualname
+			# __init__.py's qualname is already the package name (see
+			# import_code), so a level=1 relative import from it means
+			# "within the same package", not "one level up from the
+			# package". Adjust: strip one fewer level when stem is __init__.
+			strip = node.level - ( 1 if self.module_stack[-1].stem == '__init__' else 0 )
+			parts.extend( qualname.split( '.' )[:-strip] if strip else qualname.split( '.' ))
 			if not parts:
 				self.fail( f'unable to relative import from here: {node=} {self.module_stack[-1].qualname=} {self.module_stack[-1].file=}', node )
 		if node.module:
