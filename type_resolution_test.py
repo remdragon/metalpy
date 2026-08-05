@@ -5,6 +5,7 @@ import unittest
 
 # local imports:
 from discovery import Discovery
+from mpy_types import CEnum
 from type_resolution import TypeResolver
 
 class TypeResolutionTests( unittest.TestCase ):
@@ -212,6 +213,24 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.resolver.resolve_function_body( fn )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'has no member', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_reference_resolves_and_schedules_the_enum( self ) -> None:
+		mod = self._import( '\n'.join([
+			'import compiler',
+			'@enum( u32 )',
+			'class MyError:',
+			'	FileNotFound = 2',
+			'	Other = _',
+			'',
+			'def main() -> u32:',
+			'	return MyError.FileNotFound',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# the CEnum must be fully resolved after resolve_function_body
+		myerr = next( u for u in self.resolver.queue.queue if isinstance( u, CEnum ) )
+		self.assertIsNone( myerr.resolve )
+		self.assertEqual( myerr.members, { 'FileNotFound': 2, 'Other': 3 } )
 
 	# --- idempotency --------------------------------------------------------
 

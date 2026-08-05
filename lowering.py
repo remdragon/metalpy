@@ -11,7 +11,7 @@ from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
-	Specialization, TaggedUnion, CStruct, CUnion, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
+	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
 from type_resolution import TypeResolver
@@ -1537,11 +1537,70 @@ class Lowering:
 		return ir.Const( type = expected_type, value = node.value )
 
 	def _expr_Attribute( self, node: ast.Attribute, expected_type: Type|None ) -> ir.Operand:
+		# CEnum member VALUE expressions (OSError.FileNotFoundError used as
+		# a runtime value) — the base is a class, not a runtime value, so
+		# the normal _lower_expr path would reject it. Walk the namespace
+		# chain through .names dicts (type_resolution.py already resolved
+		# and scheduled every link) and fold the member to an ir.Const.
+		chain = self.find_name_recursive( node )
+		if chain is not None:
+			obj, attr = chain
+			if isinstance( obj, CEnum ):
+				assert obj.resolve is None, (
+					f'CEnum {obj.qualname} reached lowering unresolved — '
+					f'type_resolution.py visit_Attribute should have resolved it'
+				)
+				value = obj.members.get( attr )
+				if value is not None:
+					return ir.Const( type = obj.value_type, value = value )
 		obj = self._lower_expr( node.value, None )
 		attr_var = self._attr_lookup( obj.type, node.attr, node )
 		dest = self._new_temp( attr_var.type )
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
 		return dest
+
+	def find_name_recursive( self, node: ast.Attribute ) -> tuple[object,str]|None:
+		''' Resolve a dotted ast.Attribute expression (builtins.OSError.
+		FileNotFoundError) to the terminal scope object and the final
+		attribute name. Purely walks .names dicts — no ensure_resolved,
+		no scheduling, no type-resolving. The chain is assumed to already
+		be fully resolved by type_resolution.py before lowering runs.
+
+		Returns (terminal_object, last_attr) on success, None when the
+		root isn't an ast.Name or isn't a registered name at all (caller
+		falls through to the normal value-lowering path).
+
+		Records a specific error via discovery.fail when an intermediate
+		attr is missing so the user gets a clear message rather than the
+		generic "not a value" from the value-lowering fallthrough. '''
+		# collect attrs right-to-left: builtins.OSError.FileNotFoundError → ['FileNotFoundError', 'OSError']
+		attrs: list[str] = []
+		cur: ast.expr = node
+		while isinstance( cur, ast.Attribute ):
+			attrs.append( cur.attr )
+			cur = cur.value
+		if not isinstance( cur, ast.Name ):
+			return None
+		root_name = cur.id
+		obj: object|None = self.discovery.find_name_or_none( root_name )
+		if obj is None:
+			return None
+		# only walk when the root is a scope-like object (Module, ClassLike,
+		# etc.) — a local Variable or bare Function has no .names of its own
+		# and should fall through to the normal value-lowering path
+		if not isinstance( getattr( obj, 'names', None ), dict ):
+			return None
+		# walk intermediate scopes (all but the last attr) through .names
+		for attr in reversed( attrs[1:] ):
+			names = getattr( obj, 'names', None )
+			if not isinstance( names, dict ):
+				self.discovery.fail( f'{root_name} has no members, cannot look up {attr!r} ({ast.unparse(node)})', node )
+				return None
+			obj = names.get( attr )
+			if obj is None:
+				self.discovery.fail( f'{root_name} has no attribute {attr!r} ({ast.unparse(node)})', node )
+				return None
+		return obj, attrs[0]
 
 	_SUBSCRIPT_ALTERNATIVES = 'call .__getitem__(...) directly and consume its Result yourself instead'
 

@@ -551,6 +551,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self.locals[node.targets[0].id] = self._type_of_expr( node.value )
 		return node
 
+	def visit_Attribute( self, node: ast.Attribute ) -> ast.expr:
+		# CEnum member VALUE expressions (OSError.FileNotFoundError
+		# used as a runtime value) - the base is a class, not a
+		# runtime value. Lowering.py's _expr_Attribute owns the
+		# actual int folding; this pass only guarantees the CEnum
+		# itself is resolved and scheduled before lowering ever sees
+		# this Attribute node - same division of labour as
+		# visit_Compare (resolves union for tag ordinals) / visit_Match
+		# (resolves union for member payloads), neither of which
+		# rewrite the subject expression itself.
+		self.generic_visit( node )
+		# _try_resolve_callable_namespace (silent, via find_name_or_none)
+		# rather than _try_resolve_namespace (raising, via find_name) -
+		# compiler.wrap_arithmetic and similar intrinsics are recognized
+		# textually by lowering.py and are never real registered names,
+		# so a raising probe would spuriously record an error for them
+		base = self._try_resolve_callable_namespace( node.value )
+		if isinstance( base, CEnum ):
+			# _try_resolve_callable_namespace only calls ensure_resolved
+			# on recursive ast.Attribute traversal, not on a bare
+			# ast.Name result - resolve now, which also schedules the
+			# CEnum as a compile unit (TypeResolver.ensure_resolved
+			# always calls schedule() on its argument)
+			self.resolver.ensure_resolved( base )
+		return node
+
 	# --- rewrite 1: is/is not None ---
 
 	def visit_Compare( self, node: ast.Compare ) -> ast.expr:

@@ -37,7 +37,6 @@ class Tests( unittest.TestCase ):
 	def _test_ir( self, code: str, expected: list[ir.Instruction] ) -> None:
 		self._import( code )
 
-		# TODO FIXME: we need to implement better error handling
 		#self.assertEqual( len( analyzer.errors ), 0, f"Compiler errors found: {analyzer.errors}" )
 
 		fn = self._lower_main()
@@ -4098,6 +4097,49 @@ class Tests( unittest.TestCase ):
 				mod = self._import( code )
 				self.compiler._lower( mod.get_local( 'main' ))
 				self.assertTrue( any( 'takes exactly one argument' in e for e in self.discovery.errors.errors ))
+
+	def test_cenum_member_value_expression_lowers_to_const( self ) -> None:
+		code = '\n'.join([
+			#'import compiler',
+			'@enum( u32 )',
+			'class MyError:',
+			'	FileNotFound = 2',
+			'	Other = _',
+			'',
+			'def main() -> u32:',
+			'	return MyError.FileNotFound',
+		])
+		u32 = self.discovery.get_intrinsics()['u32']
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = u32 ),
+			ir.Return( value = ir.Const( type = u32, value = 2 )),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_recursive_namespace_cenum_member_value_expression_lowers_to_const( self ) -> None:
+		import platform
+		match platform.system():
+			case 'Windows':
+				oserror_type = 'u32'
+			case 'Linux':
+				oserror_type = 'i32'
+			case _:
+				assert False, f'unsupported {platform.system()=}'
+		code = '\n'.join([
+			'import compiler',
+			'import builtins',
+			f'def main() -> {oserror_type}:',
+			'	return builtins.OSError.FileNotFoundError',
+		])
+		oserror_type = self.discovery.get_intrinsics()[oserror_type]
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = 'main', params = [], return_type = oserror_type ),
+			ir.Return( value = ir.Const( type = oserror_type, value = 2 )),
+			ir.FuncEnd( name = 'main' ),
+		])
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
