@@ -42,6 +42,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'C compiler override (clang/gcc/msvc, overrides METALPY_CC)' )
 	p.add_argument( '--dep-report', action = 'store_true',
 		help = 'print every lowered FQDN after compilation' )
+	p.add_argument( '-c', action = 'store_true',
+		help = 'emit C source only, do not compile or link' )
 	p.add_argument( '--cflags', type = str, default = '',
 		help = 'extra flags passed through to the C compiler' )
 	p.add_argument( '--ldflags', type = str, default = '',
@@ -142,6 +144,13 @@ def main() -> None:
 
 	# --- stage 5: emit C ---
 	c_source = emitter_c.emit_c( compiler )
+
+	# --- -c: emit C source only ---
+	if args.c:
+		c_path = args.output or args.source.with_suffix( '.c' )
+		c_path.write_text( c_source, encoding = 'utf-8' )
+		print( f'mpy: wrote {c_path}' )
+		return
 
 	# --- stage 6: detect compiler ---
 	cc = linker_c.detect_cc()

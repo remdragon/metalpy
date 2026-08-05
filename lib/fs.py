@@ -45,7 +45,8 @@ def write_raw(
 		None, # lpOverlapped
 	)
 	if success:
-		return Result.Ok( usize( written ))
+		with compiler.wrap_arithmetic:
+			return Result.Ok( usize( written ))
 	else:
 		return Result.Err( OSError( GetLastError() ))
 
