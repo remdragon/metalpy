@@ -69,10 +69,18 @@ class CTypeTests( unittest.TestCase ):
 		self.assertEqual( emitter_c.c_type( _scalar( 'usize' )), 'uintptr_t' )
 		self.assertEqual( emitter_c.c_type( _scalar( 'bool', 'builtins.bool' )), 'bool' )
 
-	def test_nonetype_and_noreturn_are_void( self ) -> None:
-		self.assertEqual( emitter_c.c_type( _scalar( 'NoneType' )), 'void' )
+	def test_nonetype_is_metalpynone_noreturn_is_void( self ) -> None:
+		# NoneType as a value (parameter/field) is MetalpyNone, not void —
+		# void is only for return types and Ptr[None] pointees
+		self.assertEqual( emitter_c.c_type( _scalar( 'NoneType' )), 'MetalpyNone' )
 		self.assertEqual( emitter_c.c_type( _scalar( 'NoReturn' )), 'void' )
 		self.assertEqual( emitter_c.c_type( None ), 'void' )
+
+	def test_ptr_of_nonetype_is_void_star( self ) -> None:
+		ptr_cls = Scalar( stem = 'Ptr', qualname = 'intrinsics.Ptr', file = None, line = None, sizeof = 8 )
+		none_type = _scalar( 'NoneType' )
+		ptr_none = Specialization( stem = 'Ptr[NoneType]', qualname = 'intrinsics.Ptr[intrinsics.NoneType]', file = None, line = None, base = ptr_cls, args = [ none_type ] )
+		self.assertEqual( emitter_c.c_type( ptr_none ), 'void*' )
 
 	def test_ptr_and_constptr_specializations( self ) -> None:
 		ptr_cls = Scalar( stem = 'Ptr', qualname = 'intrinsics.Ptr', file = None, line = None, sizeof = 8 )
@@ -430,9 +438,9 @@ def main() -> None:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		src = emitter_c.emit_function( main_lf )
-		self.assertIn( '= &main$x;', src ) # AddrOf
-		self.assertIn( '[main$i] = main$seven;', src ) # SetItem
-		self.assertIn( '(main$p)[main$i];', src ) # GetItem
+		self.assertIn( '= &x;', src ) # AddrOf
+		self.assertIn( '[i] = seven;', src ) # SetItem
+		self.assertIn( '(p)[i];', src ) # GetItem
 
 _UNION_FIXTURE = '\n'.join([
 	'@union',
@@ -1285,7 +1293,7 @@ class StringLiteralTests( BuiltinsStrTestCase ):
 		self.assertIn( 'static const uint8_t __literal_', src )
 		self.assertIn( 'static struct builtins$str __literal_', src )
 		self.assertIn( '.ref_count = METALPY_IMMORTAL_REFCOUNT', src )
-		self.assertIn( '104, 101, 108, 108, 111, 0', src ) # 'hello' + NUL, per str's own __byte_size convention
+		self.assertIn( '"hello\\x00";', src ) # 'hello' + NUL as C string literal
 		self.assertIn( '.__byte_size = 6', src )
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		main_src = emitter_c.emit_function( main_lf )

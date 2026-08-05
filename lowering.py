@@ -1720,6 +1720,11 @@ class Lowering:
 		# scalar casts - operand_kwargs is however the specific opcode names
 		# its operand(s) (left/right for a binop, operand for USub/cast)
 		check_type = self.discovery._get_or_create_specialization( result_cls, [ result_type, error_cls ] )
+		# the emitter declares a local variable of this Result type; the
+		# struct definition must exist even though the Check op's result
+		# is consumed inline (OrReturn/OrJump/Unwrap) — schedule it now
+		# so monomorphize_class emits it into compiler.tagged_unions
+		self.schedule( check_type )
 		check_dest = self._new_temp( check_type )
 		self._emit( opcode( dest = check_dest, **operand_kwargs ))
 		return self._consume_checked_result( check_dest, result_type, extra )

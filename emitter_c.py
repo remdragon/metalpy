@@ -59,6 +59,23 @@ _NONE_PLACEHOLDER_TYPEDEF = f'typedef unsigned char {_NONE_PLACEHOLDER_TYPE};'
 
 # --- name mangling -----------------------------------------------------------
 
+# C reserved keywords that can't be used as bare local/parameter names.
+# `_c_local_name` uses this to safely prefix them with `_` when unmangled.
+_C_KEYWORDS: frozenset[str] = frozenset([
+	'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do',
+	'double', 'else', 'enum', 'extern', 'float', 'for', 'goto', 'if',
+	'int', 'long', 'register', 'return', 'short', 'signed', 'sizeof',
+	'static', 'struct', 'switch', 'typedef', 'union', 'unsigned', 'void',
+	'volatile', 'while', '_Bool', '_Complex', '_Imaginary', 'inline',
+	'restrict', '_Alignas', '_Alignof', '_Atomic', '_Generic', '_Noreturn',
+	'_Static_assert', '_Thread_local',
+])
+
+def _c_local_name( stem: str ) -> str:
+	''' return a C-safe local variable name. C keywords get a leading
+	underscore; everything else passes through unchanged. '''
+	return f'_{stem}' if stem in _C_KEYWORDS else stem
+
 def mangle_qualname( qualname: str ) -> str:
 	''' plain string-level mangling for an already-computed qualname (a
 	Function/Variable/ordinary-class qualname, or the already-bracketed
@@ -174,7 +191,13 @@ def c_type( t: Type|None ) -> str:
 	if isinstance( t, Specialization ):
 		base = t.base
 		if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
-			inner = _value_spelling( t.args[0] )
+			inner_type = t.args[0]
+			# Ptr[None]/ConstPtr[None] is void*/const void* — the
+			# pointee is 'nothing', not a real value type
+			if isinstance( inner_type, Scalar ) and inner_type.stem == 'NoneType':
+				inner = 'void'
+			else:
+				inner = _value_spelling( inner_type )
 			return f'{inner}*' if base.stem == 'Ptr' else f'const {inner}*'
 		if isinstance( base, RCClass ):
 			return f'struct {mangle_type(t)}*'
@@ -183,7 +206,7 @@ def c_type( t: Type|None ) -> str:
 		raise NotImplementedError( f'c_type: unsupported Specialization base {base!r}' )
 	if isinstance( t, Scalar ):
 		if t.stem == 'NoneType':
-			return 'void'
+			return _NONE_PLACEHOLDER_TYPE
 		if t.stem == 'NoReturn':
 			return 'void'
 		if t.stem == 'Ptr': # bare, unsubscripted (rare - see lowering.py's own compiler.sizeof(Ptr) note)
@@ -306,14 +329,18 @@ def _has_self( function: Function ) -> bool:
 def _function_prototype( function: Function ) -> str:
 	params: list[str] = []
 	if _has_self( function ):
-		params.append( f'{c_type(function.cls)} {mangle_qualname(_self_qualname(function))}' )
+		params.append( f'{c_type(function.cls)} self' )
 	for p in ( function.parameters or [] ):
-		params.append( f'{c_type(p.type)} {mangle_qualname(p.qualname)}' )
+		params.append( f'{c_type(p.type)} {_c_local_name(p.stem)}' )
 	params_str = ', '.join( params ) if params else 'void'
 	if _is_entry_point( function ):
 		return f'int main( {params_str} )'
 	noreturn = '_Noreturn ' if _is_noreturn( function.return_type ) else ''
-	ret = c_type( function.return_type )
+	# NoneType/NoReturn are value-less in C — return void, not MetalpyNone
+	if function.return_type is None or ( isinstance( function.return_type, Scalar ) and function.return_type.stem in ( 'NoneType', 'NoReturn' )):
+		ret = 'void'
+	else:
+		ret = c_type( function.return_type )
 	name = mangle_qualname( function.qualname )
 	return f'{noreturn}{ret} {name}( {params_str} )'
 
@@ -323,7 +350,9 @@ def _emit_operand( op: ir.Operand ) -> str:
 	if isinstance( op, ir.Temp ):
 		return f't{op.id}'
 	if isinstance( op, Variable ):
-		return mangle_qualname( op.qualname )
+		# locals (parameters, stack locals) use bare stem; globals
+		# need the full mangled qualname (cross-TU visibility)
+		return _c_local_name( op.stem ) if not op.is_global else mangle_qualname( op.qualname )
 	raise NotImplementedError( f'_emit_operand: unsupported operand {op!r}' )
 
 def _emit_const( c: ir.Const ) -> str:
@@ -598,9 +627,9 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# re-declared) so only genuine first-time locals trigger it
 	declared: set[str] = set()
 	if _has_self( function ):
-		declared.add( mangle_qualname( _self_qualname( function )))
+		declared.add( 'self' )
 	for p in ( function.parameters or [] ):
-		declared.add( mangle_qualname( p.qualname ))
+		declared.add( _c_local_name( p.stem ))
 	for instr in fn.instructions:
 		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
 	lines.append( '}' )
@@ -630,7 +659,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
-			name = mangle_qualname( instr.dest.qualname )
+			name = _c_local_name( instr.dest.stem )
 			if name not in declared:
 				declared.add( name )
 				return [ f'\t{c_type(instr.dest.type)} {name} = {src};' ]
@@ -1017,6 +1046,31 @@ _STRING_LITERAL_FIELDS = {
 	'builtins.bytes': ( '__data', '__len', False ),
 }
 
+def _c_string_literal( data: bytes ) -> str:
+	''' convert raw bytes to a C string literal with proper escapes.
+	printable ASCII is emitted as-is; non-printable characters (including
+	NUL, backslash, double-quote, control chars, and high bytes) are
+	escaped as C escape sequences. '''
+	parts: list[str] = []
+	for b in data:
+		if b == 0:
+			parts.append( chr(92) + 'x00' )
+		elif b == 34: # double-quote
+			parts.append( chr(92) + chr(34) )
+		elif b == 92: # backslash
+			parts.append( chr(92) + chr(92) )
+		elif b == 10: # newline
+			parts.append( chr(92) + 'n' )
+		elif b == 13: # carriage return
+			parts.append( chr(92) + 'r' )
+		elif b == 9: # tab
+			parts.append( chr(92) + 't' )
+		elif 32 <= b <= 126: # printable ASCII
+			parts.append( chr( b ))
+		else:
+			parts.append( chr(92) + f'x{b:02x}' )
+	return chr(34) + ''.join( parts ) + chr(34)
+
 def _string_literal_name( qualname: str, value: str|bytes ) -> str:
 	# deterministic and content-derived (not a counter/registry) so
 	# _emit_const stays a pure function - every reference to the SAME
@@ -1033,10 +1087,9 @@ def _emit_one_string_literal( qualname: str, value: str|bytes ) -> list[str]:
 	data_bytes = payload + ( b'\x00' if nul_terminate else b'' )
 	name = _string_literal_name( qualname, value )
 	data_name = f'{name}$data'
-	byte_list = ', '.join( str( b ) for b in data_bytes ) if data_bytes else '0'
 	struct_name = mangle_qualname( qualname )
 	return [
-		f'static const uint8_t {data_name}[] = {{ {byte_list} }};',
+		f'static const uint8_t {data_name}[] = {_c_string_literal(data_bytes)};',
 		f'static struct {struct_name} {name} = {{',
 		f'\t.$header = {{ .ref_count = METALPY_IMMORTAL_REFCOUNT }},',
 		f'\t.{_field_name(data_field)} = {data_name},',

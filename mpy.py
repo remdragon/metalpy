@@ -44,6 +44,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'print every lowered FQDN after compilation' )
 	p.add_argument( '-c', action = 'store_true',
 		help = 'emit C source only, do not compile or link' )
+	p.add_argument( '--keep-c', action = 'store_true',
+		help = 'on compile failure, save generated C to -o path (or source.c) instead of discarding' )
 	p.add_argument( '--cflags', type = str, default = '',
 		help = 'extra flags passed through to the C compiler' )
 	p.add_argument( '--ldflags', type = str, default = '',
@@ -167,9 +169,10 @@ def main() -> None:
 		if result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
 			print( result.stderr, file = sys.stderr )
-			# also dump the generated C for debugging
-			print( f'\n--- generated.c ({src_path}) ---', file = sys.stderr )
-			print( c_source, file = sys.stderr )
+			if args.keep_c:
+				c_path = args.output or args.source.with_suffix( '.c' )
+				src_path.rename( c_path )
+				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
 
 		# --- link .o → executable ---
