@@ -9,8 +9,9 @@ from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
 from mpy_types import (
-	CEnum, ClassLike, CStruct, CUnion, Function, Module, Name, Parameter, RCClass,
-	Scalar, Specialization, TaggedUnion, Type, TypeVar, Variable,
+	CEnum, ClassLike, CStruct, CUnion, Function, Module, Name, Overload,
+	Parameter, RCClass, Scalar, Specialization, TaggedUnion, Type,
+	TypeVar, Variable,
 )
 from union_storage import UnionStorage
 
@@ -407,6 +408,107 @@ class TypeResolver:
 		self._sys_functions[name] = fn
 		return fn
 
+
+	# --- namespace resolution (moved from lowering.py) ----------------------
+
+	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
+		''' a silent probe: is this expression a compile-time-resolvable
+		namespace path (a free function, or Class.staticmethod reached
+		by class name)? Returns None rather than failing for an ordinary
+		value expression — that means the caller should do receiver-based
+		resolution. '''
+		if isinstance( node, ast.Name ):
+			return self.discovery.find_name( node.id, node )
+		if isinstance( node, ast.Attribute ):
+			base = self._try_resolve_namespace( node.value )
+			if base is None:
+				return None
+			self.ensure_resolved( base )
+			if isinstance( base, TaggedUnion ):
+				self.union_storage.get( base )
+			names = getattr( base, 'names', None )
+			if not isinstance( names, dict ):
+				return None
+			return names.get( node.attr )
+		if isinstance( node, ast.Subscript ):
+			base = self._try_resolve_namespace( node.value )
+			if not isinstance( base, Function ) or not base.type_params:
+				return None
+			if base.resolve is not None:
+				base.resolve()
+			arg_nodes = node.slice.elts if isinstance( node.slice, ast.Tuple ) else [ node.slice ]
+			if len( arg_nodes ) != len( base.type_params ):
+				self.discovery.fail(
+					f'{base.qualname}[...] expects {len(base.type_params)} type argument(s), got {len(arg_nodes)}: {ast.unparse(node)}',
+					node,
+				)
+			args: list[Type] = []
+			for a in arg_nodes:
+				resolved = self._try_resolve_namespace( a )
+				if not isinstance( resolved, Type ):
+					self.discovery.fail( f'{base.qualname}[...] argument is not a type: {ast.unparse(a)}', node )
+				args.append( resolved )
+			return self.discovery._get_or_create_specialization( base, args )
+		return None
+
+	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
+		owner_type = self.ensure_resolved( owner_type )
+		names = getattr( owner_type, 'names', None )
+		if not isinstance( names, dict ):
+			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
+		found = names.get( attr )
+		if not isinstance( found, ( Function, Overload )):
+			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
+		return found
+
+	def _resolve_union_receiver_members( self, union: TaggedUnion, members: list[Variable], attr: str, ctx: ast.AST ):
+		# imported here to avoid circular dependency
+		from union_storage import ReceiverDispatch
+		per_leaf: list[tuple[Variable,Function]] = []
+		for member in members:
+			if member.resolve is not None:
+				member.resolve()
+			found = self._attr_lookup_callable( member.type, attr, ctx )
+			if not isinstance( found, Function ):
+				self.discovery.fail(
+					f'{member.type.qualname if member.type else "?"}.{attr} is an overload group - calling an overloaded '
+					f'method through a union receiver is not supported yet: {ast.unparse(ctx)}',
+					ctx,
+				)
+			self.ensure_resolved( found )
+			per_leaf.append(( member, found ))
+
+		reference = per_leaf[0][1]
+		for member, fn in per_leaf[1:]:
+			if fn.return_type is not reference.return_type:
+				self.discovery.fail(
+					f'{union.qualname}.{attr}(...): leaf implementations disagree on return type '
+					f'({reference.cls.qualname if reference.cls else "?"}.{attr} -> '
+					f'{reference.return_type.qualname if reference.return_type else "None"}, '
+					f'{member.type.qualname if member.type else "?"}.{attr} -> '
+					f'{fn.return_type.qualname if fn.return_type else "None"})',
+					ctx,
+				)
+			if len( fn.parameters or [] ) != len( reference.parameters or [] ):
+				self.discovery.fail(
+					f'{union.qualname}.{attr}(...): leaf implementations have differing parameter counts, not supported yet',
+					ctx,
+				)
+		return ReceiverDispatch( union = union, attr = attr, per_leaf = per_leaf )
+
+	def _resolve_callee_target( self, func_node: ast.expr ) -> Function|Overload|Specialization|object|None:
+		''' resolve the textual call target to a Function/Overload/
+		Specialization, or a _ReceiverDispatch for union receiver calls.
+		Returns None if this needs receiver-based resolution
+		(some_local.method(...)) — the caller must lower the receiver
+		and resolve through its type. '''
+		namespace_result = self._try_resolve_namespace( func_node )
+		if isinstance( namespace_result, ( Function, Overload )):
+			return namespace_result
+		if isinstance( namespace_result, Specialization ) and isinstance( namespace_result.base, Function ):
+			return namespace_result
+		return None  # caller must resolve through receiver type
+	
 	def schedule( self, unit: object ) -> None:
 		# moved verbatim from Compiler._enqueue - lowering.py hands this
 		# anything it comes across (a Function, a class, a Variable, a

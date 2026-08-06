@@ -1930,80 +1930,12 @@ class Lowering:
 		return self._monomorphizer.monomorphize_class( spec )
 
 	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
-		# a *silent* probe: is this expression a compile-time-resolvable
-		# namespace path (a free function, or Class.staticmethod/classmethod
-		# reached by class name)? Mirrors discovery.py's own
-		# visit_Name/visit_Attribute (find_name + .names traversal), but
-		# deliberately doesn't call self.discovery.fail() for "this base has
-		# no .names" - that's an expected, normal outcome here (it means
-		# _resolve_callee should fall back to receiver-based resolution, e.g.
-		# `some_local.method()`), not a real error to record. A genuinely
-		# undefined identifier (find_name failing outright) is still a real
-		# error either way, so that's left to report/unwind normally.
-		if isinstance( node, ast.Name ):
-			return self.discovery.find_name( node.id, node )
-		if isinstance( node, ast.Attribute ):
-			base = self._try_resolve_namespace( node.value )
-			if base is None:
-				return None
-			self._ensure_resolved( base )
-			if isinstance( base, TaggedUnion ):
-				# a union member's own constructor (Foo.Bar, the synthesized
-				# @staticmethod - see union_storage.py's _build_member_
-				# constructor) lives in base.names, same as tag/data - but
-				# unlike an ordinary class's real methods (already in .names
-				# from discovery.py's own class-body parsing), nothing
-				# guarantees UnionStorage.get() has actually run yet by the
-				# time a namespace path reaches here (same ordering hazard
-				# _attr_lookup's own tag/data trigger defends against below)
-				self._union_storage.get( base )
-			names = getattr( base, 'names', None )
-			if not isinstance( names, dict ):
-				return None
-			return names.get( node.attr )
-		if isinstance( node, ast.Subscript ):
-			# Name[T](...) / Attribute[T](...) - explicit generic
-			# instantiation of a *function* (sys.alloc[u8]), which
-			# monomorphizes (a distinct compiled unit per instantiation -
-			# see _monomorphized_function) rather than the anonymous-union
-			# runtime-tag-checkable approach _get_or_create_union uses for
-			# X|Y. Only meaningful when the base is itself a generic
-			# Function; a generic CLASS reached this way (Foo[i32], used as
-			# a type annotation, not a call) is handled entirely by
-			# discovery.py's own visit_Subscript instead - this method is
-			# lowering-only namespace-path resolution
-			base = self._try_resolve_namespace( node.value )
-			if not isinstance( base, Function ) or not base.type_params:
-				return None
-			# resolve (populate .parameters/.type_params), but deliberately
-			# NOT via _ensure_resolved - that also unconditionally
-			# schedules its argument, which would incorrectly compile the
-			# shared, unspecialized base function too (T never gets bound
-			# there - see _monomorphized_function). Only the Specialization
-			# this returns gets scheduled, by the caller (_lower_call)
-			if base.resolve is not None:
-				base.resolve()
-			arg_nodes = node.slice.elts if isinstance( node.slice, ast.Tuple ) else [ node.slice ]
-			if len( arg_nodes ) != len( base.type_params ):
-				self.discovery.fail(
-					f'{base.qualname}[...] expects {len(base.type_params)} type argument(s), got {len(arg_nodes)}: {ast.unparse(node)}',
-					node,
-				)
-			args: list[Type] = []
-			for a in arg_nodes:
-				resolved = self._try_resolve_namespace( a )
-				if not isinstance( resolved, Type ):
-					self.discovery.fail( f'{base.qualname}[...] argument is not a type: {ast.unparse(a)}', node )
-				args.append( resolved )
-			return self.discovery._get_or_create_specialization( base, args )
-		return None
+		return self._type_resolver._try_resolve_namespace( node )
 
 	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization|_ReceiverDispatch,ir.Operand|None]:
-		namespace_result = self._try_resolve_namespace( func_node )
-		if isinstance( namespace_result, ( Function, Overload )):
-			return namespace_result, None
-		if isinstance( namespace_result, Specialization ) and isinstance( namespace_result.base, Function ):
-			return namespace_result, None
+		target = self._type_resolver._resolve_callee_target( func_node )
+		if target is not None:
+			return target, None
 
 		if not isinstance( func_node, ast.Attribute ):
 			self.discovery.fail( f'cannot call {ast.unparse(func_node)}', func_node )
@@ -2014,61 +1946,14 @@ class Lowering:
 			self._ensure_resolved( base )
 			direct = base.names.get( func_node.attr )
 			if not isinstance( direct, ( Function, Overload )):
-				return self._resolve_union_receiver_members( base, members, func_node.attr, func_node ), receiver
-		target = self._attr_lookup_callable( receiver.type, func_node.attr, func_node )
+				return self._type_resolver._resolve_union_receiver_members( base, members, func_node.attr, func_node ), receiver
+		target = self._type_resolver._attr_lookup_callable( receiver.type, func_node.attr, func_node )
 		return target, receiver
 
-	def _resolve_union_receiver_members( self, union: TaggedUnion, members: list[Variable], attr: str, ctx: ast.AST ) -> _ReceiverDispatch:
-		# the union itself has no .names entry for attr (an anonymous X|Y
-		# union never does; a real @union class only reaches here if it
-		# doesn't declare attr as a real method of its own) - so each leaf
-		# type's own, unrelated method under this name has to be looked up
-		# individually instead, then dispatched on the receiver's runtime tag.
-		# `members` is already substituted against the receiver's own
-		# concrete args when it's a generic union (see _tagged_union_shape) -
-		# a generic leaf's declared type (e.g. `Some: T`) is a bare TypeVar
-		# otherwise, which has no attribute lookup of its own to speak of
-		per_leaf: list[tuple[Variable,Function]] = []
-		for member in members:
-			if member.resolve is not None:
-				member.resolve()
-			found = self._attr_lookup_callable( member.type, attr, ctx )
-			if not isinstance( found, Function ):
-				self.discovery.fail(
-					f'{member.type.qualname if member.type else "?"}.{attr} is an overload group - calling an overloaded '
-					f'method through a union receiver is not supported yet: {ast.unparse(ctx)}',
-					ctx,
-				)
-			self._ensure_resolved( found ) # need .return_type/.parameters populated for the signature-consistency check just below
-			per_leaf.append(( member, found ))
 
-		reference = per_leaf[0][1]
-		for member, fn in per_leaf[1:]:
-			if fn.return_type is not reference.return_type:
-				self.discovery.fail(
-					f'{union.qualname}.{attr}(...): leaf implementations disagree on return type '
-					f'({reference.cls.qualname if reference.cls else "?"}.{attr} -> '
-					f'{reference.return_type.qualname if reference.return_type else "None"}, '
-					f'{member.type.qualname if member.type else "?"}.{attr} -> '
-					f'{fn.return_type.qualname if fn.return_type else "None"})',
-					ctx,
-				)
-			if len( fn.parameters or [] ) != len( reference.parameters or [] ):
-				self.discovery.fail(
-					f'{union.qualname}.{attr}(...): leaf implementations have differing parameter counts, not supported yet',
-					ctx,
-				)
-		return _ReceiverDispatch( union = union, attr = attr, per_leaf = per_leaf )
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
-		owner_type = self._ensure_resolved( owner_type ) # a Specialization owner is swapped for its real, substituted ClassLike/Function here
-		names = getattr( owner_type, 'names', None )
-		if not isinstance( names, dict ):
-			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
-		found = names.get( attr )
-		if not isinstance( found, ( Function, Overload )):
-			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
-		return found
+		return self._type_resolver._attr_lookup_callable( owner_type, attr, ctx )
 
 	def _match_call_args( self, target: Function, call: ast.Call ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
 		if any( isinstance( a, ast.Starred ) for a in call.args ):
