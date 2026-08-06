@@ -418,7 +418,10 @@ class TypeResolver:
 		value expression — that means the caller should do receiver-based
 		resolution. '''
 		if isinstance( node, ast.Name ):
-			return self.discovery.find_name( node.id, node )
+			result = self.discovery.find_name( node.id, node )
+			if getattr( result, 'resolve', None ) is not None:
+				result.resolve()
+			return result
 		if isinstance( node, ast.Attribute ):
 			base = self._try_resolve_namespace( node.value )
 			if base is None:
@@ -429,7 +432,10 @@ class TypeResolver:
 			names = getattr( base, 'names', None )
 			if not isinstance( names, dict ):
 				return None
-			return names.get( node.attr )
+			result = names.get( node.attr )
+			if getattr( result, 'resolve', None ) is not None:
+				result.resolve()
+			return result
 		if isinstance( node, ast.Subscript ):
 			base = self._try_resolve_namespace( node.value )
 			if not isinstance( base, Function ) or not base.type_params:

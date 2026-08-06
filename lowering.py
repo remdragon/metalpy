@@ -2280,8 +2280,7 @@ class Lowering:
 		# resolve (populate .names/.attributes) WITHOUT scheduling yet - a
 		# generic target_cls must never itself become a real compile unit
 		# (see below); only a concrete Specialization should
-		if target_cls.resolve is not None:
-			target_cls.resolve()
+		assert target_cls.resolve is None, f'internal compiler error, {target_cls=} is not fully resolved'
 		init = target_cls.names.get( '__init__' )
 		if init is None:
 			return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
