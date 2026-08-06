@@ -1458,9 +1458,13 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# that needs a real prototype in scope first, and unlike an ordinary
 	# Function, nothing else already provides one (destructors have no
 	# backing Function/LoweredFunction entry at all - pure emitter-side
-	# synthesis, see emit_rcclass_destructor)
+	# synthesis, see emit_rcclass_destructor). Always emitted for every
+	# non-generic RCClass: a Decref against an immortal string-literal
+	# object still references the destructor as a function pointer (even
+	# though release_object skips the call at runtime for immortals), and
+	# C needs the symbol declared regardless.
 	for cls in compiler.rcclasses:
-		if not cls.type_params and _rcclass_was_constructed( cls, compiler ):
+		if not cls.type_params:
 			parts.append( f'static void {_rcclass_destructor_name(cls)}( void* obj );' )
 
 	# pass 2: full RCClass struct bodies (every other tag already exists)
@@ -1486,7 +1490,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 				src = src.replace( '{\n', '{\n\t__metalpy_init();\n', 1 )
 			parts.append( src )
 	for cls in compiler.rcclasses:
-		if not cls.type_params and _rcclass_was_constructed( cls, compiler ):
+		if not cls.type_params:
 			parts.append( emit_rcclass_destructor( cls ))
 
 	# custom entry point when CRT is not linked - the linker expects

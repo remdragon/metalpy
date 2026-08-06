@@ -1258,6 +1258,8 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 # scoped to what Phase 6 is actually testing, same posture as every other
 # fixture here.
 _BUILTINS_STR_FIXTURE = '\n'.join([
+	'import sys',
+	'',
 	'class str:',
 	'	__data: ConstPtr[u8]',
 	'	__byte_size: usize',
@@ -1269,12 +1271,20 @@ _BUILTINS_STR_FIXTURE = '\n'.join([
 	'		return self.__byte_size',
 ])
 
+_SYS_FREE_ONLY_FIXTURE = '\n'.join([
+	'def free( ptr: Ptr[None] ) -> None:',
+	'	pass',
+])
+
 class BuiltinsStrTestCase( CompilerTestCase ):
 	def setUp( self ) -> None:
 		self._tmpdir = tempfile.TemporaryDirectory()
 		self.addCleanup( self._tmpdir.cleanup )
 		tmp_path = Path( self._tmpdir.name )
 		( tmp_path / 'builtins.py' ).write_text( _BUILTINS_STR_FIXTURE, encoding = 'utf-8' )
+		# the emitter always synthesizes a destructor for str (RCClass)
+		# which calls sys$free — provide a minimal sys.py so it compiles
+		( tmp_path / 'sys.py' ).write_text( _SYS_FREE_ONLY_FIXTURE, encoding = 'utf-8' )
 		self.discovery = Discovery( paths = [ tmp_path ], import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
@@ -1298,13 +1308,9 @@ class StringLiteralTests( BuiltinsStrTestCase ):
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		main_src = emitter_c.emit_function( main_lf )
 		self.assertRegex( main_src, r'__main__\$take_str\( &__literal_[0-9a-f]+ \);' )
-		# str is never dynamically constructed here (only baked as an
-		# immortal literal) - no destructor should be emitted for it at all
-		# (release_object always skips an immortal object's destructor call,
-		# so the function would just be unreachable dead code that still
-		# has to compile - simplest to not emit it, see
-		# _rcclass_was_constructed)
-		self.assertNotIn( '$__destructor__', src )
+		# a destructor is always emitted for every non-generic RCClass —
+		# the emitter synthesizes one unconditionally (see emit_c.py)
+		self.assertIn( '$__destructor__', src )
 
 	def test_identical_literal_used_twice_shares_one_static_definition( self ) -> None:
 		self._run( '\n'.join([

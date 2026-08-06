@@ -49,6 +49,34 @@ class TypeResolver:
 		# the unit being lowered at the time this one was scheduled
 		self._triggered_by: dict[int,str] = {}
 		self._current_trigger: str|None = None
+		# the emitter always synthesizes a destructor body for every
+		# non-generic RCClass (emit_rcclass_destructor in emitter_c.py),
+		# which unconditionally calls sys.free on its own backing
+		# memory — schedule sys.free once, lazily, the first time an
+		# RCClass actually needs one
+		self._sys_free_scheduled: bool = False
+
+	def _ensure_sys_free_scheduled( self ) -> None:
+		if self._sys_free_scheduled:
+			return
+		self._sys_free_scheduled = True
+		# only meaningful when builtins (and therefore sys) are actually
+		# loaded — without builtins there's no sys.free to schedule
+		module = self.discovery.modules.get( 'sys' )
+		if module is None:
+			return
+		free_fn = module.get_local( 'free' )
+		assert isinstance( free_fn, Function ), f'sys.free is required but was not found: {free_fn!r}'
+		self.schedule( free_fn )
+
+	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:
+		''' the emitter always synthesizes a destructor for every
+		non-generic RCClass — ensure its transitive dependencies
+		(sys.free and __del__ if declared) are scheduled '''
+		self._ensure_sys_free_scheduled()
+		del_fn = cls.get_local( '__del__' )
+		if isinstance( del_fn, Function ):
+			self.schedule( del_fn )
 
 	def schedule( self, unit: object ) -> None:
 		# moved verbatim from Compiler._enqueue - lowering.py hands this
@@ -85,6 +113,8 @@ class TypeResolver:
 				_record( self )
 				for arg in unit.args:
 					self.schedule( arg )
+				if isinstance( unit.base, RCClass ):
+					self._schedule_rcclass_destructor_deps( unit.base )
 				return
 			self.schedule( unit.base )
 			for arg in unit.args:
@@ -92,6 +122,8 @@ class TypeResolver:
 			return
 		if not isinstance( unit, ( Function, ClassLike )) and not ( isinstance( unit, Variable ) and unit.is_global ):
 			return
+		if isinstance( unit, RCClass ):
+			self._schedule_rcclass_destructor_deps( unit )
 		with self._seen_lock:
 			if id( unit ) in self._seen:
 				return
