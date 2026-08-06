@@ -364,21 +364,9 @@ def print( msg: str, end: str = '\n' ) -> None:
 # Call for now, forwarding to whatever T's own __len__ is; TODO once @inline
 # exists (see TODO.txt): this should become @inline so len(x) compiles down
 # to the same code as x.__len__() directly, no call overhead.
-#
-# len(x) where x: bytes|bytearray (bytes.__init__'s len(copy_from)) works
-# through this too: T is inferred as the WHOLE union type, and t.__len__()
-# inside the monomorphized body resolves via receiver narrowing
-# (_resolve_union_receiver_members) - bytes.__len__/bytearray.__len__ agree
-# on usize, so this isn't even a new case, just two existing fixes composing.
-#
-# len(src) where src: move[bytearray] (str.from_cstr/bytes.from_bytearray)
-# is still broken - a known, separate, already-tracked gap (see TODO.txt's
-# incref/decref/move[T] note: Move has no .names at all, so ANY method/attr
-# access through a move[T]-typed value fails, not just this one)
-#
-# slice[T]'s own length accessor is named .len(), not __len__() (see
-# slice[T].len() above) - len(arr) at a slice[T] call site (e.g.
-# bisect.py's bisect_right) still doesn't resolve, and isn't fixed by this:
-# T would infer fine, but slice[T] itself has no __len__, only .len()
+
 def len[T]( t: T ) -> usize:
 	return t.__len__()
+
+# import this at the end because it depends on str etc to already be pre-parsed:
+from .__File import File

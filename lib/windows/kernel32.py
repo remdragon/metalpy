@@ -68,3 +68,46 @@ def WriteFile(
 	lpOverlapped: Ptr[None],
 ) -> bool:
 	...
+
+@extern('kernel32', 'CreateFileA')
+def CreateFileA(
+	lpFileName: ConstPtr[u8],
+	dwDesiredAccess: u32,
+	dwShareMode: u32,
+	lpSecurityAttributes: Ptr[None],
+	dwCreationDisposition: u32,
+	dwFlagsAndAttributes: u32,
+	hTemplateFile: HANDLE,
+) -> HANDLE:
+	...
+
+@extern('kernel32', 'ReadFile')
+def ReadFile(
+	hFile: HANDLE,
+	lpBuffer: Ptr[u8],
+	nNumberOfBytesToRead: u32,
+	lpNumberOfBytesRead: Ptr[u32],
+	lpOverlapped: Ptr[None],
+) -> bool:
+	...
+
+@extern('kernel32', 'CloseHandle')
+def CloseHandle(
+	hObject: HANDLE,
+) -> bool:
+	...
+
+@extern('kernel32', 'SetFilePointerEx')
+def SetFilePointerEx(
+	hFile: HANDLE,
+	liDistanceToMove: i64,
+	lpNewFilePointer: Ptr[i64],
+	dwMoveMethod: u32,
+) -> bool:
+	...
+
+@extern('kernel32', 'SetEndOfFile')
+def SetEndOfFile(
+	hFile: HANDLE,
+) -> bool:
+	...

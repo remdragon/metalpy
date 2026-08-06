@@ -87,3 +87,40 @@ def write(
 	count: usize,
 ) -> isize:
 	...
+
+@extern( 'c', 'open' )
+def open(
+	path: ConstPtr[u8],
+	flags: i32,
+	mode: i32,
+) -> i32:
+	...
+
+@extern( 'c', 'close' )
+def close(
+	fd: i32,
+) -> i32:
+	...
+
+@extern( 'c', 'read' )
+def read(
+	fd: i32,
+	buf: Ptr[u8],
+	count: usize,
+) -> isize:
+	...
+
+@extern( 'c', 'lseek' )
+def lseek(
+	fd: i32,
+	offset: i64,
+	whence: i32,
+) -> i64:
+	...
+
+@extern( 'c', 'ftruncate' )
+def ftruncate(
+	fd: i32,
+	length: i64,
+) -> i32:
+	...
