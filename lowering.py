@@ -1538,7 +1538,9 @@ class Lowering:
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
 		if expected_type is None:
-			if isinstance( node.value, int ):
+			if isinstance( node.value, bool ):
+				expected_type = self.discovery.get_intrinsics()['bool']
+			elif isinstance( node.value, int ):
 				# integer literals default to i32 when no contextual type is
 				# available (bare `x = 1`, generic-call arg inference, etc.)
 				# TODO FIXME: for most user code, this should probably be builtins.int and get scheduled as an immortal constant
@@ -3055,6 +3057,21 @@ class Lowering:
 			def _resolve_original( fn: Function ) -> Function:
 				original = original_by_id.get( id( fn ), fn )
 				if cls_args is not None and original.cls is group_cls:
+					# when a stub won the overload resolution, `fn` is the stub's
+					# `bound_to` (the real impl) and won't be in original_by_id -
+					# the stub has a more specific return type than the real
+					# impl (e.g. T vs T|None), so use the stub's return type
+					# while still calling through to the real impl
+					winning_stub = next( ( s for s in target.stubs if s.bound_to is original ), None )
+					if winning_stub is not None:
+						stub_spec = self.discovery._get_or_create_specialization( winning_stub, cls_args )
+						stub_mono = self._monomorphized_function( stub_spec )
+						method_spec = self.discovery._get_or_create_specialization( original, cls_args )
+						impl_mono = self._monomorphized_function( method_spec )
+						# the call target is the real impl, but the return type is
+						# the stub's (more precise) one - swap it on the caller's
+						# side via replace() so schedule() sees the right type
+						return replace( impl_mono, return_type = stub_mono.return_type )
 					method_spec = self.discovery._get_or_create_specialization( original, cls_args )
 					return self._monomorphized_function( method_spec )
 				return original
