@@ -355,8 +355,7 @@ class Lowering:
 		# real errdefer+clang round trip once _ensure_resolved's own
 		# incidental scheduling was scheduling BOTH the abstract AND the
 		# correctly-monomorphized version side by side
-		if is_err_fn.resolve is not None:
-			is_err_fn.resolve()
+		assert is_err_fn.resolve is None, f'internal compiler error - {is_err_fn.qualname} was not fully resolved by the type_resolution module'
 		return_type = self._return_value_var.type
 		if isinstance( return_type, Specialization ) and return_type.base is is_err_fn.cls:
 			# the receiver's type (self._return_value_var, always a
@@ -2695,8 +2694,6 @@ class Lowering:
 		# expected_type is usually enough to resolve every class type
 		# param here without needing the arguments' own types at all
 		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by the type_resolution module'
-		if target.resolve is not None:
-			target.resolve()
 		cls = target.cls
 		class_type_params = cls.type_params or [] if cls is not None else []
 		bindings: dict[int,Type] = {}
