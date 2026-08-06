@@ -10,7 +10,7 @@ from errors import CompileError
 from monomorphize import Monomorphizer
 from mpy_types import (
 	CEnum, ClassLike, CStruct, CUnion, Function, Module, Name, Parameter, RCClass,
-	Specialization, TaggedUnion, Type, TypeVar, Variable,
+	Scalar, Specialization, TaggedUnion, Type, TypeVar, Variable,
 )
 from union_storage import UnionStorage
 
@@ -621,6 +621,101 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		result = ast.Compare( left = tag_expr, ops = [ op ], comparators = [ ast.Constant( value = tags[none_member.stem] ) ] )
 		ast.copy_location( result, node )
 		return result
+
+	# --- rewrite 1b: T|None truthiness (if x: / while x:) ---
+
+	def _rewrite_tagged_union_truthiness( self, expr_node: ast.expr, ctx_node: ast.AST ) -> ast.expr|None:
+		''' if x: or while x: where x's type is a TaggedUnion that includes
+		None — rewrite `x` to `x.tag != TAG_NONE and x.data.v_<T>.__bool__()`
+		(or just `x.data.v_bool` when the leaf type IS bool).
+		Returns None when the type isn't a TaggedUnion, has no None member,
+		or has multiple non-None variants (auto-generated union __bool__ is
+		future work). '''
+		expr_type = self._type_of_expr( expr_node )
+		if expr_type is None:
+			return None
+		base = expr_type.base if isinstance( expr_type, Specialization ) else expr_type
+		if not isinstance( base, TaggedUnion ):
+			return None
+		if isinstance( expr_type, Specialization ):
+			members = self.resolver.monomorphizer.monomorphize_class( expr_type ).attributes
+		else:
+			self.resolver.ensure_resolved( base )
+			for attr in base.attributes:
+				self.resolver.ensure_resolved( attr )
+			members = base.attributes
+		none_type = self.discovery.get_none_type()
+		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
+		if none_member is None:
+			return None # no None member — auto-generated union __bool__ is future work
+		tag_attr, data_attr, _payload_cls, tags = self.resolver.union_storage.get( base )
+		# synthesize: expr.tag != TAG_NONE
+		tag_expr = ast.Attribute( value = expr_node, attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, ctx_node )
+		tag_cmp = ast.Compare(
+			left = tag_expr,
+			ops = [ ast.NotEq() ],
+			comparators = [ ast.Constant( value = tags[none_member.stem] ) ],
+		)
+		ast.copy_location( tag_cmp, ctx_node )
+		# synthesize: expr.data.v_<T> (or .__bool__() on it for non-bool leaf)
+		non_none = [ m for m in members if m.type is not none_type ]
+		if len( non_none ) != 1:
+			return None # multiple non-None variants — need auto-generated union __bool__
+		member = non_none[0]
+		data_expr = ast.Attribute( value = expr_node, attr = data_attr.stem, ctx = ast.Load() )
+		ast.copy_location( data_expr, ctx_node )
+		payload_expr = ast.Attribute( value = data_expr, attr = f'v_{member.stem}', ctx = ast.Load() )
+		ast.copy_location( payload_expr, ctx_node )
+		# if the leaf type IS bool, the value itself is the boolean — no __bool__() call needed
+		leaf_type = member.type
+		if isinstance( leaf_type, Scalar ) and leaf_type.stem == 'bool':
+			value_expr: ast.expr = payload_expr
+		else:
+			value_expr = ast.Call(
+				func = ast.Attribute( value = payload_expr, attr = '__bool__', ctx = ast.Load() ),
+				args = [],
+				keywords = [],
+			)
+			ast.copy_location( value_expr, ctx_node )
+		# synthesize: tag_cmp and value_expr
+		result = ast.BoolOp( op = ast.And(), values = [ tag_cmp, value_expr ] )
+		ast.copy_location( result, ctx_node )
+		return result
+
+	def visit_If( self, node: ast.If ) -> ast.If:
+		# rewrite test BEFORE generic_visit recurses into it, so the new BoolOp
+		# children (Name references, Compare, Call) are visited normally
+		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
+		if rewritten is not None:
+			node.test = rewritten
+		self.generic_visit( node )
+		return node
+
+	def visit_While( self, node: ast.While ) -> ast.While:
+		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
+		if rewritten is not None:
+			node.test = rewritten
+		self.generic_visit( node )
+		return node
+
+	def visit_BoolOp( self, node: ast.BoolOp ) -> ast.BoolOp:
+		# each operand of `and`/`or` is a boolean context — rewrite
+		# T|None operands BEFORE generic_visit recurses into the old nodes
+		for i, value in enumerate( node.values ):
+			rewritten = self._rewrite_tagged_union_truthiness( value, node )
+			if rewritten is not None:
+				node.values[i] = rewritten
+		self.generic_visit( node )
+		return node
+
+	def visit_IfExp( self, node: ast.IfExp ) -> ast.IfExp:
+		# ternary `x if cond else y` — cond is a boolean context
+		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
+		if rewritten is not None:
+			node.test = rewritten
+		self.generic_visit( node )
+		return node
 
 	# --- rewrite 2: match statements ---
 

@@ -133,6 +133,195 @@ class TypeResolutionTests( unittest.TestCase ):
 		src = ast.unparse( fn.node )
 		self.assertIn( 'x.tag == 1', src )
 
+	# --- if / while truthiness (rewrite 1b: T|None truthiness) ----------
+
+	def test_if_bool_or_none_param_rewrites_to_tag_and_payload( self ) -> None:
+		# `if exists:` where exists: bool|None — tag check AND the bool payload
+		# itself (bool has no __bool__() to call; the value IS the boolean)
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Val: bool',
+			'	Absent: None',
+			'',
+			'def main( x: MaybeBool ) -> i32:',
+			'	if x:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'if x:', src )
+		self.assertIn( 'if x.tag != 1 and x.data.v_Val:', src )
+
+	def test_if_bool_or_none_param_with_else_rewrites( self ) -> None:
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Absent: None',
+			'	Val: bool',
+			'',
+			'def main( x: MaybeBool ) -> i32:',
+			'	if x:',
+			'		return 1',
+			'	else:',
+			'		return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'if x.tag != 0 and x.data.v_Val:', src )
+		self.assertIn( 'else', src )
+
+	def test_while_bool_or_none_param_rewrites( self ) -> None:
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Val: bool',
+			'	Absent: None',
+			'',
+			'def main( x: MaybeBool ) -> None:',
+			'	while x:',
+			'		pass',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'while x:', src )
+		self.assertIn( 'while x.tag != 1 and x.data.v_Val:', src )
+
+	def test_if_with_non_bool_leaf_calls___bool__( self ) -> None:
+		# x: MaybeString where the non-None variant is `str`, not `bool` -
+		# needs x.data.v_Some.__bool__() since the payload isn't itself truthy
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeString:',
+			'	Some: str',
+			'	Nothing: None',
+			'',
+			'def main( x: MaybeString ) -> i32:',
+			'	if x:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'x.data.v_Some.__bool__()', src )
+
+	def test_if_on_annotated_bool_or_none_local_rewrites( self ) -> None:
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Val: bool',
+			'	Absent: None',
+			'',
+			'def main() -> i32:',
+			'	x: MaybeBool = MaybeBool.Absent( None )',
+			'	if x:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'x.tag != 1 and x.data.v_Val:', src )
+
+	def test_if_on_non_union_type_is_left_unchanged( self ) -> None:
+		mod = self._import( '\n'.join([
+			'def main( flag: bool ) -> i32:',
+			'	if flag:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'if flag:', src )
+		self.assertNotIn( '.tag', src )
+
+	def test_if_on_union_without_none_is_left_unchanged( self ) -> None:
+		# T|U with no None member — auto-generated union __bool__ is future
+		# work; leave the condition untouched for now
+		mod = self._import( '\n'.join([
+			'@union',
+			'class IntOrStr:',
+			'	V: i32',
+			'	S: str',
+			'',
+			'def main( x: IntOrStr ) -> i32:',
+			'	if x:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'if x:', src )
+		self.assertNotIn( '.tag', src )
+
+
+	# --- BoolOp (and / or) truthiness -------------------------------------
+
+	def test_and_with_bool_or_none_operands_rewrites_both( self ) -> None:
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Val: bool',
+			'	Absent: None',
+			'',
+			'def main( x: MaybeBool, y: MaybeBool ) -> i32:',
+			'	if x and y:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		# each operand of `and` gets its own truthiness rewrite
+		self.assertIn( '(x.tag != 1 and x.data.v_Val) and (y.tag != 1 and y.data.v_Val)', src )
+
+	def test_or_with_bool_or_none_operands_rewrites_both( self ) -> None:
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Val: bool',
+			'	Absent: None',
+			'',
+			'def main( x: MaybeBool, y: MaybeBool ) -> i32:',
+			'	if x or y:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'x.tag != 1 and x.data.v_Val or (y.tag != 1 and y.data.v_Val)', src )
+
+	def test_and_with_mixed_bool_or_none_and_plain_bool_rewrites_only_union_operand( self ) -> None:
+		# one operand is bool|None, the other is plain bool — only the union
+		# operand should be rewritten; the plain bool stays as-is
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Val: bool',
+			'	Absent: None',
+			'',
+			'def main( x: MaybeBool, flag: bool ) -> i32:',
+			'	if x and flag:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		# x gets rewritten, flag stays bare
+		self.assertIn( '(x.tag != 1 and x.data.v_Val) and flag', src )
+
+	def test_ternary_with_bool_or_none_condition_rewrites( self ) -> None:
+		mod = self._import( '\n'.join([
+			'@union',
+			'class MaybeBool:',
+			'	Val: bool',
+			'	Absent: None',
+			'',
+			'def main( x: MaybeBool ) -> i32:',
+			'	return 1 if x else 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( '1 if x.tag != 1 and x.data.v_Val else 0', src )
 	# --- match ------------------------------------------------------------
 
 	def test_match_union_rewrites_to_if_elif_chain( self ) -> None:

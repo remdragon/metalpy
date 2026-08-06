@@ -18,13 +18,13 @@ from fs import (
 if compiler.target.os == 'windows':
 	from fs import (
 		GENERIC_READ, GENERIC_WRITE,
-		CREATE_ALWAYS, OPEN_ALWAYS, OPEN_EXISTING,
+		CREATE_NEW, CREATE_ALWAYS, OPEN_EXISTING, OPEN_ALWAYS, TRUNCATE_EXISTING,
 		FILE_END,
 	)
 else:
 	from fs import (
 		O_RDONLY, O_WRONLY, O_RDWR,
-		O_CREAT, O_TRUNC, O_APPEND,
+		O_CREAT, O_EXCL, O_TRUNC, O_APPEND,
 	)
 
 
@@ -143,12 +143,21 @@ class File:
 		path: str,
 		append: bool = False,
 		truncate: bool = True,
+		exists: bool|None = None,
 	) -> Result[BinaryWriter, OSError]:
 		access: u32 = GENERIC_WRITE
-		if truncate:
-			creation: u32 = CREATE_ALWAYS
+		if exists is None:
+			if truncate:
+				creation: u32 = CREATE_ALWAYS
+			else:
+				creation: u32 = OPEN_ALWAYS
+		elif exists:
+			if truncate:
+				creation: u32 = TRUNCATE_EXISTING
+			else:
+				creation: u32 = OPEN_EXISTING
 		else:
-			creation: u32 = OPEN_ALWAYS
+			creation: u32 = CREATE_NEW
 		fd: FD = open_raw( path.get_cstr(), access, creation ).or_return()
 		if append:
 			seek_raw( fd, 0, FILE_END ).or_return()
@@ -160,10 +169,18 @@ class File:
 		path: str,
 		append: bool = False,
 		truncate: bool = True,
+		exists: bool|None = None,
 	) -> Result[BinaryWriter, OSError]:
-		flags: i32 = O_WRONLY | O_CREAT
-		if truncate:
-			flags |= O_TRUNC
+		flags: i32 = O_WRONLY
+		if exists is None:
+			flags |= O_CREAT
+			if truncate:
+				flags |= O_TRUNC
+		elif exists:
+			if truncate:
+				flags |= O_TRUNC
+		else:
+			flags |= O_CREAT | O_EXCL
 		if append:
 			flags |= O_APPEND
 		fd: FD = open_raw( path.get_cstr(), flags, 0o644 ).or_return()
@@ -177,12 +194,21 @@ class File:
 		path: str,
 		append: bool = False,
 		truncate: bool = True,
+		exists: bool|None = None,
 	) -> Result[BinaryReadWriter, OSError]:
 		access: u32 = GENERIC_READ | GENERIC_WRITE
-		if truncate:
-			creation: u32 = CREATE_ALWAYS
+		if exists is None:
+			if truncate:
+				creation: u32 = CREATE_ALWAYS
+			else:
+				creation: u32 = OPEN_ALWAYS
+		elif exists:
+			if truncate:
+				creation: u32 = TRUNCATE_EXISTING
+			else:
+				creation: u32 = OPEN_EXISTING
 		else:
-			creation: u32 = OPEN_ALWAYS
+			creation: u32 = CREATE_NEW
 		fd: FD = open_raw( path.get_cstr(), access, creation ).or_return()
 		if append:
 			seek_raw( fd, 0, FILE_END ).or_return()
@@ -194,10 +220,18 @@ class File:
 		path: str,
 		append: bool = False,
 		truncate: bool = True,
+		exists: bool|None = None,
 	) -> Result[BinaryReadWriter, OSError]:
-		flags: i32 = O_RDWR | O_CREAT
-		if truncate:
-			flags |= O_TRUNC
+		flags: i32 = O_RDWR
+		if exists is None:
+			flags |= O_CREAT
+			if truncate:
+				flags |= O_TRUNC
+		elif exists:
+			if truncate:
+				flags |= O_TRUNC
+		else:
+			flags |= O_CREAT | O_EXCL
 		if append:
 			flags |= O_APPEND
 		fd: FD = open_raw( path.get_cstr(), flags, 0o644 ).or_return()
