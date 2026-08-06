@@ -2594,8 +2594,7 @@ class Lowering:
 		# substituting a SOLVED binding through arbitrarily nested
 		# Specializations (list[T] etc), so unification mirrors that same
 		# recursive shape instead of only handling a bare `t: T` parameter
-		if target.resolve is not None:
-			target.resolve()
+		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by the type_resolution module'
 		positional, keyword = self._match_call_args( target, node )
 		args = [ self._lower_expr( expr, None ) for _param, expr in positional ]
 		kwargs = { param.stem: self._lower_expr( expr, None ) for param, expr in keyword }
@@ -2695,6 +2694,7 @@ class Lowering:
 		# _lower_inferred_generic_call's own comment), the surrounding
 		# expected_type is usually enough to resolve every class type
 		# param here without needing the arguments' own types at all
+		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by the type_resolution module'
 		if target.resolve is not None:
 			target.resolve()
 		cls = target.cls
@@ -2828,8 +2828,7 @@ class Lowering:
 			# than guessing if more than one genuinely could
 			candidates = [ *target.stubs, *target.implementations ]
 			for fn in candidates:
-				if fn.resolve is not None:
-					fn.resolve()
+				assert fn.resolve is None, f'internal compiler error - {fn.qualname} was not resolved before overload dispatch'
 			args = [ self._lower_overload_arg( a, i, None, candidates, node ) for i, a in enumerate( node.args ) ]
 			if any( kw.arg is None for kw in node.keywords ):
 				self.discovery.fail( f'**kwargs not supported yet: {ast.unparse(node)}', node )

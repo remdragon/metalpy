@@ -465,7 +465,18 @@ class TypeResolver:
 		found = names.get( attr )
 		if not isinstance( found, ( Function, Overload )):
 			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
+		if isinstance( found, ( Function, Overload )):
+			self._resolve_callable( found )
 		return found
+
+	def _resolve_callable( self, callee: Function|Overload ) -> None:
+		if isinstance( callee, Function ):
+			if callee.resolve is not None:
+				callee.resolve()
+		else:
+			for fn in ( *callee.stubs, *callee.implementations ):
+				if fn.resolve is not None:
+					fn.resolve()
 
 	def _resolve_union_receiver_members( self, union: TaggedUnion, members: list[Variable], attr: str, ctx: ast.AST ):
 		# imported here to avoid circular dependency
@@ -510,6 +521,7 @@ class TypeResolver:
 		and resolve through its type. '''
 		namespace_result = self._try_resolve_namespace( func_node )
 		if isinstance( namespace_result, ( Function, Overload )):
+			self._resolve_callable( namespace_result )
 			return namespace_result
 		if isinstance( namespace_result, Specialization ) and isinstance( namespace_result.base, Function ):
 			return namespace_result
@@ -991,8 +1003,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				if target.resolve is not None:
 					target.resolve()
 				init = target.names.get( '__init__' )
-				if isinstance( init, Function ) and init.resolve is not None:
-					init.resolve()
+				if isinstance( init, Function ):
+					self.resolver._resolve_callable( init )
 			return node
 		target, args = resolved
 		spec = self.discovery._get_or_create_specialization( target, args )
