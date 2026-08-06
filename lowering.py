@@ -1777,10 +1777,11 @@ class Lowering:
 			)
 
 	def _expr_UnaryOp( self, node: ast.UnaryOp, expected_type: Type|None ) -> ir.Operand:
-		# `not` (ast.Not) is deliberately not handled here - there's no
-		# boolean-negation opcode in ir.py yet (unlike Invert/Neg*), and
-		# adding one is a real design decision, not just wiring up an
-		# existing primitive like the rest of this method does
+		if isinstance( node.op, ast.Not ):
+			operand = self._lower_expr( node.operand, expected_type )
+			dest = self._new_temp( expected_type or operand.type )
+			self._emit( ir.Not( dest = dest, operand = operand ))
+			return dest
 		operand = self._lower_expr( node.operand, expected_type )
 		result_type = expected_type or operand.type
 

@@ -749,6 +749,46 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		self.generic_visit( node )
 		return node
 
+	def visit_Assert( self, node: ast.Assert ) -> list[ast.stmt]:
+		self.generic_visit( node )
+		if node.msg is None:
+			self.discovery.fail(
+				'assert requires a message (e.g. assert cond, "reason"): '
+				+ ast.unparse( node ),
+				node,
+			)
+		# force-import sys and resolve its _assert function — the rewritten
+		# AST uses a bare `sys._assert(...)` reference, but that name won't
+		# resolve in the current scope; tag the Call node with resolved_callee
+		# so lowering uses the Function object directly (same pattern as
+		# visit_Call's generic-call resolution), never touching `sys` at all
+		try:
+			sys_module = self.discovery.import_name( 'sys' )
+		except FileNotFoundError:
+			self.discovery.fail(
+				'assert requires the sys module, but it could not be found '
+				'(try calling sys._assert() directly instead): '
+				+ ast.unparse( node ),
+				node,
+			)
+		_assert_fn = sys_module.get_local( '_assert' )
+		if isinstance( _assert_fn, Function ):
+			self.resolver.schedule( _assert_fn )
+		call = ast.Call(
+			func = ast.Attribute(
+				value = ast.Name( id = 'sys', ctx = ast.Load() ),
+				attr = '_assert',
+				ctx = ast.Load(),
+			),
+			args = [ node.test, node.msg ],
+			keywords = [],
+		)
+		ast.copy_location( call, node )
+		call.resolved_callee = _assert_fn
+		stmt = ast.Expr( value = call )
+		ast.copy_location( stmt, node )
+		return [ stmt ]
+
 	# --- rewrite 2: match statements ---
 
 	def visit_Match( self, node: ast.Match ) -> list[ast.stmt]:

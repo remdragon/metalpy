@@ -110,6 +110,11 @@ def panic( message: str ) -> NoReturn:
 	_write_stderr_cstr( message.get_cstr(), message.byte_len() )
 	_exit_process( 1 )
 
+def _assert( cond: bool, msg: str ) -> None:
+	# TODO FIXME: change type_discovery.py to emit this logic directly
+	if not cond:
+		panic( msg )
+
 # private helper functions:
 
 @compiler.target( os = 'windows' )

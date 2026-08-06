@@ -1049,20 +1049,21 @@ class Tests( unittest.TestCase ):
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
 
-	def test_unaryop_not_remains_unsupported( self ) -> None:
-		# no boolean-negation opcode exists in ir.py yet - flagged as a
-		# separate, real design decision rather than guessed at here
+	def test_unaryop_not_emits_not_instruction( self ) -> None:
+		# needs builtins for the intrinsic `bool` type
+		disco = Discovery( import_builtins = True )
+		comp = Compiler( disco )
 		code = '\n'.join([
-			'class bool: pass',
-			'',
 			'def main() -> None:',
 			'	a: bool',
 			'	b: bool = not a',
 			'	return',
 		])
-		self._import( code )
-		self._lower_main()
-		self.assertIn( 'unsupported unary operator', self.discovery.errors.errors[0] )
+		comp.import_code( code, filename = Path( '__test__.py' ))
+		fn = comp._lower( disco.main )
+		self.assertEqual( disco.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'Not', kinds )
 
 	# --- comparisons ---------------------------------------------------------
 

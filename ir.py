@@ -183,6 +183,14 @@ class CastWrap( UnaryOp ): pass
 class CastCheck( UnaryOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class CastSaturate( UnaryOp ): pass
 
+@dataclass( kw_only = True )
+class Not( Instruction ): # boolean negation: dest = !operand
+	dest: Temp
+	operand: Operand
+
+	def test_repr( self ) -> str:
+		return f'Not( dest={self.dest!r}, operand={self.operand!r} )'
+
 # Result-consuming ops - Check-mode arithmetic and Div/Mod hand back a
 # Result[T,OverflowError] rather than panicking inline. These mirror the real
 # methods already defined on builtins.Result (or_return, unwrap, unwrap_or in
