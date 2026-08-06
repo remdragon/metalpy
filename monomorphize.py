@@ -113,7 +113,7 @@ class Monomorphizer:
 		# copy per distinct instantiation.
 		#
 		# .node is deep-copied, not shared with base - every specialization
-		# gets its own independent body. This is what lets type_resolution.py's
+		# gets its own independent body. This is what lets type_resolver.py's
 		# generic-call resolution (_ReferenceResolver.visit_Call) tag a
 		# DIFFERENT node.resolved_callee per specialization when this
 		# function's own body calls another generic function using its own
@@ -121,7 +121,7 @@ class Monomorphizer:
 		# call depends on which T this copy was bound to, so the two
 		# specializations of foo genuinely need independent bodies, not a
 		# shared one interpreted two different ways - see resolve_function_
-		# body's own docstring in type_resolution.py, which relies on this)
+		# body's own docstring in type_resolver.py, which relies on this)
 		if spec.monomorphized is not None:
 			return spec.monomorphized
 		base = spec.base

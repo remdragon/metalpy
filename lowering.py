@@ -14,7 +14,7 @@ from mpy_types import (
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
-from type_resolution import TypeResolver
+from type_resolver import TypeResolver
 from union_storage import ReceiverDispatch as _ReceiverDispatch
 
 # compile-error "here's what to do instead" text for a Check-mode opcode's
@@ -111,7 +111,7 @@ class Lowering:
 
 	def __init__( self, discovery: Discovery, type_resolver: 'TypeResolver' ) -> None:
 		self.discovery = discovery
-		# type_resolver (type_resolution.py) owns the reachable-from-main
+		# TypeResolver (type_resolver.py) owns the reachable-from-main
 		# work queue and the shared UnionStorage/Monomorphizer instances -
 		# both already depended on nothing but Discovery and a `schedule`
 		# callback, so Lowering just borrows the SAME instances rather than
@@ -355,7 +355,7 @@ class Lowering:
 		# real errdefer+clang round trip once _ensure_resolved's own
 		# incidental scheduling was scheduling BOTH the abstract AND the
 		# correctly-monomorphized version side by side
-		assert is_err_fn.resolve is None, f'internal compiler error - {is_err_fn.qualname} was not fully resolved by the type_resolution module'
+		assert is_err_fn.resolve is None, f'internal compiler error - {is_err_fn.qualname} was not fully resolved by the type_resolver module'
 		return_type = self._return_value_var.type
 		if isinstance( return_type, Specialization ) and return_type.base is is_err_fn.cls:
 			# the receiver's type (self._return_value_var, always a
@@ -1561,7 +1561,7 @@ class Lowering:
 		# CEnum member VALUE expressions (OSError.FileNotFoundError used as
 		# a runtime value) — the base is a class, not a runtime value, so
 		# the normal _lower_expr path would reject it. Walk the namespace
-		# chain through .names dicts (type_resolution.py already resolved
+		# chain through .names dicts (type_resolver.py already resolved
 		# and scheduled every link) and fold the member to an ir.Const.
 		chain = self.find_name_recursive( node )
 		if chain is not None:
@@ -1569,7 +1569,7 @@ class Lowering:
 			if isinstance( obj, CEnum ):
 				assert obj.resolve is None, (
 					f'CEnum {obj.qualname} reached lowering unresolved — '
-					f'type_resolution.py visit_Attribute should have resolved it'
+					f'type_resolver.py visit_Attribute should have resolved it'
 				)
 				value = obj.members.get( attr )
 				if value is not None:
@@ -1597,7 +1597,7 @@ class Lowering:
 		FileNotFoundError) to the terminal scope object and the final
 		attribute name. Purely walks .names dicts — no ensure_resolved,
 		no scheduling, no type-resolving. The chain is assumed to already
-		be fully resolved by type_resolution.py before lowering runs.
+		be fully resolved by type_resolver.py before lowering runs.
 
 		Returns (terminal_object, last_attr) on success, None when the
 		root isn't an ast.Name or isn't a registered name at all (caller
@@ -1859,7 +1859,7 @@ class Lowering:
 
 		if left_is_none or right_is_none:
 			# a TaggedUnion-typed operand (T|None) never reaches here anymore -
-			# type_resolution.py's _ReferenceResolver already rewrote that
+			# type_resolver.py's _ReferenceResolver already rewrote that
 			# shape into a plain tag Eq/NotEq Compare before lowering ever
 			# saw this statement (see its own visit_Compare). What's left is
 			# a flat Cmp against a real None-typed Const - e.g. a raw
@@ -1880,7 +1880,7 @@ class Lowering:
 	# --- shared helpers ----------------------------------------------------------
 
 	def _ensure_resolved( self, obj: object ) -> object:
-		# moved to TypeResolver.ensure_resolved (type_resolution.py) - kept
+		# moved to TypeResolver.ensure_resolved (type_resolver.py) - kept
 		# here as a thin delegate since this file calls it ~15 times and the
 		# behavior (resolve now + unconditionally schedule + swap a
 		# Specialization for its monomorphized form) is still exactly what
@@ -2593,7 +2593,7 @@ class Lowering:
 		# substituting a SOLVED binding through arbitrarily nested
 		# Specializations (list[T] etc), so unification mirrors that same
 		# recursive shape instead of only handling a bare `t: T` parameter
-		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by the type_resolution module'
+		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by the type_resolver module'
 		positional, keyword = self._match_call_args( target, node )
 		args = [ self._lower_expr( expr, None ) for _param, expr in positional ]
 		kwargs = { param.stem: self._lower_expr( expr, None ) for param, expr in keyword }
@@ -2693,7 +2693,7 @@ class Lowering:
 		# _lower_inferred_generic_call's own comment), the surrounding
 		# expected_type is usually enough to resolve every class type
 		# param here without needing the arguments' own types at all
-		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by the type_resolution module'
+		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by the type_resolver module'
 		cls = target.cls
 		class_type_params = cls.type_params or [] if cls is not None else []
 		bindings: dict[int,Type] = {}
@@ -2764,7 +2764,7 @@ class Lowering:
 			if allocate_dest is not None:
 				return allocate_dest if want_result else None
 
-		# type_resolution.py's own generic-call resolution
+		# type_resolver.py's own generic-call resolution
 		# (_ReferenceResolver.visit_Call) may already have tagged this call
 		# with its resolved, monomorphized callee (an ordinary, concrete
 		# Function - never a Specialization) - when present, it's

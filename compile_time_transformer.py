@@ -21,7 +21,7 @@ subject wins, its body is spliced in (any `as`/bare-name capture the
 winning pattern introduces is preceded by a synthesized `name = <value>`
 assignment, since the match statement itself is gone and can no longer
 bind it), and every other case is dropped. This is more than just an
-optimization for match - type_resolution.py's own _ReferenceResolver
+optimization for match - type_resolver.py's own _ReferenceResolver
 (which now rewrites every match statement into an if/elif/else chain
 before lowering.py ever sees one - see its own module docstring) doesn't
 implement MatchValue/MatchSingleton/MatchOr patterns at all yet (only

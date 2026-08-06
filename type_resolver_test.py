@@ -8,7 +8,7 @@ import unittest
 # local imports:
 from discovery import Discovery
 from mpy_types import CEnum, Function
-from type_resolution import TypeResolver
+from type_resolver import TypeResolver
 
 class TypeResolutionTests( unittest.TestCase ):
 	''' TypeResolver built directly against a real Discovery instance (same

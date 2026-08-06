@@ -9,7 +9,7 @@ from discovery import Discovery
 from errors import CompileError
 from lowering import Lowering
 from mpy_types import Module, Function, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization
-from type_resolution import TypeResolver
+from type_resolver import TypeResolver
 
 @dataclass( kw_only = True )
 class LoweredFunction:
@@ -33,7 +33,7 @@ class Compiler:
 	The work queue itself (a stdlib queue.Queue, already thread-safe even
 	though nothing here is threaded yet) and the "what's actually a
 	dependency worth scheduling" judgment both live on type_resolver
-	(type_resolution.py) now - lowering.py hands it anything it comes
+	(type_resolver.py) now - lowering.py hands it anything it comes
 	across (a Function, a class, a Variable, a Specialization, even a
 	Module walked mid-namespace-lookup) without needing to know which of
 	those are real compile units; see TypeResolver.schedule's own
@@ -48,7 +48,7 @@ class Compiler:
 	'''
 	def __init__( self, disco: Discovery ) -> None:
 		self.disco = disco
-		# type_resolver (type_resolution.py) owns the reachable-from-main
+		# TypeResolver (type_resolver.py) owns the reachable-from-main
 		# work queue (previously built directly here) and the shared
 		# UnionStorage/Monomorphizer instances (previously built inside
 		# Lowering.__init__) - see its own docstring
