@@ -1053,6 +1053,27 @@ _BOX_FIXTURE = _FOO_FIXTURE + '\n' + '\n'.join([
 ])
 
 class RCClassDestructorTests( RCClassTestCase ):
+	def _emit_and_find_destructor( self, qualname: str ) -> str:
+		''' emit full C and extract the destructor body for the given
+		class qualname. '''
+		c_src = emitter_c.emit_c( self.compiler )
+		mangled = emitter_c.mangle_qualname( qualname )
+		dtor_name = f'{mangled}$$__destructor__'
+		lines = c_src.split( chr( 10 ))
+		start = None
+		for i, line in enumerate( lines ):
+			if dtor_name in line and 'void* __obj ) {' in line:
+				start = i
+				break
+		self.assertIsNotNone( start, f'destructor {dtor_name} not found in emitted C' )
+		# collect lines until the closing brace
+		body_lines = []
+		for j in range( start, len( lines )):
+			body_lines.append( lines[j] )
+			if lines[j].strip() == '}':
+				break
+		return '\n'.join( body_lines )
+
 	def test_del_method_is_called_from_synthesized_destructor( self ) -> None:
 		self._run( _OWNER_FIXTURE + '\n' + '\n'.join([
 			'def main() -> None:',
@@ -1062,10 +1083,9 @@ class RCClassDestructorTests( RCClassTestCase ):
 			'	return',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
-		owner_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Owner' )
-		destructor_src = emitter_c.emit_rcclass_destructor( owner_cls )
-		self.assertIn( '__main__$Owner$__del__( self );', destructor_src )
-		self.assertIn( 'sys$free( ( void* )self );', destructor_src )
+		destructor_src = self._emit_and_find_destructor( '__main__.Owner' )
+		self.assertIn( '__main__$Owner$__del__( self )', destructor_src )
+		self.assertIn( 'sys$free( (void*)(self) )', destructor_src )
 		# __del__ runs BEFORE sys.free - fields must still be valid when it runs
 		self.assertLess( destructor_src.index( '__del__' ), destructor_src.index( 'sys$free' ))
 
@@ -1077,18 +1097,16 @@ class RCClassDestructorTests( RCClassTestCase ):
 			'	return',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
-		box_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Box' )
-		destructor_src = emitter_c.emit_rcclass_destructor( box_cls )
+		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
 		self.assertNotIn( '__del__', destructor_src ) # Box declares none
-		self.assertIn( 'release_object( &(self->inner)->$header, __main__$Foo$$__destructor__ );', destructor_src )
-		self.assertIn( 'sys$free( ( void* )self );', destructor_src )
+		self.assertIn( 'release_object', destructor_src )
+		self.assertIn( '__main__$Foo$$__destructor__', destructor_src )
+		self.assertIn( 'sys$free( (void*)(self) )', destructor_src )
 
 	def test_taggedunion_field_cascades_a_tag_gated_decref( self ) -> None:
 		# a TaggedUnion-typed field with an RC-leaf member (MaybeFoo.Some)
-		# needs the same tag-gated shape cfg.py builds at the IR level for
-		# LOCAL bindings, reimplemented in raw C here since no IR backs a
-		# synthesized destructor body - the non-RC member (Nothing) needs
-		# no branch at all
+		# goes through normal lowering now — the tag check becomes an
+		# ordinary if statement in the lowered IR, no longer raw C text
 		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
 			'@union',
 			'class MaybeFoo:',
@@ -1108,17 +1126,19 @@ class RCClassDestructorTests( RCClassTestCase ):
 			'	return',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
-		box_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Box' )
-		destructor_src = emitter_c.emit_rcclass_destructor( box_cls )
-		self.assertIn( 'uint8_t __tag = (self->maybe).tag;', destructor_src )
-		self.assertIn( 'if ( __tag == 0 ) {', destructor_src )
-		self.assertIn( 'release_object( &((self->maybe).data.v_Some)->$header, __main__$Foo$$__destructor__ );', destructor_src )
+		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
+		# should have a tag comparison (lowered from the AST if statement)
+		self.assertIn( '.tag', destructor_src )
+		self.assertIn( 'goto L_', destructor_src )  # the if/else branching
+		# should decref the RC member only
+		self.assertIn( 'release_object', destructor_src )
+		self.assertIn( 'v_Some', destructor_src )
 		self.assertNotIn( 'v_Nothing', destructor_src ) # the non-RC member needs no branch at all
 
 	def test_nested_cstruct_field_cascades_decref_into_its_own_fields( self ) -> None:
 		# a by-value CStruct field is always fully live (unlike a union, no
-		# discriminant needed) - safe to walk its own fields unconditionally,
-		# recursively, looking for further RC leaves
+		# discriminant needed) - the cascade walks through the struct to
+		# reach the nested RC leaf
 		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
 			'@cstruct',
 			'class Wrapper:',
@@ -1137,9 +1157,9 @@ class RCClassDestructorTests( RCClassTestCase ):
 			'	return',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
-		box_cls = next( cls for cls in self.compiler.rcclasses if cls.qualname == '__main__.Box' )
-		destructor_src = emitter_c.emit_rcclass_destructor( box_cls )
-		self.assertIn( 'release_object( &((self->w).inner)->$header, __main__$Foo$$__destructor__ );', destructor_src )
+		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
+		self.assertIn( 'release_object', destructor_src )
+		self.assertIn( '__main__$Foo$$__destructor__', destructor_src )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):

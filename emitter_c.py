@@ -368,7 +368,7 @@ def _result_tag_data_names( result_spec: Type ) -> tuple[str,str,str,str]:
 	Result[T,E]-shaped value - Result is a real @union like any other
 	(TaggedUnion), so this reads the actual field names Lowering.
 	_tagged_union_storage synthesized into its own .names['tag']/['data'],
-	the SAME shape emit_tagged_union/_emit_field_teardown already read,
+	the SAME shape emit_tagged_union already reads,
 	rather than hardcoding '_tag'/'_payload.ok'/'_payload.err' the way this
 	module used to when Result predated @union. The Ok=0/Err=1 tag-VALUE
 	convention stays a literal assumption at every call site below (that's
@@ -910,7 +910,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# expands any TaggedUnion-typed Incref/Decref into a tag-gated
 		# GetAttr+Cmp+Jump*+Incref/Decref sequence at the IR level - see the
 		# plan's grounding facts) - its own synthesized destructor (see
-		# emit_rcclass_destructor) is always the right one to reference
+		# _rcclass_destructor_name) is always the right one to reference
 		destructor_name = _rcclass_destructor_name( instr.value.type )
 		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header, {destructor_name} );' ]
 	if isinstance( instr, ir.RefCount ):
@@ -1064,104 +1064,6 @@ def _rcclass_destructor_name( cls: Type ) -> str:
 	# emit_rcclass's own $header
 	return f'{mangle_type(cls)}$$__destructor__'
 
-def _type_needs_teardown( t: Type ) -> bool:
-	# does tearing down a VALUE of this type require any action at all -
-	# generalizes cfg.py's own is_rc()/rc_leaves() to ALSO recurse into
-	# CStruct/TaggedUnion fields. cfg.py deliberately doesn't do that for
-	# LOCAL VARIABLE tracking (see its own "v1 deliberately doesn't reach
-	# into struct/union FIELDS" comment) - that's a separate, still-open
-	# limitation of the ownership-tracking model this doesn't touch. A
-	# destructor's own cascading walk is different: it already has to
-	# visit every field of the RCClass being torn down regardless, so
-	# finding RC leaves nested inside a by-value CStruct/TaggedUnion field
-	# is no extra structural work, just recursion.
-	base = t.base if isinstance( t, Specialization ) else t
-	if isinstance( base, RCClass ):
-		return True
-	if isinstance( base, ( CStruct, TaggedUnion )):
-		return any( _type_needs_teardown( attr.type ) for attr in base.attributes )
-	# CUnion has no discriminant of its own to safely recurse through (see
-	# _emit_field_teardown's own comment) - CEnum/Scalar/Ptr never need
-	# teardown at all
-	return False
-
-def _emit_field_teardown( self_expr: str, field_type: Type ) -> list[str]:
-	# recursively decrefs every RC leaf reachable from a VALUE at
-	# self_expr, without needing any external discriminant. RCClass
-	# (direct decref), CStruct (every field is always live - safe to walk
-	# unconditionally), and TaggedUnion (a tag-gated decref into whichever
-	# member's own tag says is live, mirroring cfg.py's own
-	# _tag_gated_refcount_instructions at the IR level) are all safe to
-	# recurse into this way. A bare CUnion has no discriminant of its own
-	# to consult - only some ENCLOSING context (a sibling tag field the
-	# CUnion's own type has no knowledge of) could know which member is
-	# live, and there's no general way to detect that pairing structurally
-	# from the union's own type alone - skipped, same "compiles clean, not
-	# necessarily leak-free yet" posture Phase 3's own NULL-destructor
-	# placeholder already established for a narrower case.
-	if not _type_needs_teardown( field_type ):
-		return []
-	base = field_type.base if isinstance( field_type, Specialization ) else field_type
-	if isinstance( base, RCClass ):
-		destructor = _rcclass_destructor_name( field_type )
-		return [ f'\trelease_object( &({self_expr})->$header, {destructor} );' ]
-	if isinstance( base, CStruct ):
-		lines: list[str] = []
-		for attr in base.attributes:
-			lines.extend( _emit_field_teardown( f'({self_expr}).{_field_name(attr.stem)}', attr.type ))
-		return lines
-	if isinstance( base, TaggedUnion ):
-		tag_attr = base.names.get( 'tag' )
-		data_attr = base.names.get( 'data' )
-		if not ( isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable )):
-			# _tagged_union_storage never actually ran for this union (no
-			# real construction/match anywhere reached it) - no real
-			# runtime storage shape exists to tear down at all
-			return []
-		lines = [ '\t{', f'\t\tuint8_t __tag = ({self_expr}).{_field_name(tag_attr.stem)};' ]
-		for i, member in enumerate( base.attributes ):
-			if not _type_needs_teardown( member.type ):
-				continue
-			member_expr = f'({self_expr}).{_field_name(data_attr.stem)}.{_field_name(f"v_{member.stem}")}'
-			lines.append( f'\t\tif ( __tag == {i} ) {{' )
-			lines.extend( f'\t{inner}' for inner in _emit_field_teardown( member_expr, member.type ))
-			lines.append( '\t\t}' )
-		lines.append( '\t}' )
-		return lines
-	return []
-
-def emit_rcclass_destructor( cls: RCClass ) -> str:
-	# the void(*)(void*) release_object needs - pure emitter-side synthesis
-	# (no compiler stage recognizes __del__ specially, and there's no IR
-	# stream backing a synthesized destructor body - this module has to
-	# build the C text directly, unlike every other emit_* function here).
-	# Order: the class's own __del__ runs FIRST (as an ordinary function
-	# call, not inlined - fields are still fully valid at this point),
-	# THEN cascading decref into every RC leaf reachable from a field
-	# (base fields before derived, matching emit_rcclass's own field
-	# ordering - see _emit_field_teardown for how deeply this recurses),
-	# THEN sys.free on the object's own backing memory.
-	name = _rcclass_destructor_name( cls )
-	ctype = c_type( cls )
-	lines = [
-		f'static void {name}( void* __obj ) {{',
-		f'\t{ctype} self = ({ctype})__obj;',
-	]
-	del_fn = cls.get_local( '__del__' )
-	if isinstance( del_fn, Function ):
-		lines.append( f'\t{mangle_qualname(del_fn.qualname)}( self );' )
-	chain: list[RCClass] = []
-	node: RCClass|None = cls
-	while node is not None:
-		chain.append( node )
-		node = node.base
-	for base_cls in reversed( chain ):
-		for attr in base_cls.attributes:
-			lines.extend( _emit_field_teardown( f'self->{_field_name(attr.stem)}', attr.type ))
-	sys_free_name = mangle_qualname( 'sys.free' )
-	lines.append( f'\t{sys_free_name}( ( void* )self );' )
-	lines.append( '}' )
-	return '\n'.join( lines )
 
 # --- string/bytes literal static-baking -----------------------------------
 #
@@ -1416,25 +1318,6 @@ def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 
 # --- whole-program driver ------------------------------------------------
 
-def _rcclass_was_constructed( cls: RCClass, compiler: Compiler ) -> bool:
-	# a class landing in compiler.rcclasses does NOT by itself mean an
-	# instance was ever actually heap-allocated - a bare parameter/local
-	# type annotation (x: Foo) schedules the CLASS the same way construction
-	# does (see lowering.py's own var-type scheduling), independent of
-	# whether .__allocate__()/sys.alloc[Foo] was ever reached. A class only
-	# EVER needs a real destructor if sys.alloc[cls] itself was scheduled
-	# (Lowering._lower_allocate_fields's RCClass branch - the one and only
-	# place that happens), which is also exactly the trigger that already
-	# schedules sys.free/__del__ for it - so this is the precise signal for
-	# "will release_object's own function-pointer argument ever actually be
-	# invoked for this class." Classes that are only ever baked as an
-	# immortal string/bytes literal (never dynamically constructed) are the
-	# motivating case: release_object skips an immortal object's destructor
-	# call entirely at runtime, so the destructor function itself doesn't
-	# need to exist (and its own body's sys.free call, needed unconditionally
-	# by every OTHER real destructor, was never scheduled either).
-	alloc_qualname = f'sys.alloc[{cls.qualname}]'
-	return any( lf.function.qualname == alloc_qualname for lf in compiler.functions )
 
 def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	''' single C11 translation unit - see the plan's "three-pass emission

@@ -2,11 +2,12 @@
 import ast
 import logging
 from pathlib import Path
+import queue as queue_module
 import unittest
 
 # local imports:
 from discovery import Discovery
-from mpy_types import CEnum
+from mpy_types import CEnum, Function
 from type_resolution import TypeResolver
 
 class TypeResolutionTests( unittest.TestCase ):
@@ -544,6 +545,134 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		[ callee ] = self._resolved_callees( fn )
 		self.assertIsNone( callee )
+
+
+	# --- destructor synthesis -------------------------------------------------
+
+	def _resolve_class( self, mod, name: str ):
+		''' resolve a class body and its attributes, same as
+		compiler._lower would do for a bare RCClass '''
+		cls = mod.get_local( name )
+		if cls.resolve is not None:
+			cls.resolve()
+		for attr in cls.attributes:
+			if attr.resolve is not None:
+				attr.resolve()
+		return cls
+
+	def _synthesize_and_dequeue( self, cls ):
+		''' call _synthesize_rcclass_destructor and dequeue the resulting
+		Function from the resolver's work queue '''
+		self.resolver._synthesize_rcclass_destructor( cls )
+		queued = []
+		while True:
+			try:
+				queued.append( self.resolver.queue.get_nowait() )
+			except queue_module.Empty:
+				break
+		dtors = [ u for u in queued if isinstance( u, Function ) and u.is_destructor and u.qualname.startswith( cls.qualname ) ]
+		self.assertEqual( len( dtors ), 1, f'expected exactly one destructor in the queue for {cls.qualname}, got {[u.qualname for u in dtors]}' )
+		return dtors[0]
+
+	def test_destructor_synthesis_basic( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+		]))
+		cls = self._resolve_class( mod, 'Foo' )
+		dtor = self._synthesize_and_dequeue( cls )
+		src = ast.unparse( dtor.node )
+		# must call sys.free(self)
+		self.assertIn( 'sys.free', src )
+		self.assertIn( 'self', src )
+		# no __del__ call since Foo doesn't declare one
+		self.assertNotIn( '__del__', src )
+		# no compiler.decref since Foo has no fields
+		self.assertNotIn( 'compiler.decref', src )
+		self.assertTrue( dtor.is_destructor )
+		self.assertTrue( dtor.is_static )
+		self.assertIsNone( dtor.cls )
+
+	def test_destructor_synthesis_calls_del_before_free( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Owner:',
+			'	x: i32',
+			'	def __del__( self ) -> None:',
+			'		pass',
+		]))
+		cls = self._resolve_class( mod, 'Owner' )
+		dtor = self._synthesize_and_dequeue( cls )
+		src = ast.unparse( dtor.node )
+		# __del__ must appear before sys.free
+		del_pos = src.index( 'self.__del__()' )
+		free_pos = src.index( 'sys.free' )
+		self.assertLess( del_pos, free_pos )
+
+	def test_destructor_synthesis_decrefs_rc_field( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Inner: pass',
+			'class Outer:',
+			'	inner: Inner',
+		]))
+		cls = self._resolve_class( mod, 'Outer' )
+		dtor = self._synthesize_and_dequeue( cls )
+		src = ast.unparse( dtor.node )
+		self.assertIn( 'compiler.decref(self.inner)', src )
+		# decref before sys.free
+		decref_pos = src.index( 'compiler.decref' )
+		free_pos = src.index( 'sys.free' )
+		self.assertLess( decref_pos, free_pos )
+
+	def test_destructor_synthesis_cascades_through_cstruct_field( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Inner: pass',
+			'@cstruct',
+			'class Wrapper:',
+			'	inner: Inner',
+			'class Outer:',
+			'	w: Wrapper',
+		]))
+		cls = self._resolve_class( mod, 'Outer' )
+		dtor = self._synthesize_and_dequeue( cls )
+		src = ast.unparse( dtor.node )
+		# should see compiler.decref(self.w.inner) — the cascade through the CStruct
+		self.assertIn( 'compiler.decref(self.w.inner)', src )
+		self.assertNotIn( 'compiler.decref(self.w)', src )  # Wrapper itself isn't RC
+
+	def test_destructor_synthesis_tagged_union_decrefs_active_rc_member( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+			'@union',
+			'class MaybeFoo:',
+			'	Some: Foo',
+			'	Nothing: i32',
+			'class Outer:',
+			'	maybe: MaybeFoo',
+		]))
+		cls = self._resolve_class( mod, 'Outer' )
+		dtor = self._synthesize_and_dequeue( cls )
+		src = ast.unparse( dtor.node )
+		# should have a conditional on the tag
+		self.assertIn( '__dtor_tag_', src )
+		self.assertIn( 'if __dtor_tag_0 == 0:', src )  # tag == 0 → Some
+		self.assertIn( 'compiler.decref(self.maybe.data.v_Some)', src )
+		# the i32 (Nothing) member should not trigger any decref
+		self.assertNotIn( 'self.maybe.data.v_Nothing', src )
+
+	def test_destructor_synthesis_is_idempotent( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+		]))
+		cls = self._resolve_class( mod, 'Foo' )
+		self.resolver._synthesize_rcclass_destructor( cls )
+		# drain the queue
+		while True:
+			try:
+				self.resolver.queue.get_nowait()
+			except queue_module.Empty:
+				break
+		# second call should be a no-op (idempotency guard)
+		self.resolver._synthesize_rcclass_destructor( cls )
+		self.assertTrue( self.resolver.queue.empty(), 'second synthesis should not enqueue anything' )
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG, force = True )
