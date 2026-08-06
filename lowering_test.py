@@ -2261,6 +2261,45 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'takes exactly one argument', self.discovery.errors.errors[0] )
 
+	def test_compiler_incref_emits_incref_instruction( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	compiler.incref( f )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'Incref', kinds )
+
+	def test_compiler_incref_wrong_arg_count_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	compiler.incref()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'takes exactly one argument', self.discovery.errors.errors[0] )
+
+	def test_compiler_incref_non_rc_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 1',
+			'	compiler.incref( x )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'reference-counted value', self.discovery.errors.errors[0] )
+
 	# --- loops (while / for / break / continue) -----------------------------
 
 	def test_while_shape( self ) -> None:

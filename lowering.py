@@ -853,6 +853,9 @@ class Lowering:
 		if self._is_compiler_call( node.value ) == 'decref':
 			self._lower_compiler_decref( node.value )
 			return
+		if self._is_compiler_call( node.value ) == 'incref':
+			self._lower_compiler_incref( node.value )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -1098,6 +1101,19 @@ class Lowering:
 				node,
 			)
 		self._emit( ir.Decref( value = operand ))
+
+	def _lower_compiler_incref( self, node: ast.Call ) -> None:
+		# compiler.incref(x) — emit an ir.Incref for x.
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.incref(...) takes exactly one argument: {ast.unparse(node)}', node )
+		operand = self._lower_expr( node.args[0], None )
+		if operand.type is None or not self._is_RC( operand.type ):
+			self.discovery.fail(
+				f'compiler.incref(...) argument must be a reference-counted value, not '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		self._emit( ir.Incref( value = operand ))
 
 	# --- defer/errdefer ----------------------------------------------------------
 
