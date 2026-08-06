@@ -236,6 +236,7 @@ class Function( Type, ScopeMixin ):
 
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
+	is_destructor: bool = False # synthesized $$__destructor__ body — emitter uses void(void*) signature + cast prologue
 
 def _leaf_is_accepted( leaf: Type, declared: Type ) -> bool:
 	# identity-based deliberately, not `==` - Type dataclasses have structural

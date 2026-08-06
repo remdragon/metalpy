@@ -140,7 +140,9 @@ class Compiler:
 			if isinstance( monomorphized, RCClass ):
 				if monomorphized.base is not None:
 					self._enqueue( monomorphized.base )
-				self.rcclasses.append( monomorphized )
+				if monomorphized not in self.rcclasses:
+					self.rcclasses.append( monomorphized )
+				self.type_resolver._synthesize_rcclass_destructor( monomorphized )
 			elif isinstance( monomorphized, CStruct ):
 				self.cstructs.append( monomorphized )
 			elif isinstance( monomorphized, CUnion ):
@@ -165,7 +167,9 @@ class Compiler:
 				self.lowering._ensure_resolved( attr )
 			if unit.base is not None:
 				self._enqueue( unit.base )
-			self.rcclasses.append( unit )
+			if unit not in self.rcclasses:
+				self.rcclasses.append( unit )
+				self.type_resolver._synthesize_rcclass_destructor( unit )
 			return unit
 		elif isinstance( unit, CStruct ):
 			if unit.resolve is not None:

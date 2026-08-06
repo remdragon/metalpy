@@ -14,6 +14,81 @@ from mpy_types import (
 )
 from union_storage import UnionStorage
 
+
+def _union_member_ast_path( union: TaggedUnion, member_stem: str ) -> ast.Attribute:
+	''' build an ast.Attribute path for a union's member reference in a
+	match-case pattern, e.g. builtins.MaybeFoo.Some — the union's own
+	qualname dotted then the member name. '''
+	parts = union.qualname.rsplit( '.', 1 )
+	if len( parts ) == 2:
+		return ast.Attribute(
+			value = ast.Attribute(
+				value = ast.Name( id = parts[0], ctx = ast.Load() ),
+				attr = parts[1], ctx = ast.Load(),
+			),
+			attr = member_stem, ctx = ast.Load(),
+		)
+	return ast.Attribute(
+		value = ast.Name( id = parts[0], ctx = ast.Load() ),
+		attr = member_stem, ctx = ast.Load(),
+	)
+
+
+def _id( name: str ) -> ast.Name:
+	return ast.Name( id = name, ctx = ast.Load() )
+
+
+def _expr_stmt( value: ast.expr ) -> ast.Expr:
+	return ast.Expr( value = value )
+
+
+def _build_field_teardown_ast( field_expr: ast.Attribute, field_type: Type ) -> list[ast.stmt]:
+	''' recursively build AST statements to decref every RC leaf
+	reachable from field_expr, given its declared type. '''
+	base = field_type.base if isinstance( field_type, Specialization ) else field_type
+	if isinstance( base, RCClass ):
+		return [ _expr_stmt( ast.Call(
+			func = ast.Attribute( value = _id('compiler'), attr = 'decref', ctx = ast.Load() ),
+			args = [ field_expr ], keywords = [],
+		)) ]
+	if isinstance( base, CStruct ):
+		stmts: list[ast.stmt] = []
+		for attr in base.attributes:
+			sub_expr = ast.Attribute( value = field_expr, attr = attr.stem, ctx = ast.Load() )
+			stmts.extend( _build_field_teardown_ast( sub_expr, attr.type ))
+		return stmts
+	if isinstance( base, TaggedUnion ):
+		cases: list[ast.match_case] = []
+		for member in base.attributes:
+			member_base = member.type.base if isinstance( member.type, Specialization ) else member.type
+			if isinstance( member_base, RCClass ):
+				bind_name = f'__dtor_{member.stem}'
+				cases.append( ast.match_case(
+					pattern = ast.MatchClass(
+						cls = _union_member_ast_path( base, member.stem ),
+						patterns = [ ast.MatchAs( name = bind_name ) ],
+						kwd_attrs = [], kwd_patterns = [],
+					),
+					guard = None,
+					body = [ _expr_stmt( ast.Call(
+						func = ast.Attribute( value = _id('compiler'), attr = 'decref', ctx = ast.Load() ),
+						args = [ _id( bind_name ) ], keywords = [],
+					)) ],
+				))
+			else:
+				cases.append( ast.match_case(
+					pattern = ast.MatchClass(
+						cls = _union_member_ast_path( base, member.stem ),
+						patterns = [ ast.MatchAs( name = None ) ],
+						kwd_attrs = [], kwd_patterns = [],
+					),
+					guard = None,
+					body = [ ast.Pass() ],
+				))
+		return [ ast.Match( subject = field_expr, cases = cases ) ]
+	return []
+
+
 class TypeResolver:
 	'''
 	stage 1.5: sits between discovery.py (lazy name-binding + skeleton type
@@ -49,12 +124,12 @@ class TypeResolver:
 		# the unit being lowered at the time this one was scheduled
 		self._triggered_by: dict[int,str] = {}
 		self._current_trigger: str|None = None
-		# the emitter always synthesizes a destructor body for every
-		# non-generic RCClass (emit_rcclass_destructor in emitter_c.py),
-		# which unconditionally calls sys.free on its own backing
-		# memory — schedule sys.free once, lazily, the first time an
-		# RCClass actually needs one
+		# the emitter synthesizes a destructor body for every non-generic
+		# RCClass — see _synthesize_rcclass_destructor. Schedule sys.free
+		# once, lazily, the first time an RCClass actually needs one
 		self._sys_free_scheduled: bool = False
+		self._destructors_synthesized: set[int] = set()
+		self._dtor_label_id = 0
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -78,6 +153,194 @@ class TypeResolver:
 		if isinstance( del_fn, Function ):
 			self.schedule( del_fn )
 
+
+	def _synthesize_rcclass_destructor( self, cls: RCClass ) -> None:
+		''' build an AST Function for $$__destructor__ that the emitter
+		can lower like any other function. Called from compiler._lower
+		after the class body is resolved, never from within schedule(). '''
+		if cls.type_params:
+			return  # only concrete RCClasses get a destructor
+		sys_module = self.discovery.modules.get( 'sys' )
+		if sys_module is None:
+			return  # sys.free must be available
+		# a bare RCClass may reach _lower twice (once as Specialization,
+		# once directly via param type scheduling) — synthesize only once
+		if id( cls ) in self._destructors_synthesized:
+			return
+		self._destructors_synthesized.add( id( cls ))
+
+		none_type = self.discovery.get_none_type()
+		qualname = f'{cls.qualname}$$__destructor__'
+		del_fn = cls.get_local( '__del__' )
+		if not isinstance( del_fn, Function ):
+			del_fn = None
+
+		body: list[ast.stmt] = []
+
+		# 1. self.__del__() if declared (fields still intact)
+		if del_fn is not None:
+			body.append( ast.Expr( ast.Call(
+				func = ast.Attribute(
+					value = ast.Name( id = 'self', ctx = ast.Load() ),
+					attr = '__del__', ctx = ast.Load(),
+				),
+				args = [], keywords = [],
+			)))
+
+		# 2. field cascade: decref every RC leaf, base-first
+		if cls.resolve is not None:
+			cls.resolve()
+		chain: list[RCClass] = []
+		node_ref: RCClass|None = cls
+		while node_ref is not None:
+			chain.append( node_ref )
+			node_ref = node_ref.base
+		for base_cls in reversed( chain ):
+			for attr in base_cls.attributes:
+				if attr.resolve is not None:
+					attr.resolve()
+				body.extend( self._build_field_teardown_ast(
+					ast.Attribute(
+						value = ast.Name( id = 'self', ctx = ast.Load() ),
+						attr = attr.stem, ctx = ast.Load(),
+					),
+					attr.type,
+				))
+
+		# 3. sys.free(self) — resolve the callee and tag it so lowering
+		# skips overload resolution (sys.free is an Overload group,
+		# self: RCClass doesn't match any overload's declared type)
+		free_overload = sys_module.get_local( 'free' )
+		from mpy_types import Overload
+		if isinstance( free_overload, Overload ):
+			free_fn = free_overload.implementations[0]
+			if free_fn.resolve is not None:
+				free_fn.resolve()
+		else:
+			free_fn = free_overload
+		free_call = ast.Call(
+			func = ast.Attribute(
+				value = ast.Name( id = 'sys', ctx = ast.Load() ),
+				attr = 'free', ctx = ast.Load(),
+			),
+			args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+		)
+		free_call.resolved_callee = free_fn
+		free_call.end_lineno = None; free_call.end_col_offset = None
+		body.append( ast.Expr( free_call ))
+
+		self_param = Parameter(
+			stem = 'self', qualname = f'{qualname}.self',
+			file = cls.file, line = cls.line, type = cls,
+		)
+		node = ast.FunctionDef(
+			name = '$$__destructor__',
+			args = ast.arguments(
+				posonlyargs = [], args = [], vararg = None,
+				kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [],
+			),
+			body = body, decorator_list = [], returns = None, type_params = [],
+			lineno = cls.line or 1, col_offset = 0,
+			end_lineno = cls.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+
+		fn = Function(
+			stem = '$$__destructor__', qualname = qualname,
+			file = cls.file, line = cls.line,
+			cls = None, node = node,
+			parameters = [ self_param ], return_type = none_type,
+			is_static = True, is_destructor = True, resolve = None,
+		)
+		fn.add_name( 'self', self_param )
+		self.schedule( fn )
+
+	def _build_field_teardown_ast( self, field_expr: ast.Attribute, field_type: Type ) -> list[ast.stmt]:
+		''' recursively build AST statements to decref every RC leaf
+		reachable from field_expr, given its declared type. '''
+		base = field_type.base if isinstance( field_type, Specialization ) else field_type
+		line = field_expr.lineno if hasattr( field_expr, 'lineno' ) and field_expr.lineno else 1
+
+		# RCClass — compiler.decref(expr)
+		if isinstance( base, RCClass ):
+			if base.resolve is not None:
+				base.resolve()
+			return [ ast.Expr( ast.Call(
+				func = ast.Attribute(
+					value = ast.Name( id = 'compiler', ctx = ast.Load(), lineno = line, col_offset = 0 ),
+					attr = 'decref', ctx = ast.Load(), lineno = line, col_offset = 0,
+				),
+				args = [ field_expr ], keywords = [],
+			), lineno = line, col_offset = 0 ) ]
+
+		# CStruct — recurse into each field (all are always live)
+		if isinstance( base, CStruct ):
+			if base.resolve is not None:
+				base.resolve()
+			stmts: list[ast.stmt] = []
+			for attr in base.attributes:
+				if attr.resolve is not None:
+					attr.resolve()
+				sub_expr = ast.Attribute(
+					value = field_expr, attr = attr.stem, ctx = ast.Load(),
+					lineno = line, col_offset = 0,
+				)
+				stmts.extend( self._build_field_teardown_ast( sub_expr, attr.type ))
+			return stmts
+
+		# TaggedUnion — if-chain: read tag, decref active RC member
+		if isinstance( base, TaggedUnion ):
+			if base.resolve is not None:
+				base.resolve()
+			for attr in base.attributes:
+				if attr.resolve is not None:
+					attr.resolve()
+			tag_attr, data_attr, _payload_cls, tags = self.union_storage.get( base )
+
+			# __tag = expr.tag
+			tag_name = f'__dtor_tag_{self._dtor_label_id}'
+			self._dtor_label_id += 1
+			stmts: list[ast.stmt] = [ ast.Assign(
+				targets = [ ast.Name( id = tag_name, ctx = ast.Store(), lineno = line, col_offset = 0 ) ],
+				value = ast.Attribute( value = field_expr, attr = tag_attr.stem, ctx = ast.Load(), lineno = line, col_offset = 0 ),
+				lineno = line, col_offset = 0,
+			) ]
+
+			for i, member in enumerate( base.attributes ):
+				member_base = member.type.base if isinstance( member.type, Specialization ) else member.type
+				if not isinstance( member_base, RCClass ):
+					continue
+				member_expr = ast.Attribute(
+					value = ast.Attribute(
+						value = field_expr,
+						attr = data_attr.stem, ctx = ast.Load(),
+						lineno = line, col_offset = 0,
+					),
+					attr = f'v_{member.stem}', ctx = ast.Load(),
+					lineno = line, col_offset = 0,
+				)
+				stmts.append( ast.If(
+					test = ast.Compare(
+						left = ast.Name( id = tag_name, ctx = ast.Load(), lineno = line, col_offset = 0 ),
+						ops = [ ast.Eq() ],
+						comparators = [ ast.Constant( value = tags[member.stem], lineno = line, col_offset = 0 ) ],
+						lineno = line, col_offset = 0,
+					),
+					body = [ ast.Expr( ast.Call(
+						func = ast.Attribute(
+							value = ast.Name( id = 'compiler', ctx = ast.Load(), lineno = line, col_offset = 0 ),
+							attr = 'decref', ctx = ast.Load(), lineno = line, col_offset = 0,
+						),
+						args = [ member_expr ], keywords = [],
+					), lineno = line, col_offset = 0 ) ],
+					orelse = [],
+					lineno = line, col_offset = 0,
+				))
+			return stmts
+
+		# CUnion / CEnum / Scalar / Ptr — never RC, nothing to tear down
+		return []
+	
 	def schedule( self, unit: object ) -> None:
 		# moved verbatim from Compiler._enqueue - lowering.py hands this
 		# anything it comes across (a Function, a class, a Variable, a

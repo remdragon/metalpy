@@ -432,6 +432,9 @@ def _has_self( function: Function ) -> bool:
 	return function.cls is not None and not function.is_static and not function.is_classmethod
 
 def _function_prototype( function: Function ) -> str:
+	if function.is_destructor:
+		name = mangle_qualname( function.qualname )
+		return f'static void {name}( void* __obj )'
 	params: list[str] = []
 	if _has_self( function ):
 		params.append( f'{c_type(function.cls)} self' )
@@ -739,6 +742,10 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	if prototype_only or function.extern_lib is not None:
 		return proto + ';'
 	lines = [ proto + ' {' ]
+	if function.is_destructor:
+		# cast void* __obj to the concrete struct Foo* self
+		self_type = c_type( function.parameters[0].type ) if function.parameters else 'void*'
+		lines.append( f'\t{self_type} self = ({self_type})__obj;' )
 	# locals (x: i32 = 1) have no DeclareTemp-style IR instruction of their
 	# own - lowering.py just emits a plain Assign against a Variable that
 	# was never separately "declared". C needs a declaration before use, so
@@ -852,16 +859,19 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# a method call (instr.receiver is not None) is just an ordinary C
 		# function call with self prepended as the first argument - _has_self/
 		# _function_prototype already synthesize the matching `self`
-		# PARAMETER this way for the callee's own definition (there's no
-		# dot-call syntax here, this is C, not C++), and _emit_call_args
-		# already prepends instr.receiver the same way
 		# @extern functions are called by their raw C symbol name
 		if instr.target.extern_lib is not None:
 			target_name = instr.target.extern_symbol
 		else:
 			target_name = mangle_qualname( instr.target.qualname )
-		has_args = instr.receiver is not None or instr.args or instr.kwargs
-		call_expr = f'{target_name}( {", ".join(_emit_call_args(instr))} )' if has_args else f'{target_name}()'
+		# destructor calls sys.free(self) — self is struct Foo*, free takes
+		# void*; C needs an explicit cast since the two are different types
+		arg_texts = list( _emit_call_args( instr ))
+		if function is not None and function.is_destructor and target_name == mangle_qualname( 'sys.free' ):
+			for i, a in enumerate( arg_texts ):
+				arg_texts[i] = f'(void*)({a})'
+		has_args = bool( arg_texts )
+		call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
 		if instr.dest is not None:
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
 		return [ f'\t{call_expr};' ]
@@ -1459,19 +1469,8 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	parts.extend( _emit_value_type_bodies( compiler ))
 	for lf in compiler.functions:
 		parts.append( emit_function( lf, prototype_only = True ))
-	# a destructor is referenced by NAME (a function pointer value passed to
-	# release_object), never just called directly - unlike a struct tag,
-	# that needs a real prototype in scope first, and unlike an ordinary
-	# Function, nothing else already provides one (destructors have no
-	# backing Function/LoweredFunction entry at all - pure emitter-side
-	# synthesis, see emit_rcclass_destructor). Always emitted for every
-	# non-generic RCClass: a Decref against an immortal string-literal
-	# object still references the destructor as a function pointer (even
-	# though release_object skips the call at runtime for immortals), and
-	# C needs the symbol declared regardless.
-	for cls in compiler.rcclasses:
-		if not cls.type_params:
-			parts.append( f'static void {_rcclass_destructor_name(cls)}( void* obj );' )
+
+	# pass 2: full RCClass struct bodies (every other tag already exists)
 
 	# pass 2: full RCClass struct bodies (every other tag already exists)
 	for cls in compiler.rcclasses:
@@ -1495,9 +1494,6 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			if _is_entry_point( lf.function ) and compiler.disco.active_target['os'] == 'windows':
 				src = src.replace( '{\n', '{\n\t__metalpy_init();\n', 1 )
 			parts.append( src )
-	for cls in compiler.rcclasses:
-		if not cls.type_params:
-			parts.append( emit_rcclass_destructor( cls ))
 
 	# custom entry point when CRT is not linked - the linker expects
 	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls

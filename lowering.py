@@ -850,6 +850,9 @@ class Lowering:
 		if self._is_compiler_call( node.value ) == 'early_return':
 			self._lower_compiler_early_return( node.value )
 			return
+		if self._is_compiler_call( node.value ) == 'decref':
+			self._lower_compiler_decref( node.value )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -1081,6 +1084,20 @@ class Lowering:
 		return_stmt = ast.Return( value = err_call )
 		ast.copy_location( return_stmt, node )
 		self._stmt_Return( return_stmt )
+
+	def _lower_compiler_decref( self, node: ast.Call ) -> None:
+		# compiler.decref(x) — emit an ir.Decref for x. Used inside
+		# synthesized destructor bodies to tear down each RC field.
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.decref(...) takes exactly one argument: {ast.unparse(node)}', node )
+		operand = self._lower_expr( node.args[0], None )
+		if operand.type is None or not self._is_RC( operand.type ):
+			self.discovery.fail(
+				f'compiler.decref(...) argument must be a reference-counted value, not '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		self._emit( ir.Decref( value = operand ))
 
 	# --- defer/errdefer ----------------------------------------------------------
 
