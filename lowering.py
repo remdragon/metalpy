@@ -1654,7 +1654,12 @@ class Lowering:
 			# that doesn't define subscript access as a method) - falls
 			# back to the flat GetItem opcode, unconditionally
 			if expected_type is None:
-				self.discovery.fail( f'cannot infer the result type of {ast.unparse(node)} - no expected type available from context', node )
+				# for Ptr[T]/ConstPtr[T], the pointee type is the natural
+				# result of a dereference; for any other type we can't guess
+				if isinstance( obj.type, Specialization ) and isinstance( obj.type.base, Scalar ) and obj.type.base.stem in ( 'Ptr', 'ConstPtr' ):
+					expected_type = obj.type.args[0]
+				else:
+					self.discovery.fail( f'cannot infer the result type of {ast.unparse(node)} - no expected type available from context', node )
 			# pointer subscript indices are always usize (pointer arithmetic
 			# is defined in terms of the pointer's own element size, not the
 			# index's runtime width) — give the index a concrete type so a
