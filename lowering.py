@@ -2282,6 +2282,8 @@ class Lowering:
 		# (see below); only a concrete Specialization should
 		assert target_cls.resolve is None, f'internal compiler error, {target_cls=} is not fully resolved'
 		init = target_cls.names.get( '__init__' )
+		if isinstance( init, Function ):
+			assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
 		if init is None:
 			return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
 		if not isinstance( target_cls, RCClass ):
@@ -2339,10 +2341,10 @@ class Lowering:
 		# params are exactly as inferable as a generic method's - working
 		# against __init__'s ABSTRACT parameter list throughout (substituting
 		# per-parameter via _substitute_type_params) because the concrete,
-		# monomorphized __init__ isn't available until the args are already
-		# resolved
-		if init.resolve is not None:
-			init.resolve()
+		# monomorphized __init__ can only be built once the generic type
+		# params are inferred from the call's arguments. init's own Function
+		# body (parameters/return_type) was already resolved by the caller.
+		assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
 		class_type_params = target_cls.type_params or []
 		bindings: dict[int,Type] = {}
 		# expected_type pins target_cls's own args directly for a non-

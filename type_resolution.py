@@ -980,6 +980,19 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		self.generic_visit( node )
 		resolved = self._try_resolve_generic_call( node )
 		if resolved is None:
+			# construction-call detection: Box(...) / Namespace.Class(...)
+			# — the class body and its __init__'s parameter list need to
+			# be fully resolved before lowering ever reaches this call
+			# site. Only resolve (populate .names/.attributes), never
+			# schedule — a generic class must never become a compile
+			# unit until a concrete Specialization is built from it.
+			target = self._try_resolve_callable_namespace( node.func )
+			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				if target.resolve is not None:
+					target.resolve()
+				init = target.names.get( '__init__' )
+				if isinstance( init, Function ) and init.resolve is not None:
+					init.resolve()
 			return node
 		target, args = resolved
 		spec = self.discovery._get_or_create_specialization( target, args )
