@@ -1,5 +1,6 @@
 # stdlib imports:
 import ast
+import logging
 from pathlib import Path
 import unittest
 
@@ -18,7 +19,7 @@ class TypeResolutionTests( unittest.TestCase ):
 	already checks constant folding. '''
 
 	def setUp( self ) -> None:
-		self.discovery = Discovery( import_builtins = False )
+		self.discovery = Discovery()
 		self.resolver = TypeResolver( self.discovery )
 
 	def _import( self, code: str ):
@@ -543,3 +544,7 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		[ callee ] = self._resolved_callees( fn )
 		self.assertIsNone( callee )
+
+if __name__ == '__main__':
+	logging.basicConfig( level = logging.DEBUG, force = True )
+	unittest.main()

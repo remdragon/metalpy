@@ -803,11 +803,14 @@ _SYS_FIXTURE = '\n'.join([
 
 class RCClassTestCase( CompilerTestCase ):
 	def setUp( self ) -> None:
-		self._tmpdir = tempfile.TemporaryDirectory()
-		self.addCleanup( self._tmpdir.cleanup )
-		tmp_path = Path( self._tmpdir.name )
-		( tmp_path / 'sys.py' ).write_text( _SYS_FIXTURE, encoding = 'utf-8' )
-		self.discovery = Discovery( paths = [ tmp_path ], import_builtins = False )
+		#self._tmpdir = tempfile.TemporaryDirectory()
+		#self.addCleanup( self._tmpdir.cleanup )
+		#tmp_path = Path( self._tmpdir.name )
+		#( tmp_path / 'sys.py' ).write_text( _SYS_FIXTURE, encoding = 'utf-8' )
+		self.discovery = Discovery(
+			#paths = [ tmp_path ],
+			import_builtins = True,
+		)
 		self.compiler = Compiler( self.discovery )
 
 _FOO_FIXTURE = '\n'.join([
