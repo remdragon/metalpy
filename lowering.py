@@ -122,33 +122,6 @@ class Lowering:
 		self.schedule = type_resolver.schedule
 		self._union_storage = type_resolver.union_storage
 		self._monomorphizer = type_resolver.monomorphizer
-		# resolved lazily, the first time something actually needs a given
-		# real sys.<name> library function (sys.panic for panic_arithmetic's
-		# Unwrap, sys.alloc/sys.free for RCClass construction/destruction) -
-		# cached per name so a program needing the same one in multiple
-		# places only resolves it once (see _resolve_sys_function)
-		self._sys_functions: dict[str,Function] = {}
-
-	def _resolve_sys_function( self, name: str ) -> Function:
-		# every place stage 2 needs to call into a REAL stdlib function
-		# rather than inventing emitter-side behavior goes through here -
-		# an emitter has no business deciding what "panic" or "how memory
-		# gets freed" means, that's a language/stdlib decision, made here.
-		# Reached via discovery.import_name(...) rather than a user-
-		# namespace lookup, mirroring how Discovery.__init__ already force-
-		# imports 'builtins' regardless of whether user code ever imports
-		# it - a program needing one of these shouldn't need its own
-		# `import sys` for it to work
-		cached = self._sys_functions.get( name )
-		if cached is not None:
-			return cached
-		module = self.discovery.import_name( 'sys' )
-		fn = module.get_local( name )
-		assert isinstance( fn, Function ), f'sys.{name} is required but was not found: {fn!r}'
-		if fn.resolve is not None:
-			fn.resolve()
-		self._sys_functions[name] = fn
-		return fn
 
 	def _init_lowering_state( self, fn: Function | None ) -> None:
 		self._instructions: list[ir.Instruction] = []
@@ -414,7 +387,7 @@ class Lowering:
 		none_type = self.discovery.get_none_type()
 		if fn.return_type is none_type:
 			return False
-		shape = self._result_shape( fn.return_type )
+		shape = self._type_resolver._result_shape( fn.return_type )
 		ok = shape is not None and shape[0] is none_type
 		if not ok:
 			self.discovery.fail(
@@ -968,7 +941,7 @@ class Lowering:
 		if len( node.args ) != 1 or node.keywords:
 			self.discovery.fail( f'compiler.refcount(...) takes exactly one argument: {ast.unparse(node)}', node )
 		value = self._lower_expr( node.args[0], None )
-		if not self._is_RC( value.type ):
+		if not self._type_resolver._is_RC( value.type ):
 			self.discovery.fail(
 				f'compiler.refcount(...) argument must be a reference-counted value, not '
 				f'{value.type.qualname if value.type else "?"}: {ast.unparse(node)}',
@@ -1072,7 +1045,7 @@ class Lowering:
 			self.discovery.fail( f'compiler.early_return(...) takes exactly one argument: {ast.unparse(node)}', node )
 		fn = self._current_fn
 		return_type = fn.return_type if fn is not None else None
-		ok = fn is not None and self._result_shape( return_type ) is not None
+		ok = fn is not None and self._type_resolver._result_shape( return_type ) is not None
 		if not ok:
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail( f'compiler.early_return(...) requires the enclosing function to return Result[_,_] ({where})', node )
@@ -1094,7 +1067,7 @@ class Lowering:
 		if len( node.args ) != 1 or node.keywords:
 			self.discovery.fail( f'compiler.decref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is None or not self._is_RC( operand.type ):
+		if operand.type is None or not self._type_resolver._is_RC( operand.type ):
 			self.discovery.fail(
 				f'compiler.decref(...) argument must be a reference-counted value, not '
 				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
@@ -1107,7 +1080,7 @@ class Lowering:
 		if len( node.args ) != 1 or node.keywords:
 			self.discovery.fail( f'compiler.incref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is None or not self._is_RC( operand.type ):
+		if operand.type is None or not self._type_resolver._is_RC( operand.type ):
 			self.discovery.fail(
 				f'compiler.incref(...) argument must be a reference-counted value, not '
 				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
@@ -1153,7 +1126,7 @@ class Lowering:
 		fn = self._current_fn
 		if is_err_only:
 			return_type = fn.return_type if fn is not None else None
-			ok = fn is not None and self._result_shape( return_type ) is not None
+			ok = fn is not None and self._type_resolver._result_shape( return_type ) is not None
 			if not ok:
 				where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 				self.discovery.fail( f'errdefer requires the enclosing function to return Result[_,_] ({where})', node )
@@ -1290,11 +1263,11 @@ class Lowering:
 		# so a program that never defines Result at all (or hasn't
 		# imported builtins) must not hard-fail here just because this
 		# particular value happens not to be Result-shaped
-		shape = self._result_shape( value.type )
+		shape = self._type_resolver._result_shape( value.type )
 		if shape is None:
 			return value
 		result_type, error_cls = shape
-		self._require_result_return( node, value.type.base, error_cls, alternatives )
+		self._type_resolver._require_result_return( node, value.type.base, error_cls, alternatives, fn = self._current_fn )
 		return self._consume_checked_result( value, result_type, extra = None )
 
 	def _bind_loop_target( self, target: ast.Name, default_type: Type, value_expr: ast.expr, node: ast.AST ) -> Variable:
@@ -1563,7 +1536,7 @@ class Lowering:
 		# differently-typed pointer (e.g. return ptr where ptr: Ptr[u8]
 		# but the function returns Ptr[T]), insert a CastWrap — in C all
 		# object pointers have the same representation, so this is safe
-		if expected_type is not None and name.type is not expected_type and self._is_ptr_specialization( name.type ) and self._is_ptr_specialization( expected_type ):
+		if expected_type is not None and name.type is not expected_type and self._type_resolver._is_ptr_specialization( name.type ) and self._type_resolver._is_ptr_specialization( expected_type ):
 			dest = self._new_temp( expected_type )
 			self._emit( ir.CastWrap( dest = dest, operand = name ))
 			return dest
@@ -1756,12 +1729,12 @@ class Lowering:
 		# compiler.panic_arithmetic(msg):` (extra is the lowered msg
 		# operand) uses Unwrap instead, which panics immediately and so has
 		# no such requirement
-		result_cls, error_cls = self._lookup_result_and_error_types( node, opcode.checked_error )
+		result_cls, error_cls = self._type_resolver._lookup_result_and_error_types( node, opcode.checked_error )
 		if extra is None:
 			# validated before anything gets emitted - a mid-statement
 			# failure here must not leave partial instructions behind for
 			# the per-statement recovery boundary to silently keep
-			self._require_result_return( node, result_cls, error_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error] )
+			self._type_resolver._require_result_return( node, result_cls, error_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error], fn = self._current_fn )
 		return self._emit_checked_op( opcode, operand_kwargs, result_type, result_cls, error_cls, extra )
 
 	def _emit_checked_op( self, opcode: type, operand_kwargs: dict, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
@@ -1790,32 +1763,10 @@ class Lowering:
 			else:
 				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
 		else:
-			panic_fn = self._resolve_sys_function( 'panic' )
+			panic_fn = self._type_resolver._resolve_sys_function( 'panic' )
 			self.schedule( panic_fn )
 			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra, panic = panic_fn ))
 		return unwrapped
-
-	def _lookup_result_and_error_types( self, node: ast.AST, error_name: str ) -> tuple[ClassLike,ClassLike]:
-		result_cls = self.discovery.find_name( 'Result', node )
-		error_cls = self.discovery.find_name( error_name, node )
-		return result_cls, error_cls
-
-	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, alternatives: str ) -> None:
-		fn = self._current_fn
-		return_type = fn.return_type if fn is not None else None
-		ok = (
-			fn is not None
-			and isinstance( return_type, Specialization )
-			and return_type.base is result_cls
-			and len( return_type.args ) == 2
-			and return_type.args[1] is error_cls
-		)
-		if not ok:
-			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
-			self.discovery.fail(
-				f'this requires the enclosing function to return Result[_,{error_cls.stem}] ({where}) - {alternatives}',
-				node,
-			)
 
 	def _expr_UnaryOp( self, node: ast.UnaryOp, expected_type: Type|None ) -> ir.Operand:
 		if isinstance( node.op, ast.Not ):
@@ -1929,11 +1880,6 @@ class Lowering:
 
 	# --- shared helpers ----------------------------------------------------------
 
-	def _is_ptr_specialization( self, t: Type|None ) -> bool:
-		return ( isinstance( t, Specialization )
-			and isinstance( t.base, Scalar )
-			and t.base.stem in ( 'Ptr', 'ConstPtr' ))
-
 	def _ensure_resolved( self, obj: object ) -> object:
 		# moved to TypeResolver.ensure_resolved (type_resolution.py) - kept
 		# here as a thin delegate since this file calls it ~15 times and the
@@ -1942,50 +1888,6 @@ class Lowering:
 		# every one of those call sites needs. See TypeResolver's own
 		# docstring for why this can't wait for schedule()'s work queue.
 		return self._type_resolver.ensure_resolved( obj )
-
-	def _tagged_union_shape( self, t: Type|None ) -> tuple[TaggedUnion,list[Variable]]|None:
-		''' `t` may be a Specialization wrapping a generic @union (a concrete
-		MyOption[i32], not the shared anonymous-union case - substituting a
-		TypeVar-mentioning leaf there already rebuilds a real TaggedUnion
-		directly, see Monomorphizer.substitute_type_params's own TaggedUnion
-		branch). Specialization itself has no .attributes of its own (see
-		mpy_types.py), and a generic member's own declared type (e.g.
-		`Some: T`) is a bare TypeVar until substituted against t's own args -
-		an identity comparison against a real, concrete type could never
-		match without this. Returns (ABSTRACT base, substituted member list)
-		or None if t isn't a TaggedUnion (possibly Specialization-wrapped) at
-		all. The ABSTRACT base, not a monomorphized copy, is what
-		UnionStorage.get needs - tag/payload identity is SHARED across every
-		specialization of a generic union (see UnionStorage.get's own
-		comment), so looking it up against a monomorphized copy would
-		synthesize a second, non-canonical tag/payload rather than reusing
-		the real one. '''
-		base = t.base if isinstance( t, Specialization ) else t
-		if not isinstance( base, TaggedUnion ):
-			return None
-		members = self.monomorphize_class( t ).attributes if isinstance( t, Specialization ) else base.attributes
-		return base, members
-
-	def _result_shape( self, t: Type|None ) -> tuple[Type,Type]|None:
-		''' (T, E) if `t` is Result[T,E], else None - checks base identity
-		against the real Result class (via find_name_or_none, so a program
-		that never defines/imports Result doesn't hard-fail just because
-		this ran speculatively), not just "some 2-arg Specialization",
-		which is not tight enough (Result is not the only generic class
-		that could ever have exactly two type args). '''
-		result_cls = self.discovery.find_name_or_none( 'Result' )
-		if result_cls is None or not ( isinstance( t, Specialization ) and t.base is result_cls and len( t.args ) == 2 ):
-			return None
-		return t.args[0], t.args[1]
-
-	def _is_RC( self, t: Type|None ) -> bool:
-		''' true if `t` is an RCClass, possibly wrapped in a Specialization -
-		a generic RCClass's own concrete instantiation (Box[i32]) isn't an
-		RCClass instance itself (Specialization has no base-class
-		relationship of its own, see mpy_types.py), but is still
-		reference-counted the same as any other RCClass. '''
-		base = t.base if isinstance( t, Specialization ) else t
-		return isinstance( base, RCClass )
 
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
 		# _ensure_resolved is the one place a Specialization gets swapped for
@@ -2106,7 +2008,7 @@ class Lowering:
 		if not isinstance( func_node, ast.Attribute ):
 			self.discovery.fail( f'cannot call {ast.unparse(func_node)}', func_node )
 		receiver = self._lower_expr( func_node.value, None )
-		shape = self._tagged_union_shape( receiver.type )
+		shape = self._type_resolver._tagged_union_shape( receiver.type )
 		if shape is not None:
 			base, members = shape
 			self._ensure_resolved( base )
@@ -2410,7 +2312,7 @@ class Lowering:
 		# path) and _try_lower_construct_call (the real __init__ path) -
 		# both eventually emit an ir.Allocate for a real RCClass and need
 		# identical scheduling
-		sys_alloc_fn = self._resolve_sys_function( 'alloc' )
+		sys_alloc_fn = self._type_resolver._resolve_sys_function( 'alloc' )
 		alloc_spec = self.discovery._get_or_create_specialization( sys_alloc_fn, [ concrete_type ])
 		self.schedule( alloc_spec )
 		# every constructed RCClass needs its own destructor eventually
@@ -2424,7 +2326,7 @@ class Lowering:
 		# type - scheduling this for every bare type annotation would drag
 		# in sys.free's own transitive dependencies (real HeapFree/crt free
 		# externs) for classes that are never actually instantiated
-		sys_free_fn = self._resolve_sys_function( 'free' )
+		sys_free_fn = self._type_resolver._resolve_sys_function( 'free' )
 		self.schedule( sys_free_fn )
 		del_fn = target_cls.get_local( '__del__' ) # target_cls is always the abstract base - methods aren't re-specialized per Specialization (Specialization.names passes through to .base.names)
 		if isinstance( del_fn, Function ):
@@ -2568,7 +2470,7 @@ class Lowering:
 		# failing) when this particular construction isn't Result-shaped
 		# at all, same posture as _maybe_consume_result
 		pinning_type = expected_type
-		shape = self._result_shape( expected_type )
+		shape = self._type_resolver._result_shape( expected_type )
 		if shape is not None:
 			pinning_type = shape[0]
 		if isinstance( pinning_type, Specialization ) and pinning_type.base is target_cls:
@@ -2739,11 +2641,11 @@ class Lowering:
 		# scheduled/lowered as a real function as a result.
 		if node.args or node.keywords:
 			self.discovery.fail( f'or_return() takes no arguments: {ast.unparse(node)}', node )
-		shape = self._result_shape( receiver.type )
+		shape = self._type_resolver._result_shape( receiver.type )
 		if shape is None:
 			self.discovery.fail( f'or_return() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
 		result_type, error_cls = shape
-		self._require_result_return( node, receiver.type.base, error_cls, self._OR_RETURN_ALTERNATIVES )
+		self._type_resolver._require_result_return( node, receiver.type.base, error_cls, self._OR_RETURN_ALTERNATIVES, fn = self._current_fn )
 		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
@@ -3172,7 +3074,7 @@ class Lowering:
 		bool_cls = self.discovery.find_name( 'bool', node )
 		for param, leaf_type in conditions:
 			operand = self._dispatch_operand_for_param( node, target, param, args, kwargs )
-			shape = self._tagged_union_shape( operand.type )
+			shape = self._type_resolver._tagged_union_shape( operand.type )
 			if shape is None:
 				self.discovery.fail( f'{target.qualname}: conditional dispatch on a non-union argument: {ast.unparse(node)}', node )
 			base, members = shape
@@ -3213,7 +3115,7 @@ class Lowering:
 		# argument - mirrors match's own payload extraction
 		if target_type is None or operand.type is target_type:
 			return operand
-		shape = self._tagged_union_shape( operand.type )
+		shape = self._type_resolver._tagged_union_shape( operand.type )
 		if shape is None:
 			return operand
 		base, members = shape

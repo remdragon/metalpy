@@ -130,6 +130,7 @@ class TypeResolver:
 		self._sys_free_scheduled: bool = False
 		self._destructors_synthesized: set[int] = set()
 		self._dtor_label_id = 0
+		self._sys_functions: dict[str,Function] = {}
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -341,6 +342,71 @@ class TypeResolver:
 		# CUnion / CEnum / Scalar / Ptr — never RC, nothing to tear down
 		return []
 	
+
+	# --- pure type queries (moved from lowering.py) ---------------------------
+
+	def _is_ptr_specialization( self, t: Type|None ) -> bool:
+		return ( isinstance( t, Specialization )
+			and isinstance( t.base, Scalar )
+			and t.base.stem in ( 'Ptr', 'ConstPtr' ))
+
+	def _is_RC( self, t: Type|None ) -> bool:
+		''' true if `t` is an RCClass, possibly wrapped in a Specialization. '''
+		base = t.base if isinstance( t, Specialization ) else t
+		return isinstance( base, RCClass )
+
+	def _result_shape( self, t: Type|None ) -> tuple[Type,Type]|None:
+		''' (T, E) if `t` is Result[T,E], else None. '''
+		result_cls = self.discovery.find_name_or_none( 'Result' )
+		if result_cls is None or not ( isinstance( t, Specialization ) and t.base is result_cls and len( t.args ) == 2 ):
+			return None
+		return t.args[0], t.args[1]
+
+	def _tagged_union_shape( self, t: Type|None ) -> tuple[TaggedUnion,list[Variable]]|None:
+		''' (abstract base, substituted member list) or None if t isn't
+		a TaggedUnion (possibly Specialization-wrapped). '''
+		base = t.base if isinstance( t, Specialization ) else t
+		if not isinstance( base, TaggedUnion ):
+			return None
+		members = self.monomorphizer.monomorphize_class( t ).attributes if isinstance( t, Specialization ) else base.attributes
+		return base, members
+
+	def _lookup_result_and_error_types( self, node: ast.AST, error_name: str ) -> tuple[ClassLike,ClassLike]:
+		result_cls = self.discovery.find_name( 'Result', node )
+		error_cls = self.discovery.find_name( error_name, node )
+		return result_cls, error_cls
+
+	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, alternatives: str, fn: Function|None = None ) -> None:
+		return_type = fn.return_type if fn is not None else None
+		ok = (
+			fn is not None
+			and isinstance( return_type, Specialization )
+			and return_type.base is result_cls
+			and len( return_type.args ) == 2
+			and return_type.args[1] is error_cls
+		)
+		if not ok:
+			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
+			self.discovery.fail(
+				f'this requires the enclosing function to return Result[_,{error_cls.stem}] ({where}) - {alternatives}',
+				node,
+			)
+
+	def _resolve_sys_function( self, name: str ) -> Function:
+		''' resolve and cache a real stdlib function (sys.panic, sys.alloc,
+		sys.free, ...) — reached via discovery.import_name rather than
+		user-namespace lookup. '''
+		cached = self._sys_functions.get( name )
+		if cached is not None:
+			return cached
+		module = self.discovery.import_name( 'sys' )
+		fn = module.get_local( name )
+		assert isinstance( fn, Function ), f'sys.{name} is required but was not found: {fn!r}'
+		if fn.resolve is not None:
+			fn.resolve()
+		self._sys_functions[name] = fn
+		return fn
+
 	def schedule( self, unit: object ) -> None:
 		# moved verbatim from Compiler._enqueue - lowering.py hands this
 		# anything it comes across (a Function, a class, a Variable, a
