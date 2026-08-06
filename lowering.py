@@ -1541,6 +1541,7 @@ class Lowering:
 			if isinstance( node.value, int ):
 				# integer literals default to i32 when no contextual type is
 				# available (bare `x = 1`, generic-call arg inference, etc.)
+				# TODO FIXME: for most user code, this should probably be builtins.int and get scheduled as an immortal constant
 				expected_type = self.discovery.get_intrinsics()['i32']
 			else:
 				self.discovery.fail(
