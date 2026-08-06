@@ -38,6 +38,15 @@ _ALTERNATIVES_BY_ERROR: dict[str,str] = {
 	'ZeroDivisionError': 'wrap this in `with compiler.panic_arithmetic(...):` instead',
 }
 
+# ast.BinOp operator -> the dunder method name to dispatch to for a
+# non-scalar left operand (str.__add__, etc.). Scalar operands always
+# go through arithmetic mode instead.
+_BINOP_DUNDER: dict[type,str] = {
+	ast.Add: '__add__',
+	ast.Sub: '__sub__',
+	ast.Mult: '__mul__',
+}
+
 
 class Lowering:
 	'''
@@ -1698,6 +1707,20 @@ class Lowering:
 
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
 		left, right = self._lower_binary_operands( node.left, node.right, expected_type )
+
+		# non-scalar left operand — try the dunder method (str.__add__, ...)
+		if not isinstance( left.type, Scalar ):
+			method_name = _BINOP_DUNDER.get( type( node.op ))
+			if method_name is not None:
+				method = self._find_method( left.type, method_name )
+				if method is not None:
+					self._ensure_resolved( method )
+					self.schedule( method.return_type )
+					for p in ( method.parameters or [] ):
+						self.schedule( p.type )
+					dest = self._new_temp( expected_type or method.return_type )
+					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
+					return dest
 
 		result_type = expected_type or left.type
 

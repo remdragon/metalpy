@@ -389,7 +389,8 @@ class TypeResolver:
 		if not ok:
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
-				f'this requires the enclosing function to return Result[_,{error_cls.stem}] ({where}) - {alternatives}',
+				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{error_cls.stem}] '
+				f'({where}) - {alternatives}',
 				node,
 			)
 

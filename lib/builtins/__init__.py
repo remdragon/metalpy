@@ -165,25 +165,30 @@ class str:
 	def __del__( self ) -> None:
 		sys.free( self.__data )
 	
-	def __add__( self, other: str ) -> Result[str,OverflowError]:
-		self_len = self.__byte_size - 1
-		new_byte_size: usize = self_len + other.__byte_size
-		new_buf: Ptr[u8] = sys.alloc[u8]( new_byte_size )
-		errdefer( sys.free( new_buf ))
+	def __add__( self, other: str ) -> str:
+		if compiler.target.debug:
+			assert self.__byte_size > 0, 'invalid str instance (byte_size must be >0)'
+		with compiler.wrap_arithmetic:
+			self_len = self.__byte_size - 1
+		new_byte_size: usize
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			new_byte_size = self_len + other.__byte_size
+			new_buf: Ptr[u8] = sys.alloc[u8]( new_byte_size )
 
-		sys.memcpy( new_buf, self.__data, self_len )
-		sys.memcpy( new_buf + self_len, other.__data, other.__byte_size )
+			sys.memcpy( new_buf, self.__data, self_len )
+			sys.memcpy( new_buf + self_len, other.__data, other.__byte_size )
 		
 		return str._from_owned_cstr( new_buf, new_byte_size )
 	
 	@staticmethod
-	def concat( parts: slice[str] ) -> Result[str,OverflowError]:
+	def concat( parts: slice[str] ) -> str:
 		new_size: usize = 1 # for the zero terminator
 		i: usize = 0
 		count: usize = parts.len()
 		for i in range( count ):
 			part: str = parts.get_unchecked( i )
-			new_size += part.__byte_size - 1
+			with compiler.panic_arithmetic( 'irrational string length' ):
+				new_size += part.__byte_size - 1
 
 		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
 		errdefer( sys.free( new_buf ))
@@ -191,7 +196,8 @@ class str:
 
 		for i in range( count ):
 			part: str = parts.get_unchecked( i )
-			part_len: usize = part.__byte_size - 1
+			with compiler.panic_arithmetic( 'irrational string length' ):
+				part_len: usize = part.__byte_size - 1
 			sys.memcpy( new_buf + offset, part.__data, part_len )
 			offset += part_len
 		
@@ -277,7 +283,9 @@ class str:
 		# can't use cstrlen() here, we can only check to make sure the terminating 0 exists where expected
 		if byte_size_including_zero_terminator == 0:
 			return Result.Err( CodecError( 'utf-8', 'empty buffer' ))
-		byte_len: usize = byte_size_including_zero_terminator - 1
+		byte_len: usize
+		with compiler.wrap_arithmetic: # guaranteed to be > 0
+			byte_len = byte_size_including_zero_terminator - 1
 		if ptr[byte_len] != 0:
 			return Result.Err( CodecError( 'utf-8', 'missing 0-terminator' ))
 		
