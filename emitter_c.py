@@ -396,8 +396,12 @@ def _result_tag_data_names( result_spec: Type ) -> tuple[str,str,str,str]:
 
 def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]] ) -> str:
 	lines = [ f'{keyword} {name} {{' ]
-	for field_name, field_type in attrs:
-		lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+	if not attrs:
+		# MSVC (and pedantic C) reject empty structs/unions:
+		lines.append( '\tchar dummy;' )
+	else:
+		for field_name, field_type in attrs:
+			lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 

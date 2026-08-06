@@ -104,7 +104,7 @@ class bytes:
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		return utf8.decode( self )
 
-BYTEARRAY_INVALID: ConstPtr[u8] = b'' # this is a sentinel to indicate a bytearray was released
+BYTEARRAY_INVALID: u32 = 0 # this is a sentinel to indicate a bytearray was released
 
 class bytearray:
 	__data: Ptr[u8]
