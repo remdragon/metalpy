@@ -1538,10 +1538,15 @@ class Lowering:
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
 		if expected_type is None:
-			self.discovery.fail(
-				f'cannot infer the type of literal {node.value!r} - no expected type available from context ({ast.unparse(node)})',
-				node,
-			)
+			if isinstance( node.value, int ):
+				# integer literals default to i32 when no contextual type is
+				# available (bare `x = 1`, generic-call arg inference, etc.)
+				expected_type = self.discovery.get_intrinsics()['i32']
+			else:
+				self.discovery.fail(
+					f'cannot infer the type of literal {node.value!r} - no expected type available from context ({ast.unparse(node)})',
+					node,
+				)
 		return ir.Const( type = expected_type, value = node.value )
 
 	def _expr_Attribute( self, node: ast.Attribute, expected_type: Type|None ) -> ir.Operand:

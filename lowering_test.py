@@ -214,17 +214,21 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
-	def test_bare_assign_of_uninferrable_literal_still_fails( self ) -> None:
-		# a bare literal has no type of its own to infer from - same
-		# limitation _expr_Constant already has for any other context
+	def test_bare_assign_ints_default_to_i32( self ) -> None:
+		# integer literals default to i32 when no context type is available
 		code = '\n'.join([
-			'def main() -> None:',
+			'def main() -> i32:',
 			'	x = 1',
-			'	return',
+			'	return x',
 		])
-		self._import( code )
-		self._lower_main()
-		self.assertIn( 'cannot infer the type', self.discovery.errors.errors[0] )
+		i32 = self.discovery.get_intrinsics()['i32']
+		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 2, type = i32 )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = i32 ),
+			ir.Assign( dest = x, src = ir.Const( type = i32, value = 1 )),
+			ir.Return( value = x ),
+			ir.FuncEnd( name = 'main' ),
+		])
 
 	# --- del statement -----------------------------------------------------
 
