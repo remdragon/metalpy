@@ -1653,6 +1653,13 @@ class Lowering:
 				# available (bare `x = 1`, generic-call arg inference, etc.)
 				# TODO FIXME: for most user code, this should probably be builtins.int and get scheduled as an immortal constant
 				expected_type = self.discovery.get_intrinsics()['i32']
+			elif isinstance( node.value, str ):
+				expected_type = self.discovery.find_name_or_none( 'str' )
+				if expected_type is None:
+					self.discovery.fail(
+						f'cannot infer the type of literal {node.value!r} - no str type available ({ast.unparse(node)})',
+						node,
+					)
 			else:
 				self.discovery.fail(
 					f'cannot infer the type of literal {node.value!r} - no expected type available from context ({ast.unparse(node)})',
@@ -1942,16 +1949,37 @@ class Lowering:
 			self.discovery.fail( f'chained comparisons are not yet supported: {ast.unparse(node)}', node )
 		if isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
 			return self._lower_is_comparison( node, negate = isinstance( node.ops[0], ast.IsNot ))
+
+		# non-scalar equality — try the dunder method (str.__eq__, ...)
+		if isinstance( node.ops[0], ( ast.Eq, ast.NotEq )):
+			left = self._lower_expr( node.left, None )
+			if not isinstance( left.type, Scalar ):
+				method_name = '__eq__' if isinstance( node.ops[0], ast.Eq ) else '__ne__'
+				method = self._find_method( left.type, method_name )
+				if method is not None:
+					right = self._lower_expr( node.comparators[0], left.type )
+					self._ensure_resolved( method )
+					self.schedule( method.return_type )
+					for p in ( method.parameters or [] ):
+						self.schedule( p.type )
+					dest = self._new_temp( expected_type or method.return_type )
+					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
+					return dest
+			# scalar or no dunder — reuse already-lowered left, lower right
+			right = self._lower_expr( node.comparators[0], left.type )
+			bool_cls = self.discovery.find_name( 'bool', node )
+			dest = self._new_temp( bool_cls )
+			cmp_op = self._CMP_OPCODES.get( type( node.ops[0] ))
+			if cmp_op is None:
+				self.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
+			self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
+			return dest
+
 		cmp_op = self._CMP_OPCODES.get( type( node.ops[0] ))
 		if cmp_op is None:
 			self.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
 
 		right_node = node.comparators[0]
-		# unlike _expr_BinOp, expected_type here is the comparison's own
-		# result type (bool) - unrelated to what type the operands
-		# themselves should be lowered as, so it's never passed to either
-		# side, only used (below) as one operand's own type inferred from
-		# the other
 		left, right = self._lower_binary_operands( node.left, right_node, None, infer_right_from_left = False )
 
 		bool_cls = self.discovery.find_name( 'bool', node )

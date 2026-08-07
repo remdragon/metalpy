@@ -8,6 +8,17 @@ def RtlCopyMemory(
 ) -> None:
 	...
 
+# ntdll.dll internally links a small set of C-runtime comparison functions
+# as well (confirmed via dumpbin /exports ntdll.dll) — using these keeps
+# Windows builds CRT-free, same as memcpy/memmove/memzero above.
+@extern( 'ntdll', 'RtlCompareMemory' )
+def RtlCompareMemory(
+	Source1: ConstPtr[u8],
+	Source2: ConstPtr[u8],
+	Length: usize,
+) -> usize:
+	...
+
 @extern('ntdll', 'RtlExitUserProcess')
 def RtlExitUserProcess(
 	ExitCode: u32,

@@ -53,6 +53,14 @@ def memcpy(
 ) -> Ptr[u8]:
 	...
 
+@extern( 'c', 'memcmp' )
+def memcmp(
+	a: ConstPtr[u8],
+	b: ConstPtr[u8],
+	n: usize,
+) -> i32:
+	...
+
 @extern( 'c', 'memmove' )
 def memmove(
 	dest: Ptr[u8],

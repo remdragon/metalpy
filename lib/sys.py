@@ -95,6 +95,18 @@ def memzero( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
 	memset( ptr, 0, count )
 	return ptr
 
+@compiler.target( os = 'windows' )
+def memcmp( a: ConstPtr[u8], b: ConstPtr[u8], count: usize ) -> i32:
+	from windows.ntdll import RtlCompareMemory
+	if RtlCompareMemory( a, b, count ) == count:
+		return 0
+	return 1
+
+@compiler.target( os = not 'windows' )
+def memcmp( a: ConstPtr[u8], b: ConstPtr[u8], count: usize ) -> i32:
+	from crt import memcmp as _crt_memcmp
+	return _crt_memcmp( a, b, count )
+
 def panic( message: str ) -> NoReturn:
 	# TODO: route through a real `stderr` stream once IO interfaces exist (see
 	# TODO.txt); for now always use the OS low-level unbuffered write (no

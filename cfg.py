@@ -57,6 +57,13 @@ def is_rc( t: Type ) -> bool:
 	base = t.base if isinstance( t, Specialization ) else t
 	return isinstance( base, RCClass )
 
+def is_result_type( t: Type|None ) -> bool:
+	''' True when `t` is a concrete Result[T,E] specialization. '''
+	if t is None:
+		return False
+	base = t.base if isinstance( t, Specialization ) else t
+	return isinstance( base, TaggedUnion ) and base.stem == 'Result'
+
 def rc_leaves( t: Type ) -> list[Type]:
 	# a TaggedUnion's RC-relevant leaves specifically - str|i32 needs a
 	# tag-gated incref (only str); str|int (both RC) needs none of that,

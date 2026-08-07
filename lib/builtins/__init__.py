@@ -173,12 +173,13 @@ class str:
 		new_byte_size: usize
 		with compiler.panic_arithmetic( 'irrational string length' ):
 			new_byte_size = self_len + other.__byte_size
-			new_buf: Ptr[u8] = sys.alloc[u8]( new_byte_size )
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_byte_size )
 
-			sys.memcpy( new_buf, self.__data, self_len )
+		sys.memcpy( new_buf, self.__data, self_len )
+		with compiler.wrap_arithmetic:
 			sys.memcpy( new_buf + self_len, other.__data, other.__byte_size )
 		
-		return str._from_owned_cstr( new_buf, new_byte_size )
+		return str._from_owned_cstr( new_buf, new_byte_size ).unwrap( 'invalid UTF-8 in str.__add__' )
 	
 	@staticmethod
 	def concat( parts: slice[str] ) -> str:
@@ -191,19 +192,19 @@ class str:
 				new_size += part.__byte_size - 1
 
 		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
-		errdefer( sys.free( new_buf ))
 		offset: usize = 0
 
 		for i in range( count ):
 			part: str = parts.get_unchecked( i )
 			with compiler.panic_arithmetic( 'irrational string length' ):
 				part_len: usize = part.__byte_size - 1
-			sys.memcpy( new_buf + offset, part.__data, part_len )
-			offset += part_len
+			with compiler.wrap_arithmetic:
+				sys.memcpy( new_buf + offset, part.__data, part_len )
+				offset += part_len
 		
 		new_buf[offset] = 0 # guarantee null termination
 		
-		return str._from_owned_cstr( new_buf, new_size )
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in concat' )
 	
 	def encode( self, codec: Codec = utf8 ) -> Result[bytes,CodecError]:
 		return codec.encode( self )
@@ -275,7 +276,44 @@ class str:
 					count += 1
 				i += 1
 		return count
-	
+
+	def upper( self ) -> str:
+		''' ASCII-only uppercase: 'a'-'z' mapped to 'A'-'Z'.
+		Non-ASCII bytes pass through unchanged. Proper
+		Unicode case folding will replace this once the
+		compiler supports dict/table lookups. '''
+		self_len: usize = self.byte_len()
+		new_buf: Ptr[u8] = sys.alloc[u8]( self.__byte_size )
+		sys.memcpy( new_buf, self.get_const_ptr(), self.__byte_size )
+		i: usize = 0
+		while i < self_len:
+			with compiler.wrap_arithmetic:
+				c: u8 = new_buf[i]
+				if c >= 97 and c <= 122:  # 'a'..'z'
+					new_buf[i] = c - 32
+				i += 1
+		return str._from_owned_cstr( new_buf, self.__byte_size ).unwrap( 'invalid UTF-8 in upper()' )
+
+	def __eq__( self, other: str ) -> bool:
+		if self.__byte_size != other.__byte_size:
+			return False
+		return sys.memcmp( self.__data, other.__data, self.__byte_size ) == 0
+
+	def lower( self ) -> str:
+		''' ASCII-only lowercase: 'A'-'Z' mapped to 'a'-'z'.
+		Non-ASCII bytes pass through unchanged. '''
+		self_len: usize = self.byte_len()
+		new_buf: Ptr[u8] = sys.alloc[u8]( self.__byte_size )
+		sys.memcpy( new_buf, self.get_const_ptr(), self.__byte_size )
+		i: usize = 0
+		while i < self_len:
+			with compiler.wrap_arithmetic:
+				c: u8 = new_buf[i]
+				if c >= 65 and c <= 90:  # 'A'..'Z'
+					new_buf[i] = c + 32
+				i += 1
+		return str._from_owned_cstr( new_buf, self.__byte_size ).unwrap( 'invalid UTF-8 in lower()' )
+
 	@private
 	@staticmethod
 	def _from_owned_cstr( ptr: Ptr[u8], byte_size_including_zero_terminator: usize ) -> Result[str,CodecError]:
@@ -359,7 +397,7 @@ class str:
 			__data = ptr,
 			__byte_size = byte_size_including_zero_terminator,
 		)
-		return s
+		return Result.Ok( s )
 
 def print( msg: str, end: str = '\n' ) -> None:
 	# No *args/**kwargs, use f-strings instead (once implemented)
