@@ -1515,7 +1515,7 @@ def malloc( size: usize ) -> Ptr[u8]:
 def malloc( size: usize ) -> Ptr[u8]:
 	...
 ''' )
-		self.assertTrue( any( 'requires exactly 2 positional arguments' in e for e in disco.errors.errors ))
+		self.assertTrue( any( 'requires 2 or 3 positional arguments' in e for e in disco.errors.errors ))
 
 	def test_non_string_arg_is_a_compile_error( self ) -> None:
 		disco, mod = self._import( '''

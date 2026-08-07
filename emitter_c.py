@@ -7,7 +7,7 @@ import re
 import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from mpy_types import (
-	CEnum, ClassLike, CStruct, CUnion, Copy, Function, Move,
+	CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, Variable,
 )
 
@@ -324,6 +324,8 @@ def c_type( t: Type|None ) -> str:
 		return f'{_class_keyword(t)} {mangle_type(t)}'
 	if isinstance( t, CEnum ):
 		return mangle_type( t ) # the typedef name itself, no struct/union prefix
+	if isinstance( t, CType ):
+		return t.c_name
 	raise NotImplementedError( f'c_type: unsupported type {t!r}' )
 
 def _is_noreturn( t: Type|None ) -> bool:
@@ -345,6 +347,8 @@ def _value_spelling( t: Type ) -> str:
 	base = t.base if isinstance( t, Specialization ) else t
 	if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion )):
 		return f'{_class_keyword(base)} {mangle_type(t)}'
+	if isinstance( t, CType ):
+		return t.c_name
 	return c_type( t ) # scalars/CEnum - value and reference spelling are identical
 
 def _field_type_spelling( t: Type ) -> str:
@@ -894,6 +898,9 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.AddrOf ):
 		return [ f'\t{_emit_operand(instr.dest)} = &{_emit_operand(instr.value)};' ]
 
+	if isinstance( instr, ir.BlindExpr ):
+		return [ f'\t{_emit_operand(instr.dest)} = ({instr.expr});' ]
+
 	if isinstance( instr, ir.SizeOf ):
 		# a real class-like type's size is whatever the C compiler itself
 		# computes for its struct/union body (sizeof(struct Foo), never
@@ -1324,7 +1331,15 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
 	program is already collected into one Compiler instance, so there's no
 	reason to split output across files. '''
-	parts: list[str] = [ PROLOGUE, _NONE_PLACEHOLDER_TYPEDEF ]
+	parts: list[str] = [ PROLOGUE ]
+
+	# collect #include requirements from all modules whose symbols are
+	# compiled into this translation unit
+	for h in sorted( compiler.disco.required_headers ):
+		parts.append( f'#include <{h}>' )
+	parts.append( '' )
+
+	parts.append( _NONE_PLACEHOLDER_TYPEDEF )
 
 	# pass 1: forward declarations (opaque RCClass tags, full CEnum bodies,
 	# full CStruct/CUnion/TaggedUnion bodies in dependency order, function
@@ -1351,6 +1366,11 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))
 	for lf in compiler.functions:
+		# skip @extern prototypes when the header that declares them is
+		# already included via compiler.require_header
+		fn = lf.function
+		if fn.extern_lib is not None and fn.extern_header is not None and fn.extern_header in compiler.disco.required_headers:
+			continue
 		parts.append( emit_function( lf, prototype_only = True ))
 
 	# pass 2: full RCClass struct bodies (every other tag already exists)

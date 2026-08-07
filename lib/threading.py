@@ -4,6 +4,11 @@
 # OS primitive on each platform:
 #   Windows → SRWLOCK (AcquireSRWLockExclusive / TryAcquireSRWLockExclusive)
 #   Linux   → pthread_mutex_t (pthread_mutex_lock / pthread_mutex_trylock)
+#
+# On non-Windows targets, the mutex buffer is sized via
+# compiler.cexpr('sizeof(pthread_mutex_t)', 'pthread.h') at
+# compile time — a tiny C program is compiled, run, and its output
+# cached under $TMPDIR/metalpy/cexpr/.
 
 import compiler
 import sys
@@ -29,11 +34,9 @@ class FastLock:
 	@compiler.target( os = not 'windows' )
 	def __init__( self ) -> None:
 		from posix.pthread import pthread_mutex_init
-		# sizeof(pthread_mutex_t) varies by platform (40 bytes glibc,
-		# 48 bytes musl); 64 bytes is generous and safe for all common
-		# 64-bit targets.
-		self.__lock = sys.alloc[u8]( 64 )
-		sys.memzero( self.__lock, 64 )
+		mutex_size: usize = compiler.cexpr( 'sizeof(pthread_mutex_t)', 'pthread.h' )
+		self.__lock = sys.alloc[u8]( mutex_size )
+		sys.memzero( self.__lock, mutex_size )
 		result: i32 = pthread_mutex_init( self.__lock, None )
 		if result != 0:
 			sys.panic( 'FastLock.__init__: pthread_mutex_init failed' )
@@ -50,7 +53,9 @@ class FastLock:
 	@compiler.target( os = not 'windows' )
 	def __del__( self ) -> None:
 		from posix.pthread import pthread_mutex_destroy
-		pthread_mutex_destroy( self.__lock )
+		result: i32 = pthread_mutex_destroy( self.__lock )
+		if result != 0:
+			sys.panic( 'FastLock.__del__: pthread_mutex_destroy failed (lock still held?)' )
 		sys.free( self.__lock )
 
 	# ------------------------------------------------------------------

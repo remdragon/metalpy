@@ -205,6 +205,15 @@ class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 
+@dataclass( kw_only = True )
+class CType( Type ):
+	''' a C type defined in an external header, referenced by bare name.
+	Used with compiler.c_type('pthread_mutex_t', header='pthread.h') -
+	the emitter spells this as the raw C name, and compiler.sizeof(CType)
+	emits sizeof(pthread_mutex_t) in the generated C. '''
+	c_name: str          # e.g. 'pthread_mutex_t'
+	required_header: str  # e.g. 'pthread.h'
+
 # anything that can own methods/be a Function's .cls
 ClassLike = Union[ RCClass, CStruct, CUnion, TaggedUnion, CEnum ]
 
@@ -233,6 +242,7 @@ class Function( Type, ScopeMixin ):
 	# ordinary function
 	extern_lib: str|None = None
 	extern_symbol: str|None = None
+	extern_header: str|None = None # optional header that declares this @extern function; when included via require_header, the emitter skips the prototype
 
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
@@ -306,3 +316,4 @@ class Module( Name, ScopeMixin ):
 	intrinsics: dict[str,Name]
 	builtins: dict[str,Name]|None
 	names: dict[str,Name] = field( default_factory = dict )
+	required_headers: set[str] = field( default_factory = set )

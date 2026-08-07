@@ -11,7 +11,7 @@ import compile_time_transformer
 from errors import CompileError, ErrorCollector
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, Function, Overload,
-	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike,
+	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
 	Module, _is_covered_by, _overlaps,
 )
 
@@ -115,6 +115,7 @@ class Discovery( ast.NodeVisitor ):
 		self.modules: dict[str,Module] = {}
 		self.main: Function|None = None
 		self.errors = ErrorCollector()
+		self.required_headers: set[str] = set()
 
 		self.module_stack: list[Module] = []
 		self.scope_stack: list[Module|ClassLike|Function] = []
@@ -380,6 +381,31 @@ class Discovery( ast.NodeVisitor ):
 	# (a bare Assign's rvalue) just calls self.visit() on the expression node
 	# and inspects whatever comes back.
 
+	def visit_Expr( self, node: ast.Expr ) -> None:
+		# module-level compiler directives like
+		# `compiler.require_header('pthread.h')` — recognized textually
+		# (same pattern as _is_compiler_target_call), not by actually
+		# resolving the `compiler` module
+		if isinstance( node.value, ast.Call ):
+			call = node.value
+			if (
+				isinstance( call.func, ast.Attribute )
+				and isinstance( call.func.value, ast.Name )
+				and call.func.value.id == 'compiler'
+			):
+				if call.func.attr == 'require_header':
+					if len( call.args ) != 1 or call.keywords:
+						self.fail( f'compiler.require_header(...) takes exactly one argument: {ast.unparse(node)}', node )
+					arg = call.args[0]
+					if not ( isinstance( arg, ast.Constant ) and isinstance( arg.value, str )):
+						self.fail( f'compiler.require_header(...) argument must be a string literal: {ast.unparse(node)}', node )
+					self.module_stack[-1].required_headers.add( arg.value )
+					self.required_headers.add( arg.value )
+				return
+		# otherwise: a bare expression statement at module level that isn't a
+		# compiler directive — silently ignore (same as generic_visit, which
+		# would recurse into child nodes but find nothing useful this pass needs)
+
 	def visit_Name( self, node: ast.Name ) -> Name:
 		assert isinstance( node.ctx, ast.Load ), f'invalid context on {node=}' # internal invariant - Load is the only context an expression-position Name can have
 		name = self.find_name( node.id, node )
@@ -644,6 +670,28 @@ class Discovery( ast.NodeVisitor ):
 		if isinstance( scope, CEnum ):
 			self._register_enum_member( scope, node )
 			return None
+
+		# compiler.c_type('name', header='header.h') — declare a C type
+		# defined in an external header, registrable as a normal Name
+		if self._is_compiler_c_type_call( node.value ):
+			if len( node.targets ) != 1 or not isinstance( node.targets[0], ast.Name ):
+				self.fail( f'compiler.c_type(...) must be assigned to a single name: {ast.unparse(node)}', node )
+			c_name, header = self._parse_compiler_c_type_call( node.value, node )
+			target_name = node.targets[0].id
+			module = self.module_stack[-1]
+			ctype = CType(
+				stem = target_name,
+				qualname = self._get_qualname( target_name ),
+				file = module.file,
+				line = node.lineno,
+				c_name = c_name,
+				required_header = header,
+			)
+			# also register the header requirement for the emitter
+			module.required_headers.add( header )
+			self.required_headers.add( header )
+			scope.add_name( target_name, ctype )
+			return ctype
 
 		# this stage does not parse function bodies, so this is either a
 		# global variable or a class attribute with no annotation - its type
@@ -980,6 +1028,31 @@ class Discovery( ast.NodeVisitor ):
 			and decorator.func.value.id == 'compiler'
 		)
 
+	def _is_compiler_c_type_call( self, expr: ast.expr ) -> bool:
+		return (
+			isinstance( expr, ast.Call )
+			and isinstance( expr.func, ast.Attribute )
+			and expr.func.attr == 'c_type'
+			and isinstance( expr.func.value, ast.Name )
+			and expr.func.value.id == 'compiler'
+		)
+
+	def _parse_compiler_c_type_call( self, call: ast.Call, node: ast.AST ) -> tuple[str,str]:
+		if len( call.args ) != 1 or not isinstance( call.args[0], ast.Constant ) or not isinstance( call.args[0].value, str ):
+			self.fail( f'compiler.c_type(name, header=...) requires a string literal name as the first argument: {ast.unparse(node)}', node )
+		c_name = call.args[0].value
+		header: str|None = None
+		for kw in call.keywords:
+			if kw.arg == 'header':
+				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
+					self.fail( f'compiler.c_type(...) header= must be a string literal: {ast.unparse(node)}', node )
+				header = kw.value.value
+			else:
+				self.fail( f'compiler.c_type(...) unexpected keyword argument {kw.arg!r}: {ast.unparse(node)}', node )
+		if header is None:
+			self.fail( f'compiler.c_type(...) requires header="..." keyword argument: {ast.unparse(node)}', node )
+		return c_name, header
+
 	def _matches_active_target( self, call: ast.Call ) -> bool:
 		for kw in call.keywords:
 			if kw.arg not in self.active_target:
@@ -997,20 +1070,28 @@ class Discovery( ast.NodeVisitor ):
 			return any( self._target_value_matches( elt, active_value ) for elt in node.elts )
 		self.fail( f'unsupported compiler.target(...) value: {ast.unparse(node)}', node )
 
-	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str]:
-		# @extern('lib', 'symbol') - a foreign call signature declaration.
+	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None]:
+		# @extern('lib', 'symbol') or @extern('lib', 'symbol', header='<name>')
 		# 'lib' is the .lib/.so name to link against, except the literal
 		# 'c' which means the platform C runtime rather than a real file on
 		# disk - that distinction is a future emitter/linker's job to act
 		# on, not this parse step's
-		if not isinstance( decorator, ast.Call ) or len( decorator.args ) != 2 or decorator.keywords:
-			self.fail( f'@extern(lib, symbol) requires exactly 2 positional arguments: {ast.unparse(decorator)}', node )
-		lib_arg, symbol_arg = decorator.args
+		if not isinstance( decorator, ast.Call ) or len( decorator.args ) < 2 or len( decorator.args ) > 3:
+			self.fail( f'@extern(lib, symbol[, header=...]) requires 2 or 3 positional arguments: {ast.unparse(decorator)}', node )
+		lib_arg, symbol_arg = decorator.args[0], decorator.args[1]
 		if not ( isinstance( lib_arg, ast.Constant ) and isinstance( lib_arg.value, str )):
 			self.fail( f'@extern(...) lib name must be a string literal: {ast.unparse(decorator)}', node )
 		if not ( isinstance( symbol_arg, ast.Constant ) and isinstance( symbol_arg.value, str )):
 			self.fail( f'@extern(...) symbol name must be a string literal: {ast.unparse(decorator)}', node )
-		return lib_arg.value, symbol_arg.value
+		header: str|None = None
+		for kw in decorator.keywords:
+			if kw.arg == 'header':
+				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
+					self.fail( f'@extern(...) header= must be a string literal: {ast.unparse(decorator)}', node )
+				header = kw.value.value
+			else:
+				self.fail( f'@extern(...) unexpected keyword argument {kw.arg!r}: {ast.unparse(decorator)}', node )
+		return lib_arg.value, symbol_arg.value, header
 
 	def _parse_function(
 		self,
@@ -1028,6 +1109,7 @@ class Discovery( ast.NodeVisitor ):
 		is_private = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
+		extern_header: str|None = None
 		for decorator in node.decorator_list or []:
 			if self._is_compiler_target_call( decorator ):
 				if not self._matches_active_target( decorator ):
@@ -1048,7 +1130,7 @@ class Discovery( ast.NodeVisitor ):
 				case 'private':
 					is_private = True
 				case 'extern':
-					extern_lib, extern_symbol = self._parse_extern_decorator( decorator, node, qualname )
+					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
 					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
 
@@ -1071,6 +1153,7 @@ class Discovery( ast.NodeVisitor ):
 			is_overload = is_overload,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
+			extern_header = extern_header,
 		)
 		if node.name == 'main':
 			self.main = fn

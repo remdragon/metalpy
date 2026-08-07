@@ -10,7 +10,7 @@ import ir
 from discovery import Discovery
 from errors import CompileError
 from mpy_types import (
-	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module,
+	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
 )
 import overload_resolution
@@ -922,6 +922,15 @@ class Lowering:
 		usize_cls = self.discovery.get_intrinsics()['usize']
 		if size := getattr( target_type, 'sizeof', None ):
 			return ir.Const( type = expected_type or usize_cls, value = size )
+		# a C type declared via compiler.c_type('pthread_mutex_t', ...) -
+		# as opaque to this compiler as a real ClassLike; stays a real
+		# ir.SizeOf, letting the C compiler itself compute it
+		if isinstance( target_type, CType ):
+			self.discovery.required_headers.add( target_type.required_header )
+			dest = self._new_temp( expected_type or usize_cls )
+			self._emit( ir.SizeOf( dest = dest, type = target_type ))
+			return dest
+
 		# a real class-like type (RCClass/CStruct/CUnion/TaggedUnion, or a
 		# concrete Specialization of one) - no field-layout algorithm exists
 		# in this compiler (nor should one - that's the C compiler's own
@@ -981,6 +990,104 @@ class Lowering:
 		dest = self._new_temp( expected_type or ptr_type )
 		self._emit( ir.AddrOf( dest = dest, value = value ))
 		return dest
+	
+	def _lower_compiler_blind_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.blind_call('raw C expression') — emits the expression
+		# as-is into the generated C. The result type defaults to usize
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.blind_call(...) takes exactly one argument: {ast.unparse(node)}', node )
+		arg_node = node.args[0]
+		if not ( isinstance( arg_node, ast.Constant ) and isinstance( arg_node.value, str )):
+			self.discovery.fail( f'compiler.blind_call(...) argument must be a string literal: {ast.unparse(node)}', node )
+		usize_cls = self.discovery.get_intrinsics()['usize']
+		result_type = expected_type or usize_cls
+		dest = self._new_temp( result_type )
+		self._emit( ir.BlindExpr( dest = dest, expr = arg_node.value, result_type = result_type ))
+		return dest
+
+	def _eval_cexpr( self, expr: str, header: str, node: ast.AST ) -> int:
+		import hashlib
+		import os
+		import tempfile
+		from pathlib import Path
+		# cache key derived from (expr, header) — deterministic, so the
+		# same expression always hits the same cached value regardless
+		# of which compilation or project it appears in
+		key = hashlib.sha256( f'{expr}\0{header}'.encode() ).hexdigest()[:16]
+		cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'cexpr'
+		cache_dir.mkdir( parents = True, exist_ok = True )
+		cache_file = cache_dir / key
+		if cache_file.is_file():
+			return int( cache_file.read_text().strip() )
+
+		# no cached value — compile and run a tiny C program
+		import linker_c
+		cc = linker_c.detect_cc()
+		if cc is None:
+			self.discovery.fail(
+				f'compiler.cexpr({expr!r}, {header!r}) needs a C compiler '
+				f'(clang, gcc, or MSVC) — none was found',
+				node,
+			)
+		c_src = f'#include <{header}>\n#include <stdio.h>\nint main(void) {{ printf("%zu\\n", (size_t)({expr})); return 0; }}\n'
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'cexpr.c'
+			obj_path = Path( tmp ) / 'cexpr.o'
+			exe_path = Path( tmp ) / 'cexpr'
+			src_path.write_text( c_src, encoding = 'utf-8' )
+			cc_result = cc.compile( src_path, obj_path )
+			if cc_result.returncode != 0:
+				self.discovery.fail(
+					f'compiler.cexpr({expr!r}, {header!r}): failed to compile '
+					f'the C snippet:\n{cc_result.stdout}',
+					node,
+				)
+			link_result = cc.link( exe_path, [ obj_path ] )
+			if link_result.returncode != 0:
+				self.discovery.fail(
+					f'compiler.cexpr({expr!r}, {header!r}): failed to link '
+					f'the C snippet:\n{link_result.stdout}',
+					node,
+				)
+			import subprocess
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True, text = True )
+			if run_result.returncode != 0:
+				self.discovery.fail(
+					f'compiler.cexpr({expr!r}, {header!r}): C program exited '
+					f'{run_result.returncode}',
+					node,
+				)
+			value = int( run_result.stdout.strip() )
+		cache_file.write_text( str( value ), encoding = 'utf-8' )
+		return value
+
+	def _lower_compiler_cexpr( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.cexpr('C expression', 'header.h', [target_type])
+		# compiles a tiny C program that printf()'s the expression,
+		# runs it, and folds the captured stdout to an ir.Const.
+		# The result is cached under $TMPDIR/metalpy/cexpr/.
+		if len( node.args ) < 2 or len( node.args ) > 3 or node.keywords:
+			self.discovery.fail(
+				f'compiler.cexpr(expr, header[, type]) takes 2-3 '
+				f'positional arguments: {ast.unparse(node)}', node )
+		expr_arg, header_arg = node.args[0], node.args[1]
+		if not ( isinstance( expr_arg, ast.Constant ) and isinstance( expr_arg.value, str )):
+			self.discovery.fail( f'compiler.cexpr(...) expr must be a string literal: {ast.unparse(node)}', node )
+		if not ( isinstance( header_arg, ast.Constant ) and isinstance( header_arg.value, str )):
+			self.discovery.fail( f'compiler.cexpr(...) header must be a string literal: {ast.unparse(node)}', node )
+		expr, header = expr_arg.value, header_arg.value
+		if len( node.args ) == 3:
+			user_type = self._try_resolve_namespace( node.args[2] )
+			if not isinstance( user_type, Scalar ):
+				self.discovery.fail(
+					f'compiler.cexpr(...) third argument must be a scalar '
+					f'type: {ast.unparse(node)}', node )
+			result_type = user_type
+		else:
+			usize_cls = self.discovery.get_intrinsics()['usize']
+			result_type = expected_type or usize_cls
+		value = self._eval_cexpr( expr, header, node )
+		return ir.Const( type = result_type, value = value )
 
 	def _lower_scalar_cast( self, target_type: Scalar, source: ast.expr|ir.Operand, node: ast.AST ) -> ir.Operand:
 		# shared by compiler.cast(T, x) and T(x) construction-sugar - the
@@ -2776,6 +2883,14 @@ class Lowering:
 
 			case 'addrof':
 				result = self._lower_compiler_addrof( node, expected_type )
+				return result if want_result else None
+
+			case 'blind_call':
+				result = self._lower_compiler_blind_call( node, expected_type )
+				return result if want_result else None
+
+			case 'cexpr':
+				result = self._lower_compiler_cexpr( node, expected_type )
 				return result if want_result else None
 
 		# each recognizer returns None (not an error) when this call doesn't
