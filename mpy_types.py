@@ -316,4 +316,3 @@ class Module( Name, ScopeMixin ):
 	intrinsics: dict[str,Name]
 	builtins: dict[str,Name]|None
 	names: dict[str,Name] = field( default_factory = dict )
-	required_headers: set[str] = field( default_factory = set )

@@ -898,8 +898,6 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.AddrOf ):
 		return [ f'\t{_emit_operand(instr.dest)} = &{_emit_operand(instr.value)};' ]
 
-	if isinstance( instr, ir.BlindExpr ):
-		return [ f'\t{_emit_operand(instr.dest)} = ({instr.expr});' ]
 
 	if isinstance( instr, ir.SizeOf ):
 		# a real class-like type's size is whatever the C compiler itself

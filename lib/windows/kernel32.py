@@ -119,23 +119,23 @@ def SetEndOfFile(
 
 @cstruct
 class _SRWLOCK:
-	Ptr: Ptr[None]  # SRWLOCK is a single pointer-sized opaque struct
+	_opaque: Ptr[None]  # SRWLOCK is a single pointer-sized opaque struct
 
 
 @extern('kernel32', 'AcquireSRWLockExclusive')
 def AcquireSRWLockExclusive(
-	SRWLock: Ptr[None],
+	SRWLock: Ptr[_SRWLOCK],
 ) -> None:
 	...
 
 @extern('kernel32', 'TryAcquireSRWLockExclusive')
 def TryAcquireSRWLockExclusive(
-	SRWLock: Ptr[None],
+	SRWLock: Ptr[_SRWLOCK],
 ) -> bool:
 	...
 
 @extern('kernel32', 'ReleaseSRWLockExclusive')
 def ReleaseSRWLockExclusive(
-	SRWLock: Ptr[None],
+	SRWLock: Ptr[_SRWLOCK],
 ) -> None:
 	...

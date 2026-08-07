@@ -364,15 +364,6 @@ class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no fi
 		return f'SizeOf( dest={self.dest!r}, type={self.type.qualname!r} )'
 
 @dataclass( kw_only = True )
-class BlindExpr( Instruction ): # compiler.blind_call('C expression') — raw C emitted as-is
-	dest: Temp
-	expr: str          # the raw C expression text
-	result_type: Type   # the metalpy type this expression produces
-
-	def test_repr( self ) -> str:
-		return f'BlindExpr( dest={self.dest!r}, expr={self.expr!r}, result_type={self.result_type.qualname!r} )'
-
-@dataclass( kw_only = True )
 class Return( Instruction ):
 	value: Operand|None
 	

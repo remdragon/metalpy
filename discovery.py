@@ -399,7 +399,6 @@ class Discovery( ast.NodeVisitor ):
 					arg = call.args[0]
 					if not ( isinstance( arg, ast.Constant ) and isinstance( arg.value, str )):
 						self.fail( f'compiler.require_header(...) argument must be a string literal: {ast.unparse(node)}', node )
-					self.module_stack[-1].required_headers.add( arg.value )
 					self.required_headers.add( arg.value )
 				return
 		# otherwise: a bare expression statement at module level that isn't a
@@ -688,7 +687,6 @@ class Discovery( ast.NodeVisitor ):
 				required_header = header,
 			)
 			# also register the header requirement for the emitter
-			module.required_headers.add( header )
 			self.required_headers.add( header )
 			scope.add_name( target_name, ctype )
 			return ctype
@@ -1155,6 +1153,8 @@ class Discovery( ast.NodeVisitor ):
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,
 		)
+		if extern_header is not None:
+			self.required_headers.add( extern_header )
 		if node.name == 'main':
 			self.main = fn
 		self._parse_type_params( node.type_params, fn )

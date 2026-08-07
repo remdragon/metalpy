@@ -5,20 +5,28 @@
 #   Windows → SRWLOCK (AcquireSRWLockExclusive / TryAcquireSRWLockExclusive)
 #   Linux   → pthread_mutex_t (pthread_mutex_lock / pthread_mutex_trylock)
 #
-# On non-Windows targets, the mutex buffer is sized via
-# compiler.cexpr('sizeof(pthread_mutex_t)', 'pthread.h') at
-# compile time — a tiny C program is compiled, run, and its output
-# cached under $TMPDIR/metalpy/cexpr/.
+# Per-platform opaque lock type — the field annotation Ptr[LockOpaque] gives
+# the correct C pointer type at every call site.  On Linux the @extern
+# prototypes are suppressed (header='pthread.h') so the C compiler sees the
+# real signatures from <pthread.h> directly; if our types disagree, the C
+# compiler catches it.
 
 import compiler
 import sys
+
+if compiler.target.os == 'windows':
+	from windows.kernel32 import _SRWLOCK
+	LockOpaque: TypeAlias = _SRWLOCK
+else:
+	LockOpaque = compiler.c_type('pthread_mutex_t', header='pthread.h')
+
 
 class LockError:
 	pass
 
 class FastLock:
-	__lock: Ptr[u8]    # heap-allocated platform-specific lock bytes
-	__locked: bool      # tracks current lock state for locked() queries
+	__lock: Ptr[LockOpaque]  # Ptr[_SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
+	__locked: bool
 
 	# ------------------------------------------------------------------
 	# __init__ — allocate and initialise the inner OS lock
@@ -26,17 +34,20 @@ class FastLock:
 
 	@compiler.target( os = 'windows' )
 	def __init__( self ) -> None:
-		# SRWLOCK is sizeof(PVOID) = 8 bytes on 64-bit; zero-init
-		self.__lock = sys.alloc[u8]( 8 )
-		sys.memzero( self.__lock, 8 )
+		self.__lock = sys.alloc[LockOpaque]( 1 )
+		sys.memzero( self.__lock, compiler.sizeof( LockOpaque ))
 		self.__locked = False
 
 	@compiler.target( os = not 'windows' )
 	def __init__( self ) -> None:
 		from posix.pthread import pthread_mutex_init
-		mutex_size: usize = compiler.cexpr( 'sizeof(pthread_mutex_t)', 'pthread.h' )
-		self.__lock = sys.alloc[u8]( mutex_size )
-		sys.memzero( self.__lock, mutex_size )
+		# sys._alloc returns Ptr[u8] — pthread_mutex_init expects
+		# pthread_mutex_t*, but void*/u8* implicitly converts there;
+		# we zero the raw bytes before init for defense-in-depth
+		mutex_size: usize = compiler.sizeof( LockOpaque )
+		raw: Ptr[u8] = sys._alloc( mutex_size )
+		sys.memzero( raw, mutex_size )
+		self.__lock = raw
 		result: i32 = pthread_mutex_init( self.__lock, None )
 		if result != 0:
 			sys.panic( 'FastLock.__init__: pthread_mutex_init failed' )

@@ -991,19 +991,6 @@ class Lowering:
 		self._emit( ir.AddrOf( dest = dest, value = value ))
 		return dest
 	
-	def _lower_compiler_blind_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
-		# compiler.blind_call('raw C expression') — emits the expression
-		# as-is into the generated C. The result type defaults to usize
-		if len( node.args ) != 1 or node.keywords:
-			self.discovery.fail( f'compiler.blind_call(...) takes exactly one argument: {ast.unparse(node)}', node )
-		arg_node = node.args[0]
-		if not ( isinstance( arg_node, ast.Constant ) and isinstance( arg_node.value, str )):
-			self.discovery.fail( f'compiler.blind_call(...) argument must be a string literal: {ast.unparse(node)}', node )
-		usize_cls = self.discovery.get_intrinsics()['usize']
-		result_type = expected_type or usize_cls
-		dest = self._new_temp( result_type )
-		self._emit( ir.BlindExpr( dest = dest, expr = arg_node.value, result_type = result_type ))
-		return dest
 
 	def _eval_cexpr( self, expr: str, header: str, node: ast.AST ) -> int:
 		import hashlib
@@ -2885,9 +2872,6 @@ class Lowering:
 				result = self._lower_compiler_addrof( node, expected_type )
 				return result if want_result else None
 
-			case 'blind_call':
-				result = self._lower_compiler_blind_call( node, expected_type )
-				return result if want_result else None
 
 			case 'cexpr':
 				result = self._lower_compiler_cexpr( node, expected_type )
