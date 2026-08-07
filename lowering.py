@@ -47,6 +47,18 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.Mult: '__mul__',
 }
 
+# ast comparison operator -> the dunder method name to dispatch to for a
+# non-scalar left operand (str.__eq__, etc.). Scalar operands go through
+# flat ir.Cmp instead.
+_COMP_DUNDER: dict[type,str] = {
+	ast.Eq: '__eq__',
+	ast.NotEq: '__ne__',
+	ast.Lt: '__lt__',
+	ast.LtE: '__le__',
+	ast.Gt: '__gt__',
+	ast.GtE: '__ge__',
+}
+
 
 class Lowering:
 	'''
@@ -1930,6 +1942,29 @@ class Lowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
+	def _expr_IfExp( self, node: ast.IfExp, expected_type: Type|None ) -> ir.Operand:
+		# ternary `x if cond else y` — both branches assign to the same
+		# dest temp, then merge at end_label. Use JumpIfTrue so the true
+		# branch (body) comes first, avoiding an extra negate.
+		bool_cls = self.discovery.find_name( 'bool', node )
+		cond = self._lower_expr( node.test, bool_cls )
+		else_label = self._new_label( 'ifexp_else' )
+		end_label = self._new_label( 'ifexp_end' )
+		dest = self._new_temp( expected_type ) if expected_type is not None else None
+		self._emit( ir.JumpIfFalse( cond = cond, target = else_label ))
+		# true branch
+		true_val = self._lower_expr( node.body, expected_type )
+		if dest is None:
+			dest = self._new_temp( true_val.type )
+		self._emit( ir.Assign( dest = dest, src = true_val ))
+		self._emit( ir.Jump( target = end_label ))
+		# false branch
+		self._emit( ir.Label( name = else_label ))
+		false_val = self._lower_expr( node.orelse, dest.type )
+		self._emit( ir.Assign( dest = dest, src = false_val ))
+		self._emit( ir.Label( name = end_label ))
+		return dest
+
 	_CMP_OPCODES: dict[type,'ir.CmpOp'] = {
 		ast.Eq: ir.CmpOp.EQ,
 		ast.NotEq: ir.CmpOp.NE,
@@ -1950,11 +1985,11 @@ class Lowering:
 		if isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
 			return self._lower_is_comparison( node, negate = isinstance( node.ops[0], ast.IsNot ))
 
-		# non-scalar equality — try the dunder method (str.__eq__, ...)
-		if isinstance( node.ops[0], ( ast.Eq, ast.NotEq )):
-			left = self._lower_expr( node.left, None )
-			if not isinstance( left.type, Scalar ):
-				method_name = '__eq__' if isinstance( node.ops[0], ast.Eq ) else '__ne__'
+		# non-scalar left operand — try the dunder method (str.__eq__, ...)
+		left = self._lower_expr( node.left, None )
+		if not isinstance( left.type, Scalar ):
+			method_name = _COMP_DUNDER.get( type( node.ops[0] ))
+			if method_name is not None:
 				method = self._find_method( left.type, method_name )
 				if method is not None:
 					right = self._lower_expr( node.comparators[0], left.type )
@@ -1965,23 +2000,14 @@ class Lowering:
 					dest = self._new_temp( expected_type or method.return_type )
 					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
 					return dest
-			# scalar or no dunder — reuse already-lowered left, lower right
-			right = self._lower_expr( node.comparators[0], left.type )
-			bool_cls = self.discovery.find_name( 'bool', node )
-			dest = self._new_temp( bool_cls )
-			cmp_op = self._CMP_OPCODES.get( type( node.ops[0] ))
-			if cmp_op is None:
-				self.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
-			self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
-			return dest
+			# non-scalar without a matching dunder — fall through to
+			# flat Cmp (pointer comparison), same pre-dunder behavior
 
+		# scalar left operand — flat ir.Cmp
+		right = self._lower_expr( node.comparators[0], left.type )
 		cmp_op = self._CMP_OPCODES.get( type( node.ops[0] ))
 		if cmp_op is None:
 			self.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
-
-		right_node = node.comparators[0]
-		left, right = self._lower_binary_operands( node.left, right_node, None, infer_right_from_left = False )
-
 		bool_cls = self.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))

@@ -57,6 +57,24 @@ class ConstantFoldingTests( unittest.TestCase ):
 	def test_nested_folds_bottom_up( self ) -> None:
 		self.assertEqual( _fold( 'x = (1 + 1) == 2', {} ), 'x = True' )
 
+	def test_str_cmp( self ) -> None:
+		self.assertEqual( _fold( 'x = "abc" == "ABC"', {} ), 'x = False' )
+		self.assertEqual( _fold( 'x = "abc" == "abc"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "abc" != "ABC"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "abc" != "abc"', {} ), 'x = False' )
+		self.assertEqual( _fold( 'x = "abc" < "ABC"', {} ), 'x = False' )
+		self.assertEqual( _fold( 'x = "abc" < "abc"', {} ), 'x = False' )
+		self.assertEqual( _fold( 'x = "ABC" < "abc"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "abc" <= "ABC"', {} ), 'x = False' )
+		self.assertEqual( _fold( 'x = "abc" <= "abc"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "ABC" <= "abc"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "abc" >= "ABC"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "abc" >= "abc"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "ABC" >= "abc"', {} ), 'x = False' )
+		self.assertEqual( _fold( 'x = "abc" > "ABC"', {} ), 'x = True' )
+		self.assertEqual( _fold( 'x = "abc" > "abc"', {} ), 'x = False' )
+		self.assertEqual( _fold( 'x = "ABC" > "abc"', {} ), 'x = False' )
+
 
 class CompilerTargetSubstitutionTests( unittest.TestCase ):
 	def test_os_substituted( self ) -> None:

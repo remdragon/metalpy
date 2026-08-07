@@ -98,8 +98,11 @@ def memzero( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
 @compiler.target( os = 'windows' )
 def memcmp( a: ConstPtr[u8], b: ConstPtr[u8], count: usize ) -> i32:
 	from windows.ntdll import RtlCompareMemory
-	if RtlCompareMemory( a, b, count ) == count:
+	matched: usize = RtlCompareMemory( a, b, count )
+	if matched == count:
 		return 0
+	if a[matched] < b[matched]:
+		return -1
 	return 1
 
 @compiler.target( os = not 'windows' )

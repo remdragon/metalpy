@@ -294,10 +294,35 @@ class str:
 				i += 1
 		return str._from_owned_cstr( new_buf, self.__byte_size ).unwrap( 'invalid UTF-8 in upper()' )
 
+	def __cmp__( self, other: str ) -> i32:
+		''' three-way comparison: -1 if self < other, 0 if equal, 1 if self > other '''
+		min_len: usize = self.__byte_size if self.__byte_size < other.__byte_size else other.__byte_size
+		result: i32 = sys.memcmp( self.__data, other.__data, min_len )
+		if result != 0:
+			return result
+		if self.__byte_size < other.__byte_size:
+			return -1
+		if self.__byte_size > other.__byte_size:
+			return 1
+		return 0
+
 	def __eq__( self, other: str ) -> bool:
-		if self.__byte_size != other.__byte_size:
-			return False
-		return sys.memcmp( self.__data, other.__data, self.__byte_size ) == 0
+		return self.__cmp__( other ) == 0
+
+	def __ne__( self, other: str ) -> bool:
+		return self.__cmp__( other ) != 0
+
+	def __lt__( self, other: str ) -> bool:
+		return self.__cmp__( other ) < 0
+
+	def __le__( self, other: str ) -> bool:
+		return self.__cmp__( other ) <= 0
+
+	def __gt__( self, other: str ) -> bool:
+		return self.__cmp__( other ) > 0
+
+	def __ge__( self, other: str ) -> bool:
+		return self.__cmp__( other ) >= 0
 
 	def lower( self ) -> str:
 		''' ASCII-only lowercase: 'A'-'Z' mapped to 'a'-'z'.

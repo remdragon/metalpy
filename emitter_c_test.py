@@ -1567,11 +1567,16 @@ class StrUpperLowerTests( CompilerTestCase ):
 		return ' '.join( flags )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_upper_and_lower( self ) -> None:
+	def test_str_comparison_ops( self ) -> None:
 		self._run( '''
 def main() -> i32:
-	if 'fOo'.upper() == 'FOO' and 'fOo'.lower() == 'foo':
-		return 0
+	if 'a' == 'a':
+		if 'a' != 'b':
+			if 'a' < 'b':
+				if 'a' <= 'b':
+					if 'b' > 'a':
+						if 'b' >= 'a':
+							return 0
 	return 1
 ''' )
 		c_source = emitter_c.emit_c( self.compiler )
@@ -1589,7 +1594,7 @@ def main() -> i32:
 				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
 			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
 			self.assertEqual( run_result.returncode, 0,
-				f'str.upper/lower failed, exit {run_result.returncode}' )
+				f'str comparison ops failed, exit {run_result.returncode}' )
 
 
 if __name__ == '__main__':

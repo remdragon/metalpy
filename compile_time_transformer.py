@@ -178,7 +178,6 @@ class _ConstFolder( ast.NodeTransformer ):
 					continue
 				except TypeError:
 					pass
-			
 			# Can't resolve this pair
 			resolved.append((left, op, right))
 		
