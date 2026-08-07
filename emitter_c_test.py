@@ -1488,5 +1488,68 @@ class WindowsTargetCTypeTests( unittest.TestCase ):
 		c = ir.Const( type = none_type, value = None )
 		self.assertEqual( emitter_c._emit_const( c ), '0' )
 
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile+run verification' )
+class FastLockCompileRunTests( CompilerTestCase ):
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		''' derive linker flags from self.compiler.extern_libs, matching
+			mpy.py's own link step '''
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if self.discovery.active_target['os'] == 'windows':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	def test_acquire_release_and_nonblocking_reacquire( self ) -> None:
+		self._run( '''
+import threading
+
+def main() -> i32:
+	lock: threading.FastLock = threading.FastLock()
+	# blocking acquire should succeed
+	if lock.acquire().is_err():
+		return 1
+	# non-blocking re-acquire should fail (already locked)
+	if not lock.acquire( False ).is_err():
+		return 2
+	# release it
+	lock.release()
+	# after release, non-blocking acquire should succeed again
+	if lock.acquire( False ).is_err():
+		return 3
+	lock.release()
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+		self._assert_compiles_and_runs( c_source )
+
+
+
 if __name__ == '__main__':
 	unittest.main()

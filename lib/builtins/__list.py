@@ -273,7 +273,7 @@ class list[T]:
 	# Returns the stable ID assigned to the element.
 	def append( self, val: T ) -> Result[usize, OverflowError]:
 		compiler.incref( val )
-		id: usize = self.__raw._append( compiler.addressof( val ).cast[None]() ).or_return()
+		id: usize = self.__raw._append( compiler.addrof( val ).cast[None]() ).or_return()
 		return Result.Ok( id )
 	
 	# Access element by stable ID. Returns a copy (with incref if RC).
@@ -329,6 +329,6 @@ class list[T]:
 		h: Handle[T] = Handle.__allocate__(
 			__id          = id,
 			__validity_id = validity_id,
-			__raw         = compiler.addressof( self.__raw ),
+			__raw         = compiler.addrof( self.__raw ),
 		)
 		return Result.Ok( h )

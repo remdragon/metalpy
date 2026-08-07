@@ -111,3 +111,31 @@ def SetEndOfFile(
 	hFile: HANDLE,
 ) -> bool:
 	...
+
+
+# ---------------------------------------------------------------------------
+# SRWLOCK — slim reader/writer lock (exclusive-only for FastLock)
+# ---------------------------------------------------------------------------
+
+@cstruct
+class _SRWLOCK:
+	Ptr: Ptr[None]  # SRWLOCK is a single pointer-sized opaque struct
+
+
+@extern('kernel32', 'AcquireSRWLockExclusive')
+def AcquireSRWLockExclusive(
+	SRWLock: Ptr[None],
+) -> None:
+	...
+
+@extern('kernel32', 'TryAcquireSRWLockExclusive')
+def TryAcquireSRWLockExclusive(
+	SRWLock: Ptr[None],
+) -> bool:
+	...
+
+@extern('kernel32', 'ReleaseSRWLockExclusive')
+def ReleaseSRWLockExclusive(
+	SRWLock: Ptr[None],
+) -> None:
+	...
