@@ -1569,15 +1569,36 @@ class StrUpperLowerTests( CompilerTestCase ):
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_str_comparison_ops( self ) -> None:
 		self._run( '''
+def test( a: str, op: str, b: str ) -> bool:
+	if op == '==':
+		return a == b
+	if op == '!=':
+		return a != b
+	if op == '<':
+		return a < b
+	if op == '>':
+		return a > b
+	if op == '<=':
+		return a <= b
+	if op == '>=':
+		return a >= b
+	return False
+
 def main() -> i32:
-	if 'a' == 'a':
-		if 'a' != 'b':
-			if 'a' < 'b':
-				if 'a' <= 'b':
-					if 'b' > 'a':
-						if 'b' >= 'a':
-							return 0
-	return 1
+	if test( 'a', '!=', 'a' ): return 1
+	if test( 'a', '==', 'b' ): return 2
+	if test( 'a', '>=', 'b' ): return 3
+	if test( 'a', '>', 'b' ): return 4
+	if test( 'b', '<=', 'a' ): return 5
+	if test( 'b', '<', 'a' ): return 6
+	# specifically compare unequal length strings with shared prefix:
+	if not test( 'a', '!=', 'aa' ): return 7
+	if test( 'a', '==', 'aa' ): return 8
+	if test( 'aa', '<', 'a' ): return 9
+	if test( 'aa', '<=', 'a' ): return 10
+	if test( 'a', '>', 'aa' ): return 11
+	if test( 'a', '>=', 'aa' ): return 12
+	return 0
 ''' )
 		c_source = emitter_c.emit_c( self.compiler )
 		with tempfile.TemporaryDirectory() as tmp:
