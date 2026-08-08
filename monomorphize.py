@@ -40,6 +40,23 @@ class Monomorphizer:
 		# since a Specialization is already the canonical, memoized-by-
 		# qualname object for its own (base, args) pair - every reference to
 		# the same instantiation, from anywhere, shares that one cache
+		#
+		# id(Specialization) currently mid-construction inside
+		# monomorphize_class - guards substitute_type_params's own eager-
+		# monomorphize step (see _is_concrete's use there) against infinite
+		# recursion on a self-referential generic class: a method declared
+		# inside Result[T,E] that itself returns Result[T,E] substitutes,
+		# for Result[i32,MyError], to a return type of Result[i32,MyError]
+		# again - the SAME spec this monomorphize_class call is still in
+		# the middle of building, whose .monomorphized cache slot isn't
+		# set yet. Recursing into monomorphize_class for it again would
+		# just repeat the same unfinished work forever; this set lets
+		# substitute_type_params notice and fall back to handing back the
+		# bare (but now concrete) Specialization instead, exactly like
+		# before this eager step existed - a real, correct Specialization
+		# whose own .monomorphized DOES get filled in, by the very
+		# monomorphize_class call already in progress for it
+		self._building: set[int] = set()
 
 	def _ensure_resolved( self, obj: object ) -> None:
 		# same discipline as Lowering._ensure_resolved - duplicated here
@@ -49,6 +66,22 @@ class Monomorphizer:
 		if resolve is not None:
 			resolve()
 		self.schedule( obj )
+
+	def _is_concrete( self, t: Type|None ) -> bool:
+		''' true if `t` has no TypeVar anywhere in it, recursively. A
+		Specialization built from a fully-concrete arg list is a REAL,
+		instantiable type (Result[i32,MyError]); one that still mentions a
+		TypeVar (Result[T,E], or Result[Box[T],E]) is still abstract -
+		monomorphizing it would silently build a bogus "concrete" class
+		whose own fields are still typed with those TypeVars, and cache it
+		under spec.monomorphized as if it really were one. Same shape as
+		_ReferenceResolver's identical TypeVar check for the function-call
+		case (type_resolver.py's _try_resolve_generic_call) '''
+		if isinstance( t, TypeVar ):
+			return False
+		if isinstance( t, Specialization ):
+			return self._is_concrete( t.base ) and all( self._is_concrete( a ) for a in t.args )
+		return True
 
 	def substitute_type_params( self, t: Type|None, type_params: list[TypeVar], args: list[Type] ) -> Type|None:
 		if isinstance( t, TypeVar ):
@@ -60,7 +93,21 @@ class Monomorphizer:
 			substituted_args = [ self.substitute_type_params( a, type_params, args ) for a in t.args ]
 			if all( sa is a for sa, a in zip( substituted_args, t.args )):
 				return t
-			return self.discovery._get_or_create_specialization( t.base, substituted_args )
+			substituted = self.discovery._get_or_create_specialization( t.base, substituted_args )
+			if isinstance( t.base, ClassLike ) and self._is_concrete( substituted ) and id( substituted ) not in self._building:
+				# the substitution just produced a fully-concrete class
+				# Specialization - e.g. Result[T,E]'s own `data: Result$data
+				# [T,E]` field, substituted for Result[i32,MyError], becomes
+				# Result$data[i32,MyError]. Monomorphize it immediately
+				# rather than handing back a bare Specialization that every
+				# future reader (attribute access, self-typing, isinstance-
+				# style queries) would need its OWN ensure_resolved call to
+				# unwrap - this is the single highest-leverage fix point:
+				# every concrete field/parameter/return type substituted
+				# through monomorphize_class or monomorphized_function flows
+				# through here (see PLAN_RESOLVE_CLASS_SPECIALIZATIONS.md)
+				return self.monomorphize_class( substituted )
+			return substituted
 		if isinstance( t, TaggedUnion ) and t.file is None:
 			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
 			# _get_or_create_union - file is None only for these, never for
@@ -199,68 +246,78 @@ class Monomorphizer:
 		# here.
 		if spec.monomorphized is not None:
 			return spec.monomorphized
-		base = spec.base
-		if base.resolve is not None:
-			base.resolve()
-		for attr in base.attributes:
-			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's own identical resolve loop
-		if isinstance( base, TaggedUnion ):
-			# tag/data are synthesized lazily, the first time the union is
-			# actually touched (UnionStorage.get) - trigger that BEFORE
-			# snapshotting base.names below, or the snapshot misses 'tag'
-			# entirely on a union that's never been constructed/matched
-			# against yet (this specialization would be the first reference)
-			self._union_storage.get( base )
-		type_params = base.type_params or []
-		substituted_attrs = [
-			replace( attr, type = self.substitute_type_params( attr.type, type_params, spec.args ))
-			for attr in base.attributes
-		]
-		substituted_names = dict( base.names )
-		for attr in substituted_attrs:
-			substituted_names[attr.stem] = attr
-		for member in base.methods:
-			if not isinstance( member, Function ) or member.type_params:
-				continue
-			method_spec = self.discovery._get_or_create_specialization( member, spec.args )
-			substituted_names[member.stem] = self.monomorphized_function( method_spec )
-
-		extra: dict = {}
-		if isinstance( base, TaggedUnion ):
-			# base.names['tag']/['data'] (synthesized by UnionStorage.get,
-			# already triggered above) are SHARED across every specialization
-			# of a generic union - the abstract base's own payload_cls
-			# carries bare TypeVar fields (v_Ok: T, v_Err: E), never a real
-			# emittable C type. A plain replace() would leave THIS
-			# specialization's own .names pointing at that same abstract,
-			# TypeVar-typed object - give it its own substituted payload_cls
-			# (own qualname, so it doesn't collide with the abstract's or a
-			# sibling specialization's), scheduled here since (mirroring
-			# UnionStorage.get's own identical comment on the abstract case)
-			# nothing else would ever reach it on its own.
-			_tag_attr, data_attr, payload_cls, _tags = self._union_storage.get( base )
-			substituted_payload_fields = [
-				replace( f, type = self.substitute_type_params( f.type, type_params, spec.args ))
-				for f in payload_cls.attributes
+		# marked for the duration of the build - see _building's own
+		# docstring (__init__) for why: a method returning a Specialization
+		# of this SAME spec (a generic class method that returns its own
+		# enclosing class) would otherwise send substitute_type_params's
+		# eager-monomorphize step straight back into monomorphize_class for
+		# THIS spec, before .monomorphized is set, forever
+		self._building.add( id( spec ))
+		try:
+			base = spec.base
+			if base.resolve is not None:
+				base.resolve()
+			for attr in base.attributes:
+				self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's own identical resolve loop
+			if isinstance( base, TaggedUnion ):
+				# tag/data are synthesized lazily, the first time the union is
+				# actually touched (UnionStorage.get) - trigger that BEFORE
+				# snapshotting base.names below, or the snapshot misses 'tag'
+				# entirely on a union that's never been constructed/matched
+				# against yet (this specialization would be the first reference)
+				self._union_storage.get( base )
+			type_params = base.type_params or []
+			substituted_attrs = [
+				replace( attr, type = self.substitute_type_params( attr.type, type_params, spec.args ))
+				for attr in base.attributes
 			]
-			substituted_payload_cls = CUnion(
-				stem = payload_cls.stem,
-				qualname = f'{spec.qualname}$data',
-				file = payload_cls.file,
-				line = payload_cls.line,
-				attributes = substituted_payload_fields,
-				names = { f.stem: f for f in substituted_payload_fields },
+			substituted_names = dict( base.names )
+			for attr in substituted_attrs:
+				substituted_names[attr.stem] = attr
+			for member in base.methods:
+				if not isinstance( member, Function ) or member.type_params:
+					continue
+				method_spec = self.discovery._get_or_create_specialization( member, spec.args )
+				substituted_names[member.stem] = self.monomorphized_function( method_spec )
+
+			extra: dict = {}
+			if isinstance( base, TaggedUnion ):
+				# base.names['tag']/['data'] (synthesized by UnionStorage.get,
+				# already triggered above) are SHARED across every specialization
+				# of a generic union - the abstract base's own payload_cls
+				# carries bare TypeVar fields (v_Ok: T, v_Err: E), never a real
+				# emittable C type. A plain replace() would leave THIS
+				# specialization's own .names pointing at that same abstract,
+				# TypeVar-typed object - give it its own substituted payload_cls
+				# (own qualname, so it doesn't collide with the abstract's or a
+				# sibling specialization's), scheduled here since (mirroring
+				# UnionStorage.get's own identical comment on the abstract case)
+				# nothing else would ever reach it on its own.
+				_tag_attr, data_attr, payload_cls, _tags = self._union_storage.get( base )
+				substituted_payload_fields = [
+					replace( f, type = self.substitute_type_params( f.type, type_params, spec.args ))
+					for f in payload_cls.attributes
+				]
+				substituted_payload_cls = CUnion(
+					stem = payload_cls.stem,
+					qualname = f'{spec.qualname}$data',
+					file = payload_cls.file,
+					line = payload_cls.line,
+					attributes = substituted_payload_fields,
+					names = { f.stem: f for f in substituted_payload_fields },
+				)
+				self.schedule( substituted_payload_cls )
+				substituted_names['data'] = replace( data_attr, type = substituted_payload_cls )
+			monomorphized = replace(
+				base,
+				qualname = spec.qualname,
+				attributes = substituted_attrs,
+				names = substituted_names,
+				type_params = None,
+				resolve = None,
+				**extra,
 			)
-			self.schedule( substituted_payload_cls )
-			substituted_names['data'] = replace( data_attr, type = substituted_payload_cls )
-		monomorphized = replace(
-			base,
-			qualname = spec.qualname,
-			attributes = substituted_attrs,
-			names = substituted_names,
-			type_params = None,
-			resolve = None,
-			**extra,
-		)
+		finally:
+			self._building.discard( id( spec ))
 		spec.monomorphized = monomorphized
 		return monomorphized
