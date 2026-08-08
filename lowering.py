@@ -3015,67 +3015,39 @@ class Lowering:
 			kwarg_types = { name: op.type for name, op in kwargs.items() }
 
 			# an @overload group declared inside a generic CLASS (e.g.
-			# Result[T,E].unwrap_or's `default: T` stub) still carries the
-			# class's own bare TypeVars on every member's .parameters -
-			# overload_resolution.py is a pure function of types with no
-			# substitution logic of its own (see its module docstring), so
-			# candidate matching there would otherwise compare a REAL,
-			# concrete call-site argument type (i32) against the abstract
-			# TypeVar T itself and never match. Substitute member-owned
-			# copies (parameters only - matching is all resolve_call needs
-			# them for) whenever the receiver's own type already pins a
-			# concrete specialization of this group's class, mirroring
-			# _lower_class_generic_method_call's identical receiver check
-			# for a single (non-overloaded) generic method.
-			group_cls = candidates[0].cls if candidates else None
-			group_type_params = group_cls.type_params or [] if group_cls is not None else []
-			cls_args: list[Type]|None = None
-			if group_type_params and receiver is not None and isinstance( receiver.type, Specialization ) and receiver.type.base is group_cls:
-				cls_args = receiver.type.args
-
-			def _for_matching( fn: Function ) -> Function:
-				if cls_args is None:
-					return fn
-				substituted_params = [
-					replace( p, type = self._substitute_type_params( p.type, group_type_params, cls_args ))
-					for p in ( fn.parameters or [] )
-				]
-				return replace( fn, parameters = substituted_params )
-
-			match_stubs = [ _for_matching( fn ) for fn in target.stubs ]
-			match_impls = [ _for_matching( fn ) for fn in target.implementations ]
-			# resolve_call's own "targets" dict maps a plain (non-stub)
-			# candidate to ITSELF - for a substituted copy, that's the
-			# SUBSTITUTED copy, a throwaway replace()'d object, never a real
-			# compile unit - map it back to the real, original Function
-			# resolve_call actually meant (a stub instead resolves via its
-			# own .bound_to, already the original, untouched by _for_matching)
-			original_by_id = { id( sub ): orig for orig, sub in zip( target.implementations, match_impls ) }
+			# Result[T,E].unwrap_or's `default: T` stub) is now pre-
+			# substituted by monomorphize_class itself whenever `target`
+			# was reached through a concrete class specialization - see
+			# Monomorphizer._substituted_overload. target.stubs/
+			# .implementations are ALREADY the correctly monomorphized
+			# Functions in that case (each one's own .cls a Specialization,
+			# the same convention monomorphized_function already uses for
+			# a single non-overloaded generic method), so no per-call-site
+			# substitution is needed here at all anymore - this used to
+			# reconstruct that same substitution by hand from the
+			# RECEIVER's own type instead (isinstance(receiver.type,
+			# Specialization)), which only worked because the receiver
+			# hadn't been resolved to its real ClassLike yet; detecting
+			# "was this group substituted" now just reads the already-
+			# substituted candidate's own .cls, the same signal
+			# monomorphized_function already exposes everywhere else
+			substituted = bool( candidates ) and isinstance( candidates[0].cls, Specialization )
 
 			def _resolve_original( fn: Function ) -> Function:
-				original = original_by_id.get( id( fn ), fn )
-				if cls_args is not None and original.cls is group_cls:
-					# when a stub won the overload resolution, `fn` is the stub's
-					# `bound_to` (the real impl) and won't be in original_by_id -
-					# the stub has a more specific return type than the real
-					# impl (e.g. T vs T|None), so use the stub's return type
-					# while still calling through to the real impl
-					winning_stub = next( ( s for s in target.stubs if s.bound_to is original ), None )
-					if winning_stub is not None:
-						stub_spec = self.discovery._get_or_create_specialization( winning_stub, cls_args )
-						stub_mono = self._monomorphized_function( stub_spec )
-						method_spec = self.discovery._get_or_create_specialization( original, cls_args )
-						impl_mono = self._monomorphized_function( method_spec )
-						# the call target is the real impl, but the return type is
-						# the stub's (more precise) one - swap it on the caller's
-						# side via replace() so schedule() sees the right type
-						return replace( impl_mono, return_type = stub_mono.return_type )
-					method_spec = self.discovery._get_or_create_specialization( original, cls_args )
-					return self._monomorphized_function( method_spec )
-				return original
+				if not substituted:
+					return fn
+				# when a stub won the overload resolution, `fn` is the
+				# stub's own `bound_to` (the real, already-monomorphized
+				# implementation) - the stub has a more specific return
+				# type than the impl (e.g. T vs T|None), so use the
+				# stub's return type while still calling through to the impl
+				winning_stub = next( ( s for s in target.stubs if s.bound_to is fn ), None )
+				if winning_stub is not None:
+					return replace( fn, return_type = winning_stub.return_type )
+				return fn
 
 			try:
-				branches, resolved = overload_resolution.resolve_call( match_stubs, match_impls, arg_types, kwarg_types, qualname = target.qualname )
+				branches, resolved = overload_resolution.resolve_call( target.stubs, target.implementations, arg_types, kwarg_types, qualname = target.qualname )
 			except CompileError as e:
 				# resolve_call is a pure function of types with no
 				# AST/Discovery reference by design - it raises unrecorded,

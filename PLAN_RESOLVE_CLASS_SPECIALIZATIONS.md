@@ -222,3 +222,51 @@ addition - bigger than what "land declared-type resolution first, then stop"
 was scoped for. compiler.py and type_resolver.py have been reverted back to
 their pre-session state (monomorphize.py's step 1 fix is the only change
 currently in the working tree); nothing broken is left uncommitted.
+
+Working through the isinstance(Specialization) sites one at a time
+
+Rather than the origin-field audit (which touches every site at once),
+decided to work through the ~12 confirmed sites individually, starting with
+the ones that don't need it at all.
+
+lowering.py:3033 - overload-group receiver substitution - FIXED, no origin
+field needed
+
+This one turned out to be self-contained: monomorphize_class's method-
+substitution loop only ever handled plain Function members, explicitly
+skipping Overload groups ("a separate, bigger piece of work, out of scope
+here" per its own original comment) - every specialization of a generic
+class shared the SAME abstract Overload object, so _lower_call had to
+reconstruct a substituted copy by hand, per call site, using the RECEIVER's
+own (still-Specialization) type as the only place the concrete args were
+available. Extended monomorphize_class to also substitute Overload members
+(Monomorphizer._substituted_overload) the same way it already substitutes
+plain methods - once, up front, memoized - so target.stubs/.implementations
+arrive at _lower_call already concrete. Detecting "was this group
+substituted" no longer needs the receiver at all: it reads the already-
+substituted candidate's own .cls (a Specialization set by monomorphized_
+function, the SAME convention already used everywhere else for a single
+generic method), so lowering.py's Overload branch shrank from the
+cls_args/_for_matching/original_by_id apparatus down to a single `bool(
+candidates) and isinstance(candidates[0].cls, Specialization)` check.
+
+Along the way, hit and fixed a real, PRE-EXISTING bug in discovery.py's
+_get_or_create_specialization, unrelated to the origin-tracking gap: its
+cache key is `base.qualname[args...]`, and a stub and the plain
+implementation it binds to share the exact same .qualname (both just
+called e.g. `make` - _get_qualname has no notion of "which overload
+candidate"). Monomorphizing both through the shared cache made whichever
+one got built first get silently handed back for the other too. Only
+implementations go through the shared monomorphized_function cache now
+(they're real, independently-reachable compile units); stubs - never
+independently scheduled/compiled, dispatch-only, no real body - are
+substituted directly instead, sidestepping the collision entirely rather
+than fixing the cache key itself (which would need spec.qualname to stay
+unique per candidate too, for C symbol naming, not just the cache).
+
+Full suite: 558 tests, same 2 pre-existing environment-only failures.
+monomorphize_test.py's test_monomorphize_class_leaves_overload_group_
+untouched renamed to test_monomorphize_class_substitutes_overload_group
+and rewritten for the new (intended) behavior.
+
+Next site to look at: TBD.

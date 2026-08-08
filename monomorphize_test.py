@@ -60,25 +60,43 @@ class Box[T]:
 		self.assertIs( get_fn.return_type, i32_cls )
 		self.assertIsNone( get_fn.type_params )
 
-	def test_monomorphize_class_leaves_overload_group_untouched( self ) -> None:
+	def test_monomorphize_class_substitutes_overload_group( self ) -> None:
+		# regression test: an @overload group used to be left exactly as
+		# declared - every specialization sharing the SAME abstract Overload
+		# object, own candidates still typed with the class's bare TypeVars.
+		# lowering.py's _lower_call had to reconstruct a substituted copy by
+		# hand, per call site, from the receiver's own type - now
+		# monomorphize_class does it once, up front, the same way it
+		# already does for a plain (non-overloaded) method
 		mod = self._import( '''
 class Box[T]:
 	v: T
 	@overload
-	@staticmethod
-	def make( x: i32 ) -> i32:
+	def make( self, x: T ) -> T:
+		...
+	def make( self, x: T ) -> T:
 		return x
-	@overload
-	@staticmethod
-	def make( x: usize ) -> i32:
-		return 0
 ''' )
 		box_cls = self._cls( mod, 'Box' )
 		i32_cls = self.discovery.get_intrinsics()['i32']
 		spec = self.discovery._get_or_create_specialization( box_cls, [ i32_cls ] )
 		monomorphized = self.monomorphizer.monomorphize_class( spec )
-		self.assertIsInstance( monomorphized.names['make'], Overload )
-		self.assertIs( monomorphized.names['make'], box_cls.names['make'] ) # same object - not substituted
+		group = monomorphized.names['make']
+		self.assertIsInstance( group, Overload )
+		self.assertIsNot( group, box_cls.names['make'] ) # a real, distinct substituted copy
+		self.assertEqual( len( group.stubs ), 1 )
+		self.assertEqual( len( group.implementations ), 1 )
+		for candidate in ( *group.stubs, *group.implementations ):
+			self.assertIsNone( candidate.type_params )
+			self.assertIs( candidate.return_type, i32_cls ) # every candidate's own T substituted
+			self.assertIs( candidate.parameters[0].type, i32_cls ) # self is excluded from .parameters (see discovery.py's add_param)
+		# the stub's own .bound_to must be re-pointed at the SUBSTITUTED
+		# implementation, not the abstract one it was bound to before
+		# monomorphization - _lower_call's own winning_stub lookup matches
+		# by `s.bound_to is <the resolved implementation>`, which only
+		# ever sees the substituted implementations
+		self.assertIs( group.stubs[0].bound_to, group.implementations[0] )
+		self.assertIsNot( group.stubs[0].bound_to, box_cls.names['make'].stubs[0].bound_to )
 
 	def test_monomorphize_class_tagged_union_tag_and_data_correct( self ) -> None:
 		mod = self._import( '''

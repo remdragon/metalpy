@@ -5,7 +5,7 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Variable
+from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable
 from union_storage import UnionStorage
 
 '''
@@ -213,6 +213,80 @@ class Monomorphizer:
 		spec.monomorphized = monomorphized
 		return monomorphized
 
+	def _substituted_overload( self, group: Overload, spec: Specialization ) -> Overload:
+		# an @overload group declared inside a generic class (e.g. Result
+		# [T,E].unwrap_or's `default: T` stub) still carries the class's
+		# own bare TypeVars on every member's .parameters, same as an
+		# ordinary (non-overloaded) method would before monomorphized_
+		# function gets a chance at it - substitute each implementation
+		# through monomorphized_function, exactly like the plain-method
+		# branch in monomorphize_class already does, just once per member
+		# instead of a fresh, throwaway per-call-site copy every time this
+		# group is ever dispatched. A member with its OWN additional type
+		# params (independently generic beyond the class) is left
+		# unsubstituted, same carve-out monomorphize_class's own plain-
+		# method loop already applies - it's resolved through the ordinary
+		# generic-call machinery when actually invoked, not here.
+		def sub_impl( fn: Function ) -> Function:
+			if fn.type_params:
+				return fn
+			method_spec = self.discovery._get_or_create_specialization( fn, spec.args )
+			return self.monomorphized_function( method_spec )
+		substituted_impls = [ sub_impl( fn ) for fn in group.implementations ]
+		# a substituted STUB's own .bound_to (set by discovery.py's stub-
+		# binding pass, pointing at the ABSTRACT implementation) has to be
+		# re-pointed at the SUBSTITUTED implementation - _lower_call's own
+		# winning_stub lookup matches by `s.bound_to is <the resolved
+		# implementation>`, which only ever sees the substituted ones
+		impl_by_original_id = { id( orig ): sub_fn for orig, sub_fn in zip( group.implementations, substituted_impls ) }
+
+		def sub_stub( stub: Function ) -> Function:
+			if stub.type_params:
+				return stub
+			# deliberately NOT routed through _get_or_create_specialization/
+			# monomorphized_function's shared cache, unlike sub_impl above -
+			# a stub and the plain implementation it binds to share the
+			# EXACT SAME .qualname (discovery.py's _get_qualname has no
+			# notion of "which overload candidate"; both are just called
+			# `make`), so the cache key those two build would COLLIDE -
+			# whichever of the two got monomorphized first would silently
+			# be handed back for BOTH, cached under the other's spec too.
+			# A stub is never independently scheduled/compiled anyway (no
+			# real body, dispatch-only), so it doesn't need that shared,
+			# by-qualname identity at all - substitute it directly instead
+			if stub.resolve is not None:
+				# populates .parameters/.return_type AND runs discovery.
+				# py's own stub-binding (_bind_overload_stub) against the
+				# ABSTRACT group, setting THIS stub's own .bound_to - relies
+				# on group.implementations' own .resolve having already run
+				# (see _bind_overload_stub's own "if impl.resolve is not
+				# None: impl.resolve()"), which sub_impl above guarantees
+				# by running first
+				stub.resolve()
+			cls_type_params = stub.cls.type_params if stub.cls is not None else None
+			substituted_cls = (
+				self.discovery._get_or_create_specialization( stub.cls, spec.args )
+				if cls_type_params else stub.cls
+			)
+			type_params = cls_type_params or []
+			substituted_params = [
+				replace( p, type = self.substitute_type_params( p.type, type_params, spec.args ))
+				for p in ( stub.parameters or [] )
+			]
+			substituted_return = self.substitute_type_params( stub.return_type, type_params, spec.args )
+			bound_to = impl_by_original_id.get( id( stub.bound_to ), stub.bound_to ) if stub.bound_to is not None else None
+			return replace(
+				stub,
+				cls = substituted_cls,
+				parameters = substituted_params,
+				return_type = substituted_return,
+				node = copy.deepcopy( stub.node ),
+				bound_to = bound_to,
+				resolve = None,
+			)
+		substituted_stubs = [ sub_stub( fn ) for fn in group.stubs ]
+		return replace( group, stubs = substituted_stubs, implementations = substituted_impls )
+
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
 		# gives a concrete generic class specialization (Result[i32,
 		# OverflowError]) a real, independent struct/union layout - a
@@ -275,6 +349,9 @@ class Monomorphizer:
 			for attr in substituted_attrs:
 				substituted_names[attr.stem] = attr
 			for member in base.methods:
+				if isinstance( member, Overload ):
+					substituted_names[member.stem] = self._substituted_overload( member, spec )
+					continue
 				if not isinstance( member, Function ) or member.type_params:
 					continue
 				method_spec = self.discovery._get_or_create_specialization( member, spec.args )
