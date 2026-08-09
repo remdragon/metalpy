@@ -2474,17 +2474,14 @@ class Lowering:
 			self_type = target_cls
 			args, kwargs = self._lower_call_args( init, node )
 
-		# self_temp.type is self_type (target_cls itself, or the
-		# Specialization for a generic construction) - NEVER a bare
-		# monomorphized ClassLike object floating free of any Specialization
-		# wrapper, or scheduling it again anywhere else (e.g. sys.alloc[T]'s
-		# own substituted return type, exactly T) would register it a
-		# second time outside the Specialization dedup path. ir.Allocate's
-		# own `cls`, unlike self_temp.type, is always the ABSTRACT target_cls
-		# regardless - the emitter only uses it for an RCClass-vs-not check,
-		# never to read field layout (real field VALUES are already in
-		# `fields`, and the mangled alloc name comes from dest.type, not cls
-		# - see emitter_c.py's own ir.Allocate handling)
+		# self_temp.type is self_type - already scheduled above (schedule
+		# (target_cls) for the plain case, _ensure_resolved(cls_spec) for the
+		# generic case), so no separate schedule() call is needed here.
+		# ir.Allocate's own `cls`, unlike self_temp.type, is always the
+		# ABSTRACT target_cls - the emitter only uses it for an RCClass-vs-not
+		# check, never field layout (values are in `fields`, and the mangled
+		# alloc name comes from dest.type, not cls - see emitter_c.py's own
+		# ir.Allocate handling)
 		self_temp = self._new_temp( self_type )
 		self._schedule_rcclass_construction( target_cls, self_temp.type )
 		self._emit( ir.Allocate( dest = self_temp, cls = target_cls, fields = {} ))
@@ -2497,6 +2494,47 @@ class Lowering:
 			self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
 			return self_temp
 		return self._emit_fallible_construction( node, self_type, init, self_temp, args, kwargs, expected_type )
+
+	def _lower_and_infer_call_args(
+		self, node: ast.Call, callee: Function, type_params: list[TypeVar], bindings: dict[int,Type], qualname: str,
+	) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
+		# shared by _lower_generic_construction_args/_lower_class_generic_
+		# method_call - both need to lower a call's arguments against a
+		# callee whose own class type params aren't fully bound yet, then
+		# use those SAME arguments' real lowered types to refine `bindings`
+		# further. Matches call args against callee's own ABSTRACT
+		# parameter list, lowers each one with an expected-type hint built
+		# from `bindings` as pinned SO FAR (a class type param not yet
+		# bound just passes its own bare TypeVar through -
+		# _substitute_type_params leaves anything it doesn't recognize
+		# alone, so an unbound param position simply gets no useful hint,
+		# same as today), applies move hooks, then unifies each argument's
+		# own real lowered type against its declared parameter type,
+		# mutating `bindings` in place. The caller still owns everything
+		# after that (checking for a still-missing binding, building the
+		# final concrete arg list/Specialization) - that part differs too
+		# much between callers (construction pins from a possibly-
+		# Result[_,_]-wrapped expected_type via _result_shape; a class
+		# method's own receiver-vs-static distinction) to fold in here too
+		positional, keyword = self._match_call_args( callee, node )
+		partial_args = [ bindings.get( id( tv ), tv ) for tv in type_params ]
+		args = [
+			self._lower_expr( expr, self._substitute_type_params( param.type, type_params, partial_args ))
+			for param, expr in positional
+		]
+		kwargs = {
+			param.stem: self._lower_expr( expr, self._substitute_type_params( param.type, type_params, partial_args ))
+			for param, expr in keyword
+		}
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._apply_move_hook( param, operand, qualname )
+		for param, _expr in keyword:
+			self._apply_move_hook( param, kwargs[param.stem], qualname )
+		for ( param, _expr ), operand in zip( positional, args ):
+			self._unify_type_param( type_params, param.type, operand.type, bindings, node, qualname )
+		for param, _expr in keyword:
+			self._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, qualname )
+		return args, kwargs
 
 	def _lower_generic_construction_args( self, node: ast.Call, target_cls: RCClass, init: Function, expected_type: Type|None ) -> tuple[RCClass|Specialization,Function,list[ir.Operand],dict[str,ir.Operand]]:
 		# Box(...) where Box is generic: target_cls's own concrete type args
@@ -2529,25 +2567,7 @@ class Lowering:
 			for tv, arg in zip( class_type_params, pinning_type.args ):
 				bindings[ id( tv ) ] = arg
 
-		positional, keyword = self._match_call_args( init, node )
-		partial_args = [ bindings.get( id( tv ), tv ) for tv in class_type_params ]
-		args = [
-			self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
-			for param, expr in positional
-		]
-		kwargs = {
-			param.stem: self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
-			for param, expr in keyword
-		}
-		for ( param, _expr ), operand in zip( positional, args ):
-			self._apply_move_hook( param, operand, init.qualname )
-		for param, _expr in keyword:
-			self._apply_move_hook( param, kwargs[param.stem], init.qualname )
-
-		for ( param, _expr ), operand in zip( positional, args ):
-			self._unify_type_param( class_type_params, param.type, operand.type, bindings, node, target_cls.qualname )
-		for param, _expr in keyword:
-			self._unify_type_param( class_type_params, param.type, kwargs[param.stem].type, bindings, node, target_cls.qualname )
+		args, kwargs = self._lower_and_infer_call_args( node, init, class_type_params, bindings, target_cls.qualname )
 
 		missing = [ tv.stem for tv in class_type_params if id( tv ) not in bindings ]
 		if missing:
@@ -2867,25 +2887,7 @@ class Lowering:
 		if expected_type is not None:
 			self._unify_type_param( class_type_params, target.return_type, expected_type, bindings, node, target.qualname )
 
-		positional, keyword = self._match_call_args( target, node )
-		partial_args = [ bindings.get( id( tv ), tv ) for tv in class_type_params ]
-		args = [
-			self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
-			for param, expr in positional
-		]
-		kwargs = {
-			param.stem: self._lower_expr( expr, self._substitute_type_params( param.type, class_type_params, partial_args ))
-			for param, expr in keyword
-		}
-		for ( param, _expr ), operand in zip( positional, args ):
-			self._apply_move_hook( param, operand, target.qualname )
-		for param, _expr in keyword:
-			self._apply_move_hook( param, kwargs[param.stem], target.qualname )
-
-		for ( param, _expr ), operand in zip( positional, args ):
-			self._unify_type_param( class_type_params, param.type, operand.type, bindings, node, target.qualname )
-		for param, _expr in keyword:
-			self._unify_type_param( class_type_params, param.type, kwargs[param.stem].type, bindings, node, target.qualname )
+		args, kwargs = self._lower_and_infer_call_args( node, target, class_type_params, bindings, target.qualname )
 
 		missing = [ tv.stem for tv in class_type_params if id( tv ) not in bindings ]
 		if missing:

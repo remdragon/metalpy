@@ -296,4 +296,30 @@ Full suite: 558 tests, same 2 pre-existing environment-only failures.
 Confirmed test_allocate_external_call_is_rejected (a @cstruct, not RCClass)
 still passes, exercising the ClassLike-generality directly.
 
+lowering.py:2498/2831 - _lower_generic_construction_args and
+_lower_class_generic_method_call - not a Specialization gap, but a real
+duplication found while reviewing the site
+
+While confirming _lower_generic_construction_args (Box(...) construction
+inference) doesn't have the overload-style gap - it doesn't; __init__ is a
+plain Function, already correctly substituted by monomorphize_class's
+existing method loop, unaffected by and unrelated to the overload fix -
+noticed its own "match args against the callee's still-abstract
+parameters, lower each with a partial-binding-derived expected-type hint,
+apply move hooks, unify to refine bindings" block was duplicated near-
+verbatim in _lower_class_generic_method_call (Result.Ok(val) static/
+classmethod dispatch - same class-type-param inference problem, just
+reached without a receiver instead of via a constructor). Extracted into
+Lowering._lower_and_infer_call_args(node, callee, type_params, bindings,
+qualname), called from both. Only real behavior change: _lower_generic_
+construction_args's move-hook calls used to tag CFG move-tracking with
+init.qualname while its own unify calls used target_cls.qualname (an
+inconsistency within that one function) - now both use target_cls.qualname
+uniformly, matching what _lower_class_generic_method_call (and every other
+message in that same function) already did throughout.
+
+Full suite: 558/558 passing (the 2 usually-failing kernel32.lib/ntdll.lib
+link tests passed this run too - environment flake, unrelated to this
+change).
+
 Next site to look at: TBD.
