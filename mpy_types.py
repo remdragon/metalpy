@@ -37,6 +37,29 @@ class ScopeMixin:
 	def get_local( self, name: str ) -> Name|None:
 		return self.names.get( name )
 
+	def in_private_scope( self, scope: 'Type|None' ) -> bool:
+		''' true if `scope` (whatever class the function currently being
+		lowered belongs to - Lowering._current_fn.cls, possibly a
+		Specialization for a monomorphized generic-class method) IS this
+		class itself, i.e. private access (currently just a `__allocate__`
+		call - see Lowering._try_lower_allocate_call) from a method of
+		this class is allowed. `scope` is unwrapped to its own abstract
+		base first - Specialization.base means "the generic template" (NOT
+		to be confused with RCClass.base, "parent class in an inheritance
+		chain") - a generic class's own body always spells the template
+		name bare (Result.Ok's own body says `Result.__allocate__`, never
+		`Result[i32,E].__allocate__`), so the comparison has to be against
+		whichever template `self` and `scope` are each an instance of, not
+		against one specific instantiation of it. Lives on ScopeMixin
+		(not just RCClass) because every ClassLike kind can own methods
+		and therefore has the same privacy concept - confirmed load-
+		bearing for TaggedUnion specifically: every @union member
+		constructor's own synthesized body calls the outer union's
+		`__allocate__` this way (see union_storage.py's _build_member_
+		constructor) '''
+		base = scope.base if isinstance( scope, Specialization ) else scope
+		return base is self
+
 @dataclass( kw_only = True )
 class Scalar( Type, ScopeMixin ):
 	'''

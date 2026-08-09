@@ -269,4 +269,31 @@ monomorphize_test.py's test_monomorphize_class_leaves_overload_group_
 untouched renamed to test_monomorphize_class_substitutes_overload_group
 and rewritten for the new (intended) behavior.
 
+lowering.py:2420 - _try_lower_allocate_call's private-access check - FIXED,
+no origin field needed (this one isn't a type-shape query at all)
+
+This site was never actually about recovering a Specialization's args -
+it's a pure identity/access-control check ("is the class attached to the
+CURRENTLY EXECUTING method the same class __allocate__ is being called
+on"), which reads clearer as a named predicate than an inline isinstance-
+and-unwrap. Added ScopeMixin.in_private_scope(scope) (mpy_types.py) - `self`
+is the target class, `scope` is whatever class the current function
+belongs to (Lowering._current_fn.cls, possibly a Specialization for a
+monomorphized generic-class method); unwraps scope to its own abstract
+base and compares identity. Landed on ScopeMixin rather than RCClass alone
+after confirming target_cls at this call site is typed as ClassLike (not
+RCClass-only) and that TaggedUnion.__allocate__ genuinely goes through this
+exact check in production: every @union member constructor's synthesized
+body calls the outer union's own __allocate__ this way (union_storage.py's
+_build_member_constructor) - RCClass/CStruct/CUnion/TaggedUnion share no
+common base class to hang a single method off other than ScopeMixin, which
+all of them (plus CEnum/Function/Module) already use.
+_try_lower_allocate_call's own check collapses to `not target_cls.
+in_private_scope(fn.cls)`, no local fn_cls/fn_base_cls unwrapping left
+inline.
+
+Full suite: 558 tests, same 2 pre-existing environment-only failures.
+Confirmed test_allocate_external_call_is_rejected (a @cstruct, not RCClass)
+still passes, exercising the ClassLike-generality directly.
+
 Next site to look at: TBD.

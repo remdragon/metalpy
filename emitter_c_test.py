@@ -1502,7 +1502,7 @@ class FastLockCompileRunTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if self.discovery.active_target['os'] == 'windows':
+			if _CC is not None and _CC.name == 'cl':
 				flags.append( f'{lib}.lib' )
 			else:
 				flags.append( f'-l{lib}' )
@@ -1560,7 +1560,7 @@ class StrUpperLowerTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if self.discovery.active_target['os'] == 'windows':
+			if _CC is not None and _CC.name == 'cl':
 				flags.append( f'{lib}.lib' )
 			else:
 				flags.append( f'-l{lib}' )

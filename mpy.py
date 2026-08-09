@@ -196,7 +196,7 @@ def main() -> None:
 			if lib == 'c':
 				continue
 			if lib not in ldflags:
-				if active_target['os'] == 'windows':
+				if cc.name == 'cl':
 					flag = f'{lib}.lib'
 				else:
 					flag = f'-l{lib}'

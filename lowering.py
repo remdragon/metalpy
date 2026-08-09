@@ -2410,15 +2410,7 @@ class Lowering:
 			return None
 
 		fn = self._current_fn
-		# fn.cls is the CONCRETE class specialization for a monomorphized
-		# generic-class method (Result.Ok's own fn.cls is Result[i32,E],
-		# not bare Result - see _monomorphized_function's substituted_cls),
-		# while target_cls (resolved from the shared, unspecialized AST
-		# body's own `Result.__allocate__` reference) is always the
-		# abstract base - compare against fn.cls's own base in that case
-		fn_cls = fn.cls if fn is not None else None
-		fn_base_cls = fn_cls.base if isinstance( fn_cls, Specialization ) else fn_cls
-		if fn is None or fn_base_cls is not target_cls:
+		if fn is None or not target_cls.in_private_scope( fn.cls ):
 			self.discovery.fail(
 				f'{target_cls.qualname}.__allocate__(...) is private - only callable from a method of {target_cls.qualname} itself',
 				node,
@@ -2452,9 +2444,8 @@ class Lowering:
 
 		if not isinstance( target_cls, ClassLike ):
 			return None
-		# resolve (populate .names/.attributes) WITHOUT scheduling yet - a
-		# generic target_cls must never itself become a real compile unit
-		# (see below); only a concrete Specialization should
+		# target_cls is already resolved by now - _try_resolve_namespace's
+		# own lookup resolves whatever it returns
 		assert target_cls.resolve is None, f'internal compiler error, {target_cls=} is not fully resolved'
 		init = target_cls.names.get( '__init__' )
 		if isinstance( init, Function ):
