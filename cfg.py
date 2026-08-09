@@ -561,6 +561,32 @@ class CFGState:
 			instructions += entry.instructions
 		return instructions
 
+	def check_loop_exit_unchecked_results( self, entry_results: set[str], ctx: str ) -> None:
+		''' break/continue's own unchecked-Result analogue of unwind_to() -
+		called alongside it, same call sites. Only a Result introduced
+		SINCE the loop's own entry (entry_results, from the same snapshot
+		unwind_to() takes) is checked - one that already existed
+		(unchecked) before the loop started isn't going out of scope here,
+		its obligation is still owed by whatever outer code declared it,
+		discharged wherever THAT binding's own scope actually ends (a later
+		return, del, overwrite, or an enclosing if/loop's own merge point) -
+		mirrors unwind_to()'s own "only entries pushed since snap" scoping
+		for RC decrefs. Always clears the confined portion, whether this
+		raises or not - same reasoning as check_unchecked_results(): dead
+		code may still get lowered after this break/continue (see
+		unwind_to()'s own docstring), and loop_back_edge()'s later,
+		unconditional call must not re-discover (and potentially re-raise,
+		uncaught) the exact same already-reported names. '''
+		confined_unchecked = self._unchecked_results - entry_results
+		self._unchecked_results -= confined_unchecked
+		if confined_unchecked:
+			names = ', '.join( repr( n ) for n in sorted( confined_unchecked ))
+			plural = len( confined_unchecked ) > 1
+			raise CompileError(
+				f"{ctx}: Result value{'s' if plural else ''} {names} {'were' if plural else 'was'} never inspected "
+				f"before exiting the loop - use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
+			)
+
 	# --- return / fall-off-the-end --------------------------------------------
 
 	def return_(

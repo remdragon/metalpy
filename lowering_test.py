@@ -4416,28 +4416,25 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertTrue( any( "'r'" in e and 'produced fresh every loop iteration' in e for e in self.discovery.errors.errors ) )
 
-	# --- known v1 gaps -------------------------------------------------------
+	# --- formerly-known v1 gaps -----------------------------------------------
 	#
-	# Each test below documents a real, currently-unclosed hole in the
-	# unchecked-Result check (found and deliberately scoped out while
-	# building it, not discovered later) by asserting today's actual
-	# (wrong) behavior - discovery.errors.errors == [] where the feature's
-	# own stated goal says it should NOT be empty. If one of these ever
-	# starts failing on its own (errors show up where the assertion says
-	# there are none), that's the gap closing - update the test to assert
-	# the new, correct error instead of loosening/deleting it.
+	# Each of these used to document a real hole in the unchecked-Result
+	# check (found and deliberately scoped out while building it) by
+	# asserting the then-current (wrong) behavior - discovery.errors.errors
+	# == [] where the feature's own stated goal said it should NOT be
+	# empty. All three have since been closed; these now assert the
+	# correct error instead, guarding against regressing back to the gap.
 
-	def test_gap_break_can_silently_discard_a_result_the_fallthrough_path_checks( self ) -> None:
+	def test_break_can_no_longer_silently_discard_a_result_the_fallthrough_path_checks( self ) -> None:
 		# r is discarded on the break path (never reaches r.is_ok(), which
-		# only the non-break path executes) - but loop_back_edge()'s own
-		# fresh-in-loop check only ever looks at self._unchecked_results at
-		# the END of lowering the loop body's text, which - since break
-		# doesn't mutate cfg state at all (see unwind_to()'s own docstring)
-		# - reflects the FALL-THROUGH path's state (r cleared by the
-		# trailing is_ok()), not the break path's. Neither unwind_to() nor
-		# _stmt_Break/_stmt_Continue currently call check_unchecked_results
-		# at all - v1 scope cut, see loop_back_edge()'s own docstring in
-		# cfg.py
+		# only the non-break path executes) - closed via cfg.py's
+		# check_loop_exit_unchecked_results(), called from _stmt_Break/
+		# _stmt_Continue alongside the existing unwind_to() call. Only
+		# flags Results introduced SINCE the loop's own entry (confined to
+		# the loop body, about to be lost) - a pre-existing outer unchecked
+		# Result is deliberately not flagged by a break/continue, since its
+		# obligation isn't lost, just deferred to wherever its own scope
+		# actually ends
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
 			'class MyError: pass',
 			'',
@@ -4456,21 +4453,17 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertEqual( self.discovery.errors.errors, [] ) # should NOT be empty - the break path never checks r
+		self.assertTrue( any( "'r'" in e and 'never inspected before exiting the loop' in e for e in self.discovery.errors.errors ) )
 
-	def test_gap_checked_arithmetic_overflow_can_silently_discard_an_unrelated_result( self ) -> None:
-		# a +check+ b's own overflow-triggered OrReturn (_consume_checked_
-		# result, shared with or_return()'s own early-exit) is a second,
-		# separate function-exit point exactly like or_return()'s - but only
-		# _lower_or_return calls check_unchecked_results before its own
-		# exit; _emit_checked_op/_consume_checked_result don't carry an ast
-		# node to attach a discovery.fail() location to, and threading one
-		# through was scoped out (see _lower_or_return's own comment).
-		# r's own is_ok() below runs UNCONDITIONALLY in the compile-time
-		# model (checked arithmetic's OrReturn isn't a real _stmt_If/
-		# merge_if branch - it's raw IR with no CFG-visible branching at
-		# all), so it clears r regardless of whether the overflow check
-		# actually reaches it at runtime
+	def test_checked_arithmetic_overflow_can_no_longer_silently_discard_an_unrelated_result( self ) -> None:
+		# a + b's own overflow-triggered OrReturn (_consume_checked_result,
+		# shared with or_return()'s own early-exit) is a second, separate
+		# function-exit point exactly like or_return()'s - closed by moving
+		# the clear_result( receiver )/check_unchecked_results() pair OUT of
+		# _lower_or_return and INTO _consume_checked_result itself (the
+		# actual shared choke point), with an ast node now threaded through
+		# _emit_checked_op/_consume_checked_result from their real callers
+		# for discovery.fail()'s own location
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
 			'class MyError: pass',
 			'class OverflowError: pass',
@@ -4489,19 +4482,18 @@ class Tests( unittest.TestCase ):
 		if fn.resolve is not None:
 			fn.resolve()
 		self.compiler._lower( fn )
-		self.assertEqual( self.discovery.errors.errors, [] ) # should NOT be empty - the overflow path never checks r
+		self.assertTrue( any( "'r'" in e and 'never inspected' in e for e in self.discovery.errors.errors ) )
 
-	def test_gap_receiver_based_generic_method_call_bypasses_the_discard_check( self ) -> None:
-		# the discard-check (task 7) only lives in _lower_call's shared tail
-		# (the branch a plain Function target, or an Overload resolved to
-		# one unambiguous implementation, reaches) - a generic METHOD called
-		# through a receiver whose type isn't known until lowering (Box's
-		# own local `b` here) is left untagged by type_resolver.py's own
-		# pre-pass (see type_resolver_test.py's own
+	def test_receiver_based_generic_method_call_can_no_longer_bypass_the_discard_check( self ) -> None:
+		# a generic METHOD called through a receiver whose type isn't known
+		# until lowering (Box's own local `b` here) is left untagged by
+		# type_resolver.py's own pre-pass (see type_resolver_test.py's own
 		# test_generic_call_on_receiver_local_is_left_untagged) and routes
 		# through _lower_class_generic_method_call/_emit_generic_call
-		# instead, which has its own, separate want_result-gated emission
-		# that was never given the same check
+		# instead of _lower_call's own shared tail - closed by adding the
+		# same discard check directly to _emit_generic_call, which is the
+		# actual shared tail for every generic-call dispatch path (explicit
+		# Name[T](...), inferred, and class-generic-method alike)
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
 			'class MyError: pass',
 			'',
@@ -4517,7 +4509,7 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertEqual( self.discovery.errors.errors, [] ) # should NOT be empty - b.get(n)'s Result is silently discarded
+		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ) )
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )

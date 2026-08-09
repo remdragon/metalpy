@@ -1370,10 +1370,17 @@ class Lowering:
 			self._loop_labels.pop()
 			self._loop_depth -= 1
 
+	def _check_loop_exit_unchecked_results( self, loop_snapshot: object, node: ast.AST ) -> None:
+		try:
+			self._cfg.check_loop_exit_unchecked_results( loop_snapshot.results, self._current_fn.qualname )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
+
 	def _stmt_Break( self, node: ast.Break ) -> None:
 		if not self._loop_labels:
 			self.discovery.fail( 'break outside a loop', node )
 		_, break_label, loop_snapshot = self._loop_labels[-1]
+		self._check_loop_exit_unchecked_results( loop_snapshot, node )
 		for instr in self._cfg.unwind_to( loop_snapshot ):
 			self._emit( instr )
 		self._emit( ir.Jump( target = break_label ))
@@ -1382,6 +1389,7 @@ class Lowering:
 		if not self._loop_labels:
 			self.discovery.fail( 'continue outside a loop', node )
 		continue_label, _, loop_snapshot = self._loop_labels[-1]
+		self._check_loop_exit_unchecked_results( loop_snapshot, node )
 		for instr in self._cfg.unwind_to( loop_snapshot ):
 			self._emit( instr )
 		self._emit( ir.Jump( target = continue_label ))
@@ -1438,7 +1446,7 @@ class Lowering:
 		# shape being non-None already proves Result is defined
 		result_cls = self.discovery.find_name( 'Result', node )
 		self._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
-		return self._consume_checked_result( value, result_type, extra = None )
+		return self._consume_checked_result( node, value, result_type, extra = None )
 
 	def _bind_loop_target( self, target: ast.Name, default_type: Type, value_expr: ast.expr, node: ast.AST ) -> Variable:
 		# mirrors _stmt_Assign's Name-target "reuse existing, else infer/
@@ -1935,9 +1943,9 @@ class Lowering:
 			# failure here must not leave partial instructions behind for
 			# the per-statement recovery boundary to silently keep
 			self._type_resolver._require_result_return( node, result_cls, error_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error], fn = self._current_fn )
-		return self._emit_checked_op( opcode, operand_kwargs, result_type, result_cls, error_cls, extra )
+		return self._emit_checked_op( node, opcode, operand_kwargs, result_type, result_cls, error_cls, extra )
 
-	def _emit_checked_op( self, opcode: type, operand_kwargs: dict, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
+	def _emit_checked_op( self, node: ast.AST, opcode: type, operand_kwargs: dict, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
 		# shared by Check-mode binops (Add/Sub/Mult/Shl/Div/Mod), USub, and
 		# scalar casts - operand_kwargs is however the specific opcode names
 		# its operand(s) (left/right for a binop, operand for USub/cast)
@@ -1949,14 +1957,29 @@ class Lowering:
 		self.schedule( check_type )
 		check_dest = self._new_temp( check_type )
 		self._emit( opcode( dest = check_dest, **operand_kwargs ))
-		return self._consume_checked_result( check_dest, result_type, extra )
+		return self._consume_checked_result( node, check_dest, result_type, extra )
 
-	def _consume_checked_result( self, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
+	def _consume_checked_result( self, node: ast.AST, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
 		# shared by both binop (AddCheck/.../Div/Mod) and unary (NegCheck)
-		# Check-mode ops - see _expr_BinOp's own comment on the OrReturn/
-		# OrJump/Unwrap split
+		# Check-mode ops, _maybe_consume_result's __len__/__getitem__ auto-
+		# unwrap, and _lower_or_return's own <result_expr>.or_return() - see
+		# _expr_BinOp's own comment on the OrReturn/OrJump/Unwrap split.
+		# check_dest is sometimes a real, named Variable (or_return()'s own
+		# receiver) and sometimes a bare Temp (checked arithmetic, __len__/
+		# __getitem__'s auto-unwrap) - isinstance covers both uniformly
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
+			if isinstance( check_dest, Variable ):
+				self._cfg.clear_result( check_dest.stem ) # this call IS the inspection of check_dest - clear it before the exit-path check below, or it'd wrongly flag itself
+			# the OrReturn/OrJump path below is a second, separate function-
+			# exit point alongside plain `return` (see cfg.check_unchecked_
+			# results' own docstring) - anything else still unchecked here
+			# would otherwise be silently discarded exactly like falling off
+			# the end unchecked would be
+			try:
+				self._cfg.check_unchecked_results( None )
+			except CompileError as e:
+				self.discovery.fail( str( e ), node )
 			label = self._cfg.current_epilogue_label()
 			if label is not None:
 				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
@@ -2816,25 +2839,12 @@ class Lowering:
 		# identical comment on why
 		result_cls = self.discovery.find_name( 'Result', node )
 		self._type_resolver._require_result_return( node, result_cls, error_cls, self._OR_RETURN_ALTERNATIVES, fn = self._current_fn )
-		if isinstance( receiver, Variable ):
-			self._cfg.clear_result( receiver.stem ) # or_return() IS the inspection of receiver - clear it before the exit-path check below, or it'd wrongly flag itself
-		# or_return()'s Err path is a second, separate function-exit point
-		# alongside plain `return` (see _consume_checked_result, right
-		# below) - anything else still unchecked at this point would be
-		# silently discarded exactly like falling off the end unchecked
-		# would be, so it gets the same validation. NOTE: checked-arithmetic
-		# (a +check+ b) shares _consume_checked_result's own OrReturn/OrJump
-		# emission for its own overflow-triggered early return, but isn't
-		# covered here - _emit_checked_op/_consume_checked_result don't
-		# currently carry an ast node to attach a discovery.fail() location
-		# to, and threading one through is out of scope for this pass. v1
-		# gap: a checked-arithmetic overflow can still silently discard an
-		# unrelated unchecked Result elsewhere in the same function
-		try:
-			self._cfg.check_unchecked_results( None )
-		except CompileError as e:
-			self.discovery.fail( str( e ), node )
-		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
+		# clearing receiver (when it's a named Variable) and validating that
+		# nothing ELSE is still unchecked at this early-exit point both now
+		# live in _consume_checked_result itself, shared with checked-
+		# arithmetic's own identical OrReturn/OrJump early-exit - see its
+		# own comment
+		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
 	def _lower_call_args( self, target: Function, node: ast.Call ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
@@ -2879,7 +2889,7 @@ class Lowering:
 		# count - not the abstract, unsubstituted one)
 		monomorphized = self._monomorphized_function( spec )
 		args, kwargs = self._lower_call_args( monomorphized, node )
-		return self._emit_generic_call( spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
+		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_inferred_generic_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# a BARE call to a generic function (mylen(a), no explicit [T]) -
@@ -2921,7 +2931,7 @@ class Lowering:
 		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 		spec = self.discovery._get_or_create_specialization( target, inferred_args )
 		monomorphized = self._monomorphized_function( spec )
-		return self._emit_generic_call( spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
+		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST, context_qualname: str ) -> None:
 		# generalized over an explicit type_params list (rather than always
@@ -2964,14 +2974,26 @@ class Lowering:
 		# yet (no general type-checking pass exists), same as every other
 		# call site in this file today
 
-	def _emit_generic_call( self, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+	def _emit_generic_call( self, node: ast.Call, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# schedules the Specialization itself as the compile unit (see
 		# _monomorphized_function/compiler.py's own handling of it), shared
-		# tail for both the explicit Name[T](...) and inferred call paths
+		# tail for both the explicit Name[T](...) and inferred call paths -
+		# and, unlike _lower_call's OWN shared tail (which only ever sees a
+		# call type_resolver.py's pre-pass could tag with resolved_callee),
+		# the ONLY tail a receiver-based generic method call reaches at all
+		# (see _lower_class_generic_method_call's own comment on why that
+		# one is always left untagged) - so the discard check needs its own
+		# copy here too, not just in _lower_call's
 		self.schedule( spec )
 		self.schedule( monomorphized.return_type )
 		for param in monomorphized.parameters or []:
 			self.schedule( param.type )
+		if not want_result and cfg.is_result_type( monomorphized.return_type ):
+			self.discovery.fail(
+				f'{monomorphized.qualname}(...) returns a Result that is discarded here - '
+				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
+				node,
+			)
 		if want_result:
 			dest = self._new_temp( expected_type or monomorphized.return_type )
 			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
@@ -3027,7 +3049,7 @@ class Lowering:
 		cls_args = [ bindings[id(tv)] for tv in class_type_params ]
 		method_spec = self.discovery._get_or_create_specialization( target, cls_args )
 		monomorphized = self._monomorphized_function( method_spec )
-		return self._emit_generic_call( method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
+		return self._emit_generic_call( node, method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		match self._is_compiler_call( node ):
