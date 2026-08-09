@@ -447,6 +447,17 @@ def _self_qualname( function: Function ) -> str:
 def _has_self( function: Function ) -> bool:
 	return function.cls is not None and not function.is_static and not function.is_classmethod
 
+def _returns_void_in_c( return_type: Type|None ) -> bool:
+	''' NoneType/NoReturn are value-less in C - a real void, not a
+	MetalpyNone struct with nothing in it. Shared by _function_prototype
+	(the C prototype itself) and _emit_instruction's own ir.Return handling
+	(the actual `return ...;` statements inside the body) - they have to
+	agree, or a generic method monomorphized with T=NoneType (e.g.
+	Result[None,E].unwrap(), whose body is `return self.data.v_Ok`) gets a
+	void-declared C function whose own body still tries to `return` a real
+	(if structurally empty) operand, which every C compiler rejects. '''
+	return return_type is None or ( isinstance( return_type, Scalar ) and return_type.stem in ( 'NoneType', 'NoReturn' ))
+
 def _function_prototype( function: Function ) -> str:
 	if function.is_destructor:
 		name = mangle_qualname( function.qualname )
@@ -461,7 +472,7 @@ def _function_prototype( function: Function ) -> str:
 		return f'int main( {params_str} )'
 	noreturn = '_Noreturn ' if _is_noreturn( function.return_type ) else ''
 	# NoneType/NoReturn are value-less in C — return void, not MetalpyNone
-	if function.return_type is None or ( isinstance( function.return_type, Scalar ) and function.return_type.stem in ( 'NoneType', 'NoReturn' )):
+	if _returns_void_in_c( function.return_type ):
 		ret = 'void'
 	else:
 		ret = c_type( function.return_type )
@@ -794,6 +805,15 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# success code here (a real exit-code convention, if one is ever
 			# needed, is a later/library concern, not this bare fallback)
 			return [ '\treturn 0;' ] if _is_entry_point( function ) else [ '\treturn;' ]
+		if function is not None and _returns_void_in_c( function.return_type ):
+			# instr.value is a real IR operand (not Python None - that's the
+			# branch above), but the function's own C return type is void -
+			# a generic method monomorphized with T=NoneType still has a
+			# real `return <T-typed-expr>;` in its own body (e.g. Result
+			# [None,E].unwrap()'s `return self.data.v_Ok`), which would
+			# otherwise emit `return t2;` from a function declared void -
+			# see _returns_void_in_c's own comment
+			return [ '\treturn;' ]
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
 	if isinstance( instr, ir.DeclareTemp ):

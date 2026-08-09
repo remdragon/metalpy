@@ -513,6 +513,34 @@ def main() -> None:
 ''' )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
+	def test_generic_method_returning_t_monomorphized_to_none_compiles( self ) -> None:
+		# regression test: a generic method whose body does `return self.
+		# <T-typed-field>` (Result[None,E].unwrap()'s own `return self.data
+		# .v_Ok` is the real-world case that found this) still had a real
+		# ir.Return(value=<some operand>) once T monomorphizes to NoneType -
+		# _emit_instruction's own ir.Return handling only checked whether
+		# THAT operand was Python None (i.e. "no expression"), not whether
+		# the function's own C return type was void, so it emitted
+		# `return t0;` from a function _function_prototype had separately
+		# (correctly) declared `void` - "void function should not return a
+		# value" from every C compiler. Fixed by sharing one
+		# _returns_void_in_c() check between the prototype and the return
+		# statement itself.
+		self._run( '''
+@cstruct
+class Box[T]:
+	v: T
+	def get( self ) -> T:
+		return self.v
+
+def main() -> None:
+	b: Box[None] = Box( v = None )
+	b.get()
+	return
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
 	def test_wrap_arithmetic_smoke_test_compiles( self ) -> None:
 		# Phase 1 milestone (a): the first real smoke test, sidesteps
 		# Result plumbing entirely

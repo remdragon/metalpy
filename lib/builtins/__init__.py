@@ -641,15 +641,9 @@ class str:
 
 def print( msg: str, end: str = '\n' ) -> None:
 	# No *args/**kwargs, use f-strings instead (once implemented)
-	# .is_ok() not .unwrap(...) - Result[None,OSError].unwrap() hits an
-	# unrelated, pre-existing emitter_c.py bug (a T=None unwrap() compiles
-	# to a C function declared void that still tries to `return` a value -
-	# separate issue, not touched here); print() swallowing a write failure
-	# is no worse than before this session's unchecked-Result check made
-	# the OLD silent-discard here a compile error in the first place
-	sys.stdout.write( msg ).is_ok()
+	sys.stdout.write( msg ).unwrap( 'stdout write failed' )
 	if end:
-		sys.stdout.write( end ).is_ok()
+		sys.stdout.write( end ).unwrap( 'stdout write failed' )
 
 # a single generic function now that bare-call monomorphization can infer T
 # from the argument (see lowering.py's _lower_inferred_generic_call) - a real
