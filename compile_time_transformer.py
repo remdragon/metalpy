@@ -46,6 +46,7 @@ stays consistent with what the language actually supports:
 # stdlib imports:
 import ast
 import operator
+from typing import Callable
 
 _BINOP_FNS: dict[type,object] = {
 	ast.Add: operator.add,
@@ -90,9 +91,31 @@ def _is_compiler_target_query( node: ast.expr ) -> str|None:
 	return node.attr
 
 
+def _is_compiler_has_library_call( node: ast.expr ) -> bool:
+	''' true for a `compiler.has_library(...)` call - same shape check as
+	_is_compiler_target_query, just for a Call instead of an Attribute
+	chain. '''
+	return (
+		isinstance( node, ast.Call )
+		and isinstance( node.func, ast.Attribute )
+		and node.func.attr == 'has_library'
+		and isinstance( node.func.value, ast.Name )
+		and node.func.value.id == 'compiler'
+	)
+
+
 class _ConstFolder( ast.NodeTransformer ):
-	def __init__( self, active_target: dict[str,object] ) -> None:
+	def __init__( self, active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> None:
 		self.active_target = active_target
+		# a CALLABLE, not an already-resolved CcTool - detect_cc() itself is
+		# cheap once cached (see Discovery._detect_cc), but this class is
+		# instantiated for every module (transform_stmt_list runs on every
+		# import) and every referenced function body alike, and the real
+		# cost - has_symbol()'s own compile+link subprocess pair, see
+		# visit_Call below - must only ever be paid for a module/function
+		# that actually contains a compiler.has_library(...) call, never as
+		# a blanket cost of importing this pass at all
+		self._detect_cc = detect_cc
 
 	# --- class/function boundary visitors ---
 	# These deliberately do NOT descend into body or touch decorator_list.
@@ -117,6 +140,30 @@ class _ConstFolder( ast.NodeTransformer ):
 			return ast.copy_location( ast.Constant( value = self.active_target[key] ), node )
 		self.generic_visit( node )
 		return node
+
+	def visit_Call( self, node: ast.Call ) -> ast.expr:
+		self.generic_visit( node )
+		if not _is_compiler_has_library_call( node ):
+			return node
+		# malformed args, or no detect_cc callback/no C compiler found: left
+		# UNFOLDED rather than reported here - this class has no discovery.
+		# fail() access by design (every other fold here is best-effort,
+		# deferring real error reporting to whatever later pass actually
+		# tries to resolve the still-unfolded node), matching how e.g.
+		# visit_BinOp silently leaves a node alone on a fold it can't do
+		if (
+			len( node.args ) != 2 or node.keywords
+			or not isinstance( node.args[0], ast.Constant ) or not isinstance( node.args[0].value, str )
+			or not isinstance( node.args[1], ast.Constant ) or not isinstance( node.args[1].value, str )
+			or self._detect_cc is None
+		):
+			return node
+		cc = self._detect_cc()
+		if cc is None:
+			return node
+		import linker_c
+		available = linker_c.has_symbol( cc, node.args[0].value, node.args[1].value )
+		return ast.copy_location( ast.Constant( value = available ), node )
 
 	def visit_BinOp( self, node: ast.BinOp ) -> ast.expr:
 		self.generic_visit( node )
@@ -331,28 +378,33 @@ class _ConstFolder( ast.NodeTransformer ):
 		return None
 
 
-def transform_stmt_list( body: list[ast.stmt], active_target: dict[str,object] ) -> list[ast.stmt]:
+def transform_stmt_list( body: list[ast.stmt], active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> list[ast.stmt]:
 	'''
 	Folds compile-time-constant expressions, if/while/match statements, and
 	compiler.target.<key> queries in a list of statements. Works on function
 	bodies, module-level statement lists, class bodies \u2014 anywhere a statement
 	list needs compile-time simplification before the rest of the pipeline sees it.
-	
+
 	Wrapping in a throwaway Module lets ast.NodeTransformer's own list-field
 	splicing (visit_If/visit_While returning a list gets flattened into the
 	parent's body list) do the work, instead of reimplementing it here.
+
+	detect_cc - see _ConstFolder's own comment - is optional: a caller that
+	never needs compiler.has_library(...) folding (or doesn't have a
+	Discovery instance's own cached detector handy) can simply omit it,
+	leaving any compiler.has_library(...) call unfolded rather than failing.
 	'''
 	container = ast.Module( body = list( body ), type_ignores = [] )
-	_ConstFolder( active_target ).generic_visit( container )
+	_ConstFolder( active_target, detect_cc ).generic_visit( container )
 	return container.body
 
 
-def transform_function_body( body: list[ast.stmt], active_target: dict[str,object] ) -> list[ast.stmt]:
+def transform_function_body( body: list[ast.stmt], active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> list[ast.stmt]:
 	''' legacy name \u2014 just transform_stmt_list, kept for existing callers '''
-	return transform_stmt_list( body, active_target )
+	return transform_stmt_list( body, active_target, detect_cc )
 
 
-def transform_expr( node: ast.expr, active_target: dict[str,object] ) -> ast.expr:
+def transform_expr( node: ast.expr, active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> ast.expr:
 	''' single-expression sibling of transform_function_body - for contexts
 	that lower a bare expression rather than a statement list (a global
 	variable's or a class attribute's own initializer - see discovery.py's
@@ -360,5 +412,5 @@ def transform_expr( node: ast.expr, active_target: dict[str,object] ) -> ast.exp
 	same way function bodies already fold through transform_function_body) '''
 	wrapper = ast.Expr( value = node )
 	ast.copy_location( wrapper, node )
-	folded = transform_function_body( [ wrapper ], active_target )
+	folded = transform_function_body( [ wrapper ], active_target, detect_cc )
 	return folded[0].value

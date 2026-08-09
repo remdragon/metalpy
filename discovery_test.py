@@ -7,6 +7,7 @@ import unittest
 # local imports
 import discovery
 from errors import CompileError
+import linker_c
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
 	Function, Variable, Specialization, Move, Copy, ConditionalDispatch, Scalar,
@@ -1422,6 +1423,73 @@ def foo() -> i32:
 		# 'wasm') - 'posix' is a separate bool field, not a family value
 		disco = discovery.Discovery( import_builtins = False )
 		self.assertIn( disco.active_target['family'], ( 'unix', 'windows' ))
+
+
+_CC = linker_c.detect_cc()
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )
+class CompilerHasLibraryTargetTests( unittest.TestCase ):
+	''' @compiler.target(has_library=(lib, symbol)) - eager decorator-level
+	filtering, backed by a real compile+link probe (see linker_c.has_symbol) -
+	mirrors CompilerTargetTests' own os=/arch= style, but has_library's
+	value is the PROBE's own (lib, symbol) arguments, not a lookup against
+	active_target (see Discovery._matches_has_library's own comment on why
+	it's special-cased ahead of the generic dict-lookup path). '''
+
+	def _import( self, code: str ) -> tuple[discovery.Discovery, Module]:
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( code, Path( '__main__.py' ), scope = None )
+		return disco, mod
+
+	def test_available_symbol_included( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( has_library = ( 'kernel32', 'GetLastError' ))
+def foo() -> i32:
+	pass
+''' )
+		self.assertIsInstance( mod.get_local( 'foo' ), Function )
+
+	def test_unavailable_symbol_excluded( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( has_library = ( 'kernel32', 'ThisIsNotARealSymbol123' ))
+def foo() -> i32:
+	pass
+''' )
+		self.assertIsNone( mod.get_local( 'foo' ))
+
+	def test_negated_has_library( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( has_library = not ( 'kernel32', 'ThisIsNotARealSymbol123' ))
+def foo() -> i32:
+	pass
+''' )
+		self.assertIsInstance( mod.get_local( 'foo' ), Function )
+
+	def test_same_named_functions_pick_the_available_one( self ) -> None:
+		# mirrors CompilerTargetTests' own os= version of this same shape -
+		# two mutually-exclusive has_library-gated defs, only the matching
+		# one should ever get registered
+		disco, mod = self._import( '''
+@compiler.target( has_library = ( 'kernel32', 'GetLastError' ))
+def get_error() -> i32:
+	return 1
+
+@compiler.target( has_library = not ( 'kernel32', 'GetLastError' ))
+def get_error() -> i32:
+	return 2
+''' )
+		fn = mod.get_local( 'get_error' )
+		self.assertIsInstance( fn, Function )
+		self.assertNotIsInstance( fn, Overload )
+		self.assertEqual( fn.node.body[0].value.value, 1 )
+
+	def test_malformed_value_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@compiler.target( has_library = 'kernel32' )
+def foo() -> i32:
+	pass
+''' )
+		self.assertTrue( any( 'has_library' in e for e in disco.errors.errors ))
 
 
 class CompileTimeFoldingIntegrationTests( unittest.TestCase ):

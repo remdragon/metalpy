@@ -129,6 +129,17 @@ class Discovery( ast.NodeVisitor ):
 		self._moves: dict[str,Move] = {}
 		self._copies: dict[str,Copy] = {}
 
+		# lazily detected the first time a has_library(...) check (decorator
+		# or compiler.has_library(...) expression - see _matches_has_library/
+		# compile_time_transformer.py's own _ConstFolder) actually needs one -
+		# detect_cc() does real shutil.which()/subprocess work (slower still
+		# for MSVC's vswhere auto-detection), so this is cached on the
+		# instance rather than re-run per check. _cc_detected distinguishes
+		# "not yet probed" from "probed, found nothing" (self._cc is None
+		# either way)
+		self._cc: 'linker_c.CcTool | None' = None
+		self._cc_detected = False
+
 		if import_builtins:
 			# just for the side effect of populating self.modules['builtins'] -
 			# import_code() looks it up from there directly (see below), so
@@ -221,7 +232,7 @@ class Discovery( ast.NodeVisitor ):
 			# statement doesn't stop the rest of the module from being scanned -
 			# see _resolve_guarded for the same idea applied to individual
 			# symbols' .resolve()
-			tree.body = compile_time_transformer.transform_stmt_list( tree.body, self.active_target )
+			tree.body = compile_time_transformer.transform_stmt_list( tree.body, self.active_target, self._detect_cc )
 			for node in tree.body:
 				try:
 					self.visit( node )
@@ -615,7 +626,7 @@ class Discovery( ast.NodeVisitor ):
 		# otherwise passed through compile_time_transformer at all, so
 		# without this `X: u32 = u32(-11)` (a real WinAPI-style constant)
 		# would never see its own compile-time-constant argument folded
-		init = compile_time_transformer.transform_expr( node.value, self.active_target ) if node.value is not None else None
+		init = compile_time_transformer.transform_expr( node.value, self.active_target, self._detect_cc ) if node.value is not None else None
 		var_obj = Variable(
 			stem = node.target.id,
 			qualname = self._get_qualname( node.target.id ),
@@ -719,7 +730,7 @@ class Discovery( ast.NodeVisitor ):
 		module = self.module_stack[-1]
 		# folded eagerly, same as a function body (_make_function_resolver) -
 		# see the identical comment on visit_AnnAssign
-		init = compile_time_transformer.transform_expr( node.value, self.active_target )
+		init = compile_time_transformer.transform_expr( node.value, self.active_target, self._detect_cc )
 		var_obj = Variable(
 			stem = target.id,
 			qualname = self._get_qualname( target.id ),
@@ -1053,6 +1064,17 @@ class Discovery( ast.NodeVisitor ):
 
 	def _matches_active_target( self, call: ast.Call ) -> bool:
 		for kw in call.keywords:
+			if kw.arg == 'has_library':
+				# checked before the active_target dict lookup below,
+				# deliberately - has_library=(lib, symbol) is structurally
+				# a 2-tuple too, and would otherwise be wrongly read as an
+				# OR-list of alternatives against active_target['has_library']
+				# (which doesn't exist) by _target_value_matches' own
+				# ast.Tuple handling, meant for os=('windows','macos')-style
+				# axis alternatives, not a function argument pair
+				if not self._matches_has_library( kw.value, call ):
+					return False
+				continue
 			if kw.arg not in self.active_target:
 				continue # unmodeled keyword (e.g. arch, vendor) - inert placeholder for future cross-compilation support
 			if not self._target_value_matches( kw.value, self.active_target[kw.arg] ):
@@ -1067,6 +1089,49 @@ class Discovery( ast.NodeVisitor ):
 		if isinstance( node, ast.Tuple ):
 			return any( self._target_value_matches( elt, active_value ) for elt in node.elts )
 		self.fail( f'unsupported compiler.target(...) value: {ast.unparse(node)}', node )
+
+	def _detect_cc( self ) -> 'linker_c.CcTool | None':
+		if not self._cc_detected:
+			import linker_c
+			self._cc = linker_c.detect_cc()
+			self._cc_detected = True
+		return self._cc
+
+	def _matches_has_library( self, value: ast.expr, call: ast.Call ) -> bool:
+		''' @compiler.target(has_library=('icuuc', 'ucasemap_utf8ToUpper'))
+		- eagerly probes (via a real compile+link, cached to disk - see
+		linker_c.has_symbol()) whether the given symbol resolves when
+		linked against the given library, and filters the decorated
+		def/class in or out entirely, the same way os=/arch=/etc already
+		do. Deliberately eager (unlike compiler.has_library(...) used as
+		an expression inside a function body, which only probes if that
+		code path is actually reached during lowering - see compile_time_
+		transformer.py's own _ConstFolder) - a whole alternate definition,
+		selected by decorator, has no "reached during lowering" moment to
+		defer to; the choice has to be made right here, during this early
+		scan, same as every other @compiler.target(...) axis. '''
+		negate = False
+		node = value
+		if isinstance( node, ast.UnaryOp ) and isinstance( node.op, ast.Not ):
+			negate = True
+			node = node.operand
+		if not (
+			isinstance( node, ast.Tuple ) and len( node.elts ) == 2
+			and isinstance( node.elts[0], ast.Constant ) and isinstance( node.elts[0].value, str )
+			and isinstance( node.elts[1], ast.Constant ) and isinstance( node.elts[1].value, str )
+		):
+			self.fail( f'@compiler.target(has_library=(lib, symbol)) requires a 2-tuple of string literals: {ast.unparse(call)}', call )
+		lib, symbol = node.elts[0].value, node.elts[1].value
+		cc = self._detect_cc()
+		if cc is None:
+			self.fail(
+				f'@compiler.target(has_library=({lib!r}, {symbol!r})) needs a C compiler '
+				f'(clang, gcc, or MSVC) to probe with - none was found',
+				call,
+			)
+		import linker_c
+		available = linker_c.has_symbol( cc, lib, symbol )
+		return available != negate
 
 	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None]:
 		# @extern('lib', 'symbol') or @extern('lib', 'symbol', header='<name>')
@@ -1282,7 +1347,7 @@ class Discovery( ast.NodeVisitor ):
 			# compile-time-constant expressions/if/while before lowering.py
 			# ever walks this body - done once, here, rather than on every
 			# lowering attempt
-			fn.node.body = compile_time_transformer.transform_function_body( fn.node.body, self.active_target )
+			fn.node.body = compile_time_transformer.transform_function_body( fn.node.body, self.active_target, self._detect_cc )
 			with self.module_context( module ):
 				with ( self.scope_context( class_obj ) if class_obj is not None else nullcontext() ):
 					with self.scope_context( fn ):

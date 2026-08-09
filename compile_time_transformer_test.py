@@ -4,11 +4,15 @@ import unittest
 
 # local imports
 import compile_time_transformer as ctt
+import linker_c
 
 
-def _fold( src: str, active_target: dict[str,object] ) -> str:
-	body = ctt.transform_function_body( ast.parse( src ).body, active_target )
+def _fold( src: str, active_target: dict[str,object], detect_cc = None ) -> str:
+	body = ctt.transform_function_body( ast.parse( src ).body, active_target, detect_cc )
 	return '\n'.join( ast.unparse( stmt ) for stmt in body )
+
+
+_CC = linker_c.detect_cc()
 
 
 class ConstantFoldingTests( unittest.TestCase ):
@@ -96,6 +100,56 @@ class CompilerTargetSubstitutionTests( unittest.TestCase ):
 			_fold( "x = compiler.target.os == 'windows'", { 'os': 'windows' } ),
 			'x = True',
 		)
+
+
+class CompilerHasLibraryFoldingTests( unittest.TestCase ):
+	''' compiler.has_library(lib, symbol) - lazy expression-level folding,
+	only probed (a real compile+link, via linker_c.has_symbol) when a
+	detect_cc callback is actually supplied and the call is actually
+	reached, unlike compiler.target.<key>'s always-known dict lookup. '''
+
+	def test_no_detect_cc_left_unfolded( self ) -> None:
+		# the default (detect_cc=None) - a caller that never needs this
+		# folding shouldn't pay for it, or fail merely for omitting it
+		self.assertEqual(
+			_fold( "x = compiler.has_library( 'kernel32', 'GetLastError' )", {} ),
+			"x = compiler.has_library('kernel32', 'GetLastError')",
+		)
+
+	def test_malformed_args_left_unfolded( self ) -> None:
+		self.assertEqual(
+			_fold( "x = compiler.has_library( 'kernel32' )", {}, lambda: _CC ),
+			"x = compiler.has_library('kernel32')",
+		)
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )
+	def test_available_symbol_folds_to_true( self ) -> None:
+		self.assertEqual(
+			_fold( "x = compiler.has_library( 'kernel32', 'GetLastError' )", {}, lambda: _CC ),
+			'x = True',
+		)
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )
+	def test_unavailable_symbol_folds_to_false( self ) -> None:
+		self.assertEqual(
+			_fold( "x = compiler.has_library( 'kernel32', 'ThisIsNotARealSymbol123' )", {}, lambda: _CC ),
+			'x = False',
+		)
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )
+	def test_substitution_feeds_if_collapse( self ) -> None:
+		# the whole point: the losing branch is gone from the AST entirely,
+		# not just skipped at runtime - a real @extern reference inside it
+		# would never even reach lowering.py, let alone the linker
+		src = "if compiler.has_library( 'kernel32', 'GetLastError' ):\n\ta = 1\nelse:\n\ta = 2"
+		self.assertEqual( _fold( src, {}, lambda: _CC ), 'a = 1' )
+		src2 = "if compiler.has_library( 'kernel32', 'ThisIsNotARealSymbol123' ):\n\ta = 1\nelse:\n\ta = 2"
+		self.assertEqual( _fold( src2, {}, lambda: _CC ), 'a = 2' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )
+	def test_negation_via_not( self ) -> None:
+		src = "if not compiler.has_library( 'kernel32', 'ThisIsNotARealSymbol123' ):\n\ta = 1\nelse:\n\ta = 2"
+		self.assertEqual( _fold( src, {}, lambda: _CC ), 'a = 1' )
 
 
 class IfSimplificationTests( unittest.TestCase ):

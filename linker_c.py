@@ -66,6 +66,54 @@ class CcTool:
 		)
 
 
+def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
+	'''
+	Probes whether `symbol` resolves when linked against `lib` - compile
+	and link only, no run (unlike lowering.py's compiler.cexpr(), which
+	has to execute the probe binary to read its result - this only checks
+	that the linker can find the symbol, so it works even cross-compiling).
+
+	Declares `symbol` with a deliberately vague signature (`char symbol();`
+	- an old-style K&R declaration whose actual return type doesn't matter,
+	since main() never really calls it meaningfully) and takes its return
+	value, mirroring autoconf's own AC_CHECK_LIB macro - the standard,
+	portable way to ask "does this symbol link" without needing the real
+	header/prototype.
+
+	Cached to disk under %TEMP%/metalpy/has_symbol/, keyed by (lib, symbol,
+	compiler name) - same spirit and location as compiler.cexpr()'s own
+	cache (see lowering.py's _eval_cexpr) - so a real compile+link
+	subprocess pair is only ever paid once per (lib, symbol) pair, not on
+	every mpy invocation that happens to reference it.
+	'''
+	import hashlib
+	import tempfile
+
+	key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
+	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'has_symbol'
+	cache_dir.mkdir( parents = True, exist_ok = True )
+	cache_file = cache_dir / key
+	if cache_file.is_file():
+		return cache_file.read_text().strip() == '1'
+
+	c_src = f'char {symbol}();\nint main(void) {{ return {symbol}(); }}\n'
+	with tempfile.TemporaryDirectory() as tmp:
+		src_path = Path( tmp ) / 'probe.c'
+		obj_path = Path( tmp ) / 'probe.o'
+		exe_path = Path( tmp ) / 'probe'
+		src_path.write_text( c_src, encoding = 'utf-8' )
+		compile_result = cc.compile( src_path, obj_path )
+		if compile_result.returncode != 0:
+			available = False
+		else:
+			ldflag = f'{lib}.lib' if cc.name == 'cl' else f'-l{lib}'
+			link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflag )
+			available = link_result.returncode == 0
+
+	cache_file.write_text( '1' if available else '0', encoding = 'utf-8' )
+	return available
+
+
 def detect_cc() -> CcTool|None:
 	'''
 	detect a working C compiler. respects METALPY_CC (one of clang/
