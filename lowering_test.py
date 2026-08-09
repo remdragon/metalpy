@@ -4511,6 +4511,117 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ) )
 
+# --- compiler.fetch_unicode_table('upper'|'lower') ---------------------------
+
+class FetchUnicodeTableTests( unittest.TestCase ):
+	''' structural invariants only (sorted, no duplicate codepoints, valid
+	codepoint range, ASCII agrees with the obvious A<->a relationship) - NOT
+	specific mappings pinned to a specific Unicode version, per
+	PLAN_CASE_FOLDING.md's own explicit "no version pinning" decision (a
+	newer UCD release changing some obscure codepoint's mapping should never
+	break this suite). METALPY_UNICODE_DATA_DIR points every test at a
+	small, hand-written UnicodeData.txt fixture, so none of this ever
+	touches the network or depends on what "latest" resolves to today - see
+	_fetch_unicode_data_txt's own env-override support in lowering.py. '''
+
+	_UNICODE_DATA_TXT = '\n'.join([
+		'0041;LATIN CAPITAL LETTER A;Lu;0;L;;;;;N;;;;0061;',
+		'0061;LATIN SMALL LETTER A;Ll;0;L;;;;;N;;;0041;;',
+		'0042;LATIN CAPITAL LETTER B;Lu;0;L;;;;;N;;;;0062;',
+		'0062;LATIN SMALL LETTER B;Ll;0;L;;;;;N;;;0042;;',
+		'00DF;LATIN SMALL LETTER SHARP S;Ll;0;L;;;;;N;;;;;', # real UCD entry: no simple uppercase (needs SpecialCasing.txt's ß->SS, out of scope) - must be skipped, not crash
+		'', # trailing blank line - must be skipped, not crash
+	])
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+		self._env_cleanup()
+
+	def _env_cleanup( self ) -> None:
+		import os
+		old = os.environ.get( 'METALPY_UNICODE_DATA_DIR' )
+		def _restore() -> None:
+			if old is None:
+				os.environ.pop( 'METALPY_UNICODE_DATA_DIR', None )
+			else:
+				os.environ['METALPY_UNICODE_DATA_DIR'] = old
+		self.addCleanup( _restore )
+
+	def _point_env_at_fixture( self, contents: str ) -> None:
+		import os
+		import tempfile
+		tmp = tempfile.TemporaryDirectory()
+		self.addCleanup( tmp.cleanup )
+		( Path( tmp.name ) / 'UnicodeData.txt' ).write_text( contents, encoding = 'utf-8' )
+		os.environ['METALPY_UNICODE_DATA_DIR'] = tmp.name
+
+	def _fetch( self, which: str ) -> bytes:
+		code = '\n'.join([
+			'import compiler',
+			f"TABLE: bytes = compiler.fetch_unicode_table( {which!r} )",
+			'',
+			'def main() -> None:',
+			'	x: bytes = TABLE',
+			'	return',
+		])
+		self.compiler.import_code( code, Path( '__test__.py' ), scope = None )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		g = self.compiler.globals[0]
+		assign = g.instructions[0]
+		self.assertIsInstance( assign, ir.Assign )
+		const = assign.src
+		self.assertIsInstance( const, ir.Const )
+		self.assertIsInstance( const.value, bytes )
+		return const.value
+
+	def _decode( self, table: bytes ) -> list[tuple[int,int]]:
+		self.assertEqual( len( table ) % 8, 0, 'table must be a whole number of 8-byte (codepoint,mapped) entries' )
+		return [
+			( int.from_bytes( table[i:i+4], 'little' ), int.from_bytes( table[i+4:i+8], 'little' ))
+			for i in range( 0, len( table ), 8 )
+		]
+
+	def test_upper_table_matches_fixture_exactly( self ) -> None:
+		self._point_env_at_fixture( self._UNICODE_DATA_TXT )
+		# only 'a'->'A' and 'b'->'B' have a simple uppercase mapping in the
+		# fixture ('A'/'B' are already upper, 'ß' has none - see comment above)
+		self.assertEqual( self._decode( self._fetch( 'upper' )), [ ( 0x61, 0x41 ), ( 0x62, 0x42 ) ] )
+
+	def test_lower_table_matches_fixture_exactly( self ) -> None:
+		self._point_env_at_fixture( self._UNICODE_DATA_TXT )
+		self.assertEqual( self._decode( self._fetch( 'lower' )), [ ( 0x41, 0x61 ), ( 0x42, 0x62 ) ] )
+
+	def test_structural_invariants_hold( self ) -> None:
+		self._point_env_at_fixture( self._UNICODE_DATA_TXT )
+		for which in ( 'upper', 'lower' ):
+			entries = self._decode( self._fetch( which ))
+			codepoints = [ cp for cp, _mapped in entries ]
+			self.assertEqual( codepoints, sorted( codepoints ), f'{which} table must be sorted ascending for binary search' )
+			self.assertEqual( len( codepoints ), len( set( codepoints )), f'{which} table must have no duplicate codepoints' )
+			for cp, mapped in entries:
+				self.assertLessEqual( cp, 0x10FFFF, f'{which}: codepoint {cp:#x} exceeds Unicode\'s own max' )
+				self.assertLessEqual( mapped, 0x10FFFF, f'{which}: mapped codepoint {mapped:#x} exceeds Unicode\'s own max' )
+
+	def test_missing_override_file_is_a_compile_error_not_a_crash( self ) -> None:
+		import tempfile
+		import os
+		tmp = tempfile.TemporaryDirectory()
+		self.addCleanup( tmp.cleanup )
+		os.environ['METALPY_UNICODE_DATA_DIR'] = tmp.name # real dir, but no UnicodeData.txt in it
+		code = '\n'.join([
+			'import compiler',
+			"TABLE: bytes = compiler.fetch_unicode_table( 'upper' )",
+			'',
+			'def main() -> None:',
+			'	x: bytes = TABLE',
+			'	return',
+		])
+		self.compiler.import_code( code, Path( '__test__.py' ), scope = None )
+		self.compiler.run()
+		self.assertTrue( any( 'does not exist' in e for e in self.discovery.errors.errors ))
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

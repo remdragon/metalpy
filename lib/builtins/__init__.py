@@ -280,13 +280,13 @@ class str:
 	def upper( self ) -> str:
 		''' case_folder (see PLAN_CASE_FOLDING.md) is checked first, ahead
 		of the OS-backed path - a program that never calls case_folding.
-		install() never sets simple_count away from 0, so this is a single
+		install() never sets upper_count away from 0, so this is a single
 		cheap field read for the overwhelming majority of programs, which
 		don't import case_folding at all. Kept as ONE os-independent method
 		(rather than duplicating this check into each of _upper_os_native's
 		own @compiler.target(os=...) bodies) specifically so it's written
 		and checked exactly once. '''
-		if case_folder.simple_count != 0:
+		if case_folder.upper_count != 0:
 			return case_folder.upper( self )
 		return self._upper_os_native()
 
@@ -338,7 +338,7 @@ class str:
 
 	def lower( self ) -> str:
 		''' mirrors upper()'s own case_folder-first check - see its comment. '''
-		if case_folder.simple_count != 0:
+		if case_folder.lower_count != 0:
 			return case_folder.lower( self )
 		return self._lower_os_native()
 
@@ -673,17 +673,12 @@ class str:
 # "install() swaps behavior" is realized by swapping DATA on this one
 # shared global instance, not by swapping which class's methods run.
 # case_folding.py (a separate, optional module nothing here ever imports)
-# calls install() to point simple_table/simple_count at its own embedded
-# Unicode table; a program that never imports case_folding never
-# references that table at all, so it's never linked in - the ONLY cost
-# every program pays is the one `if simple_count != 0` check in upper()/
-# lower() above.
+# calls install() to point upper_table/upper_count/lower_table/lower_count
+# at its own embedded Unicode table; a program that never imports
+# case_folding never references that table at all, so it's never linked
+# in - the ONLY cost every program pays is the one `if upper_count != 0`/
+# `if lower_count != 0` check in str.upper()/str.lower() above.
 # ---------------------------------------------------------------------------
-
-@cstruct
-class CaseFoldEntry:
-	codepoint: u32
-	mapped: u32
 
 @cstruct
 class CaseFolding:
@@ -701,22 +696,108 @@ class CaseFolding:
 	# no heap allocation, nothing to run before it's valid) - exactly the
 	# "not installed" state this needs by default, with no init call
 	# required at all.
-	simple_table: Ptr[CaseFoldEntry]
-	simple_count: usize
+	#
+	# upper_table/lower_table are RAW BYTES (ConstPtr[u8]), not a typed
+	# Ptr[SomeEntryStruct] - this compiler has no pointer-reinterpretation
+	# primitive (compiler.reinterpret_cast[T] is listed in TODO.txt as
+	# never implemented) and no array-literal syntax to construct a typed
+	# static table from metalpy source directly. Sidestepped the same way
+	# str.upper()'s own UTF-8 decode/encode already does: read individual
+	# bytes and reconstruct u32s by hand (_read_u32_le, below) - each
+	# table entry is exactly 8 bytes (codepoint: u32 LE, mapped: u32 LE),
+	# sorted by codepoint for binary search, *_count is the number of
+	# 8-byte entries (not the byte length) - see compiler.
+	# fetch_unicode_table()'s own docstring in lowering.py for how the
+	# bytes themselves get produced/embedded.
+	upper_table: ConstPtr[u8]
+	upper_count: usize
+	lower_table: ConstPtr[u8]
+	lower_count: usize
 
 	def upper( self, s: str ) -> str:
-		# table-driven mapping lands in a later phase (see
-		# PLAN_CASE_FOLDING.md) - str.upper() only ever calls this once
-		# simple_count != 0, so there's no "not installed" fallback to
-		# write here; a caller that somehow reaches this with an empty
-		# table is a bug in str.upper()'s own gating, not something this
-		# method should paper over
-		return s
+		return self._map( s, self.upper_table, self.upper_count )
 
 	def lower( self, s: str ) -> str:
-		return s
+		return self._map( s, self.lower_table, self.lower_count )
 
-case_folder: CaseFolding = CaseFolding( simple_table = None, simple_count = 0 )
+	@private
+	def _map( self, s: str, table: ConstPtr[u8], count: usize ) -> str:
+		# str.upper()/lower() only ever call upper()/lower() above once
+		# their own respective *_count != 0, so table/count here are
+		# always real - no "not installed" fallback needed. Otherwise
+		# mirrors _case_map_posix's own two-pass (size, then fill) shape
+		# almost exactly, just consulting this table instead of towupper_l
+		# /towlower_l - see that method's own comment for why two passes
+		self_len: usize = s.byte_len()
+		if self_len == 0:
+			return str( s )
+		data: ConstPtr[u8] = s.get_const_ptr()
+
+		new_size: usize = 1 # zero terminator
+		i: usize = 0
+		consumed: usize = 0
+		while i < self_len:
+			cp: u32 = str._decode_utf8_at( data, i, compiler.addrof( consumed ))
+			mapped: u32 = CaseFolding._lookup( table, count, cp )
+			with compiler.panic_arithmetic( 'irrational string length' ):
+				new_size += str._utf8_encoded_len( mapped )
+			with compiler.wrap_arithmetic:
+				i += consumed
+
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		out_i: usize = 0
+		i = 0
+		while i < self_len:
+			cp = str._decode_utf8_at( data, i, compiler.addrof( consumed ))
+			mapped = CaseFolding._lookup( table, count, cp )
+			with compiler.wrap_arithmetic:
+				out_i += str._encode_utf8_at( new_buf, out_i, mapped )
+				i += consumed
+		new_buf[out_i] = 0
+
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 produced by case_folding table lookup' )
+
+	@private
+	@staticmethod
+	def _lookup( table: ConstPtr[u8], count: usize, cp: u32 ) -> u32:
+		# binary search over the 8-bytes-per-entry (codepoint, mapped)
+		# table, sorted ascending by codepoint - a codepoint with no entry
+		# (the overwhelming majority - most codepoints have no case at
+		# all) passes through unchanged, same posture as the OS-backed
+		# _case_map_windows/_case_map_posix paths
+		lo: usize = 0
+		hi: usize = count
+		while lo < hi:
+			# // (FloorDiv) is always checked against ZeroDivisionError, in
+			# every arithmetic mode (see arithmetic_mode.py's own comment on
+			# ArithmeticChecked.GetBinOp) - panic_arithmetic here is that
+			# check's escape hatch, not overflow protection; lo < hi (the
+			# while condition) already guarantees hi - lo > 0
+			with compiler.panic_arithmetic( 'unreachable: hi > lo in binary search' ):
+				mid: usize = lo + ( hi - lo ) // 2
+				offset: usize = mid * 8
+			entry_cp: u32 = CaseFolding._read_u32_le( table, offset )
+			if entry_cp == cp:
+				with compiler.wrap_arithmetic:
+					mapped_offset: usize = offset + 4
+				return CaseFolding._read_u32_le( table, mapped_offset )
+			if entry_cp < cp:
+				with compiler.wrap_arithmetic:
+					lo = mid + 1
+			else:
+				hi = mid
+		return cp
+
+	@private
+	@staticmethod
+	def _read_u32_le( data: ConstPtr[u8], i: usize ) -> u32:
+		with compiler.wrap_arithmetic:
+			return u32( data[i] ) | ( u32( data[i+1] ) << 8 ) | ( u32( data[i+2] ) << 16 ) | ( u32( data[i+3] ) << 24 )
+
+case_folder: CaseFolding = CaseFolding(
+	upper_table = None, upper_count = 0,
+	lower_table = None, lower_count = 0,
+)
 
 def print( msg: str, end: str = '\n' ) -> None:
 	# No *args/**kwargs, use f-strings instead (once implemented)

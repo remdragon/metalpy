@@ -1186,15 +1186,25 @@ def _emit_one_string_literal( qualname: str, value: str|bytes ) -> list[str]:
 
 def _emit_string_literals( compiler: Compiler ) -> list[str]:
 	# a program-wide collection pass, since C requires each static object
-	# defined exactly once - walks every function's instructions looking
-	# for a str/bytes-valued ir.Const, deduplicating by (qualname, value)
-	# (the same pair _string_literal_name derives its name from, so two
-	# occurrences of the identical literal anywhere in the program share
-	# one static definition)
+	# defined exactly once - walks every function's AND every global
+	# variable's instructions looking for a str/bytes-valued ir.Const,
+	# deduplicating by (qualname, value) (the same pair _string_literal_
+	# name derives its name from, so two occurrences of the identical
+	# literal anywhere in the program share one static definition).
+	# compiler.globals is scanned too, not just compiler.functions - a
+	# module-level `X: bytes = <a str/bytes-valued expression>` lowers
+	# its own initializer into a LoweredGlobal's own .instructions (see
+	# lower_global), completely separate from every ordinary function
+	# body; missing this list here left a global's own literal reference
+	# dangling (compiles the reference, e.g. `&__literal_...`, but never
+	# actually emits the `static const ... __literal_... = ...;` it
+	# points at - "use of undeclared identifier" from the C compiler) -
+	# found by compiler.fetch_unicode_table()'s own real use (a global
+	# bytes constant), not a synthetic case
 	seen: set[tuple[str,str|bytes]] = set()
 	parts: list[str] = []
-	for lf in compiler.functions:
-		for instr in lf.instructions:
+	def scan( instructions: list[ir.Instruction] ) -> None:
+		for instr in instructions:
 			for op in _iter_instruction_operands( instr ):
 				if not ( isinstance( op, ir.Const ) and isinstance( op.value, ( str, bytes ) )):
 					continue
@@ -1205,6 +1215,10 @@ def _emit_string_literals( compiler: Compiler ) -> list[str]:
 					continue
 				seen.add( key )
 				parts.append( '\n'.join( _emit_one_string_literal( *key )))
+	for lf in compiler.functions:
+		scan( lf.instructions )
+	for lg in compiler.globals:
+		scan( lg.instructions )
 	return parts
 
 def _iter_instruction_operands( instr: ir.Instruction ) -> list[ir.Operand]:

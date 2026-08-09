@@ -1109,6 +1109,117 @@ class Lowering:
 		cache_file.write_text( str( value ), encoding = 'utf-8' )
 		return value
 
+	_UNICODE_DATA_URL = 'https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt'
+
+	def _fetch_unicode_data_txt( self, node: ast.AST ) -> bytes:
+		''' downloads (or reads a locally-cached/overridden copy of)
+		UnicodeData.txt - see PLAN_CASE_FOLDING.md's own "Data acquisition"
+		section: deliberately NOT version-pinned (the caller's own choice -
+		fetches whatever the UCD's own 'latest' alias currently points at),
+		cached indefinitely once fetched (same no-expiry philosophy
+		compiler.cexpr()'s own cache already uses - see _eval_cexpr), with
+		METALPY_UNICODE_DATA_DIR (mirroring METALPY_CC's existing override
+		convention) letting an offline/CI build point at a local copy
+		instead of ever reaching the network. '''
+		import os
+		import tempfile
+		from pathlib import Path
+
+		override_dir = os.environ.get( 'METALPY_UNICODE_DATA_DIR', '' ).strip()
+		if override_dir:
+			local_path = Path( override_dir ) / 'UnicodeData.txt'
+			if not local_path.is_file():
+				self.discovery.fail(
+					f'METALPY_UNICODE_DATA_DIR={override_dir!r} is set but {local_path} does not exist',
+					node,
+				)
+			return local_path.read_bytes()
+
+		cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'case_folding'
+		cache_dir.mkdir( parents = True, exist_ok = True )
+		cache_file = cache_dir / 'UnicodeData.txt'
+		if cache_file.is_file():
+			return cache_file.read_bytes()
+
+		import urllib.error
+		import urllib.request
+		request = urllib.request.Request( self._UNICODE_DATA_URL, headers = { 'User-Agent': 'metalpy-compiler' } )
+		try:
+			with urllib.request.urlopen( request, timeout = 30 ) as response:
+				data = response.read()
+		except ( urllib.error.URLError, OSError ) as e:
+			self.discovery.fail(
+				f'compiler.fetch_unicode_table(...): failed to download {self._UNICODE_DATA_URL} ({e}) - '
+				f'set METALPY_UNICODE_DATA_DIR to a local directory containing UnicodeData.txt to avoid the network entirely',
+				node,
+			)
+		cache_file.write_bytes( data )
+		return data
+
+	def _build_unicode_simple_table( self, data: bytes, which: str, node: ast.AST ) -> bytes:
+		''' parses UnicodeData.txt's own semicolon-delimited fields (field 0
+		= codepoint, field 12 = simple uppercase mapping, field 13 = simple
+		lowercase mapping - both hex, empty when the codepoint has no
+		simple mapping in that direction) into a binary-searchable table:
+		sorted-by-codepoint pairs of (codepoint: u32 LE, mapped: u32 LE),
+		8 bytes per entry, no header/count prefix (the caller already
+		knows the byte length via bytes.byte_len(), used as entry_count*8
+		directly - see CaseFolding.upper()/lower()'s own comment). Simple-
+		mapping ONLY (~1500 entries either direction) - SpecialCasing.txt's
+		one-to-many (ß -> SS) and context-sensitive (Greek final sigma)
+		entries are a documented v1 scope cut, same posture as the OS-
+		backed path this is meant to improve on (see PLAN_CASE_FOLDING.md). '''
+		field_index = 12 if which == 'upper' else 13
+		entries: list[tuple[int,int]] = []
+		for line in data.decode( 'utf-8' ).splitlines():
+			if not line or line.startswith( '#' ):
+				continue
+			fields = line.split( ';' )
+			if len( fields ) <= field_index or not fields[field_index]:
+				continue
+			try:
+				codepoint = int( fields[0], 16 )
+				mapped = int( fields[field_index], 16 )
+			except ValueError:
+				continue
+			entries.append( ( codepoint, mapped ) )
+		entries.sort()
+		if not entries:
+			self.discovery.fail(
+				f"compiler.fetch_unicode_table({which!r}): parsed UnicodeData.txt but found zero entries - "
+				f"the file is probably not what was expected (wrong format, truncated download, ...)",
+				node,
+			)
+		table = bytearray()
+		for codepoint, mapped in entries:
+			table += codepoint.to_bytes( 4, 'little' )
+			table += mapped.to_bytes( 4, 'little' )
+		return bytes( table )
+
+	def _lower_compiler_fetch_unicode_table( self, node: ast.Call ) -> ir.Operand:
+		''' compiler.fetch_unicode_table('upper' | 'lower') - downloads/
+		caches UnicodeData.txt (see _fetch_unicode_data_txt) and folds to
+		an ir.Const(type=bytes, value=<the encoded table>) - the SAME
+		program-wide static-embedding path _emit_string_literals already
+		gives any str/bytes-valued ir.Const (see emitter_c.py), so this
+		needs no new emitter support at all: the table shows up as an
+		ordinary static const byte array, deduplicated the same way two
+		identical string literals already are. Only actually reached (and
+		only actually pays the download/parse cost) for a program that
+		references compiler.fetch_unicode_table(...) itself - nothing in
+		builtins does, only case_folding.py - see CaseFolding's own
+		comment in lib/builtins/__init__.py. '''
+		if len( node.args ) != 1 or node.keywords or not isinstance( node.args[0], ast.Constant ) or node.args[0].value not in ( 'upper', 'lower' ):
+			self.discovery.fail(
+				f"compiler.fetch_unicode_table(...) takes exactly one literal argument, 'upper' or 'lower': {ast.unparse(node)}",
+				node,
+			)
+		which = node.args[0].value
+		data = self._fetch_unicode_data_txt( node )
+		table = self._build_unicode_simple_table( data, which, node )
+		bytes_cls = self.discovery.find_name( 'bytes', node )
+		return ir.Const( type = bytes_cls, value = table )
+
 	def _lower_compiler_cexpr( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.cexpr('C expression', 'header.h', [target_type])
 		# compiles a tiny C program that printf()'s the expression,
@@ -3072,6 +3183,10 @@ class Lowering:
 
 			case 'cexpr':
 				result = self._lower_compiler_cexpr( node, expected_type )
+				return result if want_result else None
+
+			case 'fetch_unicode_table':
+				result = self._lower_compiler_fetch_unicode_table( node )
 				return result if want_result else None
 
 		# each recognizer returns None (not an error) when this call doesn't

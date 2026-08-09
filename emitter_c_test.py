@@ -1832,29 +1832,81 @@ def main() -> i32:
 
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_case_folder_install_wiring( self ) -> None:
-		# proves the actual dispatch mechanism from PLAN_CASE_FOLDING.md end
-		# to end (with a stub CaseFolding.upper()/lower() that just returns
-		# its argument unchanged - the real table-driven lookup is a later
-		# phase): before any mutation, case_folder.simple_count is 0 (a
+	def test_case_folder_dispatch_gate_before_install( self ) -> None:
+		# proves the dispatch GATE itself (str.upper()/lower() checking
+		# case_folder.upper_count/lower_count) independent of install() or
+		# real Unicode data: before any mutation, both counts are 0 (a
 		# cstruct global's own C {0} static zero-init - see CaseFolding's
 		# own comment on why it's a cstruct, not a class), so str.upper()
-		# takes the OS-native path as always. Setting simple_count away from
-		# 0 - exactly what case_folding.install() will eventually do, from a
-		# SEPARATE module, once it exists - makes str.upper() dispatch to
-		# case_folder.upper() instead, with no change at the .upper() call
-		# site itself
+		# takes the OS-native path. Pointing upper_table/upper_count at a
+		# tiny hand-built one-entry table (no case_folding.py, no network)
+		# makes str.upper() dispatch through CaseFolding.upper()'s real
+		# binary-search lookup instead, with no change at the .upper() call
+		# site itself - and confirms an unmapped codepoint passes through
+		# unchanged (the "not every codepoint has an entry" path)
 		self._run( '''
 import builtins
+import compiler
+import sys
 
 def main() -> i32:
-	before: str = 'hello'.upper()
-	if before != 'HELLO':
+	before: str = 'ab'.upper()
+	if before != 'AB':
 		return 1
-	builtins.case_folder.simple_count = 1
-	after: str = 'hello'.upper()
-	if after != 'hello': # CaseFolding.upper()'s current stub is the identity function
+
+	# one entry: 'a' (0x61) -> 'Z' (0x5A), sorted, 8 bytes (u32 LE codepoint + u32 LE mapped)
+	table: Ptr[u8] = sys.alloc[u8]( 8 )
+	table[0] = 0x61
+	table[1] = 0
+	table[2] = 0
+	table[3] = 0
+	table[4] = 0x5A
+	table[5] = 0
+	table[6] = 0
+	table[7] = 0
+	builtins.case_folder.upper_table = table
+	builtins.case_folder.upper_count = 1
+
+	after: str = 'ab'.upper()
+	if after != 'Zb': # 'a' hits the table entry, 'b' has no entry and passes through unchanged
 		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_case_folding_install_real_unicode_table( self ) -> None:
+		# end-to-end with the REAL case_folding.py module: install() fetches
+		# (or reuses the disk cache for) the actual UnicodeData.txt and
+		# populates case_folder's tables for real - see PLAN_CASE_FOLDING.md's
+		# explicit "build-time download, no version pinning" decision, and
+		# lib/case_folding.py's own install(). Assertions stick to long-
+		# stable simple mappings only (plain ASCII, and one well-known
+		# accented Latin letter), never a hardcoded exhaustive table, so a
+		# newer UCD release can't break this test - see
+		# FetchUnicodeTableTests in lowering_test.py for the structural
+		# (sortedness/no-duplicates/valid-range) invariants that DO get
+		# checked against the real fetched data.
+		self._run( '''
+import case_folding
+
+def main() -> i32:
+	if 'hello'.upper() != 'HELLO':
+		return 1
+	if 'HELLO'.lower() != 'hello':
+		return 2
+
+	case_folding.install()
+
+	if 'hello'.upper() != 'HELLO':
+		return 3
+	if 'HELLO'.lower() != 'hello':
+		return 4
+	if 'café'.upper() != 'CAFÉ':
+		return 5
+	if 'CAFÉ'.lower() != 'café':
+		return 6
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
