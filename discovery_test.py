@@ -93,6 +93,34 @@ class ImportTests( unittest.TestCase ):
 		self.assertEqual( len( d2.paths ), 2 )
 
 
+class ImportFileEncodingTests( unittest.TestCase ):
+	''' regression test: import_file() used to open() source files with no
+	explicit encoding, which defaults to the OS locale encoding - on
+	Windows that's the system ANSI codepage (e.g. CP1252), not UTF-8. A
+	non-ASCII string literal in a real .py file (not passed as an in-
+	memory str via import_code, which never touches this path at all)
+	would get silently decoded wrong here, then re-encoded as corrupted
+	UTF-8 by emitter_c.py's own string literal emission - invisible on
+	Linux/macOS, where the locale encoding is already UTF-8. '''
+
+	def test_non_ascii_source_file_reads_as_real_utf8( self ) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			tmp_path = Path( tmp )
+			( tmp_path / '__main__.py' ).write_text(
+				"GREETING: str = 'straße café'\n", encoding = 'utf-8',
+			)
+			disco = discovery.Discovery( paths = [ tmp_path ], import_builtins = False )
+			mod = disco.import_file( tmp_path / '__main__.py', scope = None )
+			greeting = mod.get_local( 'GREETING' )
+			self.assertEqual( disco.errors.errors, [] )
+			# the AST constant itself, not a lowered value - this test is
+			# about the SOURCE bytes surviving the read, not full string
+			# lowering (see emitter_c_test.py's own real-compile coverage
+			# for that)
+			self.assertEqual( greeting.init.value, 'straße café' )
+
+
 class ShallowScanTests( unittest.TestCase ):
 	'''
 	a module body is scanned immediately: every top-level class/function/

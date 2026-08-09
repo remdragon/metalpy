@@ -1,3 +1,5 @@
+import compiler
+
 @compiler.target( os = not ( 'windows', 'macos' ))
 @extern( 'c', '__errno_location' )
 def __error() -> Ptr[i32]:
@@ -130,5 +132,59 @@ def lseek(
 def ftruncate(
 	fd: i32,
 	length: i64,
+) -> i32:
+	...
+
+# ---------------------------------------------------------------------------
+# Unicode-correct case mapping - str.upper()/str.lower() (see PLAN_STR_UPPER_
+# LOWER.md). towupper_l/towlower_l (the explicit-locale, thread-safe POSIX.1-
+# 2008 variants) rather than plain setlocale()+towupper()/towlower() - a bare
+# setlocale() mutates process-global state, which is a real data race against
+# any other thread calling .upper()/.lower() (or anything else locale-
+# sensitive) concurrently - this codebase has lib/threading.py, so that's a
+# real scenario, not a hypothetical one. 'C.UTF-8' gives Unicode-aware casing
+# without any language-specific tailoring (no Turkish dotless-i surprises) -
+# the POSIX equivalent of Windows' LOCALE_NAME_INVARIANT. Only handles
+# single-codepoint mappings (towupper_l/towlower_l are inherently 1-in-1-out)
+# - no ICU here, so one-to-many expansions (ß -> SS) and context-sensitive
+# rules (Greek final sigma) aren't covered on this path - see
+# PLAN_STR_UPPER_LOWER.md's own notes on why (ICU's availability isn't
+# guaranteed on any of these platforms, and compiler.has_library()-gating it
+# would mean every program that merely imports builtins pays an eager probe).
+# ---------------------------------------------------------------------------
+
+locale_t: TypeAlias = Ptr[None]
+
+# LC_CTYPE_MASK's numeric value isn't ABI-stable across glibc/musl/macOS's
+# libc (each defines it as 1 << their own LC_CTYPE, which aren't guaranteed
+# to agree) - compiler.cexpr fetches the real one from the actual headers
+# this build will compile against, rather than hardcoding a guess
+LC_CTYPE_MASK: i32 = compiler.cexpr( 'LC_CTYPE_MASK', 'locale.h', i32 )
+
+@extern( 'c', 'newlocale' )
+def newlocale(
+	category_mask: i32,
+	locale: ConstPtr[u8],
+	base: locale_t,
+) -> locale_t:
+	...
+
+@extern( 'c', 'freelocale' )
+def freelocale(
+	locobj: locale_t,
+) -> None:
+	...
+
+@extern( 'c', 'towupper_l' )
+def towupper_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
+
+@extern( 'c', 'towlower_l' )
+def towlower_l(
+	wc: i32,
+	loc: locale_t,
 ) -> i32:
 	...

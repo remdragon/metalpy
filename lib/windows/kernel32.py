@@ -139,3 +139,56 @@ def ReleaseSRWLockExclusive(
 	SRWLock: Ptr[_SRWLOCK],
 ) -> None:
 	...
+
+
+# ---------------------------------------------------------------------------
+# Unicode-correct case mapping - str.upper()/str.lower() (see PLAN_STR_UPPER_
+# LOWER.md) - MultiByteToWideChar/WideCharToMultiByte for UTF-8<->UTF-16, and
+# LCMapStringEx (with LCMAP_LINGUISTIC_CASING) for the actual casing, which
+# handles one-to-many expansions (ss -> SS) and context-sensitive rules
+# (Greek final sigma) that a plain per-codepoint mapping can't.
+# ---------------------------------------------------------------------------
+
+CP_UTF8: u32 = 65001
+
+LCMAP_LOWERCASE:         u32 = 0x00000100
+LCMAP_UPPERCASE:         u32 = 0x00000200
+LCMAP_LINGUISTIC_CASING: u32 = 0x01000000
+
+@extern('kernel32', 'MultiByteToWideChar')
+def MultiByteToWideChar(
+	CodePage: u32,
+	dwFlags: u32,
+	lpMultiByteStr: ConstPtr[u8],
+	cbMultiByte: i32,
+	lpWideCharStr: Ptr[u16],
+	cchWideChar: i32,
+) -> i32:
+	...
+
+@extern('kernel32', 'WideCharToMultiByte')
+def WideCharToMultiByte(
+	CodePage: u32,
+	dwFlags: u32,
+	lpWideCharStr: ConstPtr[u16],
+	cchWideChar: i32,
+	lpMultiByteStr: Ptr[u8],
+	cbMultiByte: i32,
+	lpDefaultChar: ConstPtr[u8],
+	lpUsedDefaultChar: Ptr[u32], # really LPBOOL (Win32 BOOL is a 4-byte int, not this language's 1-byte bool) - always passed None here, so the exact pointee width is moot in practice
+) -> i32:
+	...
+
+@extern('kernel32', 'LCMapStringEx')
+def LCMapStringEx(
+	lpLocaleName: ConstPtr[u16],
+	dwMapFlags: u32,
+	lpSrcStr: ConstPtr[u16],
+	cchSrc: i32,
+	lpDestStr: Ptr[u16],
+	cchDest: i32,
+	lpVersionInformation: Ptr[None],
+	lpReserved: Ptr[None],
+	sortHandle: usize,
+) -> i32:
+	...

@@ -193,7 +193,14 @@ class Discovery( ast.NodeVisitor ):
 			assert popped == module
 
 	def import_file( self, filename: Path, scope: str|None = None, package: str|None = None ) -> Module:
-		with filename.open( 'r' ) as f:
+		# explicit encoding='utf-8' - open()'s own default is the OS locale
+		# encoding, which on Windows is the system ANSI codepage (e.g.
+		# CP1252), not UTF-8. Every non-ASCII source file (a bare string
+		# literal like 'straße', or `# -*- comment -*-` text) read on
+		# Windows without this would get silently decoded wrong here, then
+		# re-encoded as (corrupted) UTF-8 by emitter_c.py's own string
+		# literal emission - a real, no-op-on-Linux/macOS Windows-only bug
+		with filename.open( 'r', encoding = 'utf-8' ) as f:
 			code = f.read()
 		return self.import_code( code, filename, scope, package = package )
 

@@ -524,6 +524,44 @@ def main() -> i32:
 ''' )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
+	def test_checked_cast_i32_to_usize_does_not_false_positive_overflow( self ) -> None:
+		# regression test: __metalpy_wideint (used to range-check every
+		# Check-mode cast) used to be selected by a bare `#ifdef _MSC_VER`
+		# in the emitted C prelude - but clang targeting Windows ALSO
+		# defines _MSC_VER (for MSVC source compatibility) despite fully
+		# supporting __int128, unlike real MSVC (cl.exe). That wrongly
+		# routed clang-on-Windows through the int64_t/uint64_t fallback,
+		# whose __metalpy_wideint (signed 64-bit) can't represent usize's
+		# full unsigned range - a checked cast to usize/u64 (see _emit_cast
+		# in emitter_c.py) could then produce a garbage max-value constant
+		# once forced into that signed 64-bit type, causing even a tiny,
+		# clearly in-range value like 11 to spuriously "overflow". Found by
+		# str.upper()'s own real end-to-end test (see StrUpperLowerTests)
+		# panicking on ordinary short ASCII input.
+		self._run( '''
+def main() -> i32:
+	x: i32 = 11
+	y: usize
+	with compiler.saturate_arithmetic:
+		y = usize( x )
+	if y != 11:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}' )
+			link_result = _CC.link( exe_path, [ obj_path ] )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, 0, f'exited {run_result.returncode}, expected 0 (a nonzero panic-exit or wrong-value exit means the false-overflow bug regressed)' )
+
 	def test_default_check_mode_arithmetic_compiles( self ) -> None:
 		# Phase 1 milestone (b): default Check-mode arithmetic, proving
 		# AddCheck + the synthesized Result[i32,OverflowError] struct +
@@ -1383,7 +1421,7 @@ class StringLiteralTests( BuiltinsStrTestCase ):
 		self.assertIn( 'static const uint8_t __literal_', src )
 		self.assertIn( 'static struct builtins$str __literal_', src )
 		self.assertIn( '.ref_count = METALPY_IMMORTAL_REFCOUNT', src )
-		self.assertIn( '"hello\\x00";', src ) # 'hello' + NUL as C string literal
+		self.assertIn( '"hello\\000";', src ) # 'hello' + NUL as C string literal (octal escape - see _c_string_literal's own comment on why not \x)
 		self.assertIn( '.__byte_size = 6', src )
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		main_src = emitter_c.emit_function( main_lf )
@@ -1415,6 +1453,29 @@ class StringLiteralRealCompileTests( _ClangCompileMixin, BuiltinsStrTestCase ):
 			'',
 			'def main() -> None:',
 			'	take_str( \'hello\' )',
+			'	return',
+		]))
+		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+
+	def test_non_ascii_literal_with_ambiguous_hex_escape_compiles( self ) -> None:
+		# regression test: _c_string_literal used to escape non-printable
+		# bytes as \xXX - but C's \x escape has NO length limit and keeps
+		# consuming hex-digit CHARACTERS for as long as they appear next,
+		# so a byte like 0x9F (from 'ß', UTF-8 C3 9F) immediately followed
+		# by the literal, RAW-emitted printable byte 'e' (itself just a
+		# hex digit character) became the single escape \x9fe (0xf9e, out
+		# of uint8_t's range) instead of two separate bytes - "hex escape
+		# sequence out of range" from clang/gcc on ANY non-ASCII string
+		# followed by a hex-digit-looking character. Fixed by switching to
+		# fixed-3-digit octal escapes (\ooo), which the C standard caps at
+		# exactly 3 digits regardless of what follows - see
+		# _c_string_literal's own comment.
+		self._run( '\n'.join([
+			'def take_str( s: str ) -> None:',
+			'	return',
+			'',
+			'def main() -> None:',
+			"	take_str( 'straße' )", # 'ß' (UTF-8 C3 9F) directly followed by the raw printable byte 'e'
 			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
@@ -1673,6 +1734,73 @@ def main() -> i32:
 			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
 			self.assertEqual( run_result.returncode, 0,
 				f'str comparison ops failed, exit {run_result.returncode}' )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_upper_lower_ascii( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if 'hello world'.upper() != 'HELLO WORLD':
+		return 1
+	if 'HELLO WORLD'.lower() != 'hello world':
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_upper_lower_simple_non_ascii_mapping( self ) -> None:
+		# single-codepoint Unicode case mapping, covering accented Latin
+		# and Greek - see _case_map_windows'/_case_map_posix's own comments
+		# on why this is the ceiling (no ICU, no SpecialCasing.txt one-to-
+		# many/context-sensitive rules - "straße".upper() staying "STRAßE"
+		# rather than "STRASSE" is expected here, not a bug)
+		self._run( '''
+def main() -> i32:
+	if 'café'.upper() != 'CAFÉ':
+		return 1
+	if 'CAFÉ'.lower() != 'café':
+		return 2
+	if 'Σίσυφος'.upper() != 'ΣΊΣΥΦΟΣ':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_upper_lower_empty_and_roundtrip( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if ''.upper() != '':
+		return 1
+	if ''.lower() != '':
+		return 2
+	if 'MiXeD CaSe 123!'.upper() != 'MIXED CASE 123!':
+		return 3
+	if 'MiXeD CaSe 123!'.lower() != 'mixed case 123!':
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
 if __name__ == '__main__':

@@ -51,7 +51,19 @@ static inline void release_object( ObjectHeader* obj, void (*destructor)(void*) 
 
 // metalpy arithmetic intrinsics — dispatch to compiler builtins (GCC/Clang)
 // or manual checks (MSVC). All metalpy scalars are <= 64 bits.
-#ifdef _MSC_VER
+//
+// defined(_MSC_VER) && !defined(__clang__), not just _MSC_VER: clang
+// targeting Windows defines _MSC_VER too (for MSVC source compatibility)
+// even though it fully supports __int128/__builtin_*_overflow, unlike
+// real MSVC (cl.exe) - a bare #ifdef _MSC_VER wrongly routed clang-on-
+// Windows through the int64_t/uint64_t fallback below, whose
+// __metalpy_wideint (signed 64-bit) can't represent usize/u64's full
+// unsigned range - a checked cast to usize with ANY valid value greater
+// than INT64_MAX would (silently, incorrectly) read as an overflow, and
+// in practice even small in-range values misfired once __metalpy_wideint
+// end up promoted from a corrupted MAX constant - see the checked-cast
+// test this was actually caught by.
+#if defined(_MSC_VER) && !defined(__clang__)
 typedef int64_t __metalpy_wideint;
 typedef uint64_t __metalpy_wideuint;
 
@@ -1094,11 +1106,22 @@ def _c_string_literal( data: bytes ) -> str:
 	''' convert raw bytes to a C string literal with proper escapes.
 	printable ASCII is emitted as-is; non-printable characters (including
 	NUL, backslash, double-quote, control chars, and high bytes) are
-	escaped as C escape sequences. '''
+	escaped as C escape sequences - octal (\\ooo, always exactly 3 digits),
+	not hex: C's \\x escape has NO length limit and keeps consuming hex
+	digit CHARACTERS (0-9a-fA-F) for as long as they appear next in the
+	literal, so \\x9f immediately followed by the literal printable byte
+	'e' (itself just emitted raw, below) silently becomes the single
+	escape \\x9fe (0xf9e, out of uint8_t's range - "hex escape sequence
+	out of range" from a real non-ASCII string like "straße", or worse,
+	an in-range-but-wrong byte value with NO compile error at all for a
+	different byte/character combination). Octal escapes don't have this
+	problem - the C standard caps them at exactly 3 octal digits
+	regardless of what follows, so zero-padding to 3 digits always is
+	unambiguous no matter what the next byte is. '''
 	parts: list[str] = []
 	for b in data:
 		if b == 0:
-			parts.append( chr(92) + 'x00' )
+			parts.append( chr(92) + '000' )
 		elif b == 34: # double-quote
 			parts.append( chr(92) + chr(34) )
 		elif b == 92: # backslash
@@ -1112,7 +1135,7 @@ def _c_string_literal( data: bytes ) -> str:
 		elif 32 <= b <= 126: # printable ASCII
 			parts.append( chr( b ))
 		else:
-			parts.append( chr(92) + f'x{b:02x}' )
+			parts.append( chr(92) + f'{b:03o}' )
 	return chr(34) + ''.join( parts ) + chr(34)
 
 def _string_literal_name( qualname: str, value: str|bytes ) -> str:
