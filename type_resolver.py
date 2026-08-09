@@ -920,7 +920,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return None
 		if target.resolve is not None:
 			target.resolve()
-		args = self._infer_generic_args( node, target )
+		args = self._infer_generic_args( node, target, target.type_params )
 		if args is None:
 			return None
 		return target, args
@@ -951,18 +951,46 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			pairs.append(( param, kw.value ))
 		return pairs
 
-	def _infer_generic_args( self, node: ast.Call, target: Function ) -> list[Type]|None:
+	def _infer_generic_args(
+		self, node: ast.Call, target: Function, type_params: list[TypeVar], *, trust_literals: bool = True,
+	) -> list[Type]|None:
 		# a BARE call to a generic function (mylen(a), no explicit [T]) - T
 		# has to be inferred from the arguments' own (best-effort,
 		# _type_of_expr-derived) types. Mirrors Lowering.
 		# _lower_inferred_generic_call's unification, just against
-		# source-level types instead of already-lowered IR operand types
+		# source-level types instead of already-lowered IR operand types.
+		# `type_params` is passed in explicitly, not read off target.
+		# type_params, so this same inference is shared by a generic
+		# FREE function's own type params (target IS the generic thing)
+		# and a generic CLASS's own type params via its __init__ (target
+		# is __init__, whose own .type_params is empty - the class's are
+		# what's actually being solved for) - see _try_resolve_generic_
+		# construction, mirroring Lowering._unify_type_param's identical
+		# generalization
+		#
+		# trust_literals=False (construction's own call) refuses to let a
+		# bare literal argument (Box(1)) contribute a binding via its own
+		# context-free default type (_type_of_expr's Constant branch,
+		# int/str/bool/float) - unlike a function call, a construction's
+		# class type param can ALSO be pinned from an expected_type
+		# Lowering._lower_generic_construction_args sees (b: Box[i32] =
+		# Box(1) pins T=i32 before the literal is even lowered, giving it
+		# an i32 hint directly) but this pass has no expected-type context
+		# threaded through it at all - inferring T=builtins.int from the
+		# literal's own default here instead would be an outright WRONG
+		# answer, not just a missed one, silently building and compiling
+		# an extra, incorrect Box[int] specialization alongside the real
+		# Box[i32] (confirmed by a real repro, not just this reasoning) -
+		# so this pass simply never trusts a literal for construction; a
+		# class type param only ever inferable from one always falls
+		# through to lowering's own, correct, expected_type-aware pass
 		pairs = self._pair_call_args_for_inference( target, node )
 		if pairs is None:
 			return None
-		type_params = target.type_params or []
 		bindings: dict[int,Type] = {} # id(TypeVar) -> the concrete Type it was inferred as
 		for param, expr in pairs:
+			if not trust_literals and isinstance( expr, ast.Constant ):
+				continue
 			actual = self._type_of_expr( expr )
 			if actual is None or isinstance( actual, TypeVar ):
 				continue # can't determine this one - not an error here, just doesn't contribute a binding (see the "missing" check below)
@@ -971,6 +999,47 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if any( id( tv ) not in bindings for tv in type_params ):
 			return None # couldn't infer everything from what this pass could determine - lowering's own (stronger, IR-level) inference gets a full attempt
 		return [ bindings[id(tv)] for tv in type_params ]
+
+	def _try_resolve_generic_construction( self, node: ast.Call, target_cls: object, init: object ) -> tuple[RCClass,Function]|None:
+		''' Foo(...) where Foo is a generic RCClass with a plain, non-
+		fallible __init__ and no base class - the construction analogue
+		of _try_resolve_generic_call, mirroring Lowering._lower_generic_
+		construction_args's own inference (unify the class's own type
+		params from the constructor's arguments, via the same _infer_
+		generic_args this pass already uses for generic function calls -
+		see its own comment on being generalized over an explicit
+		type_params list for exactly this reason). expected_type-based
+		pinning is deliberately NOT replicated here - this pass has no
+		expected-type context threaded through it at all (visit_Call
+		never receives one), unlike lowering's own two-phase strategy - a
+		construction inferable ONLY from expected_type, never from any
+		argument, is simply left for lowering's existing, still fully
+		correct fallback to resolve. Same "any doubt, bail" discipline as
+		_try_resolve_generic_call throughout: explicit-subscript
+		construction (Box[i32](...)) isn't even resolvable by name lookup
+		today (_try_resolve_callable_namespace has no Subscript-over-a-
+		class handling), and a fallible/overloaded __init__, a class with
+		a base, or no __init__ at all (bare field=value sugar) are all
+		left untouched too - none of those are this pass's to resolve.
+		Takes target_cls/init already resolved by visit_Call's own
+		caller, rather than re-resolving them here, since that lookup
+		has to happen unconditionally anyway (see visit_Call's own
+		comment on why - lowering.py's own asserts rely on it) '''
+		if not isinstance( target_cls, RCClass ) or not target_cls.type_params or target_cls.base is not None:
+			return None
+		if not isinstance( init, Function ) or init.type_params:
+			return None
+		if init.return_type is not self.discovery.get_none_type():
+			return None # fallible (or malformed) __init__ - out of scope, let lowering's own _init_fallibility/_emit_fallible_construction handle it
+		args = self._infer_generic_args( node, init, target_cls.type_params, trust_literals = False )
+		if args is None:
+			return None
+		spec = self.discovery._get_or_create_specialization( target_cls, args )
+		concrete_cls = self.resolver.monomorphizer.monomorphize_class( spec )
+		concrete_init = concrete_cls.names.get( '__init__' )
+		if not isinstance( concrete_init, Function ):
+			return None # shouldn't happen (monomorphize_class's own method loop always substitutes a plain __init__ too), but stay silent/consistent with this pass's own discipline rather than assert
+		return concrete_cls, concrete_init
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type] ) -> bool:
 		# ported from Lowering._unify_type_param, minus the discovery.fail()
@@ -996,9 +1065,21 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# construction-call detection: Box(...) / Namespace.Class(...)
 			# — the class body and its __init__'s parameter list need to
 			# be fully resolved before lowering ever reaches this call
-			# site. Only resolve (populate .names/.attributes), never
-			# schedule — a generic class must never become a compile
-			# unit until a concrete Specialization is built from it.
+			# site regardless (lowering.py's own asserts rely on it) -
+			# resolve (populate .names/.attributes) unconditionally, then
+			# separately try the same generic-construction inference
+			# _try_resolve_generic_call already does for functions (see
+			# _try_resolve_generic_construction's own docstring for why
+			# most of this doesn't apply - fallible/overloaded/subclassed
+			# __init__, a no-__init__ class, explicit Box[i32](...) - and
+			# falls back to lowering's unchanged machinery whenever it
+			# doesn't). Never schedules anything itself either way - a
+			# generic class must never become a compile unit until a
+			# concrete Specialization is built from it, and node.
+			# resolved_construction's own concrete_cls/concrete_init get
+			# scheduled the ordinary way, by lowering.py, exactly once,
+			# whenever it actually reaches this call site - same
+			# discipline as node.resolved_callee above
 			target = self._try_resolve_callable_namespace( node.func )
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				if target.resolve is not None:
@@ -1006,6 +1087,9 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				init = target.names.get( '__init__' )
 				if isinstance( init, Function ):
 					self.resolver._resolve_callable( init )
+				construction = self._try_resolve_generic_construction( node, target, init )
+				if construction is not None:
+					node.resolved_construction = construction
 			return node
 		target, args = resolved
 		spec = self.discovery._get_or_create_specialization( target, args )

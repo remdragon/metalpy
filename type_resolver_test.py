@@ -546,6 +546,79 @@ class TypeResolutionTests( unittest.TestCase ):
 		[ callee ] = self._resolved_callees( fn )
 		self.assertIsNone( callee )
 
+	# --- generic construction resolution --------------------------------------
+
+	def test_generic_construction_via_argument_type_tags_resolved_construction( self ) -> None:
+		# the TODO.txt-confirmed bug this closes: a generic class's own
+		# __init__ was never monomorphized when reached through plain
+		# ClassName(...) construction inside a helper function - it only
+		# ever worked when constructed directly against an annotation
+		# lowering.py could pin an expected_type from
+		mod = self._import( '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, v: T ) -> None:',
+			'		self.v = v',
+			'',
+			'def make_box( x: i32 ) -> None:',
+			'	b: Box[i32] = Box( x )',
+		]))
+		fn = self._resolved_fn( mod, 'make_box' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		ann_assign = fn.node.body[0]
+		self.assertIsInstance( ann_assign, ast.AnnAssign )
+		construction = getattr( ann_assign.value, 'resolved_construction', None )
+		self.assertIsNotNone( construction )
+		concrete_cls, concrete_init = construction
+		self.assertEqual( concrete_cls.qualname, '__test__.Box[intrinsics.i32]' )
+		self.assertEqual( concrete_init.qualname, '__test__.Box.__init__[intrinsics.i32]' )
+
+	def test_generic_construction_with_literal_argument_is_left_untagged( self ) -> None:
+		# a bare literal argument (Box(1)) has no safe, context-free
+		# answer for this pass - its own default type (builtins.int) can
+		# genuinely disagree with what an expected_type annotation would
+		# have pinned (b: Box[i32] = Box(1) means T=i32, not int) -
+		# lowering.py's own _lower_generic_construction_args sees that
+		# annotation and gets it right; this pass has no expected-type
+		# context at all, so it must never guess here (confirmed by a
+		# real repro during development: guessing built and compiled an
+		# extra, wrong Box[int] specialization alongside the real one)
+		mod = self._import( '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, v: T ) -> None:',
+			'		self.v = v',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box( 1 )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		ann_assign = fn.node.body[0]
+		self.assertIsNone( getattr( ann_assign.value, 'resolved_construction', None ))
+
+	def test_generic_construction_with_fallible_init_is_left_untagged( self ) -> None:
+		# Foo(...) where __init__ returns Result[None,E] becomes
+		# Result[Foo,E] (SYNTAX.md) - deliberately out of scope for this
+		# pass (no Ok/Err-wrapping synthesis here), left for lowering's
+		# existing _init_fallibility/_emit_fallible_construction machinery
+		mod = self._import( '\n'.join([
+			'class MyError: pass',
+			'',
+			'class Box[T]:',
+			'	v: T',
+			'	def __init__( self, v: T ) -> Result[None,MyError]:',
+			'		self.v = v',
+			'		return Result.Ok( None )',
+			'',
+			'def make_box( x: i32 ) -> None:',
+			'	r = Box( x )',
+		]))
+		fn = self._resolved_fn( mod, 'make_box' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assign = fn.node.body[0]
+		self.assertIsInstance( assign, ast.Assign )
+		self.assertIsNone( getattr( assign.value, 'resolved_construction', None ))
 
 	# --- destructor synthesis -------------------------------------------------
 

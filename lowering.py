@@ -2447,32 +2447,51 @@ class Lowering:
 		# target_cls is already resolved by now - _try_resolve_namespace's
 		# own lookup resolves whatever it returns
 		assert target_cls.resolve is None, f'internal compiler error, {target_cls=} is not fully resolved'
-		init = target_cls.names.get( '__init__' )
-		if isinstance( init, Function ):
-			assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
-		if init is None:
-			return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
-		if not isinstance( target_cls, RCClass ):
-			# __init__ on a @cstruct/@cunion/@enum - not supported yet
-			# (attribute lifetime tracking is scoped to RCClass, matching
-			# RCCLASS ATTRIBUTE LIFETIME.md's own title) - falls through to
-			# the normal call path, same "not callable" as always
-			return None
-		if not isinstance( init, Function ):
-			self.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
-		if target_cls.base is not None:
-			self.discovery.fail(
-				f'{target_cls.qualname}(...): __init__ invocation is only supported for classes with no base class yet: {ast.unparse(node)}',
-				node,
-			)
 
-		if target_cls.type_params:
-			self_type, init, args, kwargs = self._lower_generic_construction_args( node, target_cls, init, expected_type )
-		else:
-			self.schedule( target_cls )
+		resolved_construction = getattr( node, 'resolved_construction', None )
+		if resolved_construction is not None:
+			# type_resolver.py's own generic-construction resolution
+			# (_ReferenceResolver._try_resolve_generic_construction)
+			# already inferred target_cls's own concrete type args from
+			# this call's arguments and built the real, monomorphized
+			# class + __init__ - an ordinary, concrete Function, never a
+			# Specialization, same "resolved ahead of time" discipline as
+			# node.resolved_callee. Neither gets scheduled here - that
+			# happens the ordinary way, right below, exactly like the
+			# plain (non-generic) branch already schedules target_cls/
+			# init directly
+			concrete_cls, init = resolved_construction
+			self.schedule( concrete_cls )
 			self._ensure_resolved( init )
-			self_type = target_cls
+			self_type = concrete_cls
 			args, kwargs = self._lower_call_args( init, node )
+		else:
+			init = target_cls.names.get( '__init__' )
+			if isinstance( init, Function ):
+				assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
+			if init is None:
+				return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
+			if not isinstance( target_cls, RCClass ):
+				# __init__ on a @cstruct/@cunion/@enum - not supported yet
+				# (attribute lifetime tracking is scoped to RCClass, matching
+				# RCCLASS ATTRIBUTE LIFETIME.md's own title) - falls through to
+				# the normal call path, same "not callable" as always
+				return None
+			if not isinstance( init, Function ):
+				self.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
+			if target_cls.base is not None:
+				self.discovery.fail(
+					f'{target_cls.qualname}(...): __init__ invocation is only supported for classes with no base class yet: {ast.unparse(node)}',
+					node,
+				)
+
+			if target_cls.type_params:
+				self_type, init, args, kwargs = self._lower_generic_construction_args( node, target_cls, init, expected_type )
+			else:
+				self.schedule( target_cls )
+				self._ensure_resolved( init )
+				self_type = target_cls
+				args, kwargs = self._lower_call_args( init, node )
 
 		# self_temp.type is self_type - already scheduled above (schedule
 		# (target_cls) for the plain case, _ensure_resolved(cls_spec) for the

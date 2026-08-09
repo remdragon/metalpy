@@ -323,3 +323,67 @@ link tests passed this run too - environment flake, unrelated to this
 change).
 
 Next site to look at: TBD.
+
+Step 4 implemented: generic construction call resolution
+
+Went ahead and implemented the deferred "Step 4" (moving construction-call
+resolution into type_resolver.py, mirroring the generic-function-call
+rewrite) after discussing _lower_generic_construction_args's own `bindings`
+mechanism - it isn't a Specialization-caching gap like the overload case,
+it's genuine inference (there's no Specialization to preprocess against
+until this function decides what it is), but the SAME "redo the inference
+at every call site, never pre-resolved before lowering" cost the function-
+call work already eliminated for calls applies here too.
+
+Added TypeResolver._try_resolve_generic_construction (type_resolver.py),
+called from visit_Call whenever _try_resolve_generic_call itself doesn't
+match: detects Foo(...) where Foo is a generic RCClass with a plain,
+non-fallible __init__ and no base class, infers the class's own type
+params via the SAME _infer_generic_args/_unify_type_param machinery
+already built for function calls (generalized to take an explicit
+type_params list rather than reading target.type_params, since here it's
+the CLASS's params being solved via __init__'s parameters, not the
+function's own), and tags the call node - node.resolved_construction =
+(concrete_cls, concrete_init) - both ordinary, already-monomorphized
+objects, never a Specialization, same discipline as node.resolved_callee.
+lowering.py's _try_lower_construct_call gets one new short-circuit branch;
+neither concrete_cls nor concrete_init is scheduled by type_resolver.py
+itself - that happens the ordinary way when lowering.py actually reaches
+the tagged call, exactly mirroring how a resolved_callee Function gets
+scheduled by lowering's own ordinary call path rather than by the tagging
+pass.
+
+Deliberately out of scope, matching the earlier decision: fallible
+__init__ (Result[None,E] return, SYNTAX.md's Result[Foo,E]-wrapping),
+explicit Box[i32](...) syntax (not even resolvable by name lookup today -
+_try_resolve_callable_namespace has no Subscript-over-a-class handling),
+overloaded/subclassed __init__, and bare field=value construction sugar
+(no __init__ at all) - all left untouched, falling through to lowering's
+unchanged, still fully correct machinery.
+
+Real bug caught and fixed during implementation, not just a missed
+optimization: unlike a function call, _lower_generic_construction_args
+ALSO pins from an expected_type when one's available (b: Box[i32] =
+Box(1) binds T=i32 before the literal argument 1 is even lowered, giving
+it an i32 hint directly) - this pass has no expected-type context
+threaded through it at all, so trusting a bare literal argument's own
+context-free default type (_type_of_expr's Constant handling, i.e.
+builtins.int) would silently infer the WRONG type param whenever it
+disagrees with what the surrounding annotation actually says. Confirmed
+via a real repro (not just reasoning): Box(1) under b: Box[i32] = ...
+built and compiled a spurious extra Box[builtins.int] specialization
+alongside the correct Box[intrinsics.i32] one, before the fix. Fixed by
+adding trust_literals=False to _infer_generic_args (shared with the
+function-call path, which keeps trust_literals=True - a bare function
+call has no equivalent expected_type-pinning to disagree with, since
+Lowering._lower_inferred_generic_call itself never uses expected_type
+either) - a class type param only ever inferable from a literal argument
+now simply falls through to lowering's own, correct, expected_type-aware
+pass, same as any other case this pass can't confidently resolve.
+
+Verified against TODO.txt's own confirmed repro (generic RCClass
+constructed via plain ClassName(...) inside a helper function) directly,
+plus 3 new type_resolver_test.py tests (successful inference via an
+argument's real type, literal-argument bail-out, fallible-init bail-out).
+
+Full suite: 561/561 passing (558 + 3 new).
