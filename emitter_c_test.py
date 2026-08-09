@@ -1831,5 +1831,34 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_case_folder_install_wiring( self ) -> None:
+		# proves the actual dispatch mechanism from PLAN_CASE_FOLDING.md end
+		# to end (with a stub CaseFolding.upper()/lower() that just returns
+		# its argument unchanged - the real table-driven lookup is a later
+		# phase): before any mutation, case_folder.simple_count is 0 (a
+		# cstruct global's own C {0} static zero-init - see CaseFolding's
+		# own comment on why it's a cstruct, not a class), so str.upper()
+		# takes the OS-native path as always. Setting simple_count away from
+		# 0 - exactly what case_folding.install() will eventually do, from a
+		# SEPARATE module, once it exists - makes str.upper() dispatch to
+		# case_folder.upper() instead, with no change at the .upper() call
+		# site itself
+		self._run( '''
+import builtins
+
+def main() -> i32:
+	before: str = 'hello'.upper()
+	if before != 'HELLO':
+		return 1
+	builtins.case_folder.simple_count = 1
+	after: str = 'hello'.upper()
+	if after != 'hello': # CaseFolding.upper()'s current stub is the identity function
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 if __name__ == '__main__':
 	unittest.main()

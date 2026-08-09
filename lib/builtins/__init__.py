@@ -277,15 +277,30 @@ class str:
 				i += 1
 		return count
 
-	@compiler.target( os = 'windows' )
 	def upper( self ) -> str:
+		''' case_folder (see PLAN_CASE_FOLDING.md) is checked first, ahead
+		of the OS-backed path - a program that never calls case_folding.
+		install() never sets simple_count away from 0, so this is a single
+		cheap field read for the overwhelming majority of programs, which
+		don't import case_folding at all. Kept as ONE os-independent method
+		(rather than duplicating this check into each of _upper_os_native's
+		own @compiler.target(os=...) bodies) specifically so it's written
+		and checked exactly once. '''
+		if case_folder.simple_count != 0:
+			return case_folder.upper( self )
+		return self._upper_os_native()
+
+	@compiler.target( os = 'windows' )
+	@private
+	def _upper_os_native( self ) -> str:
 		''' Unicode-correct uppercase via LCMapStringEx - see
 		PLAN_STR_UPPER_LOWER.md and _case_map_windows' own comment. '''
 		from windows.kernel32 import LCMAP_UPPERCASE
 		return self._case_map_windows( LCMAP_UPPERCASE )
 
 	@compiler.target( os = not 'windows' )
-	def upper( self ) -> str:
+	@private
+	def _upper_os_native( self ) -> str:
 		''' Unicode-correct (single-codepoint-mapping) uppercase via
 		towupper_l - see PLAN_STR_UPPER_LOWER.md and _case_map_posix's own
 		comment for what this does and doesn't cover. '''
@@ -321,15 +336,23 @@ class str:
 	def __ge__( self, other: str ) -> bool:
 		return self.__cmp__( other ) >= 0
 
-	@compiler.target( os = 'windows' )
 	def lower( self ) -> str:
+		''' mirrors upper()'s own case_folder-first check - see its comment. '''
+		if case_folder.simple_count != 0:
+			return case_folder.lower( self )
+		return self._lower_os_native()
+
+	@compiler.target( os = 'windows' )
+	@private
+	def _lower_os_native( self ) -> str:
 		''' Unicode-correct lowercase via LCMapStringEx - see
 		PLAN_STR_UPPER_LOWER.md and _case_map_windows' own comment. '''
 		from windows.kernel32 import LCMAP_LOWERCASE
 		return self._case_map_windows( LCMAP_LOWERCASE )
 
 	@compiler.target( os = not 'windows' )
-	def lower( self ) -> str:
+	@private
+	def _lower_os_native( self ) -> str:
 		''' Unicode-correct (single-codepoint-mapping) lowercase via
 		towlower_l - see PLAN_STR_UPPER_LOWER.md and _case_map_posix's own
 		comment for what this does and doesn't cover. '''
@@ -638,6 +661,62 @@ class str:
 			cased = towlower_l( wc, loc )
 		with compiler.panic_arithmetic( 'towupper_l/towlower_l returned a negative/out-of-range codepoint' ):
 			return u32( cased )
+
+
+# ---------------------------------------------------------------------------
+# case_folder: str.upper()/str.lower()'s install()-able full-Unicode-casing
+# hook (see PLAN_CASE_FOLDING.md). CaseFolding is a single concrete class,
+# not something meant to be subclassed - this compiler has no virtual/
+# polymorphic method dispatch (confirmed by direct inspection: method calls
+# always resolve from the receiver's static declared type, ir.Call always
+# targets one fixed C symbol, no vtable concept exists anywhere), so
+# "install() swaps behavior" is realized by swapping DATA on this one
+# shared global instance, not by swapping which class's methods run.
+# case_folding.py (a separate, optional module nothing here ever imports)
+# calls install() to point simple_table/simple_count at its own embedded
+# Unicode table; a program that never imports case_folding never
+# references that table at all, so it's never linked in - the ONLY cost
+# every program pays is the one `if simple_count != 0` check in upper()/
+# lower() above.
+# ---------------------------------------------------------------------------
+
+@cstruct
+class CaseFoldEntry:
+	codepoint: u32
+	mapped: u32
+
+@cstruct
+class CaseFolding:
+	# a value type (embedded inline in the global below), not an RCClass
+	# (heap-allocated, referenced through a pointer) - deliberately, to
+	# sidestep a real, documented, pre-existing gap: a global whose
+	# initializer needs real computation (any RCClass construction) gets
+	# its own __metalpy_init_<name>() function generated, but nothing
+	# ever calls it (see emitter_c.py's emit_global, "Wiring this init
+	# function into a real process entry point is out of scope... it
+	# just needs to exist and compile") - case_folder was silently a null
+	# pointer forever, and dereferencing it segfaulted on the very first
+	# .upper()/.lower() call. A cstruct global instead gets C's own
+	# static {0} zero-initializer for its own fields DIRECTLY (no pointer,
+	# no heap allocation, nothing to run before it's valid) - exactly the
+	# "not installed" state this needs by default, with no init call
+	# required at all.
+	simple_table: Ptr[CaseFoldEntry]
+	simple_count: usize
+
+	def upper( self, s: str ) -> str:
+		# table-driven mapping lands in a later phase (see
+		# PLAN_CASE_FOLDING.md) - str.upper() only ever calls this once
+		# simple_count != 0, so there's no "not installed" fallback to
+		# write here; a caller that somehow reaches this with an empty
+		# table is a bug in str.upper()'s own gating, not something this
+		# method should paper over
+		return s
+
+	def lower( self, s: str ) -> str:
+		return s
+
+case_folder: CaseFolding = CaseFolding( simple_table = None, simple_count = 0 )
 
 def print( msg: str, end: str = '\n' ) -> None:
 	# No *args/**kwargs, use f-strings instead (once implemented)
