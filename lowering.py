@@ -1381,7 +1381,14 @@ class Lowering:
 		if shape is None:
 			return value
 		result_type, error_cls = shape
-		self._type_resolver._require_result_return( node, value.type.base, error_cls, alternatives, fn = self._current_fn )
+		# find_name, not value.type.base - value.type may already be the
+		# real, monomorphized Result object itself (not a Specialization
+		# wrapper) by the time _result_shape above succeeds - see
+		# Monomorphizer.origin_of's own docstring. Safe to use the raising
+		# lookup here (unlike _result_shape's own find_name_or_none) since
+		# shape being non-None already proves Result is defined
+		result_cls = self.discovery.find_name( 'Result', node )
+		self._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
 		return self._consume_checked_result( value, result_type, extra = None )
 
 	def _bind_loop_target( self, target: ast.Name, default_type: Type, value_expr: ast.expr, node: ast.AST ) -> Variable:
@@ -2628,7 +2635,14 @@ class Lowering:
 			self._emit( instr )
 		self._emit( ir.Assign( dest = result_var, src = init_result ))
 
-		error_cls = init.return_type.args[1]
+		# _result_shape, not init.return_type.args[1] directly -
+		# init.return_type may already be the real, monomorphized Result
+		# object itself (not a Specialization wrapper) - see Monomorphizer.
+		# origin_of's own docstring. Guaranteed to succeed here: the only
+		# caller (_try_lower_construct_call) already confirmed init is
+		# fallible (Result[None,_]-shaped) via _init_fallibility before
+		# ever reaching this method
+		error_cls = self._type_resolver._result_shape( init.return_type )[1]
 		result_cls = self.discovery.find_name( 'Result', node )
 		outer_result_type = expected_type or self.discovery._get_or_create_specialization( result_cls, [ concrete_cls, error_cls ] )
 		dest_var = self._declare_hidden_local( f'__ctor_dest_{unique}', outer_result_type, node )
@@ -2736,7 +2750,10 @@ class Lowering:
 		if shape is None:
 			self.discovery.fail( f'or_return() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
 		result_type, error_cls = shape
-		self._type_resolver._require_result_return( node, receiver.type.base, error_cls, self._OR_RETURN_ALTERNATIVES, fn = self._current_fn )
+		# find_name, not receiver.type.base - see _maybe_consume_result's
+		# identical comment on why
+		result_cls = self.discovery.find_name( 'Result', node )
+		self._type_resolver._require_result_return( node, result_cls, error_cls, self._OR_RETURN_ALTERNATIVES, fn = self._current_fn )
 		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
@@ -2837,7 +2854,12 @@ class Lowering:
 			return
 		if any( declared is tv for tv in type_params ):
 			existing = bindings.get( id( declared ) )
-			if existing is not None and existing is not actual:
+			# _same_type, not a bare `is` - two argument positions can
+			# reveal the identical specialization through two different
+			# representations (e.g. one already monomorphized, the other
+			# a fresh Specialization built from an annotation) - see
+			# Monomorphizer.origin_of's own docstring
+			if existing is not None and existing is not actual and not self._type_resolver._same_type( existing, actual ):
 				self.discovery.fail(
 					f'{context_qualname}(...): type parameter {declared.stem!r} is inferred as both '
 					f'{existing.qualname} and {actual.qualname} by different arguments: {ast.unparse(node)}',
@@ -2845,9 +2867,16 @@ class Lowering:
 				)
 			bindings[ id( declared ) ] = actual
 			return
-		if isinstance( declared, Specialization ) and isinstance( actual, Specialization ) and declared.base is actual.base:
-			for d_arg, a_arg in zip( declared.args, actual.args ):
-				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
+		if isinstance( declared, Specialization ):
+			# _as_specialization, not a bare isinstance(actual, Specialization)
+			# check - actual may already be the real, monomorphized object
+			# itself (not a Specialization wrapper) if substitute_type_params's
+			# own eager-monomorphize step got to it first - see Monomorphizer.
+			# origin_of's own docstring
+			actual_spec = self._type_resolver._as_specialization( actual )
+			if actual_spec is not None and declared.base is actual_spec.base:
+				for d_arg, a_arg in zip( declared.args, actual_spec.args ):
+					self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
 		# else: this parameter position doesn't mention any of type_params
 		# (a concrete parameter, or a nested type whose base doesn't even
 		# match the argument's) - nothing to infer here. Not an error by

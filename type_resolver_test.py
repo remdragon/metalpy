@@ -597,11 +597,16 @@ class TypeResolutionTests( unittest.TestCase ):
 		ann_assign = fn.node.body[0]
 		self.assertIsNone( getattr( ann_assign.value, 'resolved_construction', None ))
 
-	def test_generic_construction_with_fallible_init_is_left_untagged( self ) -> None:
+	def test_generic_construction_with_fallible_init_is_tagged( self ) -> None:
 		# Foo(...) where __init__ returns Result[None,E] becomes
-		# Result[Foo,E] (SYNTAX.md) - deliberately out of scope for this
-		# pass (no Ok/Err-wrapping synthesis here), left for lowering's
-		# existing _init_fallibility/_emit_fallible_construction machinery
+		# Result[Foo,E] (SYNTAX.md) - resolved the same way as the non-
+		# fallible case (fallibility doesn't affect how the class's own
+		# type params are inferred from __init__'s parameters at all,
+		# only what lowering.py does with the return value afterward) -
+		# lowering.py's own _init_fallibility/_emit_fallible_construction,
+		# unchanged, still owns the actual Ok/Err-wrapping synthesis,
+		# branching on the CONCRETE, already-substituted init's own
+		# return type
 		mod = self._import( '\n'.join([
 			'class MyError: pass',
 			'',
@@ -618,7 +623,19 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		assign = fn.node.body[0]
 		self.assertIsInstance( assign, ast.Assign )
-		self.assertIsNone( getattr( assign.value, 'resolved_construction', None ))
+		construction = getattr( assign.value, 'resolved_construction', None )
+		self.assertIsNotNone( construction )
+		concrete_cls, concrete_init = construction
+		i32 = self.discovery.get_intrinsics()['i32']
+		self.assertEqual( concrete_cls.qualname, '__test__.Box[intrinsics.i32]' )
+		self.assertIs( concrete_init.parameters[0].type, i32 ) # v's own T substituted
+		# the fallible RETURN shape itself is untouched by substitution -
+		# MyError doesn't mention T, so Result[None,MyError] passes
+		# through substitute_type_params unchanged (same object, still a
+		# Specialization - see PLAN_RESOLVE_CLASS_SPECIALIZATIONS.md on
+		# why that's NOT true in general once the error type itself
+		# depends on the class's own type params)
+		self.assertIsNot( concrete_init.return_type, self.discovery.get_none_type() )
 
 	# --- destructor synthesis -------------------------------------------------
 

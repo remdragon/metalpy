@@ -57,6 +57,25 @@ class Monomorphizer:
 		# whose own .monomorphized DOES get filled in, by the very
 		# monomorphize_class call already in progress for it
 		self._building: set[int] = set()
+		# id(monomorphized ClassLike) -> the Specialization it came from -
+		# recovers "what generic instantiation is this" for a caller that
+		# only has the concrete object in hand, no Specialization wrapper
+		# to read .base/.args from. Needed specifically because of the
+		# eager-monomorphize step above: substitute_type_params can hand
+		# back an ALREADY-MONOMORPHIZED object instead of a Specialization
+		# the moment a substitution actually changes something (e.g. a
+		# method's own Result[None,E] return type, once E is bound to a
+		# concrete error class) - a caller checking "is this Result-
+		# shaped, and if so what are its args" (see type_resolver.py's
+		# _result_shape/_require_result_return) needs this fallback or it
+		# silently stops recognizing a perfectly well-formed Result[None,
+		# _] the moment eager substitution beat it to unwrapping the
+		# Specialization. Only monomorphize_class populates this -
+		# monomorphized_function's own output is never affected by the
+		# eager-monomorphize step this exists for (that step only ever
+		# fires on a ClassLike-based Specialization, substitute_type_
+		# params' own condition - see its own comment)
+		self._origins: dict[int,Specialization] = {}
 
 	def _ensure_resolved( self, obj: object ) -> None:
 		# same discipline as Lowering._ensure_resolved - duplicated here
@@ -397,4 +416,8 @@ class Monomorphizer:
 		finally:
 			self._building.discard( id( spec ))
 		spec.monomorphized = monomorphized
+		self._origins[ id( monomorphized )] = spec
 		return monomorphized
+
+	def origin_of( self, t: object ) -> 'Specialization|None':
+		return self._origins.get( id( t ))

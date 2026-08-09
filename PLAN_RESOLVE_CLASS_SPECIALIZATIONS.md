@@ -387,3 +387,93 @@ plus 3 new type_resolver_test.py tests (successful inference via an
 argument's real type, literal-argument bail-out, fallible-init bail-out).
 
 Full suite: 561/561 passing (558 + 3 new).
+
+Fallible __init__() support - DONE, plus a newly-surfaced pre-existing bug
+flagged (not fixed)
+
+Extended _try_resolve_generic_construction to also accept a __init__
+returning Result[None,_] (fallible, SYNTAX.md), not just plain None -
+turned out to need almost nothing beyond widening the bail condition to
+`init.return_type is none_type OR _result_shape(init.return_type)[0] is
+none_type`: type-param inference only ever looks at __init__'s own
+PARAMETERS, never its return type, so fallibility doesn't change how the
+class's type args get inferred at all - only what lowering.py does with
+the result afterward (Lowering._init_fallibility/_emit_fallible_
+construction, both unchanged, still own that decision entirely, reading
+it off the CONCRETE, already-substituted init this pass hands them).
+test_generic_construction_with_fallible_init_is_left_untagged rewritten
+to test_generic_construction_with_fallible_init_is_tagged for the new
+behavior.
+
+While verifying, found (but did NOT fix - out of scope, pre-existing, and
+not introduced by this session's construction work) a real bug in
+_result_shape (type_resolver.py) that the eager-monomorphization fix
+(step 1, commit 28e96fa) introduced: _result_shape only recognizes a
+Specialization (`isinstance(t, Specialization) and t.base is result_cls`).
+If a fallible __init__'s error type is itself the class's OWN type param
+(`def __init__(self, v: T) -> Result[None,T]:` - unusual, but legal) then
+substitute_type_params's rebuild of Result[None,T] against a concrete T
+actually changes something, which step 1's own eager-monomorphize step
+then immediately resolves into a real, concrete TaggedUnion/CStruct
+object - losing the .args a Specialization would have carried, and with
+it _result_shape's only way to recognize "this is Result[None,SomeError]"
+at all. Confirmed via direct repro, and confirmed NOT specific to this
+session's tagging work: the identical error ("must return None or
+Result[None,_], got builtins.Result[...]") fires through the OLD,
+untagged Lowering._lower_generic_construction_args path too, by forcing a
+literal argument to make trust_literals bail construction resolution.
+Every real test/library case uses a FIXED, unrelated error class (Result
+[None,MyError]) - substitute_type_params's own early-return ("if all(sa
+is a...): return t" - unchanged, no eager-monomorphize triggered)
+protects that entirely, which is why nothing has hit this in practice.
+The real fix is the "origin" tracking this whole plan doc originally
+proposed and then deferred (see the very first sections above) - probably
+smaller in scope than first imagined (Monomorphizer could track id
+(monomorphized) -> Specialization in an internal dict, set inside
+monomorphize_class itself, letting _result_shape/_require_result_return/
+_emit_fallible_construction recover the origin without adding a field to
+every ClassLike dataclass) - but touches enough call sites (at least
+lowering.py:1384's own `value.type.base`, type_resolver.py's
+_require_result_return, _emit_fallible_construction's `init.return_type.
+args[1]`) that it deserves its own pass rather than folding into this one.
+
+Origin-tracking - DONE
+
+Implemented as scoped down: Monomorphizer gained a plain `self._origins:
+dict[int,Specialization]` (id(monomorphized ClassLike) -> the Specialization
+it came from), populated the moment monomorphize_class finishes building
+one, plus `origin_of(t)` to look it up. No new field on any mpy_types.py
+dataclass. TypeResolver.`_as_specialization(t)` wraps it (t itself if
+already a Specialization, else origin_of(t)) as the one shared "get me a
+Specialization's .base/.args from this, whichever representation it's
+currently in" primitive, used by:
+
+- `_result_shape`/`_require_result_return` (type_resolver.py) - the
+  original trigger
+- `Lowering._unify_type_param`'s recursive Specialization-vs-Specialization
+  branch (both copies, lowering.py and type_resolver.py) - a SEPARATE bug
+  found while testing: a monomorphized method's own return type (Result.
+  Ok's declared Result[T,E], unified against an already-substituted
+  Result[None,i32]) hit the identical gap
+- a third helper, `_same_type(a,b)`, added for _unify_type_param's
+  CONFLICT check specifically (`existing is not actual` used bare identity
+  - two argument positions revealing the SAME specialization through two
+  DIFFERENT representations - one still a bare Specialization, one already
+  monomorphized - triggered a false "inferred as both X and X" - same
+  qualname printed twice, since both representations share it)
+
+Two call sites (lowering.py:1384's `value.type.base`, and the identical
+`receiver.type.base` in or_return()'s own check) turned out not to need
+origin-tracking at all - they were only ever using .base to recover "the
+abstract Result class" from an already-Result-shaped value, which
+`self.discovery.find_name('Result', node)` gets directly and unconditionally,
+sidestepping the representation question entirely. `_emit_fallible_
+construction`'s `init.return_type.args[1]` now goes through `_result_shape`
+instead.
+
+Verified against the exact repro that started this (a fallible __init__
+whose error type is the class's own T, both via type_resolver.py's new
+tagging path and forced through the old untagged lowering.py fallback via
+a literal argument) - 2 new emitter_c_test.py tests, one per path.
+
+Full suite: 563/563 passing (561 + 2 new).

@@ -356,12 +356,51 @@ class TypeResolver:
 		base = t.base if isinstance( t, Specialization ) else t
 		return isinstance( base, RCClass )
 
+	def _as_specialization( self, t: Type|None ) -> Specialization|None:
+		''' `t` itself if it's already a Specialization, else the
+		Specialization it was eagerly monomorphized FROM (see
+		Monomorphizer.origin_of's own docstring, and PLAN_RESOLVE_CLASS_
+		SPECIALIZATIONS.md) - None if `t` is neither (a genuinely plain,
+		non-generic type, or a Specialization whose base isn't a ClassLike
+		at all - Ptr[T]/ConstPtr[T] never get monomorphized, so they never
+		show up in Monomorphizer's own origin table, but they're already
+		handled by the isinstance(t, Specialization) branch directly).
+		Needed anywhere a caller wants a Specialization's own .base/.args
+		from a Type that MIGHT have already been substitute_type_params's
+		eager-monomorphize target instead (a rebuilt Specialization whose
+		args are now all concrete gets resolved to the real object
+		immediately, rather than staying a Specialization wrapper -
+		correct and desired everywhere EXCEPT here, where the wrapper
+		itself was the only thing carrying "which instantiation is this" '''
+		if isinstance( t, Specialization ):
+			return t
+		return self.monomorphizer.origin_of( t )
+
+	def _same_type( self, a: Type|None, b: Type|None ) -> bool:
+		''' true if `a`/`b` are the same type, even when one is a bare
+		Specialization and the other is ITS OWN monomorphized form (or
+		vice versa) - two representations of the identical instantiation,
+		not a genuine conflict. Needed specifically for _unify_type_param's
+		own "already bound to something else" check: two different
+		argument positions can easily reveal the SAME class specialization
+		through different representations (e.g. one from an already-
+		monomorphized receiver, another built fresh via _get_or_create_
+		specialization from an annotation) - see Monomorphizer.origin_of's
+		own docstring for why a Specialization and its monomorphized form
+		aren't always identity-equal even though they mean the same thing '''
+		if a is b:
+			return True
+		a_spec = self._as_specialization( a )
+		b_spec = self._as_specialization( b )
+		return a_spec is not None and a_spec is b_spec
+
 	def _result_shape( self, t: Type|None ) -> tuple[Type,Type]|None:
 		''' (T, E) if `t` is Result[T,E], else None. '''
 		result_cls = self.discovery.find_name_or_none( 'Result' )
-		if result_cls is None or not ( isinstance( t, Specialization ) and t.base is result_cls and len( t.args ) == 2 ):
+		spec = self._as_specialization( t )
+		if result_cls is None or not ( spec is not None and spec.base is result_cls and len( spec.args ) == 2 ):
 			return None
-		return t.args[0], t.args[1]
+		return spec.args[0], spec.args[1]
 
 	def _tagged_union_shape( self, t: Type|None ) -> tuple[TaggedUnion,list[Variable]]|None:
 		''' (abstract base, substituted member list) or None if t isn't
@@ -379,12 +418,13 @@ class TypeResolver:
 
 	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, alternatives: str, fn: Function|None = None ) -> None:
 		return_type = fn.return_type if fn is not None else None
+		spec = self._as_specialization( return_type )
 		ok = (
 			fn is not None
-			and isinstance( return_type, Specialization )
-			and return_type.base is result_cls
-			and len( return_type.args ) == 2
-			and return_type.args[1] is error_cls
+			and spec is not None
+			and spec.base is result_cls
+			and len( spec.args ) == 2
+			and spec.args[1] is error_cls
 		)
 		if not ok:
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
@@ -1001,16 +1041,16 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		return [ bindings[id(tv)] for tv in type_params ]
 
 	def _try_resolve_generic_construction( self, node: ast.Call, target_cls: object, init: object ) -> tuple[RCClass,Function]|None:
-		''' Foo(...) where Foo is a generic RCClass with a plain, non-
-		fallible __init__ and no base class - the construction analogue
-		of _try_resolve_generic_call, mirroring Lowering._lower_generic_
-		construction_args's own inference (unify the class's own type
-		params from the constructor's arguments, via the same _infer_
-		generic_args this pass already uses for generic function calls -
-		see its own comment on being generalized over an explicit
-		type_params list for exactly this reason). expected_type-based
-		pinning is deliberately NOT replicated here - this pass has no
-		expected-type context threaded through it at all (visit_Call
+		''' Foo(...) where Foo is a generic RCClass with a plain __init__
+		(fallible - returns Result[None,_] - or not) and no base class -
+		the construction analogue of _try_resolve_generic_call, mirroring
+		Lowering._lower_generic_construction_args's own inference (unify
+		the class's own type params from the constructor's arguments, via
+		the same _infer_generic_args this pass already uses for generic
+		function calls - see its own comment on being generalized over an
+		explicit type_params list for exactly this reason). expected_type-
+		based pinning is deliberately NOT replicated here - this pass has
+		no expected-type context threaded through it at all (visit_Call
 		never receives one), unlike lowering's own two-phase strategy - a
 		construction inferable ONLY from expected_type, never from any
 		argument, is simply left for lowering's existing, still fully
@@ -1018,19 +1058,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		_try_resolve_generic_call throughout: explicit-subscript
 		construction (Box[i32](...)) isn't even resolvable by name lookup
 		today (_try_resolve_callable_namespace has no Subscript-over-a-
-		class handling), and a fallible/overloaded __init__, a class with
-		a base, or no __init__ at all (bare field=value sugar) are all
-		left untouched too - none of those are this pass's to resolve.
-		Takes target_cls/init already resolved by visit_Call's own
-		caller, rather than re-resolving them here, since that lookup
-		has to happen unconditionally anyway (see visit_Call's own
-		comment on why - lowering.py's own asserts rely on it) '''
+		class handling), and an overloaded __init__, a class with a base,
+		a malformed __init__ return type (neither None nor Result[None,_] -
+		left for lowering's own _init_fallibility to report), or no
+		__init__ at all (bare field=value sugar) are all left untouched
+		too - none of those are this pass's to resolve. Takes target_cls/
+		init already resolved by visit_Call's own caller, rather than
+		re-resolving them here, since that lookup has to happen
+		unconditionally anyway (see visit_Call's own comment on why -
+		lowering.py's own asserts rely on it) '''
 		if not isinstance( target_cls, RCClass ) or not target_cls.type_params or target_cls.base is not None:
 			return None
 		if not isinstance( init, Function ) or init.type_params:
 			return None
-		if init.return_type is not self.discovery.get_none_type():
-			return None # fallible (or malformed) __init__ - out of scope, let lowering's own _init_fallibility/_emit_fallible_construction handle it
+		none_type = self.discovery.get_none_type()
+		if init.return_type is not none_type:
+			# not the plain (non-fallible) shape - only a genuine
+			# Result[None,_] (fallible __init__, SYNTAX.md) is otherwise
+			# acceptable; the tagged callee/construction resolution itself
+			# doesn't care WHICH shape init.return_type has (only lowering.
+			# py's own _init_fallibility/_emit_fallible_construction, run
+			# unchanged against the CONCRETE, substituted init built below,
+			# ever branch on it) - this is purely "is it one of the two
+			# legal shapes, or something malformed lowering should report"
+			shape = self.resolver._result_shape( init.return_type )
+			if shape is None or shape[0] is not none_type:
+				return None
 		args = self._infer_generic_args( node, init, target_cls.type_params, trust_literals = False )
 		if args is None:
 			return None
@@ -1050,12 +1103,21 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return True
 		if any( declared is tv for tv in type_params ):
 			existing = bindings.get( id( declared ))
-			if existing is not None and existing is not actual:
+			# _same_type, not a bare `is` - see Lowering._unify_type_param's
+			# identical comment
+			if existing is not None and existing is not actual and not self.resolver._same_type( existing, actual ):
 				return False
 			bindings[ id( declared )] = actual
 			return True
-		if isinstance( declared, Specialization ) and isinstance( actual, Specialization ) and declared.base is actual.base:
-			return all( self._unify_type_param( type_params, d, a, bindings ) for d, a in zip( declared.args, actual.args ))
+		if isinstance( declared, Specialization ):
+			# _as_specialization, not a bare isinstance(actual, Specialization)
+			# check - actual may already be the real, monomorphized object
+			# itself (not a Specialization wrapper) if substitute_type_params'
+			# own eager-monomorphize step got to it first - see Monomorphizer.
+			# origin_of's own docstring
+			actual_spec = self.resolver._as_specialization( actual )
+			if actual_spec is not None and declared.base is actual_spec.base:
+				return all( self._unify_type_param( type_params, d, a, bindings ) for d, a in zip( declared.args, actual_spec.args ))
 		return True # this parameter position doesn't mention any of type_params - nothing to infer here
 
 	def visit_Call( self, node: ast.Call ) -> ast.Call:

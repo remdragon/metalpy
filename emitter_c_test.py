@@ -982,6 +982,60 @@ class RCClassConstructTests( RCClassTestCase ):
 		init_fns = [ f.function.qualname for f in self.compiler.functions if f.function.qualname.startswith( '__main__.Box.__init__' ) ]
 		self.assertEqual( init_fns, [ '__main__.Box.__init__[intrinsics.i32]' ])
 
+	# regression tests: a fallible __init__ whose ERROR type is itself one
+	# of the class's own type params (Result[None,T], not a fixed
+	# unrelated error class like MyError above) - substituting T for a
+	# concrete type actually changes Result[None,T]'s own args, which
+	# Monomorphizer.substitute_type_params's eager-monomorphize step (see
+	# PLAN_RESOLVE_CLASS_SPECIALIZATIONS.md) then immediately resolves
+	# into a real, concrete TaggedUnion object instead of leaving it a
+	# Specialization - _result_shape/_require_result_return/_unify_type_
+	# param all used to assume a Result-shaped type was ALWAYS still a
+	# bare Specialization, so this used to fail with a spurious "must
+	# return None or Result[None,_]" (or, once that was fixed, "cannot
+	# infer type parameter(s) E", or "inferred as both X and X" -
+	# comparing a bare Specialization against its own already-
+	# monomorphized form by identity) even though init's own return type
+	# is perfectly well-formed
+	_GENERIC_ERROR_TYPE_FIXTURE = '\n'.join([
+		'@union',
+		'class Result[T,E]:',
+		'	Ok: T',
+		'	Err: E',
+		'	def is_ok( self ) -> bool:',
+		'		return self.tag == 0',
+		'	def is_err( self ) -> bool:',
+		'		return self.tag == 1',
+		'',
+		'class Box[T]:',
+		'	v: T',
+		'	def __init__( self, v: T ) -> Result[None,T]:',
+		'		self.v = v',
+		'		return Result.Ok( None )',
+		'',
+	])
+
+	def test_generic_init_construction_error_type_reusing_the_class_own_type_param_compiles( self ) -> None:
+		# non-literal argument - resolved by type_resolver.py's own tagging
+		self._run( self._GENERIC_ERROR_TYPE_FIXTURE + '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 5',
+			'	r: Result[Box[i32],i32] = Box( x )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_generic_init_construction_error_type_reusing_the_class_own_type_param_compiles_via_untagged_fallback( self ) -> None:
+		# literal argument - falls back to lowering.py's own untagged path
+		# (Lowering._lower_generic_construction_args), never tagged by
+		# type_resolver.py at all (trust_literals=False)
+		self._run( self._GENERIC_ERROR_TYPE_FIXTURE + '\n'.join([
+			'def main() -> None:',
+			'	r: Result[Box[i32],i32] = Box( 5 )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_generic_init_construction_uninferable_type_args_is_a_clear_error( self ) -> None:
 		# T genuinely never appears in __init__'s own parameter list here, so
 		# nothing could ever bind it - a clean "cannot infer" error, not a
