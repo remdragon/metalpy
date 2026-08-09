@@ -3804,6 +3804,7 @@ class Tests( unittest.TestCase ):
 			'',
 			'def main() -> None:',
 			'	r = Bar( True )',
+			'	r.is_ok()',
 		])
 		mod = self._import( code )
 		lowered = self.compiler._lower( mod.get_local( 'main' ))
@@ -3926,6 +3927,8 @@ class Tests( unittest.TestCase ):
 			'def main() -> None:',
 			'	ok: Result[i32,MyError] = Result.Ok( 5 )',
 			'	err: Result[i32,MyError] = Result.Err( MyError() )',
+			'	ok.is_ok()',
+			'	err.is_ok()',
 		])
 		mod = self._import( code )
 		self.compiler._lower( mod.get_local( 'main' ))
@@ -4212,6 +4215,309 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( assign.src.value, 42 )
 		from mpy_types import CEnum
 		self.assertIsInstance( assign.src.type, CEnum )
+
+	# --- unchecked Result tracking ------------------------------------------
+
+	def test_unchecked_result_at_return_is_a_compile_error( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	r: Result[i32,MyError] = get()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main() # caught by lower_function's own per-statement recovery - doesn't raise, just records
+		self.assertTrue( any( "'r'" in e and 'never inspected' in e for e in self.discovery.errors.errors ) )
+
+	def test_returning_the_unchecked_result_itself_is_fine( self ) -> None:
+		# "return r transfers the obligation to the caller" - v1 scope cut
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> Result[i32,MyError]:',
+			'	r: Result[i32,MyError] = get()',
+			'	return r',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_overwriting_unchecked_result_is_a_compile_error( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	r: Result[i32,MyError] = get()',
+			'	r = get()',
+			'	r.is_ok()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( "'r'" in e and 'discarded' in e for e in self.discovery.errors.errors ) )
+
+	def test_del_unchecked_result_is_a_compile_error( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	r: Result[i32,MyError] = get()',
+			'	del r',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( "'r'" in e and 'discarded via del' in e for e in self.discovery.errors.errors ) )
+
+	def test_is_ok_clears_the_result( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	r: Result[i32,MyError] = get()',
+			'	r.is_ok()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_match_clears_the_original_name_not_just_the_synthetic_subject( self ) -> None:
+		# regression test for the false-positive the naive match desugaring
+		# would otherwise produce: match r: rewrites to __match_subj_N = r;
+		# if ... - without the is_match_subject/match_clears_name fix, the
+		# synthetic __match_subj_N would itself become a phantom tracked
+		# obligation nothing ever clears, AND the original r would never
+		# get cleared either (ordinary aliasing assignment doesn't propagate
+		# a clear back to its source)
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	r: Result[i32,MyError] = get()',
+			'	match r:',
+			'		case Result.Ok( v ):',
+			'			x: i32 = v',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_bare_result_returning_call_statement_is_a_compile_error( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	get()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'discarded' in e for e in self.discovery.errors.errors ) )
+
+	def test_one_branch_checks_other_doesnt_is_a_compile_error( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	c: bool',
+			'	r: Result[i32,MyError] = get()',
+			'	if c:',
+			'		r.is_ok()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'inspected on one branch' in e for e in self.discovery.errors.errors ) )
+
+	def test_branch_confined_fresh_result_never_checked_is_a_compile_error( self ) -> None:
+		# NOT in the plan's original validation table - required by the
+		# feature's own goal: a Result introduced fresh inside just one
+		# non-terminating branch and left unchecked at that branch's own
+		# join point is about to go out of scope right there
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	c: bool',
+			'	if c:',
+			'		r: Result[i32,MyError] = get()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( "'r'" in e and 'never inspected' in e for e in self.discovery.errors.errors ) )
+
+	def test_result_with_no_rc_leaves_is_still_tracked( self ) -> None:
+		# regression test: cfg.py's bindings/rc_leaves machinery is RC-only
+		# by design ("invisible here" per the module docstring) - the
+		# unchecked-Result set must be tracked independent of that gate, or
+		# a Result[i32,SomeScalarError] (the common shape) would never be
+		# checked at all
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'@cstruct',
+			'class MyError:',
+			'	code: i32',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	r: Result[i32,MyError] = get()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( "'r'" in e and 'never inspected' in e for e in self.discovery.errors.errors ) )
+
+	def test_result_fresh_every_loop_iteration_never_checked_is_a_compile_error( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	a: bool',
+			'	while a:',
+			'		r: Result[i32,MyError] = get()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( "'r'" in e and 'produced fresh every loop iteration' in e for e in self.discovery.errors.errors ) )
+
+	# --- known v1 gaps -------------------------------------------------------
+	#
+	# Each test below documents a real, currently-unclosed hole in the
+	# unchecked-Result check (found and deliberately scoped out while
+	# building it, not discovered later) by asserting today's actual
+	# (wrong) behavior - discovery.errors.errors == [] where the feature's
+	# own stated goal says it should NOT be empty. If one of these ever
+	# starts failing on its own (errors show up where the assertion says
+	# there are none), that's the gap closing - update the test to assert
+	# the new, correct error instead of loosening/deleting it.
+
+	def test_gap_break_can_silently_discard_a_result_the_fallthrough_path_checks( self ) -> None:
+		# r is discarded on the break path (never reaches r.is_ok(), which
+		# only the non-break path executes) - but loop_back_edge()'s own
+		# fresh-in-loop check only ever looks at self._unchecked_results at
+		# the END of lowering the loop body's text, which - since break
+		# doesn't mutate cfg state at all (see unwind_to()'s own docstring)
+		# - reflects the FALL-THROUGH path's state (r cleared by the
+		# trailing is_ok()), not the break path's. Neither unwind_to() nor
+		# _stmt_Break/_stmt_Continue currently call check_unchecked_results
+		# at all - v1 scope cut, see loop_back_edge()'s own docstring in
+		# cfg.py
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	a: bool',
+			'	c: bool',
+			'	while a:',
+			'		r: Result[i32,MyError] = get()',
+			'		if c:',
+			'			break',
+			'		r.is_ok()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] ) # should NOT be empty - the break path never checks r
+
+	def test_gap_checked_arithmetic_overflow_can_silently_discard_an_unrelated_result( self ) -> None:
+		# a +check+ b's own overflow-triggered OrReturn (_consume_checked_
+		# result, shared with or_return()'s own early-exit) is a second,
+		# separate function-exit point exactly like or_return()'s - but only
+		# _lower_or_return calls check_unchecked_results before its own
+		# exit; _emit_checked_op/_consume_checked_result don't carry an ast
+		# node to attach a discovery.fail() location to, and threading one
+		# through was scoped out (see _lower_or_return's own comment).
+		# r's own is_ok() below runs UNCONDITIONALLY in the compile-time
+		# model (checked arithmetic's OrReturn isn't a real _stmt_If/
+		# merge_if branch - it's raw IR with no CFG-visible branching at
+		# all), so it clears r regardless of whether the overflow check
+		# actually reaches it at runtime
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'class OverflowError: pass',
+			'',
+			'def get() -> Result[i32,MyError]:',
+			'	pass',
+			'',
+			'def checked( a: i32, b: i32 ) -> Result[i32,OverflowError]:',
+			'	r: Result[i32,MyError] = get()',
+			'	x: i32 = a + b',
+			'	r.is_ok()',
+			'	return Result.Ok( x )',
+		])
+		self._import( code )
+		fn = self.discovery.modules['__test__'].get_local( 'checked' )
+		if fn.resolve is not None:
+			fn.resolve()
+		self.compiler._lower( fn )
+		self.assertEqual( self.discovery.errors.errors, [] ) # should NOT be empty - the overflow path never checks r
+
+	def test_gap_receiver_based_generic_method_call_bypasses_the_discard_check( self ) -> None:
+		# the discard-check (task 7) only lives in _lower_call's shared tail
+		# (the branch a plain Function target, or an Overload resolved to
+		# one unambiguous implementation, reaches) - a generic METHOD called
+		# through a receiver whose type isn't known until lowering (Box's
+		# own local `b` here) is left untagged by type_resolver.py's own
+		# pre-pass (see type_resolver_test.py's own
+		# test_generic_call_on_receiver_local_is_left_untagged) and routes
+		# through _lower_class_generic_method_call/_emit_generic_call
+		# instead, which has its own, separate want_result-gated emission
+		# that was never given the same check
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'',
+			'class Box:',
+			'	def get[T]( self, x: T ) -> Result[T,MyError]:',
+			'		pass',
+			'',
+			'def main() -> None:',
+			'	b: Box',
+			'	n: i32 = 5',
+			'	b.get( n )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] ) # should NOT be empty - b.get(n)'s Result is silently discarded
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )

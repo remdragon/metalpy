@@ -1406,6 +1406,23 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subj_name = f'__match_subj_{unique}'
 		subj_assign = ast.Assign( targets = [ ast.Name( id = subj_name, ctx = ast.Store() ) ], value = self.generic_visit_expr( node.subject ))
 		ast.copy_location( subj_assign, node )
+		# two attributes lowering.py's own _stmt_Assign reads (getattr(...,
+		# default), same bridging technique visit_Call's own resolved_callee
+		# already uses) - see cfg.py's unchecked-Result tracking. Always set
+		# is_match_subject: __match_subj_N is compiler-internal scaffolding
+		# that the if-chain below only ever reads via raw tag Compares
+		# (never is_ok()/is_err()/etc), so if it were tracked like an
+		# ordinary Result-typed local, nothing would ever clear it and every
+		# match over a Result would falsely report an unchecked result.
+		# match_clears_name is set only when the subject is a bare Name:
+		# ordinary aliasing assignment deliberately does NOT propagate a
+		# clear back to its source (see cfg.py's "Independent tracking"),
+		# but `match r:` genuinely IS the inspection of r itself, so the
+		# original name needs an explicit clear here that a plain alias
+		# assign wouldn't give it for free
+		subj_assign.is_match_subject = True
+		if isinstance( node.subject, ast.Name ):
+			subj_assign.match_clears_name = node.subject.id
 		subj_ref = ast.Name( id = subj_name, ctx = ast.Load() )
 		ast.copy_location( subj_ref, node )
 

@@ -971,6 +971,7 @@ class RCClassConstructTests( RCClassTestCase ):
 			'',
 			'def main() -> None:',
 			'	r: Result[Box[i32],MyError] = Box( 1 )',
+			'	r.is_ok()',
 			'	return',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -1021,6 +1022,7 @@ class RCClassConstructTests( RCClassTestCase ):
 			'def main() -> None:',
 			'	x: i32 = 5',
 			'	r: Result[Box[i32],i32] = Box( x )',
+			'	r.is_ok()',
 			'	return',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -1032,6 +1034,7 @@ class RCClassConstructTests( RCClassTestCase ):
 		self._run( self._GENERIC_ERROR_TYPE_FIXTURE + '\n'.join([
 			'def main() -> None:',
 			'	r: Result[Box[i32],i32] = Box( 5 )',
+			'	r.is_ok()',
 			'	return',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )

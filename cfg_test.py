@@ -501,6 +501,127 @@ def foo() -> None:
 		self.assertEqual( false_instrs, [] )
 		self.assertEqual( removed, [] )
 
+# --- unchecked Result tracking -------------------------------------------
+
+class ResultMergeTests( CFGTestBase ):
+	''' merge_if()'s/loop_back_edge()'s own results-set reconciliation,
+	tested directly against CFGState the same way IfMergeTests/LoopTests
+	test the RC side - track_result()/clear_result() called directly rather
+	than through assign(), since only the reconciliation logic itself is
+	under test here (see lowering_test.py's UncheckedResultTests for the
+	real assign()/is_ok()/match end-to-end integration). '''
+
+	def setUp( self ) -> None:
+		super().setUp()
+		self._import( '''
+@union
+class Result[T,E]:
+	Ok: T
+	Err: E
+
+def foo() -> None:
+	pass
+''' )
+		self.state = self._state( self._fn( 'foo' ))
+
+	def test_both_branches_still_unchecked_stays_unchecked( self ) -> None:
+		entry = self.state.snapshot()
+		self.state.track_result( 'r' )
+		true_end_results = self.state.unchecked_results()
+		self.state.restore( entry )
+		self.state.track_result( 'r' )
+		false_end_results = self.state.unchecked_results()
+		self.state.restore( entry )
+		self.state.merge_if(
+			{}, {}, {}, 'foo',
+			entry_results = { 'r' }, true_end_results = true_end_results, false_end_results = false_end_results,
+		)
+		self.assertEqual( self.state.unchecked_results(), { 'r' } )
+
+	def test_one_branch_checks_other_doesnt_raises( self ) -> None:
+		entry = self.state.snapshot()
+		self.state.track_result( 'r' )
+		entry_results = self.state.unchecked_results()
+		self.state.clear_result( 'r' ) # true branch checks it
+		true_end_results = self.state.unchecked_results()
+		self.state.restore( entry )
+		self.state.track_result( 'r' ) # false branch leaves it alone (still unchecked)
+		false_end_results = self.state.unchecked_results()
+		self.state.restore( entry )
+		with self.assertRaises( CompileError ) as ctx:
+			self.state.merge_if(
+				{}, {}, {}, 'foo',
+				entry_results = entry_results, true_end_results = true_end_results, false_end_results = false_end_results,
+			)
+		self.assertIn( 'inspected on one branch but not the other', str( ctx.exception ))
+
+	def test_fresh_on_one_branch_never_checked_raises( self ) -> None:
+		# NOT the plan's own "one branch checks, other doesn't" case - r
+		# never existed before the if at all here, confined to the true
+		# branch and left unchecked at ITS OWN join point
+		entry = self.state.snapshot()
+		self.state.track_result( 'r' )
+		true_end_results = self.state.unchecked_results()
+		self.state.restore( entry )
+		false_end_results = self.state.unchecked_results() # empty - r never mentioned
+		with self.assertRaises( CompileError ) as ctx:
+			self.state.merge_if(
+				{}, {}, {}, 'foo',
+				entry_results = set(), true_end_results = true_end_results, false_end_results = false_end_results,
+			)
+		self.assertIn( 'never inspected', str( ctx.exception ))
+
+	def test_both_terminate_resets_to_empty( self ) -> None:
+		self.state.track_result( 'r' ) # leftover from whatever the terminating branches did - must not leak past the if
+		self.state.merge_if(
+			{}, {}, {}, 'foo',
+			entry_results = set(), true_end_results = { 'r' }, false_end_results = set(),
+			true_terminates = True, false_terminates = True,
+		)
+		self.assertEqual( self.state.unchecked_results(), set() )
+
+	def test_one_terminates_survivor_results_win( self ) -> None:
+		self.state.track_result( 'stale' ) # simulates leftover tracking from the terminating branch's own trailing code
+		self.state.merge_if(
+			{}, {}, {}, 'foo',
+			entry_results = set(), true_end_results = { 'stale' }, false_end_results = { 'r' },
+			true_terminates = True,
+		)
+		self.assertEqual( self.state.unchecked_results(), { 'r' } ) # only the non-terminating (false) branch's own results reach the join
+
+class ResultLoopTests( CFGTestBase ):
+
+	def setUp( self ) -> None:
+		super().setUp()
+		self._import( '''
+@union
+class Result[T,E]:
+	Ok: T
+	Err: E
+
+def foo() -> None:
+	pass
+''' )
+		self.state = self._state( self._fn( 'foo' ))
+
+	def test_fresh_every_iteration_never_checked_raises( self ) -> None:
+		entry = self.state.snapshot()
+		self.state.track_result( 'r' ) # r = get() inside the loop body, never checked
+		with self.assertRaises( CompileError ) as ctx:
+			self.state.loop_back_edge( {}, 'foo', entry_results = entry.results )
+		self.assertIn( 'produced fresh every loop iteration', str( ctx.exception ))
+
+	def test_checked_entering_not_reassigned_is_allowed( self ) -> None:
+		# r unchecked entering the loop, checked somewhere inside the body,
+		# never reassigned after - no runtime code depends on this being
+		# stable across iterations (unlike RC's OwnState), so this must NOT
+		# raise the way an analogous RC state mismatch would
+		self.state.track_result( 'r' )
+		entry = self.state.snapshot()
+		self.state.clear_result( 'r' )
+		instrs = self.state.loop_back_edge( {}, 'foo', entry_results = entry.results )
+		self.assertEqual( instrs, [] )
+
 # --- loops ---------------------------------------------------------------
 
 class LoopTests( CFGTestBase ):

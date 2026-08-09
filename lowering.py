@@ -300,6 +300,19 @@ class Lowering:
 					if self._construction_self is not None:
 						self._complete_construction_or_fail( fn )
 
+					# validated unconditionally, whether or not the body
+					# actually falls off the end for real: if every path
+					# already returned explicitly, merge_if()'s own
+					# terminates-reconciliation has already left
+					# self._unchecked_results correctly empty/reconciled by
+					# this point (and each individual `return` already ran
+					# this same check at its own point), so this is a no-op
+					# in that case - not a second, redundant error source
+					try:
+						self._cfg.check_unchecked_results( None )
+					except CompileError as e:
+						self.discovery.fail( str( e ), fn.node )
+
 					if self._cfg.current_epilogue_label() is not None:
 						# some return (or OrJump) already jumped into the
 						# shared epilogue ladder (_stmt_Return/_consume_checked_
@@ -596,6 +609,10 @@ class Lowering:
 			# the whole capture, not just the top-level statement
 			self.discovery.fail( f'return is not allowed inside a defer/errdefer body: {ast.unparse(node)}', node )
 		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
+		try:
+			self._cfg.check_unchecked_results( value )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
 		if self._construction_self is not None:
 			# every return in a non-fallible __init__ is unconditionally
 			# success (construction_fallible is False, so the `and` below
@@ -662,7 +679,11 @@ class Lowering:
 		existing = fn.names.get( target.id )
 		if not isinstance( existing, Variable ):
 			self.discovery.fail( f'{target.id!r} is not a local variable, cannot del it', node )
-		for instr in self._cfg.deleted( existing ):
+		try:
+			instructions = self._cfg.deleted( existing )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
+		for instr in instructions:
 			self._emit( instr )
 		del fn.names[target.id]
 
@@ -726,6 +747,19 @@ class Lowering:
 		# revisit this once one does
 		return isinstance( node, ( ast.Name, ast.Attribute ))
 
+	def _cfg_assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, node: ast.AST, track_result: bool = True ) -> list[ir.Instruction]:
+		# thin wrapper around cfg.assign() - now that it can raise
+		# CompileError (see cfg.py's own unchecked-Result overwrite check),
+		# every one of its 7 call sites needs the same discovery.fail()
+		# conversion _stmt_If/loop_back_edge's own call sites already use,
+		# or the raised-but-unrecorded error would just be silently
+		# swallowed by the nearest enclosing per-statement `except
+		# CompileError: continue` recovery boundary
+		try:
+			return self._cfg.assign( dest, src, is_alias = is_alias, track_result = track_result )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
+
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
 		if not isinstance( node.target, ast.Name ):
 			self.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
@@ -742,7 +776,7 @@ class Lowering:
 		self.schedule( var_type )
 		if node.value is not None:
 			operand = self._lower_expr( node.value, var_type )
-			for instr in self._cfg.assign( var, operand, is_alias = self._is_aliasing_expr( node.value )):
+			for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value ), node = node ):
 				self._emit( instr )
 			self._emit( ir.Assign( dest = var, src = operand ))
 
@@ -756,7 +790,7 @@ class Lowering:
 				if not isinstance( existing, Variable ):
 					self.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 				operand = self._lower_expr( node.value, existing.type )
-				for instr in self._cfg.assign( existing, operand, is_alias = self._is_aliasing_expr( node.value )):
+				for instr in self._cfg_assign( existing, operand, is_alias = self._is_aliasing_expr( node.value ), node = node ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = existing, src = operand ))
 			else:
@@ -774,9 +808,24 @@ class Lowering:
 				)
 				fn.add_name( var.stem, var )
 				self.schedule( var.type )
-				for instr in self._cfg.assign( var, operand, is_alias = self._is_aliasing_expr( node.value )):
+				# type_resolver.py's visit_Match desugars `match r:` into
+				# `__match_subj_N = r; if ...` and marks the synthesized
+				# Assign with these two attributes (see its own comment) -
+				# is_match_subject means the fresh __match_subj_N temp must
+				# never itself become a tracked obligation (the if-chain
+				# below only does raw tag Compares, never is_ok()/is_err(),
+				# so nothing would ever clear it); match_clears_name carries
+				# the ORIGINAL name through when the subject was a bare Name
+				# - ordinary aliasing assignment deliberately does NOT clear
+				# the source (see cfg.py's "Independent tracking"), but a
+				# match statement genuinely IS the inspection of its subject
+				is_match_subject = getattr( node, 'is_match_subject', False )
+				for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value ), node = node, track_result = not is_match_subject ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
+				match_clears_name = getattr( node, 'match_clears_name', None )
+				if match_clears_name is not None:
+					self._cfg.clear_result( match_clears_name )
 		elif isinstance( target, ast.Attribute ):
 			obj = self._lower_expr( target.value, None )
 			attr_var = self._attr_lookup( obj.type, target.attr, target )
@@ -1299,7 +1348,7 @@ class Lowering:
 		loop_snapshot = self._cfg.snapshot()
 		self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname )
+			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
 			self.discovery.fail( str( e ), node )
 		for instr in back_edge_instructions:
@@ -1474,7 +1523,7 @@ class Lowering:
 		loop_snapshot = self._cfg.snapshot()
 		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname )
+			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
 			self.discovery.fail( str( e ), node )
 		for instr in back_edge_instructions:
@@ -1549,7 +1598,7 @@ class Lowering:
 
 		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname )
+			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
 			self.discovery.fail( str( e ), node )
 		for instr in back_edge_instructions:
@@ -1588,6 +1637,7 @@ class Lowering:
 				continue
 		true_captured = self._instructions
 		true_end = dict( self._cfg.bindings )
+		true_end_results = self._cfg.unchecked_results()
 		# return/break/continue as a branch's own last statement means
 		# that branch never reaches the if's join point at all - see
 		# merge_if()'s own comment on why that has to be treated
@@ -1606,10 +1656,12 @@ class Lowering:
 					continue
 			false_captured = self._instructions
 			false_end = dict( self._cfg.bindings )
+			false_end_results = self._cfg.unchecked_results()
 			false_terminates = bool( node.orelse ) and isinstance( node.orelse[-1], ( ast.Return, ast.Break, ast.Continue ))
 		else:
 			false_captured = []
 			false_end = dict( entry_snapshot.bindings )
+			false_end_results = set( entry_snapshot.results )
 			false_terminates = False
 
 		self._cfg.restore( entry_snapshot )
@@ -1617,6 +1669,7 @@ class Lowering:
 		try:
 			true_extra, false_extra, removed = self._cfg.merge_if(
 				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
+				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
 				true_terminates = true_terminates, false_terminates = false_terminates,
 			)
 		except CompileError as e:
@@ -2624,14 +2677,22 @@ class Lowering:
 		init_result = self._new_temp( init.return_type )
 		self._emit( ir.Call( dest = init_result, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
 
+		# track_result=False throughout this method's own hidden locals -
+		# result_var/dest_var are compiler-internal Result-typed scaffolding
+		# (see cfg.assign()'s own comment): result_var's is_err-ness is
+		# already unconditionally checked right below by the synthesized
+		# branch itself (that's the whole point of this method), and
+		# dest_var is just a relay for whichever of ok_value/err_value wins -
+		# the REAL obligation lands on whatever binding the OUTER `Foo(...)`
+		# expression's own result gets assigned into, tracked normally there
 		unique = self._label_id
 		self_var = self._declare_hidden_local( f'__ctor_self_{unique}', concrete_cls, node )
-		for instr in self._cfg.assign( self_var, self_temp, is_alias = False ):
+		for instr in self._cfg_assign( self_var, self_temp, is_alias = False, node = node, track_result = False ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = self_var, src = self_temp ))
 
 		result_var = self._declare_hidden_local( f'__ctor_result_{unique}', init.return_type, node )
-		for instr in self._cfg.assign( result_var, init_result, is_alias = False ):
+		for instr in self._cfg_assign( result_var, init_result, is_alias = False, node = node, track_result = False ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = result_var, src = init_result ))
 
@@ -2664,7 +2725,7 @@ class Lowering:
 		)
 		ast.copy_location( ok_expr, node )
 		ok_value = self._lower_expr( ok_expr, outer_result_type )
-		for instr in self._cfg.assign( dest_var, ok_value, is_alias = False ):
+		for instr in self._cfg_assign( dest_var, ok_value, is_alias = False, node = node, track_result = False ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = dest_var, src = ok_value ))
 		self._emit( ir.Jump( target = end_label ))
@@ -2683,7 +2744,7 @@ class Lowering:
 		)
 		ast.copy_location( err_expr, node )
 		err_value = self._lower_expr( err_expr, outer_result_type )
-		for instr in self._cfg.assign( dest_var, err_value, is_alias = False ):
+		for instr in self._cfg_assign( dest_var, err_value, is_alias = False, node = node, track_result = False ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = dest_var, src = err_value ))
 		self._emit( ir.Label( name = end_label ))
@@ -2728,6 +2789,7 @@ class Lowering:
 		return dest
 
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
+	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
 
 	def _lower_or_return( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
 		# <result_expr>.or_return() is recognized textually here rather than
@@ -2754,6 +2816,24 @@ class Lowering:
 		# identical comment on why
 		result_cls = self.discovery.find_name( 'Result', node )
 		self._type_resolver._require_result_return( node, result_cls, error_cls, self._OR_RETURN_ALTERNATIVES, fn = self._current_fn )
+		if isinstance( receiver, Variable ):
+			self._cfg.clear_result( receiver.stem ) # or_return() IS the inspection of receiver - clear it before the exit-path check below, or it'd wrongly flag itself
+		# or_return()'s Err path is a second, separate function-exit point
+		# alongside plain `return` (see _consume_checked_result, right
+		# below) - anything else still unchecked at this point would be
+		# silently discarded exactly like falling off the end unchecked
+		# would be, so it gets the same validation. NOTE: checked-arithmetic
+		# (a +check+ b) shares _consume_checked_result's own OrReturn/OrJump
+		# emission for its own overflow-triggered early return, but isn't
+		# covered here - _emit_checked_op/_consume_checked_result don't
+		# currently carry an ast node to attach a discovery.fail() location
+		# to, and threading one through is out of scope for this pass. v1
+		# gap: a checked-arithmetic overflow can still silently discard an
+		# unrelated unchecked Result elsewhere in the same function
+		try:
+			self._cfg.check_unchecked_results( None )
+		except CompileError as e:
+			self.discovery.fail( str( e ), node )
 		unwrapped = self._consume_checked_result( receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
@@ -3003,6 +3083,21 @@ class Lowering:
 		if receiver is not None:
 			self.schedule( receiver.type )
 
+		if isinstance( target, ( Function, Overload )) and target.stem in self._RESULT_CONSUMING_METHODS and isinstance( receiver, Variable ):
+			# .is_ok()/.is_err()/.unwrap(msg)/.unwrap_or(default) - like
+			# or_return() above, these aren't given their own IR shape;
+			# they're ordinary method dispatch (unwrap_or in particular
+			# resolves through the Overload branch below, for its `default:
+			# T` stub), so recognition has to happen here by stem + class
+			# identity rather than at a single shared call site the way
+			# or_return's own _lower_or_return is. Placed before any of the
+			# dispatch branches below (rather than only in the plain-
+			# Function "final else" tail) so it applies uniformly regardless
+			# of which branch actually ends up lowering the call
+			target_cls_base = target.cls.base if isinstance( target.cls, Specialization ) else target.cls
+			if target_cls_base is self.discovery.find_name( 'Result', node ):
+				self._cfg.clear_result( receiver.stem )
+
 		if isinstance( target, _ReceiverDispatch ):
 			return self._lower_union_receiver_call( node, target, receiver, expected_type, want_result )
 
@@ -3108,6 +3203,25 @@ class Lowering:
 		self.schedule( target.return_type )
 		for param in target.parameters or []:
 			self.schedule( param.type )
+
+		if not want_result and cfg.is_result_type( target.return_type ):
+			# a bare `foo()` statement whose return value is a Result -
+			# _stmt_Expr is the only caller that ever passes want_result=
+			# False for a call used as a full statement (every other
+			# _lower_call caller threads want_result through from ITS OWN
+			# caller instead), so this is the "value produced, immediately
+			# discarded, never even bound to a name" case from the plan's
+			# validation table. v1 gap: this only covers calls that reach
+			# this shared tail (plain Function targets, and Overload targets
+			# that resolve to one unambiguous implementation without needing
+			# _lower_conditional_dispatch) - a bare-statement call to a
+			# GENERIC Result-returning function/method, or one requiring
+			# runtime union-argument dispatch, isn't covered
+			self.discovery.fail(
+				f'{target.qualname}(...) returns a Result that is discarded here - '
+				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
+				node,
+			)
 
 		if want_result:
 			dest = self._new_temp( expected_type or target.return_type )

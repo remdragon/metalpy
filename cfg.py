@@ -112,6 +112,7 @@ class _Snapshot:
 	orchestration lowering.py performs around branches/loop bodies. '''
 	bindings: Bindings
 	stack_depth: int
+	results: set[str]
 
 class CFGState:
 	''' one instance per function being lowered. `bindings` is public and
@@ -136,6 +137,7 @@ class CFGState:
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
 		self.bindings: Bindings = {}
+		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
 		self.prologue_instructions: list[ir.Instruction] = []
 		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
@@ -219,7 +221,7 @@ class CFGState:
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
 
 	def snapshot( self ) -> _Snapshot:
-		return _Snapshot( bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ))
+		return _Snapshot( bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ))
 
 	def restore( self, snap: _Snapshot ) -> None:
 		''' truncates back to the snapshot's own depth for ordinary (RC)
@@ -229,17 +231,92 @@ class CFGState:
 		cleanup always runs at the FUNCTION's own shared epilogue, no matter
 		which branch (if any) armed it - the flag alone decides whether it
 		actually replays - so it has to survive this truncation instead of
-		being discarded with the branch's own locals. '''
+		being discarded with the branch's own locals. _unchecked_results is
+		reverted the same way bindings is - unconditionally, even for a loop
+		body that provably checked something inside it: a while-loop's body
+		may run zero times, so anything only checked INSIDE the body can't be
+		assumed checked once we're back outside it (see loop_back_edge()). '''
 		self.bindings = dict( snap.bindings )
+		self._unchecked_results = set( snap.results )
 		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
+
+	# --- unchecked Result tracking ----------------------------------------
+
+	def track_result( self, name: str ) -> None:
+		''' called whenever a Result[T,E]-typed value is bound to a local
+		(see assign()) - `name` now owes an inspection before it can be
+		overwritten, del'd, or the function can exit while it's still live.
+		Independent of RC tracking entirely - unlike self.bindings, this
+		applies even to a Result whose T/E are both plain scalars/enums (no
+		RC leaves at all), which is the common shape. '''
+		self._unchecked_results.add( name )
+
+	def clear_result( self, name: str ) -> None:
+		''' called wherever a Result binding gets genuinely inspected -
+		.is_ok()/.is_err()/.or_return()/.unwrap(msg)/.unwrap_or(default), or
+		being the subject of a match. A plain discard - safe to call on a
+		name that was never tracked (not a Result, or already checked). '''
+		self._unchecked_results.discard( name )
+
+	def is_unchecked( self, name: str ) -> bool:
+		return name in self._unchecked_results
+
+	def unchecked_results( self ) -> set[str]:
+		''' a defensive copy for lowering.py to snapshot alongside bindings
+		around if/loop orchestration (see merge_if()/loop_back_edge()) -
+		mirrors dict(self.bindings) being taken at the same call sites. '''
+		return set( self._unchecked_results )
+
+	def check_unchecked_results( self, returned_operand: ir.Operand | None ) -> None:
+		''' called at every real function-exit point: each `return`
+		statement, the function's own fall-off-the-end, and or_return()'s/
+		checked-arithmetic's own early-return-on-Err path (see lowering.py's
+		_consume_checked_result) - raises if anything is still owed.
+		Deliberately NOT folded into return_() itself: most returns route
+		through current_epilogue_label()'s shared-ladder Jump instead of
+		calling return_() inline (see its own docstring), so a check placed
+		only inside return_() would silently skip every return that also has
+		an RC decref or defer/errdefer pending - a very common combination.
+		returned_operand is excluded by name (not identity - a returned
+		Result has no epilogue entry to compare against) when it's a
+		Variable: `return r` transfers the obligation to the CALLER, it's
+		not this function's to discharge (v1 scope cut, see the plan).
+
+		Always clears _unchecked_results entirely before returning OR
+		raising - unlike return_() on the RC side, which deliberately
+		leaves self.bindings untouched (no code follows a return on that
+		path, so nothing needs it to look any particular way). This one
+		DOES need to mutate, unconditionally: it's called at points other
+		than a genuine, unnested, function-ending return too - a `return`
+		inside a loop body or an if-branch leaves the rest of that lowering
+		pass (loop_back_edge()'s own fresh-in-loop check, or this same
+		method called again later at the function's own fall-off point)
+		still looking at whatever was live right before the return. Without
+		clearing on the RAISE path too, the fall-off point's own call would
+		re-discover the exact same already-reported problem and raise a
+		SECOND time - this one uncaught (it runs after lower_function's own
+		per-statement recovery loop has already finished), crashing the
+		compiler instead of just recording one clean error. '''
+		excluded = returned_operand.stem if isinstance( returned_operand, Variable ) else None
+		remaining = self._unchecked_results - ( { excluded } if excluded is not None else set() )
+		self._unchecked_results = set()
+		if remaining:
+			names = ', '.join( repr( n ) for n in sorted( remaining ))
+			plural = len( remaining ) > 1
+			raise CompileError(
+				f"Result value{'s' if plural else ''} {names} {'were' if plural else 'was'} never inspected - "
+				f"use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
+			)
 
 	# --- IF/ELSE/ENDIF -----------------------------------------------------
 
 	def merge_if(
 		self, entry_bindings: Bindings, true_end: Bindings, false_end: Bindings, ctx: str,
-		*, true_terminates: bool = False, false_terminates: bool = False,
+		*,
+		entry_results: set[str] = frozenset(), true_end_results: set[str] = frozenset(), false_end_results: set[str] = frozenset(),
+		true_terminates: bool = False, false_terminates: bool = False,
 	) -> tuple[list[ir.Instruction],list[ir.Instruction],list[str]]:
 		''' called after lowering.py has already restore()'d back to the
 		if's own entry snapshot (so self.bindings/self._epilogue_stack are
@@ -294,7 +371,18 @@ class CFGState:
 		instead (an if/else where a local declared before it survives
 		untouched, the single most common shape there is). Only a name
 		that's genuinely new to the stack (never in entry_bindings, or
-		re-pushed after being del'd and reassigned) needs a real push. '''
+		re-pushed after being del'd and reassigned) needs a real push.
+
+		entry_results/true_end_results/false_end_results are the unchecked-
+		Result analogue of entry_bindings/true_end/false_end - captured by
+		lowering.py via unchecked_results() at the same three points it
+		already captures dict(self.bindings) - and are reconciled by
+		_merge_results() below, mutating self._unchecked_results directly
+		(mirroring reestablish()'s direct self.bindings mutation above). Kept
+		as a separate parallel set rather than folded into Bindings/_Binding
+		because a Result[i32,SomeEnum] has no RC leaves and so has no entry
+		in Bindings at all (see assign()'s own comment) - Bindings is an
+		RC-only mechanism by design. '''
 		true_instructions: list[ir.Instruction] = []
 		false_instructions: list[ir.Instruction] = []
 		removed: list[str] = []
@@ -310,15 +398,23 @@ class CFGState:
 
 		if true_terminates or false_terminates:
 			survivor = None
+			survivor_results = None
 			if true_terminates and not false_terminates:
 				survivor = false_end
+				survivor_results = false_end_results
 			elif false_terminates and not true_terminates:
 				survivor = true_end
+				survivor_results = true_end_results
 			if survivor is not None:
 				for name, binding in survivor.items():
 					prior = entry_bindings.get( name )
 					already_live = prior is not None and prior.entry is binding.entry
 					reestablish( name, binding, already_live )
+			# both terminate -> nothing reaches the join at all (dead code
+			# past here, same reasoning as the RC side above) - empty is the
+			# safe choice; one terminates -> only the survivor's own results
+			# state can possibly reach the join
+			self._unchecked_results = set( survivor_results ) if survivor_results is not None else set()
 			return true_instructions, false_instructions, removed
 		for name in set( true_end ) | set( false_end ):
 			in_true = name in true_end
@@ -353,11 +449,42 @@ class CFGState:
 			else:
 				false_instructions += decref
 			removed.append( name )
+		self._merge_results( entry_results, true_end_results, false_end_results, ctx )
 		return true_instructions, false_instructions, removed
+
+	def _merge_results( self, entry_results: set[str], true_end_results: set[str], false_end_results: set[str], ctx: str ) -> None:
+		''' the unchecked-Result analogue of merge_if()'s own binding
+		reconciliation, for the neither-branch-terminates case (the
+		terminates case is handled directly in merge_if() - only the
+		survivor's own results state matters there, same as for bindings).
+		Unlike OwnState (4 possible states, needs an equality check),
+		"unchecked" is a plain presence/absence - the only two interesting
+		outcomes per name are "still unchecked on both branches" (stays
+		live) and "unchecked on exactly one branch" (an error, in both
+		flavors: a pre-existing Result checked on only one side, per the
+		plan's own validation table, and a Result introduced fresh inside
+		just one branch and left unchecked at that branch's own join point -
+		NOT in the original table, but required by the feature's own goal:
+		that branch-confined binding is about to go out of scope right here,
+		same as reaching `return` while unchecked. '''
+		merged: set[str] = set()
+		for name in true_end_results | false_end_results:
+			in_true = name in true_end_results
+			in_false = name in false_end_results
+			if in_true and in_false:
+				merged.add( name )
+				continue
+			if name in entry_results:
+				raise CompileError( f"{ctx}: Result {name!r} was inspected on one branch but not the other" )
+			raise CompileError(
+				f"{ctx}: Result value {name!r} was never inspected before going out of scope at the end of its branch - "
+				f"use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
+			)
+		self._unchecked_results = merged
 
 	# --- loops ---------------------------------------------------------------
 
-	def loop_back_edge( self, entry_bindings: Bindings, ctx: str ) -> list[ir.Instruction]:
+	def loop_back_edge( self, entry_bindings: Bindings, ctx: str, *, entry_results: set[str] | None = None ) -> list[ir.Instruction]:
 		''' called after lowering the loop body once (hooks mutated
 		self.bindings/self._epilogue_stack live throughout) - compares
 		entry_bindings (snapshot from before the body) against the current
@@ -371,7 +498,27 @@ class CFGState:
 		right before the Jump back to the loop's start. Caller still needs
 		to restore() back to the entry snapshot afterward (this method
 		doesn't mutate state itself, matching merge_if's split of
-		responsibilities). '''
+		responsibilities).
+
+		entry_results (unchecked-Result analogue of entry_bindings) is
+		checked for exactly one thing, deliberately NOT the full stability
+		check bindings get above: a Result name absent from entry_results
+		but present in self._unchecked_results now (i.e. produced fresh
+		SOMEWHERE inside the loop body and still unchecked at the back edge)
+		is a real bug - every iteration silently overwrites the previous
+		one's unchecked Result via the same, once-lowered assign. The
+		REVERSE direction (unchecked entering, checked somewhere in the
+		body, never reassigned after) is deliberately NOT flagged: unlike
+		OwnState, "checked" has no runtime representation and no generated
+		code depends on it being stable across iterations - the only actual
+		soundness concern is restore()'s own job (a while-loop may run zero
+		times, so nothing checked only inside the body can be assumed
+		checked once back outside it), not this method's. break/continue
+		early exits aren't covered here either (v1 scope cut - unlike
+		bindings, which unwind_to() handles for RC purposes, no equivalent
+		exists yet for Results; a Result assigned earlier in a loop body and
+		discarded via an early continue/break before ever being checked
+		currently slips through uncaught). '''
 		back_edge = self.bindings
 		instructions: list[ir.Instruction] = []
 		for name in set( entry_bindings ) | set( back_edge ):
@@ -389,6 +536,14 @@ class CFGState:
 			binding = back_edge[name]
 			if binding.state in ( OwnState.OWNED, OwnState.COPY ):
 				instructions += self._decref_instructions( binding.type, binding.operand )
+		if entry_results is not None:
+			fresh_and_unchecked = self._unchecked_results - entry_results
+			if fresh_and_unchecked:
+				name = sorted( fresh_and_unchecked )[0]
+				raise CompileError(
+					f"{ctx}: Result value {name!r} is produced fresh every loop iteration but never inspected "
+					f"before the next iteration overwrites it - use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
+				)
 		return instructions
 
 	def unwind_to( self, snap: _Snapshot ) -> list[ir.Instruction]:
@@ -580,7 +735,7 @@ class CFGState:
 
 	# --- assignment: fresh / aliasing / replace, all in one -----------------
 
-	def assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool ) -> list[ir.Instruction]:
+	def assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, track_result: bool = True ) -> list[ir.Instruction]:
 		''' called right before lowering.py emits `ir.Assign(dest=dest,
 		src=src)` (or the Allocate/Call/GetAttr that IS the fresh value, for
 		an AnnAssign's own initializer) - returns instructions to emit
@@ -588,7 +743,27 @@ class CFGState:
 		reference to an ALREADY-LIVE binding (a plain Name/GetAttr read) and
 		needs an Incref; False means `src` is a freshly-produced value
 		(Allocate, or a Call returning an RC type) that's already a fresh
-		owned handoff, needing none. '''
+		owned handoff, needing none.
+
+		The unchecked-Result bookkeeping below runs BEFORE the rc_leaves()
+		early-exit further down, deliberately: a Result[i32,SomeEnum] (no RC
+		leaves at all) must still be tracked, and self.bindings/rc_leaves are
+		an RC-only mechanism (see the module docstring - "invisible here").
+		track_result=False opts a specific destination out of ever becoming
+		a tracked obligation - used for compiler-synthesized locals whose
+		Result-ness is scaffolding, not something user code is expected to
+		inspect itself (the match-statement subject temp, and the hidden
+		locals _emit_fallible_construction threads a fallible __init__'s
+		Result through - see their own lowering.py call sites). '''
+		if dest.stem in self._unchecked_results:
+			raise CompileError(
+				f"Result value {dest.stem!r} is discarded - it was never inspected: "
+				f"use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
+			)
+		if track_result and is_result_type( dest.type ):
+			self.track_result( dest.stem )
+		else:
+			self.clear_result( dest.stem )
 		if not rc_leaves( dest.type ):
 			return []
 		instructions: list[ir.Instruction] = []
@@ -743,7 +918,16 @@ class CFGState:
 	def deleted( self, variable: Variable ) -> list[ir.Instruction]:
 		''' called for `del x` (see lowering.py's _stmt_Delete) - returns
 		the Decref to emit right there (if x was OWNED/COPY), and
-		neutralizes its epilogue entry so it's never decref'd again. '''
+		neutralizes its epilogue entry so it's never decref'd again.
+		Independent-of-RC unchecked-Result check first, same reasoning as
+		assign()'s own early check - del'ing a still-unchecked Result is
+		exactly the "discarded via del" table entry, regardless of whether
+		its type has any RC leaves at all. '''
+		if variable.stem in self._unchecked_results:
+			raise CompileError(
+				f"Result value {variable.stem!r} is discarded via del - it was never inspected: "
+				f"use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
+			)
 		binding = self.bindings.pop( variable.stem, None )
 		if binding is None or binding.entry is None:
 			return []
