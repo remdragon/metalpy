@@ -2530,6 +2530,12 @@ class Lowering:
 		return self._type_resolver._attr_lookup_callable( owner_type, attr, ctx )
 
 	def _match_call_args( self, target: Function, call: ast.Call ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
+		if target.parameters is None:
+			# target's own parameter resolution already failed (and recorded
+			# an error - see discovery.py's _resolve_guarded/_make_function_
+			# resolver, which can leave .parameters at its None default) -
+			# fail cleanly here instead of crashing below on `for p in None`
+			self.discovery.fail( f'{target.qualname} could not be resolved (see earlier error): {ast.unparse(call)}', call )
 		if any( isinstance( a, ast.Starred ) for a in call.args ):
 			self.discovery.fail( f'*args not supported yet: {ast.unparse(call)}', call )
 		if any( kw.arg is None for kw in call.keywords ):

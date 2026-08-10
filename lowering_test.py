@@ -2602,6 +2602,30 @@ class Tests( unittest.TestCase ):
 
 	# --- calls ---------------------------------------------------------------
 
+	def test_call_to_function_with_broken_parameters_fails_cleanly( self ) -> None:
+		# helper's own parameter resolution fails (missing annotation on
+		# 'x'), which raises CompileError partway through discovery.py's
+		# _make_function_resolver body - before fn.parameters is ever
+		# assigned, so it's left at its None default. discovery.py's
+		# _resolve_guarded swallows that CompileError so helper's own
+		# broken definition is reported once, not re-raised - but that
+		# used to leave any CALLER of helper crashing with an unhandled
+		# TypeError ('NoneType' object is not iterable) inside
+		# _match_call_args, instead of just reporting a second, clean
+		# compile error here at the call site
+		code = '\n'.join([
+			'def helper( x ) -> i32:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	helper( 5 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( "helper parameter 'x' has no type annotation", self.discovery.errors.errors[0] )
+		self.assertIn( 'helper could not be resolved', self.discovery.errors.errors[1] )
+
 	def test_call_free_function_positional_and_keyword( self ) -> None:
 		code = '\n'.join([
 			'def foo( x: i32, y: i32 = 2 ) -> None:',
