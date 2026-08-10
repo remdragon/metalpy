@@ -822,6 +822,66 @@ class Foo:
 		foo.resolve()
 		self.assertIn( 'only supported on @interface classes', self.discovery.errors.errors[0] )
 
+	def test_bare_interface_type_rejected_as_parameter( self ) -> None:
+		# an @interface CStruct is never a plain value type - self is
+		# always Ptr[T] (see PLAN_SUBCLASSING_VTABLES_COM.md's REVISION).
+		# Construction never produces a bare value, but a bare-typed
+		# annotation was still syntactically legal and reachable through
+		# Ptr[T]'s own [0] escape hatch - confirmed to crash the compiler
+		# outright rather than fail gracefully, before this check existed.
+		mod = self._import( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self ) -> i32: ...
+
+def call_through_base( f: IFoo ) -> i32:
+	return f.get_value()
+''' )
+		fn = mod.get_local( 'call_through_base' )
+		fn.resolve()
+		self.assertIn( 'can never be a plain value type', self.discovery.errors.errors[0] )
+
+	def test_bare_interface_type_rejected_as_return_type( self ) -> None:
+		mod = self._import( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self ) -> i32: ...
+
+def make_foo() -> IFoo: ...
+''' )
+		fn = mod.get_local( 'make_foo' )
+		fn.resolve()
+		self.assertIn( 'can never be a plain value type', self.discovery.errors.errors[0] )
+
+	def test_bare_interface_type_rejected_as_variable_annotation( self ) -> None:
+		mod = self._import( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self ) -> i32: ...
+
+x: IFoo = None
+''' )
+		x = mod.get_local( 'x' )
+		x.resolve()
+		self.assertIn( 'can never be a plain value type', self.discovery.errors.errors[0] )
+
+	def test_ptr_interface_type_still_allowed( self ) -> None:
+		mod = self._import( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self ) -> i32: ...
+
+def make_foo() -> Ptr[IFoo]: ...
+y: Ptr[IFoo] = None
+''' )
+		mod.get_local( 'make_foo' ).resolve()
+		mod.get_local( 'y' ).resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 
 class FunctionParameterTests( unittest.TestCase ):
 	''' full ast.arguments coverage - stage 2 needs the kind flags plus `default` to bind keyword/optional call-site arguments down to positional ones '''

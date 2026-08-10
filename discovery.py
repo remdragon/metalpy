@@ -694,9 +694,35 @@ class Discovery( ast.NodeVisitor ):
 			with self.module_context( module ):
 				with ( self.scope_context( scope ) if scope is not module else nullcontext() ):
 					var_obj.type = self.visit( annotation )
+					self._reject_bare_interface_value_type( var_obj.type, annotation, var_obj.qualname )
 		def resolve() -> None:
 			self._resolve_guarded( var_obj, body )
 		return resolve
+
+	def _reject_bare_interface_value_type( self, t: 'Type|None', node: ast.AST, context: str ) -> None:
+		''' an @interface CStruct is never a plain value type - self,
+		locals, parameters, return types are all Ptr[T]/ConstPtr[T],
+		never bare T (see PLAN_SUBCLASSING_VTABLES_COM.md's REVISION).
+		Construction never produces a bare value anymore (always Ptr[T] -
+		see lowering.py's _lower_allocate_fields), but a bare-typed
+		annotation was still syntactically legal and reachable through
+		Ptr[T]'s own [0] escape hatch (p[0] genuinely does produce a bare
+		CStruct value) - confirmed to CRASH the compiler outright (an
+		internal assertion in emitter_c.py's _emit_self_operand, which
+		assumes every @interface CStruct method's receiver is already
+		Ptr[T]) rather than fail gracefully, once such a bare value was
+		passed to a bare-typed parameter and a method called on it.
+		Rejected here instead, at every real value-type-annotation site
+		(parameters, return types, variables/attributes) - self is exempt
+		(never reaches these call sites at all: add_param skips it
+		entirely, matching ordinary Python's own implicit self typing;
+		its own Ptr[T] type is set up separately, in lowering.py). '''
+		if isinstance( t, CStruct ) and t.is_interface:
+			self.fail(
+				f'{context}: {t.qualname} is an @interface CStruct - it can never be a plain value type, '
+				f'only Ptr[{t.stem}]/ConstPtr[{t.stem}]: {ast.unparse(node)}',
+				node,
+			)
 
 	def visit_Assign( self, node: ast.Assign ) -> Name|None:
 		scope = self.scope_stack[-1]
@@ -1444,12 +1470,14 @@ class Discovery( ast.NodeVisitor ):
 								return
 							if arg.annotation is None:
 								self.fail( f'{fn.qualname} parameter {arg.arg!r} has no type annotation', arg )
+							param_type = self.visit( arg.annotation )
+							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
 								stem = arg.arg,
 								qualname = self._get_qualname( arg.arg ),
 								file = fn.file,
 								line = fn.line,
-								type = self.visit( arg.annotation ),
+								type = param_type,
 								default = default,
 								**kind,
 							)
@@ -1475,7 +1503,11 @@ class Discovery( ast.NodeVisitor ):
 							add_param( args.kwarg, None, is_kwarg = True )
 
 						fn.parameters = parameters
-						fn.return_type = self.visit( fn.node.returns ) if fn.node.returns is not None else self.get_none_type()
+						if fn.node.returns is not None:
+							fn.return_type = self.visit( fn.node.returns )
+							self._reject_bare_interface_value_type( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
+						else:
+							fn.return_type = self.get_none_type()
 			# set self done *before* touching any overload siblings below - a
 			# sibling's own resolve may need to cross-check back against fn,
 			# and seeing fn.resolve is None already tells it not to re-enter
