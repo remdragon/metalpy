@@ -15,6 +15,22 @@ from mpy_types import (
 	Module, _is_covered_by, _overlaps,
 )
 
+def is_stub_body( body: list[ast.stmt] ) -> bool:
+	''' a bodyless `...`-only declaration - @overload's own stub convention,
+	reused elsewhere for "this signature has no real implementation yet"
+	(e.g. an @interface CStruct's own unfulfilled @virtual slot - see
+	PLAN_SUBCLASSING_VTABLES_COM.md). Module-level (not just Discovery's own
+	_is_stub_body method, which now just forwards here) so other modules
+	(lowering.py, emitter_c.py) can reuse it without needing a Discovery
+	instance - same "shared pure helper" convention as mpy_types.py's own
+	_is_covered_by/_overlaps. '''
+	return (
+		len( body ) == 1
+		and isinstance( body[0], ast.Expr )
+		and isinstance( body[0].value, ast.Constant )
+		and body[0].value.value is Ellipsis
+	)
+
 class CompilerModule( Module ):
 	' TODO FIXME: put target object here and anything else needed'
 
@@ -1264,6 +1280,12 @@ class Discovery( ast.NodeVisitor ):
 			# and @virtual on a plain (non-@interface) class/CStruct would be
 			# silently meaningless rather than a real error, which is worse
 			self.fail( f'@virtual {qualname} is only supported on @interface classes right now', node )
+		if is_virtual and is_overload:
+			# combining the two is a real, separate design question (which
+			# overload's signature does the vtable slot use? does each
+			# overload get its own slot?) that this plan never addressed -
+			# reject rather than silently building something half-right
+			self.fail( f'@virtual {qualname} cannot also be @overload - not supported', node )
 
 		module = self.module_stack[-1]
 		fn = Function(
@@ -1345,12 +1367,7 @@ class Discovery( ast.NodeVisitor ):
 		return fn
 
 	def _is_stub_body( self, body: list[ast.stmt] ) -> bool:
-		return (
-			len( body ) == 1
-			and isinstance( body[0], ast.Expr )
-			and isinstance( body[0].value, ast.Constant )
-			and body[0].value.value is Ellipsis
-		)
+		return is_stub_body( body )
 
 	def _bind_overload_stub( self, stub: Function, group: Overload ) -> None:
 		# a stub has no body of its own - it must resolve to exactly one plain

@@ -5,7 +5,7 @@ import queue
 
 # local imports:
 import ir
-from discovery import Discovery
+from discovery import Discovery, is_stub_body
 from errors import CompileError
 from lowering import Lowering
 from mpy_types import Module, Function, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization
@@ -146,6 +146,9 @@ class Compiler:
 			elif isinstance( monomorphized, CStruct ):
 				if monomorphized.base is not None:
 					self._enqueue( monomorphized.base )
+				if monomorphized.is_interface:
+					self._validate_interface_vtable( monomorphized )
+					self._schedule_interface_vtable_impls( monomorphized )
 				self.cstructs.append( monomorphized )
 			elif isinstance( monomorphized, CUnion ):
 				self.cunions.append( monomorphized )
@@ -180,6 +183,9 @@ class Compiler:
 				self.lowering._ensure_resolved( attr )
 			if unit.base is not None: # @interface subclass - base interface needs to be a real compile unit too (its Vtbl type is what $vtable actually points to), same as RCClass.base above
 				self._enqueue( unit.base )
+			if unit.is_interface:
+				self._validate_interface_vtable( unit )
+				self._schedule_interface_vtable_impls( unit )
 			self.cstructs.append( unit )
 			return unit
 		elif isinstance( unit, CUnion ):
@@ -210,6 +216,82 @@ class Compiler:
 			return lg
 		else:
 			assert False, f'unsupported compile unit: {unit!r}'
+
+	def _validate_interface_vtable( self, cls: CStruct ) -> None:
+		''' every @virtual method on an @interface CStruct must either BE a
+		root-declared slot (cls IS the root - nothing to check, its own
+		@virtual methods ARE the slot definitions) or OVERRIDE one (name +
+		strict signature match against the root's own slot of that name) -
+		since a subclass's own $vtable field is fixed to the ROOT's Vtbl
+		type (see PLAN_SUBCLASSING_VTABLES_COM.md's Layout section /
+		CStruct.interface_root), only the root can introduce a genuinely
+		NEW slot. Runs once per real (non-generic) @interface CStruct
+		compile unit, here rather than discovery.py, because checking an
+		override's signature needs the OVERRIDDEN root slot's own
+		parameters/return_type already resolved, which isn't guaranteed
+		yet at discovery-time parse order (a subclass can be parsed before
+		its base's own methods are individually resolved). '''
+		root = cls.interface_root()
+		if cls is root:
+			return
+		root_slots = { m.stem: m for m in cls.virtual_slots() }
+		for m in cls.methods:
+			if not ( isinstance( m, Function ) and m.is_virtual ):
+				continue
+			if m.resolve is not None:
+				m.resolve()
+			slot = root_slots.get( m.stem )
+			if slot is None:
+				self.disco.fail(
+					f'{m.qualname}: new @virtual methods can only be declared on the interface root '
+					f'({root.qualname}) - {cls.qualname} can only override an existing slot',
+					m.node,
+				)
+				continue
+			if slot.resolve is not None:
+				slot.resolve()
+			if not self._virtual_signatures_match( m, slot ):
+				self.disco.fail(
+					f"{m.qualname}: @virtual override does not match {slot.qualname}'s signature "
+					f'(strict signature matching required - no covariance/contravariance)',
+					m.node,
+				)
+
+	def _virtual_signatures_match( self, a: Function, b: Function ) -> bool:
+		if a.return_type is not b.return_type:
+			return False
+		a_params = a.parameters or []
+		b_params = b.parameters or []
+		if len( a_params ) != len( b_params ):
+			return False
+		return all( ap.type is bp.type for ap, bp in zip( a_params, b_params ))
+
+	def _schedule_interface_vtable_impls( self, cls: CStruct ) -> None:
+		# every slot's ACTUAL implementing Function (found by walking cls's
+		# own chain, nearest override wins) needs to be a real, lowered
+		# compile unit - it might only ever be reached through vtable
+		# dispatch (emitter_c.py's own static vtable instance references it
+		# by mangled name directly, never through an ordinary call site the
+		# ordinary schedule()-on-reference path would already have caught).
+		# Skipped entirely if any slot is unfulfilled (a stub body,
+		# lowering.py's own construction-time check already rejects
+		# actually building one) - matches emitter_c.py's own identical
+		# "None if any slot is unfulfilled" gate for whether to emit a
+		# static vtable instance for this class at all, so the two stay in
+		# lockstep: this schedules exactly the set of functions that
+		# emission will end up referencing by name.
+		impls: list[Function] = []
+		for slot in cls.virtual_slots():
+			impl = cls.chain_lookup( slot.stem )
+			if not isinstance( impl, Function ):
+				return
+			if impl.resolve is not None:
+				impl.resolve()
+			if is_stub_body( impl.node.body ):
+				return
+			impls.append( impl )
+		for impl in impls:
+			self._enqueue( impl )
 
 if __name__ == '__main__':
 	Discovery.log_unhandled = False # enable for discovery debugging

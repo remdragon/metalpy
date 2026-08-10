@@ -6,6 +6,7 @@ import re
 # local imports:
 import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
+from discovery import is_stub_body
 from mpy_types import (
 	CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, Variable,
@@ -748,9 +749,9 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
 	return '->' if isinstance( base, RCClass ) else '.'
 
-def _emit_self_operand( receiver: ir.Operand, target_cls: ClassLike|None ) -> str:
+def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 	''' an inherited (non-@virtual) CStruct method's `self` parameter is
-	declared with the ANCESTOR class's own struct type (c_type(target_cls),
+	declared with the ANCESTOR class's own struct type (c_type(target.cls),
 	matching _function_prototype's own `self` spelling) - CStruct methods
 	take self BY VALUE (unlike RCClass, always a pointer), so passing a
 	DERIVED-typed value directly where C expects the ancestor's struct type
@@ -764,8 +765,27 @@ def _emit_self_operand( receiver: ir.Operand, target_cls: ClassLike|None ) -> st
 	so &(...) is always a real C lvalue. Only CStruct needs this: RCClass's
 	self is already a pointer (trivially covariant via a plain cast), and
 	RCClass doesn't have base-chain method lookup wired yet (see
-	PLAN_SUBCLASSING_VTABLES_COM.md - deferred). '''
+	PLAN_SUBCLASSING_VTABLES_COM.md - deferred).
+
+	A @virtual call is different again: the concrete callee is decided at
+	RUNTIME (whichever class's static instance $vtable actually points at -
+	see emit_interface_vtable_instance), so there's no single ancestor type
+	to narrow to at the call site the way an ordinary inherited call can -
+	every vtable slot's function-pointer type takes self as `const
+	RootType*` (_vtable_slot_c_type), regardless of which override
+	statically resolved the call (target.cls might be a subclass's own
+	override, not the root) - the trampoline itself does the narrowing
+	back down to the concrete implementing class internally, so the call
+	site just needs the receiver's address, cast to the ROOT's own pointer
+	type (a plain pointer reinterpretation - safe, and needed to avoid an
+	"incompatible pointer types" warning/UB when target.cls is actually a
+	subclass, not the root itself). '''
 	receiver_text = _emit_operand( receiver )
+	if target.is_virtual:
+		assert isinstance( target.cls, CStruct )
+		root = target.cls.interface_root()
+		return f'(const {c_type(root)}*)&({receiver_text})'
+	target_cls = target.cls
 	if (
 		isinstance( target_cls, CStruct )
 		and isinstance( receiver.type, CStruct )
@@ -778,7 +798,7 @@ def _emit_call_args( instr: ir.Call ) -> list[str]:
 	params = instr.target.parameters or []
 	values: list[str] = []
 	if instr.receiver is not None:
-		values.append( _emit_self_operand( instr.receiver, instr.target.cls ))
+		values.append( _emit_self_operand( instr.receiver, instr.target ))
 	positional = list( instr.args )
 	for i, param in enumerate( params ):
 		if i < len( positional ):
@@ -932,8 +952,17 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		if function is not None and function.is_destructor and target_name == mangle_qualname( 'sys.free' ):
 			for i, a in enumerate( arg_texts ):
 				arg_texts[i] = f'(void*)({a})'
-		has_args = bool( arg_texts )
-		call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
+		if instr.target.is_virtual:
+			# vtable dispatch, not a direct call - _emit_self_operand already
+			# put &(receiver) at arg_texts[0]; the receiver's own $vtable
+			# field (typed const RootVtbl* - see emit_cstruct) already IS the
+			# right pointer type, no cast needed at this call site
+			assert instr.receiver is not None # is_virtual only ever set on real instance methods - see discovery.py's _parse_function
+			slot_name = _field_name( instr.target.stem )
+			call_expr = f'({_emit_operand(instr.receiver)}).$vtable->{slot_name}( {", ".join(arg_texts)} )'
+		else:
+			has_args = bool( arg_texts )
+			call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
 		if instr.dest is not None:
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
 		return [ f'\t{call_expr};' ]
@@ -1014,10 +1043,19 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# nothing here re-validates that - discovery/lowering already did)
 		ctype = c_type( instr.dest.type )
 		dest = _emit_operand( instr.dest )
-		if not instr.fields:
+		field_init_strs = [ f'.{_field_name(name)} = {_emit_operand(value)}' for name, value in instr.fields.items() ]
+		if isinstance( instr.cls, CStruct ) and instr.cls.is_interface:
+			# every constructed @interface CStruct wires its own $vtable to
+			# its OWN static instance (never a base's - each concrete class
+			# gets its own set of trampolines pointing at ITS OWN slot
+			# implementations, see emit_interface_vtable_instance) -
+			# lowering.py's construction-time check already guarantees this
+			# class's vtable is fully fulfilled before an Allocate for it is
+			# ever emitted, so the symbol referenced here is always real
+			field_init_strs.insert( 0, f'.$vtable = &{mangle_type(instr.cls)}$$vtable' )
+		if not field_init_strs:
 			return [ f'\t{dest} = ({ctype}){{0}};' ] # empty {} isn't valid standard C11
-		field_inits = ', '.join( f'.{_field_name(name)} = {_emit_operand(value)}' for name, value in instr.fields.items() )
-		return [ f'\t{dest} = ({ctype}){{ {field_inits} }};' ]
+		return [ f'\t{dest} = ({ctype}){{ {", ".join(field_init_strs)} }};' ]
 
 	if isinstance( instr, ir.OrReturn ):
 		return _emit_or_return( instr, function )
@@ -1266,20 +1304,111 @@ def _iter_instruction_operands( instr: ir.Instruction ) -> list[ir.Operand]:
 			operands.extend( v for v in value.values() if isinstance( v, ( ir.Const, ir.Temp, Variable )))
 	return operands
 
-def _interface_root( cls: CStruct ) -> CStruct:
-	''' walk to the top of an @interface CStruct's single-inheritance chain -
-	that root is what actually declares the vtable's C type (see
-	_interface_vtbl_name) - @interface subclasses inherit the SAME $vtable
-	field type unchanged, they never get their own (PLAN_SUBCLASSING_
-	VTABLES_COM.md's own Layout example types every level's $vtable as
-	`const IFooVtbl*`, never a per-subclass FooImplVtbl) '''
-	node = cls
-	while node.base is not None:
-		node = node.base
-	return node
-
 def _interface_vtbl_name( cls: CStruct ) -> str:
-	return f'{mangle_type(_interface_root(cls))}Vtbl'
+	# @interface subclasses inherit the SAME $vtable field type as their
+	# root, unchanged - never a per-subclass FooImplVtbl (PLAN_SUBCLASSING_
+	# VTABLES_COM.md's own Layout example types every level's $vtable as
+	# `const IFooVtbl*`) - see CStruct.interface_root's own docstring
+	return f'{mangle_type(cls.interface_root())}Vtbl'
+
+def _vtable_slot_c_type( root: CStruct, slot: Function ) -> tuple[str,list[str]]:
+	''' the function-pointer type for one vtable slot - self is always a
+	POINTER to the ROOT's own struct type (unlike an ordinary CStruct
+	method, which takes self by value - see emit_cstruct/c_type's own
+	"CStruct is a plain value" rule). A vtable slot has to be ONE C type
+	shared by every override sharing that slot (a function pointer field
+	can only ever hold one type), so self can't be typed per-override the
+	way an ordinary method's self is - only a pointer lets the SAME field
+	type work for every concrete implementation, each internally
+	reinterpreting the pointer back to its own real struct type (see
+	_emit_vtable_trampoline). '''
+	if slot.resolve is not None:
+		slot.resolve()
+	ret = 'void' if _returns_void_in_c( slot.return_type ) else c_type( slot.return_type )
+	params = [ f'const {c_type(root)}* self' ]
+	for p in ( slot.parameters or [] ):
+		params.append( f'{c_type(p.type)} {_c_local_name(p.stem)}' )
+	return ret, params
+
+def emit_interface_vtbl_struct( root: CStruct ) -> str:
+	# the FULL vtable struct body - one function-pointer field per slot
+	# (root.virtual_slots(), declaration order - see CStruct.virtual_slots'
+	# own docstring on why only the root ever contributes slots). Function-
+	# pointer fields only ever reference OTHER structs by pointer, never by
+	# value, so this needs no forward-declared tags of its own - C's
+	# implicit "first pointer mention forward-declares an incomplete
+	# struct" rule already covers self's own `const RootStruct*` (see
+	# PLAN_SUBCLASSING_VTABLES_COM.md's own worked example, which has no
+	# separate forward-declare step for this reason either).
+	name = _interface_vtbl_name( root )
+	slots = root.virtual_slots()
+	lines = [ f'typedef struct {name} {{' ]
+	if not slots:
+		lines.append( '\tchar dummy;' ) # MSVC (and pedantic C) reject empty structs - same convention as _struct_or_union_body
+	for slot in slots:
+		ret, params = _vtable_slot_c_type( root, slot )
+		lines.append( f'\t{ret} (*{_field_name(slot.stem)})( {", ".join(params)} );' )
+	lines.append( f'}} {name};' )
+	return '\n'.join( lines )
+
+def _interface_fulfilled_slot_impls( cls: CStruct ) -> list[Function]|None:
+	''' the ordered per-slot implementing Function for a CONCRETE @interface
+	CStruct (nearest override in cls's own chain, or the root's own
+	declaration if never overridden) - None if ANY slot is unfulfilled (a
+	stub body) anywhere in the chain, meaning cls is a "pure interface"
+	role that never gets a static vtable instance at all (matches
+	compiler.py's _schedule_interface_vtable_impls and lowering.py's
+	construction-time check - all three have to agree on exactly which
+	classes are "complete", so this recomputes the identical walk rather
+	than trusting a cache that could drift out of sync). '''
+	impls: list[Function] = []
+	for slot in cls.virtual_slots():
+		impl = cls.chain_lookup( slot.stem )
+		if not isinstance( impl, Function ):
+			return None
+		if impl.resolve is not None:
+			impl.resolve()
+		if is_stub_body( impl.node.body ):
+			return None
+		impls.append( impl )
+	return impls
+
+def _vtable_trampoline_name( cls: CStruct, slot: Function ) -> str:
+	return f'{mangle_type(cls)}$$vtable$${_field_name(slot.stem)}'
+
+def emit_interface_vtable_instance( cls: CStruct ) -> str|None:
+	''' one thin trampoline per slot (pointer self -> narrows to the
+	IMPLEMENTING class's own by-value type -> forwards to the real,
+	ordinarily-declared-by-value method - same value-narrowing-cast
+	posture as _emit_self_operand, just with the pointer already in hand
+	instead of needing &self) plus the static const vtable instance
+	itself, wiring each slot to its own trampoline. None (no instance
+	built) if cls's vtable isn't fully fulfilled - see
+	_interface_fulfilled_slot_impls. '''
+	slot_impls = _interface_fulfilled_slot_impls( cls )
+	if slot_impls is None:
+		return None
+	root = cls.interface_root()
+	lines: list[str] = []
+	field_inits: list[str] = []
+	for slot, impl in zip( cls.virtual_slots(), slot_impls ):
+		trampoline_name = _vtable_trampoline_name( cls, slot )
+		ret, params = _vtable_slot_c_type( root, slot )
+		impl_args = [ f'*(const {c_type(impl.cls)}*)self' ]
+		for p in ( slot.parameters or [] ):
+			impl_args.append( _c_local_name( p.stem ))
+		call_expr = f'{mangle_qualname(impl.qualname)}( {", ".join(impl_args)} )'
+		lines.append( f'static {ret} {trampoline_name}( {", ".join(params)} ) {{' )
+		lines.append( f'\treturn {call_expr};' if not _returns_void_in_c( slot.return_type ) else f'\t{call_expr};' )
+		lines.append( '}' )
+		field_inits.append( f'.{_field_name(slot.stem)} = {trampoline_name}' )
+	vtbl_type = _interface_vtbl_name( cls )
+	instance_name = f'{mangle_type(cls)}$$vtable'
+	if field_inits:
+		lines.append( f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};' )
+	else:
+		lines.append( f'static const {vtbl_type} {instance_name} = {{0}};' )
+	return '\n'.join( lines )
 
 def emit_cstruct( cls: CStruct ) -> str:
 	attrs: list[tuple[str,Type]]
@@ -1479,20 +1608,37 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	for cls in compiler.rcclasses:
 		if not cls.type_params:
 			parts.append( f'struct {mangle_type(cls)};' )
-	# @interface CStructs' $vtable field points at the Vtbl struct type
-	# (see emit_cstruct/_interface_vtbl_name) before that struct's own full
-	# body exists (Phase 2 work) - an opaque forward tag is enough for a
-	# pointer field, same "forward-declare before any prototype/body can
-	# reference it" reasoning as the RCClass tags just above. Only interface
-	# ROOTS get a typedef (every subclass in the chain shares its root's
-	# $vtable type - see _interface_root) - dict used as an insertion-
-	# ordered dedup set, same convention as elsewhere in this module.
-	vtbl_names: dict[str,None] = {}
+	# every @interface CStruct gets the SAME forward tag treatment as
+	# RCClass above, for the SAME reason (confirmed by a real clang error,
+	# not just theory: "incompatible pointer types", "will not be visible
+	# outside of this function") - the Vtbl struct's own `self` parameter,
+	# the trampolines' own narrowing casts, and any ordinary function
+	# taking/returning one of these by value or pointer all mention the
+	# struct tag well before its own full body exists (emitted later, in
+	# _emit_value_type_bodies) - unlike a PLAIN CStruct, which is never
+	# used as a pointer/prototype-parameter type before its full body is
+	# needed anyway (a plain CStruct is only ever passed/returned BY
+	# VALUE, which forces the body to already exist - see c_type), an
+	# @interface CStruct's OWN Vtbl-related machinery references it AS A
+	# POINTER first, triggering the prototype-scope trap RCClass tags
+	# exist to avoid.
 	for cls in compiler.cstructs:
 		if cls.is_interface and not cls.type_params:
-			vtbl_names[ _interface_vtbl_name( cls ) ] = None
-	for vtbl_name in vtbl_names:
-		parts.append( f'typedef struct {vtbl_name} {vtbl_name};' )
+			parts.append( f'struct {mangle_type(cls)};' )
+	# @interface CStructs' $vtable field points at the Vtbl struct type
+	# (see emit_cstruct/_interface_vtbl_name) - its FULL body (one function-
+	# pointer field per slot) is emitted here, early, same "before any
+	# prototype/body can reference it" reasoning as the RCClass tags just
+	# above. Only interface ROOTS get a Vtbl type at all (every subclass in
+	# the chain shares its root's - see CStruct.interface_root) - dict used
+	# as an insertion-ordered dedup set, same convention as elsewhere in
+	# this module.
+	vtbl_roots: dict[str,CStruct] = {}
+	for cls in compiler.cstructs:
+		if cls.is_interface and not cls.type_params:
+			vtbl_roots[ _interface_vtbl_name( cls ) ] = cls.interface_root()
+	for root in vtbl_roots.values():
+		parts.append( emit_interface_vtbl_struct( root ))
 	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
 		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))
@@ -1519,6 +1665,16 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	parts.extend( _emit_string_literals( compiler ))
 	for g in compiler.globals:
 		parts.append( emit_global( g ))
+	# static vtable instances (+ their own trampolines) - only need every
+	# other function's PROTOTYPE (pass 1), not its body, so this can sit
+	# anywhere in pass 3; placed before the real function bodies since
+	# nothing in a function body depends on a vtable instance's own address
+	# existing any earlier than "somewhere in this translation unit"
+	for cls in compiler.cstructs:
+		if cls.is_interface and not cls.type_params:
+			instance_src = emit_interface_vtable_instance( cls )
+			if instance_src is not None:
+				parts.append( instance_src )
 	for lf in compiler.functions:
 		# @extern functions have no body (only a ; declaration in pass 1)
 		if lf.function.extern_lib is None:

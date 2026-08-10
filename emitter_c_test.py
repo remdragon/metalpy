@@ -1958,12 +1958,17 @@ class InterfaceCStructLayoutTests( CompilerTestCase ):
 		self._run( '''
 @interface
 class IFoo:
-	def helper( self ) -> i32: ...
+	@virtual
+	def helper( self, n: i32 ) -> i32: ...
 
 @interface
 class FooImpl( IFoo ):
 	x: i32
 	y: i32
+
+	@virtual
+	def helper( self, n: i32 ) -> i32:
+		return n
 
 def main() -> None:
 	f: FooImpl = FooImpl( x = 1, y = 2 )
@@ -1971,7 +1976,12 @@ def main() -> None:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
-		self.assertIn( 'typedef struct __main__$IFooVtbl __main__$IFooVtbl;', src )
+		self.assertIn(
+			'typedef struct __main__$IFooVtbl {\n'
+			'\tint32_t (*helper)( const struct __main__$IFoo* self, int32_t n );\n'
+			'} __main__$IFooVtbl;',
+			src,
+		)
 		self.assertIn(
 			'struct __main__$IFoo {\n\tconst __main__$IFooVtbl* $vtable;\n};',
 			src,
@@ -2046,6 +2056,113 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_virtual_dispatch_calls_the_override_not_the_stub( self ) -> None:
+		# Phase 2: real vtable dispatch, not a direct call - IFoo's own
+		# get_value is an unfulfilled stub (never emitted as a real C
+		# function - see lowering.py's construction-time check, which
+		# would reject constructing a bare IFoo directly); FooImpl's own
+		# override is what the vtable slot actually points at
+		# (emit_interface_vtable_instance's static instance + trampoline).
+		# Calling through `f.get_value()` on a FooImpl-typed value goes
+		# through `(f).$vtable->get_value(&(f))`, not a direct call to
+		# either function by name (see emitter_c.py's _emit_virtual_call
+		# path in the ir.Call branch) - if dispatch were silently
+		# reverting to a direct static call, this would still pass (the
+		# static target IS the right override already), so the real
+		# assertion is the generated C shape below, not just the exit code.
+		self._run( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self ) -> i32: ...
+
+@interface
+class FooImpl( IFoo ):
+	x: i32
+
+	@virtual
+	def get_value( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	f: FooImpl = FooImpl( x = 99 )
+	direct: i32 = f.get_value()
+	with compiler.wrap_arithmetic:
+		diff: i32 = direct - 99
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( '(f).$vtable->get_value( (const struct __main__$IFoo*)&(f) )', src )
+		self.assertIn(
+			'static const __main__$IFooVtbl __main__$FooImpl$$vtable = { .get_value = __main__$FooImpl$$vtable$$get_value };',
+			src,
+		)
+		self.assertIn( '.$vtable = &__main__$FooImpl$$vtable', src )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_construct_unfulfilled_interface_is_a_compile_error( self ) -> None:
+		# a "pure interface" (any @interface class with an unfulfilled
+		# @virtual slot anywhere in its own chain) is never meant to be
+		# constructed directly - see lowering.py's _lower_allocate_fields
+		self._run( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self ) -> i32: ...
+
+def main() -> None:
+	f: IFoo = IFoo()
+	return
+''' )
+		self.assertIn( 'cannot be constructed', self.discovery.errors.errors[0] )
+
+	def test_new_virtual_slot_below_root_is_a_compile_error( self ) -> None:
+		# FooImpl properly overrides get_value (so the construction-time
+		# fulfillment check - a SEPARATE concern - doesn't mask this one)
+		# but also tries to introduce a brand-new @virtual slot of its own
+		self._run( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self ) -> i32: ...
+
+@interface
+class FooImpl( IFoo ):
+	@virtual
+	def get_value( self ) -> i32:
+		return 1
+
+	@virtual
+	def other( self ) -> i32:
+		return 1
+
+def main() -> None:
+	f: FooImpl = FooImpl()
+	return
+''' )
+		self.assertIn( 'can only be declared on the interface root', self.discovery.errors.errors[0] )
+
+	def test_override_signature_mismatch_is_a_compile_error( self ) -> None:
+		self._run( '''
+@interface
+class IFoo:
+	@virtual
+	def get_value( self, n: i32 ) -> i32: ...
+
+@interface
+class FooImpl( IFoo ):
+	@virtual
+	def get_value( self, n: i64 ) -> i32:
+		return 1
+
+def main() -> None:
+	f: FooImpl = FooImpl()
+	return
+''' )
+		self.assertIn( 'does not match', self.discovery.errors.errors[0] )
 
 
 if __name__ == '__main__':

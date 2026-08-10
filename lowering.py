@@ -7,7 +7,7 @@ from dataclasses import replace
 import arithmetic_mode
 import cfg
 import ir
-from discovery import Discovery
+from discovery import Discovery, is_stub_body
 from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
@@ -2261,6 +2261,29 @@ class Lowering:
 		# docstring for why this can't wait for schedule()'s work queue.
 		return self._type_resolver.ensure_resolved( obj )
 
+	def _resolve_call_target( self, target: Function ) -> None:
+		# a @virtual call's STATIC target (whatever chain_lookup found at
+		# the call site's own declared receiver type) is NEVER itself
+		# directly invoked - real dispatch goes through the vtable at
+		# runtime (see emitter_c.py's _emit_virtual_call), reaching whatever
+		# concrete override actually applies. compiler.py's own
+		# _schedule_interface_vtable_impls already schedules each
+		# CONSTRUCTED class's real per-slot implementation independently -
+		# scheduling the STATIC target here too would be redundant at best,
+		# and actively wrong when it resolves to an unfulfilled root
+		# declaration (a stub body, `...` - see PLAN_SUBCLASSING_VTABLES_
+		# COM.md's "Unimplemented @virtual methods"): _ensure_resolved
+		# unconditionally schedules its target for real lowering, and
+		# lowering a stub body as if it were a real function fails outright.
+		# Only .resolve() (populating parameters/return_type, needed for
+		# THIS call's own type-checking/emission) is needed here - not the
+		# scheduling side effect.
+		if target.is_virtual:
+			if target.resolve is not None:
+				target.resolve()
+			return
+		self._ensure_resolved( target )
+
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
 		# _ensure_resolved is the one place a Specialization gets swapped for
 		# its real, substituted ClassLike - owner_type past this point is
@@ -2446,6 +2469,28 @@ class Lowering:
 		self._ensure_resolved( target_cls )
 		for attr in target_cls.attributes:
 			self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _attr_lookup's found.resolve
+		if isinstance( target_cls, CStruct ) and target_cls.is_interface:
+			# a "pure interface" (or any @interface class with an unfulfilled
+			# @virtual slot anywhere in its chain - a stub body, same shape
+			# @overload stubs use) is never meant to be constructed directly -
+			# nothing else in this compiler enforces that (there's no separate
+			# @abstract marker - see PLAN_SUBCLASSING_VTABLES_COM.md's own
+			# "Unimplemented @virtual methods" reasoning), so it's checked
+			# here, at the one place a real CStruct value actually gets built
+			unfulfilled: list[str] = []
+			for slot in target_cls.virtual_slots():
+				impl = target_cls.chain_lookup( slot.stem )
+				assert isinstance( impl, Function ) # virtual_slots()'s own entries always exist somewhere in the chain - at minimum the root's own declaration chain_lookup started from
+				if impl.resolve is not None:
+					impl.resolve()
+				if is_stub_body( impl.node.body ):
+					unfulfilled.append( slot.stem )
+			if unfulfilled:
+				self.discovery.fail(
+					f'{target_cls.qualname}{label} cannot be constructed - virtual method(s) have no implementation: '
+					f'{", ".join(unfulfilled)}',
+					node,
+				)
 		# target_cls is always the ABSTRACT class (resolved via
 		# _try_resolve_namespace on the shared, unspecialized AST body's
 		# own `SomeGeneric.__allocate__` reference - see
@@ -3340,7 +3385,7 @@ class Lowering:
 			target = _resolve_original( resolved )
 			self._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
 		else:
-			self._ensure_resolved( target )
+			self._resolve_call_target( target )
 			args, kwargs = self._lower_call_args( target, node )
 
 		self.schedule( target.return_type )

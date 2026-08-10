@@ -221,6 +221,30 @@ class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
 			node = node.base
 		return None
 
+	def interface_root( self ) -> 'CStruct':
+		''' walk to the top of this @interface CStruct's single-inheritance
+		chain - that root is what actually declares the vtable's C type
+		(every level shares the SAME $vtable field type - see emitter_c.py's
+		emit_cstruct/_interface_vtbl_name) and therefore the only place a
+		NEW @virtual method (a new vtable slot) can be introduced; every
+		other level can only override an existing slot. '''
+		node = self
+		while node.base is not None:
+			node = node.base
+		return node
+
+	def virtual_slots( self ) -> list['Function']:
+		''' the ordered vtable slot list for this @interface CStruct's
+		hierarchy - the ROOT's own @virtual methods, in declaration order
+		(root.methods is append-only in source order - see discovery.py's
+		_parse_function). Only the root ever contributes slots (see
+		interface_root's own docstring) - a subclass's @virtual methods are
+		always overrides of one of these, never additions. '''
+		root = self.interface_root()
+		if root.resolve is not None:
+			root.resolve()
+		return [ m for m in root.methods if isinstance( m, Function ) and m.is_virtual ]
+
 @dataclass( kw_only = True )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:
 	type_params: list[TypeVar]|None = None

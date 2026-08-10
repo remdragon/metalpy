@@ -360,24 +360,56 @@ from it right now.
 
 Phased implementation plan
 
-1. Type model + layout. CStruct.base, the @interface decorator (or
-   equivalent, with the "@interface doesn't inherit implicitly" rule
-   enforced), $vtable as the synthesized first member, base-chain field
-   flattening generalized from emit_rcclass's existing walk so both
-   RCClass and CStruct share it, _attr_lookup/_find_method walking a
-   CStruct's own base chain, and Ptr[CStruct] heap allocation (confirm
-   the C-level type mapping directly, build whatever allocation
-   primitive turns out to be missing). No dispatch yet - this phase is
-   pure type-model + layout, testable by inspecting emitted struct/
-   vtable-typedef shapes and a round-tripped Ptr[SomeCStruct] allocation
-   directly, same spirit as the existing emitter_c_test.py style.
-2. Dispatch. The new virtual-call IR instruction + emission, per-concrete-
-   interface vtable struct + static instance generation, slot assignment
-   and override resolution across a hierarchy. A hand-written IUnknown-
-   shaped interface with one extra virtual method, called both through a
-   base-typed and a derived-typed reference, is the natural end-to-end
-   test here - QueryInterface/AddRef/Release bodies are hand-written in
-   this test too, same as real usage will be (see COM specifics above).
+1. DONE. Type model + layout. CStruct.base, the @interface decorator
+   (@interface doesn't inherit implicitly, enforced), $vtable as the
+   synthesized first member, base-chain field flattening, _attr_lookup/
+   _find_method walking a CStruct's own base chain (CStruct.chain_lookup),
+   and Ptr[CStruct] heap allocation (confirmed zero new code needed -
+   sys.alloc[T] already worked). Committed.
+2. DONE. Dispatch. Landed without a new IR instruction - emission reads
+   Function.is_virtual directly off the existing ir.Call.target and
+   changes the emitted C shape (see emitter_c.py's _emit_virtual_call
+   path in the ir.Call branch), no lowering.py/ir.py changes needed for
+   the call site itself. Delivered: full Vtbl struct body + slot ordering
+   (CStruct.virtual_slots), per-class trampolines + static const vtable
+   instance (emit_interface_vtable_instance - only for classes whose
+   vtable is fully fulfilled, see CStruct/_interface_fulfilled_slot_impls),
+   $vtable wired at construction time, slot-introduction/override-
+   signature validation (compiler.py's _validate_interface_vtable - only
+   the root may introduce a new slot, overrides must match strictly),
+   construction-time fulfillment validation (lowering.py - constructing
+   an interface with any unfulfilled/stub slot is a compile error).
+   Tested end-to-end: real vtable dispatch (not a direct call) reaching
+   an override, confirmed via both the generated C shape and actual
+   execution - see emitter_c_test.py's
+   test_virtual_dispatch_calls_the_override_not_the_stub.
+
+   Two bugs found and fixed along the way (both in this phase's own new
+   code, not pre-existing): (a) the Vtbl struct's own `self` parameter,
+   the first mention of an @interface CStruct as a pointer, hit the same
+   "function prototype scope" trap RCClass's forward tags exist to avoid
+   - every @interface CStruct now gets the same `struct X;` forward tag
+   RCClass already got. (b) a virtual call's own self-pointer needs an
+   explicit cast to the ROOT's pointer type (a statically-resolved
+   override's own .cls can be a subclass, not the root) - fixed in
+   _emit_self_operand.
+
+   One thing found but NOT fixed here, flagged separately: passing a
+   derived CStruct value where an ORDINARY (non-self) parameter or
+   variable expects a base CStruct type - e.g. a plain function taking
+   `f: IFoo` called with a `FooImpl` value - currently TYPE-CHECKS at the
+   metalpy level but produces INVALID C (a real compiler rejects it,
+   "passing struct X to parameter of incompatible type struct Y"). This
+   is a genuine, pre-existing gap in general CStruct subtype-compatible
+   argument/assignment handling - NOT part of "dispatch mechanism" (the
+   plan's own scope for this phase), and NOT something to decide
+   unilaterally (multiple valid fixes: reject at type-check time, or
+   extend the same value-narrowing-cast machinery _emit_self_operand
+   already uses for method calls to ordinary argument-passing generally).
+   The "called through a base-typed reference" half of this phase's own
+   acceptance criteria is therefore proven only via direct dispatch calls
+   and Ptr[CStruct]-based access, not via an ordinary by-value base-typed
+   function parameter - see the flagged task for this gap.
 3. COM specifics. lib/guid.py's GUID type (plus whatever str support it
    needs), HRESULT library type, a worked example consuming a real
    foreign Windows COM interface end to end (a simple, easily-testable
