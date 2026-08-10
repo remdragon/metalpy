@@ -2509,5 +2509,135 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class EarlyReturnFromLoopWithLiveRCLocalTests( CompilerTestCase ):
+	''' cfg.py's current_epilogue_label() shared-ladder optimization used to
+	assume every entry on the epilogue stack survives to the function's own
+	real end, where build_epilogue_ladder() walks it and emits each entry's
+	own label. Not true for a plain RC local declared INSIDE a loop body -
+	restore() (called once per loop, after the body's fully lowered) drops
+	it silently once the body's own lowering is done, well before the
+	function's real end - so an early `return` reached DURING that body's
+	lowering, while the entry was still the topmost active one, could
+	capture a label that never actually gets emitted ("undeclared
+	identifier" in the generated C). Found while verifying list[str]/str.
+	split() end-to-end (both exercise a while loop with a live str local
+	inside a with-block) - confirmed independent of list[T]/str via the
+	minimal repro below (no generics, no str methods beyond ==). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_early_return_past_a_loop_confined_rc_local_never_taken( self ) -> None:
+		# the early return is never actually reached at runtime (v is
+		# always 'item') - this is purely a "does it even compile, and
+		# does the untaken branch not corrupt the normal exit" check
+		self._run( '''
+def main() -> i32:
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			v: str = 'item'
+			if v != 'item':
+				return 2
+			j += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_early_return_past_a_loop_confined_rc_local_actually_taken( self ) -> None:
+		# this time the early return DOES fire (at j == 5) - proves the
+		# inline unwind path is correct, not just non-crashing: the real
+		# exit code has to come back through it
+		self._run( '''
+def main() -> i32:
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			v: str = 'item'
+			if j == 5:
+				return 2
+			j += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 2 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_early_return_past_both_an_outer_and_a_loop_confined_rc_local( self ) -> None:
+		# a function-scoped RC local (outer, pushed before the loop) AND a
+		# loop-confined one (inner, pushed inside it) both still live at
+		# the same early return - both must actually get decref'd, not
+		# just whichever one this fix was specifically chasing
+		self._run( '''
+def main() -> i32:
+	outer: str = 'outer'
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			inner: str = 'inner'
+			if j == 5:
+				if outer != 'outer' or inner != 'inner':
+					return 9
+				return 2
+			j += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 2 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_break_past_a_loop_confined_rc_local_still_works( self ) -> None:
+		# break (not return) reaching the SAME loop-confined entry - a
+		# different code path (unwind_to(), not current_epilogue_label())
+		# that this fix must not have disturbed
+		self._run( '''
+def main() -> i32:
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			v: str = 'item'
+			if j == 5:
+				break
+			j += 1
+	if j != 5:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 if __name__ == '__main__':
 	unittest.main()

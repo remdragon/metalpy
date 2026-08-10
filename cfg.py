@@ -136,6 +136,7 @@ class CFGState:
 		self._new_label = new_label
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
+		self._loop_entry_depths: list[int] = [] # see enter_loop()/exit_loop()
 		self.bindings: Bindings = {}
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
@@ -241,6 +242,23 @@ class CFGState:
 		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
+
+	def enter_loop( self, stack_depth: int ) -> None:
+		''' called by lowering.py's own _lower_loop_body, bracketing one
+		loop body's lowering - stack_depth is the SAME loop_snapshot.
+		stack_depth already taken just before it (see restore()'s own
+		"an if-branch's own locals are genuinely block-scoped" comment;
+		a loop body's locals are exactly as block-scoped, torn down by
+		restore() once the body's been lowered, one iteration's worth,
+		exactly once - regardless of how many times it actually runs at
+		runtime). Tracked here (not just left to lowering.py) so
+		current_epilogue_label() can tell "is the topmost live entry
+		confined to a loop I'm still inside lowering" without every one of
+		its many call sites threading loop context through by hand. '''
+		self._loop_entry_depths.append( stack_depth )
+
+	def exit_loop( self ) -> None:
+		self._loop_entry_depths.pop()
 
 	# --- unchecked Result tracking ----------------------------------------
 
@@ -635,15 +653,41 @@ class CFGState:
 		just the top: the shared ladder can't skip just one entry for just
 		this one return (that's what return_()'s own "excludes the
 		returned binding" already handles) - inlining via return_() is the
-		only option there. '''
+		only option there.
+
+		ALSO None whenever the topmost active entry is confined to a loop
+		body still being lowered (pushed at or after the innermost active
+		enter_loop()'s own depth, and not flag-guarded - see restore()'s
+		own comment on why a plain RC entry doesn't survive a loop body's
+		exit but a defer/errdefer one does): that entry's own label would
+		never actually get emitted anywhere (build_epilogue_ladder() only
+		ever walks the stack that SURVIVES to the function's real end -
+		restore() silently drops confined entries once the loop body
+		lowering that pushed them finishes, well before then), so jumping
+		into it here would be a dangling reference to a label that's never
+		declared - confirmed by a real repro, not just reasoning (an early
+		return from inside a while loop, past a locally-declared RC value,
+		nested inside a with-block). return_()'s own full, inline unwind
+		(which walks the ENTIRE stack directly, needing no label of its
+		own at all) is the only correct option for a loop-confined entry,
+		exactly like the returned-operand case just above. '''
 		if returned_operand is not None and any(
 			not entry.cancelled and entry.operand is returned_operand
 			for entry in self._epilogue_stack
 		):
 			return None
-		for entry in reversed( self._epilogue_stack ):
-			if not entry.cancelled:
-				return entry.name
+		# None (not 0) when no loop is currently being lowered - the whole
+		# confinement check below must be a no-op then (every entry is
+		# function-scoped), not "confined below index 0" (which would
+		# wrongly treat EVERY entry as confined, since every valid index
+		# is >= 0)
+		loop_floor = self._loop_entry_depths[-1] if self._loop_entry_depths else None
+		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
+			if entry.cancelled:
+				continue
+			if loop_floor is not None and not entry.is_flag_guarded and i >= loop_floor:
+				return None
+			return entry.name
 		return None
 
 	def build_epilogue_ladder(

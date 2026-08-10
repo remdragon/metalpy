@@ -1565,6 +1565,13 @@ class Lowering:
 	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> None:
 		self._loop_depth += 1
 		self._loop_labels.append(( continue_label, break_label, loop_snapshot ))
+		# see cfg.py's CFGState.enter_loop's own docstring: lets
+		# current_epilogue_label() recognize an RC entry pushed while
+		# lowering THIS body as loop-confined (restore(), called once this
+		# body's fully lowered, silently drops it - its own label, if a
+		# `return` from inside here ever pointed at it, would never
+		# actually get emitted)
+		self._cfg.enter_loop( loop_snapshot.stack_depth )
 		try:
 			for stmt in body:
 				try:
@@ -1572,6 +1579,7 @@ class Lowering:
 				except CompileError:
 					continue
 		finally:
+			self._cfg.exit_loop()
 			self._loop_labels.pop()
 			self._loop_depth -= 1
 
