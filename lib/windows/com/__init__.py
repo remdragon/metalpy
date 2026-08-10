@@ -1,10 +1,14 @@
 import guid
 
-# HRESULT/IUnknown - see PLAN_SUBCLASSING_VTABLES_COM.md's "COM specifics"
-# section. A library addition, not a compiler change - matches the plan's
-# own "hand-rolling first" decision (QueryInterface/AddRef/Release are
-# ordinary, hand-written @virtual methods; no compiler-synthesized
-# IUnknown boilerplate here).
+# HRESULT/IUnknown/core COM bootstrapping - see
+# PLAN_SUBCLASSING_VTABLES_COM.md's "COM specifics" section. A library
+# addition, not a compiler change - matches the plan's own "hand-rolling
+# first" decision (QueryInterface/AddRef/Release are ordinary, hand-
+# written @virtual methods; no compiler-synthesized IUnknown boilerplate
+# here). A real package (not a flat com.py) so individual COM interfaces
+# can live in their own files as they're added - see ipersist.py for the
+# first one - matching lib/builtins' own package-with-submodules
+# convention (__list.py, __dict.py, ...).
 
 HRESULT: TypeAlias = i32
 
@@ -59,3 +63,37 @@ class IUnknown:
 
 	@virtual
 	def Release( self ) -> u32: ...
+
+# CoInitializeEx's own dwCoInit values (objbase.h) - only the one this
+# library actually recommends (apartment-threaded, the common case for
+# code that isn't itself implementing a free-threaded COM server)
+COINIT_APARTMENTTHREADED: u32 = 0x2
+COINIT_MULTITHREADED: u32 = 0x0
+
+# CoCreateInstance's own dwClsContext values (wtypesbase.h) - only
+# in-process, the common case; CLSCTX_ALL/CLSCTX_LOCAL_SERVER/etc. can be
+# added here if something actually needs them
+CLSCTX_INPROC_SERVER: u32 = 0x1
+
+@extern( 'ole32', 'CoInitializeEx' )
+def CoInitializeEx( pvReserved: Ptr[None], dwCoInit: u32 ) -> HRESULT:
+	...
+
+@extern( 'ole32', 'CoUninitialize' )
+def CoUninitialize() -> None:
+	...
+
+# rclsid/riid are REFCLSID/REFIID in the real signature (C++ references),
+# which compile down to plain pointers at the C ABI level - Ptr[GUID],
+# not GUID by value (verified against Microsoft Learn's own
+# CoCreateInstance docs, not just memory - see the plan doc's own note on
+# why GUID values/signatures for real COM interop got this scrutiny)
+@extern( 'ole32', 'CoCreateInstance' )
+def CoCreateInstance(
+	rclsid: Ptr[guid.GUID],
+	pUnkOuter: Ptr[IUnknown],
+	dwClsContext: u32,
+	riid: Ptr[guid.GUID],
+	ppv: Ptr[Ptr[None]],
+) -> HRESULT:
+	...

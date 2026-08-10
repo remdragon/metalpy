@@ -2930,34 +2930,12 @@ def main() -> i32:
 		# already-compiled COM object's actual in-memory layout - not
 		# just with other metalpy code.
 		self._run( '''
-from windows.com import IUnknown, HRESULT, S_OK, SUCCEEDED
+from windows.com import HRESULT, SUCCEEDED, CoInitializeEx, CoUninitialize, CoCreateInstance, COINIT_APARTMENTTHREADED, CLSCTX_INPROC_SERVER
+from windows.com.ipersist import IPersist
 import guid
 
-@interface
-class IPersist( IUnknown ):
-	@virtual
-	def GetClassID( self, pClassID: Ptr[guid.GUID] ) -> HRESULT: ...
-
-@extern( 'ole32', 'CoInitializeEx' )
-def CoInitializeEx( pvReserved: Ptr[None], dwCoInit: u32 ) -> HRESULT:
-	...
-
-@extern( 'ole32', 'CoUninitialize' )
-def CoUninitialize() -> None:
-	...
-
-@extern( 'ole32', 'CoCreateInstance' )
-def CoCreateInstance(
-	rclsid: Ptr[guid.GUID],
-	pUnkOuter: Ptr[IUnknown],
-	dwClsContext: u32,
-	riid: Ptr[guid.GUID],
-	ppv: Ptr[Ptr[None]],
-) -> HRESULT:
-	...
-
 def main() -> i32:
-	init_hr: HRESULT = CoInitializeEx( None, 2 ) # COINIT_APARTMENTTHREADED
+	init_hr: HRESULT = CoInitializeEx( None, COINIT_APARTMENTTHREADED )
 	if not SUCCEEDED( init_hr ):
 		return 1
 
@@ -2970,7 +2948,7 @@ def main() -> i32:
 	create_hr: HRESULT = CoCreateInstance(
 		compiler.addrof( clsid_shelllink ),
 		None,
-		1, # CLSCTX_INPROC_SERVER
+		CLSCTX_INPROC_SERVER,
 		compiler.addrof( iid_ipersist ),
 		compiler.addrof( out ),
 	)
