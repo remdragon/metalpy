@@ -2938,6 +2938,7 @@ def main() -> i32:
 	init_hr: HRESULT = CoInitializeEx( None, COINIT_APARTMENTTHREADED )
 	if not SUCCEEDED( init_hr ):
 		return 1
+	defer( CoUninitialize() )
 
 	# well-known, published GUIDs (verified against Microsoft Learn, not
 	# just memory) - CLSID_ShellLink and IID_IPersist
@@ -2953,7 +2954,6 @@ def main() -> i32:
 		compiler.addrof( out ),
 	)
 	if not SUCCEEDED( create_hr ):
-		CoUninitialize()
 		return 2
 
 	persist: Ptr[IPersist] = compiler.cast( Ptr[IPersist], out )
@@ -2961,14 +2961,11 @@ def main() -> i32:
 	returned_clsid: guid.GUID = guid.GUID.from_str( '00000000-0000-0000-0000-000000000000' )
 	getclassid_hr: HRESULT = persist.GetClassID( compiler.addrof( returned_clsid ))
 	if not SUCCEEDED( getclassid_hr ):
-		CoUninitialize()
 		return 3
 
 	if returned_clsid != clsid_shelllink:
-		CoUninitialize()
 		return 4
 
-	CoUninitialize()
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
