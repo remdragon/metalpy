@@ -454,13 +454,36 @@ Phased implementation plan
    anywhere - see the REVISION's own note on why that's not exhaustively
    guarded against, and the flagged follow-up task for the remaining
    `p[0]`-escape-hatch case.
-3. COM specifics. lib/guid.py's GUID type (plus whatever str support it
-   needs), HRESULT library type, a worked example consuming a real
-   foreign Windows COM interface end to end (a simple, easily-testable
-   one - TBD which), and a worked example exposing a metalpy-implemented
-   interface to a hand-written C caller - both with hand-written
-   QueryInterface/AddRef/Release, matching the "hand-rolling first"
-   decision above.
+3. PAUSED - blocked on a prerequisite. COM specifics: lib/guid.py's GUID
+   type (plus whatever str support it needs), HRESULT library type, a
+   worked example consuming a real foreign Windows COM interface end to
+   end (a simple, easily-testable one - TBD which), and a worked example
+   exposing a metalpy-implemented interface to a hand-written C caller -
+   both with hand-written QueryInterface/AddRef/Release, matching the
+   "hand-rolling first" decision above.
+
+   Blocker found while starting this phase: GUID's constructor needs
+   str.split('-') to parse a hyphenated hex string, but list[T] (str.
+   split()'s natural return type) turned out to be completely broken -
+   `list[i32]()` fails with "cannot call list[i32]", a `.cast[T]()`
+   failure, and a missing arithmetic-mode wrapper in list.__del__, for
+   ANY type parameter, not just RC types. Confirmed list[T] has never
+   actually been compiled anywhere in the test suite before (only
+   Python-level `list[str]` type hints in test harness code, unrelated).
+   Also found and fixed along the way (kept, unrelated to the list[T]
+   bug itself): compiler.py's _trigger_name called `getattr(unit,
+   'qualname', str(unit))`, which Python evaluates eagerly regardless of
+   whether qualname exists - harmless normally, but a genuine infinite
+   hang the moment the reachable object graph has a real cycle (which
+   list[T] apparently triggers) since dataclass __repr__ has no cycle
+   detection. That fix is committed on its own.
+
+   Decided: fix list[T] properly as its own, separate piece of work
+   (not a narrower split() workaround) - and while there, implement
+   str.find()/str.index() as real general-purpose methods (both already
+   listed missing in TODO.txt) rather than embedding one-off byte-
+   scanning logic inside split() itself. Flagged as a background task;
+   this phase resumes once that lands.
 4. Stretch/optional, not committed: an opt-in automatic-IUnknown
    convenience (compiler-synthesized QueryInterface/AddRef/Release,
    `_synthesize_rcclass_destructor`-style) - revisit once Phase 1-3 are
