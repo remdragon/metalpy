@@ -454,36 +454,29 @@ Phased implementation plan
    anywhere - see the REVISION's own note on why that's not exhaustively
    guarded against, and the flagged follow-up task for the remaining
    `p[0]`-escape-hatch case.
-3. PAUSED - blocked on a prerequisite. COM specifics: lib/guid.py's GUID
-   type (plus whatever str support it needs), HRESULT library type, a
-   worked example consuming a real foreign Windows COM interface end to
-   end (a simple, easily-testable one - TBD which), and a worked example
+3. RESUMED - blocker cleared. COM specifics: lib/guid.py's GUID type
+   (plus whatever str support it needs), HRESULT library type, a worked
+   example consuming a real foreign Windows COM interface end to end (a
+   simple, easily-testable one - TBD which), and a worked example
    exposing a metalpy-implemented interface to a hand-written C caller -
    both with hand-written QueryInterface/AddRef/Release, matching the
    "hand-rolling first" decision above.
 
-   Blocker found while starting this phase: GUID's constructor needs
-   str.split('-') to parse a hyphenated hex string, but list[T] (str.
-   split()'s natural return type) turned out to be completely broken -
-   `list[i32]()` fails with "cannot call list[i32]", a `.cast[T]()`
-   failure, and a missing arithmetic-mode wrapper in list.__del__, for
-   ANY type parameter, not just RC types. Confirmed list[T] has never
-   actually been compiled anywhere in the test suite before (only
-   Python-level `list[str]` type hints in test harness code, unrelated).
-   Also found and fixed along the way (kept, unrelated to the list[T]
-   bug itself): compiler.py's _trigger_name called `getattr(unit,
-   'qualname', str(unit))`, which Python evaluates eagerly regardless of
-   whether qualname exists - harmless normally, but a genuine infinite
-   hang the moment the reachable object graph has a real cycle (which
-   list[T] apparently triggers) since dataclass __repr__ has no cycle
-   detection. That fix is committed on its own.
-
-   Decided: fix list[T] properly as its own, separate piece of work
-   (not a narrower split() workaround) - and while there, implement
-   str.find()/str.index() as real general-purpose methods (both already
-   listed missing in TODO.txt) rather than embedding one-off byte-
-   scanning logic inside split() itself. Flagged as a background task;
-   this phase resumes once that lands.
+   Was blocked on: GUID's constructor needs str.split('-') to parse a
+   hyphenated hex string, but list[T] (str.split()'s natural return
+   type) turned out to be completely broken - confirmed never actually
+   compiled anywhere in the test suite before this. Fixed in a separate
+   session/branch (merged: commits c994244 "Fix list[T] (broken for any
+   type) and implement str.find/index/split", 38f95b9 "cfg.py: fix
+   undeclared epilogue label for early return past a loop-confined RC
+   local" - the latter a genuinely independent bug found while verifying
+   the former, unrelated to generics/RC at all). str.find()/str.index()
+   landed as real general-purpose methods (not embedded in split()), and
+   list[T]/list[str] are now verified working end-to-end via real C
+   compile-and-run tests. compiler.py's _trigger_name eagerly evaluating
+   str(unit) was also fixed earlier and independently (committed on its
+   own, unrelated to list[T]'s own bugs beyond being how the hang was
+   first noticed). 640 tests passing on master as of this resume.
 4. Stretch/optional, not committed: an opt-in automatic-IUnknown
    convenience (compiler-synthesized QueryInterface/AddRef/Release,
    `_synthesize_rcclass_destructor`-style) - revisit once Phase 1-3 are
