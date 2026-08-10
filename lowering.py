@@ -2,6 +2,7 @@
 import ast
 from contextlib import nullcontext
 from dataclasses import replace
+from typing import Callable
 
 # local imports:
 import arithmetic_mode
@@ -794,6 +795,53 @@ class Lowering:
 				self._emit( instr )
 			self._emit( ir.Assign( dest = var, src = operand ))
 
+	def _lower_attr_target_obj( self, value_node: ast.expr ) -> tuple[ir.Operand, Callable[[ir.Operand],None]|None]:
+		''' the object operand for an attribute assignment target
+		(target.attr = ...), plus an optional writeback callback the
+		caller must invoke (with the SAME operand, now mutated via
+		SetAttr) once the ordinary SetAttr has been emitted.
+
+		Ordinarily there's no writeback needed - the object expression's
+		own lowered value (self, an already-Ptr[T] variable, ...) IS the
+		lvalue SetAttr writes through (the dot-operator already makes a
+		bare Ptr[T] receiver work correctly here - see _attr_lookup's own
+		pointee-redirect, emitter_c.py's _member_access_operator). But
+		`ptr[idx].attr = value` is different: ptr[idx] ALONE (via
+		_expr_Subscript's raw-pointer GetItem fallback, the only shape a
+		raw pointer's own subscript has - no real __getitem__ method to
+		dispatch to) loads a COPY of the pointee into a fresh temp, and
+		writing through that copy silently drops the write entirely -
+		confirmed by a real repro, not just reasoning. C has no single
+		"address of the idx'th pointee, then ->field = value" primitive
+		this compiler emits directly (unlike a bare Ptr[T] receiver,
+		which is already the pointer itself) - so this reads the WHOLE
+		element via ir.GetItem, returns that temp as the object SetAttr
+		mutates (reusing every existing RC-tracking/attr-assignment path
+		unchanged), and writes the WHOLE element back via ir.SetItem
+		afterward - the same read-modify-write shape `ptr[idx] = value`
+		(whole-value replacement) already uses one level up. ptr/index
+		are lowered exactly once here (not re-lowered inside
+		_expr_Subscript AND again for the writeback) - relowering the
+		AST a second time would double-evaluate them, a real correctness
+		risk if either expression has side effects (matches the same
+		concern _stmt_AugAssign's own Attribute/Subscript-target
+		restriction is about). '''
+		if isinstance( value_node, ast.Subscript ):
+			ptr_obj = self._lower_expr( value_node.value, None )
+			if (
+				self._find_method( ptr_obj.type, '__getitem__' ) is None
+				and self._type_resolver._is_ptr_specialization( ptr_obj.type )
+			):
+				index_type = self.discovery.get_intrinsics()['usize']
+				index = self._lower_expr( value_node.slice, index_type )
+				elem_type = ptr_obj.type.args[0]
+				elem = self._new_temp( elem_type )
+				self._emit( ir.GetItem( dest = elem, obj = ptr_obj, index = index ))
+				def writeback( updated: ir.Operand ) -> None:
+					self._emit( ir.SetItem( obj = ptr_obj, index = index, value = updated ))
+				return elem, writeback
+		return self._lower_expr( value_node, None ), None
+
 	def _stmt_Assign( self, node: ast.Assign ) -> None:
 		if len( node.targets ) != 1:
 			self.discovery.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
@@ -841,7 +889,7 @@ class Lowering:
 				if match_clears_name is not None:
 					self._cfg.clear_result( match_clears_name )
 		elif isinstance( target, ast.Attribute ):
-			obj = self._lower_expr( target.value, None )
+			obj, writeback = self._lower_attr_target_obj( target.value )
 			attr_var = self._attr_lookup( obj.type, target.attr, target )
 			operand = self._lower_expr( node.value, attr_var.type )
 			if self._construction_self is not None and obj is self._construction_self:
@@ -863,6 +911,8 @@ class Lowering:
 				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self._is_aliasing_expr( node.value )):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = target.attr, value = operand ))
+			if writeback is not None:
+				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
 			obj = self._lower_expr( target.value, None )
 			index = self._lower_expr( target.slice, None )

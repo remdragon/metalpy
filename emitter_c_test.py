@@ -2062,9 +2062,10 @@ def main() -> i32:
 		# the Ptr[T]/ConstPtr[T] dot-operator is general - not specific to
 		# @interface CStructs - so this ALSO fixes the pre-existing
 		# Ptr[T][idx].field = value write-through bug (found while building
-		# Phase 1/2) for the p.field spelling: `p[0].x = 5` still copies
-		# *p into a temp and discards it (unfixed, tracked separately), but
-		# `p.x = 5` now emits a real `(p)->x = 5;` and writes through
+		# Phase 1/2) for the p.field spelling: `p.x = 5` now emits a real
+		# `(p)->x = 5;` and writes through. The `p[0].x = 5` spelling is a
+		# separate case (see test_ptr_index_field_write_through_nonzero_index
+		# below, fixed via a read-modify-write GetItem/SetAttr/SetItem)
 		self._run( '''
 import sys
 
@@ -2086,6 +2087,39 @@ def main() -> i32:
 		src = emitter_c.emit_c( self.compiler )
 		self.assertIn( '(p)->x = 5;', src )
 		self.assertIn( '(p)->y = 6;', src )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ptr_index_field_write_through_nonzero_index( self ) -> None:
+		# Ptr[T][idx].field = value used to silently drop the write for any
+		# index (including 0): _expr_Subscript's raw-pointer fallback loads
+		# *(p + idx) into a VALUE COPY temp, and the old code then mutated
+		# and discarded that copy. Fixed via _lower_attr_target_obj, which
+		# does a read (GetItem), mutate (the ordinary SetAttr path,
+		# unchanged), write-back (SetItem) - evaluating the pointer/index
+		# expressions exactly once, same double-evaluation concern as the
+		# AugAssign restriction elsewhere in this file.
+		self._run( '''
+import sys
+
+@cstruct
+class Point:
+	x: i32
+	y: i32
+
+def main() -> i32:
+	p: Ptr[Point] = sys.alloc[Point]( 3 )
+	p[1].x = 5
+	p[1].y = 6
+	result: i32 = p[1].x
+	with compiler.wrap_arithmetic:
+		diff: i32 = ( result - 5 ) + ( p[1].y - 6 )
+	sys.free( p )
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( '(p)[1] = t1;', src ) # real write-back, not a copy-mutate-discard
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
