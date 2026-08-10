@@ -803,18 +803,38 @@ def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 	''' an @interface CStruct's self is ALWAYS Ptr[T] (see lowering.py's
 	self_param construction) - receiver is therefore always already a
 	pointer here, never a plain value, for both an ordinary inherited call
-	(target.cls a base, e.g. calling IFoo's own method through a FooImpl
-	receiver) and a @virtual dispatch call (target.cls might be a
-	subclass's own override, but every vtable slot's function-pointer type
-	takes self as Ptr[root] regardless - see _vtable_slot_c_type). Either
-	way this is a plain pointer-to-pointer reinterpretation - safe and
-	free at runtime, no address-of/value-narrowing dance needed (that
-	machinery only ever existed to work around self being passed BY VALUE,
-	which is no longer how @interface CStruct methods work at all). '''
+	and a @virtual dispatch call. Either way this is a plain pointer-to-
+	pointer reinterpretation - safe and free at runtime, no address-of/
+	value-narrowing dance needed (that machinery only ever existed to work
+	around self being passed BY VALUE, which is no longer how @interface
+	CStruct methods work at all).
+
+	The cast TARGET differs between the two cases though:
+	- an ordinary (non-virtual) inherited call always resolves to ONE
+	  concrete Function (target.cls, whichever ancestor declared it) - a
+	  plain narrowing cast to that ancestor's own type.
+	- a @virtual call's target vtable SLOT lives in a Vtbl struct typed
+	  uniformly to its owner (see _vtable_slot_c_type) - but which Vtbl
+	  struct is "the" one depends on the RECEIVER's own concrete type, not
+	  on target.cls (whichever ancestor happened to statically resolve the
+	  call - could be any level, an override further down, or the
+	  original declaration). receiver's own $vtable field is already typed
+	  to receiver's own vtbl_owner() (see emit_cstruct) - the self
+	  argument has to match THAT, not target.cls's own root or owner
+	  (CStruct.vtbl_owner's own docstring: two different concrete classes
+	  sharing an interface can have different vtbl_owner()s even for the
+	  SAME inherited slot, e.g. calling an IFoo-declared method through a
+	  BarImpl receiver two levels below IFoo needs Ptr[IBar], not
+	  Ptr[IFoo], because BarImpl's own $vtable is typed IBarVtbl*). '''
 	receiver_text = _emit_operand( receiver )
 	target_cls = target.cls
 	if isinstance( target_cls, CStruct ) and target_cls.is_interface:
-		cast_target = target_cls.interface_root() if target.is_virtual else target_cls
+		if target.is_virtual:
+			receiver_pointee = receiver.type.args[0] if isinstance( receiver.type, Specialization ) else None
+			assert isinstance( receiver_pointee, CStruct ) # every @interface CStruct method's self/receiver is Ptr[T] - see lowering.py's self_param construction
+			cast_target = receiver_pointee.vtbl_owner()
+		else:
+			cast_target = target_cls
 		return f'({_self_c_type(cast_target)})({receiver_text})'
 	return receiver_text
 
@@ -1383,17 +1403,24 @@ def _iter_instruction_operands( instr: ir.Instruction ) -> list[ir.Operand]:
 	return operands
 
 def _interface_vtbl_name( cls: CStruct ) -> str:
-	# @interface subclasses inherit the SAME $vtable field type as their
-	# root, unchanged - never a per-subclass FooImplVtbl (PLAN_SUBCLASSING_
-	# VTABLES_COM.md's own Layout example types every level's $vtable as
-	# `const IFooVtbl*`) - see CStruct.interface_root's own docstring
-	return f'{mangle_type(cls.interface_root())}Vtbl'
+	# a class's own $vtable field is typed to its vtbl_owner()'s Vtbl type,
+	# not necessarily its own (see CStruct.vtbl_owner's own docstring) -
+	# only the nearest new-slot-introducing class at or above `cls` gets a
+	# real Vtbl type of its own; every class below it that adds nothing
+	# new just reuses that same type unchanged (never a per-subclass
+	# FooImplVtbl for an ordinary implementation)
+	return f'{mangle_type(cls.vtbl_owner())}Vtbl'
 
-def _vtable_slot_c_type( root: CStruct, slot: Function ) -> tuple[str,list[str]]:
-	''' the function-pointer type for one vtable slot - self is Ptr[root],
-	same as every @interface CStruct method's self (see _self_c_type,
-	lowering.py's own self_param construction). A vtable slot has to be
-	ONE C type shared by every override sharing that slot (a function
+def _vtable_slot_c_type( owner: CStruct, slot: Function ) -> tuple[str,list[str]]:
+	''' the function-pointer type for one vtable slot in `owner`'s own
+	Vtbl struct - self is Ptr[owner] UNIFORMLY for every slot in that one
+	struct (including slots owner merely inherited from its own base -
+	real COM vtable structs work the same way: IFooVtbl types ALL of its
+	slots, including IUnknown's inherited 3, as taking IFoo*, not a mix of
+	IUnknown*/IFoo* per slot - see _self_c_type, lowering.py's own
+	self_param construction, for the identical "self is Ptr[T]" rule
+	every @interface CStruct method already follows). A vtable slot has to
+	be ONE C type shared by every override sharing that slot (a function
 	pointer field can only ever hold one type), so self can't be typed
 	per-override the way an ordinary method's self is - the static vtable
 	instance itself casts each concrete implementation's own function
@@ -1404,28 +1431,31 @@ def _vtable_slot_c_type( root: CStruct, slot: Function ) -> tuple[str,list[str]]
 	if slot.resolve is not None:
 		slot.resolve()
 	ret = 'void' if _returns_void_in_c( slot.return_type ) else c_type( slot.return_type )
-	params = [ f'{_self_c_type(root)} self' ]
+	params = [ f'{_self_c_type(owner)} self' ]
 	for p in ( slot.parameters or [] ):
 		params.append( f'{c_type(p.type)} {_c_local_name(p.stem)}' )
 	return ret, params
 
-def emit_interface_vtbl_struct( root: CStruct ) -> str:
-	# the FULL vtable struct body - one function-pointer field per slot
-	# (root.virtual_slots(), declaration order - see CStruct.virtual_slots'
-	# own docstring on why only the root ever contributes slots). Function-
-	# pointer fields only ever reference OTHER structs by pointer, never by
-	# value, so this needs no forward-declared tags of its own - C's
-	# implicit "first pointer mention forward-declares an incomplete
-	# struct" rule already covers self's own `const RootStruct*` (see
+def emit_interface_vtbl_struct( owner: CStruct ) -> str:
+	# the FULL vtable struct body for a class that IS its own vtbl_owner()
+	# (see CStruct.vtbl_owner) - one function-pointer field per slot
+	# (owner.virtual_slots(), declaration order - see CStruct.virtual_slots'
+	# own docstring: every new-slot-introducing ancestor's own slots,
+	# root-first, up to and including owner itself - e.g. IUnknown's own 3
+	# first, then IFoo's own new ones, if owner is IFoo). Function-pointer
+	# fields only ever reference OTHER structs by pointer, never by value,
+	# so this needs no forward-declared tags of its own - C's implicit
+	# "first pointer mention forward-declares an incomplete struct" rule
+	# already covers self's own `const OwnerStruct*` (see
 	# PLAN_SUBCLASSING_VTABLES_COM.md's own worked example, which has no
 	# separate forward-declare step for this reason either).
-	name = _interface_vtbl_name( root )
-	slots = root.virtual_slots()
+	name = _interface_vtbl_name( owner )
+	slots = owner.virtual_slots()
 	lines = [ f'typedef struct {name} {{' ]
 	if not slots:
 		lines.append( '\tchar dummy;' ) # MSVC (and pedantic C) reject empty structs - same convention as _struct_or_union_body
 	for slot in slots:
-		ret, params = _vtable_slot_c_type( root, slot )
+		ret, params = _vtable_slot_c_type( owner, slot )
 		lines.append( f'\t{ret} (*{_field_name(slot.stem)})( {", ".join(params)} );' )
 	lines.append( f'}} {name};' )
 	return '\n'.join( lines )
@@ -1467,10 +1497,10 @@ def emit_interface_vtable_instance( cls: CStruct ) -> str|None:
 	slot_impls = _interface_fulfilled_slot_impls( cls )
 	if slot_impls is None:
 		return None
-	root = cls.interface_root()
+	owner = cls.vtbl_owner()
 	field_inits: list[str] = []
 	for slot, impl in zip( cls.virtual_slots(), slot_impls ):
-		ret, params = _vtable_slot_c_type( root, slot )
+		ret, params = _vtable_slot_c_type( owner, slot )
 		slot_fn_ptr_type = f'{ret} (*)( {", ".join(params)} )'
 		field_inits.append( f'.{_field_name(slot.stem)} = ({slot_fn_ptr_type}){mangle_qualname(impl.qualname)}' )
 	vtbl_type = _interface_vtbl_name( cls )
@@ -1484,8 +1514,9 @@ def emit_cstruct( cls: CStruct ) -> str:
 	if cls.is_interface:
 		# $vtable is the literal first member (COM's one hard ABI
 		# requirement) - base-chain flattening mirrors emit_rcclass's own
-		# walk, except every level shares the same inherited $vtable field
-		# (see _interface_root) rather than each base contributing its own
+		# walk, except $vtable itself is a SINGLE inherited field (typed
+		# to cls.vtbl_owner()'s own Vtbl type - see _interface_vtbl_name/
+		# CStruct.vtbl_owner) rather than each base contributing its own
 		# vtable pointer
 		chain: list[CStruct] = []
 		node: CStruct|None = cls
@@ -1677,37 +1708,47 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	for cls in compiler.rcclasses:
 		if not cls.type_params:
 			parts.append( f'struct {mangle_type(cls)};' )
-	# every @interface CStruct gets the SAME forward tag treatment as
-	# RCClass above, for the SAME reason (confirmed by a real clang error,
-	# not just theory: "incompatible pointer types", "will not be visible
-	# outside of this function") - the Vtbl struct's own `self` parameter,
-	# the trampolines' own narrowing casts, and any ordinary function
-	# taking/returning one of these by value or pointer all mention the
-	# struct tag well before its own full body exists (emitted later, in
-	# _emit_value_type_bodies) - unlike a PLAIN CStruct, which is never
-	# used as a pointer/prototype-parameter type before its full body is
-	# needed anyway (a plain CStruct is only ever passed/returned BY
-	# VALUE, which forces the body to already exist - see c_type), an
-	# @interface CStruct's OWN Vtbl-related machinery references it AS A
-	# POINTER first, triggering the prototype-scope trap RCClass tags
-	# exist to avoid.
+	# every CStruct/CUnion/TaggedUnion gets the SAME forward tag treatment
+	# as RCClass above, for the SAME reason (confirmed by a real clang
+	# error, not just theory: "incompatible function pointer types",
+	# "will not be visible outside of this function"). This used to be
+	# is_interface-only (an @interface CStruct's self/Vtbl slot signatures
+	# reference it AS A POINTER before its own full body exists, the
+	# original trigger) - but ANY value type can be referenced as a
+	# pointer inside an @interface CStruct's OWN vtable slot signature
+	# too (e.g. QueryInterface's `riid: ConstPtr[GUID]`, GUID a perfectly
+	# ordinary, non-interface @cstruct) - confirmed by a real repro: GUID
+	# hit this exact trap the moment it appeared as a Vtbl slot parameter
+	# type, well before its own body is emitted later in
+	# _emit_value_type_bodies. Forward-tagging every value type
+	# unconditionally, not just ones already known to need it, is cheap
+	# and always safe (an unused tag is harmless) - simpler and more
+	# robust than trying to enumerate exactly which types get referenced
+	# by pointer somewhere in a vtable slot signature.
 	for cls in compiler.cstructs:
-		if cls.is_interface and not cls.type_params:
+		if not cls.type_params:
+			parts.append( f'struct {mangle_type(cls)};' )
+	for cls in compiler.cunions:
+		if not cls.type_params:
+			parts.append( f'union {mangle_type(cls)};' )
+	for cls in compiler.tagged_unions:
+		if not cls.type_params:
 			parts.append( f'struct {mangle_type(cls)};' )
 	# @interface CStructs' $vtable field points at the Vtbl struct type
 	# (see emit_cstruct/_interface_vtbl_name) - its FULL body (one function-
 	# pointer field per slot) is emitted here, early, same "before any
 	# prototype/body can reference it" reasoning as the RCClass tags just
-	# above. Only interface ROOTS get a Vtbl type at all (every subclass in
-	# the chain shares its root's - see CStruct.interface_root) - dict used
-	# as an insertion-ordered dedup set, same convention as elsewhere in
-	# this module.
-	vtbl_roots: dict[str,CStruct] = {}
+	# above. Only each interface's own vtbl_owner() gets a Vtbl type of its
+	# own (every class below it that adds nothing new reuses that same
+	# type unchanged - see CStruct.vtbl_owner) - dict used as an
+	# insertion-ordered dedup set, same convention as elsewhere in this
+	# module.
+	vtbl_owners: dict[str,CStruct] = {}
 	for cls in compiler.cstructs:
 		if cls.is_interface and not cls.type_params:
-			vtbl_roots[ _interface_vtbl_name( cls ) ] = cls.interface_root()
-	for root in vtbl_roots.values():
-		parts.append( emit_interface_vtbl_struct( root ))
+			vtbl_owners[ _interface_vtbl_name( cls ) ] = cls.vtbl_owner()
+	for owner in vtbl_owners.values():
+		parts.append( emit_interface_vtbl_struct( owner ))
 	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
 		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))

@@ -2151,10 +2151,15 @@ def main() -> None:
 ''' )
 		self.assertIn( 'cannot be constructed', self.discovery.errors.errors[0] )
 
-	def test_new_virtual_slot_below_root_is_a_compile_error( self ) -> None:
-		# FooImpl properly overrides get_value (so the construction-time
-		# fulfillment check - a SEPARATE concern - doesn't mask this one)
-		# but also tries to introduce a brand-new @virtual slot of its own
+	def test_new_virtual_slot_below_root_gets_its_own_vtbl_type( self ) -> None:
+		# REVISION: any level can introduce new @virtual slots now, not
+		# just the root - real COM interface hierarchies routinely add
+		# methods at every level (IUnknown -> ICustom (adds methods) ->
+		# ConcreteImpl), which the original root-only-introduces-slots
+		# rule could never express. FooImpl adds a NEW slot (helper) on
+		# top of what it inherits from IFoo (get_value) - FooImpl becomes
+		# its own vtbl_owner(), with its own FooImplVtbl type (a superset
+		# of IFooVtbl: get_value first, then FooImpl's own new helper).
 		self._run( '''
 @interface
 class IFoo:
@@ -2168,14 +2173,65 @@ class FooImpl( IFoo ):
 		return 1
 
 	@virtual
-	def other( self ) -> i32:
-		return 1
+	def helper( self ) -> i32:
+		return 2
 
 def main() -> None:
 	f: Ptr[FooImpl] = FooImpl()
 	return
 ''' )
-		self.assertIn( 'can only be declared on the interface root', self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn(
+			'typedef struct __main__$FooImplVtbl {\n'
+			'\tint32_t (*get_value)( struct __main__$FooImpl* self );\n'
+			'\tint32_t (*helper)( struct __main__$FooImpl* self );\n'
+			'} __main__$FooImplVtbl;',
+			src,
+		)
+		self.assertIn( 'const __main__$FooImplVtbl* $vtable;', src )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_three_level_hierarchy_dispatches_through_the_right_vtbl_type( self ) -> None:
+		# the real COM pattern this whole revision exists for: IUnknown-
+		# shaped root -> ICustom (adds a method, becomes its own
+		# vtbl_owner) -> ConcreteImpl (adds nothing new, reuses ICustom's
+		# own Vtbl type unchanged). Dispatch through a ConcreteImpl-typed
+		# receiver for a method ICustom declared (not ConcreteImpl) has to
+		# use ConcreteImpl's own vtbl_owner() (ICustom) for the self cast,
+		# not IRoot and not ConcreteImpl itself - see emitter_c.py's
+		# _emit_self_operand.
+		self._run( '''
+@interface
+class IRoot:
+	@virtual
+	def base_method( self ) -> i32: ...
+
+@interface
+class ICustom( IRoot ):
+	@virtual
+	def custom_method( self ) -> i32: ...
+
+@interface
+class ConcreteImpl( ICustom ):
+	@virtual
+	def base_method( self ) -> i32:
+		return 10
+
+	@virtual
+	def custom_method( self ) -> i32:
+		return 20
+
+def main() -> i32:
+	c: Ptr[ConcreteImpl] = ConcreteImpl()
+	a: i32 = c.base_method()
+	b: i32 = c.custom_method()
+	with compiler.wrap_arithmetic:
+		diff: i32 = ( a - 10 ) + ( b - 20 )
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	def test_override_signature_mismatch_is_a_compile_error( self ) -> None:
 		self._run( '''
@@ -2712,6 +2768,143 @@ def main() -> i32:
 		return 2
 	if a == c:
 		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
+class ComTests( CompilerTestCase ):
+	''' lib/windows/com.py's HRESULT/IUnknown pattern -
+	PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3 worked example: a
+	metalpy-implemented COM interface (IUnknown -> IFoo, adding a method -
+	the real COM pattern the per-level-Vtbl-types revision exists for),
+	hand-written QueryInterface/AddRef/Release, constructed and dispatched
+	through end-to-end. Needs import_builtins=True (str.split, list[str],
+	GUID's own dependencies). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	def test_succeeded_failed_helpers( self ) -> None:
+		self._run( '''
+from windows.com import S_OK, E_FAIL, SUCCEEDED, FAILED
+
+def main() -> i32:
+	if not SUCCEEDED( S_OK ):
+		return 1
+	if SUCCEEDED( E_FAIL ):
+		return 2
+	if FAILED( S_OK ):
+		return 3
+	if not FAILED( E_FAIL ):
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_iunknown_subclass_construct_dispatch_queryinterface_addref_release( self ) -> None:
+		# IFoo(IUnknown) adds get_value - the exact COM pattern that
+		# motivated the per-level-Vtbl-types revision (IUnknown's own 3
+		# slots first, then IFoo's own new one, all in IFoo's own
+		# FooImpl-shared Vtbl type). Hand-written QueryInterface/AddRef/
+		# Release (no compiler synthesis, per the plan's own "hand-rolling
+		# first" decision) - QueryInterface writes a real pointer through
+		# its Ptr[Ptr[None]] out-param and calls AddRef itself, matching
+		# real COM QueryInterface semantics.
+		self._run( '''
+from windows.com import IUnknown, HRESULT, S_OK, E_NOINTERFACE, SUCCEEDED, FAILED
+import guid
+
+@interface
+class IFoo( IUnknown ):
+	@virtual
+	def get_value( self ) -> i32: ...
+
+@interface
+class FooImpl( IFoo ):
+	x: i32
+	ref_count: u32
+
+	@virtual
+	def QueryInterface( self, riid: ConstPtr[guid.GUID], ppvObject: Ptr[Ptr[None]] ) -> HRESULT:
+		ppvObject[0] = compiler.cast( Ptr[None], self )
+		self.AddRef()
+		return S_OK
+
+	@virtual
+	def AddRef( self ) -> u32:
+		with compiler.wrap_arithmetic:
+			self.ref_count = self.ref_count + 1
+		return self.ref_count
+
+	@virtual
+	def Release( self ) -> u32:
+		with compiler.wrap_arithmetic:
+			self.ref_count = self.ref_count - 1
+		return self.ref_count
+
+	@virtual
+	def get_value( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	f: Ptr[FooImpl] = FooImpl( x = 99, ref_count = 1 )
+
+	direct: i32 = f.get_value()
+	with compiler.wrap_arithmetic:
+		diff: i32 = direct - 99
+	if diff != 0:
+		return 1
+
+	out: Ptr[None] = None
+	requested_iid: guid.GUID = guid.GUID.from_str( '00000000-0000-0000-0000-000000000000' )
+	hr: HRESULT = f.QueryInterface( compiler.addrof( requested_iid ), compiler.addrof( out ))
+	if not SUCCEEDED( hr ):
+		return 2
+	if f.ref_count != 2:
+		return 3
+	if out == None:
+		return 4
+
+	f.Release()
+	if f.ref_count != 1:
+		return 5
+
+	if not FAILED( E_NOINTERFACE ):
+		return 6
+
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

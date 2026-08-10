@@ -221,29 +221,62 @@ class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
 			node = node.base
 		return None
 
-	def interface_root( self ) -> 'CStruct':
-		''' walk to the top of this @interface CStruct's single-inheritance
-		chain - that root is what actually declares the vtable's C type
-		(every level shares the SAME $vtable field type - see emitter_c.py's
-		emit_cstruct/_interface_vtbl_name) and therefore the only place a
-		NEW @virtual method (a new vtable slot) can be introduced; every
-		other level can only override an existing slot. '''
+	def own_new_virtual_slots( self ) -> list['Function']:
+		''' this class's OWN @virtual methods that AREN'T already a slot
+		somewhere in its ancestor chain - i.e. genuinely NEW vtable slots
+		introduced here, not overrides of an inherited one. Any interface
+		level can introduce new slots now (not just the root - see
+		vtbl_owner's own docstring for why this changed from the original
+		single-shared-vtable-type design: real COM interface hierarchies
+		routinely add methods at every level, e.g. IUnknown -> ICustom
+		(adds methods) -> ConcreteImpl, which a root-only-introduces-slots
+		rule can never express). '''
+		if self.resolve is not None:
+			self.resolve()
+		inherited_names: set[str] = set()
+		node = self.base
+		while node is not None:
+			if node.resolve is not None:
+				node.resolve()
+			inherited_names.update( m.stem for m in node.methods if isinstance( m, Function ) and m.is_virtual )
+			node = node.base
+		return [ m for m in self.methods if isinstance( m, Function ) and m.is_virtual and m.stem not in inherited_names ]
+
+	def vtbl_owner( self ) -> 'CStruct':
+		''' the nearest class at or above `self` (self itself, or walking
+		up .base) whose own Vtbl C struct type is the one self's own
+		$vtable field actually points at - the nearest one (starting from
+		self) that introduces at least one genuinely new slot (see
+		own_new_virtual_slots). A class that adds nothing of its own
+		(pure overrides, or no @virtual methods at all) simply reuses
+		whatever ancestor's Vtbl type is already in effect - matches real
+		COM: FooImpl (an ordinary implementation, no new capabilities)
+		still has an $vtable field literally typed as whichever interface
+		it implements' own IFooVtbl*, not a FooImplVtbl of its own. '''
 		node = self
-		while node.base is not None:
+		while node.base is not None and not node.own_new_virtual_slots():
 			node = node.base
 		return node
 
 	def virtual_slots( self ) -> list['Function']:
-		''' the ordered vtable slot list for this @interface CStruct's
-		hierarchy - the ROOT's own @virtual methods, in declaration order
-		(root.methods is append-only in source order - see discovery.py's
-		_parse_function). Only the root ever contributes slots (see
-		interface_root's own docstring) - a subclass's @virtual methods are
-		always overrides of one of these, never additions. '''
-		root = self.interface_root()
-		if root.resolve is not None:
-			root.resolve()
-		return [ m for m in root.methods if isinstance( m, Function ) and m.is_virtual ]
+		''' the full, ordered slot list for THIS class's own EFFECTIVE
+		vtable type (vtbl_owner()'s own type) - every new-slot-introducing
+		ancestor's own slots, root-first, up to and including vtbl_owner()
+		itself (root.methods is append-only in source order - see
+		discovery.py's _parse_function, so each level's own contribution
+		is already declaration-ordered). This is a superset walk, not
+		"only the root" - see vtbl_owner's own docstring on why every
+		level can contribute now. '''
+		owner = self.vtbl_owner()
+		chain: list[CStruct] = []
+		node: CStruct|None = owner
+		while node is not None:
+			chain.append( node )
+			node = node.base
+		slots: list[Function] = []
+		for node in reversed( chain ):
+			slots.extend( node.own_new_virtual_slots() )
+		return slots
 
 @dataclass( kw_only = True )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:

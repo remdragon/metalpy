@@ -260,7 +260,10 @@ places an override at the SAME slot its base declared, and appends any
 new virtual methods it introduces itself after everything inherited - no
 slot ever gets renumbered, so a caller holding a base-typed pointer can
 always call through the base's own known slot index regardless of the
-actual concrete implementation.
+actual concrete implementation. (This was always the plan as written
+here - Phase 1/2's first implementation didn't actually follow it,
+wrongly restricting new slots to the root only; fixed in Phase 3's own
+per-level-Vtbl-types revision, see above.)
 
 4. Dispatch mechanism
 
@@ -454,13 +457,15 @@ Phased implementation plan
    anywhere - see the REVISION's own note on why that's not exhaustively
    guarded against, and the flagged follow-up task for the remaining
    `p[0]`-escape-hatch case.
-3. RESUMED - blocker cleared. COM specifics: lib/guid.py's GUID type
-   (plus whatever str support it needs), HRESULT library type, a worked
-   example consuming a real foreign Windows COM interface end to end (a
-   simple, easily-testable one - TBD which), and a worked example
-   exposing a metalpy-implemented interface to a hand-written C caller -
-   both with hand-written QueryInterface/AddRef/Release, matching the
-   "hand-rolling first" decision above.
+3. DONE (mostly) - COM specifics. lib/guid.py's GUID type, lib/windows/
+   com.py's HRESULT constants + IUnknown pattern, and a worked example
+   exposing a metalpy-implemented interface with hand-written
+   QueryInterface/AddRef/Release, constructed and dispatched through
+   end-to-end. NOT done: a worked example consuming a REAL foreign
+   Windows COM object (CoCreateInstance etc.) - genuine OS-level COM
+   activation is a separate, larger undertaking (and explicitly out of
+   scope per this plan's own "Explicitly out of scope" list below); the
+   ABI-correctness of the metalpy side is what's actually been proven.
 
    Was blocked on: GUID's constructor needs str.split('-') to parse a
    hyphenated hex string, but list[T] (str.split()'s natural return
@@ -474,9 +479,61 @@ Phased implementation plan
    landed as real general-purpose methods (not embedded in split()), and
    list[T]/list[str] are now verified working end-to-end via real C
    compile-and-run tests. compiler.py's _trigger_name eagerly evaluating
-   str(unit) was also fixed earlier and independently (committed on its
-   own, unrelated to list[T]'s own bugs beyond being how the hang was
-   first noticed). 640 tests passing on master as of this resume.
+   str(unit) was also fixed earlier and independently.
+
+   MAJOR REVISION found while building the worked example: the original
+   Phase 1/2 design ("every level shares the ROOT's own Vtbl type,
+   unchanged") only allows the interface ROOT to ever introduce a new
+   @virtual slot - which blocks the single most common COM pattern,
+   IUnknown -> ICustomInterface (adds methods) -> ConcreteImpl. Real COM
+   handles this via PER-LEVEL vtable types: each interface that adds new
+   methods gets its own Vtbl struct type, a superset of its base's (base
+   slots first, same order, then its own appended) - a caller holding a
+   base-typed pointer reads through the base's own (shorter) Vtbl type;
+   a caller holding the derived type sees the full superset. Decided:
+   implement per-level Vtbl types properly (not the alternative -
+   requiring every root interface to duplicate QueryInterface/AddRef/
+   Release inline, matching real MIDL-generated C headers' own
+   convention, which would have avoided touching the compiler at all but
+   was rejected as less faithful to how COM interfaces are actually
+   composed).
+
+   New concepts (mpy_types.py's CStruct): own_new_virtual_slots() (this
+   class's own @virtual methods not already an inherited slot - any
+   level can have some now, not just the root), vtbl_owner() (nearest
+   class at or above self that owns its own Vtbl type - self if it adds
+   something new, else walks up until it finds one), virtual_slots()
+   (redefined: the full ordered slot list up to vtbl_owner(), not just
+   the root's own). compiler.py's _validate_interface_vtable no longer
+   rejects new slots below the root - only an actual NAME COLLISION with
+   an inherited slot still needs strict signature matching (an
+   override). emitter_c.py: every $vtable field is typed to its own
+   class's vtbl_owner() (not a single shared root); a virtual call's own
+   self-cast target is the RECEIVER's concrete type's vtbl_owner() (not
+   target.cls's, which can be any ancestor, and not a single root) -
+   different concrete classes sharing an interface at different depths
+   can have different vtbl_owners for the SAME inherited slot.
+
+   One more bug found and fixed while building the worked example
+   (general, not specific to the vtable-type revision): a PLAIN, non-
+   interface CStruct (e.g. GUID) referenced as a POINTER parameter
+   inside an @interface CStruct's own vtable slot signature (e.g.
+   QueryInterface's `riid: ConstPtr[GUID]`) hit the same "function
+   prototype scope" trap the existing RCClass/interface-CStruct forward
+   tags exist to avoid - generalized the forward-tag step to cover every
+   CStruct/CUnion/TaggedUnion unconditionally (cheap, always safe) rather
+   than only ones already known to need it.
+
+   Verified end-to-end (real C compile + run): a three-level interface
+   hierarchy (IRoot -> ICustom (adds a method) -> ConcreteImpl)
+   dispatching correctly through the right Vtbl type at each level, and
+   a full IUnknown -> IFoo -> FooImpl worked example (construct, direct
+   dispatch, QueryInterface writing a real pointer through its
+   Ptr[Ptr[None]] out-param and calling AddRef, Release) - see
+   emitter_c_test.py's InterfaceCStructLayoutTests (new tests:
+   test_new_virtual_slot_below_root_gets_its_own_vtbl_type,
+   test_three_level_hierarchy_dispatches_through_the_right_vtbl_type)
+   and ComTests. 645 tests passing.
 4. Stretch/optional, not committed: an opt-in automatic-IUnknown
    convenience (compiler-synthesized QueryInterface/AddRef/Release,
    `_synthesize_rcclass_destructor`-style) - revisit once Phase 1-3 are

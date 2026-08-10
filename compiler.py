@@ -234,36 +234,30 @@ class Compiler:
 			assert False, f'unsupported compile unit: {unit!r}'
 
 	def _validate_interface_vtable( self, cls: CStruct ) -> None:
-		''' every @virtual method on an @interface CStruct must either BE a
-		root-declared slot (cls IS the root - nothing to check, its own
-		@virtual methods ARE the slot definitions) or OVERRIDE one (name +
-		strict signature match against the root's own slot of that name) -
-		since a subclass's own $vtable field is fixed to the ROOT's Vtbl
-		type (see PLAN_SUBCLASSING_VTABLES_COM.md's Layout section /
-		CStruct.interface_root), only the root can introduce a genuinely
-		NEW slot. Runs once per real (non-generic) @interface CStruct
-		compile unit, here rather than discovery.py, because checking an
-		override's signature needs the OVERRIDDEN root slot's own
-		parameters/return_type already resolved, which isn't guaranteed
-		yet at discovery-time parse order (a subclass can be parsed before
-		its base's own methods are individually resolved). '''
-		root = cls.interface_root()
-		if cls is root:
-			return
-		root_slots = { m.stem: m for m in cls.virtual_slots() }
+		''' every @virtual method on an @interface CStruct is either a
+		genuinely NEW slot (its name isn't already a slot anywhere in
+		cls's own ancestor chain - always allowed, any level can
+		introduce new capabilities now, see CStruct.vtbl_owner's own
+		docstring on why the original root-only rule was replaced) or an
+		OVERRIDE (name collides with an inherited slot - must strict-
+		signature-match it, no covariance/contravariance). Runs once per
+		real (non-generic) @interface CStruct compile unit, here rather
+		than discovery.py, because checking an override's signature needs
+		the OVERRIDDEN slot's own parameters/return_type already resolved,
+		which isn't guaranteed yet at discovery-time parse order (a
+		subclass can be parsed before its base's own methods are
+		individually resolved). '''
+		if cls.base is None:
+			return # nothing to inherit from - every one of cls's own @virtual methods is trivially a new slot
+		ancestor_slots = { m.stem: m for m in cls.base.virtual_slots() }
 		for m in cls.methods:
 			if not ( isinstance( m, Function ) and m.is_virtual ):
 				continue
 			if m.resolve is not None:
 				m.resolve()
-			slot = root_slots.get( m.stem )
+			slot = ancestor_slots.get( m.stem )
 			if slot is None:
-				self.disco.fail(
-					f'{m.qualname}: new @virtual methods can only be declared on the interface root '
-					f'({root.qualname}) - {cls.qualname} can only override an existing slot',
-					m.node,
-				)
-				continue
+				continue # a genuinely new slot - always fine now
 			if slot.resolve is not None:
 				slot.resolve()
 			if not self._virtual_signatures_match( m, slot ):
