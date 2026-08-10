@@ -277,6 +277,90 @@ class str:
 				i += 1
 		return count
 
+	def find( self, sub: str, start: usize = 0 ) -> Result[usize,IndexError]:
+		''' byte offset of the first occurrence of sub in self, searching
+		from byte offset start onward (default 0 - the whole string; used
+		by split() below to resume searching just past each match, without
+		its own separate scanning logic). UTF-8-safe at the byte level even
+		though the scan itself is pure byte comparison (sys.memcmp): sub is
+		itself valid UTF-8 (str's own construction-time invariant - see
+		_from_owned_cstr), so a genuine match boundary can never be split
+		mid-codepoint - an ASCII byte or a UTF-8 leading/continuation byte
+		can only byte-for-byte equal the same kind of byte in sub, never
+		straddle one. Empty sub matches at offset start, same as Python's
+		str.find(''). '''
+		self_len: usize = self.byte_len()
+		sub_len: usize = sub.byte_len()
+		if start > self_len:
+			return Result.Err( IndexError() )
+		if sub_len == 0:
+			return Result.Ok( start )
+		with compiler.wrap_arithmetic: # start <= self_len, just checked above
+			remaining: usize = self_len - start
+		if sub_len > remaining:
+			return Result.Err( IndexError() )
+		with compiler.wrap_arithmetic: # sub_len <= self_len, just checked above
+			last_start: usize = self_len - sub_len
+		i: usize = start
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i <= last_start:
+				candidate: ConstPtr[u8] = self.__data + i
+				if sys.memcmp( candidate, sub.__data, sub_len ) == 0:
+					return Result.Ok( i )
+				i += 1
+		return Result.Err( IndexError() )
+
+	def index( self, sub: str ) -> usize:
+		''' like find(), but panics instead of returning Err - matches
+		Python's str.index() raising ValueError where str.find() returns
+		-1, adapted to this language's panic-not-exceptions convention. '''
+		return self.find( sub ).unwrap( 'substring not found' )
+
+	@private
+	def _byte_slice( self, start: usize, end: usize ) -> str:
+		''' bytes [start, end) of self, as a new, independently-owned str.
+		Only ever called (see split(), below) with start/end landing on
+		real UTF-8 codepoint boundaries - a byte-exact match of a valid-
+		UTF-8 needle always lands there, see find()'s own comment on why -
+		but still goes through _from_owned_cstr's own revalidation anyway,
+		same "revalidate on construction" consistency str.concat/__add__
+		above already keep rather than a separate trust-me bypass path. '''
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			piece_len: usize = end - start
+			buf_size: usize = piece_len + 1 # +1 for the zero terminator
+		new_buf: Ptr[u8] = sys.alloc[u8]( buf_size )
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			src: ConstPtr[u8] = self.__data + start
+		sys.memcpy( new_buf, src, piece_len )
+		new_buf[piece_len] = 0
+		return str._from_owned_cstr( new_buf, buf_size ).unwrap( 'invalid UTF-8 in _byte_slice' )
+
+	def split( self, sep: str ) -> list[str]:
+		''' splits self on every occurrence of sep - Python str.split(sep)
+		semantics (a leading/trailing/consecutive separator produces empty
+		strings at those positions - no "collapse empty pieces" special
+		case, unlike bare .split() with no separator, which isn't
+		implemented here). Built entirely on find()/​_byte_slice above, not
+		its own separate byte-scanning logic. sep must not be empty
+		(Python raises ValueError there; this language panics instead,
+		matching its own panic-not-exceptions convention throughout). '''
+		if sep.byte_len() == 0:
+			sys.panic( 'str.split(...): separator must not be empty' )
+		result: list[str] = list[str]()
+		self_len: usize = self.byte_len()
+		sep_len: usize = sep.byte_len()
+		start: usize = 0
+		while True:
+			found: Result[usize,IndexError] = self.find( sep, start )
+			if found.is_err():
+				result.append( self._byte_slice( start, self_len )).unwrap( 'str.split: append failed' )
+				break
+			match_start: usize = found.unwrap( 'unreachable: find() confirmed is_ok' )
+			result.append( self._byte_slice( start, match_start )).unwrap( 'str.split: append failed' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				start = match_start + sep_len
+		return result
+
 	def upper( self ) -> str:
 		''' case_folder (see PLAN_CASE_FOLDING.md) is checked first, ahead
 		of the OS-backed path - a program that never calls case_folding.

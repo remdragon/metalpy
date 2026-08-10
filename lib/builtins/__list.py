@@ -44,7 +44,7 @@ class RawList:
 			data_bytes: usize     = initial_capacity * element_size
 			meta_bytes: usize     = initial_capacity * compiler.sizeof( _ListMetadata )
 			index_bytes: usize    = initial_capacity * compiler.sizeof( usize )
-		self.__data     = sys.alloc[None]( data_bytes )
+		self.__data     = compiler.cast( Ptr[None], sys.alloc[u8]( data_bytes ))
 		self.__metadata = sys.alloc[_ListMetadata]( meta_bytes )
 		self.__indexes  = sys.alloc[usize]( index_bytes )
 	
@@ -71,7 +71,7 @@ class RawList:
 	# Bounds-checked against __len (not __cap).
 	def _ptr_at( self, idx: usize ) -> Result[Ptr[None], IndexError]:
 		if idx >= self.__len:
-			return Result.Err( IndexError )
+			return Result.Err( IndexError() )
 		with compiler.panic_arithmetic( 'RawList _ptr_at: offset overflow' ):
 			slot_ptr: Ptr[None] = self.__data + idx * self.__element_size
 		return Result.Ok( slot_ptr )
@@ -79,7 +79,7 @@ class RawList:
 	# Returns a raw pointer to the element referenced by stable id.
 	def _get( self, id: usize ) -> Result[Ptr[None], IndexError]:
 		if id >= self.__cap:
-			return Result.Err( IndexError )
+			return Result.Err( IndexError() )
 		data_idx: usize = self.__indexes[id]
 		return self._ptr_at( data_idx )
 	
@@ -97,8 +97,12 @@ class RawList:
 		# Assign a stable ID for the new slot
 		id: usize = self._get_free_id()
 		
-		# Write element bytes into data buffer
-		slot_ptr: Ptr[None] = self._ptr_at( self.__len )
+		# Write element bytes into data buffer - _slot_ptr, not _ptr_at:
+		# the new element goes into the NEXT free slot (data-buffer index
+		# __len, one past the currently-counted bound but still within
+		# __cap) - _ptr_at's own bounds check (idx < __len, valid EXISTING
+		# elements only) would always reject exactly this slot
+		slot_ptr: Ptr[None] = self._slot_ptr( self.__len )
 		sys.memcpy( slot_ptr, val_ptr, self.__element_size )
 		
 		# Write metadata: this slot's reverse ID is id
@@ -109,23 +113,24 @@ class RawList:
 		
 		# Update the stable ID -> data index mapping
 		self.__indexes[id] = self.__len
-		self.__len += 1
+		self.__len = self.__len + 1
 		return Result.Ok( id )
 	
 	# O(1) swap-and-pop removal by stable ID.
 	# Does NOT perform RC decref — caller is responsible.
 	def _erase( self, id: usize ) -> Result[None, IndexError]:
 		if id >= self.__cap:
-			return Result.Err( IndexError )
+			return Result.Err( IndexError() )
 		data_idx: usize     = self.__indexes[id]
 		if data_idx >= self.__len:
-			return Result.Err( IndexError )
-		with compiler.panic_arithmetic:
+			return Result.Err( IndexError() )
+		with compiler.panic_arithmetic( 'RawList _erase: underflow computing last_idx' ):
 			last_idx: usize = self.__len - 1
 		last_id: usize      = self.__metadata[last_idx].rid
-		
+
 		# Increment validity_id of the removed slot to invalidate existing handles
-		self.__metadata[data_idx].validity_id += 1
+		with compiler.panic_arithmetic( 'RawList _erase: validity_id overflow' ):
+			self.__metadata[data_idx].validity_id = self.__metadata[data_idx].validity_id + 1
 		
 		if data_idx != last_idx:
 			# Swap element bytes
@@ -140,15 +145,16 @@ class RawList:
 			
 			# Update the moved element's stable ID -> new data index
 			self.__indexes[last_id] = data_idx
-	
-		self.__len -= 1
+
+		with compiler.panic_arithmetic( 'RawList _erase: __len underflow' ):
+			self.__len = self.__len - 1
 		return Result.Ok( None )
 	
 	# O(1) swap-and-pop removal by data-buffer index.
 	# Does NOT perform RC decref — caller is responsible.
 	def _erase_at( self, idx: usize ) -> Result[None, IndexError]:
 		if idx >= self.__len:
-			return Result.Err( IndexError )
+			return Result.Err( IndexError() )
 		id: usize = self.__metadata[idx].rid
 		return self._erase( id )
 	
@@ -156,13 +162,16 @@ class RawList:
 	def _clear( self ) -> None:
 		i: usize = 0
 		while i < self.__len:
-			self.__metadata[i].validity_id += 1
-			i += 1
+			with compiler.panic_arithmetic( 'RawList _clear: overflow' ):
+				self.__metadata[i].validity_id = self.__metadata[i].validity_id + 1
+				i += 1
 		self.__len = 0
 	
 	# Returns a pointer to the raw bytes of the slot at data_idx (for caller to read before erase).
 	def _slot_ptr( self, data_idx: usize ) -> Ptr[None]:
-		return self.__data.add( data_idx * self.__element_size )
+		with compiler.panic_arithmetic( 'RawList _slot_ptr: offset overflow' ):
+			slot_ptr: Ptr[None] = self.__data + data_idx * self.__element_size
+		return slot_ptr
 	
 	# Doubles buffer capacity.
 	def _grow( self ) -> Result[None, OverflowError]:
@@ -172,7 +181,7 @@ class RawList:
 		new_meta_bytes:  usize = new_cap * compiler.sizeof( _ListMetadata )
 		new_index_bytes: usize = new_cap * compiler.sizeof( usize )
 		
-		new_data:     Ptr[None]          = sys.alloc[None]( new_data_bytes )
+		new_data:     Ptr[None]          = compiler.cast( Ptr[None], sys.alloc[u8]( new_data_bytes ))
 		errdefer( sys.free( new_data ))
 		new_metadata: Ptr[_ListMetadata] = sys.alloc[_ListMetadata]( new_meta_bytes )
 		errdefer( sys.free( new_metadata ))
@@ -232,7 +241,7 @@ class Handle[T]:
 	# Returns a borrowed pointer to the element. Check is_valid() first.
 	def get( self ) -> Result[Ptr[T], IndexError]:
 		ptr: Ptr[None] = self.__raw[0]._get( self.__id ).or_return()
-		return Result.Ok( ptr.cast[T]() )
+		return Result.Ok( compiler.cast( Ptr[T], ptr ))
 	
 	def id( self ) -> usize:
 		return self.__id
@@ -249,18 +258,53 @@ class list[T]:
 	__raw: RawList
 	
 	def __init__( self, initial_capacity: usize = 8 ) -> None:
+		# an RC element's own SLOT in the buffer holds its handle (a
+		# pointer, sizeof(usize)-wide - always pointer-width regardless of
+		# T, same width usize itself is on every target this compiler
+		# supports), never its struct body - compiler.sizeof(T) deliberately
+		# stays the OBJECT's own real, layout-dependent size (needed by
+		# sys.alloc[T]'s construction use, and would otherwise wildly
+		# overallocate/misalign every element slot here). compiler.is_rc(T)
+		# folds away at compile time (see type_resolver.py's own rewrite 4),
+		# so only the branch that actually applies to THIS T ever compiles
+		element_size: usize = 0
+		if compiler.is_rc( T ):
+			element_size = compiler.sizeof( usize )
+		else:
+			element_size = compiler.sizeof( T )
 		self.__raw = RawList(
-			element_size     = compiler.sizeof( T ),
+			element_size     = element_size,
 			initial_capacity = initial_capacity,
 		)
 	
+	# Read the T value stored at a raw slot address. An RC element's own
+	# slot holds its HANDLE directly (see __init__'s own comment on why
+	# element_size is pointer-width there) - reinterpreting the slot as
+	# Ptr[T] and dereferencing it (the value-typed path below) would read
+	# struct-BODY-sized memory out of a pointer-sized slot, since Ptr[T]
+	# itself always stays single-indirection even for an RCClass T (needed
+	# elsewhere for sys.alloc[T]'s own construction use - see PLAN_LIST_T.md).
+	# compiler.is_rc(T) folds away entirely at compile time (only the
+	# branch that actually applies to THIS T ever gets compiled - see
+	# type_resolver.py's own rewrite 4), so this stays one shared,
+	# readable method instead of scattering the distinction through every
+	# accessor below.
+	def _read_element( self, slot: Ptr[None] ) -> T:
+		if compiler.is_rc( T ):
+			handle_slot: Ptr[Ptr[None]] = compiler.cast( Ptr[Ptr[None]], slot )
+			return compiler.cast( T, handle_slot[0] )
+		else:
+			ptr: Ptr[T] = compiler.cast( Ptr[T], slot )
+			return ptr[0]
+
 	def __del__( self ) -> None:
 		# Decref all RC elements before RawList frees the buffer
 		i: usize = 0
 		while i < self.__raw.len():
-			ptr: Ptr[T] = self.__raw._slot_ptr( i ).cast[T]()
-			compiler.decref( ptr[0] )
-			i += 1
+			val: T = self._read_element( self.__raw._slot_ptr( i ))
+			compiler.decref( val )
+			with compiler.panic_arithmetic( 'list.__del__: overflow' ):
+				i += 1
 		# RawList.__del__ will free the raw buffers
 	
 	def __len__( self ) -> usize:
@@ -273,53 +317,57 @@ class list[T]:
 	# Returns the stable ID assigned to the element.
 	def append( self, val: T ) -> Result[usize, OverflowError]:
 		compiler.incref( val )
-		id: usize = self.__raw._append( compiler.addrof( val ).cast[None]() ).or_return()
+		id: usize = self.__raw._append( compiler.cast( Ptr[None], compiler.addrof( val ))).or_return()
 		return Result.Ok( id )
-	
+
 	# Access element by stable ID. Returns a copy (with incref if RC).
 	def __getitem__( self, id: usize ) -> Result[T, IndexError]:
-		ptr: Ptr[T] = self.__raw._get( id ).or_return().cast[T]()
-		val: T = ptr[0]
+		val: T = self._read_element( self.__raw._get( id ).or_return())
 		compiler.incref( val )
 		return Result.Ok( val )
-	
+
 	# Access element by contiguous data-buffer index (for fast iteration).
 	def get_at( self, idx: usize ) -> Result[T, IndexError]:
-		ptr: Ptr[T] = self.__raw._get_at( idx ).or_return().cast[T]()
-		val: T = ptr[0]
+		val: T = self._read_element( self.__raw._get_at( idx ).or_return())
 		compiler.incref( val )
 		return Result.Ok( val )
-	
+
 	# Get a borrowed pointer directly into the buffer (no copy, no incref).
 	# Caller must NOT store this pointer beyond the next mutation of the list.
+	# NOTE: for an RC element type, Ptr[T] itself stays single-indirection
+	# (see _read_element's own comment) - a slot only ever holds a T
+	# HANDLE, not a T value, so there is no correctly-typed Ptr[T] this
+	# method could return today. Value-typed T only, for now.
 	def get_ptr( self, id: usize ) -> Result[Ptr[T], IndexError]:
-		ptr: Ptr[T] = self.__raw._get( id ).or_return().cast[T]()
+		ptr: Ptr[T] = compiler.cast( Ptr[T], self.__raw._get( id ).or_return())
 		return Result.Ok( ptr )
-	
+
 	# Get a borrowed data-index pointer directly (for hot iteration loops).
+	# NOTE: same RC-element limitation as get_ptr above.
 	def get_ptr_at( self, idx: usize ) -> Result[Ptr[T], IndexError]:
-		ptr: Ptr[T] = self.__raw._get_at( idx ).or_return().cast[T]()
+		ptr: Ptr[T] = compiler.cast( Ptr[T], self.__raw._get_at( idx ).or_return())
 		return Result.Ok( ptr )
-	
+
 	# Remove by stable ID. Decrefs the removed element if T is RC.
 	def erase( self, id: usize ) -> Result[None, IndexError]:
-		ptr: Ptr[T] = self.__raw._get( id ).or_return().cast[T]()
-		compiler.decref( ptr[0] )
+		val: T = self._read_element( self.__raw._get( id ).or_return())
+		compiler.decref( val )
 		return self.__raw._erase( id )
-	
+
 	# Remove by data-buffer index. Decrefs the removed element if T is RC.
 	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
-		ptr: Ptr[T] = self.__raw._get_at( idx ).or_return().cast[T]()
-		compiler.decref( ptr[0] )
+		val: T = self._read_element( self.__raw._get_at( idx ).or_return())
+		compiler.decref( val )
 		return self.__raw._erase_at( idx )
-	
+
 	# Erase all elements, decrefing each RC element first.
 	def clear( self ) -> None:
 		i: usize = 0
 		while i < self.__raw.len():
-			ptr: Ptr[T] = self.__raw._slot_ptr( i ).cast[T]()
-			compiler.decref( ptr[0] )
-			i += 1
+			val: T = self._read_element( self.__raw._slot_ptr( i ))
+			compiler.decref( val )
+			with compiler.panic_arithmetic( 'list.clear: overflow' ):
+				i += 1
 		self.__raw._clear()
 	
 	# Create a stable handle to the element at stable ID.

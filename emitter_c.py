@@ -551,6 +551,17 @@ _ARITH_BUILTIN = {
 }
 _PLAIN_BITWISE_SYMBOL = { ir.BitAnd: '&', ir.BitOr: '|', ir.BitXor: '^', ir.Shr: '>>' }
 
+def _is_pointer_type( t: Type|None ) -> bool:
+	# Ptr[T]/ConstPtr[T] - a pointer value, not an integer scalar. +/- on
+	# one of these means byte-address arithmetic (RawList's whole element-
+	# buffer indexing scheme is built on this), computed via a uintptr_t
+	# round-trip rather than handed to C's own pointer arithmetic - the
+	# latter is undefined on void*/const void* outside GCC/Clang's own
+	# extension (this compiler also targets MSVC), and scaled by
+	# sizeof(*ptr) even where it IS defined, which is never what this
+	# language's own explicit, manually-sized element buffers want
+	return isinstance( t, Specialization ) and isinstance( t.base, Scalar ) and t.base.stem in ( 'Ptr', 'ConstPtr' )
+
 def _emit_wrap_arith( dest: str, left: ir.Operand, right: ir.Operand, symbol: str, dest_type: Type ) -> list[str]:
 	# C's signed overflow is UB, not wraparound - cast to the same-width
 	# unsigned type (well-defined wraparound there), compute, cast back
@@ -558,8 +569,10 @@ def _emit_wrap_arith( dest: str, left: ir.Operand, right: ir.Operand, symbol: st
 	# same posture as everywhere else this compiler already leans on real-
 	# world compiler behavior over strict-ISO-C portability)
 	ctype = c_type( dest_type )
-	stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
 	l, r = _emit_operand( left ), _emit_operand( right )
+	if _is_pointer_type( dest_type ):
+		return [ f'\t{dest} = ({ctype})((uintptr_t)({l}) {symbol} (uintptr_t)({r}));' ]
+	stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
 	if stem in _SIGNED_TO_UNSIGNED:
 		uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
 		return [ f'\t{dest} = ({ctype})(({uctype})({l}) {symbol} ({uctype})({r}));' ]
@@ -572,6 +585,21 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 	dest = f't{dest_temp_id}'
 	l, r = _emit_operand( left ), _emit_operand( right )
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( result_spec )
+	if _is_pointer_type( ok_type ):
+		if kind not in ( 'add', 'sub' ):
+			raise NotImplementedError( f'checked pointer {kind} is not supported' )
+		return [
+			'\t{',
+			'\t\tuintptr_t __tmp;',
+			f'\t\tbool __overflow = {builtin}( (uintptr_t)({l}), (uintptr_t)({r}), &__tmp );',
+			'\t\tif ( __overflow ) {',
+			f'\t\t\t{dest}.{tag_f} = 1;',
+			'\t\t} else {',
+			f'\t\t\t{dest}.{tag_f} = 0;',
+			f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})__tmp;',
+			'\t\t}',
+			'\t}',
+		]
 	return [
 		'\t{',
 		f'\t\t{ctype} __tmp;',
@@ -827,6 +855,41 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		declared.add( 'self' )
 	for p in ( function.parameters or [] ):
 		declared.add( _c_local_name( p.stem ))
+	# __return_value (ir.OrJump's own return_slot - see Lowering.
+	# _return_value_var) is referenced two ways neither of which goes
+	# through the ordinary "declare on first Assign" mechanism below: a
+	# field-store ({slot}.tag = 1;` in _emit_or_jump, never an ir.Assign),
+	# and build_epilogue_ladder()'s own unconditional "fall off the end"
+	# `return __return_value;` - emitted whenever this function EVER
+	# pushed an epilogue entry at all, even along a path this compiler
+	# never proves unreachable (e.g. a while-True loop whose every real
+	# exit is an explicit return/break - CFG-wise indistinguishable here
+	# from one that might fall through). Either reference can be the
+	# FIRST (only) mention of __return_value in the whole function, with
+	# no ir.Assign to it anywhere - confirmed by two INDEPENDENT real
+	# repros, not just reasoning, and neither one implies the other: an
+	# OrJump can reference return_slot without its OWN target label still
+	# being live by the time build_epilogue_ladder() walks the (by-then-
+	# popped) stack, and a dead "fall off the end" epilogue can exist with
+	# no OrJump anywhere in the function at all (a while-True loop whose
+	# only exits are return/break, e.g. str.split() below). So this checks
+	# for EITHER shape, not just one: any OrJump with a return_slot, OR
+	# any Label at all whose name starts with 'epilogue' (cfg.py's
+	# Epilogue.name is always 'epilogue_N', from _new_label('epilogue') -
+	# a reliable proxy for "an Epilogue entry existed, so build_epilogue_
+	# ladder() ran" without replicating cfg.py's own push/cancel
+	# bookkeeping here). `declared` then makes any actual ir.Assign to it
+	# (from the function's own `return <expr>`) just an ordinary
+	# re-assignment, not a second declaration
+	needs_return_value = any(
+		( isinstance( instr, ir.OrJump ) and instr.return_slot is not None )
+		or ( isinstance( instr, ir.Label ) and 'epilogue' in instr.name ) # _new_label('epilogue') -> '__epilogue_N__', not a bare prefix
+		for instr in fn.instructions
+	)
+	if needs_return_value and not _returns_void_in_c( function.return_type ):
+		name = _c_local_name( '__return_value' )
+		lines.append( f'\t{c_type(function.return_type)} {name};' )
+		declared.add( name )
 	for instr in fn.instructions:
 		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
 	lines.append( '}' )

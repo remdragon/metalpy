@@ -2197,5 +2197,317 @@ def main() -> None:
 		self.assertIn( 'does not match', self.discovery.errors.errors[0] )
 
 
+class ListGenericTests( CompilerTestCase ):
+	''' list[T] (lib/builtins/__list.py) end-to-end, for both a value type
+	(i32) and an RC type (str) - see PLAN_SUBCLASSING_VTABLES_COM.md's own
+	blocked-on note: list[T] was written but never actually compiled
+	anywhere before this. Mirrors InterfaceCStructLayoutTests/
+	StrUpperLowerTests' own import_builtins=True + real compile-and-run
+	convention (list[T] needs str/Result/the rest of builtins for real). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_i32_construct_append_getitem_del( self ) -> None:
+		# a non-RC element type: list[i32]() construction/destruction alone
+		# (x never used past declaration) already exercises RawList's own
+		# alloc/free and list[T].__del__'s decref-skip loop; append/
+		# __getitem__ round-trip three values through the buffer
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[usize,OverflowError] = x.append( 10 )
+	r1: Result[usize,OverflowError] = x.append( 20 )
+	r2: Result[usize,OverflowError] = x.append( 30 )
+	if r0.is_err() or r1.is_err() or r2.is_err():
+		return 9
+	id0: usize = r0.unwrap( 'append failed' )
+	id1: usize = r1.unwrap( 'append failed' )
+	id2: usize = r2.unwrap( 'append failed' )
+	if x.__len__() != 3:
+		return 1
+	g0: Result[i32,IndexError] = x.__getitem__( id0 )
+	g1: Result[i32,IndexError] = x.__getitem__( id1 )
+	g2: Result[i32,IndexError] = x.__getitem__( id2 )
+	if g0.is_err() or g1.is_err() or g2.is_err():
+		return 8
+	if g0.unwrap( 'getitem failed' ) != 10:
+		return 2
+	if g1.unwrap( 'getitem failed' ) != 20:
+		return 3
+	if g2.unwrap( 'getitem failed' ) != 30:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_i32_grows_past_initial_capacity( self ) -> None:
+		# initial_capacity defaults to 8 - 20 appends forces RawList._grow()
+		# at least once, and every value must still read back correctly
+		# afterward (the swap/copy during growth must preserve contents)
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	i: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while i < 20:
+			ar: Result[usize,OverflowError] = x.append( compiler.cast( i32, i ))
+			if ar.is_err():
+				return 9
+			i += 1
+	if x.__len__() != 20:
+		return 1
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			gr: Result[i32,IndexError] = x.__getitem__( j )
+			if gr.is_err():
+				return 8
+			v: i32 = gr.unwrap( 'getitem failed' )
+			if v != compiler.cast( i32, j ):
+				return 2
+			j += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_str_construct_append_getitem_del( self ) -> None:
+		# an RC element type - a list[T] slot holds str's own HANDLE
+		# (pointer-width), not its struct body (see list.__init__'s own
+		# comment); __del__ must decref every stored element without
+		# reading struct-body-sized memory out of a pointer-sized slot
+		self._run( '''
+def main() -> i32:
+	x: list[str] = list[str]()
+	r0: Result[usize,OverflowError] = x.append( 'hello' )
+	r1: Result[usize,OverflowError] = x.append( 'world' )
+	if r0.is_err() or r1.is_err():
+		return 9
+	id0: usize = r0.unwrap( 'append failed' )
+	id1: usize = r1.unwrap( 'append failed' )
+	if x.__len__() != 2:
+		return 1
+	g0: Result[str,IndexError] = x.__getitem__( id0 )
+	g1: Result[str,IndexError] = x.__getitem__( id1 )
+	if g0.is_err() or g1.is_err():
+		return 8
+	if g0.unwrap( 'getitem failed' ) != 'hello':
+		return 2
+	if g1.unwrap( 'getitem failed' ) != 'world':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_str_grows_past_initial_capacity( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	x: list[str] = list[str]()
+	i: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while i < 20:
+			ar: Result[usize,OverflowError] = x.append( 'item' )
+			if ar.is_err():
+				return 9
+			i += 1
+	if x.__len__() != 20:
+		return 1
+	all_ok: bool = True
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			gr: Result[str,IndexError] = x.__getitem__( j )
+			if gr.is_err():
+				all_ok = False
+			else:
+				v: str = gr.unwrap( 'getitem failed' )
+				if v != 'item':
+					all_ok = False
+			j += 1
+	if not all_ok:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
+class StrFindIndexSplitTests( CompilerTestCase ):
+	''' str.find()/str.index()/str.split() (lib/builtins/__init__.py) -
+	both listed missing in TODO.txt, implemented as real general-purpose
+	methods (byte-level substring search built directly off str's own
+	__data/__byte_size fields) rather than one-off logic embedded in
+	split() alone - split() itself is built on find(), not its own
+	separate scanning. Same import_builtins=True + real compile-and-run
+	convention as ListGenericTests above (split() needs list[T] for real). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_find_and_index( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
+	r0: Result[usize,IndexError] = s.find( '-' )
+	if r0.is_err() or r0.unwrap( 'x' ) != 8:
+		return 1
+	r1: Result[usize,IndexError] = s.find( 'zzz' )
+	if r1.is_ok():
+		return 2
+	r2: Result[usize,IndexError] = s.find( '' )
+	if r2.is_err() or r2.unwrap( 'x' ) != 0:
+		return 3
+	if s.index( 'beef' ) != 4:
+		return 4
+	if s.find( s ).unwrap( 'x' ) != 0:
+		return 5
+	r3: Result[usize,IndexError] = s.find( 'toolongtoolongtoolongtoolongtoolongtoolong' )
+	if r3.is_ok():
+		return 6
+	# find() with an explicit start offset - resumes past the first match
+	r4: Result[usize,IndexError] = s.find( '-', 9 )
+	if r4.is_err() or r4.unwrap( 'x' ) != 13:
+		return 7
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_split_guid_like_string( self ) -> None:
+		# the exact motivating case from PLAN_SUBCLASSING_VTABLES_COM.md's
+		# own blocked-on note: GUID's constructor parsing a hyphenated hex
+		# string via str.split('-')
+		self._run( '''
+def main() -> i32:
+	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
+	parts: list[str] = s.split( '-' )
+	if parts.__len__() != 5:
+		return 1
+	g0: Result[str,IndexError] = parts.__getitem__( 0 )
+	g1: Result[str,IndexError] = parts.__getitem__( 1 )
+	g2: Result[str,IndexError] = parts.__getitem__( 2 )
+	g3: Result[str,IndexError] = parts.__getitem__( 3 )
+	g4: Result[str,IndexError] = parts.__getitem__( 4 )
+	if g0.is_err() or g1.is_err() or g2.is_err() or g3.is_err() or g4.is_err():
+		return 9
+	if g0.unwrap( 'x' ) != 'deadbeef':
+		return 2
+	if g1.unwrap( 'x' ) != 'dead':
+		return 3
+	if g2.unwrap( 'x' ) != 'beef':
+		return 4
+	if g3.unwrap( 'x' ) != 'dead':
+		return 5
+	if g4.unwrap( 'x' ) != 'beefdeadbeef':
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_split_edge_cases( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	empty: list[str] = ''.split( ',' )
+	if empty.__len__() != 1:
+		return 1
+	e0: Result[str,IndexError] = empty.__getitem__( 0 )
+	if e0.unwrap( 'x' ) != '':
+		return 2
+
+	leading: list[str] = ',a,b'.split( ',' )
+	if leading.__len__() != 3:
+		return 3
+	l0: Result[str,IndexError] = leading.__getitem__( 0 )
+	if l0.unwrap( 'x' ) != '':
+		return 4
+
+	no_sep: list[str] = 'abc'.split( ',' )
+	if no_sep.__len__() != 1:
+		return 5
+	n0: Result[str,IndexError] = no_sep.__getitem__( 0 )
+	if n0.unwrap( 'x' ) != 'abc':
+		return 6
+
+	consecutive: list[str] = 'a,,b'.split( ',' )
+	if consecutive.__len__() != 3:
+		return 7
+	c1: Result[str,IndexError] = consecutive.__getitem__( 1 )
+	if c1.unwrap( 'x' ) != '':
+		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 if __name__ == '__main__':
 	unittest.main()

@@ -1023,6 +1023,32 @@ class Lowering:
 		self._emit( ir.SizeOf( dest = dest, type = target_type ))
 		return dest
 
+	def _lower_compiler_is_rc( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.is_rc(T) - a compile-time constant bool, true iff T is an
+		# RCClass (possibly wrapped in a Specialization). T is always
+		# concrete by the time this lowers (same "no unbound TypeVar"
+		# requirement as compiler.sizeof), so this always folds directly to
+		# an ir.Const - no runtime check, no emitter support needed at all.
+		# Lets generic library code (list[T]'s own per-slot storage width -
+		# an RCClass value IS a pointer everywhere else in this compiler,
+		# but compiler.sizeof(T) deliberately stays the OBJECT's own struct-
+		# body size always, for sys.alloc[T]'s sake - see its own docstring)
+		# branch on T's own RC-ness without a new kind of type-level
+		# reflection existing anywhere else in the language
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.is_rc(...) takes exactly one type argument: {ast.unparse(node)}', node )
+		target_type = self._try_resolve_namespace( node.args[0] )
+		if target_type is None:
+			self.discovery.fail( f'compiler.is_rc(...) argument must be a type: {ast.unparse(node)}', node )
+		if isinstance( target_type, TypeVar ):
+			self.discovery.fail(
+				f'compiler.is_rc({target_type.stem}) requires a concrete type - {target_type.qualname} is still an '
+				f'unbound generic type parameter here (call the enclosing function through an explicit specialization, e.g. foo[SomeType](...))',
+				node,
+			)
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		return ir.Const( type = expected_type or bool_cls, value = self._type_resolver._is_RC( target_type ))
+
 	def _lower_compiler_refcount( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.refcount(x) - unlike compiler.sizeof(T), x is a real
 		# VALUE (an RC object), not a type reference, so it's lowered via
@@ -1297,8 +1323,33 @@ class Lowering:
 				f'unbound generic type parameter here (call the enclosing function through an explicit specialization, e.g. foo[SomeType](...))',
 				node,
 			)
+		if self._type_resolver._is_pointer_representable( target_type ):
+			# Ptr[T]/ConstPtr[T], OR a bare RCClass - both are a single
+			# machine pointer's worth of bits, just typed differently (see
+			# _is_pointer_representable) - a plain reinterpret cast between
+			# any of these (RawList's own byte-buffer indexing scheme needs
+			# this: a Ptr[None] slot pointer reinterpreted as Ptr[T], OR
+			# reinterpreted directly as a bare RC element T itself, since a
+			# T-typed SLOT holds exactly T's own handle, not a Ptr[T] to
+			# one - see list[T]'s own read/write helpers). Never fails at
+			# runtime (unlike a scalar cast, which can lose bits) - no
+			# arithmetic-mode concept applies, so this bypasses
+			# _lower_scalar_cast/_lower_arithmetic_op entirely and reuses
+			# ir.CastWrap directly, purely for its emitter_c.py shape
+			# (`dest = (ctype)(operand);`, no overflow check) - not because
+			# this is "wrap mode" in the arithmetic sense
+			value = self._lower_expr( node.args[1], None )
+			if not self._type_resolver._is_pointer_representable( value.type ):
+				self.discovery.fail(
+					f'compiler.cast({target_type.qualname}, ...) second argument must be a pointer or RC value, not '
+					f'{value.type.qualname if value.type else "?"}: {ast.unparse(node)}',
+					node,
+				)
+			dest = self._new_temp( expected_type or target_type )
+			self._emit( ir.CastWrap( dest = dest, operand = value ))
+			return dest
 		if not isinstance( target_type, Scalar ):
-			self.discovery.fail( f'compiler.cast({target_type.qualname}, ...) is not supported yet - only Scalar-to-Scalar casts are, for now', node )
+			self.discovery.fail( f'compiler.cast({target_type.qualname}, ...) is not supported yet - only Scalar-to-Scalar and pointer-to-pointer casts are, for now', node )
 		value_node = node.args[1]
 		if isinstance( value_node, ast.Constant ):
 			return self._lower_scalar_cast( target_type, value_node, node )
@@ -1349,32 +1400,61 @@ class Lowering:
 		ast.copy_location( return_stmt, node )
 		self._stmt_Return( return_stmt )
 
+	def _in_generic_class_method( self ) -> bool:
+		# true while lowering a MONOMORPHIZED method of a generic class
+		# (list[i32].__del__, ...) - Monomorphizer.monomorphized_function
+		# sets a substituted method's own .cls to the concrete class
+		# Specialization it was built for (base.cls stays plain/None for
+		# an ordinary, non-generic method) - see its own comment on why.
+		# Used by compiler.incref/decref to tell "T turned out non-RC this
+		# instantiation" (routine, no-op) apart from "this was never RC to
+		# begin with" (a real mistake, still rejected) - see their own
+		# docstrings
+		cls = getattr( self._current_fn, 'cls', None )
+		return isinstance( cls, Specialization )
+
 	def _lower_compiler_decref( self, node: ast.Call ) -> None:
 		# compiler.decref(x) — emit an ir.Decref for x. Used inside
-		# synthesized destructor bodies to tear down each RC field.
+		# synthesized destructor bodies to tear down each RC field, and by
+		# generic containers (list[T]) that need to conditionally RC-manage
+		# elements whose T may or may not turn out to be an RC type once
+		# monomorphized - a silent no-op for a non-RC T (rather than a hard
+		# failure) is allowed ONLY inside a monomorphized generic-class
+		# method (_in_generic_class_method), so the SAME generic method
+		# body stays correct for both list[SomeRCClass] and list[i32]
+		# without the class itself branching on whether T is RC - an
+		# ordinary, non-generic call site with a genuinely wrong (always
+		# non-RC) argument is still rejected, same as before
 		if len( node.args ) != 1 or node.keywords:
 			self.discovery.fail( f'compiler.decref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is None or not self._type_resolver._is_RC( operand.type ):
-			self.discovery.fail(
-				f'compiler.decref(...) argument must be a reference-counted value, not '
-				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
-				node,
-			)
-		self._emit( ir.Decref( value = operand ))
+		if operand.type is not None and self._type_resolver._is_RC( operand.type ):
+			self._emit( ir.Decref( value = operand ))
+			return
+		if operand.type is not None and self._in_generic_class_method():
+			return
+		self.discovery.fail(
+			f'compiler.decref(...) argument must be a reference-counted value, not '
+			f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+			node,
+		)
 
 	def _lower_compiler_incref( self, node: ast.Call ) -> None:
-		# compiler.incref(x) — emit an ir.Incref for x.
+		# compiler.incref(x) — emit an ir.Incref for x. Same conditional
+		# no-op-for-non-RC-T posture as _lower_compiler_decref above.
 		if len( node.args ) != 1 or node.keywords:
 			self.discovery.fail( f'compiler.incref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is None or not self._type_resolver._is_RC( operand.type ):
-			self.discovery.fail(
-				f'compiler.incref(...) argument must be a reference-counted value, not '
-				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
-				node,
-			)
-		self._emit( ir.Incref( value = operand ))
+		if operand.type is not None and self._type_resolver._is_RC( operand.type ):
+			self._emit( ir.Incref( value = operand ))
+			return
+		if operand.type is not None and self._in_generic_class_method():
+			return
+		self.discovery.fail(
+			f'compiler.incref(...) argument must be a reference-counted value, not '
+			f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+			node,
+		)
 
 	# --- defer/errdefer ----------------------------------------------------------
 
@@ -2007,15 +2087,30 @@ class Lowering:
 		# operand from the other outside the constant branches above
 		left_is_const = isinstance( left_node, ast.Constant )
 		right_is_const = isinstance( right_node, ast.Constant )
+		usize_cls = self.discovery.get_intrinsics()['usize']
+		# pointer arithmetic (ptr + offset) is never homogeneous the way
+		# ordinary scalar +/- is - hinting the OTHER (non-pointer) side with
+		# the pointer's own type here (as every branch below otherwise
+		# does) would wrongly propagate into a nested BinOp too (e.g. `ptr +
+		# idx * element_size` - the outer Add's own right-hint, if left
+		# unguarded, leaks into the INNER Mult's result_type, producing a
+		# nonsensical "checked pointer multiply"). usize is the natural
+		# offset type - same reasoning _expr_Subscript's own pointer index
+		# hint already uses
 		if left_is_const and not right_is_const:
 			right = self._lower_expr( right_node, expected_type )
-			left = self._lower_expr( left_node, right.type )
+			left_hint = usize_cls if self._type_resolver._is_ptr_specialization( right.type ) else right.type
+			left = self._lower_expr( left_node, left_hint )
 		elif right_is_const and not left_is_const:
 			left = self._lower_expr( left_node, expected_type )
-			right = self._lower_expr( right_node, left.type )
+			right_hint = usize_cls if self._type_resolver._is_ptr_specialization( left.type ) else left.type
+			right = self._lower_expr( right_node, right_hint )
 		else:
 			left = self._lower_expr( left_node, expected_type )
-			right_hint = ( expected_type or left.type ) if infer_right_from_left else expected_type
+			if infer_right_from_left:
+				right_hint = usize_cls if self._type_resolver._is_ptr_specialization( left.type ) else ( expected_type or left.type )
+			else:
+				right_hint = expected_type
 			right = self._lower_expr( right_node, right_hint )
 		return left, right
 
@@ -2727,6 +2822,20 @@ class Lowering:
 		# matching lower_function's own scope check for __init__ itself.
 		target_cls = self._try_resolve_namespace( node.func )
 
+		# explicit generic-class construction via subscript - list[i32](...).
+		# _try_resolve_namespace's own Subscript branch resolves this shape
+		# to a Specialization (same as it always did for Name[T](...) over a
+		# generic FUNCTION) - _ensure_resolved schedules that Specialization
+		# the ordinary way (same discipline as node.resolved_callee/
+		# resolved_construction below - compiler.py's own pipeline builds
+		# the real struct from it once dequeued) and hands back the real,
+		# concrete, already-monomorphized class (type_params/resolve both
+		# cleared - see Monomorphizer.monomorphize_class), which every check
+		# below this point already knows how to treat as an ordinary,
+		# non-generic class
+		if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+			target_cls = self._ensure_resolved( target_cls )
+
 		# CEnum construction: EnumName(value) is a plain cast to the
 		# enum's underlying type — no allocation, no refcounting, just
 		# reinterpret the raw integer as the enum type. e.g. OSError(ENOENT)
@@ -3270,6 +3379,10 @@ class Lowering:
 		match self._is_compiler_call( node ):
 			case 'sizeof':
 				result = self._lower_compiler_sizeof( node, expected_type )
+				return result if want_result else None
+
+			case 'is_rc':
+				result = self._lower_compiler_is_rc( node, expected_type )
 				return result if want_result else None
 
 			case 'refcount':

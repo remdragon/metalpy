@@ -356,6 +356,16 @@ class TypeResolver:
 		base = t.base if isinstance( t, Specialization ) else t
 		return isinstance( base, RCClass )
 
+	def _is_pointer_representable( self, t: Type|None ) -> bool:
+		''' true if `t`'s own runtime representation IS a single machine
+		pointer - a real Ptr[T]/ConstPtr[T], OR an RCClass value (always a
+		pointer to its heap object everywhere in this compiler - see
+		_is_RC). Used by compiler.cast(...) to allow a plain reinterpret
+		cast between ANY two of these (Ptr[None] <-> Ptr[T], Ptr[None] <->
+		a bare RCClass, ...) - they're all the same bit pattern, just
+		typed differently at the metalpy level '''
+		return self._is_ptr_specialization( t ) or self._is_RC( t )
+
 	def _as_specialization( self, t: Type|None ) -> Specialization|None:
 		''' `t` itself if it's already a Specialization, else the
 		Specialization it was eagerly monomorphized FROM (see
@@ -458,6 +468,12 @@ class TypeResolver:
 		by class name)? Returns None rather than failing for an ordinary
 		value expression — that means the caller should do receiver-based
 		resolution. '''
+		if isinstance( node, ast.Constant ) and node.value is None:
+			# a bare `None` used as a TYPE reference (sys.alloc[None](...),
+			# compiler.sizeof(None), Ptr[None]'s own inner arg) - same
+			# NoneType-literal special case discovery.py's own annotation
+			# resolution already applies everywhere else
+			return self.discovery.get_none_type()
 		if isinstance( node, ast.Name ):
 			result = self.discovery.find_name( node.id, node )
 			if getattr( result, 'resolve', None ) is not None:
@@ -479,10 +495,18 @@ class TypeResolver:
 			return result
 		if isinstance( node, ast.Subscript ):
 			base = self._try_resolve_namespace( node.value )
-			if not isinstance( base, Function ) or not base.type_params:
+			# Name[T] - a generic FUNCTION (mylen[i32]), a generic CLASS
+			# construction (list[i32]()), or an intrinsic generic pointer
+			# scalar (Ptr[u8]/ConstPtr[u8], as a type reference - e.g.
+			# compiler.sizeof(Ptr[u8])) all share this same shape. Scalar
+			# has no .resolve of its own (intrinsics aren't parsed from a
+			# real source file - see Scalar's own docstring), unlike the
+			# other two - getattr rather than a bare access
+			if not isinstance( base, ( Function, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Scalar )) or not getattr( base, 'type_params', None ):
 				return None
-			if base.resolve is not None:
-				base.resolve()
+			resolve = getattr( base, 'resolve', None )
+			if resolve is not None:
+				resolve()
 			arg_nodes = node.slice.elts if isinstance( node.slice, ast.Tuple ) else [ node.slice ]
 			if len( arg_nodes ) != len( base.type_params ):
 				self.discovery.fail(
@@ -1331,7 +1355,57 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		ast.copy_location( result, ctx_node )
 		return result
 
-	def visit_If( self, node: ast.If ) -> ast.If:
+	def _try_fold_is_rc_if( self, node: ast.If ) -> list[ast.stmt]|None:
+		''' rewrite 4: `if compiler.is_rc(T): A else: B` (T a generic class's
+		own type param) folds to just A's or B's statements, the OTHER
+		branch dropped entirely before it's ever type-checked - same
+		compile-time-branch-elimination shape compile_time_transformer.py's
+		own `if compiler.target.os == ...` folding already has, just keyed
+		on a monomorphization's own concrete type-parameter binding instead
+		of the active build target. This is what lets generic library code
+		(list[T]'s own per-slot storage/access, an RCClass value being a
+		pointer everywhere else in this compiler, but Ptr[T] itself staying
+		single-indirection always - see PLAN_LIST_T.md's own grounding
+		notes) write ONE shared method body with a plain `if`, rather than
+		needing two separately-selected whole function bodies (compiler.
+		target's own granularity) or scattering is_rc calls through every
+		accessor.
+		Only ever fires once T is genuinely CONCRETE (this pass also runs
+		against the shared, abstract body first, where T is still its own
+		unbound TypeVar - _try_resolve_namespace returns the TypeVar itself
+		there, correctly declining to fold; the SAME node.test, revisited
+		against the monomorphized copy's own deep-copied body once T is
+		bound, folds correctly then - same "run once per specialization"
+		discipline rewrite 3 already relies on, see resolve_function_body's
+		own docstring). Never authoritative about failure, matching every
+		other rewrite in this class: any doubt at all (not this exact
+		shape, T not concrete, T not even a real type) returns None and
+		leaves the if statement untouched for lowering.py's own unchanged,
+		ordinary if-handling to report whatever's actually wrong '''
+		test = node.test
+		if not (
+			isinstance( test, ast.Call ) and not test.keywords and len( test.args ) == 1
+			and isinstance( test.func, ast.Attribute ) and test.func.attr == 'is_rc'
+			and isinstance( test.func.value, ast.Name ) and test.func.value.id == 'compiler'
+		):
+			return None
+		target_type = self._try_resolve_namespace( test.args[0] )
+		if target_type is None or isinstance( target_type, TypeVar ):
+			return None
+		winning_body = node.body if self.resolver._is_RC( target_type ) else node.orelse
+		folded: list[ast.stmt] = []
+		for stmt in winning_body:
+			result = self.visit( stmt )
+			if isinstance( result, list ):
+				folded.extend( result )
+			elif result is not None:
+				folded.append( result )
+		return folded
+
+	def visit_If( self, node: ast.If ) -> ast.If|list[ast.stmt]:
+		folded = self._try_fold_is_rc_if( node )
+		if folded is not None:
+			return folded
 		# rewrite test BEFORE generic_visit recurses into it, so the new BoolOp
 		# children (Name references, Compare, Call) are visited normally
 		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )

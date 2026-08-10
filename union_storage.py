@@ -152,6 +152,31 @@ class UnionStorage:
 		self._ensure_resolved( union )
 		for attr in union.attributes:
 			self._ensure_resolved( attr )
+		# a monomorphized CONCRETE specialization's own .names starts as a
+		# shallow copy of its abstract base's .names (Monomorphizer.
+		# monomorphize_class calls union_storage.get(base) before building
+		# that copy, precisely so 'tag'/'data' already ride along in it) -
+		# a caller reaching THIS object directly for the first time (this
+		# instance's own _cache, keyed by id(union), has never seen this
+		# exact object - cfg.py's own per-temp decref lookups are the
+		# confirmed real case) would otherwise immediately collide with
+		# its own inherited copy below. Detected via the synthesized
+		# payload CUnion's own reserved qualname pattern (f'{union.
+		# qualname}$data' - '$' never appears in a real source identifier,
+		# so this can't coincidentally match a genuine user-declared field
+		# of the same name) - a TRUE collision (a real @union class that
+		# happens to declare its own 'tag'/'data' member) still falls
+		# through to the ordinary synthesis-and-fail path below
+		existing_tag = union.names.get( 'tag' )
+		existing_data = union.names.get( 'data' )
+		if (
+			isinstance( existing_tag, Variable ) and isinstance( existing_data, Variable )
+			and isinstance( existing_data.type, CUnion ) and existing_data.type.qualname == f'{union.qualname}$data'
+		):
+			tags = { attr.stem: i for i, attr in enumerate( union.attributes ) }
+			result = ( existing_tag, existing_data, existing_data.type, tags )
+			self._cache[ id( union ) ] = result
+			return result
 		u8_cls = self.discovery.get_intrinsics()['u8']
 		tag_attr = Variable( stem = 'tag', qualname = f'{union.qualname}.tag', file = union.file, line = union.line, type = u8_cls )
 		payload_fields = [

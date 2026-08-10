@@ -125,6 +125,28 @@ class Monomorphizer:
 				# every concrete field/parameter/return type substituted
 				# through monomorphize_class or monomorphized_function flows
 				# through here (see PLAN_RESOLVE_CLASS_SPECIALIZATIONS.md)
+				#
+				# schedule() too, not just monomorphize_class() - this path
+				# is reached from monomorphized_function's own substitution
+				# of a METHOD's return/parameter types (see monomorphize_
+				# class's method loop), which runs unconditionally for
+				# every plain method a generic class has, whether or not
+				# that method is ever actually CALLED anywhere. Without an
+				# explicit schedule() here, a method that's never called
+				# has nothing else to ever enqueue this nested generic type
+				# as a real compile unit - monomorphize_class() alone only
+				# builds and memoizes the concrete object (spec.
+				# monomorphized), it never appends it to compiler.cstructs/
+				# .cunions/.tagged_unions/.rcclasses itself (only compiler.
+				# py's own queue-draining _lower() does that) - confirmed by
+				# a real repro: a generic class with an uncalled method
+				# returning Result[OtherGeneric[T],E] left OtherGeneric[i32]
+				# forward-declared but never given a body, an "incomplete
+				# type" C compile error the moment that Result's own
+				# payload union (itself scheduled unconditionally by
+				# monomorphize_class's TaggedUnion branch) embeds it by
+				# value
+				self.schedule( substituted )
 				return self.monomorphize_class( substituted )
 			return substituted
 		if isinstance( t, TaggedUnion ) and t.file is None:

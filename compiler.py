@@ -159,11 +159,14 @@ class Compiler:
 				if monomorphized.is_interface:
 					self._validate_interface_vtable( monomorphized )
 					self._schedule_interface_vtable_impls( monomorphized )
-				self.cstructs.append( monomorphized )
+				if monomorphized not in self.cstructs:
+					self.cstructs.append( monomorphized )
 			elif isinstance( monomorphized, CUnion ):
-				self.cunions.append( monomorphized )
+				if monomorphized not in self.cunions:
+					self.cunions.append( monomorphized )
 			elif isinstance( monomorphized, TaggedUnion ):
-				self.tagged_unions.append( monomorphized )
+				if monomorphized not in self.tagged_unions:
+					self.tagged_unions.append( monomorphized )
 			return monomorphized
 		elif isinstance( unit, Function ):
 			if unit.resolve is not None:
@@ -196,21 +199,24 @@ class Compiler:
 			if unit.is_interface:
 				self._validate_interface_vtable( unit )
 				self._schedule_interface_vtable_impls( unit )
-			self.cstructs.append( unit )
+			if unit not in self.cstructs:
+				self.cstructs.append( unit )
 			return unit
 		elif isinstance( unit, CUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
 			for attr in unit.attributes:
 				self.lowering._ensure_resolved( attr )
-			self.cunions.append( unit )
+			if unit not in self.cunions:
+				self.cunions.append( unit )
 			return unit
 		elif isinstance( unit, TaggedUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
 			for attr in unit.attributes:
 				self.lowering._ensure_resolved( attr )
-			self.tagged_unions.append( unit )
+			if unit not in self.tagged_unions:
+				self.tagged_unions.append( unit )
 			return unit
 		elif isinstance( unit, CEnum ):
 			if unit.resolve is not None:
