@@ -457,15 +457,29 @@ Phased implementation plan
    anywhere - see the REVISION's own note on why that's not exhaustively
    guarded against, and the flagged follow-up task for the remaining
    `p[0]`-escape-hatch case.
-3. DONE (mostly) - COM specifics. lib/guid.py's GUID type, lib/windows/
-   com.py's HRESULT constants + IUnknown pattern, and a worked example
-   exposing a metalpy-implemented interface with hand-written
-   QueryInterface/AddRef/Release, constructed and dispatched through
-   end-to-end. NOT done: a worked example consuming a REAL foreign
-   Windows COM object (CoCreateInstance etc.) - genuine OS-level COM
-   activation is a separate, larger undertaking (and explicitly out of
-   scope per this plan's own "Explicitly out of scope" list below); the
-   ABI-correctness of the metalpy side is what's actually been proven.
+3. DONE - COM specifics. lib/guid.py's GUID type, lib/windows/com.py's
+   HRESULT constants + IUnknown pattern, a worked example exposing a
+   metalpy-implemented interface with hand-written QueryInterface/
+   AddRef/Release (construct + dispatch end-to-end), AND a worked
+   example consuming a REAL foreign Windows COM object: CoInitializeEx +
+   CoCreateInstance(CLSID_ShellLink, ..., IID_IPersist, ...) against
+   shell32's real IShellLinkW implementation, then IPersist::GetClassID
+   through the OBJECT'S OWN real vtable (not metalpy-built), verifying
+   the returned CLSID matches the well-known, published CLSID_ShellLink
+   - genuine proof the metalpy-declared vtable shape lines up with a
+   real, foreign, already-compiled COM object's actual in-memory layout,
+   not just with other metalpy code. IPersist (IUnknown + exactly one
+   method, GetClassID) was chosen specifically for being about as
+   minimal as a real standard COM interface gets - low risk of a wrong
+   slot count/order silently calling into the wrong function. GUID
+   values and the GetClassID signature verified against Microsoft
+   Learn's own docs, not just memory, given a wrong vtable shape here
+   wouldn't fail gracefully. See emitter_c_test.py's ComTests.
+   test_real_windows_com_service_shelllink_getclassid (windows-only,
+   skipped elsewhere). No compiler-genuine "full COM activation/
+   registration" (IClassFactory, DllGetClassObject, regsvr32) was
+   needed or attempted - CoCreateInstance already does that on the
+   caller's behalf, matching this plan's own scope boundary.
 
    Was blocked on: GUID's constructor needs str.split('-') to parse a
    hyphenated hex string, but list[T] (str.split()'s natural return

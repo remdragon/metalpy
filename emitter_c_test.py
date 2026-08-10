@@ -2910,6 +2910,92 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( sys.platform == 'win32', 'real Windows COM interop - windows-only' )
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_real_windows_com_service_shelllink_getclassid( self ) -> None:
+		# consumes a REAL foreign Windows COM object - CoCreateInstance's
+		# own CLSID_ShellLink (shell32's IShellLinkW implementation,
+		# always present on any real Windows install), requesting its
+		# IPersist view. IPersist is about as minimal as a real, standard
+		# COM interface gets: IUnknown's 3 slots plus exactly one method,
+		# GetClassID(CLSID*) -> HRESULT (verified directly against
+		# Microsoft Learn's own IPersist::GetClassID docs, not just
+		# memory, given a wrong vtable slot COUNT/ORDER here would be
+		# calling into whatever real function actually sits at that
+		# offset - not a graceful failure). Querying an object for its
+		# OWN class id and checking it matches the well-known,
+		# published CLSID_ShellLink is the "queries for a piece of
+		# data" the whole point of this test is to prove: the metalpy-
+		# declared vtable shape genuinely lines up with a real, foreign,
+		# already-compiled COM object's actual in-memory layout - not
+		# just with other metalpy code.
+		self._run( '''
+from windows.com import IUnknown, HRESULT, S_OK, SUCCEEDED
+import guid
+
+@interface
+class IPersist( IUnknown ):
+	@virtual
+	def GetClassID( self, pClassID: Ptr[guid.GUID] ) -> HRESULT: ...
+
+@extern( 'ole32', 'CoInitializeEx' )
+def CoInitializeEx( pvReserved: Ptr[None], dwCoInit: u32 ) -> HRESULT:
+	...
+
+@extern( 'ole32', 'CoUninitialize' )
+def CoUninitialize() -> None:
+	...
+
+@extern( 'ole32', 'CoCreateInstance' )
+def CoCreateInstance(
+	rclsid: Ptr[guid.GUID],
+	pUnkOuter: Ptr[IUnknown],
+	dwClsContext: u32,
+	riid: Ptr[guid.GUID],
+	ppv: Ptr[Ptr[None]],
+) -> HRESULT:
+	...
+
+def main() -> i32:
+	init_hr: HRESULT = CoInitializeEx( None, 2 ) # COINIT_APARTMENTTHREADED
+	if not SUCCEEDED( init_hr ):
+		return 1
+
+	# well-known, published GUIDs (verified against Microsoft Learn, not
+	# just memory) - CLSID_ShellLink and IID_IPersist
+	clsid_shelllink: guid.GUID = guid.GUID.from_str( '00021401-0000-0000-c000-000000000046' )
+	iid_ipersist: guid.GUID = guid.GUID.from_str( '0000010c-0000-0000-c000-000000000046' )
+
+	out: Ptr[None] = None
+	create_hr: HRESULT = CoCreateInstance(
+		compiler.addrof( clsid_shelllink ),
+		None,
+		1, # CLSCTX_INPROC_SERVER
+		compiler.addrof( iid_ipersist ),
+		compiler.addrof( out ),
+	)
+	if not SUCCEEDED( create_hr ):
+		CoUninitialize()
+		return 2
+
+	persist: Ptr[IPersist] = compiler.cast( Ptr[IPersist], out )
+
+	returned_clsid: guid.GUID = guid.GUID.from_str( '00000000-0000-0000-0000-000000000000' )
+	getclassid_hr: HRESULT = persist.GetClassID( compiler.addrof( returned_clsid ))
+	if not SUCCEEDED( getclassid_hr ):
+		CoUninitialize()
+		return 3
+
+	if returned_clsid != clsid_shelllink:
+		CoUninitialize()
+		return 4
+
+	CoUninitialize()
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 if __name__ == '__main__':
 	unittest.main()
