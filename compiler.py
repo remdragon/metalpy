@@ -96,7 +96,17 @@ class Compiler:
 		if isinstance( unit, Specialization ):
 			suffix = f'[{", ".join( a.qualname for a in unit.args if hasattr( a, "qualname" ))}]'
 			unit = unit.base
-		return getattr( unit, 'qualname', str( unit )) + suffix
+		# NOT getattr(unit, 'qualname', str(unit)) - Python eagerly evaluates
+		# a getattr() default argument regardless of whether the attribute
+		# exists, so str(unit) (a dataclass's auto-generated __repr__, which
+		# walks every field with no cycle detection) ran unconditionally for
+		# EVERY unit here, not just the rare one actually missing .qualname.
+		# Harmless most of the time, but a genuine hang the moment any
+		# reachable object graph has a real cycle (confirmed: list[str]
+		# triggers one - Function.cls <-> its owning class's own .methods
+		# list, or similar back-reference, recursing forever through repr).
+		qualname = getattr( unit, 'qualname', None )
+		return ( qualname if qualname is not None else str( unit ) ) + suffix
 
 	def _enqueue( self, unit: object ) -> None:
 		# thin delegate, kept for existing white-box tests and the two
