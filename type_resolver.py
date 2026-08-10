@@ -500,6 +500,10 @@ class TypeResolver:
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
 		owner_type = self.ensure_resolved( owner_type )
+		if isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar ) and owner_type.base.stem in ( 'Ptr', 'ConstPtr' ):
+			# dot-operator on a raw pointer means arrow - see lowering.py's
+			# _attr_lookup's identical redirect for the non-callable case
+			owner_type = self.ensure_resolved( owner_type.args[0] )
 		if isinstance( owner_type, CStruct ):
 			found = owner_type.chain_lookup( attr )
 		else:

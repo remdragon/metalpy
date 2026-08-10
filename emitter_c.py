@@ -459,13 +459,25 @@ def _returns_void_in_c( return_type: Type|None ) -> bool:
 	(if structurally empty) operand, which every C compiler rejects. '''
 	return return_type is None or ( isinstance( return_type, Scalar ) and return_type.stem in ( 'NoneType', 'NoReturn' ))
 
+def _self_c_type( cls: ClassLike ) -> str:
+	# an @interface CStruct is never a plain value type (see
+	# PLAN_SUBCLASSING_VTABLES_COM.md) - self is Ptr[T], for EVERY method,
+	# virtual or not (consistency - see lowering.py's own self_param
+	# construction, which types self identically). c_type(cls) itself stays
+	# unchanged/untouched (a bare CStruct is still a plain value everywhere
+	# else - e.g. Ptr[T]'s own c_type spelling needs the UNqualified value
+	# spelling for its inner type) - the pointer-ness is added explicitly
+	# here, only for self's own spelling.
+	base = c_type( cls )
+	return f'{base}*' if isinstance( cls, CStruct ) and cls.is_interface else base
+
 def _function_prototype( function: Function ) -> str:
 	if function.is_destructor:
 		name = mangle_qualname( function.qualname )
 		return f'static void {name}( void* __obj )'
 	params: list[str] = []
 	if _has_self( function ):
-		params.append( f'{c_type(function.cls)} self' )
+		params.append( f'{_self_c_type(function.cls)} self' )
 	for p in ( function.parameters or [] ):
 		params.append( f'{c_type(p.type)} {_c_local_name(p.stem)}' )
 	params_str = ', '.join( params ) if params else 'void'
@@ -745,53 +757,37 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 	# not an RCClass instance itself - unwrap first, or a monomorphized
 	# generic method's own `self` (already typed as a Specialization) would
 	# wrongly emit `.` (value access) instead of `->` (every RCClass
-	# instance is always accessed through a pointer in C)
+	# instance is always accessed through a pointer in C). Ptr[T]/ConstPtr[T]
+	# is ALSO always a Specialization (base=the Ptr/ConstPtr intrinsic
+	# scalar, args=[T]) - the dot-operator on a raw pointer means arrow too
+	# (see lowering.py's _attr_lookup/_attr_lookup_callable, which redirect
+	# NAME lookup to the pointee but leave the operand itself, and its
+	# type, as the pointer - this is where that pointer-ness actually
+	# becomes `->` in the emitted C).
 	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
-	return '->' if isinstance( base, RCClass ) else '.'
+	if isinstance( base, RCClass ):
+		return '->'
+	if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
+		return '->'
+	return '.'
 
 def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
-	''' an inherited (non-@virtual) CStruct method's `self` parameter is
-	declared with the ANCESTOR class's own struct type (c_type(target.cls),
-	matching _function_prototype's own `self` spelling) - CStruct methods
-	take self BY VALUE (unlike RCClass, always a pointer), so passing a
-	DERIVED-typed value directly where C expects the ancestor's struct type
-	is a real mismatch: different struct types, even with a layout-
-	compatible prefix (base fields first - see emit_cstruct), aren't
-	implicitly convertible by value in C. A value-narrowing cast through a
-	pointer - take the receiver's address, reinterpret as a pointer to the
-	ancestor's own struct type, dereference - slices out just the
-	ancestor's own prefix. Safe: receiver is always a Temp/Variable here
-	(ir.Operand has no other addressable-by-value case - see _emit_operand),
-	so &(...) is always a real C lvalue. Only CStruct needs this: RCClass's
-	self is already a pointer (trivially covariant via a plain cast), and
-	RCClass doesn't have base-chain method lookup wired yet (see
-	PLAN_SUBCLASSING_VTABLES_COM.md - deferred).
-
-	A @virtual call is different again: the concrete callee is decided at
-	RUNTIME (whichever class's static instance $vtable actually points at -
-	see emit_interface_vtable_instance), so there's no single ancestor type
-	to narrow to at the call site the way an ordinary inherited call can -
-	every vtable slot's function-pointer type takes self as `const
-	RootType*` (_vtable_slot_c_type), regardless of which override
-	statically resolved the call (target.cls might be a subclass's own
-	override, not the root) - the trampoline itself does the narrowing
-	back down to the concrete implementing class internally, so the call
-	site just needs the receiver's address, cast to the ROOT's own pointer
-	type (a plain pointer reinterpretation - safe, and needed to avoid an
-	"incompatible pointer types" warning/UB when target.cls is actually a
-	subclass, not the root itself). '''
+	''' an @interface CStruct's self is ALWAYS Ptr[T] (see lowering.py's
+	self_param construction) - receiver is therefore always already a
+	pointer here, never a plain value, for both an ordinary inherited call
+	(target.cls a base, e.g. calling IFoo's own method through a FooImpl
+	receiver) and a @virtual dispatch call (target.cls might be a
+	subclass's own override, but every vtable slot's function-pointer type
+	takes self as Ptr[root] regardless - see _vtable_slot_c_type). Either
+	way this is a plain pointer-to-pointer reinterpretation - safe and
+	free at runtime, no address-of/value-narrowing dance needed (that
+	machinery only ever existed to work around self being passed BY VALUE,
+	which is no longer how @interface CStruct methods work at all). '''
 	receiver_text = _emit_operand( receiver )
-	if target.is_virtual:
-		assert isinstance( target.cls, CStruct )
-		root = target.cls.interface_root()
-		return f'(const {c_type(root)}*)&({receiver_text})'
 	target_cls = target.cls
-	if (
-		isinstance( target_cls, CStruct )
-		and isinstance( receiver.type, CStruct )
-		and receiver.type is not target_cls
-	):
-		return f'(*(const {c_type(target_cls)}*)&({receiver_text}))'
+	if isinstance( target_cls, CStruct ) and target_cls.is_interface:
+		cast_target = target_cls.interface_root() if target.is_virtual else target_cls
+		return f'({_self_c_type(cast_target)})({receiver_text})'
 	return receiver_text
 
 def _emit_call_args( instr: ir.Call ) -> list[str]:
@@ -954,12 +950,16 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 				arg_texts[i] = f'(void*)({a})'
 		if instr.target.is_virtual:
 			# vtable dispatch, not a direct call - _emit_self_operand already
-			# put &(receiver) at arg_texts[0]; the receiver's own $vtable
-			# field (typed const RootVtbl* - see emit_cstruct) already IS the
-			# right pointer type, no cast needed at this call site
+			# put the (possibly re-cast) receiver pointer at arg_texts[0];
+			# the receiver's own $vtable field (typed const RootVtbl* - see
+			# emit_cstruct) already IS the right pointer type, no cast
+			# needed at this call site. receiver is always Ptr[T] now (see
+			# lowering.py's self_param construction), so $vtable access is
+			# always -> (_member_access_operator), never . directly
 			assert instr.receiver is not None # is_virtual only ever set on real instance methods - see discovery.py's _parse_function
 			slot_name = _field_name( instr.target.stem )
-			call_expr = f'({_emit_operand(instr.receiver)}).$vtable->{slot_name}( {", ".join(arg_texts)} )'
+			vtable_op = _member_access_operator( instr.receiver.type )
+			call_expr = f'({_emit_operand(instr.receiver)}){vtable_op}$vtable->{slot_name}( {", ".join(arg_texts)} )'
 		else:
 			has_args = bool( arg_texts )
 			call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
@@ -1010,7 +1010,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
-			# routed through sys.alloc[dest.type] - the SAME allocation path
+			# routed through sys.alloc[cls] - the SAME allocation path
 			# every other real allocation in the language goes through, not
 			# an emitter-invented allocator (explicit user decision - see
 			# the plan's Context section). lowering.py's _lower_allocate_
@@ -1024,8 +1024,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# T (see c_type's Ptr/ConstPtr branch), so sys.alloc[Foo]'s real
 			# C return type is ALREADY struct Foo* - representationally
 			# identical to dest's own type, no cast needed.
-			dest_type = instr.dest.type
-			alloc_name = mangle_qualname( f'sys.alloc[{dest_type.qualname}]' )
+			# instr.dest.type, NOT instr.cls: instr.cls is always the
+			# ABSTRACT class for a generic RCClass construction (Box[i32](...)
+			# - see _lower_allocate_fields's own comment), but sys.alloc
+			# needs the CONCRETE specialization Box[i32], matching exactly
+			# what _schedule_rcclass_construction scheduled.
+			alloc_name = mangle_qualname( f'sys.alloc[{instr.dest.type.qualname}]' )
 			dest = _emit_operand( instr.dest )
 			lines = [ f'\t{dest} = {alloc_name}( 1 );' ]
 			# freshly allocated = owned by dest immediately (lowering.py
@@ -1036,23 +1040,34 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			for name, value in instr.fields.items():
 				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )
 			return lines
-		# CStruct/CUnion - plain value construction, no header/no heap
-		# allocation at all (see the grounding facts in the plan) - a C11
-		# designated-initializer compound literal covers both (a union
+		if isinstance( instr.cls, CStruct ) and instr.cls.is_interface:
+			# an @interface CStruct is never a plain value type (see
+			# PLAN_SUBCLASSING_VTABLES_COM.md) - heap-allocated via
+			# sys.alloc[cls] same as RCClass above, but NO ObjectHeader/
+			# refcount init (no automatic RC for a COM object - AddRef/
+			# Release are the user's own virtual methods). Every instance
+			# wires $vtable to its OWN class's static instance (never a
+			# base's - each concrete class's own vtable instance points at
+			# ITS OWN slot implementations, see
+			# emit_interface_vtable_instance) - lowering.py's construction-
+			# time check already guarantees this class's vtable is fully
+			# fulfilled before an Allocate for it is ever emitted, so the
+			# symbol referenced here is always real
+			alloc_name = mangle_qualname( f'sys.alloc[{instr.cls.qualname}]' )
+			dest = _emit_operand( instr.dest )
+			lines = [ f'\t{dest} = {alloc_name}( 1 );' ]
+			lines.append( f'\t({dest})->$vtable = &{mangle_type(instr.cls)}$$vtable;' )
+			for name, value in instr.fields.items():
+				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )
+			return lines
+		# plain CStruct/CUnion - stack value construction, no header/no
+		# heap allocation at all (see the grounding facts in the plan) - a
+		# C11 designated-initializer compound literal covers both (a union
 		# with more than one field given would be a real error, but
 		# nothing here re-validates that - discovery/lowering already did)
 		ctype = c_type( instr.dest.type )
 		dest = _emit_operand( instr.dest )
 		field_init_strs = [ f'.{_field_name(name)} = {_emit_operand(value)}' for name, value in instr.fields.items() ]
-		if isinstance( instr.cls, CStruct ) and instr.cls.is_interface:
-			# every constructed @interface CStruct wires its own $vtable to
-			# its OWN static instance (never a base's - each concrete class
-			# gets its own set of trampolines pointing at ITS OWN slot
-			# implementations, see emit_interface_vtable_instance) -
-			# lowering.py's construction-time check already guarantees this
-			# class's vtable is fully fulfilled before an Allocate for it is
-			# ever emitted, so the symbol referenced here is always real
-			field_init_strs.insert( 0, f'.$vtable = &{mangle_type(instr.cls)}$$vtable' )
 		if not field_init_strs:
 			return [ f'\t{dest} = ({ctype}){{0}};' ] # empty {} isn't valid standard C11
 		return [ f'\t{dest} = ({ctype}){{ {", ".join(field_init_strs)} }};' ]
@@ -1312,20 +1327,21 @@ def _interface_vtbl_name( cls: CStruct ) -> str:
 	return f'{mangle_type(cls.interface_root())}Vtbl'
 
 def _vtable_slot_c_type( root: CStruct, slot: Function ) -> tuple[str,list[str]]:
-	''' the function-pointer type for one vtable slot - self is always a
-	POINTER to the ROOT's own struct type (unlike an ordinary CStruct
-	method, which takes self by value - see emit_cstruct/c_type's own
-	"CStruct is a plain value" rule). A vtable slot has to be ONE C type
-	shared by every override sharing that slot (a function pointer field
-	can only ever hold one type), so self can't be typed per-override the
-	way an ordinary method's self is - only a pointer lets the SAME field
-	type work for every concrete implementation, each internally
-	reinterpreting the pointer back to its own real struct type (see
-	_emit_vtable_trampoline). '''
+	''' the function-pointer type for one vtable slot - self is Ptr[root],
+	same as every @interface CStruct method's self (see _self_c_type,
+	lowering.py's own self_param construction). A vtable slot has to be
+	ONE C type shared by every override sharing that slot (a function
+	pointer field can only ever hold one type), so self can't be typed
+	per-override the way an ordinary method's self is - the static vtable
+	instance itself casts each concrete implementation's own function
+	pointer (self: Ptr[ConcreteClass]) to this shared slot type (see
+	emit_interface_vtable_instance) - a plain pointer-to-pointer
+	reinterpretation, safe and free at runtime, no wrapper function
+	needed. '''
 	if slot.resolve is not None:
 		slot.resolve()
 	ret = 'void' if _returns_void_in_c( slot.return_type ) else c_type( slot.return_type )
-	params = [ f'const {c_type(root)}* self' ]
+	params = [ f'{_self_c_type(root)} self' ]
 	for p in ( slot.parameters or [] ):
 		params.append( f'{c_type(p.type)} {_c_local_name(p.stem)}' )
 	return ret, params
@@ -1373,42 +1389,32 @@ def _interface_fulfilled_slot_impls( cls: CStruct ) -> list[Function]|None:
 		impls.append( impl )
 	return impls
 
-def _vtable_trampoline_name( cls: CStruct, slot: Function ) -> str:
-	return f'{mangle_type(cls)}$$vtable$${_field_name(slot.stem)}'
-
 def emit_interface_vtable_instance( cls: CStruct ) -> str|None:
-	''' one thin trampoline per slot (pointer self -> narrows to the
-	IMPLEMENTING class's own by-value type -> forwards to the real,
-	ordinarily-declared-by-value method - same value-narrowing-cast
-	posture as _emit_self_operand, just with the pointer already in hand
-	instead of needing &self) plus the static const vtable instance
-	itself, wiring each slot to its own trampoline. None (no instance
-	built) if cls's vtable isn't fully fulfilled - see
-	_interface_fulfilled_slot_impls. '''
+	''' the static const vtable instance for a fully-fulfilled @interface
+	CStruct - each slot is wired DIRECTLY to its real implementing
+	function via a function-pointer cast (self: Ptr[ConcreteClass]
+	reinterpreted as self: Ptr[root], the shared slot type - see
+	_vtable_slot_c_type). No wrapper/trampoline function needed - now that
+	self is uniformly Ptr[T] for every @interface method (see
+	lowering.py's self_param construction), a plain pointer-to-pointer
+	function-pointer cast is all dispatch ever needed; the earlier
+	trampoline-based approach only existed to work around self being
+	passed by value. None (no instance built) if cls's vtable isn't fully
+	fulfilled - see _interface_fulfilled_slot_impls. '''
 	slot_impls = _interface_fulfilled_slot_impls( cls )
 	if slot_impls is None:
 		return None
 	root = cls.interface_root()
-	lines: list[str] = []
 	field_inits: list[str] = []
 	for slot, impl in zip( cls.virtual_slots(), slot_impls ):
-		trampoline_name = _vtable_trampoline_name( cls, slot )
 		ret, params = _vtable_slot_c_type( root, slot )
-		impl_args = [ f'*(const {c_type(impl.cls)}*)self' ]
-		for p in ( slot.parameters or [] ):
-			impl_args.append( _c_local_name( p.stem ))
-		call_expr = f'{mangle_qualname(impl.qualname)}( {", ".join(impl_args)} )'
-		lines.append( f'static {ret} {trampoline_name}( {", ".join(params)} ) {{' )
-		lines.append( f'\treturn {call_expr};' if not _returns_void_in_c( slot.return_type ) else f'\t{call_expr};' )
-		lines.append( '}' )
-		field_inits.append( f'.{_field_name(slot.stem)} = {trampoline_name}' )
+		slot_fn_ptr_type = f'{ret} (*)( {", ".join(params)} )'
+		field_inits.append( f'.{_field_name(slot.stem)} = ({slot_fn_ptr_type}){mangle_qualname(impl.qualname)}' )
 	vtbl_type = _interface_vtbl_name( cls )
 	instance_name = f'{mangle_type(cls)}$$vtable'
 	if field_inits:
-		lines.append( f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};' )
-	else:
-		lines.append( f'static const {vtbl_type} {instance_name} = {{0}};' )
-	return '\n'.join( lines )
+		return f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
+	return f'static const {vtbl_type} {instance_name} = {{0}};'
 
 def emit_cstruct( cls: CStruct ) -> str:
 	attrs: list[tuple[str,Type]]

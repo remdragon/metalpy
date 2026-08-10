@@ -190,7 +190,21 @@ class Lowering:
 					self._construction_self: Variable | None = None
 					self._construction_fallible = False
 					if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
-						self_param = Parameter( stem = 'self', qualname = f'{fn.qualname}.self', file = fn.file, line = fn.line, type = fn.cls )
+						self_type: Type|None = fn.cls
+						if isinstance( fn.cls, CStruct ) and fn.cls.is_interface:
+							# an @interface CStruct is never a plain value
+							# type (see PLAN_SUBCLASSING_VTABLES_COM.md) -
+							# self is Ptr[T], for every method, virtual or
+							# not (consistency, per the plan doc's own
+							# decision) - self.x/self.method() still read
+							# like ordinary attribute access thanks to the
+							# Ptr[T]/ConstPtr[T] dot-operator (see
+							# _attr_lookup/_expr_Attribute's own pointee-
+							# redirect, and emitter_c.py's matching
+							# _member_access_operator rule)
+							ptr_cls = self.discovery.get_intrinsics()['Ptr']
+							self_type = self.discovery._get_or_create_specialization( ptr_cls, [ fn.cls ] )
+						self_param = Parameter( stem = 'self', qualname = f'{fn.qualname}.self', file = fn.file, line = fn.line, type = self_type )
 						fn.add_name( 'self', self_param )
 						# fn.cls may be a Specialization for a monomorphized
 						# generic-class __init__ (see Lowering._lower_generic_
@@ -2291,6 +2305,15 @@ class Lowering:
 		# substituted field/method entries (see monomorphize.py), so no
 		# separate per-field substitution is needed here anymore
 		owner_type = self._ensure_resolved( owner_type )
+		if isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar ) and owner_type.base.stem in ( 'Ptr', 'ConstPtr' ):
+			# dot-operator on a raw pointer means arrow - `p.attr` looks up
+			# `attr` on the POINTEE's own type, same as `p[0].attr` already
+			# does (see _expr_Subscript's identical pointee-inference for
+			# GetItem) - the OPERAND embedded in the resulting ir.GetAttr
+			# stays the pointer itself (unchanged), only the NAME LOOKUP
+			# redirects here; emitter_c.py's _member_access_operator reads
+			# that same Ptr[T]/ConstPtr[T] type to decide `->` over `.`
+			owner_type = self._ensure_resolved( owner_type.args[0] )
 		if isinstance( owner_type, TaggedUnion ) and attr in ( 'tag', 'data' ) and owner_type.names.get( attr ) is None:
 			# tag/data are synthesized lazily, the first time the union is
 			# actually constructed or matched against (UnionStorage.get) -
@@ -2591,6 +2614,23 @@ class Lowering:
 				self._emit( instr )
 			fields[name] = value
 
+		if isinstance( target_cls, CStruct ) and target_cls.is_interface:
+			# an @interface CStruct is never a plain value type (see
+			# PLAN_SUBCLASSING_VTABLES_COM.md) - construction heap-allocates
+			# (like RCClass's own ClassName(...), via the same real
+			# sys.alloc[T] path - see _schedule_interface_construction) and
+			# produces a Ptr[T], not a bare T. Unlike RCClass, this is an
+			# EXPLICIT Ptr[T] in the metalpy type system (not an invisible-
+			# pointer convention) - self is ALSO always Ptr[T] for the same
+			# reason (see lower_function's own self_param construction)
+			ptr_cls = self.discovery.get_intrinsics()['Ptr']
+			ptr_type = self.discovery._get_or_create_specialization( ptr_cls, [ target_cls ] )
+			dest = self._new_temp( expected_type or ptr_type )
+			self.schedule( dest.type )
+			self._schedule_interface_construction( target_cls )
+			self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
+			return dest
+
 		dest = self._new_temp( expected_type or target_cls )
 		# dest.type can be a concrete Specialization (ResultPayload[i32,
 		# OverflowError], inferred from the substituted field type this
@@ -2605,6 +2645,19 @@ class Lowering:
 			self._schedule_rcclass_construction( target_cls, dest.type )
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
 		return dest
+
+	def _schedule_interface_construction( self, target_cls: CStruct ) -> None:
+		# heap-allocating an @interface CStruct goes through sys.alloc[T],
+		# the same real allocation path everything else in the language
+		# uses (see _schedule_rcclass_construction's identical reasoning) -
+		# NO automatic destructor scheduling here though (unlike RCClass):
+		# there's no automatic refcounting/RC management for an @interface
+		# CStruct COM object at all - AddRef/Release are the user's own
+		# ordinary virtual methods, never wired into metalpy's automatic
+		# Incref/Decref (see PLAN_SUBCLASSING_VTABLES_COM.md's own decision)
+		sys_alloc_fn = self._type_resolver._resolve_sys_function( 'alloc' )
+		alloc_spec = self.discovery._get_or_create_specialization( sys_alloc_fn, [ target_cls ] )
+		self.schedule( alloc_spec )
 
 	def _schedule_rcclass_construction( self, target_cls: RCClass, concrete_type: Type ) -> None:
 		# guarantees sys.alloc[concrete_type] is a real, lowered compile unit

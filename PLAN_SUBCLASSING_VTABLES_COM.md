@@ -38,6 +38,67 @@ Decisions made so far (see the conversation this plan came out of)
   work resumes - one consistent decorator/rule across both, not two
   independently-invented ones.
 
+REVISION (post Phase 1+2): @interface CStructs are never a plain value
+type
+
+After Phase 1+2 shipped (self by value, trampolines narrowing a pointer
+down to a value, construction as a stack compound literal - all
+documented below and now superseded), a real problem surfaced: passing
+a derived CStruct VALUE where a base CStruct VALUE was expected
+type-checked but emitted invalid C (different struct types aren't
+implicitly convertible by value, even sharing a layout prefix). The fix
+isn't a narrower type-check - it's that COM identity fundamentally
+doesn't work by value at all. An @interface CStruct was redesigned to
+never be a plain value type anywhere: not a local, not a parameter, not
+a return type, not self. Concretely:
+
+- self is Ptr[T], for EVERY method on an @interface CStruct - virtual or
+  not. Consistency was chosen deliberately over a narrower rule (self by
+  value for ordinary methods, Ptr[T] only for @virtual ones): one
+  calling convention, not two, and it eliminates the trampoline/value-
+  narrowing-cast machinery Phase 2 originally needed (a plain pointer-
+  to-pointer cast replaces both - see "Dispatch mechanism" below).
+- Construction (`FooImpl(x=1, y=2)`) heap-allocates via sys.alloc[T] -
+  the same real allocation path RCClass's own `ClassName(...)` already
+  uses - and produces a Ptr[T], never a bare T. Unlike RCClass, this is
+  an EXPLICIT Ptr[T] in the metalpy type system, not an invisible-
+  pointer convention (c_type(cls) itself is untouched - a bare CStruct
+  is still a plain value everywhere c_type sees it bare; the pointer-ness
+  is added explicitly only where self/construction need it - see
+  emitter_c.py's _self_c_type).
+- The Ptr[T]/ConstPtr[T] dot-operator: `.attr`/`.method()` on ANY
+  Ptr[T]/ConstPtr[T] (not just @interface CStruct - this is a general
+  language feature) redirects name lookup to the pointee and emits a
+  real `->`, matching what `[0].attr` already did for lookup but,
+  unlike `[0].attr`, without copying the pointee into a value first -
+  so `self.x`/`p.x = 5` read like ordinary Python attribute access
+  despite self/p being genuine pointers. Implemented in lowering.py's
+  _attr_lookup/_attr_lookup_callable (redirect to the pointee's type,
+  leaving the operand itself untouched) and emitter_c.py's
+  _member_access_operator (Ptr/ConstPtr now emits -> like RCClass
+  already does). Bonus: this incidentally fixes the pre-existing
+  Ptr[T][0].field = value write-through bug for the `.field` spelling
+  (real arrow-write, not deref-into-a-temp-and-discard) - see
+  emitter_c_test.py's test_ptr_dot_operator_write_through_on_plain_cstruct.
+  The explicit-index spelling (`p[idx].field = value`, idx != 0) still
+  has the old bug, flagged separately.
+- No exhaustive rejection of bare-value type annotations was added
+  everywhere (parameters/locals/fields) - construction simply never
+  produces a bare value anymore, which covers the intended usage.
+  `p[0]` still technically produces a bare value as an escape hatch (an
+  existing, general Ptr[T] capability, not special-cased away) - a
+  function declaring a bare-typed parameter is syntactically legal but
+  uncallable with any value produced the ordinary way.
+- Lifetime management is fully manual, matching real COM (see "AddRef/
+  Release are the user's own virtual methods" below) - not wired into
+  metalpy's automatic Incref/Decref. A simple, NOT YET BUILT pattern for
+  users who want deterministic cleanup anyway: wrap a Ptr[T] COM object
+  inside a small RCClass whose __del__ calls Release() - gets automatic
+  decref-driven cleanup for free from the existing RC machinery, no
+  compiler changes needed. Worth a small stdlib helper (something like
+  ComPtr[T]) once there's real usage to shape it against - not part of
+  this plan yet.
+
 Why RCClass is deferred, not abandoned
 
 The original draft of this plan included RCClass, on the reasoning that
@@ -93,13 +154,12 @@ this plan does not attempt, and matches genuine COM semantics anyway
 every real COM client calls AddRef/Release by hand).
 
 Given that, lifetime/allocation for a CStruct-based COM object is the
-program's own responsibility too: CStructs have no heap allocation today
-(emitter_c.py: "CStruct/CUnion - plain value construction, no header/no
-heap allocation at all"). An implementation that needs a stable address
-to hand out as a pointer (the common case - an interface pointer handed
-to a foreign caller, or to another process, has to outlive the call that
-produced it) needs Ptr[CStruct] to work - see "Heap allocation via
-Ptr[CStruct]" below.
+program's own responsibility too (no automatic Incref/Decref). Per the
+REVISION above, an @interface CStruct is now heap-allocated by
+construction itself (never a plain stack value at all, unlike a plain
+@cstruct) - so the "needs a stable address to hand out as a pointer"
+concern that originally motivated a separate Ptr[CStruct] investigation
+is now just how construction always works, not a follow-on step.
 
 Design
 
@@ -252,34 +312,23 @@ from it right now.
   neither RCClass nor CStruct's own lookup does this at all. DONE
   (Phase 1) - CStruct.chain_lookup in mpy_types.py, wired into
   _attr_lookup/_attr_lookup_callable/_find_method.
-- FIXED (Phase 1): calling an inherited, non-@virtual method on a
-  DERIVED instance failed to compile as real C at first - chain_lookup
-  correctly RESOLVED the method (ir.Call targeting the base's Function),
-  but CStruct methods take `self` BY VALUE (unlike RCClass, always a
-  pointer), so the emitted call passed the derived-typed struct value
-  directly to a parameter typed for the BASE struct, which C rejects
-  (different struct types aren't implicitly convertible by value, even
-  with a layout-compatible prefix). Decided: a value-narrowing cast at
-  the call site, not a switch to self-by-pointer semantics - "most
-  consistent with our architecture, safe and explicit in C". Implemented
-  as _emit_self_operand in emitter_c.py: when the receiver's static type
-  differs from the target method's own .cls, take the receiver's
-  address, reinterpret as a pointer to the ancestor's own struct type,
-  dereference - `*(const AncestorType*)&derived_value`. Safe because a
-  self/receiver operand is always a Temp or Variable (see ir.Operand),
-  never a non-addressable expression. Verified end-to-end (real C
-  compile + run) in emitter_c_test.py's
-  test_inherited_method_callable_through_subclass_instance. The same
-  question will resurface for Phase 2's @virtual dispatch (a vtable slot
-  call also needs a correctly-typed self) - this establishes the answer
-  for that case too: narrow, don't switch calling convention.
+- SUPERSEDED by the REVISION above (kept for history): calling an
+  inherited, non-@virtual method on a DERIVED instance originally failed
+  to compile as real C, because CStruct methods took self BY VALUE, and
+  a value-narrowing cast (`*(const AncestorType*)&derived_value`) was
+  the first fix. Once self became Ptr[T] uniformly for every @interface
+  method (see the REVISION), the fix simplified to a plain pointer-to-
+  pointer cast - `(AncestorType*)derived_ptr` - no address-of, no
+  dereference, no value copy. Still in emitter_c.py's
+  _emit_self_operand. Verified end-to-end in emitter_c_test.py's
+  test_inherited_method_callable_through_subclass_instance.
 - No construction-chaining story is needed here the way RCClass
   subclassing would need one (base __init__ before derived fields, etc.)
-  - CStruct construction is already "plain value construction", and an
-  implementation CStruct's own fields (vtable pointer plus whatever it
-  adds) are just ordinary field-value construction, unaffected by
-  inheritance depth. This is one of the concrete ways scoping to CStruct
-  is smaller, not just "RCClass's plan with fewer steps."
+  - an implementation CStruct's own fields (vtable pointer plus whatever
+  it adds) are just ordinary field-value construction into the heap-
+  allocated instance, unaffected by inheritance depth. This is one of
+  the concrete ways scoping to CStruct is smaller, not just "RCClass's
+  plan with fewer steps."
 - A CStruct subclassing an @interface CStruct MUST itself be declared
   @interface too - @interface-ness is NOT inherited implicitly. A
   subclass that omits it is a compile error, not a silent "data-only
@@ -368,48 +417,43 @@ Phased implementation plan
    sys.alloc[T] already worked). Committed.
 2. DONE. Dispatch. Landed without a new IR instruction - emission reads
    Function.is_virtual directly off the existing ir.Call.target and
-   changes the emitted C shape (see emitter_c.py's _emit_virtual_call
-   path in the ir.Call branch), no lowering.py/ir.py changes needed for
-   the call site itself. Delivered: full Vtbl struct body + slot ordering
-   (CStruct.virtual_slots), per-class trampolines + static const vtable
-   instance (emit_interface_vtable_instance - only for classes whose
-   vtable is fully fulfilled, see CStruct/_interface_fulfilled_slot_impls),
-   $vtable wired at construction time, slot-introduction/override-
-   signature validation (compiler.py's _validate_interface_vtable - only
-   the root may introduce a new slot, overrides must match strictly),
-   construction-time fulfillment validation (lowering.py - constructing
-   an interface with any unfulfilled/stub slot is a compile error).
-   Tested end-to-end: real vtable dispatch (not a direct call) reaching
-   an override, confirmed via both the generated C shape and actual
-   execution - see emitter_c_test.py's
+   changes the emitted C shape (see the ir.Call branch's is_virtual check
+   in emitter_c.py), no lowering.py/ir.py changes needed for the call
+   site itself. Delivered: full Vtbl struct body + slot ordering
+   (CStruct.virtual_slots), a static const vtable instance per fully-
+   fulfilled class (emit_interface_vtable_instance - see
+   CStruct/_interface_fulfilled_slot_impls) wiring each slot DIRECTLY to
+   its real implementing function via a function-pointer cast (no
+   trampoline - see the REVISION above, self being uniformly Ptr[T] made
+   the trampoline layer unnecessary), $vtable wired at construction time,
+   slot-introduction/override-signature validation (compiler.py's
+   _validate_interface_vtable - only the root may introduce a new slot,
+   overrides must match strictly), construction-time fulfillment
+   validation (lowering.py - constructing an interface with any
+   unfulfilled/stub slot is a compile error). Tested end-to-end: real
+   vtable dispatch (not a direct call) reaching an override, confirmed
+   via both the generated C shape and actual execution - see
+   emitter_c_test.py's
    test_virtual_dispatch_calls_the_override_not_the_stub.
 
-   Two bugs found and fixed along the way (both in this phase's own new
-   code, not pre-existing): (a) the Vtbl struct's own `self` parameter,
-   the first mention of an @interface CStruct as a pointer, hit the same
-   "function prototype scope" trap RCClass's forward tags exist to avoid
-   - every @interface CStruct now gets the same `struct X;` forward tag
-   RCClass already got. (b) a virtual call's own self-pointer needs an
-   explicit cast to the ROOT's pointer type (a statically-resolved
-   override's own .cls can be a subclass, not the root) - fixed in
-   _emit_self_operand.
+   One bug found and fixed along the way (in this phase's own new code,
+   not pre-existing): the Vtbl struct's own `self` parameter, the first
+   mention of an @interface CStruct as a pointer, hit the same "function
+   prototype scope" trap RCClass's forward tags exist to avoid - every
+   @interface CStruct now gets the same `struct X;` forward tag RCClass
+   already got.
 
-   One thing found but NOT fixed here, flagged separately: passing a
-   derived CStruct value where an ORDINARY (non-self) parameter or
-   variable expects a base CStruct type - e.g. a plain function taking
-   `f: IFoo` called with a `FooImpl` value - currently TYPE-CHECKS at the
-   metalpy level but produces INVALID C (a real compiler rejects it,
-   "passing struct X to parameter of incompatible type struct Y"). This
-   is a genuine, pre-existing gap in general CStruct subtype-compatible
-   argument/assignment handling - NOT part of "dispatch mechanism" (the
-   plan's own scope for this phase), and NOT something to decide
-   unilaterally (multiple valid fixes: reject at type-check time, or
-   extend the same value-narrowing-cast machinery _emit_self_operand
-   already uses for method calls to ordinary argument-passing generally).
-   The "called through a base-typed reference" half of this phase's own
-   acceptance criteria is therefore proven only via direct dispatch calls
-   and Ptr[CStruct]-based access, not via an ordinary by-value base-typed
-   function parameter - see the flagged task for this gap.
+   A second thing found here turned out to be a symptom of a bigger
+   design gap, not a narrow bug: passing a derived CStruct value where an
+   ORDINARY (non-self) parameter expected a base CStruct type type-
+   checked but produced invalid C. Chasing this led to the REVISION above
+   (self by value, and CStruct-as-value generally, was the wrong model
+   for a COM-identity type) rather than a local patch. A general CStruct
+   subtype-coercion gap can still resurface for the same reason it did
+   here IF a bare (non-Ptr[T]) @interface CStruct type annotation is used
+   anywhere - see the REVISION's own note on why that's not exhaustively
+   guarded against, and the flagged follow-up task for the remaining
+   `p[0]`-escape-hatch case.
 3. COM specifics. lib/guid.py's GUID type (plus whatever str support it
    needs), HRESULT library type, a worked example consuming a real
    foreign Windows COM interface end to end (a simple, easily-testable

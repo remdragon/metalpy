@@ -1954,7 +1954,10 @@ class InterfaceCStructLayoutTests( CompilerTestCase ):
 		# matches the plan doc's own Layout worked example: a root
 		# interface's $vtable is its only member; a subclass inherits the
 		# SAME $vtable field type (never its own FooImplVtbl) at the same
-		# first-member position, with its own fields appended after
+		# first-member position, with its own fields appended after.
+		# self is Ptr[T] for every @interface method (consistency, per the
+		# plan doc's revised decision), so the vtable slot's own self type
+		# is a plain (non-const) pointer too.
 		self._run( '''
 @interface
 class IFoo:
@@ -1971,14 +1974,14 @@ class FooImpl( IFoo ):
 		return n
 
 def main() -> None:
-	f: FooImpl = FooImpl( x = 1, y = 2 )
+	f: Ptr[FooImpl] = FooImpl( x = 1, y = 2 )
 	return
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
 		self.assertIn(
 			'typedef struct __main__$IFooVtbl {\n'
-			'\tint32_t (*helper)( const struct __main__$IFoo* self, int32_t n );\n'
+			'\tint32_t (*helper)( struct __main__$IFoo* self, int32_t n );\n'
 			'} __main__$IFooVtbl;',
 			src,
 		)
@@ -1995,14 +1998,12 @@ def main() -> None:
 	def test_inherited_method_callable_through_subclass_instance( self ) -> None:
 		# base-chain lookup (CStruct.chain_lookup) - a subclass instance can
 		# call a method it never redeclared, found by walking to its base.
-		# CStruct methods take `self` BY VALUE, so the call site needs a
-		# value-narrowing cast (receiver's address, reinterpreted as a
-		# pointer to the ANCESTOR's own struct type, dereferenced) to slice
-		# out just the base's own prefix - see _emit_self_operand in
-		# emitter_c.py.
+		# self is Ptr[T] uniformly now, so an inherited call is just a
+		# plain pointer-to-pointer cast (Ptr[FooImpl] -> Ptr[IFoo]) at the
+		# call site - see _emit_self_operand in emitter_c.py.
 		self._run( '''
 def main() -> i32:
-	f: FooImpl = FooImpl( x = 1 )
+	f: Ptr[FooImpl] = FooImpl( x = 1 )
 	with compiler.wrap_arithmetic:
 		result: i32 = f.helper() - 42
 	return result
@@ -2023,15 +2024,13 @@ class FooImpl( IFoo ):
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_ptr_interface_cstruct_heap_roundtrip( self ) -> None:
-		# Ptr[CStruct] heap allocation via sys.alloc[T] - confirmed to need
-		# no new code at all (sys.alloc[T] is a plain generic byte
-		# allocator with no RCClass special-casing in its own body - see
-		# lib/sys.py), same as the pre-existing Ptr[_ListMetadata] pattern
-		# in lib/builtins/__list.py's own RawList
+	def test_ptr_interface_cstruct_field_and_method_access( self ) -> None:
+		# the Ptr[T]/ConstPtr[T] dot-operator (p.attr / p.method() means
+		# arrow, redirecting name lookup to the pointee - see
+		# lowering.py's _attr_lookup/_attr_lookup_callable) makes field
+		# assignment and method calls through a Ptr[FooImpl] read like
+		# ordinary attribute access despite f being a genuine pointer
 		self._run( '''
-import sys
-
 @interface
 class IFoo:
 	def do_thing( self, n: i32 ) -> i32: ...
@@ -2046,32 +2045,64 @@ class FooImpl( IFoo ):
 		return result
 
 def main() -> i32:
-	p: Ptr[FooImpl] = sys.alloc[FooImpl]( 1 )
-	p[0] = FooImpl( x = 5 )
-	result: i32 = p[0].do_thing( 1 )
-	sys.free( p )
+	f: Ptr[FooImpl] = FooImpl( x = 5 )
+	f.x = 7
+	result: i32 = f.do_thing( 1 )
 	with compiler.wrap_arithmetic:
-		diff: i32 = result - 6
+		diff: i32 = result - 8
 	return diff
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( '(f)->x = 7;', src ) # real arrow write-through, not a copy-mutate-discard
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ptr_dot_operator_write_through_on_plain_cstruct( self ) -> None:
+		# the Ptr[T]/ConstPtr[T] dot-operator is general - not specific to
+		# @interface CStructs - so this ALSO fixes the pre-existing
+		# Ptr[T][idx].field = value write-through bug (found while building
+		# Phase 1/2) for the p.field spelling: `p[0].x = 5` still copies
+		# *p into a temp and discards it (unfixed, tracked separately), but
+		# `p.x = 5` now emits a real `(p)->x = 5;` and writes through
+		self._run( '''
+import sys
+
+@cstruct
+class Point:
+	x: i32
+	y: i32
+
+def main() -> i32:
+	p: Ptr[Point] = sys.alloc[Point]( 1 )
+	p.x = 5
+	p.y = 6
+	with compiler.wrap_arithmetic:
+		diff: i32 = ( p.x - 5 ) + ( p.y - 6 )
+	sys.free( p )
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( '(p)->x = 5;', src )
+		self.assertIn( '(p)->y = 6;', src )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_virtual_dispatch_calls_the_override_not_the_stub( self ) -> None:
-		# Phase 2: real vtable dispatch, not a direct call - IFoo's own
-		# get_value is an unfulfilled stub (never emitted as a real C
-		# function - see lowering.py's construction-time check, which
-		# would reject constructing a bare IFoo directly); FooImpl's own
-		# override is what the vtable slot actually points at
-		# (emit_interface_vtable_instance's static instance + trampoline).
-		# Calling through `f.get_value()` on a FooImpl-typed value goes
-		# through `(f).$vtable->get_value(&(f))`, not a direct call to
-		# either function by name (see emitter_c.py's _emit_virtual_call
-		# path in the ir.Call branch) - if dispatch were silently
-		# reverting to a direct static call, this would still pass (the
-		# static target IS the right override already), so the real
-		# assertion is the generated C shape below, not just the exit code.
+		# real vtable dispatch, not a direct call - IFoo's own get_value is
+		# an unfulfilled stub (never emitted as a real C function - see
+		# lowering.py's construction-time check, which would reject
+		# constructing a bare IFoo directly); FooImpl's own override is
+		# what the vtable slot actually points at, via a direct function-
+		# pointer cast (no trampoline needed now that self is uniformly
+		# Ptr[T] - see emit_interface_vtable_instance). Calling through
+		# `f.get_value()` goes through `(f)->$vtable->get_value(...)`, not
+		# a direct call to either function by name - if dispatch were
+		# silently reverting to a direct static call, this would still
+		# pass (the static target IS the right override already), so the
+		# real assertion is the generated C shape below, not just the
+		# exit code.
 		self._run( '''
 @interface
 class IFoo:
@@ -2087,7 +2118,7 @@ class FooImpl( IFoo ):
 		return self.x
 
 def main() -> i32:
-	f: FooImpl = FooImpl( x = 99 )
+	f: Ptr[FooImpl] = FooImpl( x = 99 )
 	direct: i32 = f.get_value()
 	with compiler.wrap_arithmetic:
 		diff: i32 = direct - 99
@@ -2095,12 +2126,13 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
-		self.assertIn( '(f).$vtable->get_value( (const struct __main__$IFoo*)&(f) )', src )
+		self.assertIn( '(f)->$vtable->get_value( (struct __main__$IFoo*)(f) )', src )
 		self.assertIn(
-			'static const __main__$IFooVtbl __main__$FooImpl$$vtable = { .get_value = __main__$FooImpl$$vtable$$get_value };',
+			'static const __main__$IFooVtbl __main__$FooImpl$$vtable = '
+			'{ .get_value = (int32_t (*)( struct __main__$IFoo* self ))__main__$FooImpl$get_value };',
 			src,
 		)
-		self.assertIn( '.$vtable = &__main__$FooImpl$$vtable', src )
+		self.assertIn( '$vtable = &__main__$FooImpl$$vtable;', src )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	def test_construct_unfulfilled_interface_is_a_compile_error( self ) -> None:
@@ -2114,7 +2146,7 @@ class IFoo:
 	def get_value( self ) -> i32: ...
 
 def main() -> None:
-	f: IFoo = IFoo()
+	f: Ptr[IFoo] = IFoo()
 	return
 ''' )
 		self.assertIn( 'cannot be constructed', self.discovery.errors.errors[0] )
@@ -2140,7 +2172,7 @@ class FooImpl( IFoo ):
 		return 1
 
 def main() -> None:
-	f: FooImpl = FooImpl()
+	f: Ptr[FooImpl] = FooImpl()
 	return
 ''' )
 		self.assertIn( 'can only be declared on the interface root', self.discovery.errors.errors[0] )
@@ -2159,7 +2191,7 @@ class FooImpl( IFoo ):
 		return 1
 
 def main() -> None:
-	f: FooImpl = FooImpl()
+	f: Ptr[FooImpl] = FooImpl()
 	return
 ''' )
 		self.assertIn( 'does not match', self.discovery.errors.errors[0] )
