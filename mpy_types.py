@@ -186,11 +186,40 @@ class RCClass( Type, ScopeMixin ): # normal ref-counted class
 
 @dataclass( kw_only = True )
 class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
+	# base is only meaningful for @interface CStructs (single inheritance,
+	# same "resolved eagerly at class-creation time" reasoning as
+	# RCClass.base above) - a plain (non-@interface) CStruct subclassing
+	# another CStruct is out of scope for now (see
+	# PLAN_SUBCLASSING_VTABLES_COM.md's "Subclassing mechanics")
+	base: 'CStruct|None' = None
+	is_interface: bool = False # @interface class Foo: - NOT inherited implicitly, see plan doc
 	type_params: list[TypeVar]|None = None
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
+
+	def chain_lookup( self, name: str ) -> Name|None:
+		''' walk this CStruct's own single-inheritance chain (self, then
+		base, then base.base, ... until None) looking for `name` - .names
+		only ever holds a class's OWN declared members (discovery.py never
+		merges a base's own names into a subclass), so an @interface
+		subclass needs this to see an inherited method/attribute at all.
+		RCClass does NOT get the equivalent walk yet - RCClass subclassing/
+		vtables stays deferred (see PLAN_SUBCLASSING_VTABLES_COM.md); this
+		is CStruct-only, and only ever non-trivial for an @interface
+		CStruct (a plain @cstruct can't have a base at all - see
+		discovery.py's _parse_ClassDef_CStruct, which rejects bases
+		outright). '''
+		node: CStruct|None = self
+		while node is not None:
+			if node.resolve is not None: # each level's .names is populated lazily, same "None means already resolved" convention as everywhere else - a base interface's own body may not have run yet just because the derived class's own resolve() (already done by the caller) ran
+				node.resolve()
+			found = node.names.get( name )
+			if found is not None:
+				return found
+			node = node.base
+		return None
 
 @dataclass( kw_only = True )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:
@@ -257,6 +286,13 @@ class Function( Type, ScopeMixin ):
 	is_abstract: bool = False
 	is_move: bool = False
 	is_private: bool = False
+	# @virtual - this method occupies a vtable slot (see
+	# PLAN_SUBCLASSING_VTABLES_COM.md). Deliberately not CStruct-specific:
+	# lives on Function itself, same as every other decorator flag here, so
+	# RCClass can reuse the identical concept once that work resumes. An
+	# override of an inherited @virtual method must repeat @virtual on its
+	# own re-declaration - matching name+signature alone is not enough.
+	is_virtual: bool = False
 
 	# @extern('lib', 'symbol') - a foreign call signature declaration (body
 	# must be a stub - see discovery.py's _is_stub_body). extern_lib is the

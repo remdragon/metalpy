@@ -144,6 +144,8 @@ class Compiler:
 					self.rcclasses.append( monomorphized )
 				self.type_resolver._synthesize_rcclass_destructor( monomorphized )
 			elif isinstance( monomorphized, CStruct ):
+				if monomorphized.base is not None:
+					self._enqueue( monomorphized.base )
 				self.cstructs.append( monomorphized )
 			elif isinstance( monomorphized, CUnion ):
 				self.cunions.append( monomorphized )
@@ -176,6 +178,8 @@ class Compiler:
 				unit.resolve()
 			for attr in unit.attributes:
 				self.lowering._ensure_resolved( attr )
+			if unit.base is not None: # @interface subclass - base interface needs to be a real compile unit too (its Vtbl type is what $vtable actually points to), same as RCClass.base above
+				self._enqueue( unit.base )
 			self.cstructs.append( unit )
 			return unit
 		elif isinstance( unit, CUnion ):

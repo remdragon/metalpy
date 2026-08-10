@@ -1530,8 +1530,11 @@ class Lowering:
 		# (for loop iterability checks, __getitem__'s raw-GetItem fallback),
 		# not a real error to report
 		owner_type = self._ensure_resolved( owner_type )
-		names = getattr( owner_type, 'names', None )
-		found = names.get( name ) if isinstance( names, dict ) else None
+		if isinstance( owner_type, CStruct ):
+			found = owner_type.chain_lookup( name )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( name ) if isinstance( names, dict ) else None
 		return found if isinstance( found, Function ) else None
 
 	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str ) -> ir.Operand:
@@ -2277,10 +2280,13 @@ class Lowering:
 			# guarantee) - trigger it here too, lazily, the moment it's
 			# actually needed
 			self._union_storage.get( owner_type )
-		names = getattr( owner_type, 'names', None )
-		if not isinstance( names, dict ):
-			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
-		found = names.get( attr )
+		if isinstance( owner_type, CStruct ):
+			found = owner_type.chain_lookup( attr )
+		else:
+			names = getattr( owner_type, 'names', None )
+			if not isinstance( names, dict ):
+				self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
+			found = names.get( attr )
 		if not isinstance( found, Variable ):
 			self.discovery.fail( f'{owner_type.qualname if owner_type else "?"} has no attribute {attr!r}', ctx )
 		self._ensure_resolved( found )

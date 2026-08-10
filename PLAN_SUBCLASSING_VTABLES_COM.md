@@ -132,24 +132,41 @@ handing a pointer to a foreign caller). This needs Ptr[T] to work for a
 CStruct T, paired with some way to heap-allocate one and get a Ptr[T]
 back.
 
-The C-level type mapping already looks general enough to not need
-changes: c_type's own Specialization branch for Ptr[T]/ConstPtr[T] calls
-_value_spelling(inner_type) on whatever T is, with no RCClass-specific
-restriction visible in that code path - worth confirming directly rather
-than assuming, but it doesn't look like new emitter work. sys.alloc[T]
-itself (lib/sys.py) isn't the gap either - it's a plain generic function,
+CONFIRMED (Phase 1, not just read - actually compiled and run):
+sys.alloc[SomeInterfaceCStruct](1) needs no new code at all. The C-level
+type mapping was already general enough (c_type's own Specialization
+branch for Ptr[T]/ConstPtr[T] calls _value_spelling(inner_type) on
+whatever T is, no RCClass-specific restriction), and sys.alloc[T] itself
+(lib/sys.py) was never the gap either - it's a plain generic function,
 sizeof(T) * count bytes from the raw _alloc allocator, no RCClass
-special-casing in its own body. The real gap is one level up: how a
-constructed RCClass gets from that raw allocation to a live object is
-orchestrated by lowering.py (_schedule_rcclass_construction schedules
-sys.alloc[concrete_type] as a real compile unit, then _lower_allocate_
-fields/_try_lower_construct_call emit ir.Allocate) and finished by
-emitter_c.py's ir.Allocate handling, which assumes ObjectHeader
-initialization follows the raw allocation. There's no existing path to
-"heap-allocate a bare value type and hand back a pointer to it, no
-header, no refcount field, just the raw bytes" - that's the piece to
-add. Needs its own primitive/code path, sized during Phase 1 once the
-exact gap is confirmed by trying it directly.
+special-casing in its own body. There's real prior art too: lib/builtins/
+__list.py's own RawList already heap-allocates Ptr[_ListMetadata] (a
+plain @cstruct) via sys.alloc[_ListMetadata] and indexes/reads/writes
+through it - a working, in-production example of exactly this pattern
+that predates this plan entirely. Whole-struct heap alloc + index +
+whole-value read/write (`p[0] = FooImpl(x=5)`, `p[0].do_thing(...)`) is
+verified working end-to-end (real C compile + run, see
+InterfaceCStructLayoutTests.test_ptr_interface_cstruct_heap_roundtrip in
+emitter_c_test.py). One caveat found along the way, NOT part of this
+gap: `p[0].field = value` (a FIELD-level write THROUGH a dereferenced
+pointer index, as opposed to replacing the whole value) silently doesn't
+write back to the pointee - lowering copies `*p` into a local temp,
+mutates the temp, and discards it. Confirmed pre-existing and unrelated
+to CStruct/@interface specifically (reproduces identically for a plain,
+non-@interface @cstruct too) - a general Ptr[T] indexed-lvalue lowering
+gap, flagged separately, not this plan's problem to fix.
+
+(For context on why this looked riskier before checking: RCClass's OWN
+construction path - _schedule_rcclass_construction, ir.Allocate,
+ObjectHeader initialization - IS RCClass-shaped, but that machinery only
+runs for RCClass's `ClassName(...)` heap-construction syntax. CStruct's
+`ClassName(...)` is plain stack/value construction (a C compound
+literal, confirmed in emitter_c_test.py) and never touches ir.Allocate
+at all - the two constructor syntaxes were never on the same code path
+to begin with, which is why sys.alloc[T] alone was already enough.)
+
+Status: DONE, no code changes needed - Phase 1 for this section is
+complete.
 
 3. Vtable struct + static instance, per concrete interface/implementation
 
@@ -232,7 +249,30 @@ from it right now.
 - _attr_lookup/_find_method need to walk a CStruct's own base chain, the
   same single-inheritance linear walk RCClass subclassing would have
   needed (self, then base, then base.base, ... until None) - today
-  neither RCClass nor CStruct's own lookup does this at all.
+  neither RCClass nor CStruct's own lookup does this at all. DONE
+  (Phase 1) - CStruct.chain_lookup in mpy_types.py, wired into
+  _attr_lookup/_attr_lookup_callable/_find_method.
+- FIXED (Phase 1): calling an inherited, non-@virtual method on a
+  DERIVED instance failed to compile as real C at first - chain_lookup
+  correctly RESOLVED the method (ir.Call targeting the base's Function),
+  but CStruct methods take `self` BY VALUE (unlike RCClass, always a
+  pointer), so the emitted call passed the derived-typed struct value
+  directly to a parameter typed for the BASE struct, which C rejects
+  (different struct types aren't implicitly convertible by value, even
+  with a layout-compatible prefix). Decided: a value-narrowing cast at
+  the call site, not a switch to self-by-pointer semantics - "most
+  consistent with our architecture, safe and explicit in C". Implemented
+  as _emit_self_operand in emitter_c.py: when the receiver's static type
+  differs from the target method's own .cls, take the receiver's
+  address, reinterpret as a pointer to the ancestor's own struct type,
+  dereference - `*(const AncestorType*)&derived_value`. Safe because a
+  self/receiver operand is always a Temp or Variable (see ir.Operand),
+  never a non-addressable expression. Verified end-to-end (real C
+  compile + run) in emitter_c_test.py's
+  test_inherited_method_callable_through_subclass_instance. The same
+  question will resurface for Phase 2's @virtual dispatch (a vtable slot
+  call also needs a correctly-typed self) - this establishes the answer
+  for that case too: narrow, don't switch calling convention.
 - No construction-chaining story is needed here the way RCClass
   subclassing would need one (base __init__ before derived fields, etc.)
   - CStruct construction is already "plain value construction", and an

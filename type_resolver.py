@@ -500,10 +500,13 @@ class TypeResolver:
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
 		owner_type = self.ensure_resolved( owner_type )
-		names = getattr( owner_type, 'names', None )
-		if not isinstance( names, dict ):
-			self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
-		found = names.get( attr )
+		if isinstance( owner_type, CStruct ):
+			found = owner_type.chain_lookup( attr )
+		else:
+			names = getattr( owner_type, 'names', None )
+			if not isinstance( names, dict ):
+				self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
+			found = names.get( attr )
 		if not isinstance( found, ( Function, Overload )):
 			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
 		if isinstance( found, ( Function, Overload )):

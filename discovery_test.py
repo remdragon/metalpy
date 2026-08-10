@@ -707,6 +707,122 @@ class Foo( Point ):
 		self.assertIn( 'cannot subclass', self.discovery.errors.errors[0] )
 
 
+class InterfaceCStructTests( unittest.TestCase ):
+	''' @interface CStructs - see PLAN_SUBCLASSING_VTABLES_COM.md. Single
+	inheritance, @interface-ness NOT inherited implicitly (a subclass must
+	redeclare it), @virtual only meaningful on an @interface CStruct right
+	now (RCClass vtable support is deferred). '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_root_interface_is_a_cstruct_marked_is_interface( self ) -> None:
+		mod = self._import( '''
+@interface
+class IFoo:
+	def helper( self ) -> i32: ...
+''' )
+		ifoo = mod.get_local( 'IFoo' )
+		self.assertIsInstance( ifoo, CStruct )
+		self.assertTrue( ifoo.is_interface )
+		self.assertIsNone( ifoo.base )
+
+	def test_subclass_base_resolved_eagerly( self ) -> None:
+		mod = self._import( '''
+@interface
+class IFoo:
+	def helper( self ) -> i32: ...
+
+@interface
+class FooImpl( IFoo ):
+	x: i32
+''' )
+		ifoo = mod.get_local( 'IFoo' )
+		fooimpl = mod.get_local( 'FooImpl' )
+		self.assertIs( fooimpl.base, ifoo )
+
+	def test_plain_cstruct_cannot_have_a_base( self ) -> None:
+		self._import( '''
+@interface
+class IFoo:
+	def helper( self ) -> i32: ...
+
+@cstruct
+class Bad( IFoo ):
+	pass
+''' )
+		self.assertIn( 'cannot have a base', self.discovery.errors.errors[0] )
+
+	def test_subclass_must_redeclare_interface( self ) -> None:
+		# @interface-ness is NOT inherited implicitly - deliberately
+		# conservative, see the plan doc's "Subclassing mechanics"
+		self._import( '''
+@interface
+class IFoo:
+	def helper( self ) -> i32: ...
+
+class Bad( IFoo ):
+	def helper( self ) -> i32:
+		return 1
+''' )
+		self.assertIn( 'cannot subclass', self.discovery.errors.errors[0] )
+
+	def test_interface_cannot_subclass_plain_cstruct( self ) -> None:
+		self._import( '''
+@cstruct
+class Point:
+	x: i32
+
+@interface
+class Bad( Point ):
+	pass
+''' )
+		self.assertIn( 'cannot subclass', self.discovery.errors.errors[0] )
+
+	def test_interface_multiple_inheritance_errors( self ) -> None:
+		self._import( '''
+@interface
+class A:
+	pass
+
+@interface
+class B:
+	pass
+
+@interface
+class C( A, B ):
+	pass
+''' )
+		self.assertIn( 'multiple inheritance', self.discovery.errors.errors[0] )
+
+	def test_virtual_allowed_on_interface_method( self ) -> None:
+		mod = self._import( '''
+@interface
+class IFoo:
+	@virtual
+	def helper( self ) -> i32: ...
+''' )
+		ifoo = mod.get_local( 'IFoo' )
+		ifoo.resolve()
+		helper = ifoo.get_local( 'helper' )
+		self.assertTrue( helper.is_virtual )
+
+	def test_virtual_rejected_on_plain_cstruct( self ) -> None:
+		mod = self._import( '''
+@cstruct
+class Foo:
+	@virtual
+	def helper( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'only supported on @interface classes', self.discovery.errors.errors[0] )
+
+
 class FunctionParameterTests( unittest.TestCase ):
 	''' full ast.arguments coverage - stage 2 needs the kind flags plus `default` to bind keyword/optional call-site arguments down to positional ones '''
 

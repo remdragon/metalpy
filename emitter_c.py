@@ -748,11 +748,37 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
 	return '->' if isinstance( base, RCClass ) else '.'
 
+def _emit_self_operand( receiver: ir.Operand, target_cls: ClassLike|None ) -> str:
+	''' an inherited (non-@virtual) CStruct method's `self` parameter is
+	declared with the ANCESTOR class's own struct type (c_type(target_cls),
+	matching _function_prototype's own `self` spelling) - CStruct methods
+	take self BY VALUE (unlike RCClass, always a pointer), so passing a
+	DERIVED-typed value directly where C expects the ancestor's struct type
+	is a real mismatch: different struct types, even with a layout-
+	compatible prefix (base fields first - see emit_cstruct), aren't
+	implicitly convertible by value in C. A value-narrowing cast through a
+	pointer - take the receiver's address, reinterpret as a pointer to the
+	ancestor's own struct type, dereference - slices out just the
+	ancestor's own prefix. Safe: receiver is always a Temp/Variable here
+	(ir.Operand has no other addressable-by-value case - see _emit_operand),
+	so &(...) is always a real C lvalue. Only CStruct needs this: RCClass's
+	self is already a pointer (trivially covariant via a plain cast), and
+	RCClass doesn't have base-chain method lookup wired yet (see
+	PLAN_SUBCLASSING_VTABLES_COM.md - deferred). '''
+	receiver_text = _emit_operand( receiver )
+	if (
+		isinstance( target_cls, CStruct )
+		and isinstance( receiver.type, CStruct )
+		and receiver.type is not target_cls
+	):
+		return f'(*(const {c_type(target_cls)}*)&({receiver_text}))'
+	return receiver_text
+
 def _emit_call_args( instr: ir.Call ) -> list[str]:
 	params = instr.target.parameters or []
 	values: list[str] = []
 	if instr.receiver is not None:
-		values.append( _emit_operand( instr.receiver ))
+		values.append( _emit_self_operand( instr.receiver, instr.target.cls ))
 	positional = list( instr.args )
 	for i, param in enumerate( params ):
 		if i < len( positional ):
@@ -1240,7 +1266,43 @@ def _iter_instruction_operands( instr: ir.Instruction ) -> list[ir.Operand]:
 			operands.extend( v for v in value.values() if isinstance( v, ( ir.Const, ir.Temp, Variable )))
 	return operands
 
+def _interface_root( cls: CStruct ) -> CStruct:
+	''' walk to the top of an @interface CStruct's single-inheritance chain -
+	that root is what actually declares the vtable's C type (see
+	_interface_vtbl_name) - @interface subclasses inherit the SAME $vtable
+	field type unchanged, they never get their own (PLAN_SUBCLASSING_
+	VTABLES_COM.md's own Layout example types every level's $vtable as
+	`const IFooVtbl*`, never a per-subclass FooImplVtbl) '''
+	node = cls
+	while node.base is not None:
+		node = node.base
+	return node
+
+def _interface_vtbl_name( cls: CStruct ) -> str:
+	return f'{mangle_type(_interface_root(cls))}Vtbl'
+
 def emit_cstruct( cls: CStruct ) -> str:
+	attrs: list[tuple[str,Type]]
+	if cls.is_interface:
+		# $vtable is the literal first member (COM's one hard ABI
+		# requirement) - base-chain flattening mirrors emit_rcclass's own
+		# walk, except every level shares the same inherited $vtable field
+		# (see _interface_root) rather than each base contributing its own
+		# vtable pointer
+		chain: list[CStruct] = []
+		node: CStruct|None = cls
+		while node is not None:
+			chain.append( node )
+			node = node.base
+		own_attrs: list[tuple[str,Type]] = []
+		for base_cls in reversed( chain ):
+			own_attrs.extend( ( attr.stem, attr.type ) for attr in base_cls.attributes )
+		vtbl_name = _interface_vtbl_name( cls )
+		lines = [ f'struct {mangle_type(cls)} {{', f'\tconst {vtbl_name}* $vtable;' ]
+		for field_name, field_type in own_attrs:
+			lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+		lines.append( '};' )
+		return '\n'.join( lines )
 	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]
 	return _struct_or_union_body( mangle_type( cls ), 'struct', attrs )
 
@@ -1417,6 +1479,20 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	for cls in compiler.rcclasses:
 		if not cls.type_params:
 			parts.append( f'struct {mangle_type(cls)};' )
+	# @interface CStructs' $vtable field points at the Vtbl struct type
+	# (see emit_cstruct/_interface_vtbl_name) before that struct's own full
+	# body exists (Phase 2 work) - an opaque forward tag is enough for a
+	# pointer field, same "forward-declare before any prototype/body can
+	# reference it" reasoning as the RCClass tags just above. Only interface
+	# ROOTS get a typedef (every subclass in the chain shares its root's
+	# $vtable type - see _interface_root) - dict used as an insertion-
+	# ordered dedup set, same convention as elsewhere in this module.
+	vtbl_names: dict[str,None] = {}
+	for cls in compiler.cstructs:
+		if cls.is_interface and not cls.type_params:
+			vtbl_names[ _interface_vtbl_name( cls ) ] = None
+	for vtbl_name in vtbl_names:
+		parts.append( f'typedef struct {vtbl_name} {vtbl_name};' )
 	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
 		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))

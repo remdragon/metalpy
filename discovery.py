@@ -818,6 +818,8 @@ class Discovery( ast.NodeVisitor ):
 			match decname:
 				case 'cstruct':
 					return self._parse_ClassDef_CStruct( node, qualname )
+				case 'interface':
+					return self._parse_ClassDef_Interface( node, qualname )
 				case 'cunion':
 					return self._parse_ClassDef_CUnion( node, qualname )
 				case 'enum':
@@ -933,6 +935,52 @@ class Discovery( ast.NodeVisitor ):
 
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
+
+		self._parse_type_params( node.type_params, class_obj )
+
+		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+
+		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
+
+		return class_obj
+
+	def _parse_ClassDef_Interface( self, node: ast.ClassDef, qualname: str ) -> CStruct:
+		# @interface class IFoo: / @interface class FooImpl(IFoo): - a CStruct
+		# that participates in vtable dispatch (see
+		# PLAN_SUBCLASSING_VTABLES_COM.md). Its own parse method, not a flag on
+		# _parse_ClassDef_CStruct, because the base-class rules are genuinely
+		# different from plain @cstruct (which forbids bases outright) -
+		# mirrors _parse_ClassDef_RCClass's base handling instead.
+		module = self.module_stack[-1]
+		class_obj = CStruct(
+			stem = node.name,
+			qualname = qualname,
+			file = module.file,
+			line = node.lineno,
+			is_interface = True,
+		)
+		if len( node.bases ) > 1:
+			self.fail(
+				f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})',
+				node,
+			)
+		if node.keywords:
+			self.fail( f'@interface {qualname} cannot have keywords ({node.keywords!r})', node )
+
+		scope = self.scope_stack[-1]
+		scope.add_name( class_obj.stem, class_obj )
+
+		if node.bases:
+			# @interface-ness is NOT inherited implicitly - a CStruct
+			# subclassing an @interface CStruct must itself be declared
+			# @interface too (this method only runs when it was), and its
+			# base must itself already be an @interface CStruct, not a plain
+			# one. Deliberately conservative - see "Subclassing mechanics" in
+			# PLAN_SUBCLASSING_VTABLES_COM.md.
+			base = self.visit( node.bases[0] )
+			if not ( isinstance( base, CStruct ) and base.is_interface ):
+				self.fail( f'{qualname} cannot subclass {base.qualname} (@interface can only subclass another @interface CStruct)', node )
+			class_obj.base = base
 
 		self._parse_type_params( node.type_params, class_obj )
 
@@ -1177,6 +1225,7 @@ class Discovery( ast.NodeVisitor ):
 		is_abstract = False
 		is_move = False
 		is_private = False
+		is_virtual = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
@@ -1199,6 +1248,8 @@ class Discovery( ast.NodeVisitor ):
 					is_move = True
 				case 'private':
 					is_private = True
+				case 'virtual':
+					is_virtual = True
 				case 'extern':
 					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
@@ -1206,6 +1257,13 @@ class Discovery( ast.NodeVisitor ):
 
 		if extern_lib is not None and not self._is_stub_body( node.body ):
 			self.fail( f'@extern function {qualname} must have a stub body (...) - it declares a foreign call signature, not a real implementation', node )
+
+		if is_virtual and not ( isinstance( class_obj, CStruct ) and class_obj.is_interface ):
+			# only @interface CStructs build a vtable at all right now -
+			# RCClass support is deferred (PLAN_SUBCLASSING_VTABLES_COM.md),
+			# and @virtual on a plain (non-@interface) class/CStruct would be
+			# silently meaningless rather than a real error, which is worse
+			self.fail( f'@virtual {qualname} is only supported on @interface classes right now', node )
 
 		module = self.module_stack[-1]
 		fn = Function(
@@ -1220,6 +1278,7 @@ class Discovery( ast.NodeVisitor ):
 			is_abstract = is_abstract,
 			is_move = is_move,
 			is_private = is_private,
+			is_virtual = is_virtual,
 			is_overload = is_overload,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,

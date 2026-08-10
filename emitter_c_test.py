@@ -1912,5 +1912,141 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+class InterfaceCStructLayoutTests( CompilerTestCase ):
+	''' @interface CStruct layout - see PLAN_SUBCLASSING_VTABLES_COM.md's
+	Phase 1 (type model + layout, no dispatch yet). Needs import_builtins
+	(string literals in error messages, sys.alloc's own body) the same way
+	StrUpperLowerTests above does. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	def test_vtable_typedef_and_base_chain_flattening( self ) -> None:
+		# matches the plan doc's own Layout worked example: a root
+		# interface's $vtable is its only member; a subclass inherits the
+		# SAME $vtable field type (never its own FooImplVtbl) at the same
+		# first-member position, with its own fields appended after
+		self._run( '''
+@interface
+class IFoo:
+	def helper( self ) -> i32: ...
+
+@interface
+class FooImpl( IFoo ):
+	x: i32
+	y: i32
+
+def main() -> None:
+	f: FooImpl = FooImpl( x = 1, y = 2 )
+	return
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( 'typedef struct __main__$IFooVtbl __main__$IFooVtbl;', src )
+		self.assertIn(
+			'struct __main__$IFoo {\n\tconst __main__$IFooVtbl* $vtable;\n};',
+			src,
+		)
+		self.assertIn(
+			'struct __main__$FooImpl {\n\tconst __main__$IFooVtbl* $vtable;\n\tint32_t x;\n\tint32_t y;\n};',
+			src,
+		)
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_inherited_method_callable_through_subclass_instance( self ) -> None:
+		# base-chain lookup (CStruct.chain_lookup) - a subclass instance can
+		# call a method it never redeclared, found by walking to its base.
+		# CStruct methods take `self` BY VALUE, so the call site needs a
+		# value-narrowing cast (receiver's address, reinterpreted as a
+		# pointer to the ANCESTOR's own struct type, dereferenced) to slice
+		# out just the base's own prefix - see _emit_self_operand in
+		# emitter_c.py.
+		self._run( '''
+def main() -> i32:
+	f: FooImpl = FooImpl( x = 1 )
+	with compiler.wrap_arithmetic:
+		result: i32 = f.helper() - 42
+	return result
+
+@interface
+class IFoo:
+	def helper( self ) -> i32:
+		return 42
+
+@interface
+class FooImpl( IFoo ):
+	x: i32
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		target_call = next( instr for instr in call.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( target_call.target.qualname, '__main__.IFoo.helper' )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ptr_interface_cstruct_heap_roundtrip( self ) -> None:
+		# Ptr[CStruct] heap allocation via sys.alloc[T] - confirmed to need
+		# no new code at all (sys.alloc[T] is a plain generic byte
+		# allocator with no RCClass special-casing in its own body - see
+		# lib/sys.py), same as the pre-existing Ptr[_ListMetadata] pattern
+		# in lib/builtins/__list.py's own RawList
+		self._run( '''
+import sys
+
+@interface
+class IFoo:
+	def do_thing( self, n: i32 ) -> i32: ...
+
+@interface
+class FooImpl( IFoo ):
+	x: i32
+
+	def do_thing( self, n: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			result: i32 = self.x + n
+		return result
+
+def main() -> i32:
+	p: Ptr[FooImpl] = sys.alloc[FooImpl]( 1 )
+	p[0] = FooImpl( x = 5 )
+	result: i32 = p[0].do_thing( 1 )
+	sys.free( p )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 if __name__ == '__main__':
 	unittest.main()
