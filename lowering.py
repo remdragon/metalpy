@@ -1013,25 +1013,98 @@ class Lowering:
 			self.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 
 	def _stmt_AugAssign( self, node: ast.AugAssign ) -> None:
-		# desugars x += y to x = x + y (reusing whatever arithmetic mode is
-		# active, exactly like a hand-written x = x + y would) - only for a
-		# bare Name target: this reads the target once (via the synthesized
-		# BinOp) and writes it once (via the synthesized Assign), which is
-		# only safe because a Name lookup has no side effects. An Attribute/
-		# Subscript target's object/index expression would need evaluating
-		# twice under this same desugaring (once to read, once to resolve
-		# the write) - a real correctness risk (e.g. get_obj().x += 1 would
-		# call get_obj() twice) - so those are left unsupported for now
-		# rather than silently introducing a double-evaluation bug
-		if not isinstance( node.target, ast.Name ):
+		# x += y desugars to x = x + y (reusing whatever arithmetic mode is
+		# active, exactly like a hand-written x = x + y would). A bare Name
+		# target reads/writes via the synthesized BinOp+Assign below - safe
+		# because a Name lookup has no side effects of its own. Attribute/
+		# Subscript targets can't use that same trick (their object/index
+		# expression would be evaluated twice - once to read, once to
+		# resolve the write - a real correctness risk: `get_obj().x += 1`
+		# must only call get_obj() once), so those two branches lower the
+		# target's object/index exactly once themselves, then read/compute/
+		# write through the SAME already-lowered operand(s) - mirroring
+		# _lower_attr_target_obj's own reasoning and _stmt_Assign's own
+		# Attribute/Subscript branches, just fused with a read first.
+		if isinstance( node.target, ast.Name ):
+			read = ast.Name( id = node.target.id, ctx = ast.Load() )
+			ast.copy_location( read, node.target )
+			binop = ast.BinOp( left = read, op = node.op, right = node.value )
+			ast.copy_location( binop, node )
+			assign = ast.Assign( targets = [ node.target ], value = binop )
+			ast.copy_location( assign, node )
+			self._stmt_Assign( assign )
+		elif isinstance( node.target, ast.Attribute ):
+			obj, writeback = self._lower_attr_target_obj( node.target.value )
+			attr_var = self._attr_lookup( obj.type, node.target.attr, node.target )
+			old = self._new_temp( attr_var.type )
+			self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
+			usize_cls = self.discovery.get_intrinsics()['usize']
+			right_hint = usize_cls if self._type_resolver._is_ptr_specialization( old.type ) else old.type
+			right = self._lower_expr( node.value, right_hint )
+			result = self._lower_binop_values( node, old, right, attr_var.type )
+			if self._construction_self is not None and obj is self._construction_self:
+				# self.<attr> += value, inside __init__ construction itself -
+				# same definite-assignment/self-escape tracking an ordinary
+				# self.<attr> = value gets in _stmt_Assign
+				for instr in self._cfg.attr_assign( attr_var, result, is_alias = False ):
+					self._emit( instr )
+			elif cfg.rc_leaves( attr_var.type ):
+				# ordinary SetAttr on an already-constructed instance - `old`
+				# is exactly the CURRENT value _stmt_Assign's own Attribute
+				# branch would otherwise re-read via its own fresh GetAttr;
+				# reusing it here avoids a redundant third read
+				for instr in self._cfg.attr_replace( attr_var.type, old, result, is_alias = False ):
+					self._emit( instr )
+			self._emit( ir.SetAttr( obj = obj, attr = node.target.attr, value = result ))
+			if writeback is not None:
+				writeback( obj )
+		elif isinstance( node.target, ast.Subscript ):
+			obj = self._lower_expr( node.target.value, None )
+			getitem_fn = self._find_method( obj.type, '__getitem__' )
+			if getitem_fn is None:
+				# no real __getitem__ declared (raw pointers, or any other
+				# type that doesn't define subscript access as a method) -
+				# mirrors _expr_Subscript's own raw-pointer GetItem fallback
+				# and _stmt_Assign's own raw-pointer SetItem fallback, fused
+				# around a single obj/index lowering
+				if isinstance( obj.type, Specialization ) and isinstance( obj.type.base, Scalar ) and obj.type.base.stem in ( 'Ptr', 'ConstPtr' ):
+					elem_type = obj.type.args[0]
+				else:
+					self.discovery.fail( f'cannot infer the element type of {ast.unparse(node.target)} - no expected type available from context', node.target )
+				index_type = self.discovery.get_intrinsics()['usize']
+				index = self._lower_expr( node.target.slice, index_type )
+				old = self._new_temp( elem_type )
+				self._emit( ir.GetItem( dest = old, obj = obj, index = index ))
+				right = self._lower_expr( node.value, old.type )
+				result = self._lower_binop_values( node, old, right, old.type )
+				self._emit( ir.SetItem( obj = obj, index = index, value = result ))
+			else:
+				# a real __getitem__ - read via it like any other method
+				# call, auto-consuming a Result exactly like an ordinary
+				# `obj[i]` read already does, then write back via
+				# __setitem__ the same way an ordinary `obj[i] = v` already
+				# does - index is lowered exactly once, shared by both
+				setitem_fn = self._find_method( obj.type, '__setitem__' )
+				if setitem_fn is None:
+					self.discovery.fail( f'{ast.unparse(node.target.value)} defines __getitem__ but not __setitem__ - cannot assign to {ast.unparse(node.target)}', node.target )
+				self._ensure_resolved( getitem_fn )
+				self.schedule( getitem_fn.return_type )
+				index = self._lower_expr( node.target.slice, getitem_fn.parameters[0].type )
+				get_dest = self._new_temp( getitem_fn.return_type )
+				self._emit( ir.Call( dest = get_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
+				old = self._maybe_consume_result( node.target, get_dest, self._SUBSCRIPT_ALTERNATIVES )
+				right = self._lower_expr( node.value, old.type )
+				result = self._lower_binop_values( node, old, right, old.type )
+				self._ensure_resolved( setitem_fn )
+				self.schedule( setitem_fn.return_type )
+				if setitem_fn.return_type is self.discovery.get_none_type():
+					self._emit( ir.Call( dest = None, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
+				else:
+					set_dest = self._new_temp( setitem_fn.return_type )
+					self._emit( ir.Call( dest = set_dest, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
+					self._maybe_consume_result( node.target, set_dest, self._SUBSCRIPT_ALTERNATIVES )
+		else:
 			self.discovery.fail( f'unsupported AugAssign target: {ast.unparse(node)}', node )
-		read = ast.Name( id = node.target.id, ctx = ast.Load() )
-		ast.copy_location( read, node.target )
-		binop = ast.BinOp( left = read, op = node.op, right = node.value )
-		ast.copy_location( binop, node )
-		assign = ast.Assign( targets = [ node.target ], value = binop )
-		ast.copy_location( assign, node )
-		self._stmt_Assign( assign )
 
 	def _stmt_Expr( self, node: ast.Expr ) -> None:
 		defer_kind = self._defer_kind_of_call( node.value )
@@ -2324,6 +2397,17 @@ class Lowering:
 
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
 		left, right = self._lower_binary_operands( node.left, node.right, expected_type )
+		return self._lower_binop_values( node, left, right, expected_type )
+
+	def _lower_binop_values( self, node: 'ast.BinOp|ast.AugAssign', left: ir.Operand, right: ir.Operand, expected_type: Type|None ) -> ir.Operand:
+		# the dunder-dispatch/checked-arithmetic core of _expr_BinOp, split
+		# out so _stmt_AugAssign's own Attribute/Subscript-target handling
+		# can reuse it with operands it already lowered itself (reading the
+		# target's object/index exactly once - see that method's own
+		# comment) instead of going through _lower_binary_operands, which
+		# always lowers both sides fresh from AST. `node` is only ever
+		# read for its `.op` (ast.BinOp and ast.AugAssign both have one)
+		# and as an error-reporting location - never for `.left`/`.right`.
 
 		# non-scalar left operand — try the dunder method (str.__add__, ...)
 		if not isinstance( left.type, Scalar ):

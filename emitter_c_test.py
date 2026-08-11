@@ -558,6 +558,123 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+class AugAssignRealCompileTests( CompilerTestCase ):
+	''' real compile+run coverage for _stmt_AugAssign's Attribute/Subscript-
+	target support (lowering.py) - unlike the IR-shape assertions in
+	lowering_test.py, these confirm the generated code actually computes
+	the right value AND doesn't corrupt memory (an RC attribute replaced
+	many times in a loop is exactly the shape a wrong/missing decref would
+	show up in). Needs real builtins, like
+	UnionAsUnconstructedResultErrorTypeTests above. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_attribute_target_rc_value_replaced_in_a_loop( self ) -> None:
+		# f.s += 'a' 200 times - exercises the dunder (str.__add__) dispatch
+		# path plus cfg.attr_replace's decref of the OLD str each iteration;
+		# a missing/wrong decref here either leaks or double-frees, and 200
+		# iterations is enough for ASan/heap-corruption-on-double-free to
+		# reliably surface if it were broken (confirmed against a
+		# deliberately-reintroduced bug before writing this test)
+		self._run( '''
+class Foo:
+	s: str
+
+def main() -> i32:
+	f: Foo = Foo( s = "a" )
+	i: i32 = 0
+	while i < 200:
+		f.s += "a"
+		with compiler.wrap_arithmetic:
+			i += 1
+	if len( f.s ) != 201:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_subscript_target_raw_pointer_fallback( self ) -> None:
+		# p[0] += 5 through the flat GetItem/SetItem fallback (no
+		# __getitem__/__setitem__) - confirms the read-modify-write actually
+		# lands in the right memory, not just that it compiles
+		self._run( '''
+import sys
+
+def main() -> i32:
+	p: Ptr[i32] = sys.alloc[i32]( 1 )
+	p[0] = 10
+	with compiler.wrap_arithmetic:
+		p[0] += 5
+	v: i32 = p[0]
+	sys.free( p )
+	if v != 15:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_subscript_target_with_real_getitem_setitem_methods( self ) -> None:
+		# d[1] += 5 through a real __getitem__/__setitem__ pair (dict[K,V]) -
+		# both fallible, auto-consumed exactly like an ordinary d[1] read/
+		# write already is, and both driven off the SAME index operand
+		# (lowered once). main() itself can't return Result (the C entry
+		# point's signature is fixed - see emitter_c._is_entry_point), so
+		# the dict logic lives in a helper that does, mirroring how every
+		# other real-run test needing a fallible operation at top level
+		# already structures this (see
+		# UnionAsUnconstructedResultErrorTypeTests above)
+		self._run( '''
+def helper() -> Result[i32, KeyError]:
+	d: dict[i32,i32] = dict[i32,i32]()
+	d[1] = 10
+	with compiler.wrap_arithmetic:
+		d[1] += 5
+	v: i32 = d[1]
+	return Result.Ok( v )
+
+def main() -> i32:
+	v: i32 = helper().unwrap( 'x' )
+	if v != 15:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
 		with tempfile.TemporaryDirectory() as tmp:

@@ -152,23 +152,126 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( "name 'x' is not defined", self.discovery.errors.errors[0] )
 
-	def test_augassign_attribute_target_unsupported( self ) -> None:
-		# left unsupported deliberately - the object expression would need
-		# to be evaluated twice under the x = x + y desugaring (once to
-		# read the current value, once to resolve the write target), a real
-		# correctness risk for anything with side effects
+	def test_augassign_attribute_target( self ) -> None:
+		# f.x += 2 reads f.x exactly once (GetAttr into a fresh temp),
+		# computes the BinOp against that temp, then writes back exactly
+		# once (SetAttr) - f itself is lowered exactly once, shared by both
+		# the read and the write, unlike the x = x + y desugaring a bare
+		# Name target uses (which would double-evaluate f here)
 		code = '\n'.join([
 			'class Foo:',
 			'	x: i32',
 			'',
 			'def main() -> None:',
 			'	f: Foo',
-			'	f.x += 1',
+			'	with compiler.wrap_arithmetic:',
+			'		f.x += 2',
+			'	return',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		foo_cls = mod.get_local( 'Foo' )
+		if foo_cls.resolve is not None:
+			foo_cls.resolve()
+		f = Variable( stem = 'f', qualname = 'main.f', file = Path( '__test__.py' ), line = 5, type = foo_cls )
+		t0 = ir.Temp( type = i32, id = 0 )
+		t1 = ir.Temp( type = i32, id = 1 )
+
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.DeclareTemp( temp = t0 ),
+			ir.GetAttr( dest = t0, obj = f, attr = 'x' ),
+			ir.DeclareTemp( temp = t1 ),
+			ir.AddWrap( dest = t1, left = t0, right = ir.Const( type = i32, value = 2 )),
+			ir.SetAttr( obj = f, attr = 'x', value = t1 ),
+			ir.DeleteTemp( temp = t1 ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_augassign_attribute_target_object_evaluated_once( self ) -> None:
+		# get_obj().x += 1 must call get_obj() exactly once - the real
+		# correctness risk _stmt_AugAssign's own Attribute branch exists to
+		# avoid (the x += y-as-x = x + y desugaring a bare Name target uses
+		# would otherwise double-evaluate the object expression)
+		code = '\n'.join([
+			'class Foo:',
+			'	x: i32',
+			'',
+			'g: Foo',
+			'',
+			'def get_obj() -> Foo:',
+			'	return g',
+			'',
+			'def main() -> None:',
+			'	with compiler.wrap_arithmetic:',
+			'		get_obj().x += 1',
 			'	return',
 		])
 		self._import( code )
-		self._lower_main()
-		self.assertIn( 'unsupported AugAssign target', self.discovery.errors.errors[0] )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].target.qualname, '__test__.get_obj' )
+
+	def test_augassign_subscript_target_raw_pointer_fallback( self ) -> None:
+		# no __getitem__/__setitem__ declared (raw pointers) - falls back to
+		# the flat GetItem/SetItem opcodes, index/obj lowered exactly once
+		code = '\n'.join([
+			'import sys',
+			'',
+			'@cstruct',
+			'class Point:',
+			'	x: i32',
+			'',
+			'def main() -> None:',
+			'	p: Ptr[i32] = sys.alloc[i32]( 1 )',
+			'	with compiler.wrap_arithmetic:',
+			'		p[0] += 1',
+			'	sys.free( p )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'GetItem', kinds )
+		self.assertIn( 'SetItem', kinds )
+		self.assertIn( 'AddWrap', kinds )
+
+	def test_augassign_subscript_target_with_getitem_setitem_methods( self ) -> None:
+		# a real __getitem__/__setitem__ pair - read via __getitem__, add,
+		# write back via __setitem__, index lowered exactly once and shared
+		# by both calls
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, i: usize ) -> i32:',
+			'		return self.y',
+			'',
+			'	def __setitem__( self, i: usize, v: i32 ) -> None:',
+			'		self.y = v',
+			'',
+			'def main( b: Box ) -> None:',
+			'	with compiler.wrap_arithmetic:',
+			'		b[0] += 5',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'GetItem', kinds )
+		self.assertNotIn( 'SetItem', kinds )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Box.__getitem__', '__test__.Box.__setitem__' ] )
 
 	def test_bare_assign_to_new_name_infers_type_from_rhs( self ) -> None:
 		# no annotation at all - x's type comes from y's, same as if it had
