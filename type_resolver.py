@@ -149,8 +149,23 @@ class TypeResolver:
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:
 		''' the emitter always synthesizes a destructor for every
 		non-generic RCClass — ensure its transitive dependencies
-		(sys.free and __del__ if declared) are scheduled '''
+		(sys.free and __del__ if declared) are scheduled.
+
+		schedule()'s own Specialization branch calls this with the BARE
+		base class even when that base is generic (e.g. list[RawEntry]'s
+		own schedule() call passes bare `list`, not the specialization) -
+		cls.type_params is the guard for that case: a generic class's own
+		__del__ has an unbound T, never directly compilable (confirmed:
+		scheduling it bare crashes downstream with "compiler.is_rc(T)
+		requires a concrete type"). monomorphize_class's own per-
+		Specialization method-substitution loop already builds and
+		schedules the correctly-substituted __del__[ConcreteArgs] for
+		whichever specialization is actually in use - only sys.free needs
+		ensuring here for that case, not a second, wrong scheduling of the
+		abstract __del__ template. '''
 		self._ensure_sys_free_scheduled()
+		if cls.type_params:
+			return
 		del_fn = cls.get_local( '__del__' )
 		if isinstance( del_fn, Function ):
 			self.schedule( del_fn )
