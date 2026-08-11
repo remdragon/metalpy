@@ -61,23 +61,3 @@ class RawDict:
 		
 		# Maintain sorted order in __indices list
 		self.__indices.insert( pos, RawIndex( hash = hash, entry_idx = entry_idx ) )
-
-class dict[K, V]:
-	__raw: RawDict
-	
-	def __init__( self ) -> None:
-		self.__raw = RawDict()
-	
-	def __getitem__( self, key: K ) -> Result[V, KeyError]:
-		h: u64 = hash( key )
-		key_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( key )
-		
-		val_ptr = self.__raw.lookup( h, key_ptr, K.__eq_fn__ ).or_return()
-		return Result.Ok( compiler.reinterpret_cast[V]( val_ptr ) )
-	
-	def __setitem__( self, key: K, value: V ) -> None:
-		h: u64 = hash( key )
-		key_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( key )
-		val_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( value )
-		
-		self.__raw.insert( h, key_ptr, val_ptr, K.__eq_fn__ )

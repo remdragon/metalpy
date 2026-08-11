@@ -245,6 +245,14 @@ class RawFastList:
 	# _erase's own swap-and-keep-alive of the last element (see
 	# emitter_c_test.py's test_append_after_erase_reissues_a_live_id,
 	# written to pin this down before the fix)
+	#
+	# TODO/FIXME: __free_ids is its own separate __cap-sized allocation,
+	# doubling memory next to __indexes for something that's mostly spare
+	# capacity. Better: store the free list intrusively in the unused tail
+	# of __indexes itself (each free slot holds the next free id, forming
+	# a linked list) instead of a whole second array - drop __free_ids/
+	# __free_count entirely. Left as-is for now to stay focused on
+	# getting dict[K,V] working; revisit once that's done.
 	def _get_free_id( self ) -> usize:
 		if self.__free_count > 0:
 			with compiler.panic_arithmetic( 'RawFastList _get_free_id: underflow' ):

@@ -2,11 +2,11 @@ from codecs import Codec, CodecError
 from codecs.utf8 import utf8
 import compiler
 import sys
-from .__dict import dict
 from .__errors import OSError
 from .__fastlist import FastList
 from .__int import int
 from .__list import list
+from .__RawDict import RawDict
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
 # SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
@@ -898,6 +898,26 @@ def print( msg: str, end: str = '\n' ) -> None:
 
 def len[T]( t: T ) -> usize:
 	return t.__len__()
+
+class dict[K, V]:
+	__raw: RawDict
+
+	def __init__( self ) -> None:
+		self.__raw = RawDict()
+
+	def __getitem__( self, key: K ) -> Result[V, KeyError]:
+		h: u64 = hash( key )
+		key_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( key )
+
+		val_ptr = self.__raw.lookup( h, key_ptr, K.__eq_fn__ ).or_return()
+		return Result.Ok( compiler.reinterpret_cast[V]( val_ptr ) )
+
+	def __setitem__( self, key: K, value: V ) -> None:
+		h: u64 = hash( key )
+		key_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( key )
+		val_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( value )
+
+		self.__raw.insert( h, key_ptr, val_ptr, K.__eq_fn__ )
 
 # import this at the end because it depends on str etc to already be pre-parsed:
 from .__File import File
