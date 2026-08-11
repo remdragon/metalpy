@@ -3185,6 +3185,112 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class ChrOrdTests( CompilerTestCase ):
+	''' chr()/ord() (lib/builtins/__init__.py) - built on str's own private
+	UTF-8 encode/decode helpers (the same ones upper()/lower()/case-
+	folding already use), not separate logic. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ascii_round_trip( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if chr( 65 ) != "A":
+		return 1
+	if ord( "A" ) != 65:
+		return 2
+	if ord( "0" ) != 48:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_multibyte_round_trip( self ) -> None:
+		# U+00E9 (e-acute, 2 UTF-8 bytes) and U+1F600 (grinning face emoji,
+		# 4 UTF-8 bytes) - exercises _utf8_encoded_len/_encode_utf8_at/
+		# _decode_utf8_at's own 2-byte and 4-byte branches, not just ASCII
+		self._run( '''
+def main() -> i32:
+	c2: str = chr( 0xE9 )
+	if c2.byte_len() != 2:
+		return 1
+	if ord( c2 ) != 0xE9:
+		return 2
+	c4: str = chr( 0x1F600 )
+	if c4.byte_len() != 4:
+		return 3
+	if ord( c4 ) != 0x1F600:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ord_on_empty_string_panics( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	ord( "" )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ord_on_multi_codepoint_string_panics( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	ord( "ab" )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_chr_on_surrogate_half_panics( self ) -> None:
+		# U+D800 is a UTF-16 surrogate half - not a valid Unicode code point
+		# on its own, same as Python's own chr(0xD800) raising ValueError
+		self._run( '''
+def main() -> i32:
+	chr( 0xD800 )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+
 class StrFindIndexSplitTests( CompilerTestCase ):
 	''' str.find()/str.index()/str.split() (lib/builtins/__init__.py) -
 	both listed missing in TODO.txt, implemented as real general-purpose

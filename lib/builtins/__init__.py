@@ -926,6 +926,42 @@ def print( msg: str, end: str = '\n' ) -> None:
 def len[T]( t: T ) -> usize:
 	return t.__len__()
 
+def chr( cp: u32 ) -> str:
+	''' the inverse of ord() below - encodes a single Unicode code point as
+	UTF-8 into a freshly allocated buffer, then constructs a str from it -
+	reuses str's own private UTF-8 size/encode helpers (the same ones
+	upper()/lower()/case-folding already build on) rather than duplicating
+	that logic here. cp must be a real Unicode code point (<= U+10FFFF,
+	not a UTF-16 surrogate half) - _from_owned_cstr's own UTF-8
+	revalidation (the same one every other str-constructing method here
+	already goes through) catches an invalid one, panicking via unwrap()
+	rather than returning a Result: Python's real chr() raises ValueError
+	for this, and this language panics instead of raising exceptions
+	throughout (see str.split's identical reasoning for its own
+	non-empty-separator precondition). '''
+	encoded_len: usize = str._utf8_encoded_len( cp )
+	buf_size: usize
+	with compiler.panic_arithmetic( 'irrational string length' ):
+		buf_size = encoded_len + 1 # +1 for the zero terminator
+	buf: Ptr[u8] = sys.alloc[u8]( buf_size )
+	str._encode_utf8_at( buf, 0, cp )
+	buf[encoded_len] = 0
+	return str._from_owned_cstr( buf, buf_size ).unwrap( 'chr(): not a valid Unicode code point' )
+
+def ord( s: str ) -> u32:
+	''' the inverse of chr() above - decodes s's own first (and only) code
+	point back to its integer value, reusing str's own private UTF-8
+	decode helper. Requires s to be exactly one code point long, matching
+	Python's own ord() (TypeError otherwise) - panics instead, same
+	panic-not-exceptions convention chr() above follows. '''
+	if s.byte_len() == 0:
+		sys.panic( 'ord(): expected a string of length 1, got an empty string' )
+	consumed: usize = 0
+	cp: u32 = str._decode_utf8_at( s.get_const_ptr(), 0, compiler.addrof( consumed ))
+	if consumed != s.byte_len():
+		sys.panic( 'ord(): expected a string of length 1, got a longer string' )
+	return cp
+
 class dict[K, V]:
 	''' see PLAN_CALLABLE.md. RawDict (lib/builtins/__RawDict.py) is
 	genuinely type-erased - it never decodes a key_ptr/value_ptr back to a
