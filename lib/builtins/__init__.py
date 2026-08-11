@@ -4,6 +4,7 @@ import compiler
 import sys
 from .__dict import dict
 from .__errors import OSError
+from .__fastlist import FastList
 from .__int import int
 from .__list import list
 
