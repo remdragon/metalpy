@@ -2580,6 +2580,90 @@ class Tests( unittest.TestCase ):
 		self.assertNotIn( 'OrJump', kinds )
 		self.assertEqual( self.discovery.errors.errors, [] )
 
+	def test_subscript_assign_with_setitem_dispatches_to_method( self ) -> None:
+		# obj[i] = v used to unconditionally emit the flat SetItem opcode,
+		# even when obj.type declares a real __setitem__ - meaning a
+		# user-defined __setitem__ could never actually be invoked through
+		# assignment syntax. Now mirrors _expr_Subscript's own __getitem__
+		# resolution: a real __setitem__ is called like any other method
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __setitem__( self, i: usize, v: i32 ) -> None:',
+			'		self.y = v',
+			'',
+			'def main( b: Box ) -> None:',
+			'	b[0] = 5',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'Call', kinds )
+		self.assertNotIn( 'SetItem', kinds )
+		call = next( instr for instr in fn.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.qualname, '__test__.Box.__setitem__' )
+
+	def test_subscript_assign_without_setitem_falls_back_to_raw_setitem( self ) -> None:
+		# no __setitem__ declared (raw pointers, or any other type that
+		# doesn't define subscript assignment as a method) - must keep
+		# emitting the flat SetItem opcode exactly as before this fix
+		code = '\n'.join([
+			'import sys',
+			'',
+			'@cstruct',
+			'class Point:',
+			'	x: i32',
+			'',
+			'def main() -> None:',
+			'	p: Ptr[Point] = sys.alloc[Point]( 1 )',
+			'	p[0] = Point( x = 7 )',
+			'	sys.free( p )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'SetItem', kinds )
+		self.assertEqual( [ type( i ).__name__ for i in fn.instructions if isinstance( i, ir.Call ) and 'setitem' in i.target.qualname.lower() ], [] )
+
+	def test_subscript_assign_with_setitem_resolves_and_consumes_result( self ) -> None:
+		# obj[i] = v is sugar for obj.__setitem__(i, v).or_return() whenever
+		# __setitem__ can fail - mirrors test_subscript_with_getitem_
+		# resolves_and_consumes_result above, for the write side
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __setitem__( self, i: usize, v: i32 ) -> Result[None,MyError]:',
+			'		self.y = v',
+			'		return Result.__allocate__( x = None )',
+			'',
+			'def foo( b: Box, i: usize ) -> Result[None,MyError]:',
+			'	b[i] = 5',
+			'	return Result.Err( MyError() )',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		fn = self.compiler._lower( foo_fn )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'OrReturn', kinds )
+		setitem_errors = [ e for e in self.discovery.errors.errors if 'b[i]' in e or '__setitem__' in e ]
+		self.assertEqual( setitem_errors, [] )
+
 	def test_if_body_recovery_boundary_does_not_stop_orelse( self ) -> None:
 		# one bad statement inside the if-body doesn't prevent orelse (or
 		# anything after the if) from still being lowered - same recovery

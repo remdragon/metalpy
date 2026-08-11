@@ -915,9 +915,28 @@ class Lowering:
 				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
 			obj = self._lower_expr( target.value, None )
-			index = self._lower_expr( target.slice, None )
-			operand = self._lower_expr( node.value, None )
-			self._emit( ir.SetItem( obj = obj, index = index, value = operand ))
+			setitem_fn = self._find_method( obj.type, '__setitem__' )
+			if setitem_fn is None:
+				# no real __setitem__ declared (raw pointers, or any other
+				# type that doesn't define subscript assignment as a method)
+				# - falls back to the flat SetItem opcode, unconditionally
+				# (mirrors _expr_Subscript's own raw-pointer GetItem fallback)
+				index = self._lower_expr( target.slice, None )
+				operand = self._lower_expr( node.value, None )
+				self._emit( ir.SetItem( obj = obj, index = index, value = operand ))
+			else:
+				# a real __setitem__ - call it like any other method, then if
+				# it returns Result[T,E], auto-consume it exactly like
+				# _expr_Subscript's own __getitem__ call does: `obj[i] = v`
+				# reads as sugar for `obj.__setitem__(i, v).or_return()`
+				# whenever __setitem__ can fail
+				self._ensure_resolved( setitem_fn )
+				self.schedule( setitem_fn.return_type )
+				index = self._lower_expr( target.slice, setitem_fn.parameters[0].type )
+				operand = self._lower_expr( node.value, setitem_fn.parameters[1].type )
+				call_dest = self._new_temp( setitem_fn.return_type )
+				self._emit( ir.Call( dest = call_dest, target = setitem_fn, receiver = obj, args = [ index, operand ], kwargs = {} ))
+				self._maybe_consume_result( node, call_dest, self._SUBSCRIPT_ALTERNATIVES )
 		else:
 			self.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 
