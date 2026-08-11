@@ -33,12 +33,33 @@ import sys
 # type does -- the only ways an operation on `int` can actually fail are:
 # running out of memory, dividing by zero, parsing a malformed digit
 # string, or narrowing a value back down into something like i32.
-@enum( i32 )
+#
+# @union, not @enum: a CEnum member used as a real runtime value (which is
+# exactly what every `Result.Err( IntError.X )` below needs) is a pre-
+# existing, documented lowering.py gap (see emitter_c_test.py's own
+# EmitCEnumTests comment, "CEnum never being referenced by real lowering.py
+# output today") - confirmed directly here too (Result's own E type
+# parameter came back inferred as BOTH i32 and IntError, from the same
+# argument, at every one of this file's `Result.Err( IntError.X )` call
+# sites, the moment any of them was actually exercised). sys.py's own
+# OwnershipError carries the identical leftover comment for the identical
+# reason - @union sidesteps it entirely since union-variant values ARE real,
+# lowerable values (Result itself is one). Every variant is a plain no-
+# payload tag (`: None`), constructed as `IntError.X( None )` rather than
+# referenced bare.
+@union
 class IntError:
-	DivideByZero = 0
-	InvalidDigit = 1
-	Overflow = 2
-	Other = _
+	DivideByZero: None
+	InvalidDigit: None
+	Overflow: None
+	Other: None
+
+# divmod()'s own return value - see its own comment on why this exists
+# instead of a bare (int, int) tuple.
+@cstruct
+class DivMod:
+	quotient: int
+	remainder: int
 
 # ---------------------------------------------------------------------------
 # 2. The `int` class
@@ -47,6 +68,21 @@ class IntError:
 # Digits are stored least-significant-first (index 0 = ones place), exactly
 # as in BigInt.h's own comment: "Greater indices hold more significant
 # digits." Each element holds one decimal digit, 0-9.
+
+# ord() does not exist in this language (confirmed by direct inspection -
+# no compiler/lib code implements it anywhere else); ASCII byte literals are
+# spelled out directly instead, matching guid.py's own established idiom for
+# the same thing.
+_ASCII_MINUS: u8 = 0x2D # '-'
+_ASCII_ZERO: u8 = 0x30 # '0'
+_ASCII_NINE: u8 = 0x39 # '9'
+
+# i32.min/i32.max are not real expressions in this language (scalars have no
+# such members - confirmed by direct inspection); to_i32()'s own bounds
+# check spells the literal range out instead, widened to i64 to match
+# value's own type there.
+_I32_MIN: i64 = -2147483648
+_I32_MAX: i64 = 2147483647
 
 class int:
 	__digits: Ptr[u8]
@@ -65,7 +101,9 @@ class int:
 		# undefined behavior for INT_MIN -- a bug this port sidesteps by
 		# picking a wide-enough type up front instead of checking for it
 		# after the fact.
-		magnitude: u32 = u32( -i64( value ) ) if self.__is_negative else u32( value )
+		magnitude: u32
+		with compiler.panic_arithmetic( 'i64 is wide enough to negate any i32 value (including i32.MIN) without overflow' ):
+			magnitude = u32( -i64( value ) ) if self.__is_negative else u32( value )
 		count: usize = int._digit_count( magnitude )
 
 		digits: Ptr[u8] = sys.alloc[u8]( count )
@@ -79,7 +117,7 @@ class int:
 			m: u32 = magnitude
 			while i < count:
 				self.__digits[i] = u8( m % 10 )
-				m = m / 10
+				m = m // 10
 				i += 1
 
 	@staticmethod
@@ -97,7 +135,7 @@ class int:
 			count: usize = 0
 			v: u32 = value
 			while v > 0:
-				v = v / 10
+				v = v // 10
 				count += 1
 			return count
 
@@ -106,7 +144,10 @@ class int:
 		cstr: ConstPtr[u8] = s.get_cstr()
 		length: usize = s.byte_len()
 
-		is_negative: bool = length > 0 and cstr[0] == ord( '-' )
+		if length == 0:
+			return Result.Err( IntError.InvalidDigit( None ))
+
+		is_negative: bool = cstr[0] == _ASCII_MINUS
 		with compiler.panic_arithmetic( 'a leading sign character is at most one byte within the string\'s own length' ):
 			start: usize = 1 if is_negative else 0
 
@@ -114,13 +155,13 @@ class int:
 			# character behind (so "0" and "-0" still parse to zero
 			# instead of being treated as empty).
 			pos: usize = start
-			while pos < length - 1 and cstr[pos] == ord( '0' ):
+			while pos < length - 1 and cstr[pos] == _ASCII_ZERO:
 				pos += 1
 
 			num_digits: usize = length - pos
 
 		if num_digits == 0:
-			return Result.Err( IntError.InvalidDigit )
+			return Result.Err( IntError.InvalidDigit( None ))
 
 		digits: Ptr[u8] = sys.alloc[u8]( num_digits )
 
@@ -128,10 +169,10 @@ class int:
 			i: usize = 0
 			while i < num_digits:
 				ch: u8 = cstr[ length - 1 - i ]
-				if ch < ord( '0' ) or ch > ord( '9' ):
+				if ch < _ASCII_ZERO or ch > _ASCII_NINE:
 					sys.free( digits )
-					return Result.Err( IntError.InvalidDigit )
-				digits[i] = ch - ord( '0' )
+					return Result.Err( IntError.InvalidDigit( None ))
+				digits[i] = ch - _ASCII_ZERO
 				i += 1
 
 		result = int.__allocate__(
@@ -144,6 +185,19 @@ class int:
 		return Result.Ok( result )
 
 	def clone( self ) -> int:
+		# Never fails (sys.alloc panics on OOM rather than returning an
+		# error - see its own definition in lib/sys.py), so this returns a
+		# bare `int` rather than Result[int, IntError]: every caller already
+		# gets the simplest possible form (`result = self.clone()`, no
+		# .or_return() ceremony for an outcome that structurally can't
+		# happen), and there's no correctness downside - Result[int,...]
+		# .or_return() from within int's own methods works correctly now
+		# (see type_resolver.py's _type_of_expr, the 'or_return' branch -
+		# fixed a real bug there: a bare `x = <result>.or_return()` with no
+		# type annotation used to schedule or_return() itself as a real
+		# compiled function while inferring x's type, which fails for ANY
+		# same-file receiver type, self-referential or not), so this is a
+		# genuine design choice now, not a workaround for that bug.
 		capacity: usize = self.__num_allocated if self.__num_allocated > 0 else 1
 		new_digits: Ptr[u8] = sys.alloc[u8]( capacity )
 
@@ -153,12 +207,12 @@ class int:
 				new_digits[i] = self.__digits[i]
 				i += 1
 
-		return Result.Ok( int.__allocate__(
+		return int.__allocate__(
 			__digits = new_digits,
 			__num_digits = self.__num_digits,
 			__num_allocated = capacity,
 			__is_negative = self.__is_negative,
-		) )
+		)
 
 	def __del__( self ) -> None:
 		sys.free( self.__digits )
@@ -170,9 +224,9 @@ class int:
 	# BigInt_add_digits/BigInt_subtract_digits.
 
 	@private
-	def _ensure_digits( self, digits_needed: usize ) -> None:
+	def _ensure_digits( self, digits_needed: usize ) -> Result[None, IntError]:
 		if self.__num_allocated >= digits_needed:
-			return
+			return Result.Ok( None )
 
 		new_digits: Ptr[u8] = sys.alloc[u8]( digits_needed )
 
@@ -186,6 +240,7 @@ class int:
 		self.__digits = new_digits
 		self.__num_allocated = digits_needed
 		sys.free( old_digits )
+		return Result.Ok( None )
 
 	@staticmethod
 	@private
@@ -211,7 +266,8 @@ class int:
 	@private
 	def _add_magnitude( self, other: int ) -> Result[None, IntError]:
 		with compiler.panic_arithmetic( 'one more digit than the longer of two existing operands is always enough headroom and cannot overflow usize' ):
-			digits_needed: usize = max( self.__num_digits, other.__num_digits ) + 1
+			longer: usize = self.__num_digits if self.__num_digits > other.__num_digits else other.__num_digits
+			digits_needed: usize = longer + 1
 		self._ensure_digits( digits_needed ).or_return()
 
 		with compiler.panic_arithmetic( 'per-digit sums (two digits 0-9 plus a carry 0-1) stay far under u8\'s range, and the index/count bookkeeping is bounded by digits_needed' ):
@@ -220,7 +276,7 @@ class int:
 			while i < other.__num_digits or carry > 0:
 				if i == self.__num_digits:
 					self.__digits[i] = 0
-					self.__num_digits += 1
+					self.__num_digits = self.__num_digits + 1
 				other_digit: u8 = other.__digits[i] if i < other.__num_digits else 0
 				total: u8 = self.__digits[i] + other_digit + carry
 				self.__digits[i] = total % 10
@@ -235,7 +291,8 @@ class int:
 	@private
 	def _subtract_magnitude( self, other: int ) -> Result[None, IntError]:
 		with compiler.panic_arithmetic( 'one more digit than the longer of two existing operands is always enough headroom and cannot overflow usize' ):
-			digits_needed: usize = max( self.__num_digits, other.__num_digits ) + 1
+			longer: usize = self.__num_digits if self.__num_digits > other.__num_digits else other.__num_digits
+			digits_needed: usize = longer + 1
 		self._ensure_digits( digits_needed ).or_return()
 
 		greater_digits: Ptr[u8]
@@ -291,10 +348,10 @@ class int:
 				self.__digits[i] = self.__digits[i - 1]
 				i -= 1
 			self.__digits[0] = digit
-			self.__num_digits += 1
+			self.__num_digits = self.__num_digits + 1
 
 			while self.__num_digits > 1 and self.__digits[self.__num_digits - 1] == 0:
-				self.__num_digits -= 1
+				self.__num_digits = self.__num_digits - 1
 		return Result.Ok( None )
 
 	# --- sign-aware comparison --------------------------------------------
@@ -350,17 +407,25 @@ class int:
 	# enclosing arithmetic context.
 
 	def __add__( self, other: int ) -> Result[int, IntError]:
-		result = self.clone().or_return()
+		result = self.clone()
 		if result.__is_negative == other.__is_negative:
 			result._add_magnitude( other ).or_return()
 		else:
 			result_is_negative = result.__is_negative if int._compare_magnitude( result, other ) > 0 else other.__is_negative
 			result._subtract_magnitude( other ).or_return()
-			result.__is_negative = result_is_negative
+			# same "negative zero" guard __mul__ already documents on its own
+			# sign assignment: opposite-sign operands with EQUAL magnitude
+			# (e.g. 5 + (-5)) subtract down to exactly zero, but
+			# _compare_magnitude(result, other) > 0 was false going in (the
+			# magnitudes were equal, not result>other), so result_is_negative
+			# came from other's sign regardless of the actual (zero) outcome
+			# - without this guard, 5 + (-5) produces a "negative" zero that
+			# compares unequal to (and less than) a plain int(0)
+			result.__is_negative = result_is_negative and not result.is_zero()
 		return Result.Ok( result )
 
 	def __sub__( self, other: int ) -> Result[int, IntError]:
-		result = self.clone().or_return()
+		result = self.clone()
 		result_is_negative: bool = result.compare( other ) < 0
 		if result.__is_negative == other.__is_negative:
 			result._subtract_magnitude( other ).or_return()
@@ -370,12 +435,12 @@ class int:
 		return Result.Ok( result )
 
 	def __neg__( self ) -> Result[int, IntError]:
-		result = self.clone().or_return()
+		result = self.clone()
 		result.__is_negative = not result.__is_negative and not result.is_zero()
 		return Result.Ok( result )
 
 	def __mul__( self, other: int ) -> Result[int, IntError]:
-		result = int( 0 ).or_return()
+		result = int( 0 )
 		with compiler.panic_arithmetic( 'a product needs at most one more digit than the sum of its operands\' digit counts, which cannot overflow usize' ):
 			capacity: usize = self.__num_digits + other.__num_digits + 1
 		result._ensure_digits( capacity ).or_return()
@@ -397,12 +462,12 @@ class int:
 					idx: usize = i + j
 					total: u16 = u16( result.__digits[idx] ) + u16( self.__digits[i] ) * other_digit + carry
 					result.__digits[idx] = u8( total % 10 )
-					carry = total / 10
+					carry = total // 10
 					j += 1
 				i += 1
 
 			while result.__num_digits > 1 and result.__digits[result.__num_digits - 1] == 0:
-				result.__num_digits -= 1
+				result.__num_digits = result.__num_digits - 1
 
 		# BigInt_multiply in the C version set is_negative unconditionally
 		# from the two operands' signs, which produces a "negative zero"
@@ -423,24 +488,47 @@ class int:
 	# positive. This port applies ordinary truncating-division semantics:
 	# the quotient's sign is the xor of the operands' signs, and the
 	# remainder takes the dividend's sign (matching C's own `/` and `%`).
-	def divmod( self, divisor: int ) -> Result[( int, int ), IntError]:
+	#
+	# Returns a DivMod (below), not a bare (int, int) tuple - this language
+	# has no tuple type at all (confirmed directly: a bare `(int, int)`
+	# return-type annotation crashes discovery.py outright, AttributeError
+	# on a None .qualname, since no visit_Tuple exists anywhere to handle
+	# one - tuples are simply never a supported type here).
+	def divmod( self, divisor: int ) -> Result[DivMod, IntError]:
 		if divisor.is_zero():
-			return Result.Err( IntError.DivideByZero )
+			return Result.Err( IntError.DivideByZero( None ))
 
-		base = divisor.clone().or_return()
+		base = divisor.clone()
 		base.__is_negative = False
 
-		multiples: list[int] = [ base ]
+		# A fixed-size array of the 9 multiples (1x-9x of |divisor|), managed
+		# by hand with a raw Ptr[None] handle array rather than list[int] -
+		# list[T].__getitem__(idx).unwrap(...) (T an RC type) is a separate,
+		# newly-found real bug: the generated C double-releases the payload
+		# (once via an extra receiver-cleanup release_object, once via the
+		# destination binding's own scope-exit epilogue) while never
+		# incref'ing it a second time to back both, so the object's
+		# refcount undercounts and it can be freed while still referenced -
+		# confirmed with a minimal repro entirely outside int/divmod
+		# (`list[int]` + `xs.__getitem__(0).unwrap(...)` alone reproduces
+		# it). Not yet root-caused/fixed (separate from the two bugs fixed
+		# alongside this comment, #1's list.__del__ double-decref and #5's
+		# or_return() same-file resolution gap) - this workaround stays
+		# until that one is.
+		multiples: Ptr[Ptr[None]] = compiler.cast( Ptr[Ptr[None]], sys.alloc[usize]( 9 ))
+		compiler.incref( base )
+		multiples[0] = compiler.cast( Ptr[None], base )
 		with compiler.panic_arithmetic( 'building exactly eight more multiples of the divisor cannot overflow usize bookkeeping' ):
 			k: usize = 1
 			while k < 9:
-				next_multiple = multiples[k - 1].clone().or_return()
+				next_multiple = compiler.cast( int, multiples[k - 1] ).clone()
 				next_multiple._add_magnitude( base ).or_return()
-				multiples.append( next_multiple )
+				compiler.incref( next_multiple )
+				multiples[k] = compiler.cast( Ptr[None], next_multiple )
 				k += 1
 
-		quotient = int( 0 ).or_return()
-		remainder = int( 0 ).or_return()
+		quotient = int( 0 )
+		remainder = int( 0 )
 
 		with compiler.panic_arithmetic( 'walking down from an existing digit count to zero, and building up quotient/remainder digits one at a time, cannot overflow usize' ):
 			i: usize = self.__num_digits
@@ -451,8 +539,18 @@ class int:
 				new_digit: u8 = 0
 				d: usize = 9
 				while d >= 1:
-					if int._compare_magnitude( remainder, multiples[d - 1] ) >= 0:
-						remainder._subtract_magnitude( multiples[d - 1] ).or_return()
+					# borrowed straight off `multiples` each time, deliberately
+					# never bound to a named local across iterations: cfg.py's
+					# assign() marks any named local holding an RC value as
+					# OWNED and decrefs its PREVIOUS value on each
+					# reassignment, but compiler.cast(...) produces a fresh
+					# Temp that assign() treats as already "a fresh owned
+					# handoff" needing no balancing incref - a raw reinterpret
+					# cast is neither of those things, so a named local
+					# reassigned from compiler.cast(...) inside a loop would
+					# decref one extra, real reference every iteration
+					if int._compare_magnitude( remainder, compiler.cast( int, multiples[d - 1] )) >= 0:
+						remainder._subtract_magnitude( compiler.cast( int, multiples[d - 1] )).or_return()
 						new_digit = u8( d )
 						break
 					d -= 1
@@ -461,15 +559,22 @@ class int:
 		quotient.__is_negative = ( self.__is_negative != divisor.__is_negative ) and not quotient.is_zero()
 		remainder.__is_negative = self.__is_negative and not remainder.is_zero()
 
-		return Result.Ok( ( quotient, remainder ) )
+		with compiler.panic_arithmetic( 'walking down from a fixed count of 9 cannot underflow usize' ):
+			j: usize = 9
+			while j > 0:
+				j -= 1
+				compiler.decref( compiler.cast( int, multiples[j] ))
+		sys.free( compiler.cast( Ptr[u8], multiples ))
+
+		return Result.Ok( DivMod( quotient = quotient, remainder = remainder ))
 
 	def __floordiv__( self, other: int ) -> Result[int, IntError]:
-		q, _r = self.divmod( other ).or_return()
-		return Result.Ok( q )
+		result = self.divmod( other ).or_return()
+		return Result.Ok( result.quotient )
 
 	def __mod__( self, other: int ) -> Result[int, IntError]:
-		_q, r = self.divmod( other ).or_return()
-		return Result.Ok( r )
+		result = self.divmod( other ).or_return()
+		return Result.Ok( result.remainder )
 
 	# --- narrowing / widening conversions ------------------------------
 	# int never implicitly converts to/from fixed-width types (SYNTAX.md
@@ -477,7 +582,7 @@ class int:
 	
 	@staticmethod
 	def from_i32( value: i32 ) -> Result[int, IntError]:
-		return int( value )
+		return Result.Ok( int( value ))
 	
 	def to_i32( self ) -> Result[i32, IntError]:
 		# A 19-digit number is the most that can possibly fit in an i64
@@ -486,7 +591,7 @@ class int:
 		# overflow -- no need for BigInt_to_int's per-digit
 		# check_mul_int_int/check_add_int_int guards.
 		if self.__num_digits > 19:
-			return Result.Err( IntError.Overflow )
+			return Result.Err( IntError.Overflow( None ))
 		
 		with compiler.panic_arithmetic( 'accumulating at most 19 decimal digits into an i64 cannot overflow, guaranteed by the digit-count check above' ):
 			value: i64 = 0
@@ -497,31 +602,42 @@ class int:
 			if self.__is_negative:
 				value = -value
 		
-		if value < i32.min or value > i32.max:
-			return Result.Err( IntError.Overflow )
-		return Result.Ok( i32( value ) )
+		if value < _I32_MIN or value > _I32_MAX:
+			return Result.Err( IntError.Overflow( None ))
+		with compiler.wrap_arithmetic: # already range-checked above; this narrows, never truncates
+			return Result.Ok( i32( value ) )
 	
 	# --- string conversion ----------------------------------------------
 	#
-	# Builds the digits into a fresh bytearray (most-significant digit
-	# first, i.e. reversed from our own internal storage order) and hands
-	# ownership of it straight to str.from_cstr, rather than
-	# hand-rolling a sys.alloc'd buffer. Since `ba` is a local with no other
-	# references, its refcount is guaranteed to be 1, so the release()
-	# inside from_cstr always takes the fast (no-copy) path.
+	# Builds the digits (most-significant digit first, i.e. reversed from
+	# our own internal storage order) directly into a fresh sys.alloc'd
+	# buffer, then hands ownership straight to str.from_cstr - bytearray
+	# has no zero-argument constructor and no append() method (it's a
+	# fixed-size buffer, sized once at construction - see its own
+	# definition in lib/builtins/__init__.py), so it can't support this
+	# grow-as-you-go usage at all.
 	def __str__( self ) -> str:
-		ba: bytearray = bytearray()
+		with compiler.panic_arithmetic( 'a digit count plus an optional sign byte plus one zero terminator cannot overflow usize' ):
+			size: usize = self.__num_digits + 1 # +1 for the zero terminator
+			if self.__is_negative:
+				size += 1
 
+		buf: Ptr[u8] = sys.alloc[u8]( size )
+
+		pos: usize = 0
 		if self.__is_negative:
-			ba.append( u8( ord( '-' )))
+			buf[0] = _ASCII_MINUS
+			pos = 1
 
-		with compiler.panic_arithmetic( 'walking down from an existing digit count to zero cannot underflow usize' ):
+		with compiler.panic_arithmetic( 'walking down from an existing digit count to zero cannot underflow usize, and pos stays within the buffer sized above' ):
 			i: usize = self.__num_digits
 			while i > 0:
 				i -= 1
-				ba.append( self.__digits[i] + ord( '0' ))
+				buf[pos] = self.__digits[i] + _ASCII_ZERO
+				pos += 1
+			buf[pos] = 0
 
-		return str.from_cstr( ba )
+		return str._from_owned_cstr( buf, size ).unwrap( 'int.__str__: internal buffer was not valid UTF-8 (unreachable -- only ASCII digits and \'-\' are ever written)' )
 
 	def __repr__( self ) -> str:
 		return self.__str__()

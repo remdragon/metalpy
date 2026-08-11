@@ -4,7 +4,7 @@ import compiler
 import sys
 from .__errors import OSError
 from .__fastlist import FastList
-from .__int import int
+from .__int import int, IntError, DivMod
 from .__list import list
 from .__RawDict import RawDict
 

@@ -495,6 +495,69 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 
 _CC = linker_c.detect_cc()
 
+class UnionAsUnconstructedResultErrorTypeTests( CompilerTestCase ):
+	''' regression coverage for a real, previously-crashing gap: a @union
+	referenced ONLY as a Result[T,E]'s own error type, with no reachable
+	code anywhere constructing one of its own variants, used to crash
+	emit_c() outright - AssertionError, "_tagged_union_storage has not run
+	yet - no real storage shape to emit" (union_storage.get(union) is
+	normally triggered lazily, the first time some code path constructs or
+	matches a variant; nothing here ever does either for MyErr). Fixed in
+	type_resolver.py's schedule() - see its own new
+	_schedule_uniontype_storage/_union_storage_scheduling. Needs real
+	builtins (Result itself), unlike EmitTaggedUnionTests above. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_unconstructed_union_error_type_compiles_and_runs( self ) -> None:
+		self._run( '''
+@union
+class MyErr:
+	A: None
+	B: None
+
+def helper() -> Result[i32, MyErr]:
+	return Result.Ok( 5 )
+
+def main() -> i32:
+	v: i32 = helper().unwrap( 'x' )
+	if v != 5:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -2628,6 +2691,96 @@ def main() -> i32:
 	if g0.unwrap( 'x' ) == 10 and g1.unwrap( 'x' ) == 20:
 		return 0
 	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_local_var_of_multi_field_rcclass( self ) -> None:
+		# regression test for a real double-Decref, found while building
+		# int.divmod() (see __int.py's own divmod() comment): list.__del__
+		# reads each element into a named local and manually
+		# compiler.decref()s it, but cfg.py never learned that decref
+		# already released it, so the local's own scope-exit epilogue
+		# decref'd it a SECOND time - heap-use-after-free, confirmed with
+		# AddressSanitizer (Windows raw HeapAlloc/HeapFree corruption isn't
+		# ASan-visible directly; diagnosed by shimming HeapAlloc/HeapFree
+		# onto malloc/free for one instrumented build). NOT a
+		# type_resolver.py/_schedule_rcclass_destructor_deps issue (an
+		# earlier, incorrect theory this comment used to describe) - that
+		# function was already correct. Fixed in cfg.py's
+		# manually_decreffed(), called from lowering.py's
+		# _lower_compiler_decref. This particular repro's 3-field/list[T]
+		# shape doesn't bear on the bug itself (the double-decref happens
+		# for ANY compiler.decref'd named local, any field count) - it's
+		# just the shape that happened to be large enough to make the OS
+		# heap allocator's own corruption detection fire reliably; smaller
+		# objects can silently corrupt the heap without an immediate crash,
+		# so passing here is necessary but not sufficient - see this
+		# session's own investigation notes for the direct-PowerShell-
+		# execution proof this file's own _assert_compiles_and_runs can't
+		# fully replace (subprocess.run from a process tree rooted in a
+		# git-bash/MSYS shell was observed to silently swallow this exact
+		# STATUS_HEAP_CORRUPTION rather than propagate it as a nonzero
+		# exit code, in this project's actual dev environment)
+		self._run( '''
+class Triple:
+	a: usize
+	b: usize
+	c: usize
+
+	def __init__( self, v: usize = 0 ) -> None:
+		self.a = v
+		self.b = v
+		self.c = v
+
+def main() -> i32:
+	xs: list[Triple] = list[Triple]()
+	r1: Result[None,OverflowError] = xs.append( Triple( 5 ))
+	if r1.is_err():
+		return 1
+	g1: Result[Triple,IndexError] = xs.__getitem__( 0 )
+	if g1.is_err():
+		return 2
+	got: Triple = g1.unwrap( 'x' )
+	if got.a != 5 or got.b != 5 or got.c != 5:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fastlist_local_var_of_multi_field_rcclass( self ) -> None:
+		# same as test_list_local_var_of_multi_field_rcclass above, but for
+		# FastList[T] - a separate implementation (lib/builtins/__fastlist.py)
+		# with the identical `val: T = <read>; compiler.decref(val)` shape in
+		# its own __del__, so it reproduced the identical double-Decref bug
+		# for the identical reason (see the other test's own updated comment
+		# - cfg.py's manually_decreffed(), not anything list/FastList-specific)
+		self._run( '''
+class Triple:
+	a: usize
+	b: usize
+	c: usize
+
+	def __init__( self, v: usize = 0 ) -> None:
+		self.a = v
+		self.b = v
+		self.c = v
+
+def main() -> i32:
+	xs: FastList[Triple] = FastList[Triple]()
+	r1: Result[usize,OverflowError] = xs.append( Triple( 7 ))
+	if r1.is_err():
+		return 1
+	g1: Result[Triple,IndexError] = xs.__getitem__( 0 )
+	if g1.is_err():
+		return 2
+	got: Triple = g1.unwrap( 'x' )
+	if got.a != 7 or got.b != 7 or got.c != 7:
+		return 3
+	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))

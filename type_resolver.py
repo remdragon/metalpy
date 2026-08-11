@@ -132,6 +132,14 @@ class TypeResolver:
 		self._destructors_synthesized: set[int] = set()
 		self._dtor_label_id = 0
 		self._sys_functions: dict[str,Function] = {}
+		# re-entrancy guard for _schedule_uniontype_storage: union_storage.
+		# get(union) itself calls schedule() on the union's own attributes
+		# (UnionStorage._ensure_resolved), which for a bare TaggedUnion
+		# attribute routes straight back into _schedule_uniontype_storage -
+		# without this, that's unbounded recursion for any union with an
+		# RC-typed member (including Result itself, Ok: T/Err: E), since
+		# get()'s own memoization cache isn't populated until get() finishes
+		self._union_storage_scheduling: set[int] = set()
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -170,6 +178,50 @@ class TypeResolver:
 		if isinstance( del_fn, Function ):
 			self.schedule( del_fn )
 
+	def _schedule_uniontype_storage( self, union: TaggedUnion ) -> None:
+		''' every TaggedUnion that gets scheduled for real emission needs its
+		runtime tag/data storage shape built (union_storage.get(union) —
+		see UnionStorage.get's own docstring for what that computes).
+		Normally that happens lazily, the first time some reachable code
+		path actually constructs a variant (ClassName.Variant(value)) or
+		matches on one. A union referenced ONLY as a Result[T,E]/other
+		generic's type argument, with no reachable code anywhere
+		constructing one of its own variants, never hits that lazy path -
+		it still gets scheduled here (as a Specialization's own .base, or
+		bare, both below), but its storage is never built, and emit_c()
+		crashes outright trying to emit a union whose storage doesn't
+		exist yet (confirmed directly: AssertionError, "_tagged_union_
+		storage has not run yet - no real storage shape to emit", from a
+		minimal repro with a @union used purely as a Result error type and
+		never constructed). Calling union_storage.get() unconditionally
+		here, mirroring _schedule_rcclass_destructor_deps's identical role
+		for RCClass's own synthesized destructor just above, closes that
+		gap - same type_params guard for the same reason (an abstract
+		generic union's own attributes still carry unbound TypeVars, not
+		yet substituted into anything union_storage.get() could build real
+		C storage from; monomorphize_class handles that substitution
+		separately for whichever concrete specialization is actually in
+		use, the same way it does for RCClass methods - see
+		_schedule_rcclass_destructor_deps's own comment on that split).
+
+		Re-entrancy guard (self._union_storage_scheduling) is required, not
+		optional: union_storage.get(union) itself starts with _ensure_
+		resolved(union), which calls schedule(union) right back - routing
+		straight into THIS method again for the same union, before get()'s
+		own memoization cache has anything in it yet to short-circuit on
+		(the cache is only populated once get() finishes). Confirmed
+		directly: without this guard, scheduling any union at all (even
+		plain Result[i32,OverflowError]) blew the stack immediately. '''
+		if union.type_params:
+			return
+		key = id( union )
+		if key in self._union_storage_scheduling:
+			return
+		self._union_storage_scheduling.add( key )
+		try:
+			self.union_storage.get( union )
+		finally:
+			self._union_storage_scheduling.discard( key )
 
 	def _synthesize_rcclass_destructor( self, cls: RCClass ) -> None:
 		''' build an AST Function for $$__destructor__ that the emitter
@@ -662,6 +714,8 @@ class TypeResolver:
 					self.schedule( arg )
 				if isinstance( unit.base, RCClass ):
 					self._schedule_rcclass_destructor_deps( unit.base )
+				if isinstance( unit.base, TaggedUnion ):
+					self._schedule_uniontype_storage( unit.base )
 				return
 			self.schedule( unit.base )
 			for arg in unit.args:
@@ -671,6 +725,8 @@ class TypeResolver:
 			return
 		if isinstance( unit, RCClass ):
 			self._schedule_rcclass_destructor_deps( unit )
+		if isinstance( unit, TaggedUnion ):
+			self._schedule_uniontype_storage( unit )
 		with self._seen_lock:
 			if id( unit ) in self._seen:
 				return
@@ -906,6 +962,36 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			else:
 				target = self._try_resolve_callable_namespace( node.func )
 			if isinstance( target, Function ):
+				if target.stem == 'or_return':
+					# or_return() is never a real, scheduled/compiled function
+					# (its declared body is a spec for lowering.py's own
+					# _lower_or_return to special-case at the call site, not
+					# something literally compilable - see that method's own
+					# comment) - but ensure_resolved() below unconditionally
+					# schedules whatever it's handed, with no exemption for
+					# this one method. Reached here specifically for a bare
+					# `x = <result_expr>.or_return()` (no type annotation) -
+					# this pass's own speculative bookkeeping for x's type
+					# then resolves the RECEIVER (a Result[T,E] Specialization)
+					# down to its monomorphized concrete class two lines up,
+					# whose own already-monomorphized 'or_return' entry (found
+					# via names.get above) is what target is here - scheduling
+					# THAT literally compiles or_return[T,E]'s spec-only body,
+					# which fails the moment it does (confirmed directly: a
+					# self-referential/same-file T, e.g. a method of Foo
+					# returning Result[Foo,E] and or_return()-ing it from
+					# elsewhere in Foo, reaches exactly this path and crashes
+					# with "compiler.early_return(...) requires the enclosing
+					# function to return Result[_,_]"). Result[T,E].or_return()
+					# always returns T - read it straight off the receiver's
+					# own Specialization args instead, no scheduling needed.
+					target_cls_base = target.cls.base if isinstance( target.cls, Specialization ) else target.cls
+					if (
+						target_cls_base is self.discovery.find_name_or_none( 'Result' )
+						and isinstance( target.cls, Specialization ) and target.cls.args
+					):
+						return target.cls.args[0]
+					return None
 				target = self.resolver.ensure_resolved( target )
 				return target.return_type if isinstance( target, Function ) else None
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):

@@ -47,6 +47,8 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.Add: '__add__',
 	ast.Sub: '__sub__',
 	ast.Mult: '__mul__',
+	ast.FloorDiv: '__floordiv__',
+	ast.Mod: '__mod__',
 }
 
 # ast comparison operator -> the dunder method name to dispatch to for a
@@ -59,6 +61,14 @@ _COMP_DUNDER: dict[type,str] = {
 	ast.LtE: '__le__',
 	ast.Gt: '__gt__',
 	ast.GtE: '__ge__',
+}
+
+# ast.UnaryOp operator -> the dunder method name to dispatch to for a
+# non-scalar operand (int.__neg__, ...). Scalar operands always go through
+# arithmetic mode instead. ast.UAdd/ast.Invert are deliberately not mapped -
+# no builtin type defines __pos__/__invert__ today.
+_UNARYOP_DUNDER: dict[type,str] = {
+	ast.USub: '__neg__',
 }
 
 
@@ -1508,6 +1518,11 @@ class Lowering:
 		operand = self._lower_expr( node.args[0], None )
 		if operand.type is not None and self._type_resolver._is_RC( operand.type ):
 			self._emit( ir.Decref( value = operand ))
+			# stop the scope-exit epilogue from decref'ing operand a SECOND
+			# time - see cfg.py's manually_decreffed's own comment for why
+			# this is required, not optional (a real, always-on double
+			# Decref/use-after-free otherwise, confirmed with ASan)
+			self._cfg.manually_decreffed( operand )
 			return
 		if operand.type is not None and self._in_generic_class_method():
 			return
@@ -2361,6 +2376,22 @@ class Lowering:
 			self._emit( ir.Not( dest = dest, operand = operand ))
 			return dest
 		operand = self._lower_expr( node.operand, expected_type )
+
+		# non-scalar operand — try the dunder method (int.__neg__, ...),
+		# mirroring _expr_BinOp/_expr_Compare's identical dispatch
+		if not isinstance( operand.type, Scalar ):
+			method_name = _UNARYOP_DUNDER.get( type( node.op ))
+			if method_name is not None:
+				method = self._find_method( operand.type, method_name )
+				if method is not None:
+					self._ensure_resolved( method )
+					self.schedule( method.return_type )
+					for p in ( method.parameters or [] ):
+						self.schedule( p.type )
+					dest = self._new_temp( expected_type or method.return_type )
+					self._emit( ir.Call( dest = dest, target = method, receiver = operand, args = [], kwargs = {} ))
+					return dest
+
 		result_type = expected_type or operand.type
 
 		opcode, extra = self._arithmetic_mode[-1].GetUnaryOp( node )

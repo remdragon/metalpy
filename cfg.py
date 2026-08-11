@@ -1007,6 +1007,42 @@ class CFGState:
 		binding.entry.cancelled = True
 		return instructions
 
+	# --- compiler.decref(x) -------------------------------------------------
+
+	def manually_decreffed( self, operand: ir.Operand ) -> None:
+		''' called for compiler.decref(x) (see lowering.py's
+		_lower_compiler_decref) - x's own explicit Decref is emitted by
+		lowering.py right at the call site regardless; this only stops x's
+		binding from being auto-decref'd a SECOND time once its own scope
+		ends. Without this, a live OWNED/COPY local manually decref'd (the
+		established idiom throughout this stdlib for tearing down RC
+		elements read out of a container - list.__del__/FastList.__del__/
+		dict's own _release_key/_release_value all do `val: T = <read>;
+		compiler.decref(val)`) gets decref'd AGAIN by the scope's own
+		epilogue, since compiler.decref was never wired into the ownership-
+		tracking that epilogue relies on - confirmed with
+		AddressSanitizer: a real, always-on (not merely heap-layout-
+		dependent) double Decref -> use-after-free -> heap corruption on
+		every single call, for exactly this shape. Mirrors move()'s own
+		cancellation exactly (same entry.cancelled flag, same transition to
+		MOVED so a later reference to x - now potentially freed - is caught
+		as a compile error same as using a moved-out value would be), but
+		without move()'s own state-mismatch error: compiler.decref(x) on a
+		BORROWED binding (an ordinary un-owned parameter, entry is None -
+		nothing to cancel) or one already MOVED/decref'd is left to whatever
+		lowering.py itself decides to allow, not rejected here. '''
+		if isinstance( operand, Variable ):
+			binding = self.bindings.get( operand.stem )
+			if binding is None or binding.entry is None:
+				return
+			if binding.state not in ( OwnState.OWNED, OwnState.COPY ):
+				return
+			binding.entry.cancelled = True
+			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )
+			return
+		if isinstance( operand, ir.Temp ):
+			self._temp_states.pop( operand.id, None )
+
 	# --- self construction (__init__) -------------------------------------
 
 	def check_self_escape( self, operand: ir.Operand, ctx: str ) -> None:
