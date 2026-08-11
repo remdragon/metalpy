@@ -1089,6 +1089,39 @@ class RCClassConstructTests( RCClassTestCase ):
 		self.assertIn( 'ObjectHeader $header;', struct_src )
 		self.assertIn( 'int32_t x;', struct_src )
 
+	def test_construction_sets_header_destructor_field( self ) -> None:
+		# Phase 2a: every RCClass construction now also wires up
+		# $header.destructor (read generically by release_object_dynamic -
+		# closures, later, are the first real caller) - ordinary
+		# release_object call sites (plain Decref) are UNCHANGED, still a
+		# direct literal reference, not a read through this field
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'def main() -> None:',
+			'	foo: Foo = Foo.make( 1 )',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		make_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == '__main__.Foo.make' )
+		src = emitter_c.emit_function( make_lf )
+		self.assertIn( '$header.destructor = __main__$Foo$$__destructor__;', src )
+		# ordinary Decref (main's own epilogue for `foo`) must still pass
+		# the destructor as a direct literal argument, not read it back off
+		# the header - the hot path stays exactly as cheap as before
+		main2_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		main_src = emitter_c.emit_function( main2_lf )
+		self.assertIn( 'release_object( &(foo)->$header, __main__$Foo$$__destructor__ )', main_src )
+
+	def test_release_object_dynamic_is_emitted_and_compiles( self ) -> None:
+		# the new generic-release path itself - no real caller exists yet
+		# (Phase 2b's closures are the first one), so this just confirms
+		# it's present, well-formed C, and part of the always-included
+		# prologue (a real clang/gcc compile catches a signature mismatch
+		# against ObjectHeader.destructor immediately)
+		c_source = emitter_c.PROLOGUE
+		self.assertIn( 'void (*destructor)(void*);', c_source )
+		self.assertIn( 'static inline void release_object_dynamic( ObjectHeader* obj )', c_source )
+		self.assertIn( 'release_object( obj, obj->destructor );', c_source )
+
 	def test_init_construction_schedules_sys_alloc_for_the_constructed_class( self ) -> None:
 		# regression test: _try_lower_construct_call's own ir.Allocate (the
 		# real __init__ path, as opposed to _lower_allocate_fields's field=

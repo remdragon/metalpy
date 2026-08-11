@@ -32,6 +32,7 @@ PROLOGUE = '''\
 
 typedef struct {
 	_Atomic int32_t ref_count;
+	void (*destructor)(void*); // set once at construction (see emit_c's ir.Allocate codegen) - read only by release_object_dynamic below, not by the hot incref/decref path
 } ObjectHeader;
 
 static inline void retain_object( ObjectHeader* obj ) {
@@ -47,6 +48,19 @@ static inline void release_object( ObjectHeader* obj, void (*destructor)(void*) 
 				destructor( obj );
 			}
 		}
+	}
+}
+
+// same as release_object, but reads the destructor from the object's own
+// header instead of requiring the caller to know it statically - for
+// releasing a type-erased reference (a closure's captured receiver; later,
+// base-typed decref once RCClass subclassing exists). Deliberately NOT
+// used for ordinary ir.Decref sites, which already know the concrete type
+// at compile time and keep using release_object's own literal-reference
+// calling convention directly - no header read added to that hot path.
+static inline void release_object_dynamic( ObjectHeader* obj ) {
+	if ( obj ) {
+		release_object( obj, obj->destructor );
 	}
 }
 
@@ -1218,6 +1232,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# - starting the header at 0 would underflow the very first
 			# paired Decref
 			lines.append( f'\t({dest})->$header.ref_count = 1;' )
+			# set once, here, not read again until release_object_dynamic
+			# (if ever) - the destructor's own real signature (static void
+			# NAME(void* __obj), see _function_prototype's is_destructor
+			# branch) already matches ObjectHeader.destructor's declared
+			# type exactly, no cast needed
+			lines.append( f'\t({dest})->$header.destructor = {_rcclass_destructor_name(instr.dest.type)};' )
 			for name, value in instr.fields.items():
 				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )
 			return lines
