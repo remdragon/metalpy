@@ -2444,6 +2444,54 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_erase_preserves_stable_id_identity_despite_position_swap( self ) -> None:
+		# complements test_erase_does_not_preserve_positional_order above:
+		# get_at (position-based) breaks order, but __getitem__ (stable-ID-
+		# based) is a DIFFERENT accessor - _erase repoints the swapped
+		# element's __indexes entry at its new position (see RawList._erase),
+		# so every surviving id still resolves to the same VALUE it always
+		# did, regardless of where the swap physically moved it. Same
+		# 10,20,30,40,50 / erase id for 30 setup as the position test, but
+		# reading back via the original ids (0,1,3,4) instead of positions
+		# (0,1,2,3) - this is expected to read back 10,20,40,50 (identity
+		# preserved), even though the POSITIONAL read of the same list does
+		# not (10,20,50,40, per the other test)
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[usize,OverflowError] = x.append( 10 )
+	r1: Result[usize,OverflowError] = x.append( 20 )
+	r2: Result[usize,OverflowError] = x.append( 30 )
+	r3: Result[usize,OverflowError] = x.append( 40 )
+	r4: Result[usize,OverflowError] = x.append( 50 )
+	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
+		return 9
+	id0: usize = r0.unwrap( 'append failed' )
+	id1: usize = r1.unwrap( 'append failed' )
+	id2: usize = r2.unwrap( 'append failed' )
+	id3: usize = r3.unwrap( 'append failed' )
+	id4: usize = r4.unwrap( 'append failed' )
+	er: Result[None,IndexError] = x.erase( id2 )
+	if er.is_err():
+		return 8
+	g0: Result[i32,IndexError] = x.__getitem__( id0 )
+	g1: Result[i32,IndexError] = x.__getitem__( id1 )
+	g3: Result[i32,IndexError] = x.__getitem__( id3 )
+	g4: Result[i32,IndexError] = x.__getitem__( id4 )
+	if g0.is_err() or g1.is_err() or g3.is_err() or g4.is_err():
+		return 7
+	v0: i32 = g0.unwrap( 'x' )
+	v1: i32 = g1.unwrap( 'x' )
+	v3: i32 = g3.unwrap( 'x' )
+	v4: i32 = g4.unwrap( 'x' )
+	if v0 == 10 and v1 == 20 and v3 == 40 and v4 == 50:
+		return 0 # stable-ID identity survived the positional swap
+	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_list_str_construct_append_getitem_del( self ) -> None:
 		# an RC element type - a list[T] slot holds str's own HANDLE
 		# (pointer-width), not its struct body (see list.__init__'s own
