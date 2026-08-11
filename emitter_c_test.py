@@ -2289,11 +2289,13 @@ def main() -> None:
 
 class ListGenericTests( CompilerTestCase ):
 	''' list[T] (lib/builtins/__list.py) end-to-end, for both a value type
-	(i32) and an RC type (str) - see PLAN_SUBCLASSING_VTABLES_COM.md's own
-	blocked-on note: list[T] was written but never actually compiled
-	anywhere before this. Mirrors InterfaceCStructLayoutTests/
-	StrUpperLowerTests' own import_builtins=True + real compile-and-run
-	convention (list[T] needs str/Result/the rest of builtins for real). '''
+	(i32) and an RC type (str). A plain contiguous order-preserving array -
+	real Python-list semantics, positions ARE the index, insert/erase shift
+	via memmove. See FastListGenericTests below for the OTHER container
+	(FastList[T]) that trades order for O(1) erase + stable IDs. Mirrors
+	InterfaceCStructLayoutTests/StrUpperLowerTests' own
+	import_builtins=True + real compile-and-run convention (list[T] needs
+	str/Result/the rest of builtins for real). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -2332,10 +2334,342 @@ class ListGenericTests( CompilerTestCase ):
 		# a non-RC element type: list[i32]() construction/destruction alone
 		# (x never used past declaration) already exercises RawList's own
 		# alloc/free and list[T].__del__'s decref-skip loop; append/
-		# __getitem__ round-trip three values through the buffer
+		# __getitem__ round-trip three values through the buffer, by
+		# POSITION (an index IS a position now - no separate stable ID)
 		self._run( '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
+	r0: Result[None,OverflowError] = x.append( 10 )
+	r1: Result[None,OverflowError] = x.append( 20 )
+	r2: Result[None,OverflowError] = x.append( 30 )
+	if r0.is_err() or r1.is_err() or r2.is_err():
+		return 9
+	if x.__len__() != 3:
+		return 1
+	g0: Result[i32,IndexError] = x.__getitem__( 0 )
+	g1: Result[i32,IndexError] = x.__getitem__( 1 )
+	g2: Result[i32,IndexError] = x.__getitem__( 2 )
+	if g0.is_err() or g1.is_err() or g2.is_err():
+		return 8
+	if g0.unwrap( 'getitem failed' ) != 10:
+		return 2
+	if g1.unwrap( 'getitem failed' ) != 20:
+		return 3
+	if g2.unwrap( 'getitem failed' ) != 30:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_i32_grows_past_initial_capacity( self ) -> None:
+		# initial_capacity defaults to 8 - 20 appends forces RawList._grow()
+		# at least once, and every value must still read back correctly
+		# afterward (the copy during growth must preserve contents)
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	i: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while i < 20:
+			ar: Result[None,OverflowError] = x.append( compiler.cast( i32, i ))
+			if ar.is_err():
+				return 9
+			i += 1
+	if x.__len__() != 20:
+		return 1
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			gr: Result[i32,IndexError] = x.__getitem__( j )
+			if gr.is_err():
+				return 8
+			v: i32 = gr.unwrap( 'getitem failed' )
+			if v != compiler.cast( i32, j ):
+				return 2
+			j += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_erase_at_preserves_positional_order( self ) -> None:
+		# the whole point of this container vs. FastList[T]: erase_at
+		# shifts everything after the removed slot left by one (memmove),
+		# it does not swap the last element into the gap. Append
+		# 10,20,30,40,50, erase_at(2) (the value 30) - must read back
+		# 10,20,40,50, never 10,20,50,40 (that shape would mean this
+		# regressed to FastList's swap-and-pop behavior)
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[None,OverflowError] = x.append( 10 )
+	r1: Result[None,OverflowError] = x.append( 20 )
+	r2: Result[None,OverflowError] = x.append( 30 )
+	r3: Result[None,OverflowError] = x.append( 40 )
+	r4: Result[None,OverflowError] = x.append( 50 )
+	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
+		return 9
+	er: Result[None,IndexError] = x.erase_at( 2 )
+	if er.is_err():
+		return 8
+	if x.__len__() != 4:
+		return 1
+	g0: Result[i32,IndexError] = x.__getitem__( 0 )
+	g1: Result[i32,IndexError] = x.__getitem__( 1 )
+	g2: Result[i32,IndexError] = x.__getitem__( 2 )
+	g3: Result[i32,IndexError] = x.__getitem__( 3 )
+	if g0.is_err() or g1.is_err() or g2.is_err() or g3.is_err():
+		return 7
+	v0: i32 = g0.unwrap( 'x' )
+	v1: i32 = g1.unwrap( 'x' )
+	v2: i32 = g2.unwrap( 'x' )
+	v3: i32 = g3.unwrap( 'x' )
+	if v0 == 10 and v1 == 20 and v2 == 40 and v3 == 50:
+		return 0 # order preserved - everything after the gap shifted left
+	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_insert_shifts_tail_right_and_preserves_order( self ) -> None:
+		# the mirror image of erase_at above: insert(1, 99) into
+		# [10,20,30] must produce [10,99,20,30], not overwrite or corrupt
+		# anything - everything at/after the insertion point shifts right
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[None,OverflowError] = x.append( 10 )
+	r1: Result[None,OverflowError] = x.append( 20 )
+	r2: Result[None,OverflowError] = x.append( 30 )
+	if r0.is_err() or r1.is_err() or r2.is_err():
+		return 9
+	ir: Result[None,OverflowError] = x.insert( 1, 99 )
+	if ir.is_err():
+		return 8
+	if x.__len__() != 4:
+		return 1
+	g0: Result[i32,IndexError] = x.__getitem__( 0 )
+	g1: Result[i32,IndexError] = x.__getitem__( 1 )
+	g2: Result[i32,IndexError] = x.__getitem__( 2 )
+	g3: Result[i32,IndexError] = x.__getitem__( 3 )
+	if g0.is_err() or g1.is_err() or g2.is_err() or g3.is_err():
+		return 7
+	v0: i32 = g0.unwrap( 'x' )
+	v1: i32 = g1.unwrap( 'x' )
+	v2: i32 = g2.unwrap( 'x' )
+	v3: i32 = g3.unwrap( 'x' )
+	if v0 == 10 and v1 == 99 and v2 == 20 and v3 == 30:
+		return 0
+	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_insert_past_end_clamps_to_append( self ) -> None:
+		# matches Python's own list.insert - an out-of-range index doesn't
+		# error, it just appends
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[None,OverflowError] = x.append( 10 )
+	r1: Result[None,OverflowError] = x.append( 20 )
+	if r0.is_err() or r1.is_err():
+		return 9
+	ir: Result[None,OverflowError] = x.insert( 100, 30 )
+	if ir.is_err():
+		return 8
+	if x.__len__() != 3:
+		return 1
+	g2: Result[i32,IndexError] = x.__getitem__( 2 )
+	if g2.is_err():
+		return 7
+	if g2.unwrap( 'x' ) != 30:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_setitem_via_assignment_syntax_overwrites_in_place( self ) -> None:
+		# exercises x[i] = v as real assignment syntax (not
+		# .__setitem__(...) called directly) - this only actually reaches
+		# list[T].__setitem__ because of lowering.py's own dispatch fix
+		# (obj[i] = v used to always emit a raw SetItem, ignoring any real
+		# __setitem__ the type declared)
+		self._run( '''
+def set_it( x: list[i32] ) -> Result[None,IndexError]:
+	x[1] = 99
+	return Result.Ok( None )
+
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[None,OverflowError] = x.append( 10 )
+	r1: Result[None,OverflowError] = x.append( 20 )
+	r2: Result[None,OverflowError] = x.append( 30 )
+	if r0.is_err() or r1.is_err() or r2.is_err():
+		return 9
+	sr: Result[None,IndexError] = set_it( x )
+	if sr.is_err():
+		return 7
+	g0: Result[i32,IndexError] = x.__getitem__( 0 )
+	g1: Result[i32,IndexError] = x.__getitem__( 1 )
+	g2: Result[i32,IndexError] = x.__getitem__( 2 )
+	if g0.is_err() or g1.is_err() or g2.is_err():
+		return 8
+	if g0.unwrap( 'x' ) == 10 and g1.unwrap( 'x' ) == 99 and g2.unwrap( 'x' ) == 30:
+		return 0
+	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_str_construct_append_getitem_del( self ) -> None:
+		# an RC element type - a list[T] slot holds str's own HANDLE
+		# (pointer-width), not its struct body (see list.__init__'s own
+		# comment); __del__ must decref every stored element without
+		# reading struct-body-sized memory out of a pointer-sized slot
+		self._run( '''
+def main() -> i32:
+	x: list[str] = list[str]()
+	r0: Result[None,OverflowError] = x.append( 'hello' )
+	r1: Result[None,OverflowError] = x.append( 'world' )
+	if r0.is_err() or r1.is_err():
+		return 9
+	if x.__len__() != 2:
+		return 1
+	g0: Result[str,IndexError] = x.__getitem__( 0 )
+	g1: Result[str,IndexError] = x.__getitem__( 1 )
+	if g0.is_err() or g1.is_err():
+		return 8
+	if g0.unwrap( 'getitem failed' ) != 'hello':
+		return 2
+	if g1.unwrap( 'getitem failed' ) != 'world':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_str_grows_past_initial_capacity( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	x: list[str] = list[str]()
+	i: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while i < 20:
+			ar: Result[None,OverflowError] = x.append( 'item' )
+			if ar.is_err():
+				return 9
+			i += 1
+	if x.__len__() != 20:
+		return 1
+	all_ok: bool = True
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			gr: Result[str,IndexError] = x.__getitem__( j )
+			if gr.is_err():
+				all_ok = False
+			else:
+				v: str = gr.unwrap( 'getitem failed' )
+				if v != 'item':
+					all_ok = False
+			j += 1
+	if not all_ok:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_str_erase_at_preserves_order_and_refcounts( self ) -> None:
+		# RC-element coverage for erase_at's ordering guarantee - 'b' is
+		# decreffed on removal, 'a' and 'c' must survive (and read back
+		# correctly) in the shifted positions. If decref/incref bookkeeping
+		# were wrong here, this would double-free or leak at __del__ time
+		# (list[T].__del__ decrefs every remaining slot on the way out) -
+		# not something this test can observe directly without ASAN, but a
+		# wrong refcount is exactly the kind of thing that turns into a
+		# crash on a real run
+		self._run( '''
+def main() -> i32:
+	x: list[str] = list[str]()
+	r0: Result[None,OverflowError] = x.append( 'a' )
+	r1: Result[None,OverflowError] = x.append( 'b' )
+	r2: Result[None,OverflowError] = x.append( 'c' )
+	if r0.is_err() or r1.is_err() or r2.is_err():
+		return 9
+	er: Result[None,IndexError] = x.erase_at( 1 )
+	if er.is_err():
+		return 8
+	if x.__len__() != 2:
+		return 1
+	g0: Result[str,IndexError] = x.__getitem__( 0 )
+	g1: Result[str,IndexError] = x.__getitem__( 1 )
+	if g0.is_err() or g1.is_err():
+		return 7
+	if g0.unwrap( 'x' ) == 'a' and g1.unwrap( 'x' ) == 'c':
+		return 0
+	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
+class FastListGenericTests( CompilerTestCase ):
+	''' FastList[T] (lib/builtins/__fastlist.py) end-to-end - the ORIGINAL
+	StableIndexVector port: O(1) swap-and-pop erase, stable IDs that
+	survive other inserts/deletes, but positional order is NOT preserved
+	across an erase. Split out from list[T] (which now has real
+	Python-list/array semantics instead - see ListGenericTests above) once
+	that distinction became load-bearing enough to need two containers. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fastlist_i32_construct_append_getitem_del( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
 	r1: Result[usize,OverflowError] = x.append( 20 )
 	r2: Result[usize,OverflowError] = x.append( 30 )
@@ -2363,54 +2697,22 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_i32_grows_past_initial_capacity( self ) -> None:
-		# initial_capacity defaults to 8 - 20 appends forces RawList._grow()
-		# at least once, and every value must still read back correctly
-		# afterward (the swap/copy during growth must preserve contents)
-		self._run( '''
-def main() -> i32:
-	x: list[i32] = list[i32]()
-	i: usize = 0
-	with compiler.panic_arithmetic( 'overflow' ):
-		while i < 20:
-			ar: Result[usize,OverflowError] = x.append( compiler.cast( i32, i ))
-			if ar.is_err():
-				return 9
-			i += 1
-	if x.__len__() != 20:
-		return 1
-	j: usize = 0
-	with compiler.panic_arithmetic( 'overflow' ):
-		while j < 20:
-			gr: Result[i32,IndexError] = x.__getitem__( j )
-			if gr.is_err():
-				return 8
-			v: i32 = gr.unwrap( 'getitem failed' )
-			if v != compiler.cast( i32, j ):
-				return 2
-			j += 1
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_erase_does_not_preserve_positional_order( self ) -> None:
-		# list[T]/RawList ports StableIndexVector (see the PLAN doc's own
-		# credit at the top of __list.py) - a swap-and-pop design, not an
+		# FastList[T]/RawFastList ports StableIndexVector (see the file's
+		# own module docstring) - a swap-and-pop design, not an
 		# insertion-order-preserving one. Its own README says so plainly:
 		# "On deletion, the last element is swapped into the gap." This is
 		# NOT a bug - it's what buys the O(1) erase and the "stable ID
-		# survives other inserts/deletes" guarantee Handle[T] depends on.
-		# This test pins that behavior down with a real compile-and-run so
-		# it can't be "fixed" by accident later: append 10,20,30,40,50 (data
-		# positions 0..4 in insertion order), erase the middle one (30, at
-		# position 2) - if order were preserved, positions 0..3 would read
-		# back 10,20,40,50; instead the LAST element (50) gets swapped into
-		# the vacated slot, giving 10,20,50,40.
+		# survives other inserts/deletes" guarantee FastListHandle depends
+		# on. This test pins that behavior down with a real compile-and-run
+		# so it can't be "fixed" by accident later: append 10,20,30,40,50
+		# (data positions 0..4 in insertion order), erase the middle one
+		# (30, at position 2) - if order were preserved, positions 0..3
+		# would read back 10,20,40,50; instead the LAST element (50) gets
+		# swapped into the vacated slot, giving 10,20,50,40.
 		self._run( '''
 def main() -> i32:
-	x: list[i32] = list[i32]()
+	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
 	r1: Result[usize,OverflowError] = x.append( 20 )
 	r2: Result[usize,OverflowError] = x.append( 30 )
@@ -2448,17 +2750,17 @@ def main() -> i32:
 		# complements test_erase_does_not_preserve_positional_order above:
 		# get_at (position-based) breaks order, but __getitem__ (stable-ID-
 		# based) is a DIFFERENT accessor - _erase repoints the swapped
-		# element's __indexes entry at its new position (see RawList._erase),
-		# so every surviving id still resolves to the same VALUE it always
-		# did, regardless of where the swap physically moved it. Same
-		# 10,20,30,40,50 / erase id for 30 setup as the position test, but
-		# reading back via the original ids (0,1,3,4) instead of positions
-		# (0,1,2,3) - this is expected to read back 10,20,40,50 (identity
-		# preserved), even though the POSITIONAL read of the same list does
-		# not (10,20,50,40, per the other test)
+		# element's __indexes entry at its new position (see
+		# RawFastList._erase), so every surviving id still resolves to the
+		# same VALUE it always did, regardless of where the swap physically
+		# moved it. Same 10,20,30,40,50 / erase id for 30 setup as the
+		# position test, but reading back via the original ids (0,1,3,4)
+		# instead of positions (0,1,2,3) - this is expected to read back
+		# 10,20,40,50 (identity preserved), even though the POSITIONAL read
+		# of the same list does not (10,20,50,40, per the other test)
 		self._run( '''
 def main() -> i32:
-	x: list[i32] = list[i32]()
+	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
 	r1: Result[usize,OverflowError] = x.append( 20 )
 	r2: Result[usize,OverflowError] = x.append( 30 )
@@ -2492,25 +2794,21 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_append_after_erase_reissues_a_live_id( self ) -> None:
-		# a separate, more serious bug found while investigating order
-		# preservation (unrelated to swap-vs-shift): RawList._get_free_id
-		# always returns __len (see its own comment: "for simplicity in
-		# this initial implementation, ID == __len always" - a known,
-		# flagged simplification). __len SHRINKS on erase, so the next
-		# append after an erase can hand out an id that's still held by a
-		# live element: append 10,20,30,40,50 (ids 0..4), erase id 2 (30) -
-		# len drops to 4, and the swap repoints id 4 (50) at its new
-		# position - then append 60: _get_free_id() returns __len == 4,
-		# the SAME id already in use by 50. The new append's `__indexes[4]
-		# = __len` silently overwrites 50's index entry, so id 4 now
-		# resolves to 60 - 50 becomes an orphaned zombie slot (still
-		# physically present, still visited by positional iteration,
-		# permanently unreachable by id) until some later erase happens to
-		# swap over it.
+	def test_append_after_erase_reuses_freed_id_without_aliasing( self ) -> None:
+		# regression test for the id-collision bug found while
+		# investigating order preservation (see emitter_c_test.py history -
+		# RawFastList._get_free_id used to always return __len, which
+		# SHRINKS on erase, so the next append could hand out an id that
+		# was still held by a live element, silently aliasing two elements
+		# onto the same id). Fixed via a real free-list (__free_ids/
+		# __free_count) plus a monotonic __next_id counter that never goes
+		# backwards. Same 10,20,30,40,50 / erase id for 30 / append 60
+		# setup that used to demonstrate the collision: id4 (50) must
+		# survive untouched, and the recycled id (from erasing 30) must be
+		# handed to 60 rather than colliding with id4
 		self._run( '''
 def main() -> i32:
-	x: list[i32] = list[i32]()
+	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
 	r1: Result[usize,OverflowError] = x.append( 20 )
 	r2: Result[usize,OverflowError] = x.append( 30 )
@@ -2527,80 +2825,17 @@ def main() -> i32:
 	if r5.is_err():
 		return 7
 	id5: usize = r5.unwrap( 'append failed' )
-	if id5 != id4:
-		return 50 # ids came out distinct - no collision (would mean this bug is already fixed)
+	if id5 == id4:
+		return 50 # still colliding - the fix did not take
 	g4: Result[i32,IndexError] = x.__getitem__( id4 )
-	if g4.is_err():
+	g5: Result[i32,IndexError] = x.__getitem__( id5 )
+	if g4.is_err() or g5.is_err():
 		return 6
 	v4: i32 = g4.unwrap( 'x' )
-	if v4 == 60:
-		return 0 # confirmed: id4 now silently resolves to the NEW element, not the original 50
-	if v4 == 50:
-		return 51 # original element somehow still reachable - not what the trace predicts
+	v5: i32 = g5.unwrap( 'x' )
+	if v4 == 50 and v5 == 60:
+		return 0 # no aliasing - both ids resolve to their own, correct values
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_str_construct_append_getitem_del( self ) -> None:
-		# an RC element type - a list[T] slot holds str's own HANDLE
-		# (pointer-width), not its struct body (see list.__init__'s own
-		# comment); __del__ must decref every stored element without
-		# reading struct-body-sized memory out of a pointer-sized slot
-		self._run( '''
-def main() -> i32:
-	x: list[str] = list[str]()
-	r0: Result[usize,OverflowError] = x.append( 'hello' )
-	r1: Result[usize,OverflowError] = x.append( 'world' )
-	if r0.is_err() or r1.is_err():
-		return 9
-	id0: usize = r0.unwrap( 'append failed' )
-	id1: usize = r1.unwrap( 'append failed' )
-	if x.__len__() != 2:
-		return 1
-	g0: Result[str,IndexError] = x.__getitem__( id0 )
-	g1: Result[str,IndexError] = x.__getitem__( id1 )
-	if g0.is_err() or g1.is_err():
-		return 8
-	if g0.unwrap( 'getitem failed' ) != 'hello':
-		return 2
-	if g1.unwrap( 'getitem failed' ) != 'world':
-		return 3
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_str_grows_past_initial_capacity( self ) -> None:
-		self._run( '''
-def main() -> i32:
-	x: list[str] = list[str]()
-	i: usize = 0
-	with compiler.panic_arithmetic( 'overflow' ):
-		while i < 20:
-			ar: Result[usize,OverflowError] = x.append( 'item' )
-			if ar.is_err():
-				return 9
-			i += 1
-	if x.__len__() != 20:
-		return 1
-	all_ok: bool = True
-	j: usize = 0
-	with compiler.panic_arithmetic( 'overflow' ):
-		while j < 20:
-			gr: Result[str,IndexError] = x.__getitem__( j )
-			if gr.is_err():
-				all_ok = False
-			else:
-				v: str = gr.unwrap( 'getitem failed' )
-				if v != 'item':
-					all_ok = False
-			j += 1
-	if not all_ok:
-		return 2
-	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
