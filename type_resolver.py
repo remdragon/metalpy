@@ -1645,11 +1645,19 @@ class _ReferenceResolver( ast.NodeTransformer ):
 
 	def _match_pattern( self, subj_expr: ast.expr, pattern: ast.pattern, node: ast.AST ) -> tuple[ast.expr,list[ast.stmt]]:
 		# ported from lowering.py's Lowering._match_pattern - same shape,
-		# same two supported pattern kinds (a bare name/wildcard always
-		# matches; a TaggedUnion member becomes a tag Cmp + recurse into
-		# the member's own sub-pattern against data.v_<member>) - anything
-		# else fails outright, exactly as it always has, just reported
-		# here instead of lazily during lowering
+		# plus a third pattern kind lowering.py's own version never had: a
+		# bare name/wildcard always matches; a TaggedUnion member becomes a
+		# tag Cmp + recurse into the member's own sub-pattern against
+		# data.v_<member>; a VALUE pattern (ast.MatchValue - `case
+		# Color.Red:`, `case 5:`, anything spelled as a dotted name or a
+		# literal with no call-parens) becomes a plain == Compare against
+		# the value expression, unresolved here - whatever `case Color.Red:`
+		# folds to at lowering time (lowering.py's _expr_Attribute's own
+		# CEnum-member-to-Const handling, for the enum case) decides
+		# correctness the same way an ordinary `subj == Color.Red`
+		# comparison already would. Anything else fails outright, exactly
+		# as it always has, just reported here instead of lazily during
+		# lowering
 		if isinstance( pattern, ast.MatchAs ) and pattern.pattern is None:
 			test = ast.Constant( value = True )
 			ast.copy_location( test, node )
@@ -1658,6 +1666,18 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			bind = ast.Assign( targets = [ ast.Name( id = pattern.name, ctx = ast.Store() ) ], value = subj_expr )
 			ast.copy_location( bind, node )
 			return test, [ bind ]
+
+		if isinstance( pattern, ast.MatchValue ):
+			# the value expression comes straight from user source (case
+			# Color.Red:) and, unlike subj_expr (already visited by
+			# whichever caller built it - visit_Match's own subj_ref, or an
+			# outer _match_pattern call's synthesized payload_expr), has
+			# never been visited yet - same reasoning as visit_Match's own
+			# subj_assign.value above
+			value = self.generic_visit_expr( pattern.value )
+			test = ast.Compare( left = subj_expr, ops = [ ast.Eq() ], comparators = [ value ] )
+			ast.copy_location( test, node )
+			return test, []
 
 		if not isinstance( pattern, ast.MatchClass ):
 			self.discovery.fail( f'unsupported match pattern: {ast.unparse(pattern)}', node )

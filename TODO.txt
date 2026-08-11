@@ -432,17 +432,6 @@ emitter:
 			a compiler error disallowing RC content in a bare @cunion with no
 			discriminant at all, simpler now that ResultPayload no longer
 			needs a name-based exemption.
-		- CEnum member VALUE expressions (Color.Red used as a real runtime
-			value, e.g. lib/builtins/__errors.py's `OSError.
-			FileNotFoundError`) don't lower at all - CEnum stores its members
-			in .members/.values (plain int dicts), never in .names as
-			Variables, so _attr_lookup's `isinstance(found, Variable)` check
-			can never succeed for one; _expr_Name would also reject the bare
-			CEnum class name itself. No compiler.reinterpret_cast[T](...)
-			intrinsic exists yet either (referenced in lib/builtins/__dict.py's
-			source but never implemented in lowering.py), which would be the
-			only other way to synthesize a real CEnum-typed value from source
-			today.
 		- linking is entirely out of scope so far: no wiring of a module's
 			__metalpy_init_<global> functions into the real process entry
 			point, no linker pragmas/flags for an @extern function's own

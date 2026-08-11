@@ -405,6 +405,50 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'has no member', self.discovery.errors.errors[0] )
 
+	def test_match_value_pattern_rewrites_to_equality_compare( self ) -> None:
+		# case Color.Red: (ast.MatchValue - a dotted-name value pattern, not
+		# ast.MatchClass - Color.Red has no call-parens) desugars to a plain
+		# == Compare against the value expression, unresolved here - the
+		# same CEnum-member-to-Const folding an ordinary `c == Color.Red`
+		# comparison already gets at lowering time decides correctness
+		mod = self._import( '\n'.join([
+			'@enum( i32 )',
+			'class Color:',
+			'	Red = 1',
+			'	Green = 2',
+			'',
+			'def main( c: Color ) -> i32:',
+			'	match c:',
+			'		case Color.Red:',
+			'			return 1',
+			'		case Color.Green:',
+			'			return 2',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'match ', src )
+		self.assertNotIn( 'case ', src )
+		self.assertIn( 'if __match_subj_0 == Color.Red', src )
+		self.assertIn( 'elif __match_subj_0 == Color.Green', src )
+
+	def test_match_value_pattern_supports_plain_literals( self ) -> None:
+		# case 1: (a bare literal, also ast.MatchValue - Python's grammar
+		# doesn't distinguish "dotted name" from "literal constant" here)
+		mod = self._import( '\n'.join([
+			'def main( x: i32 ) -> i32:',
+			'	match x:',
+			'		case 1:',
+			'			return 100',
+			'		case _:',
+			'			return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'if __match_subj_0 == 1', src )
+
 	def test_cenum_member_reference_resolves_and_schedules_the_enum( self ) -> None:
 		mod = self._import( '\n'.join([
 			'import compiler',

@@ -3291,6 +3291,99 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
 
 
+class MatchValuePatternRealCompileTests( CompilerTestCase ):
+	''' real compile+run coverage for type_resolver.py's _match_pattern
+	ast.MatchValue handling - `case Color.Red:`/`case 5:` desugaring to a
+	plain == Compare. Unlike type_resolver_test.py's own MatchValue tests
+	(which only check the desugared AST shape), these confirm the
+	generated code actually branches correctly. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_match_cenum_member_value_patterns( self ) -> None:
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 1
+	Green = 2
+	Blue = _
+
+def classify( c: Color ) -> i32:
+	match c:
+		case Color.Red:
+			return 1
+		case Color.Green:
+			return 2
+		case _:
+			return 99
+
+def main() -> i32:
+	if classify( Color.Green ) != 2:
+		return 1
+	if classify( Color.Blue ) != 99:
+		return 2
+	if classify( Color.Red ) != 1:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_match_plain_literal_value_patterns( self ) -> None:
+		self._run( '''
+def classify( x: i32 ) -> i32:
+	match x:
+		case 1:
+			return 100
+		case 2:
+			return 200
+		case _:
+			return 999
+
+def main() -> i32:
+	if classify( 1 ) != 100:
+		return 1
+	if classify( 2 ) != 200:
+		return 2
+	if classify( 3 ) != 999:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class StrFindIndexSplitTests( CompilerTestCase ):
 	''' str.find()/str.index()/str.split() (lib/builtins/__init__.py) -
 	both listed missing in TODO.txt, implemented as real general-purpose
