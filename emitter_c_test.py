@@ -2591,6 +2591,48 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_as_class_field_constructs_and_destructs( self ) -> None:
+		# regression test for a real compiler bug found while building
+		# dict[K,V] (see type_resolver.py's own _schedule_rcclass_
+		# destructor_deps fix): list[T] used as a FIELD of another class
+		# (as opposed to a local variable) used to crash - schedule()'s own
+		# Specialization branch called _schedule_rcclass_destructor_deps
+		# with the BARE, unspecialized `list` class, which then scheduled
+		# list's own __del__ directly for compilation with T still an
+		# unbound TypeVar ("compiler.is_rc(T) requires a concrete type").
+		# Whether this actually crashed depended on resolution ordering -
+		# a plain local `x: list[i32] = list[i32]()` never triggered it,
+		# only a FIELD assignment (self.items = list[i32]()) reliably did
+		self._run( '''
+class Holder:
+	items: list[i32]
+
+	def __init__( self ) -> None:
+		self.items = list[i32]()
+
+	def add( self, v: i32 ) -> None:
+		r: Result[None,OverflowError] = self.items.append( v )
+		if r.is_err():
+			sys.panic( 'append failed' )
+
+def main() -> i32:
+	h: Holder = Holder()
+	h.add( 10 )
+	h.add( 20 )
+	if h.items.__len__() != 2:
+		return 1
+	g0: Result[i32,IndexError] = h.items.__getitem__( 0 )
+	g1: Result[i32,IndexError] = h.items.__getitem__( 1 )
+	if g0.is_err() or g1.is_err():
+		return 2
+	if g0.unwrap( 'x' ) == 10 and g1.unwrap( 'x' ) == 20:
+		return 0
+	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_list_str_erase_at_preserves_order_and_refcounts( self ) -> None:
 		# RC-element coverage for erase_at's ordering guarantee - 'b' is
 		# decreffed on removal, 'a' and 'c' must survive (and read back
