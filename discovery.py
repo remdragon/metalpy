@@ -10,7 +10,7 @@ from typing import Any, Callable, Generator, NoReturn
 import compile_time_transformer
 from errors import CompileError, ErrorCollector
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
 	Module, _is_covered_by, _overlaps,
 )
@@ -144,6 +144,7 @@ class Discovery( ast.NodeVisitor ):
 		self._specializations: dict[str,Specialization] = {}
 		self._moves: dict[str,Move] = {}
 		self._copies: dict[str,Copy] = {}
+		self._callables: dict[str,CallableType] = {}
 
 		# lazily detected the first time a has_library(...) check (decorator
 		# or compiler.has_library(...) expression - see _matches_has_library/
@@ -513,7 +514,7 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy:
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType:
 		# move[T]/copy[T] are compiler syntax, not a real generic lookup -
 		# recognized textually here the same way @move is recognized
 		# textually as a decorator name in _parse_function, rather than
@@ -525,6 +526,24 @@ class Discovery( ast.NodeVisitor ):
 			if node.value.id == 'move':
 				return self._get_or_create_move( inner )
 			return self._get_or_create_copy( inner )
+
+		# Callable[[Arg1,Arg2,...], Ret] - also compiler syntax (see
+		# PLAN_CALLABLE.md), recognized the same textual way as move/copy
+		# above rather than resolved as an ordinary generic base: its own
+		# shape (an arg-type LIST nested inside the subscript, not a bare
+		# type argument) doesn't fit the ordinary type_params path at all
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Callable':
+			shape_ok = (
+				isinstance( node.slice, ast.Tuple )
+				and len( node.slice.elts ) == 2
+				and isinstance( node.slice.elts[0], ast.List )
+			)
+			if not shape_ok:
+				self.fail( f"Callable[...] must look like Callable[[ArgType, ...], RetType]: {ast.unparse(node)}", node )
+			arg_nodes, ret_node = node.slice.elts
+			arg_types = [ self.visit( arg_node ) for arg_node in arg_nodes.elts ]
+			return_type = self.visit( ret_node )
+			return self._get_or_create_callable_type( arg_types, return_type )
 
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
@@ -566,6 +585,21 @@ class Discovery( ast.NodeVisitor ):
 		)
 		self._copies[key] = cp
 		return cp
+
+	def _get_or_create_callable_type( self, arg_types: list[Type], return_type: Type ) -> CallableType:
+		key = f'Callable[[{",".join( a.qualname for a in arg_types )}],{return_type.qualname}]'
+		if fn_type := self._callables.get( key ):
+			return fn_type
+		fn_type = CallableType(
+			stem = key,
+			qualname = key,
+			file = return_type.file,
+			line = return_type.line,
+			arg_types = arg_types,
+			return_type = return_type,
+		)
+		self._callables[key] = fn_type
+		return fn_type
 
 	def _get_or_create_specialization( self, base: Type, args: list[Type] ) -> Specialization:
 		key = f'{base.qualname}[{",".join( a.qualname for a in args )}]'

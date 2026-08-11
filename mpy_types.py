@@ -163,6 +163,22 @@ class Copy( Type ):
 	the CFG work this exists for. '''
 	inner: Type
 
+@dataclass( kw_only = True )
+class CallableType( Type ):
+	''' `Callable[[Arg1,Arg2,...], Ret]` in annotation position - a bare
+	function SIGNATURE used as a type (see PLAN_CALLABLE.md), for typing a
+	function-pointer value: Ptr[Callable[[Ptr[None],Ptr[None]],bool]], not
+	a callable OBJECT (no receiver/closure environment - see the plan doc's
+	own "deferred" list for why bound-method/capturing-lambda references
+	aren't in scope yet). Not a ScopeMixin - has no members of its own,
+	purely a shape to type-check a bare function reference or an indirect
+	call against. Interned by discovery.py's _get_or_create_callable_type,
+	the same way Specialization/TaggedUnion/Move/Copy already are, so two
+	annotations spelling the same signature share one object (needed for
+	identity-based comparisons elsewhere, e.g. _leaf_is_accepted). '''
+	arg_types: list[Type]
+	return_type: Type
+
 # a class's own body scan (revealing its attribute/method *names*) is
 # deferred behind .resolve, exactly like a Function's parameters or a
 # Variable's type - nothing about a class's members is known until something
