@@ -23,7 +23,12 @@ In scope:
    value.
 3. Calling through a Ptr[Callable[...]]-typed value (an indirect call).
 4. Using Ptr[Callable[...]] as a function parameter type and a local
-   variable type - not yet as a struct field, not deeply nested.
+   variable type - not yet as a struct field, not deeply nested, and NOT
+   as a function's own return type (confirmed: crashes today - a function
+   RETURNING a function pointer is C's gnarliest declarator shape,
+   `RetType (*name(Params))(InnerParams)`, genuinely different from every
+   other declarator _declarator handles. Not needed by dict[K,V] - it only
+   ever passes a callback as a parameter, never returns one).
 
 Deferred (flagged, not attempted this pass):
 - Lambda expressions / nested function defs - needed for zoneinfo.py's

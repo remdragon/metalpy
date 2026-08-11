@@ -2827,6 +2827,145 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	# --- Callable[...] function references / indirect calls (PLAN_CALLABLE.md) ---
+
+	def test_bare_function_reference_lowers_to_function_ref( self ) -> None:
+		# a plain, receiver-less function name used as a VALUE (not called)
+		# lowers to ir.FunctionRef, typed Ptr[Callable[[ArgTypes],RetType]]
+		# - this used to fail outright ('not a value, cannot use it as an
+		# expression')
+		code = '\n'.join([
+			'def add_one( x: i32 ) -> i32:',
+			'	with compiler.wrap_arithmetic:',
+			'		return x + 1',
+			'',
+			'def main() -> None:',
+			'	f: Ptr[Callable[[i32],i32]] = add_one',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assign = next( instr for instr in fn.instructions if isinstance( instr, ir.Assign ))
+		self.assertIsInstance( assign.src, ir.FunctionRef )
+		self.assertEqual( assign.src.fn.qualname, '__test__.add_one' )
+		ptr_type = assign.src.type
+		self.assertIsInstance( ptr_type, Specialization )
+		self.assertEqual( ptr_type.base.stem, 'Ptr' )
+		fn_type = ptr_type.args[0]
+		self.assertEqual( [ t.stem for t in fn_type.arg_types ], [ 'i32' ] )
+		self.assertEqual( fn_type.return_type.stem, 'i32' )
+
+	def test_staticmethod_reference_lowers_to_function_ref( self ) -> None:
+		# a @staticmethod has no receiver either - same as a free function.
+		# Referenced bare/unqualified from a SIBLING method's own body (the
+		# shape dict[K,V]'s own generated code actually needs - a
+		# monomorphized dict[K,V] method referencing its own @staticmethod
+		# helper) - a bare Name lookup from inside a method body already
+		# searches the enclosing class's own scope (confirmed separately;
+		# not new behavior from this feature). Qualified Class.method
+		# attribute access is a DIFFERENT codepath (_expr_Attribute, not
+		# _expr_Name) that this pass doesn't touch at all - out of scope,
+		# not needed by dict[K,V].
+		code = '\n'.join([
+			'class Box:',
+			'	@staticmethod',
+			'	def add_one( x: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return x + 1',
+			'',
+			'	def use_it( self ) -> None:',
+			'		f: Ptr[Callable[[i32],i32]] = add_one',
+			'		return',
+		])
+		self._import( code )
+		box_cls = self.discovery.modules['__test__'].get_local( 'Box' )
+		if box_cls.resolve is not None:
+			box_cls.resolve()
+		use_it_fn = box_cls.get_local( 'use_it' )
+		if use_it_fn.resolve is not None:
+			use_it_fn.resolve()
+		lf = self.compiler._lower( use_it_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assign = next( instr for instr in lf.instructions if isinstance( instr, ir.Assign ))
+		self.assertIsInstance( assign.src, ir.FunctionRef )
+		self.assertEqual( assign.src.fn.qualname, '__test__.Box.add_one' )
+
+	def test_instance_method_reference_is_rejected( self ) -> None:
+		# a bound instance method has an implicit receiver with nowhere to
+		# go in a raw C function pointer - that's a closure, out of scope
+		# (see PLAN_CALLABLE.md's own "deferred" list). Same bare-reference-
+		# from-a-sibling-method shape as the staticmethod test above -
+		# get() is never actually CALLED anywhere, only referenced as a
+		# value, so this must directly lower use_it (not rely on
+		# reachability from main(), which would never reach this code at
+		# all and silently prove nothing)
+		code = '\n'.join([
+			'class Box:',
+			'	v: i32',
+			'	def get( self ) -> i32:',
+			'		return self.v',
+			'',
+			'	def use_it( self ) -> None:',
+			'		f: Ptr[Callable[[],i32]] = get',
+			'		return',
+		])
+		self._import( code )
+		box_cls = self.discovery.modules['__test__'].get_local( 'Box' )
+		if box_cls.resolve is not None:
+			box_cls.resolve()
+		use_it_fn = box_cls.get_local( 'use_it' )
+		if use_it_fn.resolve is not None:
+			use_it_fn.resolve()
+		self.compiler._lower( use_it_fn )
+		self.assertIn( 'no receiver to bind', self.discovery.errors.errors[0] )
+
+	def test_generic_function_reference_is_rejected( self ) -> None:
+		# no single fixed signature to point a raw function pointer at -
+		# which specialization?
+		code = '\n'.join([
+			'def identity[T]( x: T ) -> T:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	f: Ptr[Callable[[i32],i32]] = identity',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'is generic', self.discovery.errors.errors[0] )
+
+	def test_call_through_callable_pointer_emits_call_indirect( self ) -> None:
+		# eq_fn(a, b) where eq_fn: Ptr[Callable[[i32,i32],bool]] - a call
+		# through a function-pointer VALUE, not a named Function/method
+		# lookup (there's no Function object to resolve at all - the
+		# parameter's own declared type is the only thing available)
+		code = '\n'.join([
+			'def call_it( f: Ptr[Callable[[i32,i32],bool]], a: i32, b: i32 ) -> bool:',
+			'	return f( a, b )',
+		])
+		self._import( code )
+		call_it_fn = self.discovery.modules['__test__'].get_local( 'call_it' )
+		if call_it_fn.resolve is not None:
+			call_it_fn.resolve()
+		lf = self.compiler._lower( call_it_fn )
+		call_indirect = next( instr for instr in lf.instructions if isinstance( instr, ir.CallIndirect ))
+		self.assertEqual( call_indirect.target.stem, 'f' )
+		self.assertEqual( [ a.stem for a in call_indirect.args ], [ 'a', 'b' ])
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_call_through_callable_pointer_wrong_arg_count_rejected( self ) -> None:
+		code = '\n'.join([
+			'def call_it( f: Ptr[Callable[[i32,i32],bool]], a: i32 ) -> bool:',
+			'	return f( a )',
+		])
+		self._import( code )
+		call_it_fn = self.discovery.modules['__test__'].get_local( 'call_it' )
+		if call_it_fn.resolve is not None:
+			call_it_fn.resolve()
+		self.compiler._lower( call_it_fn )
+		self.assertIn( 'takes 2 argument(s), got 1', self.discovery.errors.errors[0] )
+
 	# --- object construction (Class.__allocate__) ---------------------------
 
 	def test_allocate_emits_allocate_instruction( self ) -> None:

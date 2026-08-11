@@ -3191,6 +3191,106 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class CallableTests( CompilerTestCase ):
+	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
+	PLAN_CALLABLE.md: a bare function reference used as a value (never
+	compiled anywhere before this), stored/passed as a real C function
+	pointer, and called indirectly through it. Mirrors ListGenericTests'
+	own import_builtins=True + real compile-and-run convention. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_function_reference_stored_and_called_indirectly( self ) -> None:
+		# add_one's address is taken (a real C function-pointer cast, not
+		# a call), stored in a Ptr[Callable[[i32],i32]] local, passed to
+		# another function, and called THROUGH it - no direct call to
+		# add_one appears anywhere in this source
+		self._run( '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:
+	return f( v )
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = add_one
+	result: i32 = call_it( f, 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( '(int32_t (*)( int32_t ))__main__$add_one', src ) # a real function-pointer cast, not a call
+		self.assertIn( '(f)( v )', src ) # a call THROUGH the pointer, no explicit deref needed
+		self._assert_compiles_and_runs( src )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_staticmethod_reference_called_indirectly( self ) -> None:
+		# the exact shape dict[K,V]'s own comparator/hasher helpers will
+		# use: a @staticmethod referenced bare from a sibling method of the
+		# same class, stored in a local, called indirectly from there.
+		# NOTE: deliberately does NOT return the Ptr[Callable[...]] value
+		# from a function - that's a real, separate gap (a function
+		# RETURNING a function pointer is C's gnarliest declarator shape,
+		# `RetType (*name(Params))(InnerParams)` - _declarator only covers
+		# parameter/local declarations, per PLAN_CALLABLE.md's own scope).
+		# Not needed here: dict[K,V] only ever passes a callback as a
+		# parameter, never returns one.
+		self._run( '''
+class Ops:
+	@staticmethod
+	def double( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x * 2
+
+	def run( self, v: i32 ) -> i32:
+		f: Ptr[Callable[[i32],i32]] = double
+		return f( v )
+
+def main() -> i32:
+	o: Ops = Ops()
+	result: i32 = o.run( 21 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class ComTests( CompilerTestCase ):
 	''' lib/windows/com.py's HRESULT/IUnknown pattern -
 	PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3 worked example: a
