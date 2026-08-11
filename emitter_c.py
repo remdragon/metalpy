@@ -8,7 +8,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, Variable,
 )
 
@@ -344,6 +344,58 @@ def c_type( t: Type|None ) -> str:
 def _is_noreturn( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem == 'NoReturn'
 
+def _callable_ptr_type( t: Type|None ) -> CallableType|None:
+	''' t's own CallableType if t is Ptr[Callable[...]] (see
+	PLAN_CALLABLE.md) - the ptr-vs-bare distinction and the interning both
+	live in discovery.py/type_resolver.py already (see TypeResolver.
+	_callable_type_of); this is emitter_c.py's own copy of the same
+	structural check since this module works on Type objects directly,
+	with no TypeResolver instance around to call. '''
+	if isinstance( t, Specialization ) and isinstance( t.base, Scalar ) and t.base.stem == 'Ptr':
+		inner = t.args[0]
+		if isinstance( inner, CallableType ):
+			return inner
+	return None
+
+def _fn_ptr_cast_type( ret: str, params: list[str] ) -> str:
+	''' the C function-pointer TYPE spelling itself (RetType (*)(ParamTypes),
+	no name) - shared by emit_interface_vtable_instance (casting a concrete
+	implementation's address into a shared vtable slot type) and
+	_emit_operand's own FunctionRef branch (spelling a bare function
+	reference's cast expression), from whichever (ret, params) tuple the
+	caller already has (_vtable_slot_c_type's own self-prepended shape, or
+	_function_pointer_c_type's plain one below). '''
+	params_str = ', '.join( params ) if params else 'void'
+	return f'{ret} (*)( {params_str} )'
+
+def _function_pointer_c_type( fn_type: CallableType ) -> tuple[str,list[str]]:
+	''' (return type spelling, param type spellings) for fn_type's own
+	signature - the same shape _vtable_slot_c_type already builds for a
+	vtable slot's function-pointer field, for a different reason
+	(dispatching through a concrete implementation's own address rather
+	than an arbitrary Ptr[Callable] value's contents). Shared here rather
+	than reimplemented a third time by FunctionRef's own cast expression
+	(see _emit_operand) and every Ptr[Callable[...]] declarator (see
+	_declarator below). '''
+	ret = 'void' if _returns_void_in_c( fn_type.return_type ) else c_type( fn_type.return_type )
+	params = [ c_type( a ) for a in fn_type.arg_types ]
+	return ret, params
+
+def _declarator( t: Type|None, name: str ) -> str:
+	''' "TYPE NAME" for an ordinary parameter/local-variable declaration -
+	except when t is Ptr[Callable[...]], where C's function-pointer syntax
+	is the one declarator shape that ISN'T "prefix type, then name": the
+	name goes INSIDE the parens (RetType (*name)(ParamTypes)), so plain
+	string concatenation of c_type(t) and name can't express it. Scoped to
+	parameter/local declarations only (see PLAN_CALLABLE.md) - not struct
+	fields (nothing needs that yet). '''
+	fn_type = _callable_ptr_type( t )
+	if fn_type is None:
+		return f'{c_type(t)} {name}'
+	ret, params = _function_pointer_c_type( fn_type )
+	params_str = ', '.join( params ) if params else 'void'
+	return f'{ret} (*{name})( {params_str} )'
+
 def _value_spelling( t: Type ) -> str:
 	''' the C spelling of T's OWN VALUE representation - unlike c_type(),
 	which auto-promotes a bare RCClass reference to a pointer (struct Foo*,
@@ -479,7 +531,7 @@ def _function_prototype( function: Function ) -> str:
 	if _has_self( function ):
 		params.append( f'{_self_c_type(function.cls)} self' )
 	for p in ( function.parameters or [] ):
-		params.append( f'{c_type(p.type)} {_c_local_name(p.stem)}' )
+		params.append( _declarator( p.type, _c_local_name( p.stem )))
 	params_str = ', '.join( params ) if params else 'void'
 	if _is_entry_point( function ):
 		return f'int main( {params_str} )'
@@ -508,6 +560,16 @@ def _emit_operand( op: ir.Operand ) -> str:
 		return _emit_const( op )
 	if isinstance( op, ir.Temp ):
 		return f't{op.id}'
+	if isinstance( op, ir.FunctionRef ):
+		# a bare function reference used as a value - see PLAN_CALLABLE.md.
+		# Same cast-expression shape emit_interface_vtable_instance already
+		# builds to point a vtable slot at a concrete implementation
+		# (a plain pointer-to-pointer function-pointer cast, safe and free
+		# at runtime, no wrapper needed) - reused via _function_pointer_c_type
+		fn_type = _callable_ptr_type( op.type )
+		assert fn_type is not None, f'_emit_operand: FunctionRef with non-Ptr[Callable] type {op.type!r}'
+		ret, params = _function_pointer_c_type( fn_type )
+		return f'({_fn_ptr_cast_type(ret, params)}){mangle_qualname(op.fn.qualname)}'
 	if isinstance( op, Variable ):
 		# locals (parameters, stack locals) use bare stem; globals
 		# need the full mangled qualname (cross-TU visibility)
@@ -908,7 +970,7 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	)
 	if needs_return_value and not _returns_void_in_c( function.return_type ):
 		name = _c_local_name( '__return_value' )
-		lines.append( f'\t{c_type(function.return_type)} {name};' )
+		lines.append( f'\t{_declarator( function.return_type, name )};' )
 		declared.add( name )
 	for instr in fn.instructions:
 		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
@@ -942,7 +1004,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
 	if isinstance( instr, ir.DeclareTemp ):
-		return [ f'\t{c_type(instr.temp.type)} t{instr.temp.id};' ]
+		return [ f'\t{_declarator( instr.temp.type, f"t{instr.temp.id}" )};' ]
 	if isinstance( instr, ir.DeleteTemp ):
 		return [] # C block scoping already handles temp lifetime - nothing to emit
 	if isinstance( instr, ir.Assign ):
@@ -951,7 +1013,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			name = _c_local_name( instr.dest.stem )
 			if name not in declared:
 				declared.add( name )
-				return [ f'\t{c_type(instr.dest.type)} {name} = {src};' ]
+				return [ f'\t{_declarator( instr.dest.type, name )} = {src};' ]
 			return [ f'\t{name} = {src};' ]
 		# a global Variable is declared separately at file scope (Phase 7 -
 		# emit_global) - never re-declared here, only assigned
@@ -1046,6 +1108,17 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		else:
 			has_args = bool( arg_texts )
 			call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
+		if instr.dest is not None:
+			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
+		return [ f'\t{call_expr};' ]
+
+	if isinstance( instr, ir.CallIndirect ):
+		# calling THROUGH a Ptr[Callable[...]]-typed value - see
+		# PLAN_CALLABLE.md. No explicit deref needed (C calls a function
+		# pointer directly), same as a vtable slot call above doesn't need
+		# one either
+		arg_texts = [ _emit_operand( a ) for a in instr.args ]
+		call_expr = f'({_emit_operand(instr.target)})( {", ".join(arg_texts)} )'
 		if instr.dest is not None:
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
 		return [ f'\t{call_expr};' ]
@@ -1433,7 +1506,7 @@ def _vtable_slot_c_type( owner: CStruct, slot: Function ) -> tuple[str,list[str]
 	ret = 'void' if _returns_void_in_c( slot.return_type ) else c_type( slot.return_type )
 	params = [ f'{_self_c_type(owner)} self' ]
 	for p in ( slot.parameters or [] ):
-		params.append( f'{c_type(p.type)} {_c_local_name(p.stem)}' )
+		params.append( _declarator( p.type, _c_local_name( p.stem )))
 	return ret, params
 
 def emit_interface_vtbl_struct( owner: CStruct ) -> str:
@@ -1501,8 +1574,7 @@ def emit_interface_vtable_instance( cls: CStruct ) -> str|None:
 	field_inits: list[str] = []
 	for slot, impl in zip( cls.virtual_slots(), slot_impls ):
 		ret, params = _vtable_slot_c_type( owner, slot )
-		slot_fn_ptr_type = f'{ret} (*)( {", ".join(params)} )'
-		field_inits.append( f'.{_field_name(slot.stem)} = ({slot_fn_ptr_type}){mangle_qualname(impl.qualname)}' )
+		field_inits.append( f'.{_field_name(slot.stem)} = ({_fn_ptr_cast_type(ret, params)}){mangle_qualname(impl.qualname)}' )
 	vtbl_type = _interface_vtbl_name( cls )
 	instance_name = f'{mangle_type(cls)}$$vtable'
 	if field_inits:
