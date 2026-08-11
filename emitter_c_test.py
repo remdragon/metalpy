@@ -2426,6 +2426,38 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_list_rc_element_getitem_unwrap_chained_on_bare_receiver( self ) -> None:
+		# regression test for a real double-Decref, found while reverting
+		# an int.py workaround (see __int.py's own divmod() comment): a
+		# real (RC-typed, not i32) element read back via
+		# `x.__getitem__(i).unwrap(msg)` chained directly - the receiver
+		# Result[T,IndexError] never bound to a name - used to free the
+		# element while x itself still referenced it. unwrap()'s own
+		# declared body (`return self.data.v_Ok`) never increfs; the
+		# receiver's own pending cleanup (registered the moment its owning
+		# Call was emitted - see cfg.py's fresh_temp) was never cancelled
+		# to reflect that its one real reference now backs the .unwrap()
+		# return value instead, so BOTH the receiver's own cleanup and the
+		# destination binding's own future decref tried to release it -
+		# confirmed with AddressSanitizer, not merely by this passing.
+		# int(5), not i32, matters: element_size shortcuts for a non-RC T
+		# never exercised the buggy path at all - see list.__init__'s own
+		# is_rc(T) branch. Fixed in lowering.py's _lower_call (the new
+		# Temp-receiver branch for unwrap()/unwrap_or(), alongside the
+		# existing Variable-receiver one).
+		self._run( '''
+def main() -> i32:
+	x: list[int] = list[int]()
+	x.append( int( 5 )).unwrap( 'append failed' )
+	got: int = x.__getitem__( 0 ).unwrap( 'getitem failed' )
+	if got != int( 5 ):
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_list_i32_grows_past_initial_capacity( self ) -> None:
 		# initial_capacity defaults to 8 - 20 appends forces RawList._grow()
 		# at least once, and every value must still read back correctly

@@ -791,6 +791,26 @@ class Lowering:
 			self.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
 		fn = self._current_fn
 		var_type = self.discovery.visit( node.annotation )
+		# NOTE: var_type is deliberately left as whatever discovery.visit()
+		# returns (often a bare, un-monomorphized Specialization) rather
+		# than passed through _ensure_resolved() - that looks like a real
+		# gap (cfg.py's rc_leaves() reads a Specialization's abstract
+		# base.attributes, still bare TypeVars, and silently concludes an
+		# annotated local like `x: Result[SomeRCClass,E]` has no RC leaves
+		# at all, skipping its own incref/decref entirely - reproduced
+		# directly with AddressSanitizer) but resolving unconditionally
+		# here regressed several existing, passing tests whose annotations
+		# are still genuinely abstract at this point (a generic method
+		# body's own `res: Foo[T]`, T being the method/class's own
+		# still-unbound type param - ensure_resolved() has no "is this
+		# concrete yet" guard of its own and will monomorphize_class() a
+		# bogus "concrete" Foo[T], caching it under spec.monomorphized as
+		# if T really were a real type). Left as a known gap rather than
+		# risking a wider, under-tested fix here - see the int class
+		# investigation notes (division/unwrap-chaining bugs) for the
+		# narrower, verified fix that was shipped instead (lowering.py's
+		# own Temp-receiver handling for .unwrap()/.unwrap_or()).
+		self.schedule( var_type )
 		var = Variable(
 			stem = node.target.id,
 			qualname = f'{fn.qualname}.{node.target.id}',
@@ -799,7 +819,6 @@ class Lowering:
 			type = var_type,
 		)
 		fn.add_name( var.stem, var )
-		self.schedule( var_type )
 		if node.value is not None:
 			operand = self._lower_expr( node.value, var_type )
 			for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value ), node = node ):
@@ -3681,6 +3700,33 @@ class Lowering:
 			target_cls_base = target.cls.base if isinstance( target.cls, Specialization ) else target.cls
 			if target_cls_base is self.discovery.find_name( 'Result', node ):
 				self._cfg.clear_result( receiver.stem )
+
+		if (
+			isinstance( target, ( Function, Overload )) and target.stem in ( 'unwrap', 'unwrap_or' )
+			and isinstance( receiver, ir.Temp )
+		):
+			# <chained_call>.unwrap(msg)/.unwrap_or(default) - e.g.
+			# xs.__getitem__(0).unwrap(msg), never bound to a name - the
+			# receiver is a bare Temp holding a Result[T,E] value whose
+			# RC payload (if any) is registered in _temp_states (every
+			# Call/Allocate dest with RC leaves is - see _emit's own
+			# fresh_temp() call) as still needing its own eventual
+			# decref if nothing else claims it first. unwrap()/unwrap_or()
+			# return that SAME payload reference (their own declared
+			# body is a plain `return self.data.v_Ok`, no incref) - the
+			# call's OWN return value inherits ownership of it, so the
+			# receiver temp's registration has to be dropped here,
+			# silently (no decref emitted - _cfg.move()'s identical Temp
+			# branch does exactly this), or the temp's own cleanup
+			# (DeleteTemp, once nothing else in this statement still
+			# needs it) decrefs the SAME reference a second time while
+			# the returned value is ALSO independently tracked as owning
+			# it - confirmed with a real repro + AddressSanitizer, not
+			# just reasoning: exactly this shape freed a still-referenced
+			# int while it was still stored in a list. is_ok()/is_err()
+			# don't return the payload, so they're deliberately excluded -
+			# the receiver's own eventual cleanup is still correct there.
+			self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' )
 
 		if isinstance( target, _ReceiverDispatch ):
 			return self._lower_union_receiver_call( node, target, receiver, expected_type, want_result )

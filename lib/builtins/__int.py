@@ -501,30 +501,28 @@ class int:
 		base = divisor.clone()
 		base.__is_negative = False
 
-		# A fixed-size array of the 9 multiples (1x-9x of |divisor|), managed
-		# by hand with a raw Ptr[None] handle array rather than list[int] -
-		# list[T].__getitem__(idx).unwrap(...) (T an RC type) is a separate,
-		# newly-found real bug: the generated C double-releases the payload
-		# (once via an extra receiver-cleanup release_object, once via the
-		# destination binding's own scope-exit epilogue) while never
-		# incref'ing it a second time to back both, so the object's
-		# refcount undercounts and it can be freed while still referenced -
-		# confirmed with a minimal repro entirely outside int/divmod
-		# (`list[int]` + `xs.__getitem__(0).unwrap(...)` alone reproduces
-		# it). Not yet root-caused/fixed (separate from the two bugs fixed
-		# alongside this comment, #1's list.__del__ double-decref and #5's
-		# or_return() same-file resolution gap) - this workaround stays
-		# until that one is.
-		multiples: Ptr[Ptr[None]] = compiler.cast( Ptr[Ptr[None]], sys.alloc[usize]( 9 ))
-		compiler.incref( base )
-		multiples[0] = compiler.cast( Ptr[None], base )
+		# The 9 multiples (1x-9x of |divisor|), precomputed once so the
+		# digit-picking loop below can search them per dividend digit
+		# instead of recomputing. Plain list[int] - list[T].__getitem__
+		# (idx).unwrap(...) chained directly (T an RC type, receiver never
+		# bound to a name) used to double-release the payload: the
+		# receiver Temp's own pending cleanup (registered the moment its
+		# owning Call/Allocate was emitted - see cfg.py's fresh_temp) was
+		# never cancelled when .unwrap()'s return (an alias of the SAME
+		# reference, not a fresh incref) got bound to a name instead,
+		# undercounting the refcount by one - confirmed with
+		# AddressSanitizer, not just reasoning. Fixed in lowering.py's
+		# _lower_call (the Temp-receiver branch alongside the existing
+		# Variable-receiver one for is_ok/is_err/unwrap/unwrap_or).
+		multiples: list[int] = list[int]()
+		multiples.append( base ).unwrap( 'divmod: multiples.append failed' )
 		with compiler.panic_arithmetic( 'building exactly eight more multiples of the divisor cannot overflow usize bookkeeping' ):
 			k: usize = 1
 			while k < 9:
-				next_multiple = compiler.cast( int, multiples[k - 1] ).clone()
+				prev: int = multiples.__getitem__( k - 1 ).unwrap( 'divmod: multiples index in bounds by construction' )
+				next_multiple = prev.clone()
 				next_multiple._add_magnitude( base ).or_return()
-				compiler.incref( next_multiple )
-				multiples[k] = compiler.cast( Ptr[None], next_multiple )
+				multiples.append( next_multiple ).unwrap( 'divmod: multiples.append failed' )
 				k += 1
 
 		quotient = int( 0 )
@@ -539,18 +537,9 @@ class int:
 				new_digit: u8 = 0
 				d: usize = 9
 				while d >= 1:
-					# borrowed straight off `multiples` each time, deliberately
-					# never bound to a named local across iterations: cfg.py's
-					# assign() marks any named local holding an RC value as
-					# OWNED and decrefs its PREVIOUS value on each
-					# reassignment, but compiler.cast(...) produces a fresh
-					# Temp that assign() treats as already "a fresh owned
-					# handoff" needing no balancing incref - a raw reinterpret
-					# cast is neither of those things, so a named local
-					# reassigned from compiler.cast(...) inside a loop would
-					# decref one extra, real reference every iteration
-					if int._compare_magnitude( remainder, compiler.cast( int, multiples[d - 1] )) >= 0:
-						remainder._subtract_magnitude( compiler.cast( int, multiples[d - 1] )).or_return()
+					candidate: int = multiples.__getitem__( d - 1 ).unwrap( 'divmod: multiples index in bounds by construction' )
+					if int._compare_magnitude( remainder, candidate ) >= 0:
+						remainder._subtract_magnitude( candidate ).or_return()
 						new_digit = u8( d )
 						break
 					d -= 1
@@ -558,13 +547,6 @@ class int:
 
 		quotient.__is_negative = ( self.__is_negative != divisor.__is_negative ) and not quotient.is_zero()
 		remainder.__is_negative = self.__is_negative and not remainder.is_zero()
-
-		with compiler.panic_arithmetic( 'walking down from a fixed count of 9 cannot underflow usize' ):
-			j: usize = 9
-			while j > 0:
-				j -= 1
-				compiler.decref( compiler.cast( int, multiples[j] ))
-		sys.free( compiler.cast( Ptr[u8], multiples ))
 
 		return Result.Ok( DivMod( quotient = quotient, remainder = remainder ))
 
