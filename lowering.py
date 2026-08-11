@@ -935,9 +935,17 @@ class Lowering:
 				self.schedule( setitem_fn.return_type )
 				index = self._lower_expr( target.slice, setitem_fn.parameters[0].type )
 				operand = self._lower_expr( node.value, setitem_fn.parameters[1].type )
-				call_dest = self._new_temp( setitem_fn.return_type )
-				self._emit( ir.Call( dest = call_dest, target = setitem_fn, receiver = obj, args = [ index, operand ], kwargs = {} ))
-				self._maybe_consume_result( node, call_dest, self._SUBSCRIPT_ALTERNATIVES )
+				if setitem_fn.return_type is self.discovery.get_none_type():
+					# the ordinary/conventional case (matches Python's own
+					# __setitem__ protocol, which always returns None) -
+					# a real Temp dest here would try to assign C's void
+					# return to a variable, which doesn't compile; no
+					# Result to auto-consume either
+					self._emit( ir.Call( dest = None, target = setitem_fn, receiver = obj, args = [ index, operand ], kwargs = {} ))
+				else:
+					call_dest = self._new_temp( setitem_fn.return_type )
+					self._emit( ir.Call( dest = call_dest, target = setitem_fn, receiver = obj, args = [ index, operand ], kwargs = {} ))
+					self._maybe_consume_result( node, call_dest, self._SUBSCRIPT_ALTERNATIVES )
 		else:
 			self.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 
@@ -2028,6 +2036,31 @@ class Lowering:
 			self.discovery.fail( f'{fn.qualname} is one of several @overload implementations - cannot take a bare reference to it by name alone: {ast.unparse(node)}', node )
 		if fn.cls is not None and not fn.is_static:
 			self.discovery.fail( f'{fn.qualname} is an instance method or classmethod - cannot take a bare reference to it (no receiver to bind): {ast.unparse(node)}', node )
+		if fn.cls is not None and fn.cls.type_params:
+			# a @staticmethod belonging to a GENERIC class, referenced bare
+			# from within another method of that SAME class - discovery.
+			# find_name only ever returns the abstract template (fn.cls
+			# itself, K/V still bare TypeVars: confirmed - _value_spelling
+			# crashes on the unresolved TypeVar downstream in emitter_c.py
+			# without this). Ordinary calls (self.method(...)) never hit
+			# this because _lower_generic_call_with_receiver substitutes
+			# the class type args and calls _monomorphized_function BEFORE
+			# emitting the Call - a bare reference has no such call site to
+			# hang that on, so it's done here instead, using the CURRENT
+			# specialization being lowered (self._current_fn.cls) rather
+			# than inferring from arguments (there's nothing to infer from
+			# for a value reference - Ptr[Callable[...]]'s own shape
+			# carries no class-type-param information at all)
+			current_cls = self._current_fn.cls if self._current_fn is not None else None
+			current_spec = current_cls if isinstance( current_cls, Specialization ) else None
+			if current_spec is None or current_spec.base is not fn.cls:
+				self.discovery.fail(
+					f"{fn.qualname} belongs to a generic class - a bare reference to it is only resolvable from "
+					f"inside one of {fn.cls.qualname}'s own (already-specialized) methods: {ast.unparse(node)}",
+					node,
+				)
+			method_spec = self.discovery._get_or_create_specialization( fn, current_spec.args )
+			fn = self._monomorphized_function( method_spec )
 		self._ensure_resolved( fn )
 		if fn.parameters is None:
 			self.discovery.fail( f'{fn.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
@@ -3585,6 +3618,21 @@ class Lowering:
 			target, receiver = resolved_callee, None
 		else:
 			target, receiver = self._resolve_callee( node.func )
+		if receiver is not None and isinstance( target, Function ) and ( target.is_static or target.is_classmethod ):
+			# self.static_method(...) - _resolve_callee's own Attribute
+			# fallback always computes a receiver for ANY dotted callee (it
+			# has no way to know staticness before resolving the attribute
+			# itself), but ir.Call.receiver's own docstring already says a
+			# @staticmethod/@classmethod call takes none at all ("None for
+			# a free function, staticmethod, or classmethod call") - this
+			# is the one place that promise wasn't kept, and it showed up
+			# as a real C compile error (an extra `self` argument at the
+			# call site that the callee's own prototype never declared).
+			# ClassName.static_method(...) never hits this: it already
+			# resolves through _resolve_callee_target's namespace-lookup
+			# path instead, which never computes a receiver in the first
+			# place - only the self.-qualified spelling needs the null-out
+			receiver = None
 		if receiver is not None:
 			self.schedule( receiver.type )
 

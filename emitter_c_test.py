@@ -3332,6 +3332,78 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_self_dot_staticmethod_call_passes_no_receiver( self ) -> None:
+		# regression test for a real compiler bug found while building
+		# dict[K,V]: self.static_method(...) (as opposed to
+		# ClassName.static_method(...)) used to always attach self as a
+		# receiver argument at the call site, even though a @staticmethod
+		# takes none - ir.Call.receiver's own docstring already promised
+		# "None for a free function, staticmethod, or classmethod call",
+		# but _resolve_callee's Attribute fallback (used for ANY dotted
+		# callee, since it can't know staticness before resolving the
+		# attribute) always computed one regardless. Confirmed via real
+		# emitted C: the call site passed 2 arguments to a 1-parameter
+		# prototype ("too many arguments to function call"). ClassName.
+		# method(...) never hit this (a different, namespace-lookup
+		# resolution path that never computes a receiver at all) - only
+		# self.-qualified calls did, which is exactly the shape dict[K,V]
+		# needs throughout (its own RC-branching helpers are all
+		# @staticmethods, called via self. from __getitem__/__setitem__/
+		# __del__)
+		self._run( '''
+class Box:
+	v: i32
+
+	@staticmethod
+	def double( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x * 2
+
+	def use_it( self, x: i32 ) -> i32:
+		return self.double( x )
+
+def main() -> i32:
+	b: Box = Box( v = 0 )
+	result: i32 = b.use_it( 21 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( 'int32_t __main__$Box$double( int32_t x )', src ) # no self parameter
+		self.assertIn( '__main__$Box$double( x )', src ) # no self argument at the call site either
+		self._assert_compiles_and_runs( src )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_setitem_returning_plain_none_does_not_assign_void( self ) -> None:
+		# regression test for a real compiler bug found while building
+		# dict[K,V]: obj[i] = v always created a destination Temp for
+		# __setitem__'s call, even when __setitem__ returns plain None
+		# (C void) - the ordinary/conventional case, matching Python's own
+		# __setitem__ protocol. Confirmed via real emitted C: `t1 = some_
+		# void_returning_call();` doesn't compile ("assigning to
+		# 'MetalpyNone' from incompatible type 'void'"). Only __setitem__
+		# implementations returning a real Result[None,E] (the OTHER,
+		# fallible case - see test_subscript_assign_with_setitem_resolves_
+		# and_consumes_result in lowering_test.py) ever exercised the
+		# call-with-a-real-dest path before, so this never surfaced
+		self._run( '''
+class Box:
+	y: i32
+
+	def __setitem__( self, i: usize, v: i32 ) -> None:
+		self.y = v
+
+def main() -> i32:
+	b: Box = Box( y = 0 )
+	b[0] = 42
+	return b.y
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
+
 
 class ComTests( CompilerTestCase ):
 	''' lib/windows/com.py's HRESULT/IUnknown pattern -
