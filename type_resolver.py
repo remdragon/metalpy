@@ -9,7 +9,7 @@ from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
 from mpy_types import (
-	CEnum, ClassLike, CStruct, CUnion, Function, Module, Name, Overload,
+	CallableType, CEnum, ClassLike, CStruct, CUnion, Function, Module, Name, Overload,
 	Parameter, RCClass, Scalar, Specialization, TaggedUnion, Type,
 	TypeVar, Variable,
 )
@@ -350,6 +350,17 @@ class TypeResolver:
 		return ( isinstance( t, Specialization )
 			and isinstance( t.base, Scalar )
 			and t.base.stem in ( 'Ptr', 'ConstPtr' ))
+
+	def _callable_type_of( self, t: Type|None ) -> CallableType|None:
+		''' t's own CallableType if t is Ptr[Callable[...]] (a function-
+		pointer value - see PLAN_CALLABLE.md), else None. A bare
+		CallableType (unwrapped by Ptr) never appears as a real value's
+		type - same "always a pointer" rule as every other "address of"
+		result in this language (see ir.FunctionRef's own docstring). '''
+		if not self._is_ptr_specialization( t ):
+			return None
+		inner = t.args[0]
+		return inner if isinstance( inner, CallableType ) else None
 
 	def _is_RC( self, t: Type|None ) -> bool:
 		''' true if `t` is an RCClass, possibly wrapped in a Specialization. '''

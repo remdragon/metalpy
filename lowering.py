@@ -13,6 +13,7 @@ from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
+	CallableType,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -1996,6 +1997,8 @@ class Lowering:
 
 	def _expr_Name( self, node: ast.Name, expected_type: Type|None ) -> ir.Operand:
 		name = self.discovery.find_name( node.id, node )
+		if isinstance( name, Function ):
+			return self._lower_function_ref( name, node )
 		if not isinstance( name, Variable ):
 			self.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
 		self._ensure_resolved( name )
@@ -2008,6 +2011,33 @@ class Lowering:
 			self._emit( ir.CastWrap( dest = dest, operand = name ))
 			return dest
 		return name
+
+	def _lower_function_ref( self, fn: Function, node: ast.AST ) -> ir.Operand:
+		# a bare reference to a function used AS A VALUE, not called - see
+		# PLAN_CALLABLE.md. Only a plain, receiver-less, non-generic,
+		# non-overloaded function can become a Ptr[Callable[...]] value:
+		# a bound instance method or classmethod has an implicit receiver
+		# with nowhere to go in a raw C function pointer (that's a closure,
+		# deliberately out of scope for now - see the plan doc's own
+		# "deferred" list), a generic function has no single fixed
+		# signature to point at (which specialization?), and an overload
+		# group's own individual Functions are ambiguous by name alone
+		if fn.type_params:
+			self.discovery.fail( f'{fn.qualname} is generic - cannot take a bare reference to it: {ast.unparse(node)}', node )
+		if fn.is_overload:
+			self.discovery.fail( f'{fn.qualname} is one of several @overload implementations - cannot take a bare reference to it by name alone: {ast.unparse(node)}', node )
+		if fn.cls is not None and not fn.is_static:
+			self.discovery.fail( f'{fn.qualname} is an instance method or classmethod - cannot take a bare reference to it (no receiver to bind): {ast.unparse(node)}', node )
+		self._ensure_resolved( fn )
+		if fn.parameters is None:
+			self.discovery.fail( f'{fn.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
+		for p in fn.parameters:
+			self.schedule( p.type )
+		self.schedule( fn.return_type )
+		fn_type = self.discovery._get_or_create_callable_type( [ p.type for p in fn.parameters ], fn.return_type )
+		ptr_cls = self.discovery.get_intrinsics()['Ptr']
+		ptr_type = self.discovery._get_or_create_specialization( ptr_cls, [ fn_type ] )
+		return ir.FunctionRef( type = ptr_type, fn = fn )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
 		if expected_type is None:
@@ -3218,6 +3248,43 @@ class Lowering:
 		self._emit( ir.Call( dest = dest, target = dunder, receiver = operand, args = [], kwargs = {} ))
 		return dest
 
+	def _try_lower_indirect_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
+		# eq_fn(a, b) where eq_fn: Ptr[Callable[[A,B],R]] - a call THROUGH a
+		# function-pointer VALUE, not a named Function/method lookup at all
+		# (see PLAN_CALLABLE.md) - _resolve_callee has no way to express
+		# this (it only ever returns a Function/Overload/Specialization/
+		# _ReceiverDispatch, never an arbitrary Operand), so it's
+		# recognized here instead, same "try a shape, None means try the
+		# next one" convention as the construction recognizers above.
+		# Scoped to a bare Name callee for now - the only shape dict[K,V]/
+		# RawDict's own generated code needs (a Ptr[Callable[...]]-typed
+		# PARAMETER called directly); a general expression callee (e.g.
+		# some_struct.get_callback()(...)) would need care to evaluate it
+		# exactly once, deferred until something actually needs it
+		if not isinstance( node.func, ast.Name ):
+			return None
+		name = self.discovery.find_name_or_none( node.func.id )
+		if not isinstance( name, Variable ):
+			return None
+		self._ensure_resolved( name )
+		fn_type = self._type_resolver._callable_type_of( name.type )
+		if fn_type is None:
+			return None
+		if any( isinstance( a, ast.Starred ) for a in node.args ):
+			self.discovery.fail( f'*args not supported yet: {ast.unparse(node)}', node )
+		if node.keywords:
+			self.discovery.fail( f'a Callable[...] call takes no keyword arguments: {ast.unparse(node)}', node )
+		if len( node.args ) != len( fn_type.arg_types ):
+			self.discovery.fail(
+				f'{node.func.id}(...) takes {len(fn_type.arg_types)} argument(s), got {len(node.args)}: {ast.unparse(node)}',
+				node,
+			)
+		target = self._lower_expr( node.func, None )
+		args = [ self._lower_expr( arg_node, arg_type ) for arg_node, arg_type in zip( node.args, fn_type.arg_types ) ]
+		dest = self._new_temp( expected_type or fn_type.return_type )
+		self._emit( ir.CallIndirect( dest = dest, target = target, args = args ))
+		return dest
+
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
 
@@ -3497,6 +3564,7 @@ class Lowering:
 			self._try_lower_allocate_call,
 			self._try_lower_construct_call,
 			self._try_lower_scalar_construct_call,
+			self._try_lower_indirect_call,
 		)
 		for recognizer in construction_recognizers:
 			allocate_dest = recognizer( node, expected_type )

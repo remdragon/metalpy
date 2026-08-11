@@ -19,7 +19,18 @@ class Temp( Value ):
 class Const( Value ):
 	value: bool|int|str|bytes|None # no float type exists in the language today
 
-Operand = Union[ Temp, Const, Variable ] # Variable already covers params/locals/globals via mpy_types
+@dataclass( kw_only = True )
+class FunctionRef( Value ):
+	''' a bare reference to a plain, receiver-less function (free function
+	or @staticmethod) used as a VALUE - see PLAN_CALLABLE.md. .type is
+	always Ptr[CallableType(...)] (never the bare CallableType - a function
+	reference is a pointer, same as every other "address of" operation in
+	this language). Emitted only by lowering.py's _expr_Name (there's no
+	syntax to construct one any other way yet - no lambdas/closures, see
+	the plan doc's own "deferred" list). '''
+	fn: Function
+
+Operand = Union[ Temp, Const, Variable, FunctionRef ] # Variable already covers params/locals/globals via mpy_types
 
 @dataclass( kw_only = True )
 class Instruction:
@@ -310,6 +321,21 @@ class Call( Instruction ):
 			f'Call( dest={self.dest!r}, target={self.target.qualname!r}, receiver={self.receiver!r}, '
 			f'args={self.args!r}, kwargs={self.kwargs!r} )'
 		)
+
+@dataclass( kw_only = True )
+class CallIndirect( Instruction ):
+	''' calling THROUGH a Ptr[Callable[...]]-typed value, as opposed to
+	Call's own "target is a real, named Function" shape - target here is
+	just an Operand (typically a Parameter/Variable holding a function
+	pointer, or a FunctionRef taken and called in the same expression) with
+	no qualname/resolve() of its own to reason about. No kwargs (a
+	CallableType's own shape is purely positional - see PLAN_CALLABLE.md). '''
+	dest: Temp|None
+	target: Operand
+	args: list[Operand]
+
+	def test_repr( self ) -> str:
+		return f'CallIndirect( dest={self.dest!r}, target={self.target!r}, args={self.args!r} )'
 
 @dataclass( kw_only = True )
 class Allocate( Instruction ): # Foo.__allocate__( field = value, ... )
