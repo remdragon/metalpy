@@ -15,6 +15,24 @@ from .__RawDict import RawDict
 class OverflowError: pass
 class ZeroDivisionError: pass
 class IndexError: pass
+class KeyError: pass
+
+# FNV-1a, 64-bit - a plain, fast, deterministic byte hash. Shared by
+# str.__hash__ (below) and dict[K,V]'s own _hash_key (see __init__.py's
+# own dict class further down, PLAN_CALLABLE.md) for any non-RC key type's
+# generic byte-representation hash.
+_FNV_OFFSET_BASIS: u64 = 14695981039346656037
+_FNV_PRIME: u64 = 1099511628211
+
+def _fnv1a_hash( data: ConstPtr[u8], length: usize ) -> u64:
+	h: u64 = _FNV_OFFSET_BASIS
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < length:
+			h = h ^ compiler.cast( u64, data[i] )
+			h = h * _FNV_PRIME
+			i += 1
+	return h
 
 @union
 class Result[T,E]:
@@ -408,6 +426,15 @@ class str:
 
 	def __ne__( self, other: str ) -> bool:
 		return self.__cmp__( other ) != 0
+
+	def __hash__( self ) -> u64:
+		# content-based (never the pointer's own address) - two equal
+		# strings must hash equally regardless of where each one lives, or
+		# dict[K,V] breaks. RC types can't use the generic byte-hash
+		# _fnv1a_hash's other callers rely on (dict[K,V]._hash_key for
+		# non-RC K) - the object's own address isn't meaningful content -
+		# so this is real, type-specific work only str itself can do
+		return _fnv1a_hash( self.get_const_ptr(), self.byte_len() )
 
 	def __lt__( self, other: str ) -> bool:
 		return self.__cmp__( other ) < 0
@@ -900,24 +927,163 @@ def len[T]( t: T ) -> usize:
 	return t.__len__()
 
 class dict[K, V]:
+	''' see PLAN_CALLABLE.md. RawDict (lib/builtins/__RawDict.py) is
+	genuinely type-erased - it never decodes a key_ptr/value_ptr back to a
+	real K/V, never allocates/frees/increfs/decrefs one, never computes a
+	hash. Every method below that branches on compiler.is_rc(K)/
+	compiler.is_rc(V) is a @staticmethod for exactly one reason: _key_eq
+	needs to be referenced BARE (no receiver - see lowering.py's
+	_lower_function_ref) to hand its address to RawDict as a real
+	Ptr[Callable[...]] value, and the helpers it calls (_borrow_key) have
+	to be static too so a bare reference from within a static method can
+	reach them the same way. '''
 	__raw: RawDict
 
 	def __init__( self ) -> None:
 		self.__raw = RawDict()
 
-	def __getitem__( self, key: K ) -> Result[V, KeyError]:
-		h: u64 = hash( key )
-		key_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( key )
+	def __len__( self ) -> usize:
+		return len( self.__raw )
 
-		val_ptr = self.__raw.lookup( h, key_ptr, K.__eq_fn__ ).or_return()
-		return Result.Ok( compiler.reinterpret_cast[V]( val_ptr ) )
+	def __del__( self ) -> None:
+		# RawDict itself owns no K/V-shaped resources (see its own module
+		# docstring) - releasing every stored key/value is entirely
+		# dict[K,V]'s own job, done here directly (not through a callback -
+		# __del__ runs once, in THIS monomorphized class's own code, no
+		# erasure boundary to cross)
+		i: usize = 0
+		with compiler.panic_arithmetic( 'dict.__del__: overflow' ):
+			while i < len( self.__raw ):
+				self._release_key( self.__raw.key_ptr_at( i ))
+				self._release_value( self.__raw.value_ptr_at( i ))
+				i += 1
+
+	# --- key/value ownership - only these know K/V's own RC-ness ---------
+
+	@staticmethod
+	def _owned_value( value_ptr: Ptr[None] ) -> V:
+		# returned OUT to the caller (__getitem__) - an RC value needs its
+		# own incref (the dict's own stored reference stays valid too)
+		if compiler.is_rc( V ):
+			v: V = compiler.cast( V, value_ptr )
+			compiler.incref( v )
+			return v
+		else:
+			ptr: Ptr[V] = compiler.cast( Ptr[V], value_ptr )
+			return ptr[0]
+
+	@staticmethod
+	def _store_key( key: K ) -> Ptr[None]:
+		# an OWNED copy for RawEntry to hold onto indefinitely - an RC key
+		# just gets increfed (the object is already heap-owned, storing
+		# its handle is enough); a value-typed key needs a real heap copy,
+		# since RawEntry can't hold its bytes inline (it works on opaque
+		# Ptr[None], see its own module docstring)
+		if compiler.is_rc( K ):
+			compiler.incref( key )
+			return compiler.cast( Ptr[None], key )
+		else:
+			buf: Ptr[None] = compiler.cast( Ptr[None], sys.alloc[u8]( compiler.sizeof( K )))
+			ptr: Ptr[K] = compiler.cast( Ptr[K], buf )
+			ptr[0] = key
+			return buf
+
+	@staticmethod
+	def _store_value( value: V ) -> Ptr[None]:
+		if compiler.is_rc( V ):
+			compiler.incref( value )
+			return compiler.cast( Ptr[None], value )
+		else:
+			buf: Ptr[None] = compiler.cast( Ptr[None], sys.alloc[u8]( compiler.sizeof( V )))
+			ptr: Ptr[V] = compiler.cast( Ptr[V], buf )
+			ptr[0] = value
+			return buf
+
+	@staticmethod
+	def _release_key( key_ptr: Ptr[None] ) -> None:
+		if compiler.is_rc( K ):
+			existing: K = compiler.cast( K, key_ptr )
+			compiler.decref( existing )
+		else:
+			sys.free( compiler.cast( Ptr[u8], key_ptr ))
+
+	@staticmethod
+	def _release_value( value_ptr: Ptr[None] ) -> None:
+		if compiler.is_rc( V ):
+			existing: V = compiler.cast( V, value_ptr )
+			compiler.decref( existing )
+		else:
+			sys.free( compiler.cast( Ptr[u8], value_ptr ))
+
+	# --- hashing/equality - the only crossing into RawDict's own code ----
+
+	@staticmethod
+	def _key_eq( a: Ptr[None], b: Ptr[None] ) -> bool:
+		# this is the function whose ADDRESS gets handed to RawDict as a
+		# real Ptr[Callable[[Ptr[None],Ptr[None]],bool]] value (see
+		# __getitem__/__setitem__ below) - RawDict calls it deep inside
+		# its own hash-collision scan without ever knowing what K is.
+		# Inlined rather than sharing a _borrow_key helper: a bare call to
+		# a SIBLING static method of this same generic class, from within
+		# another static method (no receiver to pin the class's own type
+		# args), hits a separate, unrelated generic-inference gap - see
+		# lowering.py's _lower_function_ref for the bare-REFERENCE version
+		# of this same class of problem, which IS handled (this method's
+		# own address, taken from __getitem__/__setitem__ below, relies on
+		# exactly that fix)
+		if compiler.is_rc( K ):
+			ka: K = compiler.cast( K, a )
+			kb: K = compiler.cast( K, b )
+			return ka == kb
+		else:
+			pa: Ptr[K] = compiler.cast( Ptr[K], a )
+			pb: Ptr[K] = compiler.cast( Ptr[K], b )
+			return pa[0] == pb[0]
+
+	def _hash_key( self, key: K ) -> u64:
+		if compiler.is_rc( K ):
+			return key.__hash__()
+		else:
+			# a generic byte hash works uniformly for ANY value-typed K
+			# (scalars, or a plain @cstruct of scalars) - equality for
+			# those is fundamentally byte/value-based already. An RC key's
+			# own address isn't meaningful content, so it can't share this
+			# path - see str.__hash__'s own comment
+			with compiler.panic_arithmetic( 'dict._hash_key: address-of overflow' ):
+				ptr: ConstPtr[u8] = compiler.cast( ConstPtr[u8], compiler.addrof( key ))
+			return _fnv1a_hash( ptr, compiler.sizeof( K ))
+
+	def __getitem__( self, key: K ) -> Result[V, KeyError]:
+		h: u64 = self._hash_key( key )
+		# BORROWED search key - taken directly here (not through a sub-
+		# call) so the address stays valid for exactly as long as this
+		# synchronous call needs it, same constraint compiler.addrof(...)
+		# already documents (bare local variable only)
+		key_ptr: Ptr[None] = 0
+		if compiler.is_rc( K ):
+			key_ptr = compiler.cast( Ptr[None], key )
+		else:
+			key_ptr = compiler.cast( Ptr[None], compiler.addrof( key ))
+		entry_idx: usize = self.__raw._find_entry_idx( h, key_ptr, _key_eq ).or_return()
+		return Result.Ok( self._owned_value( self.__raw.value_ptr_at( entry_idx )))
 
 	def __setitem__( self, key: K, value: V ) -> None:
-		h: u64 = hash( key )
-		key_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( key )
-		val_ptr: Ptr[None] = compiler.reinterpret_cast[Ptr[None]]( value )
-
-		self.__raw.insert( h, key_ptr, val_ptr, K.__eq_fn__ )
+		h: u64 = self._hash_key( key )
+		key_ptr: Ptr[None] = 0
+		if compiler.is_rc( K ):
+			key_ptr = compiler.cast( Ptr[None], key )
+		else:
+			key_ptr = compiler.cast( Ptr[None], compiler.addrof( key ))
+		found: Result[usize, KeyError] = self.__raw._find_entry_idx( h, key_ptr, _key_eq )
+		match found:
+			case Result.Ok( entry_idx ):
+				new_value_ptr: Ptr[None] = self._store_value( value )
+				old_value_ptr: Ptr[None] = self.__raw.overwrite_value_at( entry_idx, new_value_ptr )
+				self._release_value( old_value_ptr )
+			case Result.Err( _ ):
+				owned_key_ptr: Ptr[None] = self._store_key( key )
+				owned_value_ptr: Ptr[None] = self._store_value( value )
+				self.__raw.insert_new( h, owned_key_ptr, owned_value_ptr )
 
 # import this at the end because it depends on str etc to already be pre-parsed:
 from .__File import File

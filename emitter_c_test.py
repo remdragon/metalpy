@@ -3233,6 +3233,181 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class DictTests( CompilerTestCase ):
+	''' dict[K,V] (lib/builtins/__init__.py's own dict class + lib/builtins/
+	__RawDict.py's RawDict/RawEntry/RawIndex) end-to-end - see
+	PLAN_CALLABLE.md: the whole point of building Callable[...]/indirect
+	calls was to let RawDict stay genuinely type-erased (never branches on
+	RC-ness, never decodes a key_ptr/value_ptr) while still comparing keys
+	via a real function pointer supplied by the monomorphized dict[K,V].
+	Never compiled anywhere before this. Mirrors ListGenericTests' own
+	import_builtins=True + real compile-and-run convention. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_str_key_insert_and_lookup( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	d[ 'b' ] = 2
+	ra: Result[i32,KeyError] = d.__getitem__( 'a' )
+	rb: Result[i32,KeyError] = d.__getitem__( 'b' )
+	if ra.is_err() or rb.is_err():
+		return 8
+	va: i32 = ra.unwrap( 'missing a' )
+	vb: i32 = rb.unwrap( 'missing b' )
+	with compiler.wrap_arithmetic:
+		diff: i32 = ( va - 1 ) + ( vb - 2 )
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_overwrite_existing_key_replaces_value( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	d[ 'a' ] = 100
+	if d.__len__() != 1:
+		return 1
+	r: Result[i32,KeyError] = d.__getitem__( 'a' )
+	if r.is_err():
+		return 8
+	if r.unwrap( 'missing a' ) != 100:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_missing_key_returns_key_error( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	r: Result[i32,KeyError] = d.__getitem__( 'nope' )
+	if r.is_ok():
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_non_rc_key_i32_with_rc_value_str( self ) -> None:
+		# the other K/V combination - a plain value-typed key (byte-hashed
+		# via _fnv1a_hash, no __hash__ method needed) paired with an RC
+		# value, the mirror image of str-keyed dict[str,i32] above
+		self._run( '''
+def main() -> i32:
+	d: dict[i32, str] = dict[i32, str]()
+	d[ 7 ] = 'seven'
+	d[ 9 ] = 'nine'
+	if d.__len__() != 2:
+		return 1
+	r7: Result[str,KeyError] = d.__getitem__( 7 )
+	r9: Result[str,KeyError] = d.__getitem__( 9 )
+	if r7.is_err() or r9.is_err():
+		return 8
+	if r7.unwrap( 'missing 7' ) != 'seven':
+		return 2
+	if r9.unwrap( 'missing 9' ) != 'nine':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_many_entries_forces_growth_and_stays_correct( self ) -> None:
+		# 50 distinct keys forces list[T]'s own growth (both __entries and
+		# __indices) and exercises RawDict's binary search over a real
+		# range, not just a handful of entries
+		self._run( '''
+def main() -> i32:
+	d: dict[i32, i32] = dict[i32, i32]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 50:
+			key: i32 = compiler.cast( i32, i )
+			val: i32 = key * 2
+			d[ key ] = val
+			i += 1
+	if d.__len__() != 50:
+		return 1
+	j: usize = 0
+	with compiler.wrap_arithmetic:
+		while j < 50:
+			key: i32 = compiler.cast( i32, j )
+			r: Result[i32,KeyError] = d.__getitem__( key )
+			if r.is_err():
+				return 2
+			if r.unwrap( 'x' ) != key * 2:
+				return 3
+			j += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_key_and_rc_value_destruction_does_not_crash( self ) -> None:
+		# str keys AND str values together, insert/overwrite/destroy - a
+		# proxy for correct incref/decref bookkeeping: wrong refcounting
+		# here would double-free or leak, and a double-free would crash
+		# the process (nonzero/abnormal exit), not just misbehave quietly
+		self._run( '''
+def main() -> i32:
+	d: dict[str, str] = dict[str, str]()
+	d[ 'a' ] = 'apple'
+	d[ 'b' ] = 'banana'
+	d[ 'a' ] = 'avocado'
+	r: Result[str,KeyError] = d.__getitem__( 'a' )
+	if r.is_err():
+		return 8
+	if r.unwrap( 'missing a' ) != 'avocado':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never
