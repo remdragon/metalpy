@@ -2395,6 +2395,55 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_erase_does_not_preserve_positional_order( self ) -> None:
+		# list[T]/RawList ports StableIndexVector (see the PLAN doc's own
+		# credit at the top of __list.py) - a swap-and-pop design, not an
+		# insertion-order-preserving one. Its own README says so plainly:
+		# "On deletion, the last element is swapped into the gap." This is
+		# NOT a bug - it's what buys the O(1) erase and the "stable ID
+		# survives other inserts/deletes" guarantee Handle[T] depends on.
+		# This test pins that behavior down with a real compile-and-run so
+		# it can't be "fixed" by accident later: append 10,20,30,40,50 (data
+		# positions 0..4 in insertion order), erase the middle one (30, at
+		# position 2) - if order were preserved, positions 0..3 would read
+		# back 10,20,40,50; instead the LAST element (50) gets swapped into
+		# the vacated slot, giving 10,20,50,40.
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[usize,OverflowError] = x.append( 10 )
+	r1: Result[usize,OverflowError] = x.append( 20 )
+	r2: Result[usize,OverflowError] = x.append( 30 )
+	r3: Result[usize,OverflowError] = x.append( 40 )
+	r4: Result[usize,OverflowError] = x.append( 50 )
+	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
+		return 9
+	id2: usize = r2.unwrap( 'append failed' )
+	er: Result[None,IndexError] = x.erase( id2 )
+	if er.is_err():
+		return 8
+	if x.__len__() != 4:
+		return 1
+	g0: Result[i32,IndexError] = x.get_at( 0 )
+	g1: Result[i32,IndexError] = x.get_at( 1 )
+	g2: Result[i32,IndexError] = x.get_at( 2 )
+	g3: Result[i32,IndexError] = x.get_at( 3 )
+	if g0.is_err() or g1.is_err() or g2.is_err() or g3.is_err():
+		return 7
+	v0: i32 = g0.unwrap( 'x' )
+	v1: i32 = g1.unwrap( 'x' )
+	v2: i32 = g2.unwrap( 'x' )
+	v3: i32 = g3.unwrap( 'x' )
+	if v0 == 10 and v1 == 20 and v2 == 40 and v3 == 50:
+		return 42 # order WAS preserved - contradicts the documented algorithm
+	if v0 == 10 and v1 == 20 and v2 == 50 and v3 == 40:
+		return 0 # swap-and-pop confirmed: last element (50) filled the gap
+	return 99 # neither shape - something else entirely is wrong
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_list_str_construct_append_getitem_del( self ) -> None:
 		# an RC element type - a list[T] slot holds str's own HANDLE
 		# (pointer-width), not its struct body (see list.__init__'s own
