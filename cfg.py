@@ -86,9 +86,10 @@ class Epilogue:
 	list's order/length, which is what lets every block's own recorded
 	depth stay a stable, plain integer even though entries below the top
 	can be cancelled at arbitrary points - see move()/deleted(). '''
-	instructions: list[ir.Instruction]
+	instructions: list[ir.Instruction] # defer/errdefer entries only (flag is not None) - the already-lowered replay body, reused as-is (safe: _replay()'s flag-guarded path mints a fresh skip-label on every call). Plain RC entries leave this empty and use `type` below instead
 	name: str # this entry's own jump target - see current_epilogue_label()/build_epilogue_ladder()
 	operand: Variable | None = None # the RC binding this entry decrefs - None for defer/errdefer entries. Lets return_() skip decref'ing whatever's actually being returned, by identity
+	type: Type | None = None # plain RC entries only - the type to decref `operand` as. Instructions are regenerated fresh from this on every replay (_replay()/unwind_to()) rather than cached: a loop-confined entry can be replayed at more than one emission point (an early return inside the loop while it's still the topmost active entry, or several break/continue in the same loop) before it's ever dropped by restore(), and a cached instruction list would bake in the same tag-gated-decref Label names at every one of those sites - confirmed by a real repro, "redefinition of label" from clang on a loop with two early-return Result checks in a row
 	flag: Variable | None = None
 	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
@@ -200,7 +201,7 @@ class CFGState:
 		self._construction_required = required
 
 	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None ) -> Epilogue:
-		entry = Epilogue( instructions = self._decref_instructions( type_for_decref, operand ), name = self._new_label( 'epilogue' ), operand = operand )
+		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref )
 		self._epilogue_stack.append( entry )
 		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
@@ -576,7 +577,7 @@ class CFGState:
 		for entry in reversed( self._epilogue_stack[snap.stack_depth:] ):
 			if entry.cancelled or entry.is_flag_guarded:
 				continue
-			instructions += entry.instructions
+			instructions += self._decref_instructions( entry.type, entry.operand ) # regenerated fresh, not entry.instructions - see Epilogue.type's docstring
 		return instructions
 
 	def check_loop_exit_unchecked_results( self, entry_results: set[str], ctx: str ) -> None:
@@ -724,7 +725,7 @@ class CFGState:
 		# ladder skips right past it). Called only when actually needed -
 		# is_err() is a real Call, not free
 		if not entry.is_flag_guarded:
-			return entry.instructions
+			return self._decref_instructions( entry.type, entry.operand ) # regenerated fresh, not entry.instructions - see Epilogue.type's docstring
 		skip_label = self._new_label( 'defer_skip' )
 		instructions = [ ir.JumpIfFalse( cond = entry.flag, target = skip_label ) ]
 		if entry.is_err_only:

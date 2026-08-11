@@ -1483,8 +1483,17 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		getattrs = [ i for i in fn.instructions if isinstance( i, ir.GetAttr ) ]
-		self.assertEqual( [ g.attr for g in getattrs ], [ 'tag', 'data', 'v_Ok' ] )
+		# r's own RC tracking (own incref right after construction, own
+		# tag-gated decref at scope exit - correct: MyError is RC, so
+		# Result[i32,MyError] is a real mixed-leaves union, verified with a
+		# real compile+run stress test, not just by this passing) ALSO
+		# shows up as its own tag/data/v_Err GetAttr sequences elsewhere in
+		# the same function now - this test only cares about the match
+		# statement's own tag+payload extraction shape, so check that it
+		# appears as a contiguous run, not that it's the only thing here
+		attrs = [ i.attr for i in fn.instructions if isinstance( i, ir.GetAttr ) ]
+		windows = [ attrs[i:i+3] for i in range( len( attrs ) - 2 ) ]
+		self.assertIn( [ 'tag', 'data', 'v_Ok' ], windows )
 
 	def test_match_wildcard_binds_whole_subject( self ) -> None:
 		code = '\n'.join([

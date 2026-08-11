@@ -791,25 +791,13 @@ class Lowering:
 			self.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
 		fn = self._current_fn
 		var_type = self.discovery.visit( node.annotation )
-		# NOTE: var_type is deliberately left as whatever discovery.visit()
-		# returns (often a bare, un-monomorphized Specialization) rather
-		# than passed through _ensure_resolved() - that looks like a real
-		# gap (cfg.py's rc_leaves() reads a Specialization's abstract
-		# base.attributes, still bare TypeVars, and silently concludes an
-		# annotated local like `x: Result[SomeRCClass,E]` has no RC leaves
-		# at all, skipping its own incref/decref entirely - reproduced
-		# directly with AddressSanitizer) but resolving unconditionally
-		# here regressed several existing, passing tests whose annotations
-		# are still genuinely abstract at this point (a generic method
-		# body's own `res: Foo[T]`, T being the method/class's own
-		# still-unbound type param - ensure_resolved() has no "is this
-		# concrete yet" guard of its own and will monomorphize_class() a
-		# bogus "concrete" Foo[T], caching it under spec.monomorphized as
-		# if T really were a real type). Left as a known gap rather than
-		# risking a wider, under-tested fix here - see the int class
-		# investigation notes (division/unwrap-chaining bugs) for the
-		# narrower, verified fix that was shipped instead (lowering.py's
-		# own Temp-receiver handling for .unwrap()/.unwrap_or()).
+		# var_type starts as whatever discovery.visit() returns - often a
+		# bare, un-monomorphized Specialization - and STAYS that way for
+		# var's own construction/_lower_expr's expected_type below. Fixed
+		# up (see the resolution block after _lower_expr, below) only once
+		# the RHS has actually been lowered, and only when node.value is
+		# real - see that block's own comment for why both restrictions
+		# are load-bearing, not incidental.
 		self.schedule( var_type )
 		var = Variable(
 			stem = node.target.id,
@@ -821,6 +809,52 @@ class Lowering:
 		fn.add_name( var.stem, var )
 		if node.value is not None:
 			operand = self._lower_expr( node.value, var_type )
+			# Only NOW, after the RHS is fully lowered, swap var.type for
+			# its resolved (monomorphized, if a Specialization) form -
+			# ensure_resolved()'s own contract: "the SINGLE place a
+			# Specialization gets swapped for the real, substituted thing
+			# it stands in for - every caller MUST use the returned value,
+			# or they see the abstract, unsubstituted base instead"
+			# (Specialization.names/.resolve are raw passthroughs to it).
+			# var.type staying an unresolved Specialization here is a real
+			# gap: cfg.py's rc_leaves() reads a Specialization's ABSTRACT
+			# base.attributes (still bare TypeVars for a generic union like
+			# Result[T,E]) and silently concludes an annotated local like
+			# `x: Result[SomeRCClass,E]` has no RC leaves at all, skipping
+			# its own incref/decref entirely - confirmed directly with
+			# AddressSanitizer, not just reasoning.
+			#
+			# Both restrictions below are load-bearing, found by real
+			# regressions, not just caution:
+			#
+			# 1. Resolving BEFORE lowering the RHS (i.e. swapping var_type
+			# up front and reusing it for _lower_expr's own expected_type)
+			# regressed a real, unrelated bug into existence: for a
+			# generic RCClass's own construction (`b: Box[i32] = Box(1)`),
+			# eagerly monomorphizing Box[i32] here - before Box(1)'s own
+			# construction-call lowering has had a chance to monomorphize
+			# Box.__init__[i32] itself the ordinary way - raced it, and
+			# the copy built here cached a version of Box.__init__[i32]
+			# whose own `self` parameter was left typed as the abstract
+			# Box[T] instead of the concrete Box[i32], which then got
+			# scheduled as a bogus extra "Box[Box.T]" compile unit
+			# (confirmed with a real repro against compiler.rcclasses,
+			# not just a hunch). Resolving only after the RHS's own
+			# construction-call machinery has already run first sidesteps
+			# it - the resolution here then just reads back whatever it
+			# already correctly cached (monomorphized_function's own
+			# spec.monomorphized memoization), never racing it.
+			#
+			# 2. Only when node.value is not None (this whole branch) -
+			# skipped for a bare declaration (`c: Box[u32]`, assigned via
+			# a later, ordinary Assign statement, not this one) since
+			# there's no RHS lowering here to resolve after in the first
+			# place, and deferring is always safe: whatever later
+			# statement actually assigns/uses c triggers its own
+			# resolution through the ordinary paths (e.g. _attr_lookup's
+			# own _ensure_resolved call), same as it always has.
+			if self._monomorphizer._is_concrete( var_type ):
+				var.type = self._ensure_resolved( var_type )
 			for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value ), node = node ):
 				self._emit( instr )
 			self._emit( ir.Assign( dest = var, src = operand ))
