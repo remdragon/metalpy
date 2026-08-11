@@ -376,6 +376,47 @@ class AddrOf( Instruction ): # compiler.addrof(x) - yields &x, x a local variabl
 	def test_repr( self ) -> str:
 		return f'AddrOf( dest={self.dest!r}, value={self.value!r} )'
 
+class AtomicRMWOp( Enum ): # compiler.atomic_add/atomic_sub/atomic_exchange - fetch-and-op, dest gets the value BEFORE the op
+	ADD = 'add'
+	SUB = 'sub'
+	EXCHANGE = 'exchange'
+
+@dataclass( kw_only = True )
+class AtomicLoad( Instruction ): # compiler.atomic_load(ptr) - ptr: Ptr[T], T a scalar (see lowering.py's _lower_compiler_atomic_load)
+	dest: Temp
+	ptr: Operand
+
+	def test_repr( self ) -> str:
+		return f'AtomicLoad( dest={self.dest!r}, ptr={self.ptr!r} )'
+
+@dataclass( kw_only = True )
+class AtomicStore( Instruction ): # compiler.atomic_store(ptr, val)
+	ptr: Operand
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'AtomicStore( ptr={self.ptr!r}, value={self.value!r} )'
+
+@dataclass( kw_only = True )
+class AtomicRMW( Instruction ): # compiler.atomic_add/atomic_sub/atomic_exchange(ptr, val)
+	dest: Temp
+	op: AtomicRMWOp
+	ptr: Operand
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'AtomicRMW( dest={self.dest!r}, op={self.op!r}, ptr={self.ptr!r}, value={self.value!r} )'
+
+@dataclass( kw_only = True )
+class AtomicCompareExchange( Instruction ): # compiler.atomic_compare_exchange(ptr, expected, desired) -> bool - C11 strong CAS; *expected is updated to the current value on failure
+	dest: Temp
+	ptr: Operand
+	expected: Operand # Ptr[T] - the lvalue C11 atomic_compare_exchange_strong writes the actual current value into on failure
+	desired: Operand
+
+	def test_repr( self ) -> str:
+		return f'AtomicCompareExchange( dest={self.dest!r}, ptr={self.ptr!r}, expected={self.expected!r}, desired={self.desired!r} )'
+
 @dataclass( kw_only = True )
 class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no field-layout
 	# algorithm exists in this compiler (nor should one - that's the C

@@ -1164,6 +1164,31 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.RefCount ):
 		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.value)})->$header.ref_count;' ]
 
+	if isinstance( instr, ir.AtomicLoad ):
+		# cast at the point of use rather than requiring the pointee's own
+		# declared storage to be _Atomic-qualified - lowering.py's
+		# _atomic_pointee_type already guarantees instr.ptr.type is Ptr[T]
+		# with T a plain scalar
+		pointee_c_type = c_type( instr.ptr.type.args[0] )
+		return [ f'\t{_emit_operand(instr.dest)} = atomic_load((_Atomic({pointee_c_type})*){_emit_operand(instr.ptr)});' ]
+	if isinstance( instr, ir.AtomicStore ):
+		pointee_c_type = c_type( instr.ptr.type.args[0] )
+		return [ f'\tatomic_store((_Atomic({pointee_c_type})*){_emit_operand(instr.ptr)}, {_emit_operand(instr.value)});' ]
+	if isinstance( instr, ir.AtomicRMW ):
+		pointee_c_type = c_type( instr.ptr.type.args[0] )
+		fn_name = { ir.AtomicRMWOp.ADD: 'atomic_fetch_add', ir.AtomicRMWOp.SUB: 'atomic_fetch_sub', ir.AtomicRMWOp.EXCHANGE: 'atomic_exchange' }[instr.op]
+		return [ f'\t{_emit_operand(instr.dest)} = {fn_name}((_Atomic({pointee_c_type})*){_emit_operand(instr.ptr)}, {_emit_operand(instr.value)});' ]
+	if isinstance( instr, ir.AtomicCompareExchange ):
+		# expected stays a plain T* (not _Atomic-cast) - that's what C11's
+		# own atomic_compare_exchange_strong signature expects for its
+		# second parameter, only the first (the atomic object itself) gets
+		# the _Atomic(T)* cast
+		pointee_c_type = c_type( instr.ptr.type.args[0] )
+		return [
+			f'\t{_emit_operand(instr.dest)} = atomic_compare_exchange_strong('
+			f'(_Atomic({pointee_c_type})*){_emit_operand(instr.ptr)}, {_emit_operand(instr.expected)}, {_emit_operand(instr.desired)});'
+		]
+
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
 			# routed through sys.alloc[cls] - the SAME allocation path

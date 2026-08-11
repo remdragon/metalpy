@@ -2373,6 +2373,117 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'takes exactly one argument', self.discovery.errors.errors[0] )
 
+	# --- compiler.atomic_*(ptr, ...) -----------------------------------------
+
+	def test_compiler_atomic_load_emits_atomicload_instruction( self ) -> None:
+		code = '\n'.join([
+			'import sys',
+			'def main() -> i32:',
+			'	p: Ptr[i32] = sys.alloc[i32]( 1 )',
+			'	return compiler.atomic_load( p )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		loads = [ i for i in fn.instructions if isinstance( i, ir.AtomicLoad ) ]
+		self.assertEqual( len( loads ), 1 )
+		i32 = self.discovery.get_intrinsics()['i32']
+		self.assertEqual( loads[0].dest.type, i32 )
+
+	def test_compiler_atomic_store_emits_atomicstore_instruction( self ) -> None:
+		code = '\n'.join([
+			'import sys',
+			'def main() -> None:',
+			'	p: Ptr[i32] = sys.alloc[i32]( 1 )',
+			'	compiler.atomic_store( p, 5 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		stores = [ i for i in fn.instructions if isinstance( i, ir.AtomicStore ) ]
+		self.assertEqual( len( stores ), 1 )
+		self.assertEqual( stores[0].value.value, 5 )
+
+	def test_compiler_atomic_add_emits_atomicrmw_add( self ) -> None:
+		code = '\n'.join([
+			'import sys',
+			'def main() -> i32:',
+			'	p: Ptr[i32] = sys.alloc[i32]( 1 )',
+			'	return compiler.atomic_add( p, 1 )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		rmws = [ i for i in fn.instructions if isinstance( i, ir.AtomicRMW ) ]
+		self.assertEqual( len( rmws ), 1 )
+		self.assertEqual( rmws[0].op, ir.AtomicRMWOp.ADD )
+
+	def test_compiler_atomic_sub_and_exchange_use_distinct_ops( self ) -> None:
+		code = '\n'.join([
+			'import sys',
+			'def main() -> i32:',
+			'	p: Ptr[i32] = sys.alloc[i32]( 1 )',
+			'	a: i32 = compiler.atomic_sub( p, 1 )',
+			'	b: i32 = compiler.atomic_exchange( p, 2 )',
+			'	return a',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		rmws = [ i for i in fn.instructions if isinstance( i, ir.AtomicRMW ) ]
+		self.assertEqual( [ r.op for r in rmws ], [ ir.AtomicRMWOp.SUB, ir.AtomicRMWOp.EXCHANGE ] )
+
+	def test_compiler_atomic_compare_exchange_emits_instruction( self ) -> None:
+		code = '\n'.join([
+			'import sys',
+			'def main() -> bool:',
+			'	p: Ptr[i32] = sys.alloc[i32]( 1 )',
+			'	expected: Ptr[i32] = sys.alloc[i32]( 1 )',
+			'	return compiler.atomic_compare_exchange( p, expected, 5 )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		cas = [ i for i in fn.instructions if isinstance( i, ir.AtomicCompareExchange ) ]
+		self.assertEqual( len( cas ), 1 )
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		self.assertEqual( cas[0].dest.type, bool_cls )
+
+	def test_compiler_atomic_on_non_pointer_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 1',
+			'	return compiler.atomic_load( x )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'must be Ptr[T]', self.discovery.errors.errors[0] )
+
+	def test_compiler_atomic_on_rc_pointee_is_a_compile_error( self ) -> None:
+		# the lock-free-RC rabbit hole this deliberately stays out of - see
+		# the plan's own Context section
+		code = '\n'.join([
+			'class Foo: pass',
+			'import sys',
+			'def main() -> None:',
+			'	p: Ptr[Foo] = sys.alloc[Foo]( 1 )',
+			'	compiler.atomic_load( p )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'plain scalar', self.discovery.errors.errors[0] )
+
+	def test_compiler_atomic_load_wrong_arg_count_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	return compiler.atomic_load()',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'takes exactly one argument', self.discovery.errors.errors[0] )
+
 	def test_compiler_incref_emits_incref_instruction( self ) -> None:
 		code = '\n'.join([
 			'class Foo: pass',

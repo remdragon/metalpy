@@ -3384,6 +3384,149 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class AtomicRealCompileTests( CompilerTestCase ):
+	''' real compile+run coverage for compiler.atomic_*(Ptr[T], ...)
+	(lowering.py's _lower_compiler_atomic_*, ir.py's Atomic* instructions,
+	emitter_c.py's stdatomic.h-based codegen) and lib/atomic.py's Atomic[T]
+	wrapper built on top of them. Single-threaded correctness only here -
+	a real multi-threaded stress test lands once Phase 3 (Thread) exists. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_load_store_add_sub_exchange_round_trip( self ) -> None:
+		self._run( '''
+import sys
+
+def main() -> i32:
+	p: Ptr[i32] = sys.alloc[i32]( 1 )
+	compiler.atomic_store( p, 10 )
+	if compiler.atomic_load( p ) != 10:
+		return 1
+	old: i32 = compiler.atomic_add( p, 5 )
+	if old != 10 or compiler.atomic_load( p ) != 15:
+		return 2
+	old = compiler.atomic_sub( p, 3 )
+	if old != 15 or compiler.atomic_load( p ) != 12:
+		return 3
+	old = compiler.atomic_exchange( p, 100 )
+	if old != 12 or compiler.atomic_load( p ) != 100:
+		return 4
+	sys.free( p )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_compare_exchange_success_and_failure( self ) -> None:
+		self._run( '''
+import sys
+
+def main() -> i32:
+	p: Ptr[i32] = sys.alloc[i32]( 1 )
+	compiler.atomic_store( p, 15 )
+	expected: Ptr[i32] = sys.alloc[i32]( 1 )
+	expected[0] = 15
+	if not compiler.atomic_compare_exchange( p, expected, 100 ):
+		return 1
+	if compiler.atomic_load( p ) != 100:
+		return 2
+	# stale expected - must fail and be updated to the real current value
+	expected[0] = 15
+	if compiler.atomic_compare_exchange( p, expected, 999 ):
+		return 3
+	if expected[0] != 100:
+		return 4
+	if compiler.atomic_load( p ) != 100:
+		return 5
+	sys.free( p )
+	sys.free( expected )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_atomic_wrapper_i32_and_bool( self ) -> None:
+		self._run( '''
+import atomic
+
+def main() -> i32:
+	a: atomic.Atomic[i32] = atomic.Atomic[i32]( 5 )
+	if a.load() != 5:
+		return 1
+	old: i32 = a.fetch_add( 10 )
+	if old != 5 or a.load() != 15:
+		return 2
+	old = a.fetch_sub( 5 )
+	if old != 15 or a.load() != 10:
+		return 3
+	old = a.exchange( 42 )
+	if old != 10 or a.load() != 42:
+		return 4
+
+	b: atomic.Atomic[bool] = atomic.Atomic[bool]( False )
+	if b.load():
+		return 5
+	b.store( True )
+	if not b.load():
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_atomic_wrapper_compare_exchange( self ) -> None:
+		self._run( '''
+import atomic
+import sys
+
+def main() -> i32:
+	a: atomic.Atomic[usize] = atomic.Atomic[usize]( 7 )
+	expected: Ptr[usize] = sys.alloc[usize]( 1 )
+	expected[0] = 7
+	if not a.compare_exchange( expected, 200 ):
+		return 1
+	if a.load() != 200:
+		return 2
+	sys.free( expected )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class StrFindIndexSplitTests( CompilerTestCase ):
 	''' str.find()/str.index()/str.split() (lib/builtins/__init__.py) -
 	both listed missing in TODO.txt, implemented as real general-purpose

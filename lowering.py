@@ -1126,6 +1126,9 @@ class Lowering:
 		if self._is_compiler_call( node.value ) == 'incref':
 			self._lower_compiler_incref( node.value )
 			return
+		if self._is_compiler_call( node.value ) == 'atomic_store':
+			self._lower_compiler_atomic_store( node.value )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -1305,7 +1308,85 @@ class Lowering:
 		dest = self._new_temp( expected_type or ptr_type )
 		self._emit( ir.AddrOf( dest = dest, value = value ))
 		return dest
-	
+
+	def _atomic_pointee_type( self, ptr_type: Type|None, node: ast.AST ) -> Type:
+		# shared by every compiler.atomic_*(ptr, ...) intrinsic - ptr must be
+		# Ptr[T] (not ConstPtr[T]: every op here either writes through the
+		# pointer, or (atomic_load) is only meaningful on a location another
+		# thread can concurrently write - a genuinely immutable location
+		# needs no atomic access at all) with T a plain scalar. RC types are
+		# rejected deliberately: atomically swapping an RC pointer without
+		# incref/decref bookkeeping is exactly the lock-free-RC rabbit hole
+		# this intentionally stays out of (see the plan's own Context).
+		if not ( isinstance( ptr_type, Specialization ) and isinstance( ptr_type.base, Scalar ) and ptr_type.base.stem == 'Ptr' ):
+			self.discovery.fail( f'compiler.atomic_*(...) argument must be Ptr[T]: {ast.unparse(node)}', node )
+		pointee = ptr_type.args[0]
+		if not isinstance( pointee, Scalar ):
+			self.discovery.fail(
+				f'compiler.atomic_*(...) argument must point to a plain scalar, not '
+				f'{pointee.qualname if pointee else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		return pointee
+
+	def _lower_compiler_atomic_load( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.atomic_load(...) takes exactly one argument: {ast.unparse(node)}', node )
+		ptr = self._lower_expr( node.args[0], None )
+		pointee = self._atomic_pointee_type( ptr.type, node )
+		dest = self._new_temp( expected_type or pointee )
+		self._emit( ir.AtomicLoad( dest = dest, ptr = ptr ))
+		return dest
+
+	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
+		# statement-only (see _stmt_Expr's own dispatch) - mirrors
+		# compiler.incref/decref: no return value, nothing to hand back to
+		# an expression context
+		if len( node.args ) != 2 or node.keywords:
+			self.discovery.fail( f'compiler.atomic_store(...) takes exactly two arguments: {ast.unparse(node)}', node )
+		ptr = self._lower_expr( node.args[0], None )
+		pointee = self._atomic_pointee_type( ptr.type, node )
+		value = self._lower_expr( node.args[1], pointee )
+		self._emit( ir.AtomicStore( ptr = ptr, value = value ))
+
+	def _lower_compiler_atomic_rmw( self, node: ast.Call, expected_type: Type|None, op: ir.AtomicRMWOp ) -> ir.Operand:
+		# shared by atomic_add/atomic_sub/atomic_exchange - same shape
+		# (ptr, val), dest gets the value from BEFORE the op (C11
+		# atomic_fetch_add/sub/exchange's own convention)
+		if len( node.args ) != 2 or node.keywords:
+			self.discovery.fail( f'compiler.atomic_{op.value}(...) takes exactly two arguments: {ast.unparse(node)}', node )
+		ptr = self._lower_expr( node.args[0], None )
+		pointee = self._atomic_pointee_type( ptr.type, node )
+		value = self._lower_expr( node.args[1], pointee )
+		dest = self._new_temp( expected_type or pointee )
+		self._emit( ir.AtomicRMW( dest = dest, op = op, ptr = ptr, value = value ))
+		return dest
+
+	def _lower_compiler_atomic_compare_exchange( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# C11 strong CAS: ptr, expected: Ptr[T], desired -> bool. On
+		# failure *expected is written with the actual current value - that
+		# side effect happens through `expected` itself (an ordinary Ptr[T]
+		# the caller already owns), nothing more to hand back for it here
+		if len( node.args ) != 3 or node.keywords:
+			self.discovery.fail(
+				f'compiler.atomic_compare_exchange(...) takes exactly three arguments (ptr, expected, desired): {ast.unparse(node)}',
+				node,
+			)
+		ptr = self._lower_expr( node.args[0], None )
+		pointee = self._atomic_pointee_type( ptr.type, node )
+		expected = self._lower_expr( node.args[1], None )
+		expected_pointee = self._atomic_pointee_type( expected.type, node )
+		if expected_pointee is not pointee:
+			self.discovery.fail(
+				f'compiler.atomic_compare_exchange(...): ptr and expected must point to the same type: {ast.unparse(node)}',
+				node,
+			)
+		desired = self._lower_expr( node.args[2], pointee )
+		bool_cls = self.discovery.find_name( 'bool', node )
+		dest = self._new_temp( expected_type or bool_cls )
+		self._emit( ir.AtomicCompareExchange( dest = dest, ptr = ptr, expected = expected, desired = desired ))
+		return dest
+
 
 	def _eval_cexpr( self, expr: str, header: str, node: ast.AST ) -> int:
 		import hashlib
@@ -3748,6 +3829,25 @@ class Lowering:
 				result = self._lower_compiler_addrof( node, expected_type )
 				return result if want_result else None
 
+			case 'atomic_load':
+				result = self._lower_compiler_atomic_load( node, expected_type )
+				return result if want_result else None
+
+			case 'atomic_add':
+				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.ADD )
+				return result if want_result else None
+
+			case 'atomic_sub':
+				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.SUB )
+				return result if want_result else None
+
+			case 'atomic_exchange':
+				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.EXCHANGE )
+				return result if want_result else None
+
+			case 'atomic_compare_exchange':
+				result = self._lower_compiler_atomic_compare_exchange( node, expected_type )
+				return result if want_result else None
 
 			case 'cexpr':
 				result = self._lower_compiler_cexpr( node, expected_type )
