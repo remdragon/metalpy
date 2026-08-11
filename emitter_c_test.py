@@ -2492,6 +2492,57 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_append_after_erase_reissues_a_live_id( self ) -> None:
+		# a separate, more serious bug found while investigating order
+		# preservation (unrelated to swap-vs-shift): RawList._get_free_id
+		# always returns __len (see its own comment: "for simplicity in
+		# this initial implementation, ID == __len always" - a known,
+		# flagged simplification). __len SHRINKS on erase, so the next
+		# append after an erase can hand out an id that's still held by a
+		# live element: append 10,20,30,40,50 (ids 0..4), erase id 2 (30) -
+		# len drops to 4, and the swap repoints id 4 (50) at its new
+		# position - then append 60: _get_free_id() returns __len == 4,
+		# the SAME id already in use by 50. The new append's `__indexes[4]
+		# = __len` silently overwrites 50's index entry, so id 4 now
+		# resolves to 60 - 50 becomes an orphaned zombie slot (still
+		# physically present, still visited by positional iteration,
+		# permanently unreachable by id) until some later erase happens to
+		# swap over it.
+		self._run( '''
+def main() -> i32:
+	x: list[i32] = list[i32]()
+	r0: Result[usize,OverflowError] = x.append( 10 )
+	r1: Result[usize,OverflowError] = x.append( 20 )
+	r2: Result[usize,OverflowError] = x.append( 30 )
+	r3: Result[usize,OverflowError] = x.append( 40 )
+	r4: Result[usize,OverflowError] = x.append( 50 )
+	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
+		return 9
+	id2: usize = r2.unwrap( 'append failed' )
+	id4: usize = r4.unwrap( 'append failed' )
+	er: Result[None,IndexError] = x.erase( id2 )
+	if er.is_err():
+		return 8
+	r5: Result[usize,OverflowError] = x.append( 60 )
+	if r5.is_err():
+		return 7
+	id5: usize = r5.unwrap( 'append failed' )
+	if id5 != id4:
+		return 50 # ids came out distinct - no collision (would mean this bug is already fixed)
+	g4: Result[i32,IndexError] = x.__getitem__( id4 )
+	if g4.is_err():
+		return 6
+	v4: i32 = g4.unwrap( 'x' )
+	if v4 == 60:
+		return 0 # confirmed: id4 now silently resolves to the NEW element, not the original 50
+	if v4 == 50:
+		return 51 # original element somehow still reachable - not what the trace predicts
+	return 99
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_list_str_construct_append_getitem_del( self ) -> None:
 		# an RC element type - a list[T] slot holds str's own HANDLE
 		# (pointer-width), not its struct body (see list.__init__'s own
