@@ -8,7 +8,7 @@ from .__fastlist import FastList
 from .__int import int, IntError
 from .__list import list, UnsafeList
 from .__RawDict import RawDict
-from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp
+from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
 # SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
@@ -1027,6 +1027,124 @@ class str:
 		out_size: usize = 0
 		out_buf: Ptr[u8] = case_map( self.get_const_ptr(), self.byte_len(), False, compiler.addrof( out_size ))
 		return str._from_owned_cstr( out_buf, out_size ).unwrap( 'invalid UTF-8 produced by case_map' )
+
+	def swapcase( self ) -> str:
+		''' every cased codepoint flipped (upper<->lower), every uncased
+		codepoint unchanged - matches Python's str.swapcase() for the
+		common one-codepoint-in/one-codepoint-out case. A genuine one-to-
+		many case expansion (German ß uppercasing to "SS") isn't
+		supported: __str.py's case_map_one always maps exactly one
+		codepoint to exactly one codepoint (see its own comment) - the
+		same ceiling upper()/lower()'s own per-codepoint POSIX path
+		already has. Two-pass (size, then fill), same shape case_map
+		itself uses. '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return str( self )
+		new_size: usize = 1 # zero terminator
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				mapped: u32 = cp
+				if is_upper_cp( cp ):
+					mapped = case_map_one( cp, False )
+				elif is_lower_cp( cp ):
+					mapped = case_map_one( cp, True )
+				new_size += utf8_encoded_len( mapped )
+				i += consumed
+
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		out_i: usize = 0
+		i = 0
+		with compiler.wrap_arithmetic:
+			while i < self_len:
+				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				mapped = cp
+				if is_upper_cp( cp ):
+					mapped = case_map_one( cp, False )
+				elif is_lower_cp( cp ):
+					mapped = case_map_one( cp, True )
+				out_i += encode_utf8_at( new_buf, out_i, mapped )
+				i += consumed
+		new_buf[out_i] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in swapcase' )
+
+	def title( self ) -> str:
+		''' the first codepoint of every alphabetic run uppercased, every
+		other alphabetic codepoint lowercased, non-alphabetic codepoints
+		unchanged - matches Python's str.title() (word boundaries are
+		transitions into/out of an alphabetic run, not whitespace
+		specifically - Python's own "they're bill's".title() ==
+		"They'Re Bill'S", apostrophes aren't word characters, and neither
+		are they here). Same one-to-many case-expansion ceiling
+		swapcase() above has. '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return str( self )
+		new_size: usize = 1 # zero terminator
+		i: usize = 0
+		consumed: usize = 0
+		prev_alpha: bool = False
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				mapped: u32 = cp
+				if is_alpha_cp( cp ):
+					mapped = case_map_one( cp, not prev_alpha )
+					prev_alpha = True
+				else:
+					prev_alpha = False
+				new_size += utf8_encoded_len( mapped )
+				i += consumed
+
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		out_i: usize = 0
+		i = 0
+		prev_alpha = False
+		with compiler.wrap_arithmetic:
+			while i < self_len:
+				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				mapped = cp
+				if is_alpha_cp( cp ):
+					mapped = case_map_one( cp, not prev_alpha )
+					prev_alpha = True
+				else:
+					prev_alpha = False
+				out_i += encode_utf8_at( new_buf, out_i, mapped )
+				i += consumed
+		new_buf[out_i] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in title' )
+
+	def istitle( self ) -> bool:
+		''' True if every uppercase codepoint follows an uncased
+		codepoint and every lowercase codepoint follows a cased one, with
+		at least one cased codepoint present - matches Python's
+		str.istitle() (False for an empty string or an all-uncased
+		string). '''
+		self_len: usize = self.byte_len()
+		i: usize = 0
+		consumed: usize = 0
+		prev_cased: bool = False
+		saw_cased: bool = False
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if is_upper_cp( cp ):
+					if prev_cased:
+						return False
+					prev_cased = True
+					saw_cased = True
+				elif is_lower_cp( cp ):
+					if not prev_cased:
+						return False
+					prev_cased = True
+					saw_cased = True
+				else:
+					prev_cased = False
+				i += consumed
+		return saw_cased
 
 	@private
 	@staticmethod

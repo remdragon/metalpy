@@ -4861,6 +4861,116 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class StrPhase4CaseCompositeTests( CompilerTestCase ):
+	''' Phase 4 of TODO.txt's str-methods plan: swapcase()/title()/
+	istitle() (lib/builtins/__init__.py), built on __str.py's new
+	case_map_one primitive (a real, new small-buffer LCMapStringEx call on
+	Windows - swapcase()'s own Windows path is the one genuinely new piece
+	of Win32 plumbing in this whole plan, so it gets its own explicit
+	test, not just incidental coverage through title()). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_swapcase_ascii( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if 'Hello World'.swapcase() != 'hELLO wORLD':
+		return 1
+	if '12345'.swapcase() != '12345':
+		return 2
+	if ''.swapcase() != '':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_swapcase_non_ascii( self ) -> None:
+		# exercises the new per-codepoint Windows LCMapStringEx path
+		# (case_map_one) directly - the one genuinely new piece of Win32
+		# plumbing this whole phase adds
+		self._run( '''
+def main() -> i32:
+	if 'café'.swapcase() != 'CAFÉ':
+		return 1
+	if 'ÉCOLE'.swapcase() != 'école':
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_title( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if 'hello world'.title() != 'Hello World':
+		return 1
+	if "they're bill's".title() != "They'Re Bill'S":
+		return 2
+	if ''.title() != '':
+		return 3
+	if 'ALREADY UPPER'.title() != 'Already Upper':
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_istitle( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'Hello World'.istitle():
+		return 1
+	if 'Hello world'.istitle():
+		return 2
+	if 'HELLO WORLD'.istitle():
+		return 3
+	if ''.istitle():
+		return 4
+	if '123'.istitle():
+		return 5
+	if not 'Abc123'.istitle():
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class EarlyReturnFromLoopWithLiveRCLocalTests( CompilerTestCase ):
 	''' cfg.py's current_epilogue_label() shared-ladder optimization used to
 	assume every entry on the epilogue stack survives to the function's own

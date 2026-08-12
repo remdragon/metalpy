@@ -395,3 +395,69 @@ def is_printable_cp( cp: u32 ) -> bool:
 	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
 		wc: i32 = i32( cp )
 	return iswprint_l( wc, loc ) != 0
+
+# ---------------------------------------------------------------------------
+# per-codepoint case mapping - str.swapcase()/title()/istitle() (see
+# __init__.py's str class, TODO.txt's str-methods plan). Unlike case_map
+# above (one direction applied to a WHOLE buffer at once - all of it goes
+# upper, or all of it goes lower), swapcase()/title() each need a
+# DIFFERENT direction chosen per codepoint, so case_map's own whole-buffer
+# LCMapStringEx call can't be reused directly on Windows - this is its
+# single-codepoint sibling. Always maps exactly one codepoint to exactly
+# one codepoint: a genuine one-to-many case expansion (German ß
+# uppercasing to "SS") isn't representable through a u32 -> u32 signature,
+# the same ceiling upper()/lower()'s own per-codepoint POSIX path
+# (towupper_l/towlower_l) already has - documented, not a bug.
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'windows' )
+def case_map_one( cp: u32, is_upper: bool ) -> u32:
+	''' single-codepoint case mapping via LCMapStringEx - same UTF-8-
+	>UTF-16->LCMapStringEx->UTF-8 pipeline as case_map's own Windows path
+	and _char_type_windows above, just scoped to one codepoint in both
+	directions (the reverse WideCharToMultiByte + decode_utf8_at step is
+	new here - case_map's own whole-buffer path never needed to decode
+	its OWN output back into a codepoint, only str.py's _from_owned_cstr
+	needed the raw bytes). '''
+	from windows.kernel32 import MultiByteToWideChar, WideCharToMultiByte, LCMapStringEx, CP_UTF8, LCMAP_LINGUISTIC_CASING, LCMAP_UPPERCASE, LCMAP_LOWERCASE
+	flags: u32 = LCMAP_UPPERCASE if is_upper else LCMAP_LOWERCASE
+
+	buf8: Ptr[u8] = sys.alloc[u8]( 4 )
+	defer( sys.free( buf8 ))
+	n: usize = encode_utf8_at( buf8, 0, cp )
+	with compiler.panic_arithmetic( 'a single encoded codepoint always fits in i32' ):
+		n_i32: i32 = i32( n )
+	wide: Ptr[u16] = sys.alloc[u16]( 4 )
+	defer( sys.free( wide ))
+	wide_len: i32 = MultiByteToWideChar( CP_UTF8, 0, buf8, n_i32, wide, 4 )
+	if wide_len <= 0:
+		sys.panic( 'MultiByteToWideChar failed mapping a single codepoint' )
+
+	empty_locale: u16 = 0
+	map_flags: u32 = flags | LCMAP_LINGUISTIC_CASING
+	mapped: Ptr[u16] = sys.alloc[u16]( 4 )
+	defer( sys.free( mapped ))
+	mapped_len: i32 = LCMapStringEx( compiler.addrof( empty_locale ), map_flags, wide, wide_len, mapped, 4, None, None, 0 )
+	if mapped_len <= 0:
+		sys.panic( 'LCMapStringEx failed mapping a single codepoint' )
+
+	out8: Ptr[u8] = sys.alloc[u8]( 8 )
+	defer( sys.free( out8 ))
+	out_len: i32 = WideCharToMultiByte( CP_UTF8, 0, mapped, mapped_len, out8, 8, None, None )
+	if out_len <= 0:
+		sys.panic( 'WideCharToMultiByte failed mapping a single codepoint' )
+	consumed: usize = 0
+	return decode_utf8_at( out8, 0, compiler.addrof( consumed ))
+
+@compiler.target( os = not 'windows' )
+def case_map_one( cp: u32, is_upper: bool ) -> u32:
+	''' towupper_l/towlower_l are already single-codepoint-in/single-
+	codepoint-out, so this is a thin wrapper opening its own locale (same
+	per-call convention every is_*_cp primitive above already uses)
+	around the existing _case_codepoint_posix. '''
+	from crt import newlocale, freelocale, LC_CTYPE_MASK
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return cp
+	defer( freelocale( loc ))
+	return _case_codepoint_posix( cp, is_upper, loc )
