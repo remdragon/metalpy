@@ -2,6 +2,7 @@ from codecs import Codec, CodecError
 from codecs.utf8 import utf8
 import compiler
 import sys
+import threading
 from .__errors import OSError
 from .__fastlist import FastList
 from .__int import int, IntError, DivMod
@@ -962,7 +963,7 @@ def ord( s: str ) -> u32:
 		sys.panic( 'ord(): expected a string of length 1, got a longer string' )
 	return cp
 
-class dict[K, V]:
+class UnsafeDict[K, V]:
 	''' see PLAN_CALLABLE.md. RawDict (lib/builtins/__RawDict.py) is
 	genuinely type-erased - it never decodes a key_ptr/value_ptr back to a
 	real K/V, never allocates/frees/increfs/decrefs one, never computes a
@@ -972,7 +973,13 @@ class dict[K, V]:
 	_lower_function_ref) to hand its address to RawDict as a real
 	Ptr[Callable[...]] value, and the helpers it calls (_borrow_key) have
 	to be static too so a bare reference from within a static method can
-	reach them the same way. '''
+	reach them the same way.
+
+	UnsafeDict[K,V]: thin type-safe wrapper over RawDict - no locking of
+	its own. dict[K,V] (below) is the locked-by-default wrapper around
+	this that most code should actually reach for - see __list.py's own
+	header comment for why list[T]/UnsafeList[T] made the same split;
+	dict[K,V] follows it for the same reason. '''
 	__raw: RawDict
 
 	def __init__( self ) -> None:
@@ -1120,6 +1127,47 @@ class dict[K, V]:
 				owned_key_ptr: Ptr[None] = self._store_key( key )
 				owned_value_ptr: Ptr[None] = self._store_value( value )
 				self.__raw.insert_new( h, owned_key_ptr, owned_value_ptr )
+
+class dict[K, V]:
+	''' dict[K,V]: locked-by-default wrapper around UnsafeDict[K,V] - same
+	split as list[T]/UnsafeList[T] (see __list.py's own header comment):
+	dict[K,V] is the default most people reach for, so every operation
+	acquires a real FastLock; UnsafeDict[K,V] is the identical, unlocked
+	implementation for callers who already know their dict never crosses
+	a thread boundary (e.g. a private, never-escaping field). '''
+	__inner: UnsafeDict[K, V]
+	__lock:  threading.FastLock
+
+	def __init__( self ) -> None:
+		self.__inner = UnsafeDict[K, V]()
+		self.__lock  = threading.FastLock()
+
+	def __len__( self ) -> usize:
+		self.__lock.acquire().unwrap( 'dict.__len__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__len__()
+
+	def __getitem__( self, key: K ) -> Result[V, KeyError]:
+		self.__lock.acquire().unwrap( 'dict.__getitem__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__getitem__( key )
+
+	def __setitem__( self, key: K, value: V ) -> None:
+		self.__lock.acquire().unwrap( 'dict.__setitem__: lock failed' )
+		defer( self.__lock.release() )
+		self.__inner.__setitem__( key, value )
+
+	def with_lock( self, body: Closure[[UnsafeDict[K, V]], None] ) -> None:
+		# unlike list[T]'s own no-arg with_lock, body here takes the raw
+		# UnsafeDict[K,V] directly - a compound read-modify-write (the
+		# whole reason to reach for with_lock instead of two separate
+		# locked calls) needs to touch storage WHILE the lock is held,
+		# and __inner is private - body has no other way in. Calling back
+		# through self.__getitem__/self.__setitem__ from inside body would
+		# try to re-acquire this same (non-reentrant) FastLock and deadlock.
+		self.__lock.acquire().unwrap( 'dict.with_lock: lock failed' )
+		defer( self.__lock.release() )
+		body( self.__inner )
 
 # import this at the end because it depends on str etc to already be pre-parsed:
 from .__File import File

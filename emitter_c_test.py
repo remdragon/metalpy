@@ -4755,6 +4755,255 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class DictThreadSafetyTests( CompilerTestCase ):
+	''' dict[K,V] (lib/builtins/__init__.py) is now locked by default (a
+	real FastLock, acquired/released around every method) - same split as
+	list[T]/UnsafeList[T] (see ListThreadSafetyTests above). These are the
+	real compile+run stress tests that actually exercise concurrent
+	access; DictTests above already covers single-threaded behavior and
+	still passes unchanged against the new locked wrapper. subprocess
+	timeout matches ListThreadSafetyTests, for the same reason (a real
+	hang should fail loudly, not wedge the suite). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			try:
+				run_result = subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = 30 )
+			except subprocess.TimeoutExpired:
+				self.fail( 'exe did not finish within 30s - likely a lost lock/update causing an infinite spin' )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	# Layer 1: disjoint keys, isolates concurrent insert/growth correctness
+	# (RawDict's own __entries/__indices, both UnsafeList[T] under the
+	# hood) - 8 threads each insert 100 distinct, known key->value pairs
+	# (thread t owns keys t*100 .. t*100+99) with no overlap, so a wrong
+	# final count or a wrong value at any key reliably indicates a lost/
+	# corrupted insert, not just "probably fine".
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_concurrent_insert_disjoint_keys_from_8_threads( self ) -> None:
+		self._run( '''
+import threading
+
+class DictWriter:
+	target: dict[i32,i32]
+	base: i32
+
+	@staticmethod
+	def make( target: dict[i32,i32], base: i32 ) -> DictWriter:
+		return DictWriter.__allocate__( target = target, base = base )
+
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 100:
+			with compiler.wrap_arithmetic:
+				key: i32 = self.base + i
+				val: i32 = key * 2
+			self.target[ key ] = val
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	d: dict[i32,i32] = dict[i32,i32]()
+	threads: list[threading.Thread] = list[threading.Thread]()
+	t: i32 = 0
+	while t < 8:
+		with compiler.wrap_arithmetic:
+			base: i32 = t * 100
+		w: DictWriter = DictWriter.make( d, base )
+		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+	i: usize = 0
+	while i < 8:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+	if d.__len__() != 800:
+		return 1
+	key: i32 = 0
+	with compiler.wrap_arithmetic:
+		while key < 800:
+			r: Result[i32,KeyError] = d.__getitem__( key )
+			if r.is_err():
+				return 2
+			with compiler.wrap_arithmetic:
+				expected: i32 = key * 2
+			if r.unwrap( 'x' ) != expected:
+				return 3
+			key += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	# Layer 2: SAME key, 8 threads each doing 1000 read-modify-write
+	# increments through with_lock - proves with_lock's escape hatch
+	# actually serializes a compound operation as a single atomic unit
+	# (get, +1, set, all under ONE lock acquisition). Doing this same
+	# increment as two separate locked calls (d.__getitem__ then
+	# d.__setitem__) would NOT be atomic - another thread's write could
+	# land between them - and would lose updates; with_lock is exactly
+	# the tool that closes that gap, so this is the test that actually
+	# proves it's not just a decorative API.
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_with_lock_serializes_compound_increment_from_8_threads( self ) -> None:
+		self._run( '''
+import threading
+
+class Incrementer:
+	target: dict[str,i32]
+
+	@staticmethod
+	def make( target: dict[str,i32] ) -> Incrementer:
+		return Incrementer.__allocate__( target = target )
+
+	def bump_once( self, raw: UnsafeDict[str,i32] ) -> None:
+		r: Result[i32,KeyError] = raw.__getitem__( 'counter' )
+		v: i32 = r.unwrap( 'counter missing' )
+		with compiler.wrap_arithmetic:
+			v += 1
+		raw.__setitem__( 'counter', v )
+
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 1000:
+			self.target.with_lock( self.bump_once )
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	d: dict[str,i32] = dict[str,i32]()
+	d[ 'counter' ] = 0
+	threads: list[threading.Thread] = list[threading.Thread]()
+	inc: Incrementer = Incrementer.make( d )
+	t: i32 = 0
+	while t < 8:
+		threads.append( threading.Thread( inc.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+	i: usize = 0
+	while i < 8:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+	r: Result[i32,KeyError] = d.__getitem__( 'counter' )
+	if r.is_err():
+		return 1
+	if r.unwrap( 'x' ) != 8000:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	# Layer 3: RC keys AND RC values (str->str), disjoint keys, inserted
+	# concurrently from 4 threads - the RC-bookkeeping analogue of Layer 1
+	# (incref/decref on _store_key/_store_value racing against RawDict's
+	# own concurrent growth). A double-free/leak here would show up as a
+	# nonzero/abnormal exit, not just a wrong value - the same "crash is
+	# the real assertion" reasoning DictTests' own
+	# test_rc_key_and_rc_value_destruction_does_not_crash already uses,
+	# just under real concurrent insertion instead of sequential.
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_concurrent_insert_of_rc_keys_and_values_no_leak_or_double_free( self ) -> None:
+		self._run( '''
+import threading
+
+class StrDictWriter:
+	target: dict[str,str]
+	base: i32
+
+	@staticmethod
+	def make( target: dict[str,str], base: i32 ) -> StrDictWriter:
+		return StrDictWriter.__allocate__( target = target, base = base )
+
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 50:
+			with compiler.wrap_arithmetic:
+				n: i32 = self.base + i
+			key: str = _key_for( n )
+			val: str = _key_for( n ) + '!'
+			self.target[ key ] = val
+			with compiler.wrap_arithmetic:
+				i += 1
+
+# str has no int-to-string conversion (only a copy constructor) - build a
+# distinct 2-character key from n (0..199) as two base-26 letters via
+# chr(), the same way ord()/chr() are used elsewhere in this stdlib
+def _key_for( n: i32 ) -> str:
+	with compiler.panic_arithmetic( '_key_for: overflow' ):
+		d1: i32 = n // 26
+		d2: i32 = n % 26
+	with compiler.wrap_arithmetic:
+		c1: u32 = compiler.cast( u32, 97 + d1 )
+		c2: u32 = compiler.cast( u32, 97 + d2 )
+	return chr( c1 ) + chr( c2 )
+
+def main() -> i32:
+	d: dict[str,str] = dict[str,str]()
+	threads: list[threading.Thread] = list[threading.Thread]()
+	t: i32 = 0
+	while t < 4:
+		with compiler.wrap_arithmetic:
+			base: i32 = t * 50
+		w: StrDictWriter = StrDictWriter.make( d, base )
+		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+	i: usize = 0
+	while i < 4:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+	if d.__len__() != 200:
+		return 1
+	n: i32 = 0
+	with compiler.wrap_arithmetic:
+		while n < 200:
+			key: str = _key_for( n )
+			r: Result[str,KeyError] = d.__getitem__( key )
+			if r.is_err():
+				return 2
+			expected: str = _key_for( n ) + '!'
+			if r.unwrap( 'x' ) != expected:
+				return 3
+			n += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never

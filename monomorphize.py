@@ -5,7 +5,7 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType
+from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType
 from union_storage import UnionStorage
 
 '''
@@ -164,6 +164,26 @@ class Monomorphizer:
 			if all( sa is a for sa, a in zip( substituted_arg_types, t.arg_types )) and substituted_return_type is t.return_type:
 				return t
 			return self.discovery._get_or_create_callable_type( substituted_arg_types, substituted_return_type )
+		if isinstance( t, ClosureType ):
+			# Closure[[Arg1,...],Ret] (see ClosureType's own docstring) can
+			# mention a type param in its own arg_types/return_type the same
+			# way CallableType above can - e.g. dict[K,V].with_lock's own
+			# `body: Closure[[UnsafeDict[K,V]],None]` parameter. Same
+			# recursive-rebuild-and-intern shape, through
+			# _get_or_create_closure_type instead of _get_or_create_
+			# callable_type. Unlike CallableType, ClosureType IS a real
+			# RCClass (fn/self fields, its own destructor) - but neither
+			# field depends on arg_types/return_type, and _get_or_create_
+			# closure_type already interns/memoizes by (arg_types,
+			# return_type) key and wires up its own lazy .resolve, so
+			# rebuilding through it is enough; no separate
+			# monomorphize_class step needed (mirrors CallableType, which
+			# is never itself a ClassLike either).
+			substituted_arg_types = [ self.substitute_type_params( a, type_params, args ) for a in t.arg_types ]
+			substituted_return_type = self.substitute_type_params( t.return_type, type_params, args )
+			if all( sa is a for sa, a in zip( substituted_arg_types, t.arg_types )) and substituted_return_type is t.return_type:
+				return t
+			return self.discovery._get_or_create_closure_type( substituted_arg_types, substituted_return_type )
 		if isinstance( t, TaggedUnion ) and t.file is None:
 			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
 			# _get_or_create_union - file is None only for these, never for
