@@ -31,6 +31,7 @@ class ReceiverDispatch:
 def _build_member_constructor(
 	union: TaggedUnion, member: Variable, tag_value: int,
 	tag_attr: Variable, data_attr: Variable, payload_cls: CUnion, return_type: Type,
+	fn_file: object, fn_line: int|None,
 ) -> Function:
 	''' SYNTAX.md: `@union` expands into a struct wrapping a synthesized
 	payload CUnion "plus one @staticmethod constructor per variant"
@@ -70,10 +71,26 @@ def _build_member_constructor(
 	generic_method_call unifies expected_type against target.return_type to
 	solve the class's type params (Result.Ok(x) never mentions E in its own
 	parameter list at all) - a bare, unparameterized `union` return type has
-	no TypeVar anywhere in it for that unification to bind. '''
+	no TypeVar anywhere in it for that unification to bind.
+
+	fn_file/fn_line are deliberately NOT union.file/union.line: for a real
+	user `@union class Foo:` they're the same thing, but an anonymous
+	synthesized union (X|Y) always has file=None (emitter_c.py's
+	mangle_type() relies on exactly that to mangle it via the special
+	$__u$$... scheme rather than plain mangle_qualname(), which can't
+	handle a qualname containing a literal '|') - yet this Function still
+	needs a REAL file the moment anything actually calls it (Lowering.
+	_find_module_for looks up "which module owns this" by matching .file
+	against a real Module's .file, and fails outright on a bare None,
+	unlike the tag/data-field-only paths that never needed a real Function
+	here at all before Lowering._coerce_into_union). UnionStorage.get()
+	passes "whichever module is currently active" (self.discovery.
+	module_stack[-1]) for this reason - same fallback
+	_get_or_create_closure_type already established for ClosureType's own
+	fn/self fields needing __del__ discoverable. '''
 	value_param = Parameter(
 		stem = 'value', qualname = f'{union.qualname}.{member.stem}.value',
-		file = union.file, line = union.line, type = member.type,
+		file = fn_file, line = fn_line, type = member.type,
 	)
 	payload_call = ast.Call(
 		func = ast.Name( id = '$payload_cls', ctx = ast.Load() ),
@@ -94,13 +111,13 @@ def _build_member_constructor(
 		body = [ ast.Return( value = allocate_call ) ],
 		decorator_list = [], returns = None, type_params = [],
 	)
-	node.lineno = union.line or 1
+	node.lineno = fn_line or 1
 	node.col_offset = 0
 	ast.fix_missing_locations( node )
 
 	fn = Function(
 		stem = member.stem, qualname = f'{union.qualname}.{member.stem}',
-		file = union.file, line = union.line,
+		file = fn_file, line = fn_line,
 		cls = union, node = node, parameters = [ value_param ], return_type = return_type,
 		is_static = True, resolve = None,
 	)
@@ -210,8 +227,20 @@ class UnionStorage:
 			self.discovery._get_or_create_specialization( union, union.type_params )
 			if union.type_params else union
 		)
+		# union.file is None for a synthesized anonymous union (by design -
+		# see _build_member_constructor's own comment on why that can't
+		# change) but each constructor Function still needs a real file the
+		# moment anything actually CALLS it - "whichever module is
+		# currently active" is the same fallback discovery.py's own
+		# _get_or_create_closure_type already established for the
+		# identical reason
+		fn_file = union.file
+		fn_line = union.line
+		if fn_file is None and self.discovery.module_stack:
+			fn_file = self.discovery.module_stack[-1].file
+			fn_line = self.discovery.module_stack[-1].line
 		for tag_value, attr in enumerate( union.attributes ):
-			union.names[attr.stem] = _build_member_constructor( union, attr, tag_value, tag_attr, data_attr, payload_cls, ctor_return_type )
+			union.names[attr.stem] = _build_member_constructor( union, attr, tag_value, tag_attr, data_attr, payload_cls, ctor_return_type, fn_file, fn_line )
 		# payload_cls (the synthesized CUnion backing `data`) needs its own
 		# explicit schedule() here - unlike the outer TaggedUnion itself
 		# (already scheduled by every caller reaching this point), nothing

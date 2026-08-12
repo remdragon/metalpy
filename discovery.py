@@ -493,6 +493,21 @@ class Discovery( ast.NodeVisitor ):
 		# canonicalize per ARCHITECTURE.md: sort operand qualnames asciibetically
 		# and join with '|' (str|int -> builtins.int|builtins.str), dedupe on
 		# that key. No cname assigned here - that's a stage-2 scheduling concern.
+		#
+		# file/line MUST stay None here (not "whichever module is currently
+		# active", unlike _get_or_create_closure_type's identical-looking
+		# case just below) - emitter_c.py's mangle_type() uses "TaggedUnion
+		# with file is None" as ITS OWN signal to recognize a synthesized
+		# anonymous union (vs. a real user `@union class Foo:`, which always
+		# has a genuine file) and mangle it via the special $__u$$... scheme
+		# instead of plain mangle_qualname() (which can't handle this
+		# object's own qualname containing a literal '|', not a legal C
+		# identifier character) - giving the union itself a real file would
+		# silently break that detection. See union_storage.py's
+		# _build_member_constructor instead for where a REAL file is
+		# actually needed (Lowering._find_module_for, once something
+		# schedules one of this union's synthesized member constructors,
+		# not just reads its tag/data fields directly).
 		ordered = sorted( operands, key = lambda t: t.qualname )
 		key = '|'.join( t.qualname for t in ordered )
 		if union := self._unions.get( key ):

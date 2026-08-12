@@ -254,6 +254,25 @@ def mangle_type( t: Type ) -> str:
 		return '$' + '$$'.join( parts ) + '$data'
 	return mangle_qualname( t.qualname )
 
+def mangle_function_qualname( fn: Function ) -> str:
+	''' union-aware entry point for a Function's own symbol name - call
+	this (not mangle_qualname directly) for any real function/method
+	symbol. Only matters for union_storage.py's own synthesized per-member
+	constructor Functions on an ANONYMOUS union (fn.cls is a TaggedUnion
+	with file is None - see mangle_type's own comment on why that's the
+	anonymous-union signal): fn.qualname there directly embeds the outer
+	union's own raw '|'-joined qualname as its prefix (e.g.
+	'builtins.str|intrinsics.NoneType.str'), which plain mangle_qualname
+	would leave a literal '|' in (not a legal C identifier character) -
+	same failure mode mangle_type's own CUnion branch already documents
+	for the payload struct. A REAL @union class's own methods (fn.cls.file
+	is never None there) mangle exactly as before - this only branches for
+	the specific shape nothing scheduled before Lowering._coerce_into_union
+	started actually calling these constructors. '''
+	if isinstance( fn.cls, TaggedUnion ) and fn.cls.file is None:
+		return f'{mangle_type( fn.cls )}${mangle_qualname( fn.stem )}'
+	return mangle_qualname( fn.qualname )
+
 def _c_label( name: str ) -> str:
 	# label names (lowering.py's own generated 'else'/'end'/epilogue labels)
 	# are already unique within one function (C's own label scoping is
@@ -555,7 +574,7 @@ def _self_c_type( cls: ClassLike ) -> str:
 
 def _function_prototype( function: Function ) -> str:
 	if function.is_destructor:
-		name = mangle_qualname( function.qualname )
+		name = mangle_function_qualname( function )
 		return f'static void {name}( void* __obj )'
 	params: list[str] = []
 	if _has_self( function ):
@@ -582,7 +601,7 @@ def _function_prototype( function: Function ) -> str:
 		if isinstance( ret, str ) and ret.endswith( '*' ):
 			ret = 'void*' if not ret.startswith( 'const' ) else 'const void*'
 	else:
-		name = mangle_qualname( function.qualname )
+		name = mangle_function_qualname( function )
 	return f'{noreturn}{ret} {name}( {params_str} )'
 
 def _emit_operand( op: ir.Operand ) -> str:
@@ -599,7 +618,7 @@ def _emit_operand( op: ir.Operand ) -> str:
 		fn_type = _callable_ptr_type( op.type )
 		assert fn_type is not None, f'_emit_operand: FunctionRef with non-Ptr[Callable] type {op.type!r}'
 		ret, params = _function_pointer_c_type( fn_type )
-		return f'({_fn_ptr_cast_type(ret, params)}){mangle_qualname(op.fn.qualname)}'
+		return f'({_fn_ptr_cast_type(ret, params)}){mangle_function_qualname(op.fn)}'
 	if isinstance( op, Variable ):
 		# locals (parameters, stack locals) use bare stem; globals
 		# need the full mangled qualname (cross-TU visibility)
@@ -1128,7 +1147,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		if instr.target.extern_lib is not None:
 			target_name = instr.target.extern_symbol
 		else:
-			target_name = mangle_qualname( instr.target.qualname )
+			target_name = mangle_function_qualname( instr.target )
 		# destructor calls sys.free(self) — self is struct Foo*, free takes
 		# void*; C needs an explicit cast since the two are different types
 		arg_texts = list( _emit_call_args( instr ))

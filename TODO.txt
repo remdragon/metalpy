@@ -147,7 +147,9 @@ lowering:
 		body spliced directly at each call site (no real Call/FuncStart/
 		FuncEnd for it) - lib/builtins/__init__.py's len() is meant to become
 		@inline once this exists, so len(x) costs exactly what x.__len__()
-		would and no more
+		would and no more. See PLAN_INLINE.md for the full design (scoped to
+		single `return <expr>` bodies - covers len() plus ~50 other
+		one-liner forwarders found across lib/).
 	incref/decref
 		part of this: remodel move[T]/Move properly. It's currently a Type
 		wrapper (mpy_types.Move, holding .inner), which is wrong - move[T]
@@ -338,6 +340,50 @@ lowering:
 		or has incompatible function signatures, it will be caught when it gets resolved and lowered,
 		so we don't have to do any special type checking when actually generating the automatic
 		union methods
+
+		DONE (the leaf-into-union direction): `a: IntStr = 'foo'` -> `a =
+			IntStr.v_str('foo')`, exactly the first worked example just below -
+			lowering.py's _lower_expr/_coerce_into_union now reuses union_storage.py's
+			own per-member constructor Functions (the same UnionStorage.get()
+			machinery a real, explicit Result.Ok(x) call already goes through) to wrap
+			any plain leaf value (a literal, a variable, bare None) the moment it flows
+			into a T|None-typed call argument, default, or variable declaration/
+			assignment. Confirmed this had NEVER worked anywhere in the codebase before
+			- every T|None usage (bisect.py's key=, __File.py's exists=, unwrap_or's own
+			default) only ever received its None default at every real call site; a real
+			override value either crashed at Python-level emission (a literal - _emit_const
+			couldn't handle a Const mistyped as the whole union) or silently produced
+			invalid C nothing had ever caught (a plain variable - only found by actually
+			invoking clang, not just checking Python-level emission succeeded). Also fixed
+			along the way: emitter_c.py's mangle_qualname() couldn't mangle a synthesized
+			union-member-constructor Function's own symbol name (its qualname embeds the
+			anonymous union's raw '|'-joined qualname) - new mangle_function_qualname()
+			entry point; and an anonymous union's synthesized constructor Function needs a
+			REAL file for Lowering._find_module_for's module-ownership lookup, without
+			giving the UNION ITSELF a real file (mangle_type()'s own anonymous-union
+			detection relies on file is None staying true for the union/its payload CUnion)
+			- union_storage.py's UnionStorage.get() now passes "whichever module is
+			currently active" to _build_member_constructor for just the Function, same
+			fallback discovery.py's _get_or_create_closure_type already established.
+			Real compile+run tests: emitter_c_test.py's UnionLeafCoercionTests (including
+			a repeated-call RC-refcount check and a spot-check matching __File.py's own
+			real exists: bool|None = None usage), lowering_test.py's
+			test_leaf_value_coerced_into_union_via_synthesized_constructor (IR-shape).
+
+		STILL OPEN (the union-into-leaf direction - narrowing/extraction): confirmed via
+			a real clang invocation (not just Python-level emission, which succeeds and
+			hides it) that `if x is None: ... else: y: T = x` still emits invalid C -
+			`x` stays typed as the whole union (T|None) in the `else` branch (no real
+			control-flow narrowing exists - see this file's own "union disambiguation"
+			section above), so a plain assignment/declaration binding it to `y: T` passes
+			the raw union struct where a leaf-typed value is expected. `match x: case
+			T(y): ...` doesn't work for an anonymous union either ("unsupported match
+			pattern class"). This is what actually blocks giving str.strip()/lstrip()/
+			rstrip() (lib/builtins/__init__.py) a real `chars: str|None = None` parameter
+			- the leaf-into-union fix above only gets a literal/variable INTO the
+			parameter correctly, the function's own body still can't get it back OUT.
+			A value already consumed via `is None`/bare truthiness (no extraction, e.g.
+			__File.py's own `elif exists:`) already works fine and isn't affected.
 
 		For this code example, assume:
 			@union

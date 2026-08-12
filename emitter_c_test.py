@@ -5750,6 +5750,173 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class UnionLeafCoercionTests( CompilerTestCase ):
+	''' a plain leaf value (a literal, a variable, bare None) flowing into
+	a T|None (TaggedUnion)-typed slot - a call argument, a default value,
+	or a variable declaration/assignment. Never worked before (confirmed:
+	every T|None usage anywhere in this codebase - bisect.py's key=,
+	__File.py's exists=, unwrap_or's own default - only ever received its
+	None default at every real call site; passing an actual override
+	value either crashed at Python-level emission (a literal) or silently
+	produced invalid C that only a real clang invocation would catch (a
+	plain variable) - see lowering.py's _lower_expr/_coerce_into_union and
+	their own comments for the fix, and TODO.txt's "opportunistic union
+	emission" section this closes. Reuses UnionStorage's own per-member
+	constructor Functions (union_storage.py) - the exact mechanism a real,
+	explicit Result.Ok(x) call already goes through - so this is
+	implicit/automatic construction through that same path, not new
+	construction machinery. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_literal_variable_and_none_as_call_arguments( self ) -> None:
+		self._run( '''
+def helper( x: str|None ) -> bool:
+	return x is None
+
+def main() -> i32:
+	s: str = "hi"
+	if helper( s ):
+		return 1
+	if helper( "literal" ):
+		return 2
+	if not helper( None ):
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_literal_and_none_in_variable_declarations( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	x: str|None = "hi"
+	if x is None:
+		return 1
+	y: str|None = None
+	if y is not None:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_non_leaf_type_is_a_compile_error( self ) -> None:
+		# a genuine type mismatch (not one of the union's own members) must
+		# stay a real compile error, not get silently passed through
+		self._run( '''
+def helper( x: str|None ) -> bool:
+	return x is None
+
+def main() -> i32:
+	helper( 5 )
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bool_leaf_matches_lib_File_py_own_exists_parameter_shape( self ) -> None:
+		# spot-checks a real pre-existing site, not just a synthetic
+		# example: lib/builtins/__File.py's binary_writer()/etc all take
+		# exists: bool|None = None and branch `if exists is None: ...
+		# elif exists: ... else: ...` - this mirrors that exact shape
+		# (own `is None`/truthiness checks directly on the union value,
+		# no leaf EXTRACTION needed, so no further gap blocks it) with a
+		# real True/False override at the call site, never exercised
+		# anywhere in the codebase before this fix
+		self._run( '''
+def resolve( exists: bool|None = None ) -> i32:
+	if exists is None:
+		return 0
+	elif exists:
+		return 1
+	else:
+		return 2
+
+def main() -> i32:
+	if resolve() != 0:
+		return 1
+	if resolve( True ) != 1:
+		return 2
+	if resolve( False ) != 2:
+		return 3
+	e: bool = True
+	if resolve( e ) != 1:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_leaf_refcount_correct_after_repeated_calls( self ) -> None:
+		# a real RC-lifetime check, not just "doesn't crash once" - calls a
+		# str|None-taking function in a loop, each iteration constructing a
+		# fresh str and letting it flow through the union wrap/unwrap
+		# round trip; a leaked or double-released reference here would
+		# drift the refcount or crash under repetition, not just once.
+		# 'hello'.upper() (not the bare literal 'hello') - a bare string
+		# literal binds straight to its own static, immortal storage (no
+		# allocation, refcount reads as a sentinel, never 1), so it can't
+		# tell a leak/double-release apart from doing nothing; .upper()
+		# always allocates a genuine, freshly refcounted buffer (__str.py's
+		# case_map), independent of this fix
+		self._run( '''
+def identity_len( x: str|None ) -> usize:
+	if x is None:
+		return 0
+	return 1
+
+def main() -> i32:
+	i: i32 = 0
+	while i < 1000:
+		s: str = 'hello'.upper()
+		if compiler.refcount( s ) != 1:
+			return 1
+		identity_len( s )
+		if compiler.refcount( s ) != 1:
+			return 2
+		with compiler.wrap_arithmetic:
+			i += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never

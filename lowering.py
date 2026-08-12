@@ -2780,7 +2780,44 @@ class FunctionLowering:
 		method = getattr( self, f'_expr_{node.__class__.__name__}', None )
 		if method is None:
 			self.lowering.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
-		return method( node, expected_type )
+		operand = method( node, expected_type )
+		# post-hoc, not a pre-emptive override of expected_type before
+		# dispatch: a node kind that already produces the right union type
+		# on its own (an explicit Result.Ok(x) call, a match-narrowed
+		# union-typed value, ...) already satisfies operand.type is
+		# expected_type and skips this entirely - only a genuine mismatch
+		# (a plain leaf value where the union itself was expected) reaches
+		# _coerce_into_union, see its own comment
+		if isinstance( expected_type, TaggedUnion ) and operand.type is not expected_type:
+			operand = self._coerce_into_union( operand, expected_type, node )
+		return operand
+
+	def _coerce_into_union( self, operand: ir.Operand, union: TaggedUnion, node: ast.AST ) -> ir.Operand:
+		# operand's own type doesn't match the union it needs to become -
+		# TODO.txt's own documented "opportunistic union emission" gap
+		# (a: IntStr = 'foo' should become a = IntStr.v_str('foo')). If
+		# operand.type is exactly one of the union's own leaves, wrap it
+		# through that leaf's own UnionStorage-synthesized member
+		# constructor - the SAME Function a real, explicit Result.Ok(x)
+		# call already resolves to and calls via ordinary call resolution;
+		# this just does that implicitly. A genuine mismatch (operand's
+		# type isn't a member of the union at all) is a real compile
+		# error, not silently passed through.
+		self.lowering._union_storage.get( union ) # ensures union.names[leaf.stem] exists
+		leaf = next( ( attr for attr in union.attributes if attr.type is operand.type ), None )
+		if leaf is None:
+			self.lowering.discovery.fail(
+				f'{ast.unparse(node)}: expected {union.qualname}, got a type that is not one of its members',
+				node,
+			)
+		ctor_fn = union.names[leaf.stem]
+		self.lowering.schedule( ctor_fn )
+		self.lowering.schedule( ctor_fn.return_type )
+		for p in ctor_fn.parameters or []:
+			self.lowering.schedule( p.type )
+		dest = self._new_temp( union )
+		self._emit( ir.Call( dest = dest, target = ctor_fn, receiver = None, args = [ operand ], kwargs = {} ))
+		return dest
 
 	def _expr_Name( self, node: ast.Name, expected_type: Type|None ) -> ir.Operand:
 		name = self.lowering.discovery.find_name( node.id, node )
@@ -3072,7 +3109,14 @@ class FunctionLowering:
 		return self.lowering._function_ref_operand( synthetic )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
-		if expected_type is None:
+		# expected_type being a TaggedUnion (e.g. str|None) is treated the
+		# same as no expected_type at all: a literal's OWN Python type
+		# always determines its natural type (bool/i32/str/NoneType) -
+		# blindly typing the Const as the whole union here would be wrong
+		# (a literal is never itself union-shaped at the C level), and
+		# _lower_expr's own post-hoc coercion (see its comment) is what
+		# actually wraps this natural-typed Const into the union afterward
+		if expected_type is None or isinstance( expected_type, TaggedUnion ):
 			if isinstance( node.value, bool ):
 				expected_type = self.lowering.discovery.get_intrinsics()['bool']
 			elif isinstance( node.value, int ):
@@ -3087,6 +3131,8 @@ class FunctionLowering:
 						f'cannot infer the type of literal {node.value!r} - no str type available ({ast.unparse(node)})',
 						node,
 					)
+			elif node.value is None:
+				expected_type = self.lowering.discovery.get_none_type()
 			else:
 				self.lowering.discovery.fail(
 					f'cannot infer the type of literal {node.value!r} - no expected type available from context ({ast.unparse(node)})',

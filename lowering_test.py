@@ -5508,6 +5508,41 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ) )
 
+	# --- T|None leaf coercion (_lower_expr/_coerce_into_union) -------------
+
+	def test_leaf_value_coerced_into_union_via_synthesized_constructor( self ) -> None:
+		# a plain leaf value (i32) flowing into an i32|bool-typed call
+		# argument must go through the union's own UnionStorage-synthesized
+		# member constructor (an ir.Call), not a bare ir.Const mistyped as
+		# the whole union - see TODO.txt's "opportunistic union emission",
+		# lowering.py's _lower_expr/_coerce_into_union. Uses intrinsics
+		# only (i32/bool), not str - this class's own Discovery is built
+		# with import_builtins=False
+		code = '\n'.join([
+			'def helper( x: i32|bool ) -> i32|bool:',
+			'	return x',
+			'',
+			'def main() -> i32:',
+			'	helper( 5 )',
+			'	return 0',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# the FIRST Call is the coercion itself (argument lowering runs
+		# before the helper(...) call is emitted) - target is the union's
+		# own synthesized 'i32' member constructor, called with the
+		# literal's own natural i32-typed Const, not the union type
+		call = next( instr for instr in fn.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.stem, 'i32' )
+		self.assertEqual( len( call.args ), 1 )
+		self.assertIsInstance( call.args[0], ir.Const )
+		self.assertEqual( call.args[0].type.stem, 'i32' )
+		self.assertEqual( call.args[0].value, 5 )
+		# the call's own dest is the union itself, not the leaf type
+		# (canonicalized asciibetically by qualname - 'bool' < 'i32')
+		self.assertEqual( call.dest.type.stem, 'intrinsics.bool|intrinsics.i32' )
+
 # --- compiler.fetch_unicode_table('upper'|'lower') ---------------------------
 
 class FetchUnicodeTableTests( unittest.TestCase ):
