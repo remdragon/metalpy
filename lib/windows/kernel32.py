@@ -215,3 +215,35 @@ def LCMapStringEx(
 	sortHandle: usize,
 ) -> i32:
 	...
+
+# ---------------------------------------------------------------------------
+# Unicode codepoint classification - str.isalpha()/isdigit()/isspace()/
+# isupper()/islower()/isalnum()/isprintable() (see __str.py's is_*_cp
+# primitives, TODO.txt's str-methods plan). GetStringTypeW (not the
+# locale-aware GetStringTypeExW - character TYPE classification is
+# inherently locale-independent per Win32 docs, so the simpler, non-
+# deprecated, no-locale-parameter API is the right one here, unlike
+# LCMapStringEx above which genuinely needs LOCALE_NAME_INVARIANT for
+# case mapping). CT_CTYPE1 selects the C1_* "character type 1" flag set.
+# ---------------------------------------------------------------------------
+
+CT_CTYPE1: u32 = 1
+
+C1_UPPER:  u16 = 0x0001
+C1_LOWER:  u16 = 0x0002
+C1_DIGIT:  u16 = 0x0004
+C1_SPACE:  u16 = 0x0008
+C1_PUNCT:  u16 = 0x0010
+C1_CNTRL:  u16 = 0x0020
+C1_BLANK:  u16 = 0x0040
+C1_XDIGIT: u16 = 0x0080
+C1_ALPHA:  u16 = 0x0100
+
+@extern('kernel32', 'GetStringTypeW')
+def GetStringTypeW(
+	dwInfoType: u32,
+	lpSrcStr: ConstPtr[u16],
+	cchSrc: i32,
+	lpCharType: Ptr[u16],
+) -> bool:
+	...

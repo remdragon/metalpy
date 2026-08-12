@@ -8,7 +8,7 @@ from .__fastlist import FastList
 from .__int import int, IntError
 from .__list import list, UnsafeList
 from .__RawDict import RawDict
-from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map
+from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
 # SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
@@ -706,6 +706,241 @@ class str:
 			offset += rest_len
 		new_buf[offset] = 0
 		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in zfill' )
+
+	def isalpha( self ) -> bool:
+		''' True if self is non-empty and every codepoint is alphabetic
+		(OS-native classification, __str.py's is_alpha_cp) - matches
+		Python's str.isalpha() semantics (False for an empty string). '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if not is_alpha_cp( cp ):
+					return False
+				i += consumed
+		return True
+
+	def isdigit( self ) -> bool:
+		''' True if self is non-empty and every codepoint is a digit
+		(OS-native classification, __str.py's is_digit_cp) - matches
+		Python's str.isdigit() semantics (False for an empty string). '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if not is_digit_cp( cp ):
+					return False
+				i += consumed
+		return True
+
+	def isdecimal( self ) -> bool:
+		''' real Python distinguishes isdecimal() (Unicode category Nd
+		only) from isdigit()/isnumeric() (broader) via fine-grained
+		Unicode category data no OS classification API exposes directly -
+		all three collapse onto is_digit_cp here, a documented
+		approximation rather than a precise match (see TODO.txt). '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if not is_digit_cp( cp ):
+					return False
+				i += consumed
+		return True
+
+	def isnumeric( self ) -> bool:
+		''' see isdecimal()'s own comment - the same documented
+		approximation applies here too. '''
+		return self.isdecimal()
+
+	def isspace( self ) -> bool:
+		''' True if self is non-empty and every codepoint is whitespace
+		(OS-native classification, __str.py's is_space_cp) - matches
+		Python's str.isspace() semantics (False for an empty string). '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if not is_space_cp( cp ):
+					return False
+				i += consumed
+		return True
+
+	def isupper( self ) -> bool:
+		''' True if self is non-empty and every CASED codepoint is
+		uppercase (OS-native classification, __str.py's is_upper_cp) -
+		matches Python's str.isupper() semantics (False for an empty
+		string; uncased codepoints like digits/punctuation don't
+		themselves disqualify a match, but at least one cased codepoint
+		must be upper for this to differ meaningfully from an all-
+		uncased string - approximated here as "no codepoint is lowercase"
+		since is_upper_cp already only fires on cased-uppercase
+		codepoints, matching real Python closely for the common case). '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		saw_cased: bool = False
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if is_lower_cp( cp ):
+					return False
+				if is_upper_cp( cp ):
+					saw_cased = True
+				i += consumed
+		return saw_cased
+
+	def islower( self ) -> bool:
+		''' the mirror image of isupper() above. '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		saw_cased: bool = False
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if is_upper_cp( cp ):
+					return False
+				if is_lower_cp( cp ):
+					saw_cased = True
+				i += consumed
+		return saw_cased
+
+	def isalnum( self ) -> bool:
+		''' True if self is non-empty and every codepoint is alphabetic
+		or a digit (OS-native classification, __str.py's is_alnum_cp) -
+		matches Python's str.isalnum() semantics (False for an empty
+		string). '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if not is_alnum_cp( cp ):
+					return False
+				i += consumed
+		return True
+
+	def isprintable( self ) -> bool:
+		''' True if EVERY codepoint is printable (OS-native
+		classification, __str.py's is_printable_cp) - matches Python's
+		str.isprintable() semantics, including its one asymmetry with
+		the other is*() methods here: True (vacuously) for an empty
+		string. '''
+		self_len: usize = self.byte_len()
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if not is_printable_cp( cp ):
+					return False
+				i += consumed
+		return True
+
+	def isidentifier( self ) -> bool:
+		''' approximates Python's real XID_Start/XID_Continue Unicode
+		tables using the alpha/digit classification primitives every
+		other is*() method here uses (see TODO.txt) - first codepoint
+		must be alphabetic or underscore, every codepoint after that
+		alphabetic, a digit, or underscore. False for an empty string,
+		matching Python. '''
+		self_len: usize = self.byte_len()
+		if self_len == 0:
+			return False
+		i: usize = 0
+		consumed: usize = 0
+		first: bool = True
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				is_underscore: bool = cp == 0x5F # '_'
+				if first:
+					if not ( is_alpha_cp( cp ) or is_underscore ):
+						return False
+					first = False
+				else:
+					if not ( is_alpha_cp( cp ) or is_digit_cp( cp ) or is_underscore ):
+						return False
+				i += consumed
+		return True
+
+	def strip( self ) -> str:
+		''' self with leading AND trailing whitespace codepoints stripped
+		- Python's str.strip() with no arguments. The chars= form isn't
+		implemented here: passing a literal str to a str|None-typed
+		parameter hits a separate, pre-existing compiler gap (a string
+		literal ends up typed against the WHOLE union rather than its
+		str variant, and fails at emission) - confirmed independently of
+		this work, flagged in TODO.txt rather than worked around here.
+		Built from lstrip()/rstrip() below. '''
+		return self.lstrip().rstrip()
+
+	def lstrip( self ) -> str:
+		''' self with leading whitespace codepoints stripped
+		(is_space_cp), matching Python's str.lstrip() with no
+		arguments. '''
+		self_len: usize = self.byte_len()
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if not is_space_cp( cp ):
+					break
+				i += consumed
+		return self._byte_slice( i, self_len )
+
+	def rstrip( self ) -> str:
+		''' self with trailing whitespace codepoints stripped, matching
+		Python's str.rstrip() with no arguments. UTF-8 can only be
+		decoded FORWARD, so trimming from the end needs one forward pass
+		recording each codepoint's own start offset before walking that
+		record backward. '''
+		self_len: usize = self.byte_len()
+		starts: UnsafeList[usize] = UnsafeList[usize]()
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while i < self_len:
+				starts.append( i ).unwrap( 'rstrip: append failed' )
+				decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				i += consumed
+
+		end: usize = self_len
+		n: usize = starts.__len__()
+		with compiler.panic_arithmetic( 'bounded by n, cannot overflow' ):
+			while n > 0:
+				start: usize = starts.__getitem__( n - 1 ).unwrap( 'rstrip: index in bounds by construction' )
+				cp: u32 = decode_utf8_at( self.__data, start, compiler.addrof( consumed ))
+				if not is_space_cp( cp ):
+					break
+				end = start
+				n -= 1
+		return self._byte_slice( 0, end )
 
 	def upper( self ) -> str:
 		''' case_folder (see PLAN_CASE_FOLDING.md) is checked first, ahead

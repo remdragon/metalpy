@@ -232,3 +232,166 @@ def case_map( data: ConstPtr[u8], byte_len: usize, is_upper: bool, out_size: Ptr
 
 	out_size[0] = new_size
 	return new_buf
+
+# ---------------------------------------------------------------------------
+# Unicode codepoint classification - str.isalpha()/isdigit()/isspace()/
+# isupper()/islower()/isalnum()/isprintable() (see __init__.py's str class,
+# TODO.txt's str-methods plan). OS-native best-effort, same philosophy as
+# case_map above: no embedded Unicode tables (those are opt-in, see
+# case_folding.py), just whatever the platform's own classification API
+# says. Each is_*_cp is a @compiler.target-gated pair sharing one name,
+# same structure as case_map.
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'windows' )
+def _char_type_windows( cp: u32 ) -> u16:
+	''' GetStringTypeW's raw C1_* flags word for a single codepoint -
+	shared by every is_*_cp below, so the UTF-8->UTF-16 conversion (the
+	same MultiByteToWideChar step case_map's own Windows path already
+	does, just scoped to one codepoint) only happens once per call site,
+	not once per predicate. Codepoints outside the Basic Multilingual
+	Plane encode to a UTF-16 surrogate PAIR - GetStringTypeW classifies
+	each half independently (no astral-plane awareness), so this reads
+	only the first code unit's flags; a documented limitation, not a
+	correctness concern for the alpha/digit/space/upper/lower/printable
+	classes these primitives back (essentially never astral-plane in
+	practice). '''
+	from windows.kernel32 import MultiByteToWideChar, GetStringTypeW, CP_UTF8, CT_CTYPE1
+	buf8: Ptr[u8] = sys.alloc[u8]( 4 )
+	defer( sys.free( buf8 ))
+	n: usize = encode_utf8_at( buf8, 0, cp )
+	with compiler.panic_arithmetic( 'a single encoded codepoint always fits in i32' ):
+		n_i32: i32 = i32( n )
+	wide: Ptr[u16] = sys.alloc[u16]( 2 )
+	defer( sys.free( wide ))
+	wide_len: i32 = MultiByteToWideChar( CP_UTF8, 0, buf8, n_i32, wide, 2 )
+	if wide_len <= 0:
+		sys.panic( 'MultiByteToWideChar failed classifying a single codepoint' )
+	char_types: Ptr[u16] = sys.alloc[u16]( 2 )
+	defer( sys.free( char_types ))
+	GetStringTypeW( CT_CTYPE1, wide, wide_len, char_types )
+	return char_types[0]
+
+@compiler.target( os = 'windows' )
+def is_alpha_cp( cp: u32 ) -> bool:
+	from windows.kernel32 import C1_ALPHA
+	return ( _char_type_windows( cp ) & C1_ALPHA ) != 0
+
+@compiler.target( os = not 'windows' )
+def is_alpha_cp( cp: u32 ) -> bool:
+	from crt import newlocale, freelocale, LC_CTYPE_MASK, iswalpha_l
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return False
+	defer( freelocale( loc ))
+	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
+		wc: i32 = i32( cp )
+	return iswalpha_l( wc, loc ) != 0
+
+@compiler.target( os = 'windows' )
+def is_digit_cp( cp: u32 ) -> bool:
+	from windows.kernel32 import C1_DIGIT
+	return ( _char_type_windows( cp ) & C1_DIGIT ) != 0
+
+@compiler.target( os = not 'windows' )
+def is_digit_cp( cp: u32 ) -> bool:
+	from crt import newlocale, freelocale, LC_CTYPE_MASK, iswdigit_l
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return False
+	defer( freelocale( loc ))
+	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
+		wc: i32 = i32( cp )
+	return iswdigit_l( wc, loc ) != 0
+
+@compiler.target( os = 'windows' )
+def is_space_cp( cp: u32 ) -> bool:
+	from windows.kernel32 import C1_SPACE
+	return ( _char_type_windows( cp ) & C1_SPACE ) != 0
+
+@compiler.target( os = not 'windows' )
+def is_space_cp( cp: u32 ) -> bool:
+	from crt import newlocale, freelocale, LC_CTYPE_MASK, iswspace_l
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return False
+	defer( freelocale( loc ))
+	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
+		wc: i32 = i32( cp )
+	return iswspace_l( wc, loc ) != 0
+
+@compiler.target( os = 'windows' )
+def is_upper_cp( cp: u32 ) -> bool:
+	from windows.kernel32 import C1_UPPER
+	return ( _char_type_windows( cp ) & C1_UPPER ) != 0
+
+@compiler.target( os = not 'windows' )
+def is_upper_cp( cp: u32 ) -> bool:
+	from crt import newlocale, freelocale, LC_CTYPE_MASK, iswupper_l
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return False
+	defer( freelocale( loc ))
+	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
+		wc: i32 = i32( cp )
+	return iswupper_l( wc, loc ) != 0
+
+@compiler.target( os = 'windows' )
+def is_lower_cp( cp: u32 ) -> bool:
+	from windows.kernel32 import C1_LOWER
+	return ( _char_type_windows( cp ) & C1_LOWER ) != 0
+
+@compiler.target( os = not 'windows' )
+def is_lower_cp( cp: u32 ) -> bool:
+	from crt import newlocale, freelocale, LC_CTYPE_MASK, iswlower_l
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return False
+	defer( freelocale( loc ))
+	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
+		wc: i32 = i32( cp )
+	return iswlower_l( wc, loc ) != 0
+
+@compiler.target( os = 'windows' )
+def is_alnum_cp( cp: u32 ) -> bool:
+	# no distinct C1_ALNUM flag - Windows composes it from the same
+	# classification word ALPHA/DIGIT already read, one call either way
+	from windows.kernel32 import C1_ALPHA, C1_DIGIT
+	flags: u16 = _char_type_windows( cp )
+	return ( flags & ( C1_ALPHA | C1_DIGIT )) != 0
+
+@compiler.target( os = not 'windows' )
+def is_alnum_cp( cp: u32 ) -> bool:
+	# POSIX DOES have a distinct iswalnum_l - used directly rather than
+	# composed from is_alpha_cp/is_digit_cp (each of which would open its
+	# own separate locale), for consistency with every other is_*_cp here
+	from crt import newlocale, freelocale, LC_CTYPE_MASK, iswalnum_l
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return False
+	defer( freelocale( loc ))
+	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
+		wc: i32 = i32( cp )
+	return iswalnum_l( wc, loc ) != 0
+
+@compiler.target( os = 'windows' )
+def is_printable_cp( cp: u32 ) -> bool:
+	# space (0x20) is C1_SPACE|C1_BLANK, never C1_CNTRL, so it's already
+	# printable here with no special-casing needed - matches Python's own
+	# isprintable() treatment of plain space
+	from windows.kernel32 import C1_CNTRL
+	return ( _char_type_windows( cp ) & C1_CNTRL ) == 0
+
+@compiler.target( os = not 'windows' )
+def is_printable_cp( cp: u32 ) -> bool:
+	# C's own iswprint already treats space as printable and control
+	# characters as not - matches Python's isprintable() without any
+	# special-casing needed here either
+	from crt import newlocale, freelocale, LC_CTYPE_MASK, iswprint_l
+	loc: Ptr[None] = newlocale( LC_CTYPE_MASK, 'C.UTF-8'.get_cstr(), None )
+	if loc is None:
+		return False
+	defer( freelocale( loc ))
+	with compiler.panic_arithmetic( 'codepoint out of range for wint_t - impossible for valid Unicode (max U+10FFFF)' ):
+		wc: i32 = i32( cp )
+	return iswprint_l( wc, loc ) != 0

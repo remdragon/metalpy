@@ -4662,6 +4662,205 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class StrPhase3ClassificationTests( CompilerTestCase ):
+	''' Phase 3 of TODO.txt's str-methods plan: OS-native Unicode
+	classification (__str.py's is_alpha_cp/is_digit_cp/is_space_cp/
+	is_upper_cp/is_lower_cp/is_alnum_cp/is_printable_cp, each a real
+	GetStringTypeW/iswalpha_l-family call, not an ASCII fallback) and the
+	str methods built on them, plus strip()/lstrip()/rstrip() (whitespace-
+	only - see this file's own comment on the str|None compiler gap that
+	blocks a chars= form for now). Includes at least one non-ASCII case
+	per classification method, to actually exercise the OS-native path
+	rather than just ASCII-range-looking input a broken implementation
+	could also pass by accident. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isalpha( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'hello'.isalpha():
+		return 1
+	if 'hello world'.isalpha():
+		return 2
+	if 'hello1'.isalpha():
+		return 3
+	if ''.isalpha():
+		return 4
+	if not 'café'.isalpha():
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isdigit_isdecimal_isnumeric( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not '12345'.isdigit():
+		return 1
+	if '123a5'.isdigit():
+		return 2
+	if ''.isdigit():
+		return 3
+	if not '12345'.isdecimal():
+		return 4
+	if not '12345'.isnumeric():
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isspace( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not '   \\t\\n'.isspace():
+		return 1
+	if ' a '.isspace():
+		return 2
+	if ''.isspace():
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isupper_islower( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'HELLO'.isupper():
+		return 1
+	if 'Hello'.isupper():
+		return 2
+	if not 'HELLO123'.isupper():
+		return 3
+	if '123'.isupper():
+		return 4
+	if not 'hello'.islower():
+		return 5
+	if 'Hello'.islower():
+		return 6
+	if not 'ÉCOLE'.isupper():
+		return 7
+	if not 'école'.islower():
+		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isalnum( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'abc123'.isalnum():
+		return 1
+	if 'abc 123'.isalnum():
+		return 2
+	if ''.isalnum():
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isprintable( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'hello world'.isprintable():
+		return 1
+	if not ''.isprintable():
+		return 2
+	if not 'café'.isprintable():
+		return 3
+	if '\\n'.isprintable():
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isidentifier( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'valid_name'.isidentifier():
+		return 1
+	if not '_leading'.isidentifier():
+		return 2
+	if '1starts_with_digit'.isidentifier():
+		return 3
+	if 'has space'.isidentifier():
+		return 4
+	if ''.isidentifier():
+		return 5
+	if not 'name123'.isidentifier():
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_strip_lstrip_rstrip( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if '  hi  '.strip() != 'hi':
+		return 1
+	if '  hi  '.lstrip() != 'hi  ':
+		return 2
+	if '  hi  '.rstrip() != '  hi':
+		return 3
+	if '\\t\\n hi \\t\\n'.strip() != 'hi':
+		return 4
+	if 'noleadingortrailing'.strip() != 'noleadingortrailing':
+		return 5
+	if '     '.strip() != '':
+		return 6
+	if ''.strip() != '':
+		return 7
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class EarlyReturnFromLoopWithLiveRCLocalTests( CompilerTestCase ):
 	''' cfg.py's current_epilogue_label() shared-ladder optimization used to
 	assume every entry on the epilogue stack survives to the function's own

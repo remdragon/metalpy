@@ -188,3 +188,61 @@ def towlower_l(
 	loc: locale_t,
 ) -> i32:
 	...
+
+# ---------------------------------------------------------------------------
+# Unicode codepoint classification - str.isalpha()/isdigit()/isspace()/
+# isupper()/islower()/isalnum()/isprintable() (see __str.py's is_*_cp
+# primitives, TODO.txt's str-methods plan). Same explicit-locale,
+# 'C.UTF-8', per-call newlocale/freelocale convention as towupper_l/
+# towlower_l above, for the identical data-race reasoning - a plain
+# iswalpha()/etc would depend on process-global locale state.
+# ---------------------------------------------------------------------------
+
+@extern( 'c', 'iswalpha_l' )
+def iswalpha_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
+
+@extern( 'c', 'iswdigit_l' )
+def iswdigit_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
+
+@extern( 'c', 'iswspace_l' )
+def iswspace_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
+
+@extern( 'c', 'iswupper_l' )
+def iswupper_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
+
+@extern( 'c', 'iswlower_l' )
+def iswlower_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
+
+@extern( 'c', 'iswalnum_l' )
+def iswalnum_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
+
+@extern( 'c', 'iswprint_l' )
+def iswprint_l(
+	wc: i32,
+	loc: locale_t,
+) -> i32:
+	...
