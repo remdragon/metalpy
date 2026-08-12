@@ -5004,6 +5004,121 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class TupleTests( CompilerTestCase ):
+	''' tuple[T0, T1, ...] (tuple_storage.py's TupleStorage, discovery.py's
+	tuple[...] recognition, lowering.py's _expr_Tuple/_expr_Subscript) end-
+	to-end - see PLAN_TUPLE.md. Mirrors ListGenericTests'/DictTests' own
+	import_builtins=True + real compile-and-run convention (an RC element
+	like str needs the rest of builtins for real). Unlike list[T]/dict[K,V]
+	there's no FastLock wrapper to test - a tuple's fields are only ever
+	written once, by construction, so no ThreadSafetyTests sibling class is
+	needed here (see PLAN_TUPLE.md's own "Deferred" list on why). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_construct_and_read_back_heterogeneous_elements( self ) -> None:
+		# a value element (i32), an RC element (str), and a value element
+		# again (bool) - constant-index reads each one back correctly, and
+		# a deliberately WRONG expected value on each check (return 1/2/3)
+		# rules out a vacuous pass (every check actually has to fire)
+		self._run( '''
+def main() -> i32:
+	t: tuple[i32, str, bool] = ( 10, "hi", True )
+	if t[0] != 10:
+		return 1
+	if t[1] != "hi":
+		return 2
+	if t[2] != True:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_unannotated_local_infers_element_types( self ) -> None:
+		# no annotation at all - each element's own type is inferred
+		# independently (bare int literals default to i32), same as any
+		# other unannotated local declaration
+		self._run( '''
+def main() -> i32:
+	t = ( 1, 2, 3 )
+	if t[0] != 1 or t[1] != 2 or t[2] != 3:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_element_constructed_and_dropped_without_crashing( self ) -> None:
+		# an RC element (str) constructed into a tuple that's never read
+		# again after construction - exercises the synthesized backing
+		# RCClass's own destructor cascade (type_resolver.py's
+		# _synthesize_rcclass_destructor, triggered here via the ordinary
+		# scope-exit path, same as any other RC-holding local) tearing down
+		# the str field correctly. No leak/double-free assertion is made
+		# directly (this file has no ASan integration) - a clean exit code
+		# 0 from a real compiled-and-linked binary is the same correctness
+		# signal ListGenericTests'/DictTests' own RC-element tests rely on.
+		self._run( '''
+def main() -> i32:
+	t: tuple[str, i32] = ( "owned", 5 )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_two_distinct_tuple_shapes_construct_and_read_back_independently( self ) -> None:
+		# tuple[i32,str] and tuple[str,i32] are two different backing
+		# classes (see tuple_storage.py) - constructing/reading both in the
+		# same function proves they don't collide with each other
+		self._run( '''
+def main() -> i32:
+	a: tuple[i32, str] = ( 1, "x" )
+	b: tuple[str, i32] = ( "y", 2 )
+	if a[0] != 1 or a[1] != "x":
+		return 1
+	if b[0] != "y" or b[1] != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never

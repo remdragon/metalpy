@@ -4008,6 +4008,120 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	# --- tuple[...] value construction / constant-index access (PLAN_TUPLE.md) ---
+
+	def test_tuple_type_interning( self ) -> None:
+		# two annotations spelling the same element-type list share one
+		# TupleType object - mirrors CallableType's own interning
+		# (discovery.py's _get_or_create_callable_type), so identity-based
+		# comparisons elsewhere (e.g. tuple_storage's own reverse lookup)
+		# work correctly
+		i32 = self.discovery.get_intrinsics()['i32']
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		tt1 = self.discovery._get_or_create_tuple_type( [ i32, bool_cls ] )
+		tt2 = self.discovery._get_or_create_tuple_type( [ i32, bool_cls ] )
+		self.assertIs( tt1, tt2 )
+		tt3 = self.discovery._get_or_create_tuple_type( [ bool_cls, i32 ] )
+		self.assertIsNot( tt1, tt3 ) # different element ORDER is a different tuple type
+
+	def test_tuple_literal_lowers_to_allocate_with_positional_fields( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	t: tuple[i32, bool] = ( 1, True )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		alloc = next( instr for instr in fn.instructions if isinstance( instr, ir.Allocate ))
+		self.assertEqual( alloc.cls.qualname, 'tuple[intrinsics.i32,intrinsics.bool]' )
+		self.assertEqual( set( alloc.fields.keys() ), { '_0', '_1' } )
+		self.assertEqual( alloc.fields['_0'].value, 1 )
+		self.assertEqual( alloc.fields['_1'].value, True )
+		# no synthesized __init__ call anywhere - field=value sugar only,
+		# same as any other class with no real __init__ (_lower_allocate_
+		# fields' own "no __init__" path)
+		self.assertFalse( any( isinstance( instr, ir.Call ) for instr in fn.instructions ))
+
+	def test_tuple_literal_needs_at_least_two_elements( self ) -> None:
+		# a 1-element/empty tuple literal is a real Python ast.Tuple parsing
+		# ambiguity (a 1-tuple needs a trailing comma to disambiguate from a
+		# plain parenthesized expression) - deferred, see PLAN_TUPLE.md's
+		# own "Deferred" list. `(1,)` is arity 1 - still rejected here.
+		code = '\n'.join([
+			'def main() -> None:',
+			'	t = ( 1, )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'at least 2 elements', self.discovery.errors.errors[0] )
+
+	def test_tuple_annotation_needs_at_least_two_type_arguments( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	t: tuple[i32] = ( 1, 2 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'at least 2 type arguments', self.discovery.errors.errors[0] )
+
+	def test_constant_index_lowers_to_getattr( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	t: tuple[i32, bool] = ( 1, True )',
+			'	x: i32 = t[0]',
+			'	y: bool = t[1]',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		getattrs = [ instr for instr in fn.instructions if isinstance( instr, ir.GetAttr ) ]
+		self.assertEqual( [ g.attr for g in getattrs ], [ '_0', '_1' ] )
+		# no __getitem__ call/GetItem opcode - constant-index access is
+		# plain attribute access, resolved entirely at lowering time
+		self.assertFalse( any( isinstance( instr, ( ir.Call, ir.GetItem )) for instr in fn.instructions ))
+
+	def test_out_of_range_constant_index_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	t: tuple[i32, bool] = ( 1, True )',
+			'	x: i32 = t[2]',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	def test_non_constant_index_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	t: tuple[i32, bool] = ( 1, True )',
+			'	i: usize = 0',
+			'	x: i32 = t[i]',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'compile-time-constant integer index', self.discovery.errors.errors[0] )
+
+	def test_two_distinct_tuple_shapes_never_share_a_backing_class( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: tuple[i32, bool] = ( 1, True )',
+			'	b: tuple[bool, i32] = ( True, 1 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocs = [ instr for instr in fn.instructions if isinstance( instr, ir.Allocate ) ]
+		self.assertEqual( len( allocs ), 2 )
+		self.assertIsNot( allocs[0].cls, allocs[1].cls )
+		self.assertNotEqual( allocs[0].cls.qualname, allocs[1].cls.qualname )
+
 	# --- globals -------------------------------------------------------------
 
 	def test_reads_module_global( self ) -> None:

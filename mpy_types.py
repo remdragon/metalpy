@@ -179,6 +179,31 @@ class CallableType( Type ):
 	arg_types: list[Type]
 	return_type: Type
 
+@dataclass( kw_only = True )
+class TupleType( Type ):
+	''' `tuple[T0, T1, ..., Tn]` in annotation position (see PLAN_TUPLE.md) -
+	a heterogeneous, fixed-arity value group. Unlike list[T]/dict[K,V]
+	(ordinary fixed-arity generics, matched against a class's own
+	type_params by discovery.py's ordinary generic-subscript path), tuple
+	is variadic arity AND heterogeneous, so there's no type_params-bearing
+	base class to subscript against - recognized textually in
+	visit_Subscript instead, the same way Callable[...]/Closure[...] are.
+	Not a ScopeMixin itself (mirrors CallableType - no members of its own
+	on the TYPE); unlike CallableType (a bare, receiver-less function-
+	pointer SHAPE that's never constructed), a tuple genuinely needs a
+	real, constructible, destructible, RC-aware backing class - synthesized
+	lazily by tuple_storage.TupleStorage.get() the first time this exact
+	TupleType is touched, and cached here afterward (self-caching slot in
+	the same spirit as Specialization.monomorphized above, except the
+	backing class itself is the cache rather than a callback, and it
+	doesn't self-clear). Interned by discovery.py's _get_or_create_tuple_
+	type, the same way CallableType already is, so two annotations
+	spelling the same element-type list share one object (and therefore
+	one backing class/one synthesized __init__, not a fresh one per
+	occurrence). '''
+	elem_types: list[Type]
+	backing: 'RCClass|None' = None
+
 # a class's own body scan (revealing its attribute/method *names*) is
 # deferred behind .resolve, exactly like a Function's parameters or a
 # Variable's type - nothing about a class's members is known until something

@@ -155,6 +155,7 @@ class Lowering:
 		self.schedule = type_resolver.schedule
 		self._union_storage = type_resolver.union_storage
 		self._monomorphizer = type_resolver.monomorphizer
+		self._tuple_storage = type_resolver.tuple_storage
 		self._closure_trampolines: dict[tuple[int,int],Function] = {} # (id(method), id(owner_type)) -> its one synthesized trampoline, see _get_or_create_closure_trampoline
 		self._lambda_counter = 0 # -> f'$$lambda_{n}', unique per compile run - see _expr_Lambda (PLAN_LAMBDA.md)
 
@@ -3192,10 +3193,89 @@ class FunctionLowering:
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
 		return dest
 
+	def _expr_Tuple( self, node: ast.Tuple, expected_type: Type|None ) -> ir.Operand:
+		# `(a, b, c)` in value position (PLAN_TUPLE.md) - the first real
+		# handling of ast.Tuple as a VALUE anywhere in this file (elsewhere
+		# it only ever appears as an annotation-subscript shape, e.g. Dict
+		# [K,V]'s own multi-arg slice). No synthesized __init__/construct-
+		# call round-trip needed: this builds the backing RCClass directly
+		# via ir.Allocate's own field=value shape, the exact same "no real
+		# __init__" convention _lower_allocate_fields already applies to any
+		# class that doesn't declare one, and the same direct-Allocate shape
+		# _lower_bound_method_closure already uses to build a ClosureType
+		# value with no __init__ of its own either.
+		if len( node.elts ) < 2:
+			# arity 0/1 is a real Python ast.Tuple parsing ambiguity (a
+			# 1-tuple LITERAL needs a trailing comma to disambiguate from a
+			# plain parenthesized expression) - deferred rather than
+			# guessed at, see PLAN_TUPLE.md's own "Deferred" list. An empty
+			# `()` reaches here too (len 0) - same deferral.
+			self.lowering.discovery.fail( f'tuple literals need at least 2 elements: {ast.unparse(node)}', node )
+		operands: list[ir.Operand] = []
+		for elt in node.elts:
+			value = self._lower_expr( elt, None )
+			# same per-field RC-retain emission _lower_allocate_fields's own
+			# field-value loop uses for every other class's field=value
+			# construction sugar - a fresh value (Allocate/Call/Constant)
+			# needs no extra incref, an aliasing read of an existing
+			# binding (Name/Attribute) does, since the tuple now
+			# independently owns a reference alongside whatever binding the
+			# element came from
+			for instr in self._cfg.field_value( value.type, value, is_alias = self.lowering._is_aliasing_expr( elt, value.type )):
+				self._emit( instr )
+			operands.append( value )
+		tt = self.lowering.discovery._get_or_create_tuple_type( [ op.type for op in operands ] )
+		backing_cls = self.lowering._ensure_resolved( tt )
+		# every constructed RCClass needs sys.alloc[T]/sys.free (and __del__,
+		# if declared - not applicable here) scheduled at the CONSTRUCTION
+		# site, same as every other ir.Allocate emission in this file -
+		# _ensure_resolved(tt) alone only guarantees the backing class
+		# itself is scheduled, not its allocator
+		self.lowering._schedule_rcclass_construction( backing_cls, backing_cls )
+		fields = { f'_{i}': op for i, op in enumerate( operands ) }
+		# resolve expected_type too, not just tt - an annotated declaration
+		# (`x: tuple[i32,str] = (1,"a")`) hands down the SAME bare,
+		# unresolved TupleType discovery.py's visit_Subscript produced for
+		# the annotation (interned - same object as tt above), not yet
+		# swapped for backing_cls
+		resolved_expected = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
+		dest = self._new_temp( resolved_expected or backing_cls )
+		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
+		return dest
+
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
 		obj = self._lower_expr( node.value, None )
 		getitem_fn = self.lowering._find_method( obj.type, '__getitem__' )
 		if getitem_fn is None:
+			# tuple[...]'s own constant-index-only element access
+			# (PLAN_TUPLE.md) - checked ahead of the ordinary Ptr/ConstPtr
+			# GetItem fallback below: a heterogeneous tuple has no real
+			# __getitem__ (no single return type to give one), so `t[0]`
+			# can only ever be resolved to plain attribute access on a
+			# COMPILE-TIME-CONSTANT index, never a runtime GetItem
+			resolved_obj_type = self.lowering._ensure_resolved( obj.type )
+			tuple_type = self.lowering._tuple_storage.tuple_type_for( resolved_obj_type )
+			if tuple_type is not None:
+				valid_index = (
+					isinstance( node.slice, ast.Constant )
+					and isinstance( node.slice.value, int )
+					and not isinstance( node.slice.value, bool ) # bool is an int subclass in Python's own ast - not a legal tuple index
+				)
+				if not valid_index:
+					self.lowering.discovery.fail(
+						f'tuple element access requires a compile-time-constant integer index: {ast.unparse(node)}',
+						node,
+					)
+				index = node.slice.value
+				if not ( 0 <= index < len( tuple_type.elem_types )):
+					self.lowering.discovery.fail(
+						f'tuple index {index} out of range for {resolved_obj_type.qualname} (0..{len(tuple_type.elem_types)-1}): {ast.unparse(node)}',
+						node,
+					)
+				attr_var = self.lowering._attr_lookup( resolved_obj_type, f'_{index}', node )
+				dest = self._new_temp( attr_var.type )
+				self._emit( ir.GetAttr( dest = dest, obj = obj, attr = f'_{index}' ))
+				return dest
 			# no real __getitem__ declared (raw pointers, or any other type
 			# that doesn't define subscript access as a method) - falls
 			# back to the flat GetItem opcode, unconditionally

@@ -10,7 +10,7 @@ from typing import Any, Callable, Generator, NoReturn
 import compile_time_transformer
 from errors import CompileError, ErrorCollector
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
 	Module, _is_covered_by, _overlaps,
 )
@@ -146,6 +146,7 @@ class Discovery( ast.NodeVisitor ):
 		self._copies: dict[str,Copy] = {}
 		self._callables: dict[str,CallableType] = {}
 		self._closures: dict[str,ClosureType] = {}
+		self._tuples: dict[str,TupleType] = {}
 
 		# lazily detected the first time a has_library(...) check (decorator
 		# or compiler.has_library(...) expression - see _matches_has_library/
@@ -515,7 +516,7 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType:
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType:
 		# move[T]/copy[T] are compiler syntax, not a real generic lookup -
 		# recognized textually here the same way @move is recognized
 		# textually as a decorator name in _parse_function, rather than
@@ -564,6 +565,31 @@ class Discovery( ast.NodeVisitor ):
 			arg_types = [ self.visit( arg_node ) for arg_node in arg_nodes.elts ]
 			return_type = self.visit( ret_node )
 			return self._get_or_create_closure_type( arg_types, return_type )
+
+		# tuple[T0, T1, ..., Tn] (n >= 1, arity >= 2) - heterogeneous,
+		# fixed-arity value groups (see PLAN_TUPLE.md). Recognized textually
+		# here, the same way move/copy/Callable/Closure already are above,
+		# rather than resolved as an ordinary generic base: there's no real
+		# class with type_params to subscript against - tuple is variadic
+		# arity AND heterogeneous, so every distinct element-type list needs
+		# its own backing layout, synthesized lazily by tuple_storage.
+		# TupleStorage.get() the first time this exact TupleType is actually
+		# touched (constructed, or read via a constant index), not here -
+		# see _get_or_create_tuple_type's own comment. Lowercase 'tuple'
+		# (not 'Tuple') deliberately matches list[T]/dict[K,V]'s own
+		# established casing - from a user's perspective this reads as an
+		# ordinary builtin, not compiler magic the way Callable/Closure are.
+		if isinstance( node.value, ast.Name ) and node.value.id == 'tuple':
+			arity_ok = isinstance( node.slice, ast.Tuple ) and len( node.slice.elts ) >= 2
+			if not arity_ok:
+				# arity 0/1 (bare `tuple[T]`, or no elements at all) is a
+				# real Python ast.Tuple parsing ambiguity (a 1-tuple LITERAL
+				# needs a trailing comma to disambiguate from a plain
+				# parenthesized expression) - deferred rather than guessed
+				# at, see PLAN_TUPLE.md's own "Deferred" list
+				self.fail( f'tuple[...] needs at least 2 type arguments: {ast.unparse(node)}', node )
+			elem_types = [ self.visit( elt ) for elt in node.slice.elts ]
+			return self._get_or_create_tuple_type( elem_types )
 
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
@@ -620,6 +646,28 @@ class Discovery( ast.NodeVisitor ):
 		)
 		self._callables[key] = fn_type
 		return fn_type
+
+	def _get_or_create_tuple_type( self, elem_types: list[Type] ) -> TupleType:
+		# key mirrors _get_or_create_specialization's own qualname convention
+		# (f'{base.qualname}[{args}]') - see PLAN_TUPLE.md and tuple_storage.
+		# py's own identical qualname choice for the backing RCClass this
+		# interns to. backing is populated lazily by tuple_storage.
+		# TupleStorage.get() the first time this exact TupleType is actually
+		# touched (constructed, or read via a constant index) - not here,
+		# same "type resolves without needing a real runtime representation
+		# yet" split CallableType/ClosureType above already use.
+		key = f'tuple[{",".join( t.qualname for t in elem_types )}]'
+		if tt := self._tuples.get( key ):
+			return tt
+		tt = TupleType(
+			stem = key,
+			qualname = key,
+			file = None,
+			line = None,
+			elem_types = elem_types,
+		)
+		self._tuples[key] = tt
+		return tt
 
 	def _get_or_create_closure_type( self, arg_types: list[Type], return_type: Type ) -> ClosureType:
 		key = f'Closure[[{",".join( a.qualname for a in arg_types )}],{return_type.qualname}]'

@@ -11,8 +11,9 @@ from monomorphize import Monomorphizer
 from mpy_types import (
 	CallableType, CEnum, ClassLike, CStruct, CUnion, Function, Module, Name, Overload,
 	Parameter, RCClass, Scalar, Specialization, TaggedUnion, Type,
-	TypeVar, Variable,
+	TupleType, TypeVar, Variable,
 )
+from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
 
@@ -117,6 +118,7 @@ class TypeResolver:
 		self._seen_lock = threading.Lock()
 		self.union_storage = UnionStorage( discovery, self.schedule )
 		self.monomorphizer = Monomorphizer( discovery, self.schedule, self.union_storage )
+		self.tuple_storage = TupleStorage( discovery, self.schedule ) # PLAN_TUPLE.md - same "depends on nothing but Discovery + schedule" shape as union_storage/monomorphizer above
 		# keyed by id(fn.node), not id(fn) - the SAME shared AST body object
 		# is reused by every monomorphized copy of a generic function (see
 		# resolve_function_body's own docstring)
@@ -810,6 +812,18 @@ class TypeResolver:
 			# scalars - see mpy_types.py's Scalar) has no monomorphization
 			# support at all - .names/.resolve stay raw passthroughs to the
 			# abstract base, same as always
+		if isinstance( obj, TupleType ):
+			# PLAN_TUPLE.md - the same "swap for the real, substituted
+			# thing" spot the Specialization branch above uses, so every
+			# EXISTING _ensure_resolved/ensure_resolved call site (there are
+			# ~15+ across lowering.py/type_resolver.py) transparently
+			# receives tuple_storage.TupleStorage's synthesized backing
+			# RCClass instead of the bare, field-less TupleType, with zero
+			# changes needed at any of those call sites - a TupleType is
+			# never itself further specialized/monomorphized (it has no
+			# type_params of its own to substitute), so this is a flat
+			# swap, not a recursive one
+			return self.tuple_storage.get( obj )
 		return obj
 
 	def _find_module_for( self, fn: Function ) -> Module:
