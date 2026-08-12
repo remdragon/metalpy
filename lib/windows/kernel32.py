@@ -97,6 +97,29 @@ def CloseHandle(
 ) -> bool:
 	...
 
+# DWORD WINAPI ThreadProc(LPVOID lpParameter) - the one shape every thread
+# entry point takes; lib/threading.py's own Thread class always hands this
+# the same fixed trampoline (never a per-closure one - see its own comment)
+@extern('kernel32', 'CreateThread')
+def CreateThread(
+	lpThreadAttributes: Ptr[None],
+	dwStackSize: usize,
+	lpStartAddress: Ptr[Callable[[Ptr[None]], u32]],
+	lpParameter: Ptr[None],
+	dwCreationFlags: u32,
+	lpThreadId: Ptr[u32],
+) -> HANDLE:
+	...
+
+INFINITE: u32 = u32( -1 )
+
+@extern('kernel32', 'WaitForSingleObject')
+def WaitForSingleObject(
+	hHandle: HANDLE,
+	dwMilliseconds: u32,
+) -> u32:
+	...
+
 @extern('kernel32', 'SetFilePointerEx')
 def SetFilePointerEx(
 	hFile: HANDLE,

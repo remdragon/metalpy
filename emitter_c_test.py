@@ -3774,6 +3774,126 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class ThreadRealCompileTests( CompilerTestCase ):
+	''' real compile+run coverage for threading.Thread (lib/threading.py),
+	built on Phase 1 (compiler.atomic_*/lib/atomic.py) and Phase 2b
+	(Closure[[...],...]) - see the approved atomics-closures-threading
+	plan. A real OS thread is the only way to confirm the closure-as-
+	thread-payload design actually works end to end: the receiver's own
+	RC lifecycle across a genuine thread boundary, and N threads safely
+	sharing ONE closure via an ordinary aliasing incref (not move[T] - see
+	the plan's own reasoning for why that would have been wrong).
+	subprocess timeout is set explicitly (unlike every other real-run test
+	class here) since a real hang (a deadlocked join()) should fail loudly
+	rather than wedge the whole suite indefinitely. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			try:
+				run_result = subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = 30 )
+			except subprocess.TimeoutExpired:
+				self.fail( 'exe did not finish within 30s - likely a deadlocked join()' )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_spawn_one_thread_mutates_shared_state( self ) -> None:
+		self._run( '''
+import threading
+
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def run( self ) -> None:
+		self.x = 99
+
+def main() -> i32:
+	w: Worker = Worker.make( 0 )
+	t: threading.Thread = threading.Thread( w.run )
+	t.join()
+	if w.x != 99:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_n_threads_share_one_closure_via_atomic_counter( self ) -> None:
+		# the real end-to-end proof: one closure, shared (ordinary
+		# aliasing incref, NOT move[T]) across 8 separate Thread spawns,
+		# each running 1000 lock-free fetch_add's on the SAME Atomic[usize]
+		# - the exact shape the plan's own design discussion converged on
+		self._run( '''
+import threading
+import atomic
+
+class Counter:
+	n: atomic.Atomic[usize]
+
+	@staticmethod
+	def make() -> Counter:
+		return Counter.__allocate__( n = atomic.Atomic[usize]( 0 ) )
+
+	def bump( self ) -> None:
+		i: usize = 0
+		while i < 1000:
+			self.n.fetch_add( 1 )
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	c: Counter = Counter.make()
+	closure: Closure[[], None] = c.bump
+	threads: list[threading.Thread] = list[threading.Thread]()
+	i: usize = 0
+	while i < 8:
+		threads.append( threading.Thread( closure ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			i += 1
+	i = 0
+	while i < 8:
+		t: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		t.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+	if c.n.load() != 8000:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class StrFindIndexSplitTests( CompilerTestCase ):
 	''' str.find()/str.index()/str.split() (lib/builtins/__init__.py) -
 	both listed missing in TODO.txt, implemented as real general-purpose

@@ -3786,7 +3786,25 @@ class Lowering:
 			)
 		target = self._lower_expr( node.func, None )
 		args = [ self._lower_expr( arg_node, arg_type ) for arg_node, arg_type in zip( node.args, fn_type.arg_types ) ]
-		dest = self._new_temp( expected_type or fn_type.return_type )
+		return self._emit_call_indirect( target, args, fn_type.return_type, expected_type )
+
+	def _emit_call_indirect( self, target: ir.Operand, args: list[ir.Operand], return_type: Type, expected_type: Type|None ) -> ir.Operand:
+		# shared by _try_lower_indirect_call/_try_lower_closure_call - a
+		# NoneType-returning target (Callable[[...],None]/Closure[[...],
+		# None]) needs dest=None in the emitted ir.CallIndirect (matching
+		# ir.Call's own void-return convention - emitter_c.py's C
+		# expression for the call itself has C type void there, and
+		# `t = (void)(...)` is a real, confirmed compile error, not just
+		# reasoning), but the CALLER here (a construction-sugar recognizer,
+		# "None means try the next one") still needs to return a real,
+		# non-None ir.Operand to signal "matched" - ir.Const(NoneType,
+		# None) is a real value, the same representation an explicit
+		# `x = None` already produces, distinct from Python's own None
+		none_type = self.discovery.get_none_type()
+		if return_type is none_type:
+			self._emit( ir.CallIndirect( dest = None, target = target, args = args ))
+			return ir.Const( type = none_type, value = None )
+		dest = self._new_temp( expected_type or return_type )
 		self._emit( ir.CallIndirect( dest = dest, target = target, args = args ))
 		return dest
 
@@ -3838,9 +3856,7 @@ class Lowering:
 		fn_cast = self._new_temp( trampoline_ptr_type )
 		self._emit( ir.CastWrap( dest = fn_cast, operand = fn_operand ))
 
-		dest = self._new_temp( expected_type or closure_type.return_type )
-		self._emit( ir.CallIndirect( dest = dest, target = fn_cast, args = [ self_operand, *args ] ))
-		return dest
+		return self._emit_call_indirect( fn_cast, [ self_operand, *args ], closure_type.return_type, expected_type )
 
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return

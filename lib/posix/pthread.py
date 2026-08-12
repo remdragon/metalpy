@@ -35,3 +35,29 @@ def pthread_mutex_unlock(
 	mutex: Ptr[None],
 ) -> i32:
 	...
+
+# pthread_t is opaque/platform-specific (typically an unsigned long or a
+# small struct) - Ptr[None] stands in for pthread_t itself (an opaque
+# handle, same as HANDLE on Windows); `thread` here is pthread_t*, an
+# OUT-param pthread_create WRITES the new thread's own handle into, so
+# it's Ptr[Ptr[None]] - one level more indirection than mutex/attr above.
+# header='pthread.h' means the REAL declaration from the header is what
+# the C compiler actually sees, this one is only for this compiler's own
+# type-checking
+@extern('pthread', 'pthread_create', header='pthread.h')
+def pthread_create(
+	thread: Ptr[Ptr[None]],
+	attr: Ptr[None],
+	start_routine: Ptr[Callable[[Ptr[None]], Ptr[None]]],
+	arg: Ptr[None],
+) -> i32:
+	...
+
+# thread is pthread_t itself here (passed by value, not by pointer -
+# unlike pthread_create's own out-param above)
+@extern('pthread', 'pthread_join', header='pthread.h')
+def pthread_join(
+	thread: Ptr[None],
+	retval: Ptr[None],
+) -> i32:
+	...

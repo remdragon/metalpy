@@ -3189,6 +3189,28 @@ class Tests( unittest.TestCase ):
 		self.compiler._lower( call_it_fn )
 		self.assertIn( 'takes 2 argument(s), got 1', self.discovery.errors.errors[0] )
 
+	def test_call_through_none_returning_callable_pointer_omits_dest( self ) -> None:
+		# regression test: a NoneType-returning Callable[...] call used to
+		# always allocate a dest temp and emit ir.CallIndirect(dest=...),
+		# producing `t = (void)(...)` in the generated C (a real,
+		# confirmed compile error - void isn't assignable to anything) -
+		# found while building Thread's own entry trampoline, which calls
+		# through exactly this shape (Closure[[],None])
+		code = '\n'.join([
+			'def call_it( f: Ptr[Callable[[],None]] ) -> None:',
+			'	f()',
+			'	return',
+		])
+		self._import( code )
+		call_it_fn = self.discovery.modules['__test__'].get_local( 'call_it' )
+		if call_it_fn.resolve is not None:
+			call_it_fn.resolve()
+		lf = self.compiler._lower( call_it_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call_indirects = [ i for i in lf.instructions if isinstance( i, ir.CallIndirect ) ]
+		self.assertEqual( len( call_indirects ), 1 )
+		self.assertIsNone( call_indirects[0].dest )
+
 	# --- Closure[[...],...] bound-method values -------------------------------
 
 	def test_bound_method_reference_builds_closure_allocate( self ) -> None:
