@@ -3236,6 +3236,82 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( call.target.parameters[1].type.stem, 'intrinsics.Ptr[Callable[[intrinsics.i32],intrinsics.i32]]' ) # key: Ptr[Callable[[T],K]] -> Ptr[Callable[[i32],i32]], both T and K bound
 		self.assertEqual( call.target.return_type.stem, 'i32' ) # K -> i32
 
+	def test_lambda_eagerly_lowered_infers_generic_return_type( self ) -> None:
+		# the circular case the CallableType fix above still couldn't solve
+		# on its own (PLAN_LAMBDA.md, "eager lambda lowering"): K is only
+		# knowable from the LAMBDA's own inferred return type, which means
+		# _expr_Lambda has to lower the lambda's body right now, at this
+		# call site, instead of only ever deferring it onto the work queue -
+		# see FunctionLowering/_compile_now (compiler.py's own backreference)
+		code = '\n'.join([
+			'def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:',
+			'	return key( x )',
+			'',
+			'def main() -> i32:',
+			'	return apply( 5, key = lambda v: v )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( instr for instr in fn.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.parameters[0].type.stem, 'i32' ) # x: T -> i32
+		self.assertEqual( call.target.parameters[1].type.stem, 'intrinsics.Ptr[Callable[[intrinsics.i32],intrinsics.i32]]' ) # key: Ptr[Callable[[T],K]] -> Ptr[Callable[[i32],i32]], K inferred from the lambda's OWN body
+		self.assertEqual( call.target.return_type.stem, 'i32' ) # K -> i32
+		lambda_ref = call.kwargs['key']
+		self.assertIsInstance( lambda_ref, ir.FunctionRef )
+		self.assertEqual( lambda_ref.fn.return_type.stem, 'i32' ) # the synthesized lambda Function's own return_type was patched after eager lowering, not left None
+		lowered_names = { lf.function.qualname for lf in self.compiler.functions }
+		self.assertIn( lambda_ref.fn.qualname, lowered_names ) # actually registered into compiler.functions by the eager _compile_now path, not silently dropped
+
+	def test_lambda_still_fails_when_arg_type_uninferable( self ) -> None:
+		# unlike the return type, a lambda's own PARAMETER types have no
+		# body to infer them from - an unbound arg type in the expected
+		# Callable[...] is still unrecoverable, eager lowering or not, and
+		# must keep failing with a clear error rather than silently trying
+		# to eagerly lower a body it can't even assign parameter types to
+		code = '\n'.join([
+			'def only_callable[T]( key: Ptr[Callable[[T],T]] ) -> i32:',
+			'	return 0',
+			'',
+			'def main() -> i32:',
+			'	return only_callable( key = lambda v: v )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any(
+			'cannot infer lambda parameter types' in e for e in self.discovery.errors.errors
+		), self.discovery.errors.errors )
+
+	def test_lambda_eagerly_lowered_nested_inside_another_eager_lambda( self ) -> None:
+		# regression guard for the whole point of the FunctionLowering class
+		# split (PLAN_LAMBDA.md): eagerly lowering a lambda's body can ITSELF
+		# hit another generic call needing ANOTHER lambda eagerly lowered,
+		# mid-way through the first - a genuinely reentrant lower_function
+		# call. Each level gets its own independent FunctionLowering
+		# instance (no shared mutable per-function state to clobber), and
+		# _lambda_counter (persistent, on the shared Lowering instance)
+		# still hands out unique names across all of them
+		code = '\n'.join([
+			'def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:',
+			'	return key( x )',
+			'',
+			'def outer[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:',
+			'	return key( x )',
+			'',
+			'def main() -> i32:',
+			'	return outer( 5, key = lambda v: apply( v, key = lambda w: w ) )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( instr for instr in fn.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.return_type.stem, 'i32' )
+		lowered_names = { lf.function.qualname for lf in self.compiler.functions }
+		self.assertEqual(
+			{ 'main', 'main$$lambda_1', 'main$$lambda_1$$lambda_2' } & lowered_names,
+			{ 'main', 'main$$lambda_1', 'main$$lambda_1$$lambda_2' },
+		) # both lambdas got distinct names and were both actually registered - no counter collision, no dropped nested lowering
+
 	# --- non-capturing nested function defs (PLAN_LAMBDA.md) ------------------
 
 	def test_nested_def_called_from_enclosing_function( self ) -> None:

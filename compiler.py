@@ -54,6 +54,11 @@ class Compiler:
 		# Lowering.__init__) - see its own docstring
 		self.type_resolver = TypeResolver( disco )
 		self.lowering = Lowering( disco, self.type_resolver )
+		# lets a synthesized function's body be lowered EAGERLY, synchronously,
+		# at the call site that needs its result right away - instead of only
+		# ever being scheduled onto the work queue for later - see
+		# _expr_Lambda's eager return-type inference (PLAN_LAMBDA.md)
+		self.lowering._compile_now = self._lower
 
 		self.functions: list[LoweredFunction] = []
 		self.rcclasses: list[RCClass] = []

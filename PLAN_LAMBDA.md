@@ -43,15 +43,17 @@ block the forcing use case (`lambda tran: tran.timestamp` does no
 arithmetic at all) - noted for whoever picks up real closures/lambda
 ergonomics next.
 
-STATUS: landed and tested for the scoped case (a lambda/nested-def
-referenced where the surrounding context already supplies a concrete
-Ptr[Callable[[ArgTypes],Ret]] type - a typed parameter/local, or a call to
-a non-generic function). The stated forcing use case
-(lib/zoneinfo.py's own `bisect_right(self.transitions, timestamp, key =
-lambda tran: tran.timestamp)`) turned out to need MORE than this pass
-scoped, and is explicitly NOT done - see "found but not fixed" below.
-Decided with the user: stop here rather than expand scope further right
-now.
+STATUS: landed and tested for the originally scoped case (a lambda/
+nested-def referenced where the surrounding context already supplies a
+concrete Ptr[Callable[[ArgTypes],Ret]] type - a typed parameter/local, or
+a call to a non-generic function), AND for generic type-param inference
+through Callable[...] (both a plain function-reference argument and a
+lambda argument, including the eager-lowering case a lambda's own
+unbound return type needs - see the two follow-ups below). The stated
+forcing use case (lib/zoneinfo.py's own `bisect_right(self.transitions,
+timestamp, key = lambda tran: tran.timestamp)`) itself is still not
+attempted end to end - the one remaining known gap is the separate,
+unrelated list[T]-vs-slice[T] inference issue noted at the bottom.
 
 Follow-up done: substitute_type_params/_unify_type_param stopped
 recursing at a CallableType entirely (it's not a Specialization, so the
@@ -65,39 +67,62 @@ functions now recurse into CallableType the same way they already do for
 Specialization, rebuilding through the existing
 _get_or_create_callable_type interning.
 
-Found but not fixed - genuinely separate, larger work:
-- The fix above does NOT cover a LAMBDA argument specifically:
-  bisect_right[T,K]/bisect_left[T,K]'s key: Callable[[T],K] still has an
-  unresolved K at the point _expr_Lambda needs a concrete CallableType to
-  infer the lambda's parameter types from - K is only knowable by
-  lowering the lambda's OWN body first (its inferred return type), which
-  the current generic-call-argument machinery doesn't do (it assumes
-  every parameter's expected type is fully concrete before any argument
-  gets lowered, and body-lowering for a synthesized Function is deferred
-  onto the compile queue, not done at the call site). Confirmed via a
-  minimal, zoneinfo.py-independent repro (a generic function taking a
-  Callable[[T],K] parameter, called with a lambda still fails the same
-  way after the fix above). Real closures over a captured environment are
-  unrelated - this is a genuine circular type-inference dependency, "the
-  callee needs the lambda's type before the lambda can be given a type."
-  The clean fix needs Lowering to gain a way to eagerly lower a
-  synthesized Function's body at the call site and register it into
-  Compiler's own bookkeeping (compiler.functions) instead of only ever
-  scheduling it onto the queue - Lowering currently has no back-reference
-  to Compiler at all, so this is a real, if small, architectural addition,
-  not a two-branch fix like the one above.
-- Separately, and unrelated to lambdas: passing list[T] where bisect.py
-  declares slice[T] doesn't infer T either (found earlier this session,
-  independent of PLAN_LAMBDA.md's own work) - another thing sitting
-  between here and zoneinfo.py actually compiling.
-- Whoever picks this up next: either extend generic-call argument
-  inference to lower a Callable-typed argument's lambda body first and
-  feed its inferred type back into the callee's own type-parameter
-  binding (bigger, compiler-side), or reconsider bisect.py's own key=
-  design to sidestep the inference order problem (e.g. require an
-  already- concretely-typed Ptr[Callable[...]] value at the call site
-  instead of inferring one from a bare lambda) - library-side, smaller,
-  but changes bisect.py's own ergonomics.
+Follow-up done (eager lambda lowering): the LAMBDA-argument case above is
+now fixed. When _expr_Lambda's own expected Callable[...] type has a
+concrete arg_types but a still-unbound (bare TypeVar) return_type - e.g.
+bisect_right[T,K]/bisect_left[T,K]'s key: Callable[[T],K], with T already
+known but K only knowable from the lambda's own body - the lambda's body
+is now lowered EAGERLY, synchronously, right at the call site (via a new
+Compiler._lower backreference, Lowering._compile_now, threaded in
+Compiler.__init__) instead of only ever being scheduled onto the work
+queue for later. The real inferred return type is read off the
+synthesized body's own ir.Return afterward and patched onto the
+synthetic Function before building its FunctionRef - the CallableType
+recursion in _unify_type_param/substitute_type_params (above) then binds
+the caller's own K from that unchanged.
+
+This needed one more fix alongside it, found while testing the actual
+apply(5, key=lambda v: v) repro: _lower_inferred_generic_call (a BARE
+call to a generic function, e.g. apply(...) with no explicit [T,K]) used
+to lower EVERY argument with no expected-type hint at all, then unify
+all of them against the callee's declared parameter types only
+afterward - so by the time the key= argument's lambda was lowered, T
+(bindable from the earlier x=5 argument) was never actually visible to
+it. Fixed by interleaving: each argument is now lowered in turn with a
+hint built from whatever earlier arguments in the SAME call already
+bound, then immediately unified to refine those bindings before the next
+argument - letting a later Callable[...]-typed argument's own lambda see
+an earlier argument's inferred type params. A bare, still-fully-unbound
+type param substitutes to itself with no other information to offer, so
+that's now folded back to "no hint" explicitly (a literal argument at
+such a position still correctly fails via _expr_Constant's own "cannot
+infer" error, unchanged).
+
+Reentrancy (lowering a lambda's body while the ENCLOSING function's own
+body is still mid-lowering, exactly what eager lowering needs to do) is
+handled by moving all of Lowering's PER-FUNCTION state (the instruction
+stream being built, temp/label counters, current CFG, defer/construction
+bookkeeping - everything _init_lowering_state used to (re)set on the
+shared instance) into a brand-new FunctionLowering class, constructed
+FRESH for every lower_function/lower_global call, including a nested one
+- so an outer and inner lowering never share mutable state, and there's
+no field list to keep in sync by hand the way an explicit save/restore
+around a single shared instance would need (the approach originally
+proposed, then redirected by the user toward this structural fix
+instead, before any code was written for it). Lowering itself keeps only
+the genuinely persistent, cross-compile-run state (discovery, the type
+resolver, schedule, shared UnionStorage/Monomorphizer, closure-trampoline
+cache, lambda counter) and becomes a thin `FunctionLowering(self, fn)
+.run()` entry point. Verified with a doubly-nested case (a lambda whose
+own body eagerly lowers ANOTHER lambda argument, two FunctionLowering
+instances deep) - no counter collisions, both register correctly into
+compiler.functions.
+
+Separately, and unrelated to lambdas: passing list[T] where bisect.py
+declares slice[T] still doesn't infer T (found earlier this session,
+independent of PLAN_LAMBDA.md's own work) - still the one remaining
+thing sitting between here and zoneinfo.py/bisect.py actually compiling
+end to end; explicitly not attempted in this pass.
 
 Deferred / out of scope:
 - Real closures (captured variables) - still no forcing use case; needs a

@@ -4880,6 +4880,32 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_lambda_eagerly_lowered_infers_generic_return_type( self ) -> None:
+		# real compile-and-run version of PLAN_LAMBDA.md's "eager lambda
+		# lowering" piece: unlike the function-reference case just above, K
+		# is only knowable from the LAMBDA's own inferred return type -
+		# _expr_Lambda has to lower the lambda's body right now, at this
+		# call site, instead of only ever deferring it onto the work queue
+		# (see FunctionLowering/Compiler._lower's own _compile_now
+		# backreference). Checking the actual returned value (not just that
+		# it compiles) matters here specifically: if the eager path got the
+		# wrong return type, or clobbered the enclosing function's own
+		# in-progress lowering state, this is the kind of bug that would
+		# still compile and link, just produce a silently wrong answer
+		self._run( '''
+def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:
+	return key( x )
+
+def main() -> i32:
+	result: i32 = apply( 5, key = lambda v: v )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 5
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_self_dot_staticmethod_call_passes_no_receiver( self ) -> None:
 		# regression test for a real compiler bug found while building
 		# dict[K,V]: self.static_method(...) (as opposed to

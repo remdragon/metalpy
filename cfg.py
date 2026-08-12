@@ -124,14 +124,14 @@ class CFGState:
 
 	def __init__(
 		self,
-		fn: Function,
+		fn: Function | None,
 		*,
 		bool_type: Type,
 		new_temp: Callable[[Type], ir.Temp],
 		new_label: Callable[[str], str],
 		union_storage: UnionStorage,
 	) -> None:
-		self.fn = fn
+		self.fn = fn # None for a global Variable's own initializer (lowering.py's FunctionLowering.run_global) - no parameters to enter below, no self, no construction
 		self._bool_type = bool_type
 		self._new_temp = new_temp
 		self._new_label = new_label
@@ -144,7 +144,7 @@ class CFGState:
 		self.prologue_instructions: list[ir.Instruction] = []
 		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
 		self._construction_required: list[Variable] = [] # __init__'s own attributes that must all be initialized before self can escape/construction can complete
-		for param in fn.parameters or []:
+		for param in ( fn.parameters or [] ) if fn is not None else []:
 			self._enter_parameter( param )
 
 	# --- prologue --------------------------------------------------------------
