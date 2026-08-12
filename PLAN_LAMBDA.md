@@ -53,19 +53,39 @@ scoped, and is explicitly NOT done - see "found but not fixed" below.
 Decided with the user: stop here rather than expand scope further right
 now.
 
+Follow-up done: substitute_type_params/_unify_type_param stopped
+recursing at a CallableType entirely (it's not a Specialization, so the
+existing Ptr[T]-vs-Ptr[i32] recursion never looked inside a
+Ptr[Callable[[T],K]] parameter's own arg_types/return_type) - this broke
+generic type-param inference through ANY Callable[...]-typed parameter,
+even for a plain function-reference argument with no lambda involved at
+all (confirmed: def apply[T,K](x: T, key: Ptr[Callable[[T],K]]) -> K,
+called as apply(5, key=identity_i32), failed to infer K). Fixed - both
+functions now recurse into CallableType the same way they already do for
+Specialization, rebuilding through the existing
+_get_or_create_callable_type interning.
+
 Found but not fixed - genuinely separate, larger work:
-- bisect_right[T,K]/bisect_left[T,K] are themselves generic, and key's
-  own declared type (Callable[[T],K]) still has an unresolved K at the
-  point _expr_Lambda needs a concrete CallableType to infer the lambda's
-  parameter types from - K is only knowable by lowering the lambda's OWN
-  body first (its inferred return type), which the current generic-call-
-  argument machinery doesn't do (it assumes every parameter's expected
-  type is fully concrete before any argument gets lowered). Confirmed via
-  a minimal, zoneinfo.py-independent repro (a generic function taking a
-  Callable[[T],K] parameter, called with a lambda). Real closures over a
-  captured environment are unrelated - this is about a genuine circular
-  type-inference dependency, "the callee needs the lambda's type before
-  the lambda can be given a type."
+- The fix above does NOT cover a LAMBDA argument specifically:
+  bisect_right[T,K]/bisect_left[T,K]'s key: Callable[[T],K] still has an
+  unresolved K at the point _expr_Lambda needs a concrete CallableType to
+  infer the lambda's parameter types from - K is only knowable by
+  lowering the lambda's OWN body first (its inferred return type), which
+  the current generic-call-argument machinery doesn't do (it assumes
+  every parameter's expected type is fully concrete before any argument
+  gets lowered, and body-lowering for a synthesized Function is deferred
+  onto the compile queue, not done at the call site). Confirmed via a
+  minimal, zoneinfo.py-independent repro (a generic function taking a
+  Callable[[T],K] parameter, called with a lambda still fails the same
+  way after the fix above). Real closures over a captured environment are
+  unrelated - this is a genuine circular type-inference dependency, "the
+  callee needs the lambda's type before the lambda can be given a type."
+  The clean fix needs Lowering to gain a way to eagerly lower a
+  synthesized Function's body at the call site and register it into
+  Compiler's own bookkeeping (compiler.functions) instead of only ever
+  scheduling it onto the queue - Lowering currently has no back-reference
+  to Compiler at all, so this is a real, if small, architectural addition,
+  not a two-branch fix like the one above.
 - Separately, and unrelated to lambdas: passing list[T] where bisect.py
   declares slice[T] doesn't infer T either (found earlier this session,
   independent of PLAN_LAMBDA.md's own work) - another thing sitting
