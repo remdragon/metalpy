@@ -9,7 +9,7 @@ from compiler import Compiler, LoweredFunction
 from discovery import Discovery
 from errors import CompileError
 import ir
-from mpy_types import Variable, Specialization, Function
+from mpy_types import Variable, Specialization, Function, ClosureType
 
 logger = logging.getLogger( __name__ )
 
@@ -3188,6 +3188,164 @@ class Tests( unittest.TestCase ):
 			call_it_fn.resolve()
 		self.compiler._lower( call_it_fn )
 		self.assertIn( 'takes 2 argument(s), got 1', self.discovery.errors.errors[0] )
+
+	# --- Closure[[...],...] bound-method values -------------------------------
+
+	def test_bound_method_reference_builds_closure_allocate( self ) -> None:
+		code = '\n'.join([
+			'class Worker:',
+			'	x: i32',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Worker:',
+			'		return Worker.__allocate__( x = v )',
+			'	def get( self ) -> i32:',
+			'		return self.x',
+			'',
+			'def main() -> None:',
+			'	w: Worker = Worker.make( 1 )',
+			'	c: Closure[[], i32] = w.get',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# incref the receiver exactly once (a new owner - the closure),
+		# BEFORE the Allocate that actually constructs the closure value
+		increfs = [ i for i in fn.instructions if isinstance( i, ir.Incref ) ]
+		self.assertEqual( len( increfs ), 1 )
+		allocates = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) and isinstance( i.cls, ClosureType ) ]
+		self.assertEqual( len( allocates ), 1 )
+		self.assertIn( 'fn', allocates[0].fields )
+		self.assertIn( 'self', allocates[0].fields )
+		self.assertLess( fn.instructions.index( increfs[0] ), fn.instructions.index( allocates[0] ))
+
+	def test_bound_method_reference_synthesizes_one_trampoline_reused_across_references( self ) -> None:
+		# two separate `w.get` references to the SAME method - only one
+		# trampoline gets synthesized (memoized by (method, owner_type)),
+		# not one per reference
+		code = '\n'.join([
+			'class Worker:',
+			'	x: i32',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Worker:',
+			'		return Worker.__allocate__( x = v )',
+			'	def get( self ) -> i32:',
+			'		return self.x',
+			'',
+			'def main() -> None:',
+			'	w: Worker = Worker.make( 1 )',
+			'	c1: Closure[[], i32] = w.get',
+			'	c2: Closure[[], i32] = w.get',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		fn_refs = [ i.src for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.src, ir.FunctionRef ) ]
+		# both closures' own fn field construction goes through the SAME
+		# trampoline Function object - never re-synthesized per reference.
+		# fn_refs itself won't show this directly (the CastWrap operand is
+		# what carries the FunctionRef - see the Allocate fields instead)
+		allocates = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) and isinstance( i.cls, ClosureType ) ]
+		self.assertEqual( len( allocates ), 2 )
+		cast_wraps = [ i for i in fn.instructions if isinstance( i, ir.CastWrap ) and isinstance( i.operand, ir.FunctionRef ) ]
+		self.assertEqual( len( cast_wraps ), 2 )
+		self.assertIs( cast_wraps[0].operand.fn, cast_wraps[1].operand.fn )
+
+	def test_ordinary_method_call_does_not_construct_a_closure( self ) -> None:
+		# w.get() (call parens) must stay an ordinary, direct method call -
+		# _lower_call resolves node.func structurally and never routes it
+		# through _expr_Attribute's own closure-construction branch at all
+		code = '\n'.join([
+			'class Worker:',
+			'	x: i32',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Worker:',
+			'		return Worker.__allocate__( x = v )',
+			'	def get( self ) -> i32:',
+			'		return self.x',
+			'',
+			'def main() -> i32:',
+			'	w: Worker = Worker.make( 1 )',
+			'	return w.get()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertFalse( any( isinstance( i, ir.Allocate ) and isinstance( i.cls, ClosureType ) for i in fn.instructions ))
+		self.assertFalse( any( isinstance( i, ir.Incref ) for i in fn.instructions ))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Worker.make', '__test__.Worker.get' ] )
+
+	def test_closure_call_emits_callindirect_with_self_prepended( self ) -> None:
+		code = '\n'.join([
+			'class Worker:',
+			'	x: i32',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Worker:',
+			'		return Worker.__allocate__( x = v )',
+			'	def add( self, n: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return self.x + n',
+			'',
+			'def main() -> i32:',
+			'	w: Worker = Worker.make( 1 )',
+			'	c: Closure[[i32], i32] = w.add',
+			'	return c( 5 )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call_indirects = [ i for i in fn.instructions if isinstance( i, ir.CallIndirect ) ]
+		self.assertEqual( len( call_indirects ), 1 )
+		# 2 args on the wire: the closure's own erased self, then the
+		# user-supplied 5 - not just the user-supplied argument alone
+		self.assertEqual( len( call_indirects[0].args ), 2 )
+
+	def test_bound_method_on_monomorphized_generic_class_works( self ) -> None:
+		# Box[T].get isn't itself generic (method.type_params is empty -
+		# T comes from the CLASS's own specialization, already concrete by
+		# the time _find_method resolves it through _ensure_resolved) -
+		# only a method that's independently generic (def foo[T](...)) hits
+		# _lower_function_ref's own restriction; this is a different case
+		# and is expected to just work
+		code = '\n'.join([
+			'class Box[T]:',
+			'	v: T',
+			'	def get( self ) -> T:',
+			'		return self.v',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box( v = 1 )',
+			'	c: Closure[[], i32] = b.get',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocates = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) and isinstance( i.cls, ClosureType ) ]
+		self.assertEqual( len( allocates ), 1 )
+
+	def test_bound_method_generic_function_itself_is_rejected( self ) -> None:
+		# a method that's independently generic (not just via its owning
+		# class) has no single fixed signature to point a trampoline at -
+		# a real compile error either way (confirmed: rejected earlier,
+		# by _find_method itself failing to resolve a bare generic-method
+		# reference at all, before this closure-construction's own
+		# type_params check would even run)
+		code = '\n'.join([
+			'class Foo:',
+			'	def get[T]( self, default: T ) -> T:',
+			'		return default',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo()',
+			'	c: Closure[[i32], i32] = f.get',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( self.discovery.errors.errors )
 
 	# --- object construction (Class.__allocate__) ---------------------------
 

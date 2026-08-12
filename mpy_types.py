@@ -201,6 +201,32 @@ class RCClass( Type, ScopeMixin ): # normal ref-counted class
 	resolve: Callable[[],None]|None = None
 
 @dataclass( kw_only = True )
+class ClosureType( RCClass ):
+	''' `Closure[[Arg1,Arg2,...], Ret]` - a bound-method VALUE (`worker.run`
+	used as a value, not called - see PLAN_CALLABLE.md's own "closure in
+	miniature" deferred item, and lowering.py's _expr_Attribute for where
+	it's actually constructed). Unlike CallableType (a bare, receiver-less
+	function-pointer SHAPE, never RC-managed, always spelled Ptr[Callable
+	[...]]), a closure genuinely owns a reference to its captured receiver
+	- "creating a closure is by definition creating a new reference to an
+	RC object" - so it's a REAL RCClass (subclassed, not wrapped): every
+	existing RC mechanism (cfg.py's is_rc/rc_leaves/assign/move,
+	emitter_c.py's retain_object/release_object) applies to it completely
+	unchanged, no new special-casing needed anywhere past discovery.py.
+	Two fields (fn/self, both Ptr[None] - see discovery.py's
+	_get_or_create_closure_type), populated lazily via the ordinary
+	RCClass.resolve convention. arg_types/return_type are ONLY needed for
+	type-checking a call THROUGH a closure value (lowering.py's
+	_try_lower_closure_call) and building the right trampoline signature -
+	the underlying struct layout never depends on them, only the interning
+	key does (two different signatures must never be assignment-
+	compatible with each other, even though their runtime representation
+	is identical - same reasoning CallableType's own interning already
+	uses). '''
+	arg_types: list[Type] = field( default_factory = list )
+	return_type: Type|None = None
+
+@dataclass( kw_only = True )
 class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
 	# base is only meaningful for @interface CStructs (single inheritance,
 	# same "resolved eagerly at class-creation time" reasoning as

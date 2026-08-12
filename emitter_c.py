@@ -809,7 +809,19 @@ def _emit_cast( instr ) -> list[str]:
 	operand = _emit_operand( instr.operand )
 	target_type = instr.dest.type if mode != 'check' else instr.dest.type.args[0]
 	stem = target_type.stem if isinstance( target_type, Scalar ) else None
-	ctype = c_type( target_type )
+	# Ptr[Callable[...]] is the one type c_type() can't spell alone (C's
+	# function-pointer syntax needs the (*)(...) shape, not a plain prefix
+	# string) - a closure's own fn field cast back to its real trampoline
+	# signature (lowering.py's _try_lower_closure_call) is the first real
+	# cast-TO-a-function-pointer this emitter ever needed; every existing
+	# Ptr[Callable[...]] value came from ir.FunctionRef directly before,
+	# never through an explicit cast
+	fn_type = _callable_ptr_type( target_type )
+	if fn_type is not None:
+		ret, params = _function_pointer_c_type( fn_type )
+		ctype = _fn_ptr_cast_type( ret, params )
+	else:
+		ctype = c_type( target_type )
 	if mode == 'wrap':
 		# C's own integer conversion rules ARE wrap semantics for an
 		# out-of-range value (well-defined, no UB, unlike an ARITHMETIC
@@ -1175,6 +1187,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# _rcclass_destructor_name) is always the right one to reference
 		destructor_name = _rcclass_destructor_name( instr.value.type )
 		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header, {destructor_name} );' ]
+	if isinstance( instr, ir.DecrefDynamic ):
+		# instr.value is Ptr[None] (type-erased) - $header is always the
+		# FIRST member of every RCClass struct (emit_rcclass's own field-
+		# flattening), so a pointer to the start of any RCClass instance is
+		# always validly reinterpretable as ObjectHeader* directly
+		return [ f'\trelease_object_dynamic( (ObjectHeader*){_emit_operand(instr.value)} );' ]
 	if isinstance( instr, ir.RefCount ):
 		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.value)})->$header.ref_count;' ]
 

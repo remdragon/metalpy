@@ -10,7 +10,7 @@ from typing import Any, Callable, Generator, NoReturn
 import compile_time_transformer
 from errors import CompileError, ErrorCollector
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
 	Module, _is_covered_by, _overlaps,
 )
@@ -145,6 +145,7 @@ class Discovery( ast.NodeVisitor ):
 		self._moves: dict[str,Move] = {}
 		self._copies: dict[str,Copy] = {}
 		self._callables: dict[str,CallableType] = {}
+		self._closures: dict[str,ClosureType] = {}
 
 		# lazily detected the first time a has_library(...) check (decorator
 		# or compiler.has_library(...) expression - see _matches_has_library/
@@ -545,6 +546,25 @@ class Discovery( ast.NodeVisitor ):
 			return_type = self.visit( ret_node )
 			return self._get_or_create_callable_type( arg_types, return_type )
 
+		# Closure[[Arg1,Arg2,...], Ret] - a bound-method VALUE (`worker.run`
+		# used as a value - see mpy_types.ClosureType's own docstring),
+		# same textual recognition/shape as Callable[...] just above, not a
+		# generalization of it - deliberately additive, keeps Callable[...]
+		# /Ptr[Callable[...]]'s own existing machinery (dict[K,V]/RawDict's
+		# callback erasure) untouched
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Closure':
+			shape_ok = (
+				isinstance( node.slice, ast.Tuple )
+				and len( node.slice.elts ) == 2
+				and isinstance( node.slice.elts[0], ast.List )
+			)
+			if not shape_ok:
+				self.fail( f"Closure[...] must look like Closure[[ArgType, ...], RetType]: {ast.unparse(node)}", node )
+			arg_nodes, ret_node = node.slice.elts
+			arg_types = [ self.visit( arg_node ) for arg_node in arg_nodes.elts ]
+			return_type = self.visit( ret_node )
+			return self._get_or_create_closure_type( arg_types, return_type )
+
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
 		if not type_params:
@@ -600,6 +620,88 @@ class Discovery( ast.NodeVisitor ):
 		)
 		self._callables[key] = fn_type
 		return fn_type
+
+	def _get_or_create_closure_type( self, arg_types: list[Type], return_type: Type ) -> ClosureType:
+		key = f'Closure[[{",".join( a.qualname for a in arg_types )}],{return_type.qualname}]'
+		if cls := self._closures.get( key ):
+			return cls
+		# NOT return_type.file: return_type is very often a scalar
+		# intrinsic (Closure[[],None] - i.e. return_type is NoneType) with
+		# no file of its own, which would leave __del__/$$__destructor__
+		# unable to find an owning module later (_find_module_for).
+		# module_stack[-1] is "whichever module is currently active" - a
+		# real, valid module in both callers (visit_Subscript, parsing a
+		# real Closure[...] annotation; lowering.py's own construction,
+		# still inside module_context(...) for whatever function is being
+		# lowered) - same pattern _make_value_resolver already uses
+		file = self.module_stack[-1].file if self.module_stack else None
+		line = self.module_stack[-1].line if self.module_stack else None
+		cls = ClosureType(
+			stem = key, qualname = key, file = file, line = line,
+			arg_types = arg_types, return_type = return_type,
+		)
+		# lazy, exactly like an ordinary RCClass's own .resolve convention -
+		# nothing about fn/self/__del__ needs to be known before something
+		# actually asks for cls.attributes/.names (a Closure[...] type is
+		# never itself further subscripted, so unlike type_params there's
+		# no eager-resolution requirement here)
+		def resolve() -> None:
+			ptr_cls = self.get_intrinsics()['Ptr']
+			ptr_none_type = self._get_or_create_specialization( ptr_cls, [ self.get_none_type() ] )
+			fn_field = Variable( stem = 'fn', qualname = f'{key}.fn', file = cls.file, line = cls.line, type = ptr_none_type )
+			self_field = Variable( stem = 'self', qualname = f'{key}.self', file = cls.file, line = cls.line, type = ptr_none_type )
+			cls.attributes = [ fn_field, self_field ]
+			cls.add_name( 'fn', fn_field )
+			cls.add_name( 'self', self_field )
+			del_fn = self._build_closure_destructor( cls )
+			cls.methods = [ del_fn ]
+			cls.add_name( '__del__', del_fn )
+			cls.resolve = None
+		cls.resolve = resolve
+		self._closures[key] = cls
+		return cls
+
+	def _build_closure_destructor( self, cls: ClosureType ) -> Function:
+		# releases the captured, type-erased receiver: self.self is
+		# Ptr[None] by now (the field just built in _get_or_create_closure_
+		# type's own resolve() above), so this goes through compiler.
+		# decref_dynamic (reads the destructor off the receiver's own
+		# header - see emitter_c.py's ObjectHeader.destructor, Phase 2a),
+		# not compiler.decref (which needs a statically RC-typed operand).
+		# An ORDINARY method (cls set, is_static False), not a bare
+		# function like _synthesize_rcclass_destructor's own $$__destructor
+		# __ below it - self is synthesized automatically by lowering.py's
+		# own lower_function for any Function shaped this way, same as any
+		# hand-written __del__ - nothing extra needed here for it
+		line = cls.line or 1
+		self_self_expr = ast.Attribute(
+			value = ast.Name( id = 'self', ctx = ast.Load(), lineno = line, col_offset = 0 ),
+			attr = 'self', ctx = ast.Load(), lineno = line, col_offset = 0,
+		)
+		call = ast.Call(
+			func = ast.Attribute(
+				value = ast.Name( id = 'compiler', ctx = ast.Load(), lineno = line, col_offset = 0 ),
+				attr = 'decref_dynamic', ctx = ast.Load(), lineno = line, col_offset = 0,
+			),
+			args = [ self_self_expr ], keywords = [],
+			lineno = line, col_offset = 0,
+		)
+		node = ast.FunctionDef(
+			name = '__del__',
+			args = ast.arguments(
+				posonlyargs = [], args = [], vararg = None,
+				kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [],
+			),
+			body = [ ast.Expr( call, lineno = line, col_offset = 0 ) ],
+			decorator_list = [], returns = None, type_params = [],
+			lineno = line, col_offset = 0, end_lineno = line, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+		return Function(
+			stem = '__del__', qualname = f'{cls.qualname}.__del__', file = cls.file, line = cls.line,
+			cls = cls, node = node, parameters = [], return_type = self.get_none_type(),
+			resolve = None,
+		)
 
 	def _get_or_create_specialization( self, base: Type, args: list[Type] ) -> Specialization:
 		key = f'{base.qualname}[{",".join( a.qualname for a in args )}]'

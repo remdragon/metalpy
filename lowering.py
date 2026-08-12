@@ -13,7 +13,7 @@ from errors import CompileError
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
-	CallableType,
+	CallableType, ClosureType,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -155,6 +155,7 @@ class Lowering:
 		self.schedule = type_resolver.schedule
 		self._union_storage = type_resolver.union_storage
 		self._monomorphizer = type_resolver.monomorphizer
+		self._closure_trampolines: dict[tuple[int,int],Function] = {} # (id(method), id(owner_type)) -> its one synthesized trampoline, see _get_or_create_closure_trampoline
 
 	def _init_lowering_state( self, fn: Function | None ) -> None:
 		self._instructions: list[ir.Instruction] = []
@@ -471,7 +472,7 @@ class Lowering:
 			with self.discovery.module_context( module ):
 				with self.discovery.scope_context( cls ):
 					default_value = self._lower_expr( attr.init, attr.type )
-			for instr in self._cfg.attr_assign( attr, default_value, is_alias = self._is_aliasing_expr( attr.init )):
+			for instr in self._cfg.attr_assign( attr, default_value, is_alias = self._is_aliasing_expr( attr.init, default_value.type )):
 				self._emit( instr )
 			self._emit( ir.SetAttr( obj = self_param, attr = attr.stem, value = default_value ))
 
@@ -753,7 +754,7 @@ class Lowering:
 				self.discovery.fail( str( e ), node )
 			self._current_fn.add_name( alias.asname or alias.name, mod )
 
-	def _is_aliasing_expr( self, node: ast.expr ) -> bool:
+	def _is_aliasing_expr( self, node: ast.expr, operand_type: Type|None = None ) -> bool:
 		# does lowering `node` hand back a reference to a value that
 		# already exists independently (needing its own Incref if it's
 		# stored into a new binding), vs a genuinely fresh value (Allocate,
@@ -770,7 +771,24 @@ class Lowering:
 		# (raw ir.GetItem, genuinely aliasing a container element) isn't
 		# reachable by any real code yet - no indexable container exists
 		# yet (list[T]/dict[K,V] are still first-draft/WIP per TODO.txt) -
-		# revisit this once one does
+		# revisit this once one does.
+		#
+		# ast.Attribute is genuinely ambiguous now, the same way Subscript
+		# already is above: `obj.field` reads an existing field (aliasing),
+		# but `worker.run` (a bound-method reference) CONSTRUCTS a fresh
+		# closure (an Allocate underneath, via _lower_bound_method_closure)
+		# - same "fresh owned handoff" shape as a Call, not a read.
+		# Re-inspecting node itself can't tell these apart without
+		# re-resolving (and risking double-evaluating) the receiver, so
+		# callers instead pass the operand they ALREADY lowered from node -
+		# its type alone settles it cheaply and exactly, no re-lowering.
+		# Scoped to ast.Attribute specifically, NOT every ClosureType
+		# operand - `d = c` (a bare Name reading an EXISTING closure local)
+		# is an ordinary aliasing read like any other RC-typed Name, and
+		# must still incref (confirmed by a real regression: `d = c` then
+		# calling both silently underreferenced the shared closure)
+		if isinstance( node, ast.Attribute ) and isinstance( operand_type, ClosureType ):
+			return False
 		return isinstance( node, ( ast.Name, ast.Attribute ))
 
 	def _cfg_assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, node: ast.AST, track_result: bool = True ) -> list[ir.Instruction]:
@@ -855,7 +873,7 @@ class Lowering:
 			# own _ensure_resolved call), same as it always has.
 			if self._monomorphizer._is_concrete( var_type ):
 				var.type = self._ensure_resolved( var_type )
-			for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value ), node = node ):
+			for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value, operand.type ), node = node ):
 				self._emit( instr )
 			self._emit( ir.Assign( dest = var, src = operand ))
 
@@ -916,7 +934,7 @@ class Lowering:
 				if not isinstance( existing, Variable ):
 					self.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 				operand = self._lower_expr( node.value, existing.type )
-				for instr in self._cfg_assign( existing, operand, is_alias = self._is_aliasing_expr( node.value ), node = node ):
+				for instr in self._cfg_assign( existing, operand, is_alias = self._is_aliasing_expr( node.value, operand.type ), node = node ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = existing, src = operand ))
 			else:
@@ -946,7 +964,7 @@ class Lowering:
 				# the source (see cfg.py's "Independent tracking"), but a
 				# match statement genuinely IS the inspection of its subject
 				is_match_subject = getattr( node, 'is_match_subject', False )
-				for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value ), node = node, track_result = not is_match_subject ):
+				for instr in self._cfg_assign( var, operand, is_alias = self._is_aliasing_expr( node.value, operand.type ), node = node, track_result = not is_match_subject ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
 				match_clears_name = getattr( node, 'match_clears_name', None )
@@ -960,7 +978,7 @@ class Lowering:
 				# self.<attr> = value, inside __init__ construction itself -
 				# tracked for definite-assignment/self-escape purposes (see
 				# RCCLASS ATTRIBUTE LIFETIME.md and cfg.attr_assign())
-				for instr in self._cfg.attr_assign( attr_var, operand, is_alias = self._is_aliasing_expr( node.value )):
+				for instr in self._cfg.attr_assign( attr_var, operand, is_alias = self._is_aliasing_expr( node.value, operand.type )):
 					self._emit( instr )
 			elif cfg.rc_leaves( attr_var.type ):
 				# ordinary SetAttr on an already-constructed instance -
@@ -972,7 +990,7 @@ class Lowering:
 				# fresh here rather than consulted from any tracked state
 				old = self._new_temp( attr_var.type )
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = target.attr ))
-				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self._is_aliasing_expr( node.value )):
+				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self._is_aliasing_expr( node.value, operand.type )):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = target.attr, value = operand ))
 			if writeback is not None:
@@ -1128,6 +1146,9 @@ class Lowering:
 			return
 		if self._is_compiler_call( node.value ) == 'atomic_store':
 			self._lower_compiler_atomic_store( node.value )
+			return
+		if self._is_compiler_call( node.value ) == 'decref_dynamic':
+			self._lower_compiler_decref_dynamic( node.value )
 			return
 		if not isinstance( node.value, ast.Call ):
 			self.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
@@ -1606,10 +1627,19 @@ class Lowering:
 		# _try_resolve_namespace, same as compiler.sizeof's argument, not
 		# _lower_expr), x is a real value. The call's own target type is
 		# always authoritative for the result - unlike an ordinary literal,
-		# an explicit cast overrides whatever the ambient expected_type is
+		# an explicit cast overrides whatever the ambient expected_type is.
+		# node.args[0].resolved_type, if set, bypasses namespace resolution
+		# entirely - mirrors resolved_callee's own established escape hatch
+		# (type_resolver.py's _synthesize_rcclass_destructor), for
+		# compiler-synthesized AST that already knows its target Type
+		# object directly and has no natural resolvable-by-name spelling
+		# for it (a closure trampoline's own receiver cast, see
+		# _get_or_create_closure_trampoline)
 		if len( node.args ) != 2 or node.keywords:
 			self.discovery.fail( f'compiler.cast(...) takes exactly two arguments: {ast.unparse(node)}', node )
-		target_type = self._try_resolve_namespace( node.args[0] )
+		target_type = getattr( node.args[0], 'resolved_type', None )
+		if target_type is None:
+			target_type = self._try_resolve_namespace( node.args[0] )
 		if target_type is None:
 			self.discovery.fail( f'compiler.cast(...) first argument must be a type: {ast.unparse(node)}', node )
 		if isinstance( target_type, TypeVar ):
@@ -1755,6 +1785,29 @@ class Lowering:
 			f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
 			node,
 		)
+
+	def _lower_compiler_decref_dynamic( self, node: ast.Call ) -> None:
+		# compiler.decref_dynamic(ptr) - releases a TYPE-ERASED Ptr[None]
+		# generically, reading its destructor off the object's own header
+		# (release_object_dynamic - see emitter_c.py's ObjectHeader) instead
+		# of requiring the concrete type statically, unlike compiler.decref
+		# above. Internal machinery for compiler-synthesized code (a
+		# closure's own __del__, releasing its captured receiver after
+		# type erasure) - not meant for ordinary user code, which always
+		# has a real static type and should use compiler.decref instead
+		if len( node.args ) != 1 or node.keywords:
+			self.discovery.fail( f'compiler.decref_dynamic(...) takes exactly one argument: {ast.unparse(node)}', node )
+		operand = self._lower_expr( node.args[0], None )
+		none_type = self.discovery.get_none_type()
+		ptr_cls = self.discovery.get_intrinsics()['Ptr']
+		ptr_none_type = self.discovery._get_or_create_specialization( ptr_cls, [ none_type ] )
+		if operand.type is not ptr_none_type:
+			self.discovery.fail(
+				f'compiler.decref_dynamic(...) argument must be Ptr[None], not '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		self._emit( ir.DecrefDynamic( value = operand ))
 
 	# --- defer/errdefer ----------------------------------------------------------
 
@@ -2317,6 +2370,160 @@ class Lowering:
 				)
 		return ir.Const( type = expected_type, value = node.value )
 
+	def _get_or_create_closure_trampoline( self, method: Function, owner_type: Type ) -> Function:
+		# one small, memoized, module-level function per (method, owner
+		# class): (Ptr[None] erased_self, *rest_args) -> Ret, casting
+		# erased_self back to owner_type (compile-time known here, even
+		# though the closure's own declared type has erased it - see
+		# ClosureType's own docstring) and calling the real method on it.
+		# Built the same way type_resolver.py's _synthesize_rcclass_
+		# destructor builds $$__destructor__ - a hand-built ast.FunctionDef,
+		# scheduled, then lowered completely normally
+		key = ( id( method ), id( owner_type ))
+		if trampoline := self._closure_trampolines.get( key ):
+			return trampoline
+
+		self._ensure_resolved( method )
+		if method.parameters is None:
+			self.discovery.fail( f'{method.qualname} could not be resolved (see earlier error)', method.node )
+		self.schedule( method.return_type )
+		for p in method.parameters:
+			self.schedule( p.type )
+
+		ptr_cls = self.discovery.get_intrinsics()['Ptr']
+		none_type = self.discovery.get_none_type()
+		ptr_none_type = self.discovery._get_or_create_specialization( ptr_cls, [ none_type ] )
+
+		line = method.line or 1
+		qualname = f'{owner_type.qualname}${method.stem}$$__closure_trampoline__'
+
+		erased_self_arg = ast.arg( arg = 'erased_self', lineno = line, col_offset = 0 )
+		rest_args = [ ast.arg( arg = p.stem, lineno = line, col_offset = 0 ) for p in method.parameters ]
+
+		# owner_type has no natural resolvable-by-name spelling from this
+		# synthesized function's own lexical context - resolved_type
+		# bypasses namespace resolution entirely (see _lower_compiler_
+		# cast's own comment on this escape hatch)
+		owner_type_ref = ast.Name( id = '<closure_owner>', ctx = ast.Load(), lineno = line, col_offset = 0 )
+		owner_type_ref.resolved_type = owner_type
+		cast_call = ast.Call(
+			func = ast.Attribute(
+				value = ast.Name( id = 'compiler', ctx = ast.Load(), lineno = line, col_offset = 0 ),
+				attr = 'cast', ctx = ast.Load(), lineno = line, col_offset = 0,
+			),
+			args = [ owner_type_ref, ast.Name( id = 'erased_self', ctx = ast.Load(), lineno = line, col_offset = 0 ) ],
+			keywords = [], lineno = line, col_offset = 0,
+		)
+		# the cast is inlined DIRECTLY as the call's own receiver expression
+		# - deliberately NOT assigned to a named local first (`real_self =
+		# compiler.cast(...)`, then `real_self.method(...)`). A named
+		# local's own RHS, here a compiler.cast(...) call, is never
+		# recognized as aliasing (_is_aliasing_expr only special-cases
+		# Name/Attribute/ClosureType - an ordinary Call is always "fresh,
+		# owned"), so cfg.assign() would push a REAL epilogue entry for it
+		# and decref it at the trampoline's own return - a real, confirmed
+		# bug (a real compile+run test showed the receiver's refcount
+		# short by one after every closure call): the cast doesn't create
+		# a new owned reference, it's a reinterpretation of the SAME
+		# pointer the closure's own `self` field already owns, only
+		# BORROWED for the duration of this call - exactly like an
+		# ordinary method's own self parameter already is (cfg.py's
+		# enter_self, OwnState.BORROWED). Inlining the cast as a bare
+		# expression sidesteps this entirely: a CastWrap's own temp result
+		# is never fresh_temp()-registered (only Call/Allocate results are
+		# - see _emit), so nothing ever schedules a decref for it at all,
+		# matching the borrowed semantics this needs
+		method_call = ast.Call(
+			func = ast.Attribute(
+				value = cast_call, attr = method.stem, ctx = ast.Load(), lineno = line, col_offset = 0,
+			),
+			args = [ ast.Name( id = p.stem, ctx = ast.Load(), lineno = line, col_offset = 0 ) for p in method.parameters ],
+			keywords = [], lineno = line, col_offset = 0,
+		)
+		none_return = isinstance( method.return_type, Scalar ) and method.return_type.stem == 'NoneType'
+		call_stmt: ast.stmt = (
+			ast.Expr( method_call, lineno = line, col_offset = 0 ) if none_return
+			else ast.Return( value = method_call, lineno = line, col_offset = 0 )
+		)
+
+		node = ast.FunctionDef(
+			name = '$$__closure_trampoline__',
+			args = ast.arguments(
+				posonlyargs = [], args = [ erased_self_arg, *rest_args ],
+				vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [],
+			),
+			body = [ call_stmt ],
+			decorator_list = [], returns = None, type_params = [],
+			lineno = line, col_offset = 0, end_lineno = line, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+
+		erased_self_param = Parameter( stem = 'erased_self', qualname = f'{qualname}.erased_self', file = method.file, line = method.line, type = ptr_none_type )
+		rest_params = [
+			Parameter( stem = p.stem, qualname = f'{qualname}.{p.stem}', file = method.file, line = method.line, type = p.type )
+			for p in method.parameters
+		]
+		trampoline = Function(
+			stem = '$$__closure_trampoline__', qualname = qualname, file = method.file, line = method.line,
+			cls = None, node = node, parameters = [ erased_self_param, *rest_params ], return_type = method.return_type,
+			is_static = True, resolve = None,
+		)
+		trampoline.add_name( 'erased_self', erased_self_param )
+		for p in rest_params:
+			trampoline.add_name( p.stem, p )
+
+		self.schedule( trampoline )
+		self._closure_trampolines[key] = trampoline
+		return trampoline
+
+	def _lower_bound_method_closure( self, node: ast.Attribute, obj: ir.Operand, method: Function, expected_type: Type|None ) -> ir.Operand:
+		# worker.run used as a VALUE (not called) - a bound-method
+		# reference, PLAN_CALLABLE.md's own "closure in miniature" deferred
+		# item. Builds a real closure value: {fn: Ptr[None] (the memoized
+		# trampoline above), self: Ptr[None] (the receiver, increffed -
+		# "creating a closure is by definition creating a new reference")}
+		# - a compiler-synthesized RCClass (ClosureType), so every existing
+		# RC mechanism (cfg.py's is_rc/rc_leaves/assign/move) applies
+		# completely unchanged from here on, no special-casing needed
+		self._ensure_resolved( method )
+		if method.parameters is None:
+			self.discovery.fail( f'{method.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
+		arg_types = [ p.type for p in method.parameters ]
+		self.schedule( method.return_type )
+		for t in arg_types:
+			self.schedule( t )
+
+		closure_type = self.discovery._get_or_create_closure_type( arg_types, method.return_type )
+		self._ensure_resolved( closure_type )
+		# same scheduling _lower_allocate_fields/_try_lower_construct_call
+		# already do for every OTHER RCClass construction (sys.alloc[cls]/
+		# sys.free/__del__ must be real, lowered compile units by the time
+		# the emitter sees the ir.Allocate below) - closure_type is already
+		# concrete, no Specialization involved, so target_cls == concrete_type
+		self._schedule_rcclass_construction( closure_type, closure_type )
+		trampoline = self._get_or_create_closure_trampoline( method, obj.type )
+
+		ptr_cls = self.discovery.get_intrinsics()['Ptr']
+		none_type = self.discovery.get_none_type()
+		ptr_none_type = self.discovery._get_or_create_specialization( ptr_cls, [ none_type ] )
+		trampoline_callable_type = self.discovery._get_or_create_callable_type(
+			[ p.type for p in ( trampoline.parameters or [] ) ], trampoline.return_type,
+		)
+		trampoline_ptr_type = self.discovery._get_or_create_specialization( ptr_cls, [ trampoline_callable_type ] )
+
+		fn_ref = ir.FunctionRef( type = trampoline_ptr_type, fn = trampoline )
+		fn_erased = self._new_temp( ptr_none_type )
+		self._emit( ir.CastWrap( dest = fn_erased, operand = fn_ref ))
+
+		self_erased = self._new_temp( ptr_none_type )
+		self._emit( ir.CastWrap( dest = self_erased, operand = obj ))
+
+		self._emit( ir.Incref( value = obj )) # the closure is a new owner of the receiver
+
+		dest = self._new_temp( expected_type or closure_type )
+		self._emit( ir.Allocate( dest = dest, cls = closure_type, fields = { 'fn': fn_erased, 'self': self_erased } ))
+		return dest
+
 	def _expr_Attribute( self, node: ast.Attribute, expected_type: Type|None ) -> ir.Operand:
 		# CEnum member VALUE expressions (OSError.FileNotFoundError used as
 		# a runtime value) — the base is a class, not a runtime value, so
@@ -2347,6 +2554,22 @@ class Lowering:
 					self._ensure_resolved( name_obj )
 					return name_obj
 		obj = self._lower_expr( node.value, None )
+		# worker.run used as a VALUE (no call parens) - _attr_lookup below
+		# only ever finds a Variable (a real field); a method is a
+		# Function, which it rejects outright ("has no attribute"). Same
+		# restrictions _lower_function_ref already enforces for a BARE
+		# function reference (no receiver to bind there) minus the
+		# receiver-less requirement itself, since THAT'S exactly what a
+		# closure is for: a generic/overloaded/static method still has
+		# nowhere natural to bind (no single fixed signature, or no
+		# receiver at all - closures only wrap a REAL bound instance call)
+		method = self._find_method( obj.type, node.attr )
+		if (
+			isinstance( method, Function ) and method.cls is not None
+			and not method.is_static and not method.is_classmethod
+			and not method.type_params and not method.is_overload
+		):
+			return self._lower_bound_method_closure( node, obj, method, expected_type )
 		attr_var = self._attr_lookup( obj.type, node.attr, node )
 		dest = self._new_temp( attr_var.type )
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
@@ -3100,7 +3323,7 @@ class Lowering:
 			# _enqueue) - value.type is always the operand's real, concrete
 			# type regardless, since only concrete values ever actually get
 			# lowered
-			for instr in self._cfg.field_value( value.type, value, is_alias = self._is_aliasing_expr( expr )):
+			for instr in self._cfg.field_value( value.type, value, is_alias = self._is_aliasing_expr( expr, value.type )):
 				self._emit( instr )
 			fields[name] = value
 
@@ -3567,6 +3790,58 @@ class Lowering:
 		self._emit( ir.CallIndirect( dest = dest, target = target, args = args ))
 		return dest
 
+	def _try_lower_closure_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
+		# my_closure(a, b) where my_closure: Closure[[A,B],R] - a call
+		# THROUGH a closure VALUE (see _lower_bound_method_closure). Same
+		# "try a shape, None means try the next one" convention as
+		# _try_lower_indirect_call just above, scoped to a bare Name callee
+		# for the identical reason (a general expression callee needs care
+		# to evaluate it exactly once - deferred there too)
+		if not isinstance( node.func, ast.Name ):
+			return None
+		name = self.discovery.find_name_or_none( node.func.id )
+		if not isinstance( name, Variable ):
+			return None
+		self._ensure_resolved( name )
+		closure_type = name.type
+		if not isinstance( closure_type, ClosureType ):
+			return None
+		self._ensure_resolved( closure_type )
+		if any( isinstance( a, ast.Starred ) for a in node.args ):
+			self.discovery.fail( f'*args not supported yet: {ast.unparse(node)}', node )
+		if node.keywords:
+			self.discovery.fail( f'a closure call takes no keyword arguments: {ast.unparse(node)}', node )
+		if len( node.args ) != len( closure_type.arg_types ):
+			self.discovery.fail(
+				f'{node.func.id}(...) takes {len(closure_type.arg_types)} argument(s), got {len(node.args)}: {ast.unparse(node)}',
+				node,
+			)
+		closure_operand = self._lower_expr( node.func, None )
+		args = [ self._lower_expr( arg_node, arg_type ) for arg_node, arg_type in zip( node.args, closure_type.arg_types ) ]
+
+		fn_field = closure_type.get_local( 'fn' )
+		self_field = closure_type.get_local( 'self' )
+		fn_operand = self._new_temp( fn_field.type )
+		self._emit( ir.GetAttr( dest = fn_operand, obj = closure_operand, attr = 'fn' ))
+		self_operand = self._new_temp( self_field.type )
+		self._emit( ir.GetAttr( dest = self_operand, obj = closure_operand, attr = 'self' ))
+
+		# fn is Ptr[None] (type-erased) on the closure struct itself - cast
+		# back to the trampoline's real (Ptr[None], *ArgTypes) -> RetType
+		# shape before calling through it, exactly mirroring how it was
+		# erased going IN (_lower_bound_method_closure's own ir.CastWrap)
+		ptr_cls = self.discovery.get_intrinsics()['Ptr']
+		trampoline_callable_type = self.discovery._get_or_create_callable_type(
+			[ fn_field.type, *closure_type.arg_types ], closure_type.return_type,
+		)
+		trampoline_ptr_type = self.discovery._get_or_create_specialization( ptr_cls, [ trampoline_callable_type ] )
+		fn_cast = self._new_temp( trampoline_ptr_type )
+		self._emit( ir.CastWrap( dest = fn_cast, operand = fn_operand ))
+
+		dest = self._new_temp( expected_type or closure_type.return_type )
+		self._emit( ir.CallIndirect( dest = dest, target = fn_cast, args = [ self_operand, *args ] ))
+		return dest
+
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
 
@@ -3866,6 +4141,7 @@ class Lowering:
 			self._try_lower_construct_call,
 			self._try_lower_scalar_construct_call,
 			self._try_lower_indirect_call,
+			self._try_lower_closure_call,
 		)
 		for recognizer in construction_recognizers:
 			allocate_dest = recognizer( node, expected_type )

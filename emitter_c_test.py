@@ -3560,6 +3560,214 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class ClosureRealCompileTests( CompilerTestCase ):
+	''' real compile+run coverage for bound-method closures
+	(Closure[[...],...] - mpy_types.ClosureType, lowering.py's
+	_lower_bound_method_closure/_get_or_create_closure_trampoline/
+	_try_lower_closure_call). Unlike the IR-shape tests in
+	lowering_test.py, these confirm the generated code actually computes
+	the right values AND manages the captured receiver's refcount
+	correctly - a wrong/missing incref or decref here either leaks or
+	double-frees, and calling a closure must never touch the receiver's
+	refcount at all (confirmed by real, repeated calls in a loop, not
+	just a single call). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_construct_and_call_no_args( self ) -> None:
+		self._run( '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def get( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	c: Closure[[], i32] = w.get
+	if c() != 42:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_construct_and_call_with_args( self ) -> None:
+		self._run( '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def add( self, n: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x + n
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	c: Closure[[i32], i32] = w.add
+	if c( 8 ) != 50:
+		return 1
+	if c( 100 ) != 142:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ordinary_method_call_unaffected( self ) -> None:
+		# the exact same class/method also called the ordinary way
+		# (w.get(), no Closure[...] anywhere) must keep working unchanged
+		self._run( '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def get( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	w: Worker = Worker.make( 7 )
+	if w.get() != 7:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_refcount_incremented_once_on_construction_and_calls_are_neutral( self ) -> None:
+		# construct once, incref by exactly 1; call it 200 times in a loop
+		# (calling a closure must never touch the receiver's refcount -
+		# the cast back to the real receiver type inside the trampoline is
+		# a borrowed reinterpretation, not a new owned reference); decref
+		# once, back to the pre-construction refcount
+		self._run( '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def get( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	rc0: usize = compiler.refcount( w )
+	c: Closure[[], i32] = w.get
+	rc1: usize = compiler.refcount( w )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+	i: i32 = 0
+	while i < 200:
+		if c() != 42:
+			return 2
+		with compiler.wrap_arithmetic:
+			i += 1
+	rc_after_calls: usize = compiler.refcount( w )
+	if rc_after_calls != rc1:
+		return 3
+	compiler.decref( c )
+	rc2: usize = compiler.refcount( w )
+	if rc2 != rc0:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_shared_closure_across_multiple_owners( self ) -> None:
+		# `d = c` (an ordinary aliasing read) makes d a SECOND owner of the
+		# SAME closure object - an ordinary RC incref on the closure
+		# itself, not a second incref of w (w's own refcount only moves at
+		# closure construction/destruction, never at aliasing) - this is
+		# exactly the "same closure handed to N places" shape Thread will
+		# need (spawn N threads off one closure), just via a local alias
+		# here rather than N constructor calls
+		self._run( '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def get( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	w: Worker = Worker.make( 9 )
+	rc0: usize = compiler.refcount( w )
+	c: Closure[[], i32] = w.get
+	rc1: usize = compiler.refcount( w )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+	d: Closure[[], i32] = c
+	closure_rc: usize = compiler.refcount( c )
+	if closure_rc != 2:
+		return 2
+	if c() != 9 or d() != 9:
+		return 3
+	compiler.decref( c )
+	rc_mid: usize = compiler.refcount( w )
+	if rc_mid != rc1:
+		return 4
+	compiler.decref( d )
+	rc2: usize = compiler.refcount( w )
+	if rc2 != rc0:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class StrFindIndexSplitTests( CompilerTestCase ):
 	''' str.find()/str.index()/str.split() (lib/builtins/__init__.py) -
 	both listed missing in TODO.txt, implemented as real general-purpose

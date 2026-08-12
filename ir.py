@@ -361,6 +361,13 @@ class Decref( Instruction ):
 		return f'Decref( value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class DecrefDynamic( Instruction ): # compiler.decref_dynamic(ptr) - releases a type-erased Ptr[None] via release_object_dynamic, reading the destructor from the object's own header instead of a compile-time-known type (see emitter_c.py's ObjectHeader.destructor) - used by a synthesized closure's own __del__ to release its captured, type-erased receiver
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'DecrefDynamic( value={self.value!r} )'
+
+@dataclass( kw_only = True )
 class RefCount( Instruction ): # compiler.refcount(x) - reads x's current header refcount
 	dest: Temp
 	value: Operand
