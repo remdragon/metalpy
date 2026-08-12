@@ -3280,6 +3280,69 @@ class Tests( unittest.TestCase ):
 		self.compiler._lower( spec )
 		self.assertIn( 'nested function defs are not supported inside a generic function', self.discovery.errors.errors[0] )
 
+	# --- non-capturing lambdas (PLAN_LAMBDA.md) --------------------------------
+
+	def test_lambda_param_types_inferred_from_expected_callable( self ) -> None:
+		code = '\n'.join([
+			'def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:',
+			'	return f( v )',
+			'',
+			'def main() -> i32:',
+			'	return call_it( lambda x: x, 5 )',
+		])
+		self._import( code )
+		main_fn = self.discovery.modules['__test__'].get_local( 'main' )
+		if main_fn.resolve is not None:
+			main_fn.resolve()
+		lf = self.compiler._lower( main_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( instr for instr in lf.instructions if isinstance( instr, ir.Call ))
+		lambda_ref = next( a for a in call.args if isinstance( a, ir.FunctionRef ))
+		self.assertEqual( lambda_ref.fn.qualname, 'main$$lambda_1' ) # 'main' is reserved as the bare, never module-qualified entry point
+		self.assertEqual( lambda_ref.fn.parameters[0].type.stem, 'i32' )
+		self.assertEqual( lambda_ref.fn.return_type.stem, 'i32' )
+
+	def test_lambda_without_expected_callable_context_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	f = lambda x: x',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'cannot infer lambda parameter types', self.discovery.errors.errors[0] )
+
+	def test_lambda_wrong_arg_count_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def call_it( f: Ptr[Callable[[i32,i32],bool]] ) -> None:',
+			'	return',
+			'',
+			'def main() -> None:',
+			'	call_it( lambda x: x )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'lambda takes 1 argument(s)', self.discovery.errors.errors[0] )
+
+	def test_lambda_capturing_enclosing_local_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:',
+			'	return f( v )',
+			'',
+			'def outer( y: i32 ) -> i32:',
+			'	return call_it( lambda x: y, 5 )',
+			'',
+			'def main() -> i32:',
+			'	return outer( 1 )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		self.compiler._lower( outer_fn )
+		self.assertIn( "captures 'y' from the enclosing function", self.discovery.errors.errors[0] )
+
 	# --- Closure[[...],...] bound-method values -------------------------------
 
 	def test_bound_method_reference_builds_closure_allocate( self ) -> None:

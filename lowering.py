@@ -156,6 +156,7 @@ class Lowering:
 		self._union_storage = type_resolver.union_storage
 		self._monomorphizer = type_resolver.monomorphizer
 		self._closure_trampolines: dict[tuple[int,int],Function] = {} # (id(method), id(owner_type)) -> its one synthesized trampoline, see _get_or_create_closure_trampoline
+		self._lambda_counter = 0 # -> f'$$lambda_{n}', unique per compile run - see _expr_Lambda (PLAN_LAMBDA.md)
 
 	def _init_lowering_state( self, fn: Function | None ) -> None:
 		self._instructions: list[ir.Instruction] = []
@@ -2422,18 +2423,7 @@ class Lowering:
 		enclosing = self._current_fn
 		if enclosing is None:
 			self.discovery.fail( f'nested function def outside any function: {ast.unparse(node)}', node )
-		# type_params alone isn't enough: a MONOMORPHIZED generic function's
-		# own copy has type_params reset to None (it's concrete now, not
-		# generic anymore - see Monomorphizer.monomorphized_function) - the
-		# qualname's own '[...]' suffix is the one signal that survives
-		# substitution (discovery.py's _get_or_create_specialization always
-		# spells a Specialization's qualname as f'{base.qualname}[{args}]')
-		if enclosing.type_params or '[' in enclosing.qualname or isinstance( enclosing.cls, Specialization ):
-			self.discovery.fail(
-				f"{node.name}: nested function defs are not supported inside a generic function or a "
-				f"generic class's own method yet: {ast.unparse(node)}",
-				node,
-			)
+		self._reject_generic_enclosing_scope( enclosing, node, 'nested function defs' )
 		if node.decorator_list:
 			self.discovery.fail( f'{node.name}: decorators are not supported on a nested function def: {ast.unparse(node)}', node )
 
@@ -2487,6 +2477,91 @@ class Lowering:
 
 		enclosing.add_name( node.name, synthetic )
 		self.schedule( synthetic )
+
+	def _reject_generic_enclosing_scope( self, enclosing: Function, node: ast.AST, what: str ) -> None:
+		# shared by _stmt_FunctionDef and _expr_Lambda - a nested def/
+		# lambda inside a generic function or a generic class's own method
+		# is rejected outright for now (see PLAN_LAMBDA.md's own "deferred"
+		# list - sidesteps "which monomorphization does this belong to"
+		# entirely). type_params alone isn't enough: a MONOMORPHIZED
+		# generic function's own copy has type_params reset to None (it's
+		# concrete now, not generic anymore - see Monomorphizer.
+		# monomorphized_function) - the qualname's own '[...]' suffix is
+		# the one signal that survives substitution (discovery.py's
+		# _get_or_create_specialization always spells a Specialization's
+		# qualname as f'{base.qualname}[{args}]')
+		if enclosing.type_params or '[' in enclosing.qualname or isinstance( enclosing.cls, Specialization ):
+			self.discovery.fail(
+				f"{what} are not supported inside a generic function or a generic class's own method yet: {ast.unparse(node)}",
+				node,
+			)
+
+	def _expr_Lambda( self, node: ast.Lambda, expected_type: Type|None ) -> ir.Operand:
+		# a non-capturing lambda expression - see PLAN_LAMBDA.md. Lambda
+		# syntax carries no type annotations at all, so parameter types are
+		# inferred entirely from expected_type (must already be a
+		# Ptr[Callable[[ArgTypes],Ret]] shape flowing in from the
+		# surrounding context - e.g. a `key: Callable[[T],K]` parameter's
+		# own declared type, while lowering the argument expression at a
+		# call site)
+		fn_type = self._type_resolver._callable_type_of( expected_type )
+		if fn_type is None:
+			self.discovery.fail(
+				f'cannot infer lambda parameter types - no expected Callable[...] context: {ast.unparse(node)}',
+				node,
+			)
+		args = node.args
+		if args.vararg is not None or args.kwarg is not None or args.kwonlyargs:
+			self.discovery.fail( f'lambda does not support *args/**kwargs/keyword-only parameters yet: {ast.unparse(node)}', node )
+		positional = [ *args.posonlyargs, *args.args ]
+		if len( positional ) != len( fn_type.arg_types ):
+			self.discovery.fail(
+				f'lambda takes {len(positional)} argument(s), the expected Callable[...] type declares {len(fn_type.arg_types)}: {ast.unparse(node)}',
+				node,
+			)
+
+		enclosing = self._current_fn
+		if enclosing is None:
+			self.discovery.fail( f'lambda outside any function: {ast.unparse(node)}', node )
+		self._reject_generic_enclosing_scope( enclosing, node, 'lambdas' )
+
+		self._lambda_counter += 1
+		name = f'$$lambda_{self._lambda_counter}'
+		qualname = f'{enclosing.qualname}{name}'
+		synthetic_node = ast.FunctionDef(
+			name = name,
+			args = ast.arguments(
+				posonlyargs = [], args = [ ast.arg( arg = p.arg, annotation = None ) for p in positional ],
+				vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [],
+			),
+			body = [ ast.Return( value = node.body ) ],
+			decorator_list = [], returns = None, type_params = [],
+			lineno = node.lineno, col_offset = node.col_offset,
+		)
+		ast.fix_missing_locations( synthetic_node )
+
+		synthetic = Function(
+			stem = name, qualname = qualname,
+			file = enclosing.file, line = node.lineno,
+			cls = None, node = synthetic_node,
+			parameters = None, return_type = fn_type.return_type,
+			resolve = None,
+		)
+		parameters: list[Parameter] = []
+		for arg_node, arg_type in zip( positional, fn_type.arg_types ):
+			param = Parameter(
+				stem = arg_node.arg, qualname = f'{qualname}.{arg_node.arg}',
+				file = enclosing.file, line = node.lineno,
+				type = arg_type,
+			)
+			parameters.append( param )
+			synthetic.add_name( param.stem, param )
+		synthetic.parameters = parameters
+
+		self._reject_free_variables( [ node.body ], { p.arg for p in positional }, node )
+
+		self.schedule( synthetic )
+		return self._function_ref_operand( synthetic )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
 		if expected_type is None:

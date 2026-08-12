@@ -4667,6 +4667,20 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_lambda_param_types_inferred_and_called_indirectly( self ) -> None:
+		self._run( '''
+def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:
+	return f( v )
+
+def main() -> i32:
+	result: i32 = call_it( lambda x: x, 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 5
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 class ComTests( CompilerTestCase ):
 	''' lib/windows/com.py's HRESULT/IUnknown pattern -

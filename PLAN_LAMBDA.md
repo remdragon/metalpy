@@ -33,6 +33,16 @@ In scope:
    anything from the immediately enclosing function's own scope is
    rejected with a clear error, not silently miscompiled.
 
+Known limitation (found during implementation, not fixed): a lambda body
+that does checked arithmetic (+, -, *) under the default Check mode fails,
+since Check mode needs either `with compiler.panic_arithmetic(...):`
+around the expression or a Result-returning enclosing function to
+propagate into - and lambda syntax forbids `with`/statements entirely, so
+there is no way to satisfy either from inside a lambda body today. Doesn't
+block the forcing use case (`lambda tran: tran.timestamp` does no
+arithmetic at all) - noted for whoever picks up real closures/lambda
+ergonomics next.
+
 Deferred / out of scope:
 - Real closures (captured variables) - still no forcing use case; needs a
   representation decision (heap env + RC vs. borrowed fat pointer).
