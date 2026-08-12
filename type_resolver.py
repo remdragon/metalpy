@@ -117,8 +117,13 @@ class TypeResolver:
 		self._seen: set[int] = set()
 		self._seen_lock = threading.Lock()
 		self.union_storage = UnionStorage( discovery, self.schedule )
-		self.monomorphizer = Monomorphizer( discovery, self.schedule, self.union_storage )
-		self.tuple_storage = TupleStorage( discovery, self.schedule ) # PLAN_TUPLE.md - same "depends on nothing but Discovery + schedule" shape as union_storage/monomorphizer above
+		# constructed before monomorphizer (below), which now depends on it -
+		# substitute_type_params needs to resolve a bare TupleType bound to a
+		# generic class's own type param the same way it already eagerly
+		# monomorphizes a bare Specialization (see monomorphize.py's own
+		# comment on why)
+		self.tuple_storage = TupleStorage( discovery, self.schedule ) # PLAN_TUPLE.md - same "depends on nothing but Discovery + schedule" shape as union_storage above
+		self.monomorphizer = Monomorphizer( discovery, self.schedule, self.union_storage, self.tuple_storage )
 		# keyed by id(fn.node), not id(fn) - the SAME shared AST body object
 		# is reused by every monomorphized copy of a generic function (see
 		# resolve_function_body's own docstring)
@@ -477,12 +482,27 @@ class TypeResolver:
 		monomorphized receiver, another built fresh via _get_or_create_
 		specialization from an annotation) - see Monomorphizer.origin_of's
 		own docstring for why a Specialization and its monomorphized form
-		aren't always identity-equal even though they mean the same thing '''
+		aren't always identity-equal even though they mean the same thing.
+
+		PLAN_TUPLE.md: the exact same duality exists for a bare TupleType
+		vs its own resolved backing RCClass (TupleType.backing) - confirmed
+		by a real failure, not anticipated up front: `Result.Ok((q, r))`
+		unified against a declared `Result[tuple[int,int],E]` return-type
+		annotation saw the ANNOTATION's own bare TupleType (never resolved,
+		since an annotation's own type is only resolved on demand) as
+		`existing`, and the tuple LITERAL's own already-resolved backing
+		RCClass (ensure_resolved runs during _expr_Tuple itself) as
+		`actual` - same qualname text, genuinely different objects, wrongly
+		reported as "inferred as both X and X" without this. '''
 		if a is b:
 			return True
 		a_spec = self._as_specialization( a )
 		b_spec = self._as_specialization( b )
-		return a_spec is not None and a_spec is b_spec
+		if a_spec is not None and a_spec is b_spec:
+			return True
+		a_backing = a.backing if isinstance( a, TupleType ) else a
+		b_backing = b.backing if isinstance( b, TupleType ) else b
+		return a_backing is not None and a_backing is b_backing
 
 	def _result_shape( self, t: Type|None ) -> tuple[Type,Type]|None:
 		''' (T, E) if `t` is Result[T,E], else None. '''

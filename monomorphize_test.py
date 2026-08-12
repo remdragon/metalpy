@@ -6,18 +6,21 @@ import unittest
 from discovery import Discovery
 from monomorphize import Monomorphizer
 from mpy_types import Overload, TaggedUnion, Variable
+from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
 class MonomorphizeTests( unittest.TestCase ):
 	''' Monomorphizer built directly against a real Discovery instance (same
 	discipline as cfg_test.py) - never lowering.py itself, since
-	Monomorphizer depends only on Discovery/schedule/UnionStorage. '''
+	Monomorphizer depends only on Discovery/schedule/UnionStorage/
+	TupleStorage. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = False )
 		self.scheduled: list[object] = []
 		self.union_storage = UnionStorage( self.discovery, self.scheduled.append )
-		self.monomorphizer = Monomorphizer( self.discovery, self.scheduled.append, self.union_storage )
+		self.tuple_storage = TupleStorage( self.discovery, self.scheduled.append )
+		self.monomorphizer = Monomorphizer( self.discovery, self.scheduled.append, self.union_storage, self.tuple_storage )
 
 	def _import( self, code: str ):
 		return self.discovery.import_code( code, filename = Path( '__test__.py' ))

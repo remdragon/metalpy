@@ -271,8 +271,8 @@ def main() -> i32:
 		]
 		self._assert_program_succeeds( '''
 def main() -> i32:
-	dm1: DivMod = int(17).divmod(int(5)).unwrap('x')
-	if dm1.quotient != int(3) or dm1.remainder != int(2):
+	dm1: tuple[int,int] = int(17).divmod(int(5)).unwrap('x')
+	if dm1[0] != int(3) or dm1[1] != int(2):
 		return 1
 	if ( int(17) // int(5) ).unwrap('x') != int(3):
 		return 2
@@ -292,8 +292,8 @@ def main() -> i32:
 		return 8
 	if not int(5).divmod(int(0)).is_err():
 		return 9
-	dm2: DivMod = int(1).divmod(int(1)).unwrap('x')
-	if dm2.quotient != int(1) or dm2.remainder != int(0):
+	dm2: tuple[int,int] = int(1).divmod(int(1)).unwrap('x')
+	if dm2[0] != int(1) or dm2[1] != int(0):
 		return 10
 	return 0
 ''', checks )

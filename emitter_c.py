@@ -9,7 +9,7 @@ from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
 	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
-	RCClass, Scalar, Specialization, TaggedUnion, Type, Variable,
+	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
 # stage 3: turns a fully-lowered Compiler's output into C11 source. Pure
@@ -344,6 +344,25 @@ def c_type( t: Type|None ) -> str:
 		return mapped
 	if isinstance( t, RCClass ):
 		return f'struct {mangle_type(t)}*'
+	if isinstance( t, TupleType ):
+		# PLAN_TUPLE.md, found by a real hang (not anticipated up front): a
+		# bare, unresolved TupleType can still reach here even after
+		# monomorphize.py's own substitute_type_params fix - a plain LOCAL/
+		# PARAMETER/GLOBAL declaration's own annotation type (e.g. `dm1:
+		# tuple[int,int] = ...`) is never independently resolved anywhere
+		# on the general path, only when it happens to be the destination
+		# of a freshly-lowered tuple LITERAL (lowering.py's _expr_Tuple
+		# resolves expected_type defensively for exactly that one case).
+		# Rather than chase every remaining place resolution could be lost,
+		# TupleType gets the exact same treatment Specialization already
+		# gets a few lines up: directly emittable via its own mangled
+		# qualname, no resolution required - guaranteed to match whatever
+		# concrete backing RCClass eventually gets emitted under the SAME
+		# mangled name, since TupleType.qualname == backing.qualname by
+		# construction (tuple_storage.py's own TupleStorage.get()). Always
+		# a pointer, same as RCClass directly above - a tuple's backing is
+		# never anything else.
+		return f'struct {mangle_type(t)}*'
 	if isinstance( t, ( CStruct, CUnion, TaggedUnion )):
 		return f'{_class_keyword(t)} {mangle_type(t)}'
 	if isinstance( t, CEnum ):
@@ -421,7 +440,7 @@ def _value_spelling( t: Type ) -> str:
 	if isinstance( t, ( Move, Copy )):
 		return _value_spelling( t.inner )
 	base = t.base if isinstance( t, Specialization ) else t
-	if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion )):
+	if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion, TupleType )):
 		return f'{_class_keyword(base)} {mangle_type(t)}'
 	if isinstance( t, CType ):
 		return t.c_name
@@ -878,7 +897,7 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 	# type, as the pointer - this is where that pointer-ness actually
 	# becomes `->` in the emitted C).
 	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
-	if isinstance( base, RCClass ):
+	if isinstance( base, ( RCClass, TupleType )): # PLAN_TUPLE.md: a tuple's backing is always an RCClass, always pointer-accessed
 		return '->'
 	if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
 		return '->'

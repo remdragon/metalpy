@@ -54,13 +54,6 @@ class IntError:
 	Overflow: None
 	Other: None
 
-# divmod()'s own return value - see its own comment on why this exists
-# instead of a bare (int, int) tuple.
-@cstruct
-class DivMod:
-	quotient: int
-	remainder: int
-
 # ---------------------------------------------------------------------------
 # 2. The `int` class
 # ---------------------------------------------------------------------------
@@ -489,12 +482,17 @@ class int:
 	# the quotient's sign is the xor of the operands' signs, and the
 	# remainder takes the dividend's sign (matching C's own `/` and `%`).
 	#
-	# Returns a DivMod (below), not a bare (int, int) tuple - this language
-	# has no tuple type at all (confirmed directly: a bare `(int, int)`
-	# return-type annotation crashes discovery.py outright, AttributeError
-	# on a None .qualname, since no visit_Tuple exists anywhere to handle
-	# one - tuples are simply never a supported type here).
-	def divmod( self, divisor: int ) -> Result[DivMod, IntError]:
+	# Returns a real tuple[int,int] (quotient, remainder) - see PLAN_TUPLE.md.
+	# Used to return a hand-rolled `@cstruct class DivMod: quotient: int;
+	# remainder: int` instead, because this language had no tuple type at
+	# all (a bare `(int, int)` return-type annotation used to crash
+	# discovery.py outright, AttributeError on a None .qualname). That
+	# CStruct's own int fields were never actually torn down by the CFG on
+	# scope exit either (cfg.py's v1 ownership tracking deliberately
+	# doesn't reach into struct fields - see PLAN_TUPLE.md's own "why
+	# RCClass, not CStruct" reasoning) - a real, if narrow, leak this
+	# migration fixes as a side effect, not just a workaround removed.
+	def divmod( self, divisor: int ) -> Result[tuple[int,int], IntError]:
 		if divisor.is_zero():
 			return Result.Err( IntError.DivideByZero( None ))
 
@@ -552,15 +550,15 @@ class int:
 		quotient.__is_negative = ( self.__is_negative != divisor.__is_negative ) and not quotient.is_zero()
 		remainder.__is_negative = self.__is_negative and not remainder.is_zero()
 
-		return Result.Ok( DivMod( quotient = quotient, remainder = remainder ))
+		return Result.Ok( ( quotient, remainder ))
 
 	def __floordiv__( self, other: int ) -> Result[int, IntError]:
 		result = self.divmod( other ).or_return()
-		return Result.Ok( result.quotient )
+		return Result.Ok( result[0] )
 
 	def __mod__( self, other: int ) -> Result[int, IntError]:
 		result = self.divmod( other ).or_return()
-		return Result.Ok( result.remainder )
+		return Result.Ok( result[1] )
 
 	# --- narrowing / widening conversions ------------------------------
 	# int never implicitly converts to/from fixed-width types (SYNTAX.md

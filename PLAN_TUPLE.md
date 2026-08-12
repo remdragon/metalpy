@@ -349,3 +349,86 @@ this pass): int.divmod() -> tuple[int,int] migration (would also fix the
 latent DivMod CStruct RC-field-teardown gap described above); str.
 partition() itself (the concurrent session's own work, unblocked by this
 landing); everything under "Deferred" above remains deferred.
+
+UPDATE (int.divmod() migration): done - lib/builtins/__int.py's divmod()
+now returns Result[tuple[int,int], IntError] directly, DivMod (the @cstruct
+workaround) is gone, __floordiv__/__mod__ read result[0]/result[1].
+int_test.py/lib/builtins/__init__.py updated to match.
+
+This migration surfaced a real, previously-latent gap in tuple's OWN
+implementation (this pass's own "landed" claim above was true only for the
+shapes actually exercised by TupleTests - a bare local declared straight
+from a tuple literal in the same statement. divmod's own shape - T bound to
+tuple[int,int] through GENERIC type inference, then read back through a
+chain of Result[T,E].unwrap() - is structurally different, and broke
+immediately): a bare, unresolved TupleType can reach emitter_c.py in at
+least three ways this pass never exercised, each fixed as found, not
+anticipated:
+
+1. monomorphize.py's substitute_type_params (the TypeVar branch) returned
+   whatever `arg` a type param was bound to completely unprocessed - fine
+   for an already-concrete type, but a bare TupleType bound to T (e.g. from
+   Result.Ok((q,r))'s own generic-call inference) needs the exact same
+   eager-resolve treatment the Specialization branch two lines down already
+   gives itself, and for the identical reason ("the single highest-leverage
+   fix point... every future reader would otherwise need its OWN
+   ensure_resolved call to unwrap"). Fixed by resolving through tuple_
+   storage.get() right there - Monomorphizer now takes a TupleStorage too
+   (threaded from type_resolver.py, constructed before Monomorphizer since
+   it's now a dependency, same relationship union_storage already has).
+2. A side effect of chasing (1): TWO different Specialization objects can
+   exist for what looks like "the same" Result[tuple[int,int],IntError] -
+   one from divmod's own declared return-type annotation (bare TupleType,
+   discovery.py never resolves an annotation on parse), one from generic-
+   call inference at a construction site (resolved, since _expr_Tuple
+   defensively resolves expected_type). _get_or_create_specialization
+   interns by qualname STRING, and TupleType.qualname == backing.qualname
+   by construction, so lowering.py's _unify_type_param's own conflict
+   check (_same_type) needed a TupleType<->backing duality branch too,
+   mirroring the EXISTING Specialization<->monomorphized-form duality it
+   already had for the identical reason (two representations of the same
+   type reaching from two different argument positions).
+3. Even after (1)/(2), a PLAIN LOCAL/PARAMETER/GLOBAL declared straight
+   from a tuple[...] annotation (`dm1: tuple[int,int] = ...`) is NEVER
+   independently re-resolved anywhere in the general case - only ever
+   fixed up when the RHS happens to be a tuple LITERAL in the SAME
+   statement (_expr_Tuple's own defensive resolve of expected_type, added
+   during THIS pass's original landing - divmod's dm1 is assigned from a
+   method CALL, not a literal, so that fix never applied). Rather than
+   chase every remaining place resolution could theoretically be lost (a
+   genuinely open-ended search - found by a real hang during THIS one
+   migration, not by inspection), fixed architecturally instead: gave
+   TupleType the same "directly emittable without prior resolution"
+   treatment Specialization already has everywhere in emitter_c.py -
+   c_type()/_value_spelling()/_member_access_operator() each got a
+   TupleType branch alongside their existing RCClass one (always a
+   pointer, always `->`, mangled via its own qualname - guaranteed to
+   match whatever concrete backing eventually gets emitted, since
+   TupleType.qualname == backing.qualname by construction). Also found:
+   cfg.py's is_rc() (ownership-tracking - decides whether a binding needs
+   scope-exit decref at all) had the identical gap - unlike an ordinary
+   generic, where the ABSTRACT TEMPLATE class alone already answers "is
+   this RC" without monomorphizing, TupleType has no template to check;
+   fixed by returning True unconditionally for any TupleType (a tuple's
+   backing is ALWAYS RCClass by construction, a structural guarantee, not
+   something that needs .backing to already be populated).
+
+None of this was caught by this pass's own TupleTests, despite one of them
+being an "RC element constructed and dropped without crashing" test -
+every original test happened to construct straight into an annotated local
+in the same statement, the one shape _expr_Tuple's own defensive resolve
+already covered. is_rc() returning False for an unresolved TupleType is a
+silent LEAK, not a crash, so a real-compile-and-run test that only checks
+the exit code (this whole file's own convention, no ASan integration - see
+this plan's own Verification section) would never have caught it either.
+Added directly: emitter_c_test.py's TupleTests gained test_tuple_bound_
+through_generic_inference_not_a_bare_literal (a self-contained generic
+function returning Result[tuple[i32,i32],E], independent of int itself) -
+guards the fix, not just the workaround.
+
+Full suite: 771 -> 772 passing throughout this migration (four
+monomorphize_test.py call sites needed updating for Monomorphizer's new
+tuple_storage constructor argument, not new tests, just fixed call sites;
+int_test.py's own divmod coverage already existed and needed only its
+DivMod->tuple[int,int] read-back updated in place; +1 new test, the
+generic-inference regression case above). No other regressions.

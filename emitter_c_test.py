@@ -5118,6 +5118,37 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_tuple_bound_through_generic_inference_not_a_bare_literal( self ) -> None:
+		# regression test for PLAN_TUPLE.md's own "UPDATE (int.divmod()
+		# migration)" section: every OTHER test in this class constructs a
+		# tuple literal straight into an annotated local in the SAME
+		# statement - the one shape lowering.py's _expr_Tuple defensively
+		# resolves expected_type for. A tuple bound to a generic type
+		# parameter T (here, by Result.Ok((a,b)) inferring T from the
+		# tuple literal's own type) and then read back through a SEPARATE
+		# statement's .unwrap() call is structurally different - exactly
+		# the shape that broke int.divmod()'s own real migration (a bare,
+		# unresolved TupleType reached emitter_c.py three different ways,
+		# each fixed in monomorphize.py/lowering.py/emitter_c.py/cfg.py -
+		# see the plan doc for the full account). This guards those fixes
+		# directly, independent of int itself.
+		self._run( '''
+class PairError:
+	pass
+
+def make_pair( a: i32, b: i32 ) -> Result[tuple[i32,i32], PairError]:
+	return Result.Ok( ( a, b ) )
+
+def main() -> i32:
+	pair: tuple[i32,i32] = make_pair( 3, 4 ).unwrap( 'x' )
+	if pair[0] != 3 or pair[1] != 4:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 class CallableTests( CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see

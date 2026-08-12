@@ -5,7 +5,7 @@ import sys
 import threading
 from .__errors import OSError
 from .__fastlist import FastList
-from .__int import int, IntError, DivMod
+from .__int import int, IntError
 from .__list import list, UnsafeList
 from .__RawDict import RawDict
 from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map

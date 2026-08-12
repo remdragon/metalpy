@@ -5,7 +5,8 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType
+from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType
+from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
 '''
@@ -30,10 +31,11 @@ class Monomorphizer:
 	memoized here for the whole Lowering instance's lifetime.
 	'''
 
-	def __init__( self, discovery: Discovery, schedule: Callable[[object],None], union_storage: UnionStorage ) -> None:
+	def __init__( self, discovery: Discovery, schedule: Callable[[object],None], union_storage: UnionStorage, tuple_storage: TupleStorage ) -> None:
 		self.discovery = discovery
 		self.schedule = schedule
 		self._union_storage = union_storage
+		self._tuple_storage = tuple_storage
 		# no separate memo tables here - the monomorphized result (Function
 		# or ClassLike, whichever matches spec.base's own kind) is cached
 		# directly on spec.monomorphized (see mpy_types.py's Specialization)
@@ -106,6 +108,28 @@ class Monomorphizer:
 		if isinstance( t, TypeVar ):
 			for param, arg in zip( type_params, args ):
 				if t is param:
+					# PLAN_TUPLE.md, found by a real hang (not anticipated
+					# up front): a bare, unresolved TupleType bound to T
+					# (e.g. Result[T,E].Ok's own `value: T`, T bound to
+					# tuple[int,int] by generic-call inference) is NEVER
+					# itself emittable - unlike a bare Specialization
+					# (which the branch just below already eagerly
+					# monomorphizes for the exact same reason, "the single
+					# highest-leverage fix point... every future reader
+					# would otherwise need its OWN ensure_resolved call to
+					# unwrap"), emitter_c.py has no ensure_resolved to call
+					# on its own (no Discovery/TypeResolver instance around
+					# - see _callable_ptr_type's own comment) and genuinely
+					# has no c_type()/mangle_type() support for a bare
+					# TupleType at all. Resolved here, once, regardless of
+					# which "argument position" (a literal's own already-
+					# resolved type, or a bare annotation never resolved at
+					# all) `arg` happened to come from - _unify_type_param's
+					# own last-writer-wins bindings dict makes the ORDER of
+					# those two non-deterministic from here, so this can't
+					# be fixed by reordering call sites instead.
+					if isinstance( arg, TupleType ):
+						return self._tuple_storage.get( arg )
 					return arg
 			return t
 		if isinstance( t, Specialization ):

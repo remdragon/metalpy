@@ -6,7 +6,7 @@ from typing import Callable
 # local imports:
 import ir
 from errors import CompileError
-from mpy_types import Type, Variable, Parameter, Function, RCClass, TaggedUnion, CUnion, Move, Copy, Specialization
+from mpy_types import Type, Variable, Parameter, Function, RCClass, TaggedUnion, CUnion, Move, Copy, Specialization, TupleType
 
 '''
 Ownership tracking for automatic INCREF/DECREF placement - see TODO.txt's
@@ -55,6 +55,23 @@ def is_rc( t: Type ) -> bool:
 	# generic-union instance method's own `self` (already typed as a
 	# Specialization) would wrongly look untracked here
 	base = t.base if isinstance( t, Specialization ) else t
+	if isinstance( base, TupleType ):
+		# PLAN_TUPLE.md: unlike an ordinary generic (list[T]/Result[T,E]/...),
+		# where the ABSTRACT template class itself (Specialization.base)
+		# already answers "is this RC" without ever needing to monomorphize
+		# a specific instantiation, a TupleType has no such template - the
+		# only place "is a tuple RC" lives is its own synthesized backing
+		# RCClass (tuple_storage.py), which may not have been synthesized
+		# yet for this particular TupleType (a local variable's own
+		# declared annotation type is never independently re-resolved after
+		# discovery.py first builds it - see emitter_c.py's c_type() for
+		# the identical "found by a real hang, not anticipated up front"
+		# gap this mirrors). No lazy check needed here though: EVERY
+		# TupleType's backing is unconditionally an RCClass by construction
+		# (tuple_storage.TupleStorage.get() never produces anything else),
+		# so this is a structural guarantee, not something that depends on
+		# whether .backing happens to be populated yet.
+		return True
 	return isinstance( base, RCClass )
 
 def is_result_type( t: Type|None ) -> bool:
