@@ -32,7 +32,7 @@ PROLOGUE = '''\
 
 typedef struct {
 	_Atomic int32_t ref_count;
-	void (*destructor)(void*); // set once at construction (see emit_c's ir.Allocate codegen) - read only by release_object_dynamic below, not by the hot incref/decref path
+	void (*destructor)(void*); // set once at construction (see emit_c's ir.Allocate codegen), read here on every release - adjacent to ref_count in the same cache line the atomic decrement below already touches, not a separate fetch
 } ObjectHeader;
 
 static inline void retain_object( ObjectHeader* obj ) {
@@ -41,26 +41,23 @@ static inline void retain_object( ObjectHeader* obj ) {
 	}
 }
 
-static inline void release_object( ObjectHeader* obj, void (*destructor)(void*) ) {
+// the destructor was previously an explicit argument, passed as a compile-
+// time literal at every call site - redundant with the header's own
+// destructor field (set once at construction), which every caller can
+// already reach directly. Reading it here uniformly also means every
+// release, not just a type-erased one, is now safe to call through a
+// base-typed reference once RCClass subclassing exists (see
+// PLAN_SUBCLASSING_VTABLES_COM.md's "Why RCClass is deferred") - without
+// making retain_object/the refcount increment/decrement themselves
+// virtual, which is the actual hot-path cost that plan deliberately
+// avoided paying
+static inline void release_object( ObjectHeader* obj ) {
 	if ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {
 		if ( atomic_fetch_sub( &obj->ref_count, 1 ) == 1 ) {
-			if ( destructor ) {
-				destructor( obj );
+			if ( obj->destructor ) {
+				obj->destructor( obj );
 			}
 		}
-	}
-}
-
-// same as release_object, but reads the destructor from the object's own
-// header instead of requiring the caller to know it statically - for
-// releasing a type-erased reference (a closure's captured receiver; later,
-// base-typed decref once RCClass subclassing exists). Deliberately NOT
-// used for ordinary ir.Decref sites, which already know the concrete type
-// at compile time and keep using release_object's own literal-reference
-// calling convention directly - no header read added to that hot path.
-static inline void release_object_dynamic( ObjectHeader* obj ) {
-	if ( obj ) {
-		release_object( obj, obj->destructor );
 	}
 }
 
@@ -1179,20 +1176,15 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.Incref ):
 		return [ f'\tretain_object( &({_emit_operand(instr.value)})->$header );' ]
 	if isinstance( instr, ir.Decref ):
-		# instr.value.type is always concrete RCClass-typed by the time the
-		# emitter sees a bare Decref (cfg.py's own union-handling already
-		# expands any TaggedUnion-typed Incref/Decref into a tag-gated
-		# GetAttr+Cmp+Jump*+Incref/Decref sequence at the IR level - see the
-		# plan's grounding facts) - its own synthesized destructor (see
-		# _rcclass_destructor_name) is always the right one to reference
-		destructor_name = _rcclass_destructor_name( instr.value.type )
-		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header, {destructor_name} );' ]
+		# release_object reads the destructor off the object's own header
+		# now (see ObjectHeader's own comment) - nothing to compute here
+		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header );' ]
 	if isinstance( instr, ir.DecrefDynamic ):
 		# instr.value is Ptr[None] (type-erased) - $header is always the
 		# FIRST member of every RCClass struct (emit_rcclass's own field-
 		# flattening), so a pointer to the start of any RCClass instance is
 		# always validly reinterpretable as ObjectHeader* directly
-		return [ f'\trelease_object_dynamic( (ObjectHeader*){_emit_operand(instr.value)} );' ]
+		return [ f'\trelease_object( (ObjectHeader*){_emit_operand(instr.value)} );' ]
 	if isinstance( instr, ir.RefCount ):
 		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.value)})->$header.ref_count;' ]
 
@@ -1250,11 +1242,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# - starting the header at 0 would underflow the very first
 			# paired Decref
 			lines.append( f'\t({dest})->$header.ref_count = 1;' )
-			# set once, here, not read again until release_object_dynamic
-			# (if ever) - the destructor's own real signature (static void
-			# NAME(void* __obj), see _function_prototype's is_destructor
-			# branch) already matches ObjectHeader.destructor's declared
-			# type exactly, no cast needed
+			# set once, here - every release_object call reads it back off
+			# the header from here on (see ObjectHeader's own comment). The
+			# destructor's own real signature (static void NAME(void*
+			# __obj), see _function_prototype's is_destructor branch)
+			# already matches ObjectHeader.destructor's declared type
+			# exactly, no cast needed
 			lines.append( f'\t({dest})->$header.destructor = {_rcclass_destructor_name(instr.dest.type)};' )
 			for name, value in instr.fields.items():
 				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )

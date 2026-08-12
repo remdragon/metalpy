@@ -1788,8 +1788,8 @@ class Lowering:
 
 	def _lower_compiler_decref_dynamic( self, node: ast.Call ) -> None:
 		# compiler.decref_dynamic(ptr) - releases a TYPE-ERASED Ptr[None]
-		# generically, reading its destructor off the object's own header
-		# (release_object_dynamic - see emitter_c.py's ObjectHeader) instead
+		# generically, via release_object, which reads its destructor off
+		# the object's own header (see emitter_c.py's ObjectHeader) instead
 		# of requiring the concrete type statically, unlike compiler.decref
 		# above. Internal machinery for compiler-synthesized code (a
 		# closure's own __del__, releasing its captured receiver after

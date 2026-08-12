@@ -1090,11 +1090,12 @@ class RCClassConstructTests( RCClassTestCase ):
 		self.assertIn( 'int32_t x;', struct_src )
 
 	def test_construction_sets_header_destructor_field( self ) -> None:
-		# Phase 2a: every RCClass construction now also wires up
-		# $header.destructor (read generically by release_object_dynamic -
-		# closures, later, are the first real caller) - ordinary
-		# release_object call sites (plain Decref) are UNCHANGED, still a
-		# direct literal reference, not a read through this field
+		# every RCClass construction wires up $header.destructor;
+		# release_object (both the ordinary Decref path and the type-
+		# erased DecrefDynamic path a closure's own __del__ uses) reads it
+		# back from there uniformly - see ObjectHeader's own comment on why
+		# passing it again as an explicit argument at every release site
+		# would just be redundant with what's already in the header
 		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
 			'def main() -> None:',
 			'	foo: Foo = Foo.make( 1 )',
@@ -1104,23 +1105,25 @@ class RCClassConstructTests( RCClassTestCase ):
 		make_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == '__main__.Foo.make' )
 		src = emitter_c.emit_function( make_lf )
 		self.assertIn( '$header.destructor = __main__$Foo$$__destructor__;', src )
-		# ordinary Decref (main's own epilogue for `foo`) must still pass
-		# the destructor as a direct literal argument, not read it back off
-		# the header - the hot path stays exactly as cheap as before
+		# ordinary Decref (main's own epilogue for `foo`) calls the single,
+		# merged release_object with just the header pointer - no
+		# destructor argument, no _rcclass_destructor_name reference here
 		main2_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		main_src = emitter_c.emit_function( main2_lf )
-		self.assertIn( 'release_object( &(foo)->$header, __main__$Foo$$__destructor__ )', main_src )
+		self.assertIn( 'release_object( &(foo)->$header )', main_src )
+		self.assertNotIn( '__main__$Foo$$__destructor__', main_src )
 
-	def test_release_object_dynamic_is_emitted_and_compiles( self ) -> None:
-		# the new generic-release path itself - no real caller exists yet
-		# (Phase 2b's closures are the first one), so this just confirms
-		# it's present, well-formed C, and part of the always-included
-		# prologue (a real clang/gcc compile catches a signature mismatch
-		# against ObjectHeader.destructor immediately)
+	def test_release_object_reads_destructor_from_header( self ) -> None:
+		# a single, merged release_object - see ObjectHeader's own comment
+		# on why a separate release_object_dynamic isn't needed: every
+		# release already has the destructor one field-read away, adjacent
+		# to ref_count in the same cache line the atomic decrement below
+		# already touches
 		c_source = emitter_c.PROLOGUE
 		self.assertIn( 'void (*destructor)(void*);', c_source )
-		self.assertIn( 'static inline void release_object_dynamic( ObjectHeader* obj )', c_source )
-		self.assertIn( 'release_object( obj, obj->destructor );', c_source )
+		self.assertIn( 'static inline void release_object( ObjectHeader* obj )', c_source )
+		self.assertIn( 'obj->destructor( obj );', c_source )
+		self.assertNotIn( 'release_object_dynamic', c_source )
 
 	def test_init_construction_schedules_sys_alloc_for_the_constructed_class( self ) -> None:
 		# regression test: _try_lower_construct_call's own ir.Allocate (the
@@ -1435,8 +1438,10 @@ class RCClassDestructorTests( RCClassTestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
 		self.assertNotIn( '__del__', destructor_src ) # Box declares none
-		self.assertIn( 'release_object', destructor_src )
-		self.assertIn( '__main__$Foo$$__destructor__', destructor_src )
+		# release_object now reads the field's own destructor back off its
+		# own header at runtime (see ObjectHeader's own comment) rather
+		# than this call site naming it as a literal argument
+		self.assertIn( 'release_object( &(t0)->$header )', destructor_src )
 		self.assertIn( 'sys$free( (void*)(self) )', destructor_src )
 
 	def test_taggedunion_field_cascades_a_tag_gated_decref( self ) -> None:
@@ -1494,8 +1499,9 @@ class RCClassDestructorTests( RCClassTestCase ):
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
 		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
-		self.assertIn( 'release_object', destructor_src )
-		self.assertIn( '__main__$Foo$$__destructor__', destructor_src )
+		# release_object now reads the field's own destructor back off its
+		# own header at runtime rather than this call site naming it
+		self.assertIn( 'release_object( &(t1)->$header )', destructor_src )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
