@@ -462,45 +462,50 @@ finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
 
 str class:
-	missing helper methods like:
-		.startswith()
-		.endswith()
-		.partition()
-		.find()
-		.index()
-		.upper()
-		.lower()
-		.split()
-		.join()
-		.format()
-		.isalnum()
-		.isalpha()
-		.isascii()
-		.isdecimal()
-		.isdigit()
-		.isidentifier()
-		.islower()
-		.isnumeric()
-		.isprintable()
-		.isspace()
-		.istitle()
-		.isupper()
-		.ljust()
-		.lstrip()
-		.removeprefix()
-		.removesuffix()
-		.replace()
-		.rfind()
-		.rindex()
-		.rjust()
-		.rpartition()
-		.rsplit()
-		.rstrip()
-		.startswith()
-		.swapcase()
-		.title()
-		.translate()
-		.zfill()
+	all of find()/index()/upper()/lower()/split()/startswith()/endswith()/
+		removeprefix()/removesuffix()/rfind()/rindex()/replace()/rsplit()/
+		join()/partition()/rpartition()/isascii()/ljust()/rjust()/zfill()/
+		isalpha()/isdigit()/isspace()/isupper()/islower()/isalnum()/
+		isprintable()/isdecimal()/isnumeric()/isidentifier()/strip()/
+		lstrip()/rstrip()/swapcase()/title()/istitle() are now implemented
+		(lib/builtins/__init__.py + lib/builtins/__str.py), real-compile-
+		and-run tested (emitter_c_test.py's StrPhase1MethodsTests/
+		StrPhase2PaddingTests/StrPhase3ClassificationTests/
+		StrPhase4CaseCompositeTests). partition()/rpartition() return a
+		real tuple[str,str,str], not a hand-rolled struct.
+
+		isdecimal()/isnumeric() and isidentifier() are documented
+		approximations: no OS classification API distinguishes Python's
+		fine-grained Unicode categories (Nd vs the broader "digit"
+		notion, or the real XID_Start/XID_Continue identifier tables), so
+		these collapse onto the same OS-native alpha/digit primitives
+		everything else here uses (deliberately NOT ASCII-only fallbacks
+		- see __str.py's own comment). isalpha()/isdigit()/isspace()/
+		isupper()/islower()/isalnum()/isprintable() are genuinely OS-
+		native (GetStringTypeW on Windows, iswalpha_l-family on POSIX),
+		not approximated.
+
+		strip()/lstrip()/rstrip() only implement the no-argument
+		(whitespace-only) form - Python's chars= argument isn't
+		implemented, because a real, separate, pre-existing compiler gap
+		was found while designing it: a string literal assigned/passed to
+		a str|None-typed parameter fails at code emission (_emit_const
+		gets a literal typed against the WHOLE union rather than its str
+		variant) - confirmed via a standalone repro independent of this
+		work, not chased down/fixed here since a no-arg strip() already
+		covers what this file itself asked for.
+
+		swapcase()/title() always map exactly one codepoint to exactly
+		one codepoint - a genuine one-to-many case expansion (German ß
+		uppercasing to "SS") isn't representable through __str.py's
+		case_map_one, the same ceiling upper()/lower()'s own per-
+		codepoint POSIX path (towupper_l/towlower_l) already has.
+
+		still missing: .format() (tracked separately below, "implement
+		str.format" + f-string support - much bigger features) and
+		.translate() (deferred - Python's real signature depends on
+		str.maketrans(), which doesn't exist here, and there's no clear
+		replacement shape yet).
 
 datetime class
 
