@@ -509,7 +509,17 @@ timedelta class
 list class
 	first-draft implementation
 
-	I'm fairly certain this code isn't thread-safe
+	list[T] is now thread-safe: it's a FastLock-guarded wrapper (lib/
+		builtins/__list.py) around UnsafeList[T], which is the old
+		unsynchronized implementation, kept as an explicit opt-in escape
+		hatch (same positional/order-preserving semantics, no lock).
+		FastList[T] is unrelated (swap-and-pop erase, stable IDs, not
+		insertion-order-preserving) and untouched by this. Verified via
+		real compile+run concurrency stress tests in emitter_c_test.py's
+		ListThreadSafetyTests (8 producers pushing known values, 8
+		producers + 1 concurrent consumer draining, and an RC-element
+		variant confirming no leak/double-free) - repeat-run 10x via
+		PowerShell with zero flakiness.
 
 	slice[T] (builtins/__init__.py) is a borrowed view (_ptr/__len only, no
 		owning storage) - any function that snapshots a slice's .len() once

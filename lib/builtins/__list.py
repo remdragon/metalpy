@@ -7,9 +7,41 @@
 # keeping for callers that actually want its trade-offs, but it is NOT a
 # drop-in replacement for a real array (confirmed by emitter_c_test.py's
 # test_erase_does_not_preserve_positional_order).
+#
+# Three related types now, each a genuinely different tradeoff, not three
+# names for the same thing:
+#   list[T]        - THIS is what the name means by default: every method
+#                     locked (a real FastLock, acquired/released around
+#                     each call). list[T] is the container every program
+#                     reaches for out of habit, so it defaults to safe
+#                     rather than fast - an unsafe-by-default container
+#                     that looks ordinary is a worse failure mode than a
+#                     slightly slower safe one. RawList itself has no
+#                     synchronization of its own (see its own comment
+#                     below) - two threads racing _grow() is a real
+#                     double-free, not a hypothetical.
+#   UnsafeList[T]   - the SAME positional/order-preserving semantics as
+#                     list[T], with no locking at all - the escape hatch
+#                     for code that's confined to one thread and wants to
+#                     skip the lock-acquire cost. Also what list[T] itself
+#                     is built on, and what any OTHER internal, never-
+#                     escaping, hot-path buffer in this stdlib should use
+#                     directly (RawDict's own storage, int.divmod()'s own
+#                     scratch multiples cache) - those have nothing to do
+#                     with cross-thread sharing and shouldn't silently pay
+#                     for it just because they're built on "a list".
+#   FastList[T]     - unrelated to the safe/unsafe axis above: genuinely
+#                     different erase/ordering semantics (swap-and-pop,
+#                     stable IDs). Untouched by this split.
+#
+# get_ptr() (a borrowed pointer straight into the buffer) is UnsafeList[T]
+# only, deliberately not on list[T] - the pointer's own validity window
+# ("don't use it past the next mutation") is meaningless once the lock
+# that made "the next mutation" observable has already been released.
 
 import compiler
 import sys
+import threading
 
 # ---------------------------------------------------------------------------
 # RawList: the non-generic implementation core.
@@ -133,13 +165,15 @@ class RawList:
 
 
 # ---------------------------------------------------------------------------
-# list[T]: thin type-safe wrapper over RawList.
+# UnsafeList[T]: thin type-safe wrapper over RawList - no locking of its
+# own (see this file's own header comment for the three-way split with
+# list[T]/FastList[T]).
 #
 # Monomorphized per T, but each method is a one-liner cast + RawList call.
 # RC operations (incref/decref) are performed here so RawList stays generic.
 # ---------------------------------------------------------------------------
 
-class list[T]:
+class UnsafeList[T]:
 	__raw: RawList
 
 	def __init__( self, initial_capacity: usize = 8 ) -> None:
@@ -261,3 +295,106 @@ class list[T]:
 			with compiler.panic_arithmetic( 'list.clear: overflow' ):
 				i += 1
 		self.__raw._clear()
+
+
+# ---------------------------------------------------------------------------
+# list[T]: the safe default - every method locked around a plain
+# UnsafeList[T] (see this file's own header comment). __inner/__lock are
+# both ordinary RC fields, so the compiler's own synthesized destructor
+# already cascades into both of theirs correctly (decref every element,
+# free the buffer, free the OS lock) - no __del__ needed here at all.
+#
+# Every wrapper method follows the same shape: acquire, defer the release
+# (so it still runs on every exit path, not just the ordinary one - a
+# panic or an early return inside the delegated call must never leave the
+# lock held), delegate to __inner, return whatever it returned.
+# ---------------------------------------------------------------------------
+
+class list[T]:
+	__inner: UnsafeList[T]
+	__lock:  threading.FastLock
+
+	def __init__( self, initial_capacity: usize = 8 ) -> None:
+		self.__inner = UnsafeList[T]( initial_capacity )
+		self.__lock  = threading.FastLock()
+
+	def __len__( self ) -> usize:
+		self.__lock.acquire().unwrap( 'list.__len__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__len__()
+
+	def capacity( self ) -> usize:
+		self.__lock.acquire().unwrap( 'list.capacity: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.capacity()
+
+	# Append a value at the end. Increfs val if T is an RC type.
+	def append( self, val: T ) -> Result[None, OverflowError]:
+		self.__lock.acquire().unwrap( 'list.append: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.append( val )
+
+	# Insert a value at idx, shifting everything at/after idx one slot to
+	# the right. idx > len clamps to len (append), matching Python's own
+	# list.insert. Increfs val if T is an RC type.
+	def insert( self, idx: usize, val: T ) -> Result[None, OverflowError]:
+		self.__lock.acquire().unwrap( 'list.insert: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.insert( idx, val )
+
+	# Access element by position. Returns a copy (with incref if RC).
+	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:
+		self.__lock.acquire().unwrap( 'list.__getitem__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__getitem__( idx )
+
+	# Overwrite the element at idx. Increfs val and decrefs the value it replaces.
+	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
+		self.__lock.acquire().unwrap( 'list.__setitem__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__setitem__( idx, val )
+
+	# Remove and return the LAST element (O(1), no shift needed) - list[T]
+	# has no equivalent of this today; natural for a producer/consumer
+	# queue/stack shape, which is exactly what sharing a list[T] across
+	# threads is usually FOR. Composes __getitem__ (increfs) + erase_at
+	# (reads the same slot again, decrefs) rather than a dedicated "take"
+	# primitive on UnsafeList[T] - one extra, balanced incref/decref pair,
+	# negligible next to the lock acquire/release this already pays for;
+	# revisit only if profiling ever says otherwise.
+	def pop( self ) -> Result[T, IndexError]:
+		self.__lock.acquire().unwrap( 'list.pop: lock failed' )
+		defer( self.__lock.release() )
+		n: usize = self.__inner.__len__()
+		if n == 0:
+			return Result.Err( IndexError() )
+		with compiler.wrap_arithmetic: # n > 0, just checked
+			last: usize = n - 1
+		val: T = self.__inner.__getitem__( last ).unwrap( 'list.pop: index in bounds by construction' )
+		self.__inner.erase_at( last ).unwrap( 'list.pop: index in bounds by construction' )
+		return Result.Ok( val )
+
+	# Remove the element at idx, shifting everything after it one slot to
+	# the left. Decrefs the removed element if T is RC.
+	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
+		self.__lock.acquire().unwrap( 'list.erase_at: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.erase_at( idx )
+
+	# Erase all elements, decrefing each RC element first.
+	def clear( self ) -> None:
+		self.__lock.acquire().unwrap( 'list.clear: lock failed' )
+		defer( self.__lock.release() )
+		self.__inner.clear()
+
+	# Hold the lock across more than one call - for compound, "check-then-
+	# act" sequences that need to happen atomically (e.g. "append only if
+	# not already full"), which no single method here can express safely
+	# on its own. body is a bound-method closure (see the approved
+	# atomics-closures-threading plan) - typically a method on the SAME
+	# object that owns whatever else needs to be touched alongside this
+	# list under the same critical section.
+	def with_lock( self, body: Closure[[], None] ) -> None:
+		self.__lock.acquire().unwrap( 'list.with_lock: lock failed' )
+		defer( self.__lock.release() )
+		body()

@@ -34,12 +34,17 @@ class RawIndex:
 	entry_idx: usize
 
 class RawDict:
-	__entries: list[RawEntry]
-	__indices: list[RawIndex]
+	# UnsafeList[T], not list[T]: RawDict's own storage is private and never
+	# escapes - it has nothing to do with cross-thread sharing, and
+	# shouldn't silently pay list[T]'s own lock-acquire cost on every dict
+	# operation just because it happens to be built on "a list" (see
+	# __list.py's own header comment on this split)
+	__entries: UnsafeList[RawEntry]
+	__indices: UnsafeList[RawIndex]
 
 	def __init__( self ) -> None:
-		self.__entries = list[RawEntry]()
-		self.__indices = list[RawIndex]()
+		self.__entries = UnsafeList[RawEntry]()
+		self.__indices = UnsafeList[RawIndex]()
 
 	def __len__( self ) -> usize:
 		return len( self.__entries )

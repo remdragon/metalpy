@@ -3008,6 +3008,342 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class UnsafeListGenericTests( CompilerTestCase ):
+	''' UnsafeList[T] (lib/builtins/__list.py) - the same positional/order-
+	preserving semantics list[T] itself has, minus the lock. Confirms the
+	list[T] -> UnsafeList[T] rename (list[T] becoming the locked default)
+	didn't change UnsafeList[T]'s own behavior at all - it's the exact
+	code list[T] used to be. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_construct_append_getitem_get_ptr_erase( self ) -> None:
+		# get_ptr() specifically - list[T] itself no longer exposes it (a
+		# borrowed pointer is incompatible with a type whose whole point is
+		# "safe to hand to another thread"), but UnsafeList[T] still does
+		self._run( '''
+def main() -> i32:
+	x: UnsafeList[i32] = UnsafeList[i32]()
+	x.append( 1 ).unwrap( 'append failed' )
+	x.append( 2 ).unwrap( 'append failed' )
+	x.append( 3 ).unwrap( 'append failed' )
+	if x.__len__() != 3:
+		return 1
+	v: i32 = x.__getitem__( 1 ).unwrap( 'getitem failed' )
+	if v != 2:
+		return 2
+	p: Ptr[i32] = x.get_ptr( 0 ).unwrap( 'get_ptr failed' )
+	if p[0] != 1:
+		return 3
+	x.erase_at( 0 ).unwrap( 'erase_at failed' )
+	if x.__len__() != 2:
+		return 4
+	v = x.__getitem__( 0 ).unwrap( 'getitem failed' )
+	if v != 2:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
+class ListThreadSafetyTests( CompilerTestCase ):
+	''' list[T] (lib/builtins/__list.py) is now locked by default (a real
+	FastLock, acquired/released around every method) - these are the real
+	compile+run stress tests that actually exercise concurrent access, not
+	just single-threaded behavior (ListGenericTests above already covers
+	that, and still passes unchanged against the new locked wrapper).
+
+	Each test uses a KNOWN, closed-form expected total (count and/or sum),
+	computed from the exact values each thread pushes - a wrong final
+	number reliably indicates a lost/duplicated/corrupted element, not
+	just "probably fine". subprocess timeout matches ThreadRealCompileTests
+	(a real hang - e.g. a lost pop causing the consumer to spin forever -
+	should fail loudly, not wedge the suite). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			try:
+				run_result = subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = 30 )
+			except subprocess.TimeoutExpired:
+				self.fail( 'exe did not finish within 30s - likely a lost push/pop causing an infinite spin' )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	# Layer 1: push-only, isolates concurrent append/_grow() correctness
+	# from pop() entirely. 8 threads each append 1000 distinct, known
+	# values (thread t appends t*1000 .. t*1000+999) with no popping.
+	# Expected count (8000) and expected sum (31996000, verified by direct
+	# computation, not just asserted) both catch lost/duplicated/corrupted
+	# appends - this is the race most likely to actually corrupt memory
+	# (two threads racing _grow() is a genuine double-free on the old,
+	# unlocked implementation).
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_concurrent_append_from_8_threads_known_sum( self ) -> None:
+		self._run( '''
+import threading
+
+class Pusher:
+	target: list[i32]
+	base: i32
+
+	@staticmethod
+	def make( target: list[i32], base: i32 ) -> Pusher:
+		return Pusher.__allocate__( target = target, base = base )
+
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 1000:
+			with compiler.wrap_arithmetic:
+				v: i32 = self.base + i
+			self.target.append( v ).unwrap( 'append failed' )
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	l: list[i32] = list[i32]()
+	threads: list[threading.Thread] = list[threading.Thread]()
+	t: i32 = 0
+	while t < 8:
+		with compiler.wrap_arithmetic:
+			base: i32 = t * 1000
+		p: Pusher = Pusher.make( l, base )
+		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+	i: usize = 0
+	while i < 8:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+	if l.__len__() != 8000:
+		return 1
+	total: i64 = 0
+	i = 0
+	while i < 8000:
+		v: i32 = l.__getitem__( i ).unwrap( 'getitem failed' )
+		with compiler.wrap_arithmetic:
+			total += i64( v )
+			i += 1
+	if total != 31996000:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	# Layer 2: your own producer/consumer scenario - 8 producer threads
+	# push the same 8000 known values while ONE consumer thread
+	# continuously pops, concurrently (true overlap, not "wait for
+	# producers then drain"). The consumer needs no atomics of its own:
+	# with a single consumer, popped-count/running-sum are purely its own
+	# local state (nothing else reads or writes them), so the only
+	# actually-shared, concurrently-mutated state is the list itself,
+	# already covered by its own lock. Stop condition is the same known
+	# total both sides already agree on (8000), not a sentinel or a
+	# separate done-flag - a stuck consumer (lost pop) shows up as the 30s
+	# timeout above, not a hang.
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_8_producers_1_consumer_concurrent_push_pop_known_sum( self ) -> None:
+		self._run( '''
+import threading
+
+class Pusher:
+	target: list[i32]
+	base: i32
+
+	@staticmethod
+	def make( target: list[i32], base: i32 ) -> Pusher:
+		return Pusher.__allocate__( target = target, base = base )
+
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 1000:
+			with compiler.wrap_arithmetic:
+				v: i32 = self.base + i
+			self.target.append( v ).unwrap( 'append failed' )
+			with compiler.wrap_arithmetic:
+				i += 1
+
+class Consumer:
+	source: list[i32]
+	total: i64
+	popped: usize
+
+	@staticmethod
+	def make( source: list[i32] ) -> Consumer:
+		return Consumer.__allocate__( source = source, total = 0, popped = 0 )
+
+	def run( self ) -> None:
+		while self.popped < 8000:
+			r: Result[i32, IndexError] = self.source.pop()
+			if r.is_ok():
+				v: i32 = r.unwrap( 'checked is_ok' )
+				with compiler.wrap_arithmetic:
+					self.total += i64( v )
+					self.popped += 1
+
+def main() -> i32:
+	l: list[i32] = list[i32]()
+	c: Consumer = Consumer.make( l )
+	consumer_thread: threading.Thread = threading.Thread( c.run )
+	threads: list[threading.Thread] = list[threading.Thread]()
+	t: i32 = 0
+	while t < 8:
+		with compiler.wrap_arithmetic:
+			base: i32 = t * 1000
+		p: Pusher = Pusher.make( l, base )
+		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+	i: usize = 0
+	while i < 8:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+	consumer_thread.join()
+	if c.popped != 8000:
+		return 1
+	if c.total != 31996000:
+		return 2
+	if l.__len__() != 0:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	# Layer 3: an RC-element variant of Layer 1 - plain integers never
+	# touch the incref/decref path at all, so this is the one that
+	# actually proves concurrent append's own RC bookkeeping (not just the
+	# raw buffer/length bookkeeping) is correct: push 1000 distinct Item
+	# instances from 4 threads, then single-threaded, pop everything back
+	# and confirm each one's own refcount is exactly 1 (sole ownership,
+	# no leak, no double-free) before letting it go out of scope normally.
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_concurrent_append_of_rc_elements_no_leak_or_double_free( self ) -> None:
+		self._run( '''
+import threading
+
+class Item:
+	value: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Item:
+		return Item.__allocate__( value = v )
+
+class ItemPusher:
+	target: list[Item]
+	base: i32
+
+	@staticmethod
+	def make( target: list[Item], base: i32 ) -> ItemPusher:
+		return ItemPusher.__allocate__( target = target, base = base )
+
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 250:
+			with compiler.wrap_arithmetic:
+				v: i32 = self.base + i
+			it: Item = Item.make( v )
+			self.target.append( it ).unwrap( 'append failed' )
+			compiler.decref( it )
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	l: list[Item] = list[Item]()
+	threads: list[threading.Thread] = list[threading.Thread]()
+	t: i32 = 0
+	while t < 4:
+		with compiler.wrap_arithmetic:
+			base: i32 = t * 250
+		p: ItemPusher = ItemPusher.make( l, base )
+		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+	i: usize = 0
+	while i < 4:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+	if l.__len__() != 1000:
+		return 1
+	i = 0
+	while i < 1000:
+		it: Item = l.pop().unwrap( 'pop failed' )
+		rc: usize = compiler.refcount( it )
+		if rc != 1:
+			return 2
+		compiler.decref( it )
+		with compiler.wrap_arithmetic:
+			i += 1
+	if l.__len__() != 0:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class FastListGenericTests( CompilerTestCase ):
 	''' FastList[T] (lib/builtins/__fastlist.py) end-to-end - the ORIGINAL
 	StableIndexVector port: O(1) swap-and-pop erase, stable IDs that

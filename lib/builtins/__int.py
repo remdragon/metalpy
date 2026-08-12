@@ -503,18 +503,22 @@ class int:
 
 		# The 9 multiples (1x-9x of |divisor|), precomputed once so the
 		# digit-picking loop below can search them per dividend digit
-		# instead of recomputing. Plain list[int] - list[T].__getitem__
-		# (idx).unwrap(...) chained directly (T an RC type, receiver never
-		# bound to a name) used to double-release the payload: the
-		# receiver Temp's own pending cleanup (registered the moment its
-		# owning Call/Allocate was emitted - see cfg.py's fresh_temp) was
-		# never cancelled when .unwrap()'s return (an alias of the SAME
-		# reference, not a fresh incref) got bound to a name instead,
-		# undercounting the refcount by one - confirmed with
+		# instead of recomputing. UnsafeList[int], not list[T] - this is a
+		# purely local scratch buffer, never shared, on a hot arithmetic
+		# path, so it shouldn't pay list[T]'s own per-call lock cost (see
+		# __list.py's own header comment on this split). Originally
+		# list[T].__getitem__(idx).unwrap(...) chained directly (T an RC
+		# type, receiver never bound to a name) used to double-release the
+		# payload: the receiver Temp's own pending cleanup (registered the
+		# moment its owning Call/Allocate was emitted - see cfg.py's
+		# fresh_temp) was never cancelled when .unwrap()'s return (an alias
+		# of the SAME reference, not a fresh incref) got bound to a name
+		# instead, undercounting the refcount by one - confirmed with
 		# AddressSanitizer, not just reasoning. Fixed in lowering.py's
 		# _lower_call (the Temp-receiver branch alongside the existing
-		# Variable-receiver one for is_ok/is_err/unwrap/unwrap_or).
-		multiples: list[int] = list[int]()
+		# Variable-receiver one for is_ok/is_err/unwrap/unwrap_or) - that
+		# fix applies equally regardless of which list type this is.
+		multiples: UnsafeList[int] = UnsafeList[int]()
 		multiples.append( base ).unwrap( 'divmod: multiples.append failed' )
 		with compiler.panic_arithmetic( 'building exactly eight more multiples of the divisor cannot overflow usize bookkeeping' ):
 			k: usize = 1
