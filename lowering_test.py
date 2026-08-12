@@ -3211,6 +3211,31 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( len( call_indirects ), 1 )
 		self.assertIsNone( call_indirects[0].dest )
 
+	def test_generic_call_infers_type_params_through_callable_parameter( self ) -> None:
+		# regression test: _unify_type_param/substitute_type_params used to
+		# stop recursing at a CallableType (it's not a Specialization, so
+		# the existing Ptr[T]-vs-Ptr[i32] recursion never looked inside a
+		# Ptr[Callable[[T],K]] parameter's own arg_types/return_type at
+		# all) - even a plain function reference argument (no lambda
+		# involved) failed to infer K this way before the fix
+		code = '\n'.join([
+			'def identity_i32( v: i32 ) -> i32:',
+			'	return v',
+			'',
+			'def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:',
+			'	return key( x )',
+			'',
+			'def main() -> i32:',
+			'	return apply( 5, key = identity_i32 )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( instr for instr in fn.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.parameters[0].type.stem, 'i32' ) # x: T -> i32
+		self.assertEqual( call.target.parameters[1].type.stem, 'intrinsics.Ptr[Callable[[intrinsics.i32],intrinsics.i32]]' ) # key: Ptr[Callable[[T],K]] -> Ptr[Callable[[i32],i32]], both T and K bound
+		self.assertEqual( call.target.return_type.stem, 'i32' ) # K -> i32
+
 	# --- non-capturing nested function defs (PLAN_LAMBDA.md) ------------------
 
 	def test_nested_def_called_from_enclosing_function( self ) -> None:

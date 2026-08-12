@@ -5,7 +5,7 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable
+from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType
 from union_storage import UnionStorage
 
 '''
@@ -149,6 +149,21 @@ class Monomorphizer:
 				self.schedule( substituted )
 				return self.monomorphize_class( substituted )
 			return substituted
+		if isinstance( t, CallableType ):
+			# Callable[[Arg1,...],Ret] can mention a type param in either its
+			# own arg_types or its return_type (e.g. a generic function's own
+			# key: Callable[[T],K] parameter) - same recursive-rebuild-and-
+			# intern shape as the Specialization branch above, just through
+			# _get_or_create_callable_type (PLAN_CALLABLE.md) instead of
+			# _get_or_create_specialization. Never itself a ClassLike (it has
+			# no members of its own - see CallableType's own docstring), so
+			# no monomorphize_class/schedule() step is needed the way a
+			# Specialization's does
+			substituted_arg_types = [ self.substitute_type_params( a, type_params, args ) for a in t.arg_types ]
+			substituted_return_type = self.substitute_type_params( t.return_type, type_params, args )
+			if all( sa is a for sa, a in zip( substituted_arg_types, t.arg_types )) and substituted_return_type is t.return_type:
+				return t
+			return self.discovery._get_or_create_callable_type( substituted_arg_types, substituted_return_type )
 		if isinstance( t, TaggedUnion ) and t.file is None:
 			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
 			# _get_or_create_union - file is None only for these, never for

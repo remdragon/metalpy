@@ -4519,6 +4519,31 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_call_infers_type_params_through_callable_parameter( self ) -> None:
+		# regression test for a real compiler bug found while exploring
+		# PLAN_LAMBDA.md's own zoneinfo.py blocker: _unify_type_param/
+		# substitute_type_params used to stop recursing at a CallableType
+		# (not a Specialization, so the Ptr[T]-vs-Ptr[i32] recursion never
+		# looked inside a Ptr[Callable[[T],K]] parameter's own arg_types/
+		# return_type) - even a plain function reference argument (no
+		# lambda at all) failed to infer K this way before the fix
+		self._run( '''
+def identity_i32( v: i32 ) -> i32:
+	return v
+
+def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:
+	return key( x )
+
+def main() -> i32:
+	result: i32 = apply( 5, key = identity_i32 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 5
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_self_dot_staticmethod_call_passes_no_receiver( self ) -> None:
 		# regression test for a real compiler bug found while building
 		# dict[K,V]: self.static_method(...) (as opposed to

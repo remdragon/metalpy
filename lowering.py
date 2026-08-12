@@ -4230,6 +4230,19 @@ class Lowering:
 			if actual_spec is not None and declared.base is actual_spec.base:
 				for d_arg, a_arg in zip( declared.args, actual_spec.args ):
 					self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
+			return
+		if isinstance( declared, CallableType ) and isinstance( actual, CallableType ):
+			# Ptr[Callable[[T],K]] reaches here via the Specialization branch
+			# above's own recursion (its single type ARG is the CallableType
+			# itself) - e.g. a generic key: Ptr[Callable[[T],K]] parameter,
+			# matched against a Ptr[Callable[[i32],i32]]-typed argument
+			# (a real function/nested-def reference's own FunctionRef type -
+			# PLAN_CALLABLE.md), binds T=i32/K=i32 the same way Specialization's
+			# own args do
+			for d_arg, a_arg in zip( declared.arg_types, actual.arg_types ):
+				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
+			self._unify_type_param( type_params, declared.return_type, actual.return_type, bindings, node, context_qualname )
+			return
 		# else: this parameter position doesn't mention any of type_params
 		# (a concrete parameter, or a nested type whose base doesn't even
 		# match the argument's) - nothing to infer here. Not an error by
