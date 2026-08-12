@@ -43,6 +43,42 @@ block the forcing use case (`lambda tran: tran.timestamp` does no
 arithmetic at all) - noted for whoever picks up real closures/lambda
 ergonomics next.
 
+STATUS: landed and tested for the scoped case (a lambda/nested-def
+referenced where the surrounding context already supplies a concrete
+Ptr[Callable[[ArgTypes],Ret]] type - a typed parameter/local, or a call to
+a non-generic function). The stated forcing use case
+(lib/zoneinfo.py's own `bisect_right(self.transitions, timestamp, key =
+lambda tran: tran.timestamp)`) turned out to need MORE than this pass
+scoped, and is explicitly NOT done - see "found but not fixed" below.
+Decided with the user: stop here rather than expand scope further right
+now.
+
+Found but not fixed - genuinely separate, larger work:
+- bisect_right[T,K]/bisect_left[T,K] are themselves generic, and key's
+  own declared type (Callable[[T],K]) still has an unresolved K at the
+  point _expr_Lambda needs a concrete CallableType to infer the lambda's
+  parameter types from - K is only knowable by lowering the lambda's OWN
+  body first (its inferred return type), which the current generic-call-
+  argument machinery doesn't do (it assumes every parameter's expected
+  type is fully concrete before any argument gets lowered). Confirmed via
+  a minimal, zoneinfo.py-independent repro (a generic function taking a
+  Callable[[T],K] parameter, called with a lambda). Real closures over a
+  captured environment are unrelated - this is about a genuine circular
+  type-inference dependency, "the callee needs the lambda's type before
+  the lambda can be given a type."
+- Separately, and unrelated to lambdas: passing list[T] where bisect.py
+  declares slice[T] doesn't infer T either (found earlier this session,
+  independent of PLAN_LAMBDA.md's own work) - another thing sitting
+  between here and zoneinfo.py actually compiling.
+- Whoever picks this up next: either extend generic-call argument
+  inference to lower a Callable-typed argument's lambda body first and
+  feed its inferred type back into the callee's own type-parameter
+  binding (bigger, compiler-side), or reconsider bisect.py's own key=
+  design to sidestep the inference order problem (e.g. require an
+  already- concretely-typed Ptr[Callable[...]] value at the call site
+  instead of inferring one from a bare lambda) - library-side, smaller,
+  but changes bisect.py's own ergonomics.
+
 Deferred / out of scope:
 - Real closures (captured variables) - still no forcing use case; needs a
   representation decision (heap env + RC vs. borrowed fat pointer).
@@ -96,9 +132,11 @@ Verification
   lambda with no expected-Callable context rejected; lambda capture
   rejected.
 - emitter_c_test.py real compile-and-run: nested def called directly and
-  via bare reference/indirect call; lambda passed as key= to
-  bisect_right/bisect_left producing the right answer; lib/zoneinfo.py's
-  own get_ttinfo/utcoffset/abbr compiling and running correctly for real -
-  the concrete forcing use case.
-- Full python tests.py green throughout; nested-def support committed
-  first, lambda support second.
+  via bare reference/indirect call; a lambda's parameter types inferred
+  from a concrete Ptr[Callable[...]] context, called indirectly. NOT
+  covered (see "found but not fixed" above): lambda passed as key= to a
+  GENERIC bisect_right/bisect_left, and lib/zoneinfo.py's own
+  get_ttinfo/utcoffset/abbr - both need the further generic-inference
+  work this pass stopped short of.
+- Full python tests.py green throughout (746 passing); nested-def support
+  committed first, lambda support second.
