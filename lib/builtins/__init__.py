@@ -382,6 +382,235 @@ class str:
 				start = match_start + sep_len
 		return result
 
+	def rsplit( self, sep: str ) -> list[str]:
+		''' splits self on every occurrence of sep, same semantics as
+		split() above - without a maxsplit limit (not implemented here,
+		same scope split() itself has), splitting from the right produces
+		the exact same list as splitting from the left, just conceptually
+		built in the other direction, so this is a direct call-through
+		rather than a separate scan. '''
+		return self.split( sep )
+
+	def startswith( self, prefix: str, start: usize = 0 ) -> bool:
+		''' True if self, starting at byte offset start, begins with
+		prefix - mirrors find()'s own start parameter. An empty prefix
+		always matches (same vacuously-true convention find('') uses),
+		matching Python. '''
+		self_len: usize = self.byte_len()
+		prefix_len: usize = prefix.byte_len()
+		if start > self_len:
+			return False
+		if prefix_len == 0:
+			return True
+		with compiler.wrap_arithmetic: # start <= self_len, just checked above
+			remaining: usize = self_len - start
+		if prefix_len > remaining:
+			return False
+		with compiler.wrap_arithmetic: # start bounded by self_len above
+			candidate: ConstPtr[u8] = self.__data + start
+		return sys.memcmp( candidate, prefix.__data, prefix_len ) == 0
+
+	def endswith( self, suffix: str ) -> bool:
+		''' True if self ends with suffix. An empty suffix always
+		matches, matching Python. '''
+		self_len: usize = self.byte_len()
+		suffix_len: usize = suffix.byte_len()
+		if suffix_len == 0:
+			return True
+		if suffix_len > self_len:
+			return False
+		with compiler.wrap_arithmetic: # suffix_len <= self_len, just checked above
+			offset: usize = self_len - suffix_len
+			candidate: ConstPtr[u8] = self.__data + offset
+		return sys.memcmp( candidate, suffix.__data, suffix_len ) == 0
+
+	def removeprefix( self, prefix: str ) -> str:
+		''' self with prefix removed if present, else an unchanged copy -
+		matches Python's str.removeprefix(). '''
+		if not self.startswith( prefix ):
+			return str( self )
+		return self._byte_slice( prefix.byte_len(), self.byte_len() )
+
+	def removesuffix( self, suffix: str ) -> str:
+		''' self with suffix removed if present, else an unchanged copy -
+		matches Python's str.removesuffix(). '''
+		if not self.endswith( suffix ):
+			return str( self )
+		with compiler.wrap_arithmetic: # suffix_len <= self_len, endswith() just confirmed it
+			end: usize = self.byte_len() - suffix.byte_len()
+		return self._byte_slice( 0, end )
+
+	def rfind( self, sub: str ) -> Result[usize,IndexError]:
+		''' byte offset of the LAST occurrence of sub in self - mirrors
+		find() above exactly, just scanning from the end. Empty sub
+		matches at self's own end (self_len), the mirror image of
+		find('')'s own vacuous match at offset 0. '''
+		self_len: usize = self.byte_len()
+		sub_len: usize = sub.byte_len()
+		if sub_len == 0:
+			return Result.Ok( self_len )
+		if sub_len > self_len:
+			return Result.Err( IndexError() )
+		with compiler.wrap_arithmetic: # sub_len <= self_len, just checked above
+			i: usize = self_len - sub_len
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			while True:
+				candidate: ConstPtr[u8] = self.__data + i
+				if sys.memcmp( candidate, sub.__data, sub_len ) == 0:
+					return Result.Ok( i )
+				if i == 0:
+					break
+				i -= 1
+		return Result.Err( IndexError() )
+
+	def rindex( self, sub: str ) -> usize:
+		''' like rfind(), but panics instead of returning Err - mirrors
+		index()'s own relationship to find() above. '''
+		return self.rfind( sub ).unwrap( 'substring not found' )
+
+	def replace( self, old: str, new: str ) -> str:
+		''' every occurrence of old replaced with new - two-pass (count
+		occurrences and compute the exact output size, then fill), the
+		same shape __str.py's case_map already uses. old must not be
+		empty (same convention split() above already established for an
+		empty separator). '''
+		if old.byte_len() == 0:
+			sys.panic( 'str.replace(...): old must not be empty' )
+		self_len: usize = self.byte_len()
+		old_len: usize = old.byte_len()
+		new_len: usize = new.byte_len()
+
+		occurrences: usize = 0
+		start: usize = 0
+		while True:
+			found: Result[usize,IndexError] = self.find( old, start )
+			if found.is_err():
+				break
+			match_start: usize = found.unwrap( 'unreachable: find() confirmed is_ok' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				occurrences += 1
+				start = match_start + old_len
+
+		if occurrences == 0:
+			return str( self )
+
+		new_size: usize = 1 # zero terminator
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			removed: usize = occurrences * old_len
+			added: usize = occurrences * new_len
+		with compiler.wrap_arithmetic: # removed <= self_len - occurrences counted from real non-overlapping matches
+			kept: usize = self_len - removed
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			new_size += kept + added
+
+		buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		out: usize = 0
+		start = 0
+		while True:
+			found = self.find( old, start )
+			if found.is_err():
+				break
+			match_start = found.unwrap( 'unreachable: find() confirmed is_ok' )
+			with compiler.wrap_arithmetic:
+				piece_len: usize = match_start - start
+				sys.memcpy( buf + out, self.__data + start, piece_len )
+				out += piece_len
+				sys.memcpy( buf + out, new.__data, new_len )
+				out += new_len
+				start = match_start + old_len
+
+		with compiler.wrap_arithmetic:
+			tail_len: usize = self_len - start
+			sys.memcpy( buf + out, self.__data + start, tail_len )
+			out += tail_len
+		buf[out] = 0
+
+		return str._from_owned_cstr( buf, new_size ).unwrap( 'invalid UTF-8 in replace' )
+
+	def join( self, parts: list[str] ) -> str:
+		''' self inserted between each element of parts - str.concat's own
+		two-pass shape, plus self's own bytes between consecutive parts.
+		Takes list[str] rather than slice[str] (str.concat's own parameter
+		type) - slice[T] has no real construction path from ordinary
+		metalpy source anywhere in this codebase yet (no array-literal
+		syntax - see CaseFolding's own upper_table comment), while
+		list[str] is the container every caller already has a piece of
+		text collection in (e.g. split()'s own return type). '''
+		count: usize = parts.__len__()
+		if count == 0:
+			return str( '' )
+		self_len: usize = self.byte_len()
+		new_size: usize = 1 # zero terminator
+		i: usize = 0
+		for i in range( count ):
+			part: str = parts.__getitem__( i ).unwrap( 'str.join: index in bounds by construction' )
+			with compiler.panic_arithmetic( 'irrational string length' ):
+				new_size += part.byte_len()
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			new_size += self_len * ( count - 1 ) # count-1 separators between count parts
+
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		offset: usize = 0
+		for i in range( count ):
+			if i != 0:
+				with compiler.wrap_arithmetic:
+					sys.memcpy( new_buf + offset, self.__data, self_len )
+					offset += self_len
+			part = parts.__getitem__( i ).unwrap( 'str.join: index in bounds by construction' )
+			part_len: usize = part.byte_len()
+			with compiler.wrap_arithmetic:
+				sys.memcpy( new_buf + offset, part.__data, part_len )
+				offset += part_len
+
+		new_buf[offset] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in join' )
+
+	def partition( self, sep: str ) -> tuple[str,str,str]:
+		''' splits self at the FIRST occurrence of sep into (before, sep,
+		after) - a real tuple[str,str,str] (PLAN_TUPLE.md), matching
+		Python's own str.partition() return shape exactly. sep not found:
+		(self, '', '') - Python's own no-match convention (the whole
+		string stays on the side the search started from). '''
+		found: Result[usize,IndexError] = self.find( sep )
+		match found:
+			case Result.Ok( idx ):
+				self_len: usize = self.byte_len()
+				with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+					after_start: usize = idx + sep.byte_len()
+				return ( self._byte_slice( 0, idx ), sep, self._byte_slice( after_start, self_len ))
+			case Result.Err( _ ):
+				return ( str( self ), str( '' ), str( '' ))
+
+	def rpartition( self, sep: str ) -> tuple[str,str,str]:
+		''' like partition() above, but splits at the LAST occurrence of
+		sep. Not found: ('', '', self) - the mirror image of partition()'s
+		own no-match convention (rpartition searches from the end, so the
+		whole string stays there). '''
+		found: Result[usize,IndexError] = self.rfind( sep )
+		match found:
+			case Result.Ok( idx ):
+				self_len: usize = self.byte_len()
+				with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+					after_start: usize = idx + sep.byte_len()
+				return ( self._byte_slice( 0, idx ), sep, self._byte_slice( after_start, self_len ))
+			case Result.Err( _ ):
+				return ( str( '' ), str( '' ), str( self ))
+
+	def isascii( self ) -> bool:
+		''' True if every byte is < 0x80 - vacuously True for an empty
+		string (matches Python). Byte-level only, no codepoint decoding
+		needed: ASCII-ness is a UTF-8-byte-level property, not a Unicode
+		classification concern (see __str.py's classification primitives,
+		used by isalpha()/isdigit()/etc instead). '''
+		byte_len: usize = self.byte_len()
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow' ):
+			while i < byte_len:
+				if self.__data[i] >= 0x80:
+					return False
+				i += 1
+		return True
+
 	def upper( self ) -> str:
 		''' case_folder (see PLAN_CASE_FOLDING.md) is checked first, ahead
 		of the OS-backed path - a program that never calls case_folding.

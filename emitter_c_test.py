@@ -4371,6 +4371,208 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class StrPhase1MethodsTests( CompilerTestCase ):
+	''' Phase 1 of TODO.txt's str-methods plan: startswith/endswith/
+	removeprefix/removesuffix/rfind/rindex/replace/rsplit/join/partition/
+	rpartition/isascii (lib/builtins/__init__.py) - all built directly on
+	find()/_byte_slice()/byte_len(), no new OS primitives. partition()/
+	rpartition() return a real tuple[str,str,str] (PLAN_TUPLE.md). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_startswith_endswith( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'hello world'.startswith( 'hello' ):
+		return 1
+	if 'hello world'.startswith( 'world' ):
+		return 2
+	if not 'hello world'.startswith( 'world', 6 ):
+		return 3
+	if not 'hello world'.startswith( '' ):
+		return 4
+	if not 'hello world'.endswith( 'world' ):
+		return 5
+	if 'hello world'.endswith( 'hello' ):
+		return 6
+	if not 'hello world'.endswith( '' ):
+		return 7
+	if 'short'.startswith( 'much too long' ):
+		return 8
+	if 'short'.endswith( 'much too long' ):
+		return 9
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_removeprefix_removesuffix( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if 'hello world'.removeprefix( 'hello ' ) != 'world':
+		return 1
+	if 'hello world'.removeprefix( 'nope' ) != 'hello world':
+		return 2
+	if 'hello world'.removesuffix( ' world' ) != 'hello':
+		return 3
+	if 'hello world'.removesuffix( 'nope' ) != 'hello world':
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rfind_rindex( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	r1: Result[usize,IndexError] = 'abcabc'.rfind( 'abc' )
+	if r1.unwrap( 'x' ) != 3:
+		return 1
+	r2: Result[usize,IndexError] = 'abcabc'.rfind( 'nope' )
+	if r2.is_ok():
+		return 2
+	if 'abcabc'.rindex( 'bc' ) != 4:
+		return 3
+	if 'abcabc'.rfind( '' ).unwrap( 'x' ) != 6:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rindex_panics_when_not_found( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	'abc'.rindex( 'nope' )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_replace( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if 'banana'.replace( 'a', 'o' ) != 'bonono':
+		return 1
+	if 'banana'.replace( 'nope', 'x' ) != 'banana':
+		return 2
+	if 'aaa'.replace( 'a', 'bb' ) != 'bbbbbb':
+		return 3
+	if 'aaa'.replace( 'aa', 'b' ) != 'ba':
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rsplit_matches_split( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	a: list[str] = 'a,b,c'.rsplit( ',' )
+	if a.__len__() != 3:
+		return 1
+	if a.__getitem__( 0 ).unwrap( 'x' ) != 'a':
+		return 2
+	if a.__getitem__( 2 ).unwrap( 'x' ) != 'c':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_join( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	parts: list[str] = 'a,b,c'.split( ',' )
+	joined: str = '-'.join( parts )
+	if joined != 'a-b-c':
+		return 1
+	empty: list[str] = list[str]()
+	if '-'.join( empty ) != '':
+		return 2
+	single: list[str] = list[str]()
+	single.append( 'solo' ).unwrap( 'append failed' )
+	if '-'.join( single ) != 'solo':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_partition_rpartition( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	p1: tuple[str,str,str] = 'key=value'.partition( '=' )
+	if p1[0] != 'key' or p1[1] != '=' or p1[2] != 'value':
+		return 1
+	p2: tuple[str,str,str] = 'noequals'.partition( '=' )
+	if p2[0] != 'noequals' or p2[1] != '' or p2[2] != '':
+		return 2
+	p3: tuple[str,str,str] = 'a.b.c'.rpartition( '.' )
+	if p3[0] != 'a.b' or p3[1] != '.' or p3[2] != 'c':
+		return 3
+	p4: tuple[str,str,str] = 'noequals'.rpartition( '=' )
+	if p4[0] != '' or p4[1] != '' or p4[2] != 'noequals':
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_isascii( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	if not 'hello'.isascii():
+		return 1
+	if not ''.isascii():
+		return 2
+	if 'héllo'.isascii():
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class EarlyReturnFromLoopWithLiveRCLocalTests( CompilerTestCase ):
 	''' cfg.py's current_epilogue_label() shared-ladder optimization used to
 	assume every entry on the epilogue stack survives to the function's own
