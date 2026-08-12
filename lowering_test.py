@@ -3211,6 +3211,75 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( len( call_indirects ), 1 )
 		self.assertIsNone( call_indirects[0].dest )
 
+	# --- non-capturing nested function defs (PLAN_LAMBDA.md) ------------------
+
+	def test_nested_def_called_from_enclosing_function( self ) -> None:
+		code = '\n'.join([
+			'def outer() -> i32:',
+			'	def inner( x: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return x + 1',
+			'	return inner( 5 )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( instr for instr in lf.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.qualname, '__test__.outer$$nested_inner' )
+
+	def test_nested_def_bare_reference_lowers_to_function_ref( self ) -> None:
+		code = '\n'.join([
+			'def outer() -> None:',
+			'	def inner( x: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return x + 1',
+			'	f: Ptr[Callable[[i32],i32]] = inner',
+			'	return',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assign = next( instr for instr in lf.instructions if isinstance( instr, ir.Assign ))
+		self.assertIsInstance( assign.src, ir.FunctionRef )
+		self.assertEqual( assign.src.fn.qualname, '__test__.outer$$nested_inner' )
+
+	def test_nested_def_capturing_enclosing_local_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def outer( y: i32 ) -> i32:',
+			'	def inner( x: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return x + y',
+			'	return inner( 5 )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		self.compiler._lower( outer_fn )
+		self.assertIn( "captures 'y' from the enclosing function", self.discovery.errors.errors[0] )
+
+	def test_nested_def_inside_generic_function_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def outer[T]( y: T ) -> None:',
+			'	def inner() -> None:',
+			'		return',
+			'	inner()',
+			'	return',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		spec = self.discovery._get_or_create_specialization( outer_fn, [ self.discovery.get_intrinsics()['i32'] ] )
+		self.compiler._lower( spec )
+		self.assertIn( 'nested function defs are not supported inside a generic function', self.discovery.errors.errors[0] )
+
 	# --- Closure[[...],...] bound-method values -------------------------------
 
 	def test_bound_method_reference_builds_closure_allocate( self ) -> None:

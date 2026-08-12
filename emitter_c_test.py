@@ -4591,6 +4591,83 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
 
 
+class NestedFunctionTests( CompilerTestCase ):
+	''' non-capturing nested function defs - see PLAN_LAMBDA.md. Never
+	compiled anywhere before this (previously hit lowering.py's generic
+	"unsupported statement" fallback). Mirrors CallableTests' own
+	import_builtins=True + real compile-and-run convention. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_nested_def_called_directly( self ) -> None:
+		self._run( '''
+def outer() -> i32:
+	def inner( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + 1
+	return inner( 5 )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		diff: i32 = outer() - 6
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_nested_def_bare_reference_called_indirectly( self ) -> None:
+		self._run( '''
+def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:
+	return f( v )
+
+def outer() -> i32:
+	def inner( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + 1
+	f: Ptr[Callable[[i32],i32]] = inner
+	return call_it( f, 5 )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		diff: i32 = outer() - 6
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class ComTests( CompilerTestCase ):
 	''' lib/windows/com.py's HRESULT/IUnknown pattern -
 	PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3 worked example: a

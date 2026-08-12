@@ -2295,6 +2295,59 @@ class Lowering:
 			return dest
 		return name
 
+	def _reject_free_variables( self, roots: list[ast.AST], param_names: set[str], node: ast.AST ) -> None:
+		# a nested def/lambda may only reference its own parameters/locally
+		# -assigned names, module-level names, and builtins - referencing
+		# anything from the immediately enclosing function's own scope is a
+		# capture, deliberately unsupported for now (see PLAN_LAMBDA.md's
+		# own "deferred" list - no representation decision made yet for a
+		# captured environment). `roots` is the def's own body (a list of
+		# statements) or a lambda's own body wrapped in a single-element
+		# list (a bare expression - lambda syntax forbids assignment
+		# statements, but NOT ast.NamedExpr/walrus, which also binds via
+		# Name(Store) - the same walk covers both shapes uniformly without
+		# special-casing). Doesn't recurse into a FURTHER nested def/
+		# lambda's own body - that one gets its own independent check when
+		# IT gets synthesized (only its OWN name, if it's a def, becomes a
+		# local binding at THIS level, same as an ordinary assignment would)
+		local_names = set( param_names )
+		class _BindingCollector( ast.NodeVisitor ):
+			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+				local_names.add( fd.name )
+			def visit_Lambda( self, lam: ast.Lambda ) -> None:
+				pass
+			def visit_Name( self, n: ast.Name ) -> None:
+				if isinstance( n.ctx, ast.Store ):
+					local_names.add( n.id )
+		binder = _BindingCollector()
+		for root in roots:
+			binder.visit( root )
+
+		free: list[ast.Name] = []
+		class _LoadCollector( ast.NodeVisitor ):
+			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+				pass
+			def visit_Lambda( self, lam: ast.Lambda ) -> None:
+				pass
+			def visit_Name( self, n: ast.Name ) -> None:
+				if isinstance( n.ctx, ast.Load ) and n.id not in local_names:
+					free.append( n )
+		loader = _LoadCollector()
+		for root in roots:
+			loader.visit( root )
+
+		enclosing_fn = self._current_fn
+		if enclosing_fn is None:
+			return
+		for free_name in free:
+			if free_name.id in enclosing_fn.names:
+				self.discovery.fail(
+					f"{ast.unparse(node)}: captures {free_name.id!r} from the enclosing function - nested "
+					f"functions/lambdas can only reference their own parameters, module-level names, and "
+					f"builtins (no captured variables yet)",
+					node,
+				)
+
 	def _lower_function_ref( self, fn: Function, node: ast.AST ) -> ir.Operand:
 		# a bare reference to a function used AS A VALUE, not called - see
 		# PLAN_CALLABLE.md. Only a plain, receiver-less, non-generic,
@@ -2339,13 +2392,101 @@ class Lowering:
 		self._ensure_resolved( fn )
 		if fn.parameters is None:
 			self.discovery.fail( f'{fn.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
-		for p in fn.parameters:
+		return self._function_ref_operand( fn )
+
+	def _function_ref_operand( self, fn: Function ) -> ir.FunctionRef:
+		# fn.parameters/fn.return_type must already be resolved (not None) -
+		# shared by _lower_function_ref (a bare reference to an EXISTING
+		# Function) and _expr_Lambda/_stmt_FunctionDef (a reference to a
+		# freshly synthesized one, PLAN_LAMBDA.md) - both end up needing
+		# the exact same Ptr[Callable[...]]-typed FunctionRef operand once
+		# they have a resolved Function in hand
+		for p in fn.parameters or []:
 			self.schedule( p.type )
 		self.schedule( fn.return_type )
-		fn_type = self.discovery._get_or_create_callable_type( [ p.type for p in fn.parameters ], fn.return_type )
+		fn_type = self.discovery._get_or_create_callable_type( [ p.type for p in fn.parameters or [] ], fn.return_type )
 		ptr_cls = self.discovery.get_intrinsics()['Ptr']
 		ptr_type = self.discovery._get_or_create_specialization( ptr_cls, [ fn_type ] )
 		return ir.FunctionRef( type = ptr_type, fn = fn )
+
+	def _stmt_FunctionDef( self, node: ast.FunctionDef ) -> None:
+		# a non-capturing nested function def - see PLAN_LAMBDA.md.
+		# Synthesized as an independent, fully real Function (real
+		# parameter/return annotations, resolved exactly like an ordinary
+		# top-level function via discovery.visit(...) - the same mechanism
+		# _stmt_AnnAssign already uses mid-lowering for an ordinary local's
+		# own annotation), scheduled and compiled like any other compile
+		# unit, and made callable/bare-referenceable by name for the rest
+		# of the enclosing function's own body. The statement itself emits
+		# no IR - a def only binds a name, same as Python
+		enclosing = self._current_fn
+		if enclosing is None:
+			self.discovery.fail( f'nested function def outside any function: {ast.unparse(node)}', node )
+		# type_params alone isn't enough: a MONOMORPHIZED generic function's
+		# own copy has type_params reset to None (it's concrete now, not
+		# generic anymore - see Monomorphizer.monomorphized_function) - the
+		# qualname's own '[...]' suffix is the one signal that survives
+		# substitution (discovery.py's _get_or_create_specialization always
+		# spells a Specialization's qualname as f'{base.qualname}[{args}]')
+		if enclosing.type_params or '[' in enclosing.qualname or isinstance( enclosing.cls, Specialization ):
+			self.discovery.fail(
+				f"{node.name}: nested function defs are not supported inside a generic function or a "
+				f"generic class's own method yet: {ast.unparse(node)}",
+				node,
+			)
+		if node.decorator_list:
+			self.discovery.fail( f'{node.name}: decorators are not supported on a nested function def: {ast.unparse(node)}', node )
+
+		qualname = f'{enclosing.qualname}$$nested_{node.name}'
+		synthetic = Function(
+			stem = node.name, qualname = qualname,
+			file = enclosing.file, line = node.lineno,
+			cls = None, node = node,
+			parameters = None, return_type = None,
+			resolve = None,
+		)
+
+		args = node.args
+		parameters: list[Parameter] = []
+		def add_param( arg: ast.arg, default: ast.expr|None, **kind: bool ) -> None:
+			if arg.annotation is None:
+				self.discovery.fail( f'{qualname} parameter {arg.arg!r} has no type annotation: {ast.unparse(node)}', node )
+			param_type = self.discovery.visit( arg.annotation )
+			self.discovery._reject_bare_interface_value_type( param_type, arg, f'{qualname} parameter {arg.arg!r}' )
+			param = Parameter(
+				stem = arg.arg, qualname = f'{qualname}.{arg.arg}',
+				file = enclosing.file, line = node.lineno,
+				type = param_type, default = default, **kind,
+			)
+			parameters.append( param )
+			synthetic.add_name( param.stem, param )
+
+		# `defaults` applies to the trailing N of posonlyargs+args combined
+		# (an ast-module quirk) - left-pad with None so every positional
+		# param lines up with its own default (or lack of one) - same
+		# convention discovery.py's own _make_function_resolver uses
+		positional = [ *args.posonlyargs, *args.args ]
+		defaults = [ None ] * ( len( positional ) - len( args.defaults )) + list( args.defaults )
+		for i, arg in enumerate( positional ):
+			add_param( arg, defaults[i], is_posonly = i < len( args.posonlyargs ))
+		if args.vararg is not None:
+			add_param( args.vararg, None, is_vararg = True )
+		for arg, default in zip( args.kwonlyargs, args.kw_defaults ):
+			add_param( arg, default, is_kwonly = True )
+		if args.kwarg is not None:
+			add_param( args.kwarg, None, is_kwarg = True )
+
+		synthetic.parameters = parameters
+		if node.returns is not None:
+			synthetic.return_type = self.discovery.visit( node.returns )
+			self.discovery._reject_bare_interface_value_type( synthetic.return_type, node.returns, f'{qualname} return type' )
+		else:
+			synthetic.return_type = self.discovery.get_none_type()
+
+		self._reject_free_variables( node.body, { p.stem for p in parameters }, node )
+
+		enclosing.add_name( node.name, synthetic )
+		self.schedule( synthetic )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
 		if expected_type is None:
