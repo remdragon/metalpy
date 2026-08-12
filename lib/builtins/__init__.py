@@ -611,6 +611,102 @@ class str:
 				i += 1
 		return True
 
+	def ljust( self, width: usize, fillchar: str = ' ' ) -> str:
+		''' pads self on the RIGHT with fillchar until self's own codepoint
+		count reaches width - matches Python's str.ljust(). Already-long-
+		enough is a no-op (returns an unchanged copy). fillchar must be
+		exactly one codepoint, panicking otherwise - Python itself raises
+		TypeError for the same len(fillchar) != 1 case. '''
+		if len( fillchar ) != 1:
+			sys.panic( 'str.ljust(...): fillchar must be exactly one character' )
+		self_count: usize = self.__len__()
+		if self_count >= width:
+			return str( self )
+		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
+			pad_count: usize = width - self_count
+		self_len: usize = self.byte_len()
+		fill_len: usize = fillchar.byte_len()
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			pad_bytes: usize = pad_count * fill_len
+			new_size: usize = self_len + pad_bytes + 1
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		sys.memcpy( new_buf, self.__data, self_len )
+		offset: usize = self_len
+		i: usize = 0
+		while i < pad_count:
+			with compiler.wrap_arithmetic:
+				sys.memcpy( new_buf + offset, fillchar.__data, fill_len )
+				offset += fill_len
+				i += 1
+		new_buf[offset] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in ljust' )
+
+	def rjust( self, width: usize, fillchar: str = ' ' ) -> str:
+		''' pads self on the LEFT with fillchar until self's own codepoint
+		count reaches width - the mirror image of ljust() above, same
+		fillchar/no-op/panic conventions. '''
+		if len( fillchar ) != 1:
+			sys.panic( 'str.rjust(...): fillchar must be exactly one character' )
+		self_count: usize = self.__len__()
+		if self_count >= width:
+			return str( self )
+		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
+			pad_count: usize = width - self_count
+		self_len: usize = self.byte_len()
+		fill_len: usize = fillchar.byte_len()
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			pad_bytes: usize = pad_count * fill_len
+			new_size: usize = self_len + pad_bytes + 1
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		offset: usize = 0
+		i: usize = 0
+		while i < pad_count:
+			with compiler.wrap_arithmetic:
+				sys.memcpy( new_buf + offset, fillchar.__data, fill_len )
+				offset += fill_len
+				i += 1
+		with compiler.wrap_arithmetic:
+			sys.memcpy( new_buf + offset, self.__data, self_len )
+			offset += self_len
+		new_buf[offset] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in rjust' )
+
+	def zfill( self, width: usize ) -> str:
+		''' like rjust(width, '0'), except a leading '+'/'-' byte stays
+		first, with the zero padding inserted right after it - matches
+		Python's '-42'.zfill(5) == '-0042'. A leading sign is always a
+		single ASCII byte (0x2B/0x2D), never a multi-byte codepoint, so
+		checking self.__data[0] directly (rather than decoding a
+		codepoint) is exact, not an approximation. '''
+		self_len: usize = self.byte_len()
+		has_sign: bool = self_len > 0 and ( self.__data[0] == 0x2B or self.__data[0] == 0x2D ) # '+' or '-'
+		self_count: usize = self.__len__()
+		if self_count >= width:
+			return str( self )
+		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
+			pad_count: usize = width - self_count
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			new_size: usize = self_len + pad_count + 1
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		offset: usize = 0
+		body_start: usize = 0
+		if has_sign:
+			new_buf[0] = self.__data[0]
+			offset = 1
+			body_start = 1
+		i: usize = 0
+		while i < pad_count:
+			new_buf[offset] = 0x30 # '0'
+			with compiler.wrap_arithmetic:
+				offset += 1
+				i += 1
+		with compiler.wrap_arithmetic:
+			rest_len: usize = self_len - body_start
+			sys.memcpy( new_buf + offset, self.__data + body_start, rest_len )
+			offset += rest_len
+		new_buf[offset] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in zfill' )
+
 	def upper( self ) -> str:
 		''' case_folder (see PLAN_CASE_FOLDING.md) is checked first, ahead
 		of the OS-backed path - a program that never calls case_folding.
