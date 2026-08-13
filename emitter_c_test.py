@@ -7294,6 +7294,181 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class WhileNarrowingTests( CompilerTestCase ):
+	''' Phase 7 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
+	`while type(x) is T:`/`while type(x) is not T:`/`while instanceof(x,
+	T):` against a bare-Name, union-typed x - narrows x for the loop
+	BODY's own duration, and separately narrows x for code AFTER the loop
+	once it exits (the condition is checked at least once even for a
+	zero-iteration loop, so this holds regardless of how many times the
+	body actually ran - no "runs at least once" reasoning needed, unlike a
+	body-always-does-X kind of claim would). `is`'s own exit narrowing
+	needs a 2-member union (same "not T uniquely determines the other
+	member" reasoning the if/match wildcard case has); `is not`'s own
+	exit narrowing works for ANY union size - `not(x is not T)` means `x
+	is T` directly, no disambiguation needed.
+
+	Confirms the user's own worked example: `while isinstance(x, int):
+	return` (return inside the body) narrows x to str AFTER the loop
+	purely via the natural exit path - the return contributes NOTHING to
+	that fact (it exits the FUNCTION, never reaches "after the loop" at
+	all - see steady-dancing-haven.md's own "Context" section). Real
+	compile-and-run tests, full suite green (bash + PowerShell). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_narrows_the_loop_body( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32|str = 5
+		total: i32 = 0
+		while type( x ) is i32:
+			total = total + x
+			x = "done"
+		if total != 5:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_is_not_narrows_the_loop_body_to_the_other_member( self ) -> None:
+		# a 2-member union, `is not` form - the body is only entered while
+		# x is NOT i32, i.e. while it's str
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32|str = "hi"
+		count: i32 = 0
+		while type( x ) is not i32:
+			if x.byte_len() != 2:
+				return 1
+			count = count + 1
+			x = 5
+		if count != 1:
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_narrows_after_the_loop_exits( self ) -> None:
+		# post-loop exit narrowing - x.byte_len() only resolves at all if
+		# x was actually narrowed to str once the loop's own condition
+		# went false
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32|str = 5
+		while type( x ) is i32:
+			x = "done"
+		if x.byte_len() != 4:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_user_worked_example_return_inside_while( self ) -> None:
+		# the user's own example: a `return` inside the loop body
+		# contributes NOTHING to post-loop narrowing (it exits the
+		# function, never reaches "after the loop") - x is narrowed to
+		# str after the loop purely via the natural exit path
+		self._run( '''
+def describe( x: i32|str ) -> i32:
+	with compiler.wrap_arithmetic:
+		while type( x ) is i32:
+			return 999
+		return i32( x.byte_len() )
+
+def main() -> i32:
+	if describe( "hello" ) != 5:
+		return 1
+	if describe( 1 ) != 999:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_three_member_union_body_narrows_but_exit_declines( self ) -> None:
+		# a 3+-member union: the `is` form still narrows the BODY
+		# correctly (single-member narrowing to the matched member is
+		# always well-defined), even though exit-narrowing can't apply
+		# (declines gracefully, no error, x just stays unnarrowed after)
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32|str|bool = 5
+		total: i32 = 0
+		while type( x ) is i32:
+			total = total + x
+			x = "done"
+		if total != 5:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_loop_executions_no_leak( self ) -> None:
+		# real RC-lifetime stress check under repetition, same rigor as
+		# every other RC test this session established - the outer loop
+		# runs the whole while-narrowing construct 1000 times
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			x: str|None = 'hello'.upper()
+			while type( x ) is not str:
+				return 1
+			if x.byte_len() != 5:
+				return 2
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 	''' regression tests for a real leak in lowering.py's _stmt_Return: a
 	function whose entire body is a single `return SomeConstructor(

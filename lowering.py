@@ -1794,6 +1794,28 @@ class FunctionLowering:
 				return elem, writeback
 		return self._lower_expr( value_node, None ), None
 
+	def _resolve_narrow_member( self, name: str, member_stem: str, node: ast.AST ) -> Variable:
+		# type_resolver.py hands down only a STEM (see its own comment on
+		# why - resolved against the TEXTUAL/abstract union at that pass,
+		# T/E may still be bare TypeVars there) - re-resolve the real,
+		# substituted member against `name`'s own already-monomorphized
+		# type here, the same pattern _coerce_into_union already uses. A
+		# parameter's own declared type (unlike a local var initialized
+		# from a call's already-eagerly-monomorphized return type) stays a
+		# genuine Specialization wrapping the ABSTRACT base - .base alone
+		# isn't enough, has to go through monomorphize_class same as any
+		# other generic-class use site, or the member's own .type resolves
+		# to the unsubstituted TypeVar instead of the real leaf (str, not T).
+		# Shared by _stmt_Assign's own is_narrowing_bind handling (match/if-
+		# desugared narrowing) and _stmt_While's own exit-narrowing (Phase 7).
+		subject_var = self.lowering.discovery.find_name( name, node )
+		assert isinstance( subject_var, Variable )
+		base = self.lowering.monomorphize_class( subject_var.type ) if isinstance( subject_var.type, Specialization ) else subject_var.type
+		self.lowering._union_storage.get( base )
+		member = next( ( attr for attr in base.attributes if attr.stem == member_stem ), None )
+		assert member is not None
+		return member
+
 	def _stmt_Assign( self, node: ast.Assign ) -> None:
 		if getattr( node, 'is_narrowing_bind', False ):
 			# type_resolver.py's _match_pattern: `match x: case T(x):`
@@ -1802,25 +1824,9 @@ class FunctionLowering:
 			# here until this scope's own restore() may read through the
 			# union's own payload instead") - no IR at all, see cfg.py's
 			# narrow()/_expr_Name's own comment for the read-side rewrite.
-			# node.narrows_member_stem is only a STEM (see type_resolver.py's
-			# own comment on why) - re-resolve the real, substituted member
-			# against x's own already-monomorphized type here, the same
-			# pattern _coerce_into_union already uses. A parameter's own
-			# declared type (unlike a local var initialized from a call's
-			# already-eagerly-monomorphized return type) stays a genuine
-			# Specialization wrapping the ABSTRACT base (T/E still bare
-			# TypeVars) - .base alone isn't enough, has to go through
-			# monomorphize_class same as any other generic-class use site,
-			# or the member's own .type resolves to the unsubstituted TypeVar
-			# instead of the real leaf (str, not T).
 			target_name = node.targets[0]
 			assert isinstance( target_name, ast.Name )
-			subject_var = self.lowering.discovery.find_name( target_name.id, node )
-			assert isinstance( subject_var, Variable )
-			base = self.lowering.monomorphize_class( subject_var.type ) if isinstance( subject_var.type, Specialization ) else subject_var.type
-			self.lowering._union_storage.get( base )
-			member = next( ( attr for attr in base.attributes if attr.stem == node.narrows_member_stem ), None )
-			assert member is not None
+			member = self._resolve_narrow_member( target_name.id, node.narrows_member_stem, node )
 			self._cfg.narrow( target_name.id, member )
 			return
 		if len( node.targets ) != 1:
@@ -2529,6 +2535,21 @@ class FunctionLowering:
 		for instr in back_edge_instructions:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
+		# Phase 7: type_resolver.py's visit_While stamps this when the
+		# loop's own condition is a type(x) is T/is not T/instanceof(x, T)
+		# check against a bare-Name, union-typed x - the ONLY way to reach
+		# end_label is via the condition going false, which (for a 2-member
+		# union, or unconditionally for the `is not` form) uniquely proves
+		# x's own type from here on, regardless of how many iterations the
+		# body actually ran (the condition is checked at least once even
+		# for a zero-iteration loop). restore() above already reverted
+		# _narrowed to the loop's own entry state - this overlays the new,
+		# real post-loop fact on top of that, same as _stmt_Assign's own
+		# is_narrowing_bind handling overlays a fresh narrow() call
+		exit_name = getattr( node, 'exit_narrows_name', None )
+		if exit_name is not None:
+			member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
+			self._cfg.narrow( exit_name, member )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 

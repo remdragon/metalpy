@@ -1724,6 +1724,48 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				folded.append( result )
 		return folded
 
+	def _type_is_shape( self, test: ast.expr ) -> tuple[ast.expr,ast.expr,TaggedUnion,Variable,bool]|None:
+		''' recognizes type(x) is T / type(x) is not T / instanceof(x, T)
+		against a union-typed x, resolving all the way through to the real
+		(union, member) pair - shared by _try_desugar_type_is_if (an if's
+		own condition, Phase 4) and visit_While (a while loop's own
+		condition, Phase 7). Returns (subject_expr, type_expr, base,
+		member, is_not), or None on ANY doubt - never authoritative about
+		failure, matching _try_fold_is_rc_if's own philosophy: the caller
+		declines silently and falls through to visit_Compare's/
+		visit_Call's own existing recognition and error-reporting for
+		ordinary (non-narrowing) use. '''
+		instanceof_args = self._instanceof_args( test )
+		if instanceof_args is not None:
+			subject_expr, type_expr = instanceof_args
+			is_not = False
+		else:
+			if not ( isinstance( test, ast.Compare ) and len( test.ops ) == 1 and isinstance( test.ops[0], ( ast.Is, ast.IsNot )) ):
+				return None
+			left_subject = self._type_call_subject( test.left )
+			right_subject = self._type_call_subject( test.comparators[0] )
+			if left_subject is None and right_subject is None:
+				return None
+			if left_subject is not None and right_subject is not None:
+				return None # type(x) is type(y) - let visit_Compare's own rewrite report this
+			subject_expr = left_subject if left_subject is not None else right_subject
+			type_expr = test.comparators[0] if left_subject is not None else test.left
+			is_not = isinstance( test.ops[0], ast.IsNot )
+		leaf_type = self._try_resolve_namespace( type_expr )
+		if leaf_type is None:
+			return None
+		subj_type = self._type_of_expr( subject_expr )
+		if subj_type is None:
+			return None
+		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		if not isinstance( base, TaggedUnion ):
+			return None
+		members = self._resolved_union_members( subj_type, base )
+		member = next( ( attr for attr in members if attr.type is leaf_type ), None )
+		if member is None:
+			return None
+		return subject_expr, type_expr, base, member, is_not
+
 	def _try_desugar_type_is_if( self, node: ast.If ) -> list[ast.stmt]|None:
 		''' rewrite 5 (Phase 4): `if type(x) is T: A else: B` -> `match x:
 		case T(x): A \n case _: B` (`if instanceof(x, T):` is the identical
@@ -1764,36 +1806,10 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		T)` used as an ordinary (non-narrowing) boolean condition, so
 		nothing is ever silently dropped - just narrowing declining to
 		apply, never validation being skipped. '''
-		test = node.test
-		instanceof_args = self._instanceof_args( test )
-		if instanceof_args is not None:
-			subject_expr, type_expr = instanceof_args
-			is_not = False
-		else:
-			if not ( isinstance( test, ast.Compare ) and len( test.ops ) == 1 and isinstance( test.ops[0], ( ast.Is, ast.IsNot )) ):
-				return None
-			left_subject = self._type_call_subject( test.left )
-			right_subject = self._type_call_subject( test.comparators[0] )
-			if left_subject is None and right_subject is None:
-				return None
-			if left_subject is not None and right_subject is not None:
-				return None # type(x) is type(y) - let visit_Compare's own rewrite report this
-			subject_expr = left_subject if left_subject is not None else right_subject
-			type_expr = test.comparators[0] if left_subject is not None else test.left
-			is_not = isinstance( test.ops[0], ast.IsNot )
-		leaf_type = self._try_resolve_namespace( type_expr )
-		if leaf_type is None:
+		shape = self._type_is_shape( node.test )
+		if shape is None:
 			return None
-		subj_type = self._type_of_expr( subject_expr )
-		if subj_type is None:
-			return None
-		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
-		if not isinstance( base, TaggedUnion ):
-			return None
-		members = self._resolved_union_members( subj_type, base )
-		member = next( ( attr for attr in members if attr.type is leaf_type ), None )
-		if member is None:
-			return None
+		subject_expr, type_expr, _base, _member, is_not = shape
 		match_body = node.orelse if is_not else node.body
 		fallback_body = node.body if is_not else node.orelse
 		inner_pattern = ast.MatchAs( pattern = None, name = subject_expr.id if isinstance( subject_expr, ast.Name ) else None )
@@ -1826,10 +1842,92 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		return node
 
 	def visit_While( self, node: ast.While ) -> ast.While:
-		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
-		if rewritten is not None:
-			node.test = rewritten
-		self.generic_visit( node )
+		''' Phase 7: `while type(x) is T:`/`while type(x) is not T:`/
+		`while instanceof(x, T):` against a union-typed, bare-Name x -
+		narrows x for the loop BODY's own duration (the matched member for
+		`is`, or - 2-member union only - the union's OTHER member for `is
+		not`), and, separately, narrows x for CODE AFTER the loop once it
+		exits (the loop's own condition is checked at least once even for
+		a zero-iteration loop, so this holds regardless of how many times
+		the body actually ran - see steady-dancing-haven.md's own "Context"
+		section on why this needs no special "runs at least once"
+		reasoning, unlike a body-always-does-X kind of claim would).
+		`is`'s own exit narrowing needs a 2-member union (same "not T
+		uniquely determines the other member" reasoning as the if/match
+		wildcard case); `is not`'s own exit narrowing works for ANY union
+		size - `not(x is not T)` means `x is T` directly, no
+		disambiguation needed at all.
+
+		Manually walks node.body itself (not left to generic_visit's own
+		field-list traversal) - a synthesized narrow-marker Assign
+		(is_narrowing_bind=True) prepended to node.body must NEVER be
+		re-visited through the ordinary visit_Assign path (which would
+		immediately clobber it - see _build_narrow_marker's own callers
+		elsewhere, none of which are ever visited either), the exact same
+		reasoning visit_Match's own manual per-case body loop already has. '''
+		shape = self._type_is_shape( node.test )
+		subject_name: str|None = None
+		body_member: Variable|None = None
+		exit_member: Variable|None = None
+		if shape is not None and isinstance( shape[0], ast.Name ):
+			subject_expr, _type_expr, base, member, is_not = shape
+			subject_name = subject_expr.id
+			subj_type = self._type_of_expr( subject_expr )
+			members = self._resolved_union_members( subj_type, base )
+			others = [ m for m in members if m is not member ]
+			other = others[0] if len( others ) == 1 else None
+			if is_not:
+				body_member = other
+				exit_member = member # not(x is not T) -> x is T, any union size
+			else:
+				body_member = member
+				exit_member = other # not(x is T) -> x is the sole OTHER member, 2-member unions only
+			tag_attr, _data_attr, _payload_cls, tags = self.resolver.union_storage.get( base )
+			tag_expr = ast.Attribute( value = subject_expr, attr = tag_attr.stem, ctx = ast.Load() )
+			ast.copy_location( tag_expr, node )
+			op = ast.NotEq() if is_not else ast.Eq()
+			new_test = ast.Compare( left = tag_expr, ops = [ op ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
+			ast.copy_location( new_test, node )
+			node.test = new_test
+		else:
+			rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
+			if rewritten is not None:
+				node.test = rewritten
+			else:
+				node.test = self.generic_visit_expr( node.test )
+		case_entry_narrowed = dict( self._narrowed )
+		if body_member is not None and subject_name is not None:
+			self._narrowed[subject_name] = [ body_member.type ]
+		try:
+			new_body: list[ast.stmt] = []
+			for stmt in node.body:
+				visited = self.visit( stmt )
+				if isinstance( visited, list ):
+					new_body.extend( visited )
+				elif visited is not None:
+					new_body.append( visited )
+			node.body = new_body
+		finally:
+			self._narrowed = case_entry_narrowed
+		if body_member is not None and subject_name is not None:
+			node.body = [ self._build_narrow_marker( subject_name, body_member, node ), *node.body ]
+		if node.orelse:
+			# while/else isn't supported (lowering.py's _stmt_While fails
+			# it outright) - still flattened correctly here (mirroring
+			# node.body's own loop above) so a program using it fails with
+			# THAT clear error at lowering time, not a confusing crash here
+			new_orelse: list[ast.stmt] = []
+			for stmt in node.orelse:
+				visited = self.visit( stmt )
+				if isinstance( visited, list ):
+					new_orelse.extend( visited )
+				elif visited is not None:
+					new_orelse.append( visited )
+			node.orelse = new_orelse
+		if exit_member is not None and subject_name is not None:
+			node.exit_narrows_name = subject_name
+			node.exit_narrows_member_stem = exit_member.stem
+			self._narrowed[subject_name] = [ exit_member.type ]
 		return node
 
 	def visit_BoolOp( self, node: ast.BoolOp ) -> ast.BoolOp:
