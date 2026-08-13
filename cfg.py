@@ -707,8 +707,7 @@ class CFGState:
 		right after this statement would decref the very value we just
 		handed to the caller. get_is_err_check is only ever actually called
 		if an errdefer entry is genuinely live here - see _replay(). '''
-		if isinstance( returned_operand, ir.Temp ):
-			self._temp_states.pop( returned_operand.id, None )
+		self.untrack_temp( returned_operand )
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack ):
 			if entry.cancelled:
@@ -896,7 +895,7 @@ class CFGState:
 
 	# --- assignment: fresh / aliasing / replace, all in one -----------------
 
-	def assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, track_result: bool = True ) -> list[ir.Instruction]:
+	def assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, track_result: bool = True, borrow: bool = False ) -> list[ir.Instruction]:
 		''' called right before lowering.py emits `ir.Assign(dest=dest,
 		src=src)` (or the Allocate/Call/GetAttr that IS the fresh value, for
 		an AnnAssign's own initializer) - returns instructions to emit
@@ -915,7 +914,23 @@ class CFGState:
 		Result-ness is scaffolding, not something user code is expected to
 		inspect itself (the match-statement subject temp, and the hidden
 		locals _emit_fallible_construction threads a fallible __init__'s
-		Result through - see their own lowering.py call sites). '''
+		Result through - see their own lowering.py call sites).
+
+		borrow=True registers dest as a non-owning alias (BORROWED, like an
+		ordinary parameter - see _enter_parameter) instead of taking out its
+		own Incref'd copy: used only for the match-statement subject temp
+		when the subject itself is a bare Name (is_alias=True) - the ORIGINAL
+		name already owns a live reference for at least the duration of the
+		match (it's function-scoped, never dropped mid-statement), so the
+		synthesized __match_subj_N alias doesn't need an independent
+		Incref/epilogue-Decref pair of its own; each arm's own bind (a real,
+		separately-tracked extraction) already takes whatever retain IT
+		needs before __match_subj_N is ever read again. Skipping this
+		previously emitted a real, always-unbalanced-until-function-exit
+		Incref with no corresponding use - harmless by construction (release
+		of the ORIGINAL still nets it to zero eventually) but inflated every
+		compiler.refcount() read taken inside a match arm by one, and every
+		match execution paid for a wholly unneeded retain/release pair. '''
 		if dest.stem in self._unchecked_results:
 			raise CompileError(
 				f"Result value {dest.stem!r} is discarded - it was never inspected: "
@@ -925,6 +940,9 @@ class CFGState:
 			self.track_result( dest.stem )
 		else:
 			self.clear_result( dest.stem )
+		if borrow:
+			self.bindings[dest.stem] = _Binding( operand = dest, type = dest.type, state = OwnState.BORROWED, entry = None )
+			return []
 		if not rc_leaves( dest.type ):
 			return []
 		instructions: list[ir.Instruction] = []
@@ -1010,6 +1028,20 @@ class CFGState:
 		if t is None:
 			return []
 		return self._decref_instructions( t, temp )
+
+	def untrack_temp( self, operand: ir.Operand | None ) -> None:
+		''' drops `operand` from _temp_states without emitting a Decref -
+		ownership is transferring elsewhere (handed to the caller as a
+		`return` value, moved into self._return_value_var across a shared-
+		epilogue-label Jump - see lowering.py's _stmt_Return, both of its
+		branches) rather than actually ending here. A later delete_temp()
+		for the SAME temp (lowering.py's own per-statement pending-temp
+		flush - _flush_pending_temps) then correctly becomes a no-op
+		instead of decref'ing the very value just handed off. A no-op for
+		anything that isn't a Temp (an ordinary Variable/Parameter was
+		never in _temp_states to begin with). '''
+		if isinstance( operand, ir.Temp ):
+			self._temp_states.pop( operand.id, None )
 
 	# --- struct/union field construction (Allocate) -----------------------------
 

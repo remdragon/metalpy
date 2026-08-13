@@ -660,10 +660,10 @@ class Tests( unittest.TestCase ):
 			ir.Allocate( dest = t0, cls = myerror_cls, fields = {} ),
 			ir.DeclareTemp( temp = t1 ),
 			ir.Call( dest = t1, target = self.compiler.lowering._monomorphized_function( monomorphized_err ), receiver = None, args = [ t0 ], kwargs = {} ),
-			ir.Return( value = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.Decref( value = t0 ), # t0 is genuinely RCClass-typed now, so its cleanup correctly decrefs it - previously invisible to cfg.py while it was mistyped as the bare TypeVar
 			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = t1 ),
 			ir.FuncEnd( name = '__test__.foo' ),
 		])
 
@@ -3633,8 +3633,8 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = make_fn.qualname, params = [ v ], return_type = foo_cls ),
 			ir.DeclareTemp( temp = t0 ),
 			ir.Allocate( dest = t0, cls = foo_cls, fields = { 'x': v, 'y': ir.Const( type = i32, value = 2 ) } ),
-			ir.Return( value = t0 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = t0 ),
 			ir.FuncEnd( name = make_fn.qualname ),
 		])
 
@@ -4950,8 +4950,8 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = 'main', params = [], return_type = i32 ),
 			ir.DeclareTemp( temp = ir.Temp( type = i32, id = 0 )),
 			ir.Call( dest = ir.Temp( type = i32, id = 0 ), target = helper_fn, receiver = None, args = [], kwargs = {} ),
-			ir.Return( value = ir.Temp( type = i32, id = 0 )),
 			ir.DeleteTemp( temp = ir.Temp( type = i32, id = 0 )),
+			ir.Return( value = ir.Temp( type = i32, id = 0 )),
 			ir.FuncEnd( name = 'main' ),
 		])
 
@@ -4968,8 +4968,8 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = 'main', params = [], return_type = i32 ),
 			ir.DeclareTemp( temp = ir.Temp( type = i32, id = 0 )),
 			ir.Call( dest = ir.Temp( type = i32, id = 0 ), target = helper_fn, receiver = None, args = [], kwargs = {} ),
-			ir.Return( value = ir.Temp( type = i32, id = 0 )),
 			ir.DeleteTemp( temp = ir.Temp( type = i32, id = 0 )),
+			ir.Return( value = ir.Temp( type = i32, id = 0 )),
 			ir.FuncEnd( name = 'main' ),
 		])
 

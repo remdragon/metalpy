@@ -6111,13 +6111,22 @@ def main() -> i32:
 		# allocation - a literal binds to immortal static storage and
 		# can't distinguish a leak/double-release from doing nothing.
 		#
-		# NB: does NOT assert compiler.refcount(r) == 1 inside the arm -
-		# a separate, pre-existing bug (confirmed present without this
-		# session's narrowing changes at all, via `git stash`) makes
-		# match-statement lowering emit one spurious extra retain of the
-		# first case's own payload before the match even dispatches,
-		# inflating the observed refcount independent of narrowing. Flagged
-		# separately; out of scope for this fix.
+		# NB: still does NOT assert compiler.refcount(r) == 1 inside the
+		# arm, even though the bug this comment used to describe (match-
+		# statement lowering taking out a spurious extra retain of the
+		# first case's own payload, computed from the raw subject before
+		# __match_subj_N's own assignment even ran - see cfg.py's assign()
+		# borrow= parameter) is now fixed - see
+		# test_rc_lifetime_repeated_match_exact_refcount below for the
+		# exact-count regression test that fix enabled. This test still
+		# can't assert an exact count because of a SEPARATE, still-open
+		# bug: make()'s own `return Result.Ok('hello'.upper())` - a single-
+		# statement body - leaves the intermediate str temp's own release
+		# instruction emitted AFTER the ir.Return in the generated C
+		# (unreachable dead code), permanently inflating every Result
+		# make() returns by one extra retain. Confirmed via direct
+		# inspection of emit_c's output for make() alone; unrelated to
+		# match/narrowing, flagged separately.
 		self._run( '''
 class MyError:
 	pass
@@ -6138,6 +6147,55 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			i += 1
 	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_match_exact_refcount( self ) -> None:
+		# regression test for the match-subject-alias bug fixed via cfg.py's
+		# assign() borrow= parameter: `match r:` used to lower
+		# `__match_subj_N = r` as an owning COPY (its own Incref, paired
+		# with its own epilogue Decref) even though r itself already owns a
+		# live reference for the whole rest of its (function-scoped)
+		# lifetime - the synthesized subject temp never needed an
+		# independent one. That extra, always-superfluous retain showed up
+		# in the generated C as a real retain_object() call computed
+		# straight from the raw subject BEFORE __match_subj_N's own
+		# assignment even ran (no tag check, always the union's first
+		# member) - harmless in the sense that it was eventually balanced
+		# by r's own release at scope exit, but it inflated every
+		# compiler.refcount() read taken inside a match arm by exactly one,
+		# and paid for a wholly unneeded retain/release pair on every match
+		# execution.
+		#
+		# Unlike test_rc_lifetime_repeated_calls_no_leak above, this
+		# constructs the Result INLINE in the same function as the match
+		# (no separate make()-style helper returning it) specifically to
+		# avoid that other, still-open, unrelated return-statement temp-
+		# cleanup bug documented on that test - keeping this assertion an
+		# exact, uncontaminated check of match-subject aliasing alone: r's
+		# own ownership (1) plus x's own separately-tracked extraction-bind
+		# (1) is exactly 2, every single one of 1000 iterations, on a real
+		# heap allocation ('hello'.upper(), not a literal - see that test's
+		# own comment for why).
+		self._run( '''
+class MyError:
+	pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			r: Result[str,MyError] = Result.Ok( 'hello'.upper() )
+			match r:
+				case Result.Ok( x ):
+					if compiler.refcount( x ) != 2:
+						return 1
+				case Result.Err( e ):
+					return 2
+			i += 1
+		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
@@ -6179,6 +6237,133 @@ def main() -> i32:
 	if helper( -1 ) != 0:
 		return 2
 	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
+class ReturnStatementTempLifetimeTests( CompilerTestCase ):
+	''' regression tests for a real leak in lowering.py's _stmt_Return: a
+	function whose entire body is a single `return SomeConstructor(
+	helper_expr())`-shaped statement (no earlier statement for the ordinary
+	per-statement pending-temp flush to land harmlessly before) used to emit
+	the intermediate temp's own cleanup (the argument's Decref/DeleteTemp,
+	previously appended by _lower_stmt's own post-method-call loop) AFTER
+	the ir.Return/ir.Jump that statement's OWN handler already emitted -
+	dead, unreachable C code, permanently leaking one retained reference on
+	the argument every call. Fixed by having _stmt_Return flush its own
+	still-pending temps itself (lowering.py's _flush_pending_temps), before
+	its own terminator, in both branches (the plain inline ir.Return, and
+	the shared-epilogue-label ir.Jump - cfg.py's untrack_temp() keeps
+	either branch from also decref'ing the value being handed to the
+	caller). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_single_statement_return_body_does_not_leak_argument_temp( self ) -> None:
+		# make()'s ENTIRE body is one `return Result.Ok('hello'.upper())` -
+		# no earlier statement exists for the intermediate str temp's own
+		# cleanup to land after harmlessly, so this is the minimal shape
+		# that exposed the bug: before the fix, the generated C had
+		# `release_object(&t0->header)` positioned AFTER `return t1;`
+		# inside make() (confirmed via direct source inspection), an
+		# unreachable statement that left every string make() ever returned
+		# permanently over-retained by one. Checked here end-to-end by
+		# asserting the EXACT refcount of the returned string once it
+		# reaches main() (through an ordinary match bind, itself already
+		# covered/fixed separately - see
+		# MatchArmSameNameNarrowingTests.test_rc_lifetime_repeated_match_exact_refcount):
+		# 2 (make()'s own Result payload's ownership, plus x's own
+		# separately-tracked extraction-bind) - 3 before this fix, from the
+		# permanently-leaked extra retain make() itself introduced.
+		self._run( '''
+class MyError:
+	pass
+
+def make() -> Result[str,MyError]:
+	return Result.Ok( 'hello'.upper() )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		r: Result[str,MyError] = make()
+		rc: usize = 0
+		match r:
+			case Result.Ok( x ):
+				rc = compiler.refcount( x )
+			case Result.Err( e ):
+				rc = 999
+		return i32( rc )
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		# the generated C itself should never have a release/decref call
+		# positioned after make()'s own return - a direct, source-level
+		# check that the dead-code-after-return shape is really gone, not
+		# just that its net effect (the refcount below) happens to work out
+		make_start = src.index( '__main__$make( void ) {' )
+		make_body = src[ make_start : src.index( '\n}', make_start ) ]
+		return_pos = make_body.index( 'return t1;' )
+		self.assertNotIn( 'release_object', make_body[ return_pos: ] )
+		self._assert_compiles_and_runs( src, expected_exit = 2 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_single_statement_return_body_repeated_calls_no_leak( self ) -> None:
+		# the same single-statement-body shape as above, but stressed over
+		# 1000 repeated calls+matches on FRESH heap allocations each time -
+		# a real RC-lifetime check, not just "doesn't crash once" (mirrors
+		# MatchArmSameNameNarrowingTests.test_rc_lifetime_repeated_calls_no_leak's
+		# own reasoning for why a bare content check every iteration matters)
+		self._run( '''
+class MyError:
+	pass
+
+def make() -> Result[str,MyError]:
+	return Result.Ok( 'hello'.upper() )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			r: Result[str,MyError] = make()
+			match r:
+				case Result.Ok( x ):
+					if compiler.refcount( x ) != 2:
+						return 1
+				case Result.Err( e ):
+					return 2
+			i += 1
+		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))

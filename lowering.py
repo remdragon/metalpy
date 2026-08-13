@@ -1474,21 +1474,37 @@ class FunctionLowering:
 			if method is None:
 				self.lowering.discovery.fail( f'unsupported statement: {ast.unparse(node)}', node )
 			method( node )
-			for t in reversed( self._pending_temps ):
-				# a temp genuinely fresh_temp()-registered (see _emit) and
-				# never consumed by assign()/return_()/move()/field_value()
-				# along the way (e.g. `foo( SomeClass() )` where SomeClass()
-				# is passed into a plain, non-move[T] parameter - nothing
-				# ever untracks it) still needs its own decref right here,
-				# at the natural end of the temporary's own expression-scoped
-				# lifetime. A no-op for every already-consumed temp (already
-				# untracked by whichever hook consumed it) and every non-RC
-				# temp (never registered in the first place)
-				for instr in self._cfg.delete_temp( t ):
-					self._emit( instr )
-				self._emit( ir.DeleteTemp( temp = t ))
+			# a no-op by the time this runs for a Return (see _stmt_Return's
+			# own comment - it flushes _pending_temps ITSELF, before its own
+			# ir.Return/ir.Jump, precisely so this generic post-statement
+			# flush - unconditionally emitted AFTER method(node) returns,
+			# i.e. AFTER any unconditional terminator that statement itself
+			# already emitted - never lands as dead code following it)
+			self._flush_pending_temps()
 		finally:
 			self._pending_temps = outer_pending
+
+	def _flush_pending_temps( self ) -> None:
+		''' decref+DeleteTemp every still-pending temp (reverse declaration
+		order), then clear the list. A temp genuinely fresh_temp()-
+		registered (see _emit) and never consumed by assign()/return_()/
+		untrack_temp()/move()/field_value() along the way (e.g. `foo(
+		SomeClass() )` where SomeClass() is passed into a plain, non-move[T]
+		parameter - nothing ever untracks it) still needs its own decref
+		right here, at the natural end of the temporary's own expression-
+		scoped lifetime. A no-op for every already-consumed temp (already
+		untracked by whichever hook consumed it) and every non-RC temp
+		(never registered in the first place). Factored out of _lower_stmt
+		so _stmt_Return can call it explicitly BEFORE its own terminator
+		(ir.Return/ir.Jump) instead of relying on _lower_stmt's own post-
+		method call, which - for every OTHER statement kind, fine, since
+		none of them emit an unconditional jump/return of their own - would
+		otherwise land as unreachable code right after one. '''
+		for t in reversed( self._pending_temps ):
+			for instr in self._cfg.delete_temp( t ):
+				self._emit( instr )
+			self._emit( ir.DeleteTemp( temp = t ))
+		self._pending_temps = []
 
 	def _stmt_Return( self, node: ast.Return ) -> None:
 		if self._in_deferred_body:
@@ -1531,6 +1547,24 @@ class FunctionLowering:
 			# the jump some other way than a direct ir.Return
 			if self._return_value_var is not None and value is not None:
 				self._emit( ir.Assign( dest = self._return_value_var, src = value ))
+			# value's own ownership (if it's a bare temp - `return
+			# SomeConstructor(...)`, never assigned to a name) just
+			# transferred into self._return_value_var above via the plain
+			# ir.Assign - untrack it so _flush_pending_temps below doesn't
+			# ALSO decref it (return_()'s own docstring explains the
+			# identical concern for the other branch)
+			self._cfg.untrack_temp( value )
+			# flushed HERE, before this branch's own unconditional
+			# ir.Jump - not left to _lower_stmt's own post-method flush,
+			# which runs strictly after this whole method returns and so
+			# would land as dead code following the Jump (see
+			# _flush_pending_temps' own docstring for the general shape of
+			# this bug: a single-statement function body like `def make()
+			# -> Result[str,E]: return Result.Ok('hello'.upper())` used to
+			# leave the intermediate str temp's own release permanently
+			# unreachable, inflating the returned Result's refcount by one
+			# forever)
+			self._flush_pending_temps()
 			self._emit( ir.Jump( target = label ))
 		else:
 			# either nothing is pending, or `value` IS itself one of the
@@ -1541,6 +1575,12 @@ class FunctionLowering:
 			# they're just as "pending" as an RC decref from here)
 			for instr in self._cfg.return_( value, lambda: self._build_is_err_check( node )):
 				self._emit( instr )
+			# same reasoning as the label-is-not-None branch above - flush
+			# BEFORE this branch's own unconditional ir.Return, not after
+			# (return_() already untracked `value` itself, so this only
+			# ever cleans up OTHER still-pending temps - e.g. an
+			# intermediate argument consumed into constructing `value`)
+			self._flush_pending_temps()
 			self._emit( ir.Return( value = value ))
 
 	def _stmt_Pass( self, node: ast.Pass ) -> None:
@@ -1621,7 +1661,7 @@ class FunctionLowering:
 				self.lowering.discovery.fail( str( e ), node )
 			self._current_fn.add_name( alias.asname or alias.name, mod )
 
-	def _cfg_assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, node: ast.AST, track_result: bool = True ) -> list[ir.Instruction]:
+	def _cfg_assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, node: ast.AST, track_result: bool = True, borrow: bool = False ) -> list[ir.Instruction]:
 		# thin wrapper around cfg.assign() - now that it can raise
 		# CompileError (see cfg.py's own unchecked-Result overwrite check),
 		# every one of its 7 call sites needs the same discovery.fail()
@@ -1630,7 +1670,7 @@ class FunctionLowering:
 		# swallowed by the nearest enclosing per-statement `except
 		# CompileError: continue` recovery boundary
 		try:
-			return self._cfg.assign( dest, src, is_alias = is_alias, track_result = track_result )
+			return self._cfg.assign( dest, src, is_alias = is_alias, track_result = track_result, borrow = borrow )
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
 
@@ -1823,7 +1863,18 @@ class FunctionLowering:
 				# the source (see cfg.py's "Independent tracking"), but a
 				# match statement genuinely IS the inspection of its subject
 				is_match_subject = getattr( node, 'is_match_subject', False )
-				for instr in self._cfg_assign( var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type ), node = node, track_result = not is_match_subject ):
+				is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )
+				# when the subject is a bare Name (is_alias=True), the
+				# ORIGINAL name already owns a live reference for the whole
+				# (function-scoped) rest of its lifetime, so __match_subj_N
+				# only needs a BORROW, not its own Incref/epilogue-Decref
+				# pair - see cfg.py's assign() borrow= doc for the bug this
+				# fixes (a real, always-unbalanced-until-function-exit
+				# Incref that inflated every compiler.refcount() read taken
+				# inside a match arm). A non-Name subject (e.g. `match
+				# make():`) has no such original owner, so it keeps full
+				# ownership tracking unchanged (borrow=False there).
+				for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node, track_result = not is_match_subject, borrow = is_match_subject and is_alias ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
 				match_clears_name = getattr( node, 'match_clears_name', None )
