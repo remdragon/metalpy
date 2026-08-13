@@ -888,35 +888,39 @@ class str:
 				i += consumed
 		return True
 
-	def strip( self ) -> str:
-		''' self with leading AND trailing whitespace codepoints stripped
-		- Python's str.strip() with no arguments. The chars= form isn't
-		implemented here: passing a literal str to a str|None-typed
-		parameter hits a separate, pre-existing compiler gap (a string
-		literal ends up typed against the WHOLE union rather than its
-		str variant, and fails at emission) - confirmed independently of
-		this work, flagged in TODO.txt rather than worked around here.
+	def strip( self, chars: str|None = None ) -> str:
+		''' self with leading AND trailing codepoints stripped - whitespace
+		codepoints (is_space_cp) when chars is None, matching Python's
+		str.strip() with no arguments; otherwise strips only codepoints
+		that appear anywhere in chars, matching str.strip(chars). The
+		chars= form only became possible once real union narrowing/
+		extraction existed (see TODO.txt's own former "union
+		disambiguation" blocker note, now resolved) - _should_strip_cp
+		below is this method's own real use of it, via `match chars:`.
 		Built from lstrip()/rstrip() below. '''
-		return self.lstrip().rstrip()
+		return self.lstrip( chars ).rstrip( chars )
 
-	def lstrip( self ) -> str:
-		''' self with leading whitespace codepoints stripped
-		(is_space_cp), matching Python's str.lstrip() with no
-		arguments. '''
+	def lstrip( self, chars: str|None = None ) -> str:
+		''' self with leading codepoints stripped - whitespace
+		(is_space_cp) when chars is None, matching Python's str.lstrip()
+		with no arguments; otherwise strips only codepoints that appear
+		anywhere in chars, matching str.lstrip(chars). '''
 		self_len: usize = self.byte_len()
 		i: usize = 0
 		consumed: usize = 0
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			while i < self_len:
 				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
-				if not is_space_cp( cp ):
+				if not self._should_strip_cp( cp, chars ):
 					break
 				i += consumed
 		return self._byte_slice( i, self_len )
 
-	def rstrip( self ) -> str:
-		''' self with trailing whitespace codepoints stripped, matching
-		Python's str.rstrip() with no arguments. UTF-8 can only be
+	def rstrip( self, chars: str|None = None ) -> str:
+		''' self with trailing codepoints stripped - whitespace
+		(is_space_cp) when chars is None, matching Python's str.rstrip()
+		with no arguments; otherwise strips only codepoints that appear
+		anywhere in chars, matching str.rstrip(chars). UTF-8 can only be
 		decoded FORWARD, so trimming from the end needs one forward pass
 		recording each codepoint's own start offset before walking that
 		record backward. '''
@@ -936,11 +940,32 @@ class str:
 			while n > 0:
 				start: usize = starts.__getitem__( n - 1 ).unwrap( 'rstrip: index in bounds by construction' )
 				cp: u32 = decode_utf8_at( self.__data, start, compiler.addrof( consumed ))
-				if not is_space_cp( cp ):
+				if not self._should_strip_cp( cp, chars ):
 					break
 				end = start
 				n -= 1
 		return self._byte_slice( 0, end )
+
+	@private
+	def _should_strip_cp( self, cp: u32, chars: str|None ) -> bool:
+		''' shared by lstrip()/rstrip() (and so strip(), built from both):
+		whitespace (is_space_cp) when chars is None, matching Python's
+		strip()/lstrip()/rstrip() no-argument form; otherwise true iff cp
+		appears anywhere in chars, matching Python's own chars= form. '''
+		match chars:
+			case None:
+				return is_space_cp( cp )
+			case str( c ):
+				c_len: usize = c.byte_len()
+				j: usize = 0
+				j_consumed: usize = 0
+				with compiler.panic_arithmetic( 'bounded by c_len, cannot overflow' ):
+					while j < c_len:
+						other_cp: u32 = decode_utf8_at( c.__data, j, compiler.addrof( j_consumed ))
+						if other_cp == cp:
+							return True
+						j += j_consumed
+				return False
 
 	def upper( self ) -> str:
 		''' case_folder (see PLAN_CASE_FOLDING.md) is checked first, ahead

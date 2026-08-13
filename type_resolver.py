@@ -1330,26 +1330,39 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return all( self._unify_type_param( type_params, d, a, bindings ) for d, a in zip( declared.args, actual_spec.args ))
 		return True # this parameter position doesn't mention any of type_params - nothing to infer here
 
+	def _instanceof_args( self, expr: ast.expr ) -> tuple[ast.expr,ast.expr]|None:
+		''' does `expr` have the shape `instanceof(x, T)`? Returns (x, T),
+		or None. Shared by visit_Call (rewrites a bare instanceof(...) call
+		to the equivalent `type(x) is T` Compare) and _try_desugar_type_is_if
+		(rewrites a WHOLE if-statement whose condition is instanceof(x, T)
+		directly to the equivalent match statement, without ever building an
+		intermediate Compare at all) - both need this same (x, T) pair.
+		`instanceof` is never a real registered name (this compiler has no
+		runtime reflection/RTTI - same posture as
+		move[T]/copy[T]/compiler.sizeof(...) elsewhere). '''
+		if isinstance( expr, ast.Call ) and isinstance( expr.func, ast.Name ) and expr.func.id == 'instanceof' and len( expr.args ) == 2 and not expr.keywords:
+			return expr.args[0], expr.args[1]
+		return None
+
 	def visit_Call( self, node: ast.Call ) -> ast.expr:
-		if (
-			isinstance( node.func, ast.Name ) and node.func.id == 'instanceof'
-			and len( node.args ) == 2 and not node.keywords
-		):
-			# instanceof(x, T) - sugar for `type(x) is T` (see visit_Compare's
-			# own _rewrite_type_is_comparison) - `instanceof` is never a real
-			# registered name (this compiler has no runtime reflection/RTTI -
-			# same posture as move[T]/copy[T]/compiler.sizeof(...) elsewhere),
-			# so rather than duplicate the recognition logic, rewrite to the
-			# equivalent Compare here and re-dispatch through self.visit() -
-			# same technique visit_Match's own nested-match handling uses
-			# (a visit_X method returning an entirely different node kind).
-			# This makes instanceof(x, T) usable anywhere a bool expression
-			# is (an if condition, a boolean AND/OR, assigned to a bool
-			# variable, ...), same as `type(x) is T` itself.
+		instanceof_args = self._instanceof_args( node )
+		if instanceof_args is not None:
+			# sugar for `type(x) is T` (see visit_Compare's own
+			# _rewrite_type_is_comparison) - rather than duplicate the
+			# recognition logic, rewrite to the equivalent Compare here and
+			# re-dispatch through self.visit() - same technique visit_Match's
+			# own nested-match handling uses (a visit_X method returning an
+			# entirely different node kind). This makes instanceof(x, T)
+			# usable anywhere a bool expression is (an if condition, a
+			# boolean AND/OR, assigned to a bool variable, ...), same as
+			# `type(x) is T` itself - EXCEPT directly as an if-statement's
+			# own condition, where _try_desugar_type_is_if intercepts it
+			# before it ever reaches here (see visit_If)
+			subject_expr, type_expr = instanceof_args
 			compare = ast.Compare(
-				left = ast.Call( func = ast.Name( id = 'type', ctx = ast.Load() ), args = [ node.args[0] ], keywords = [] ),
+				left = ast.Call( func = ast.Name( id = 'type', ctx = ast.Load() ), args = [ subject_expr ], keywords = [] ),
 				ops = [ ast.Is() ],
-				comparators = [ node.args[1] ],
+				comparators = [ type_expr ],
 			)
 			ast.copy_location( compare, node )
 			ast.copy_location( compare.left, node )
@@ -1649,10 +1662,99 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				folded.append( result )
 		return folded
 
+	def _try_desugar_type_is_if( self, node: ast.If ) -> list[ast.stmt]|None:
+		''' rewrite 5 (Phase 4): `if type(x) is T: A else: B` -> `match x:
+		case T(x): A \n case _: B` (`if instanceof(x, T):` is the identical
+		rewrite - recognized directly here via _instanceof_args, never
+		routed through visit_Call's own Compare-rewriting detour, since
+		node.test needs to stay in ORIGINAL form for THIS check to even
+		recognize it: by the time generic_visit would otherwise reach it,
+		visit_Call/visit_Compare would already have collapsed it into a
+		plain tag-Cmp bool with no shape left to desugar). `type(x) is not
+		T` swaps which body lands in the T-arm vs the wildcard arm rather
+		than negating anything else. An elif chain (node.orelse holding a
+		single nested ast.If) naturally desugars into a NESTED match purely
+		as a side effect of the wildcard arm's own body being visited
+		normally - if that nested if ALSO matches this shape, visiting it
+		recurses into this same method again; if it doesn't, it's left as
+		an ordinary nested if inside the wildcard arm, exactly matching
+		TODO.txt's own `if x is int: ... elif x is str: ... else: ...`
+		worked example structurally.
+
+		Reuses visit_Match's own same-name narrowing entirely for free:
+		the synthesized case pattern binds the SAME name as the match
+		subject whenever x is itself a bare Name (case T(x), not case
+		T(_)) - visit_Match's own original_subject_name recognition then
+		narrows it exactly as it already does for a literal `match x: case
+		T(x):` written directly by the user, no separate narrowing logic
+		needed here at all. A non-Name subject (`if type(make()) is T:`)
+		has nothing meaningful to bind (the original body couldn't have
+		referenced anything from it either), so its arm captures nothing
+		(case T():), preserving only the branch-taking behavior.
+
+		Never authoritative about failure, matching _try_fold_is_rc_if's
+		own philosophy exactly: any doubt at all (not this exact shape, T
+		not a real type, T not a member of x's union, x not union-typed at
+		all) returns None and leaves the if statement untouched - the
+		SAME shape then falls through to generic_visit below, which
+		reaches visit_Compare's/visit_Call's own already-existing
+		recognition and error-reporting for `type(x) is T`/`instanceof(x,
+		T)` used as an ordinary (non-narrowing) boolean condition, so
+		nothing is ever silently dropped - just narrowing declining to
+		apply, never validation being skipped. '''
+		test = node.test
+		instanceof_args = self._instanceof_args( test )
+		if instanceof_args is not None:
+			subject_expr, type_expr = instanceof_args
+			is_not = False
+		else:
+			if not ( isinstance( test, ast.Compare ) and len( test.ops ) == 1 and isinstance( test.ops[0], ( ast.Is, ast.IsNot )) ):
+				return None
+			left_subject = self._type_call_subject( test.left )
+			right_subject = self._type_call_subject( test.comparators[0] )
+			if left_subject is None and right_subject is None:
+				return None
+			if left_subject is not None and right_subject is not None:
+				return None # type(x) is type(y) - let visit_Compare's own rewrite report this
+			subject_expr = left_subject if left_subject is not None else right_subject
+			type_expr = test.comparators[0] if left_subject is not None else test.left
+			is_not = isinstance( test.ops[0], ast.IsNot )
+		leaf_type = self._try_resolve_namespace( type_expr )
+		if leaf_type is None:
+			return None
+		subj_type = self._type_of_expr( subject_expr )
+		if subj_type is None:
+			return None
+		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		if not isinstance( base, TaggedUnion ):
+			return None
+		members = self._resolved_union_members( subj_type, base )
+		member = next( ( attr for attr in members if attr.type is leaf_type ), None )
+		if member is None:
+			return None
+		match_body = node.orelse if is_not else node.body
+		fallback_body = node.body if is_not else node.orelse
+		inner_pattern = ast.MatchAs( pattern = None, name = subject_expr.id if isinstance( subject_expr, ast.Name ) else None )
+		ast.copy_location( inner_pattern, node )
+		class_pattern = ast.MatchClass( cls = type_expr, patterns = [ inner_pattern ], kwd_patterns = [], kwd_attrs = [] )
+		ast.copy_location( class_pattern, node )
+		wildcard_pattern = ast.MatchAs( pattern = None, name = None )
+		ast.copy_location( wildcard_pattern, node )
+		match_case = ast.match_case( pattern = class_pattern, guard = None, body = list( match_body ) if match_body else [ ast.Pass() ] )
+		fallback_case = ast.match_case( pattern = wildcard_pattern, guard = None, body = list( fallback_body ) if fallback_body else [ ast.Pass() ] )
+		match_node = ast.Match( subject = subject_expr, cases = [ match_case, fallback_case ] )
+		ast.copy_location( match_node, node )
+		result = self.visit( match_node )
+		assert isinstance( result, list )
+		return result
+
 	def visit_If( self, node: ast.If ) -> ast.If|list[ast.stmt]:
 		folded = self._try_fold_is_rc_if( node )
 		if folded is not None:
 			return folded
+		desugared = self._try_desugar_type_is_if( node )
+		if desugared is not None:
+			return desugared
 		# rewrite test BEFORE generic_visit recurses into it, so the new BoolOp
 		# children (Name references, Compare, Call) are visited normally
 		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )

@@ -239,6 +239,42 @@ lowering:
 			its rare that I'll use @move, but I'm more concerned about
 				consistent and coherent language syntax here
 	union disambiguation:
+		DONE (branch-scoped narrowing): implemented, but via a materially simpler design
+			than the UnionView/permanent-CFG-state-machine sketch below - the sketch's own
+			worked example uses `x is int`/`x is str` for a type check, which this file
+			itself flags elsewhere as wrong Python syntax (`is` is identity, not a type
+			check); building the full UnionView machinery to support that invalid syntax
+			was never actually necessary. What shipped instead (see
+			MatchArmSameNameNarrowingTests/MatchAnonymousUnionTests/TypeIsInstanceofTests/
+			TypeIsIfDesugaringTests in emitter_c_test.py):
+			- `match x: case T(x): ...` (same name reused as both subject and bind) - x's
+				own Variable/storage never changes, narrowing is a pure compile-time
+				read-rewrite (cfg.py's _narrowed dict, pushed/popped via the same
+				snapshot()/restore() machinery _unchecked_results already used) that
+				rewrites a read of x, inside that arm only, into a borrowed
+				GetAttr(data).GetAttr(v_member) chain - no new incref/decref at all.
+			- `case None:`/`case str(c):` against an ANONYMOUS union (T|None, etc.) - the
+				original blocker below ("match x: case T(y): doesn't work for an anonymous
+				union") is resolved; the member is resolved by TYPE IDENTITY off the
+				subject's own static type instead of by name off the pattern's text.
+			- `type(x) is T`/`type(x) is not T`/`instanceof(x, T)` - textually recognized
+				special syntax (no runtime reflection/RTTI exists in this compiler), usable
+				as a plain bool anywhere a bool expression is.
+			- `if type(x) is T: A else: B` desugars to `match x: case T(x): A \ case _: B`
+				before lowering ever sees it - narrows x inside the T-branch by reusing the
+				match narrowing above verbatim. elif chains desugar into nested matches as a
+				natural side effect (no special elif-handling needed).
+			STILL NOT DONE, deliberately deferred (this is the part the UnionView sketch
+			below was actually FOR): narrowing does NOT survive past its own if/match block
+			today, even down a non-fallthrough branch (`if type(x) is int: return ... elif
+			type(x) is str: print(x) # x is still int|str|bytes here`) - the worked example
+			at the bottom of this sketch. Making that work needs real cfg.py cooperation
+			(mirroring merge_if's own true_terminates/false_terminates special case,
+			generalized to a narrowing dimension) - a materially separate, CFG-level
+			follow-up on top of the desugaring, not a natural part of it. The sketch below
+			is kept as-is for that follow-up's own reference, NOT as a description of
+			current behavior.
+
 		unions need to have a lowering wrapper to represent the currently understood type.
 
 		P.S. Shouldn't TaggedUnion.leaves() cache its results?
@@ -370,20 +406,18 @@ lowering:
 			real exists: bool|None = None usage), lowering_test.py's
 			test_leaf_value_coerced_into_union_via_synthesized_constructor (IR-shape).
 
-		STILL OPEN (the union-into-leaf direction - narrowing/extraction): confirmed via
-			a real clang invocation (not just Python-level emission, which succeeds and
-			hides it) that `if x is None: ... else: y: T = x` still emits invalid C -
-			`x` stays typed as the whole union (T|None) in the `else` branch (no real
-			control-flow narrowing exists - see this file's own "union disambiguation"
-			section above), so a plain assignment/declaration binding it to `y: T` passes
-			the raw union struct where a leaf-typed value is expected. `match x: case
-			T(y): ...` doesn't work for an anonymous union either ("unsupported match
-			pattern class"). This is what actually blocks giving str.strip()/lstrip()/
-			rstrip() (lib/builtins/__init__.py) a real `chars: str|None = None` parameter
-			- the leaf-into-union fix above only gets a literal/variable INTO the
-			parameter correctly, the function's own body still can't get it back OUT.
-			A value already consumed via `is None`/bare truthiness (no extraction, e.g.
-			__File.py's own `elif exists:`) already works fine and isn't affected.
+		DONE (the union-into-leaf direction - narrowing/extraction): `match x: case
+			T(x): ...` (same-name reuse) and the `if type(x) is T:`/`if instanceof(x,
+			T):` desugar-to-match both now correctly narrow x to its leaf type within
+			their own branch/arm - see the "union disambiguation" section above for the
+			real design and its own regression tests. This is what unblocked giving
+			str.strip()/lstrip()/rstrip() (lib/builtins/__init__.py) a real `chars:
+			str|None = None` parameter - see StrPhase3ClassificationTests'
+			test_strip_lstrip_rstrip_chars_argument. `if x is None: ... else: y: T = x`
+			(a PLAIN reassignment, not a match/type(x)-is-T extraction) is still not
+			narrowed - that shape was never part of this work's scope (see the
+			"union disambiguation" section's own STILL NOT DONE note for what remains:
+			narrowing surviving past its own block).
 
 		For this code example, assume:
 			@union
