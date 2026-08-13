@@ -6310,6 +6310,80 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_is_none_recheck_on_already_narrowed_name_in_same_arm( self ) -> None:
+		# regression test for a real, previously-confirmed gap: a SECOND
+		# union-shaped check (here, `x is None`) on a name the SAME arm
+		# already narrowed via same-name reuse (`case str(x):`) used to
+		# crash with "builtins.str has no attribute 'tag'" -
+		# type_resolver.py's own is-None rewrite (visit_Compare) runs in an
+		# earlier, purely AST-level pass that had no knowledge of cfg.py's
+		# _narrowed state at all, so it kept reading x's OUTER declared
+		# type (str|None, a TaggedUnion) and built a `.tag` access even
+		# though x is already narrowed to plain `str` by the time
+		# lowering.py actually processes this arm's body. Fixed by giving
+		# _ReferenceResolver its own parallel self._narrowed dict (pushed
+		# on entering a narrowing arm, popped on leaving it - see
+		# visit_Match), consulted by _type_of_expr before falling back to
+		# self.locals - flagged in the codebase's own comments (see
+		# TypeIsInstanceofTests.test_rc_lifetime_repeated_calls_no_leak)
+		# as "out of scope" until this test closed it.
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	match x:
+		case str( x ):
+			if x is None:
+				return 1
+			return 0
+		case None:
+			return 2
+	return 3
+
+def main() -> i32:
+	if describe( "hello" ) != 0:
+		return 1
+	if describe( None ) != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_narrowed_name_reverts_after_arm_even_when_rechecked_inside( self ) -> None:
+		# combines the previous test's in-arm recheck with
+		# test_narrowing_confined_to_match_arm_reverts_after's own concern:
+		# an already-narrowed x rechecked with `x is None` INSIDE its own
+		# arm must not leave self._narrowed poisoned for code AFTER the
+		# match - a second, independent `x is None` check right after the
+		# match must still see the WHOLE str|None union again, exactly as
+		# if the in-arm recheck had never happened
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	with compiler.wrap_arithmetic:
+		result: i32 = 0
+		match x:
+			case str( x ):
+				if x is None:
+					result = -1
+				else:
+					result = i32( x.byte_len() )
+			case None:
+				result = 999
+		if x is None:
+			result = result + 1000
+		return result
+
+def main() -> i32:
+	if describe( "hello" ) != 5:
+		return 1
+	if describe( None ) != 1999:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 class MatchAnonymousUnionTests( CompilerTestCase ):
 	''' Phase 2 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md): match
@@ -6656,19 +6730,16 @@ def main() -> i32:
 		# not directly into the str|None-typed slot).
 		#
 		# NB: does NOT check `x is None` (or any other union-shaped
-		# recheck of x) inside the type(x) is str branch - since PLAN's
-		# Phase 4 landed, `if type(x) is str:` desugars to a real match
-		# statement and x IS narrowed to str inside this branch (same-name
-		# reuse, Phase 1's own mechanism) - a SEPARATE, pre-existing gap
-		# (confirmed present for a literal `match x: case str(x): if x is
-		# None: ...` too, nothing to do with this phase's desugaring
-		# specifically) means a second union-shaped check on an
-		# ALREADY-narrowed name in the same arm incorrectly still builds a
-		# `.tag` access, since type_resolver.py's own is-None/type-is
-		# rewrites run before lowering and have no awareness of cfg.py's
-		# narrowing state. Flagged separately, out of scope here - this
-		# test just confirms x is correctly usable AS its narrowed str
-		# type instead.
+		# recheck of x) inside the type(x) is str branch - this test just
+		# confirms x is correctly usable AS its narrowed str type. A
+		# second union-shaped check on an already-narrowed name in the
+		# same arm used to crash outright (type_resolver.py's own is-
+		# None/type-is rewrites ran before lowering with no awareness of
+		# cfg.py's narrowing state) - now fixed via _ReferenceResolver's
+		# own self._narrowed tracking; see
+		# TypeIsIfDesugaringTests.test_is_none_recheck_on_already_narrowed_name_in_type_branch
+		# and MatchArmSameNameNarrowingTests.test_is_none_recheck_on_already_narrowed_name_in_same_arm
+		# for the dedicated regression coverage.
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -6912,6 +6983,39 @@ def main() -> i32:
 				return 2
 			i += 1
 		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_is_none_recheck_on_already_narrowed_name_in_type_branch( self ) -> None:
+		# regression test for the same gap MatchArmSameNameNarrowingTests.
+		# test_is_none_recheck_on_already_narrowed_name_in_same_arm covers
+		# for a literal `match` statement, reached here through if-
+		# desugaring instead: `if type(x) is str:` desugars to `match x:
+		# case str(x): ...` (this class's own docstring), which narrows x
+		# the same way - a SECOND union-shaped check (`x is None`) on that
+		# already-narrowed x, inside the SAME branch, used to crash with
+		# "builtins.str has no attribute 'tag'" since type_resolver.py's
+		# own rewrites ran with no knowledge of the narrowing their own
+		# desugaring had just introduced. Previously flagged as out of
+		# scope on TypeIsInstanceofTests.test_rc_lifetime_repeated_calls_
+		# no_leak's own comment; fixed by _ReferenceResolver's new
+		# self._narrowed tracking (see type_resolver.py's visit_Match).
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	if type( x ) is str:
+		if x is None:
+			return 1
+		return 0
+	return 2
+
+def main() -> i32:
+	if describe( "hello" ) != 0:
+		return 1
+	if describe( None ) != 2:
+		return 2
+	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))

@@ -17,6 +17,9 @@ from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
 
+_UNNARROWED = object() # sentinel: "this name had no entry in _ReferenceResolver._narrowed before this arm" - distinct from any real Type (including None-as-a-value, which never appears here anyway) so visit_Match's push/pop can tell "restore to absent" apart from "restore to some previously-narrowed type"
+
+
 def _union_member_ast_path( union: TaggedUnion, member_stem: str ) -> ast.Attribute:
 	''' build an ast.Attribute path for a union's member reference in a
 	match-case pattern, e.g. builtins.MaybeFoo.Some — the union's own
@@ -963,6 +966,18 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
 			self.locals['self'] = fn.cls
 		self._label_id = 0
+		# parallel to self.locals, but for a name CURRENTLY narrowed to a
+		# union member's leaf type within the lexical span of a `case T(x):`
+		# arm that reuses the union's own name (see visit_Match's push/pop
+		# around a narrowing arm's body) - mirrors cfg.py's own _narrowed
+		# dict/narrow()/unnarrow(), but at this AST-rewriting-pass level,
+		# so every union-shaped rewrite below (is-None, type(x) is T,
+		# T|None truthiness) that goes through _type_of_expr sees the
+		# NARROWED leaf type instead of the name's outer declared type -
+		# see the comment on _match_union_member's own narrow_marker for
+		# the bug this closes (a second union-shaped check on an already-
+		# narrowed name inside the same arm)
+		self._narrowed: dict[str,Type] = {}
 
 	# --- best-effort "type of this expression", Name/Attribute/Call only ---
 
@@ -1001,6 +1016,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return None
 			return self.discovery.find_name_or_none( name )
 		if isinstance( node, ast.Name ):
+			if node.id in self._narrowed:
+				return self._narrowed[node.id]
 			return self.locals.get( node.id )
 		if isinstance( node, ast.Attribute ):
 			owner_type = self._type_of_expr( node.value )
@@ -1422,12 +1439,21 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		self.generic_visit( node )
 		if isinstance( node.target, ast.Name ):
 			self.locals[node.target.id] = self.discovery.visit( node.annotation )
+			# a fresh declaration invalidates whatever this name was
+			# previously narrowed to (same reasoning as cfg.py's own
+			# unnarrow() - a rebound name no longer denotes the union
+			# member it was proven to hold) - safe to call on a name that
+			# was never narrowed
+			self._narrowed.pop( node.target.id, None )
 		return node
 
 	def visit_Assign( self, node: ast.Assign ) -> ast.Assign:
 		self.generic_visit( node )
 		if len( node.targets ) == 1 and isinstance( node.targets[0], ast.Name ):
 			self.locals[node.targets[0].id] = self._type_of_expr( node.value )
+			# see visit_AnnAssign's own comment - an ordinary reassignment
+			# invalidates prior narrowing
+			self._narrowed.pop( node.targets[0].id, None )
 		return node
 
 	def visit_Attribute( self, node: ast.Attribute ) -> ast.expr:
@@ -1879,26 +1905,52 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if case.guard is not None:
 				self.discovery.fail( f'match guards (case ... if ...) are not yet supported: {ast.unparse(case.pattern)}', node )
 			test, binds = self._match_pattern( subj_ref, case.pattern, node, original_subject_name )
-			# self.visit(stmt) returns a bare ast.stmt for most statement
-			# kinds, but a NESTED ast.Match (this method's own visit_Match,
-			# called recursively) returns a list[ast.stmt] instead (its own
-			# subj_assign + if-chain) - unlike ast.NodeTransformer's own
-			# generic_visit(), a manual comprehension doesn't auto-flatten
-			# that, so a naive `[self.visit(stmt) for stmt in case.body]`
-			# would embed the nested match's own 2-element list as ONE
-			# malformed body entry instead of two real statements - only
-			# surfaced once something actually reaches lowering.py's
-			# _lower_stmt, which has no _stmt_list handler ("unsupported
-			# statement", unparsed because ast.unparse() happens to accept a
-			# bare list of stmts too, which is what made this so confusing
-			# to trace)
-			body: list[ast.stmt] = []
-			for stmt in case.body:
-				visited = self.visit( stmt )
-				if isinstance( visited, list ):
-					body.extend( visited )
-				elif visited is not None:
-					body.append( visited )
+			# a narrowing arm (see _match_union_member's own narrow_marker)
+			# pushes name -> its narrowed leaf type into self._narrowed for
+			# exactly the span of THIS case's own body - every union-shaped
+			# rewrite below (visit_Compare's is-None check,
+			# _rewrite_type_is_comparison, _rewrite_tagged_union_truthiness)
+			# goes through _type_of_expr, which now consults self._narrowed
+			# first, so a SECOND union-shaped check on the same
+			# already-narrowed name inside this same arm sees the narrowed
+			# leaf type instead of stale outer union type (the gap this
+			# closes). Saved/restored rather than just popped, mirroring
+			# cfg.py's own snapshot/restore of _narrowed - matters for a
+			# nested match/if inside this arm's body that narrows some
+			# OTHER already-narrowed name back to itself in a sibling arm
+			narrow_name: str|None = None
+			narrow_prev: Type|object = _UNNARROWED
+			if len( binds ) == 1 and getattr( binds[0], 'is_narrowing_bind', False ):
+				narrow_name = binds[0].targets[0].id
+				narrow_prev = self._narrowed.get( narrow_name, _UNNARROWED )
+				self._narrowed[narrow_name] = binds[0].narrowed_type
+			try:
+				# self.visit(stmt) returns a bare ast.stmt for most statement
+				# kinds, but a NESTED ast.Match (this method's own visit_Match,
+				# called recursively) returns a list[ast.stmt] instead (its own
+				# subj_assign + if-chain) - unlike ast.NodeTransformer's own
+				# generic_visit(), a manual comprehension doesn't auto-flatten
+				# that, so a naive `[self.visit(stmt) for stmt in case.body]`
+				# would embed the nested match's own 2-element list as ONE
+				# malformed body entry instead of two real statements - only
+				# surfaced once something actually reaches lowering.py's
+				# _lower_stmt, which has no _stmt_list handler ("unsupported
+				# statement", unparsed because ast.unparse() happens to accept a
+				# bare list of stmts too, which is what made this so confusing
+				# to trace)
+				body: list[ast.stmt] = []
+				for stmt in case.body:
+					visited = self.visit( stmt )
+					if isinstance( visited, list ):
+						body.extend( visited )
+					elif visited is not None:
+						body.append( visited )
+			finally:
+				if narrow_name is not None:
+					if narrow_prev is _UNNARROWED:
+						self._narrowed.pop( narrow_name, None )
+					else:
+						self._narrowed[narrow_name] = narrow_prev
 			arm = ast.If( test = test, body = [ *binds, *body ], orelse = [] )
 			ast.copy_location( arm, node )
 			if chain is None:
@@ -2090,6 +2142,16 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			ast.copy_location( narrow_marker, node )
 			narrow_marker.is_narrowing_bind = True
 			narrow_marker.narrows_member_stem = member.stem
+			# member.type here is already the resolved, concrete leaf type
+			# (_resolved_union_members force-resolves/monomorphizes before
+			# this is ever reached) - visit_Match's own caller uses this to
+			# push self._narrowed[name] for the span of this arm's body, so
+			# THIS pass's own union-shaped rewrites (is-None, type(x) is T,
+			# T|None truthiness) agree with cfg.py's lowering-time narrowing
+			# about what `name` currently is, instead of falling back to its
+			# outer declared (still-union) type - see _ReferenceResolver.
+			# __init__'s own comment on self._narrowed
+			narrow_marker.narrowed_type = member.type
 			return test, [ narrow_marker ]
 		payload_expr = ast.Attribute(
 			value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
