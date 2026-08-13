@@ -4961,7 +4961,43 @@ class FunctionLowering:
 			)
 
 		if want_result:
-			dest = self._new_temp( expected_type or target.return_type )
+			target_return_type = target.return_type
+			# a Specialization of a TaggedUnion base (e.g. an unmonomorphized
+			# Result[usize,IndexError]) is just as "already the expected
+			# union" as a TaggedUnion instance itself - Result's own class
+			# body (discovery.py's _parse_ClassDef_TaggedUnion) makes its
+			# base a TaggedUnion, so a bare isinstance( _, TaggedUnion )
+			# check misses every generic-union return that hasn't been
+			# individually monomorphized yet, which target_return_type
+			# usually hasn't been at this point (nothing upstream forces it -
+			# self.lowering.schedule() below only enqueues it for later
+			# compilation)
+			target_return_type_base = target_return_type.base if isinstance( target_return_type, Specialization ) else target_return_type
+			if isinstance( expected_type, TaggedUnion ) and target_return_type is not None and not isinstance( target_return_type_base, ( TaggedUnion, TypeVar )):
+				# a call whose own return type is a plain leaf (e.g. str)
+				# flowing into a T|None-typed slot - dest must be typed as
+				# target_return_type (what the emitted ir.Call's C signature
+				# actually returns), not expected_type, or dest's C
+				# declaration wouldn't match the value assigned into it.
+				# _lower_expr's own post-hoc coercion (_coerce_into_union,
+				# right after this call returns) then wraps it into the union
+				# - see its own comment. Deliberately narrower than "prefer
+				# target_return_type whenever it's concrete": when
+				# target_return_type is ITSELF (a Specialization of) a
+				# TaggedUnion (e.g. a Result[usize,IndexError]-returning call
+				# assigned into an already Result[usize,IndexError]-typed
+				# local), the two are the same union from context but not
+				# necessarily the same object - Specialization instances for
+				# one generic instantiation aren't interned across
+				# independent resolutions, so forcing dest to expected_type
+				# there (the `else` below, unchanged from before this fix)
+				# keeps dest identity-compatible with whatever already
+				# expects it, instead of tripping _coerce_into_union's
+				# identity check with a whole (non-leaf) union value it
+				# would wrongly treat as a leaf needing wrapping
+				dest = self._new_temp( target_return_type )
+			else:
+				dest = self._new_temp( expected_type or target_return_type )
 			self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return dest
 		else:

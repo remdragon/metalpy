@@ -5916,6 +5916,45 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_call_result_as_leaf_coerces_into_union( self ) -> None:
+		# a CALL's return value (not a literal/bare-name/None) flowing into
+		# a T|None slot - the one leaf-value kind d712226 missed. Covers an
+		# AnnAssign RHS, a call argument, and a function's own return
+		# statement. Before the fix, lowering.py's _lower_call shared tail
+		# typed the call's dest as expected_type (the UNION) up front
+		# instead of target.return_type (str, the call's REAL C return
+		# type), so _lower_expr's post-hoc _coerce_into_union never even
+		# ran - dest ended up declared as the union struct while the
+		# emitted call actually assigned a raw str* into it, a real clang
+		# type error ("assigning to 'struct ...NoneType' from incompatible
+		# type 'struct builtins$str *'")
+		self._run( '''
+def make_or_none( n: i32 ) -> str|None:
+	if n < 0:
+		return None
+	return 'ok'.upper()
+
+def helper( x: str|None ) -> bool:
+	return x is None
+
+def main() -> i32:
+	x: str|None = 'hello'.upper()
+	if x is None:
+		return 1
+	if helper( 'world'.upper() ):
+		return 2
+	y: str|None = make_or_none( -1 )
+	if y is not None:
+		return 3
+	z: str|None = make_or_none( 1 )
+	if z is None:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 class MatchArmSameNameNarrowingTests( CompilerTestCase ):
 	''' `match x: case T(x): ...` - the arm rebinds the SAME name as its
