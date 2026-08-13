@@ -6457,6 +6457,192 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class TypeIsInstanceofTests( CompilerTestCase ):
+	''' Phase 3 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
+	`type(x) is T` / `type(x) is not T` / `instanceof(x, T)` syntax
+	recognition. This compiler has no runtime reflection/RTTI (no
+	vtables), so `type(x)` isn't a genuine "evaluates to a first-class
+	type value" feature the way real Python's is - `type` and
+	`instanceof` are never real registered names anywhere in lib/,
+	textually recognized special syntax instead (same posture as
+	move[T]/copy[T]/compiler.sizeof(...) elsewhere).
+
+	type_resolver.py's visit_Compare recognizes `type(x) is T`/`is not T`
+	(either side may be the type() call - `T is type(x)` works too) when
+	x's own static type is a TaggedUnion (or Specialization of one) and T
+	names one of its members, rewriting to the same tag-Cmp shape the
+	pre-existing is/is-not-None rewrite and Phase 2's _match_union_member
+	both already produce (factored to share _resolved_union_members).
+	visit_Call recognizes instanceof(x, T) as sugar for the same thing,
+	rewriting to the equivalent Compare and re-dispatching through
+	self.visit() so it shares the identical codegen.
+
+	Deliberately does NOT narrow x's type inside the if-branch - this
+	phase only ever produces a plain bool, usable anywhere a bool
+	expression is. Narrowing is Phase 4's job (if-statement desugaring to
+	an equivalent match statement, which already narrows via Phase 1). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_type_is_and_is_not( self ) -> None:
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	if type( x ) is str:
+		return 1
+	if type( x ) is not str:
+		return 2
+	return 3
+
+def main() -> i32:
+	if describe( "hi" ) != 1:
+		return 1
+	if describe( None ) != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_type_call_on_either_side( self ) -> None:
+		# T is type(x) - the type() call may be on either side of `is`
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	if str is type( x ):
+		return 1
+	return 0
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		return describe( "hi" ) - 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_instanceof_sugar( self ) -> None:
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	if instanceof( x, str ):
+		return 1
+	return 0
+
+def main() -> i32:
+	if describe( "hi" ) != 1:
+		return 1
+	if describe( None ) != 0:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_usable_as_plain_bool_value( self ) -> None:
+		# not just an if-condition - assignable to a bool local, same as
+		# any other boolean expression
+		self._run( '''
+def describe( x: str|None ) -> bool:
+	b: bool = type( x ) is str
+	return b
+
+def main() -> i32:
+	if not describe( "hi" ):
+		return 1
+	if describe( None ):
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_leaf_type_not_a_union_member_is_a_compile_error( self ) -> None:
+		# a genuine mismatch (int is not a member of str|None) must stay a
+		# real compile error, not get silently passed through - needs a
+		# real call site to force describe()'s own body to actually be
+		# resolved (this compiler resolves function bodies lazily, only
+		# once reachable from main())
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	if type( x ) is int:
+		return 1
+	return 0
+
+def main() -> i32:
+	return describe( "hi" )
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	def test_both_sides_type_call_is_a_compile_error( self ) -> None:
+		# type(x) is type(y) - neither side names a real type, a genuine
+		# misuse of the syntax, must stay a real compile error
+		self._run( '''
+def describe( x: str|None, y: str|None ) -> i32:
+	if type( x ) is type( y ):
+		return 1
+	return 0
+
+def main() -> i32:
+	return describe( "hi", "bye" )
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
+		# real RC-lifetime stress check under repetition, same rigor as
+		# MatchAnonymousUnionTests' own (see that test's own comment for
+		# why the call result is assigned to a plain `str` local first,
+		# not directly into the str|None-typed slot)
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			if type( x ) is str:
+				if x is None:
+					return 1
+			else:
+				return 2
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 	''' regression tests for a real leak in lowering.py's _stmt_Return: a
 	function whose entire body is a single `return SomeConstructor(

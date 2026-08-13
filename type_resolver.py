@@ -1330,7 +1330,31 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return all( self._unify_type_param( type_params, d, a, bindings ) for d, a in zip( declared.args, actual_spec.args ))
 		return True # this parameter position doesn't mention any of type_params - nothing to infer here
 
-	def visit_Call( self, node: ast.Call ) -> ast.Call:
+	def visit_Call( self, node: ast.Call ) -> ast.expr:
+		if (
+			isinstance( node.func, ast.Name ) and node.func.id == 'instanceof'
+			and len( node.args ) == 2 and not node.keywords
+		):
+			# instanceof(x, T) - sugar for `type(x) is T` (see visit_Compare's
+			# own _rewrite_type_is_comparison) - `instanceof` is never a real
+			# registered name (this compiler has no runtime reflection/RTTI -
+			# same posture as move[T]/copy[T]/compiler.sizeof(...) elsewhere),
+			# so rather than duplicate the recognition logic, rewrite to the
+			# equivalent Compare here and re-dispatch through self.visit() -
+			# same technique visit_Match's own nested-match handling uses
+			# (a visit_X method returning an entirely different node kind).
+			# This makes instanceof(x, T) usable anywhere a bool expression
+			# is (an if condition, a boolean AND/OR, assigned to a bool
+			# variable, ...), same as `type(x) is T` itself.
+			compare = ast.Compare(
+				left = ast.Call( func = ast.Name( id = 'type', ctx = ast.Load() ), args = [ node.args[0] ], keywords = [] ),
+				ops = [ ast.Is() ],
+				comparators = [ node.args[1] ],
+			)
+			ast.copy_location( compare, node )
+			ast.copy_location( compare.left, node )
+			ast.copy_location( compare.left.func, node )
+			return self.visit( compare )
 		self.generic_visit( node )
 		resolved = self._try_resolve_generic_call( node )
 		if resolved is None:
@@ -1421,10 +1445,36 @@ class _ReferenceResolver( ast.NodeTransformer ):
 
 	# --- rewrite 1: is/is not None ---
 
+	def _type_call_subject( self, expr: ast.expr ) -> ast.expr|None:
+		''' does `expr` have the shape `type(x)` - a bare, single-argument
+		call to a Name literally spelled `type`? Returns x, or None if not.
+		`type` is never a real registered name in this compiler (no
+		runtime reflection/RTTI - see PLAN_SUBCLASSING_VTABLES_COM.md), so
+		this is textually recognized special syntax, same posture as
+		move[T]/copy[T]/compiler.sizeof(...) elsewhere - NOT an ordinary
+		call needing resolution. '''
+		if isinstance( expr, ast.Call ) and isinstance( expr.func, ast.Name ) and expr.func.id == 'type' and len( expr.args ) == 1 and not expr.keywords:
+			return expr.args[0]
+		return None
+
 	def visit_Compare( self, node: ast.Compare ) -> ast.expr:
 		self.generic_visit( node )
 		if len( node.ops ) != 1 or not isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
 			return node
+		# rewrite 2: type(x) is T / type(x) is not T - see
+		# _type_call_subject's own comment for why this is checked before,
+		# and instead of, the ordinary is/is-not-None rewrite below (a
+		# type() call on either side is never itself a real None/union
+		# value the other rewrite's shape-detection would otherwise try to
+		# make sense of)
+		left_subject = self._type_call_subject( node.left )
+		right_subject = self._type_call_subject( node.comparators[0] )
+		if left_subject is not None or right_subject is not None:
+			if left_subject is not None and right_subject is not None:
+				self.discovery.fail( f'type(...) is type(...): only one side may be a type() call: {ast.unparse(node)}', node )
+			subject_expr = left_subject if left_subject is not None else right_subject
+			type_expr = node.comparators[0] if left_subject is not None else node.left
+			return self._rewrite_type_is_comparison( node, subject_expr, type_expr )
 		left_is_none = isinstance( node.left, ast.Constant ) and node.left.value is None
 		right_is_none = isinstance( node.comparators[0], ast.Constant ) and node.comparators[0].value is None
 		if left_is_none == right_is_none:
@@ -1446,21 +1496,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		base = other_type.base if isinstance( other_type, Specialization ) else other_type
 		if not isinstance( base, TaggedUnion ):
 			return node
-		# base.attributes may still be empty/unresolved here (self.locals'
-		# own values, e.g. from a bare annotation, never force a class body
-		# to actually resolve) - mirror Lowering._tagged_union_shape exactly:
-		# for a Specialization, monomorphize_class already resolves base as
-		# a side effect of building the substituted copy; for a bare union,
-		# force it directly. Either way, UnionStorage.get() below still
-		# always takes the ABSTRACT base, never a monomorphized copy (see
-		# comment above)
-		if isinstance( other_type, Specialization ):
-			members = self.resolver.monomorphizer.monomorphize_class( other_type ).attributes
-		else:
-			self.resolver.ensure_resolved( base )
-			for attr in base.attributes: # each field's own .type is lazily resolved, separate from the class itself - same as UnionStorage.get's/_lower_allocate_fields's identical loop
-				self.resolver.ensure_resolved( attr )
-			members = base.attributes
+		members = self._resolved_union_members( other_type, base )
 		none_type = self.discovery.get_none_type()
 		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
 		if none_member is None:
@@ -1470,6 +1506,38 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		ast.copy_location( tag_expr, node )
 		op = ast.NotEq() if isinstance( node.ops[0], ast.IsNot ) else ast.Eq()
 		result = ast.Compare( left = tag_expr, ops = [ op ], comparators = [ ast.Constant( value = tags[none_member.stem] ) ] )
+		ast.copy_location( result, node )
+		return result
+
+	def _rewrite_type_is_comparison( self, node: ast.Compare, subject_expr: ast.expr, type_expr: ast.expr ) -> ast.expr:
+		''' type(x) is T / type(x) is not T, and instanceof(x, T) (sugar for
+		the same thing, see visit_Call). Only valid when x's own static
+		type is a TaggedUnion (or Specialization of one) and T names one of
+		its members - rewrites to the SAME tag-Cmp shape visit_Compare's
+		own is/is-not-None rewrite and _match_union_member both already
+		produce. This alone only ever yields a plain bool, usable anywhere
+		a bool expression is (an if condition, a boolean AND/OR, assigned
+		to a bool variable, ...) - NARROWING x's type inside an if-branch
+		built from this is Phase 4's job (if-statement desugaring to
+		match), not this rewrite's. '''
+		leaf_type = self._try_resolve_namespace( type_expr )
+		if leaf_type is None:
+			self.discovery.fail( f'type(...) is ...: {ast.unparse(type_expr)} does not name a type: {ast.unparse(node)}', node )
+		subj_type = self._type_of_expr( subject_expr )
+		if subj_type is None:
+			self.discovery.fail( f'type(...) is ...: cannot determine the type of {ast.unparse(subject_expr)}: {ast.unparse(node)}', node )
+		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		if not isinstance( base, TaggedUnion ):
+			self.discovery.fail( f'type(...) is ...: {ast.unparse(subject_expr)} is not a union type: {ast.unparse(node)}', node )
+		members = self._resolved_union_members( subj_type, base )
+		member = next( ( attr for attr in members if attr.type is leaf_type ), None )
+		if member is None:
+			self.discovery.fail( f'{base.qualname} has no member of type {getattr( leaf_type, "qualname", leaf_type )}: {ast.unparse(node)}', node )
+		tag_attr, _data_attr, _payload_cls, tags = self.resolver.union_storage.get( base )
+		tag_expr = ast.Attribute( value = subject_expr, attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, node )
+		op = ast.NotEq() if isinstance( node.ops[0], ast.IsNot ) else ast.Eq()
+		result = ast.Compare( left = tag_expr, ops = [ op ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
 		ast.copy_location( result, node )
 		return result
 
