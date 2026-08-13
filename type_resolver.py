@@ -1685,6 +1685,16 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			subj_assign.match_clears_name = node.subject.id
 		subj_ref = ast.Name( id = subj_name, ctx = ast.Load() )
 		ast.copy_location( subj_ref, node )
+		# __match_subj_N is built directly here, never dispatched through
+		# self.visit()/visit_Assign - so unlike an ordinary Assign, nothing
+		# populates self.locals[subj_name] for free. _match_pattern's own
+		# new `case None:`/`case str(c):` handling (unlike the pre-existing
+		# `case Result.Ok(x):` handling, which reads the union off the
+		# PATTERN's own text, never the subject) needs the subject's own
+		# static type to know which union this leaf/None belongs to - same
+		# type inference visit_Assign already gives an ordinary local for
+		# free, just done explicitly here since this Assign bypasses that path
+		self.locals[subj_name] = self._type_of_expr( node.subject )
 		# only meaningful at this top level (never threaded into
 		# _match_pattern's own recursive calls against an EXTRACTED
 		# payload - see _match_pattern's own comment on why): lets a
@@ -1779,69 +1789,145 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			ast.copy_location( test, node )
 			return test, []
 
+		if isinstance( pattern, ast.MatchSingleton ) and pattern.value is None:
+			# case None: against a T|None-shaped subject - same "does this
+			# union have a None member" logic as visit_Compare's own `x is
+			# None` rewrite, just reached from a match pattern instead of a
+			# Compare. No sub-pattern to recurse into (None never binds
+			# anything), so this is just the tag check alone, unlike the
+			# ast.MatchClass branch below.
+			subj_type = self._type_of_expr( subj_expr )
+			if subj_type is None:
+				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
+			base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+			if not isinstance( base, TaggedUnion ):
+				self.discovery.fail( f'case None: requires a union-typed subject, got {getattr( subj_type, "qualname", subj_type )}: {ast.unparse(pattern)}', node )
+			members = self._resolved_union_members( subj_type, base )
+			none_type = self.discovery.get_none_type()
+			none_member = next( ( attr for attr in members if attr.type is none_type ), None )
+			if none_member is None:
+				self.discovery.fail( f'{base.qualname} has no None member: {ast.unparse(pattern)}', node )
+			tag_attr, _data_attr, _payload_cls, tags = self.resolver.union_storage.get( base )
+			tag_expr = ast.Attribute( value = subj_expr, attr = tag_attr.stem, ctx = ast.Load() )
+			ast.copy_location( tag_expr, node )
+			test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[none_member.stem] ) ] )
+			ast.copy_location( test, node )
+			return test, []
+
 		if not isinstance( pattern, ast.MatchClass ):
 			self.discovery.fail( f'unsupported match pattern: {ast.unparse(pattern)}', node )
 		if pattern.kwd_patterns or len( pattern.patterns ) != 1:
 			self.discovery.fail( f'match patterns support exactly one positional sub-pattern: {ast.unparse(pattern)}', node )
-		if not isinstance( pattern.cls, ast.Attribute ):
-			self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
 
-		owner = self._try_resolve_namespace( pattern.cls.value )
-		if isinstance( owner, TaggedUnion ):
+		if isinstance( pattern.cls, ast.Attribute ):
+			# case Result.Ok(x): - the class path directly NAMES the union
+			# (Result) and the member (Ok) as text - the union comes from
+			# the PATTERN, the subject's own static type is never consulted
+			owner = self._try_resolve_namespace( pattern.cls.value )
+			if not isinstance( owner, TaggedUnion ):
+				self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
 			owner = self.resolver.ensure_resolved( owner )
 			member = next( ( attr for attr in owner.attributes if attr.stem == pattern.cls.attr ), None )
 			if member is None:
 				self.discovery.fail( f'{owner.qualname} has no member {pattern.cls.attr!r}: {ast.unparse(pattern)}', node )
-			tag_attr, data_attr, _payload_cls, tags = self.resolver.union_storage.get( owner )
-			tag_expr = ast.Attribute( value = subj_expr, attr = tag_attr.stem, ctx = ast.Load() )
-			ast.copy_location( tag_expr, node )
-			test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
-			ast.copy_location( test, node )
-			inner_pattern = pattern.patterns[0]
-			if (
-				isinstance( inner_pattern, ast.MatchAs ) and inner_pattern.pattern is None
-				and inner_pattern.name is not None and inner_pattern.name == original_subject_name
-			):
-				# `match x: case T(x):` - the inner pattern reuses the
-				# OUTER SUBJECT's own name (not some unrelated binding that
-				# just happens to share it - original_subject_name is only
-				# ever set by visit_Match's own top-level call, see this
-				# method's own comment). x's own real Variable/storage
-				# never changes - narrow it instead of extracting-and-
-				# binding a same-named-but-distinct value (a real bug this
-				# fixes: the old extract-and-bind here left x's own type
-				# permanently stuck at the union's type, since lowering.py's
-				# _stmt_Assign reuses an EXISTING name's own Variable
-				# unchanged rather than ever narrowing it - confirmed via a
-				# real repro, `case Result.Ok(r):` on a Result[str,MyError]
-				# named r never actually narrowing r to str).
-				# lowering.py's _stmt_Assign recognizes is_narrowing_bind
-				# and calls cfg.narrow(name, member) instead of emitting an
-				# ordinary assignment - see its own comment. Carries only
-				# `member`'s own STEM (a plain string), not the Variable
-				# object itself: `owner` here is resolved from the
-				# TEXTUAL `Result` name, always the ABSTRACT class (T/E
-				# still bare TypeVars) - lowering.py re-resolves the real,
-				# SUBSTITUTED member (str, not T) against the subject
-				# variable's own already-monomorphized type instead, the
-				# same pattern _coerce_into_union already uses.
-				narrow_marker = ast.Assign(
-					targets = [ ast.Name( id = inner_pattern.name, ctx = ast.Store() ) ],
-					value = ast.Constant( value = None ),
-				)
-				ast.copy_location( narrow_marker, node )
-				narrow_marker.is_narrowing_bind = True
-				narrow_marker.narrows_member_stem = member.stem
-				return test, [ narrow_marker ]
-			payload_expr = ast.Attribute(
-				value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
-				attr = f'v_{member.stem}',
-				ctx = ast.Load(),
-			)
-			ast.copy_location( payload_expr, node )
-			inner_test, inner_binds = self._match_pattern( payload_expr, pattern.patterns[0], node )
-			combined = ast.BoolOp( op = ast.And(), values = [ test, inner_test ] )
-			ast.copy_location( combined, node )
-			return combined, inner_binds
+			return self._match_union_member( subj_expr, owner, member, pattern.patterns[0], node, original_subject_name )
+
+		if isinstance( pattern.cls, ast.Name ):
+			# case str(c): / case None-leaf-typed-class(c): - the class
+			# names a LEAF type directly (str), not a union+member path -
+			# resolve the subject's own static union type (unlike the
+			# ast.Attribute branch above, this genuinely needs it) and find
+			# whichever member's .type IS this leaf (same identity lookup
+			# _coerce_into_union already uses), then fall into the SAME
+			# tag-Cmp + payload-GetAttr codegen the ast.Attribute branch
+			# above already builds - just keyed by type identity instead of
+			# member name (see _match_union_member).
+			leaf_type = self._try_resolve_namespace( pattern.cls )
+			if leaf_type is None:
+				self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
+			subj_type = self._type_of_expr( subj_expr )
+			if subj_type is None:
+				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
+			base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+			if not isinstance( base, TaggedUnion ):
+				self.discovery.fail( f'{ast.unparse(pattern)}: match subject is not a union type', node )
+			members = self._resolved_union_members( subj_type, base )
+			member = next( ( attr for attr in members if attr.type is leaf_type ), None )
+			if member is None:
+				self.discovery.fail( f'{base.qualname} has no member of type {getattr( leaf_type, "qualname", leaf_type )}: {ast.unparse(pattern)}', node )
+			return self._match_union_member( subj_expr, base, member, pattern.patterns[0], node, original_subject_name )
 
 		self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
+
+	def _resolved_union_members( self, subj_type: Type, base: TaggedUnion ) -> list[Variable]:
+		''' base.attributes with every field's own .type force-resolved
+		(each field is lazily resolved separately from the class itself -
+		same as UnionStorage.get's/_lower_allocate_fields's identical
+		loop), substituted for a genuine Specialization (T/E still bare
+		TypeVars on the abstract base) via monomorphize_class - mirrors
+		visit_Compare's own `x is None` rewrite and
+		_rewrite_tagged_union_truthiness exactly. '''
+		if isinstance( subj_type, Specialization ):
+			return self.resolver.monomorphizer.monomorphize_class( subj_type ).attributes
+		self.resolver.ensure_resolved( base )
+		for attr in base.attributes:
+			self.resolver.ensure_resolved( attr )
+		return base.attributes
+
+	def _match_union_member( self, subj_expr: ast.expr, union: TaggedUnion, member: Variable, inner_pattern: ast.pattern, node: ast.AST, original_subject_name: str|None ) -> tuple[ast.expr,list[ast.stmt]]:
+		''' shared by both ways of landing on a (union, member) pair to
+		match against - `case Result.Ok(x):` (member resolved by NAME off
+		the pattern's own text) and `case str(c):` (member resolved by
+		TYPE IDENTITY off the subject's own static type). Builds the tag
+		Cmp, then either narrows (same-name reuse against the ORIGINAL
+		subject) or extracts-and-recurses into the sub-pattern against
+		data.v_<member>. '''
+		tag_attr, data_attr, _payload_cls, tags = self.resolver.union_storage.get( union )
+		tag_expr = ast.Attribute( value = subj_expr, attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, node )
+		test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
+		ast.copy_location( test, node )
+		if (
+			isinstance( inner_pattern, ast.MatchAs ) and inner_pattern.pattern is None
+			and inner_pattern.name is not None and inner_pattern.name == original_subject_name
+		):
+			# `match x: case T(x):` - the inner pattern reuses the
+			# OUTER SUBJECT's own name (not some unrelated binding that
+			# just happens to share it - original_subject_name is only
+			# ever set by visit_Match's own top-level call, see
+			# _match_pattern's own comment). x's own real Variable/storage
+			# never changes - narrow it instead of extracting-and-
+			# binding a same-named-but-distinct value (a real bug this
+			# fixes: the old extract-and-bind here left x's own type
+			# permanently stuck at the union's type, since lowering.py's
+			# _stmt_Assign reuses an EXISTING name's own Variable
+			# unchanged rather than ever narrowing it - confirmed via a
+			# real repro, `case Result.Ok(r):` on a Result[str,MyError]
+			# named r never actually narrowing r to str).
+			# lowering.py's _stmt_Assign recognizes is_narrowing_bind
+			# and calls cfg.narrow(name, member) instead of emitting an
+			# ordinary assignment - see its own comment. Carries only
+			# `member`'s own STEM (a plain string), not the Variable
+			# object itself: `union` here may still be the ABSTRACT class
+			# (T/E still bare TypeVars) - lowering.py re-resolves the real,
+			# SUBSTITUTED member (str, not T) against the subject
+			# variable's own already-monomorphized type instead, the
+			# same pattern _coerce_into_union already uses.
+			narrow_marker = ast.Assign(
+				targets = [ ast.Name( id = inner_pattern.name, ctx = ast.Store() ) ],
+				value = ast.Constant( value = None ),
+			)
+			ast.copy_location( narrow_marker, node )
+			narrow_marker.is_narrowing_bind = True
+			narrow_marker.narrows_member_stem = member.stem
+			return test, [ narrow_marker ]
+		payload_expr = ast.Attribute(
+			value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
+			attr = f'v_{member.stem}',
+			ctx = ast.Load(),
+		)
+		ast.copy_location( payload_expr, node )
+		inner_test, inner_binds = self._match_pattern( payload_expr, inner_pattern, node )
+		combined = ast.BoolOp( op = ast.And(), values = [ test, inner_test ] )
+		ast.copy_location( combined, node )
+		return combined, inner_binds

@@ -6242,6 +6242,182 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class MatchAnonymousUnionTests( CompilerTestCase ):
+	''' Phase 2 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md): match
+	support for anonymous unions - `case None:` (ast.MatchSingleton) and
+	`case str(c):` (ast.MatchClass whose .cls is a bare ast.Name, not the
+	pre-existing ast.Attribute-only `case Result.Ok(x):` path) against a
+	T|None-shaped subject. Neither was parseable at all before - `case
+	None:` fell through to "unsupported match pattern", `case str(c):`
+	fell through to "unsupported match pattern class" (pattern.cls wasn't
+	an ast.Attribute). This is a hard prerequisite for Phase 4's own
+	if-to-match desugaring, since the desugar target IS a match statement.
+
+	`case None:` reuses visit_Compare's own "does this union have a None
+	member" tag-comparison logic (_resolved_union_members, factored out of
+	both). `case str(c):` resolves the union off the SUBJECT's own static
+	type (self._type_of_expr, newly wired up for __match_subj_N via
+	visit_Match's self.locals[subj_name] assignment - the pre-existing
+	`case Result.Ok(x):` path never needed this, since it reads the union
+	off the PATTERN's own text instead) and finds the member by TYPE
+	IDENTITY rather than by name, then shares the exact same tag-Cmp +
+	payload-GetAttr codegen (_match_union_member) the named-member path
+	already uses - including Phase 1's same-name narrowing. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_none_and_leaf_type_patterns_both_arms( self ) -> None:
+		# both `case None:` and `case str(s):` exercised for real, against
+		# both a None and a non-None value passed through
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	match x:
+		case None:
+			return 0
+		case str( s ):
+			return 1
+	return 2
+
+def main() -> i32:
+	if describe( None ) != 0:
+		return 1
+	if describe( "hi" ) != 1:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_wildcard_fallback_arm( self ) -> None:
+		# case _: as the fallback arm, no case None: at all - confirms the
+		# leaf-type-identity path doesn't require an exhaustive None arm
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	match x:
+		case str( s ):
+			return 1
+		case _:
+			return 2
+
+def main() -> i32:
+	if describe( "hi" ) != 1:
+		return 1
+	if describe( None ) != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_same_name_reuse_narrows_leaf_type_pattern( self ) -> None:
+		# Phase 1's same-name narrowing, now reachable through the NEW
+		# leaf-type-identity path too (match x: case str(x): ...) - x.
+		# byte_len() only resolves at all if x was actually narrowed to
+		# str, not left at its original str|None type
+		self._run( '''
+def describe( x: str|None ) -> usize:
+	result: usize = 0
+	match x:
+		case None:
+			result = 999
+		case str( x ):
+			result = x.byte_len()
+	return result
+
+def main() -> i32:
+	if describe( "hello" ) != 5:
+		return 1
+	if describe( None ) != 999:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_leaf_type_not_a_union_member_is_a_compile_error( self ) -> None:
+		# a genuine mismatch (int is not a member of str|None) must stay a
+		# real compile error, not get silently passed through - needs a
+		# real call site to force describe()'s own body to actually be
+		# resolved (this compiler resolves function bodies lazily, only
+		# once reachable from main())
+		self._run( '''
+def describe( x: str|None ) -> i32:
+	match x:
+		case int( n ):
+			return 1
+		case _:
+			return 2
+
+def main() -> i32:
+	return describe( "hi" )
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
+		# real RC-lifetime stress check under repetition, same rigor as
+		# MatchArmSameNameNarrowingTests' own. 'hello'.upper() is assigned
+		# to a plain `str`-typed local FIRST, then that local assigned into
+		# the str|None-typed slot - NOT `x: str|None = 'hello'.upper()`
+		# directly, which hits a separate, unrelated, pre-existing bug
+		# (lowering.py's _lower_call shared tail using expected_type
+		# directly for a call's own destination type instead of the
+		# call's real return type, skipping union-coercion entirely -
+		# confirmed via git-independent tracing, flagged separately, out
+		# of scope here)
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			match x:
+				case None:
+					return 1
+				case str( c ):
+					if c.byte_len() != 5:
+						return 2
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 	''' regression tests for a real leak in lowering.py's _stmt_Return: a
 	function whose entire body is a single `return SomeConstructor(
