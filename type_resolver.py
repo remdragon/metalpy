@@ -1505,6 +1505,37 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return expr.args[0]
 		return None
 
+	# type(x) as a general, first-class type-reference-producing intrinsic
+	# (usable anywhere a type is expected, not just inside an is/instanceof
+	# comparison) was investigated - and deliberately deferred - alongside
+	# adding compiler.sizeof(x)'s value-argument support (lowering.py's
+	# _static_type_of_value_expr). Findings:
+	#   - the ONLY existing meaning of type(x) is the textual recognition
+	#     above, consumed exclusively by visit_Compare's is/is-not rewrite
+	#     and visit_Call's instanceof(x, T) sugar - both compile-time-only,
+	#     both require x's static type to be a TaggedUnion. There is no
+	#     runtime type(x) callable, and no runtime reflection/type-object
+	#     value anywhere in this compiler to build one on top of.
+	#   - compiler.sizeof(x)'s value-argument fix already covers the
+	#     motivating case (a self-escape exemption for "type-only" self
+	#     use - self's static type, without evaluating self) directly:
+	#     compiler.sizeof(self) reads self.type at compile time and never
+	#     makes self an instruction operand, so it's self-escape-safe with
+	#     zero changes to cfg.py. compiler.sizeof(type(self)) would just be
+	#     a redundant second spelling of the same thing.
+	#   - type(self) is T is ALSO already self-escape-safe today, for the
+	#     one case where it's legal syntax (self must be TaggedUnion-typed,
+	#     which an RCClass's self never is) - it rewrites to `self.tag ==
+	#     N`, a GetAttr(obj=self, ...) read, and GetAttr.obj is already
+	#     excluded from check_self_escape's operand list.
+	# Conclusion: no new type(x) intrinsic added. If a real future
+	# consumer needs a type-reference-position spelling of "x's own static
+	# type" outside an is/instanceof comparison, the extension point is
+	# here: generalize this method's callers beyond visit_Compare/
+	# visit_Call to also let _try_resolve_namespace (lowering.py) or this
+	# class's own _try_resolve_namespace recognize the type(x) call shape
+	# and substitute _type_of_expr(x)/_static_type_of_value_expr(x).
+
 	def visit_Compare( self, node: ast.Compare ) -> ast.expr:
 		self.generic_visit( node )
 		if len( node.ops ) != 1 or not isinstance( node.ops[0], ( ast.Is, ast.IsNot )):

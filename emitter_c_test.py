@@ -1646,6 +1646,74 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
+class SizeofValueArgumentRealCompileTests( RCClassTestCase ):
+	''' real compile+run coverage for compiler.sizeof(x)'s value-argument
+	path (lowering.py's _static_type_of_value_expr) - unlike the IR-shape
+	assertions in lowering_test.py, these confirm the generated C
+	`sizeof(...)` expression actually agrees with the type-argument
+	spelling at runtime, for both self and an ordinary local. '''
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exe exited {run_result.returncode}, expected {expected_exit}' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_sizeof_self_matches_sizeof_type_argument( self ) -> None:
+		self._run( '\n'.join([
+			'class Foo:',
+			'	a: i32',
+			'	b: i64',
+			'',
+			'	def check( self ) -> i32:',
+			'		if compiler.sizeof( self ) != compiler.sizeof( Foo ):',
+			'			return 1',
+			'		return 0',
+			'',
+			'def main() -> i32:',
+			'	f: Foo = Foo( a = 1, b = 2 )',
+			'	return f.check()',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_sizeof_local_variable_matches_sizeof_scalar_type( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	v: u32 = 0',
+			'	if compiler.sizeof( v ) != compiler.sizeof( u32 ):',
+			'		return 1',
+			'	if compiler.sizeof( v ) != 4:',
+			'		return 2',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 # str/bytes literal static-baking (Phase 6) is detected via the REAL
 # qualname 'builtins.str'/'builtins.bytes' (see the plan's grounding facts) -
 # unlike every other fixture in this file, this means the fixture class

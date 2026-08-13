@@ -2282,6 +2282,142 @@ class Tests( unittest.TestCase ):
 		usize = self.discovery.get_intrinsics()['usize']
 		self.assertIs( sizeofs[0].dest.type, usize )
 
+	# --- compiler.sizeof(x) (value argument) ------------------------------------
+
+	def test_compiler_sizeof_of_a_local_variable_folds_to_const( self ) -> None:
+		# compiler.sizeof(x) where x is a plain scalar-typed local - same
+		# ir.Const fold as compiler.sizeof(u32) itself, just resolved
+		# through the value's own static type instead of a type name
+		code = '\n'.join([
+			'def main() -> None:',
+			'	v: u32 = 1',
+			'	x: usize = compiler.sizeof( v )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		consts = [ i.src.value for i in fn.instructions if isinstance( i, ir.Assign ) ]
+		self.assertEqual( consts, [ 1, 4 ] )
+
+	def test_compiler_sizeof_of_self_emits_sizeof_instruction( self ) -> None:
+		# compiler.sizeof(self) inside an ordinary method - same ir.SizeOf
+		# shape as compiler.sizeof(Foo) itself, just resolved through
+		# self's own static type instead of the class name
+		code = '\n'.join([
+			'class Foo:',
+			'	a: i32',
+			'',
+			'	def size( self ) -> usize:',
+			'		return compiler.sizeof( self )',
+			'',
+			'def main() -> None:',
+			'	return',
+		])
+		mod = self._import( code )
+		fn = self.compiler._lower( self._method( mod, 'Foo', 'size' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		sizeofs = [ i for i in fn.instructions if isinstance( i, ir.SizeOf ) ]
+		self.assertEqual( len( sizeofs ), 1 )
+		foo_cls = mod.get_local( 'Foo' )
+		self.assertIs( sizeofs[0].type, foo_cls )
+
+	def test_compiler_sizeof_of_self_is_self_escape_safe_before_construction_completes( self ) -> None:
+		# compiler.sizeof(self) reads only self's static TYPE - it never
+		# lowers/evaluates self itself (see _static_type_of_value_expr),
+		# so self never becomes an operand of any emitted instruction and
+		# this compiles cleanly even before every required attribute is
+		# initialized, unlike an ordinary use of self (see the self-escape
+		# tests below, e.g. test_self_escape_via_plain_argument_is_a_compile_error)
+		code = '\n'.join([
+			'class Bar:',
+			'	a: i32',
+			'',
+			'	def __init__( self ) -> None:',
+			'		x: usize = compiler.sizeof( self )',
+			'		self.a = 1',
+			'',
+			'def main() -> None:',
+			'	return',
+		])
+		mod = self._import( code )
+		fn = self.compiler._lower( self._method( mod, 'Bar', '__init__' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		sizeofs = [ i for i in fn.instructions if isinstance( i, ir.SizeOf ) ]
+		self.assertEqual( len( sizeofs ), 1 )
+		bar_cls = mod.get_local( 'Bar' )
+		self.assertIs( sizeofs[0].type, bar_cls )
+
+	def test_compiler_sizeof_of_an_attribute_chain( self ) -> None:
+		# compiler.sizeof(self.field) - resolved via the same non-emitting
+		# type lookup, one Attribute hop deeper; no GetAttr instruction is
+		# emitted for the read - the value itself is never evaluated
+		code = '\n'.join([
+			'class Inner:',
+			'	v: i32',
+			'',
+			'class Outer:',
+			'	inner: Inner',
+			'',
+			'	def size( self ) -> usize:',
+			'		return compiler.sizeof( self.inner )',
+			'',
+			'def main() -> None:',
+			'	return',
+		])
+		mod = self._import( code )
+		fn = self.compiler._lower( self._method( mod, 'Outer', 'size' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( [ i for i in fn.instructions if isinstance( i, ir.GetAttr ) ], [] )
+		sizeofs = [ i for i in fn.instructions if isinstance( i, ir.SizeOf ) ]
+		self.assertEqual( len( sizeofs ), 1 )
+		inner_cls = mod.get_local( 'Inner' )
+		self.assertIs( sizeofs[0].type, inner_cls )
+
+	def test_compiler_sizeof_of_narrowed_name_uses_narrowed_type( self ) -> None:
+		# inside a `case U.A(u):` arm reusing the subject's own name, u is
+		# narrowed (cfg.py's narrow(), see _stmt_Assign's is_narrowing_bind
+		# handling) to A's own leaf type (u8) - compiler.sizeof(u) should
+		# use that narrowed scalar type, not U's own (larger) union type
+		code = '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	B: i64',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	match u:',
+			'		case U.A( u ):',
+			'			x: usize = compiler.sizeof( u )',
+			'		case U.B( u ):',
+			'			pass',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		self.assertIsInstance( assigns['x'], ir.Const )
+		self.assertEqual( assigns['x'].value, 1 ) # u8's own size, not U's (tag + i64 payload)
+
+	def test_compiler_sizeof_of_a_call_expression_is_a_compile_error( self ) -> None:
+		# calling a function just to inspect its return type would require
+		# actually evaluating it - not supported; make() itself must never
+		# be lowered/called just to answer compiler.sizeof(...)
+		code = '\n'.join([
+			'def make() -> i32:',
+			'	return 1',
+			'',
+			'def main() -> None:',
+			'	x: usize = compiler.sizeof( make() )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertIn( 'argument must be a type or a value with a known type', self.discovery.errors.errors[0] )
+		self.assertEqual( [ i for i in fn.instructions if isinstance( i, ir.Call ) ], [] )
+
 	# --- compiler.refcount(x) ---------------------------------------------------
 
 	def test_compiler_refcount_emits_refcount_instruction( self ) -> None:

@@ -2107,18 +2107,48 @@ class FunctionLowering:
 		finally:
 			self._arithmetic_mode.pop()
 
+	def _static_type_of_value_expr( self, node: ast.expr ) -> Type|None:
+		# compile-time-only: the static type of a value-shaped expression
+		# (Name/Attribute) - no IR emitted, x itself is never evaluated or
+		# lowered (unlike _lower_expr, which would emit a real GetAttr for
+		# e.g. self.field, or even execute a call, just to inspect its
+		# .type). Used by compiler.sizeof(x)'s value-argument fallback so
+		# that e.g. compiler.sizeof(self) never turns self into a real
+		# instruction operand - self is read only as self.type here, so
+		# cfg.py's check_self_escape (which only inspects instruction
+		# operands) never sees it, even mid-__init__ before construction
+		# completes
+		if isinstance( node, ast.Name ):
+			name = self.lowering.discovery.find_name( node.id, node )
+			if not isinstance( name, Variable ):
+				return None
+			member = self._cfg.narrowed_member( node.id )
+			return member.type if member is not None else name.type
+		if isinstance( node, ast.Attribute ):
+			owner_type = self._static_type_of_value_expr( node.value )
+			if owner_type is None:
+				return None
+			return self.lowering._attr_lookup( owner_type, node.attr, node ).type
+		return None
+
 	def _lower_compiler_sizeof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.sizeof(T) is a compile-time constant whenever T is
 		# already concrete - it folds directly to an ir.Const, no runtime
-		# computation involved. T is a TYPE reference, not a value, so its
-		# argument is resolved via _try_resolve_namespace (same as a
-		# generic call's own [T] argument), not _lower_expr (which would
-		# reject it - "not a value" - since a bare type isn't a Variable)
+		# computation involved. T is normally a TYPE reference, resolved
+		# via _try_resolve_namespace (same as a generic call's own [T]
+		# argument); compiler.sizeof(x) also accepts a plain VALUE
+		# expression (self, a local, self.field, ...) - _try_resolve_namespace
+		# either fails to resolve those (Attribute chains) or resolves to a
+		# Variable/Parameter rather than a Type (bare names, since every
+		# declared param/local is registered by discovery.find_name too),
+		# so falling back to _static_type_of_value_expr's own non-emitting
+		# type lookup covers both without ever lowering/evaluating x itself
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.sizeof(...) takes exactly one type argument: {ast.unparse(node)}', node )
-		target_type = self.lowering._try_resolve_namespace( node.args[0] )
+		resolved = self.lowering._try_resolve_namespace( node.args[0] )
+		target_type = resolved if isinstance( resolved, Type ) else self._static_type_of_value_expr( node.args[0] )
 		if target_type is None:
-			self.lowering.discovery.fail( f'compiler.sizeof(...) argument must be a type: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail( f'compiler.sizeof(...) argument must be a type or a value with a known type: {ast.unparse(node)}', node )
 		if isinstance( target_type, TypeVar ):
 			self.lowering.discovery.fail(
 				f'compiler.sizeof({target_type.stem}) requires a concrete type - {target_type.qualname} is still an '
