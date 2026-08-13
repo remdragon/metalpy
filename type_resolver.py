@@ -17,8 +17,6 @@ from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
 
-_UNNARROWED = object() # sentinel: "this name had no entry in _ReferenceResolver._narrowed before this arm" - distinct from any real Type (including None-as-a-value, which never appears here anyway) so visit_Match's push/pop can tell "restore to absent" apart from "restore to some previously-narrowed type"
-
 
 def _union_member_ast_path( union: TaggedUnion, member_stem: str ) -> ast.Attribute:
 	''' build an ast.Attribute path for a union's member reference in a
@@ -966,18 +964,28 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
 			self.locals['self'] = fn.cls
 		self._label_id = 0
-		# parallel to self.locals, but for a name CURRENTLY narrowed to a
-		# union member's leaf type within the lexical span of a `case T(x):`
-		# arm that reuses the union's own name (see visit_Match's push/pop
-		# around a narrowing arm's body) - mirrors cfg.py's own _narrowed
-		# dict/narrow()/unnarrow(), but at this AST-rewriting-pass level,
-		# so every union-shaped rewrite below (is-None, type(x) is T,
-		# T|None truthiness) that goes through _type_of_expr sees the
-		# NARROWED leaf type instead of the name's outer declared type -
-		# see the comment on _match_union_member's own narrow_marker for
-		# the bug this closes (a second union-shaped check on an already-
-		# narrowed name inside the same arm)
-		self._narrowed: dict[str,Type] = {}
+		# parallel to self.locals, but for a name CURRENTLY known to be one
+		# of a non-empty SET of possible union members within the lexical
+		# span of a match/if construct that narrowed it (see visit_Match's
+		# own whole-dict snapshot/restore around each case, and its own
+		# post-loop merge) - mirrors cfg.py's own _narrowed dict/narrow()/
+		# unnarrow(), but at this AST-rewriting-pass level, so every
+		# union-shaped rewrite below (is-None, type(x) is T, T|None
+		# truthiness) that goes through _type_of_expr sees the NARROWED
+		# leaf type instead of the name's outer declared type when the set
+		# has collapsed to exactly one possibility - see the comment on
+		# _match_union_member's own narrow_marker for the bug this closes
+		# (a second union-shaped check on an already-narrowed name inside
+		# the same arm). A single-arm narrow always starts as a one-
+		# element list; merging two DISAGREEING but both-still-possible
+		# arms (see visit_Match's own _merge_case_narrowing) unions them
+		# into a longer list rather than discarding the fact entirely -
+		# `_type_of_expr` only ever returns a narrowed TYPE for the
+		# single-element case (a multi-element set has no one Type to
+		# report, so a plain Name expression just falls back to its
+		# declared type - a bounded, deliberate scope cut, see the plan's
+		# own note on why this doesn't need a full UnionView).
+		self._narrowed: dict[str,list[Type]] = {}
 
 	# --- best-effort "type of this expression", Name/Attribute/Call only ---
 
@@ -1016,8 +1024,9 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return None
 			return self.discovery.find_name_or_none( name )
 		if isinstance( node, ast.Name ):
-			if node.id in self._narrowed:
-				return self._narrowed[node.id]
+			narrowed = self._narrowed.get( node.id )
+			if narrowed is not None and len( narrowed ) == 1:
+				return narrowed[0]
 			return self.locals.get( node.id )
 		if isinstance( node, ast.Attribute ):
 			owner_type = self._type_of_expr( node.value )
@@ -1562,6 +1571,33 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		leaf_type = self._try_resolve_namespace( type_expr )
 		if leaf_type is None:
 			self.discovery.fail( f'type(...) is ...: {ast.unparse(type_expr)} does not name a type: {ast.unparse(node)}', node )
+		if isinstance( subject_expr, ast.Name ):
+			narrowed = self._narrowed.get( subject_expr.id )
+			if narrowed is not None:
+				# x is already known to be one of a (possibly multi-element,
+				# see visit_Match's own _merge_case_narrowing) SET of
+				# possible members - a redundant type(x) is T check on an
+				# already-narrowed name must fold to a constant here, not
+				# fall into the ordinary union-type validation below
+				# (_type_of_expr only returns a narrowed leaf TYPE for the
+				# single-element case, so an already-fully-narrowed x would
+				# otherwise hit "not a union type" - the exact bug this
+				# closes). Foldable whenever the answer is DEFINITE: a
+				# single remaining possibility (matches T or doesn't,
+				# either way is certain), or T simply isn't among several
+				# remaining possibilities at all (definitely not it).
+				# T being ONE OF several remaining possibilities is
+				# genuinely ambiguous - falls through to the ordinary path
+				# below, which (since _type_of_expr won't return a narrowed
+				# leaf for a multi-element set) resolves against x's own
+				# full declared union, same as if it were never narrowed -
+				# safe, just not maximally precise
+				matches = any( t is leaf_type for t in narrowed )
+				if len( narrowed ) == 1 or not matches:
+					is_not = isinstance( node.ops[0], ast.IsNot )
+					result = ast.Constant( value = matches != is_not )
+					ast.copy_location( result, node )
+					return result
 		subj_type = self._type_of_expr( subject_expr )
 		if subj_type is None:
 			self.discovery.fail( f'type(...) is ...: cannot determine the type of {ast.unparse(subject_expr)}: {ast.unparse(node)}', node )
@@ -1898,15 +1934,78 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# name (`match x: case T(x): ...`) be recognized as narrowing x
 		# itself, rather than binding a same-named-but-distinct value
 		original_subject_name = node.subject.id if isinstance( node.subject, ast.Name ) else None
+		entry_narrowed = dict( self._narrowed )
+
+		# Phase 5/6 exhaustiveness pre-pass (narrowing surviving PAST the
+		# whole match, not just confined to one arm - see steady-dancing-
+		# haven.md's own "Trap 1"): a case's own empty `orelse=[]` (built
+		# below) is only semantically "there's really nothing else this
+		# could be" when either (a) it's a literal wildcard (test=True
+		# already), or (b) it's the LAST case and every case together
+		# (this one plus all before it) provably covers every one of the
+		# union's own members - otherwise it's a genuine "nothing matched"
+		# fallthrough that's a real, competing (unnarrowed) path. Only the
+		# LAST case's own orelse is ever actually empty (every earlier
+		# case's orelse is immediately overwritten by the next case being
+		# chained in), so only it needs this check. subj_type/base/members
+		# are computed here (not left to each case's own _match_pattern
+		# call) so this pre-pass and the main loop below agree on the
+		# exact same resolved member objects (identity matters - see
+		# _resolve_case_member's own comment on "owner is not base").
+		subj_type = self.locals.get( subj_name )
+		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		members = self._resolved_union_members( subj_type, base ) if isinstance( base, TaggedUnion ) else []
+		last_is_wildcard = bool( node.cases ) and isinstance( node.cases[-1].pattern, ast.MatchAs ) and node.cases[-1].pattern.pattern is None
+		last_guaranteed = last_is_wildcard
+		wildcard_narrow_member: Variable|None = None
+		if isinstance( base, TaggedUnion ) and node.cases and not last_is_wildcard:
+			resolved = [ self._resolve_case_member( base, members, case.pattern ) for case in node.cases ]
+			if resolved[-1] is not None and all( m is not None for m in resolved ):
+				distinct_ids = { id( m ) for m in resolved }
+				if len( distinct_ids ) == len( resolved ) == len( members ):
+					last_guaranteed = True
+		elif last_is_wildcard and isinstance( base, TaggedUnion ) and len( members ) == 2 and len( node.cases ) >= 2:
+			# a bare, UNNAMED wildcard specifically (case _:, not a named
+			# capture case y: - a named capture means "rebind the whole
+			# union", not "prove the other member") as the LAST of exactly
+			# the union's own 2 members, one already matched by some prior
+			# case - the union's OTHER member is then exactly what the
+			# wildcard arm must hold. Declines (stays None) for anything
+			# else: a 3+-member union (single-member narrowing can't
+			# express "one of several remaining possibilities" - the
+			# abandoned UnionView design was for exactly that, not
+			# rebuilt here), or when the prior cases don't cleanly resolve
+			# to exactly one distinct member.
+			wildcard_pattern = node.cases[-1].pattern
+			if isinstance( wildcard_pattern, ast.MatchAs ) and wildcard_pattern.name is None:
+				prior_resolved = [ self._resolve_case_member( base, members, case.pattern ) for case in node.cases[:-1] ]
+				non_none = [ m for m in prior_resolved if m is not None ]
+				if len( non_none ) == 1 and len( { id( m ) for m in non_none } ) == 1:
+					others = [ m for m in members if m is not non_none[0] ]
+					if len( others ) == 1:
+						wildcard_narrow_member = others[0]
 
 		chain: ast.If|None = None
 		tail: ast.If|None = None
-		for case in node.cases:
+		singleton_body: list[ast.stmt]|None = None
+		case_infos: list[tuple[bool,dict[str,list[Type]]]] = []
+		for case_index, case in enumerate( node.cases ):
 			if case.guard is not None:
 				self.discovery.fail( f'match guards (case ... if ...) are not yet supported: {ast.unparse(case.pattern)}', node )
 			test, binds = self._match_pattern( subj_ref, case.pattern, node, original_subject_name )
+			is_last = case_index == len( node.cases ) - 1
+			flatten_this_case = is_last and last_guaranteed
+			if (
+				flatten_this_case and wildcard_narrow_member is not None and original_subject_name is not None
+				and isinstance( case.pattern, ast.MatchAs ) and case.pattern.pattern is None and case.pattern.name is None
+			):
+				# the wildcard's own _match_pattern call above returned
+				# binds=[] (a true, unnamed wildcard never binds anything on
+				# its own) - override with a real narrow-marker targeting the
+				# DEDUCED other member, computed in the pre-pass above
+				binds = [ self._build_narrow_marker( original_subject_name, wildcard_narrow_member, node ) ]
 			# a narrowing arm (see _match_union_member's own narrow_marker)
-			# pushes name -> its narrowed leaf type into self._narrowed for
+			# pushes name -> [its narrowed leaf type] into self._narrowed for
 			# exactly the span of THIS case's own body - every union-shaped
 			# rewrite below (visit_Compare's is-None check,
 			# _rewrite_type_is_comparison, _rewrite_tagged_union_truthiness)
@@ -1914,16 +2013,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# first, so a SECOND union-shaped check on the same
 			# already-narrowed name inside this same arm sees the narrowed
 			# leaf type instead of stale outer union type (the gap this
-			# closes). Saved/restored rather than just popped, mirroring
-			# cfg.py's own snapshot/restore of _narrowed - matters for a
-			# nested match/if inside this arm's body that narrows some
-			# OTHER already-narrowed name back to itself in a sibling arm
-			narrow_name: str|None = None
-			narrow_prev: Type|object = _UNNARROWED
+			# closes). Whole-dict snapshot/restore (not just the one key
+			# THIS case's own narrow-marker touches) - matters once a
+			# NESTED construct inside this case's own body can survive PAST
+			# its own boundary (this phase's whole point): a single-key
+			# restore would leak whatever that nested construct narrowed
+			# into the NEXT sibling case
+			case_entry_narrowed = dict( self._narrowed )
 			if len( binds ) == 1 and getattr( binds[0], 'is_narrowing_bind', False ):
-				narrow_name = binds[0].targets[0].id
-				narrow_prev = self._narrowed.get( narrow_name, _UNNARROWED )
-				self._narrowed[narrow_name] = binds[0].narrowed_type
+				self._narrowed[ binds[0].targets[0].id ] = [ binds[0].narrowed_type ]
 			try:
 				# self.visit(stmt) returns a bare ast.stmt for most statement
 				# kinds, but a NESTED ast.Match (this method's own visit_Match,
@@ -1945,20 +2043,80 @@ class _ReferenceResolver( ast.NodeTransformer ):
 						body.extend( visited )
 					elif visited is not None:
 						body.append( visited )
+				terminates = bool( case.body ) and isinstance( case.body[-1], ( ast.Return, ast.Break, ast.Continue ))
+				case_infos.append( ( terminates, dict( self._narrowed )))
 			finally:
-				if narrow_name is not None:
-					if narrow_prev is _UNNARROWED:
-						self._narrowed.pop( narrow_name, None )
-					else:
-						self._narrowed[narrow_name] = narrow_prev
-			arm = ast.If( test = test, body = [ *binds, *body ], orelse = [] )
+				self._narrowed = case_entry_narrowed
+			flattened_body = [ *binds, *body ]
+			if flatten_this_case:
+				# this case's own test is PROVABLY true whenever it's
+				# reached (a literal wildcard, or the last of an
+				# exhaustive set of explicit member-cases) - wrapping it
+				# in its own `ast.If(test=True, ..., orelse=[])` would give
+				# it a vacuous, ALWAYS-empty "false branch" that a
+				# reconciliation pass has no way to tell apart from a
+				# genuine "nothing matched" fallthrough, silently
+				# discarding this arm's own narrowing before it ever
+				# reaches the real, enclosing join point - splice its body
+				# directly instead, exactly as if it were unconditional
+				# (which, per the reasoning above, it provably is)
+				if chain is None:
+					singleton_body = flattened_body
+				else:
+					tail.orelse = flattened_body
+				break
+			arm = ast.If( test = test, body = flattened_body, orelse = [] )
 			ast.copy_location( arm, node )
 			if chain is None:
 				chain = arm
 			else:
 				tail.orelse = [ arm ]
 			tail = arm
+		if not last_guaranteed:
+			# the match isn't provably exhaustive - a real "nothing
+			# matched" fallthrough exists and must participate in the
+			# merge below as its own, genuine (unnarrowed) candidate path,
+			# mirroring lowering.py's _stmt_If's own false_end = entry_
+			# bindings default for a missing orelse - otherwise a
+			# non-exhaustive match would wipe out narrowing that had
+			# nothing to do with it
+			case_infos.append( ( False, entry_narrowed ))
+		self._narrowed = self._merge_case_narrowing( case_infos )
+		if singleton_body is not None:
+			return [ subj_assign, *singleton_body ]
 		return [ subj_assign, chain ] if chain is not None else [ subj_assign ]
+
+	def _merge_case_narrowing( self, case_infos: list[tuple[bool,dict[str,list[Type]]]] ) -> dict[str,list[Type]]:
+		''' the N-ary, type_resolver.py-level analogue of cfg.py's own
+		merge_if narrowed-reconciliation - survivors = every case that
+		DOESN'T terminate (return/break/continue as its own last
+		statement); if every case terminates, nothing reaches whatever
+		follows the match at all (dead code past there - empty is the
+		safe/correct answer). A name survives into the merged, POST-match
+		state only if narrowed on EVERY surviving case - its value becomes
+		the UNION (dedup by identity) of what each survivor narrowed it
+		to, not just an identical-only intersection: if one arm proves x
+		is int and another (also surviving) proves x is str, code reaching
+		past the match genuinely could be either - "one of int|str" is
+		real, actionable information (rules out every OTHER member, e.g.
+		None), not something to discard just because the arms disagree
+		about WHICH ONE. '''
+		survivors = [ d for terminates, d in case_infos if not terminates ]
+		if not survivors:
+			return {}
+		merged: dict[str,list[Type]] = dict( survivors[0] )
+		for other in survivors[1:]:
+			next_merged: dict[str,list[Type]] = {}
+			for name, types in merged.items():
+				if name not in other:
+					continue
+				combined = list( types )
+				for t in other[name]:
+					if not any( t is existing for existing in combined ):
+						combined.append( t )
+				next_merged[name] = combined
+			merged = next_merged
+		return merged
 
 	def generic_visit_expr( self, node: ast.expr ) -> ast.expr:
 		# generic_visit() itself returns the node (mutated in place, for an
@@ -2096,6 +2254,66 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self.resolver.ensure_resolved( attr )
 		return base.attributes
 
+	def _resolve_case_member( self, base: TaggedUnion, members: list[Variable], pattern: ast.pattern ) -> Variable|None:
+		''' a SILENT (never calls discovery.fail) probe: does `pattern`
+		resolve to one specific member of `base` (whose own resolved
+		members are `members`)? Mirrors _match_pattern's own
+		ast.MatchSingleton(None)/ast.MatchClass resolution logic, but as a
+		pure lookup with no codegen and no error reporting - used by
+		visit_Match's own pre-pass to determine exhaustiveness (does the
+		LAST case's own coverage, combined with every PRIOR case, provably
+		account for every one of the union's own members - Trap 1's own
+		generalization beyond a literal wildcard). "can't tell" is always
+		a safe answer here (None), never a guess - a case whose pattern
+		names a DIFFERENT union entirely (owner is not base) also returns
+		None, since counting it toward THIS union's own coverage would be
+		a real bug (silently dropping a still-needed tag check). '''
+		if isinstance( pattern, ast.MatchSingleton ) and pattern.value is None:
+			none_type = self.discovery.get_none_type()
+			return next( ( attr for attr in members if attr.type is none_type ), None )
+		if not isinstance( pattern, ast.MatchClass ) or pattern.kwd_patterns or len( pattern.patterns ) != 1:
+			return None
+		if isinstance( pattern.cls, ast.Attribute ):
+			owner = self._try_resolve_callable_namespace( pattern.cls.value )
+			if owner is not base:
+				return None
+			return next( ( attr for attr in members if attr.stem == pattern.cls.attr ), None )
+		if isinstance( pattern.cls, ast.Name ):
+			leaf_type = self._try_resolve_callable_namespace( pattern.cls )
+			if leaf_type is None:
+				return None
+			return next( ( attr for attr in members if attr.type is leaf_type ), None )
+		return None
+
+	def _build_narrow_marker( self, name: str, member: Variable, node: ast.AST ) -> ast.Assign:
+		''' the narrow-marker Assign shape - factored out of
+		_match_union_member (its own same-name-reuse branch) so
+		visit_Match's own wildcard/negation narrowing (Phase 6 - a
+		wildcard arm narrowed to the union's OTHER member, deduced from a
+		sibling case, rather than resolved from the pattern's own text)
+		can build the identical shape without duplicating it. `member.type`
+		must already be the resolved, concrete leaf type (both callers
+		force-resolve/monomorphize before reaching here) - lowering.py's
+		_stmt_Assign recognizes is_narrowing_bind and calls cfg.narrow(name,
+		member) instead of emitting an ordinary assignment; narrowed_type
+		is what _ReferenceResolver.__init__'s own self._narrowed uses to
+		keep THIS pass's own union-shaped rewrites in sync with cfg.py's
+		lowering-time narrowing (see its own comment). narrows_member_stem
+		carries only the STEM (a plain string), not the Variable object
+		itself - lowering.py re-resolves the real, substituted member
+		against the subject's own already-monomorphized type instead, same
+		pattern _coerce_into_union uses (member.type here may still be
+		reached via an ABSTRACT class with T/E still bare TypeVars). '''
+		narrow_marker = ast.Assign(
+			targets = [ ast.Name( id = name, ctx = ast.Store() ) ],
+			value = ast.Constant( value = None ),
+		)
+		ast.copy_location( narrow_marker, node )
+		narrow_marker.is_narrowing_bind = True
+		narrow_marker.narrows_member_stem = member.stem
+		narrow_marker.narrowed_type = member.type
+		return narrow_marker
+
 	def _match_union_member( self, subj_expr: ast.expr, union: TaggedUnion, member: Variable, inner_pattern: ast.pattern, node: ast.AST, original_subject_name: str|None ) -> tuple[ast.expr,list[ast.stmt]]:
 		''' shared by both ways of landing on a (union, member) pair to
 		match against - `case Result.Ok(x):` (member resolved by NAME off
@@ -2135,24 +2353,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# SUBSTITUTED member (str, not T) against the subject
 			# variable's own already-monomorphized type instead, the
 			# same pattern _coerce_into_union already uses.
-			narrow_marker = ast.Assign(
-				targets = [ ast.Name( id = inner_pattern.name, ctx = ast.Store() ) ],
-				value = ast.Constant( value = None ),
-			)
-			ast.copy_location( narrow_marker, node )
-			narrow_marker.is_narrowing_bind = True
-			narrow_marker.narrows_member_stem = member.stem
-			# member.type here is already the resolved, concrete leaf type
-			# (_resolved_union_members force-resolves/monomorphizes before
-			# this is ever reached) - visit_Match's own caller uses this to
-			# push self._narrowed[name] for the span of this arm's body, so
-			# THIS pass's own union-shaped rewrites (is-None, type(x) is T,
-			# T|None truthiness) agree with cfg.py's lowering-time narrowing
-			# about what `name` currently is, instead of falling back to its
-			# outer declared (still-union) type - see _ReferenceResolver.
-			# __init__'s own comment on self._narrowed
-			narrow_marker.narrowed_type = member.type
-			return test, [ narrow_marker ]
+			return test, [ self._build_narrow_marker( inner_pattern.name, member, node ) ]
 		payload_expr = ast.Attribute(
 			value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
 			attr = f'v_{member.stem}',

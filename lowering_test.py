@@ -1530,12 +1530,16 @@ class Tests( unittest.TestCase ):
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		# one Cmp per case (tag == ordinal), one GetAttr per case for the
-		# payload's `data` field plus one more for the specific `v_member`
-		# field (2 each), one JumpIfFalse per case's if, one else-Label,
-		# one Jump+Label for the if/elif split
-		self.assertEqual( kinds.count( 'Cmp' ), 2 )
-		self.assertEqual( kinds.count( 'JumpIfFalse' ), 4 ) # 2 booland short-circuits + 2 if-tests
+		# Foo has exactly 2 members and both are explicitly matched here -
+		# type_resolver.py's visit_Match now recognizes this as provably
+		# exhaustive (Trap 1's own generalization - see steady-dancing-
+		# haven.md) and splices the LAST case's own body in unconditionally
+		# instead of chaining it behind a redundant tag check: only ONE
+		# real Cmp (case 0's own tag == 0), one booland short-circuit +
+		# one if-test JumpIfFalse for case 0 - case 1 (Baz) has no test at
+		# all anymore, reached unconditionally once case 0's own check fails
+		self.assertEqual( kinds.count( 'Cmp' ), 1 )
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 2 ) # case 0's own booland short-circuit + if-test
 
 	def test_match_union_construction_and_extraction_round_trip( self ) -> None:
 		# construct with one member, match should take that member's arm
@@ -1557,7 +1561,13 @@ class Tests( unittest.TestCase ):
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		getattrs = [ i for i in fn.instructions if isinstance( i, ir.GetAttr ) ]
-		self.assertEqual( [ g.attr for g in getattrs ], [ 'tag', 'data', 'v_Bar' ] )
+		# Foo has exactly ONE member (Bar) and this is the match's only
+		# case - provably exhaustive (Trap 1's own generalization) with
+		# nothing else it could possibly be, so type_resolver.py's
+		# visit_Match splices the whole case in unconditionally: no `tag`
+		# GetAttr/Cmp at all anymore, just the payload extraction
+		# (data.v_Bar) - see test_match_union_shape's own comment
+		self.assertEqual( [ g.attr for g in getattrs ], [ 'data', 'v_Bar' ] )
 
 	def test_match_result_ok_err_shape( self ) -> None:
 		# Result is a real @union now - Result.Ok(...)/Err(...) match

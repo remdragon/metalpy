@@ -346,7 +346,14 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertNotIn( 'match ', src )
 		self.assertNotIn( 'case ', src )
 		self.assertIn( 'if __match_subj_0.tag == 0', src )
-		self.assertIn( 'elif __match_subj_0.tag == 1', src )
+		# Foo has exactly 2 members and both are explicitly matched here -
+		# provably exhaustive (Trap 1's own generalization, see steady-
+		# dancing-haven.md), so the LAST case (Baz) is spliced in as a
+		# plain, unconditional else instead of a redundant `elif
+		# __match_subj_0.tag == 1` - there's nothing else it could be once
+		# case 0's own check has already failed
+		self.assertNotIn( 'elif __match_subj_0.tag == 1', src )
+		self.assertIn( 'else:', src )
 		self.assertIn( 'x = __match_subj_0.data.v_Bar', src )
 		self.assertIn( 'z = __match_subj_0.data.v_Baz', src )
 
@@ -365,7 +372,11 @@ class TypeResolutionTests( unittest.TestCase ):
 		fn = self._resolved_fn( mod, 'main' )
 		src = ast.unparse( fn.node )
 		self.assertNotIn( 'match ', src )
-		self.assertIn( 'if True', src )
+		# a bare wildcard (case rest:) as the match's own only case is
+		# provably exhaustive (Trap 1's own generalization) - the whole
+		# arm splices in unconditionally instead of behind its own
+		# vacuous `if True:` wrapper, since it's the only possibility
+		self.assertNotIn( 'if True', src )
 		self.assertIn( 'rest = __match_subj_0', src )
 
 	def test_match_guard_is_rejected( self ) -> None:

@@ -158,7 +158,7 @@ class CFGState:
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
 		self.bindings: Bindings = {}
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
-		self._narrowed: dict[str,Variable] = {} # name -> the UNION's own matched member Variable (its .type is the narrowed leaf, .stem is the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead" - same reasoning a plain field access (self.somefield) never needs its own incref until something aliases it into a new binding
+		self._narrowed: dict[str,list[Variable]] = {} # name -> the non-empty set of the UNION's own members it could still be (each .type the narrowed leaf, .stem the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead", and ONLY when the set has collapsed to exactly one member - see narrowed_member(). A single narrow() call always starts as a one-element list; merge_if's own soft-merge can grow it (two disagreeing-but-both-still-possible branches union together rather than discarding the fact) or drop it (a name narrowed on only SOME surviving paths)
 		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
 		self.prologue_instructions: list[ir.Instruction] = []
 		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
@@ -326,10 +326,12 @@ class CFGState:
 		T`/`instanceof(x, T)` check, or a `match x: case T(x):` arm. Reads
 		of `name` from here until this scope's own restore() (snapshot()
 		captures/restore() reverts this exactly like _unchecked_results
-		above - confined to the branch, never surviving past it in this
-		version) get rewritten to read through the union's own payload -
-		see lowering.py's _expr_Name. '''
-		self._narrowed[name] = member
+		above - confined to the branch unless merge_if's own reconciliation
+		lets it survive past it) get rewritten to read through the union's
+		own payload - see lowering.py's _expr_Name/narrowed_member(). A
+		single narrow() call is always exactly one member - merge_if's own
+		soft-merge is what may later widen this to more than one. '''
+		self._narrowed[name] = [ member ]
 
 	def unnarrow( self, name: str ) -> None:
 		''' called whenever `name` is reassigned (ordinary Assign/AnnAssign)
@@ -339,7 +341,24 @@ class CFGState:
 		self._narrowed.pop( name, None )
 
 	def narrowed_member( self, name: str ) -> Variable | None:
-		return self._narrowed.get( name )
+		''' the SINGLE member `name` is currently known to hold, or None -
+		either because it isn't narrowed at all, or because it's narrowed
+		to more than one still-possible member (merge_if's own soft-merge
+		unioning two disagreeing-but-both-still-possible branches together
+		- see its own docstring) - there's no one payload field to read in
+		that case, so _expr_Name correctly falls back to treating it as
+		unnarrowed for VALUE-reading purposes (safe, just not maximally
+		optimized; the fact that some OTHER member is now excluded simply
+		isn't exploited any further than this). '''
+		members = self._narrowed.get( name )
+		return members[0] if members is not None and len( members ) == 1 else None
+
+	def narrowed_snapshot( self ) -> dict[str,list[Variable]]:
+		''' a defensive copy for lowering.py to capture alongside bindings/
+		unchecked_results() around if/loop orchestration (see merge_if()'s
+		own true_end_narrowed/false_end_narrowed params) - mirrors
+		unchecked_results()'s own identical purpose. '''
+		return dict( self._narrowed )
 
 	# --- unchecked Result tracking ----------------------------------------
 
@@ -416,6 +435,7 @@ class CFGState:
 		*,
 		entry_results: set[str] = frozenset(), true_end_results: set[str] = frozenset(), false_end_results: set[str] = frozenset(),
 		true_terminates: bool = False, false_terminates: bool = False,
+		true_end_narrowed: dict[str,list[Variable]] | None = None, false_end_narrowed: dict[str,list[Variable]] | None = None,
 	) -> tuple[list[ir.Instruction],list[ir.Instruction],list[str]]:
 		''' called after lowering.py has already restore()'d back to the
 		if's own entry snapshot (so self.bindings/self._epilogue_stack are
@@ -481,7 +501,19 @@ class CFGState:
 		as a separate parallel set rather than folded into Bindings/_Binding
 		because a Result[i32,SomeEnum] has no RC leaves and so has no entry
 		in Bindings at all (see assign()'s own comment) - Bindings is an
-		RC-only mechanism by design. '''
+		RC-only mechanism by design.
+
+		true_end_narrowed/false_end_narrowed are the narrowing analogue -
+		captured by lowering.py via narrowed_snapshot() at the same points
+		it captures unchecked_results() - but reconciled DIFFERENTLY: a
+		narrowed fact is an optimization/ergonomic convenience, not a
+		correctness invariant like OwnState or unchecked-Result tracking,
+		so disagreement is never an error, just silently dropped (see
+		_merge_narrowed_soft's own docstring). No entry_narrowed parameter
+		is needed - unlike bindings (which needs entry state to distinguish
+		"already live" from "needs a fresh push") or results (whose own
+		error path checks entry_results), a narrowed fact's survival past
+		the join depends only on the two end-states. '''
 		true_instructions: list[ir.Instruction] = []
 		false_instructions: list[ir.Instruction] = []
 		removed: list[str] = []
@@ -498,12 +530,15 @@ class CFGState:
 		if true_terminates or false_terminates:
 			survivor = None
 			survivor_results = None
+			survivor_narrowed = None
 			if true_terminates and not false_terminates:
 				survivor = false_end
 				survivor_results = false_end_results
+				survivor_narrowed = false_end_narrowed
 			elif false_terminates and not true_terminates:
 				survivor = true_end
 				survivor_results = true_end_results
+				survivor_narrowed = true_end_narrowed
 			if survivor is not None:
 				for name, binding in survivor.items():
 					prior = entry_bindings.get( name )
@@ -511,9 +546,10 @@ class CFGState:
 					reestablish( name, binding, already_live )
 			# both terminate -> nothing reaches the join at all (dead code
 			# past here, same reasoning as the RC side above) - empty is the
-			# safe choice; one terminates -> only the survivor's own results
-			# state can possibly reach the join
+			# safe choice; one terminates -> only the survivor's own results/
+			# narrowed state can possibly reach the join
 			self._unchecked_results = set( survivor_results ) if survivor_results is not None else set()
+			self._narrowed = dict( survivor_narrowed ) if survivor_narrowed is not None else {}
 			return true_instructions, false_instructions, removed
 		for name in set( true_end ) | set( false_end ):
 			in_true = name in true_end
@@ -549,7 +585,42 @@ class CFGState:
 				false_instructions += decref
 			removed.append( name )
 		self._merge_results( entry_results, true_end_results, false_end_results, ctx )
+		self._merge_narrowed_soft( true_end_narrowed, false_end_narrowed )
 		return true_instructions, false_instructions, removed
+
+	def _merge_narrowed_soft( self, true_end_narrowed: dict[str,list[Variable]] | None, false_end_narrowed: dict[str,list[Variable]] | None ) -> None:
+		''' the narrowing analogue of _merge_results, for the neither-
+		branch-terminates case (the terminates case is handled directly in
+		merge_if() - only the survivor's own narrowed state matters there,
+		same as for bindings/results). UNLIKE _merge_results (a hard
+		CompileError on disagreement) or reestablish() (an indeterminate-
+		state error), disagreement here is never an error: a name narrowed
+		on only ONE branch is just dropped (nothing to merge), but a name
+		narrowed on BOTH branches - even to DIFFERENT members - is UNIONED
+		together rather than discarded: if the true branch proves x is int
+		and the false branch (also surviving) proves x is str, code past
+		the join genuinely could be either - "one of int|str" is real,
+		actionable information (rules out every OTHER member, e.g. None),
+		not something to throw away just because the two branches disagree
+		about WHICH one. Identity comparison (`is`, not structural
+		equality) for dedup - the same member Variable object is expected
+		back from two independent resolutions of the same union/member
+		pair (monomorphize_class's own spec.monomorphized caching, and a
+		plain TaggedUnion's stable base.attributes list, both guarantee
+		this - see the plan's own Trap 4 regression test). '''
+		true_end_narrowed = true_end_narrowed or {}
+		false_end_narrowed = false_end_narrowed or {}
+		merged: dict[str,list[Variable]] = {}
+		for name, true_members in true_end_narrowed.items():
+			false_members = false_end_narrowed.get( name )
+			if false_members is None:
+				continue
+			combined = list( true_members )
+			for m in false_members:
+				if not any( m is existing for existing in combined ):
+					combined.append( m )
+			merged[name] = combined
+		self._narrowed = merged
 
 	def _merge_results( self, entry_results: set[str], true_end_results: set[str], false_end_results: set[str], ctx: str ) -> None:
 		''' the unchecked-Result analogue of merge_if()'s own binding

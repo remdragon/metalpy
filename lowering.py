@@ -2809,6 +2809,7 @@ class FunctionLowering:
 		true_captured = self._instructions
 		true_end = dict( self._cfg.bindings )
 		true_end_results = self._cfg.unchecked_results()
+		true_end_narrowed = self._cfg.narrowed_snapshot()
 		# return/break/continue as a branch's own last statement means
 		# that branch never reaches the if's join point at all - see
 		# merge_if()'s own comment on why that has to be treated
@@ -2832,11 +2833,13 @@ class FunctionLowering:
 			false_captured = self._instructions
 			false_end = dict( self._cfg.bindings )
 			false_end_results = self._cfg.unchecked_results()
+			false_end_narrowed = self._cfg.narrowed_snapshot()
 			false_terminates = bool( node.orelse ) and isinstance( node.orelse[-1], ( ast.Return, ast.Break, ast.Continue ))
 		else:
 			false_captured = []
 			false_end = dict( entry_snapshot.bindings )
 			false_end_results = set( entry_snapshot.results )
+			false_end_narrowed = dict( entry_snapshot.narrowed )
 			false_terminates = False
 
 		self._cfg.restore( entry_snapshot )
@@ -2846,6 +2849,7 @@ class FunctionLowering:
 				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
 				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
 				true_terminates = true_terminates, false_terminates = false_terminates,
+				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
 			)
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )

@@ -7021,6 +7021,279 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class NarrowingSurvivalTests( CompilerTestCase ):
+	''' Phases 5-6 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
+	narrowing surviving PAST its own match/if statement, not just confined
+	to one arm - the piece explicitly deferred at the end of Phase 4.
+
+	cfg.py's merge_if now reconciles _narrowed the same way it already
+	reconciles bindings/unchecked-Results: when exactly one branch
+	terminates (return/break/continue), the survivor's own narrowed state
+	carries forward; when neither terminates, two branches that BOTH
+	narrowed the same name - even to DIFFERENT members - UNION together
+	(x proven int on one path, str on the other, is real information: it
+	rules out every OTHER member) rather than being discarded just because
+	they disagree about which one specifically.
+
+	type_resolver.py's visit_Match separately recognizes when a match is
+	PROVABLY exhaustive (a literal wildcard, or explicit cases that
+	collectively cover every one of the union's own members) and splices
+	the final arm's body in unconditionally instead of chaining it behind
+	a now-provably-redundant tag check - without this, merge_if's own
+	correct-per-its-own-rules soft merge would see an ambiguous, empty
+	"else" as a competing (unnarrowed) path and drop the narrowing before
+	it ever reached the real join point. For a 2-member union specifically,
+	an UNNAMED wildcard (case _:, not a named capture) also gets narrowed
+	to the union's own remaining OTHER member, deduced from its sibling
+	case - this is what makes `if isinstance(x, int): return` (no else at
+	all) narrow x to str afterward. Real compile-and-run tests, full suite
+	green (bash + PowerShell). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_headline_example_isinstance_return_no_else( self ) -> None:
+		# the user's own motivating example: no else at all - x is
+		# narrowed to str for the rest of the function purely because the
+		# int branch terminates. instanceof(x, T) (not Python's real
+		# isinstance, which this compiler doesn't recognize) is this
+		# compiler's own sugar for type(x) is T - see Phase 3
+		self._run( '''
+def describe( x: i32|str ) -> usize:
+	with compiler.wrap_arithmetic:
+		if instanceof( x, i32 ):
+			return 999
+		return x.byte_len()
+
+def main() -> i32:
+	if describe( "hello" ) != 5:
+		return 1
+	if describe( 42 ) != 999:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_both_arms_explicit_one_terminates( self ) -> None:
+		# a real match, both members named explicitly (no wildcard at
+		# all) - the surviving (non-terminating) arm's own narrowing still
+		# carries forward, exercising merge_if's own survivor-wins path
+		# directly rather than the wildcard/negation trick
+		self._run( '''
+def describe( x: i32|str ) -> usize:
+	with compiler.wrap_arithmetic:
+		match x:
+			case i32( x ):
+				return 999
+			case str( x ):
+				pass
+		return x.byte_len()
+
+def main() -> i32:
+	if describe( "hello" ) != 5:
+		return 1
+	if describe( 42 ) != 999:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_disagreeing_arms_union_instead_of_discard( self ) -> None:
+		# neither arm terminates and they narrow to DIFFERENT members
+		# (i32 vs str) - the merged post-match state is neither "i32
+		# only" nor "unnarrowed", it's "one of i32|str" (None ruled out) -
+		# a subsequent type(x) is i32 check must still resolve correctly
+		# (i32 IS one of the remaining possibilities, ambiguous, so this
+		# falls through to an ordinary tag check against x's own full
+		# declared type rather than being folded outright - the important
+		# thing is it doesn't error as "not a union type", which is
+		# exactly what happened before the union-instead-of-discard fix)
+		self._run( '''
+def describe( x: i32|str|None ) -> i32:
+	with compiler.wrap_arithmetic:
+		match x:
+			case i32( x ):
+				pass
+			case str( x ):
+				pass
+			case _:
+				return -1
+		if type( x ) is i32:
+			return 1
+		return 2
+
+def main() -> i32:
+	if describe( 5 ) != 1:
+		return 1
+	if describe( "hi" ) != 2:
+		return 2
+	if describe( None ) != -1:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_no_explicit_else_still_narrows( self ) -> None:
+		# no else clause at all - the implicit "fell through" path IS the
+		# match's own second arm once the union is fully covered
+		self._run( '''
+def describe( x: i32|str ) -> usize:
+	with compiler.wrap_arithmetic:
+		result: usize = 0
+		if type( x ) is i32:
+			return 999
+		return x.byte_len()
+
+def main() -> i32:
+	if describe( "hello" ) != 5:
+		return 1
+	if describe( 1 ) != 999:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_named_wildcard_does_not_narrow( self ) -> None:
+		# case y: (a NAMED capture) means "rebind the whole union", not
+		# "prove the other member" - unlike case _: (bare, unnamed), this
+		# must NOT narrow: y.byte_len() must still fail to resolve since y
+		# stays union-typed (i32 has no byte_len())
+		self._run( '''
+def describe( x: i32|str ) -> usize:
+	match x:
+		case i32( x ):
+			return 999
+		case y:
+			return y.byte_len()
+
+def main() -> i32:
+	return describe( "hi" )
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_three_member_union_wildcard_declines_gracefully( self ) -> None:
+		# a 3+-member union can't express "one of the two remaining
+		# possibilities" with the single-member narrowing design (that's
+		# the abandoned UnionView scope) - the wildcard arm correctly
+		# stays UNNARROWED rather than guessing, which is still a real,
+		# valid compile (not an error). Both a str AND an i32 argument are
+		# passed at real call sites (not just i32) - a union member that's
+		# never actually constructed anywhere reachable hits a separate,
+		# pre-existing, unrelated scheduling gap (confirmed independent of
+		# this work: reproduces for an i32|str|bool parameter with no
+		# narrowing/matching involved at all) where its own RC cleanup
+		# code fails to compile against an incomplete forward declaration
+		self._run( '''
+def describe( x: i32|str|bool ) -> i32:
+	if type( x ) is i32:
+		return 1
+	return 0
+
+def main() -> i32:
+	if describe( 5 ) != 1:
+		return 1
+	return describe( "hi" )
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_todo_elif_chain_worked_example( self ) -> None:
+		# TODO.txt's own original worked example (now with real syntax) -
+		# an elif chain over a 3-member union desugars into nested
+		# matches, each arm narrowing independently within its own scope;
+		# a 3-member union can't narrow the FINAL else (see the 3-member
+		# decline test above) but the two explicit arms still work
+		# correctly on their own
+		self._run( '''
+def describe( x: i32|str|bool ) -> i32:
+	with compiler.wrap_arithmetic:
+		if type( x ) is i32:
+			return x + 100
+		elif type( x ) is str:
+			return i32( x.byte_len() )
+		else:
+			return -1
+
+def main() -> i32:
+	if describe( 5 ) != 105:
+		return 1
+	if describe( "hello" ) != 5:
+		return 2
+	if describe( True ) != -1:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
+		# real RC-lifetime stress check under repetition, same rigor as
+		# every other RC test this session established - narrowing
+		# surviving past the if (via type(x) is str, not a plain `is
+		# None` check - Phase 5/6's own narrowing-survival mechanism
+		# doesn't extend to the ordinary is-None rewrite, only type(x) is
+		# T/instanceof and match), then reading the narrowed str repeatedly
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			if type( x ) is str:
+				pass
+			else:
+				return 1
+			if x.byte_len() != 5:
+				return 2
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 	''' regression tests for a real leak in lowering.py's _stmt_Return: a
 	function whose entire body is a single `return SomeConstructor(
