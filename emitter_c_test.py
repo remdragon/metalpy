@@ -6058,12 +6058,12 @@ def main() -> i32:
 		# resolves at all if the outer narrowing survived the inner
 		# match's own push/pop cycle
 		# NB: outcome is ASSIGNED to an outer variable rather than returned
-		# directly from inside the match arms - a `return` statement inside
-		# a match-arm-desugared if-branch hits a separate, pre-existing
-		# "undeclared label" epilogue-generation bug (confirmed present
-		# without any of this session's changes, and reproducing even for
-		# ordinary, non-narrowing match arms) - out of scope here, flagged
-		# separately.
+		# directly from inside the match arms - kept that way to isolate
+		# THIS test's own narrowing concern from a `return` statement's own
+		# epilogue-label handling (see MatchArmSameNameNarrowingTests's own
+		# test_return_directly_inside_match_arm_compiles_and_runs, a
+		# formerly-dangling-label bug now fixed by cfg.py's
+		# enter_branch()/exit_branch()).
 		self._run( '''
 class MyError:
 	pass
@@ -6137,6 +6137,47 @@ def main() -> i32:
 				return 2
 		with compiler.wrap_arithmetic:
 			i += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_return_directly_inside_match_arm_compiles_and_runs( self ) -> None:
+		# a `return` as a match arm's own body (not assigned to an outer
+		# variable first) - regression test for a real "undeclared label"
+		# compile failure: the arm's own payload binding (s/e below) pushes
+		# a fresh RC epilogue entry, and current_epilogue_label() used to
+		# hand the `return` that entry's own label as its shared jump
+		# target without knowing _stmt_If's own restore() was about to
+		# silently discard that entry (branch-local, never merged past the
+		# arm) - leaving a `goto` into a label build_epilogue_ladder()
+		# never emitted. cfg.py's enter_branch()/exit_branch() now confine
+		# it the same way enter_loop()/exit_loop() already did for a
+		# loop-local RC entry, forcing an inline unwind instead of a
+		# dangling shared label.
+		self._run( '''
+class MyError:
+	pass
+
+def make( n: i32 ) -> Result[str,MyError]:
+	if n > 0:
+		return Result.Ok( "hello" )
+	return Result.Err( MyError() )
+
+def helper( n: i32 ) -> usize:
+	r: Result[str,MyError] = make( n )
+	match r:
+		case Result.Ok( s ):
+			return s.byte_len()
+		case Result.Err( e ):
+			return 0
+
+def main() -> i32:
+	if helper( 1 ) != 5:
+		return 1
+	if helper( -1 ) != 0:
+		return 2
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

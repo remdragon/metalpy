@@ -155,7 +155,7 @@ class CFGState:
 		self._new_label = new_label
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
-		self._loop_entry_depths: list[int] = [] # see enter_loop()/exit_loop()
+		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
 		self.bindings: Bindings = {}
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._narrowed: dict[str,Variable] = {} # name -> the UNION's own matched member Variable (its .type is the narrowed leaf, .stem is the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead" - same reasoning a plain field access (self.somefield) never needs its own incref until something aliases it into a new binding
@@ -285,11 +285,36 @@ class CFGState:
 		runtime). Tracked here (not just left to lowering.py) so
 		current_epilogue_label() can tell "is the topmost live entry
 		confined to a loop I'm still inside lowering" without every one of
-		its many call sites threading loop context through by hand. '''
-		self._loop_entry_depths.append( stack_depth )
+		its many call sites threading loop context through by hand. Shares
+		_confinement_depths with enter_branch()/exit_branch() below - from
+		current_epilogue_label()'s point of view an if/match arm not yet
+		merged and a loop body not yet closed are the same hazard (restore()
+		is about to silently drop entries pushed since the same kind of
+		snapshot), so one combined stack (read via min(), not just the top -
+		see current_epilogue_label()'s own comment) covers both without
+		needing to know which kind of scope is which. '''
+		self._confinement_depths.append( stack_depth )
 
 	def exit_loop( self ) -> None:
-		self._loop_entry_depths.pop()
+		self._confinement_depths.pop()
+
+	def enter_branch( self, stack_depth: int ) -> None:
+		''' called by lowering.py's own _stmt_If, bracketing one if/elif/
+		match-arm branch's own lowering - stack_depth is the SAME
+		entry_snapshot.stack_depth restore() will truncate back to once this
+		branch is fully lowered. Confirmed by a real repro (`return` as a
+		match arm's own body: the arm's payload binding - e.g. `case
+		Result.Ok(s): return s.byte_len()` - pushes a fresh RC entry that
+		current_epilogue_label() would otherwise happily hand out as the
+		return's own shared jump target, only for _stmt_If's own restore()
+		to silently discard that entry before build_epilogue_ladder() ever
+		runs, leaving a `goto` into a label that's never declared). See
+		enter_loop()'s own comment for why this shares _confinement_depths
+		rather than getting its own separate stack. '''
+		self._confinement_depths.append( stack_depth )
+
+	def exit_branch( self ) -> None:
+		self._confinement_depths.pop()
 
 	# --- union narrowing (compile-time only - see _narrowed's own comment) -
 
@@ -712,36 +737,46 @@ class CFGState:
 		only option there.
 
 		ALSO None whenever the topmost active entry is confined to a loop
-		body still being lowered (pushed at or after the innermost active
-		enter_loop()'s own depth, and not flag-guarded - see restore()'s
-		own comment on why a plain RC entry doesn't survive a loop body's
-		exit but a defer/errdefer one does): that entry's own label would
-		never actually get emitted anywhere (build_epilogue_ladder() only
-		ever walks the stack that SURVIVES to the function's real end -
-		restore() silently drops confined entries once the loop body
-		lowering that pushed them finishes, well before then), so jumping
-		into it here would be a dangling reference to a label that's never
-		declared - confirmed by a real repro, not just reasoning (an early
-		return from inside a while loop, past a locally-declared RC value,
-		nested inside a with-block). return_()'s own full, inline unwind
-		(which walks the ENTIRE stack directly, needing no label of its
-		own at all) is the only correct option for a loop-confined entry,
-		exactly like the returned-operand case just above. '''
+		body or an if/elif/match-arm branch still being lowered (pushed at
+		or after the SHALLOWEST active enter_loop()/enter_branch() depth,
+		and not flag-guarded - see restore()'s own comment on why a plain RC
+		entry doesn't survive a loop body's or a branch's own exit but a
+		defer/errdefer one does): that entry's own label would never
+		actually get emitted anywhere (build_epilogue_ladder() only ever
+		walks the stack that SURVIVES to the function's real end - restore()
+		silently drops confined entries once the loop body/branch lowering
+		that pushed them finishes, well before then), so jumping into it
+		here would be a dangling reference to a label that's never declared -
+		confirmed by real repros, not just reasoning (an early return from
+		inside a while loop, past a locally-declared RC value, nested inside
+		a with-block; a `return` as a match arm's own body, past that arm's
+		own payload binding). return_()'s own full, inline unwind (which
+		walks the ENTIRE stack directly, needing no label of its own at all)
+		is the only correct option for a confined entry, exactly like the
+		returned-operand case just above.
+
+		The shallowest (min(), not just the innermost/top-of-stack) active
+		depth is what matters, not just the most-recently-entered scope: an
+		entry pushed inside an OUTER not-yet-merged branch/loop, before some
+		INNER branch/loop was even entered, is still doomed by the OUTER
+		scope's own eventual restore() even though it predates the inner
+		one - using only the top of the stack would miss exactly that
+		entry and hand out a label for it anyway. '''
 		if returned_operand is not None and any(
 			not entry.cancelled and entry.operand is returned_operand
 			for entry in self._epilogue_stack
 		):
 			return None
-		# None (not 0) when no loop is currently being lowered - the whole
-		# confinement check below must be a no-op then (every entry is
+		# None (not 0) when no loop/branch is currently being lowered - the
+		# whole confinement check below must be a no-op then (every entry is
 		# function-scoped), not "confined below index 0" (which would
 		# wrongly treat EVERY entry as confined, since every valid index
 		# is >= 0)
-		loop_floor = self._loop_entry_depths[-1] if self._loop_entry_depths else None
+		confinement_floor = min( self._confinement_depths ) if self._confinement_depths else None
 		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
 			if entry.cancelled:
 				continue
-			if loop_floor is not None and not entry.is_flag_guarded and i >= loop_floor:
+			if confinement_floor is not None and not entry.is_flag_guarded and i >= confinement_floor:
 				return None
 			return entry.name
 		return None

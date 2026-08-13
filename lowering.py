@@ -2740,11 +2740,21 @@ class FunctionLowering:
 		entry_snapshot = self._cfg.snapshot()
 		outer_instructions = self._instructions
 		self._instructions = []
-		for stmt in node.body:
-			try:
-				self._lower_stmt( stmt )
-			except CompileError:
-				continue
+		# see cfg.py's CFGState.enter_branch's own docstring: lets
+		# current_epilogue_label() recognize an RC entry pushed while
+		# lowering THIS branch (e.g. a match arm's own payload binding) as
+		# branch-confined - restore(), called once this branch's fully
+		# lowered, silently drops it, so a `return` inside here must never
+		# be handed that entry's own label as a shared jump target
+		self._cfg.enter_branch( entry_snapshot.stack_depth )
+		try:
+			for stmt in node.body:
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+		finally:
+			self._cfg.exit_branch()
 		true_captured = self._instructions
 		true_end = dict( self._cfg.bindings )
 		true_end_results = self._cfg.unchecked_results()
@@ -2759,11 +2769,15 @@ class FunctionLowering:
 		if node.orelse:
 			self._cfg.restore( entry_snapshot )
 			self._instructions = []
-			for stmt in node.orelse:
-				try:
-					self._lower_stmt( stmt )
-				except CompileError:
-					continue
+			self._cfg.enter_branch( entry_snapshot.stack_depth )
+			try:
+				for stmt in node.orelse:
+					try:
+						self._lower_stmt( stmt )
+					except CompileError:
+						continue
+			finally:
+				self._cfg.exit_branch()
 			false_captured = self._instructions
 			false_end = dict( self._cfg.bindings )
 			false_end_results = self._cfg.unchecked_results()
