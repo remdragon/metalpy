@@ -2527,7 +2527,7 @@ class FunctionLowering:
 		test = self._lower_expr( node.test, bool_cls )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
-		self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -2535,25 +2535,36 @@ class FunctionLowering:
 		for instr in back_edge_instructions:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
-		# Phase 7: type_resolver.py's visit_While stamps this when the
-		# loop's own condition is a type(x) is T/is not T/instanceof(x, T)
-		# check against a bare-Name, union-typed x - the ONLY way to reach
-		# end_label is via the condition going false, which (for a 2-member
-		# union, or unconditionally for the `is not` form) uniquely proves
-		# x's own type from here on, regardless of how many iterations the
-		# body actually ran (the condition is checked at least once even
-		# for a zero-iteration loop). restore() above already reverted
-		# _narrowed to the loop's own entry state - this overlays the new,
-		# real post-loop fact on top of that, same as _stmt_Assign's own
-		# is_narrowing_bind handling overlays a fresh narrow() call
-		exit_name = getattr( node, 'exit_narrows_name', None )
-		if exit_name is not None:
-			member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
-			self._cfg.narrow( exit_name, member )
+		# Phase 7/8: reconcile every way execution can actually reach
+		# end_label - the loop's own natural (condition-false) exit, PLUS
+		# every break_narrowed record_break_narrowed() collected while
+		# lowering the body above. `while True:` (test still the literal
+		# Constant(True) it started as - type_resolver.py's visit_While
+		# only ever rewrites it away from that shape when it recognizes a
+		# real type(x) is T/is not T condition, never for a bare `True`)
+		# has NO real condition-false exit at all - passing None here (not
+		# a real candidate) is what keeps merge_loop_exits from wrongly
+		# treating that unreachable path as competing with, and
+		# suppressing, narrowing that only survives via an explicit break.
+		# For an ordinary loop, type_resolver.py's own exit_narrows_name/
+		# exit_narrows_member_stem (Phase 7 - the ONLY way to reach
+		# end_label is via the condition going false, which for a 2-member
+		# union, or unconditionally for the `is not` form, uniquely proves
+		# x's own type from here on) overlays loop_snapshot's own narrowed
+		# state to build the natural-exit candidate.
+		is_while_true = isinstance( node.test, ast.Constant ) and node.test.value is True
+		natural_exit_narrowed: dict[str,list[Variable]] | None = None
+		if not is_while_true:
+			natural_exit_narrowed = dict( loop_snapshot.narrowed )
+			exit_name = getattr( node, 'exit_narrows_name', None )
+			if exit_name is not None:
+				member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
+				natural_exit_narrowed[exit_name] = [ member ]
+		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
-	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> None:
+	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> list[dict[str,list[Variable]]]:
 		self._loop_depth += 1
 		self._loop_labels.append(( continue_label, break_label, loop_snapshot ))
 		# see cfg.py's CFGState.enter_loop's own docstring: lets
@@ -2563,6 +2574,7 @@ class FunctionLowering:
 		# `return` from inside here ever pointed at it, would never
 		# actually get emitted)
 		self._cfg.enter_loop( loop_snapshot.stack_depth )
+		break_narrowed: list[dict[str,list[Variable]]] = []
 		try:
 			for stmt in body:
 				try:
@@ -2570,9 +2582,15 @@ class FunctionLowering:
 				except CompileError:
 					continue
 		finally:
-			self._cfg.exit_loop()
+			# Phase 8: every narrowed-state snapshot recorded by a `break`
+			# reached while lowering this body (cfg.py's own
+			# record_break_narrowed(), called from _stmt_Break below) -
+			# handed back to the caller (_stmt_While/for-loop lowerers) to
+			# merge with the loop's own natural exit via merge_loop_exits()
+			break_narrowed = self._cfg.exit_loop()
 			self._loop_labels.pop()
 			self._loop_depth -= 1
+		return break_narrowed
 
 	def _check_loop_exit_unchecked_results( self, loop_snapshot: object, node: ast.AST ) -> None:
 		try:
@@ -2585,6 +2603,14 @@ class FunctionLowering:
 			self.lowering.discovery.fail( 'break outside a loop', node )
 		_, break_label, loop_snapshot = self._loop_labels[-1]
 		self._check_loop_exit_unchecked_results( loop_snapshot, node )
+		# Phase 8: capture whatever's narrowed RIGHT HERE, at the exact
+		# point this break fires - cfg.py's record_break_narrowed() files
+		# it under the innermost currently-lowering loop, to be merged
+		# with every other break/the loop's own natural exit once that
+		# loop's own body is fully lowered. Before unwind_to() below (which
+		# doesn't touch _narrowed at all, but ordering it first here keeps
+		# this call sitting right next to unwind_to()'s own snapshot read)
+		self._cfg.record_break_narrowed()
 		for instr in self._cfg.unwind_to( loop_snapshot ):
 			self._emit( instr )
 		self._emit( ir.Jump( target = break_label ))
@@ -2703,7 +2729,7 @@ class FunctionLowering:
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
 		loop_snapshot = self._cfg.snapshot()
-		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -2711,6 +2737,13 @@ class FunctionLowering:
 		for instr in back_edge_instructions:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
+		# Phase 8: a for-loop has no type(x) is T condition of its own to
+		# narrow FROM, but its natural exit (the range simply exhausted,
+		# including never having run the body at all - always reachable
+		# for any for-loop) is still a real candidate to reconcile against
+		# every break_narrowed collected above - same merge_loop_exits()
+		# used by _stmt_While
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
 
 		self._emit( ir.Label( name = continue_label ))
 		# the increment is a compiler-synthesized implementation detail of
@@ -2778,7 +2811,7 @@ class FunctionLowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -2786,6 +2819,8 @@ class FunctionLowering:
 		for instr in back_edge_instructions:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
+		# Phase 8 - see _lower_for_range's own identical call/comment
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
 
 		self._emit( ir.Label( name = continue_label ))
 		incr = self._new_temp( usize_cls )

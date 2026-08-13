@@ -7469,6 +7469,193 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class LoopBreakNarrowingTests( CompilerTestCase ):
+	''' Phase 8 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
+	`break`-based narrowing survival past a `while`/`for` loop, generalizing
+	Phase 7's own condition-based exit narrowing to loops whose exit isn't
+	tied to a `type(x) is T` condition at all.
+
+	The key semantic, confirmed by working through several test shapes
+	that initially seemed like they should narrow but correctly don't: a
+	name survives PAST a loop only if EVERY way of reaching that point
+	agrees. For an ordinary (non-`while True`) loop, the loop's own
+	NATURAL (condition-false, or range-exhausted) exit is always a real,
+	competing candidate - if the condition itself doesn't prove anything
+	about the name (an unrelated `while i < 3:`, or a for-loop's own range
+	check), that candidate contributes NOTHING, and a `break`'s own
+	narrowing - even if it's the only break in the whole loop - gets
+	dropped by the merge, same as any other disagreement. This is correct,
+	not a bug: nothing guarantees the break is ever actually taken. The
+	loop's own natural exit only becomes a non-issue when it's PROVABLY
+	unreachable (`while True:` with no other exit condition at all) or
+	when it already agrees (the name was ALREADY narrowed before the loop
+	even started, and nothing inside changes that).
+
+	Real compile-and-run tests, full suite green (bash + PowerShell). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_while_true_break_narrows( self ) -> None:
+		# while True: has no natural exit at all (provably unreachable) -
+		# the single break is the ONLY way out, so its own narrowing
+		# survives unconditionally. s: str = x only compiles if x was
+		# actually narrowed to str (its raw type is the whole union)
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32|str = "hello"
+		while True:
+			if type( x ) is str:
+				break
+		s: str = x
+		if s.byte_len() != 5:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_for_loop_break_survives_when_already_narrowed( self ) -> None:
+		# x is narrowed to str BEFORE the for-loop even starts (Phase 5's
+		# own if-survival) - the for-loop's own natural exit (range
+		# exhausted, or zero iterations) inherits that same fact from
+		# loop_snapshot, and the break inside doesn't disturb it, so both
+		# the natural-exit and break candidates agree
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: i32|str = "hello"
+		if type( x ) is str:
+			for i in range( 3 ):
+				if i == 1:
+					break
+			s: str = x
+			if s.byte_len() != 5:
+				return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ordinary_loop_natural_exit_drops_break_narrowing( self ) -> None:
+		# an ordinary while loop (condition unrelated to x) - the natural,
+		# condition-false exit is a real, reachable path that proves
+		# NOTHING about x, so even a single break's own narrowing is
+		# correctly dropped by the merge (not every way of reaching this
+		# point agrees) - the code still compiles and runs correctly via
+		# the ordinary, un-narrowed path, it's just not narrowed
+		self._run( '''
+def describe( x: i32|str ) -> i32:
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < 3:
+			if type( x ) is str:
+				break
+			i += 1
+		if type( x ) is str:
+			return 1
+		return 2
+
+def main() -> i32:
+	if describe( "hi" ) != 1:
+		return 1
+	if describe( 5 ) != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_disagreeing_breaks_drop_narrowing_not_error( self ) -> None:
+		# two DIFFERENT breaks (different source locations, only one ever
+		# actually reachable for a given call) narrowing to DIFFERENT
+		# members - the compiler conservatively treats both as real,
+		# competing candidates and the soft-merge drops the disagreement,
+		# same as merge_if's own disagreeing-branches behavior - genuine
+		# disagreement silently stays unnarrowed, never a compile error
+		self._run( '''
+def describe( x: i32|str ) -> i32:
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < 3:
+			if type( x ) is i32:
+				break
+			if type( x ) is str:
+				break
+			i += 1
+		if type( x ) is i32:
+			return 1
+		return 2
+
+def main() -> i32:
+	if describe( 5 ) != 1:
+		return 1
+	if describe( "hi" ) != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_break_narrowing_no_leak( self ) -> None:
+		# real RC-lifetime stress check under repetition, same rigor as
+		# every other RC test this session established - the break-
+		# narrowed str is read (and its own real content checked) every
+		# iteration of the outer stress loop
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			x: str|None = 'hello'.upper()
+			while True:
+				if type( x ) is str:
+					break
+			s: str = x
+			if s.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 	''' regression tests for a real leak in lowering.py's _stmt_Return: a
 	function whose entire body is a single `return SomeConstructor(

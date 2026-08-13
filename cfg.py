@@ -156,6 +156,7 @@ class CFGState:
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
+		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
 		self.bindings: Bindings = {}
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._narrowed: dict[str,list[Variable]] = {} # name -> the non-empty set of the UNION's own members it could still be (each .type the narrowed leaf, .stem the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead", and ONLY when the set has collapsed to exactly one member - see narrowed_member(). A single narrow() call always starts as a one-element list; merge_if's own soft-merge can grow it (two disagreeing-but-both-still-possible branches union together rather than discarding the fact) or drop it (a name narrowed on only SOME surviving paths)
@@ -292,11 +293,72 @@ class CFGState:
 		is about to silently drop entries pushed since the same kind of
 		snapshot), so one combined stack (read via min(), not just the top -
 		see current_epilogue_label()'s own comment) covers both without
-		needing to know which kind of scope is which. '''
+		needing to know which kind of scope is which. Also pushes a fresh,
+		empty collection list onto _break_narrowed_stack (Phase 8) - every
+		`break` reached while lowering THIS loop's own body records a
+		narrowed-state snapshot into it, consumed by exit_loop()'s own
+		return value once this loop's body is fully lowered. '''
 		self._confinement_depths.append( stack_depth )
+		self._break_narrowed_stack.append( [] )
 
-	def exit_loop( self ) -> None:
+	def exit_loop( self ) -> list[dict[str,list[Variable]]]:
+		''' pops and returns every narrowed-state snapshot record_break_
+		narrowed() collected while lowering this loop's own body (Phase 8)
+		- the caller (lowering.py's _stmt_While/for-loop lowerers) merges
+		these together with whatever the loop's own natural exit implies
+		via merge_loop_exits(). '''
 		self._confinement_depths.pop()
+		return self._break_narrowed_stack.pop()
+
+	def record_break_narrowed( self ) -> None:
+		''' called by lowering.py's _stmt_Break, BEFORE its own unwind_to()
+		- captures the CURRENT _narrowed state (whatever was proven true
+		at the exact point this break fires) into the innermost currently-
+		lowering loop's own collection list. Deliberately NOT called by
+		_stmt_Continue (a continue re-enters the loop, never reaches
+		whatever follows it) or _stmt_Return (a return exits the FUNCTION,
+		never reaches "after the loop" either - see the plan's own
+		"Context" section on why this is correct, not an oversight). A
+		no-op if called with no loop currently lowering (shouldn't happen
+		given _stmt_Break's own "break outside a loop" guard, but matches
+		this codebase's existing defensive style elsewhere). '''
+		if self._break_narrowed_stack:
+			self._break_narrowed_stack[-1].append( dict( self._narrowed ))
+
+	def merge_loop_exits( self, natural_exit_narrowed: dict[str,list[Variable]] | None, break_narrowed: list[dict[str,list[Variable]]] ) -> None:
+		''' called once a loop's own body has been fully lowered (after
+		its own restore() back to the loop's entry snapshot) - reconciles
+		every way execution can actually reach the code AFTER this loop:
+		every `break` record_break_narrowed() collected (Phase 8), plus
+		`natural_exit_narrowed` (the loop's own ordinary, condition-false
+		exit - None when that path is PROVABLY unreachable, e.g. `while
+		True:` with no other exit condition at all - see lowering.py's own
+		call sites for how each loop kind computes this). Same soft-merge
+		rule as _merge_narrowed_soft/_merge_case_narrowing (Phases 5-6): a
+		name survives only if narrowed on EVERY candidate path, and its
+		value is the UNION (dedup by identity) of what each one narrowed
+		it to - not just an identical-only intersection. No candidates at
+		all (an unconditional `while True:` with no break) means nothing
+		reaches past the loop - empty is correct (dead code follows). '''
+		candidates = list( break_narrowed )
+		if natural_exit_narrowed is not None:
+			candidates.append( natural_exit_narrowed )
+		if not candidates:
+			self._narrowed = {}
+			return
+		merged: dict[str,list[Variable]] = dict( candidates[0] )
+		for other in candidates[1:]:
+			next_merged: dict[str,list[Variable]] = {}
+			for name, members in merged.items():
+				if name not in other:
+					continue
+				combined = list( members )
+				for m in other[name]:
+					if not any( m is existing for existing in combined ):
+						combined.append( m )
+				next_merged[name] = combined
+			merged = next_merged
+		self._narrowed = merged
 
 	def enter_branch( self, stack_depth: int ) -> None:
 		''' called by lowering.py's own _stmt_If, bracketing one if/elif/

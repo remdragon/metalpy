@@ -1930,6 +1930,35 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._narrowed[subject_name] = [ exit_member.type ]
 		return node
 
+	def visit_For( self, node: ast.For ) -> ast.For:
+		''' Phase 8: a for-loop's own body can narrow a name via a nested
+		if/match that terminates with `break` (Phase 6's own post-if/match
+		merge) - unlike visit_Match/visit_While (which already bracket
+		their own body-visit with a save/restore of self._narrowed), a
+		bare for-loop had no such bracket at all before this, so that
+		narrowing would LEAK past the loop's own body at this AST-
+		rewriting-pass level once Phases 5-6 made narrowing survival a
+		real thing - a for-loop might never run its body at all, or might
+		run to completion without ever taking that break, so nothing
+		proven only inside is safe to assume once back outside.
+
+		cfg.py's own merge_loop_exits (Phase 8) is the REAL, authoritative
+		lowering-time reconciliation for what narrowing survives a for-
+		loop's break(s) - this pass makes NO attempt to mirror that here
+		(a deliberate, bounded scope cut, same posture as visit_While's own
+		body-only, not break-based, narrowing at this layer): it only needs
+		to stop leaking STALE state, not to also propagate the real
+		post-loop fact forward (a subsequent check after the loop just
+		sees the name's ordinary declared type, safe, just not maximally
+		precise - identical tradeoff to _type_of_expr's own narrowed
+		lookup falling back for a multi-element set). '''
+		case_entry_narrowed = dict( self._narrowed )
+		try:
+			self.generic_visit( node )
+		finally:
+			self._narrowed = case_entry_narrowed
+		return node
+
 	def visit_BoolOp( self, node: ast.BoolOp ) -> ast.BoolOp:
 		# each operand of `and`/`or` is a boolean context — rewrite
 		# T|None operands BEFORE generic_visit recurses into the old nodes
