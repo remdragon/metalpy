@@ -281,32 +281,6 @@ class Lowering:
 		else:
 			return None
 
-	def _lower_compiler_is_rc( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
-		# compiler.is_rc(T) - a compile-time constant bool, true iff T is an
-		# RCClass (possibly wrapped in a Specialization). T is always
-		# concrete by the time this lowers (same "no unbound TypeVar"
-		# requirement as compiler.sizeof), so this always folds directly to
-		# an ir.Const - no runtime check, no emitter support needed at all.
-		# Lets generic library code (list[T]'s own per-slot storage width -
-		# an RCClass value IS a pointer everywhere else in this compiler,
-		# but compiler.sizeof(T) deliberately stays the OBJECT's own struct-
-		# body size always, for sys.alloc[T]'s sake - see its own docstring)
-		# branch on T's own RC-ness without a new kind of type-level
-		# reflection existing anywhere else in the language
-		if len( node.args ) != 1 or node.keywords:
-			self.discovery.fail( f'compiler.is_rc(...) takes exactly one type argument: {ast.unparse(node)}', node )
-		target_type = self._try_resolve_namespace( node.args[0] )
-		if target_type is None:
-			self.discovery.fail( f'compiler.is_rc(...) argument must be a type: {ast.unparse(node)}', node )
-		if isinstance( target_type, TypeVar ):
-			self.discovery.fail(
-				f'compiler.is_rc({target_type.stem}) requires a concrete type - {target_type.qualname} is still an '
-				f'unbound generic type parameter here (call the enclosing function through an explicit specialization, e.g. foo[SomeType](...))',
-				node,
-			)
-		bool_cls = self.discovery.get_intrinsics()['bool']
-		return ir.Const( type = expected_type or bool_cls, value = self._type_resolver._is_RC( target_type ))
-
 	def _atomic_pointee_type( self, ptr_type: Type|None, node: ast.AST ) -> Type:
 		# shared by every compiler.atomic_*(ptr, ...) intrinsic - ptr must be
 		# Ptr[T] (not ConstPtr[T]: every op here either writes through the
@@ -2183,6 +2157,46 @@ class FunctionLowering:
 		dest = self._new_temp( expected_type or usize_cls )
 		self._emit( ir.SizeOf( dest = dest, type = target_type ))
 		return dest
+
+	def _lower_compiler_is_rc( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.is_rc(T) - a compile-time constant bool, true iff T is an
+		# RCClass (possibly wrapped in a Specialization). T is always
+		# concrete by the time this lowers (same "no unbound TypeVar"
+		# requirement as compiler.sizeof), so this always folds directly to
+		# an ir.Const - no runtime check, no emitter support needed at all.
+		# Lets generic library code (list[T]'s own per-slot storage width -
+		# an RCClass value IS a pointer everywhere else in this compiler,
+		# but compiler.sizeof(T) deliberately stays the OBJECT's own struct-
+		# body size always, for sys.alloc[T]'s sake - see its own docstring)
+		# branch on T's own RC-ness without a new kind of type-level
+		# reflection existing anywhere else in the language.
+		#
+		# Like compiler.sizeof(x), T also accepts a plain VALUE expression
+		# (self, a local, ...) - moved here (from the outer Lowering class)
+		# specifically so it can share compiler.sizeof(x)'s own non-
+		# emitting _static_type_of_value_expr fallback, rather than
+		# re-implementing a second, narrowing-unaware type lookup. Before
+		# this fix, is_rc(x) on a value silently miscomputed instead of
+		# erroring: _try_resolve_namespace(x) returns the VARIABLE (not a
+		# Type) for a bare Name, and _is_RC(variable) - `variable.base if
+		# isinstance(variable, Specialization) else variable` then
+		# `isinstance(that, RCClass)` - is always False for a Variable,
+		# regardless of the value's real type (compiler.is_rc(some_rc_var)
+		# always folded to False, silently)
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.is_rc(...) takes exactly one type argument: {ast.unparse(node)}', node )
+		resolved = self.lowering._try_resolve_namespace( node.args[0] )
+		target_type = resolved if isinstance( resolved, Type ) else self._static_type_of_value_expr( node.args[0] )
+		if target_type is None:
+			self.lowering.discovery.fail( f'compiler.is_rc(...) argument must be a type or a value with a known type: {ast.unparse(node)}', node )
+		if isinstance( target_type, TypeVar ):
+			self.lowering.discovery.fail(
+				f'compiler.is_rc({target_type.stem}) requires a concrete type - {target_type.qualname} is still an '
+				f'unbound generic type parameter here (call the enclosing function through an explicit specialization, e.g. foo[SomeType](...))',
+				node,
+			)
+		bool_cls = self.lowering.discovery.get_intrinsics()['bool']
+		return ir.Const( type = expected_type or bool_cls, value = self.lowering._type_resolver._is_RC( target_type ))
 
 	def _lower_compiler_refcount( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.refcount(x) - unlike compiler.sizeof(T), x is a real
@@ -4792,7 +4806,7 @@ class FunctionLowering:
 				return result if want_result else None
 
 			case 'is_rc':
-				result = self.lowering._lower_compiler_is_rc( node, expected_type )
+				result = self._lower_compiler_is_rc( node, expected_type )
 				return result if want_result else None
 
 			case 'refcount':

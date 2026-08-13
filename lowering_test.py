@@ -2418,6 +2418,106 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'argument must be a type or a value with a known type', self.discovery.errors.errors[0] )
 		self.assertEqual( [ i for i in fn.instructions if isinstance( i, ir.Call ) ], [] )
 
+	# --- compiler.is_rc(T/x) -----------------------------------------------------
+	# no dedicated tests existed for this intrinsic before - the value-argument
+	# gap below (silently miscomputing instead of erroring) went unnoticed
+	# for exactly that reason
+
+	def test_compiler_is_rc_true_for_an_rcclass_type_argument( self ) -> None:
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> None:',
+			'	x: bool = compiler.is_rc( Foo )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		self.assertIs( assigns['x'].value, True )
+
+	def test_compiler_is_rc_false_for_a_scalar_type_argument( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: bool = compiler.is_rc( u32 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		self.assertIs( assigns['x'].value, False )
+
+	def test_compiler_is_rc_typevar_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def foo[T]() -> None:',
+			'	x: bool = compiler.is_rc( T )',
+			'	return',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertIn( 'unbound generic type parameter', self.discovery.errors.errors[0] )
+
+	def test_compiler_is_rc_of_a_local_rc_variable_is_true( self ) -> None:
+		# regression test: before the value-argument fix, is_rc(x) resolved
+		# a bare Name via _try_resolve_namespace same as sizeof(x) used to -
+		# but unlike sizeof, it never checked "is this actually a Type",
+		# so it silently checked isinstance(<the Variable object>, RCClass)
+		# instead of the value's real type, which is always False - this
+		# always folded to False regardless of x's real RC-ness, with no
+		# compile error at all
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo()',
+			'	x: bool = compiler.is_rc( f )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		self.assertIs( assigns['x'].value, True )
+
+	def test_compiler_is_rc_of_a_non_rc_local_variable_is_false( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	v: u32 = 1',
+			'	x: bool = compiler.is_rc( v )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		self.assertIs( assigns['x'].value, False )
+
+	def test_compiler_is_rc_of_self_is_self_escape_safe_before_construction_completes( self ) -> None:
+		# same property as compiler.sizeof(self) - self is read only via
+		# its own static type, never as an instruction operand, so this
+		# compiles cleanly even before every required attribute is set
+		code = '\n'.join([
+			'class Bar:',
+			'	a: i32',
+			'',
+			'	def __init__( self ) -> None:',
+			'		x: bool = compiler.is_rc( self )',
+			'		self.a = 1',
+			'',
+			'def main() -> None:',
+			'	return',
+		])
+		mod = self._import( code )
+		fn = self.compiler._lower( self._method( mod, 'Bar', '__init__' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		self.assertIs( assigns['x'].value, True )
+
 	# --- compiler.refcount(x) ---------------------------------------------------
 
 	def test_compiler_refcount_emits_refcount_instruction( self ) -> None:
