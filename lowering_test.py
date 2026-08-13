@@ -6064,6 +6064,268 @@ class Tests( unittest.TestCase ):
 		# (canonicalized asciibetically by qualname - 'bool' < 'i32')
 		self.assertEqual( call.dest.type.stem, 'intrinsics.bool|intrinsics.i32' )
 
+# --- @inline (PLAN_INLINE.md) -------------------------------------------
+
+class InlineTests( unittest.TestCase ):
+	''' @inline splices a function's own single `return <expr>` body
+	directly at each call site - no real Call/FuncStart/FuncEnd for the
+	callee itself. Mirrors builtins.len[T]'s own shape without depending on
+	real builtins (import_builtins=False, same as the main Tests class). '''
+	maxDiff = None
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ) -> LoweredFunction:
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		return fn
+
+	def _ir_repr( self, fn: LoweredFunction ) -> list[str]:
+		return [ op.test_repr() for op in fn.instructions ]
+
+	def test_inline_method_call_compiles_identically_to_calling_the_body_directly( self ) -> None:
+		# @inline def get_len(self): return self.__len__() called as
+		# b.get_len() must produce the SAME instruction shape as writing
+		# b.__len__() directly at the call site - no Call/FuncStart/FuncEnd
+		# of its own for get_len anywhere, and the one real Call (to
+		# __len__) receives the SAME receiver (main's own `b` parameter,
+		# reused directly - no synthesized alias) either way.
+		#
+		# Compared structurally (instruction kinds + the one real Call's
+		# own target/receiver qualnames), not via a full test_repr() diff -
+		# Call.receiver's own .type is the whole Box class, whose own
+		# .methods legitimately differs between the two snippets (the
+		# `inlined` Box really does have one more method, get_len, than
+		# `direct`'s Box does), which would make a byte-for-byte repr
+		# comparison spuriously fail despite both compiling to the same
+		# real work
+		inlined = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: usize',
+			'	def __len__( self ) -> usize:',
+			'		return self.y',
+			'	@inline',
+			'	def get_len( self ) -> usize:',
+			'		return self.__len__()',
+			'',
+			'def main( b: Box ) -> usize:',
+			'	return b.get_len()',
+		])
+		direct = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: usize',
+			'	def __len__( self ) -> usize:',
+			'		return self.y',
+			'',
+			'def main( b: Box ) -> usize:',
+			'	return b.__len__()',
+		])
+		self._import( inlined )
+		inlined_fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+		other = Discovery( import_builtins = False )
+		other_compiler = Compiler( other )
+		other_compiler.import_code( direct, filename = Path( '__test__.py' ))
+		direct_fn = other_compiler._lower( other.main )
+		self.assertEqual( other.errors.errors, [] )
+
+		self.assertEqual(
+			[ type( i ).__name__ for i in inlined_fn.instructions ],
+			[ type( i ).__name__ for i in direct_fn.instructions ],
+		)
+		inlined_calls = [ i for i in inlined_fn.instructions if isinstance( i, ir.Call ) ]
+		direct_calls = [ i for i in direct_fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in inlined_calls ], [ '__test__.Box.__len__' ] )
+		self.assertEqual( [ c.target.qualname for c in direct_calls ], [ '__test__.Box.__len__' ] )
+		# the receiver is main's OWN `b` parameter, reused directly - not a
+		# freshly synthesized alias (proves the "operand already a
+		# Variable -> reuse it, no extra Assign" fast path actually fired)
+		self.assertEqual( inlined_calls[0].receiver.qualname, 'main.b' )
+		self.assertIs( inlined_calls[0].receiver, inlined_fn.function.parameters[0] )
+
+	def test_inline_bare_generic_call_resolves_t_and_splices_no_specialization_compiled( self ) -> None:
+		# mirrors builtins.len[T] exactly: a bare generic @inline free
+		# function, T inferred from the argument. After compiler.run()
+		# drains the whole queue, the ONLY compiled functions must be
+		# main and Box.__len__ - never get_len or get_len[Box], since an
+		# @inline generic instantiation is never scheduled as a real unit
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: usize', # usize directly - no scalar cast in __len__, avoids needing a Result[T,E] class in scope just for checked-cast machinery
+			'	def __len__( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def get_len[T]( t: T ) -> usize:',
+			'	return t.__len__()',
+			'',
+			'def main( b: Box ) -> usize:',
+			'	return get_len( b )',
+		])
+		self._import( code )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
+		main_fn = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Box.__len__' ] )
+
+	def test_inline_explicit_specialization_call_also_splices( self ) -> None:
+		# the explicit get_len[Box](b) spelling goes through a different
+		# lowering path (_lower_generic_function_call, not the bare-call
+		# inference path) - must be wired up the same way
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: usize', # usize directly - no scalar cast in __len__, avoids needing a Result[T,E] class in scope just for checked-cast machinery
+			'	def __len__( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def get_len[T]( t: T ) -> usize:',
+			'	return t.__len__()',
+			'',
+			'def main( b: Box ) -> usize:',
+			'	return get_len[Box]( b )',
+		])
+		self._import( code )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
+
+	def test_inline_receiver_with_side_effect_evaluated_once( self ) -> None:
+		# the receiver expression is a real call (make_box()) - inlining
+		# must not re-lower/re-evaluate it once per reference to `self` in
+		# the spliced body; it's lowered ONCE, up front, into an operand
+		# that the substitution then just reuses
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: usize',
+			'	def __len__( self ) -> usize:',
+			'		return self.y',
+			'	@inline',
+			'	def get_len( self ) -> usize:',
+			'		return self.__len__()',
+			'',
+			'def make_box() -> Box:',
+			'	b: Box',
+			'	b.y = 5',
+			'	return b',
+			'',
+			'def main() -> usize:',
+			'	return make_box().get_len()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.make_box', '__test__.Box.__len__' ] )
+
+	def test_inline_direct_recursion_rejected( self ) -> None:
+		code = '\n'.join([
+			'@inline',
+			'def foo( x: i32 ) -> i32:',
+			'	return foo( x )',
+			'',
+			'def main() -> i32:',
+			'	return foo( 1 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'recursive inlining' in e for e in self.discovery.errors.errors ))
+
+	def test_inline_mutual_recursion_rejected( self ) -> None:
+		code = '\n'.join([
+			'@inline',
+			'def ping( x: i32 ) -> i32:',
+			'	return pong( x )',
+			'',
+			'@inline',
+			'def pong( x: i32 ) -> i32:',
+			'	return ping( x )',
+			'',
+			'def main() -> i32:',
+			'	return ping( 1 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'recursive inlining' in e for e in self.discovery.errors.errors ))
+
+	def test_inline_discarding_a_result_returning_call_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'@inline',
+			'def make() -> Result[i32,MyError]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def main() -> None:',
+			'	make()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ))
+
+	def test_inline_is_ok_still_clears_cfg_unchecked_result_tracking( self ) -> None:
+		# a receiver-based generic-class method (is_ok, inherited genericity
+		# from Result[T,E]) - PLAN_INLINE.md's own correction: this reaches
+		# the ordinary plain final tail (already-monomorphized by
+		# _attr_lookup_callable before dispatch), and _cfg.clear_result(...)
+		# runs unconditionally before that tail regardless of inlining - so
+		# `r` must NOT be reported as an unchecked Result here, and the
+		# inlined body must still compile down to the bare `self.tag == 0`
+		# comparison, no Call to is_ok anywhere
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'	@inline',
+			'	def is_ok( self ) -> bool:',
+			'		return self.tag == 0',
+			'',
+			'def checked() -> Result[i32,MyError]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def main() -> bool:',
+			'	r = checked()',
+			'	return r.is_ok()',
+		])
+		self._import( code )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		main_fn = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		kinds = [ type( instr ).__name__ for instr in main_fn.instructions ]
+		# exactly one real Call (checked()) - is_ok itself never becomes one;
+		# its own body is spliced down to a bare r.tag == 0 (GetAttr + Cmp)
+		calls = [ instr for instr in main_fn.instructions if isinstance( instr, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.checked' ] )
+		self.assertIn( 'GetAttr', kinds )
+		self.assertIn( 'Cmp', kinds )
+		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		self.assertNotIn( '__test__.Result.is_ok[intrinsics.i32,__test__.MyError]', qualnames )
+
 # --- compiler.fetch_unicode_table('upper'|'lower') ---------------------------
 
 class FetchUnicodeTableTests( unittest.TestCase ):

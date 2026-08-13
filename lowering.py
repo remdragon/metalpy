@@ -783,6 +783,23 @@ class Lowering:
 			if target.resolve is not None:
 				target.resolve()
 			return
+		if target.is_inline:
+			# PLAN_INLINE.md - an @inline target is never itself a real
+			# compile unit (_lower_inline_call splices its body instead of
+			# ever emitting a Call to it) - _ensure_resolved's unconditional
+			# scheduling side effect would otherwise still compile it as
+			# real, dead, never-called code (confirmed by a real repro:
+			# Result[T,E].is_ok, @inline'd and called through a receiver -
+			# some_result.is_ok() - reaches this exact branch, since
+			# _attr_lookup_callable already hands back an already-
+			# monomorphized, non-generic Function for it - see PLAN_
+			# INLINE.md's own note on that path). Same shape as the
+			# @virtual carve-out just above: resolve the signature (needed
+			# to lower args against declared parameter types), skip the
+			# scheduling side effect.
+			if target.resolve is not None:
+				target.resolve()
+			return
 		self._ensure_resolved( target )
 
 	def _attr_lookup( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Variable:
@@ -1049,6 +1066,17 @@ class FunctionLowering:
 		self._in_deferred_body = False
 		self._defer_flags: list[Variable] = []
 		self._return_value_var = None
+		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
+		# _inlining_stack (by id(target)) is the reentrancy guard - a target
+		# already present means direct or mutual @inline recursion, rejected
+		# rather than spliced forever. _inline_binding_id is a monotonic
+		# counter giving each splice's synthesized self/parameter bindings
+		# their own unique C-safe name, so they never collide with the
+		# ENCLOSING function's own real locals/self/parameters of the same
+		# name (emitter_c.py's local-declaration tracking is by C name, not
+		# by object identity - see _lower_inline_call's own comment).
+		self._inlining_stack: list[int] = []
+		self._inline_binding_id = 0
 
 	def run( self ) -> list[ir.Instruction]:
 		fn = self._current_fn
@@ -4830,6 +4858,115 @@ class FunctionLowering:
 				kwargs[param.stem] = default_operand
 		return args, kwargs
 
+	def _lower_inline_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# PLAN_INLINE.md - target.is_inline: splice target's own single
+		# `return <expr>` body directly here instead of ever emitting a
+		# real ir.Call. `args`/`kwargs` are already-lowered operands (the
+		# caller already ran _lower_call_args, or the interleaved generic
+		# lower_and_unify - same move-hook/argument-lowering either way,
+		# only the tail differs). target may be a plain Function, OR an
+		# already-monomorphized one (target.node was deep-copied per
+		# Specialization by monomorphize.py - see its own docstring), so
+		# target.node.body is always safe to read directly here regardless
+		# of which caller reached this
+		if id( target ) in self._inlining_stack:
+			self.lowering.discovery.fail(
+				f'@inline {target.qualname}: recursive inlining (directly or through another @inline function) is not supported: {ast.unparse(node)}',
+				node,
+			)
+		if not want_result and cfg.is_result_type( target.return_type ):
+			# same discard check the ordinary call tails already apply -
+			# discovery.py's _is_inline_eligible_body already guarantees
+			# target.node.body is exactly one `return <expr>`, so this can't
+			# be sidestepped by inlining instead of calling for real
+			self.lowering.discovery.fail(
+				f'{target.qualname}(...) returns a Result that is discarded here - '
+				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
+				node,
+			)
+		bindings: dict[str,ir.Operand] = {} if receiver is None else { 'self': receiver }
+		for i, param in enumerate( target.parameters or [] ):
+			bindings[param.stem] = args[i] if i < len( args ) else kwargs[param.stem]
+
+		# each binding becomes a REAL local Variable, registered under its
+		# ordinary name ('self', a parameter's own stem) directly into
+		# target.names - not just an _expr_Name-level shortcut - because
+		# discovery.find_name is reached from more than one place while
+		# lowering a Call (e.g. _try_resolve_namespace, used by the
+		# construction-call recognizers to probe whether `self.foo(...)`
+		# might be construction sugar, BEFORE ordinary attribute/method
+		# resolution ever runs) - anything less than a real registry entry
+		# left those other paths seeing an unresolved 'self'/param name
+		# (confirmed by a real repro, not just reasoning: self.__len__()
+		# inside an inlined body failed exactly this way, from inside a
+		# construction-sugar probe, not from _expr_Name at all).
+		#
+		# the Variable's own .stem (what emitter_c.py actually declares as
+		# a C local, keyed by NAME not by object identity - see its own
+		# "declared" set) is deliberately NOT 'self'/the parameter's own
+		# stem - reusing those would silently collide with and overwrite
+		# the ENCLOSING function's own real `self`/parameter of the same
+		# name the moment one method's @inline body gets spliced into
+		# another method's own body. _inline_binding_id makes every
+		# splice's own bindings unique instead.
+		#
+		# no _cfg_assign/incref here, deliberately - this must behave
+		# exactly like an ordinary (non-@move) function parameter already
+		# does at a REAL call boundary: borrowed, no incref at the
+		# boundary, no independent decref responsibility (the caller's own
+		# argument operand keeps whatever cleanup it already had, e.g. an
+		# argument Temp's own DeleteTemp - untouched by any of this). A
+		# bare ir.Assign against a fresh Variable is exactly that: a named
+		# alias for the call's own duration, nothing more.
+		#
+		# when the operand is ALREADY a Variable (by far the common case -
+		# a bare-name receiver/argument, e.g. b.get_len()/some_result.
+		# is_ok()), it's registered directly, no fresh copy and no Assign
+		# at all - true zero overhead, and what makes the "compiles
+		# identically to writing the callee's body directly at the call
+		# site" guarantee exact, not just "close". Only a genuinely
+		# computed operand (a Temp from a sub-expression like make_box().
+		# get_len(), or a Const) needs the synthesized-local fallback -
+		# both to give it a referenceable name at all (Temp/Const aren't
+		# Name subtypes, discovery.find_name's registry requires one - see
+		# above) and to guarantee it's evaluated exactly once even if the
+		# spliced body references self/that parameter more than once
+		saved: dict[str,object] = {}
+		for stem, operand in bindings.items():
+			if isinstance( operand, Variable ):
+				fresh = operand
+			else:
+				fresh = Variable(
+					stem = f'$inline{self._inline_binding_id}${stem}',
+					qualname = f'{target.qualname}$$inline{self._inline_binding_id}${stem}',
+					file = target.file, line = target.line,
+					type = operand.type,
+				)
+				self._inline_binding_id += 1
+				self._emit( ir.Assign( dest = fresh, src = operand ))
+			saved[stem] = target.names.get( stem )
+			target.names[stem] = fresh
+
+		# discovery.py's _is_inline_eligible_body already guaranteed
+		# target.node.body is exactly one `return <expr>`, optionally
+		# preceded by a docstring - the Return is always the LAST statement
+		# either way, so no need to re-strip the docstring here
+		return_expr = target.node.body[-1].value
+		module = self.lowering._find_module_for( target )
+		self._inlining_stack.append( id( target ))
+		try:
+			with self.lowering.discovery.module_context( module ):
+				with self.lowering.discovery.scope_context( target ):
+					result = self._lower_expr( return_expr, expected_type or target.return_type )
+		finally:
+			self._inlining_stack.pop()
+			for stem, old in saved.items():
+				if old is None:
+					target.names.pop( stem, None )
+				else:
+					target.names[stem] = old
+		return result if want_result else None
+
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# sys.alloc[u8](...) - explicit generic instantiation. Matches call
 		# args against the MONOMORPHIZED signature (so a literal argument's
@@ -4837,6 +4974,8 @@ class FunctionLowering:
 		# count - not the abstract, unsubstituted one)
 		monomorphized = self.lowering._monomorphized_function( spec )
 		args, kwargs = self._lower_call_args( monomorphized, node )
+		if monomorphized.is_inline:
+			return self._lower_inline_call( node, monomorphized, receiver, args, kwargs, expected_type, want_result )
 		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_inferred_generic_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -4904,6 +5043,8 @@ class FunctionLowering:
 		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		monomorphized = self.lowering._monomorphized_function( spec )
+		if monomorphized.is_inline:
+			return self._lower_inline_call( node, monomorphized, receiver, args, kwargs, expected_type, want_result )
 		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 		# else: this parameter position doesn't mention any of type_params
 		# (a concrete parameter, or a nested type whose base doesn't even
@@ -5230,6 +5371,20 @@ class FunctionLowering:
 		else:
 			self.lowering._resolve_call_target( target )
 			args, kwargs = self._lower_call_args( target, node )
+
+		if isinstance( target, Function ) and target.is_inline:
+			# PLAN_INLINE.md - reaches this shared tail from either the
+			# plain (non-generic, non-Overload) `else` branch above, the
+			# resolved_callee pre-tag (type_resolver.py's own generic-call
+			# resolution, ~ this method's own top), or a receiver-based
+			# generic-class method already monomorphized by _attr_lookup_
+			# callable before dispatch even started (e.g. some_result.
+			# is_ok()/.is_err() - see PLAN_INLINE.md's own "traced through
+			# _attr_lookup_callable" note). Never reached with is_inline set
+			# from the Overload branch above - @inline+@overload is
+			# rejected at discovery time, so a resolved group member is
+			# never is_inline
+			return self._lower_inline_call( node, target, receiver, args, kwargs, expected_type, want_result )
 
 		self.lowering.schedule( target.return_type )
 		for param in target.parameters or []:

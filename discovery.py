@@ -1510,6 +1510,7 @@ class Discovery( ast.NodeVisitor ):
 		is_move = False
 		is_private = False
 		is_virtual = False
+		is_inline = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
@@ -1534,6 +1535,8 @@ class Discovery( ast.NodeVisitor ):
 					is_private = True
 				case 'virtual':
 					is_virtual = True
+				case 'inline':
+					is_inline = True
 				case 'extern':
 					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
@@ -1583,6 +1586,43 @@ class Discovery( ast.NodeVisitor ):
 			# building something with no coherent meaning)
 			self.fail( f'@virtual {qualname} cannot also be @staticmethod/@classmethod - no receiver to dispatch through', node )
 
+		if is_inline:
+			# PLAN_INLINE.md - each of these interacts with the real call
+			# boundary (@inline removes it entirely, splicing the body at
+			# each call site instead) in a way that hasn't been designed:
+			# @overload's "which candidate's body?" is the same open
+			# question @virtual+@overload already rejects above; @virtual
+			# needs a real vtable slot/indirect call, the opposite of
+			# splicing; @abstractmethod has no body to splice; @extern's
+			# body is a foreign signature stub, not a real body either;
+			# @classmethod would need a `cls` substitution this pass
+			# doesn't build; @move's whole-function ownership-transfer
+			# semantics at a removed call boundary hasn't been reasoned
+			# through
+			if is_overload:
+				self.fail( f'@inline {qualname} cannot also be @overload - not supported', node )
+			# is_abstract checked BEFORE is_virtual: @abstractmethod implies
+			# is_virtual=True (set earlier above), so checking is_virtual
+			# first would misreport an @inline+@abstractmethod combo as
+			# "cannot also be @virtual" - a confusing error for someone who
+			# never wrote @virtual at all
+			if is_abstract:
+				self.fail( f'@inline {qualname} cannot also be @abstractmethod - no body to splice', node )
+			if is_virtual:
+				self.fail( f'@inline {qualname} cannot also be @virtual - not supported', node )
+			if extern_lib is not None:
+				self.fail( f'@inline {qualname} cannot also be @extern - no real body to splice', node )
+			if is_classmethod:
+				self.fail( f'@inline {qualname} cannot also be @classmethod - not supported', node )
+			if is_move:
+				self.fail( f'@inline {qualname} cannot also be @move - not supported', node )
+			if not self._is_inline_eligible_body( node.body ):
+				self.fail(
+					f'@inline {qualname} must have a body of exactly `return <expr>` '
+					f'(optionally preceded by a docstring) - not yet supported for anything else',
+					node,
+				)
+
 		module = self.module_stack[-1]
 		fn = Function(
 			stem = node.name,
@@ -1598,6 +1638,7 @@ class Discovery( ast.NodeVisitor ):
 			is_private = is_private,
 			is_virtual = is_virtual,
 			is_overload = is_overload,
+			is_inline = is_inline,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,
@@ -1664,6 +1705,19 @@ class Discovery( ast.NodeVisitor ):
 
 	def _is_stub_body( self, body: list[ast.stmt] ) -> bool:
 		return is_stub_body( body )
+
+	def _is_inline_eligible_body( self, body: list[ast.stmt] ) -> bool:
+		''' PLAN_INLINE.md - @inline is only supported on a body that is
+		exactly one `return <expr>` statement, optionally preceded by a
+		docstring (an ast.Expr wrapping a string ast.Constant - the same
+		shape ast.get_docstring recognizes). Anything else (multiple
+		statements, a bare `return` with no value, control flow, ...) isn't
+		splice-able yet - lowering.py's _lower_inline_call relies on this
+		having already rejected everything else, it doesn't re-check '''
+		stmts = body
+		if stmts and isinstance( stmts[0], ast.Expr ) and isinstance( stmts[0].value, ast.Constant ) and isinstance( stmts[0].value.value, str ):
+			stmts = stmts[1:]
+		return len( stmts ) == 1 and isinstance( stmts[0], ast.Return ) and stmts[0].value is not None
 
 	def _bind_overload_stub( self, stub: Function, group: Overload ) -> None:
 		# a stub has no body of its own - it must resolve to exactly one plain

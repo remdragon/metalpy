@@ -1400,11 +1400,11 @@ def print( msg: str, end: str = '\n' ) -> None:
 		sys.stdout.write( end ).unwrap( 'stdout write failed' )
 
 # a single generic function now that bare-call monomorphization can infer T
-# from the argument (see lowering.py's _lower_inferred_generic_call) - a real
-# Call for now, forwarding to whatever T's own __len__ is; TODO once @inline
-# exists (see TODO.txt): this should become @inline so len(x) compiles down
-# to the same code as x.__len__() directly, no call overhead.
-
+# from the argument (see lowering.py's _lower_inferred_generic_call) -
+# @inline (PLAN_INLINE.md) splices this straight to whatever T's own
+# __len__ is at each call site, so len(x) costs exactly what x.__len__()
+# would and no more - never a real Call/FuncStart/FuncEnd of its own.
+@inline
 def len[T]( t: T ) -> usize:
 	return t.__len__()
 

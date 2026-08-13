@@ -883,6 +883,40 @@ class Foo:
 		foo.resolve()
 		self.assertIn( 'cannot also be @staticmethod/@classmethod', self.discovery.errors.errors[0] )
 
+	def test_inline_with_virtual_rejected( self ) -> None:
+		# PLAN_INLINE.md - @inline splices the body at each call site,
+		# @virtual dispatches indirectly through a vtable slot - mutually
+		# exclusive, and the error should name @virtual specifically (not
+		# some other decorator this combo also happens to trip)
+		mod = self._import( '''
+class Foo:
+	@inline
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @virtual', self.discovery.errors.errors[0] )
+
+	def test_inline_with_abstractmethod_rejected( self ) -> None:
+		# @abstractmethod implies is_virtual=True internally (see the "bare
+		# abstractmethod implies virtual" test above) - this must still
+		# report the @abstractmethod-specific message ("no body to splice"),
+		# not misattribute the conflict to @virtual, which was never
+		# written here at all
+		mod = self._import( '''
+class Foo:
+	@inline
+	@abstractmethod
+	def hello( self ) -> i32:
+		...
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @abstractmethod', self.discovery.errors.errors[0] )
+		self.assertNotIn( 'cannot also be @virtual', self.discovery.errors.errors[0] )
+
 	def test_virtual_with_second_plain_signature_is_a_compile_error( self ) -> None:
 		# NOT just the already-rejected @virtual+@overload-on-the-SAME-def
 		# combo - metalpy also allows multiple PLAIN (non-@overload) defs
