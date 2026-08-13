@@ -3533,6 +3533,254 @@ class FunctionLowering:
 				)
 		return ir.Const( type = expected_type, value = node.value )
 
+	def _lower_fstring_part( self, node: 'ast.Constant|ast.FormattedValue', str_type: Type ) -> ir.Operand:
+		# one element of an f-string's ast.JoinedStr.values - either a
+		# literal text segment (ast.Constant, already merged by CPython's
+		# own parser) or a {expr} interpolation (ast.FormattedValue).
+		# Shared by _expr_JoinedStr's single-part short-circuit and its
+		# N-part UnsafeList/slice/str.concat path below - both need the
+		# same str-typed operand per element, just assembled differently
+		# (PLAN_FSTRINGS.md).
+		if isinstance( node, ast.Constant ):
+			return self._lower_expr( node, str_type )
+		# ast.FormattedValue
+		if node.conversion == 97: # '!a' (ascii) - no ascii-escape primitive exists anywhere in this codebase
+			self.lowering.discovery.fail( f'f-string !a (ascii) conversion is not supported: {ast.unparse(node)}', node )
+		if node.format_spec is not None:
+			self.lowering.discovery.fail(
+				f'f-string format specs ({{expr:spec}}) are not supported yet - requires str.format() (see TODO.txt): {ast.unparse(node)}',
+				node,
+			)
+		operand = self._lower_expr( node.value, None )
+		if operand.type is str_type:
+			return operand
+		# conversion 114 == '!r'; -1 (none) and 115 ('!s') both want __str__ -
+		# matches print()'s own existing "no implicit stringification"
+		# convention: a scalar (i32, bool, ...) has no __str__ of its own,
+		# only the boxed classes do (int.__str__) - deliberately not
+		# auto-boxed here, same reasoning PLAN_FSTRINGS.md's own scope
+		# section gives
+		method_name = '__repr__' if node.conversion == 114 else '__str__'
+		method = self.lowering._find_method( operand.type, method_name )
+		if method is None:
+			type_name = operand.type.qualname if operand.type is not None else '?'
+			self.lowering.discovery.fail(
+				f'f-string: {type_name} has no {method_name}() - cannot format {ast.unparse(node.value)} in an f-string',
+				node,
+			)
+		self.lowering._ensure_resolved( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		dest = self._new_temp( str_type )
+		self._emit( ir.Call( dest = dest, target = method, receiver = operand, args = [], kwargs = {} ))
+		return dest
+
+	def _lower_unwrap_result(
+		self, result: ir.Operand, errmsg: str, payload_type: Type, error_type: Type, str_type: Type, node: ast.AST, *, want_result: bool = True,
+	) -> ir.Operand|None:
+		# unwrap()s a Result[T,E] this pass itself just produced (an
+		# UnsafeList[str].append()/.get_ptr() call, below). (payload_type,
+		# error_type) are passed in explicitly by the caller rather than
+		# read back off result.type, since substitute_type_params leaves
+		# two visibly different shapes there depending on whether the
+		# Result's own structure mentions T (get_ptr's Result[Ptr[T],
+		# IndexError] arrives as an already-monomorphized TaggedUnion;
+		# append's Result[None,OverflowError], fully concrete already in
+		# the abstract declaration, stays a plain Specialization) - the
+		# caller already knows both types unambiguously either way.
+		#
+		# Resolves the CONCRETE Result[payload_type,error_type] CLASS
+		# first (_get_or_create_specialization + _ensure_resolved), then
+		# reads `unwrap` off ITS OWN .names - the same "always go through
+		# the concrete class, never build a method Specialization directly
+		# off the abstract one" fix _expr_JoinedStr's own UnsafeList[str]
+		# handling above already needed (see its own comment). Building
+		# unwrap's Function-Specialization directly against the ABSTRACT
+		# Result class (this method's first, abandoned implementation)
+		# compiles and runs, but silently ALSO schedules a second, bogus,
+		# unspecialized copy of Result.is_ok (called from unwrap's own
+		# `if self.is_ok(): ...` body) under the bare, un-mangled C symbol
+		# name - a real "conflicting types for 'builtins$Result$is_ok'"
+		# link-shape error, confirmed via a real compile attempt and fixed
+		# by going through the concrete class first instead, exactly like
+		# ordinary source's own `some_result.unwrap(msg)` dispatch already
+		# does (Lowering._find_method's own owner_type = self._ensure_
+		# resolved(owner_type) is the same "resolve the class, not the
+		# method" step). These Results are provably always Ok (the buffer
+		# is pre-sized to exactly len(node.values) and never appended to
+		# more than that many times, and index 0 is always valid once N >=
+		# 2) - unwrap() rather than silently discarding keeps this
+		# consistent with the rest of the language's own "a Result is
+		# never silently ignored" discipline, and turns a violated
+		# invariant into a clear panic instead of undefined behavior.
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		result_spec = self.lowering.discovery._get_or_create_specialization( result_cls, [ payload_type, error_type ])
+		concrete_result_cls = self.lowering._ensure_resolved( result_spec )
+		unwrap = concrete_result_cls.names.get( 'unwrap' )
+		self.lowering._ensure_resolved( unwrap ) # schedules unwrap itself as a compile unit - see _expr_JoinedStr's own identical comment on init/append/get_ptr
+		self.lowering.schedule( unwrap.return_type )
+		for p in ( unwrap.parameters or [] ):
+			self.lowering.schedule( p.type )
+		errmsg_const = ir.Const( type = str_type, value = errmsg )
+		# want_result=False (append's own Result[None,OverflowError] - the
+		# payload is never used for anything, the call is made purely for
+		# its panic-on-Err side effect) discards the result rather than
+		# storing a None-typed payload in a Temp - a real, narrow, pre-
+		# existing emitter gap around a GENERIC Result[T,E].unwrap()
+		# monomorphized with T=NoneType (confirmed via a real compile
+		# attempt: the emitted unwrap[NoneType,...] function returns C
+		# `void`, but a stored dest expects an assignable MetalpyNone
+		# value - a mismatch nothing in lib/ has ever hit before, since no
+		# existing caller anywhere calls .unwrap() on a Result[None,_] -
+		# ListGenericTests' own list.append() usage only ever calls
+		# .is_err(), never .unwrap()). Fixing that gap for real belongs to
+		# whoever next needs a real None-payload Result value, not this
+		# pass - discarding is both correct (nothing here ever reads the
+		# payload) and sufficient (Err is still a real panic either way)
+		if not want_result:
+			self._emit( ir.Call( dest = None, target = unwrap, receiver = result, args = [ errmsg_const ], kwargs = {} ))
+			return None
+		dest = self._new_temp( unwrap.return_type )
+		self._emit( ir.Call( dest = dest, target = unwrap, receiver = result, args = [ errmsg_const ], kwargs = {} ))
+		return dest
+
+	def _lower_slice_view( self, ptr: ir.Operand, length: ir.Operand, elem_type: Type, node: ast.AST ) -> ir.Operand:
+		# builds a slice[elem_type] value directly via ir.Allocate - the one
+		# construction shape in this pass with no prior source-level call
+		# site to copy (slice[T] has no user-spellable constructor - see
+		# lib/builtins/__init__.py's join() comment, "no array-literal
+		# syntax"). Safe precisely because slice is a plain @cstruct, not
+		# an RCClass: emitter_c.py's own Allocate handling already treats a
+		# plain CStruct as "stack value construction, no header" (same
+		# posture _lower_bound_method_closure's own direct Allocate below
+		# uses for a ClosureType nothing in source can spell either) - no
+		# _schedule_rcclass_construction needed, this isn't heap-allocated
+		# or refcounted at all.
+		slice_cls = self.lowering.discovery.find_name( 'slice', node )
+		slice_spec = self.lowering.discovery._get_or_create_specialization( slice_cls, [ elem_type ])
+		concrete_slice_cls = self.lowering._ensure_resolved( slice_spec ) # the real, monomorphized slice[elem_type] - see _expr_JoinedStr's own comment on why the concrete class (not the abstract generic one) is what downstream code needs
+		dest = self._new_temp( slice_spec )
+		self._emit( ir.Allocate( dest = dest, cls = concrete_slice_cls, fields = { '_ptr': ptr, '__len': length } ))
+		return dest
+
+	def _expr_JoinedStr( self, node: ast.JoinedStr, expected_type: Type|None ) -> ir.Operand:
+		# f-string (PLAN_FSTRINGS.md). A fully compile-time-known JoinedStr
+		# never reaches here at all - compile_time_transformer.py's own
+		# _ConstFolder.visit_JoinedStr already collapsed it to a plain
+		# ast.Constant(str) before lowering.py ever sees the function body.
+		# expected_type is deliberately never used to type the result here,
+		# same reasoning _expr_Constant's own comment gives for its own
+		# TaggedUnion case: str.concat's return is authoritatively str
+		# either way, and _lower_expr's own post-hoc coercion is what wraps
+		# a plain str into a wider union afterward, if one was asked for.
+		str_type = self.lowering.discovery.find_name_or_none( 'str' )
+		if str_type is None:
+			self.lowering.discovery.fail( f'f-string requires the str type to be available: {ast.unparse(node)}', node )
+
+		if len( node.values ) == 0:
+			return ir.Const( type = str_type, value = '' )
+		if len( node.values ) == 1:
+			return self._lower_fstring_part( node.values[0], str_type )
+
+		parts = [ self._lower_fstring_part( value, str_type ) for value in node.values ]
+		n = len( parts )
+		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+
+		# UnsafeList[str](n) - the escape hatch lib/builtins/__list.py's own
+		# module docstring names for exactly this: a fixed-capacity,
+		# never-escaping, single-statement-lifetime scratch buffer, with no
+		# lock overhead a real list[T] would pay for no reason here (n is
+		# fixed at compile time - capacity never grows, so append() below
+		# can never actually trigger RawList._grow() at all)
+		# _get_or_create_specialization + _ensure_resolved gives back the
+		# REAL, concrete, already-monomorphized UnsafeList[str] ClassLike
+		# (not the Specialization wrapper - same "swap a Specialization for
+		# its monomorphized form" ensure_resolved always does), exactly the
+		# way _try_lower_construct_call's own "explicit ClassName[T](...)"
+		# branch does before ITS target_cls.type_params check ever runs
+		# (type_resolver.py's own _try_resolve_namespace pre-resolves a
+		# Subscript callee's Specialization the same way). Using this
+		# CONCRETE class from here on (not the abstract UnsafeList) matters
+		# for real: its own .names are ALREADY-substituted (T=str bound)
+		# methods, no separate per-method Specialization dance needed - and
+		# _schedule_rcclass_construction below specifically REQUIRES a
+		# concrete class (passing the still-generic abstract one there
+		# schedules the ABSTRACT __del__ as a standalone compile unit, T
+		# forever unbound - confirmed via a real repro: "compiler.is_rc(T)
+		# requires a concrete type" - type_resolver.py's own
+		# _schedule_rcclass_destructor_deps documents this exact hazard
+		# and guards against it with a cls.type_params check; this is the
+		# same hazard from the calling side instead).
+		unsafelist_cls = self.lowering.discovery.find_name( 'UnsafeList', node )
+		cls_spec = self.lowering.discovery._get_or_create_specialization( unsafelist_cls, [ str_type ])
+		concrete_cls = self.lowering._ensure_resolved( cls_spec )
+
+		init = concrete_cls.names.get( '__init__' )
+		self.lowering._ensure_resolved( init ) # schedules init ITSELF as a compile unit - monomorphize_class's own per-method substitution loop only builds+caches the substituted Function, it never schedules any of them for real emission on its own (confirmed via a real repro: an unscheduled monomorphized method compiles fine at the CALL SITE but is never actually emitted, producing a C "call to undeclared function" link-time-shaped error)
+		self.lowering.schedule( init.return_type )
+		for p in ( init.parameters or [] ):
+			self.lowering.schedule( p.type )
+
+		buf = self._new_temp( cls_spec )
+		self.lowering._schedule_rcclass_construction( concrete_cls, cls_spec )
+		self._emit( ir.Allocate( dest = buf, cls = concrete_cls, fields = {} ))
+		n_const = ir.Const( type = usize_cls, value = n )
+		self._emit( ir.Call( dest = None, target = init, receiver = buf, args = [ n_const ], kwargs = {} ))
+
+		none_type = self.lowering.discovery.get_none_type()
+		overflow_error_cls = self.lowering.discovery.find_name( 'OverflowError', node )
+		append = concrete_cls.names.get( 'append' )
+		self.lowering._ensure_resolved( append ) # see init's own comment on why this is needed
+		self.lowering.schedule( append.return_type )
+		for p in ( append.parameters or [] ):
+			self.lowering.schedule( p.type )
+		for part in parts:
+			append_result = self._new_temp( append.return_type )
+			self._emit( ir.Call( dest = append_result, target = append, receiver = buf, args = [ part ], kwargs = {} ))
+			self._lower_unwrap_result(
+				append_result, 'f-string: internal append failed (unreachable - buffer is pre-sized exactly)',
+				none_type, overflow_error_cls, str_type, node, want_result = False,
+			)
+
+		const_ptr_cls = self.lowering.discovery.get_intrinsics()['ConstPtr']
+		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		ptr_str_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ str_type ])
+		index_error_cls = self.lowering.discovery.find_name( 'IndexError', node )
+		get_ptr = concrete_cls.names.get( 'get_ptr' )
+		self.lowering._ensure_resolved( get_ptr ) # see init's own comment on why this is needed
+		self.lowering.schedule( get_ptr.return_type )
+		for p in ( get_ptr.parameters or [] ):
+			self.lowering.schedule( p.type )
+		zero_const = ir.Const( type = usize_cls, value = 0 )
+		get_ptr_result = self._new_temp( get_ptr.return_type )
+		self._emit( ir.Call( dest = get_ptr_result, target = get_ptr, receiver = buf, args = [ zero_const ], kwargs = {} ))
+		ptr = self._lower_unwrap_result(
+			get_ptr_result, 'f-string: internal index failed (unreachable - buffer is non-empty by construction)',
+			ptr_str_type, index_error_cls, str_type, node,
+		)
+
+		# CastWrap to ConstPtr[None] - a raw, untyped view into the buffer,
+		# not ConstPtr[str] - matches slice[T]'s own redesigned _ptr field
+		# (see its own comment on why: Ptr[str]/ConstPtr[str] compiles to
+		# the exact same C type as a bare str handle, one star, wrong for
+		# "array of handles")
+		none_type_ptr_target = self.lowering.discovery.get_none_type()
+		const_ptr_none = self.lowering.discovery._get_or_create_specialization( const_ptr_cls, [ none_type_ptr_target ])
+		const_ptr = self._new_temp( const_ptr_none )
+		self._emit( ir.CastWrap( dest = const_ptr, operand = ptr ))
+
+		view = self._lower_slice_view( const_ptr, n_const, str_type, node )
+
+		concat = self.lowering._find_method( str_type, 'concat' )
+		self.lowering._ensure_resolved( concat )
+		self.lowering.schedule( concat.return_type )
+		for p in ( concat.parameters or [] ):
+			self.lowering.schedule( p.type )
+		dest = self._new_temp( str_type )
+		self._emit( ir.Call( dest = dest, target = concat, receiver = None, args = [ view ], kwargs = {} ))
+		return dest
+
 	def _lower_bound_method_closure( self, node: ast.Attribute, obj: ir.Operand, method: Function, expected_type: Type|None ) -> ir.Operand:
 		# worker.run used as a VALUE (not called) - a bound-method
 		# reference, PLAN_CALLABLE.md's own "closure in miniature" deferred

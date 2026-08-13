@@ -202,6 +202,55 @@ class _ConstFolder( ast.NodeTransformer ):
 				break
 		return ast.copy_location( ast.Constant( value = result ), node )
 
+	def visit_JoinedStr( self, node: ast.JoinedStr ) -> ast.expr:
+		# f-string folding (PLAN_FSTRINGS.md). Deliberately does NOT call
+		# self.generic_visit(node) up front like every other visit_* here -
+		# that would also descend into each FormattedValue's own
+		# format_spec (itself a JoinedStr), and format_spec support isn't
+		# implemented anywhere in this pass OR in lowering.py's runtime
+		# path (str.format()'s own still-unbuilt mini-language) - folding
+		# INSIDE a format_spec here would leave it looking like a bare
+		# Constant instead of the JoinedStr shape every future consumer
+		# expects. Only each FormattedValue's own `.value` is folded
+		# (bottom-up, via an explicit self.visit() below); format_spec is
+		# left completely untouched either way, since it's rejected
+		# outright downstream regardless of its own contents.
+		#
+		# Every element's `.value` is folded UNCONDITIONALLY, even once one
+		# element has already proven the whole JoinedStr can't collapse -
+		# same "keep folding what you can, leave the rest as real nodes"
+		# spirit visit_Compare uses, not an all-or-nothing bail like
+		# visit_BinOp: f"{y}{1+1}" still folds its OWN `1+1` to `2` in
+		# place even though `y` (unfoldable) means the whole thing stays a
+		# JoinedStr.
+		foldable = True
+		parts: list[str] = []
+		for value in node.values:
+			if isinstance( value, ast.Constant ) and isinstance( value.value, str ):
+				parts.append( value.value )
+				continue
+			if isinstance( value, ast.FormattedValue ):
+				value.value = self.visit( value.value )
+				if (
+					foldable
+					and value.format_spec is None
+					and value.conversion in ( -1, 115, 114 ) # not 97 ('!a') - no ascii-escape primitive exists here, stays unfoldable
+					and isinstance( value.value, ast.Constant )
+					and not isinstance( value.value.value, bool ) # bool excluded: metalpy has no bool.__str__() this fold could match at runtime (Python's str(True) == 'True' has no metalpy equivalent)
+					and isinstance( value.value.value, ( str, int ))
+				):
+					# str(v) here matches metalpy's own int.__str__()/
+					# __repr__() exactly (plain decimal digits + optional
+					# leading '-', nothing else - see int_test.py's own
+					# round-trip assertions), so this is a genuine constant
+					# fold, not an approximation
+					parts.append( str( value.value.value ))
+					continue
+			foldable = False
+		if not foldable:
+			return node # falls through to the runtime str.concat path (lowering.py's _expr_JoinedStr) unchanged, minus whatever sub-expressions the loop above already folded in place
+		return ast.copy_location( ast.Constant( value = ''.join( parts )), node )
+
 	def visit_Compare(self, node: ast.Compare) -> ast.expr:
 		self.generic_visit(node)
 		

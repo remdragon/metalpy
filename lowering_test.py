@@ -6437,6 +6437,169 @@ class FetchUnicodeTableTests( unittest.TestCase ):
 		self.compiler.run()
 		self.assertTrue( any( 'does not exist' in e for e in self.discovery.errors.errors ))
 
+class JoinedStrLoweringTests( unittest.TestCase ):
+	''' f-string (PEP 498) runtime lowering (PLAN_FSTRINGS.md) -
+	_expr_JoinedStr/_lower_fstring_part in lowering.py. Needs real str/
+	Result/UnsafeList[T] (the runtime N-part path), same import_builtins=
+	True convention emitter_c_test.py's own FStringTests uses - compile_
+	time_transformer_test.py's own JoinedStrFoldingTests already covers
+	the compile-time-constant fold in isolation, and emitter_c_test.py's
+	FStringTests covers real end-to-end compile-and-run behavior; this
+	class checks the actual IR SHAPE the runtime path produces (proving
+	it's really UnsafeList[str]/slice[str]/str.concat, not N-1 chained
+	str.__add__ calls) and the conversion/error-reporting rules a pure
+	instruction-shape check can't see from emitter_c_test.py alone. '''
+	maxDiff = None
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ) -> LoweredFunction:
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		return fn
+
+	def _calls_to( self, fn: LoweredFunction, needle: str ) -> list[ir.Call]:
+		return [ i for i in fn.instructions if isinstance( i, ir.Call ) and needle in i.target.qualname ]
+
+	def _allocates_of( self, fn: LoweredFunction, needle: str ) -> list[ir.Allocate]:
+		return [ i for i in fn.instructions if isinstance( i, ir.Allocate ) and needle in i.cls.qualname ]
+
+	def test_single_formatted_value_short_circuits_no_concat_machinery( self ) -> None:
+		# f"{x}" alone (x: str, a real runtime value - not foldable) -
+		# len(node.values) == 1, PLAN_FSTRINGS.md's own short-circuit: the
+		# FormattedValue's own str-typed operand is used directly, no
+		# UnsafeList/slice/str.concat machinery at all
+		self._import( '\n'.join([
+			'def main( x: str ) -> str:',
+			'	return f"{x}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( self._allocates_of( fn, 'UnsafeList' ), [] )
+		self.assertEqual( self._allocates_of( fn, 'slice' ), [] )
+		self.assertEqual( self._calls_to( fn, 'concat' ), [] )
+		# the Return's own value IS x's own parameter, reused directly - no
+		# synthesized alias, no __str__ call (x is already str-typed)
+		ret = next( i for i in fn.instructions if isinstance( i, ir.Return ) )
+		self.assertIs( ret.value, fn.function.parameters[0] )
+
+	def test_multipart_runtime_path_uses_unsafelist_slice_concat_not_chained_add( self ) -> None:
+		# f"{a}{b}" (a, b: str, both real runtime values) - exactly 2
+		# parts, so exactly 2 UnsafeList[str].append() calls, exactly 1
+		# UnsafeList[str] Allocate, exactly 1 slice[str] Allocate, exactly
+		# 1 str.concat call, exactly 1 get_ptr call, and (append's own
+		# Result[None,OverflowError] x2 + get_ptr's own Result[Ptr[str],
+		# IndexError] x1 =) exactly 3 unwrap calls - and, the actual point
+		# of this whole pass, ZERO calls to str.__add__ (proving this
+		# ISN'T N-1 chained string concatenation)
+		self._import( '\n'.join([
+			'def main( a: str, b: str ) -> str:',
+			'	return f"{a}{b}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._allocates_of( fn, 'UnsafeList' )), 1 )
+		self.assertEqual( len( self._allocates_of( fn, 'slice' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '.append' )), 2 )
+		self.assertEqual( len( self._calls_to( fn, 'get_ptr' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, 'unwrap' )), 3 )
+		self.assertEqual( len( self._calls_to( fn, '.concat' )), 1 )
+		self.assertEqual( self._calls_to( fn, '__add__' ), [] )
+
+	def test_literal_and_runtime_value_mixed( self ) -> None:
+		# f"a{x}b" (x: str runtime) - N=3 parts (Constant('a'),
+		# FormattedValue(x), Constant('b')), none of them individually
+		# foldable together with x, so the whole thing stays a real
+		# runtime JoinedStr and takes the N>=2 path with exactly 3 parts
+		self._import( '\n'.join([
+			'def main( x: str ) -> str:',
+			'	return f"a{x}b"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '.append' )), 3 )
+		self.assertEqual( len( self._calls_to( fn, '.concat' )), 1 )
+
+	def test_no_conversion_uses_str_dunder( self ) -> None:
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = self._calls_to( fn, '__str__' )
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].target.stem, '__str__' )
+
+	def test_bang_s_conversion_uses_str_dunder( self ) -> None:
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n!s}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '__str__' )), 1 )
+
+	def test_bang_r_conversion_uses_repr_dunder( self ) -> None:
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n!r}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '__repr__' )), 1 )
+		self.assertEqual( self._calls_to( fn, '__str__' ), [] )
+
+	def test_bang_a_conversion_is_a_compile_error( self ) -> None:
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n!a}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any( '!a' in e and 'not supported' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	def test_format_spec_is_a_compile_error( self ) -> None:
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n:.2f}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( 'format spec' in e and 'str.format' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors,
+		)
+
+	def test_value_with_no_str_or_repr_is_a_compile_error( self ) -> None:
+		self._import( '\n'.join([
+			'@cstruct',
+			'class Foo: pass',
+			'',
+			'def main( f: Foo ) -> str:',
+			'	return f"{f}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( 'Foo' in e and '__str__' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors,
+		)
+
+	def test_self_documenting_equals_syntax_needs_no_special_handling( self ) -> None:
+		# f"{x=}" - CPython's own parser already expands this into an
+		# extra literal Constant('x=') ahead of the FormattedValue before
+		# metalpy ever sees the tree (PLAN_FSTRINGS.md's own Context
+		# section) - just confirms it compiles and takes the expected
+		# 2-part runtime path (Constant('x='), FormattedValue(x))
+		self._import( '\n'.join([
+			'def main( x: str ) -> str:',
+			'	return f"{x=}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '.append' )), 2 )
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

@@ -80,6 +80,50 @@ class ConstantFoldingTests( unittest.TestCase ):
 		self.assertEqual( _fold( 'x = "ABC" > "abc"', {} ), 'x = False' )
 
 
+class JoinedStrFoldingTests( unittest.TestCase ):
+	def test_all_literal_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"hello world"', {} ), "x = 'hello world'" )
+
+	def test_literal_plus_constant_expr_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"answer={1+21}"', {} ), "x = 'answer=22'" )
+
+	def test_negative_int_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"n={-5}"', {} ), "x = 'n=-5'" )
+
+	def test_str_constant_value_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{\"abc\"}"', {} ), "x = 'abc'" )
+
+	def test_repr_conversion_on_int_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{1+1!r}"', {} ), "x = '2'" )
+
+	def test_empty_joinedstr_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f""', {} ), "x = ''" )
+
+	def test_runtime_name_left_unfolded( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{y}"', {} ), "x = f'{y}'" )
+
+	def test_mixed_foldable_and_runtime_still_folds_the_foldable_part_in_place( self ) -> None:
+		# the whole JoinedStr can't collapse (y is runtime), but the nested
+		# 1+1 inside the OTHER FormattedValue still folds in place - proves
+		# generic_visit's own bottom-up cascade runs regardless of whether
+		# the outer JoinedStr itself ends up foldable
+		self.assertEqual( _fold( 'x = f"n={1+1}{y}"', {} ), "x = f'n={2}{y}'" )
+
+	def test_bool_value_left_unfolded( self ) -> None:
+		# no metalpy bool.__str__() exists to fold against - see
+		# visit_JoinedStr's own comment
+		self.assertEqual( _fold( 'x = f"{True}"', {} ), "x = f'{True}'" )
+
+	def test_float_value_left_unfolded( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{1.5}"', {} ), "x = f'{1.5}'" )
+
+	def test_ascii_conversion_left_unfolded( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{y!a}"', {} ), "x = f'{y!a}'" )
+
+	def test_format_spec_left_unfolded_even_when_value_is_constant( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{(1+1):.2f}"', {} ), "x = f'{2:.2f}'" )
+
+
 class CompilerTargetSubstitutionTests( unittest.TestCase ):
 	def test_os_substituted( self ) -> None:
 		self.assertEqual( _fold( 'x = compiler.target.os', { 'os': 'windows' } ), "x = 'windows'" )

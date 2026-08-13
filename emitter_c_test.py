@@ -9078,5 +9078,148 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class FStringTests( CompilerTestCase ):
+	''' f-string (PEP 498) real end-to-end compile-and-run tests
+	(PLAN_FSTRINGS.md). Mirrors StrUpperLowerTests/ListGenericTests' own
+	import_builtins=True + real compile-and-run convention - the runtime
+	N-part path needs str/Result/UnsafeList[T] for real. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_multipart_runtime_fstring( self ) -> None:
+		# exercises the real N-part runtime path (UnsafeList[str]/slice[str]/
+		# str.concat) - a and b are real runtime parameters (not folded away
+		# by compile_time_transformer.py), so this is the test that actually
+		# proves the whole pass end to end, not just compile-time folding
+		self._run( '''
+def build( a: str, b: str ) -> str:
+	return f"{a} {b}!"
+
+def main() -> i32:
+	if build( 'hello', 'world' ) != 'hello world!':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_single_interpolation_short_circuit( self ) -> None:
+		# len(node.values) == 1 - no UnsafeList/slice/concat machinery at
+		# all, just the FormattedValue's own str-typed operand directly
+		self._run( '''
+def build( a: str ) -> str:
+	return f"{a}"
+
+def main() -> i32:
+	if build( 'solo' ) != 'solo':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_non_str_value_uses_str_dunder( self ) -> None:
+		# an int value has no natural str type - resolved via int.__str__()
+		# (PLAN_FSTRINGS.md's own value-to-str resolution rules)
+		self._run( '''
+def build( n: int ) -> str:
+	return f"n={n}"
+
+def main() -> i32:
+	if build( int( 42 )) != 'n=42':
+		return 1
+	if build( int( -7 )) != 'n=-7':
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_repr_conversion_uses_repr_dunder( self ) -> None:
+		self._run( '''
+def build( n: int ) -> str:
+	return f"{n!r}"
+
+def main() -> i32:
+	if build( int( 5 )) != '5':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_compile_time_constant_fstring_folds_away( self ) -> None:
+		# fully compile-time-known - compile_time_transformer.py's own
+		# visit_JoinedStr already collapsed this to a plain str Constant
+		# before lowering.py ever sees a JoinedStr node at all; this is an
+		# end-to-end proof the fold produces correct, runnable output, not
+		# just the right ast.unparse() text (compile_time_transformer_
+		# test.py already covers that in isolation)
+		self._run( '''
+def main() -> i32:
+	if f"answer={1+41}" != 'answer=42':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_repeated_fstring_construction_does_not_leak_or_double_free( self ) -> None:
+		# runs the N-part runtime path many times over - a real stress
+		# check for the UnsafeList[str] scratch buffer's own lifecycle
+		# (construction, N appends, get_ptr, destruction) - matches this
+		# codebase's own "repeat-run stress test, not just reasoning"
+		# verification convention (see ListThreadSafetyTests)
+		self._run( '''
+def build( n: int ) -> str:
+	return f"iteration: value={n}"
+
+def main() -> i32:
+	for i in range( 1000 ):
+		s: str = build( int( 7 ))
+		if s != 'iteration: value=7':
+			return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 if __name__ == '__main__':
 	unittest.main()

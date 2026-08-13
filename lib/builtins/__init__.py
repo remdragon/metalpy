@@ -69,21 +69,53 @@ class Result[T,E]:
 
 @cstruct
 class slice[T]:
-	_ptr: ConstPtr[T]
+	# _ptr is a raw, untyped view into the backing buffer - NOT
+	# ConstPtr[T]. Ptr[Foo]/ConstPtr[Foo] for an RC class Foo compiles to
+	# the exact same C type as a bare Foo handle (struct Foo*, one star -
+	# see emitter_c.py's own _value_spelling comment: "Ptr[T]'s inner T
+	# must stay a single pointer even when T is an RCClass - sys.alloc
+	# [Foo]'s own real return type"), by design, for the "pointer to ONE
+	# freshly allocated object" use case - genuinely correct there, but
+	# incompatible with "pointer to an ARRAY of handles" (needs struct
+	# Foo**, two stars), which is what a slice over RC elements actually
+	# is. This is the exact same "an RC element's own slot holds its
+	# HANDLE, not its struct body" distinction UnsafeList's own RawList/
+	# _read_element/_write_element (lib/builtins/__list.py) already keep
+	# straight via an explicit compiler.is_rc(T) branch + Ptr[None] casts,
+	# rather than naive Ptr[T] array indexing - slice[T] mirrors that
+	# same pattern here (found + fixed together with str.concat/
+	# UnsafeList, its only real caller - PLAN_FSTRINGS.md).
+	_ptr: ConstPtr[None]
 	__len: usize
-	
+
 	def __len__( self ) -> usize:
 		return self.__len
-	
+
+	def _element_size( self ) -> usize:
+		# same split RawList's own element_size computation uses (see
+		# UnsafeList.__init__'s own comment): an RC element's SLOT is
+		# always pointer-wide (it holds a handle, never the struct body),
+		# regardless of T's own real, possibly much larger, layout size
+		if compiler.is_rc( T ):
+			return compiler.sizeof( usize )
+		return compiler.sizeof( T )
+
 	def get_unchecked( self, index: usize ) -> T:
-		return self._ptr.add( index ).deref()
-	
+		with compiler.panic_arithmetic( 'slice.get_unchecked: offset overflow' ):
+			slot: ConstPtr[None] = self._ptr + index * self._element_size()
+		if compiler.is_rc( T ):
+			handle_slot: ConstPtr[ConstPtr[None]] = compiler.cast( ConstPtr[ConstPtr[None]], slot )
+			return compiler.cast( T, handle_slot[0] )
+		else:
+			ptr: ConstPtr[T] = compiler.cast( ConstPtr[T], slot )
+			return ptr[0]
+
 	def __getitem__( self, index: usize ) -> Result[T,IndexError]:
 		if index >= self.__len:
 			return Result.Err( IndexError )
-		
+
 		return Result.Ok( self.get_unchecked( index ))
-	
+
 	def get_assert( self, index: usize ) -> T:
 		if index >= self.__len:
 			sys.panic( 'bad slice index' )
@@ -206,7 +238,7 @@ class str:
 	def concat( parts: slice[str] ) -> str:
 		new_size: usize = 1 # for the zero terminator
 		i: usize = 0
-		count: usize = parts.len()
+		count: usize = parts.__len__()
 		for i in range( count ):
 			part: str = parts.get_unchecked( i )
 			with compiler.panic_arithmetic( 'irrational string length' ):
