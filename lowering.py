@@ -536,7 +536,7 @@ class Lowering:
 		# (for loop iterability checks, __getitem__'s raw-GetItem fallback),
 		# not a real error to report
 		owner_type = self._ensure_resolved( owner_type )
-		if isinstance( owner_type, CStruct ):
+		if isinstance( owner_type, ( CStruct, RCClass )):
 			found = owner_type.chain_lookup( name )
 		else:
 			names = getattr( owner_type, 'names', None )
@@ -813,7 +813,7 @@ class Lowering:
 			# guarantee) - trigger it here too, lazily, the moment it's
 			# actually needed
 			self._union_storage.get( owner_type )
-		if isinstance( owner_type, CStruct ):
+		if isinstance( owner_type, ( CStruct, RCClass )):
 			found = owner_type.chain_lookup( attr )
 		else:
 			names = getattr( owner_type, 'names', None )
@@ -1106,7 +1106,7 @@ class FunctionLowering:
 						# Specialization.base means "the generic template" -
 						# not the same thing, don't conflate them
 						self_cls = self.lowering._ensure_resolved( fn.cls ) if isinstance( fn.cls, Specialization ) else fn.cls
-						if fn.stem == '__init__' and isinstance( self_cls, RCClass ) and self_cls.base is None:
+						if fn.stem == '__init__' and isinstance( self_cls, RCClass ):
 							self._construction_self = self_param
 							self._construction_fallible = self.lowering._init_fallibility( fn )
 
@@ -1180,7 +1180,19 @@ class FunctionLowering:
 					if self._construction_self is not None:
 						self._emit_construction_defaults( self_cls, self_param, module )
 					body_start = len( self._instructions )
-					for stmt in fn.node.body:
+					# a subclass's own __init__ must open with
+					# super().__init__(...) as its literal first statement
+					# when its base has one to chain to (RCClass single
+					# inheritance, Phase 2 of the RCClass-subclassing plan) -
+					# handled once here, before the ordinary per-statement
+					# loop below, which then only ever sees whatever's left
+					# (unaffected for every other function, and for a
+					# construction-only class with no base/no chained
+					# __init__, this returns fn.node.body unchanged)
+					body_stmts = fn.node.body
+					if self._construction_self is not None:
+						body_stmts = self._lower_super_init_if_required( self_cls, self_param )
+					for stmt in body_stmts:
 						# one bad statement doesn't stop the rest of this
 						# function's body from being lowered (and error-collected) -
 						# mirrors discovery.py's per-.resolve()/per-top-level-statement
@@ -1366,6 +1378,117 @@ class FunctionLowering:
 		except CompileError as e:
 			self.lowering.discovery.fail_loc( str( e ), fn.file, fn.line )
 
+	# --- super().__init__(...) constructor chaining (RCClass, single inheritance) --
+
+	def _super_init_shape( self, node: ast.expr ) -> tuple[ast.Call,ast.Call|None] | None:
+		''' recognizes `super().__init__(...)` (base __init__ infallible) or
+		`super().__init__(...).or_return()` (base __init__ fallible) as an
+		EXACT textual shape - `super` is never a real registered name
+		anywhere in this language (there is no builtin/intrinsic for it),
+		so this has to be recognized here, before ordinary call resolution
+		ever sees it, the same textual-recognition posture as defer/
+		errdefer/compiler.X/or_return() itself already uses throughout this
+		file. Returns (init_call, or_return_call) - or_return_call is None
+		for the plain (infallible) spelling, otherwise the OUTER .or_return()
+		ast.Call (handed to _lower_or_return unchanged, so ITS OWN existing
+		checked-result propagation logic - OrReturn/OrJump - is reused
+		verbatim rather than reimplemented here). Returns None for anything
+		that isn't this exact shape - never a compile error by itself,
+		callers decide what "not this shape" means in their own context
+		(required-and-missing vs. used somewhere it isn't allowed at all). '''
+		or_return_call: ast.Call|None = None
+		call = node
+		if (
+			isinstance( call, ast.Call ) and isinstance( call.func, ast.Attribute ) and call.func.attr == 'or_return'
+			and not call.args and not call.keywords
+		):
+			or_return_call = call
+			call = call.func.value
+		if not ( isinstance( call, ast.Call ) and isinstance( call.func, ast.Attribute ) and call.func.attr == '__init__' ):
+			return None
+		receiver = call.func.value
+		if not (
+			isinstance( receiver, ast.Call ) and isinstance( receiver.func, ast.Name ) and receiver.func.id == 'super'
+			and not receiver.args and not receiver.keywords
+		):
+			return None
+		return call, or_return_call
+
+	def _lower_super_init_if_required( self, self_cls: RCClass, self_param: Variable ) -> list[ast.stmt]:
+		''' called right before a subclass's own __init__ body is lowered
+		(self._construction_self is already set) - if self_cls.base has a
+		chained __init__ anywhere in ITS OWN chain (RCClass.chain_lookup,
+		Phase 1), THIS __init__ must open with super().__init__(...) (or,
+		when the base's own __init__ is fallible,
+		super().__init__(...).or_return()) as literally its first statement
+		- handled specially here rather than through the ordinary
+		_stmt_Expr dispatch (see _super_init_shape's own comment on why).
+		Returns the REMAINING statements for the ordinary per-statement
+		loop to process - fn.node.body[1:] when this consumed statement 0,
+		otherwise fn.node.body unchanged.
+
+		A base with no chained __init__ at all needs no super() call - if
+		it also has no fields anywhere in its own chain, there is nothing
+		for this __init__ to be responsible for on the base's behalf at
+		all (matches a root class's own construction exactly, just with a
+		harmless base contributing nothing). If it DOES have fields but no
+		__init__ to chain to, declaring a subclass __init__ at all is
+		rejected outright - a deliberate Phase 2 scope limit (see the
+		RCClass-subclassing plan's own Phase 2 notes): no sugar exists yet
+		for filling in a field-only ancestor's fields from inside a
+		subclass's own __init__, and inventing one isn't this phase's job. '''
+		fn = self._current_fn
+		if self_cls.base is None:
+			return fn.node.body
+		base_init = self_cls.base.chain_lookup( '__init__' )
+		if base_init is None:
+			if self_cls.base.flattened_attributes():
+				self.lowering.discovery.fail(
+					f'{fn.qualname}: cannot declare __init__ - base {self_cls.base.qualname} has field(s) but no '
+					f'__init__ to chain to via super().__init__() (not supported yet)',
+					fn.node,
+				)
+			return fn.node.body
+		# resolve AND schedule - base_init might otherwise never become a
+		# real compiled unit if nothing else ever calls it directly (an
+		# ordinary call's own target already goes through _ensure_resolved/
+		# schedule() somewhere upstream; this call site is entirely our own,
+		# so it has to do that itself)
+		base_init = self.lowering._ensure_resolved( base_init )
+		shape = self._super_init_shape( fn.node.body[0].value ) if fn.node.body and isinstance( fn.node.body[0], ast.Expr ) else None
+		if shape is None:
+			self.lowering.discovery.fail(
+				f'{fn.qualname}: must call super().__init__(...) as its first statement '
+				f'({self_cls.base.qualname} has its own __init__ to chain to)',
+				fn.node.body[0] if fn.node.body else fn.node,
+			)
+		init_call, or_return_call = shape
+		is_fallible = self.lowering._init_fallibility( base_init )
+		if is_fallible and or_return_call is None:
+			self.lowering.discovery.fail(
+				f'super().__init__(...): {self_cls.base.qualname}.__init__ is fallible - must be consumed via '
+				f'.or_return(): {ast.unparse(fn.node.body[0])}',
+				fn.node.body[0],
+			)
+		if not is_fallible and or_return_call is not None:
+			self.lowering.discovery.fail(
+				f'super().__init__(...).or_return(): {self_cls.base.qualname}.__init__ is not fallible - remove '
+				f'.or_return(): {ast.unparse(fn.node.body[0])}',
+				fn.node.body[0],
+			)
+		self.lowering.schedule( base_init.return_type )
+		for param in base_init.parameters or []:
+			self.lowering.schedule( param.type )
+		args, kwargs = self._lower_call_args( base_init, init_call )
+		dest = self._new_temp( base_init.return_type ) if is_fallible else None
+		call = ir.Call( dest = dest, target = base_init, receiver = self_param, args = args, kwargs = kwargs, is_super_init_call = True )
+		self._emit( call )
+		if or_return_call is not None:
+			assert dest is not None
+			self._lower_or_return( or_return_call, dest, want_result = False )
+		self._cfg.complete_base_construction( self_cls.base.flattened_attributes() )
+		return fn.node.body[1:]
+
 	# --- temp/instruction bookkeeping ----------------------------------------
 
 	def _emit( self, instr: ir.Instruction ) -> None:
@@ -1402,7 +1525,11 @@ class FunctionLowering:
 		# before CFGState is constructed, matches none of these types)
 		operands: list[ir.Operand] = []
 		if isinstance( instr, ir.Call ):
-			if instr.receiver is not None:
+			# is_super_init_call's receiver (self, mid-construction) is
+			# deliberately excluded too, alongside GetAttr.obj/SetAttr.obj
+			# above - see ir.Call.is_super_init_call's own comment. args/
+			# kwargs still go through the ordinary check below regardless
+			if instr.receiver is not None and not instr.is_super_init_call:
 				operands.append( instr.receiver )
 			operands += instr.args
 			operands += instr.kwargs.values()
@@ -2015,6 +2142,16 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'unsupported AugAssign target: {ast.unparse(node)}', node )
 
 	def _stmt_Expr( self, node: ast.Expr ) -> None:
+		if self._super_init_shape( node.value ) is not None:
+			# only ever consumed specially as literally __init__'s own first
+			# statement (_lower_super_init_if_required, called BEFORE this
+			# per-statement loop even starts) - reaching here at all means
+			# it's either not statement 0, or this isn't even __init__, or
+			# there's no base to chain to in the first place
+			self.lowering.discovery.fail(
+				f'super().__init__(...) is only allowed as the literal first statement of a subclass\'s own __init__: {ast.unparse(node)}',
+				node,
+			)
 		defer_kind = self.lowering._defer_kind_of_call( node.value )
 		if defer_kind is not None:
 			if len( node.value.args ) != 1 or node.value.keywords:
@@ -3948,6 +4085,39 @@ class FunctionLowering:
 			)
 		return self._lower_expr( expr, None ) # no candidate's parameter type is even plausible for this literal's kind - falls through to the existing error
 
+	def _check_rcclass_fully_implemented( self, target_cls: RCClass, node: ast.AST, label: str ) -> None:
+		''' RCClass analog of the CStruct-interface stub-body check just
+		below (RCClass-subclassing plan Phase 5) - an RCClass with any
+		unfulfilled @abstractmethod slot anywhere in its own chain is
+		never meant to be constructed directly. Unlike CStruct's implicit
+		stub-body-means-unimplemented convention, RCClass uses the
+		EXPLICIT is_abstract marker (discovery.py already requires
+		@abstractmethod to also be @virtual and have a stub body - so
+		checking is_abstract here is equivalent to checking the body
+		shape, just reads as what it actually means). Shared by BOTH
+		RCClass construction paths (_lower_allocate_fields's own call
+		below, and _try_lower_construct_call's __init__-based path) via
+		this one helper, so the two can't drift out of sync - matches
+		compiler.py's own _schedule_rcclass_vtable_impls, which this stays
+		in lockstep with (emitter_c.py's emit_rcclass_vtable_instance
+		skips building an instance at all for a class this check would
+		reject, the same "None if any slot is unfulfilled" gate CStruct's
+		own emit_interface_vtable_instance already uses). '''
+		unfulfilled: list[str] = []
+		for slot in target_cls.virtual_slots():
+			impl = target_cls.chain_lookup( slot.stem )
+			assert isinstance( impl, Function ) # virtual_slots()'s own entries always exist somewhere in the chain - at minimum the root's own declaration chain_lookup started from
+			if impl.resolve is not None:
+				impl.resolve()
+			if impl.is_abstract:
+				unfulfilled.append( slot.stem )
+		if unfulfilled:
+			self.lowering.discovery.fail(
+				f'{target_cls.qualname}{label} cannot be constructed - abstract method(s) have no implementation: '
+				f'{", ".join(unfulfilled)}',
+				node,
+			)
+
 	def _lower_allocate_fields( self, target_cls: ClassLike, node: ast.Call, expected_type: Type|None, label: str ) -> ir.Temp:
 		# shared by both callers of ir.Allocate (Class.__allocate__(...) and
 		# bare ClassName(...) sugar for the no-__init__ case) - everything
@@ -3961,7 +4131,15 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'**kwargs not supported for {target_cls.qualname}{label}: {ast.unparse(node)}', node )
 
 		self.lowering._ensure_resolved( target_cls )
-		for attr in target_cls.attributes:
+		# .attributes alone only ever holds a class's OWN declared fields
+		# (discovery.py never merges a base's own fields into a subclass) -
+		# flattened_attributes() walks the WHOLE single-inheritance chain
+		# (base-first), which is what this no-__init__ field=value sugar
+		# needs to see every constructible field, inherited or not. A no-op
+		# widening for RCClass/CStruct with no base (returns the same list
+		# .attributes would) and for CUnion/CEnum (never have .base at all)
+		target_fields = target_cls.flattened_attributes() if isinstance( target_cls, ( RCClass, CStruct )) else target_cls.attributes
+		for attr in target_fields:
 			self.lowering._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as _attr_lookup's found.resolve
 		if isinstance( target_cls, CStruct ) and target_cls.is_interface:
 			# a "pure interface" (or any @interface class with an unfulfilled
@@ -3985,6 +4163,8 @@ class FunctionLowering:
 					f'{", ".join(unfulfilled)}',
 					node,
 				)
+		elif isinstance( target_cls, RCClass ):
+			self._check_rcclass_fully_implemented( target_cls, node, label )
 		# target_cls is always the ABSTRACT class (resolved via
 		# _try_resolve_namespace on the shared, unspecialized AST body's
 		# own `SomeGeneric.__allocate__` reference - see
@@ -4027,9 +4207,9 @@ class FunctionLowering:
 				f'{target_cls.qualname}: UnionStorage.get() has not run yet - no real tag/data storage to allocate'
 			declared = { tag_field.stem: tag_field, data_field.stem: data_field }
 		elif isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls:
-			declared = { attr.stem: self.lowering._substituted_field( attr, fn_cls ) for attr in target_cls.attributes }
+			declared = { attr.stem: self.lowering._substituted_field( attr, fn_cls ) for attr in target_fields }
 		else:
-			declared = { attr.stem: attr for attr in target_cls.attributes }
+			declared = { attr.stem: attr for attr in target_fields }
 		given = { kw.arg for kw in node.keywords }
 		missing = declared.keys() - given
 		if isinstance( target_cls, CUnion ):
@@ -4218,11 +4398,13 @@ class FunctionLowering:
 				return None
 			if not isinstance( init, Function ):
 				self.lowering.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
-			if target_cls.base is not None:
-				self.lowering.discovery.fail(
-					f'{target_cls.qualname}(...): __init__ invocation is only supported for classes with no base class yet: {ast.unparse(node)}',
-					node,
-				)
+			# a subclass's own __init__ (found here via a FLAT, own-class-
+			# only lookup - deliberate, matches Python's "an override fully
+			# replaces the inherited one, callers never see both" semantics)
+			# is allowed to chain to its base via super().__init__(...) now
+			# (see FunctionLowering._lower_super_init_if_required) - no
+			# rejection needed here anymore (RCClass-subclassing plan Phase 2)
+			self._check_rcclass_fully_implemented( target_cls, node, '(...)' )
 
 			if target_cls.type_params:
 				self_type, init, args, kwargs = self._lower_generic_construction_args( node, target_cls, init, expected_type )
@@ -4395,7 +4577,15 @@ class FunctionLowering:
 
 		err_label = self._new_label( 'ctor_err' )
 		end_label = self._new_label( 'ctor_end' )
-		self._emit( ir.JumpIfFalse( cond = is_err_temp, target = err_label ))
+		# JumpIfTrue, not JumpIfFalse - is_err_temp holds is_err()'s own
+		# result, so a jump-to-err has to fire when it's TRUE (a bug found
+		# while prototyping Phase 2's fallible super().__init__() chaining -
+		# JumpIfFalse here meant "not an error -> jump to the error branch",
+		# inverted, for EVERY fallible RCClass __init__ in the language, not
+		# just a subclassed one - confirmed on a clean checkout before any
+		# RCClass-subclassing work, so unrelated to it beyond being how it
+		# was found)
+		self._emit( ir.JumpIfTrue( cond = is_err_temp, target = err_label ))
 
 		# Ok branch: self is fully constructed - hand it off
 		ok_expr = ast.Call(

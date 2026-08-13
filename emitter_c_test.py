@@ -591,6 +591,679 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+class RCClassSubclassingPhase1Tests( CompilerTestCase ):
+	''' Phase 1 of the RCClass-subclassing plan (base-chain lookup +
+	attribute-shadowing rejection, no constructor chaining/@virtual/
+	@abstractmethod yet - see the plan's own phasing): RCClass gained
+	chain_lookup/own_new_virtual_slots/vtbl_owner/virtual_slots
+	(mpy_types.py, generalized from CStruct's own, since both classes share
+	an identical .base/.methods/.names/.resolve shape), and lowering.py's
+	_find_method/_attr_lookup + type_resolver.py's _attr_lookup_callable now
+	walk it for RCClass too, not just CStruct. Needs real builtins, like
+	UnionAsUnconstructedResultErrorTypeTests above (RCClass construction
+	goes through the real sys.alloc[T] path). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_subclass_calls_inherited_method( self ) -> None:
+		# a subclass instance can call a method it never redeclared, found
+		# by walking to its base via the new RCClass.chain_lookup - real
+		# compile+run, not just a discovery-level resolution check.
+		# Deliberately doesn't touch any INHERITED field (Derived(y=10) only
+		# needs its OWN field) - field=value construction sugar flattening
+		# the base chain is a later phase's scope, not this one's.
+		self._run( '''
+class Base:
+	def hello( self ) -> i32:
+		return 42
+
+class Derived( Base ):
+	y: i32
+
+def main() -> i32:
+	d: Derived = Derived( y = 10 )
+	if d.hello() != 42:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_subclass_shadowing_base_field_is_a_compile_error( self ) -> None:
+		self._run( '''
+class Base:
+	x: i32
+
+class Derived( Base ):
+	x: i32
+
+def main() -> i32:
+	d: Derived = Derived( x = 5 )
+	return 0
+''' )
+		self.assertTrue( any( 'shadows' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	def test_subclass_shadowing_base_method_is_a_compile_error( self ) -> None:
+		self._run( '''
+class Base:
+	def get_x( self ) -> i32:
+		return 1
+
+class Derived( Base ):
+	def get_x( self ) -> i32:
+		return 2
+
+def main() -> i32:
+	d: Derived = Derived()
+	return 0
+''' )
+		self.assertTrue( any( 'shadows' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+class RCClassSubclassingPhase2Tests( CompilerTestCase ):
+	''' Phase 2 of the RCClass-subclassing plan: super().__init__(...)
+	constructor chaining. A subclass's own __init__ must open with
+	super().__init__(...) (or, when the base's own __init__ is fallible,
+	super().__init__(...).or_return()) as literally its first statement -
+	after it runs, cfg.py's new complete_base_construction marks every
+	base-chain attribute initialized in one shot, so the subclass's own
+	construction-safety checking only ever has to track its OWN new
+	attributes. See lowering.py's _lower_super_init_if_required/
+	cfg.py's complete_base_construction.
+
+	Found and fixed along the way (not specific to subclassing): every
+	fallible RCClass __init__ in the language - subclassed or not - had
+	its Ok/Err branch inverted (_emit_fallible_construction emitted
+	JumpIfFalse where it needed JumpIfTrue), discovered while prototyping
+	this phase's own fallible super().__init__() chaining requirement,
+	confirmed via a plain, non-subclassed repro on a clean checkout before
+	this phase's own changes. Fixed; see test_fallible_root_construction_
+	ok_path_actually_returns_ok below for the regression coverage. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_basic_constructor_chaining( self ) -> None:
+		self._run( '''
+class Base:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def get_x( self ) -> i32:
+		return self.x
+
+class Derived( Base ):
+	y: i32
+	def __init__( self, x: i32, y: i32 ) -> None:
+		super().__init__( x )
+		self.y = y
+	def get_y( self ) -> i32:
+		return self.y
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		d: Derived = Derived( x = 5, y = 10 )
+		total: i32 = d.get_x() + d.get_y()
+		if total != 15:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_three_level_chain( self ) -> None:
+		self._run( '''
+class Root:
+	a: i32
+	def __init__( self, a: i32 ) -> None:
+		self.a = a
+
+class Mid( Root ):
+	b: i32
+	def __init__( self, a: i32, b: i32 ) -> None:
+		super().__init__( a )
+		self.b = b
+
+class Leaf( Mid ):
+	c: i32
+	def __init__( self, a: i32, b: i32, c: i32 ) -> None:
+		super().__init__( a, b )
+		self.c = c
+	def total( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.a + self.b + self.c
+
+def main() -> i32:
+	leaf: Leaf = Leaf( a = 1, b = 2, c = 3 )
+	if leaf.total() != 6:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fallible_root_construction_ok_path_actually_returns_ok( self ) -> None:
+		# regression test for the inverted-branch bug this phase's own
+		# fallible-chaining prototyping found (see this class's own
+		# docstring) - a plain, non-subclassed fallible __init__, no
+		# subclassing involved at all
+		self._run( '''
+class MyError:
+	pass
+
+class Base:
+	x: i32
+	def __init__( self, x: i32 ) -> Result[None, MyError]:
+		self.x = x
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		r: Result[Base, MyError] = Base( x = 5 )
+		if r.is_err():
+			return 100
+		b: Base = r.unwrap( 'construction failed' )
+		if b.x != 5:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fallible_base_chaining_with_or_return( self ) -> None:
+		self._run( '''
+class MyError:
+	pass
+
+class Base:
+	x: i32
+	def __init__( self, x: i32 ) -> Result[None, MyError]:
+		self.x = x
+		return Result.Ok( None )
+
+class Derived( Base ):
+	y: i32
+	def __init__( self, x: i32, y: i32 ) -> Result[None, MyError]:
+		super().__init__( x ).or_return()
+		self.y = y
+		return Result.Ok( None )
+	def total( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x + self.y
+
+def main() -> i32:
+	r: Result[Derived, MyError] = Derived( x = 5, y = 10 )
+	if r.is_err():
+		return 100
+	d: Derived = r.unwrap( 'construction failed' )
+	if d.total() != 15:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_chained_construction_no_leak( self ) -> None:
+		# real RC-lifetime stress check under repetition, same rigor as
+		# this codebase's own established convention (see e.g.
+		# MatchArmSameNameNarrowingTests.test_rc_lifetime_repeated_calls_
+		# no_leak) - Base's own str field is set via super().__init__(),
+		# never touched directly by Derived's own body, so this exercises
+		# complete_base_construction's own bookkeeping specifically: if it
+		# mishandled ownership (a spurious extra incref, or none at all
+		# where one was needed), repeated construction/teardown would
+		# either leak or double-free under repetition even if a single
+		# iteration looked fine. 'hello'.upper() (not a literal) forces a
+		# real heap allocation - a literal binds to immortal static
+		# storage and can't distinguish a leak/double-release from doing
+		# nothing.
+		self._run( '''
+class Base:
+	s: str
+	def __init__( self, s: str ) -> None:
+		self.s = s
+
+class Derived( Base ):
+	y: i32
+	def __init__( self, s: str, y: i32 ) -> None:
+		super().__init__( s )
+		self.y = y
+	def byte_len( self ) -> usize:
+		return self.s.byte_len()
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			d: Derived = Derived( s = 'hello'.upper(), y = 10 )
+			if d.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+class RCClassSubclassingPhase4Tests( CompilerTestCase ):
+	''' Phase 4 of the RCClass-subclassing plan: @virtual for RCClass,
+	unifying destructor dispatch with @virtual dispatch. ObjectHeader's
+	own destructor field became a real (if often minimal) vtable pointer
+	- see the PROLOGUE's own __metalpy_ObjectVtbl comment - reusing
+	CStruct's already-shipped vtable machinery (mpy_types.py's
+	virtual_slots/vtbl_owner, compiler.py's _validate_interface_vtable,
+	emitter_c.py's vtable-instance emission) generalized to RCClass|
+	CStruct, plus RCClass-specific mechanics CStruct never needed: the
+	shared minimal type for the (still common) non-virtual case, a
+	destroy-prefixed synthesized type for virtual-bearing classes, and an
+	UNCONDITIONAL per-class vtable instance (never opt-in like CStruct's
+	own, since every RCClass instance needs one for destructor dispatch
+	regardless of whether it has any @virtual methods). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_virtual_dispatch_through_base_typed_reference( self ) -> None:
+		# real vtable dispatch (not a direct call) reaching the override -
+		# the core proof this works for a heap-allocated, refcounted
+		# RCClass object, not just CStruct's own COM-style pointer
+		self._run( '''
+class Base:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+
+class Derived( Base ):
+	@virtual
+	def hello( self ) -> i32:
+		return 2
+
+def call_hello( b: Base ) -> i32:
+	return b.hello()
+
+def main() -> i32:
+	b: Base = Base()
+	d: Derived = Derived()
+	if call_hello( b ) != 1:
+		return 1
+	if call_hello( d ) != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_three_level_hierarchy_dispatches_to_the_leaf_override( self ) -> None:
+		self._run( '''
+class Root:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+
+class Mid( Root ):
+	pass
+
+class Leaf( Mid ):
+	@virtual
+	def hello( self ) -> i32:
+		return 3
+
+def call_it( r: Root ) -> i32:
+	return r.hello()
+
+def main() -> i32:
+	leaf: Leaf = Leaf()
+	if call_it( leaf ) != 3:
+		return 1
+	root: Root = Root()
+	if call_it( root ) != 1:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_non_virtual_rcclass_gets_no_synthesized_vtbl_type( self ) -> None:
+		# the common case (no @virtual methods anywhere in the chain)
+		# costs nothing extra - $$vtable uses the shared, built-in
+		# __metalpy_ObjectVtbl directly, no per-class Vtbl struct type at
+		# all, confirmed by inspecting the emitted C directly (not just
+		# that it compiles and runs)
+		self._run( '''
+class Plain:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def get_x( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	p: Plain = Plain( x = 42 )
+	if p.get_x() != 42:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertNotIn( 'typedef struct __main__$PlainVtbl', src )
+		self.assertIn( 'static const __metalpy_ObjectVtbl __main__$Plain$$vtable', src )
+		self._assert_compiles_and_runs( src )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_override_signature_mismatch_is_a_compile_error( self ) -> None:
+		self._run( '''
+class Base:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+
+class Derived( Base ):
+	@virtual
+	def hello( self, extra: i32 ) -> i32:
+		return extra
+
+def main() -> i32:
+	d: Derived = Derived()
+	return 0
+''' )
+		self.assertTrue( any( 'does not match' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_virtual_dispatch_no_leak( self ) -> None:
+		# real RC-lifetime stress check under repetition, same rigor as
+		# this codebase's own established convention - a virtual-bearing
+		# RCClass's own $header.vtable wiring (cast to its own synthesized
+		# Vtbl type, not the shared minimal one) must not perturb
+		# construction/teardown correctness under repeated allocation
+		self._run( '''
+class Base:
+	s: str
+	def __init__( self, s: str ) -> None:
+		self.s = s
+	@virtual
+	def describe( self ) -> usize:
+		return self.s.byte_len()
+
+class Derived( Base ):
+	@virtual
+	def describe( self ) -> usize:
+		with compiler.wrap_arithmetic:
+			return self.s.byte_len() + 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			d: Derived = Derived( s = 'hello'.upper() )
+			if d.describe() != 6:
+				return 1
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+class RCClassSubclassingPhase5Tests( CompilerTestCase ):
+	''' Phase 5 of the RCClass-subclassing plan: @abstractmethod for
+	RCClass, using the explicit is_abstract marker (not CStruct's
+	implicit stub-body-means-unimplemented convention) - construction-
+	time enforcement (lowering.py's _check_rcclass_fully_implemented,
+	shared by both _lower_allocate_fields and _try_lower_construct_call)
+	and vtable-instance emission (emitter_c.py's emit_rcclass_vtable_
+	instance, None/skipped for an abstract class, matching CStruct's own
+	"None if unfulfilled" convention). The 3+-level chain tests below are
+	exactly the scenario CStruct's own root-only-implicit-stub convention
+	can't express (an abstract method left unfulfilled through an
+	intermediate level, only fulfilled at the leaf), which is the whole
+	reason RCClass gets a real, explicit decorator instead of reusing
+	CStruct's own convention. @abstractmethod alone implies @virtual (no
+	need to repeat it on the abstract declaration itself - see
+	discovery.py's _parse_function) - a concrete OVERRIDE still has to
+	write @virtual itself though, same as any other virtual override. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	def test_construct_abstract_class_directly_is_a_compile_error( self ) -> None:
+		self._run( '''
+class Base:
+	@abstractmethod
+	def hello( self ) -> i32: ...
+
+def main() -> i32:
+	b: Base = Base()
+	return 0
+''' )
+		self.assertTrue( any( 'cannot be constructed - abstract method(s)' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	def test_construct_intermediate_still_abstract_class_is_a_compile_error( self ) -> None:
+		# the abstract method is declared at the ROOT, left unfulfilled at
+		# an INTERMEDIATE level (Mid adds nothing), and only implemented
+		# at the LEAF - constructing Mid itself must still be rejected
+		self._run( '''
+class Root:
+	@abstractmethod
+	def hello( self ) -> i32: ...
+
+class Mid( Root ):
+	pass
+
+class Leaf( Mid ):
+	@virtual
+	def hello( self ) -> i32:
+		return 99
+
+def main() -> i32:
+	m: Mid = Mid()
+	return 0
+''' )
+		self.assertTrue( any( 'cannot be constructed - abstract method(s)' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_subclass_implementing_abstract_method_constructs_and_dispatches( self ) -> None:
+		self._run( '''
+class Base:
+	@abstractmethod
+	def hello( self ) -> i32: ...
+
+class Derived( Base ):
+	@virtual
+	def hello( self ) -> i32:
+		return 42
+
+def call_hello( b: Base ) -> i32:
+	return b.hello()
+
+def main() -> i32:
+	d: Derived = Derived()
+	if call_hello( d ) != 42:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_three_level_chain_abstract_fulfilled_only_at_leaf( self ) -> None:
+		# the exact scenario CStruct's own implicit stub-body convention
+		# can't express - an abstract method declared at the root, still
+		# unfulfilled through an intermediate level, only implemented at
+		# the leaf, dispatched through a ROOT-typed reference
+		self._run( '''
+class Root:
+	@abstractmethod
+	def hello( self ) -> i32: ...
+
+class Mid( Root ):
+	pass
+
+class Leaf( Mid ):
+	@virtual
+	def hello( self ) -> i32:
+		return 7
+
+def call_hello( r: Root ) -> i32:
+	return r.hello()
+
+def main() -> i32:
+	leaf: Leaf = Leaf()
+	if call_hello( leaf ) != 7:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_abstract_base_gets_no_vtable_instance_emitted( self ) -> None:
+		# an abstract class used only as a base (never constructed
+		# directly) never needs its own vtable instance - confirmed by
+		# inspecting the emitted C directly, not just that it compiles
+		self._run( '''
+class Base:
+	@abstractmethod
+	def hello( self ) -> i32: ...
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Derived( Base ):
+	@virtual
+	def hello( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	d: Derived = Derived( x = 7 )
+	if d.hello() != 7:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertNotIn( '__main__$Base$$vtable', src )
+		self.assertIn( '__main__$Derived$$vtable', src )
+		self._assert_compiles_and_runs( src )
+
 class AugAssignRealCompileTests( CompilerTestCase ):
 	''' real compile+run coverage for _stmt_AugAssign's Attribute/Subscript-
 	target support (lowering.py) - unlike the IR-shape assertions in
@@ -1123,12 +1796,15 @@ class RCClassConstructTests( RCClassTestCase ):
 		self.assertIn( 'int32_t x;', struct_src )
 
 	def test_construction_sets_header_destructor_field( self ) -> None:
-		# every RCClass construction wires up $header.destructor;
-		# release_object (both the ordinary Decref path and the type-
-		# erased DecrefDynamic path a closure's own __del__ uses) reads it
-		# back from there uniformly - see ObjectHeader's own comment on why
-		# passing it again as an explicit argument at every release site
-		# would just be redundant with what's already in the header
+		# every RCClass construction wires up $header.vtable to its own
+		# static $$vtable instance (RCClass-subclassing plan Phase 4 -
+		# unified destructor dispatch with @virtual dispatch, see
+		# ObjectHeader's own comment); release_object (both the ordinary
+		# Decref path and the type-erased DecrefDynamic path a closure's
+		# own __del__ uses) reads the destructor back through
+		# $header.vtable->destroy uniformly - see ObjectHeader's own
+		# comment on why passing it again as an explicit argument at every
+		# release site would just be redundant with what's already there
 		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
 			'def main() -> None:',
 			'	foo: Foo = Foo.make( 1 )',
@@ -1137,7 +1813,11 @@ class RCClassConstructTests( RCClassTestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		make_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == '__main__.Foo.make' )
 		src = emitter_c.emit_function( make_lf )
-		self.assertIn( '$header.destructor = __main__$Foo$$__destructor__;', src )
+		self.assertIn( '$header.vtable = &__main__$Foo$$vtable;', src )
+		# Foo has no @virtual methods anywhere in its chain - its own
+		# $$vtable instance uses the shared, built-in minimal type, not a
+		# per-class synthesized one (no cast needed at the wiring site)
+		self.assertNotIn( '(const __metalpy_ObjectVtbl*)&__main__$Foo$$vtable', src )
 		# ordinary Decref (main's own epilogue for `foo`) calls the single,
 		# merged release_object with just the header pointer - no
 		# destructor argument, no _rcclass_destructor_name reference here
@@ -1149,13 +1829,15 @@ class RCClassConstructTests( RCClassTestCase ):
 	def test_release_object_reads_destructor_from_header( self ) -> None:
 		# a single, merged release_object - see ObjectHeader's own comment
 		# on why a separate release_object_dynamic isn't needed: every
-		# release already has the destructor one field-read away, adjacent
-		# to ref_count in the same cache line the atomic decrement below
-		# already touches
+		# release already has the destructor one field-read away (through
+		# $header.vtable->destroy - unified with @virtual dispatch, see
+		# Phase 4 of the RCClass-subclassing plan), adjacent to ref_count
+		# in the same cache line the atomic decrement below already touches
 		c_source = emitter_c.PROLOGUE
-		self.assertIn( 'void (*destructor)(void*);', c_source )
+		self.assertIn( 'void (*destroy)( void* );', c_source )
+		self.assertIn( 'const __metalpy_ObjectVtbl* vtable;', c_source )
 		self.assertIn( 'static inline void release_object( ObjectHeader* obj )', c_source )
-		self.assertIn( 'obj->destructor( obj );', c_source )
+		self.assertIn( 'obj->vtable->destroy( obj );', c_source )
 		self.assertNotIn( 'release_object_dynamic', c_source )
 
 	def test_init_construction_schedules_sys_alloc_for_the_constructed_class( self ) -> None:

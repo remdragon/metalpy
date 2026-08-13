@@ -1,9 +1,11 @@
 from . import Codec, CodecError
 
 class ascii( Codec ):
+	@virtual
 	def names( self ) -> list[str]:
 		return [ 'ascii', 'us-ascii', 'US-ASCC', 'cp646' ]
-	
+
+	@virtual
 	def encode( self, s: str ) -> Result[bytes,CodecError]:
 		length: usize = s.byte_len()
 		out = bytearray( length )
@@ -23,6 +25,7 @@ class ascii( Codec ):
 		
 		return Result.Ok( bytes.from_bytearray( move( out )))
 	
+	@virtual
 	def decode( self, b: bytes ) -> Result[str,CodecError]:
 		length: usize = len( b )
 		ptr: ConstPtr[u8] = b.get_ptr()

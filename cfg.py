@@ -1346,3 +1346,35 @@ class CFGState:
 			binding = self.bindings[f'self.{attr.stem}']
 			if binding.entry is not None:
 				binding.entry.cancelled = True
+
+	def complete_base_construction( self, base_required: list[Variable] ) -> None:
+		''' called by lowering.py right after emitting a subclass's own
+		super().__init__(...) call (RCClass single-inheritance, see the
+		RCClass-subclassing plan's own Phase 2) - the base's own __init__
+		has now REALLY run and (per ITS OWN complete_construction(), a
+		completely separate CFGState instance scoped to that other
+		function's own lowering) already fully initialized every attribute
+		in `base_required` (the WHOLE base chain's own required attributes,
+		base-first - mirrors RCClass.flattened_attributes()'s own walk,
+		called from the base onward, not including the subclass's own
+		attributes). Marks each one initialized in THIS (subclass)
+		__init__'s own bindings in one shot, WITHOUT any Incref - ownership
+		was already correctly established by the base's own construction;
+		this is bookkeeping, not a new reference, mirroring attr_assign's
+		own is_rc branch exactly except for that one difference. Pushes a
+		REAL, epilogue-tracked OWNED binding for each (same as attr_assign)
+		so an early exit from the SUBCLASS's own body after this point
+		(before ITS OWN complete_construction() runs) still correctly
+		decrefs whichever base attributes are already live - exactly like
+		an ordinary attr_assign'd field would, not treated any differently
+		just because it came from the base. Never called with an attribute
+		already bound (super().__init__() is required to be literally the
+		first statement - see lowering.py - so nothing could have touched
+		self.<base_attr> before this runs), so unlike attr_assign this
+		never needs an "already exists" branch. '''
+		for attr in base_required:
+			key = f'self.{attr.stem}'
+			if rc_leaves( attr.type ):
+				self._push( attr, attr.type, OwnState.OWNED, key = key )
+			else:
+				self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )

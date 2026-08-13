@@ -30,9 +30,34 @@ PROLOGUE = '''\
 
 #define METALPY_IMMORTAL_REFCOUNT INT32_MAX
 
+// the one universal, ALWAYS-leading member of every RCClass's own vtable
+// type, whatever else that type goes on to add for its own @virtual
+// methods (see emit_rcclass_vtbl_struct's own "destroy-prefixed" comment) -
+// this is what lets ObjectHeader's own $vtable field stay typed to this one
+// shared, minimal shape and still safely read through ANY concrete class's
+// own (possibly larger) real vtable, the same "shared leading layout,
+// narrower read through a base-typed lens" trick CStruct's own per-level
+// Vtbl types already rely on (see _interface_vtbl_name)
+typedef struct {
+	void (*destroy)( void* );
+} __metalpy_ObjectVtbl;
+
 typedef struct {
 	_Atomic int32_t ref_count;
-	void (*destructor)(void*); // set once at construction (see emit_c's ir.Allocate codegen), read here on every release - adjacent to ref_count in the same cache line the atomic decrement below already touches, not a separate fetch
+	// set once at construction (see emit_c's ir.Allocate codegen), read
+	// here on every release - adjacent to ref_count in the same cache
+	// line the atomic decrement below already touches, not a separate
+	// fetch. Was a bare `void (*destructor)(void*)` function pointer
+	// before RCClass @virtual dispatch existed - unified into a real
+	// (if often minimal) vtable pointer instead of keeping destructor
+	// dispatch and @virtual dispatch as two separate mechanisms; slot 0
+	// of EVERY concrete class's own vtable type is always `destroy`
+	// (see __metalpy_ObjectVtbl above), so this field's own declared
+	// type never needs to change no matter how many @virtual methods a
+	// given class goes on to add. A non-virtual class (still the common
+	// case) costs nothing extra for this - it gets a plain
+	// __metalpy_ObjectVtbl instance, no synthesized type of its own.
+	const __metalpy_ObjectVtbl* vtable;
 } ObjectHeader;
 
 static inline void retain_object( ObjectHeader* obj ) {
@@ -43,19 +68,21 @@ static inline void retain_object( ObjectHeader* obj ) {
 
 // the destructor was previously an explicit argument, passed as a compile-
 // time literal at every call site - redundant with the header's own
-// destructor field (set once at construction), which every caller can
+// vtable field (set once at construction), which every caller can
 // already reach directly. Reading it here uniformly also means every
-// release, not just a type-erased one, is now safe to call through a
-// base-typed reference once RCClass subclassing exists (see
-// PLAN_SUBCLASSING_VTABLES_COM.md's "Why RCClass is deferred") - without
-// making retain_object/the refcount increment/decrement themselves
-// virtual, which is the actual hot-path cost that plan deliberately
-// avoided paying
+// release, not just a type-erased one, is safe to call through a
+// base-typed reference under RCClass subclassing - without making
+// retain_object/the refcount increment/decrement themselves virtual,
+// which is the actual hot-path cost that was always the point to avoid
+// paying (see the RCClass-subclassing plan's own Design decision 2 - this
+// was ORIGINALLY a bare destructor function pointer, unified into a real
+// vtable pointer once @virtual dispatch needed one too, rather than
+// keeping the two as separate fields/mechanisms)
 static inline void release_object( ObjectHeader* obj ) {
 	if ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {
 		if ( atomic_fetch_sub( &obj->ref_count, 1 ) == 1 ) {
-			if ( obj->destructor ) {
-				obj->destructor( obj );
+			if ( obj->vtable && obj->vtable->destroy ) {
+				obj->vtable->destroy( obj );
 			}
 		}
 	}
@@ -948,7 +975,14 @@ def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 	  sharing an interface can have different vtbl_owner()s even for the
 	  SAME inherited slot, e.g. calling an IFoo-declared method through a
 	  BarImpl receiver two levels below IFoo needs Ptr[IBar], not
-	  Ptr[IFoo], because BarImpl's own $vtable is typed IBarVtbl*). '''
+	  Ptr[IFoo], because BarImpl's own $vtable is typed IBarVtbl*).
+
+	RCClass (single inheritance, RCClass-subclassing plan Phase 4) follows
+	the identical two-case reasoning, just without CStruct's own Ptr[T]
+	wrapping - an RCClass receiver's own type IS (a possibly-Specialization-
+	wrapped) RCClass directly, never Ptr[T]-of-one, since _self_c_type
+	already spells a bare RCClass reference as a pointer in C (see its own
+	comment) with no separate metalpy-level Ptr[T] needed to get there. '''
 	receiver_text = _emit_operand( receiver )
 	target_cls = target.cls
 	if isinstance( target_cls, CStruct ) and target_cls.is_interface:
@@ -958,6 +992,22 @@ def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 			cast_target = receiver_pointee.vtbl_owner()
 		else:
 			cast_target = target_cls
+		return f'({_self_c_type(cast_target)})({receiver_text})'
+	if isinstance( target_cls, RCClass ):
+		# unlike the CStruct branch above (always casts, even when
+		# redundant - self is ALWAYS Ptr[T] there regardless, so a
+		# same-type "cast" is free and every existing test already
+		# expects it), RCClass receivers are ordinary values/local
+		# variables most of the time, with no subclassing involved at
+		# all - skip the cast entirely when it would be a no-op (the
+		# receiver's own concrete type already IS cast_target), so an
+		# ordinary same-class call stays textually identical to what it
+		# always was before RCClass had any cast logic here
+		receiver_pointee = receiver.type.base if isinstance( receiver.type, Specialization ) else receiver.type
+		assert isinstance( receiver_pointee, RCClass ) # every RCClass receiver is a (possibly Specialization-wrapped) RCClass directly
+		cast_target = receiver_pointee.vtbl_owner() if target.is_virtual else target_cls
+		if cast_target is receiver_pointee:
+			return receiver_text
 		return f'({_self_c_type(cast_target)})({receiver_text})'
 	return receiver_text
 
@@ -1156,16 +1206,37 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 				arg_texts[i] = f'(void*)({a})'
 		if instr.target.is_virtual:
 			# vtable dispatch, not a direct call - _emit_self_operand already
-			# put the (possibly re-cast) receiver pointer at arg_texts[0];
-			# the receiver's own $vtable field (typed const RootVtbl* - see
-			# emit_cstruct) already IS the right pointer type, no cast
-			# needed at this call site. receiver is always Ptr[T] now (see
-			# lowering.py's self_param construction), so $vtable access is
-			# always -> (_member_access_operator), never . directly
+			# put the (possibly re-cast) receiver pointer at arg_texts[0].
+			# receiver is always a pointer (Ptr[T] for @interface CStruct,
+			# or an RCClass reference, which is already pointer-shaped in C
+			# - see _self_c_type), so vtable access is always ->
+			# (_member_access_operator), never . directly. WHERE that field
+			# lives differs by class kind: CStruct's own $vtable is a plain
+			# top-level struct member, already typed to the exact Vtbl type
+			# this call needs (see emit_cstruct/_interface_vtbl_name), no
+			# cast needed. RCClass's own vtable pointer lives INSIDE $header
+			# (ObjectHeader.vtable - see the PROLOGUE's own comment),
+			# reusing the field destructor dispatch already needed rather
+			# than adding a second one - but ObjectHeader is the SAME
+			# embedded struct in EVERY RCClass, so $header.vtable's own
+			# declared C type can only ever be the one shared, minimal
+			# __metalpy_ObjectVtbl* (unlike CStruct's own per-class $vtable
+			# field, which can be typed differently per class) - reaching a
+			# REAL slot (anything past `destroy`) needs an explicit cast
+			# back to the receiver's own vtbl_owner()'s real (wider) Vtbl
+			# type first, the same cast _emit_self_operand already computes
+			# for the self argument, just applied to the vtable pointer too
 			assert instr.receiver is not None # is_virtual only ever set on real instance methods - see discovery.py's _parse_function
 			slot_name = _field_name( instr.target.stem )
 			vtable_op = _member_access_operator( instr.receiver.type )
-			call_expr = f'({_emit_operand(instr.receiver)}){vtable_op}$vtable->{slot_name}( {", ".join(arg_texts)} )'
+			if isinstance( instr.target.cls, RCClass ):
+				receiver_pointee = instr.receiver.type.base if isinstance( instr.receiver.type, Specialization ) else instr.receiver.type
+				assert isinstance( receiver_pointee, RCClass )
+				vtbl_type = _rcclass_vtbl_type_name( receiver_pointee )
+				vtable_expr = f'((const {vtbl_type}*)({_emit_operand(instr.receiver)}){vtable_op}$header.vtable)'
+				call_expr = f'{vtable_expr}->{slot_name}( {", ".join(arg_texts)} )'
+			else:
+				call_expr = f'({_emit_operand(instr.receiver)}){vtable_op}$vtable->{slot_name}( {", ".join(arg_texts)} )'
 		else:
 			has_args = bool( arg_texts )
 			call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
@@ -1282,11 +1353,26 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			lines.append( f'\t({dest})->$header.ref_count = 1;' )
 			# set once, here - every release_object call reads it back off
 			# the header from here on (see ObjectHeader's own comment). The
-			# destructor's own real signature (static void NAME(void*
-			# __obj), see _function_prototype's is_destructor branch)
-			# already matches ObjectHeader.destructor's declared type
-			# exactly, no cast needed
-			lines.append( f'\t({dest})->$header.destructor = {_rcclass_destructor_name(instr.dest.type)};' )
+			# $$vtable instance's own NAME is mangled straight from
+			# instr.dest.type (Specialization or not) - same as
+			# _rcclass_destructor_name's own identical direct use, since a
+			# monomorphized generic RCClass's qualname is deliberately set
+			# equal to its own Specialization's qualname (Monomorphizer.
+			# monomorphize_class), so mangling either one produces the
+			# SAME name. But deciding whether a CAST is needed (does this
+			# class have any REAL @virtual slot) needs the actual resolved
+			# RCClass object, not the abstract generic template
+			# Specialization.base would give - .monomorphized is that
+			# object once Monomorphizer has actually built it (guaranteed
+			# by now: lowering.py's _lower_allocate_fields already forced
+			# this exact construction through monomorphize_class/
+			# _ensure_resolved before ever emitting this Allocate)
+			concrete_cls = instr.dest.type.monomorphized if isinstance( instr.dest.type, Specialization ) else instr.dest.type
+			assert isinstance( concrete_cls, RCClass )
+			vtable_ref = f'&{mangle_type(instr.dest.type)}$$vtable'
+			if concrete_cls.virtual_slots():
+				vtable_ref = f'(const __metalpy_ObjectVtbl*){vtable_ref}'
+			lines.append( f'\t({dest})->$header.vtable = {vtable_ref};' )
 			for name, value in instr.fields.items():
 				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )
 			return lines
@@ -1578,7 +1664,7 @@ def _interface_vtbl_name( cls: CStruct ) -> str:
 	# FooImplVtbl for an ordinary implementation)
 	return f'{mangle_type(cls.vtbl_owner())}Vtbl'
 
-def _vtable_slot_c_type( owner: CStruct, slot: Function ) -> tuple[str,list[str]]:
+def _vtable_slot_c_type( owner: RCClass|CStruct, slot: Function ) -> tuple[str,list[str]]:
 	''' the function-pointer type for one vtable slot in `owner`'s own
 	Vtbl struct - self is Ptr[owner] UNIFORMLY for every slot in that one
 	struct (including slots owner merely inherited from its own base -
@@ -1674,6 +1760,123 @@ def emit_interface_vtable_instance( cls: CStruct ) -> str|None:
 	if field_inits:
 		return f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
 	return f'static const {vtbl_type} {instance_name} = {{0}};'
+
+# --- RCClass vtable dispatch (RCClass-subclassing plan, Phase 4) -----------
+#
+# Generalizes the CStruct machinery just above, but written as its own
+# parallel set of functions rather than forcing everything through one
+# mega-generalized set of branches - too much of the RCClass shape genuinely
+# differs from CStruct's own COM-interface model to share code cleanly:
+# - CStruct's own vtable field ($vtable) is a plain top-level struct member;
+#   RCClass's own vtable pointer lives INSIDE $header (ObjectHeader.vtable -
+#   see the PROLOGUE's own comment), reusing the field that already existed
+#   for dynamic destructor dispatch rather than adding a second one.
+# - Every @interface CStruct always has at least IUnknown's own 3 real
+#   slots, so it always needs its own synthesized Vtbl type. Most RCClasses
+#   have NO @virtual methods at all (still the common case) - those need no
+#   synthesized type whatsoever, just an instance of the one shared,
+#   built-in __metalpy_ObjectVtbl (see the PROLOGUE) - so "does this class
+#   need its own Vtbl struct type" is a real, RCClass-specific question
+#   CStruct's own functions never had to ask.
+# - A class that DOES need its own type always leads with `destroy` (this
+#   class's own real, per-class destructor - no CStruct/COM analog), so
+#   every RCClass's own real vtable type stays a prefix-compatible superset
+#   of __metalpy_ObjectVtbl regardless of how many @virtual methods it adds -
+#   this is what lets ObjectHeader.vtable stay declared as the one shared,
+#   minimal type and still be read correctly (const __metalpy_ObjectVtbl*)
+#   through ANY concrete class's own actual (possibly larger) vtable.
+# - Every concrete RCClass gets a real $$vtable instance, unconditionally -
+#   unlike CStruct's own "None if this class doesn't build one" (only
+#   @interface classes ever get one there), RCClass's own destructor
+#   dispatch NEEDS one for every single instance, virtual methods or not.
+#   No "unfulfilled slot" (stub-body) skip either - @abstractmethod is
+#   Phase 5's job, not this one's; see compiler.py's _schedule_rcclass_
+#   vtable_impls, which this stays in lockstep with.
+
+def _rcclass_vtbl_type_name( cls: RCClass ) -> str:
+	''' the C type name for cls's own $header.vtable field - the shared,
+	global __metalpy_ObjectVtbl when NO @virtual method exists anywhere in
+	cls's own chain (the common, zero-extra-synthesis case), otherwise
+	cls.vtbl_owner()'s own synthesized (destroy-prefixed) type - mirrors
+	_interface_vtbl_name plus this one additional "nothing real to
+	dispatch, just use the shared minimal type" case CStruct never needs. '''
+	if not cls.virtual_slots():
+		return '__metalpy_ObjectVtbl'
+	return f'{mangle_type( cls.vtbl_owner() )}Vtbl'
+
+def emit_rcclass_vtbl_struct( owner: RCClass ) -> str:
+	''' the full vtable struct body for an RCClass that IS its own
+	vtbl_owner() (owner.own_new_virtual_slots() is non-empty) - always
+	starts with `destroy` (see this section's own header comment on why),
+	then one function-pointer field per REAL @virtual slot
+	(owner.virtual_slots(), declaration order) - mirrors
+	emit_interface_vtbl_struct plus the destroy prefix. Only ever called
+	for a class with at least one real slot; see _rcclass_vtbl_type_name's
+	own "shared type" case for a class with none. '''
+	name = f'{mangle_type( owner )}Vtbl'
+	lines = [ f'typedef struct {name} {{', '\tvoid (*destroy)( void* );' ]
+	for slot in owner.virtual_slots():
+		ret, params = _vtable_slot_c_type( owner, slot )
+		lines.append( f'\t{ret} (*{_field_name(slot.stem)})( {", ".join(params)} );' )
+	lines.append( f'}} {name};' )
+	return '\n'.join( lines )
+
+def _rcclass_fulfilled_slot_impls( cls: RCClass ) -> list[Function]|None:
+	''' the ordered per-slot implementing Function for a CONCRETE RCClass
+	(nearest override in cls's own chain, or the root's own declaration
+	if never overridden) - None if ANY slot is unfulfilled (@abstractmethod
+	- RCClass-subclassing plan Phase 5) anywhere in the chain, meaning cls
+	is an abstract role that never gets a static vtable instance at all -
+	mirrors CStruct's own _interface_fulfilled_slot_impls exactly, just
+	keyed on the explicit is_abstract marker instead of stub-body
+	inference (matches compiler.py's _schedule_rcclass_vtable_impls and
+	lowering.py's _check_rcclass_fully_implemented construction-time check
+	- all three have to agree on exactly which classes are "complete", so
+	this recomputes the identical walk rather than trusting a cache that
+	could drift out of sync). '''
+	impls: list[Function] = []
+	for slot in cls.virtual_slots():
+		impl = cls.chain_lookup( slot.stem )
+		if not isinstance( impl, Function ):
+			return None
+		if impl.resolve is not None:
+			impl.resolve()
+		if impl.is_abstract:
+			return None
+		impls.append( impl )
+	return impls
+
+def emit_rcclass_vtable_instance( cls: RCClass ) -> str|None:
+	''' the static const vtable instance for a fully-fulfilled concrete
+	RCClass - unlike CStruct's own @interface-only opt-in, EVERY non-
+	abstract RCClass gets one (destructor dispatch needs one
+	unconditionally - see this section's own header comment), not just
+	ones with @virtual methods. Slot 0 is always destroy (this class's
+	own real, per-class destructor - see _rcclass_destructor_name); any
+	further slots are this class's own REAL @virtual slots, each wired
+	directly to its actual implementing Function with a function-pointer
+	cast, same "no wrapper/trampoline needed" reasoning as
+	emit_interface_vtable_instance. None (no instance built) if cls has
+	any unfulfilled (@abstractmethod) slot anywhere in its chain - see
+	_rcclass_fulfilled_slot_impls; an abstract class can never be directly
+	constructed (lowering.py's own construction-time check already
+	guarantees this), so nothing ever needs to read its own vtable
+	instance - only a concrete, fully-implemented subclass's instance
+	ever actually gets wired into $header.vtable. Always typed via
+	_rcclass_vtbl_type_name(cls) when an instance IS built. '''
+	slot_impls = _rcclass_fulfilled_slot_impls( cls )
+	if slot_impls is None:
+		return None
+	vtbl_type = _rcclass_vtbl_type_name( cls )
+	instance_name = f'{mangle_type(cls)}$$vtable'
+	field_inits = [ f'.destroy = {_rcclass_destructor_name(cls)}' ]
+	slots = cls.virtual_slots()
+	if slots:
+		owner = cls.vtbl_owner()
+		for slot, impl in zip( slots, slot_impls ):
+			ret, params = _vtable_slot_c_type( owner, slot )
+			field_inits.append( f'.{_field_name(slot.stem)} = ({_fn_ptr_cast_type(ret, params)}){mangle_qualname(impl.qualname)}' )
+	return f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
 
 def emit_cstruct( cls: CStruct ) -> str:
 	attrs: list[tuple[str,Type]]
@@ -1915,6 +2118,20 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			vtbl_owners[ _interface_vtbl_name( cls ) ] = cls.vtbl_owner()
 	for owner in vtbl_owners.values():
 		parts.append( emit_interface_vtbl_struct( owner ))
+	# RCClass analog (RCClass-subclassing plan, Phase 4) - only classes
+	# that actually introduce a REAL @virtual slot need their own
+	# synthesized type at all (own_new_virtual_slots() non-empty, via
+	# vtbl_owner()); the common case (no @virtual methods anywhere in a
+	# class's own chain) needs none - it just uses the shared, built-in
+	# __metalpy_ObjectVtbl (already defined in the PROLOGUE), never
+	# entering this dict at all. Same insertion-ordered dedup pattern as
+	# vtbl_owners above.
+	rcclass_vtbl_owners: dict[str,RCClass] = {}
+	for cls in compiler.rcclasses:
+		if not cls.type_params and cls.virtual_slots():
+			rcclass_vtbl_owners[ mangle_type( cls.vtbl_owner() )] = cls.vtbl_owner()
+	for owner in rcclass_vtbl_owners.values():
+		parts.append( emit_rcclass_vtbl_struct( owner ))
 	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
 		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))
@@ -1949,6 +2166,17 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	for cls in compiler.cstructs:
 		if cls.is_interface and not cls.type_params:
 			instance_src = emit_interface_vtable_instance( cls )
+			if instance_src is not None:
+				parts.append( instance_src )
+	# RCClass analog (RCClass-subclassing plan Phase 4, "unfulfilled"/
+	# abstract skip added Phase 5) - unlike CStruct, every CONCRETE
+	# (fully-implemented) RCClass gets one, not just ones with @virtual
+	# methods - see emit_rcclass_vtable_instance's own comment: destructor
+	# dispatch needs one for every real instance. None (skipped) for an
+	# abstract class - see _rcclass_fulfilled_slot_impls.
+	for cls in compiler.rcclasses:
+		if not cls.type_params:
+			instance_src = emit_rcclass_vtable_instance( cls )
 			if instance_src is not None:
 				parts.append( instance_src )
 	for lf in compiler.functions:

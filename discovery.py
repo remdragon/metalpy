@@ -12,7 +12,7 @@ from errors import CompileError, ErrorCollector
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
-	Module, _is_covered_by, _overlaps,
+	Module, _is_covered_by, _overlaps, chain_lookup,
 )
 
 def is_stub_body( body: list[ast.stmt] ) -> bool:
@@ -1134,9 +1134,52 @@ class Discovery( ast.NodeVisitor ):
 					# scope_stack[-1] (class_obj) owns this body - see import_code()
 					for node in body:
 						self.visit( node )
+			if isinstance( class_obj, RCClass ) and class_obj.base is not None:
+				self._validate_no_attribute_shadowing( class_obj )
 		def resolve() -> None:
 			self._resolve_guarded( class_obj, body_fn )
 		return resolve
+
+	def _validate_no_attribute_shadowing( self, class_obj: RCClass ) -> None:
+		''' a subclass cannot redeclare a name (field or method) already
+		declared by an ancestor, matching this codebase's "explicit, not
+		accidental" posture around name reuse (e.g. @interface not being
+		inherited implicitly). The one exception is a legitimate @virtual
+		override - both sides declaring the SAME name as @virtual (RCClass-
+		subclassing plan Phase 4) - a subclass overriding an inherited
+		@virtual method MUST repeat @virtual on its own re-declaration, no
+		method is virtual anywhere without @virtual written on that exact
+		declaration, matching CStruct's own identical rule. Strict
+		signature matching between the two isn't checked here - that needs
+		both sides' parameters/return_type already resolved, which isn't
+		guaranteed yet at this (discovery/parse-time) point if a subclass
+		is parsed before its base's own methods are individually resolved
+		(see compiler.py's _validate_interface_vtable, which re-walks this
+		same collision at compile-time once resolution order is no longer
+		a concern). `__init__` is exempted - a subclass declaring its own
+		__init__ is the ordinary, expected constructor-chaining case
+		(super().__init__(), Phase 2), not shadowing in the sense this
+		check cares about. Runs once class_obj's own body has been fully
+		visited (own .names is only complete once body_fn's loop finishes) -
+		the ancestor side is walked via chain_lookup starting at class_obj.
+		base specifically (not class_obj itself), since this is deliberately
+		checking OWN names against ANCESTOR names only, not self-collisions
+		(which .names, a plain dict, already can't have). '''
+		base = class_obj.base
+		assert base is not None
+		for own_name, own in class_obj.names.items():
+			if own_name == '__init__':
+				continue
+			ancestor = chain_lookup( base, own_name )
+			if ancestor is None:
+				continue
+			if isinstance( own, Function ) and own.is_virtual and isinstance( ancestor, Function ) and ancestor.is_virtual:
+				continue # a legitimate override - see this method's own docstring
+			self.fail_loc(
+				f'{class_obj.qualname}.{own_name} shadows {ancestor.qualname} - a subclass cannot '
+				f'redeclare an inherited attribute or method name',
+				class_obj.file, class_obj.line,
+			)
 
 	def _parse_ClassDef_CEnum( self, node: ast.ClassDef, qualname: str, value_type: Scalar ) -> CEnum:
 		module = self.module_stack[-1]
@@ -1499,18 +1542,46 @@ class Discovery( ast.NodeVisitor ):
 		if extern_lib is not None and not self._is_stub_body( node.body ):
 			self.fail( f'@extern function {qualname} must have a stub body (...) - it declares a foreign call signature, not a real implementation', node )
 
-		if is_virtual and not ( isinstance( class_obj, CStruct ) and class_obj.is_interface ):
-			# only @interface CStructs build a vtable at all right now -
-			# RCClass support is deferred (PLAN_SUBCLASSING_VTABLES_COM.md),
-			# and @virtual on a plain (non-@interface) class/CStruct would be
-			# silently meaningless rather than a real error, which is worse
-			self.fail( f'@virtual {qualname} is only supported on @interface classes right now', node )
+		if is_abstract:
+			# an abstract method IS a virtual slot with no implementation -
+			# @abstractmethod alone is sufficient (implies @virtual, doesn't
+			# need it repeated) since there's no OTHER coherent meaning for
+			# an unimplemented method to have; unlike @interface not being
+			# inherited implicitly or a @virtual OVERRIDE having to repeat
+			# @virtual (both genuinely ambiguous without being explicit),
+			# there's no ambiguity here to guard against. Set before the
+			# is_virtual checks below so they apply uniformly whether
+			# @virtual was ALSO explicitly written (redundant, still
+			# accepted - harmless, not contradictory) or not. RCClass-
+			# subclassing plan Phase 5, revised per user feedback.
+			is_virtual = True
+			if not self._is_stub_body( node.body ):
+				# mirrors @extern's own identical stub-body requirement
+				# just above - an abstract method's body IS the "must be
+				# overridden" declaration (there's nothing to run), same
+				# shape @overload stubs already use
+				self.fail( f'@abstractmethod {qualname} must have a stub body (...) - it declares a required override, not a real implementation', node )
+
+		if is_virtual and not ( isinstance( class_obj, CStruct ) and class_obj.is_interface ) and not isinstance( class_obj, RCClass ):
+			# @interface CStructs and ordinary RCClasses both build a real
+			# vtable now (RCClass-subclassing plan Phase 4 generalized this
+			# from CStruct-only) - CUnion/TaggedUnion/CEnum/a plain, non-
+			# @interface CStruct still never do, and @virtual on one of
+			# those would be silently meaningless rather than a real error,
+			# which is worse
+			self.fail( f'@virtual {qualname} is only supported on @interface classes or ordinary classes right now', node )
 		if is_virtual and is_overload:
 			# combining the two is a real, separate design question (which
 			# overload's signature does the vtable slot use? does each
 			# overload get its own slot?) that this plan never addressed -
 			# reject rather than silently building something half-right
 			self.fail( f'@virtual {qualname} cannot also be @overload - not supported', node )
+		if is_virtual and ( is_static or is_classmethod ):
+			# no receiver to dispatch through - vtable dispatch is
+			# meaningless without a self, same reasoning @virtual+@overload
+			# above already uses (reject outright rather than silently
+			# building something with no coherent meaning)
+			self.fail( f'@virtual {qualname} cannot also be @staticmethod/@classmethod - no receiver to dispatch through', node )
 
 		module = self.module_stack[-1]
 		fn = Function(
@@ -1723,6 +1794,30 @@ class Discovery( ast.NodeVisitor ):
 					self._check_overload_shadowing( fn, group )
 				else:
 					self._check_overload_ambiguity( fn, group )
+				if fn.is_virtual and ( len( group.stubs ) + len( group.implementations )) > 1:
+					# a @virtual method must have EXACTLY one signature - not
+					# just the already-rejected @virtual+@overload-on-the-
+					# SAME-def combo (checked eagerly at parse time, above in
+					# this same method) but ALSO metalpy's OTHER overloading
+					# mechanism: multiple plain (non-@overload) defs sharing
+					# a name with different signatures silently form an
+					# Overload group with no @overload in sight. This can
+					# only be checked here, at resolve time - group members
+					# may still be getting parsed when THIS def's own parse-
+					# time checks ran, so the group's final member count
+					# isn't settled until every sibling has been parsed
+					# (this codebase's own "single forward pass" parsing
+					# discipline guarantees that's true by the time ANY
+					# member's own resolve() actually runs - see the
+					# existing _check_overload_ambiguity/_check_overload_
+					# shadowing calls just above, which rely on the exact
+					# same guarantee)
+					self.fail_loc(
+						f'{fn.qualname}: @virtual method {fn.stem!r} must have exactly one signature - found '
+						f'{len(group.stubs) + len(group.implementations)} definitions sharing this name '
+						f'(whether declared with @overload or not)',
+						fn.file, fn.line,
+					)
 		def resolve() -> None:
 			self._resolve_guarded( fn, body )
 		return resolve

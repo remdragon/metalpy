@@ -8,7 +8,7 @@ import ir
 from discovery import Discovery, is_stub_body
 from errors import CompileError
 from lowering import Lowering
-from mpy_types import Module, Function, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization
+from mpy_types import Module, Function, Overload, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization
 from type_resolver import TypeResolver
 
 @dataclass( kw_only = True )
@@ -158,6 +158,8 @@ class Compiler:
 				if monomorphized not in self.rcclasses:
 					self.rcclasses.append( monomorphized )
 				self.type_resolver._synthesize_rcclass_destructor( monomorphized )
+				self._validate_interface_vtable( monomorphized )
+				self._schedule_rcclass_vtable_impls( monomorphized )
 			elif isinstance( monomorphized, CStruct ):
 				if monomorphized.base is not None:
 					self._enqueue( monomorphized.base )
@@ -193,6 +195,8 @@ class Compiler:
 			if unit not in self.rcclasses:
 				self.rcclasses.append( unit )
 				self.type_resolver._synthesize_rcclass_destructor( unit )
+			self._validate_interface_vtable( unit )
+			self._schedule_rcclass_vtable_impls( unit )
 			return unit
 		elif isinstance( unit, CStruct ):
 			if unit.resolve is not None:
@@ -238,8 +242,10 @@ class Compiler:
 		else:
 			assert False, f'unsupported compile unit: {unit!r}'
 
-	def _validate_interface_vtable( self, cls: CStruct ) -> None:
-		''' every @virtual method on an @interface CStruct is either a
+	def _validate_interface_vtable( self, cls: RCClass|CStruct ) -> None:
+		''' every @virtual method on an @interface CStruct (or, generalized
+		for RCClass single inheritance - the RCClass-subclassing plan's own
+		Phase 4 - an ordinary RCClass with @virtual methods) is either a
 		genuinely NEW slot (its name isn't already a slot anywhere in
 		cls's own ancestor chain - always allowed, any level can
 		introduce new capabilities now, see CStruct.vtbl_owner's own
@@ -251,12 +257,36 @@ class Compiler:
 		the OVERRIDDEN slot's own parameters/return_type already resolved,
 		which isn't guaranteed yet at discovery-time parse order (a
 		subclass can be parsed before its base's own methods are
-		individually resolved). '''
-		if cls.base is None:
-			return # nothing to inherit from - every one of cls's own @virtual methods is trivially a new slot
-		ancestor_slots = { m.stem: m for m in cls.base.virtual_slots() }
+		individually resolved). Also doubles as the ONE place every
+		@virtual method on cls is guaranteed to get its own .resolve()
+		called even if nothing else in the program ever calls it - a
+		virtual method's own resolver is what runs the single-signature-
+		only check (discovery.py's _make_function_resolver), so leaving a
+		never-called one permanently unresolved would silently skip that
+		check for genuinely dead code. This is why the per-method resolve
+		loop below runs UNCONDITIONALLY, even when cls.base is None (a root
+		class has nothing to validate an override AGAINST, but its own
+		@virtual methods still need resolving for this reason alone).
+
+		Walks cls.methods FLATTENED through any Overload group, not just
+		cls.methods' own top-level entries - a name with more than one
+		signature (whether @overload-decorated or not) is stored as ONE
+		Overload group object in cls.methods, never as the individual
+		Function objects directly (see discovery.py's _parse_function) -
+		without flattening, a @virtual method sharing its name with a
+		sibling def would never even be SEEN here, let alone resolved,
+		silently skipping both the override-collision check below and the
+		single-signature check inside its own resolver. '''
+		ancestor_slots = { m.stem: m for m in cls.base.virtual_slots() } if cls.base is not None else {}
+		members: list[Function] = []
 		for m in cls.methods:
-			if not ( isinstance( m, Function ) and m.is_virtual ):
+			if isinstance( m, Function ):
+				members.append( m )
+			elif isinstance( m, Overload ):
+				members.extend( m.stubs )
+				members.extend( m.implementations )
+		for m in members:
+			if not m.is_virtual:
 				continue
 			if m.resolve is not None:
 				m.resolve()
@@ -303,6 +333,34 @@ class Compiler:
 			if impl.resolve is not None:
 				impl.resolve()
 			if is_stub_body( impl.node.body ):
+				return
+			impls.append( impl )
+		for impl in impls:
+			self._enqueue( impl )
+
+	def _schedule_rcclass_vtable_impls( self, cls: RCClass ) -> None:
+		''' RCClass analog of _schedule_interface_vtable_impls - every REAL
+		@virtual slot's own implementing Function (cls.chain_lookup,
+		nearest override wins) needs to be a real, lowered compile unit,
+		since it might only ever be reached through vtable dispatch
+		(emitter_c.py's own static vtable instance references it by
+		mangled name directly, never through an ordinary call site the
+		usual schedule()-on-reference path would already have caught).
+		Skipped entirely if any slot is unfulfilled (@abstractmethod, a
+		real explicit marker - RCClass-subclassing plan Phase 5) - matches
+		emitter_c.py's own identical "None if any slot is unfulfilled"
+		gate for whether emit_rcclass_vtable_instance builds a static
+		instance for cls at all, so the two stay in lockstep: this
+		schedules exactly the set of functions emission will end up
+		referencing by name. A no-op when cls has no @virtual methods
+		anywhere in its chain (virtual_slots() is empty). '''
+		impls: list[Function] = []
+		for slot in cls.virtual_slots():
+			impl = cls.chain_lookup( slot.stem )
+			assert isinstance( impl, Function ) # virtual_slots()'s own entries always exist somewhere in the chain - at minimum the root's own declaration chain_lookup started from
+			if impl.resolve is not None:
+				impl.resolve()
+			if impl.is_abstract:
 				return
 			impls.append( impl )
 		for impl in impls:

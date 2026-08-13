@@ -706,6 +706,310 @@ class Foo( Point ):
 ''' )
 		self.assertIn( 'cannot subclass', self.discovery.errors.errors[0] )
 
+	def test_chain_lookup_finds_inherited_attribute_and_method( self ) -> None:
+		# RCClass.chain_lookup (generalized from CStruct's own, see
+		# mpy_types.py's shared free functions) - a subclass's own .names
+		# never gets an inherited member merged into it directly; chain_
+		# lookup is what walks up .base to find one. Phase 1 of the RCClass-
+		# subclassing plan (base-chain lookup + attribute shadowing).
+		mod = self._import( '''
+class Base:
+	x: i32
+	def hello( self ) -> i32:
+		return 42
+
+class Derived( Base ):
+	y: i32
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertEqual( derived.chain_lookup( 'y' ).qualname, '__main__.Derived.y' )
+		self.assertEqual( derived.chain_lookup( 'x' ).qualname, '__main__.Base.x' )
+		self.assertEqual( derived.chain_lookup( 'hello' ).qualname, '__main__.Base.hello' )
+		self.assertIsNone( derived.chain_lookup( 'nonexistent' ))
+
+	def test_subclass_shadowing_base_field_errors( self ) -> None:
+		mod = self._import( '''
+class Base:
+	x: i32
+
+class Derived( Base ):
+	x: i32
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertIn( 'shadows', self.discovery.errors.errors[0] )
+		self.assertIn( 'Derived.x', self.discovery.errors.errors[0] )
+		self.assertIn( 'Base.x', self.discovery.errors.errors[0] )
+
+	def test_subclass_shadowing_base_method_errors( self ) -> None:
+		mod = self._import( '''
+class Base:
+	def get_x( self ) -> i32:
+		return 1
+
+class Derived( Base ):
+	def get_x( self ) -> i32:
+		return 2
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertIn( 'shadows', self.discovery.errors.errors[0] )
+
+	def test_subclass_own_init_is_not_shadowing( self ) -> None:
+		# __init__ is exempted - a subclass declaring its own __init__ is
+		# the ordinary, expected constructor-chaining case (super().
+		# __init__() support is a later phase), not shadowing
+		mod = self._import( '''
+class Base:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Derived( Base ):
+	y: i32
+	def __init__( self, x: i32, y: i32 ) -> None:
+		self.x = x
+		self.y = y
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_unrelated_names_do_not_shadow( self ) -> None:
+		mod = self._import( '''
+class Base:
+	x: i32
+	def hello( self ) -> i32:
+		return 1
+
+class Derived( Base ):
+	y: i32
+	def world( self ) -> i32:
+		return 2
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+
+class RCClassVirtualTests( unittest.TestCase ):
+	''' Phase 4 of the RCClass-subclassing plan: @virtual generalized from
+	@interface-CStruct-only to ordinary RCClass. Reuses CStruct's own
+	vtable machinery (mpy_types.py's shared chain_lookup/virtual_slots/
+	vtbl_owner, compiler.py's _validate_interface_vtable) - this class
+	covers the RCClass-specific decorator validation: the widened
+	@virtual gate, the new single-signature-only check (metalpy's
+	implicit same-name-different-signature overloading, not just
+	@overload), @virtual+@staticmethod/@classmethod rejection, and the
+	Phase 1 shadowing check's new @virtual-override exemption. '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_virtual_allowed_on_ordinary_rcclass_method( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		hello = foo.chain_lookup( 'hello' )
+		self.assertTrue( hello.is_virtual )
+
+	def test_matching_virtual_override_is_not_shadowing( self ) -> None:
+		mod = self._import( '''
+class Base:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+
+class Derived( Base ):
+	@virtual
+	def hello( self ) -> i32:
+		return 2
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_override_missing_virtual_is_still_shadowing( self ) -> None:
+		# a subclass overriding an inherited @virtual method MUST repeat
+		# @virtual on its own re-declaration - matching an existing slot's
+		# name+signature alone is not enough (explicit-at-every-
+		# declaration-site, same posture as @interface not inheriting
+		# implicitly)
+		mod = self._import( '''
+class Base:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+
+class Derived( Base ):
+	def hello( self ) -> i32:
+		return 2
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertIn( 'shadows', self.discovery.errors.errors[0] )
+
+	def test_virtual_staticmethod_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@virtual
+	@staticmethod
+	def hello() -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @staticmethod/@classmethod', self.discovery.errors.errors[0] )
+
+	def test_virtual_classmethod_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@virtual
+	@classmethod
+	def hello( cls ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @staticmethod/@classmethod', self.discovery.errors.errors[0] )
+
+	def test_virtual_with_second_plain_signature_is_a_compile_error( self ) -> None:
+		# NOT just the already-rejected @virtual+@overload-on-the-SAME-def
+		# combo - metalpy also allows multiple PLAIN (non-@overload) defs
+		# sharing a name with different signatures, silently forming an
+		# Overload group with no @overload in sight. A @virtual method
+		# must have exactly one signature regardless of how the extra
+		# ones are spelled.
+		mod = self._import( '''
+class Foo:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+	def hello( self, x: i32 ) -> i32:
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		# the check lives inside the METHOD's own resolver (it's what
+		# guarantees a virtual method that's part of a dead-code Overload
+		# group still gets checked - see compiler.py's own eager-resolve
+		# loop in _validate_interface_vtable) - at the bare discovery
+		# level (no full Compiler pipeline), nothing else forces that, so
+		# resolve the group's own members directly, same as
+		# DeferredResolutionTests' own explicit .resolve() pattern
+		group = foo.names['hello']
+		for fn in ( *group.stubs, *group.implementations ):
+			if fn.resolve is not None:
+				fn.resolve()
+		self.assertIn( 'must have exactly one signature', self.discovery.errors.errors[0] )
+
+	def test_virtual_with_second_plain_signature_declared_first( self ) -> None:
+		# fires regardless of declaration order - the @virtual member can
+		# be either the first or second def sharing the name
+		mod = self._import( '''
+class Foo:
+	def hello( self, x: i32 ) -> i32:
+		return x
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		group = foo.names['hello']
+		for fn in ( *group.stubs, *group.implementations ):
+			if fn.resolve is not None:
+				fn.resolve()
+		self.assertIn( 'must have exactly one signature', self.discovery.errors.errors[0] )
+
+	def test_virtual_single_signature_via_overload_group_still_only_needs_one( self ) -> None:
+		# a genuinely unique name (no sibling at all) never forms an
+		# Overload group in the first place - the common case stays a
+		# no-op for this check
+		mod = self._import( '''
+class Foo:
+	@virtual
+	def hello( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+
+class RCClassAbstractTests( unittest.TestCase ):
+	''' Phase 5 of the RCClass-subclassing plan: @abstractmethod for
+	RCClass. Unlike CStruct (whose "abstract-ness" is purely structural -
+	a stub-bodied @virtual method IS the unimplemented declaration, no
+	separate marker needed), RCClass uses the EXPLICIT is_abstract flag -
+	@abstractmethod IMPLIES @virtual (there's no other coherent meaning
+	for an unimplemented method to have, unlike @interface's own non-
+	inheritance or a @virtual override having to repeat @virtual, both of
+	which are genuinely ambiguous without being explicit) and must have a
+	stub body (mirroring @extern's own identical stub-body requirement).
+	Writing @virtual alongside @abstractmethod is still accepted (harmless
+	redundancy, not contradictory). Construction-time enforcement
+	(rejecting Foo(...) when any slot in the chain is unfulfilled) lives
+	in lowering.py/emitter_c_test.py, not here - this class covers just
+	the decorator-combination validation. '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_bare_abstractmethod_implies_virtual( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@abstractmethod
+	def hello( self ) -> i32: ...
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		hello = foo.chain_lookup( 'hello' )
+		self.assertTrue( hello.is_virtual )
+		self.assertTrue( hello.is_abstract )
+
+	def test_abstractmethod_requires_stub_body( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@abstractmethod
+	def hello( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a stub body', self.discovery.errors.errors[0] )
+
+	def test_abstractmethod_with_redundant_explicit_virtual_is_accepted( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@abstractmethod
+	@virtual
+	def hello( self ) -> i32: ...
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		hello = foo.chain_lookup( 'hello' )
+		self.assertTrue( hello.is_virtual )
+		self.assertTrue( hello.is_abstract )
+		hello = foo.chain_lookup( 'hello' )
+		self.assertTrue( hello.is_virtual )
+		self.assertTrue( hello.is_abstract )
+
 
 class InterfaceCStructTests( unittest.TestCase ):
 	''' @interface CStructs - see PLAN_SUBCLASSING_VTABLES_COM.md. Single

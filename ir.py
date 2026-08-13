@@ -315,6 +315,16 @@ class Call( Instruction ):
 	receiver: Operand|None = None
 	args: list[Operand]
 	kwargs: dict[str,Operand]
+	# super().__init__(...) specifically (lowering.py's own
+	# _lower_super_init_if_required) - the receiver here is `self`,
+	# mid-construction, which cfg.py's check_self_escape would otherwise
+	# reject (self can't be handed to an ordinary call before construction
+	# completes) - this one narrow exemption lets lowering.py's own
+	# _check_self_escape_in skip just the RECEIVER of exactly this call
+	# (args/kwargs still go through the ordinary check), matching how
+	# GetAttr.obj/SetAttr.obj are already structurally exempted rather
+	# than individually special-cased at every call site
+	is_super_init_call: bool = False
 
 	def test_repr( self ) -> str:
 		return (

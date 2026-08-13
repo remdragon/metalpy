@@ -21,9 +21,11 @@ DECODE_TABLE: list[u16] = [
 ]
 
 class cp437( Codec ):
+	@virtual
 	def names( self ) -> list[str]:
 		return [ 'cp437', 'ibm437', 'IBM437', 'cspc8codecpage437' ]
-	
+
+	@virtual
 	def encode( self, s: str ) -> Result[bytes,CodecError]:
 		s_len: usize = s.byte_len()
 		s_ptr: ConstPtr[u8] = s.get_ptr()
@@ -90,6 +92,7 @@ class cp437( Codec ):
 		
 		return Result.Ok( bytes.from_bytearray( bytes, move( out )))
 	
+	@virtual
 	def decode( self, b: bytes ) -> Result[str,CodecError]:
 		b_len: usize = len( b )
 		b_ptr: ConstPtr[u8] = b.get_ptr()

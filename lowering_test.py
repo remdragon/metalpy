@@ -5053,7 +5053,15 @@ class Tests( unittest.TestCase ):
 		lowered = self.compiler._lower( mod.get_local( 'main' ))
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
-		self.assertIn( 'JumpIfFalse', kinds ) # is_err() branch on Bar(...)'s own construction result
+		# JumpIfTrue, not JumpIfFalse - is_err_temp holds is_err()'s own
+		# result, so the jump to the err branch has to fire when it's TRUE.
+		# This assertion previously encoded a real, separate bug
+		# (_emit_fallible_construction emitted JumpIfFalse here, meaning
+		# "not an error -> jump to the error branch", inverted for EVERY
+		# fallible RCClass __init__ in the language - found and fixed while
+		# prototyping the RCClass-subclassing plan's Phase 2 fallible
+		# super().__init__() chaining, unrelated to subclassing itself)
+		self.assertIn( 'JumpIfTrue', kinds ) # is_err() branch on Bar(...)'s own construction result
 		self.assertIn( 'Decref', kinds ) # self decref'd on the Err path
 		self.assertIn( 'Jump', kinds )
 
@@ -5176,6 +5184,273 @@ class Tests( unittest.TestCase ):
 		mod = self._import( code )
 		self.compiler._lower( mod.get_local( 'main' ))
 		self.assertEqual( self.discovery.errors.errors, [] )
+
+	# --- super().__init__(...) constructor chaining (RCClass single inheritance,
+	# Phase 2 of the RCClass-subclassing plan) -------------------------------
+
+	def test_super_init_call_shape( self ) -> None:
+		code = '\n'.join([
+			'class Base:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, x: i32, y: i32 ) -> None:',
+			'		super().__init__( x )',
+			'		self.y = y',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		# the super().__init__(x) call, then self.y = y (SetAttr, no Incref -
+		# y: i32 isn't RC-managed) - no Allocate here (self is already
+		# allocated by the caller of Derived(...) before __init__ ever
+		# runs), just a Call whose receiver is self cast to Base
+		self.assertEqual( kinds, [ 'FuncStart', 'Call', 'SetAttr', 'Return', 'FuncEnd' ] )
+		call = next( i for i in lowered.instructions if type( i ).__name__ == 'Call' )
+		self.assertTrue( call.is_super_init_call )
+		self.assertEqual( call.target.stem, '__init__' )
+		self.assertEqual( call.target.cls.stem, 'Base' )
+
+	def test_missing_super_init_call_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Base:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, x: i32, y: i32 ) -> None:',
+			'		self.y = y',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		with self.assertRaises( CompileError ):
+			self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertTrue( any( 'must call super().__init__' in e for e in self.discovery.errors.errors ))
+
+	def test_super_init_call_not_first_statement_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Base:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, x: i32, y: i32 ) -> None:',
+			'		self.y = y',
+			'		super().__init__( x )',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		with self.assertRaises( CompileError ):
+			self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertTrue( any( 'must call super().__init__' in e for e in self.discovery.errors.errors ))
+
+	def test_super_init_outside_first_statement_of_init_is_rejected_everywhere( self ) -> None:
+		# super().__init__(...) used in a non-__init__ method, or in a root
+		# class's own __init__ (no base to chain to at all) - both reach
+		# _stmt_Expr's own shape-check (never the special statement-0
+		# handling), which rejects unconditionally
+		code = '\n'.join([
+			'class Root:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		super().__init__( x )',
+			'		self.x = x',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		# doesn't raise - _stmt_Expr's own check fires from WITHIN this
+		# statement's own lowering, caught by lower_function's per-statement
+		# recovery boundary, same as test_self_escape_via_method_call_is_a_
+		# compile_error's own identical situation
+		self.compiler._lower( self._method( mod, 'Root', '__init__' ))
+		self.assertTrue( any( 'only allowed as the literal first statement' in e for e in self.discovery.errors.errors ))
+
+	def test_field_only_base_with_no_init_rejects_subclass_init( self ) -> None:
+		# a Phase 2 scope limit, not a soundness gap - see
+		# _lower_super_init_if_required's own comment: no sugar exists yet
+		# for a subclass's own __init__ to fill in a field-only ancestor's
+		# fields when there's no base __init__ to chain to at all
+		code = '\n'.join([
+			'class Base:',
+			'	x: i32',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, y: i32 ) -> None:',
+			'		self.y = y',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		with self.assertRaises( CompileError ):
+			self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertTrue( any( 'has field(s) but no' in e for e in self.discovery.errors.errors ))
+
+	def test_field_only_base_with_no_fields_needs_no_super_call( self ) -> None:
+		# a base with NO __init__ AND no fields at all contributes nothing -
+		# no super() call required, ordinary construction-safety applies to
+		# just the subclass's own attributes
+		code = '\n'.join([
+			'class Base:',
+			'	def hello( self ) -> i32:',
+			'		return 1',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, y: i32 ) -> None:',
+			'		self.y = y',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_fallible_base_init_requires_or_return( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'class Base:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> Result[None,MyError]:',
+			'		self.x = x',
+			'		return Result.Ok( None )',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, x: i32, y: i32 ) -> None:',
+			'		super().__init__( x )',
+			'		self.y = y',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		with self.assertRaises( CompileError ):
+			self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertTrue( any( 'is fallible - must be consumed via .or_return()' in e for e in self.discovery.errors.errors ))
+
+	def test_infallible_base_init_rejects_or_return( self ) -> None:
+		code = '\n'.join([
+			'class Base:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, x: i32, y: i32 ) -> None:',
+			'		super().__init__( x ).or_return()',
+			'		self.y = y',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		with self.assertRaises( CompileError ):
+			self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertTrue( any( 'is not fallible - remove .or_return()' in e for e in self.discovery.errors.errors ))
+
+	def test_fallible_base_init_with_or_return_shape( self ) -> None:
+		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+			'class MyError: pass',
+			'class Base:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> Result[None,MyError]:',
+			'		self.x = x',
+			'		return Result.Ok( None )',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def __init__( self, x: i32, y: i32 ) -> Result[None,MyError]:',
+			'		super().__init__( x ).or_return()',
+			'		self.y = y',
+			'		return Result.Ok( None )',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( self._method( mod, 'Derived', '__init__' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
+		self.assertIn( 'Call', kinds ) # super().__init__(x)
+		self.assertIn( 'OrReturn', kinds ) # or_return()'s own propagation primitive, consuming the super-call's result
+		call = next( i for i in lowered.instructions if type( i ).__name__ == 'Call' and i.is_super_init_call )
+		self.assertIsNotNone( call.dest ) # fallible - the Result gets a real dest for or_return() to consume
+
+	def test_self_escape_still_enforced_after_super_init_for_own_attributes( self ) -> None:
+		# super().__init__(...) satisfies the BASE's own required
+		# attributes only - the subclass's own attributes still gate self
+		# escape exactly as they would for a root class
+		code = '\n'.join([
+			'class Base:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'class Derived( Base ):',
+			'	y: i32',
+			'	def helper( self ) -> None:',
+			'		pass',
+			'	def __init__( self, x: i32, y: i32 ) -> None:',
+			'		super().__init__( x )',
+			'		self.helper()',
+			'		self.y = y',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		self.compiler._lower( self._method( mod, 'Derived', '__init__' )) # doesn't raise - see test_self_escape_via_method_call_is_a_compile_error's own comment
+		self.assertTrue( any( 'self cannot be used here' in e and 'y' in e for e in self.discovery.errors.errors ))
+
+	def test_three_level_chain_flattens_base_attributes( self ) -> None:
+		code = '\n'.join([
+			'class A:',
+			'	a: i32',
+			'	def __init__( self, a: i32 ) -> None:',
+			'		self.a = a',
+			'',
+			'class B( A ):',
+			'	b: i32',
+			'	def __init__( self, a: i32, b: i32 ) -> None:',
+			'		super().__init__( a )',
+			'		self.b = b',
+			'',
+			'class C( B ):',
+			'	c: i32',
+			'	def __init__( self, a: i32, b: i32, c: i32 ) -> None:',
+			'		super().__init__( a, b )',
+			'		self.c = c',
+			'',
+			'def main() -> None:',
+			'	pass',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( self._method( mod, 'C', '__init__' ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( i for i in lowered.instructions if type( i ).__name__ == 'Call' )
+		self.assertTrue( call.is_super_init_call )
+		self.assertEqual( call.target.cls.stem, 'B' ) # chains to the IMMEDIATE base's own __init__, not the root's
 
 	# --- local (in-function) imports ---------------------------------------
 

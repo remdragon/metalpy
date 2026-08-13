@@ -14,11 +14,11 @@ class Codec:
 	@abstractmethod
 	def encode( self, s: str ) -> Result[bytes,CodecError]:
 		...
-	
+
 	@abstractmethod
 	def decode( self, b: bytes ) -> Result[str,CodecError]:
 		...
-	
+
 	@abstractmethod
 	def names( self ) -> list[str]:
 		...

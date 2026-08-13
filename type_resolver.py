@@ -662,7 +662,7 @@ class TypeResolver:
 			# dot-operator on a raw pointer means arrow - see lowering.py's
 			# _attr_lookup's identical redirect for the non-callable case
 			owner_type = self.ensure_resolved( owner_type.args[0] )
-		if isinstance( owner_type, CStruct ):
+		if isinstance( owner_type, ( CStruct, RCClass )):
 			found = owner_type.chain_lookup( attr )
 		else:
 			names = getattr( owner_type, 'names', None )

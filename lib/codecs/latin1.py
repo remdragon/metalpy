@@ -1,9 +1,11 @@
 from . import Codec, CodecError
 
 class latin1( Codec ):
+	@virtual
 	def names( self ) -> list[str]:
 		return [ 'latin1', 'latin-1', 'iso-8859-1', 'iso8859-1', '8859' ]
-	
+
+	@virtual
 	def encode( self, s: str ) -> Result[bytes,CodecError]:
 		s_len: usize = s.byte_len()
 		s_ptr: ConstPtr[u8] = s.get_ptr()
@@ -46,6 +48,7 @@ class latin1( Codec ):
 		
 		return Result.Ok( bytes.from_bytearray( bytes, move( out )))
 	
+	@virtual
 	def decode( self, b: bytes ) -> Result[str,CodecError]:
 		b_len: usize = len( b )
 		b_ptr: ConstPtr[u8] = b.get_ptr()
