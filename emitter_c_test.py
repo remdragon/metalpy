@@ -558,6 +558,39 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_union_member_never_constructed_still_gets_full_struct( self ) -> None:
+		# a real, confirmed gap distinct from the one above: a 3+-member
+		# anonymous union used only as a PARAMETER type, where the program
+		# only ever constructs SOME of its members (here: an i32 flows in,
+		# str and bool never do) - used to fail C compilation outright,
+		# "incomplete definition of type 'struct builtins$str'", because
+		# the union's own generic tag-gated Incref/Decref cleanup code
+		# (cfg.py's _tag_gated_refcount_instructions, emitted for ANY
+		# function receiving the union, since its own static type always
+		# admits every member regardless of what this particular program
+		# happens to construct) references str's full struct layout
+		# directly, but str's own class body was never scheduled - nothing
+		# schedules a union member's own LEAF TYPE unless something
+		# separately constructs/uses it. Root-caused to union_storage.py's
+		# UnionStorage.get(): its own `for attr in union.attributes:
+		# self._ensure_resolved(attr)` loop scheduled the member's
+		# attribute VARIABLE (a class-attribute-shaped Variable, not a
+		# global one) - which schedule()'s own guard silently ignores,
+		# since it isn't a Function/ClassLike/global Variable - never the
+		# member's own attr.type (the actual RCClass that needs emitting).
+		# Fixed by also explicitly scheduling attr.type.
+		self._run( '''
+def describe( x: i32|str|bool ) -> i32:
+	return 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		return describe( 5 ) - 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 class AugAssignRealCompileTests( CompilerTestCase ):
 	''' real compile+run coverage for _stmt_AugAssign's Attribute/Subscript-
 	target support (lowering.py) - unlike the IR-shape assertions in
