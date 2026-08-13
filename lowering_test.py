@@ -6326,6 +6326,328 @@ class InlineTests( unittest.TestCase ):
 		qualnames = { lf.function.qualname for lf in self.compiler.functions }
 		self.assertNotIn( '__test__.Result.is_ok[intrinsics.i32,__test__.MyError]', qualnames )
 
+# --- return-only generic type-parameter inference (PLAN_RETURN_INFERENCE.md) -
+
+class ReturnOnlyTypeParamInferenceTests( unittest.TestCase ):
+	''' A generic function whose return type is a bare type param appearing
+	in NO parameter (only in the return annotation) - inferred by eagerly
+	lowering the body once every other, argument-bound type param is known,
+	generalizing _expr_Lambda's own eager-lowering trick (PLAN_LAMBDA.md)
+	from an unbound Callable's own return type to a named generic
+	function's own return type. import_builtins=False, same as InlineTests. '''
+	maxDiff = None
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ) -> LoweredFunction:
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		return fn
+
+	def test_return_only_param_inferred_from_body( self ) -> None:
+		# def make[T,R](t: T) -> R: return t.derive() - R never appears in
+		# any parameter, only knowable by lowering the body once T is bound
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def make[T,R]( t: T ) -> R:',
+			'	return t.derive()',
+			'',
+			'def main( w: Widget ) -> bool:',
+			'	return make( w )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# main's own instructions show ONE real Call: to the monomorphized
+		# make[Widget,bool] itself (non-@inline - not spliced) - the nested
+		# call to Widget.derive lives inside make's OWN separately compiled
+		# body, not here
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		target = calls[0].target
+		self.assertEqual( target.qualname, '__test__.make[__test__.Widget,intrinsics.bool]' )
+		# the discovered R must be the real, concrete bool - not a leaked
+		# bare TypeVar or some other default
+		self.assertEqual( target.return_type.stem, 'bool' )
+		self.assertEqual( calls[0].dest.type.stem, 'bool' )
+
+	def test_return_only_param_infers_from_multistatement_body( self ) -> None:
+		# the user's own forcing example: locals/branches before the single
+		# `return <expr>` - multi-statement bodies are fine, only multiple
+		# RETURN POINTS are restricted (see test_two_return_points_rejected)
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def make[T,R]( factory: T ) -> R:',
+			'	obj = factory.derive()',
+			'	extra: i32 = 1',
+			'	if extra == 1:',
+			'		obj = obj',
+			'	return obj',
+			'',
+			'def main( w: Widget ) -> bool:',
+			'	return make( w )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_return_only_param_mixed_with_argument_bound_param( self ) -> None:
+		# make[T,R](t: T) -> Pair[T,R] - T is ordinarily argument-bound (it
+		# occurs in `t: T`), R is return-only - the return type mentions
+		# BOTH, exercising _unify_type_param's Specialization-args recursion
+		# to fill in R while re-confirming T. Pair has a real __init__
+		# (RCClass construction-arg inference, not @cstruct field=value
+		# sugar) deliberately - a generic @cstruct with NO __init__ has a
+		# real, PRE-EXISTING, unrelated gap: _lower_allocate_fields's own
+		# construction only ever infers its class's own concrete type args
+		# from the surrounding expected_type context, never from the field
+		# VALUES themselves (confirmed: `Pair(first=t, second=t.derive())`
+		# inside a function whose own return_type is deliberately left None
+		# during eager inference - see _infer_return_only_type_params's own
+		# comment on why - built the WRONG, still-abstract Pair type; the
+		# exact same construction succeeds fine when expected_type is
+		# available, e.g. an ordinary non-return-only generic function).
+		# Flagged separately, not fixed here - out of scope for this pass.
+		code = '\n'.join([
+			'class Pair[T,R]:',
+			'	first: T',
+			'	second: R',
+			'	def __init__( self, first: T, second: R ) -> None:',
+			'		self.first = first',
+			'		self.second = second',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def make[T,R]( t: T ) -> Pair[T,R]:',
+			'	return Pair( t, t.derive() )',
+			'',
+			'def main( w: Widget ) -> None:',
+			'	p: Pair[Widget,bool] = make( w )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_two_return_points_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def make[T,R]( t: T ) -> R:',
+			'	if t.derive():',
+			'		return t.derive()',
+			'	return t.derive()',
+			'',
+			'def main( w: Widget ) -> bool:',
+			'	return make( w )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'exactly one reachable' in e for e in self.discovery.errors.errors ))
+
+	def test_bare_return_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def make[T,R]( t: T ) -> R:',
+			'	return',
+			'',
+			'def main( w: Widget ) -> bool:',
+			'	return make( w )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'exactly one reachable' in e for e in self.discovery.errors.errors ))
+
+	def test_direct_recursion_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	pass',
+			'',
+			'def make[T,R]( t: T ) -> R:',
+			'	return make( t )',
+			'',
+			'def main( w: Widget ) -> None:',
+			'	make( w )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'recursively calls itself' in e for e in self.discovery.errors.errors ))
+
+	def test_mutual_recursion_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	pass',
+			'',
+			'def ping[T,R]( t: T ) -> R:',
+			'	return pong( t )',
+			'',
+			'def pong[T,R]( t: T ) -> R:',
+			'	return ping( t )',
+			'',
+			'def main( w: Widget ) -> None:',
+			'	ping( w )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'recursively calls itself' in e for e in self.discovery.errors.errors ))
+
+	def test_two_call_sites_same_binding_reuse_one_compiled_function( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def make[T,R]( t: T ) -> R:',
+			'	return t.derive()',
+			'',
+			'def main( w1: Widget, w2: Widget ) -> None:',
+			'	x: bool = make( w1 )',
+			'	y: bool = make( w2 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and i.target.qualname.startswith( '__test__.make' ) ]
+		self.assertEqual( len( calls ), 2 )
+		self.assertIs( calls[0].target, calls[1].target )
+
+	def test_vacuous_type_param_alongside_return_only_still_fails( self ) -> None:
+		# S appears in NEITHER any parameter NOR the return type - a
+		# degenerate case, left to fail like anything else genuinely
+		# missing, not silently accepted just because R (which DOES appear
+		# in the return type) happens to be inferable
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def make[T,R,S]( t: T ) -> R:',
+			'	return t.derive()',
+			'',
+			'def main( w: Widget ) -> bool:',
+			'	return make( w )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'cannot infer type parameter(s)' in e and 'S' in e for e in self.discovery.errors.errors ))
+
+	def test_inline_return_only_param_infers_and_still_splices( self ) -> None:
+		# @inline get_len[T,R](t: T) -> R: return t.__len__() - a synthetic
+		# T whose __len__ returns i32 (not the usual usize), to actually
+		# exercise inference rather than coincidentally matching a
+		# hard-coded type. Must still emit no real Call/FuncStart/FuncEnd
+		# for get_len itself (PLAN_INLINE.md's own invariant preserved)
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'	def __len__( self ) -> i32:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def get_len[T,R]( t: T ) -> R:',
+			'	return t.__len__()',
+			'',
+			'def main( b: Box ) -> i32:',
+			'	return get_len( b )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Box.__len__' ] )
+		self.assertEqual( fn.function.return_type.stem, 'i32' )
+
+	def test_inline_return_only_two_call_sites_each_get_independent_splice( self ) -> None:
+		# unlike the non-inline case, @inline is ALWAYS spliced per call
+		# site - two call sites must NOT share one compiled unit's worth of
+		# Call, they each get their own independent Call to __len__ (the
+		# discovered R binding is what's shared/cached, not the splice)
+		code = '\n'.join([
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'	def __len__( self ) -> i32:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def get_len[T,R]( t: T ) -> R:',
+			'	return t.__len__()',
+			'',
+			'def main( b1: Box, b2: Box ) -> i32:',
+			'	x: i32 = get_len( b1 )',
+			'	y: i32 = get_len( b2 )',
+			'	return x',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Box.__len__', '__test__.Box.__len__' ] )
+
+	def test_inline_discarding_return_only_result_type_rejected( self ) -> None:
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'@inline',
+			'def make[T,R]( t: T ) -> R:',
+			'	return t.wrap()',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	def wrap( self ) -> Result[i32,MyError]:',
+			'		return Result.Ok( 1 )',
+			'',
+			'def main( w: Widget ) -> None:',
+			'	make( w )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ))
+
 # --- compiler.fetch_unicode_table('upper'|'lower') ---------------------------
 
 class FetchUnicodeTableTests( unittest.TestCase ):

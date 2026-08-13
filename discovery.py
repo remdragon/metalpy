@@ -1719,6 +1719,37 @@ class Discovery( ast.NodeVisitor ):
 			stmts = stmts[1:]
 		return len( stmts ) == 1 and isinstance( stmts[0], ast.Return ) and stmts[0].value is not None
 
+	def _is_eager_return_inferable_body( self, body: list[ast.stmt] ) -> bool:
+		''' return-only generic type-parameter inference (a generic
+		function whose return type is a bare type param appearing in no
+		parameter, only knowable by actually lowering the body once every
+		OTHER type param is bound - see lowering.py's
+		_infer_return_only_type_params) is only attempted on a body with
+		EXACTLY ONE reachable `return <expr>` ANYWHERE in it (unlike
+		@inline's _is_inline_eligible_body just above, this walks the WHOLE
+		statement tree - if/for/while/with/try/match bodies included, not
+		just the top level) - this sidesteps "do all return points agree on
+		the same concrete type" entirely, since there's only ever one to
+		agree with. Multi-statement bodies with locals/branches/loops are
+		fine; multiple RETURN POINTS are not. Doesn't descend into a nested
+		def/lambda - mirrors _reject_free_variables's identical discipline
+		(PLAN_LAMBDA.md): a nested def/lambda's own `return` belongs to IT,
+		not to the enclosing generic function's own return type. '''
+		returns: list[ast.Return] = []
+		class _ReturnCollector( ast.NodeVisitor ):
+			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+				pass
+			def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+				pass
+			def visit_Lambda( self, lam: ast.Lambda ) -> None:
+				pass
+			def visit_Return( self, ret: ast.Return ) -> None:
+				returns.append( ret )
+		collector = _ReturnCollector()
+		for stmt in body:
+			collector.visit( stmt )
+		return len( returns ) == 1 and returns[0].value is not None
+
 	def _bind_overload_stub( self, stub: Function, group: Overload ) -> None:
 		# a stub has no body of its own - it must resolve to exactly one plain
 		# (non-@overload) implementation whose accepted types, at every

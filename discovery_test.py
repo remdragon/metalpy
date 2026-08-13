@@ -2440,6 +2440,134 @@ def fine( x: i32 ) -> i32:
 		self.assertEqual( len( fine.parameters ), 1 )
 
 
+class EagerReturnInferableBodyTests( unittest.TestCase ):
+	''' PLAN_RETURN_INFERENCE.md - Discovery._is_eager_return_inferable_body,
+	tested directly against a bare function body (no compile pipeline
+	needed - this is a pure AST-shape check). '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _body( self, code: str ) -> list:
+		import ast
+		module = ast.parse( code )
+		fn = module.body[0]
+		self.assertIsInstance( fn, ast.FunctionDef )
+		return fn.body
+
+	def test_single_top_level_return_accepted( self ) -> None:
+		body = self._body( '''
+def foo():
+	return x
+''' )
+		self.assertTrue( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_single_return_nested_in_if_accepted( self ) -> None:
+		body = self._body( '''
+def foo():
+	y = 1
+	if y == 1:
+		return x
+''' )
+		self.assertTrue( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_single_return_nested_in_for_while_with_try_match_accepted( self ) -> None:
+		for snippet in (
+			'''
+def foo():
+	for i in y:
+		return x
+''',
+			'''
+def foo():
+	while y:
+		return x
+''',
+			'''
+def foo():
+	with y:
+		return x
+''',
+			'''
+def foo():
+	try:
+		return x
+	except Exception:
+		pass
+''',
+			'''
+def foo():
+	match y:
+		case 1:
+			return x
+''',
+		):
+			with self.subTest( snippet = snippet ):
+				self.assertTrue( self.discovery._is_eager_return_inferable_body( self._body( snippet )))
+
+	def test_zero_returns_rejected( self ) -> None:
+		body = self._body( '''
+def foo():
+	y = 1
+''' )
+		self.assertFalse( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_two_returns_rejected( self ) -> None:
+		body = self._body( '''
+def foo():
+	if y:
+		return x
+	return z
+''' )
+		self.assertFalse( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_bare_return_rejected( self ) -> None:
+		body = self._body( '''
+def foo():
+	return
+''' )
+		self.assertFalse( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_bare_return_mixed_with_real_return_rejected( self ) -> None:
+		body = self._body( '''
+def foo():
+	if y:
+		return
+	return x
+''' )
+		self.assertFalse( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_return_inside_nested_def_not_counted( self ) -> None:
+		# a nested def's own `return` belongs to IT, not to the enclosing
+		# function - matches _reject_free_variables's identical discipline
+		# (PLAN_LAMBDA.md)
+		body = self._body( '''
+def foo():
+	def inner():
+		return 1
+	return x
+''' )
+		self.assertTrue( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_return_inside_nested_lambda_not_counted( self ) -> None:
+		body = self._body( '''
+def foo():
+	f = lambda: 1
+	return x
+''' )
+		self.assertTrue( self.discovery._is_eager_return_inferable_body( body ))
+
+	def test_only_returns_inside_nested_def_rejected( self ) -> None:
+		# the OUTER function itself has zero returns of its own here - the
+		# one inside `inner` doesn't count
+		body = self._body( '''
+def foo():
+	def inner():
+		return 1
+''' )
+		self.assertFalse( self.discovery._is_eager_return_inferable_body( body ))
+
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG, force = True )
 	unittest.main()

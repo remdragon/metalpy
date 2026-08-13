@@ -289,19 +289,40 @@ class Monomorphizer:
 			type_params = base.cls.type_params
 			substituted_cls = self.discovery._get_or_create_specialization( base.cls, spec.args )
 		type_params = type_params or []
+		monomorphized = self._build_monomorphized_function( base, type_params, spec.args, spec.qualname, substituted_cls )
+		spec.monomorphized = monomorphized
+		return monomorphized
+
+	def _build_monomorphized_function( self, base: Function, type_params: list[TypeVar], args: list[Type], qualname: str, substituted_cls: ClassLike|None = None ) -> Function:
+		''' the substitution/copy core of monomorphized_function, split out
+		so lowering.py's eager return-only type-parameter inference (a
+		generic function whose return type is a bare type param that
+		appears in no parameter, only knowable by actually lowering the
+		body once every OTHER type param is bound) can build a PROVISIONAL
+		Function before a real, fully-concrete Specialization even exists -
+		type_params/args/qualname are threaded through explicitly instead
+		of being read off a Specialization, so a caller can pass an `args`
+		list where one entry is still a bare, unresolved TypeVar (the
+		return-only one) rather than every entry being concrete already.
+		substituted_cls defaults to base.cls unchanged - only
+		monomorphized_function's own "inherited from an enclosing generic
+		class" branch above ever needs to override it; this helper doesn't
+		need to know why, just what to substitute where. '''
+		if substituted_cls is None:
+			substituted_cls = base.cls
 		substituted_params = [
-			replace( p, type = self.substitute_type_params( p.type, type_params, spec.args ) )
+			replace( p, type = self.substitute_type_params( p.type, type_params, args ) )
 			for p in ( base.parameters or [] )
 		]
-		substituted_return = self.substitute_type_params( base.return_type, type_params, spec.args )
+		substituted_return = self.substitute_type_params( base.return_type, type_params, args )
 		substituted_names = dict( base.names )
-		for tv, arg in zip( type_params, spec.args ):
+		for tv, arg in zip( type_params, args ):
 			substituted_names[tv.stem] = arg
 		for p in substituted_params:
 			substituted_names[p.stem] = p
-		monomorphized = replace(
+		return replace(
 			base,
-			qualname = spec.qualname,
+			qualname = qualname,
 			cls = substituted_cls,
 			parameters = substituted_params,
 			return_type = substituted_return,
@@ -310,8 +331,6 @@ class Monomorphizer:
 			type_params = None,
 			resolve = None,
 		)
-		spec.monomorphized = monomorphized
-		return monomorphized
 
 	def _substituted_overload( self, group: Overload, spec: Specialization ) -> Overload:
 		# an @overload group declared inside a generic class (e.g. Result

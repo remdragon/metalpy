@@ -158,6 +158,28 @@ class Lowering:
 		self._tuple_storage = type_resolver.tuple_storage
 		self._closure_trampolines: dict[tuple[int,int],Function] = {} # (id(method), id(owner_type)) -> its one synthesized trampoline, see _get_or_create_closure_trampoline
 		self._lambda_counter = 0 # -> f'$$lambda_{n}', unique per compile run - see _expr_Lambda (PLAN_LAMBDA.md)
+		# return-only generic type-parameter inference - a generic function
+		# call whose return type is a bare type param appearing in no
+		# parameter, inferred by eagerly lowering the body once every OTHER
+		# type param is known (see FunctionLowering._infer_return_only_type_
+		# params/_infer_return_only_type_params_inline). Lives HERE, not on
+		# FunctionLowering, deliberately: the eager pre-compile (non-@inline
+		# case) always builds a BRAND NEW FunctionLowering for the nested
+		# call (PLAN_LAMBDA.md's own reentrancy fix), so a guard scoped to
+		# one FunctionLowering instance would start empty every time,
+		# invisible across exactly the boundary that needs guarding - this
+		# has to live on the one object that outlives every nested
+		# FunctionLowering. Keyed by id(target) (the abstract base Function)
+		# alone, not by which concrete args - simpler and more conservative:
+		# ANY reentrant eager-inference attempt on the same target function
+		# is rejected outright, regardless of args, rather than trying to
+		# precisely distinguish safe from unsafe recursion.
+		self._eager_return_inference_stack: list[int] = []
+		# id(target) -> the set of id(TypeVar) from target.type_params that
+		# appear ANYWHERE in target's own parameter types - a static,
+		# per-function-signature property, independent of any call site, so
+		# it's computed once and cached here rather than per call
+		self._param_referenced_type_params: dict[int,frozenset[int]] = {}
 
 	def lower_function( self, fn: Function ) -> list[ir.Instruction]:
 		# per-function lowering state (_instructions, _current_fn, _cfg, etc.
@@ -1021,6 +1043,44 @@ class Lowering:
 				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
 			self._unify_type_param( type_params, declared.return_type, actual.return_type, bindings, node, context_qualname )
 			return
+
+	def _type_mentions_param( self, t: Type|None, tv: TypeVar ) -> bool:
+		''' PLAN_RETURN_INFERENCE.md - true if the bare TypeVar `tv` occurs
+		anywhere inside `t`, using the SAME structural recursion
+		_unify_type_param itself uses (Specialization.args, CallableType.
+		arg_types/return_type) - deliberately not the broader shape
+		Monomorphizer.substitute_type_params uses (which also recurses into
+		ClosureType/anonymous-TaggedUnion leaves): "does this parameter
+		type CONTAIN tv" needs to agree exactly with "would _unify_type_param
+		actually BIND tv from an argument at this position", or a type param
+		that's structurally present but never actually unified against
+		would be wrongly classified as argument-inferable and never get a
+		chance at return-only inference at all. '''
+		if t is None:
+			return False
+		if t is tv:
+			return True
+		if isinstance( t, Specialization ):
+			return any( self._type_mentions_param( a, tv ) for a in t.args )
+		if isinstance( t, CallableType ):
+			return any( self._type_mentions_param( a, tv ) for a in t.arg_types ) or self._type_mentions_param( t.return_type, tv )
+		return False
+
+	def _param_referenced_type_params_for( self, target: Function ) -> frozenset[int]:
+		''' PLAN_RETURN_INFERENCE.md - the set of id(TypeVar) from target.
+		type_params that occur anywhere in target's own PARAMETER types - a
+		static property of the function's own signature, independent of any
+		call site, cached per id(target) since _lower_inferred_generic_call
+		consults it on every under-determined bare call to that function '''
+		cached = self._param_referenced_type_params.get( id( target ))
+		if cached is not None:
+			return cached
+		referenced = frozenset(
+			id( tv ) for tv in ( target.type_params or [] )
+			if any( self._type_mentions_param( p.type, tv ) for p in ( target.parameters or [] ))
+		)
+		self._param_referenced_type_params[ id( target )] = referenced
+		return referenced
 
 	def _dispatch_operand_for_param( self, node: ast.AST, target: Function, param: Parameter, args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> ir.Operand:
 		if param.stem in kwargs:
@@ -5281,13 +5341,45 @@ class FunctionLowering:
 		for param, _expr in keyword:
 			self._apply_move_hook( param, kwargs[param.stem], target.qualname )
 
-		missing = [ tv.stem for tv in target.type_params or [] if id( tv ) not in bindings ]
+		missing = [ tv for tv in target.type_params or [] if id( tv ) not in bindings ]
 		if missing:
-			self.lowering.discovery.fail(
-				f'{target.qualname}[...]: cannot infer type parameter(s) {", ".join(missing)} from these arguments - '
-				f'call it explicitly as {target.qualname}[...](...) instead: {ast.unparse(node)}',
-				node,
-			)
+			# return-only inference: a still-unbound type param that never
+			# appears in any PARAMETER type (so ordinary argument unification,
+			# above, could never have bound it no matter what was passed) but
+			# DOES appear in the function's own return type is inferable by
+			# actually lowering the body, once every other (argument-bound)
+			# type param is known - see _infer_return_only_type_params/
+			# _infer_return_only_type_params_inline. A param appearing in
+			# NEITHER any parameter nor the return type is a degenerate,
+			# vacuous case - left to fail below like anything else genuinely
+			# missing, not silently accepted.
+			referenced = self.lowering._param_referenced_type_params_for( target )
+			return_only_missing = [
+				tv for tv in missing
+				if id( tv ) not in referenced and self.lowering._type_mentions_param( target.return_type, tv )
+			]
+			genuinely_missing = [ tv for tv in missing if tv not in return_only_missing ]
+			if genuinely_missing:
+				# a call can't be "partially" rescued by the return-only path
+				# while some other param remains genuinely stuck from the
+				# arguments alone - lists every still-unbound name (not just
+				# the genuinely-missing ones), same as before this branch
+				# existed at all, since an explicit spelling would need to
+				# supply ALL of them anyway (no partial explicit subscript
+				# exists - see PLAN_RETURN_INFERENCE's own "Deferred")
+				self.lowering.discovery.fail(
+					f'{target.qualname}[...]: cannot infer type parameter(s) {", ".join(tv.stem for tv in missing)} from these arguments - '
+					f'call it explicitly as {target.qualname}[...](...) instead: {ast.unparse(node)}',
+					node,
+				)
+			if target.is_inline:
+				return self._infer_return_only_type_params_inline(
+					node, target, type_params, bindings, return_only_missing, receiver, args, kwargs, expected_type, want_result,
+				)
+			monomorphized = self._infer_return_only_type_params( node, target, type_params, bindings, return_only_missing )
+			inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
+			spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
+			return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result, already_compiled = True )
 		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		monomorphized = self.lowering._monomorphized_function( spec )
@@ -5301,7 +5393,190 @@ class FunctionLowering:
 		# yet (no general type-checking pass exists), same as every other
 		# call site in this file today
 
-	def _emit_generic_call( self, node: ast.Call, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+	def _infer_return_only_type_params( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], return_only: list[TypeVar] ) -> Function:
+		# PLAN_RETURN_INFERENCE.md - non-@inline variant: a bare generic
+		# call left one or more type params unbound after ordinary
+		# argument unification, each appearing ONLY in target's own return
+		# type (never in any parameter) - determined by actually, eagerly,
+		# synchronously compiling the function's body (with every OTHER,
+		# argument-bound type param already substituted) and reading the
+		# real return type back off it, generalizing _expr_Lambda's own
+		# eager-lowering trick (PLAN_LAMBDA.md) from an unbound Callable's
+		# own return type to a named generic function's own return type.
+		# Mutates `bindings` in place to add the newly-discovered args, and
+		# returns the (now fully concrete) monomorphized Function - already
+		# a real, compiled unit (appended to compiler.functions by
+		# _compile_now), never rebuilt - for the caller to finish emitting
+		# a Call against.
+		pending_args = [ bindings.get( id( tv ), tv ) for tv in type_params ]
+		pending_spec = self.lowering.discovery._get_or_create_specialization( target, pending_args )
+		if pending_spec.monomorphized is not None:
+			# another call site with the SAME known args already discovered
+			# the return-only bindings and compiled this - no new compile,
+			# just recover the bindings THIS call site's own `bindings`
+			# dict still needs filled in (the caller reads it right after
+			# this returns to build its own Specialization args)
+			self.lowering._unify_type_param( type_params, target.return_type, pending_spec.monomorphized.return_type, bindings, node, target.qualname )
+			return pending_spec.monomorphized
+
+		if id( target ) in self.lowering._eager_return_inference_stack:
+			self.lowering.discovery.fail(
+				f'{target.qualname}[...]: cannot infer return-only type parameter(s) {", ".join(tv.stem for tv in return_only)} - '
+				f'the body (directly, or through another generic function) recursively calls itself before its own return type is '
+				f'known - call it explicitly as {target.qualname}[...](...) instead: {ast.unparse(node)}',
+				node,
+			)
+		if not self.lowering.discovery._is_eager_return_inferable_body( target.node.body ):
+			self.lowering.discovery.fail(
+				f'{target.qualname}[...]: cannot infer return-only type parameter(s) {", ".join(tv.stem for tv in return_only)} - '
+				f'its body must have exactly one reachable `return <expr>` for this to work - call it explicitly as '
+				f'{target.qualname}[...](...) instead: {ast.unparse(node)}',
+				node,
+			)
+
+		self.lowering._eager_return_inference_stack.append( id( target ))
+		try:
+			# qualname deliberately the PENDING spec's own (not target's bare
+			# abstract name) - already unambiguous per known-args binding,
+			# and gives compile errors reached WHILE eagerly lowering this
+			# body a sensible name too, not the shared, unspecialized one
+			provisional = self.lowering._monomorphizer._build_monomorphized_function( target, type_params, pending_args, pending_spec.qualname )
+			# forces _stmt_Return's own _lower_expr(node.value, self.
+			# _current_fn.return_type) to lower the return expression with
+			# NO hint, taking its own natural type - _expr_Lambda's
+			# identical return_type_provisional convention, reused verbatim
+			provisional.return_type = None
+			lowered = self.lowering._compile_now( provisional ) # == Compiler._lower - this IS the final compiled unit, never rebuilt
+			# NOT a bare next(...) (unlike _expr_Lambda's own identical-
+			# looking lookup, PLAN_LAMBDA.md line ~3555 - a real, pre-
+			# existing gap there too, not fixed here, out of scope for this
+			# plan): the ONE statement in `provisional`'s own body can
+			# itself fail to lower (e.g. the reentrancy guard above,
+			# triggered one level deeper by a recursive call inside the
+			# body) - FunctionLowering.run()'s own per-statement recovery
+			# (try/except CompileError: continue) SWALLOWS that failure
+			# silently rather than propagating it here, leaving `lowered.
+			# instructions` with no ir.Return at all. A bare next(...) would
+			# crash with an unhandled StopIteration instead of a clean
+			# compile error - confirmed by a real repro (direct/mutual
+			# recursion through this same path). The real error is already
+			# recorded in discovery.errors by whatever failed deeper in the
+			# body (the reentrancy guard's own fail(), most commonly) -
+			# this fail() call is a second, redundant-but-harmless report,
+			# same accepted pattern resolve_function_body's own docstring
+			# already documents ("gets reported again... so nothing is
+			# silently swallowed")
+			return_instr = next( ( instr for instr in lowered.instructions if isinstance( instr, ir.Return ) ), None )
+			if return_instr is None:
+				self.lowering.discovery.fail(
+					f'{target.qualname}[...]: cannot infer return-only type parameter(s) {", ".join(tv.stem for tv in return_only)} - '
+					f'the body failed to compile (see earlier error): {ast.unparse(node)}',
+					node,
+				)
+			actual_return_type = (
+				return_instr.value.type if return_instr.value is not None
+				else self.lowering.discovery.get_none_type()
+			)
+			self.lowering._unify_type_param( type_params, target.return_type, actual_return_type, bindings, node, target.qualname )
+		finally:
+			self.lowering._eager_return_inference_stack.pop()
+
+		still_missing = [ tv.stem for tv in return_only if id( tv ) not in bindings ]
+		if still_missing:
+			self.lowering.discovery.fail(
+				f'{target.qualname}[...]: cannot infer type parameter(s) {", ".join(still_missing)} - the function\'s own declared '
+				f'return type does not structurally match what its body actually returns: {ast.unparse(node)}',
+				node,
+			)
+		full_args = [ bindings[id(tv)] for tv in type_params ]
+		real_spec = self.lowering.discovery._get_or_create_specialization( target, full_args )
+		# patch the SAME object in place afterward, not rebuilt - mirrors
+		# _expr_Lambda's own "reused afterward" convention exactly
+		provisional.return_type = self.lowering._substitute_type_params( target.return_type, type_params, full_args )
+		provisional.qualname = real_spec.qualname
+		real_spec.monomorphized = provisional # the real key, for a FUTURE fully-concrete lookup (e.g. an explicit foo[Concrete,Other](...) call elsewhere)
+		pending_spec.monomorphized = provisional # the pending key, for a FUTURE bare call with the same already-known args
+		return provisional
+
+	def _infer_return_only_type_params_inline( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], return_only: list[TypeVar], receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# PLAN_RETURN_INFERENCE.md - @inline variant: cheaper than
+		# _infer_return_only_type_params above because splicing the body IS
+		# the eager compile already - no separate FuncStart/CFG/real
+		# compiled unit needed for target itself here (matches PLAN_INLINE.
+		# md's own "never a real compiled unit" invariant), just the
+		# AST-level generic-call-resolution rewrite (resolve_function_body)
+		# a NESTED generic call inside the body would need, same as the
+		# ordinary is_inline path already gets via _monomorphized_function.
+		# _is_eager_return_inferable_body is NOT re-checked here - @inline's
+		# own decorator-time _is_inline_eligible_body (exactly one TOP-LEVEL
+		# `return <expr>`) is strictly stronger; every @inline-eligible body
+		# already trivially satisfies it.
+		pending_args = [ bindings.get( id( tv ), tv ) for tv in type_params ]
+		pending_spec = self.lowering.discovery._get_or_create_specialization( target, pending_args )
+		if pending_spec.monomorphized is not None:
+			# another call site already discovered R for these known args -
+			# splice against the cached provisional directly. `bindings`
+			# doesn't need filling in here (unlike the non-inline variant) -
+			# this call RETURNS the final operand straight to _lower_call's
+			# own caller, nothing downstream reads `bindings` again
+			return self._lower_inline_call( node, pending_spec.monomorphized, receiver, args, kwargs, expected_type, want_result )
+
+		if id( target ) in self.lowering._eager_return_inference_stack:
+			self.lowering.discovery.fail(
+				f'@inline {target.qualname}[...]: cannot infer return-only type parameter(s) {", ".join(tv.stem for tv in return_only)} - '
+				f'the body (directly, or through another generic function) recursively calls itself before its own return type is '
+				f'known - call it explicitly as {target.qualname}[...](...) instead: {ast.unparse(node)}',
+				node,
+			)
+		self.lowering._eager_return_inference_stack.append( id( target ))
+		try:
+			provisional = self.lowering._monomorphizer._build_monomorphized_function( target, type_params, pending_args, pending_spec.qualname )
+			provisional.return_type = None
+			# @inline never needs a real compiled unit for its own target -
+			# only the same AST-rewrite pass the ordinary is_inline path
+			# already runs on a monomorphized copy before splicing it, so a
+			# nested generic call inside the body resolves against the
+			# concrete, already-substituted T
+			self.lowering._type_resolver.resolve_function_body( provisional )
+			# forced True regardless of the real want_result - the real
+			# operand (and its .type) is needed to discover the return-only
+			# bindings even when the CALLER's own want_result is False; the
+			# discard-Result check _lower_inline_call would otherwise apply
+			# internally is skipped by forcing this (target.return_type is
+			# still None here, so it would've been a no-op anyway) and
+			# re-applied below instead, once the real return type is known
+			result = self._lower_inline_call( node, provisional, receiver, args, kwargs, expected_type, want_result = True )
+			actual_return_type = result.type if result is not None else self.lowering.discovery.get_none_type()
+			self.lowering._unify_type_param( type_params, target.return_type, actual_return_type, bindings, node, target.qualname )
+		finally:
+			self.lowering._eager_return_inference_stack.pop()
+
+		still_missing = [ tv.stem for tv in return_only if id( tv ) not in bindings ]
+		if still_missing:
+			self.lowering.discovery.fail(
+				f'{target.qualname}[...]: cannot infer type parameter(s) {", ".join(still_missing)} - the function\'s own declared '
+				f'return type does not structurally match what its body actually returns: {ast.unparse(node)}',
+				node,
+			)
+		full_args = [ bindings[id(tv)] for tv in type_params ]
+		real_spec = self.lowering.discovery._get_or_create_specialization( target, full_args )
+		provisional.return_type = self.lowering._substitute_type_params( target.return_type, type_params, full_args )
+		provisional.qualname = real_spec.qualname
+		real_spec.monomorphized = provisional # caches the PROVISIONAL BODY for reuse by _lower_inline_call at a future call site - provisional is never independently scheduled/appended to compiler.functions by this variant, matching PLAN_INLINE.md's invariant
+		pending_spec.monomorphized = provisional
+
+		if not want_result and cfg.is_result_type( provisional.return_type ):
+			# same discard check _lower_inline_call itself applies - done
+			# here instead since target.return_type wasn't known yet when
+			# _lower_inline_call ran above (want_result was forced True)
+			self.lowering.discovery.fail(
+				f'{target.qualname}(...) returns a Result that is discarded here - '
+				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
+				node,
+			)
+		return result if want_result else None
+
+	def _emit_generic_call( self, node: ast.Call, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, *, already_compiled: bool = False ) -> ir.Operand|None:
 		# schedules the Specialization itself as the compile unit (see
 		# _monomorphized_function/compiler.py's own handling of it), shared
 		# tail for both the explicit Name[T](...) and inferred call paths -
@@ -5311,7 +5586,24 @@ class FunctionLowering:
 		# (see _lower_class_generic_method_call's own comment on why that
 		# one is always left untagged) - so the discard check needs its own
 		# copy here too, not just in _lower_call's
-		self.lowering.schedule( spec )
+		#
+		# already_compiled=True (return-only type-parameter inference's own
+		# eager-compile path - see _infer_return_only_type_params) means
+		# `monomorphized` was already lowered for real, synchronously, via
+		# Lowering._compile_now, and is already sitting in compiler.functions
+		# - scheduling `spec` again here would re-enqueue it onto the
+		# ordinary work queue, and Compiler._lower's Specialization+Function
+		# branch has no "already lowered" check of its own: it would
+		# unconditionally re-run resolve_function_body (which mutates
+		# monomorphized.node.body IN PLACE - a second pass over an already-
+		# AST-rewritten body) and lower_function a second time, producing a
+		# duplicate LoweredFunction entry for the same qualname (a real
+		# duplicate-symbol C compile error), not just wasted work. Every
+		# other type/parameter still gets scheduled normally here - those
+		# are idempotent registrations of TYPES, unrelated to re-lowering
+		# monomorphized's own body
+		if not already_compiled:
+			self.lowering.schedule( spec )
 		self.lowering.schedule( monomorphized.return_type )
 		for param in monomorphized.parameters or []:
 			self.lowering.schedule( param.type )
