@@ -1685,14 +1685,40 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			subj_assign.match_clears_name = node.subject.id
 		subj_ref = ast.Name( id = subj_name, ctx = ast.Load() )
 		ast.copy_location( subj_ref, node )
+		# only meaningful at this top level (never threaded into
+		# _match_pattern's own recursive calls against an EXTRACTED
+		# payload - see _match_pattern's own comment on why): lets a
+		# top-level `case T(x):` that reuses the ORIGINAL subject's own
+		# name (`match x: case T(x): ...`) be recognized as narrowing x
+		# itself, rather than binding a same-named-but-distinct value
+		original_subject_name = node.subject.id if isinstance( node.subject, ast.Name ) else None
 
 		chain: ast.If|None = None
 		tail: ast.If|None = None
 		for case in node.cases:
 			if case.guard is not None:
 				self.discovery.fail( f'match guards (case ... if ...) are not yet supported: {ast.unparse(case.pattern)}', node )
-			test, binds = self._match_pattern( subj_ref, case.pattern, node )
-			body = [ self.visit( stmt ) for stmt in case.body ]
+			test, binds = self._match_pattern( subj_ref, case.pattern, node, original_subject_name )
+			# self.visit(stmt) returns a bare ast.stmt for most statement
+			# kinds, but a NESTED ast.Match (this method's own visit_Match,
+			# called recursively) returns a list[ast.stmt] instead (its own
+			# subj_assign + if-chain) - unlike ast.NodeTransformer's own
+			# generic_visit(), a manual comprehension doesn't auto-flatten
+			# that, so a naive `[self.visit(stmt) for stmt in case.body]`
+			# would embed the nested match's own 2-element list as ONE
+			# malformed body entry instead of two real statements - only
+			# surfaced once something actually reaches lowering.py's
+			# _lower_stmt, which has no _stmt_list handler ("unsupported
+			# statement", unparsed because ast.unparse() happens to accept a
+			# bare list of stmts too, which is what made this so confusing
+			# to trace)
+			body: list[ast.stmt] = []
+			for stmt in case.body:
+				visited = self.visit( stmt )
+				if isinstance( visited, list ):
+					body.extend( visited )
+				elif visited is not None:
+					body.append( visited )
 			arm = ast.If( test = test, body = [ *binds, *body ], orelse = [] )
 			ast.copy_location( arm, node )
 			if chain is None:
@@ -1710,7 +1736,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		self.generic_visit( node )
 		return node
 
-	def _match_pattern( self, subj_expr: ast.expr, pattern: ast.pattern, node: ast.AST ) -> tuple[ast.expr,list[ast.stmt]]:
+	def _match_pattern( self, subj_expr: ast.expr, pattern: ast.pattern, node: ast.AST, original_subject_name: str|None = None ) -> tuple[ast.expr,list[ast.stmt]]:
 		# ported from lowering.py's Lowering._match_pattern - same shape,
 		# plus a third pattern kind lowering.py's own version never had: a
 		# bare name/wildcard always matches; a TaggedUnion member becomes a
@@ -1724,7 +1750,14 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# correctness the same way an ordinary `subj == Color.Red`
 		# comparison already would. Anything else fails outright, exactly
 		# as it always has, just reported here instead of lazily during
-		# lowering
+		# lowering.
+		#
+		# original_subject_name is only ever non-None on the OUTERMOST call
+		# (visit_Match's own, never threaded into a recursive call against
+		# an EXTRACTED payload below - narrowing only makes sense against a
+		# name that already denotes a real, existing binding, which an
+		# extracted payload expression never is) - see the ast.MatchClass
+		# branch below for where it's actually used.
 		if isinstance( pattern, ast.MatchAs ) and pattern.pattern is None:
 			test = ast.Constant( value = True )
 			ast.copy_location( test, node )
@@ -1764,6 +1797,42 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			ast.copy_location( tag_expr, node )
 			test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
 			ast.copy_location( test, node )
+			inner_pattern = pattern.patterns[0]
+			if (
+				isinstance( inner_pattern, ast.MatchAs ) and inner_pattern.pattern is None
+				and inner_pattern.name is not None and inner_pattern.name == original_subject_name
+			):
+				# `match x: case T(x):` - the inner pattern reuses the
+				# OUTER SUBJECT's own name (not some unrelated binding that
+				# just happens to share it - original_subject_name is only
+				# ever set by visit_Match's own top-level call, see this
+				# method's own comment). x's own real Variable/storage
+				# never changes - narrow it instead of extracting-and-
+				# binding a same-named-but-distinct value (a real bug this
+				# fixes: the old extract-and-bind here left x's own type
+				# permanently stuck at the union's type, since lowering.py's
+				# _stmt_Assign reuses an EXISTING name's own Variable
+				# unchanged rather than ever narrowing it - confirmed via a
+				# real repro, `case Result.Ok(r):` on a Result[str,MyError]
+				# named r never actually narrowing r to str).
+				# lowering.py's _stmt_Assign recognizes is_narrowing_bind
+				# and calls cfg.narrow(name, member) instead of emitting an
+				# ordinary assignment - see its own comment. Carries only
+				# `member`'s own STEM (a plain string), not the Variable
+				# object itself: `owner` here is resolved from the
+				# TEXTUAL `Result` name, always the ABSTRACT class (T/E
+				# still bare TypeVars) - lowering.py re-resolves the real,
+				# SUBSTITUTED member (str, not T) against the subject
+				# variable's own already-monomorphized type instead, the
+				# same pattern _coerce_into_union already uses.
+				narrow_marker = ast.Assign(
+					targets = [ ast.Name( id = inner_pattern.name, ctx = ast.Store() ) ],
+					value = ast.Constant( value = None ),
+				)
+				ast.copy_location( narrow_marker, node )
+				narrow_marker.is_narrowing_bind = True
+				narrow_marker.narrows_member_stem = member.stem
+				return test, [ narrow_marker ]
 			payload_expr = ast.Attribute(
 				value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
 				attr = f'v_{member.stem}',

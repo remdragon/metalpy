@@ -7,7 +7,7 @@ from typing import Callable
 from discovery import Discovery
 from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType
 from tuple_storage import TupleStorage
-from union_storage import UnionStorage
+from union_storage import UnionStorage, build_member_constructor
 
 '''
 Monomorphization - giving a concrete generic instantiation (sys.alloc[u8],
@@ -470,7 +470,7 @@ class Monomorphizer:
 				# sibling specialization's), scheduled here since (mirroring
 				# UnionStorage.get's own identical comment on the abstract case)
 				# nothing else would ever reach it on its own.
-				_tag_attr, data_attr, payload_cls, _tags = self._union_storage.get( base )
+				tag_attr, data_attr, payload_cls, _tags = self._union_storage.get( base )
 				substituted_payload_fields = [
 					replace( f, type = self.substitute_type_params( f.type, type_params, spec.args ))
 					for f in payload_cls.attributes
@@ -484,7 +484,8 @@ class Monomorphizer:
 					names = { f.stem: f for f in substituted_payload_fields },
 				)
 				self.schedule( substituted_payload_cls )
-				substituted_names['data'] = replace( data_attr, type = substituted_payload_cls )
+				substituted_data_attr = replace( data_attr, type = substituted_payload_cls )
+				substituted_names['data'] = substituted_data_attr
 			monomorphized = replace(
 				base,
 				qualname = spec.qualname,
@@ -494,6 +495,38 @@ class Monomorphizer:
 				resolve = None,
 				**extra,
 			)
+			if isinstance( base, TaggedUnion ):
+				# the attrs-copy loop above (substituted_names[attr.stem] =
+				# attr, for every base.attributes entry) just clobbered
+				# union.names[member.stem] back to a plain, substituted
+				# attribute Variable for every member - overwriting the real
+				# per-member constructor Function base.names[member.stem]
+				# ALREADY had (synthesized by the union_storage.get(base)
+				# call above, e.g. builtins.Result.Ok(value: T) -> Result[T,E])
+				# with e.g. `Ok: str` instead of a callable `Ok(value: str) ->
+				# Result[str,MyError]`. A REAL bug, not just a refactor: found
+				# via a genuine crash (AttributeError: 'Variable' object has
+				# no attribute 'return_type') the moment anything looked up a
+				# MONOMORPHIZED union's own member constructor directly
+				# (Lowering._coerce_into_union, TODO.txt's own "opportunistic
+				# union emission") - Result.Ok(x) written directly in user
+				# source never hit this, since `Result.Ok` resolves through
+				# the ABSTRACT class's own untouched .names, never through a
+				# concrete specialization's copy. Rebuild each member's own
+				# constructor here, substituted for the concrete attr/payload
+				# types, the exact same way union_storage.py's own
+				# build_member_constructor already builds the abstract
+				# base's - fn_file/fn_line are base.file/base.line
+				# (monomorphized.file/.line, unchanged by replace() above),
+				# always real: unlike an anonymous X|Y union, base here is a
+				# real, user-declared `@union class Foo[T,E]:`, which always
+				# has a genuine file.
+				ctor_return_type = monomorphized
+				for tag_value, attr in enumerate( substituted_attrs ):
+					monomorphized.names[attr.stem] = build_member_constructor(
+						monomorphized, attr, tag_value, tag_attr, substituted_data_attr, substituted_payload_cls, ctor_return_type,
+						monomorphized.file, monomorphized.line,
+					)
 		finally:
 			self._building.discard( id( spec ))
 		spec.monomorphized = monomorphized

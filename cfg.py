@@ -131,6 +131,7 @@ class _Snapshot:
 	bindings: Bindings
 	stack_depth: int
 	results: set[str]
+	narrowed: dict[str,Variable]
 
 class CFGState:
 	''' one instance per function being lowered. `bindings` is public and
@@ -157,6 +158,7 @@ class CFGState:
 		self._loop_entry_depths: list[int] = [] # see enter_loop()/exit_loop()
 		self.bindings: Bindings = {}
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
+		self._narrowed: dict[str,Variable] = {} # name -> the UNION's own matched member Variable (its .type is the narrowed leaf, .stem is the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead" - same reasoning a plain field access (self.somefield) never needs its own incref until something aliases it into a new binding
 		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
 		self.prologue_instructions: list[ir.Instruction] = []
 		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
@@ -240,7 +242,10 @@ class CFGState:
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
 
 	def snapshot( self ) -> _Snapshot:
-		return _Snapshot( bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ))
+		return _Snapshot(
+			bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ),
+			narrowed = dict( self._narrowed ),
+		)
 
 	def restore( self, snap: _Snapshot ) -> None:
 		''' truncates back to the snapshot's own depth for ordinary (RC)
@@ -254,9 +259,17 @@ class CFGState:
 		reverted the same way bindings is - unconditionally, even for a loop
 		body that provably checked something inside it: a while-loop's body
 		may run zero times, so anything only checked INSIDE the body can't be
-		assumed checked once we're back outside it (see loop_back_edge()). '''
+		assumed checked once we're back outside it (see loop_back_edge()).
+		_narrowed reverts the same unconditional way - a union narrowed
+		inside an if/match branch (or a loop body) is never assumed to still
+		hold once back outside it, same reasoning as _unchecked_results
+		above, and (v1 scope, see TODO.txt's own "union disambiguation"
+		section) narrowing never survives past its own branch regardless of
+		whether that branch could only have been entered when it's true -
+		no cross-branch/post-if narrowing tracking is attempted yet. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
+		self._narrowed = dict( snap.narrowed )
 		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
@@ -277,6 +290,31 @@ class CFGState:
 
 	def exit_loop( self ) -> None:
 		self._loop_entry_depths.pop()
+
+	# --- union narrowing (compile-time only - see _narrowed's own comment) -
+
+	def narrow( self, name: str, member: Variable ) -> None:
+		''' called on entering a branch that's proven `name` (a TaggedUnion-
+		typed binding) currently holds `member` (one of that union's own
+		`.attributes` - its `.type` is the narrowed leaf, `.stem` the
+		`v_<stem>` payload field) - e.g. the true-branch of a `type(x) is
+		T`/`instanceof(x, T)` check, or a `match x: case T(x):` arm. Reads
+		of `name` from here until this scope's own restore() (snapshot()
+		captures/restore() reverts this exactly like _unchecked_results
+		above - confined to the branch, never surviving past it in this
+		version) get rewritten to read through the union's own payload -
+		see lowering.py's _expr_Name. '''
+		self._narrowed[name] = member
+
+	def unnarrow( self, name: str ) -> None:
+		''' called whenever `name` is reassigned (ordinary Assign/AnnAssign)
+		- a fresh value invalidates whatever this name was previously
+		proven to hold, same reasoning clear_result() already has for
+		Result tracking. Safe to call on a name that was never narrowed. '''
+		self._narrowed.pop( name, None )
+
+	def narrowed_member( self, name: str ) -> Variable | None:
+		return self._narrowed.get( name )
 
 	# --- unchecked Result tracking ----------------------------------------
 

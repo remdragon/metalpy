@@ -5917,6 +5917,232 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class MatchArmSameNameNarrowingTests( CompilerTestCase ):
+	''' `match x: case T(x): ...` - the arm rebinds the SAME name as its
+	own subject - used to crash outright (monomorphize.py silently
+	clobbering a monomorphized generic union's own per-member constructor
+	Functions back into plain, non-callable Variables - see
+	monomorphize_class's own comment) and, once that crash was fixed,
+	silently resolved the rebound name to its OLD (whole-union) type
+	instead of the narrowed leaf (lowering.py's _stmt_Assign has no
+	concept of a block-scoped shadow - reusing an existing name just
+	re-lowers the RHS against the existing Variable's own fixed type).
+
+	Fixed via a pure compile-time read-rewrite, not a new Variable: the
+	rebound name's own Variable/storage is never touched. cfg.py tracks a
+	CFG-scoped name->member map (narrow()/unnarrow()/narrowed_member(),
+	pushed/popped via the same _Snapshot machinery _unchecked_results
+	already uses), and lowering.py's _expr_Name rewrites a narrowed read
+	into a borrowed GetAttr(data).GetAttr(v_member) chain in place of the
+	raw (still union-typed) operand - no new incref/decref, x is still x. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _extern_ldflags( self ) -> str:
+		flags: list[str] = []
+		for lib in sorted( self.compiler.extern_libs ):
+			if lib == 'c':
+				continue
+			if _CC is not None and _CC.name == 'cl':
+				flags.append( f'{lib}.lib' )
+			else:
+				flags.append( f'-l{lib}' )
+		return ' '.join( flags )
+
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path )
+			self.assertEqual( cc_result.returncode, 0,
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			ldflags = self._extern_ldflags()
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
+			self.assertEqual( link_result.returncode, 0,
+				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
+			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( run_result.returncode, expected_exit,
+				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_same_name_rebind_narrows_type_in_each_arm( self ) -> None:
+		# both arms actually exercised (a real Ok and a real Err value, not
+		# just one) - a same-named Ok(r) that silently kept r's OLD
+		# (whole-union) type would fail to resolve r.byte_len() at all
+		# (Result has no byte_len()), so a clean compile here is already
+		# meaningful; the exit-code checks confirm the NARROWED value
+		# (the payload, not the union) is what's actually read
+		self._run( '''
+class MyError:
+	pass
+
+def make( n: i32 ) -> Result[str,MyError]:
+	if n > 0:
+		return Result.Ok( "hello" )
+	return Result.Err( MyError() )
+
+def helper( n: i32 ) -> usize:
+	r: Result[str,MyError] = make( n )
+	result: usize = 0
+	match r:
+		case Result.Ok( r ):
+			result = r.byte_len()
+		case Result.Err( e ):
+			result = 0
+	return result
+
+def main() -> i32:
+	if helper( 1 ) != 5:
+		return 1
+	if helper( -1 ) != 0:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_narrowing_confined_to_match_arm_reverts_after( self ) -> None:
+		# narrowing must NOT survive past the match statement's own block -
+		# a second, independent match reusing the same name right after the
+		# first must see the WHOLE union again (cfg.py's restore() pops
+		# _narrowed back to whatever it was before the branch, unconditionally)
+		self._run( '''
+class MyError:
+	pass
+
+def make( n: i32 ) -> Result[str,MyError]:
+	if n > 0:
+		return Result.Ok( "hello" )
+	return Result.Err( MyError() )
+
+def helper( n: i32 ) -> usize:
+	r: Result[str,MyError] = make( n )
+	result: usize = 0
+	match r:
+		case Result.Ok( r ):
+			result = r.byte_len()
+		case Result.Err( e ):
+			result = 0
+	with compiler.wrap_arithmetic:
+		match r:
+			case Result.Ok( r ):
+				result = result + r.byte_len()
+			case Result.Err( e ):
+				result = result + 100
+	return result
+
+def main() -> i32:
+	if helper( 1 ) != 10:
+		return 1
+	if helper( -1 ) != 100:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_nested_match_preserves_outer_narrowing( self ) -> None:
+		# an UNRELATED match nested inside a match arm's own body - the
+		# inner match's own snapshot()/restore() cycle (around its own
+		# if/elif branches) must not clobber the OUTER arm's still-active
+		# narrowing of r: restore() reverts _narrowed back to whatever it
+		# was AT THAT BRANCH's OWN ENTRY (which already includes the
+		# outer r->Ok narrowing), not wipe the whole dict. r.byte_len()
+		# after the inner match, still inside the outer Ok arm, only
+		# resolves at all if the outer narrowing survived the inner
+		# match's own push/pop cycle
+		# NB: outcome is ASSIGNED to an outer variable rather than returned
+		# directly from inside the match arms - a `return` statement inside
+		# a match-arm-desugared if-branch hits a separate, pre-existing
+		# "undeclared label" epilogue-generation bug (confirmed present
+		# without any of this session's changes, and reproducing even for
+		# ordinary, non-narrowing match arms) - out of scope here, flagged
+		# separately.
+		self._run( '''
+class MyError:
+	pass
+
+def helper( r: Result[str,MyError], r2: Result[str,MyError] ) -> i32:
+	outcome: i32 = 0
+	match r:
+		case Result.Ok( r ):
+			junk: usize = 0
+			match r2:
+				case Result.Ok( x ):
+					junk = x.byte_len()
+				case Result.Err( e ):
+					junk = 0
+			with compiler.wrap_arithmetic:
+				outcome = i32( r.byte_len() )
+		case Result.Err( e ):
+			outcome = -2
+	return outcome
+
+def main() -> i32:
+	if helper( Result.Ok( "hi" ), Result.Ok( "x" )) != 2:
+		return 1
+	if helper( Result.Ok( "hi" ), Result.Err( MyError() )) != 2:
+		return 2
+	if helper( Result.Err( MyError() ), Result.Ok( "x" )) != -2:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
+		# a real RC-lifetime stress check, not just "doesn't crash once" -
+		# if the narrowed read (lowering.py's _expr_Name rewrite, meant to
+		# be a BORROWED GetAttr chain with no incref) instead double-
+		# released the payload (the abandoned shadow-Variable design this
+		# replaced would have), repeated construction/match/decref cycles
+		# would corrupt the heap under repetition even if a single
+		# iteration looked fine - checking the extracted value's actual
+		# CONTENT (not just that it exists) every iteration catches a
+		# use-after-free that a bare "did it crash" check could miss.
+		# 'hello'.upper() (not the bare literal) forces a real heap
+		# allocation - a literal binds to immortal static storage and
+		# can't distinguish a leak/double-release from doing nothing.
+		#
+		# NB: does NOT assert compiler.refcount(r) == 1 inside the arm -
+		# a separate, pre-existing bug (confirmed present without this
+		# session's narrowing changes at all, via `git stash`) makes
+		# match-statement lowering emit one spurious extra retain of the
+		# first case's own payload before the match even dispatches,
+		# inflating the observed refcount independent of narrowing. Flagged
+		# separately; out of scope for this fix.
+		self._run( '''
+class MyError:
+	pass
+
+def make() -> Result[str,MyError]:
+	return Result.Ok( 'hello'.upper() )
+
+def main() -> i32:
+	i: i32 = 0
+	while i < 1000:
+		r: Result[str,MyError] = make()
+		match r:
+			case Result.Ok( r ):
+				if r.byte_len() != 5:
+					return 1
+			case Result.Err( e ):
+				return 2
+		with compiler.wrap_arithmetic:
+			i += 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never

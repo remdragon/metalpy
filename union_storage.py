@@ -28,12 +28,21 @@ class ReceiverDispatch:
 	attr: str
 	per_leaf: list[tuple[Variable,Function]] # (union.attributes member, that leaf's resolved method)
 
-def _build_member_constructor(
+def build_member_constructor(
 	union: TaggedUnion, member: Variable, tag_value: int,
 	tag_attr: Variable, data_attr: Variable, payload_cls: CUnion, return_type: Type,
 	fn_file: object, fn_line: int|None,
 ) -> Function:
-	''' SYNTAX.md: `@union` expands into a struct wrapping a synthesized
+	''' Not private despite historical convention elsewhere in this file -
+	monomorphize.py's own monomorphize_class also calls this directly, to
+	rebuild a GENERIC union's own per-member constructors for each concrete
+	specialization (Result[str,MyError], not bare Result) - see its own
+	comment on why a plain field-copy of the abstract base's already-
+	synthesized constructors is wrong there (a real bug this shared helper
+	fixes, not just refactors: monomorphize_class used to silently clobber
+	them back to plain attribute Variables).
+
+	SYNTAX.md: `@union` expands into a struct wrapping a synthesized
 	payload CUnion "plus one @staticmethod constructor per variant"
 	(`ClassName.Variant(value)`) - synthesized here as a REAL Function with a
 	real AST body, registered into union.names[member.stem] (overwriting the
@@ -228,7 +237,7 @@ class UnionStorage:
 			if union.type_params else union
 		)
 		# union.file is None for a synthesized anonymous union (by design -
-		# see _build_member_constructor's own comment on why that can't
+		# see build_member_constructor's own comment on why that can't
 		# change) but each constructor Function still needs a real file the
 		# moment anything actually CALLS it - "whichever module is
 		# currently active" is the same fallback discovery.py's own
@@ -240,7 +249,7 @@ class UnionStorage:
 			fn_file = self.discovery.module_stack[-1].file
 			fn_line = self.discovery.module_stack[-1].line
 		for tag_value, attr in enumerate( union.attributes ):
-			union.names[attr.stem] = _build_member_constructor( union, attr, tag_value, tag_attr, data_attr, payload_cls, ctor_return_type, fn_file, fn_line )
+			union.names[attr.stem] = build_member_constructor( union, attr, tag_value, tag_attr, data_attr, payload_cls, ctor_return_type, fn_file, fn_line )
 		# payload_cls (the synthesized CUnion backing `data`) needs its own
 		# explicit schedule() here - unlike the outer TaggedUnion itself
 		# (already scheduled by every caller reaching this point), nothing

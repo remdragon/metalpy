@@ -1755,6 +1755,34 @@ class FunctionLowering:
 		return self._lower_expr( value_node, None ), None
 
 	def _stmt_Assign( self, node: ast.Assign ) -> None:
+		if getattr( node, 'is_narrowing_bind', False ):
+			# type_resolver.py's _match_pattern: `match x: case T(x):`
+			# reusing the subject's own name - x's real Variable/storage is
+			# untouched, this is a pure compile-time fact ("reads of x from
+			# here until this scope's own restore() may read through the
+			# union's own payload instead") - no IR at all, see cfg.py's
+			# narrow()/_expr_Name's own comment for the read-side rewrite.
+			# node.narrows_member_stem is only a STEM (see type_resolver.py's
+			# own comment on why) - re-resolve the real, substituted member
+			# against x's own already-monomorphized type here, the same
+			# pattern _coerce_into_union already uses. A parameter's own
+			# declared type (unlike a local var initialized from a call's
+			# already-eagerly-monomorphized return type) stays a genuine
+			# Specialization wrapping the ABSTRACT base (T/E still bare
+			# TypeVars) - .base alone isn't enough, has to go through
+			# monomorphize_class same as any other generic-class use site,
+			# or the member's own .type resolves to the unsubstituted TypeVar
+			# instead of the real leaf (str, not T).
+			target_name = node.targets[0]
+			assert isinstance( target_name, ast.Name )
+			subject_var = self.lowering.discovery.find_name( target_name.id, node )
+			assert isinstance( subject_var, Variable )
+			base = self.lowering.monomorphize_class( subject_var.type ) if isinstance( subject_var.type, Specialization ) else subject_var.type
+			self.lowering._union_storage.get( base )
+			member = next( ( attr for attr in base.attributes if attr.stem == node.narrows_member_stem ), None )
+			assert member is not None
+			self._cfg.narrow( target_name.id, member )
+			return
 		if len( node.targets ) != 1:
 			self.lowering.discovery.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
 		target = node.targets[0]
@@ -1763,6 +1791,7 @@ class FunctionLowering:
 			if existing is not None:
 				if not isinstance( existing, Variable ):
 					self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
+				self._cfg.unnarrow( target.id ) # a real reassignment invalidates whatever this name was previously narrowed to - see cfg.py's own comment
 				operand = self._lower_expr( node.value, existing.type )
 				for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type ), node = node ):
 					self._emit( instr )
@@ -2826,6 +2855,36 @@ class FunctionLowering:
 		if not isinstance( name, Variable ):
 			self.lowering.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
 		self.lowering._ensure_resolved( name )
+		member = self._cfg.narrowed_member( node.id )
+		if member is not None and expected_type is not name.type:
+			# name is currently proven to hold this union member (cfg.py's
+			# narrow(), from a `match x: case T(x):` arm reusing x's own
+			# name) - read through the union's own payload instead of
+			# returning the raw (still union-typed) operand, unless the
+			# caller explicitly wants the whole union back (expected_type
+			# is name.type exactly - a rare escape hatch, e.g. passing x
+			# through to another T|None-typed parameter unchanged). Same
+			# GetAttr(data).GetAttr(v_member) shape cfg.py's own
+			# _extract_payload/lowering.py's _maybe_unwrap_union_arg
+			# already use elsewhere for the identical operation - a pure
+			# read, no incref needed here: name itself still owns the
+			# whole union unconditionally the entire time, this is just
+			# viewing one field of it (same as any other attribute read);
+			# only actually ALIASING this returned operand into a NEW
+			# binding needs its own incref, and that already happens the
+			# ordinary way wherever this operand is next consumed. Same
+			# Specialization gap as _stmt_Assign's own narrowing-bind
+			# handling above: a parameter's declared type stays a genuine
+			# Specialization (T/E still bare TypeVars) - .base alone would
+			# hand _union_storage.get() the ABSTRACT, unsubstituted payload
+			# shape instead of the real monomorphized one.
+			base = self.lowering.monomorphize_class( name.type ) if isinstance( name.type, Specialization ) else name.type
+			_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )
+			payload_dest = self._new_temp( payload_cls )
+			self._emit( ir.GetAttr( dest = payload_dest, obj = name, attr = data_attr.stem ))
+			leaf_dest = self._new_temp( member.type )
+			self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+			return leaf_dest
 		# when a pointer-typed local flows into a context expecting a
 		# differently-typed pointer (e.g. return ptr where ptr: Ptr[u8]
 		# but the function returns Ptr[T]), insert a CastWrap — in C all
