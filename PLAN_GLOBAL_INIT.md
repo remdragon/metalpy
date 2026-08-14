@@ -206,4 +206,32 @@ Verification
 - Full `python3 tests.py` green, baseline count recorded when work
   starts.
 
-STATUS: not started - this file is the plan only, no implementation yet.
+STATUS: done. Implemented largely as designed (Implementation steps 1-4), with
+one addition found during real-build verification (not anticipated by this
+plan's own "Current state"/"Scope" sections): a global whose non-trivial
+initializer is nonetheless a pure, all-zero value-type construction (e.g.
+lib/builtins/__init__.py's own case_folder: CaseFolding = CaseFolding(
+upper_table=None, upper_count=0, ...) - a CStruct, not an RCClass) must have
+its own separate init function suppressed ENTIRELY (not merely left uncalled)
+- an uncalled-but-still-emitted function is not a safe no-op on a no-CRT
+target: it still gets compiled, and its own struct-copy-of-an-all-zero-
+compound-literal is exactly the shape a C compiler is free to lower into a
+real memset/memcpy call, which a no-CRT build has no implementation for.
+Confirmed via a real `mpy test_hello.py --release && test_hello` failure
+(LNK2019 "unresolved external symbol memset", disassembled directly to a
+`callq memset` inside the dead function) - see emitter_c.py's
+_global_init_is_all_zero_value_type. A second real-build-only finding: on
+Windows with no_crt, mainCRTStartup already calls __metalpy_init() once
+before calling main() - main()'s own unconditional prepend (this plan's step
+3d) would call it a SECOND time, harmless back when __metalpy_init() only
+ever did SetConsoleOutputCP (idempotent), but a real double-construction bug
+now that it also builds RCClass globals - guarded with a windows_no_crt
+check. Full python3 tests.py green on both Windows and Linux/gcc (905/905
+each) after these fixes, plus a real end-to-end verification: `mpy
+test_hello.py --release && test_hello` now builds, links, and prints
+correctly on Windows (previously failed to even compile - "use of
+undeclared identifier 'sys$_Stdout$$vtable'" - a separate, pre-existing pass-
+3 ordering bug this work also surfaced and fixed: a global's own init
+function could reference an RCClass vtable instance emitted later in the
+same translation unit; the vtable-instance loops now run before the globals
+loop).

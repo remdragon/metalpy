@@ -236,6 +236,7 @@ class Compiler:
 			if unit.resolve is not None:
 				unit.resolve()
 			instructions = self.lowering.lower_global( unit )
+			unit.init_instructions = instructions # same list object as LoweredGlobal.instructions below - no duplication, no drift risk (see PLAN_GLOBAL_INIT.md)
 			lg = LoweredGlobal( variable = unit, instructions = instructions )
 			self.globals.append( lg )
 			return lg

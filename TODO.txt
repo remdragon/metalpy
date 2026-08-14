@@ -512,10 +512,10 @@ emitter:
 			a compiler error disallowing RC content in a bare @cunion with no
 			discriminant at all, simpler now that ResultPayload no longer
 			needs a name-based exemption.
-		- linking is entirely out of scope so far: no wiring of a module's
-			__metalpy_init_<global> functions into the real process entry
-			point, no linker pragmas/flags for an @extern function's own
-			declared library.
+		- linking: no linker pragmas/flags for an @extern function's own
+			declared library. (Wiring a module's __metalpy_init_<global>
+			functions into the real process entry point is done - see
+			PLAN_GLOBAL_INIT.md.)
 		- real lib/ end-to-end verification (actually compiling lib/sys.py,
 			lib/windows/kernel32.py, lib/builtins/__init__.py etc. as they
 			exist today, rather than the self-contained fixtures the emitter

@@ -124,6 +124,13 @@ class Variable( Name ):
 	# local variables, neither of which is a standalone compile unit; this is
 	# what lets Compiler._enqueue tell them apart without a separate lookup
 	is_global: bool = False
+	# stage 2's lowered form of `init` (None until Compiler._lower's Variable
+	# branch runs) - kept directly on the Variable itself, not only reachable
+	# through compiler.globals' own LoweredGlobal list, so a global's own
+	# initializer instructions travel with the variable object (see
+	# PLAN_GLOBAL_INIT.md). String-quoted to avoid a mpy_types<->ir import
+	# cycle (ir.py doesn't need to know about Variable at all).
+	init_instructions: list['ir.Instruction']|None = None
 
 @dataclass( kw_only = True )
 class Parameter( Variable ):

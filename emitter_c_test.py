@@ -2426,21 +2426,34 @@ class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
-class EmitGlobalRCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
-	def test_non_trivial_global_compiles( self ) -> None:
+class EmitGlobalRCClassRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
+	def test_non_trivial_global_compiles_and_constructor_actually_ran( self ) -> None:
 		# Phase 7 milestone: both global-initializer shapes compile clean -
 		# this is the RCClass-construction shape (mirrors lib/sys.py's own
 		# real stdout: _Stdout = _Stdout()), the trivial-constant shape is
-		# covered by EmitGlobalRealCompileTests above. This is the FINAL
-		# milestone of the whole C-emitter plan.
+		# covered by EmitGlobalRealCompileTests above.
+		#
+		# Upgraded from compile-only to compile-AND-RUN (PLAN_GLOBAL_INIT.md's
+		# own verification section): reads g_foo.x back in main() and fails
+		# unless it's exactly what Foo.make(1)'s own constructor set - real
+		# proof that __metalpy_init() (which this plan wires up to call every
+		# non-trivial global's own init function - see emitter_c.py's
+		# emit_c()) actually ran the constructor before main()'s own body
+		# executed, not just that the generated C happens to compile. Before
+		# PLAN_GLOBAL_INIT.md, g_foo would have stayed a null pointer forever
+		# (the C-level {0} zero-initializer, with nothing ever calling its
+		# own __metalpy_init_g_foo()) - reading g_foo.x here would have
+		# dereferenced a null pointer, not just returned the wrong value.
 		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
 			'g_foo: Foo = Foo.make( 1 )',
 			'',
-			'def main() -> None:',
-			'	x: Foo = g_foo',
-			'	return',
+			'def main() -> i32:',
+			'	if g_foo.x != 1:',
+			'		return 1',
+			'	return 0',
 		]))
-		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 class WindowsTargetCTypeTests( unittest.TestCase ):
 	def test_invalid_handle_value_emits_with_pointer_cast( self ) -> None:

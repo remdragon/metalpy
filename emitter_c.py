@@ -194,8 +194,9 @@ typedef unsigned __int128 __metalpy_wideuint;
 #define __metalpy_isinf(x) __builtin_isinf(x)
 #endif
 // Windows: call SetConsoleOutputCP(CP_UTF8) so Unicode print() works.
-// Called from main() on every Windows build, and from the custom entry
-// point (mainCRTStartup below) when the CRT is not linked.
+// Called from __metalpy_init() (synthesized below, in emit_c()) on every
+// Windows build, and from the custom entry point (mainCRTStartup below)
+// when the CRT is not linked.
 #ifdef _WIN32
 #define CP_UTF8 65001
 #ifdef _MSC_VER
@@ -204,11 +205,6 @@ int __stdcall SetConsoleOutputCP(unsigned int);
 #else
 int __stdcall SetConsoleOutputCP(unsigned int);
 #endif
-static void __metalpy_init( void ) {
-	SetConsoleOutputCP( CP_UTF8 );
-}
-#else
-static void __metalpy_init( void ) {}
 #endif
 '''
 
@@ -2250,26 +2246,84 @@ def _is_trivial_global_init( instructions: list[ir.Instruction] ) -> bool:
 		and isinstance( instructions[0].src, ir.Const )
 	)
 
+def _is_zero_const( op: ir.Operand ) -> bool:
+	return isinstance( op, ir.Const ) and ( op.value is None or op.value == 0 )
+
+def _global_init_is_all_zero_value_type( instructions: list[ir.Instruction] ) -> bool:
+	# a WIDER "doesn't need its init function called at all" check than
+	# _is_trivial_global_init above (which only covers a SINGLE bare-Const
+	# Assign) - this covers a value-type (CStruct, never RCClass - no
+	# sys.alloc/Call/Incref/Decref appears in a pure value-type construction)
+	# whose EVERY field is a zero/null Const, e.g. `case_folder: CaseFolding
+	# = CaseFolding(upper_table=None, upper_count=0, ...)`. Such an
+	# initializer lowers to `t0 = (struct CaseFolding){0,0,0,0}; global =
+	# t0;` - a struct-copy-of-an-all-zero-literal the C compiler is free to
+	# implement via memset/memcpy (confirmed by a REAL LNK2019 "unresolved
+	# external symbol memset" failure under a no-CRT Windows build once this
+	# global's own init function actually got called - see
+	# PLAN_GLOBAL_INIT.md). Skipping the call entirely is exactly correct
+	# here, not just a workaround: the global's own C11 `{0}` static
+	# zero-initializer (emit_global, above) is ALREADY byte-for-byte
+	# equivalent to what this instruction sequence would compute - unlike a
+	# global with any NON-zero constant field (still correctly gets a real
+	# call) or any RCClass/runtime-computed one (never matches this check at
+	# all, since ir.Allocate for an RCClass is preceded by a real
+	# sys.alloc(...) ir.Call).
+	filtered = [ i for i in instructions if not isinstance( i, ( ir.DeclareTemp, ir.DeleteTemp )) ]
+	if not filtered:
+		return True
+	*rest, last = filtered
+	if not ( isinstance( last, ir.Assign ) and isinstance( last.src, ir.Temp ) ):
+		return False
+	for instr in rest:
+		if isinstance( instr, ir.Allocate ):
+			if not all( _is_zero_const( v ) for v in instr.fields.values() ):
+				return False
+		elif isinstance( instr, ir.Assign ) and isinstance( instr.src, ( ir.Const, ir.Temp ) ):
+			continue
+		else:
+			return False
+	return True
+
+def _global_init_fn_name( g: LoweredGlobal ) -> str:
+	# shared by emit_global (which defines this function) and emit_c's own
+	# __metalpy_init() synthesis (which calls it) - factored out so the two
+	# can't drift on the naming scheme (see PLAN_GLOBAL_INIT.md)
+	return f'__metalpy_init_{mangle_qualname( g.variable.qualname )}'
+
 def emit_global( g: LoweredGlobal ) -> str:
 	name = mangle_qualname( g.variable.qualname )
 	ctype = c_type( g.variable.type )
 	if _is_trivial_global_init( g.instructions ):
 		value = _emit_operand( g.instructions[0].src )
 		return f'{ctype} {name} = {value};'
+	if _global_init_is_all_zero_value_type( g.instructions ):
+		# no separate init function at all here - not just "don't call it"
+		# (emit_c's own init_calls list already excludes it too, see there).
+		# An UNCALLED-but-still-EMITTED function is not a safe no-op: it still
+		# gets compiled, and its own struct-copy-of-an-all-zero-compound-
+		# literal is exactly the shape a C compiler is free to lower into a
+		# real memset/memcpy call (confirmed - not theoretical - by a real
+		# LNK2019 "unresolved external symbol memset" failure on a no-CRT
+		# Windows build, with the call disassembled directly out of the
+		# object file: `callq memset` inside this exact function, EVEN
+		# THOUGH nothing called the function itself). The plain {0} static
+		# initializer is already byte-for-byte the value this would compute.
+		return f'{ctype} {name} = {{0}};'
 	# a non-trivial initializer (anything needing a real computation - an
 	# RCClass construction, an arithmetic expression, ...) flattens into a
 	# private init function, reusing _emit_instruction exactly like an
 	# ordinary function body does (function=None is safe here: lower_global
 	# never emits ir.Return/ir.OrReturn, the only two branches that read
 	# it - defer/errdefer/loops can't appear in a global initializer at all,
-	# see lower_global's own comment). Wiring this init function into a
-	# real process entry point is out of scope (linking-adjacent,
-	# C_EMITTER.md excludes it) - it just needs to exist and compile. The
-	# global itself gets a {0} zero initializer in the meantime - a valid
-	# C11 initializer for ANY type alike (ISO C11 6.7.9p11: a scalar
-	# initializer may be "optionally enclosed in braces"), matching the
-	# same convention ir.Allocate's own empty-fields branch already uses
-	init_name = f'__metalpy_init_{name}'
+	# see lower_global's own comment). Called from the synthesized
+	# __metalpy_init() (emit_c(), after the globals loop below) - see
+	# PLAN_GLOBAL_INIT.md. The global itself gets a {0} zero initializer in
+	# the meantime - a valid C11 initializer for ANY type alike (ISO C11
+	# 6.7.9p11: a scalar initializer may be "optionally enclosed in
+	# braces"), matching the same convention ir.Allocate's own empty-fields
+	# branch already uses
+	init_name = _global_init_fn_name( g )
 	lines = [
 		f'{ctype} {name} = {{0}};',
 		'',
@@ -2448,19 +2502,20 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		if not cls.type_params:
 			parts.append( emit_rcclass( cls ))
 
-	# pass 3: string/bytes literal static objects (need str/bytes's own
-	# full RCClass body from pass 2 first) and global definitions, then
-	# full function bodies (which may reference either by address), then
-	# destructor bodies (need the struct's own full definition from pass 2
-	# to dereference self->field)
-	parts.extend( _emit_string_literals( compiler ))
-	for g in compiler.globals:
-		parts.append( emit_global( g ))
-	# static vtable instances (+ their own trampolines) - only need every
-	# other function's PROTOTYPE (pass 1), not its body, so this can sit
-	# anywhere in pass 3; placed before the real function bodies since
-	# nothing in a function body depends on a vtable instance's own address
-	# existing any earlier than "somewhere in this translation unit"
+	# pass 3: static vtable instances first (+ their own trampolines) - only
+	# need every other function's PROTOTYPE (pass 1) and the struct bodies
+	# (pass 2), so these can sit anywhere in pass 3 relative to THOSE - but
+	# NOT anywhere relative to what follows: a global's own non-trivial init
+	# function (emit_global, below) may itself construct an RCClass and set
+	# `.vtable = &SomeClass$$vtable` directly in its OWN function body text
+	# (unlike an ordinary function body, which is always emitted last, in
+	# compiler.functions order, and so never has this problem) - so the
+	# vtable instances have to be textually EARLIER than the globals loop, or
+	# that reference is to a not-yet-declared identifier. Confirmed by a real
+	# compile failure: lib/sys.py's `stdout: _Stdout = _Stdout()` global's
+	# own __metalpy_init_sys$stdout(), constructing a _Stdout, referenced
+	# sys$_Stdout$$vtable before this reordering, when that vtable instance
+	# was still emitted further down, after the globals loop.
 	for cls in compiler.cstructs:
 		if cls.is_interface and not cls.type_params:
 			instance_src = emit_interface_vtable_instance( cls )
@@ -2477,13 +2532,59 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			instance_src = emit_rcclass_vtable_instance( cls )
 			if instance_src is not None:
 				parts.append( instance_src )
+	# string/bytes literal static objects (need str/bytes's own full RCClass
+	# body from pass 2 first) and global definitions, then full function
+	# bodies (which may reference either by address), then destructor bodies
+	# (need the struct's own full definition from pass 2 to dereference
+	# self->field)
+	parts.extend( _emit_string_literals( compiler ))
+	for g in compiler.globals:
+		parts.append( emit_global( g ))
+	# the single, real __metalpy_init() (PLAN_GLOBAL_INIT.md) - runs the
+	# Windows console-codepage setup (previously two competing #ifdef'd
+	# function bodies in PROLOGUE, now one function with the platform bit
+	# gated internally) plus every non-trivial global's own init function,
+	# in compiler.globals order (their own declared-before-use order in
+	# THIS translation unit, guaranteed by the globals loop directly above).
+	# Always defined and always called (see main()'s own prepend below) -
+	# not just on Windows - since global initializers must run on every
+	# target now, not only the Windows-specific statement. A global whose
+	# non-trivial init is nonetheless an all-zero value-type construction
+	# (_global_init_is_all_zero_value_type) is skipped here - its own {0}
+	# static initializer (emit_global, above) already IS that value, so
+	# calling it would be a pure no-op at best (and, confirmed by a real
+	# link failure, a real problem at worst on a no-CRT target if the C
+	# compiler lowers the struct-copy into a memset/memcpy call).
+	init_calls = [
+		f'\t{_global_init_fn_name( g )}();'
+		for g in compiler.globals
+		if not _is_trivial_global_init( g.instructions )
+		and not _global_init_is_all_zero_value_type( g.instructions )
+	]
+	parts.append(
+		'static void __metalpy_init( void ) {\n'
+		'#ifdef _WIN32\n'
+		'\tSetConsoleOutputCP( CP_UTF8 );\n'
+		'#endif\n'
+		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
+		+ '}'
+	)
 	for lf in compiler.functions:
 		# @extern functions have no body (only a ; declaration in pass 1)
 		if lf.function.extern_lib is None:
 			src = emit_function( lf )
-			# Windows: prepend __metalpy_init() to main() so Unicode output
-			# is configured before any metalpy code runs
-			if _is_entry_point( lf.function ) and compiler.disco.active_target['os'] == 'windows':
+			# prepend __metalpy_init() to main() on every target - not just
+			# Windows anymore, since it now also runs global initializers
+			# (PLAN_GLOBAL_INIT.md), needed everywhere, not only the
+			# Windows-specific console-codepage setup. EXCEPT when no_crt on
+			# Windows: there, mainCRTStartup (below) is the REAL entry point
+			# and already calls __metalpy_init() before calling main() itself -
+			# prepending here too would run it (and now every global
+			# initializer) TWICE. Harmless back when this only ever did
+			# SetConsoleOutputCP (idempotent); a real double-construction bug
+			# now that it also builds RCClass globals.
+			windows_no_crt = no_crt and compiler.disco.active_target['os'] == 'windows'
+			if _is_entry_point( lf.function ) and not windows_no_crt:
 				src = src.replace( '{\n', '{\n\t__metalpy_init();\n', 1 )
 			parts.append( src )
 
