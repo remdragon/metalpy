@@ -286,19 +286,36 @@ neither anticipated by the original design:
    #9) - found by reasoning through the scheduling path before it ever
    actually reproduced as a test failure, unlike bug #1 above.
 
-Also found and worked around, NOT fixed (out of scope, flagged separately
-via spawn_task): constructing a generic `@cstruct` with no `__init__` (bare
-`ClassName(field=value, ...)` sugar) never infers the class's own concrete
-type args from the field VALUES themselves - only from the surrounding
-`expected_type` context (an explicit annotation, say).
-`_lower_allocate_fields`'s own `dest = self._new_temp(expected_type or
-target_cls)` falls back to the bare ABSTRACT class when no such context is
-available - exactly the situation inside an eagerly-inferred body, whose
-own `return_type` is deliberately still None. A generic RCClass WITH a real
-`__init__` doesn't have this gap (`_lower_generic_construction_args` does
-real argument-based inference there, independent of `expected_type`) -
-lowering_test.py's own "mixed" test uses that shape instead, with a comment
-explaining why.
+Also found and worked around, NOT fixed here (out of scope for this pass,
+flagged separately via spawn_task - since fixed, see below): constructing a
+generic `@cstruct` with no `__init__` (bare `ClassName(field=value, ...)`
+sugar) never infers the class's own concrete type args from the field
+VALUES themselves - only from the surrounding `expected_type` context (an
+explicit annotation, say). `_lower_allocate_fields`'s own `dest =
+self._new_temp(expected_type or target_cls)` falls back to the bare
+ABSTRACT class when no such context is available - exactly the situation
+inside an eagerly-inferred body, whose own `return_type` is deliberately
+still None. A generic RCClass WITH a real `__init__` doesn't have this gap
+(`_lower_generic_construction_args` does real argument-based inference
+there, independent of `expected_type`) - lowering_test.py's own "mixed"
+test used that shape instead, with a comment explaining why.
+
+Fixed in a follow-up pass: `_lower_allocate_fields` now infers via a new
+`_infer_allocate_type_args` helper, unifying each field's declared type
+against that field's own real lowered value type (same `_unify_type_param`
+every other generic call site uses), falling back to a clear compile error
+when a type param is genuinely unresolvable either way. See
+lowering_test.py's `test_bare_construct_infers_type_args_from_field_values_with_no_expected_type`,
+`test_allocate_dest_type_infers_type_args_when_no_expected_type`,
+`test_allocate_fails_loudly_when_type_args_unresolvable`, and
+`test_lambda_eager_lowering_infers_generic_no_init_construction_type_args`
+(the identical exposure in `_expr_Lambda`'s own eager-lowering branch,
+fixed for free since both route through the same shared function). Chasing
+this down also surfaced one more real, pre-existing, unrelated bug it
+depended on: `_lower_call`'s own plain-call dest computation
+(`expected_type or target_return_type`) blindly trusted a bare, unbound
+TypeVar `expected_type` hint over the callee's own concrete, resolved
+return type - fixed alongside it.
 
 Verification
 

@@ -3517,6 +3517,41 @@ class Tests( unittest.TestCase ):
 		lowered_names = { lf.function.qualname for lf in self.compiler.functions }
 		self.assertIn( lambda_ref.fn.qualname, lowered_names ) # actually registered into compiler.functions by the eager _compile_now path, not silently dropped
 
+	def test_lambda_eager_lowering_infers_generic_no_init_construction_type_args( self ) -> None:
+		# the same eager-lowering exposure as
+		# test_lambda_eagerly_lowered_infers_generic_return_type above, but
+		# for _lower_allocate_fields's own gap (see
+		# test_bare_construct_infers_type_args_from_field_values_with_no_expected_type):
+		# the lambda's own synthetic return_type is deliberately still None
+		# while its BODY lowers (same reason PLAN_RETURN_INFERENCE.md's eager
+		# passes leave return_type None), so a lambda body constructing a
+		# generic no-__init__ class hits _lower_allocate_fields with that
+		# same None expected_type - confirms _infer_allocate_type_args fixes
+		# this shared call site too, not just the free-function one
+		code = '\n'.join([
+			'@cstruct',
+			'class Box[T]:',
+			'	val: T',
+			'',
+			'def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:',
+			'	return key( x )',
+			'',
+			'def main() -> i32:',
+			'	b: Box[i32] = apply( 5, key = lambda v: Box( val = v ) )',
+			'	return b.val',
+		])
+		mod = self._import( code )
+		box_cls = mod.get_local( 'Box' )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( instr for instr in fn.instructions if isinstance( instr, ir.Call ))
+		lambda_ref = call.kwargs['key']
+		self.assertIsInstance( lambda_ref, ir.FunctionRef )
+		self.assertIsInstance( lambda_ref.fn.return_type, Specialization )
+		self.assertIs( lambda_ref.fn.return_type.base, box_cls )
+		i32_cls = self.discovery.get_intrinsics()['i32']
+		self.assertEqual( lambda_ref.fn.return_type.args, [ i32_cls ] )
+
 	def test_lambda_still_fails_when_arg_type_uninferable( self ) -> None:
 		# unlike the return type, a lambda's own PARAMETER types have no
 		# body to infer them from - an unbound arg type in the expected
@@ -3953,6 +3988,92 @@ class Tests( unittest.TestCase ):
 		allocate_instr = next( i for i in fn.instructions if isinstance( i, ir.Allocate ))
 		self.assertIsInstance( allocate_instr.dest.type, Specialization )
 		self.assertIs( allocate_instr.dest.type.base, foo_cls )
+
+	def test_allocate_dest_type_infers_type_args_when_no_expected_type( self ) -> None:
+		# sibling of test_allocate_dest_type_uses_expected_type_when_given -
+		# `res` is bare/unannotated here, so no expected_type reaches this
+		# __allocate__ call at all; only the field VALUE's own real type
+		# (fields[name].type, computed while lowering `x = v`) is available
+		# to infer Foo's own type arg from - the pre-existing gap this fixes
+		# (see _infer_allocate_type_args) silently fell back to the bare,
+		# unspecialized Foo class here instead
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo[T]:',
+			'	x: T',
+			'',
+			'	@staticmethod',
+			'	def make( v: T ) -> Foo[T]:',
+			'		res = Foo.__allocate__( x = v )',
+			'		return res',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		fn = self.compiler._lower( make_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocate_instr = next( i for i in fn.instructions if isinstance( i, ir.Allocate ))
+		self.assertIsInstance( allocate_instr.dest.type, Specialization )
+		self.assertIs( allocate_instr.dest.type.base, foo_cls )
+
+	def test_bare_construct_infers_type_args_from_field_values_with_no_expected_type( self ) -> None:
+		# the bug report's own repro shape (also PLAN_RETURN_INFERENCE.md's
+		# "Also found and worked around, NOT fixed" note): a generic
+		# @cstruct with no __init__, constructed via the bare ClassName(...)
+		# sugar (_try_lower_construct_call, not .__allocate__), assigned to
+		# an unannotated local - genuinely CONCRETE, differently-typed field
+		# values (Widget for `first`, bool for `second`) are the only source
+		# of Pair's own type args here
+		code = '\n'.join([
+			'@cstruct',
+			'class Pair[T,R]:',
+			'	first: T',
+			'	second: R',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	def derive( self ) -> bool:',
+			'		return self.y != 0',
+			'',
+			'def main( w: Widget ) -> bool:',
+			'	p = Pair( first = w, second = w.derive() )',
+			'	return p.second',
+		])
+		mod = self._import( code )
+		pair_cls = mod.get_local( 'Pair' )
+		widget_cls = mod.get_local( 'Widget' )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocate_instr = next( i for i in fn.instructions if isinstance( i, ir.Allocate ))
+		self.assertIsInstance( allocate_instr.dest.type, Specialization )
+		self.assertIs( allocate_instr.dest.type.base, pair_cls )
+		bool_cls = self.discovery.get_intrinsics()['bool']
+		self.assertEqual( allocate_instr.dest.type.args, [ widget_cls, bool_cls ] )
+
+	def test_allocate_fails_loudly_when_type_args_unresolvable( self ) -> None:
+		# S appears in no field at all - genuinely unresolvable, must fail
+		# loudly instead of silently building the abstract, unspecialized
+		# class (the pre-fix behavior) - mirrors
+		# ReturnOnlyTypeParamInferenceTests' own
+		# test_vacuous_type_param_alongside_return_only_still_fails
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo[T,S]:',
+			'	x: T',
+			'',
+			'def main( v: i32 ) -> None:',
+			'	f = Foo( x = v )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any(
+			'cannot infer type parameter(s)' in e and 'S' in e for e in self.discovery.errors.errors
+		), self.discovery.errors.errors )
 
 	def test_allocate_external_call_is_rejected( self ) -> None:
 		# strictly private per SYNTAX.md - only callable from a method of
@@ -6425,17 +6546,16 @@ class ReturnOnlyTypeParamInferenceTests( unittest.TestCase ):
 		# BOTH, exercising _unify_type_param's Specialization-args recursion
 		# to fill in R while re-confirming T. Pair has a real __init__
 		# (RCClass construction-arg inference, not @cstruct field=value
-		# sugar) deliberately - a generic @cstruct with NO __init__ has a
-		# real, PRE-EXISTING, unrelated gap: _lower_allocate_fields's own
-		# construction only ever infers its class's own concrete type args
-		# from the surrounding expected_type context, never from the field
-		# VALUES themselves (confirmed: `Pair(first=t, second=t.derive())`
-		# inside a function whose own return_type is deliberately left None
-		# during eager inference - see _infer_return_only_type_params's own
-		# comment on why - built the WRONG, still-abstract Pair type; the
-		# exact same construction succeeds fine when expected_type is
-		# available, e.g. an ordinary non-return-only generic function).
-		# Flagged separately, not fixed here - out of scope for this pass.
+		# sugar) here - this used to be load-bearing (a generic @cstruct with
+		# NO __init__ had a real, pre-existing gap: _lower_allocate_fields's
+		# own construction only ever inferred its class's own concrete type
+		# args from the surrounding expected_type context, never from the
+		# field VALUES themselves), now fixed by _infer_allocate_type_args -
+		# see test_bare_construct_infers_type_args_from_field_values_with_no_expected_type
+		# for that same shape (`Pair(first=t, second=t.derive())`, no
+		# expected_type) covered directly. Kept as __init__-based here since
+		# it's still valid, independent coverage of the Specialization-args
+		# recursion for THAT path.
 		code = '\n'.join([
 			'class Pair[T,R]:',
 			'	first: T',

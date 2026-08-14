@@ -5096,6 +5096,42 @@ class FunctionLowering:
 				node,
 			)
 
+	def _infer_allocate_type_args(
+		self, target_cls: ClassLike, class_type_params: list[TypeVar],
+		fields_to_build: dict[str,Variable], fields: dict[str,ir.Operand], node: ast.Call, label: str,
+	) -> Specialization:
+		# _lower_allocate_fields's no-__init__ field=value sugar has no
+		# _lower_generic_construction_args-style argument-based inference of
+		# its own (that path infers a generic RCClass's own type args from
+		# __init__'s parameters, independent of expected_type) - called only
+		# once expected_type has already been ruled out as usable (absent, or
+		# - PLAN_RETURN_INFERENCE.md's eager-lowering passes, whose own
+		# return_type is deliberately still None while lowering their body -
+		# untrustworthy/incompatible, same "rooted at target_cls" discipline
+		# the sibling `compatible` check just above this call's own use
+		# applies). The fields' own real, already-lowered VALUES
+		# (fields[name].type) carry exactly the concrete types needed -
+		# unify each field's declared (possibly bare-TypeVar) type against
+		# its own real value type, same _unify_type_param every OTHER
+		# generic call site already uses. Total/safe on shapes it doesn't
+		# recognize (e.g. a TaggedUnion's synthesized tag/data view isn't
+		# built from target_cls's own type params in any directly-unifiable
+		# way) - it just no-ops rather than crashing, so this applies
+		# uniformly across RCClass/CStruct/CUnion/TaggedUnion without
+		# needing to special-case any of them out
+		bindings: dict[int,Type] = {}
+		for name, field in fields_to_build.items():
+			self.lowering._unify_type_param( class_type_params, field.type, fields[name].type, bindings, node, target_cls.qualname )
+		missing_type_params = [ tv.stem for tv in class_type_params if id( tv ) not in bindings ]
+		if missing_type_params:
+			self.lowering.discovery.fail(
+				f'{target_cls.qualname}{label}: cannot infer type parameter(s) {", ".join(missing_type_params)} '
+				f'from these field values or the surrounding expected type: {ast.unparse(node)}',
+				node,
+			)
+		concrete_args = [ bindings[id(tv)] for tv in class_type_params ]
+		return self.lowering.discovery._get_or_create_specialization( target_cls, concrete_args )
+
 	def _lower_allocate_fields( self, target_cls: ClassLike, node: ast.Call, expected_type: Type|None, label: str ) -> ir.Temp:
 		# shared by both callers of ir.Allocate (Class.__allocate__(...) and
 		# bare ClassName(...) sugar for the no-__init__ case) - everything
@@ -5253,7 +5289,11 @@ class FunctionLowering:
 			# pointer convention) - self is ALSO always Ptr[T] for the same
 			# reason (see lower_function's own self_param construction)
 			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
-			ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ target_cls ] )
+			interface_class_type_params = target_cls.type_params or []
+			fallback_cls: ClassLike|Specialization = target_cls
+			if expected_type is None and interface_class_type_params:
+				fallback_cls = self._infer_allocate_type_args( target_cls, interface_class_type_params, fields_to_build, fields, node, label )
+			ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ fallback_cls ] )
 			dest = self._new_temp( expected_type or ptr_type )
 			self.lowering.schedule( dest.type )
 			self.lowering._schedule_interface_construction( target_cls )
@@ -5289,7 +5329,17 @@ class FunctionLowering:
 			or ( isinstance( expected_type, Specialization ) and expected_type.base is target_cls )
 			or ( isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls
 				and expected_type is self.lowering.monomorphize_class( fn_cls ) ))
-		dest = self._new_temp( expected_type if compatible else target_cls )
+		# when expected_type isn't usable, falling back to the bare ABSTRACT
+		# target_cls (unspecialized type_params and all) is only actually
+		# correct when target_cls isn't generic in the first place - see
+		# _infer_allocate_type_args
+		class_type_params: list[TypeVar] = (
+			target_cls.type_params or []
+		) if isinstance( target_cls, ( RCClass, CStruct, CUnion, TaggedUnion )) else []
+		fallback_cls: ClassLike|Specialization = target_cls
+		if not compatible and class_type_params:
+			fallback_cls = self._infer_allocate_type_args( target_cls, class_type_params, fields_to_build, fields, node, label )
+		dest = self._new_temp( expected_type if compatible else fallback_cls )
 		# dest.type can be a concrete Specialization (ResultPayload[i32,
 		# OverflowError], inferred from the substituted field type this
 		# construction call is being assigned into - see the field.type
@@ -6647,7 +6697,21 @@ class FunctionLowering:
 				# would wrongly treat as a leaf needing wrapping
 				dest = self._new_temp( target_return_type )
 			else:
-				dest = self._new_temp( expected_type or target_return_type )
+				# a bare TypeVar expected_type is never a legitimate coercion
+				# target here - by this point `target` is always already a
+				# concrete, resolved Function (never itself mid-generic-
+				# dispatch - see the "already tagged with its resolved,
+				# monomorphized callee" comment above), so target_return_type
+				# is the call's own real, concrete return type. A stray bare
+				# TypeVar hint (e.g. _lower_allocate_fields threading a
+				# generic field's own still-abstract declared type down as
+				# the expected_type for lowering that field's VALUE
+				# expression - _infer_allocate_type_args then needs that
+				# value's own REAL type back, not this hint bounced straight
+				# through) would otherwise silently override dest with a
+				# meaningless, unresolvable type instead of what the callee
+				# actually returns
+				dest = self._new_temp( target_return_type if isinstance( expected_type, TypeVar ) else ( expected_type or target_return_type ))
 			self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return dest
 		else:
