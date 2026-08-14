@@ -17,8 +17,17 @@ import sys
 if compiler.target.os == 'windows':
 	from windows.kernel32 import _SRWLOCK
 	LockOpaque: TypeAlias = _SRWLOCK
+	# a Win32 thread HANDLE is a void* (Ptr[None])
+	ThreadHandle: TypeAlias = Ptr[None]
 else:
 	LockOpaque = compiler.c_type('pthread_mutex_t', header='pthread.h')
+	# pthread_t is opaque and NOT a pointer on glibc (it's an unsigned long),
+	# so it can't be modelled as Ptr[None]: pthread_join takes it BY VALUE and
+	# pthread_create fills a pthread_t*, both of which a void* mis-types under
+	# GCC/clang. Use the real C type (shared with lib/posix/pthread.py's own
+	# extern signatures) so both the by-value pass and the out-pointer match.
+	from posix.pthread import pthread_t
+	ThreadHandle: TypeAlias = pthread_t
 
 
 class LockError:
@@ -148,7 +157,7 @@ class FastLock:
 # ---------------------------------------------------------------------------
 
 class Thread:
-	__handle: Ptr[None]  # HANDLE on Windows, pthread_t on Linux
+	__handle: ThreadHandle  # HANDLE (void*) on Windows, pthread_t on Linux
 
 	@compiler.target( os = 'windows' )
 	def __init__( self, entry: Closure[[], None] ) -> None:
@@ -165,10 +174,11 @@ class Thread:
 		# pthread_create's own thread* out-param needs a real, standalone
 		# pointer (compiler.addrof only accepts a bare local variable, not
 		# self.field - see lib/atomic.py's identical Atomic[T] workaround) -
-		# a one-slot heap allocation, read back into self.__handle and
-		# freed immediately, keeps self.__handle itself uniformly Ptr[None]
-		# (the handle VALUE, not a pointer to it) on both platforms
-		slot: Ptr[Ptr[None]] = sys.alloc[Ptr[None]]( 1 )
+		# a one-slot pthread_t heap allocation, read back into self.__handle
+		# (the pthread_t VALUE) and freed immediately. The slot is Ptr[pthread_t]
+		# so the emitted arg is a real pthread_t*, matching pthread_create's
+		# actual <pthread.h> prototype (a void** did not).
+		slot: Ptr[ThreadHandle] = sys.alloc[ThreadHandle]( 1 )
 		result: i32 = pthread_create( slot, None, _thread_entry, arg )
 		if result != 0:
 			sys.panic( 'Thread.__init__: pthread_create failed' )

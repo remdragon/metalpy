@@ -3319,6 +3319,26 @@ class FunctionLowering:
 			operand = self._coerce_into_union( operand, expected_type, node )
 		return operand
 
+	def _maybe_castwrap_pointer( self, operand: ir.Operand, expected_type: Type|None ) -> ir.Operand:
+		''' When a pointer-typed value flows into a context expecting a DIFFERENT
+		pointer type (e.g. self.__metadata: Ptr[_FastListMetadata] passed to
+		sys.memcpy's src: ConstPtr[u8]), insert a CastWrap - in C all object
+		pointers share one representation, so this is safe, and without it GCC/
+		clang reject the call as -Wincompatible-pointer-types. Function pointers
+		(Ptr[Callable[...]]) are deliberately excluded: casting them interferes
+		with generic-parameter inference through callable arguments, and object<->
+		function pointer casts are not the interchangeable case above. This is the
+		same coercion _expr_Name applies to bare locals, factored out so the
+		attribute path (self.field reads) gets it too. '''
+		tr = self.lowering._type_resolver
+		if ( expected_type is not None and operand.type is not expected_type
+				and tr._is_ptr_specialization( operand.type ) and tr._is_ptr_specialization( expected_type )
+				and tr._callable_type_of( operand.type ) is None and tr._callable_type_of( expected_type ) is None ):
+			dest = self._new_temp( expected_type )
+			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
+			return dest
+		return operand
+
 	def _coerce_into_union( self, operand: ir.Operand, union: TaggedUnion, node: ast.AST ) -> ir.Operand:
 		# operand's own type doesn't match the union it needs to become -
 		# TODO.txt's own documented "opportunistic union emission" gap
@@ -4190,7 +4210,10 @@ class FunctionLowering:
 		attr_var = self.lowering._attr_lookup( obj.type, node.attr, node )
 		dest = self._new_temp( attr_var.type )
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
-		return dest
+		# a pointer-typed field passed into a differently-typed pointer parameter
+		# (e.g. sys.memcpy( ..., self.__metadata, ... ) where src is ConstPtr[u8])
+		# needs the same CastWrap coercion _expr_Name does for bare locals.
+		return self._maybe_castwrap_pointer( dest, expected_type )
 
 	def _expr_Tuple( self, node: ast.Tuple, expected_type: Type|None ) -> ir.Operand:
 		# `(a, b, c)` in value position (PLAN_TUPLE.md) - the first real
