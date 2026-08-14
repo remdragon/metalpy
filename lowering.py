@@ -399,7 +399,14 @@ class Lowering:
 				f'(clang, gcc, or MSVC) — none was found',
 				node,
 			)
-		c_src = f'#include <{header}>\n#include <stdio.h>\nint main(void) {{ printf("%zu\\n", (size_t)({expr})); return 0; }}\n'
+		# _GNU_SOURCE (defined before any include) makes glibc expose the
+		# POSIX.1-2008 / GNU-gated identifiers (LC_CTYPE_MASK, CLOCK_MONOTONIC,
+		# CLOCK_REALTIME, ...) that -std=c11's implied __STRICT_ANSI__ would
+		# otherwise hide - without it these probes fail to compile on Linux even
+		# though the very same symbols are perfectly usable in the real build
+		# (which declares its own prototypes). Harmless on macOS/Windows
+		# toolchains, which ignore it and expose these by default anyway.
+		c_src = f'#define _GNU_SOURCE 1\n#include <{header}>\n#include <stdio.h>\nint main(void) {{ printf("%zu\\n", (size_t)({expr})); return 0; }}\n'
 		with tempfile.TemporaryDirectory() as tmp:
 			src_path = Path( tmp ) / 'cexpr.c'
 			obj_path = Path( tmp ) / 'cexpr.o'

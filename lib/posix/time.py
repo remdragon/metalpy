@@ -20,10 +20,15 @@ import compiler
 CLOCK_REALTIME:  i32 = compiler.cexpr( 'CLOCK_REALTIME',  'time.h', i32 )
 CLOCK_MONOTONIC: i32 = compiler.cexpr( 'CLOCK_MONOTONIC', 'time.h', i32 )
 
+# Field defaults let `timespec()` construct a zero-initialized value (the
+# constructor otherwise requires every field) - which is exactly the clean slate
+# we want before clock_gettime writes into it. Defaults are metalpy-side only;
+# the emitted C struct layout is unchanged (two 64-bit fields = struct timespec
+# on LP64).
 @cstruct
 class timespec:
-	tv_sec:  i64  # time_t on LP64
-	tv_nsec: i64  # long   on LP64
+	tv_sec:  i64 = 0  # time_t on LP64
+	tv_nsec: i64 = 0  # long   on LP64
 
 # no header= -> our own prototype is emitted and <time.h> stays out of the main
 # TU (see the timespec-collision note above). clockid_t is `int` on every target
