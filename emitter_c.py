@@ -588,36 +588,63 @@ def _union_tag_data_fields( union: TaggedUnion ) -> tuple[str,str]:
 		f'{union.qualname}: union storage not synthesized (UnionStorage.get must run before emit)'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem )
 
-def _union_member_ordinal( union: TaggedUnion, member_type: Type ) -> int:
-	''' the tag VALUE of `member_type` within `union` - its index in
-	.attributes (UnionStorage assigns tags in attribute order). Matched by
-	qualname (error classes are interned, but qualname is the stable key). '''
+def _union_member( union: TaggedUnion, member_type: Type ) -> tuple[int,Variable]:
+	''' (ordinal, attr) for the member of `union` matching `member_type` - the
+	ordinal is its index in .attributes (UnionStorage assigns tags in
+	attribute order); attr.stem names its payload field (data.v_<attr.stem>).
+	Matched by qualname (error classes are interned, but qualname is the
+	stable key that survives the Specialization-vs-monomorphized-TaggedUnion
+	split - see _result_error_type). '''
 	for i, attr in enumerate( union.attributes ):
 		if attr.type is not None and attr.type.qualname == member_type.qualname:
-			return i
+			return i, attr
 	raise AssertionError( f'{member_type.qualname} is not a member of {union.qualname}' )
 
 def _emit_widen_error( dest_expr: str, e_fn: Type, src_expr: str, e_op: Type ) -> list[str]:
 	''' assign the error value `src_expr` (of type e_op) into the error lvalue
 	`dest_expr` (of type e_fn), WIDENING when they differ. e_fn is guaranteed
 	to cover e_op (type_resolver._require_result_return's leaves-containment
-	check ran at lowering). All arithmetic error leaves are zero-payload marker
-	classes, so widening is a pure tag remap - no payload copy (mirrors how the
-	checked ops themselves only ever set the error tag, never v_Err). '''
+	check ran at lowering).
+
+	The built-in arithmetic error leaves (OverflowError, ZeroDivisionError,
+	FloatingPointError) are zero-payload markers, but or_return() widening is
+	a GENERAL mechanism - it applies to any user-declared Result[T,E], and a
+	user error class can carry real fields (`class ParseError: message: str`).
+	Every branch below therefore copies the payload value alongside the tag,
+	not just the tag - dropping it would silently discard the error's own
+	data on every widening propagation. The payload is a bare pointer for any
+	RCClass error (the only kind a bare `class Foo:` ever compiles to -
+	discovery.py's own class-parsing rule), so this is a plain pointer copy,
+	not a deep copy. RC ownership: this mirrors the pre-existing identical-
+	type fast path immediately below EXACTLY (already a raw, no-retain struct
+	copy, unchanged by this function) - not a new RC rule invented here, the
+	same ownership-transfer semantics that already govern an ordinary
+	(non-widened) error value propagating through OrReturn/OrJump. '''
 	if e_op is e_fn:
-		return [ f'\t\t{dest_expr} = {src_expr};' ] # identical layout - plain struct copy (today's fast path)
+		return [ f'\t\t{dest_expr} = {src_expr};' ] # identical layout - plain struct copy (fast path, copies any payload already)
 	assert isinstance( e_fn, TaggedUnion ), f'widening into a non-union error type {e_fn!r}'
-	fn_tag, _fn_data = _union_tag_data_fields( e_fn )
+	fn_tag, fn_data = _union_tag_data_fields( e_fn )
 	if not isinstance( e_op, TaggedUnion ):
-		# single marker class -> set the wide union's variant tag for it
-		ordinal = _union_member_ordinal( e_fn, e_op )
-		return [ f'\t\t{dest_expr}.{fn_tag} = {ordinal};' ]
-	# e_op is itself a (narrower) union -> remap each member's tag at runtime
-	op_tag, _op_data = _union_tag_data_fields( e_op )
+		# single class -> set the wide union's variant tag AND copy its
+		# payload pointer into the matching v_<member> field
+		ordinal, fn_attr = _union_member( e_fn, e_op )
+		fn_field = _field_name( f'v_{fn_attr.stem}' )
+		return [
+			f'\t\t{dest_expr}.{fn_tag} = {ordinal};',
+			f'\t\t{dest_expr}.{fn_data}.{fn_field} = {src_expr};',
+		]
+	# e_op is itself a (narrower) union -> remap each member's tag AND copy
+	# its payload at runtime, one case per e_op member
+	op_tag, op_data = _union_tag_data_fields( e_op )
 	lines = [ f'\t\tswitch ( ({src_expr}).{op_tag} ) {{' ]
-	for i, attr in enumerate( e_op.attributes ):
-		ordinal = _union_member_ordinal( e_fn, attr.type )
-		lines.append( f'\t\t\tcase {i}: {dest_expr}.{fn_tag} = {ordinal}; break;' )
+	for i, op_attr in enumerate( e_op.attributes ):
+		fn_ordinal, fn_attr = _union_member( e_fn, op_attr.type )
+		op_field = _field_name( f'v_{op_attr.stem}' )
+		fn_field = _field_name( f'v_{fn_attr.stem}' )
+		lines.append(
+			f'\t\t\tcase {i}: {dest_expr}.{fn_tag} = {fn_ordinal}; '
+			f'{dest_expr}.{fn_data}.{fn_field} = ({src_expr}).{op_data}.{op_field}; break;'
+		)
 	lines.append( '\t\t}' )
 	return lines
 

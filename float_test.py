@@ -488,10 +488,13 @@ def main() -> i32:
 ''', [ 'divide-by-zero must widen to Err', 'finite division must be Ok' ] )
 
 	def test_widening_remap_is_emitted( self ) -> None:
-		# structural check of _emit_widen_error - behavioral is_err can't see a
-		# wrong tag (markers carry no payload), so verify the remap C directly.
-		# A single-error op (float +) widening into the 3-union sets the inner
-		# variant tag; a union-error op (float /) widening emits a switch.
+		# structural check of _emit_widen_error's TAG remap specifically (the
+		# arithmetic errors it exercises here are zero-payload markers, so
+		# there's no payload to observe behaviorally through them - see
+		# test_widening_preserves_error_payload below for that, using a real
+		# user error class instead). A single-error op (float +) widening into
+		# the 3-union sets the inner variant tag; a union-error op (float /)
+		# widening emits a switch.
 		src = self._c_source( '''
 def compute( a: f64, b: f64 ) -> Result[f64, ZeroDivisionError | OverflowError | FloatingPointError]:
 	s: f64 = a + b
@@ -512,6 +515,84 @@ def main() -> i32:
 		# single->union widen sets the inner tag to 0; the / switch remaps its
 		# ZeroDivisionError arm to 2 (a non-identity mapping, the whole point)
 		self.assertRegex( src, r'v_Err\.tag = 2' )
+
+	def test_widening_preserves_error_payload( self ) -> None:
+		# or_return() widening is a GENERAL mechanism, not arithmetic-specific -
+		# a user error class can carry real fields, and _emit_widen_error must
+		# copy that payload, not just remap the tag (the actual gap this test
+		# guards: a tag-only widen would leave the payload field reading
+		# uninitialized/zeroed data on the far side of the union boundary).
+		# Two levels of widening are exercised: inner()'s single ParseError
+		# widens into outer()'s 2-member union (the single->union branch of
+		# _emit_widen_error), then outer()'s own Result widens again into
+		# outermost()'s 3-member union (the union->union switch branch) -
+		# the payload must survive both.
+		checks = [
+			'level-1 widen (single class -> union): payload survives',
+			'level-2 widen (union -> wider union): payload still survives',
+			'the Ok path (no widening) is unaffected',
+		]
+		self._assert_program_succeeds( '''
+class ParseError:
+	code: i32
+
+class OtherError:
+	pass
+
+class ThirdError:
+	pass
+
+def inner( bad: bool ) -> Result[i32, ParseError]:
+	if bad:
+		return Result.Err( ParseError( code = 42 ) )
+	return Result.Ok( 7 )
+
+def outer( bad: bool ) -> Result[i32, ParseError | OtherError]:
+	v: i32 = inner( bad ).or_return()
+	return Result.Ok( v )
+
+def outermost( bad: bool ) -> Result[i32, ParseError | OtherError | ThirdError]:
+	v: i32 = outer( bad ).or_return()
+	return Result.Ok( v )
+
+def main() -> i32:
+	r: Result[i32, ParseError | OtherError] = outer( True )
+	match r:
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			err: ParseError | OtherError = e
+			match err:
+				case ParseError( pe ):
+					if pe.code != 42:
+						return 1
+				case OtherError( oe ):
+					return 1
+
+	r2: Result[i32, ParseError | OtherError | ThirdError] = outermost( True )
+	match r2:
+		case Result.Ok( v ):
+			return 2
+		case Result.Err( e2 ):
+			err2: ParseError | OtherError | ThirdError = e2
+			match err2:
+				case ParseError( pe2 ):
+					if pe2.code != 42:
+						return 2
+				case OtherError( oe2 ):
+					return 2
+				case ThirdError( te2 ):
+					return 2
+
+	r3: Result[i32, ParseError | OtherError] = outer( False )
+	match r3:
+		case Result.Ok( v ):
+			if v != 7:
+				return 3
+		case Result.Err( e3 ):
+			return 3
+	return 0
+''', checks )
 
 	# --- checked float division catches BOTH errors (item 1 + item 4) -------
 
