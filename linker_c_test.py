@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 # local imports:
 import linker_c
+import test_support
+from test_support import KNOWN_LIB, KNOWN_SYMBOLS
 
 _CC = linker_c.detect_cc()
 
@@ -39,29 +41,29 @@ class HasSymbolTests( unittest.TestCase ):
 		return f
 
 	def test_real_symbol_is_available( self ) -> None:
-		self._fresh_cache_file( 'kernel32', 'GetLastError' )
-		self.assertTrue( linker_c.has_symbol( _CC, 'kernel32', 'GetLastError' ))
+		self._fresh_cache_file( KNOWN_LIB, KNOWN_SYMBOLS[0] )
+		self.assertTrue( linker_c.has_symbol( _CC, KNOWN_LIB, KNOWN_SYMBOLS[0] ))
 
 	def test_bogus_symbol_in_real_library_is_unavailable( self ) -> None:
-		self._fresh_cache_file( 'kernel32', 'ThisSymbolDoesNotExist987' )
-		self.assertFalse( linker_c.has_symbol( _CC, 'kernel32', 'ThisSymbolDoesNotExist987' ))
+		self._fresh_cache_file( KNOWN_LIB, 'ThisSymbolDoesNotExist987' )
+		self.assertFalse( linker_c.has_symbol( _CC, KNOWN_LIB, 'ThisSymbolDoesNotExist987' ))
 
 	def test_bogus_library_is_unavailable( self ) -> None:
-		self._fresh_cache_file( 'ThisLibraryDoesNotExist987', 'GetLastError' )
-		self.assertFalse( linker_c.has_symbol( _CC, 'ThisLibraryDoesNotExist987', 'GetLastError' ))
+		self._fresh_cache_file( 'ThisLibraryDoesNotExist987', KNOWN_SYMBOLS[0] )
+		self.assertFalse( linker_c.has_symbol( _CC, 'ThisLibraryDoesNotExist987', KNOWN_SYMBOLS[0] ))
 
 	def test_result_is_cached_to_disk( self ) -> None:
-		cache_file = self._fresh_cache_file( 'kernel32', 'CloseHandle' )
+		cache_file = self._fresh_cache_file( KNOWN_LIB, KNOWN_SYMBOLS[1] )
 		self.assertFalse( cache_file.is_file() )
-		linker_c.has_symbol( _CC, 'kernel32', 'CloseHandle' )
+		linker_c.has_symbol( _CC, KNOWN_LIB, KNOWN_SYMBOLS[1] )
 		self.assertTrue( cache_file.is_file() )
 
 	def test_second_call_hits_the_cache_not_the_compiler( self ) -> None:
-		self._fresh_cache_file( 'kernel32', 'HeapAlloc' )
-		first = linker_c.has_symbol( _CC, 'kernel32', 'HeapAlloc' )
+		self._fresh_cache_file( KNOWN_LIB, KNOWN_SYMBOLS[2] )
+		first = linker_c.has_symbol( _CC, KNOWN_LIB, KNOWN_SYMBOLS[2] )
 		# if the second call actually re-invoked the compiler instead of
 		# reading the cache, this patch would make it explode
 		with patch.object( linker_c.CcTool, 'compile', side_effect = AssertionError( 'compiler invoked - cache was not hit' ) ):
-			second = linker_c.has_symbol( _CC, 'kernel32', 'HeapAlloc' )
+			second = linker_c.has_symbol( _CC, KNOWN_LIB, KNOWN_SYMBOLS[2] )
 		self.assertEqual( first, second )
 		self.assertTrue( first )

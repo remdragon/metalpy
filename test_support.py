@@ -49,6 +49,22 @@ def c_source_on_failure( c_source: str ) -> str:
 	METALPY_TEST_DUMP_C=1 to bring it back when you need to inspect the C. '''
 	return f'\n\n--- generated.c ---\n{c_source}' if os.environ.get( 'METALPY_TEST_DUMP_C' ) else ''
 
+
+# A real (library, symbol) triple that resolves on the HOST toolchain, for the
+# has_symbol / has_library tests that need a KNOWN-AVAILABLE symbol. Windows
+# links a kernel32 export; every other platform links a libc export. Three
+# distinct symbols are provided so tests that must not share a has_symbol disk
+# cache entry can each take their own. (Before this, these tests hard-coded
+# kernel32/GetLastError and so failed on Linux, where kernel32 does not exist -
+# the feature was correct, the fixture was Windows-only.)
+if os.name == 'nt':
+	KNOWN_LIB = 'kernel32'
+	KNOWN_SYMBOLS = ( 'GetLastError', 'CloseHandle', 'HeapAlloc' )
+else:
+	KNOWN_LIB = 'c'
+	KNOWN_SYMBOLS = ( 'printf', 'malloc', 'free' )
+KNOWN_SYMBOL = KNOWN_SYMBOLS[0]
+
 # exit-code stride: a failing sub-test returns  case_index * _STRIDE + subcode .
 # case_index is small (< number of methods in a class) and subcode is the tiny
 # 1..N the original program returned, so this stays well inside the 32-bit

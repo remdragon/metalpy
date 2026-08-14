@@ -5,6 +5,7 @@ import unittest
 # local imports
 import compile_time_transformer as ctt
 import linker_c
+import test_support
 
 
 def _fold( src: str, active_target: dict[str,object], detect_cc = None ) -> str:
@@ -205,7 +206,7 @@ class CompilerHasLibraryFoldingTests( unittest.TestCase ):
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )
 	def test_available_symbol_folds_to_true( self ) -> None:
 		self.assertEqual(
-			_fold( "x = compiler.has_library( 'kernel32', 'GetLastError' )", {}, lambda: _CC ),
+			_fold( f"x = compiler.has_library( '{test_support.KNOWN_LIB}', '{test_support.KNOWN_SYMBOL}' )", {}, lambda: _CC ),
 			'x = True',
 		)
 
@@ -221,9 +222,9 @@ class CompilerHasLibraryFoldingTests( unittest.TestCase ):
 		# the whole point: the losing branch is gone from the AST entirely,
 		# not just skipped at runtime - a real @extern reference inside it
 		# would never even reach lowering.py, let alone the linker
-		src = "if compiler.has_library( 'kernel32', 'GetLastError' ):\n\ta = 1\nelse:\n\ta = 2"
+		src = f"if compiler.has_library( '{test_support.KNOWN_LIB}', '{test_support.KNOWN_SYMBOL}' ):\n\ta = 1\nelse:\n\ta = 2"
 		self.assertEqual( _fold( src, {}, lambda: _CC ), 'a = 1' )
-		src2 = "if compiler.has_library( 'kernel32', 'ThisIsNotARealSymbol123' ):\n\ta = 1\nelse:\n\ta = 2"
+		src2 = f"if compiler.has_library( '{test_support.KNOWN_LIB}', 'ThisIsNotARealSymbol123' ):\n\ta = 1\nelse:\n\ta = 2"
 		self.assertEqual( _fold( src2, {}, lambda: _CC ), 'a = 2' )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )

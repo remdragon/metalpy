@@ -7423,6 +7423,7 @@ def main() -> i32:
 ''' ),
 		] )
 
+@unittest.skipUnless( os.name == 'nt', 'COM interop is Windows-only (lib/windows/com) - skipping off Windows' )
 class ComTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/windows/com.py's HRESULT/IUnknown pattern -
 	PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3 worked example: a

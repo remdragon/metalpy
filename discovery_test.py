@@ -8,6 +8,7 @@ import unittest
 import discovery
 from errors import CompileError
 import linker_c
+import test_support
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
 	Function, Variable, Specialization, Move, Copy, ConditionalDispatch, Scalar,
@@ -1984,8 +1985,8 @@ class CompilerHasLibraryTargetTests( unittest.TestCase ):
 		return disco, mod
 
 	def test_available_symbol_included( self ) -> None:
-		disco, mod = self._import( '''
-@compiler.target( has_library = ( 'kernel32', 'GetLastError' ))
+		disco, mod = self._import( f'''
+@compiler.target( has_library = ( '{test_support.KNOWN_LIB}', '{test_support.KNOWN_SYMBOL}' ))
 def foo() -> i32:
 	pass
 ''' )
@@ -2011,12 +2012,12 @@ def foo() -> i32:
 		# mirrors CompilerTargetTests' own os= version of this same shape -
 		# two mutually-exclusive has_library-gated defs, only the matching
 		# one should ever get registered
-		disco, mod = self._import( '''
-@compiler.target( has_library = ( 'kernel32', 'GetLastError' ))
+		disco, mod = self._import( f'''
+@compiler.target( has_library = ( '{test_support.KNOWN_LIB}', '{test_support.KNOWN_SYMBOL}' ))
 def get_error() -> i32:
 	return 1
 
-@compiler.target( has_library = not ( 'kernel32', 'GetLastError' ))
+@compiler.target( has_library = not ( '{test_support.KNOWN_LIB}', '{test_support.KNOWN_SYMBOL}' ))
 def get_error() -> i32:
 	return 2
 ''' )
