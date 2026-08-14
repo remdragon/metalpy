@@ -83,6 +83,96 @@ def encode_utf8_at( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
 		dest[i+3] = u8( 0x80 | ( cp & 0x3F ))
 	return 4
 
+# ---------------------------------------------------------------------------
+# f-string !a (ascii) conversion - str._ascii_escape() in __init__.py's own
+# str class calls these. Same size-then-fill two-pass convention as
+# utf8_encoded_len/encode_utf8_at just above, just producing an ASCII-only,
+# backslash-escaped encoding instead of UTF-8 - matches Python's own
+# ascii()/repr() escaping rules (backslash and \n/\r/\t as a 2-byte escape,
+# every other non-printable-ASCII byte as \xXX, and non-ASCII codepoints as
+# \xXX/\uXXXX/\UXXXXXXXX depending on range). Deliberately does NOT add
+# surrounding quotes or escape a literal quote character - see
+# _lower_fstring_part's own comment on why (str has no __repr__() of its
+# own for !a to match the quoting behavior of).
+# ---------------------------------------------------------------------------
+
+_ASCII_BACKSLASH: u8 = 0x5C # '\'
+_ASCII_ZERO: u8 = 0x30 # '0'
+_ASCII_LOWER_A: u8 = 0x61 # 'a'
+
+def _hex_nibble( n: u32 ) -> u8:
+	''' one lowercase hex digit for a 4-bit nibble (0-15) - shared by every
+	\\xXX/\\uXXXX/\\UXXXXXXXX escape ascii_escape_one writes below. '''
+	if n < 10:
+		with compiler.wrap_arithmetic:
+			return u8( n ) + _ASCII_ZERO
+	with compiler.wrap_arithmetic:
+		return u8( n - 10 ) + _ASCII_LOWER_A
+
+def ascii_escape_width( cp: u32 ) -> usize:
+	''' byte cost of representing codepoint cp in ascii-escaped form - the
+	"size" half, paired with ascii_escape_one below. '''
+	if cp == 0x5C or cp == 0x0A or cp == 0x0D or cp == 0x09: # '\', '\n', '\r', '\t'
+		return 2
+	if cp < 0x20 or cp == 0x7F: # other ASCII control bytes + DEL
+		return 4
+	if cp < 0x7F: # ordinary printable ASCII
+		return 1
+	if cp <= 0xFF:
+		return 4
+	if cp <= 0xFFFF:
+		return 6
+	return 10
+
+def ascii_escape_one( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
+	''' encodes codepoint cp into dest starting at dest[i] per
+	ascii_escape_width's own rules above, returns the number of bytes
+	written - the "fill" half. '''
+	if cp == 0x5C or cp == 0x0A or cp == 0x0D or cp == 0x09:
+		with compiler.wrap_arithmetic:
+			dest[i] = _ASCII_BACKSLASH
+			if cp == 0x5C:
+				dest[i+1] = _ASCII_BACKSLASH
+			elif cp == 0x0A:
+				dest[i+1] = u8( 0x6E ) # 'n'
+			elif cp == 0x0D:
+				dest[i+1] = u8( 0x72 ) # 'r'
+			else:
+				dest[i+1] = u8( 0x74 ) # 't'
+		return 2
+	if cp < 0x20 or cp == 0x7F or ( cp >= 0x80 and cp <= 0xFF ):
+		with compiler.wrap_arithmetic:
+			dest[i]   = _ASCII_BACKSLASH
+			dest[i+1] = u8( 0x78 ) # 'x'
+			dest[i+2] = _hex_nibble( ( cp >> 4 ) & 0xF )
+			dest[i+3] = _hex_nibble( cp & 0xF )
+		return 4
+	if cp < 0x7F:
+		with compiler.wrap_arithmetic:
+			dest[i] = u8( cp )
+		return 1
+	if cp <= 0xFFFF:
+		with compiler.wrap_arithmetic:
+			dest[i]   = _ASCII_BACKSLASH
+			dest[i+1] = u8( 0x75 ) # 'u'
+			dest[i+2] = _hex_nibble( ( cp >> 12 ) & 0xF )
+			dest[i+3] = _hex_nibble( ( cp >> 8 ) & 0xF )
+			dest[i+4] = _hex_nibble( ( cp >> 4 ) & 0xF )
+			dest[i+5] = _hex_nibble( cp & 0xF )
+		return 6
+	with compiler.wrap_arithmetic:
+		dest[i]   = _ASCII_BACKSLASH
+		dest[i+1] = u8( 0x55 ) # 'U'
+		dest[i+2] = _hex_nibble( ( cp >> 28 ) & 0xF )
+		dest[i+3] = _hex_nibble( ( cp >> 24 ) & 0xF )
+		dest[i+4] = _hex_nibble( ( cp >> 20 ) & 0xF )
+		dest[i+5] = _hex_nibble( ( cp >> 16 ) & 0xF )
+		dest[i+6] = _hex_nibble( ( cp >> 12 ) & 0xF )
+		dest[i+7] = _hex_nibble( ( cp >> 8 ) & 0xF )
+		dest[i+8] = _hex_nibble( ( cp >> 4 ) & 0xF )
+		dest[i+9] = _hex_nibble( cp & 0xF )
+	return 10
+
 @compiler.target( os = 'windows' )
 def case_map( data: ConstPtr[u8], byte_len: usize, is_upper: bool, out_size: Ptr[usize] ) -> Ptr[u8]:
 	''' shared by str.upper()/lower() on Windows - same name/signature as

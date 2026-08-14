@@ -9220,6 +9220,154 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bang_a_conversion_escapes_non_ascii( self ) -> None:
+		# !a (PLAN_FSTRINGS.md follow-up) - a dedicated real compile-and-run
+		# test against non-ASCII input, per the plan's own verification
+		# section. Expected text is real Python's own ascii()-equivalent
+		# escaping (repr() here has no surrounding quotes to strip since
+		# !a's own metalpy semantics never add quotes - see lowering.py's
+		# _lower_ascii_escape comment): a 2-byte-UTF8 codepoint (café,
+		# U+00E9) escapes as \xE9-style... actually str._ascii_escape's
+		# own lowercase-hex convention is checked directly against real
+		# Python's escaping of the bare codepoints, not against repr()'s
+		# own quoting.
+		self._run( '''
+def build( s: str ) -> str:
+	return f"{s!a}"
+
+def main() -> i32:
+	if build( 'caf\\u00e9' ) != 'caf\\\\xe9':
+		return 1
+	if build( '\\u00e9\\u0100\\U0001F600' ) != '\\\\xe9\\\\u0100\\\\U0001f600':
+		return 2
+	if build( 'plain ascii' ) != 'plain ascii':
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_str_format_spec_width_align_fill( self ) -> None:
+		# real Python's own f-string output is the oracle throughout this
+		# class's format-spec tests, per PLAN_FSTRINGS.md's own
+		# verification section
+		self._run( f'''
+def build( s: str ) -> str:
+	return f"{{s:*^11}}"
+
+def main() -> i32:
+	if build( 'hi' ) != {f"{'hi':*^11}"!r}:
+		return 1
+	if f"{{'left':<8}}" != {f"{'left':<8}"!r}:
+		return 2
+	if f"{{'right':>8}}" != {f"{'right':>8}"!r}:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_str_format_spec_precision_truncates( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{'hello world':.5}}" != {f"{'hello world':.5}"!r}:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_int_format_spec_decimal_sign_and_width( self ) -> None:
+		self._run( f'''
+def build( n: int ) -> str:
+	return f"{{n:+06d}}"
+
+def main() -> i32:
+	if build( int( 42 )) != {f"{42:+06d}"!r}:
+		return 1
+	if build( int( -42 )) != {f"{-42:+06d}"!r}:
+		return 2
+	if f"{{int(0):5d}}" != {f"{0:5d}"!r}:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_int_format_spec_decimal_grouping( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{int(1234567):,d}}" != {f"{1234567:,d}"!r}:
+		return 1
+	if f"{{int(-1234567):_d}}" != {f"{-1234567:_d}"!r}:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_int_format_spec_radix_conversions( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{int(255):#x}}" != {f"{255:#x}"!r}:
+		return 1
+	if f"{{int(255):#X}}" != {f"{255:#X}"!r}:
+		return 2
+	if f"{{int(8):#o}}" != {f"{8:#o}"!r}:
+		return 3
+	if f"{{int(5):#b}}" != {f"{5:#b}"!r}:
+		return 4
+	if f"{{int(0):x}}" != {f"{0:x}"!r}:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_int_format_spec_zero_pad_is_sign_aware( self ) -> None:
+		# the '0' shorthand's own sign-aware zero-fill: f"{-255:#010x}" ->
+		# the '-' and '0x' prefix stay in front, zeros fill AFTER them,
+		# not before ('-0000000ff', not '000000-0xff') - this is the one
+		# real '=' alignment behavior PLAN_FSTRINGS.md's own scope covers
+		self._run( f'''
+def main() -> i32:
+	if f"{{int(-255):#010x}}" != {f"{-255:#010x}"!r}:
+		return 1
+	if f"{{int(255):#010x}}" != {f"{255:#010x}"!r}:
+		return 2
+	if f"{{int(-5):05d}}" != {f"{-5:05d}"!r}:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_explicit_conversion_plus_format_spec_runtime( self ) -> None:
+		# f"{n!r:>8}" against a real runtime int - the spec formats the
+		# ALREADY-converted str (padding), not n's own int-typed value, so
+		# this exercises the two-stage conversion-then-spec path end to
+		# end (not just the IR-shape assertion lowering_test.py already
+		# makes for the same shape)
+		self._run( f'''
+def build( n: int ) -> str:
+	return f"{{n!r:>8}}"
+
+def main() -> i32:
+	if build( int( 5 )) != {f"{5!r:>8}"!r}:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 if __name__ == '__main__':
 	unittest.main()

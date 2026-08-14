@@ -6877,23 +6877,162 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( len( self._calls_to( fn, '__repr__' )), 1 )
 		self.assertEqual( self._calls_to( fn, '__str__' ), [] )
 
-	def test_bang_a_conversion_is_a_compile_error( self ) -> None:
+	def test_bang_a_conversion_dispatches_to_repr_then_ascii_escape( self ) -> None:
+		# !a (PLAN_FSTRINGS.md follow-up): __repr__() first (same as !r),
+		# then str._ascii_escape() on the result - _lower_ascii_escape's
+		# own comment on why it does NOT add quotes, unlike Python's real
+		# ascii()/repr()
 		self._import( '\n'.join([
 			'def main( n: int ) -> str:',
 			'	return f"{n!a}"',
 		]))
-		self.compiler._lower( self.discovery.main )
-		self.assertTrue( any( '!a' in e and 'not supported' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '__repr__' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_ascii_escape' )), 1 )
+		self.assertEqual( self._calls_to( fn, '__str__' ), [] )
 
-	def test_format_spec_is_a_compile_error( self ) -> None:
+	def test_dynamic_format_spec_is_a_compile_error( self ) -> None:
+		# f"{n:{w}}" - the format_spec itself is an ast.JoinedStr holding a
+		# real ast.FormattedValue(w), not just ast.Constant pieces -
+		# _is_literal_format_spec rejects it before ever trying to parse
+		# any joined text as a spec string
+		self._import( '\n'.join([
+			'def main( n: int, w: int ) -> str:',
+			'	return f"{n:{w}}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( 'format spec' in e and 'dynamic format specs are not supported yet' in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
+	def test_float_type_char_on_int_is_a_compile_error( self ) -> None:
+		# f"{n:.2f}" - 'f' parses fine (FORMAT_SPEC_TYPE_CHARS includes the
+		# float type chars precisely so this can name them), but
+		# validate_int_spec rejects 'f' against an int operand with a
+		# dedicated message pointing at the missing float feature, not a
+		# generic "not valid for int" message
 		self._import( '\n'.join([
 			'def main( n: int ) -> str:',
 			'	return f"{n:.2f}"',
 		]))
 		self.compiler._lower( self.discovery.main )
 		self.assertTrue(
-			any( 'format spec' in e and 'str.format' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors,
+			any( "needs a real float type with formatting support, which doesn't exist yet" in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
 		)
+
+	def test_int_type_char_on_str_is_a_compile_error( self ) -> None:
+		# f"{s:x}" - 'x' parses fine but validate_str_spec rejects any
+		# type char other than 's'/None for a str operand
+		self._import( '\n'.join([
+			'def main( s: str ) -> str:',
+			'	return f"{s:x}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( "not valid for str" in e for e in self.discovery.errors.errors ), self.discovery.errors.errors,
+		)
+
+	def test_precision_on_int_is_a_compile_error( self ) -> None:
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n:.2d}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( 'precision is not allowed for int' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors,
+		)
+
+	def test_literal_str_format_spec_width_dispatches_to_rjust( self ) -> None:
+		# f"{s:>10}" - operand is already str-typed, no explicit
+		# !conversion, so the spec dispatches straight against s itself
+		# (_lower_dispatch_format_spec -> _lower_str_format_spec); '>'
+		# align maps to .rjust() via _lower_pad_by_align
+		self._import( '\n'.join([
+			'def main( s: str ) -> str:',
+			'	return f"{s:>10}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, 'rjust' )), 1 )
+		self.assertEqual( self._calls_to( fn, 'ljust' ), [] )
+		self.assertEqual( self._calls_to( fn, 'center' ), [] )
+
+	def test_literal_str_format_spec_center_align_dispatches_to_center( self ) -> None:
+		self._import( '\n'.join([
+			'def main( s: str ) -> str:',
+			'	return f"{s:^10}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, 'center' )), 1 )
+
+	def test_literal_str_format_spec_precision_dispatches_to_truncate( self ) -> None:
+		self._import( '\n'.join([
+			'def main( s: str ) -> str:',
+			'	return f"{s:.3}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_truncate_codepoints' )), 1 )
+
+	def test_bang_r_conversion_plus_format_spec_dispatches_against_the_resulting_str( self ) -> None:
+		# f"{n!r:>10}" - an explicit conversion reduces n to str FIRST
+		# (via __repr__), and the spec then formats THAT str, not n's own
+		# int type - so this dispatches through the str branch (.rjust),
+		# never through any int-specific method
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n!r:>10}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '__repr__' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, 'rjust' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_to_radix_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
+
+	def test_literal_int_format_spec_decimal_dispatches_to_sign_and_digits( self ) -> None:
+		# f"{n:05d}" - decimal path: _decimal_digits_with_grouping (empty
+		# separator) + _sign_prefix, then zero-pad via _pad_after_prefix
+		# (the '=' align implied by the '0' shorthand) rather than a
+		# generic ljust/rjust/center call
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n:05d}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_decimal_digits_with_grouping' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_pad_after_prefix' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_to_radix_digits' ), [] )
+
+	def test_literal_int_format_spec_hex_dispatches_to_radix_digits( self ) -> None:
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n:#x}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_to_radix_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
+
+	def test_literal_int_format_spec_no_width_skips_padding_helpers( self ) -> None:
+		# f"{n:x}" - no width at all, so neither _pad_after_prefix nor
+		# ljust/rjust/center should be reached; the digits + sign/prefix
+		# concat (str.__add__) is the whole story
+		self._import( '\n'.join([
+			'def main( n: int ) -> str:',
+			'	return f"{n:x}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( self._calls_to( fn, '_pad_after_prefix' ), [] )
+		self.assertEqual( self._calls_to( fn, 'rjust' ), [] )
+		self.assertGreaterEqual( len( self._calls_to( fn, '__add__' )), 1 )
 
 	def test_value_with_no_str_or_repr_is_a_compile_error( self ) -> None:
 		self._import( '\n'.join([

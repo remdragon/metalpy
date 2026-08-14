@@ -48,6 +48,9 @@ import ast
 import operator
 from typing import Callable
 
+# local imports:
+import fstring_format_spec
+
 _BINOP_FNS: dict[type,object] = {
 	ast.Add: operator.add,
 	ast.Sub: operator.sub,
@@ -203,18 +206,19 @@ class _ConstFolder( ast.NodeTransformer ):
 		return ast.copy_location( ast.Constant( value = result ), node )
 
 	def visit_JoinedStr( self, node: ast.JoinedStr ) -> ast.expr:
-		# f-string folding (PLAN_FSTRINGS.md). Deliberately does NOT call
-		# self.generic_visit(node) up front like every other visit_* here -
-		# that would also descend into each FormattedValue's own
-		# format_spec (itself a JoinedStr), and format_spec support isn't
-		# implemented anywhere in this pass OR in lowering.py's runtime
-		# path (str.format()'s own still-unbuilt mini-language) - folding
-		# INSIDE a format_spec here would leave it looking like a bare
-		# Constant instead of the JoinedStr shape every future consumer
-		# expects. Only each FormattedValue's own `.value` is folded
-		# (bottom-up, via an explicit self.visit() below); format_spec is
-		# left completely untouched either way, since it's rejected
-		# outright downstream regardless of its own contents.
+		# f-string folding (PLAN_FSTRINGS.md, extended by its own format-
+		# spec follow-up - see _try_fold_formatted_value below). Deliberately
+		# does NOT call self.generic_visit(node) up front like every other
+		# visit_* here - that would also descend into each FormattedValue's
+		# own format_spec (itself a JoinedStr), and a DYNAMIC (non-literal)
+		# format_spec isn't supported anywhere in this pass or in
+		# lowering.py's own runtime path - folding INSIDE one here would
+		# leave it looking like a bare Constant instead of the JoinedStr
+		# shape every future consumer expects. Only each FormattedValue's
+		# own `.value` is folded (bottom-up, via an explicit self.visit()
+		# below); format_spec itself is never rewritten in place - a
+		# LITERAL one's own text is read directly off its still-Constant
+		# children in _try_fold_formatted_value instead.
 		#
 		# Every element's `.value` is folded UNCONDITIONALLY, even once one
 		# element has already proven the whole JoinedStr can't collapse -
@@ -231,25 +235,59 @@ class _ConstFolder( ast.NodeTransformer ):
 				continue
 			if isinstance( value, ast.FormattedValue ):
 				value.value = self.visit( value.value )
-				if (
-					foldable
-					and value.format_spec is None
-					and value.conversion in ( -1, 115, 114 ) # not 97 ('!a') - no ascii-escape primitive exists here, stays unfoldable
-					and isinstance( value.value, ast.Constant )
-					and not isinstance( value.value.value, bool ) # bool excluded: metalpy has no bool.__str__() this fold could match at runtime (Python's str(True) == 'True' has no metalpy equivalent)
-					and isinstance( value.value.value, ( str, int ))
-				):
-					# str(v) here matches metalpy's own int.__str__()/
-					# __repr__() exactly (plain decimal digits + optional
-					# leading '-', nothing else - see int_test.py's own
-					# round-trip assertions), so this is a genuine constant
-					# fold, not an approximation
-					parts.append( str( value.value.value ))
-					continue
+				if foldable:
+					folded = self._try_fold_formatted_value( value )
+					if folded is not None:
+						parts.append( folded )
+						continue
 			foldable = False
 		if not foldable:
 			return node # falls through to the runtime str.concat path (lowering.py's _expr_JoinedStr) unchanged, minus whatever sub-expressions the loop above already folded in place
 		return ast.copy_location( ast.Constant( value = ''.join( parts )), node )
+
+	def _try_fold_formatted_value( self, value: ast.FormattedValue ) -> str|None:
+		''' the folded text for one FormattedValue (its own `.value` already
+		folded by the caller, in place), or None if it can't be folded at
+		compile time - the whole enclosing JoinedStr then falls through to
+		lowering.py's own runtime path instead, which is always correct,
+		just not maximally cheap for this one element. '''
+		if value.conversion == 97: # '!a' - no compile-time oracle written for this (would need to exactly replicate __str.py's own ascii-escaping, kept in sync by hand rather than the shared validate_*_spec functions below reuse) - stays unfoldable
+			return None
+		if not isinstance( value.value, ast.Constant ):
+			return None
+		v = value.value.value
+		if isinstance( v, bool ) or not isinstance( v, ( str, int )):
+			return None # bool excluded: metalpy has no bool.__str__() this fold could match at runtime (Python's str(True) == 'True' has no metalpy equivalent)
+
+		spec_text = None
+		if value.format_spec is not None:
+			if not all( isinstance( part, ast.Constant ) for part in value.format_spec.values ):
+				return None # dynamic format spec - not foldable, matches lowering.py's own restriction
+			spec_text = ''.join( part.value for part in value.format_spec.values )
+
+		if value.conversion in ( 114, 115 ): # '!r' or '!s' - a format spec, if present, applies to the RESULTING str (not the original value) - matches lowering.py's own _lower_fstring_part ordering
+			text = repr( v ) if value.conversion == 114 else str( v ) # str(v)/repr(v) here match metalpy's own int.__str__()/__repr__() exactly (plain decimal digits + optional leading '-', nothing else - see int_test.py's own round-trip assertions) - a genuine constant fold, not an approximation
+			if spec_text is None:
+				return text
+			try:
+				parsed = fstring_format_spec.parse_format_spec( spec_text )
+				fstring_format_spec.validate_str_spec( parsed )
+				return format( text, spec_text )
+			except ( fstring_format_spec.FormatSpecError, ValueError ):
+				return None
+
+		# conversion == -1 - no explicit conversion
+		if spec_text is None:
+			return str( v ) # matches int.__str__()/plain str exactly, same as the conversion 114/115 branch's own comment
+		try:
+			parsed = fstring_format_spec.parse_format_spec( spec_text )
+			if isinstance( v, str ):
+				fstring_format_spec.validate_str_spec( parsed )
+			else:
+				fstring_format_spec.validate_int_spec( parsed )
+			return format( v, spec_text ) # already validated against the SAME rules lowering.py's own runtime dispatch uses (fstring_format_spec.validate_*_spec) - Python's own format() here matches metalpy's runtime output byte-for-byte for everything those rules accept (verified directly, not just assumed)
+		except ( fstring_format_spec.FormatSpecError, ValueError ):
+			return None
 
 	def visit_Compare(self, node: ast.Compare) -> ast.expr:
 		self.generic_visit(node)

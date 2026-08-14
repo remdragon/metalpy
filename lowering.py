@@ -10,6 +10,7 @@ import cfg
 import ir
 from discovery import Discovery, is_stub_body
 from errors import CompileError
+from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
@@ -38,6 +39,14 @@ _ALTERNATIVES_BY_ERROR: dict[str,str] = {
 	# is the one remaining alternative to changing the return type, not a
 	# default
 	'ZeroDivisionError': 'wrap this in `with compiler.panic_arithmetic(...):` instead',
+	# float inf/nan faults - the primary path is the same as OverflowError's
+	# (the enclosing function returns Result[_,FloatingPointError] and the
+	# Result propagates via OrReturn/OrJump); wrap_arithmetic/saturate_arithmetic
+	# make float arithmetic raw IEEE (inf/nan produced silently, never an error)
+	'FloatingPointError': (
+		'wrap this in `with compiler.wrap_arithmetic:`, `with compiler.saturate_arithmetic:`, '
+		'or `with compiler.panic_arithmetic(...):` instead'
+	),
 }
 
 # ast.BinOp operator -> the dunder method name to dispatch to for a
@@ -69,6 +78,24 @@ _COMP_DUNDER: dict[type,str] = {
 # no builtin type defines __pos__/__invert__ today.
 _UNARYOP_DUNDER: dict[type,str] = {
 	ast.USub: '__neg__',
+}
+
+# the two floating-point scalar stems. A float operand/target routes arithmetic,
+# unary negate, and casts through the ArithmeticMode's GetFloat* methods (plain
+# IEEE / inf-nan-checked, per mode) instead of the integer GetBinOp/GetUnaryOp/
+# GetCast - see _lower_binop_values / _expr_UnaryOp / _lower_scalar_cast.
+# `float`/`double` resolve to the same f32/f64 Scalar objects, so checking .stem
+# covers all four spellings.
+def _is_float_scalar( t: Type|None ) -> bool:
+	return isinstance( t, Scalar ) and t.stem in ( 'f32', 'f64' )
+
+# ast binary operators that have no floating-point meaning - bitwise/shift and
+# floor-div/mod (Python's float // and % exist but aren't in this first pass).
+# Rejected with a clear message before float arithmetic routing.
+_FLOAT_UNSUPPORTED_BINOPS: dict[type,str] = {
+	ast.BitAnd: '&', ast.BitOr: '|', ast.BitXor: '^',
+	ast.LShift: '<<', ast.RShift: '>>',
+	ast.FloorDiv: '//', ast.Mod: '%',
 }
 
 
@@ -254,16 +281,30 @@ class Lowering:
 		# supported expression forms that alias existing state -
 		# BinOp/BoolOp/Compare/Constant/UnaryOp never produce RC values at
 		# all, and Call is always fresh from the caller's perspective.
-		# ast.Subscript is deliberately NOT included here even though it
-		# looks like a read: _expr_Subscript's dominant path (a real
-		# __getitem__) is a Call underneath (fresh), and its other path
-		# (raw ir.GetItem, genuinely aliasing a container element) isn't
-		# reachable by any real code yet - no indexable container exists
-		# yet (list[T]/dict[K,V] are still first-draft/WIP per TODO.txt) -
-		# revisit this once one does.
+		# ast.Subscript is NOT aliasing in general: _expr_Subscript's
+		# dominant path (a real __getitem__) is a Call underneath (fresh).
+		# Its other path (tuple[...]'s own constant-index element access,
+		# PLAN_TUPLE.md - a raw ir.GetAttr on synthesized fields _0/_1/...,
+		# since a heterogeneous tuple has no real __getitem__ to call) IS
+		# genuinely aliasing though, the same shape ast.Attribute already
+		# is below - this WAS "not reachable by any real code yet" before
+		# tuples existed, but tuple-element reads reach it now.
+		# _expr_Subscript tags the node itself (node.is_tuple_element_read)
+		# when it takes that path, rather than have this function re-
+		# inspect/re-resolve node.value's own type to tell the two
+		# Subscript shapes apart (the same "risk re-resolving and double-
+		# evaluating the receiver" ast.Attribute's own ClosureType check
+		# below avoids by taking the callee's already-lowered operand
+		# instead). Missing this (confirmed by a real, repeated-real-
+		# compile-and-run-verified use-after-free, not just reasoning):
+		# reassigning an existing local to another tuple element read
+		# (`x = some_tuple[0]`, x already bound) skipped the Incref an
+		# aliasing read needs, so the tuple's own eventual teardown
+		# (cascading decref of ITS OWN _0/_1 fields) double-released the
+		# same object x still pointed to.
 		#
 		# ast.Attribute is genuinely ambiguous now, the same way Subscript
-		# already is above: `obj.field` reads an existing field (aliasing),
+		# already was above: `obj.field` reads an existing field (aliasing),
 		# but `worker.run` (a bound-method reference) CONSTRUCTS a fresh
 		# closure (an Allocate underneath, via _lower_bound_method_closure)
 		# - same "fresh owned handoff" shape as a Call, not a read.
@@ -278,6 +319,8 @@ class Lowering:
 		# calling both silently underreferenced the shared closure)
 		if isinstance( node, ast.Attribute ) and isinstance( operand_type, ClosureType ):
 			return False
+		if isinstance( node, ast.Subscript ):
+			return getattr( node, 'is_tuple_element_read', False )
 		return isinstance( node, ( ast.Name, ast.Attribute ))
 
 	def _is_compiler_attr( self, node: ast.expr ) -> str|None:
@@ -945,6 +988,7 @@ class Lowering:
 	_LITERAL_COMPATIBLE_STEMS: dict[type,tuple[str,...]] = {
 		bool: ( 'bool', ),
 		int: ( 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'i128', 'u128', 'isize', 'usize' ),
+		float: ( 'f32', 'f64' ),
 		str: ( 'str', ),
 		bytes: ( 'bytes', ),
 	}
@@ -2539,7 +2583,17 @@ class FunctionLowering:
 		if isinstance( source, ast.expr ):
 			return self._lower_expr( source, target_type )
 		operand = source
-		opcode, extra = self._arithmetic_mode[-1].GetCast()
+		# a cast that touches a float on either side (int<->float, float<->float)
+		# takes the GetFloatCast path: floats have no integer-overflow concept,
+		# so checked/panic mode checks the result/source for inf/nan/range and
+		# wrap/saturate does a plain-or-clamping conversion - never the unsigned-
+		# roundtrip integer cast machinery. A pure int<->int cast is unchanged
+		target_is_float = _is_float_scalar( target_type )
+		source_is_float = _is_float_scalar( operand.type )
+		if target_is_float or source_is_float:
+			opcode, extra = self._arithmetic_mode[-1].GetFloatCast( target_is_float = target_is_float, source_is_float = source_is_float )
+		else:
+			opcode, extra = self._arithmetic_mode[-1].GetCast()
 		return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
 
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
@@ -3572,6 +3626,14 @@ class FunctionLowering:
 		if expected_type is None or isinstance( expected_type, TaggedUnion ):
 			if isinstance( node.value, bool ):
 				expected_type = self.lowering.discovery.get_intrinsics()['bool']
+			elif isinstance( node.value, float ):
+				# float literals default to f64 when no contextual type is
+				# available (bare `x = 3.14`) - matches Python, whose float is
+				# 64-bit. Checked before int is unnecessary (float/int are
+				# disjoint, unlike bool/int) but placed here for clarity. A
+				# hinted literal (`y: f32 = 1.5`) never reaches here with
+				# expected_type None, so this is purely the no-context default
+				expected_type = self.lowering.discovery.get_intrinsics()['f64']
 			elif isinstance( node.value, int ):
 				# integer literals default to i32 when no contextual type is
 				# available (bare `x = 1`, generic-call arg inference, etc.)
@@ -3593,6 +3655,38 @@ class FunctionLowering:
 				)
 		return ir.Const( type = expected_type, value = node.value )
 
+	def _lower_method_call( self, receiver: ir.Operand, method_name: str, args: list[ir.Operand], result_type: Type, node: ast.AST ) -> ir.Operand:
+		# shared _find_method + resolve/schedule + emit Call boilerplate -
+		# every f-string dunder-dispatch/format-spec call site below uses
+		# this same shape (receiver already lowered, method looked up by
+		# plain name, no generics involved - str/int are never generic)
+		method = self.lowering._find_method( receiver.type, method_name )
+		if method is None:
+			type_name = receiver.type.qualname if receiver.type is not None else '?'
+			self.lowering.discovery.fail( f'f-string requires {type_name}.{method_name}() to be available: {ast.unparse(node)}', node )
+		self.lowering._ensure_resolved( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		dest = self._new_temp( result_type )
+		self._emit( ir.Call( dest = dest, target = method, receiver = receiver, args = args, kwargs = {} ))
+		return dest
+
+	def _const_usize( self, value: int ) -> ir.Const:
+		return ir.Const( type = self.lowering.discovery.get_intrinsics()['usize'], value = value )
+
+	def _const_i32( self, value: int ) -> ir.Const:
+		return ir.Const( type = self.lowering.discovery.get_intrinsics()['i32'], value = value )
+
+	def _const_bool( self, value: bool ) -> ir.Const:
+		return ir.Const( type = self.lowering.discovery.get_intrinsics()['bool'], value = value )
+
+	def _is_literal_format_spec( self, format_spec: ast.JoinedStr ) -> bool:
+		return all( isinstance( v, ast.Constant ) for v in format_spec.values )
+
+	def _literal_format_spec_text( self, format_spec: ast.JoinedStr ) -> str:
+		return ''.join( v.value for v in format_spec.values ) # each v is ast.Constant(str) - _is_literal_format_spec already confirmed this
+
 	def _lower_fstring_part( self, node: 'ast.Constant|ast.FormattedValue', str_type: Type ) -> ir.Operand:
 		# one element of an f-string's ast.JoinedStr.values - either a
 		# literal text segment (ast.Constant, already merged by CPython's
@@ -3604,37 +3698,133 @@ class FunctionLowering:
 		if isinstance( node, ast.Constant ):
 			return self._lower_expr( node, str_type )
 		# ast.FormattedValue
-		if node.conversion == 97: # '!a' (ascii) - no ascii-escape primitive exists anywhere in this codebase
-			self.lowering.discovery.fail( f'f-string !a (ascii) conversion is not supported: {ast.unparse(node)}', node )
+		parsed_spec = None
 		if node.format_spec is not None:
-			self.lowering.discovery.fail(
-				f'f-string format specs ({{expr:spec}}) are not supported yet - requires str.format() (see TODO.txt): {ast.unparse(node)}',
-				node,
-			)
+			if not self._is_literal_format_spec( node.format_spec ):
+				self.lowering.discovery.fail(
+					f'f-string format specs must be a literal string for now - dynamic format specs are not supported yet: {ast.unparse(node)}',
+					node,
+				)
+			try:
+				parsed_spec = parse_format_spec( self._literal_format_spec_text( node.format_spec ))
+			except FormatSpecError as e:
+				self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
+
 		operand = self._lower_expr( node.value, None )
+
+		if node.conversion == -1 and parsed_spec is not None:
+			# no explicit !conversion - the format spec dispatches against
+			# the value's OWN type directly (int's own radix/width/sign
+			# handling, e.g.), matching Python's own format(x, spec) ==
+			# type(x).__format__(x, spec) - as opposed to format(str(x),
+			# spec) or format(repr(x), spec), which is what an EXPLICIT
+			# !s/!r/!a conversion means instead (handled below)
+			return self._lower_dispatch_format_spec( operand, parsed_spec, str_type, node )
+
+		# conversion 114 == '!r' or 97 == '!a' (ascii wants a repr-shaped
+		# text, ascii-escaped below via _lower_ascii_escape - see its own
+		# comment on why this does NOT add surrounding quotes, unlike
+		# Python's real ascii(): str has no __repr__() of its own here for
+		# !a to match the quoting behavior of either, so !a just escapes
+		# whatever !r's own resolution already produces) both want
+		# __repr__; -1 (none) and 115 ('!s') want __str__ - matches
+		# print()'s own existing "no implicit stringification" convention:
+		# a scalar (i32, bool, ...) has no __str__ of its own, only the
+		# boxed classes do (int.__str__) - deliberately not auto-boxed
+		# here, same reasoning PLAN_FSTRINGS.md's own scope section gives
 		if operand.type is str_type:
-			return operand
-		# conversion 114 == '!r'; -1 (none) and 115 ('!s') both want __str__ -
-		# matches print()'s own existing "no implicit stringification"
-		# convention: a scalar (i32, bool, ...) has no __str__ of its own,
-		# only the boxed classes do (int.__str__) - deliberately not
-		# auto-boxed here, same reasoning PLAN_FSTRINGS.md's own scope
-		# section gives
-		method_name = '__repr__' if node.conversion == 114 else '__str__'
-		method = self.lowering._find_method( operand.type, method_name )
-		if method is None:
-			type_name = operand.type.qualname if operand.type is not None else '?'
+			value_as_str = operand
+		else:
+			method_name = '__repr__' if node.conversion in ( 114, 97 ) else '__str__'
+			value_as_str = self._lower_method_call( operand, method_name, [], str_type, node )
+		if node.conversion == 97:
+			value_as_str = self._lower_ascii_escape( value_as_str, str_type, node )
+
+		if parsed_spec is not None:
+			# an explicit !s/!r/!a conversion (or the operand's own type
+			# needing __str__) already reduced the value to plain str - the
+			# spec now formats THAT text (fill/align/width/precision-as-
+			# truncation only, str's own branch below) rather than
+			# dispatching against the original value's own type again
+			return self._lower_dispatch_format_spec( value_as_str, parsed_spec, str_type, node )
+		return value_as_str
+
+	def _lower_ascii_escape( self, operand: ir.Operand, str_type: Type, node: ast.AST ) -> ir.Operand:
+		# f-string !a conversion's second half - operand is already str-
+		# typed (whatever the !r-equivalent resolution above produced);
+		# this just calls str._ascii_escape() (lib/builtins/__init__.py)
+		# on it.
+		return self._lower_method_call( operand, '_ascii_escape', [], str_type, node )
+
+	def _lower_dispatch_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
+		if operand.type is str_type:
+			return self._lower_str_format_spec( operand, spec, str_type, node )
+		int_type = self.lowering.discovery.find_name_or_none( 'int' )
+		if int_type is not None and operand.type is int_type:
+			return self._lower_int_format_spec( operand, spec, str_type, node )
+		type_name = operand.type.qualname if operand.type is not None else '?'
+		if spec.type in ( 'f', 'F', 'e', 'E', 'g', 'G', '%' ):
 			self.lowering.discovery.fail(
-				f'f-string: {type_name} has no {method_name}() - cannot format {ast.unparse(node.value)} in an f-string',
+				f"f-string format spec: {spec.type!r} needs a real float type with formatting support, which doesn't exist yet ({type_name}): {ast.unparse(node)}",
 				node,
 			)
-		self.lowering._ensure_resolved( method )
-		self.lowering.schedule( method.return_type )
-		for p in ( method.parameters or [] ):
-			self.lowering.schedule( p.type )
-		dest = self._new_temp( str_type )
-		self._emit( ir.Call( dest = dest, target = method, receiver = operand, args = [], kwargs = {} ))
-		return dest
+		self.lowering.discovery.fail(
+			f'f-string format spec: {type_name} does not support format specs yet (only str and int do): {ast.unparse(node)}',
+			node,
+		)
+
+	def _lower_pad_by_align( self, operand: ir.Operand, align: str, fill: str, width: int, str_type: Type, node: ast.AST ) -> ir.Operand:
+		method_name = { '<': 'ljust', '>': 'rjust', '^': 'center' }[align]
+		args = [ self._const_usize( width ), ir.Const( type = str_type, value = fill ) ]
+		return self._lower_method_call( operand, method_name, args, str_type, node )
+
+	def _lower_str_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
+		try:
+			validate_str_spec( spec )
+		except FormatSpecError as e:
+			self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
+		value = operand
+		if spec.precision is not None:
+			value = self._lower_method_call( value, '_truncate_codepoints', [ self._const_usize( spec.precision ) ], str_type, node )
+		if spec.width is not None:
+			value = self._lower_pad_by_align( value, spec.align or '<', spec.fill, spec.width, str_type, node ) # str's own default align is left, unlike numeric types' right
+		return value
+
+	_RADIX_BY_TYPE_CHAR = { 'b': 2, 'o': 8, 'x': 16, 'X': 16 }
+	_RADIX_PREFIX_BY_TYPE_CHAR = { 'b': '0b', 'o': '0o', 'x': '0x', 'X': '0X' }
+
+	def _lower_int_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
+		try:
+			validate_int_spec( spec )
+		except FormatSpecError as e:
+			self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
+		type_char = spec.type
+
+		if type_char in ( 'b', 'o', 'x', 'X' ):
+			base = self._RADIX_BY_TYPE_CHAR[type_char]
+			uppercase = type_char == 'X'
+			digits = self._lower_method_call( operand, '_to_radix_digits', [ self._const_i32( base ), self._const_bool( uppercase ) ], str_type, node )
+			prefix_text = self._RADIX_PREFIX_BY_TYPE_CHAR[type_char] if spec.alt else ''
+		else:
+			sep = spec.grouping or '' # '' still goes through _decimal_digits_with_grouping correctly - splitting into groups of 3 and joining with nothing reconstructs the plain digit text unchanged
+			digits = self._lower_method_call( operand, '_decimal_digits_with_grouping', [ ir.Const( type = str_type, value = sep ) ], str_type, node )
+			prefix_text = ''
+
+		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
+		if prefix_text:
+			sign_and_prefix = self._lower_str_add( sign_char, ir.Const( type = str_type, value = prefix_text ), str_type, node )
+		else:
+			sign_and_prefix = sign_char
+
+		if spec.width is None:
+			return self._lower_str_add( sign_and_prefix, digits, str_type, node )
+		if spec.align == '=': # the '0' shorthand - zero-padding goes BETWEEN sign/prefix and digits
+			return self._lower_method_call( digits, '_pad_after_prefix', [ sign_and_prefix, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ) ], str_type, node )
+		body = self._lower_str_add( sign_and_prefix, digits, str_type, node )
+		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
+
+	def _lower_str_add( self, left: ir.Operand, right: ir.Operand, str_type: Type, node: ast.AST ) -> ir.Operand:
+		return self._lower_method_call( left, '__add__', [ right ], str_type, node )
 
 	def _lower_unwrap_result(
 		self, result: ir.Operand, errmsg: str, payload_type: Type, error_type: Type, str_type: Type, node: ast.AST, *, want_result: bool = True,
@@ -4022,6 +4212,27 @@ class FunctionLowering:
 				attr_var = self.lowering._attr_lookup( resolved_obj_type, f'_{index}', node )
 				dest = self._new_temp( attr_var.type )
 				self._emit( ir.GetAttr( dest = dest, obj = obj, attr = f'_{index}' ))
+				# genuinely aliasing (a GetAttr borrow of the tuple's own
+				# field, NOT a fresh Call-owned value) - _is_aliasing_expr's
+				# own comment already anticipated exactly this path
+				# ("raw ir.GetItem/GetAttr, genuinely aliasing a container
+				# element... revisit this once [an indexable container]
+				# does [exist]") but was never revisited once tuples landed.
+				# Tag the node here (same posture as node.resolved_callee/
+				# node.is_narrowing_bind elsewhere) rather than have
+				# _is_aliasing_expr re-inspect node.value's own type itself,
+				# which is exactly the "risk re-resolving/double-evaluating
+				# the receiver" its own comment already rules out - real
+				# repro: `q: int = some_tuple[0]` (T RC) then reassigning an
+				# existing local to another tuple-index-read, in a loop,
+				# with the tuple itself released each iteration, silently
+				# skipped this Incref, so the tuple's own destructor's
+				# cascading decref of its OWN fields double-released the
+				# SAME object the reassigned local still pointed to - a
+				# real, confirmed (via generated-C inspection and repeated
+				# real-compile-and-run trials) use-after-free, not a
+				# hypothetical.
+				node.is_tuple_element_read = True
 				return dest
 			# no real __getitem__ declared (raw pointers, or any other type
 			# that doesn't define subscript access as a method) - falls
@@ -4125,6 +4336,31 @@ class FunctionLowering:
 					dest = self._new_temp( expected_type or method.return_type )
 					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
 					return dest
+
+		# a float on EITHER side takes the GetFloatBinOp path (plain IEEE, or
+		# inf/nan-checked, depending on the active mode) rather than the integer
+		# overflow machinery. Strict same-type: both sides must already be the
+		# SAME float type (a bare literal on either side has already been hinted
+		# to the other's type by _lower_binary_operands, so `f + 1.5`/`f + 1`
+		# still work; only a float mixed with an int VARIABLE, or two different
+		# float widths, reaches this error). NOTE an int VARIABLE combined with a
+		# bare float LITERAL (`i + 1.5`) is not caught here - the literal is
+		# hinted to the int's type and truncated, an accepted first-pass edge)
+		if _is_float_scalar( left.type ) or _is_float_scalar( right.type ):
+			if left.type is not right.type:
+				float_type = left.type if _is_float_scalar( left.type ) else right.type
+				self.lowering.discovery.fail(
+					f'floating-point operation requires both operands to be the same type - '
+					f'got {left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}; cast one explicitly '
+					f'(e.g. {float_type.stem}(x)): {ast.unparse(node)}',
+					node,
+				)
+			bad = _FLOAT_UNSUPPORTED_BINOPS.get( type( node.op ))
+			if bad is not None:
+				self.lowering.discovery.fail( f'operator {bad!r} is not supported on floating-point values: {ast.unparse(node)}', node )
+			result_type = expected_type if _is_float_scalar( expected_type ) else left.type
+			opcode, extra = self._arithmetic_mode[-1].GetFloatBinOp( node )
+			return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
 
 		result_type = expected_type or left.type
 
@@ -4232,9 +4468,15 @@ class FunctionLowering:
 					self._emit( ir.Call( dest = dest, target = method, receiver = operand, args = [], kwargs = {} ))
 					return dest
 
-		result_type = expected_type or operand.type
+		result_type = expected_type if _is_float_scalar( expected_type ) else operand.type
 
-		opcode, extra = self._arithmetic_mode[-1].GetUnaryOp( node )
+		# a float operand takes the GetFloatUnaryOp path: unary `-` is plain
+		# negation (never faults), `~` falls through to the unsupported-operator
+		# error - see ArithmeticMode.GetFloatUnaryOp
+		if _is_float_scalar( operand.type ):
+			opcode, extra = self._arithmetic_mode[-1].GetFloatUnaryOp( node )
+		else:
+			opcode, extra = self._arithmetic_mode[-1].GetUnaryOp( node )
 		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'operand': operand }, 'unary' )
 
 	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:

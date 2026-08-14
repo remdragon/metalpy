@@ -8,7 +8,7 @@ from .__fastlist import FastList
 from .__int import int, IntError
 from .__list import list, UnsafeList
 from .__RawDict import RawDict
-from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp
+from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
 # SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
@@ -16,6 +16,12 @@ from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, c
 # those opcodes); slice.__getitem__ raises IndexError the same way
 class OverflowError: pass
 class ZeroDivisionError: pass
+# checked/panic-mode floating-point arithmetic (FAddCheck/FSubCheck/FMulCheck)
+# and float-involving casts (FloatCastCheck) produce Result[T,FloatingPointError]
+# when a result is inf/nan or a float->int source is out of range - the float
+# analogue of OverflowError (float div-by-zero stays ZeroDivisionError, matching
+# integer /). Same empty-marker shape as the others
+class FloatingPointError: pass
 class IndexError: pass
 class KeyError: pass
 
@@ -388,6 +394,67 @@ class str:
 		new_buf[piece_len] = 0
 		return str._from_owned_cstr( new_buf, buf_size ).unwrap( 'invalid UTF-8 in _byte_slice' )
 
+	@private
+	def _truncate_codepoints( self, max_count: usize ) -> str:
+		''' keeps only the first max_count codepoints of self, discarding
+		the rest - used by f-string format-spec precision on str values
+		(f"{s:.5}"), matching Python's own precision-on-str semantics
+		(codepoint count, the same unit __len__ itself uses, not byte
+		length). Already-short-enough (including max_count >= self's own
+		__len__) is a no-op. Same "walk codepoints via the leading-byte
+		test" loop shape __len__ already uses, just capturing the BYTE
+		OFFSET where the (max_count+1)-th codepoint starts instead of only
+		counting - _byte_slice(0, that offset) then keeps exactly
+		max_count codepoints. '''
+		self_count: usize = self.__len__()
+		if self_count <= max_count:
+			return str( self )
+		count: usize = 0
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow' ):
+			byte_len: usize = self.__byte_size - 1
+			while i < byte_len:
+				c: u8 = self.__data[i]
+				if ( c & 0xC0 ) != 0x80:
+					if count == max_count:
+						return self._byte_slice( 0, i )
+					count += 1
+				i += 1
+		return self._byte_slice( 0, i )
+
+	@private
+	def _ascii_escape( self ) -> str:
+		''' backslash-escapes every non-ASCII codepoint and every non-
+		printable ASCII byte in self, matching Python's own ascii()/
+		repr() escaping rules - the f-string !a conversion's own second
+		half (lowering.py calls this on whatever text the !r-equivalent
+		resolution already produced - see _lower_fstring_part's own
+		comment on why this does NOT add surrounding quotes or escape a
+		literal quote character, unlike Python's real ascii()). Two
+		passes over the codepoints, same size-then-fill shape str.concat/
+		case_map/etc. already use - __str.py's own ascii_escape_width/
+		ascii_escape_one do the actual per-codepoint work. '''
+		self_len: usize = self.byte_len()
+		new_size: usize = 1 # zero terminator
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				new_size += ascii_escape_width( cp )
+				i += consumed
+
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		out: usize = 0
+		i = 0
+		with compiler.wrap_arithmetic:
+			while i < self_len:
+				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				out += ascii_escape_one( new_buf, out, cp )
+				i += consumed
+		new_buf[out] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in _ascii_escape' )
+
 	def split( self, sep: str ) -> list[str]:
 		''' splits self on every occurrence of sep - Python str.split(sep)
 		semantics (a leading/trailing/consecutive separator produces empty
@@ -702,6 +769,69 @@ class str:
 			offset += self_len
 		new_buf[offset] = 0
 		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in rjust' )
+
+	def center( self, width: usize, fillchar: str = ' ' ) -> str:
+		''' pads self on both sides with fillchar until self's own codepoint
+		count reaches width - matches Python's str.center() (an odd total
+		padding amount puts the extra fill character on the RIGHT, same as
+		Python - e.g. 'ab'.center(5) == ' ab  '). Already-long-enough is a
+		no-op, same convention ljust/rjust above already use. '''
+		if len( fillchar ) != 1:
+			sys.panic( 'str.center(...): fillchar must be exactly one character' )
+		self_count: usize = self.__len__()
+		if self_count >= width:
+			return str( self )
+		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
+			pad_count: usize = width - self_count
+		with compiler.panic_arithmetic( 'unreachable: dividing by the literal 2' ):
+			left_count: usize = pad_count // 2
+		with compiler.panic_arithmetic( 'bounded by pad_count, cannot overflow' ):
+			right_count: usize = pad_count - left_count
+		self_len: usize = self.byte_len()
+		fill_len: usize = fillchar.byte_len()
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			pad_bytes: usize = pad_count * fill_len
+			new_size: usize = self_len + pad_bytes + 1
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		offset: usize = 0
+		i: usize = 0
+		while i < left_count:
+			with compiler.wrap_arithmetic:
+				sys.memcpy( new_buf + offset, fillchar.__data, fill_len )
+				offset += fill_len
+				i += 1
+		with compiler.wrap_arithmetic:
+			sys.memcpy( new_buf + offset, self.__data, self_len )
+			offset += self_len
+		i = 0
+		while i < right_count:
+			with compiler.wrap_arithmetic:
+				sys.memcpy( new_buf + offset, fillchar.__data, fill_len )
+				offset += fill_len
+				i += 1
+		new_buf[offset] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in center' )
+
+	@private
+	def _pad_after_prefix( self, prefix: str, width: usize, fill: str ) -> str:
+		''' self (typically pre-sign-stripped magnitude digits) rjust-
+		padded to (width - prefix's own codepoint count), with prefix
+		then prepended - the "zero-padding goes BETWEEN a sign+radix-
+		prefix and the digits" shape f-string format specs need for e.g.
+		f"{-42:#010x}" (prefix="-0x", result "-0x0000002a") - zfill()
+		can't express this on its own, since it only ever recognizes a
+		bare leading '+'/'-' sign byte, not a multi-character prefix
+		standing in front of where the padding needs to go. Deliberately
+		saturating (not panicking) if prefix alone already reaches or
+		exceeds width - same "the sign/prefix is never truncated, the
+		result just ends up longer than the nominal width" leniency
+		Python's own str.format() has for the same edge case, not a
+		compile-time-provable-impossible situation like most of this
+		codebase's own panic_arithmetic call sites. '''
+		prefix_count: usize = prefix.__len__()
+		with compiler.saturate_arithmetic:
+			inner_width: usize = width - prefix_count
+		return prefix + self.rjust( inner_width, fill )
 
 	def zfill( self, width: usize ) -> str:
 		''' like rjust(width, '0'), except a leading '+'/'-' byte stays

@@ -120,8 +120,44 @@ class JoinedStrFoldingTests( unittest.TestCase ):
 	def test_ascii_conversion_left_unfolded( self ) -> None:
 		self.assertEqual( _fold( 'x = f"{y!a}"', {} ), "x = f'{y!a}'" )
 
-	def test_format_spec_left_unfolded_even_when_value_is_constant( self ) -> None:
+	def test_float_type_char_on_int_left_unfolded_even_when_value_is_constant( self ) -> None:
+		# '.2f' is a float type char - not valid for an int value (no boxed
+		# float class exists yet to fold this the way it would need to,
+		# see fstring_format_spec.validate_int_spec) - the nested (1+1)
+		# still folds to 2 in place, same "fold what you can" cascade
+		# every other case here relies on, but the outer JoinedStr itself
+		# correctly stays unfolded rather than silently producing wrong
+		# text
 		self.assertEqual( _fold( 'x = f"{(1+1):.2f}"', {} ), "x = f'{2:.2f}'" )
+
+	def test_literal_int_format_spec_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{5:d}"', {} ), "x = '5'" )
+		self.assertEqual( _fold( 'x = f"{-5:05d}"', {} ), "x = '-0005'" )
+		self.assertEqual( _fold( 'x = f"{5:+d}"', {} ), "x = '+5'" )
+		self.assertEqual( _fold( 'x = f"{255:#x}"', {} ), "x = '0xff'" )
+		self.assertEqual( _fold( 'x = f"{255:#X}"', {} ), "x = '0XFF'" )
+		self.assertEqual( _fold( 'x = f"{8:b}"', {} ), "x = '1000'" )
+		self.assertEqual( _fold( 'x = f"{1234567:,}"', {} ), "x = '1,234,567'" )
+		self.assertEqual( _fold( 'x = f"{-255:#010x}"', {} ), "x = '-0x00000ff'" )
+
+	def test_literal_str_format_spec_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{\'hi\':>10}"', {} ), "x = '        hi'" )
+		self.assertEqual( _fold( 'x = f"{\'hi\':<5}"', {} ), "x = 'hi   '" )
+		self.assertEqual( _fold( 'x = f"{\'hi\':^6}"', {} ), "x = '  hi  '" )
+		self.assertEqual( _fold( 'x = f"{\'hello\':.3}"', {} ), "x = 'hel'" )
+
+	def test_explicit_conversion_plus_format_spec_folds( self ) -> None:
+		# !r/!s + a spec applies the spec to the CONVERTED text, not the
+		# original value - matches lowering.py's own _lower_fstring_part
+		# ordering (and Python's own real f-string semantics)
+		self.assertEqual( _fold( 'x = f"{5!r:>5}"', {} ), "x = '    5'" )
+		self.assertEqual( _fold( 'x = f"{5!s:>5}"', {} ), "x = '    5'" )
+
+	def test_unsupported_type_char_left_unfolded( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{5:c}"', {} ), "x = f'{5:c}'" )
+
+	def test_dynamic_format_spec_left_unfolded( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{5:{y}}"', {} ), "x = f'{5:{y}}'" )
 
 
 class CompilerTargetSubstitutionTests( unittest.TestCase ):

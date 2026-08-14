@@ -70,6 +70,11 @@ _ASCII_MINUS: u8 = 0x2D # '-'
 _ASCII_ZERO: u8 = 0x30 # '0'
 _ASCII_NINE: u8 = 0x39 # '9'
 
+# f-string format-spec hex type chars (x/X) - _to_radix_digits' own digit
+# alphabet, lower/upper picked by the caller
+_HEX_DIGITS_LOWER: str = '0123456789abcdef'
+_HEX_DIGITS_UPPER: str = '0123456789ABCDEF'
+
 # i32.min/i32.max are not real expressions in this language (scalars have no
 # such members - confirmed by direct inspection); to_i32()'s own bounds
 # check spells the literal range out instead, widened to i64 to match
@@ -625,3 +630,115 @@ class int:
 
 	def __repr__( self ) -> str:
 		return self.__str__()
+
+	@private
+	def _sign_prefix( self, mode: str ) -> str:
+		''' the sign CHARACTER (a 0-or-1-codepoint str) an f-string format
+		spec's own sign mode ('+', '-', or ' ') should show before this
+		int's own magnitude digits - '-' if self is negative regardless
+		of mode (a negative number always shows its own sign), else mode
+		itself if mode != '-' (explicit '+'/' ' show for non-negative
+		values too), else '' (the default '-' mode shows nothing for a
+		non-negative value, matching Python's own f"{5:d}" == '5', not
+		'+5'). Real control flow lives here, in metalpy source, rather
+		than as hand-built conditional IR in lowering.py's own f-string
+		dispatch - see _to_radix_digits' own docstring for why a real,
+		confirmed use-after-free already came out of doing the OPPOSITE
+		(complex logic orchestrated from lowering.py itself) elsewhere in
+		this same pass. '''
+		if self.__is_negative:
+			return str( '-' )
+		if mode == '+':
+			return str( '+' )
+		if mode == ' ':
+			return str( ' ' )
+		return str( '' )
+
+	@private
+	def _to_radix_digits( self, base: i32, uppercase: bool ) -> str:
+		''' self's own MAGNITUDE (sign ignored - callers needing a sign
+		character prepend it themselves, same split __str__'s own sign-
+		then-digits construction already keeps informally) as a digit
+		string in `base` - the shared building block for f-string format-
+		spec hex/octal/binary type chars (x/X/o/b), base always 16/8/2 in
+		practice. Built on the existing divmod(), repeatedly dividing the
+		magnitude down by base and collecting remainders least-
+		significant-first, then reversed into most-significant-first
+		order - int's own arbitrary-precision representation is already
+		decimal-digit-based, so there's no faster shortcut available;
+		this reuses the same proven bignum arithmetic __floordiv__/
+		__mod__ already do, not a new from-scratch algorithm.
+
+		This method was the real, motivating repro for a genuine, general
+		use-after-free found while writing it: reassigning an existing
+		local (magnitude = result[0], or binding a new one - remainder:
+		int = result[1]) to a tuple element read never Increfed the
+		aliased reference, so the tuple's own eventual teardown (which
+		cascades a decref onto its OWN _0/_1 fields) double-released the
+		same object the local still pointed to - confirmed via repeated
+		real compile-and-run trials producing different, wrong output
+		from the SAME compiled binary run multiple times (the signature
+		of real undefined behavior, not a logic bug), and via direct
+		inspection of the generated C. Root-caused to lowering.py's
+		_is_aliasing_expr (its own comment already anticipated exactly
+		this gap, written before tuples existed to reach it) and fixed
+		there - see that function's own comment for the full account. '''
+		if self.is_zero():
+			return str( '0' )
+		magnitude: int = self.clone()
+		magnitude.__is_negative = False
+		radix: int = int( base )
+		digit_chars: str = _HEX_DIGITS_UPPER if uppercase else _HEX_DIGITS_LOWER
+		digits: list[str] = list[str]() # least-significant digit first
+		while not magnitude.is_zero():
+			result: tuple[int,int] = magnitude.divmod( radix ).unwrap( '_to_radix_digits: divmod failed (unreachable - radix is never zero)' )
+			remainder: int = result[1]
+			digit_value: i32 = remainder.to_i32().unwrap( '_to_radix_digits: remainder out of i32 range (unreachable - remainder < radix <= 16)' )
+			with compiler.panic_arithmetic( 'bounded by radix <= 16, cannot overflow' ):
+				digit_index: usize = usize( digit_value )
+				digit_index_end: usize = digit_index + 1
+			digits.append( digit_chars._byte_slice( digit_index, digit_index_end )).unwrap( '_to_radix_digits: append failed' )
+			magnitude = result[0]
+		count: usize = digits.__len__()
+		ordered: list[str] = list[str]() # most-significant digit first
+		i: usize = count
+		with compiler.panic_arithmetic( 'bounded by count, cannot underflow' ):
+			while i > 0:
+				i -= 1
+				ordered.append( digits.__getitem__( i ).unwrap( '_to_radix_digits: index in bounds by construction' )).unwrap( '_to_radix_digits: append failed' )
+		return str( '' ).join( ordered )
+
+	@private
+	def _decimal_digits_with_grouping( self, sep: str ) -> str:
+		''' self's own decimal MAGNITUDE text (no sign - same split
+		_to_radix_digits above keeps) with `sep` (a single ASCII
+		character - the f-string format-spec grouping options are always
+		',' or '_') inserted every 3 digits from the right, matching
+		Python's own f"{1234567:,}" == '1,234,567' semantics. Built by
+		walking __str__'s own (unsigned) digit text from the right in
+		groups of 3 via append() (see _to_radix_digits' own comment on
+		why NOT list.insert(0, ...)) into a least-significant-group-first
+		list, then reversed the same manual way, rather than touching the
+		bignum representation itself - grouping is pure text formatting. '''
+		digits: str = self.__str__()
+		if self.__is_negative:
+			digits = digits._byte_slice( 1, digits.byte_len() ) # drop the leading '-' - see _to_radix_digits' own "caller prepends sign" split
+		count: usize = digits.byte_len() # ASCII-only digit text - byte length is codepoint count here
+		if count <= 3:
+			return digits
+		groups: list[str] = list[str]() # least-significant GROUP first
+		end: usize = count
+		while end > 3:
+			with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+				start: usize = end - 3
+			groups.append( digits._byte_slice( start, end )).unwrap( '_decimal_digits_with_grouping: append failed' )
+			end = start
+		groups.append( digits._byte_slice( 0, end )).unwrap( '_decimal_digits_with_grouping: append failed' )
+		group_count: usize = groups.__len__()
+		ordered: list[str] = list[str]() # most-significant GROUP first
+		i: usize = group_count
+		with compiler.panic_arithmetic( 'bounded by group_count, cannot underflow' ):
+			while i > 0:
+				i -= 1
+				ordered.append( groups.__getitem__( i ).unwrap( '_decimal_digits_with_grouping: index in bounds by construction' )).unwrap( '_decimal_digits_with_grouping: append failed' )
+		return sep.join( ordered )
