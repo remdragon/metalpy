@@ -1233,7 +1233,7 @@ def main() -> None:
 		# _emit_instruction's own ir.Return handling only checked whether
 		# THAT operand was Python None (i.e. "no expression"), not whether
 		# the function's own C return type was void, so it emitted
-		# `return t0;` from a function _function_prototype had separately
+		# `return $t0;` from a function _function_prototype had separately
 		# (correctly) declared `void` - "void function should not return a
 		# value" from every C compiler. Fixed by sharing one
 		# _returns_void_in_c() check between the prototype and the return
@@ -1982,7 +1982,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime (see ObjectHeader's own comment) rather
 		# than this call site naming it as a literal argument
-		self.assertIn( 'release_object( &(t0)->$header )', destructor_src )
+		self.assertIn( 'release_object( &($t0)->$header )', destructor_src )
 		self.assertIn( 'sys$free( (void*)(self) )', destructor_src )
 
 	def test_taggedunion_field_cascades_a_tag_gated_decref( self ) -> None:
@@ -2042,7 +2042,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime rather than this call site naming it
-		self.assertIn( 'release_object( &(t1)->$header )', destructor_src )
+		self.assertIn( 'release_object( &($t1)->$header )', destructor_src )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
@@ -2411,7 +2411,7 @@ class EmitGlobalRCClassTests( RCClassTestCase ):
 		src = emitter_c.emit_global( g )
 		self.assertIn( 'struct __main__$Foo* __main__$g_foo = {0};', src )
 		self.assertIn( 'static void __metalpy_init___main__$g_foo( void ) {', src )
-		self.assertIn( '__main__$g_foo = t0;', src )
+		self.assertIn( '__main__$g_foo = $t0;', src )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
@@ -2960,7 +2960,7 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
-		self.assertIn( '(p)[1] = t1;', src ) # real write-back, not a copy-mutate-discard
+		self.assertIn( '(p)[1] = $t1;', src ) # real write-back, not a copy-mutate-discard
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -7119,7 +7119,7 @@ class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 		# no earlier statement exists for the intermediate str temp's own
 		# cleanup to land after harmlessly, so this is the minimal shape
 		# that exposed the bug: before the fix, the generated C had
-		# `release_object(&t0->header)` positioned AFTER `return t1;`
+		# `release_object(&$t0->header)` positioned AFTER `return $t1;`
 		# inside make() (confirmed via direct source inspection), an
 		# unreachable statement that left every string make() ever returned
 		# permanently over-retained by one. Checked here end-to-end by
@@ -7156,7 +7156,7 @@ def main() -> i32:
 		# just that its net effect (the refcount below) happens to work out
 		make_start = src.index( '__main__$make( void ) {' )
 		make_body = src[ make_start : src.index( '\n}', make_start ) ]
-		return_pos = make_body.index( 'return t1;' )
+		return_pos = make_body.index( 'return $t1;' )
 		self.assertNotIn( 'release_object', make_body[ return_pos: ] )
 		self._assert_compiles_and_runs( src, expected_exit = 2 )
 

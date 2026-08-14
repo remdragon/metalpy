@@ -236,6 +236,23 @@ def _c_local_name( stem: str ) -> str:
 	underscore; everything else passes through unchanged. '''
 	return f'_{stem}' if stem in _C_KEYWORDS else stem
 
+def _temp_name( temp_id: int ) -> str:
+	''' the C name for a compiler-synthesized ir.Temp, e.g. for id=5, "$t5" -
+	the single spot this scheme is defined; every declaration/reference site
+	below calls this rather than building the string itself, so they can't
+	drift apart. '$'-prefixed for the SAME reason every other purely-
+	compiler-internal name in this module is ('$header', mangle_qualname's
+	'.'->'$', ...): '$' is not a legal character in a metalpy/Python source
+	identifier, so a temp can NEVER collide with a real user local - unlike
+	the plain "t5" this used to be, which silently collided with a real
+	source local of the exact same name (confirmed by a real repro: `t5:
+	i32 = 1` alongside a compiler temp that also happened to be allocated
+	id 5 produced a bogus "redefinition"/type-mismatch error in the
+	generated C, not a clean "reserved name" diagnostic). Relies on the
+	same GCC/Clang/MSVC '$'-in-identifiers extension this module's output
+	already depends on throughout. '''
+	return f'$t{temp_id}'
+
 def mangle_qualname( qualname: str ) -> str:
 	''' plain string-level mangling for an already-computed qualname (a
 	Function/Variable/ordinary-class qualname, or the already-bracketed
@@ -729,7 +746,7 @@ def _emit_operand( op: ir.Operand ) -> str:
 	if isinstance( op, ir.Const ):
 		return _emit_const( op )
 	if isinstance( op, ir.Temp ):
-		return f't{op.id}'
+		return _temp_name( op.id )
 	if isinstance( op, ir.FunctionRef ):
 		# a bare function reference used as a value - see PLAN_CALLABLE.md.
 		# Same cast-expression shape emit_interface_vtable_instance already
@@ -823,7 +840,7 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 	ok_type = result_spec.args[0]
 	ctype = c_type( ok_type )
 	builtin = _ARITH_BUILTIN[kind]
-	dest = f't{dest_temp_id}'
+	dest = _temp_name( dest_temp_id )
 	l, r = _emit_operand( left ), _emit_operand( right )
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( result_spec )
 	if _is_pointer_type( ok_type ):
@@ -866,7 +883,7 @@ def _emit_float_check_arith( instr ) -> list[str]:
 	symbol = _FLOAT_CHECK_SYMBOL[type(instr)]
 	ok_type = instr.dest.type.args[0]
 	ctype = c_type( ok_type )
-	dest = f't{instr.dest.id}'
+	dest = _temp_name( instr.dest.id )
 	l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 	return [
@@ -893,7 +910,7 @@ def _emit_float_cast_check( instr ) -> list[str]:
 	ok_type = instr.dest.type.args[0]
 	ctype = c_type( ok_type )
 	operand = _emit_operand( instr.operand )
-	dest = f't{instr.dest.id}'
+	dest = _temp_name( instr.dest.id )
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 	if _is_float_type( ok_type ):
 		return [
@@ -980,7 +997,7 @@ def _signed_min_max( stem: str ) -> tuple[str,str]:
 def _emit_int_division( instr ) -> list[str]:
 	result_spec = instr.dest.type
 	ok_type = result_spec.args[0]
-	dest = f't{instr.dest.id}'
+	dest = _temp_name( instr.dest.id )
 	l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
 	is_mod = isinstance( instr, ( ir.Mod, ir.ModWrap, ir.ModSaturate ))
 	symbol = '%' if is_mod else '/'
@@ -1015,7 +1032,7 @@ def _emit_float_div_check( instr ) -> list[str]:
 	result_spec = instr.dest.type
 	ok_type = result_spec.args[0]
 	ctype = c_type( ok_type )
-	dest = f't{instr.dest.id}'
+	dest = _temp_name( instr.dest.id )
 	l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
 	lines = [ f'\tif ( ({r}) == 0 ) {{' ]
 	lines += _emit_set_result_err( dest, result_spec, 'ZeroDivisionError', '\t\t' )
@@ -1066,7 +1083,7 @@ def _emit_shl( instr ) -> list[str]:
 		return [ f'\t{dest} = ({l}) << ({r});' ]
 	if isinstance( instr, ir.ShlCheck ):
 		ctype = c_type( dest_type )
-		dest = f't{instr.dest.id}'
+		dest = _temp_name( instr.dest.id )
 		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 		return [
 			'\t{',
@@ -1126,7 +1143,7 @@ def _emit_neg( instr ) -> list[str]:
 			'\t}',
 		]
 	# check
-	dest = f't{instr.dest.id}'
+	dest = _temp_name( instr.dest.id )
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 	return [
 		'\t{',
@@ -1189,7 +1206,7 @@ def _emit_cast( instr ) -> list[str]:
 			'\t}',
 		]
 	# check
-	dest = f't{instr.dest.id}'
+	dest = _temp_name( instr.dest.id )
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 	return [
 		'\t{',
@@ -1389,13 +1406,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# a generic method monomorphized with T=NoneType still has a
 			# real `return <T-typed-expr>;` in its own body (e.g. Result
 			# [None,E].unwrap()'s `return self.data.v_Ok`), which would
-			# otherwise emit `return t2;` from a function declared void -
+			# otherwise emit `return $t2;` from a function declared void -
 			# see _returns_void_in_c's own comment
 			return [ '\treturn;' ]
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
 	if isinstance( instr, ir.DeclareTemp ):
-		return [ f'\t{_declarator( instr.temp.type, f"t{instr.temp.id}" )};' ]
+		return [ f'\t{_declarator( instr.temp.type, _temp_name( instr.temp.id ) )};' ]
 	if isinstance( instr, ir.DeleteTemp ):
 		return [] # C block scoping already handles temp lifetime - nothing to emit
 	if isinstance( instr, ir.Assign ):
@@ -2256,8 +2273,8 @@ def _global_init_is_all_zero_value_type( instructions: list[ir.Instruction] ) ->
 	# sys.alloc/Call/Incref/Decref appears in a pure value-type construction)
 	# whose EVERY field is a zero/null Const, e.g. `case_folder: CaseFolding
 	# = CaseFolding(upper_table=None, upper_count=0, ...)`. Such an
-	# initializer lowers to `t0 = (struct CaseFolding){0,0,0,0}; global =
-	# t0;` - a struct-copy-of-an-all-zero-literal the C compiler is free to
+	# initializer lowers to `$t0 = (struct CaseFolding){0,0,0,0}; global =
+	# $t0;` - a struct-copy-of-an-all-zero-literal the C compiler is free to
 	# implement via memset/memcpy (confirmed by a REAL LNK2019 "unresolved
 	# external symbol memset" failure under a no-CRT Windows build once this
 	# global's own init function actually got called - see

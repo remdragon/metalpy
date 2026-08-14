@@ -193,7 +193,7 @@ class UnionStorage:
 			# instructions) always needs to reference EVERY RC-bearing
 			# member's full layout, unconditionally, regardless of whether
 			# this program ever actually constructs one (confirmed via a
-			# real repro: emit_c() emits `release_object(&(t5)->$header)`
+			# real repro: emit_c() emits `release_object(&($t5)->$header)`
 			# against a leaf type that was only ever forward-declared,
 			# `struct builtins$str` with no member definitions - clang
 			# fails with "incomplete definition of type"). Explicitly
