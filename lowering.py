@@ -2416,6 +2416,14 @@ class FunctionLowering:
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
 		if size := getattr( target_type, 'sizeof', None ):
 			return ir.Const( type = expected_type or usize_cls, value = size )
+		# Ptr[T]/ConstPtr[T] is always exactly one machine pointer wide, whatever
+		# T is - fold to the Ptr/ConstPtr intrinsic's own sizeof. A Specialization
+		# carries no sizeof of its own, so the plain getattr above misses it;
+		# without this, sys.alloc[Ptr[None]]( 1 ) on the POSIX threading path
+		# (Thread.__init__'s pthread_create out-slot) fails to compile with
+		# "compiler.sizeof(Ptr[None]) is not supported yet".
+		if self.lowering._type_resolver._is_ptr_specialization( target_type ):
+			return ir.Const( type = expected_type or usize_cls, value = target_type.base.sizeof )
 		# a C type declared via compiler.c_type('pthread_mutex_t', ...) -
 		# as opaque to this compiler as a real ClassLike; stays a real
 		# ir.SizeOf, letting the C compiler itself compute it
@@ -2520,8 +2528,26 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'compiler.addrof(...) argument must be a bare local variable, not {ast.unparse(node)}', node )
 		value = self._lower_expr( arg_node, None )
 		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
-		ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ value.type ] )
-		dest = self._new_temp( expected_type or ptr_type )
+		# &value's C type is one pointer level deeper than value's OWN storage.
+		# For a scalar/CStruct a variable stores the value directly, so that is
+		# Ptr[T]. But an RCClass value is itself stored as a pointer (a `Foo`
+		# variable holds a `Foo*`), so &value is `Foo**` - which in this type
+		# system is Ptr[Ptr[Foo]], because Ptr[Foo] already spells `Foo*` (see
+		# emitter_c._value_spelling's "single pointer even when RCClass" rule,
+		# which sys.alloc[Foo] -> Ptr[Foo] relies on and must stay). Getting this
+		# level right is what makes the emitted `dest = &value` type-check under
+		# GCC and Linux-clang; Windows clang/MSVC only warned, so the old
+		# Ptr[Foo] result (`Foo*` assigned from `Foo**`) slipped through. The one
+		# caller that hits the RC path - list/UnsafeList.append/insert via
+		# compiler.cast( Ptr[None], compiler.addrof( val ) ) - casts straight to
+		# void*, so the extra level is invisible downstream. (expected_type is
+		# intentionally NOT consulted: addrof's result type is determined solely
+		# by the operand; callers wanting another pointer type cast explicitly.)
+		pointee = value.type
+		if self.lowering._type_resolver._is_RC( pointee ):
+			pointee = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ pointee ] )
+		ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ pointee ] )
+		dest = self._new_temp( ptr_type )
 		self._emit( ir.AddrOf( dest = dest, value = value ))
 		return dest
 
