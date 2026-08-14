@@ -5,8 +5,9 @@
 #
 # The program returns 0 when every check passes and a distinct nonzero i32 exit
 # code per failed check; RealCompileMixin decodes that back to the failing check.
-# print() is deliberately avoided - the stdout global-init path is unrelated
-# work-in-progress (see PLAN_GLOBAL_INIT.md), so results come back via exit code.
+# print() is deliberately avoided - exit codes keep this test decoupled from
+# stdout/print() entirely, so a future regression in THAT path can't mask or
+# be masked by a timer regression in THIS one.
 #
 # Which OS backend runs follows the build host (there is no cross-compile):
 # QueryPerformanceCounter / GetSystemTimePreciseAsFileTime on Windows,

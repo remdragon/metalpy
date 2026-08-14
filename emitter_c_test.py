@@ -2583,6 +2583,93 @@ class GlobalInitCycleDetectionTests( RCClassTestCase ):
 			self.discovery.errors.errors,
 		)
 
+class MetalpyInitSynthesisTests( unittest.TestCase ):
+	''' fast, no-C-compiler-needed checks against emit_c()'s own generated
+	text - PLAN_GLOBAL_INIT.md's own original Verification section called
+	for these three specific white-box assertions (single __metalpy_init
+	definition, main()'s own prepend being active_target-independent,
+	multiple non-trivial globals all getting called), but the landed
+	implementation substituted one real compile+link+run test instead
+	(EmitGlobalRCClassRealCompileTests/GlobalInitOrderingRealCompileTests) -
+	stronger end-to-end evidence, but not literally what the checklist
+	asked for. These fill that gap directly. Deliberately plain
+	unittest.TestCase (not RCClassTestCase) - each test needs its own
+	Discovery with an explicit active_target override, which the shared
+	setUp doesn't support. '''
+
+	_FIXTURE = '\n'.join([
+		'class Foo:',
+		'	x: i32',
+		'	@staticmethod',
+		'	def make( v: i32 ) -> Foo:',
+		'		return Foo.__allocate__( x = v )',
+		'',
+		'g1: Foo = Foo.make( 1 )',
+		'g2: Foo = Foo.make( 2 )',
+		'',
+		'def main() -> i32:',
+		'	if g1.x != 1:',
+		'		return 1',
+		'	if g2.x != 2:',
+		'		return 2',
+		'	return 0',
+	])
+
+	# minimal but complete active_target dicts (see discovery.py's own
+	# _detect_active_target for the real shape) - only 'os' actually
+	# matters to anything this test class checks
+	_WINDOWS_TARGET = { 'os': 'windows', 'arch': 'x86_64', 'family': 'windows', 'bits': 64, 'debug': True, 'posix': False }
+	_LINUX_TARGET = { 'os': 'linux', 'arch': 'x86_64', 'family': 'unix', 'bits': 64, 'debug': True, 'posix': True }
+
+	def _compiled_source( self, active_target: dict[str,object] ) -> str:
+		discovery = Discovery( import_builtins = True, active_target = active_target )
+		compiler = Compiler( discovery )
+		compiler.import_code( self._FIXTURE, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		return emitter_c.emit_c( compiler )
+
+	def _metalpy_init_body( self, src: str ) -> str:
+		start = src.index( 'static void __metalpy_init( void ) {' )
+		end = src.index( '\n}', start )
+		return src[ start : end ]
+
+	def test_exactly_one_metalpy_init_definition( self ) -> None:
+		# the two competing #ifdef'd definitions this plan replaced
+		# (emitter_c.py's old PROLOGUE) are gone - never more than one
+		# `static void __metalpy_init( void ) {` anywhere in the output,
+		# on either target
+		for target in ( self._WINDOWS_TARGET, self._LINUX_TARGET ):
+			with self.subTest( target = target[ 'os' ] ):
+				src = self._compiled_source( target )
+				self.assertEqual( src.count( 'static void __metalpy_init( void ) {' ), 1 )
+
+	def test_windows_console_codepage_call_is_gated_inside_the_one_function( self ) -> None:
+		src = self._compiled_source( self._WINDOWS_TARGET )
+		body = self._metalpy_init_body( src )
+		self.assertIn( '#ifdef _WIN32', body )
+		self.assertIn( 'SetConsoleOutputCP( CP_UTF8 );', body )
+		self.assertIn( '#endif', body )
+
+	def test_main_prepends_metalpy_init_call_on_every_target( self ) -> None:
+		# not just Windows - global initializers must run everywhere now,
+		# not only the Windows-specific console-codepage setup (this is
+		# exactly the condition PLAN_GLOBAL_INIT.md's own implementation
+		# changed from `_is_entry_point(...) and active_target['os'] ==
+		# 'windows'` to a plain `_is_entry_point(...)`)
+		for target in ( self._WINDOWS_TARGET, self._LINUX_TARGET ):
+			with self.subTest( target = target[ 'os' ] ):
+				src = self._compiled_source( target )
+				main_start = src.index( 'int main( void ) {' )
+				second_line = src[ main_start: ].split( '\n', 2 )[1]
+				self.assertIn( '__metalpy_init();', second_line )
+
+	def test_metalpy_init_calls_every_non_trivial_globals_init_function( self ) -> None:
+		src = self._compiled_source( self._LINUX_TARGET )
+		body = self._metalpy_init_body( src )
+		self.assertIn( '__metalpy_init___main__$g1();', body )
+		self.assertIn( '__metalpy_init___main__$g2();', body )
+
 class WindowsTargetCTypeTests( unittest.TestCase ):
 	def test_invalid_handle_value_emits_with_pointer_cast( self ) -> None:
 		import ir

@@ -122,6 +122,89 @@ class ImportFileEncodingTests( unittest.TestCase ):
 			self.assertEqual( greeting.init.value, 'straße café' )
 
 
+class UnsupportedBodyStatementTests( unittest.TestCase ):
+	''' regression coverage for a real, previously-crashing gap: any
+	unsupported statement at module/class scope containing a Store-context
+	ast.Name (a bare `for` loop, `x += 1`) fell through to ast.NodeVisitor's
+	own default generic_visit, which blindly recurses into it and hits
+	visit_Name's own internal invariant assert ("Load is the only context
+	an expression-position Name can have") - an uncaught AssertionError,
+	not a clean, reported CompileError. Found while reviewing PLAN_GLOBAL_
+	INIT.md's own "Deferred: arbitrary top-level statements" note (that
+	note is about a genuinely bigger, unrelated feature - general statement
+	EXECUTION at module scope, still correctly deferred, no real use case
+	yet); this is a narrower robustness fix: an unsupported statement
+	should always fail cleanly, regardless of whether real execution
+	support is ever built. Fixed via _SUPPORTED_BODY_STATEMENTS/_check_
+	supported_statement (discovery.py), called before self.visit(node) at
+	both scan sites (import_code's top-level loop, _make_class_resolver's
+	body_fn). '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_for_loop_at_module_level_is_a_clean_compile_error( self ) -> None:
+		# before the fix: AssertionError, not caught by import_code's own
+		# per-statement `except CompileError: continue` - the module import
+		# never even progressed past this line, importing nothing
+		self._import( '''
+for i in range( 3 ):
+	pass
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'unsupported statement', self.discovery.errors.errors[0] )
+
+	def test_augmented_assignment_at_module_level_is_a_clean_compile_error( self ) -> None:
+		self._import( '''
+x: i32 = 1
+x += 1
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'unsupported statement', self.discovery.errors.errors[0] )
+
+	def test_one_bad_top_level_statement_does_not_stop_the_rest_of_the_module( self ) -> None:
+		# matches import_code's own existing per-statement recovery
+		# discipline (see its docstring) - a rejected statement doesn't
+		# prevent everything AROUND it from still being registered
+		mod = self._import( '''
+x: i32 = 1
+for i in range( 3 ):
+	pass
+y: i32 = 2
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIsNotNone( mod.get_local( 'x' ))
+		self.assertIsNotNone( mod.get_local( 'y' ))
+
+	def test_for_loop_in_class_body_is_a_clean_compile_error_not_a_crash( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	for i in range( 3 ):
+		pass
+	x: i32
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve() # class bodies are scanned lazily - see ShallowScanTests
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'unsupported statement', self.discovery.errors.errors[0] )
+
+	def test_pass_bodied_class_is_still_allowed( self ) -> None:
+		# ast.Pass is the one statement kind deliberately allowed to reach
+		# generic_visit directly (no fields to recurse into, so it's
+		# provably always a no-op) - a plain `pass`-bodied class is a common,
+		# legitimate pattern (see ShallowScanTests.test_rcclass) that must
+		# keep working, not get swept up by this same fix
+		mod = self._import( '''
+class Foo:
+	pass
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIsNotNone( mod.get_local( 'Foo' ))
+
+
 class ShallowScanTests( unittest.TestCase ):
 	'''
 	a module body is scanned immediately: every top-level class/function/

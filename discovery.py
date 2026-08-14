@@ -60,6 +60,28 @@ def _detect_active_target() -> dict[str,object]:
 	return { 'os': os_name, 'arch': arch, 'family': family, 'bits': 64, 'debug': True, 'posix': family == 'unix' }
 
 
+# every ast.stmt kind Discovery's own module-body/class-body scan loops
+# (import_code, _make_class_resolver's body_fn) are prepared to hand to
+# self.visit() - anything else must be rejected BEFORE that call, not left
+# to fall through to ast.NodeVisitor's own default generic_visit. Without
+# this, an unsupported statement containing a Store-context ast.Name (a
+# bare `for` loop, `x += 1`) crashes with an uncaught internal
+# AssertionError deep inside visit_Name ("Load is the only context an
+# expression-position Name can have") the moment generic_visit blindly
+# recurses into it - confirmed via a real repro (a bare `for i in
+# range(3): pass` at module level), not a theoretical concern. A statement
+# kind IS allowed to reach generic_visit directly only when doing so is
+# provably a no-op no matter what (ast.Pass has no fields at all to
+# recurse into) - every other kind either has its own explicit visit_X
+# handler here (which may itself still reject, e.g. visit_AsyncFunctionDef
+# - that's a clean, intentional CompileError, not this guard's concern) or
+# gets rejected right here.
+_SUPPORTED_BODY_STATEMENTS: frozenset[type] = frozenset({
+	ast.Expr, ast.AnnAssign, ast.Assign, ast.ClassDef, ast.FunctionDef,
+	ast.AsyncFunctionDef, ast.Import, ast.ImportFrom, ast.Pass,
+})
+
+
 class Discovery( ast.NodeVisitor ):
 	'''
 	This class does a shallow parse of python files and processes all imports on demand
@@ -174,6 +196,13 @@ class Discovery( ast.NodeVisitor ):
 	def fail_loc( self, message: str, file: Path|None, line: int|None ) -> NoReturn:
 		self.errors.fail( message, file, line )
 
+	def _check_supported_statement( self, node: ast.stmt ) -> None:
+		''' called before self.visit(node) at every module-body/class-body
+		scan site - see _SUPPORTED_BODY_STATEMENTS' own comment for why
+		this can't just be left to generic_visit's default recursion. '''
+		if type( node ) not in _SUPPORTED_BODY_STATEMENTS:
+			self.fail( f'unsupported statement here: {ast.unparse( node )}', node )
+
 	def _resolve_guarded( self, target: 'Function|ClassLike|Variable', body: Callable[[],None] ) -> None:
 		# the shared recovery boundary every .resolve() closure runs through -
 		# a CompileError raised (and already recorded) anywhere inside body()
@@ -261,6 +290,7 @@ class Discovery( ast.NodeVisitor ):
 			tree.body = compile_time_transformer.transform_stmt_list( tree.body, self.active_target, self._detect_cc )
 			for node in tree.body:
 				try:
+					self._check_supported_statement( node )
 					self.visit( node )
 				except CompileError:
 					continue
@@ -1150,6 +1180,7 @@ class Discovery( ast.NodeVisitor ):
 				with self.scope_context( class_obj ):
 					# scope_stack[-1] (class_obj) owns this body - see import_code()
 					for node in body:
+						self._check_supported_statement( node )
 						self.visit( node )
 			if isinstance( class_obj, RCClass ) and class_obj.base is not None:
 				self._validate_no_attribute_shadowing( class_obj )
