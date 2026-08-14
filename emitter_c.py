@@ -2308,49 +2308,166 @@ def _global_init_fn_name( g: LoweredGlobal ) -> str:
 	# can't drift on the naming scheme (see PLAN_GLOBAL_INIT.md)
 	return f'__metalpy_init_{mangle_qualname( g.variable.qualname )}'
 
-def emit_global( g: LoweredGlobal ) -> str:
+def _referenced_global_qualnames( instructions: list[ir.Instruction] ) -> set[str]:
+	''' every OTHER global Variable's qualname a global's own init
+	instructions reference anywhere an ir.Operand can appear (Assign.src,
+	Call.args/kwargs/receiver, GetAttr.obj, Allocate.fields, ...one field
+	name per ir.Instruction subclass and growing). Walked GENERICALLY via
+	dataclasses.fields() rather than hand-enumerating every instruction
+	kind's own operand-bearing field(s), so a new instruction shape can
+	never silently go unwalked - this only ever looks for Temp/Const/
+	Variable/FunctionRef leaves (ir.Operand's own union, mirrored here
+	structurally) inside a field, a list, or a dict; anything else (a
+	Type, a ClassLike, a Function, a plain str/bool/enum - e.g. Allocate.
+	cls, Call.target, SizeOf.type) is neither, so it's inert here, not
+	something this needs its own case for. '''
+	found: set[str] = set()
+	def walk( value: object ) -> None:
+		if isinstance( value, Variable ):
+			if value.is_global:
+				found.add( value.qualname )
+			return
+		if isinstance( value, ( ir.Temp, ir.Const, ir.FunctionRef )):
+			return # real Operand leaves, just not globals - nothing further to walk
+		if isinstance( value, list ):
+			for item in value:
+				walk( item )
+		elif isinstance( value, dict ):
+			for item in value.values():
+				walk( item )
+	for instr in instructions:
+		for field in dataclasses.fields( instr ):
+			walk( getattr( instr, field.name ))
+	return found
+
+def _topologically_sort_globals( compiler: Compiler ) -> list[LoweredGlobal]:
+	''' compiler.globals in TypeResolver's own FIFO scheduling order (first-
+	referenced-while-lowering-reachable-code) has no relationship to which
+	global's own initializer reads which OTHER global's value - confirmed
+	as a real, reachable bug (not a theoretical one), found while proving
+	out PLAN_GLOBAL_INIT.md's own deferred "true dependency-ordering
+	between globals" limitation with a real test: `b: Foo = Foo.make(a.x)`
+	with main() only ever referencing `b` schedules b BEFORE a (main
+	reaches b first; a is only discovered as b's own dependency, so it's
+	enqueued and lowered strictly later) - emit_c's own globals loop would
+	then emit b's declaration before a's, a straight C "undeclared
+	identifier" compile error (see _emit_global_declaration/_emit_global_
+	init_fn's own split, which independently fixes THAT half - declaration
+	order needs no dependency sort at all once every declaration is a
+	self-contained {0}-or-constant). This function fixes the OTHER half:
+	the RUNTIME call order inside __metalpy_init() - b's own init function
+	dereferences a's global pointer, which must already be constructed
+	(non-null, real fields) by the time b's own init function runs.
+
+	Only globals that actually GET a call at all (excludes both
+	_is_trivial_global_init - already fully initialized by C's own static
+	initializer semantics before ANY function runs, so it's never a real
+	ordering dependency regardless of who references it - and _global_
+	init_is_all_zero_value_type, which never gets a call either way) enter
+	the graph. A stable Kahn's-algorithm topological sort, seeded in
+	compiler.globals' own original order (so two globals with no
+	dependency relationship at all keep their original relative order,
+	same determinism guarantee an unordered dependency set would otherwise
+	lose) - not a DFS-based sort, specifically so an unsatisfiable real
+	CYCLE (two globals whose own initializers each read the other's value
+	- fundamentally impossible to order, unlike a merely circular IMPORT
+	or a circular class reference, both already confirmed fine elsewhere)
+	is detected structurally (leftover nodes with no zero-indegree node
+	to pick) rather than by recursion-depth crashing or silently emitting
+	SOME arbitrary order that compiles but runs one of the two against an
+	uninitialized value. '''
+	callable_globals = [
+		g for g in compiler.globals
+		if not _is_trivial_global_init( g.instructions ) and not _global_init_is_all_zero_value_type( g.instructions )
+	]
+	by_qualname = { g.variable.qualname: g for g in callable_globals }
+	# edges[a] = globals that must be called AFTER a (a's own qualname ->
+	# the set of dependents reading a's value); indegree[b] counts how many
+	# not-yet-called prerequisites b still has
+	edges: dict[str,set[str]] = { g.variable.qualname: set() for g in callable_globals }
+	indegree: dict[str,int] = { g.variable.qualname: 0 for g in callable_globals }
+	for g in callable_globals:
+		for dep_qualname in _referenced_global_qualnames( g.instructions ):
+			if dep_qualname == g.variable.qualname or dep_qualname not in by_qualname:
+				continue # self-reference, or a dependency that never gets a call itself (trivial/all-zero) - no edge needed either way
+			if g.variable.qualname not in edges[dep_qualname]:
+				edges[dep_qualname].add( g.variable.qualname )
+				indegree[g.variable.qualname] += 1
+	ready = [ g for g in callable_globals if indegree[g.variable.qualname] == 0 ]
+	ordered: list[LoweredGlobal] = []
+	while ready:
+		g = ready.pop( 0 )
+		ordered.append( g )
+		for dependent_qualname in edges[g.variable.qualname]:
+			indegree[dependent_qualname] -= 1
+			if indegree[dependent_qualname] == 0:
+				ready.append( by_qualname[dependent_qualname] )
+	if len( ordered ) != len( callable_globals ):
+		ordered_qualnames = { g.variable.qualname for g in ordered }
+		stuck = [ g.variable.qualname for g in callable_globals if g.variable.qualname not in ordered_qualnames ]
+		unresolved = by_qualname[ stuck[0] ]
+		compiler.disco.fail_loc(
+			f'circular global-initializer dependency involving {", ".join(sorted(stuck))} - '
+			f'each one\'s own initializer (directly or transitively) reads another\'s value, '
+			f'with no valid construction order',
+			unresolved.variable.file, unresolved.variable.line,
+		)
+	return ordered
+
+def _emit_global_declaration( g: LoweredGlobal ) -> str:
 	name = mangle_qualname( g.variable.qualname )
 	ctype = c_type( g.variable.type )
 	if _is_trivial_global_init( g.instructions ):
 		value = _emit_operand( g.instructions[0].src )
 		return f'{ctype} {name} = {value};'
-	if _global_init_is_all_zero_value_type( g.instructions ):
-		# no separate init function at all here - not just "don't call it"
-		# (emit_c's own init_calls list already excludes it too, see there).
-		# An UNCALLED-but-still-EMITTED function is not a safe no-op: it still
-		# gets compiled, and its own struct-copy-of-an-all-zero-compound-
-		# literal is exactly the shape a C compiler is free to lower into a
-		# real memset/memcpy call (confirmed - not theoretical - by a real
-		# LNK2019 "unresolved external symbol memset" failure on a no-CRT
-		# Windows build, with the call disassembled directly out of the
-		# object file: `callq memset` inside this exact function, EVEN
-		# THOUGH nothing called the function itself). The plain {0} static
-		# initializer is already byte-for-byte the value this would compute.
-		return f'{ctype} {name} = {{0}};'
-	# a non-trivial initializer (anything needing a real computation - an
-	# RCClass construction, an arithmetic expression, ...) flattens into a
-	# private init function, reusing _emit_instruction exactly like an
-	# ordinary function body does (function=None is safe here: lower_global
-	# never emits ir.Return/ir.OrReturn, the only two branches that read
-	# it - defer/errdefer/loops can't appear in a global initializer at all,
-	# see lower_global's own comment). Called from the synthesized
-	# __metalpy_init() (emit_c(), after the globals loop below) - see
-	# PLAN_GLOBAL_INIT.md. The global itself gets a {0} zero initializer in
-	# the meantime - a valid C11 initializer for ANY type alike (ISO C11
-	# 6.7.9p11: a scalar initializer may be "optionally enclosed in
-	# braces"), matching the same convention ir.Allocate's own empty-fields
-	# branch already uses
+	# a {0} zero initializer either way for a non-trivial global - a valid
+	# C11 initializer for ANY type alike (ISO C11 6.7.9p11: a scalar
+	# initializer may be "optionally enclosed in braces"), matching the same
+	# convention ir.Allocate's own empty-fields branch already uses. The
+	# _global_init_is_all_zero_value_type case (see emit_global) needs
+	# nothing MORE than this - its own init function is skipped entirely,
+	# not just left uncalled.
+	return f'{ctype} {name} = {{0}};'
+
+def _emit_global_init_fn( g: LoweredGlobal ) -> str|None:
+	''' the private `static void __metalpy_init_<name>(void) { ... }` body
+	for a non-trivial global - None for a trivial global (its declaration
+	above is already the complete real value, see emit_global) or an
+	all-zero value-type one (_global_init_is_all_zero_value_type - see its
+	own docstring for why this is skipped entirely, not just left
+	uncalled). Split out from emit_global (which still returns both
+	pieces joined, for existing direct callers) so emit_c can emit EVERY
+	global's own declaration before ANY global's own init function body -
+	needed now that one global's init function can reference another
+	global BY VALUE (`b: Foo = Foo.make(a.x)`) in an order compiler.globals
+	itself doesn't guarantee (see _topologically_sort_globals) - unlike
+	declarations, which need no relative ordering among THEMSELVES at all
+	(every one is a plain, self-contained {0}-or-constant static
+	initializer, never referencing another global's value). '''
+	if _is_trivial_global_init( g.instructions ) or _global_init_is_all_zero_value_type( g.instructions ):
+		return None
+	# reuses _emit_instruction exactly like an ordinary function body does
+	# (function=None is safe here: lower_global never emits ir.Return/
+	# ir.OrReturn, the only two branches that read it - defer/errdefer/
+	# loops can't appear in a global initializer at all, see lower_global's
+	# own comment). Called from the synthesized __metalpy_init() (emit_c(),
+	# after the globals loop below) - see PLAN_GLOBAL_INIT.md.
 	init_name = _global_init_fn_name( g )
-	lines = [
-		f'{ctype} {name} = {{0}};',
-		'',
-		f'static void {init_name}( void ) {{',
-	]
+	lines = [ f'static void {init_name}( void ) {{' ]
 	declared: set[str] = set()
 	for instr in g.instructions:
 		lines.extend( _emit_instruction( instr, function = None, declared = declared ))
 	lines.append( '}' )
 	return '\n'.join( lines )
+
+def emit_global( g: LoweredGlobal ) -> str:
+	# combined declaration + (if any) init function, for direct callers
+	# (tests, mostly) that want one global's own complete emitted text as a
+	# single string - emit_c() itself uses _emit_global_declaration/_emit_
+	# global_init_fn separately (see their own docstrings for why)
+	decl = _emit_global_declaration( g )
+	init_fn = _emit_global_init_fn( g )
+	return decl if init_fn is None else f'{decl}\n\n{init_fn}'
 
 def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 	# CStruct/CUnion/TaggedUnion bodies, topologically sorted on by-value-
@@ -2555,28 +2672,46 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# (need the struct's own full definition from pass 2 to dereference
 	# self->field)
 	parts.extend( _emit_string_literals( compiler ))
+	# every global's own DECLARATION first, in compiler.globals order (each
+	# one is a self-contained {0}-or-constant static initializer, never
+	# referencing another global's value - see _emit_global_declaration -
+	# so no dependency ordering is needed among these at all), THEN every
+	# non-trivial global's own init FUNCTION BODY (which - unlike a
+	# declaration - CAN reference another global's already-declared value,
+	# e.g. `b: Foo = Foo.make(a.x)`; splitting these two into separate
+	# passes means that reference is always to an already-declared symbol
+	# regardless of compiler.globals' own order, which is scheduling order,
+	# not dependency order - see _emit_global_init_fn's own docstring)
 	for g in compiler.globals:
-		parts.append( emit_global( g ))
+		parts.append( _emit_global_declaration( g ))
+	for g in compiler.globals:
+		init_fn = _emit_global_init_fn( g )
+		if init_fn is not None:
+			parts.append( init_fn )
 	# the single, real __metalpy_init() (PLAN_GLOBAL_INIT.md) - runs the
 	# Windows console-codepage setup (previously two competing #ifdef'd
 	# function bodies in PROLOGUE, now one function with the platform bit
 	# gated internally) plus every non-trivial global's own init function,
-	# in compiler.globals order (their own declared-before-use order in
-	# THIS translation unit, guaranteed by the globals loop directly above).
-	# Always defined and always called (see main()'s own prepend below) -
-	# not just on Windows - since global initializers must run on every
-	# target now, not only the Windows-specific statement. A global whose
-	# non-trivial init is nonetheless an all-zero value-type construction
-	# (_global_init_is_all_zero_value_type) is skipped here - its own {0}
-	# static initializer (emit_global, above) already IS that value, so
-	# calling it would be a pure no-op at best (and, confirmed by a real
+	# in DEPENDENCY order (_topologically_sort_globals - NOT compiler.
+	# globals' own scheduling order, which has no relationship to which
+	# global's own initializer reads which other global's value; confirmed
+	# as a real, reachable bug via a real test - `b: Foo = Foo.make(a.x)`
+	# with main() only ever referencing b schedules b before a). Always
+	# defined and always called (see main()'s own prepend below) - not just
+	# on Windows - since global initializers must run on every target now,
+	# not only the Windows-specific statement. A global whose non-trivial
+	# init is nonetheless an all-zero value-type construction (_global_
+	# init_is_all_zero_value_type) is skipped here - its own {0} static
+	# initializer (_emit_global_declaration, above) already IS that value,
+	# so calling it would be a pure no-op at best (and, confirmed by a real
 	# link failure, a real problem at worst on a no-CRT target if the C
-	# compiler lowers the struct-copy into a memset/memcpy call).
+	# compiler lowers the struct-copy into a memset/memcpy call) -
+	# _topologically_sort_globals already excludes it from its own graph
+	# for the identical reason (it never gets a call, so it can never be a
+	# real dependency edge either).
 	init_calls = [
 		f'\t{_global_init_fn_name( g )}();'
-		for g in compiler.globals
-		if not _is_trivial_global_init( g.instructions )
-		and not _global_init_is_all_zero_value_type( g.instructions )
+		for g in _topologically_sort_globals( compiler )
 	]
 	parts.append(
 		'static void __metalpy_init( void ) {\n'

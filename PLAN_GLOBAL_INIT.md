@@ -235,3 +235,79 @@ undeclared identifier 'sys$_Stdout$$vtable'" - a separate, pre-existing pass-
 function could reference an RCClass vtable instance emitted later in the
 same translation unit; the vtable-instance loops now run before the globals
 loop).
+
+UPDATE (cross-global dependency ordering, and a separate global-construction
+crash - both found via targeted testing, not code review): the plan's own
+"Deferred: true dependency-ordering between globals" limitation above was
+flagged as unverified, not confirmed either way. Built two real tests to
+settle it:
+
+1. Circular imports + one global's constructor building an instance of
+   ANOTHER (circularly-importing) module's class (`f2: foo2.Foo2 =
+   foo2.Foo2()` in foo1.py, `f1: foo1.Foo1 = foo1.Foo1()` in foo2.py, each
+   module importing the other) - confirmed fine: compiles, links, and runs
+   correctly. Discovery's two-phase design (eager name registration,
+   deferred resolution) already handles this with no changes needed.
+2. A SINGLE global's own constructor building sibling classes, one of them
+   (Foo2) declared textually AFTER both the class that uses it and the
+   global itself (`bar: Bar = Bar()`, Bar.__init__ builds Foo1() then
+   Foo2()) - this one immediately crashed lowering.py's own _try_lower_
+   construct_call assert ("... was not resolved before construction"). Root
+   cause: an ordinary function body's construction call always gets pre-
+   resolved by TypeResolver.resolve_function_body's _ReferenceResolver
+   pass (item 3's Call-visiting branch specifically eagerly resolves a bare
+   ClassName(...) construction target's own __init__ signature) BEFORE
+   lower_function ever runs - Compiler._lower's Function branch calls it
+   explicitly. A global's own initializer never got the same treatment:
+   Compiler._lower's Variable branch went straight to lower_global. This
+   means ANY global constructed via a bare `ClassName()` (going through a
+   real __init__, unlike `ClassName.make(...)`'s own staticmethod path -
+   which this plan's own original verification fixture exclusively used,
+   so it never caught this) was completely broken, unconditionally - not
+   an edge case. Fixed: TypeResolver.resolve_global_init (type_resolver.py)
+   - the same _ReferenceResolver pass, adapted for a bare expression instead
+   of a statement list (_ReferenceResolver.__init__ now accepts fn=None for
+   this case - no parameters/self to seed, mirroring lowering.py's own
+   FunctionLowering(self, None) convention for global bodies) - called from
+   Compiler._lower's Variable branch before lower_global.
+
+With that crash fixed, a THIRD, genuinely real ordering bug surfaced
+immediately: `b: Foo = Foo.make(a.x)` (b's own initializer reads global a's
+value) with main() only ever referencing `b` directly schedules b BEFORE a
+(main reaches b first in TypeResolver's FIFO queue; a is only discovered as
+b's own dependency, mid-lowering, so it's enqueued and lowered strictly
+later) - compiler.globals ends up `[b, a]`. This broke TWO things, one
+louder than originally predicted:
+- emit_c's old single globals loop (declaration + init function as one
+  unit per global) emitted b's init function BEFORE a's declaration even
+  existed - a straight C "use of undeclared identifier '__main__$a'"
+  compile error (confirmed via a real clang -fsyntax-only run), not the
+  silent null-pointer-runtime-read originally guessed.
+- __metalpy_init() itself would have called b's init before a's even once
+  the declaration-ordering half was fixed - a real uninitialized-value read
+  at runtime.
+
+Fixed with two independent changes in emitter_c.py: (1) emit_global split
+into _emit_global_declaration/_emit_global_init_fn - emit_c now emits EVERY
+global's declaration before ANY global's own init function body, which
+needs no dependency ordering at all (every declaration is a self-contained
+{0}-or-constant, never referencing another global's value); (2) a new
+_topologically_sort_globals (Kahn's algorithm, seeded in compiler.globals'
+own original order for determinism among unrelated globals), which walks
+each global's own init instructions generically (via dataclasses.fields(),
+so no per-ir.Instruction-subclass enumeration needed) for references to
+OTHER globals, and orders __metalpy_init()'s own call sequence by real
+dependency rather than compiler.globals' scheduling order. A genuine CYCLE
+(two globals whose own initializers each read the other's value -
+fundamentally unorderable, unlike a circular import or circular class
+reference, both confirmed fine above) is detected structurally (leftover
+non-zero-indegree nodes) and reported as a clean, located CompileError via
+compiler.disco.fail_loc, not a hang or an arbitrary silently-wrong order.
+
+Verified: emitter_c_test.py gained GlobalInitOrderingRealCompileTests.
+test_global_initializer_reading_another_globals_value_runs_in_dependency_
+order (real compile+link+run, asserts the b-before-a scheduling-order
+fixture assumption explicitly so the test can't silently stop exercising
+the fix) and GlobalInitCycleDetectionTests.test_circular_global_value_
+dependency_is_a_clean_compile_error. Full python3 tests.py green
+throughout (908/908), no regressions.

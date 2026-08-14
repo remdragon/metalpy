@@ -14,6 +14,7 @@ import linker_c
 import test_support
 from compiler import Compiler
 from discovery import Discovery
+from errors import CompileError
 from mpy_types import (
 	CEnum, CStruct, Function, Parameter, RCClass, Scalar, Specialization, TaggedUnion, Variable,
 )
@@ -2454,6 +2455,133 @@ class EmitGlobalRCClassRealCompileTests( test_support.RealCompileMixin, RCClassT
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
+	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:
+		# PLAN_GLOBAL_INIT.md flags TRUE cross-global dependency ordering
+		# (global B's own initializer reading global A) as deferred/
+		# unverified. This test asks a narrower, related question instead:
+		# does a SINGLE global's own constructor, which itself constructs
+		# two other RCClasses (Bar builds Foo1 and Foo2 inside its own
+		# __init__), need any source-order help at all - specifically when
+		# one of those classes (Foo2) is declared textually AFTER both the
+		# class that uses it (Bar) and the global that transitively
+		# constructs it (bar)?
+		#
+		# Foo1/Foo2 are plain (non-@interface) RCClasses built entirely
+		# inside Bar.__init__, so this does NOT exercise the vtable-forward-
+		# reference bug PLAN_GLOBAL_INIT.md's own landing commit fixed (that
+		# one needed an @interface CStruct's own $$vtable instance). This is
+		# a different, more basic question: does discovery/lowering/emission
+		# care about SOURCE order among sibling classes at all. Expected to
+		# already be a non-issue - discovery.py registers every top-level
+		# class's NAME before resolving any class body (see Discovery's own
+		# docstring: "every top-level class/function/global it directly
+		# contains is registered right away ... so cross-references anywhere
+		# in the program can always find each other regardless of source
+		# order") - this test is the real-compile-and-run proof of that
+		# claim for the specific "global variable's constructor builds
+		# forward-referenced sibling classes" shape, not just an assertion
+		# taken on faith.
+		self._run( '\n'.join([
+			'class Foo1:',
+			'	x: i32',
+			'	def __init__( self ) -> None:',
+			'		self.x = 111',
+			'',
+			'class Bar:',
+			'	foo1: Foo1',
+			'	foo2: Foo2',
+			'	def __init__( self ) -> None:',
+			'		self.foo1 = Foo1()',
+			'		self.foo2 = Foo2()',
+			'',
+			'class Foo2:',
+			'	y: i32',
+			'	def __init__( self ) -> None:',
+			'		self.y = 222',
+			'',
+			'bar: Bar = Bar()',
+			'',
+			'def main() -> i32:',
+			'	if bar.foo1.x != 111:',
+			'		return 1',
+			'	if bar.foo2.y != 222:',
+			'		return 2',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_global_initializer_reading_another_globals_value_runs_in_dependency_order( self ) -> None:
+		# a REAL, previously-reachable bug found while stress-testing
+		# PLAN_GLOBAL_INIT.md's own "Deferred: true dependency-ordering
+		# between globals" limitation (originally flagged as unverified,
+		# not a known-good non-issue): compiler.globals is TypeResolver's
+		# own FIFO scheduling order (first-referenced-while-lowering-
+		# reachable-code), which has NO relationship to which global's own
+		# initializer reads which OTHER global's value. Here, main() only
+		# ever references `b` directly - `a` is only discovered as b's own
+		# dependency, mid-way through lowering b's initializer - so a gets
+		# scheduled (and therefore lowered, and therefore appended to
+		# compiler.globals) strictly AFTER b, even though b's own
+		# initializer reads a.x. Before _topologically_sort_globals
+		# (emitter_c.py), this produced generated C that didn't even
+		# COMPILE (b's own init function referenced the not-yet-declared
+		# __main__$a - confirmed via a real clang -fsyntax-only run), a
+		# louder failure than the null-pointer-dereference-at-runtime this
+		# test's own comment originally predicted. Now fixed: every
+		# global's DECLARATION is emitted before any global's own init
+		# FUNCTION BODY (needs no dependency order at all - see _emit_
+		# global_declaration/_emit_global_init_fn), and __metalpy_init()
+		# calls each non-trivial global's own init function in REAL
+		# dependency order (_topologically_sort_globals), not compiler.
+		# globals' own scheduling order.
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'a: Foo = Foo.make( 1 )',
+			'b: Foo = Foo.make( a.x )', # reads global a's value - main() never touches a directly
+			'',
+			'def main() -> i32:',
+			'	if b.x != 1:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		scheduled = [ g.variable.qualname for g in self.compiler.globals if g.variable.qualname in ( '__main__.a', '__main__.b' ) ]
+		self.assertEqual( scheduled, [ '__main__.b', '__main__.a' ],
+			'fixture assumption broken: b should schedule before a (main only references b) - '
+			'if this now fails, the scheduling order itself changed and this test no longer '
+			'exercises the dependency-ordering fix at all' )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+class GlobalInitCycleDetectionTests( RCClassTestCase ):
+	def test_circular_global_value_dependency_is_a_clean_compile_error( self ) -> None:
+		# the one shape _topologically_sort_globals can never satisfy: two
+		# globals whose own initializers EACH read the other's value -
+		# fundamentally unorderable, unlike a merely circular IMPORT or a
+		# circular CLASS reference (both confirmed fine elsewhere - see
+		# GlobalInitOrderingRealCompileTests/PLAN_GLOBAL_INIT.md). Must
+		# fail with a clear, located CompileError - not hang, not crash
+		# with an unrelated traceback, not silently emit some arbitrary
+		# order that compiles but runs one side against an uninitialized
+		# value.
+		self._run( _FOO_FIXTURE + '\n' + '\n'.join([
+			'a: Foo = Foo.make( b.x )',
+			'b: Foo = Foo.make( a.x )',
+			'',
+			'def main() -> i32:', # references a so both a and (transitively, via a's own initializer) b actually get scheduled/lowered as real compile units at all
+			'	if a.x != 0:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] ) # the cycle itself isn't detected until emit_c - discovery/lowering never needed a full order
+		with self.assertRaises( CompileError ):
+			emitter_c.emit_c( self.compiler )
+		self.assertTrue(
+			any( 'circular global-initializer dependency' in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
 
 class WindowsTargetCTypeTests( unittest.TestCase ):
 	def test_invalid_handle_value_emits_with_pointer_cast( self ) -> None:

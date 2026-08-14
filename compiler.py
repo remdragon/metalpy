@@ -235,6 +235,14 @@ class Compiler:
 		elif isinstance( unit, Variable ):
 			if unit.resolve is not None:
 				unit.resolve()
+			# a global's init expression needs the same construction-call
+			# pre-resolution an ordinary function body gets from resolve_
+			# function_body (below, Function branch) before lowering ever
+			# reaches it - see TypeResolver.resolve_global_init's own
+			# docstring for the real crash this fixes (a bare ClassName()
+			# construction, not a ClassName.factory() call, as a global's
+			# own initializer)
+			self.type_resolver.resolve_global_init( unit )
 			instructions = self.lowering.lower_global( unit )
 			unit.init_instructions = instructions # same list object as LoweredGlobal.instructions below - no duplication, no drift risk (see PLAN_GLOBAL_INIT.md)
 			lg = LoweredGlobal( variable = unit, instructions = instructions )

@@ -919,6 +919,40 @@ class TypeResolver:
 							new_body.append( result )
 					fn.node.body = new_body
 
+	def resolve_global_init( self, var: Variable ) -> None:
+		''' resolve_function_body's sibling for a global variable's own
+		initializer EXPRESSION (not a statement list) - without this,
+		lower_global (lowering.py's run_global) never gets item 3's Call-
+		visiting rewrite at all, specifically the "construction-call
+		detection" branch (visit_Call, this class, below) that eagerly
+		resolves a bare ClassName(...) construction target's own __init__
+		signature. An ordinary function body always gets that treatment
+		first (Compiler._lower's Function branch calls resolve_function_
+		body before lower_function ever runs) - a global never did,
+		because Compiler._lower's Variable branch went straight to lower_
+		global. Confirmed as a real, reachable crash (not theoretical): a
+		global initialized via a bare `ClassName()` construction call
+		(going through a real __init__, unlike `ClassName.make(...)`'s own
+		staticmethod path, which never hits this) trips lowering.py's own
+		_try_lower_construct_call assert ("... was not resolved before
+		construction") - PLAN_GLOBAL_INIT.md's own real-compile fixture
+		(g_foo: Foo = Foo.make(1)) never exercised this path. Memoized by
+		id(var.init), the same id()-keyed convention resolve_function_body
+		uses (id(fn.node)) for the identical "idempotent even if reached
+		twice" reason. '''
+		if var.init is None:
+			return
+		if id( var.init ) in self._body_resolved:
+			return
+		self._body_resolved.add( id( var.init ))
+		module = self._find_module_for( var )
+		with self.discovery.module_context( module ):
+			resolver = _ReferenceResolver( self, None )
+			try:
+				var.init = resolver.visit( var.init )
+			except CompileError:
+				pass # already recorded - lowering.py's own _lower_expr re-reaches and re-reports the same failure moments later, same recovery discipline as resolve_function_body's per-statement try/except
+
 
 class _ReferenceResolver( ast.NodeTransformer ):
 	'''
@@ -962,15 +996,20 @@ class _ReferenceResolver( ast.NodeTransformer ):
 	shape it doesn't recognize - real code
 	overwhelmingly writes `if ptr is None:` against a bare local anyway.
 	'''
-	def __init__( self, resolver: TypeResolver, fn: Function ) -> None:
+	def __init__( self, resolver: TypeResolver, fn: Function|None ) -> None:
 		self.resolver = resolver
 		self.discovery = resolver.discovery
 		self.fn = fn
 		self.locals: dict[str,Type] = {}
-		for param in fn.parameters or []:
-			self.locals[param.stem] = param.type
-		if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
-			self.locals['self'] = fn.cls
+		# fn is None for a global variable's own initializer expression
+		# (resolve_global_init) - no parameters, no self, matching
+		# lowering.py's own FunctionLowering( self, None ) convention for
+		# the identical case (see run_global's docstring)
+		if fn is not None:
+			for param in fn.parameters or []:
+				self.locals[param.stem] = param.type
+			if fn.cls is not None and not fn.is_static and not fn.is_classmethod:
+				self.locals['self'] = fn.cls
 		self._label_id = 0
 		# parallel to self.locals, but for a name CURRENTLY known to be one
 		# of a non-empty SET of possible union members within the lexical
