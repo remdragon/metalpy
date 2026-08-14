@@ -254,6 +254,17 @@ def mangle_qualname( qualname: str ) -> str:
 		.replace( '[', '$$g$' )
 		.replace( ',', '$$' )
 		.replace( ']', '' )
+		# '|' appears when an anonymous union is a type ARGUMENT embedded in a
+		# larger generic qualname, e.g. Result[intrinsics.f64, builtins.Zero
+		# DivisionError|builtins.FloatingPointError] from checked float division
+		# (the union's OWN standalone name never reaches here - mangle_type
+		# routes it through the $__u$$... scheme instead). A literal '|' isn't a
+		# legal C identifier character; '$or$' is unique ('$' can't appear in a
+		# real identifier) and, because every reference to the SAME qualname
+		# string - the interned Specialization AND its monomorphized concrete
+		# class (which share qualname, see monomorphize_class) - passes through
+		# this one function, all mangle to the same name.
+		.replace( '|', '$or$' )
 	)
 
 def mangle_type( t: Type ) -> str:
@@ -553,6 +564,68 @@ def _result_tag_data_names( result_spec: Type ) -> tuple[str,str,str,str]:
 		f'{base.qualname}: _tagged_union_storage has not run yet - no real storage shape to read'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem ), _field_name( 'v_Ok' ), _field_name( 'v_Err' )
 
+def _union_tag_data_fields( union: TaggedUnion ) -> tuple[str,str]:
+	''' (tag_field, data_field) C names for an anonymous error UNION (the E in
+	Result[T,E] when E is itself a union like ZeroDivisionError|OverflowError).
+	Same UnionStorage-synthesized 'tag'/'data' shape _result_tag_data_names
+	reads for the outer Result, just for the inner error union. '''
+	tag_attr = union.names.get( 'tag' )
+	data_attr = union.names.get( 'data' )
+	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
+		f'{union.qualname}: union storage not synthesized (UnionStorage.get must run before emit)'
+	return _field_name( tag_attr.stem ), _field_name( data_attr.stem )
+
+def _union_member_ordinal( union: TaggedUnion, member_type: Type ) -> int:
+	''' the tag VALUE of `member_type` within `union` - its index in
+	.attributes (UnionStorage assigns tags in attribute order). Matched by
+	qualname (error classes are interned, but qualname is the stable key). '''
+	for i, attr in enumerate( union.attributes ):
+		if attr.type is not None and attr.type.qualname == member_type.qualname:
+			return i
+	raise AssertionError( f'{member_type.qualname} is not a member of {union.qualname}' )
+
+def _emit_widen_error( dest_expr: str, e_fn: Type, src_expr: str, e_op: Type ) -> list[str]:
+	''' assign the error value `src_expr` (of type e_op) into the error lvalue
+	`dest_expr` (of type e_fn), WIDENING when they differ. e_fn is guaranteed
+	to cover e_op (type_resolver._require_result_return's leaves-containment
+	check ran at lowering). All arithmetic error leaves are zero-payload marker
+	classes, so widening is a pure tag remap - no payload copy (mirrors how the
+	checked ops themselves only ever set the error tag, never v_Err). '''
+	if e_op is e_fn:
+		return [ f'\t\t{dest_expr} = {src_expr};' ] # identical layout - plain struct copy (today's fast path)
+	assert isinstance( e_fn, TaggedUnion ), f'widening into a non-union error type {e_fn!r}'
+	fn_tag, _fn_data = _union_tag_data_fields( e_fn )
+	if not isinstance( e_op, TaggedUnion ):
+		# single marker class -> set the wide union's variant tag for it
+		ordinal = _union_member_ordinal( e_fn, e_op )
+		return [ f'\t\t{dest_expr}.{fn_tag} = {ordinal};' ]
+	# e_op is itself a (narrower) union -> remap each member's tag at runtime
+	op_tag, _op_data = _union_tag_data_fields( e_op )
+	lines = [ f'\t\tswitch ( ({src_expr}).{op_tag} ) {{' ]
+	for i, attr in enumerate( e_op.attributes ):
+		ordinal = _union_member_ordinal( e_fn, attr.type )
+		lines.append( f'\t\t\tcase {i}: {dest_expr}.{fn_tag} = {ordinal}; break;' )
+	lines.append( '\t\t}' )
+	return lines
+
+def _result_error_type( result_type: Type ) -> Type:
+	''' the E in a Result[T,E] value. Handles BOTH shapes a Result can take by
+	emit time: a Specialization (E is args[1]) OR a concrete monomorphized
+	TaggedUnion (Lowering.monomorphize_class gives it a flat qualname and
+	substituted Ok/Err members, so E is the 'Err' member's own type). A
+	function's return_type in particular is usually the concrete class, not the
+	Specialization - the reason _emit_or_return must not assume Specialization.
+	Uses .qualname (never !r) in messages - a full type repr recurses. '''
+	if isinstance( result_type, Specialization ):
+		assert len( result_type.args ) == 2, f'not a Result[T,E]: {result_type.qualname!r}'
+		return result_type.args[1]
+	assert isinstance( result_type, TaggedUnion ), f'not a Result[T,E]: {getattr(result_type, "qualname", result_type)!r}'
+	for attr in result_type.attributes:
+		if attr.stem == 'Err':
+			assert attr.type is not None, f'{result_type.qualname}: Err member has no resolved type'
+			return attr.type
+	raise AssertionError( f'{result_type.qualname}: no Err member (not a Result[T,E])' )
+
 # --- struct/union body emission -------------------------------------------
 #
 # A concrete generic class specialization (Result[i32,OverflowError]) is a
@@ -789,8 +862,8 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 # analogue of _emit_check_arith. There's no overflow builtin for floats: compute
 # the plain IEEE result, then flag it if it came out inf/nan (which also catches
 # a nan/inf operand propagating through). dest.type is Result[float,
-# FloatingPointError]. Division is NOT here (checked float / reuses ir.Div ->
-# ZeroDivisionError; see that block).
+# FloatingPointError]. Division is NOT here - checked float / is FloatDivCheck
+# (ZeroDivisionError|FloatingPointError union), see _emit_float_div_check.
 _FLOAT_CHECK_SYMBOL: dict[type,str] = { ir.FAddCheck: '+', ir.FSubCheck: '-', ir.FMulCheck: '*' }
 
 def _emit_float_check_arith( instr ) -> list[str]:
@@ -873,6 +946,92 @@ def _emit_float_to_int_clamp( instr ) -> list[str]:
 		f'( ({operand}) < ({fctype}){min_c} ? {min_c} : '
 		f'( ({operand}) > ({fctype}){max_c} ? {max_c} : ({ctype})({operand}) ) );',
 	]
+
+# --- division / modulo (mode-aware, union errors) -------------------------
+#
+# All division goes through a Result: r==0 -> ZeroDivisionError in every mode.
+# The signed INT_MIN/-1 case (UB in C) is where the modes diverge - see
+# _emit_int_division. _emit_set_result_err/_ok write into the Result temp,
+# setting the inner error-union variant tag when the error type is a union.
+
+def _emit_set_result_ok( dest: str, result_spec: Type, value_expr: str, indent: str ) -> list[str]:
+	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( result_spec )
+	return [ f'{indent}{dest}.{tag_f} = 0;', f'{indent}{dest}.{data_f}.{ok_f} = {value_expr};' ]
+
+def _emit_set_result_err( dest: str, result_spec: Type, error_stem: str, indent: str ) -> list[str]:
+	# set the Err tag; when the error type is a UNION (e.g. ZeroDivisionError|
+	# OverflowError), also set the inner union's variant tag for `error_stem`.
+	# A single-marker error type has no inner variant to pick.
+	tag_f, data_f, _ok_f, err_f = _result_tag_data_names( result_spec )
+	lines = [ f'{indent}{dest}.{tag_f} = 1;' ]
+	err_type = _result_error_type( result_spec )
+	if isinstance( err_type, TaggedUnion ):
+		inner_tag, _inner_data = _union_tag_data_fields( err_type )
+		ordinal = next( i for i, attr in enumerate( err_type.attributes ) if attr.type is not None and attr.type.stem == error_stem )
+		lines.append( f'{indent}{dest}.{data_f}.{err_f}.{inner_tag} = {ordinal};' )
+	return lines
+
+def _signed_min_max( stem: str ) -> tuple[str,str]:
+	''' (MIN, MAX) C expressions for a signed integer stem. i8..i64/isize use
+	stdint macros; i128 has none, so use the two's-complement bit pattern. '''
+	if stem in _SATURATE_LIMITS:
+		return _SATURATE_LIMITS[stem]
+	if stem == 'i128':
+		return ( '(__metalpy_wideint)((__metalpy_wideuint)1 << 127)',
+			'(__metalpy_wideint)(((__metalpy_wideuint)1 << 127) - 1)' )
+	raise NotImplementedError( f'no MIN/MAX for signed stem {stem!r}' )
+
+def _emit_int_division( instr ) -> list[str]:
+	result_spec = instr.dest.type
+	ok_type = result_spec.args[0]
+	dest = f't{instr.dest.id}'
+	l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
+	is_mod = isinstance( instr, ( ir.Mod, ir.ModWrap, ir.ModSaturate ))
+	symbol = '%' if is_mod else '/'
+	checked = isinstance( instr, ( ir.Div, ir.Mod ))       # OverflowError on INT_MIN/-1
+	wrap = isinstance( instr, ( ir.DivWrap, ir.ModWrap ))  # INT_MIN/-1 inline
+	stem = ok_type.stem if isinstance( ok_type, Scalar ) else None
+	signed = stem in _SIGNED_TO_UNSIGNED
+	ctype = c_type( ok_type )
+	lines = [ f'\tif ( ({r}) == 0 ) {{' ]
+	lines += _emit_set_result_err( dest, result_spec, 'ZeroDivisionError', '\t\t' )
+	if signed:
+		# signed INT_MIN / -1 (and INT_MIN % -1) is UB in C - handle it
+		# explicitly per mode instead of letting the CPU trap
+		min_expr, max_expr = _signed_min_max( stem )
+		lines.append( f'\t}} else if ( ({l}) == ({ctype})({min_expr}) && ({r}) == -1 ) {{' )
+		if checked:
+			lines += _emit_set_result_err( dest, result_spec, 'OverflowError', '\t\t' )
+		else:
+			# wrap/saturate: a defined inline result. Mod's true answer is 0;
+			# Div wraps to INT_MIN, saturates to INT_MAX
+			inline = '0' if is_mod else ( min_expr if wrap else max_expr )
+			lines += _emit_set_result_ok( dest, result_spec, f'({ctype})({inline})', '\t\t' )
+	lines.append( '\t} else {' )
+	lines += _emit_set_result_ok( dest, result_spec, f'({l}) {symbol} ({r})', '\t\t' )
+	lines.append( '\t}' )
+	return lines
+
+def _emit_float_div_check( instr ) -> list[str]:
+	# checked/panic float `/`: r==0 -> ZeroDivisionError; else compute and, if
+	# the quotient is inf/nan (overflow, or a non-finite operand from a prior
+	# wrap-mode block), FloatingPointError. dest.type is Result[T, union].
+	result_spec = instr.dest.type
+	ok_type = result_spec.args[0]
+	ctype = c_type( ok_type )
+	dest = f't{instr.dest.id}'
+	l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
+	lines = [ f'\tif ( ({r}) == 0 ) {{' ]
+	lines += _emit_set_result_err( dest, result_spec, 'ZeroDivisionError', '\t\t' )
+	lines.append( '\t} else {' )
+	lines.append( f'\t\t{ctype} __q = ({l}) / ({r});' )
+	lines.append( '\t\tif ( __metalpy_isinf( __q ) || __metalpy_isnan( __q ) ) {' )
+	lines += _emit_set_result_err( dest, result_spec, 'FloatingPointError', '\t\t\t' )
+	lines.append( '\t\t} else {' )
+	lines += _emit_set_result_ok( dest, result_spec, '__q', '\t\t\t' )
+	lines.append( '\t\t}' )
+	lines.append( '\t}' )
+	return lines
 
 def _emit_saturate_arith( dest: str, left: ir.Operand, right: ir.Operand, kind: str, dest_type: Type ) -> list[str]:
 	stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
@@ -1267,30 +1426,19 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ( ir.ShlWrap, ir.ShlCheck, ir.ShlSaturate )):
 		return _emit_shl( instr )
 
-	if isinstance( instr, ( ir.Div, ir.Mod )):
-		# always Check mode against ZeroDivisionError, independent of the
-		# active arithmetic mode - see lowering.py's own _expr_BinOp comment.
-		# KNOWN GAP: signed INT_MIN / -1 is itself UB in C (the one value
-		# that legitimately overflows a division) - not handled, matches
-		# nothing exercising it yet
-		ok_type = instr.dest.type.args[0]
-		dest = f't{instr.dest.id}'
-		l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
-		symbol = '/' if isinstance( instr, ir.Div ) else '%'
-		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
-		return [
-			f'\tif ( ({r}) == 0 ) {{',
-			f'\t\t{dest}.{tag_f} = 1;',
-			'\t} else {',
-			f'\t\t{dest}.{tag_f} = 0;',
-			f'\t\t{dest}.{data_f}.{ok_f} = ({l}) {symbol} ({r});',
-			'\t}',
-		]
+	if isinstance( instr, ( ir.Div, ir.Mod, ir.DivWrap, ir.DivSaturate, ir.ModWrap, ir.ModSaturate )):
+		# integer division/modulo - always zero-checked (ZeroDivisionError);
+		# signed INT_MIN/-1 handled per mode (checked -> OverflowError; wrap ->
+		# INT_MIN; saturate -> INT_MAX; mod -> 0). See _emit_int_division.
+		return _emit_int_division( instr )
+
+	if isinstance( instr, ir.FloatDivCheck ):
+		return _emit_float_div_check( instr )
 
 	if isinstance( instr, ir.FloatDiv ):
 		# wrap/saturate-mode float `/`: raw IEEE, no zero-check (x/0.0 -> inf,
 		# 0.0/0.0 -> nan, produced silently). checked/panic-mode float `/` uses
-		# ir.Div above instead (-> ZeroDivisionError)
+		# ir.FloatDivCheck above instead (-> ZeroDivisionError|FloatingPointError)
 		dest = _emit_operand( instr.dest )
 		l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
 		return [ f'\t{dest} = ({l}) / ({r});' ]
@@ -1590,11 +1738,15 @@ def _emit_or_return( instr: ir.OrReturn, function: Function ) -> list[str]:
 	return_type = function.return_type
 	ret_ctype = c_type( return_type )
 	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.value.type )
+	# the error may need WIDENING: value's error type (E_op) can be narrower
+	# than the function's declared error union (E_fn) - see _emit_widen_error
+	e_op = _result_error_type( instr.value.type )
+	e_fn = _result_error_type( return_type )
 	return [
 		f'\tif ( ({value}).{tag_f} == 1 ) {{',
 		f'\t\t{ret_ctype} __err;',
 		f'\t\t__err.{tag_f} = 1;',
-		f'\t\t__err.{data_f}.{err_f} = ({value}).{data_f}.{err_f};',
+		*_emit_widen_error( f'__err.{data_f}.{err_f}', e_fn, f'({value}).{data_f}.{err_f}', e_op ),
 		'\t\treturn __err;',
 		'\t}',
 		f'\t{dest} = ({value}).{data_f}.{ok_f};',
@@ -1607,8 +1759,12 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 	lines = [ f'\tif ( ({value}).{tag_f} == 1 ) {{' ]
 	if instr.return_slot is not None:
 		slot = _emit_operand( instr.return_slot )
+		# widen value's error (E_op) into the return slot's error union (E_fn)
+		# if they differ - same as _emit_or_return
+		e_op = _result_error_type( instr.value.type )
+		e_fn = _result_error_type( instr.return_slot.type )
 		lines.append( f'\t\t{slot}.{tag_f} = 1;' )
-		lines.append( f'\t\t{slot}.{data_f}.{err_f} = ({value}).{data_f}.{err_f};' )
+		lines.extend( _emit_widen_error( f'{slot}.{data_f}.{err_f}', e_fn, f'({value}).{data_f}.{err_f}', e_op ))
 	lines.append( f'\t\tgoto {_c_label(instr.target)};' )
 	lines.append( '\t}' )
 	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )

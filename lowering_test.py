@@ -880,17 +880,20 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_binop_floordiv_and_mod_check_mode_emits_or_return( self ) -> None:
-		# mirrors test_binop_check_mode_emits_or_return, but against
-		# ZeroDivisionError instead of OverflowError, and independent of
-		# arithmetic mode (there's no wrapped/saturated division)
+		# mirrors test_binop_check_mode_emits_or_return, but for division:
+		# SIGNED checked division can raise EITHER ZeroDivisionError (divisor 0)
+		# OR OverflowError (INT_MIN/-1), so its Result error type is the union
+		# ZeroDivisionError|OverflowError - the enclosing function must return a
+		# Result whose error covers both
 		code = '\n'.join([
 			'class ZeroDivisionError: pass',
+			'class OverflowError: pass',
 			'',
 			'@cstruct',
 			'class Result[T,E]:',
 			'	pass',
 			'',
-			'def checked() -> Result[None,ZeroDivisionError]:',
+			'def checked() -> Result[None,ZeroDivisionError | OverflowError]:',
 			'	a: i32 = 10',
 			'	b: i32 = a // 3',
 			'	c: i32 = a % 3',
@@ -902,18 +905,20 @@ class Tests( unittest.TestCase ):
 		if checked_fn.resolve is not None:
 			checked_fn.resolve()
 		zerodiv_cls = mod.get_local( 'ZeroDivisionError' )
+		overflow_cls = mod.get_local( 'OverflowError' )
 		result_cls = mod.get_local( 'Result' )
 		if result_cls.resolve is not None:
 			result_cls.resolve()
-		result_i32_zerodiv = self.discovery._get_or_create_specialization( result_cls, [ i32, zerodiv_cls ] )
+		error_union = self.discovery._get_or_create_union( [ zerodiv_cls, overflow_cls ] )
+		result_i32_err = self.discovery._get_or_create_specialization( result_cls, [ i32, error_union ] )
 
-		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 8, type = i32 )
-		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 9, type = i32 )
-		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 10, type = i32 )
+		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 9, type = i32 )
+		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 10, type = i32 )
+		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 11, type = i32 )
 
-		t0 = ir.Temp( type = result_i32_zerodiv, id = 0 ) # Div's Result
-		t1 = ir.Temp( type = i32, id = 1 )                # unwrapped via OrReturn
-		t2 = ir.Temp( type = result_i32_zerodiv, id = 2 ) # Mod's Result
+		t0 = ir.Temp( type = result_i32_err, id = 0 ) # Div's Result
+		t1 = ir.Temp( type = i32, id = 1 )            # unwrapped via OrReturn
+		t2 = ir.Temp( type = result_i32_err, id = 2 ) # Mod's Result
 		t3 = ir.Temp( type = i32, id = 3 )
 
 		fn = self.compiler._lower( checked_fn )
@@ -940,6 +945,7 @@ class Tests( unittest.TestCase ):
 	def test_binop_floordiv_without_zerodivision_result_is_a_compile_error( self ) -> None:
 		code = '\n'.join([
 			'class ZeroDivisionError: pass',
+			'class OverflowError: pass',
 			'',
 			'@cstruct',
 			'class Result[T,E]:',
@@ -952,7 +958,9 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		fn = self._lower_main()
-		self.assertIn( 'Result[_,ZeroDivisionError]', self.discovery.errors.errors[0] )
+		# signed `//` in the default checked mode can raise ZeroDivisionError OR
+		# OverflowError (INT_MIN/-1), so the required error type is their union
+		self.assertIn( 'Result[_,OverflowError | ZeroDivisionError]', self.discovery.errors.errors[0] )
 		self.assertIn( 'panic_arithmetic', self.discovery.errors.errors[0] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
@@ -990,7 +998,7 @@ class Tests( unittest.TestCase ):
 		fn = self.compiler._lower( checked_fn )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertIn( 'Div', kinds )
+		self.assertIn( 'DivWrap', kinds ) # wrap mode uses DivWrap (INT_MIN/-1 wraps inline); still zero-checked -> Result[_,ZeroDivisionError]
 		self.assertIn( 'OrReturn', kinds )
 		self.assertNotIn( 'Unwrap', kinds ) # no panic - wrap_arithmetic doesn't imply panic_arithmetic
 

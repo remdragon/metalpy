@@ -89,6 +89,14 @@ _UNARYOP_DUNDER: dict[type,str] = {
 def _is_float_scalar( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem in ( 'f32', 'f64' )
 
+# signed integer scalar stems - used to decide whether a checked Div/Mod can
+# also raise OverflowError (signed INT_MIN/-1), see ir.BinOp.signed_only and
+# _lower_arithmetic_op's error-set resolution
+_SIGNED_INT_STEMS: frozenset[str] = frozenset([ 'i8', 'i16', 'i32', 'i64', 'i128', 'isize' ])
+
+def _is_signed_scalar( t: Type|None ) -> bool:
+	return isinstance( t, Scalar ) and t.stem in _SIGNED_INT_STEMS
+
 # ast binary operators that have no floating-point meaning - bitwise/shift and
 # floor-div/mod (Python's float // and % exist but aren't in this first pass).
 # Rejected with a clear message before float arithmetic routing.
@@ -2581,6 +2589,15 @@ class FunctionLowering:
 		# already do, reusing the same Check/Wrap/Saturate/panic_arithmetic
 		# machinery, not a separate concept)
 		if isinstance( source, ast.expr ):
+			# an EXPLICIT float-literal cast to a non-float scalar (i32(1.5),
+			# compiler.cast(u8, 3.9)) truncates toward zero at compile time -
+			# this is the deliberate float->int conversion mechanism, so it
+			# bypasses _expr_Constant's implicit-hint guard (which only rejects a
+			# float literal being SILENTLY coerced to an int, e.g. `i + 1.5`).
+			# A float->float or int/other literal keeps its existing behavior
+			# (float value preserved, or int bit-reinterpretation via _lower_expr)
+			if isinstance( source, ast.Constant ) and isinstance( source.value, float ) and not _is_float_scalar( target_type ):
+				return ir.Const( type = target_type, value = int( source.value ) )
 			return self._lower_expr( source, target_type )
 		operand = source
 		# a cast that touches a float on either side (int<->float, float<->float)
@@ -3616,6 +3633,18 @@ class FunctionLowering:
 		return self.lowering._function_ref_operand( synthetic )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
+		# a floating-point literal can only be typed as a float. If context
+		# hints it toward a non-float scalar (an integer), that's a silent-
+		# truncation trap - reject it. Catches `i + 1.5` (the literal hinted to
+		# the int operand's type by _lower_binary_operands), `x: i32 = 1.5`, and
+		# `i32(1.5)`. A float target (f32/f64), no expected type (defaults f64),
+		# and a union expected type all fall through unaffected.
+		if isinstance( node.value, float ) and isinstance( expected_type, Scalar ) and not _is_float_scalar( expected_type ):
+			self.lowering.discovery.fail(
+				f'a floating-point literal cannot be used where {expected_type.qualname} is expected - '
+				f'write an explicit cast (e.g. {expected_type.stem}(...)) or use an integer literal: {ast.unparse(node)}',
+				node,
+			)
 		# expected_type being a TaggedUnion (e.g. str|None) is treated the
 		# same as no expected_type at all: a literal's OWN Python type
 		# always determines its natural type (bool/i32/str/NoneType) -
@@ -4378,26 +4407,58 @@ class FunctionLowering:
 		# unreachable from there, but harmless to share
 		if opcode is None:
 			self.lowering.discovery.fail( f'unsupported {kind} operator: {ast.unparse(node)}', node )
-		if not opcode.checked_error:
+		if not opcode.checked_errors:
 			# wrap/saturate, or no overflow concept at all (bitwise/Invert)
 			dest = self._new_temp( result_type )
 			self._emit( opcode( dest = dest, **operand_kwargs ))
 			return dest
 		# check mode (the default - see the class docstring): the op itself
-		# produces Result[result_type,<opcode.checked_error>]. How that
-		# Result gets consumed depends on `extra`: the default (extra is
-		# None) uses OrReturn, mirroring Result.or_return()'s own semantics,
-		# and needs somewhere for the error to propagate to; `with
-		# compiler.panic_arithmetic(msg):` (extra is the lowered msg
-		# operand) uses Unwrap instead, which panics immediately and so has
-		# no such requirement
-		result_cls, error_cls = self.lowering._type_resolver._lookup_result_and_error_types( node, opcode.checked_error )
+		# produces Result[result_type,<error_type>], where <error_type> is a
+		# single marker class (most ops) or the anonymous UNION of several
+		# (signed Div/Mod -> ZeroDivisionError|OverflowError; checked float / ->
+		# ZeroDivisionError|FloatingPointError). How that Result gets consumed
+		# depends on `extra`: the default (extra is None) uses OrReturn,
+		# mirroring Result.or_return()'s own semantics, and needs somewhere for
+		# the error to propagate to; `with compiler.panic_arithmetic(msg):`
+		# (extra is the lowered msg operand) uses Unwrap instead, which panics
+		# immediately and so has no such requirement
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		error_type, alternatives = self._resolve_checked_error( node, opcode, result_type )
 		if extra is None:
 			# validated before anything gets emitted - a mid-statement
 			# failure here must not leave partial instructions behind for
 			# the per-statement recovery boundary to silently keep
-			self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, _ALTERNATIVES_BY_ERROR[opcode.checked_error], fn = self._current_fn )
-		return self._emit_checked_op( node, opcode, operand_kwargs, result_type, result_cls, error_cls, extra )
+			self.lowering._type_resolver._require_result_return( node, result_cls, error_type, alternatives, fn = self._current_fn )
+		return self._emit_checked_op( node, opcode, operand_kwargs, result_type, result_cls, error_type, extra )
+
+	def _resolve_checked_error( self, node: ast.AST, opcode: type, result_type: Type ) -> tuple[ClassLike,str]:
+		# the error TYPE a checked opcode's Result is against, plus the "how to
+		# avoid needing to propagate it" message. opcode.checked_errors lists
+		# the possible error class names; opcode.signed_only names the ones that
+		# only apply to a signed integer result (OverflowError on Div/Mod's
+		# INT_MIN/-1) - filtered out for unsigned operands. A single remaining
+		# name -> that marker class (unchanged from before); several -> the
+		# anonymous union of them (interned by _get_or_create_union, so a user's
+		# own `A | B` annotation on the enclosing function's return type is the
+		# SAME object - identity holds for _require_result_return's coverage
+		# check and for OrReturn's error copy).
+		signed = _is_signed_scalar( result_type )
+		names = [ e for e in opcode.checked_errors if e not in opcode.signed_only or signed ]
+		classes = [ self.lowering.discovery.find_name( name, node ) for name in names ]
+		if len( classes ) == 1:
+			# single-error path: preserve the exact per-error message (existing
+			# tests assert e.g. 'Result[_,ZeroDivisionError]' + 'panic_arithmetic')
+			return classes[0], _ALTERNATIVES_BY_ERROR[names[0]]
+		error_union = self.lowering.discovery._get_or_create_union( classes )
+		# the union's tag/data storage must exist by emit time (OrReturn's
+		# widening and the division emitter both read the inner variant tag)
+		self.lowering.schedule( error_union )
+		self.lowering._union_storage.get( error_union )
+		alternatives = (
+			f'change the enclosing function to return Result[_,{" | ".join(sorted(c.stem for c in classes))}] '
+			'(or a wider union covering those), or wrap this in `with compiler.panic_arithmetic(...):`'
+		)
+		return error_union, alternatives
 
 	def _emit_checked_op( self, node: ast.AST, opcode: type, operand_kwargs: dict, result_type: Type, result_cls: ClassLike, error_cls: ClassLike, extra: ir.Operand|None ) -> ir.Temp:
 		# shared by Check-mode binops (Add/Sub/Mult/Shl/Div/Mod), USub, and

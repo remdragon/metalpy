@@ -528,20 +528,28 @@ class TypeResolver:
 		return result_cls, error_cls
 
 	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, alternatives: str, fn: Function|None = None ) -> None:
+		# the enclosing function must return Result[_, E_fn] where E_fn COVERS
+		# the op/receiver's error type E_op (error_cls) - every leaf of E_op is
+		# also a leaf of E_fn. This admits both an exact match (E_fn is E_op,
+		# the common case) AND WIDENING: a function may declare one wider error
+		# union (e.g. Result[_, A | B | C]) that covers each fallible op's
+		# narrower error (A, or B|C, ...), and OrReturn/OrJump remap the narrow
+		# error into that union at the propagation site (see emitter_c.py's
+		# _emit_widen_error). Leaves compared by identity - every union is
+		# interned by _get_or_create_union, so the SAME A|B object backs both
+		# an op's error and a matching annotation.
 		return_type = fn.return_type if fn is not None else None
 		spec = self._as_specialization( return_type )
-		ok = (
-			fn is not None
-			and spec is not None
-			and spec.base is result_cls
-			and len( spec.args ) == 2
-			and spec.args[1] is error_cls
-		)
-		if not ok:
+		covered = False
+		if fn is not None and spec is not None and spec.base is result_cls and len( spec.args ) == 2:
+			fn_error_leaves = spec.args[1].leaves()
+			covered = all( leaf in fn_error_leaves for leaf in error_cls.leaves() )
+		if not covered:
+			want = ' | '.join( sorted( leaf.stem for leaf in error_cls.leaves() ))
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
-				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{error_cls.stem}] '
-				f'({where}) - {alternatives}',
+				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
+				f'(or a wider union covering it) ({where}) - {alternatives}',
 				node,
 			)
 

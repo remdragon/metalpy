@@ -88,9 +88,10 @@ class ArithmeticChecked( ArithmeticMode ):
 			case ast.LShift:
 				return ir.ShlCheck, None
 			case ast.FloorDiv:
-				# always checked against ZeroDivisionError, independent of
-				# the active arithmetic mode - there's no wrapped/saturated
-				# division opcode, so Div/Mod are the same in every mode
+				# checked/panic-mode division: signed INT_MIN/-1 -> OverflowError
+				# alongside the always-present ZeroDivisionError (see ir.Div's
+				# own checked_errors/signed_only). Wrap/Saturate use their own
+				# DivWrap/DivSaturate below, which handle INT_MIN/-1 inline
 				return ir.Div, None
 			case ast.Mod:
 				return ir.Mod, None
@@ -106,10 +107,11 @@ class ArithmeticChecked( ArithmeticMode ):
 			case ast.Mult:
 				return ir.FMulCheck, None
 			case ast.Div:
-				# float `/` in checked mode reuses the integer Div opcode: its
-				# r==0 -> ZeroDivisionError check works verbatim for a float
-				# divisor (see the plan's documented division-result gap)
-				return ir.Div, None
+				# checked/panic float `/` raises ZeroDivisionError (divisor 0)
+				# OR FloatingPointError (result inf/nan) - a union, so it needs
+				# its own opcode, NOT the integer Div (which raises Overflow-
+				# Error for INT_MIN/-1, meaningless for floats)
+				return ir.FloatDivCheck, None
 			case _:
 				return None, None # float //, %, bitwise: rejected in lowering, but be safe
 
@@ -138,9 +140,9 @@ class ArithmeticWrap( ArithmeticMode ):
 			case ast.LShift:
 				return ir.ShlWrap, None
 			case ast.FloorDiv:
-				return ir.Div, None # see ArithmeticChecked.GetBinOp
+				return ir.DivWrap, None # INT_MIN/-1 wraps to INT_MIN inline (no error); only r==0 raises
 			case ast.Mod:
-				return ir.Mod, None
+				return ir.ModWrap, None
 			case _:
 				return super().GetBinOp( node )
 
@@ -170,9 +172,9 @@ class ArithmeticSaturate( ArithmeticMode ):
 			case ast.LShift:
 				return ir.ShlSaturate, None
 			case ast.FloorDiv:
-				return ir.Div, None # see ArithmeticChecked.GetBinOp
+				return ir.DivSaturate, None # INT_MIN/-1 saturates to INT_MAX inline (no error); only r==0 raises
 			case ast.Mod:
-				return ir.Mod, None
+				return ir.ModSaturate, None
 			case _:
 				return super().GetBinOp( node )
 

@@ -110,6 +110,16 @@ class FloatBehaviorTests( unittest.TestCase ):
 		joined = '\n'.join( str(e) for e in discovery.errors.errors )
 		self.assertIn( needle, joined, f'expected a compile error containing {needle!r}, got:\n{joined or "(no errors)"}' )
 
+	def _c_source( self, code: str ) -> str:
+		''' compile `code` all the way to generated C (no real cc invocation) -
+		for structural assertions on emitter output (e.g. the widening remap). '''
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( code, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [], 'compile errors:\n' + '\n'.join( str(e) for e in discovery.errors.errors ) )
+		return emitter_c.emit_c( compiler, no_crt = 'c' not in compiler.extern_libs )
+
 	# --- arithmetic, unary negate, comparisons (wrap mode = raw IEEE) --------
 
 	def test_arithmetic_and_comparisons( self ) -> None:
@@ -376,6 +386,244 @@ def main() -> i32:
 		c: f64 = a & b
 	return 0
 ''', 'not supported on floating-point' )
+
+	def test_float_literal_into_int_is_error( self ) -> None:
+		# a float literal hinted to an integer type is a silent-truncation trap
+		self._assert_compile_error( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 5
+		c: i32 = i + 1.5
+	return 0
+''', 'floating-point literal cannot be used' )
+
+	def test_float_literal_annotated_int_is_error( self ) -> None:
+		self._assert_compile_error( '''
+def main() -> i32:
+	x: i32 = 1.5
+	return 0
+''', 'floating-point literal cannot be used' )
+
+	def test_float_literal_explicit_cast_truncates( self ) -> None:
+		# an EXPLICIT cast of a float literal to an int is allowed (it's the
+		# float->int conversion mechanism) and truncates toward zero at compile
+		# time - only the IMPLICIT hint (i + 1.5, x: i32 = 1.5) is rejected
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	n: i32 = i32(1.5)
+	if n != 1:
+		return 1
+	m: i32 = i32(-2.9)
+	if m != -2:
+		return 2
+	u: u8 = u8(3.9)
+	if u != 3:
+		return 3
+	return 0
+''', [ 'i32(1.5) == 1', 'i32(-2.9) == -2 (trunc toward zero)', 'u8(3.9) == 3' ] )
+
+	def test_float_literal_into_float_is_ok( self ) -> None:
+		# the guard must NOT fire for a float target, an int-literal->float, or
+		# a bare (defaults-f64) literal
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		f: f32 = 1.0
+		g: f32 = f + 1.5
+		if g != 2.5:
+			return 1
+		h: f64 = f64(1)
+		if h != 1.0:
+			return 2
+		x = 3.25
+		if x != 3.25:
+			return 3
+	return 0
+''', [ 'f32 + 1.5 literal', 'f64(1) int->float', 'bare 3.25 defaults f64' ] )
+
+	# --- error-union widening (the general capability) ----------------------
+
+	def test_widening_end_to_end( self ) -> None:
+		# ONE declared error union covers three ops with DIFFERENT narrower
+		# errors: float / (ZeroDivisionError|FloatingPointError), float + and a
+		# float->int cast (FloatingPointError), and int // (ZeroDivisionError|
+		# OverflowError). Each widens into the union at its OrReturn. Proves the
+		# coverage check admits the mix AND the emitted C is valid and runs.
+		checks = [ 'success path returns the right Ok value', 'the Err arm must not run on all-finite inputs' ]
+		self._assert_program_succeeds( '''
+def compute( a: f64, b: f64, n: i32, d: i32 ) -> Result[i32, ZeroDivisionError | OverflowError | FloatingPointError]:
+	q: f64 = a / b
+	s: f64 = q + a
+	m: i32 = n // d
+	return Result.Ok( m + i32(s) )
+
+def main() -> i32:
+	r: Result[i32, ZeroDivisionError | OverflowError | FloatingPointError] = compute( 6.0, 2.0, 10, 5 )
+	match r:
+		case Result.Ok( v ):
+			if v != 11:
+				return 1
+		case Result.Err( e ):
+			return 2
+	return 0
+''', checks )
+
+	def test_widening_propagates_error( self ) -> None:
+		# a divide-by-zero on the float / makes compute() return Err (the
+		# ZeroDivisionError widened into the 3-error union); main sees is_err
+		self._assert_program_succeeds( '''
+def compute( a: f64, b: f64 ) -> Result[i32, ZeroDivisionError | OverflowError | FloatingPointError]:
+	q: f64 = a / b
+	return Result.Ok( i32(q) )
+
+def main() -> i32:
+	r: Result[i32, ZeroDivisionError | OverflowError | FloatingPointError] = compute( 1.0, 0.0 )
+	if not r.is_err():
+		return 1
+	ok: Result[i32, ZeroDivisionError | OverflowError | FloatingPointError] = compute( 8.0, 2.0 )
+	if ok.is_err():
+		return 2
+	return 0
+''', [ 'divide-by-zero must widen to Err', 'finite division must be Ok' ] )
+
+	def test_widening_remap_is_emitted( self ) -> None:
+		# structural check of _emit_widen_error - behavioral is_err can't see a
+		# wrong tag (markers carry no payload), so verify the remap C directly.
+		# A single-error op (float +) widening into the 3-union sets the inner
+		# variant tag; a union-error op (float /) widening emits a switch.
+		src = self._c_source( '''
+def compute( a: f64, b: f64 ) -> Result[f64, ZeroDivisionError | OverflowError | FloatingPointError]:
+	s: f64 = a + b
+	q: f64 = a / b
+	return Result.Ok( s + q )
+
+def main() -> i32:
+	r: Result[f64, ZeroDivisionError | OverflowError | FloatingPointError] = compute( 6.0, 2.0 )
+	if r.is_err():
+		return 1
+	return 0
+''' )
+		# float / produces a 2-member union (ZeroDivisionError|FloatingPointError)
+		# widened into the 3-member one -> a runtime tag remap switch
+		self.assertIn( 'switch', src )
+		# 3-union members are ascii-sorted: FloatingPointError=0, OverflowError=1,
+		# ZeroDivisionError=2. The float + raises only FloatingPointError, so its
+		# single->union widen sets the inner tag to 0; the / switch remaps its
+		# ZeroDivisionError arm to 2 (a non-identity mapping, the whole point)
+		self.assertRegex( src, r'v_Err\.tag = 2' )
+
+	# --- checked float division catches BOTH errors (item 1 + item 4) -------
+
+	def test_checked_float_div_inf_result_panics( self ) -> None:
+		# a finite/finite division that overflows to inf is a FloatingPointError
+		# even though the divisor is nonzero (division must check its RESULT)
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("fp"):
+		big: f64 = 1.0e308
+		small: f64 = 1.0e-308
+		q: f64 = big / small
+	return 0
+''' )
+
+	def test_checked_float_div_nan_operand_panics( self ) -> None:
+		# a nan produced in a wrap block, then divided in a checked block: the
+		# quotient is nan -> FloatingPointError. Proves checked code does NOT
+		# assume its operands are already finite (item 4)
+		self._assert_program_panics( '''
+def main() -> i32:
+	nan: f64 = 0.0
+	with compiler.wrap_arithmetic:
+		z: f64 = 0.0
+		nan = z / z
+	with compiler.panic_arithmetic("fp"):
+		two: f64 = 2.0
+		q: f64 = nan / two
+	return 0
+''' )
+
+	# --- signed INT_MIN/-1 is defined per mode (item 2) ---------------------
+
+	def test_int_min_div_checked_panics( self ) -> None:
+		# checked/panic: INT_MIN / -1 (and INT_MIN % -1) is an OverflowError
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("ov"):
+		neg_one: i8 = -1
+		mn: i8 = i8(128)
+		q: i8 = mn // neg_one
+	return 0
+''' )
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("ov"):
+		neg_one: i8 = -1
+		mn: i8 = i8(128)
+		m: i8 = mn % neg_one
+	return 0
+''' )
+
+	def test_int_min_div_wrap_and_saturate( self ) -> None:
+		# wrap: INT_MIN/-1 -> INT_MIN (no error); saturate -> INT_MAX; mod -> 0.
+		# Division is always zero-checked, so each op still yields a Result the
+		# helper propagates - the mode only changes the INT_MIN/-1 value
+		self._assert_program_succeeds( '''
+def wdiv( a: i8, b: i8 ) -> Result[i8, ZeroDivisionError]:
+	with compiler.wrap_arithmetic:
+		return Result.Ok( a // b )
+
+def wmod( a: i8, b: i8 ) -> Result[i8, ZeroDivisionError]:
+	with compiler.wrap_arithmetic:
+		return Result.Ok( a % b )
+
+def sdiv( a: i8, b: i8 ) -> Result[i8, ZeroDivisionError]:
+	with compiler.saturate_arithmetic:
+		return Result.Ok( a // b )
+
+def main() -> i32:
+	mn: i8 = i8(128)
+	neg_one: i8 = i8(255)
+	wq: Result[i8, ZeroDivisionError] = wdiv( mn, neg_one )
+	match wq:
+		case Result.Ok( v ):
+			if v != mn:
+				return 1
+		case Result.Err( e ):
+			return 2
+	wm: Result[i8, ZeroDivisionError] = wmod( mn, neg_one )
+	match wm:
+		case Result.Ok( v ):
+			if v != 0:
+				return 3
+		case Result.Err( e ):
+			return 4
+	sq: Result[i8, ZeroDivisionError] = sdiv( mn, neg_one )
+	match sq:
+		case Result.Ok( v ):
+			if v != 127:
+				return 5
+		case Result.Err( e ):
+			return 6
+	return 0
+''', [ 'wrap INT_MIN//-1 == INT_MIN', 'wrap div Err (unexpected)', 'wrap INT_MIN%-1 == 0', 'wrap mod Err (unexpected)', 'saturate INT_MIN//-1 == INT_MAX', 'saturate div Err (unexpected)' ] )
+
+	def test_unsigned_division_has_no_overflow_error( self ) -> None:
+		# unsigned division can only raise ZeroDivisionError (no INT_MIN/-1) -
+		# a function returning just Result[u8, ZeroDivisionError] must suffice
+		self._assert_program_succeeds( '''
+def udiv( a: u8, b: u8 ) -> Result[u8, ZeroDivisionError]:
+	return Result.Ok( a // b )
+
+def main() -> i32:
+	r: Result[u8, ZeroDivisionError] = udiv( 200, 4 )
+	match r:
+		case Result.Ok( v ):
+			if v != 50:
+				return 1
+		case Result.Err( e ):
+			return 2
+	return 0
+''', [ 'unsigned 200//4 == 50', 'unsigned div Err (unexpected)' ] )
 
 
 if __name__ == '__main__':

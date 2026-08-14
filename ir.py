@@ -134,14 +134,22 @@ class BinOp( Instruction ):
 	left: Operand
 	right: Operand
 
-	# lowering support - a class-level tag, never per-instance data (see
-	# arithmetic_mode.py, the only reader): which error a Check-mode opcode's
-	# dest.type is Result[T,<checked_error>] against, or None for a plain
-	# (non-Result) opcode. ClassVar so subclasses can override it as a bare
-	# class attribute without it becoming a dataclass __init__ parameter
-	# whose default (None, from this base class) would otherwise shadow it
-	# on every instance
-	checked_error: ClassVar[str|None] = None
+	# lowering support - class-level tags, never per-instance data (see
+	# arithmetic_mode.py / lowering.py's _lower_arithmetic_op, the only readers):
+	#
+	# checked_errors: the error class name(s) a Check-mode opcode's dest.type is
+	# Result[T, <error>] against. Empty for a plain (non-Result) opcode. When
+	# more than one, the op's error type is the anonymous UNION of them (built +
+	# interned by discovery._get_or_create_union). ClassVars so subclasses can
+	# override them as bare class attributes without becoming dataclass __init__
+	# parameters whose base-class default would otherwise shadow them.
+	#
+	# signed_only: the subset of checked_errors that applies ONLY when the
+	# result type is a SIGNED integer - lowering filters these out for unsigned
+	# operands. Currently just OverflowError on signed Div/Mod (INT_MIN/-1);
+	# unsigned division can only ever raise ZeroDivisionError.
+	checked_errors: ClassVar[tuple[str,...]] = ()
+	signed_only: ClassVar[frozenset[str]] = frozenset()
 
 	# test support:
 	def test_repr( self ) -> str:
@@ -150,23 +158,33 @@ class BinOp( Instruction ):
 		return f'{type(self).__name__}( dest={self.dest!r}, left={self.left!r}, right={self.right!r} )'
 
 class AddWrap( BinOp ): pass
-class AddCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
+class AddCheck( BinOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class AddSaturate( BinOp ): pass
 
 class SubWrap( BinOp ): pass
-class SubCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
+class SubCheck( BinOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class SubSaturate( BinOp ): pass
 
 class MulWrap( BinOp ): pass
-class MulCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
+class MulCheck( BinOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class MulSaturate( BinOp ): pass
 
 class ShlWrap( BinOp ): pass
-class ShlCheck( BinOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
+class ShlCheck( BinOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class ShlSaturate( BinOp ): pass
 
-class Div( BinOp ): checked_error = 'ZeroDivisionError' # dest.type is Result[T,ZeroDivisionError]
-class Mod( BinOp ): checked_error = 'ZeroDivisionError' # dest.type is Result[T,ZeroDivisionError]
+# integer division/modulo. Mode-specific because signed INT_MIN/-1 (the one
+# value that overflows a division, UB in C) is handled differently per mode:
+# checked/panic -> OverflowError (a second error alongside the always-present
+# ZeroDivisionError, hence the union - but ONLY for signed operands, see
+# signed_only); wrap/saturate handle it inline in the emitter (wrapped/saturated
+# result, no error), so they only ever raise ZeroDivisionError.
+class Div( BinOp ): checked_errors = ( 'ZeroDivisionError', 'OverflowError' ); signed_only = frozenset({ 'OverflowError' })
+class Mod( BinOp ): checked_errors = ( 'ZeroDivisionError', 'OverflowError' ); signed_only = frozenset({ 'OverflowError' })
+class DivWrap( BinOp ): checked_errors = ( 'ZeroDivisionError', ) # INT_MIN/-1 wraps to INT_MIN inline; only r==0 is an error
+class DivSaturate( BinOp ): checked_errors = ( 'ZeroDivisionError', ) # INT_MIN/-1 saturates to INT_MAX inline
+class ModWrap( BinOp ): checked_errors = ( 'ZeroDivisionError', ) # INT_MIN%-1 == 0 inline
+class ModSaturate( BinOp ): checked_errors = ( 'ZeroDivisionError', ) # INT_MIN%-1 == 0 inline
 
 # --- floating-point (f32/f64) arithmetic ---
 # Floats have no integer overflow concept - IEEE 754 yields inf/nan, never
@@ -175,13 +193,15 @@ class Mod( BinOp ): checked_error = 'ZeroDivisionError' # dest.type is Result[T,
 # FloatingPointError]); wrap/saturate mode uses the plain variants (raw IEEE, no
 # error). See arithmetic_mode.py (GetFloatBinOp/GetFloatUnaryOp/GetFloatCast)
 # for the mode->opcode mapping, and lowering.py's _is_float_scalar for routing.
-# NOTE division reuses the integer Div opcode in checked/panic mode (its r==0 ->
-# ZeroDivisionError check works verbatim for a float divisor - see the plan's
-# documented gap on division-result inf/nan); only wrap/saturate needs FloatDiv.
+# Checked float division (FloatDivCheck) can raise EITHER ZeroDivisionError
+# (divisor 0) OR FloatingPointError (result inf/nan, incl. from a non-finite
+# operand that flowed in from a prior wrap-mode block) - hence a union; wrap/
+# saturate float / uses the plain FloatDiv (no error at all).
 class FloatDiv( BinOp ): pass # plain IEEE l/r, no zero-check (wrap/saturate)
-class FAddCheck( BinOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
-class FSubCheck( BinOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
-class FMulCheck( BinOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
+class FloatDivCheck( BinOp ): checked_errors = ( 'ZeroDivisionError', 'FloatingPointError' ) # dest.type is Result[T, ZeroDivisionError|FloatingPointError]
+class FAddCheck( BinOp ): checked_errors = ( 'FloatingPointError', ) # dest.type is Result[T,FloatingPointError]
+class FSubCheck( BinOp ): checked_errors = ( 'FloatingPointError', ) # dest.type is Result[T,FloatingPointError]
+class FMulCheck( BinOp ): checked_errors = ( 'FloatingPointError', ) # dest.type is Result[T,FloatingPointError]
 
 class BitAnd( BinOp ): pass
 class BitOr( BinOp ): pass
@@ -193,8 +213,9 @@ class UnaryOp( Instruction ):
 	dest: Temp
 	operand: Operand
 
-	# lowering support - see BinOp.checked_error above, same reasoning
-	checked_error: ClassVar[str|None] = None
+	# lowering support - see BinOp.checked_errors/signed_only above, same reasoning
+	checked_errors: ClassVar[tuple[str,...]] = ()
+	signed_only: ClassVar[frozenset[str]] = frozenset()
 
 	# test support:
 	def test_repr( self ) -> str:
@@ -202,11 +223,11 @@ class UnaryOp( Instruction ):
 
 class Invert( UnaryOp ): pass
 class NegWrap( UnaryOp ): pass
-class NegCheck( UnaryOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
+class NegCheck( UnaryOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class NegSaturate( UnaryOp ): pass
 
 class CastWrap( UnaryOp ): pass
-class CastCheck( UnaryOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
+class CastCheck( UnaryOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class CastSaturate( UnaryOp ): pass
 
 # float-involving scalar casts (see the float-arithmetic note above). Unary `-`
@@ -216,7 +237,7 @@ class CastSaturate( UnaryOp ): pass
 # int: source out-of-range/nan check) - the emitter branches on target/source.
 # FloatToIntClamp is the wrap/saturate float->int cast (clamps nan->0 and out-of-
 # range->MIN/MAX so it's never UB - wrap==saturate here per the plan).
-class FloatCastCheck( UnaryOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
+class FloatCastCheck( UnaryOp ): checked_errors = ( 'FloatingPointError', ) # dest.type is Result[T,FloatingPointError]
 class FloatToIntClamp( UnaryOp ): pass # plain clamping float->int, no error
 
 @dataclass( kw_only = True )
