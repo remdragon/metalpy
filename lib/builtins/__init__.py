@@ -1707,17 +1707,32 @@ class UnsafeDict[K, V]:
 
 	@staticmethod
 	def _release_key( key_ptr: Ptr[None] ) -> None:
+		# compiler.decref(compiler.cast(K, key_ptr)) - NOT `existing: K =
+		# compiler.cast(...); compiler.decref(existing)`. Binding the cast
+		# result into a named local makes it an ordinary OWNED local (its own
+		# scope-exit decref fires unconditionally, same as any other local) -
+		# but compiler.cast(...) itself never increfs (it's a bare pointer
+		# reinterpret of the SAME already-owned handle, not a fresh
+		# allocation), so that auto-decref then fires in ADDITION to the
+		# explicit one right here, over-releasing by one. A cast used bare, as
+		# an expression (never bound to a name), produces a Temp that is never
+		# fresh_temp()-registered - no auto-decref for it at all - so the
+		# explicit compiler.decref(...) call is the only release, matching
+		# this function's own job: release exactly the ONE reference the dict
+		# itself held. Confirmed with a real UAF/AddressSanitizer repro
+		# (masked in every existing dict test before this - they all only
+		# ever used immortal string literal keys/values, whose release_object
+		# is a guarded no-op regardless of how many times it's called).
 		if compiler.is_rc( K ):
-			existing: K = compiler.cast( K, key_ptr )
-			compiler.decref( existing )
+			compiler.decref( compiler.cast( K, key_ptr ))
 		else:
 			sys.free( compiler.cast( Ptr[u8], key_ptr ))
 
 	@staticmethod
 	def _release_value( value_ptr: Ptr[None] ) -> None:
+		# see _release_key's own comment - identical reasoning, mirrored for V.
 		if compiler.is_rc( V ):
-			existing: V = compiler.cast( V, value_ptr )
-			compiler.decref( existing )
+			compiler.decref( compiler.cast( V, value_ptr ))
 		else:
 			sys.free( compiler.cast( Ptr[u8], value_ptr ))
 
@@ -1737,10 +1752,19 @@ class UnsafeDict[K, V]:
 		# of this same class of problem, which IS handled (this method's
 		# own address, taken from __getitem__/__setitem__ below, relies on
 		# exactly that fix)
+		#
+		# compiler.cast(K, a) == compiler.cast(K, b) - NOT bound into named
+		# ka/kb locals first. See _release_key's own comment: a cast bound to
+		# a name becomes an ordinary OWNED local with its own unconditional
+		# scope-exit decref, but the cast itself never increfs - a's and b's
+		# own borrowed handles (one from the dict's stored entry, one from the
+		# caller's own lookup key) would each be released here on every
+		# single comparison, a guaranteed double-free the moment either key is
+		# a real (non-immortal) heap string. Used bare, as an expression, the
+		# cast produces an untracked Temp - no auto-decref - matching what a
+		# pure equality check actually needs: borrow both, compare, done.
 		if compiler.is_rc( K ):
-			ka: K = compiler.cast( K, a )
-			kb: K = compiler.cast( K, b )
-			return ka == kb
+			return compiler.cast( K, a ) == compiler.cast( K, b )
 		else:
 			pa: Ptr[K] = compiler.cast( Ptr[K], a )
 			pb: Ptr[K] = compiler.cast( Ptr[K], b )
