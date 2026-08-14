@@ -3317,7 +3317,35 @@ class FunctionLowering:
 		# _coerce_into_union, see its own comment
 		if isinstance( expected_type, TaggedUnion ) and operand.type is not expected_type:
 			operand = self._coerce_into_union( operand, expected_type, node )
+		# a derived RCClass value flowing into a base-class context (arg, return,
+		# assignment) is an upcast: struct Derived* -> struct Base*, which C
+		# rejects without an explicit cast. A CastWrap is a borrowed reinterpret
+		# (its temp is never RC-registered - see _lower_bound_method_closure's own
+		# note), so this adds no incref/decref, exactly right for passing the
+		# SAME object under its base type. Restricted to a genuine strict-subclass
+		# relationship so it never masks an unrelated type mismatch.
+		elif ( expected_type is not None and operand.type is not expected_type
+				and self._is_rcclass_upcast( operand.type, expected_type ) ):
+			dest = self._new_temp( expected_type )
+			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
+			operand = dest
 		return operand
+
+	def _is_rcclass_upcast( self, sub: Type|None, sup: Type|None ) -> bool:
+		''' True if `sub` is a strict subclass (transitively) of `sup`, both being
+		RCClasses (or specializations of one) - i.e. a derived->base upcast. '''
+		def rc_of( t: Type|None ) -> Type|None:
+			base = t.base if isinstance( t, Specialization ) else t
+			return base if isinstance( base, RCClass ) else None
+		sub_c, sup_c = rc_of( sub ), rc_of( sup )
+		if sub_c is None or sup_c is None:
+			return False
+		c = getattr( sub_c, 'base', None )
+		while c is not None:
+			if c is sup_c:
+				return True
+			c = getattr( c, 'base', None )
+		return False
 
 	def _maybe_castwrap_pointer( self, operand: ir.Operand, expected_type: Type|None ) -> ir.Operand:
 		''' When a pointer-typed value flows into a context expecting a DIFFERENT
