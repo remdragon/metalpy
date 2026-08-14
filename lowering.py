@@ -14,7 +14,7 @@ from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
-	CallableType, ClosureType,
+	CallableType, ClosureType, TupleType,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -1769,6 +1769,90 @@ class FunctionLowering:
 			# the whole capture, not just the top-level statement
 			self.lowering.discovery.fail( f'return is not allowed inside a defer/errdefer body: {ast.unparse(node)}', node )
 		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
+		# what actually gets returned/assigned into the return-value slot
+		# below - defaults to `value` itself, reassigned to a widened temp
+		# further down when the covered-Result-error-widening case applies.
+		# `value` itself stays UNCHANGED throughout this whole method after
+		# this point - every other use of it (check_unchecked_results,
+		# current_epilogue_label, return_(), untrack_temp) needs the ORIGINAL
+		# operand's own identity, not the widened temp's, to correctly
+		# recognize "this tracked binding's own epilogue entry is the one
+		# being moved out here" (see ir.WidenResult's own docstring)
+		return_value = value
+		# self._current_fn.return_type is Python None ONLY as a deliberate
+		# sentinel (return-only generic type-param inference and lambda
+		# eager-lowering both temporarily set it to None specifically so
+		# _lower_expr(node.value, None) lets the return expression take its
+		# OWN natural type, unconstrained, which then gets read back as the
+		# inferred return type - see _infer_return_only_type_params/
+		# _expr_Lambda's own "return_type_provisional" comments). A GENUINE
+		# `-> None`-declared (or unannotated) function's own return_type is
+		# always the real NoneType Scalar object (discovery.py's own
+		# get_none_type()), never Python None - so this check only ever
+		# skips during that provisional, not-yet-resolved state, never for
+		# an actual declared return type
+		if value is not None and self._current_fn.return_type is not None:
+			# _lower_expr already applies every coercion it legitimately can
+			# (union-leaf-wrap via _coerce_into_union, RCClass base-upcast via
+			# _is_rcclass_upcast) - if value.type STILL doesn't match the
+			# function's own declared return type afterward, this is a
+			# genuine, uncaught mismatch that would otherwise emit a `return`
+			# of the wrong C type (confirmed: `return 5` inside a `-> str`
+			# function, or `return x` where x: Result[T,NarrowE] inside a
+			# function declared -> Result[T,WideE] even though NarrowE is
+			# covered by WideE, both previously compiled with zero errors and
+			# produced C a real compiler rejects outright). The covered-but-
+			# narrower-Result case specifically is a real, intentional gap for
+			# now - it's handled by widening instead of rejection, added
+			# separately (see the auto-widening this same function grows next
+			# to this check).
+			fn_type = self._current_fn.return_type
+			# a generic ClassLike return type (Result[T,E], list[T], any
+			# user generic class/@union) stays the ORIGINAL, un-monomorphized
+			# Specialization on fn.return_type forever (it's parsed once,
+			# from the function's own annotation, never re-resolved) - but a
+			# local Variable's own .type (e.g. `result: list[str] = ...`)
+			# DOES get monomorphized to the real, concrete ClassLike at some
+			# point before this runs (confirmed: `result.type` here is
+			# already a concrete RCClass, not the Specialization wrapping
+			# list's abstract template) - so value.type and a bare fn_type
+			# can legitimately be the "same type" while being different
+			# objects. Monomorphize fn_type the same way before comparing -
+			# mirrors _lower_expr's own identical "monomorphize a generic
+			# union expected_type before comparing" step, generalized here
+			# to every ClassLike kind (not just TaggedUnion), since this
+			# same divergence isn't union-specific. Ptr[T]/ConstPtr[T]
+			# (Scalar-based generics, not ClassLike) are deliberately
+			# excluded - those are already consistently interned via plain
+			# Specialization identity, confirmed by direct inspection, and
+			# monomorphize_class doesn't apply to them anyway
+			expected_concrete = fn_type
+			if isinstance( fn_type, Specialization ) and isinstance( fn_type.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				expected_concrete = self.lowering.monomorphize_class( fn_type )
+			elif isinstance( fn_type, TupleType ) and fn_type.backing is not None:
+				# same divergence, different shape: a tuple LITERAL (`return
+				# (a, b, c)`) lowers to its own synthesized backing RCClass
+				# directly (tuple_storage.TupleStorage.get()'s own real,
+				# constructible representation), not the bare TupleType
+				# wrapper the function's own `-> tuple[str,str,str]`
+				# annotation stays as
+				expected_concrete = fn_type.backing
+			# a CEnum value flowing into a context expecting its OWN
+			# underlying scalar type is also legitimate - "a CEnum has
+			# exactly the same runtime representation as its underlying
+			# type" (see the CEnum construction-call comment above), so
+			# returning one where the underlying type is declared is a
+			# value-preserving reinterpretation, not a mismatch
+			is_cenum_to_underlying = isinstance( value.type, CEnum ) and value.type.value_type is fn_type
+			if value.type is not fn_type and value.type is not expected_concrete and not is_cenum_to_underlying:
+				widened = self._maybe_widen_return_result( node, value, fn_type )
+				if widened is None:
+					self.lowering.discovery.fail(
+						f'{ast.unparse(node)}: function returns '
+						f'{fn_type.qualname if fn_type else "None"}, not {value.type.qualname if value.type else "?"}',
+						node,
+					)
+				return_value = widened
 		try:
 			self._cfg.check_unchecked_results( value )
 		except CompileError as e:
@@ -1796,7 +1880,7 @@ class FunctionLowering:
 			# closing brace - see _emit_epilogue) - value has to survive
 			# the jump some other way than a direct ir.Return
 			if self._return_value_var is not None and value is not None:
-				self._emit( ir.Assign( dest = self._return_value_var, src = value ))
+				self._emit( ir.Assign( dest = self._return_value_var, src = return_value ))
 			# value's own ownership (if it's a bare temp - `return
 			# SomeConstructor(...)`, never assigned to a name) just
 			# transferred into self._return_value_var above via the plain
@@ -1831,7 +1915,40 @@ class FunctionLowering:
 			# ever cleans up OTHER still-pending temps - e.g. an
 			# intermediate argument consumed into constructing `value`)
 			self._flush_pending_temps()
-			self._emit( ir.Return( value = value ))
+			self._emit( ir.Return( value = return_value ))
+
+	def _maybe_widen_return_result( self, node: ast.Return, value: ir.Operand, fn_type: Type ) -> ir.Temp|None:
+		''' `return x` where x is Result[T,NarrowE] and this function is
+		declared -> Result[T,WideE] - if WideE genuinely COVERS NarrowE (every
+		leaf of NarrowE is also a leaf of WideE - the identical leaves-
+		containment rule type_resolver._require_result_return already applies
+		for .or_return()/checked-arithmetic propagation), emit ir.WidenResult
+		and return its dest temp for the caller to actually return/assign
+		instead of `value`. Returns None (no widening applies) for every other
+		shape of mismatch - the caller's own existing error message covers
+		those. '''
+		tr = self.lowering._type_resolver
+		op_shape = tr._result_shape( value.type )
+		fn_shape = tr._result_shape( fn_type )
+		if op_shape is None or fn_shape is None:
+			return None
+		op_t, op_e = op_shape
+		fn_t, fn_e = fn_shape
+		if op_t is not fn_t or op_e is fn_e:
+			return None # different Ok type entirely, or errors already match (not this method's concern)
+		fn_e_leaves = fn_e.leaves()
+		if not all( leaf in fn_e_leaves for leaf in op_e.leaves() ):
+			return None # op's error isn't covered by fn's - a genuine mismatch, not widenable
+		# fn_type is guaranteed Result-shaped here (fn_shape matched), so
+		# schedule/monomorphize it the same way _stmt_Return's own caller
+		# already does for every OTHER ClassLike return type - dest.type
+		# must be the real, concrete Result[T,WideE] the function actually
+		# returns in C, not the abstract Specialization
+		dest_type = self.lowering.monomorphize_class( fn_type ) if isinstance( fn_type, Specialization ) else fn_type
+		self.lowering.schedule( dest_type )
+		dest = self._new_temp( dest_type )
+		self._emit( ir.WidenResult( dest = dest, src = value ))
+		return dest
 
 	def _stmt_Pass( self, node: ast.Pass ) -> None:
 		pass
@@ -3317,8 +3434,43 @@ class FunctionLowering:
 		# expected_type and skips this entirely - only a genuine mismatch
 		# (a plain leaf value where the union itself was expected) reaches
 		# _coerce_into_union, see its own comment
-		if isinstance( expected_type, TaggedUnion ) and operand.type is not expected_type:
-			operand = self._coerce_into_union( operand, expected_type, node )
+		#
+		# unwrap a Specialization first - a GENERIC union return/annotation
+		# type (Result[T,E], or any user @union class Foo[T]:) is always a
+		# Specialization wrapping the abstract TaggedUnion, never a bare
+		# TaggedUnion instance itself, so a plain isinstance check here
+		# (unlike is_rc/rc_leaves/is_result_type/_as_specialization elsewhere
+		# in this codebase, all of which unwrap first) silently never fired
+		# for one - a bare leaf value flowing into a generic union-typed
+		# context (e.g. `return some_T` where T|None is declared) never got
+		# coerced at all. Monomorphized (not the bare abstract class) once
+		# it's actually needed below - the abstract class's own .attributes
+		# hold bare TypeVars (T/E), never a real leaf's type, so
+		# _coerce_into_union needs the CONCRETE, substituted union to have
+		# any chance of matching operand.type - mirrors the identical
+		# "monomorphize_class if Specialization else itself" pattern already
+		# used elsewhere for this same reason (e.g. _expr_Name's own
+		# union-narrowing branch)
+		expected_union: TaggedUnion|None = None
+		if operand.type is not expected_type: # cheap identity check first - skip monomorphize_class entirely on the common "already matches" path
+			if isinstance( expected_type, TaggedUnion ):
+				expected_union = expected_type
+			elif isinstance( expected_type, Specialization ) and isinstance( expected_type.base, TaggedUnion ):
+				expected_union = self.lowering.monomorphize_class( expected_type )
+		if expected_union is not None and operand.type is not expected_union:
+			# _coerce_into_union is for wrapping a PLAIN LEAF value (its own
+			# docstring: "operand.type is exactly one of the union's own
+			# leaves") - if operand is ITSELF union-shaped (e.g. a genuinely
+			# unrelated Result[T,OtherE] flowing into a Result[T,E]-expected
+			# context), it can never legitimately BE one of expected_union's
+			# own leaves, so attempting coercion here would just misfire with
+			# a confusing "not one of its members" message. Leave operand
+			# untouched instead - the general type-mismatch check in
+			# _stmt_Return (or an equivalent caller-side check) reports this
+			# far more clearly than _coerce_into_union ever could
+			operand_base = operand.type.base if isinstance( operand.type, Specialization ) else operand.type
+			if not isinstance( operand_base, TaggedUnion ):
+				operand = self._coerce_into_union( operand, expected_union, node )
 		# a derived RCClass value flowing into a base-class context (arg, return,
 		# assignment) is an upcast: struct Derived* -> struct Base*, which C
 		# rejects without an explicit cast. A CastWrap is a borrowed reinterpret
@@ -3728,6 +3880,63 @@ class FunctionLowering:
 				f'write an explicit cast (e.g. {expected_type.stem}(...)) or use an integer literal: {ast.unparse(node)}',
 				node,
 			)
+		# a literal being lowered against a CONCRETE, non-union expected type -
+		# verify the literal's own Python value kind could plausibly represent
+		# it at all (the same coarse stem-compatibility _LITERAL_COMPATIBLE_
+		# STEMS already uses for overload-argument matching below). Without
+		# this, expected_type was blindly trusted for anything other than the
+		# None/TaggedUnion cases just below - `return 5` inside a function
+		# declared -> str tagged the resulting Const as type=str while its own
+		# .value stayed the Python int 5 (invalid/nonsensical downstream:
+		# emitter_c.py's _emit_const dispatches purely on c.value's own Python
+		# type, producing a bare `5` where a struct builtins$str* was
+		# expected - confirmed compiling with zero errors, a real C compiler
+		# then rejecting the mismatched return type outright). A union
+		# expected_type (possibly Specialization-wrapped, e.g. Result[T,E])
+		# is exempted here for the same reason the block below exempts it -
+		# a literal is never itself union-shaped, _lower_expr's own post-hoc
+		# coercion handles that case separately. A POINTER expected_type
+		# (Ptr[T]/ConstPtr[T]) is also exempted - a bare int literal assigned
+		# to one is a deliberate, pre-existing, well-defined bit-
+		# reinterpretation idiom real WinAPI constants rely on (e.g.
+		# lib/windows/kernel32.py's `INVALID_HANDLE_VALUE: HANDLE = -1`),
+		# already handled downstream by emitter_c.py's own _emit_const
+		# pointer-const branch - not a type error. A bare, still-unbound
+		# TypeVar (a generic class's own T, not yet substituted with a
+		# concrete type - e.g. a field=value construction argument for a
+		# still-generic Box[T]) is exempted too: there's no real type here
+		# yet to validate against at all, this literal's own natural type
+		# is what will eventually get UNIFIED to solve T, not compared
+		# against it. A CEnum expected_type (EnumName(42)'s own construction
+		# call, see _try_lower_construct_call's CEnum branch) is exempted
+		# too - "a CEnum has exactly the same runtime representation as its
+		# underlying type", so a raw int literal is exactly what a CEnum
+		# construction call is for, not a type mismatch
+		expected_base = expected_type.base if isinstance( expected_type, Specialization ) else expected_type
+		if (
+			expected_type is not None and not isinstance( expected_base, TaggedUnion )
+			and not isinstance( expected_type, ( TypeVar, CEnum ))
+			and not self.lowering._type_resolver._is_ptr_specialization( expected_type )
+		):
+			compatible_stems = self.lowering._LITERAL_COMPATIBLE_STEMS.get( type( node.value ) )
+			expected_stem = getattr( expected_type, 'stem', None )
+			# an int literal implicitly widening into a float scalar (`x: f64
+			# = 1`, `f64(1)`) is a pre-existing, legitimate pattern - NOT
+			# folded into _LITERAL_COMPATIBLE_STEMS[int] itself, since that
+			# dict is shared with _lower_overload_arg's own OVERLOAD
+			# resolution, where allowing int literals to also match a float
+			# overload would introduce new ambiguity there. The reverse
+			# (float literal -> int scalar) stays rejected by the dedicated
+			# guard at the top of this method - this is one-directional
+			is_int_into_float = type( node.value ) is int and expected_stem in ( 'f32', 'f64' )
+			if compatible_stems is not None and expected_stem not in compatible_stems and not is_int_into_float:
+				kind = type( node.value ).__name__
+				article = 'an' if kind[0] in 'aeiou' else 'a'
+				self.lowering.discovery.fail(
+					f'{ast.unparse(node)}: {article} {kind} literal cannot be used where '
+					f'{expected_type.qualname} is expected',
+					node,
+				)
 		# expected_type being a TaggedUnion (e.g. str|None) is treated the
 		# same as no expected_type at all: a literal's OWN Python type
 		# always determines its natural type (bool/i32/str/NoneType) -
@@ -4581,11 +4790,39 @@ class FunctionLowering:
 				self._cfg.check_unchecked_results( None )
 			except CompileError as e:
 				self.lowering.discovery.fail( str( e ), node )
-			label = self._cfg.current_epilogue_label()
+			# pass check_dest (when it's a named, tracked Variable - e.g.
+			# `x.or_return()`, as opposed to a bare Temp from `foo().or_return()`)
+			# into current_epilogue_label(), mirroring _stmt_Return's identical
+			# call for `return x` - this lets the identity-skip guard recognize
+			# "the operand being propagated out IS itself one of the still-live
+			# tracked bindings" and route through the safe inline-replay path
+			# below instead of jumping into check_dest's OWN epilogue label (which
+			# would double-decref its payload right after copying it into the
+			# return value, unretained - a real, confirmed use-after-free: check_
+			# dest's Err payload gets moved into the returned struct, then the
+			# shared epilogue ladder at that SAME label unconditionally decrefs
+			# check_dest's own copy of it too). A bare Temp has no epilogue entry
+			# of its own, so this is a no-op for that case, matching today's
+			# already-correct behavior exactly (identical to passing None).
+			tracked_operand = check_dest if isinstance( check_dest, Variable ) else None
+			label = self._cfg.current_epilogue_label( tracked_operand )
 			if label is not None:
 				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
 			else:
-				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest ))
+				# either check_dest's own entry needed excluding (the bug above),
+				# or (matching _stmt_Return's own inline path for the identical
+				# reasons - a confined entry, or simply nothing pending) there's no
+				# shared label to jump to at all - return_() handles both uniformly:
+				# it replays every OTHER still-live binding/defer/errdefer
+				# obligation inline, skipping only check_dest's own entry (a no-op
+				# skip when check_dest has no entry in the first place). Its
+				# DeclareTemp side effects (via the injected new_temp callback)
+				# land unconditionally in the main instruction stream right here,
+				# same as _stmt_Return's identical call - only the rest (the
+				# actual conditional replay logic) is embedded below, to run
+				# strictly inside the Err branch
+				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
 		else:
 			panic_fn = self.lowering._type_resolver._resolve_sys_function( 'panic' )
 			self.lowering.schedule( panic_fn )

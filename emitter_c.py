@@ -1739,9 +1739,11 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{dest} = ({ctype}){{ {", ".join(field_init_strs)} }};' ]
 
 	if isinstance( instr, ir.OrReturn ):
-		return _emit_or_return( instr, function )
+		return _emit_or_return( instr, function, declared )
 	if isinstance( instr, ir.OrJump ):
 		return _emit_or_jump( instr )
+	if isinstance( instr, ir.WidenResult ):
+		return _emit_widen_result( instr )
 	if isinstance( instr, ir.Unwrap ):
 		# instr.panic is a real, already-resolved sys.panic Function
 		# reference (see ir.Unwrap's own docstring / Lowering._resolve_sys_function)
@@ -1763,7 +1765,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 
 	raise NotImplementedError( f'_emit_instruction: unsupported instruction {instr!r} (later-phase work)' )
 
-def _emit_or_return( instr: ir.OrReturn, function: Function ) -> list[str]:
+def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] ) -> list[str]:
 	# OrReturn's own IR semantics ARE the branch (see ir.py's docstring:
 	# "Err -> return Result::Err(...); Ok -> dest = payload") - this one
 	# instruction expands to real conditional C here, not a pre-branched IR
@@ -1782,14 +1784,50 @@ def _emit_or_return( instr: ir.OrReturn, function: Function ) -> list[str]:
 	# than the function's declared error union (E_fn) - see _emit_widen_error
 	e_op = _result_error_type( instr.value.type )
 	e_fn = _result_error_type( return_type )
+	# instr.epilogue (see ir.OrReturn's own docstring) is only ever non-empty
+	# when `value` is a named, tracked Variable whose own ordinary scope-exit
+	# decref must be excluded here (its payload is being moved into __err,
+	# unretained, right below) while every OTHER still-live binding/defer/
+	# errdefer obligation still needs its normal cleanup on this early-exit
+	# path - emitted via the same per-instruction dispatcher as the rest of the
+	# function body, so it can contain anything return_() can produce (Decref,
+	# tag-gated GetAttr/Cmp/JumpIfFalse/Jump/Label sequences, defer replays)
+	epilogue_lines: list[str] = []
+	for sub in instr.epilogue:
+		epilogue_lines.extend( _emit_instruction( sub, function = function, declared = declared ))
 	return [
 		f'\tif ( ({value}).{tag_f} == 1 ) {{',
 		f'\t\t{ret_ctype} __err;',
 		f'\t\t__err.{tag_f} = 1;',
 		*_emit_widen_error( f'__err.{data_f}.{err_f}', e_fn, f'({value}).{data_f}.{err_f}', e_op ),
+		*epilogue_lines,
 		'\t\treturn __err;',
 		'\t}',
 		f'\t{dest} = ({value}).{data_f}.{ok_f};',
+	]
+
+def _emit_widen_result( instr: ir.WidenResult ) -> list[str]:
+	# a bare `return x` widening x's own Result[T,NarrowE] into dest's wider
+	# Result[T,WideE] (see ir.WidenResult's own docstring) - unlike OrReturn
+	# (which only ever transforms the Err branch, since its own Ok branch
+	# means "continue executing", not "return"), a bare return exits
+	# unconditionally on EITHER branch, so BOTH get built into dest here: Ok
+	# is a plain field copy (same T on both sides - nothing to widen), Err
+	# reuses the exact same _emit_widen_error helper OrReturn/OrJump already
+	# use for their own Err branch.
+	src = _emit_operand( instr.src )
+	dest = _emit_operand( instr.dest )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.src.type )
+	e_op = _result_error_type( instr.src.type )
+	e_fn = _result_error_type( instr.dest.type )
+	return [
+		f'\tif ( ({src}).{tag_f} == 0 ) {{',
+		f'\t\t{dest}.{tag_f} = 0;',
+		f'\t\t{dest}.{data_f}.{ok_f} = ({src}).{data_f}.{ok_f};',
+		'\t} else {',
+		f'\t\t{dest}.{tag_f} = 1;',
+		*_emit_widen_error( f'{dest}.{data_f}.{err_f}', e_fn, f'({src}).{data_f}.{err_f}', e_op ),
+		'\t}',
 	]
 
 def _emit_or_jump( instr: ir.OrJump ) -> list[str]:

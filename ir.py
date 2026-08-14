@@ -1,5 +1,5 @@
 # stdlib imports:
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import ClassVar, Union
 
@@ -258,9 +258,42 @@ class Not( Instruction ): # boolean negation: dest = !operand
 class OrReturn( Instruction ): # Result.or_return(): Err -> return Err from the current function; Ok -> dest = payload
 	dest: Temp
 	value: Operand # a Result[T,E]
+	# extra cleanup to replay on the Err branch, BEFORE the return - only
+	# non-empty when `value` is itself a named, tracked local binding whose own
+	# ordinary scope-exit decref must be excluded from replay here (it's being
+	# moved into the return value, not independently released) while every
+	# OTHER still-live binding/defer/errdefer obligation still needs its normal
+	# cleanup on this early-exit path. Built via the same CFGState.return_()
+	# primitive _stmt_Return already uses for the identical "returning a
+	# tracked operand" situation - see lowering.py's _consume_checked_result.
+	# Emitted inside emitter_c.py's own `if (value.tag==1) {...}` block, after
+	# the error-widening lines and before the actual `return`.
+	epilogue: list['Instruction'] = field( default_factory = list )
 
 	def test_repr( self ) -> str:
 		return f'OrReturn( dest={self.dest!r}, value={self.value!r} )'
+
+@dataclass( kw_only = True )
+class WidenResult( Instruction ):
+	''' a bare `return x` where x is Result[T,NarrowE] and the enclosing
+	function is declared -> Result[T,WideE], with WideE covering NarrowE
+	(type_resolver's leaves-containment check - see lowering.py's
+	_stmt_Return) - unlike OrReturn/OrJump (which only ever widen the ERR
+	branch, since the OK branch means "continue executing, not return"), a
+	bare return exits unconditionally on EITHER branch, so dest.type
+	(Result[T,WideE]) gets built from src on BOTH: Ok is a plain field copy
+	(same T on both sides, nothing to widen), Err reuses emitter_c.py's
+	_emit_widen_error. dest is then what the surrounding (otherwise
+	UNCHANGED) _stmt_Return return-emission logic actually returns/assigns
+	into the return-value slot - src itself is what still gets passed to
+	CFGState.current_epilogue_label()/return_() for the identity-based
+	"this operand's own epilogue entry is being moved out" exclusion, exactly
+	as for an ordinary, non-widened return of a tracked binding. '''
+	dest: Temp
+	src: Operand # a Result[T,NarrowE]
+
+	def test_repr( self ) -> str:
+		return f'WidenResult( dest={self.dest!r}, src={self.src!r} )'
 
 @dataclass( kw_only = True )
 class OrJump( Instruction ):

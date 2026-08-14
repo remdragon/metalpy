@@ -4719,21 +4719,26 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_only_use_cfg_epilogue_labels( self ):
+		# n (a real Scalar) carries the branch conditions; a (the custom RCClass)
+		# is purely for exercising RC-tracked-binding epilogue labels via
+		# b = a / c = a below - kept separate because comparing `a` (an RCClass
+		# with no __gt__ of its own) directly against a bare int literal would
+		# itself be a type mismatch, unrelated to what this test is about
 		code = '\n'.join([
 			'class int:',
 			'	def __init__( self, n: usize ) -> None:',
 			'		...',
-			'def foo( a: int ) -> None:',
-			'	if a > 10:',
+			'def foo( a: int, n: usize ) -> None:',
+			'	if n > 10:',
 			'		return', # should be a straight return, no epilogue yet
 			'	b = a',
-			'	if a > 20:',
+			'	if n > 20:',
 			'		return', # should jump to b's decref epilogue label
 			'	c = a',
 			# fallthough return should jump to c's decref epilogue label
 			'',
 			'def main() -> None:',
-			'	foo( usize( 0 ))',
+			'	foo( usize( 0 ), usize( 0 ))',
 		])
 		mod = self._import( code )
 		foo = mod.get_local( 'foo' )

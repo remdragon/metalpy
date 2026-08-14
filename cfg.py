@@ -72,6 +72,30 @@ def is_rc( t: Type ) -> bool:
 		# so this is a structural guarantee, not something that depends on
 		# whether .backing happens to be populated yet.
 		return True
+	if isinstance( base, TaggedUnion ):
+		# a union appearing as a LEAF of an outer type (e.g. Result[T, A|B] -
+		# the error union this session's own division/widening work
+		# introduced) is "RC" whenever ANY of its own members are - is_rc()
+		# is only ever called from rc_leaves()'s own per-leaf filter below
+		# (confirmed: no other call site in this module calls it directly),
+		# so this recursion only ever changes what rc_leaves() reports for
+		# an outer type's leaves, nothing else. Before this branch, a nested
+		# union leaf was ALWAYS reported as non-RC here (TaggedUnion is
+		# never RCClass/TupleType), so rc_leaves() on an OUTER type silently
+		# dropped it entirely even when its own members carried real RC
+		# payloads - no incref/decref ever fired for that leaf's own
+		# contents, a genuine reference leak (this union's own TOP-LEVEL
+		# rc_leaves(A|B) call already worked correctly - isinstance(base,
+		# TaggedUnion) is checked there directly; the gap was specifically
+		# one level up, treating A|B as an opaque, always-non-RC leaf of
+		# something else). No type-param substitution needed here (unlike
+		# rc_leaves()'s own top-level substitution step) - every leaf that
+		# reaches this branch is either a fully concrete anonymous union
+		# (never generic/Specialization-wrapped by construction) or already
+		# had its own params substituted by whichever caller is asking.
+		if base.resolve is not None:
+			base.resolve()
+		return any( is_rc( leaf ) for leaf in base.leaves() )
 	return isinstance( base, RCClass )
 
 def is_result_type( t: Type|None ) -> bool:
@@ -135,6 +159,19 @@ def rc_leaves( t: Type ) -> list[Type]:
 			leaves = [ substitution.get( id( leaf ), leaf ) for leaf in leaves ]
 		return [ leaf for leaf in leaves if is_rc( leaf ) ]
 	return [ t ] if is_rc( t ) else []
+
+def _is_direct_pointer_rc( t: Type ) -> bool:
+	''' True for an RC leaf whose OWN runtime representation is a single, bare
+	pointer (RCClass, or a TupleType's synthesized backing RCClass) - as
+	opposed to a NESTED union leaf (is_rc() now also reports these as "RC",
+	but a union's own runtime shape is a tag+data VALUE STRUCT, not a bare
+	pointer at all). _refcount_instructions' own "every member shares the
+	same underlying pointer layout, read any ONE member's accessor" shortcut
+	is only safe when EVERY leaf satisfies this - it silently produces
+	garbage for a nested-union leaf otherwise (reading that leaf's own
+	payload accessor as if it were a bare RC pointer). '''
+	base = t.base if isinstance( t, Specialization ) else t
+	return isinstance( base, ( RCClass, TupleType ))
 
 UnionStorage = Callable[[TaggedUnion], tuple[Variable,Variable,CUnion,dict[str,int]]]
 
@@ -1060,10 +1097,17 @@ class CFGState:
 		if not isinstance( t, TaggedUnion ):
 			return [ op( value = operand ) ]
 		all_leaves = t.leaves()
-		if len( leaves ) == len( all_leaves ):
-			# every member is RC - no tag check needed: they're all the
-			# same union payload memory, and every RC type shares the same
-			# header layout/offset, so any one member's accessor works
+		if len( leaves ) == len( all_leaves ) and all( _is_direct_pointer_rc( leaf ) for leaf in leaves ):
+			# every member is RC AND a bare pointer (never a nested union,
+			# whose own runtime shape is a tag+data value struct, not a
+			# pointer at all - see _is_direct_pointer_rc) - no tag check
+			# needed: they're all the same union payload memory, and every
+			# RC POINTER type shares the same header layout/offset, so any
+			# one member's accessor works. A nested-union member (now also
+			# reported by rc_leaves as "RC", per is_rc()'s own new branch)
+			# forces the tag-gated path below even when every leaf is
+			# otherwise RC, since there's no single shared pointer layout
+			# to read through uniformly in that case
 			instrs, payload = self._extract_payload( t, operand, t.attributes[0] )
 			return instrs + [ op( value = payload ) ]
 		return self._tag_gated_refcount_instructions( t, operand, leaves, op )
@@ -1107,7 +1151,16 @@ class CFGState:
 			]
 			extract, payload = self._extract_payload( t, operand, member )
 			instructions += extract
-			instructions.append( op( value = payload ))
+			# recurse rather than assuming `payload` is always a bare RC
+			# pointer op() can retain/release directly - a NESTED union
+			# member's own payload is itself a tag+data value struct
+			# (_refcount_instructions' own isinstance(t, TaggedUnion) check
+			# correctly routes it into its own, further tag-gated dispatch;
+			# a direct RCClass/TupleType member instead degenerates straight
+			# back to the plain `[op(value=payload)]` this replaces, so this
+			# is behavior-preserving for every leaf shape already handled
+			# before this fix)
+			instructions += self._refcount_instructions( member.type, payload, op )
 			instructions.append( ir.Jump( target = end_label ))
 			instructions.append( ir.Label( name = next_label ))
 		instructions.append( ir.Label( name = end_label ))
