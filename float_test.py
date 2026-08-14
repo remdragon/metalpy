@@ -24,6 +24,7 @@ import unittest
 # local imports:
 import emitter_c
 import linker_c
+import test_support
 from compiler import Compiler
 from discovery import Discovery
 
@@ -51,7 +52,7 @@ class FloatBehaviorTests( unittest.TestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 
 			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
-			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}\n\n--- generated.c ---\n{c_source}' )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
 			# every extern library the program pulled in needs an explicit link
 			# flag ('c' is the CRT, handled by no_crt). A no-CRT program on

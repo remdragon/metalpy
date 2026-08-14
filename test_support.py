@@ -27,6 +27,7 @@
 
 # stdlib imports:
 import ast
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -38,6 +39,15 @@ from compiler import Compiler
 from discovery import Discovery
 
 _CC = linker_c.detect_cc()
+
+
+def c_source_on_failure( c_source: str ) -> str:
+	''' The generated C, to be appended to a compile/link failure message ONLY
+	when METALPY_TEST_DUMP_C is set - otherwise ''. Dumping the whole translation
+	unit was useful while bringing the emitter up, but in normal runs it just
+	buries the actual compiler error(s) in thousands of lines of noise. Set
+	METALPY_TEST_DUMP_C=1 to bring it back when you need to inspect the C. '''
+	return f'\n\n--- generated.c ---\n{c_source}' if os.environ.get( 'METALPY_TEST_DUMP_C' ) else ''
 
 # exit-code stride: a failing sub-test returns  case_index * _STRIDE + subcode .
 # case_index is small (< number of methods in a class) and subcode is the tiny
@@ -187,7 +197,7 @@ class RealCompileMixin:
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			cc_result = _CC.compile( src_path, obj_path )
 			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}{c_source_on_failure( c_source )}' )
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = self._extern_ldflags( compiler ) )
 			self.assertEqual( link_result.returncode, 0,
 				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )

@@ -18,6 +18,7 @@ import unittest
 # local imports:
 import emitter_c
 import linker_c
+import test_support
 from compiler import Compiler
 from discovery import Discovery
 
@@ -54,7 +55,7 @@ class ReturnOnlyInferenceBehaviorTests( unittest.TestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 
 			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
-			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}\n\n--- generated.c ---\n{c_source}' )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
 			ldflags = ''
 			for lib in sorted( compiler.extern_libs ):
@@ -98,7 +99,7 @@ class ReturnOnlyInferenceBehaviorTests( unittest.TestCase ):
 			'	return 0',
 		])
 		result, compiler, c_source = self._run_program( code )
-		self.assertEqual( result.returncode, 0, f'stdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
+		self.assertEqual( result.returncode, 0, f'stdout: {result.stdout}\nstderr: {result.stderr}{test_support.c_source_on_failure( c_source )}' )
 		# both instantiations must be real, distinctly-typed compiled units
 		qualnames = { lf.function.qualname for lf in compiler.functions }
 		self.assertIn( '__main__.make[__main__.IntProducer,intrinsics.i32]', qualnames )
@@ -126,7 +127,7 @@ class ReturnOnlyInferenceBehaviorTests( unittest.TestCase ):
 			'	return 0',
 		])
 		result, compiler, c_source = self._run_program( code )
-		self.assertEqual( result.returncode, 0, f'stdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
+		self.assertEqual( result.returncode, 0, f'stdout: {result.stdout}\nstderr: {result.stderr}{test_support.c_source_on_failure( c_source )}' )
 		make_functions = [ lf for lf in compiler.functions if lf.function.qualname.startswith( '__main__.make[' ) ]
 		self.assertEqual( len( make_functions ), 1, f'expected exactly one compiled make[...] instantiation, got: {[lf.function.qualname for lf in make_functions]}' )
 

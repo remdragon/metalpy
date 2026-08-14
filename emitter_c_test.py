@@ -596,7 +596,7 @@ class RCClassSubclassingPhase1Tests( CompilerTestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			cc_result = _CC.compile( src_path, obj_path )
 			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}{test_support.c_source_on_failure( c_source )}' )
 			ldflags = self._extern_ldflags()
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
 			self.assertEqual( link_result.returncode, 0,
@@ -1214,7 +1214,7 @@ class _ClangCompileMixin:
 			obj_path = Path( tmp ) / 'generated.o'
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			result = _CC.compile( src_path, obj_path )
-			self.assertEqual( result.returncode, 0, f'{_CC.name} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}\n\n--- generated.c ---\n{c_source}' )
+			self.assertEqual( result.returncode, 0, f'{_CC.name} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}{test_support.c_source_on_failure( c_source )}' )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping real-compile verification' )
 class RealCompileTests( _ClangCompileMixin, CompilerTestCase ):
@@ -2180,7 +2180,7 @@ class SizeofValueArgumentRealCompileTests( RCClassTestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			cc_result = _CC.compile( src_path, obj_path )
 			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}{test_support.c_source_on_failure( c_source )}' )
 			ldflags = self._extern_ldflags()
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
 			self.assertEqual( link_result.returncode, 0,
@@ -2490,7 +2490,7 @@ class FastLockCompileRunTests( CompilerTestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			cc_result = _CC.compile( src_path, obj_path )
 			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}{test_support.c_source_on_failure( c_source )}' )
 			ldflags = self._extern_ldflags()
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
 			self.assertEqual( link_result.returncode, 0,
@@ -2769,7 +2769,7 @@ class InterfaceCStructLayoutTests( CompilerTestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			cc_result = _CC.compile( src_path, obj_path )
 			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}{test_support.c_source_on_failure( c_source )}' )
 			ldflags = self._extern_ldflags()
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
 			self.assertEqual( link_result.returncode, 0,
@@ -3561,7 +3561,7 @@ class UnsafeListGenericTests( CompilerTestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			cc_result = _CC.compile( src_path, obj_path )
 			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}{test_support.c_source_on_failure( c_source )}' )
 			ldflags = self._extern_ldflags()
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
 			self.assertEqual( link_result.returncode, 0,
@@ -7091,7 +7091,7 @@ class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 			src_path.write_text( c_source, encoding = 'utf-8' )
 			cc_result = _CC.compile( src_path, obj_path )
 			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
+				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}{test_support.c_source_on_failure( c_source )}' )
 			ldflags = self._extern_ldflags()
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
 			self.assertEqual( link_result.returncode, 0,
