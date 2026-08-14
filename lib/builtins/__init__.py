@@ -53,14 +53,33 @@ class Result[T,E]:
 	def is_err( self ) -> bool:
 		return self.tag == 1
 
+	# NOTE: each accessor copies the Ok payload into a LOCAL before returning
+	# it, rather than `return self.data.v_Ok` directly. For an RC T that copy
+	# is where the incref happens (capturing an attribute into a local
+	# increfs; a bare `return self.attr` does not) - so the caller receives a
+	# genuinely owned +1 reference. This balances against the receiver
+	# Result's OWN payload decref at the end of its expression/scope
+	# (whichever of the two applies - a temp receiver's is at end-of-
+	# expression, a named receiver's is at scope exit) - see cfg.py's
+	# rc_leaves()/_refcount_instructions for the matching fix that makes a
+	# Result value's own payload actually get tracked/decref'd at all (a
+	# separate, previously-missing half of this same balance). NOTE: this
+	# declared body is what actually runs for unwrap()/unwrap_or() (real
+	# function calls) - but NOT for or_return(), which is recognized
+	# textually and compiled to raw OrReturn/OrJump IR instead (see
+	# lowering.py's _lower_or_return); or_return's own matching incref lives
+	# in lowering.py's _consume_checked_result, which every or_return() call
+	# actually goes through.
 	def or_return( self ) -> T:
 		if self.is_err():
 			compiler.early_return( self.data.v_Err )
-		return self.data.v_Ok
+		ok: T = self.data.v_Ok
+		return ok
 
 	def unwrap( self, errmsg: str ) -> T:
 		if self.is_ok():
-			return self.data.v_Ok
+			ok: T = self.data.v_Ok
+			return ok
 		sys.panic( errmsg )
 
 	@overload
@@ -69,7 +88,8 @@ class Result[T,E]:
 
 	def unwrap_or( self, default: T|None = None ) -> T|None:
 		if self.is_ok():
-			return self.data.v_Ok
+			ok: T = self.data.v_Ok
+			return ok
 		return default
 
 

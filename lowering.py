@@ -1315,6 +1315,7 @@ class FunctionLowering:
 						new_temp = self._new_temp,
 						new_label = self._new_label,
 						union_storage = self.lowering._union_storage.get,
+						resolve_type = self.lowering._ensure_resolved,
 					)
 					if self._construction_self is not None:
 						for attr in self_cls.attributes:
@@ -1419,6 +1420,7 @@ class FunctionLowering:
 					new_temp = self._new_temp,
 					new_label = self._new_label,
 					union_storage = self.lowering._union_storage.get,
+					resolve_type = self.lowering._ensure_resolved,
 				)
 				self._pending_temps = []
 				operand = self._lower_expr( var.init, var.type )
@@ -4588,6 +4590,22 @@ class FunctionLowering:
 			panic_fn = self.lowering._type_resolver._resolve_sys_function( 'panic' )
 			self.lowering.schedule( panic_fn )
 			self._emit( ir.Unwrap( dest = unwrapped, value = check_dest, errmsg = extra, panic = panic_fn ))
+		# OrReturn/OrJump/Unwrap all extract the Ok payload as a raw struct-
+		# field copy (emitter_c.py's _emit_or_return/_emit_or_jump/ir.Unwrap
+		# handling) - a BORROW of check_dest's own payload, not a fresh
+		# reference, exactly like Result.unwrap()'s old bare `return
+		# self.data.v_Ok` was. check_dest's own payload gets its OWN eventual
+		# decref (it's an ordinary tracked temp/binding like any other Result
+		# value - see cfg.py's rc_leaves()/lowering.py's CFGState resolve_type
+		# wiring for the fix that makes that actually happen now), so without
+		# this incref `unwrapped` and check_dest's own decref would fight over
+		# the SAME single reference - confirmed with a real UAF repro
+		# (int.__floordiv__'s `self.divmod(other).or_return()`, caught by
+		# AddressSanitizer). A no-op for a non-RC result_type (plain
+		# arithmetic's own scalar Check ops), so safe to call unconditionally
+		# regardless of which of this function's three callers reached here.
+		for instr in self._cfg.incref( unwrapped.type, unwrapped ):
+			self._emit( instr )
 		return unwrapped
 
 	def _expr_UnaryOp( self, node: ast.UnaryOp, expected_type: Type|None ) -> ir.Operand:
@@ -6170,32 +6188,22 @@ class FunctionLowering:
 			if target_cls_base is self.lowering.discovery.find_name( 'Result', node ):
 				self._cfg.clear_result( receiver.stem )
 
-		if (
-			isinstance( target, ( Function, Overload )) and target.stem in ( 'unwrap', 'unwrap_or' )
-			and isinstance( receiver, ir.Temp )
-		):
-			# <chained_call>.unwrap(msg)/.unwrap_or(default) - e.g.
-			# xs.__getitem__(0).unwrap(msg), never bound to a name - the
-			# receiver is a bare Temp holding a Result[T,E] value whose
-			# RC payload (if any) is registered in _temp_states (every
-			# Call/Allocate dest with RC leaves is - see _emit's own
-			# fresh_temp() call) as still needing its own eventual
-			# decref if nothing else claims it first. unwrap()/unwrap_or()
-			# return that SAME payload reference (their own declared
-			# body is a plain `return self.data.v_Ok`, no incref) - the
-			# call's OWN return value inherits ownership of it, so the
-			# receiver temp's registration has to be dropped here,
-			# silently (no decref emitted - _cfg.move()'s identical Temp
-			# branch does exactly this), or the temp's own cleanup
-			# (DeleteTemp, once nothing else in this statement still
-			# needs it) decrefs the SAME reference a second time while
-			# the returned value is ALSO independently tracked as owning
-			# it - confirmed with a real repro + AddressSanitizer, not
-			# just reasoning: exactly this shape freed a still-referenced
-			# int while it was still stored in a list. is_ok()/is_err()
-			# don't return the payload, so they're deliberately excluded -
-			# the receiver's own eventual cleanup is still correct there.
-			self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' )
+		# NOTE: no receiver move for unwrap/unwrap_or here (this used to move a
+		# Temp receiver - xs.__getitem__(0).unwrap(msg) - so its RC payload
+		# wasn't decref'd twice, back when unwrap/unwrap_or returned
+		# self.data.v_Ok as a BORROW, AND back when a temp Result's own payload
+		# happened to never actually get tracked/decref'd at all - see cfg.py's
+		# rc_leaves()/_refcount_instructions (the resolve_type wiring above,
+		# in this file's own CFGState construction) for that separate,
+		# previously-missing half. Both are fixed now: unwrap/unwrap_or COPY
+		# the payload into a local before returning it (lib/builtins/
+		# __init__.py), which increfs it, so the returned value is a
+		# genuinely owned reference, and the
+		# receiver temp's ordinary end-of-expression decref is exactly right -
+		# moving it here would suppress that decref and leak the payload. The
+		# same incref is also what fixes the persistent-Variable-receiver
+		# double-free (g0 = xs.__getitem__(0); g0.unwrap(msg)) that the old
+		# Temp-only move never covered - so both receiver shapes now balance.
 
 		if isinstance( target, _ReceiverDispatch ):
 			return self._lower_union_receiver_call( node, target, receiver, expected_type, want_result )

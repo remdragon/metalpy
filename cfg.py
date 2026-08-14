@@ -87,7 +87,53 @@ def rc_leaves( t: Type ) -> list[Type]:
 	# unconditional instead
 	base = t.base if isinstance( t, Specialization ) else t
 	if isinstance( base, TaggedUnion ):
-		return [ leaf for leaf in base.leaves() if is_rc( leaf ) ]
+		# base.leaves() reads base.attributes directly - populated by the
+		# CLASS's own .resolve() (parsing its body), a separate step from
+		# leaves()'s own per-ATTRIBUTE attr.resolve() call (which only
+		# resolves each attribute's already-existing .type). Called too
+		# early (e.g. the very first time any code anywhere references a
+		# Result[...]-shaped type, before anything else has forced Result's
+		# own class body to resolve), base.attributes is still empty and
+		# leaves() silently returns [] - not "this union has no RC leaves",
+		# just "this union hasn't been read yet". Confirmed by a real UAF:
+		# this made a temp Result[str,CodecError] receiver of .unwrap() look
+		# RC-free depending on ONLY where in the compile that particular
+		# call site happened to land relative to Result's own first real use
+		# elsewhere - a real, load-bearing ordering bug, not just caution.
+		if base.resolve is not None:
+			base.resolve()
+		leaves = base.leaves()
+		if isinstance( t, Specialization ) and base.type_params:
+			# t is a Specialization of a still-GENERIC TaggedUnion (e.g.
+			# Result[str,MyError] - base is the abstract builtins.Result class
+			# itself, never independently monomorphized into its own concrete
+			# TaggedUnion instance). base.leaves() therefore returns Result's
+			# OWN declared field types verbatim - bare TypeVars T/E - and
+			# is_rc() always says no to a bare TypeVar (it's never an RCClass
+			# itself). That silently reported EVERY generic-union
+			# Specialization as having no RC leaves at all, regardless of what
+			# T/E were actually bound to - str is obviously RC, so
+			# Result[str,MyError] plainly has RC leaves, but nothing here ever
+			# saw that: cfg.py's callers (fresh_temp/assign/attr_assign/...)
+			# all gate their Incref/Decref emission on this return value being
+			# non-empty, so a generic-union value's OWN payload (structural
+			# lifetime aside - a nested RC value living IN it) never got
+			# tracked/released at all. Confirmed by a real UAF: a temp
+			# Result[str,E] receiver of .unwrap()/.unwrap_or() was never
+			# registered by fresh_temp in the first place (this same
+			# rc_leaves() gap), which is what made the old receiver-move
+			# workaround in lowering.py's _lower_call look load-bearing (it
+			# was popping a Temp that fresh_temp had never actually inserted -
+			# already a no-op) while the REAL gap (this function) went
+			# unnoticed. Substitute each leaf that IS one of base's own type
+			# params against t's own concrete args - shallow (one level) is
+			# enough: a leaf that's instead e.g. `list[T]` doesn't need T
+			# resolved at all to know list itself is RC (is_rc() only reads
+			# a Specialization's own .base), and a leaf that's already a fixed
+			# concrete type (not one of base's type params) is correct as-is.
+			substitution = { id( param ): arg for param, arg in zip( base.type_params, t.args ) }
+			leaves = [ substitution.get( id( leaf ), leaf ) for leaf in leaves ]
+		return [ leaf for leaf in leaves if is_rc( leaf ) ]
 	return [ t ] if is_rc( t ) else []
 
 UnionStorage = Callable[[TaggedUnion], tuple[Variable,Variable,CUnion,dict[str,int]]]
@@ -148,9 +194,22 @@ class CFGState:
 		new_temp: Callable[[Type], ir.Temp],
 		new_label: Callable[[str], str],
 		union_storage: UnionStorage,
+		resolve_type: Callable[[object], object] = lambda t: t,
 	) -> None:
 		self.fn = fn # None for a global Variable's own initializer (lowering.py's FunctionLowering.run_global) - no parameters to enter below, no self, no construction
 		self._bool_type = bool_type
+		# swaps a bare Specialization (e.g. Result[str,SomeError], still
+		# wrapping the ABSTRACT, unmonomorphized Result class) for its real,
+		# per-instantiation monomorphized ClassLike (SUBSTITUTED leaf types -
+		# see _refcount_instructions' own comment on why this matters and is
+		# called from there specifically). lowering.py wires this to its own
+		# _ensure_resolved (the same "resolve now + swap a Specialization for
+		# its monomorphized form" helper used ~15 other places in that file);
+		# defaults to the identity function so cfg_test.py's own bare-Type
+		# CFGState construction (no real Monomorphizer around at all) is
+		# unaffected - those fixture Types are never Specializations of a
+		# still-generic TaggedUnion in the first place.
+		self._resolve_type = resolve_type
 		self._new_temp = new_temp
 		self._new_label = new_label
 		self._union_storage = union_storage
@@ -960,6 +1019,17 @@ class CFGState:
 
 	# --- Incref/Decref emission, union-aware ------------------------------------
 
+	def incref( self, t: Type, operand: ir.Operand ) -> list[ir.Instruction]:
+		''' public entry point for a caller that just extracted/duplicated a
+		value from somewhere else (e.g. a checked-Result payload via
+		or_return()/checked arithmetic's own OrReturn/OrJump/Unwrap extraction
+		- lowering.py's _consume_checked_result) and needs to give it its own
+		fresh +1 reference of its own - mirroring what an ordinary Assign's
+		own is_alias branch already does internally. A no-op (empty list) for
+		a non-RC t, same as everywhere else RC emission is gated - safe to
+		call unconditionally regardless of whether t actually turns out RC. '''
+		return self._incref_instructions( t, operand )
+
 	def _incref_instructions( self, t: Type, operand: ir.Operand ) -> list[ir.Instruction]:
 		return self._refcount_instructions( t, operand, ir.Incref )
 
@@ -967,6 +1037,23 @@ class CFGState:
 		return self._refcount_instructions( t, operand, ir.Decref )
 
 	def _refcount_instructions( self, t: Type, operand: ir.Operand, op: 'type[ir.Incref]|type[ir.Decref]' ) -> list[ir.Instruction]:
+		# resolve a bare Specialization (e.g. Result[str,SomeError]) to its
+		# real, monomorphized ClassLike FIRST - this function's own codegen
+		# choices below (plain-pointer Incref/Decref vs. tag-gated payload
+		# extraction) and t.leaves()/_extract_payload's own union_storage()
+		# lookup all need t's REAL, substituted shape (str/SomeError, not
+		# Result's own abstract, still-bare-TypeVar T/E) to be correct.
+		# Without this, `isinstance(t, TaggedUnion)` is FALSE for a
+		# Specialization wrapper (even though rc_leaves(t), fixed separately
+		# to substitute leaves for exactly this reason, correctly says it
+		# has RC leaves) - taking the plain-RC-pointer branch below on a
+		# plain VALUE struct (a Result is never itself heap-allocated/
+		# pointer-shaped) emits a real Incref/Decref that the emitter turns
+		# into invalid `(a_value_struct)->$header` C. Cheap even called
+		# often: memoized by the Monomorphizer (spec.monomorphized), and a
+		# no-op passthrough for anything that isn't a Specialization at all
+		# (see resolve_type's own default/wiring).
+		t = self._resolve_type( t )
 		leaves = rc_leaves( t )
 		if not leaves:
 			return []
