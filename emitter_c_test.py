@@ -11,6 +11,7 @@ import unittest
 import ir
 import emitter_c
 import linker_c
+import test_support
 from compiler import Compiler
 from discovery import Discovery
 from mpy_types import (
@@ -495,7 +496,7 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 
 _CC = linker_c.detect_cc()
 
-class UnionAsUnconstructedResultErrorTypeTests( CompilerTestCase ):
+class UnionAsUnconstructedResultErrorTypeTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' regression coverage for a real, previously-crashing gap: a @union
 	referenced ONLY as a Result[T,E]'s own error type, with no reachable
 	code anywhere constructing one of its own variants, used to crash
@@ -510,37 +511,13 @@ class UnionAsUnconstructedResultErrorTypeTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_unconstructed_union_error_type_compiles_and_runs( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'unconstructed_union_error_type_compiles_and_runs', '''
 @union
 class MyErr:
 	A: None
@@ -554,42 +531,36 @@ def main() -> i32:
 	if v != 5:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_union_member_never_constructed_still_gets_full_struct( self ) -> None:
-		# a real, confirmed gap distinct from the one above: a 3+-member
-		# anonymous union used only as a PARAMETER type, where the program
-		# only ever constructs SOME of its members (here: an i32 flows in,
-		# str and bool never do) - used to fail C compilation outright,
-		# "incomplete definition of type 'struct builtins$str'", because
-		# the union's own generic tag-gated Incref/Decref cleanup code
-		# (cfg.py's _tag_gated_refcount_instructions, emitted for ANY
-		# function receiving the union, since its own static type always
-		# admits every member regardless of what this particular program
-		# happens to construct) references str's full struct layout
-		# directly, but str's own class body was never scheduled - nothing
-		# schedules a union member's own LEAF TYPE unless something
-		# separately constructs/uses it. Root-caused to union_storage.py's
-		# UnionStorage.get(): its own `for attr in union.attributes:
-		# self._ensure_resolved(attr)` loop scheduled the member's
-		# attribute VARIABLE (a class-attribute-shaped Variable, not a
-		# global one) - which schedule()'s own guard silently ignores,
-		# since it isn't a Function/ClassLike/global Variable - never the
-		# member's own attr.type (the actual RCClass that needs emitting).
-		# Fixed by also explicitly scheduling attr.type.
-		self._run( '''
+''' ),
+			# a real, confirmed gap distinct from the one above: a 3+-member
+			# anonymous union used only as a PARAMETER type, where the program
+			# only ever constructs SOME of its members (here: an i32 flows in,
+			# str and bool never do) - used to fail C compilation outright,
+			# "incomplete definition of type 'struct builtins$str'", because
+			# the union's own generic tag-gated Incref/Decref cleanup code
+			# (cfg.py's _tag_gated_refcount_instructions, emitted for ANY
+			# function receiving the union, since its own static type always
+			# admits every member regardless of what this particular program
+			# happens to construct) references str's full struct layout
+			# directly, but str's own class body was never scheduled - nothing
+			# schedules a union member's own LEAF TYPE unless something
+			# separately constructs/uses it. Root-caused to union_storage.py's
+			# UnionStorage.get(): its own `for attr in union.attributes:
+			# self._ensure_resolved(attr)` loop scheduled the member's
+			# attribute VARIABLE (a class-attribute-shaped Variable, not a
+			# global one) - which schedule()'s own guard silently ignores,
+			# since it isn't a Function/ClassLike/global Variable - never the
+			# member's own attr.type (the actual RCClass that needs emitting).
+			# Fixed by also explicitly scheduling attr.type.
+			( 'union_member_never_constructed_still_gets_full_struct', '''
 def describe( x: i32|str|bool ) -> i32:
 	return 1
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		return describe( 5 ) - 1
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 class RCClassSubclassingPhase1Tests( CompilerTestCase ):
 	''' Phase 1 of the RCClass-subclassing plan (base-chain lookup +
@@ -689,7 +660,7 @@ def main() -> i32:
 ''' )
 		self.assertTrue( any( 'shadows' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
 
-class RCClassSubclassingPhase2Tests( CompilerTestCase ):
+class RCClassSubclassingPhase2Tests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 2 of the RCClass-subclassing plan: super().__init__(...)
 	constructor chaining. A subclass's own __init__ must open with
 	super().__init__(...) (or, when the base's own __init__ is fallible,
@@ -712,37 +683,13 @@ class RCClassSubclassingPhase2Tests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_basic_constructor_chaining( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'basic_constructor_chaining', '''
 class Base:
 	x: i32
 	def __init__( self, x: i32 ) -> None:
@@ -765,13 +712,8 @@ def main() -> i32:
 		if total != 15:
 			return 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_three_level_chain( self ) -> None:
-		self._run( '''
+''' ),
+			( 'three_level_chain', '''
 class Root:
 	a: i32
 	def __init__( self, a: i32 ) -> None:
@@ -797,17 +739,12 @@ def main() -> i32:
 	if leaf.total() != 6:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_fallible_root_construction_ok_path_actually_returns_ok( self ) -> None:
-		# regression test for the inverted-branch bug this phase's own
-		# fallible-chaining prototyping found (see this class's own
-		# docstring) - a plain, non-subclassed fallible __init__, no
-		# subclassing involved at all
-		self._run( '''
+''' ),
+			# regression test for the inverted-branch bug this phase's own
+			# fallible-chaining prototyping found (see this class's own
+			# docstring) - a plain, non-subclassed fallible __init__, no
+			# subclassing involved at all
+			( 'fallible_root_construction_ok_path_actually_returns_ok', '''
 class MyError:
 	pass
 
@@ -826,13 +763,8 @@ def main() -> i32:
 		if b.x != 5:
 			return 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_fallible_base_chaining_with_or_return( self ) -> None:
-		self._run( '''
+''' ),
+			( 'fallible_base_chaining_with_or_return', '''
 class MyError:
 	pass
 
@@ -860,26 +792,21 @@ def main() -> i32:
 	if d.total() != 15:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_chained_construction_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# this codebase's own established convention (see e.g.
-		# MatchArmSameNameNarrowingTests.test_rc_lifetime_repeated_calls_
-		# no_leak) - Base's own str field is set via super().__init__(),
-		# never touched directly by Derived's own body, so this exercises
-		# complete_base_construction's own bookkeeping specifically: if it
-		# mishandled ownership (a spurious extra incref, or none at all
-		# where one was needed), repeated construction/teardown would
-		# either leak or double-free under repetition even if a single
-		# iteration looked fine. 'hello'.upper() (not a literal) forces a
-		# real heap allocation - a literal binds to immortal static
-		# storage and can't distinguish a leak/double-release from doing
-		# nothing.
-		self._run( '''
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# this codebase's own established convention (see e.g.
+			# MatchArmSameNameNarrowingTests.test_rc_lifetime_repeated_calls_
+			# no_leak) - Base's own str field is set via super().__init__(),
+			# never touched directly by Derived's own body, so this exercises
+			# complete_base_construction's own bookkeeping specifically: if it
+			# mishandled ownership (a spurious extra incref, or none at all
+			# where one was needed), repeated construction/teardown would
+			# either leak or double-free under repetition even if a single
+			# iteration looked fine. 'hello'.upper() (not a literal) forces a
+			# real heap allocation - a literal binds to immortal static
+			# storage and can't distinguish a leak/double-release from doing
+			# nothing.
+			( 'rc_lifetime_repeated_chained_construction_no_leak', '''
 class Base:
 	s: str
 	def __init__( self, s: str ) -> None:
@@ -902,11 +829,10 @@ def main() -> i32:
 				return 1
 			i += 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
-class RCClassSubclassingPhase4Tests( CompilerTestCase ):
+class RCClassSubclassingPhase4Tests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 4 of the RCClass-subclassing plan: @virtual for RCClass,
 	unifying destructor dispatch with @virtual dispatch. ObjectHeader's
 	own destructor field became a real (if often minimal) vtable pointer
@@ -924,40 +850,16 @@ class RCClassSubclassingPhase4Tests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_virtual_dispatch_through_base_typed_reference( self ) -> None:
-		# real vtable dispatch (not a direct call) reaching the override -
-		# the core proof this works for a heap-allocated, refcounted
-		# RCClass object, not just CStruct's own COM-style pointer
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# real vtable dispatch (not a direct call) reaching the override -
+			# the core proof this works for a heap-allocated, refcounted
+			# RCClass object, not just CStruct's own COM-style pointer
+			( 'virtual_dispatch_through_base_typed_reference', '''
 class Base:
 	@virtual
 	def hello( self ) -> i32:
@@ -979,13 +881,8 @@ def main() -> i32:
 	if call_hello( d ) != 2:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_three_level_hierarchy_dispatches_to_the_leaf_override( self ) -> None:
-		self._run( '''
+''' ),
+			( 'three_level_hierarchy_dispatches_to_the_leaf_override', '''
 class Root:
 	@virtual
 	def hello( self ) -> i32:
@@ -1010,9 +907,38 @@ def main() -> i32:
 	if call_it( root ) != 1:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# this codebase's own established convention - a virtual-bearing
+			# RCClass's own $header.vtable wiring (cast to its own synthesized
+			# Vtbl type, not the shared minimal one) must not perturb
+			# construction/teardown correctness under repeated allocation
+			( 'rc_lifetime_repeated_virtual_dispatch_no_leak', '''
+class Base:
+	s: str
+	def __init__( self, s: str ) -> None:
+		self.s = s
+	@virtual
+	def describe( self ) -> usize:
+		return self.s.byte_len()
+
+class Derived( Base ):
+	@virtual
+	def describe( self ) -> usize:
+		with compiler.wrap_arithmetic:
+			return self.s.byte_len() + 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			d: Derived = Derived( s = 'hello'.upper() )
+			if d.describe() != 6:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_non_virtual_rcclass_gets_no_synthesized_vtbl_type( self ) -> None:
@@ -1060,42 +986,7 @@ def main() -> i32:
 ''' )
 		self.assertTrue( any( 'does not match' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_virtual_dispatch_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# this codebase's own established convention - a virtual-bearing
-		# RCClass's own $header.vtable wiring (cast to its own synthesized
-		# Vtbl type, not the shared minimal one) must not perturb
-		# construction/teardown correctness under repeated allocation
-		self._run( '''
-class Base:
-	s: str
-	def __init__( self, s: str ) -> None:
-		self.s = s
-	@virtual
-	def describe( self ) -> usize:
-		return self.s.byte_len()
-
-class Derived( Base ):
-	@virtual
-	def describe( self ) -> usize:
-		with compiler.wrap_arithmetic:
-			return self.s.byte_len() + 1
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		i: i32 = 0
-		while i < 1000:
-			d: Derived = Derived( s = 'hello'.upper() )
-			if d.describe() != 6:
-				return 1
-			i += 1
-		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-class RCClassSubclassingPhase5Tests( CompilerTestCase ):
+class RCClassSubclassingPhase5Tests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 5 of the RCClass-subclassing plan: @abstractmethod for
 	RCClass, using the explicit is_abstract marker (not CStruct's
 	implicit stub-body-means-unimplemented convention) - construction-
@@ -1115,34 +1006,6 @@ class RCClassSubclassingPhase5Tests( CompilerTestCase ):
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
-
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
 
 	def test_construct_abstract_class_directly_is_a_compile_error( self ) -> None:
 		self._run( '''
@@ -1179,9 +1042,13 @@ def main() -> i32:
 ''' )
 		self.assertTrue( any( 'cannot be constructed - abstract method(s)' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_subclass_implementing_abstract_method_constructs_and_dispatches( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'subclass_implementing_abstract_method_constructs_and_dispatches', '''
 class Base:
 	@abstractmethod
 	def hello( self ) -> i32: ...
@@ -1199,17 +1066,12 @@ def main() -> i32:
 	if call_hello( d ) != 42:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_three_level_chain_abstract_fulfilled_only_at_leaf( self ) -> None:
-		# the exact scenario CStruct's own implicit stub-body convention
-		# can't express - an abstract method declared at the root, still
-		# unfulfilled through an intermediate level, only implemented at
-		# the leaf, dispatched through a ROOT-typed reference
-		self._run( '''
+''' ),
+			# the exact scenario CStruct's own implicit stub-body convention
+			# can't express - an abstract method declared at the root, still
+			# unfulfilled through an intermediate level, only implemented at
+			# the leaf, dispatched through a ROOT-typed reference
+			( 'three_level_chain_abstract_fulfilled_only_at_leaf', '''
 class Root:
 	@abstractmethod
 	def hello( self ) -> i32: ...
@@ -1230,9 +1092,8 @@ def main() -> i32:
 	if call_hello( leaf ) != 7:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_abstract_base_gets_no_vtable_instance_emitted( self ) -> None:
@@ -1264,7 +1125,7 @@ def main() -> i32:
 		self.assertIn( '__main__$Derived$$vtable', src )
 		self._assert_compiles_and_runs( src )
 
-class AugAssignRealCompileTests( CompilerTestCase ):
+class AugAssignRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for _stmt_AugAssign's Attribute/Subscript-
 	target support (lowering.py) - unlike the IR-shape assertions in
 	lowering_test.py, these confirm the generated code actually computes
@@ -1276,43 +1137,19 @@ class AugAssignRealCompileTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_attribute_target_rc_value_replaced_in_a_loop( self ) -> None:
-		# f.s += 'a' 200 times - exercises the dunder (str.__add__) dispatch
-		# path plus cfg.attr_replace's decref of the OLD str each iteration;
-		# a missing/wrong decref here either leaks or double-frees, and 200
-		# iterations is enough for ASan/heap-corruption-on-double-free to
-		# reliably surface if it were broken (confirmed against a
-		# deliberately-reintroduced bug before writing this test)
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# f.s += 'a' 200 times - exercises the dunder (str.__add__) dispatch
+			# path plus cfg.attr_replace's decref of the OLD str each iteration;
+			# a missing/wrong decref here either leaks or double-frees, and 200
+			# iterations is enough for ASan/heap-corruption-on-double-free to
+			# reliably surface if it were broken (confirmed against a
+			# deliberately-reintroduced bug before writing this test)
+			( 'attribute_target_rc_value_replaced_in_a_loop', '''
 class Foo:
 	s: str
 
@@ -1326,16 +1163,11 @@ def main() -> i32:
 	if len( f.s ) != 201:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_subscript_target_raw_pointer_fallback( self ) -> None:
-		# p[0] += 5 through the flat GetItem/SetItem fallback (no
-		# __getitem__/__setitem__) - confirms the read-modify-write actually
-		# lands in the right memory, not just that it compiles
-		self._run( '''
+''' ),
+			# p[0] += 5 through the flat GetItem/SetItem fallback (no
+			# __getitem__/__setitem__) - confirms the read-modify-write actually
+			# lands in the right memory, not just that it compiles
+			( 'subscript_target_raw_pointer_fallback', '''
 import sys
 
 def main() -> i32:
@@ -1348,22 +1180,17 @@ def main() -> i32:
 	if v != 15:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_subscript_target_with_real_getitem_setitem_methods( self ) -> None:
-		# d[1] += 5 through a real __getitem__/__setitem__ pair (dict[K,V]) -
-		# both fallible, auto-consumed exactly like an ordinary d[1] read/
-		# write already is, and both driven off the SAME index operand
-		# (lowered once). main() itself can't return Result (the C entry
-		# point's signature is fixed - see emitter_c._is_entry_point), so
-		# the dict logic lives in a helper that does, mirroring how every
-		# other real-run test needing a fallible operation at top level
-		# already structures this (see
-		# UnionAsUnconstructedResultErrorTypeTests above)
-		self._run( '''
+''' ),
+			# d[1] += 5 through a real __getitem__/__setitem__ pair (dict[K,V]) -
+			# both fallible, auto-consumed exactly like an ordinary d[1] read/
+			# write already is, and both driven off the SAME index operand
+			# (lowered once). main() itself can't return Result (the C entry
+			# point's signature is fixed - see emitter_c._is_entry_point), so
+			# the dict logic lives in a helper that does, mirroring how every
+			# other real-run test needing a fallible operation at top level
+			# already structures this (see
+			# UnionAsUnconstructedResultErrorTypeTests above)
+			( 'subscript_target_with_real_getitem_setitem_methods', '''
 def helper() -> Result[i32, KeyError]:
 	d: dict[i32,i32] = dict[i32,i32]()
 	d[1] = 10
@@ -1377,9 +1204,8 @@ def main() -> i32:
 	if v != 15:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
@@ -3289,7 +3115,7 @@ def main() -> None:
 		self.assertIn( 'does not match', self.discovery.errors.errors[0] )
 
 
-class ListGenericTests( CompilerTestCase ):
+class ListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' list[T] (lib/builtins/__list.py) end-to-end, for both a value type
 	(i32) and an RC type (str). A plain contiguous order-preserving array -
 	real Python-list semantics, positions ARE the index, insert/erase shift
@@ -3303,42 +3129,18 @@ class ListGenericTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_i32_construct_append_getitem_del( self ) -> None:
-		# a non-RC element type: list[i32]() construction/destruction alone
-		# (x never used past declaration) already exercises RawList's own
-		# alloc/free and list[T].__del__'s decref-skip loop; append/
-		# __getitem__ round-trip three values through the buffer, by
-		# POSITION (an index IS a position now - no separate stable ID)
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# a non-RC element type: list[i32]() construction/destruction alone
+			# (x never used past declaration) already exercises RawList's own
+			# alloc/free and list[T].__del__'s decref-skip loop; append/
+			# __getitem__ round-trip three values through the buffer, by
+			# POSITION (an index IS a position now - no separate stable ID)
+			( 'list_i32_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
 	r0: Result[None,OverflowError] = x.append( 10 )
@@ -3360,31 +3162,26 @@ def main() -> i32:
 	if g2.unwrap( 'getitem failed' ) != 30:
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_rc_element_getitem_unwrap_chained_on_bare_receiver( self ) -> None:
-		# regression test for a real double-Decref, found while reverting
-		# an int.py workaround (see __int.py's own divmod() comment): a
-		# real (RC-typed, not i32) element read back via
-		# `x.__getitem__(i).unwrap(msg)` chained directly - the receiver
-		# Result[T,IndexError] never bound to a name - used to free the
-		# element while x itself still referenced it. unwrap()'s own
-		# declared body (`return self.data.v_Ok`) never increfs; the
-		# receiver's own pending cleanup (registered the moment its owning
-		# Call was emitted - see cfg.py's fresh_temp) was never cancelled
-		# to reflect that its one real reference now backs the .unwrap()
-		# return value instead, so BOTH the receiver's own cleanup and the
-		# destination binding's own future decref tried to release it -
-		# confirmed with AddressSanitizer, not merely by this passing.
-		# int(5), not i32, matters: element_size shortcuts for a non-RC T
-		# never exercised the buggy path at all - see list.__init__'s own
-		# is_rc(T) branch. Fixed in lowering.py's _lower_call (the new
-		# Temp-receiver branch for unwrap()/unwrap_or(), alongside the
-		# existing Variable-receiver one).
-		self._run( '''
+''' ),
+			# regression test for a real double-Decref, found while reverting
+			# an int.py workaround (see __int.py's own divmod() comment): a
+			# real (RC-typed, not i32) element read back via
+			# `x.__getitem__(i).unwrap(msg)` chained directly - the receiver
+			# Result[T,IndexError] never bound to a name - used to free the
+			# element while x itself still referenced it. unwrap()'s own
+			# declared body (`return self.data.v_Ok`) never increfs; the
+			# receiver's own pending cleanup (registered the moment its owning
+			# Call was emitted - see cfg.py's fresh_temp) was never cancelled
+			# to reflect that its one real reference now backs the .unwrap()
+			# return value instead, so BOTH the receiver's own cleanup and the
+			# destination binding's own future decref tried to release it -
+			# confirmed with AddressSanitizer, not merely by this passing.
+			# int(5), not i32, matters: element_size shortcuts for a non-RC T
+			# never exercised the buggy path at all - see list.__init__'s own
+			# is_rc(T) branch. Fixed in lowering.py's _lower_call (the new
+			# Temp-receiver branch for unwrap()/unwrap_or(), alongside the
+			# existing Variable-receiver one).
+			( 'list_rc_element_getitem_unwrap_chained_on_bare_receiver', '''
 def main() -> i32:
 	x: list[int] = list[int]()
 	x.append( int( 5 )).unwrap( 'append failed' )
@@ -3392,16 +3189,11 @@ def main() -> i32:
 	if got != int( 5 ):
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_i32_grows_past_initial_capacity( self ) -> None:
-		# initial_capacity defaults to 8 - 20 appends forces RawList._grow()
-		# at least once, and every value must still read back correctly
-		# afterward (the copy during growth must preserve contents)
-		self._run( '''
+''' ),
+			# initial_capacity defaults to 8 - 20 appends forces RawList._grow()
+			# at least once, and every value must still read back correctly
+			# afterward (the copy during growth must preserve contents)
+			( 'list_i32_grows_past_initial_capacity', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
 	i: usize = 0
@@ -3424,19 +3216,14 @@ def main() -> i32:
 				return 2
 			j += 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_erase_at_preserves_positional_order( self ) -> None:
-		# the whole point of this container vs. FastList[T]: erase_at
-		# shifts everything after the removed slot left by one (memmove),
-		# it does not swap the last element into the gap. Append
-		# 10,20,30,40,50, erase_at(2) (the value 30) - must read back
-		# 10,20,40,50, never 10,20,50,40 (that shape would mean this
-		# regressed to FastList's swap-and-pop behavior)
-		self._run( '''
+''' ),
+			# the whole point of this container vs. FastList[T]: erase_at
+			# shifts everything after the removed slot left by one (memmove),
+			# it does not swap the last element into the gap. Append
+			# 10,20,30,40,50, erase_at(2) (the value 30) - must read back
+			# 10,20,40,50, never 10,20,50,40 (that shape would mean this
+			# regressed to FastList's swap-and-pop behavior)
+			( 'erase_at_preserves_positional_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
 	r0: Result[None,OverflowError] = x.append( 10 )
@@ -3464,16 +3251,11 @@ def main() -> i32:
 	if v0 == 10 and v1 == 20 and v2 == 40 and v3 == 50:
 		return 0 # order preserved - everything after the gap shifted left
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_insert_shifts_tail_right_and_preserves_order( self ) -> None:
-		# the mirror image of erase_at above: insert(1, 99) into
-		# [10,20,30] must produce [10,99,20,30], not overwrite or corrupt
-		# anything - everything at/after the insertion point shifts right
-		self._run( '''
+''' ),
+			# the mirror image of erase_at above: insert(1, 99) into
+			# [10,20,30] must produce [10,99,20,30], not overwrite or corrupt
+			# anything - everything at/after the insertion point shifts right
+			( 'insert_shifts_tail_right_and_preserves_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
 	r0: Result[None,OverflowError] = x.append( 10 )
@@ -3499,15 +3281,10 @@ def main() -> i32:
 	if v0 == 10 and v1 == 99 and v2 == 20 and v3 == 30:
 		return 0
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_insert_past_end_clamps_to_append( self ) -> None:
-		# matches Python's own list.insert - an out-of-range index doesn't
-		# error, it just appends
-		self._run( '''
+''' ),
+			# matches Python's own list.insert - an out-of-range index doesn't
+			# error, it just appends
+			( 'insert_past_end_clamps_to_append', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
 	r0: Result[None,OverflowError] = x.append( 10 )
@@ -3525,18 +3302,13 @@ def main() -> i32:
 	if g2.unwrap( 'x' ) != 30:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_setitem_via_assignment_syntax_overwrites_in_place( self ) -> None:
-		# exercises x[i] = v as real assignment syntax (not
-		# .__setitem__(...) called directly) - this only actually reaches
-		# list[T].__setitem__ because of lowering.py's own dispatch fix
-		# (obj[i] = v used to always emit a raw SetItem, ignoring any real
-		# __setitem__ the type declared)
-		self._run( '''
+''' ),
+			# exercises x[i] = v as real assignment syntax (not
+			# .__setitem__(...) called directly) - this only actually reaches
+			# list[T].__setitem__ because of lowering.py's own dispatch fix
+			# (obj[i] = v used to always emit a raw SetItem, ignoring any real
+			# __setitem__ the type declared)
+			( 'setitem_via_assignment_syntax_overwrites_in_place', '''
 def set_it( x: list[i32] ) -> Result[None,IndexError]:
 	x[1] = 99
 	return Result.Ok( None )
@@ -3559,17 +3331,12 @@ def main() -> i32:
 	if g0.unwrap( 'x' ) == 10 and g1.unwrap( 'x' ) == 99 and g2.unwrap( 'x' ) == 30:
 		return 0
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_str_construct_append_getitem_del( self ) -> None:
-		# an RC element type - a list[T] slot holds str's own HANDLE
-		# (pointer-width), not its struct body (see list.__init__'s own
-		# comment); __del__ must decref every stored element without
-		# reading struct-body-sized memory out of a pointer-sized slot
-		self._run( '''
+''' ),
+			# an RC element type - a list[T] slot holds str's own HANDLE
+			# (pointer-width), not its struct body (see list.__init__'s own
+			# comment); __del__ must decref every stored element without
+			# reading struct-body-sized memory out of a pointer-sized slot
+			( 'list_str_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[str] = list[str]()
 	r0: Result[None,OverflowError] = x.append( 'hello' )
@@ -3587,13 +3354,8 @@ def main() -> i32:
 	if g1.unwrap( 'getitem failed' ) != 'world':
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_str_grows_past_initial_capacity( self ) -> None:
-		self._run( '''
+''' ),
+			( 'list_str_grows_past_initial_capacity', '''
 def main() -> i32:
 	x: list[str] = list[str]()
 	i: usize = 0
@@ -3620,24 +3382,19 @@ def main() -> i32:
 	if not all_ok:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_as_class_field_constructs_and_destructs( self ) -> None:
-		# regression test for a real compiler bug found while building
-		# dict[K,V] (see type_resolver.py's own _schedule_rcclass_
-		# destructor_deps fix): list[T] used as a FIELD of another class
-		# (as opposed to a local variable) used to crash - schedule()'s own
-		# Specialization branch called _schedule_rcclass_destructor_deps
-		# with the BARE, unspecialized `list` class, which then scheduled
-		# list's own __del__ directly for compilation with T still an
-		# unbound TypeVar ("compiler.is_rc(T) requires a concrete type").
-		# Whether this actually crashed depended on resolution ordering -
-		# a plain local `x: list[i32] = list[i32]()` never triggered it,
-		# only a FIELD assignment (self.items = list[i32]()) reliably did
-		self._run( '''
+''' ),
+			# regression test for a real compiler bug found while building
+			# dict[K,V] (see type_resolver.py's own _schedule_rcclass_
+			# destructor_deps fix): list[T] used as a FIELD of another class
+			# (as opposed to a local variable) used to crash - schedule()'s own
+			# Specialization branch called _schedule_rcclass_destructor_deps
+			# with the BARE, unspecialized `list` class, which then scheduled
+			# list's own __del__ directly for compilation with T still an
+			# unbound TypeVar ("compiler.is_rc(T) requires a concrete type").
+			# Whether this actually crashed depended on resolution ordering -
+			# a plain local `x: list[i32] = list[i32]()` never triggered it,
+			# only a FIELD assignment (self.items = list[i32]()) reliably did
+			( 'list_as_class_field_constructs_and_destructs', '''
 class Holder:
 	items: list[i32]
 
@@ -3662,39 +3419,34 @@ def main() -> i32:
 	if g0.unwrap( 'x' ) == 10 and g1.unwrap( 'x' ) == 20:
 		return 0
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_local_var_of_multi_field_rcclass( self ) -> None:
-		# regression test for a real double-Decref, found while building
-		# int.divmod() (see __int.py's own divmod() comment): list.__del__
-		# reads each element into a named local and manually
-		# compiler.decref()s it, but cfg.py never learned that decref
-		# already released it, so the local's own scope-exit epilogue
-		# decref'd it a SECOND time - heap-use-after-free, confirmed with
-		# AddressSanitizer (Windows raw HeapAlloc/HeapFree corruption isn't
-		# ASan-visible directly; diagnosed by shimming HeapAlloc/HeapFree
-		# onto malloc/free for one instrumented build). NOT a
-		# type_resolver.py/_schedule_rcclass_destructor_deps issue (an
-		# earlier, incorrect theory this comment used to describe) - that
-		# function was already correct. Fixed in cfg.py's
-		# manually_decreffed(), called from lowering.py's
-		# _lower_compiler_decref. This particular repro's 3-field/list[T]
-		# shape doesn't bear on the bug itself (the double-decref happens
-		# for ANY compiler.decref'd named local, any field count) - it's
-		# just the shape that happened to be large enough to make the OS
-		# heap allocator's own corruption detection fire reliably; smaller
-		# objects can silently corrupt the heap without an immediate crash,
-		# so passing here is necessary but not sufficient - see this
-		# session's own investigation notes for the direct-PowerShell-
-		# execution proof this file's own _assert_compiles_and_runs can't
-		# fully replace (subprocess.run from a process tree rooted in a
-		# git-bash/MSYS shell was observed to silently swallow this exact
-		# STATUS_HEAP_CORRUPTION rather than propagate it as a nonzero
-		# exit code, in this project's actual dev environment)
-		self._run( '''
+''' ),
+			# regression test for a real double-Decref, found while building
+			# int.divmod() (see __int.py's own divmod() comment): list.__del__
+			# reads each element into a named local and manually
+			# compiler.decref()s it, but cfg.py never learned that decref
+			# already released it, so the local's own scope-exit epilogue
+			# decref'd it a SECOND time - heap-use-after-free, confirmed with
+			# AddressSanitizer (Windows raw HeapAlloc/HeapFree corruption isn't
+			# ASan-visible directly; diagnosed by shimming HeapAlloc/HeapFree
+			# onto malloc/free for one instrumented build). NOT a
+			# type_resolver.py/_schedule_rcclass_destructor_deps issue (an
+			# earlier, incorrect theory this comment used to describe) - that
+			# function was already correct. Fixed in cfg.py's
+			# manually_decreffed(), called from lowering.py's
+			# _lower_compiler_decref. This particular repro's 3-field/list[T]
+			# shape doesn't bear on the bug itself (the double-decref happens
+			# for ANY compiler.decref'd named local, any field count) - it's
+			# just the shape that happened to be large enough to make the OS
+			# heap allocator's own corruption detection fire reliably; smaller
+			# objects can silently corrupt the heap without an immediate crash,
+			# so passing here is necessary but not sufficient - see this
+			# session's own investigation notes for the direct-PowerShell-
+			# execution proof this file's own _assert_compiles_and_runs can't
+			# fully replace (subprocess.run from a process tree rooted in a
+			# git-bash/MSYS shell was observed to silently swallow this exact
+			# STATUS_HEAP_CORRUPTION rather than propagate it as a nonzero
+			# exit code, in this project's actual dev environment)
+			( 'list_local_var_of_multi_field_rcclass', '''
 class Triple:
 	a: usize
 	b: usize
@@ -3717,19 +3469,14 @@ def main() -> i32:
 	if got.a != 5 or got.b != 5 or got.c != 5:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_fastlist_local_var_of_multi_field_rcclass( self ) -> None:
-		# same as test_list_local_var_of_multi_field_rcclass above, but for
-		# FastList[T] - a separate implementation (lib/builtins/__fastlist.py)
-		# with the identical `val: T = <read>; compiler.decref(val)` shape in
-		# its own __del__, so it reproduced the identical double-Decref bug
-		# for the identical reason (see the other test's own updated comment
-		# - cfg.py's manually_decreffed(), not anything list/FastList-specific)
-		self._run( '''
+''' ),
+			# same as test_list_local_var_of_multi_field_rcclass above, but for
+			# FastList[T] - a separate implementation (lib/builtins/__fastlist.py)
+			# with the identical `val: T = <read>; compiler.decref(val)` shape in
+			# its own __del__, so it reproduced the identical double-Decref bug
+			# for the identical reason (see the other test's own updated comment
+			# - cfg.py's manually_decreffed(), not anything list/FastList-specific)
+			( 'fastlist_local_var_of_multi_field_rcclass', '''
 class Triple:
 	a: usize
 	b: usize
@@ -3752,21 +3499,16 @@ def main() -> i32:
 	if got.a != 7 or got.b != 7 or got.c != 7:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_list_str_erase_at_preserves_order_and_refcounts( self ) -> None:
-		# RC-element coverage for erase_at's ordering guarantee - 'b' is
-		# decreffed on removal, 'a' and 'c' must survive (and read back
-		# correctly) in the shifted positions. If decref/incref bookkeeping
-		# were wrong here, this would double-free or leak at __del__ time
-		# (list[T].__del__ decrefs every remaining slot on the way out) -
-		# not something this test can observe directly without ASAN, but a
-		# wrong refcount is exactly the kind of thing that turns into a
-		# crash on a real run
-		self._run( '''
+''' ),
+			# RC-element coverage for erase_at's ordering guarantee - 'b' is
+			# decreffed on removal, 'a' and 'c' must survive (and read back
+			# correctly) in the shifted positions. If decref/incref bookkeeping
+			# were wrong here, this would double-free or leak at __del__ time
+			# (list[T].__del__ decrefs every remaining slot on the way out) -
+			# not something this test can observe directly without ASAN, but a
+			# wrong refcount is exactly the kind of thing that turns into a
+			# crash on a real run
+			( 'list_str_erase_at_preserves_order_and_refcounts', '''
 def main() -> i32:
 	x: list[str] = list[str]()
 	r0: Result[None,OverflowError] = x.append( 'a' )
@@ -3786,9 +3528,8 @@ def main() -> i32:
 	if g0.unwrap( 'x' ) == 'a' and g1.unwrap( 'x' ) == 'c':
 		return 0
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
 class UnsafeListGenericTests( CompilerTestCase ):
@@ -3860,7 +3601,7 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
-class ListThreadSafetyTests( CompilerTestCase ):
+class ListThreadSafetyTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' list[T] (lib/builtins/__list.py) is now locked by default (a real
 	FastLock, acquired/released around every method) - these are the real
 	compile+run stress tests that actually exercise concurrent access, not
@@ -3877,48 +3618,13 @@ class ListThreadSafetyTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			try:
-				run_result = subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = 30 )
-			except subprocess.TimeoutExpired:
-				self.fail( 'exe did not finish within 30s - likely a lost push/pop causing an infinite spin' )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	# Layer 1: push-only, isolates concurrent append/_grow() correctness
-	# from pop() entirely. 8 threads each append 1000 distinct, known
-	# values (thread t appends t*1000 .. t*1000+999) with no popping.
-	# Expected count (8000) and expected sum (31996000, verified by direct
-	# computation, not just asserted) both catch lost/duplicated/corrupted
-	# appends - this is the race most likely to actually corrupt memory
-	# (two threads racing _grow() is a genuine double-free on the old,
-	# unlocked implementation).
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_concurrent_append_from_8_threads_known_sum( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'concurrent_append_from_8_threads_known_sum', '''
 import threading
 
 class Pusher:
@@ -3967,24 +3673,8 @@ def main() -> i32:
 	if total != 31996000:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	# Layer 2: your own producer/consumer scenario - 8 producer threads
-	# push the same 8000 known values while ONE consumer thread
-	# continuously pops, concurrently (true overlap, not "wait for
-	# producers then drain"). The consumer needs no atomics of its own:
-	# with a single consumer, popped-count/running-sum are purely its own
-	# local state (nothing else reads or writes them), so the only
-	# actually-shared, concurrently-mutated state is the list itself,
-	# already covered by its own lock. Stop condition is the same known
-	# total both sides already agree on (8000), not a sentinel or a
-	# separate done-flag - a stuck consumer (lost pop) shows up as the 30s
-	# timeout above, not a hang.
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_8_producers_1_consumer_concurrent_push_pop_known_sum( self ) -> None:
-		self._run( '''
+''' ),
+			( '8_producers_1_consumer_concurrent_push_pop_known_sum', '''
 import threading
 
 class Pusher:
@@ -4049,20 +3739,8 @@ def main() -> i32:
 	if l.__len__() != 0:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	# Layer 3: an RC-element variant of Layer 1 - plain integers never
-	# touch the incref/decref path at all, so this is the one that
-	# actually proves concurrent append's own RC bookkeeping (not just the
-	# raw buffer/length bookkeeping) is correct: push 1000 distinct Item
-	# instances from 4 threads, then single-threaded, pop everything back
-	# and confirm each one's own refcount is exactly 1 (sole ownership,
-	# no leak, no double-free) before letting it go out of scope normally.
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_concurrent_append_of_rc_elements_no_leak_or_double_free( self ) -> None:
-		self._run( '''
+''' ),
+			( 'concurrent_append_of_rc_elements_no_leak_or_double_free', '''
 import threading
 
 class Item:
@@ -4122,12 +3800,11 @@ def main() -> i32:
 	if l.__len__() != 0:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		], timeout = 30 )
 
 
-class FastListGenericTests( CompilerTestCase ):
+class FastListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' FastList[T] (lib/builtins/__fastlist.py) end-to-end - the ORIGINAL
 	StableIndexVector port: O(1) swap-and-pop erase, stable IDs that
 	survive other inserts/deletes, but positional order is NOT preserved
@@ -4139,37 +3816,13 @@ class FastListGenericTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_fastlist_i32_construct_append_getitem_del( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'fastlist_i32_construct_append_getitem_del', '''
 def main() -> i32:
 	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
@@ -4194,25 +3847,20 @@ def main() -> i32:
 	if g2.unwrap( 'getitem failed' ) != 30:
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_erase_does_not_preserve_positional_order( self ) -> None:
-		# FastList[T]/RawFastList ports StableIndexVector (see the file's
-		# own module docstring) - a swap-and-pop design, not an
-		# insertion-order-preserving one. Its own README says so plainly:
-		# "On deletion, the last element is swapped into the gap." This is
-		# NOT a bug - it's what buys the O(1) erase and the "stable ID
-		# survives other inserts/deletes" guarantee FastListHandle depends
-		# on. This test pins that behavior down with a real compile-and-run
-		# so it can't be "fixed" by accident later: append 10,20,30,40,50
-		# (data positions 0..4 in insertion order), erase the middle one
-		# (30, at position 2) - if order were preserved, positions 0..3
-		# would read back 10,20,40,50; instead the LAST element (50) gets
-		# swapped into the vacated slot, giving 10,20,50,40.
-		self._run( '''
+''' ),
+			# FastList[T]/RawFastList ports StableIndexVector (see the file's
+			# own module docstring) - a swap-and-pop design, not an
+			# insertion-order-preserving one. Its own README says so plainly:
+			# "On deletion, the last element is swapped into the gap." This is
+			# NOT a bug - it's what buys the O(1) erase and the "stable ID
+			# survives other inserts/deletes" guarantee FastListHandle depends
+			# on. This test pins that behavior down with a real compile-and-run
+			# so it can't be "fixed" by accident later: append 10,20,30,40,50
+			# (data positions 0..4 in insertion order), erase the middle one
+			# (30, at position 2) - if order were preserved, positions 0..3
+			# would read back 10,20,40,50; instead the LAST element (50) gets
+			# swapped into the vacated slot, giving 10,20,50,40.
+			( 'erase_does_not_preserve_positional_order', '''
 def main() -> i32:
 	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
@@ -4243,24 +3891,19 @@ def main() -> i32:
 	if v0 == 10 and v1 == 20 and v2 == 50 and v3 == 40:
 		return 0 # swap-and-pop confirmed: last element (50) filled the gap
 	return 99 # neither shape - something else entirely is wrong
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_erase_preserves_stable_id_identity_despite_position_swap( self ) -> None:
-		# complements test_erase_does_not_preserve_positional_order above:
-		# get_at (position-based) breaks order, but __getitem__ (stable-ID-
-		# based) is a DIFFERENT accessor - _erase repoints the swapped
-		# element's __indexes entry at its new position (see
-		# RawFastList._erase), so every surviving id still resolves to the
-		# same VALUE it always did, regardless of where the swap physically
-		# moved it. Same 10,20,30,40,50 / erase id for 30 setup as the
-		# position test, but reading back via the original ids (0,1,3,4)
-		# instead of positions (0,1,2,3) - this is expected to read back
-		# 10,20,40,50 (identity preserved), even though the POSITIONAL read
-		# of the same list does not (10,20,50,40, per the other test)
-		self._run( '''
+''' ),
+			# complements test_erase_does_not_preserve_positional_order above:
+			# get_at (position-based) breaks order, but __getitem__ (stable-ID-
+			# based) is a DIFFERENT accessor - _erase repoints the swapped
+			# element's __indexes entry at its new position (see
+			# RawFastList._erase), so every surviving id still resolves to the
+			# same VALUE it always did, regardless of where the swap physically
+			# moved it. Same 10,20,30,40,50 / erase id for 30 setup as the
+			# position test, but reading back via the original ids (0,1,3,4)
+			# instead of positions (0,1,2,3) - this is expected to read back
+			# 10,20,40,50 (identity preserved), even though the POSITIONAL read
+			# of the same list does not (10,20,50,40, per the other test)
+			( 'erase_preserves_stable_id_identity_despite_position_swap', '''
 def main() -> i32:
 	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
@@ -4291,24 +3934,19 @@ def main() -> i32:
 	if v0 == 10 and v1 == 20 and v3 == 40 and v4 == 50:
 		return 0 # stable-ID identity survived the positional swap
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_append_after_erase_reuses_freed_id_without_aliasing( self ) -> None:
-		# regression test for the id-collision bug found while
-		# investigating order preservation (see emitter_c_test.py history -
-		# RawFastList._get_free_id used to always return __len, which
-		# SHRINKS on erase, so the next append could hand out an id that
-		# was still held by a live element, silently aliasing two elements
-		# onto the same id). Fixed via a real free-list (__free_ids/
-		# __free_count) plus a monotonic __next_id counter that never goes
-		# backwards. Same 10,20,30,40,50 / erase id for 30 / append 60
-		# setup that used to demonstrate the collision: id4 (50) must
-		# survive untouched, and the recycled id (from erasing 30) must be
-		# handed to 60 rather than colliding with id4
-		self._run( '''
+''' ),
+			# regression test for the id-collision bug found while
+			# investigating order preservation (see emitter_c_test.py history -
+			# RawFastList._get_free_id used to always return __len, which
+			# SHRINKS on erase, so the next append could hand out an id that
+			# was still held by a live element, silently aliasing two elements
+			# onto the same id). Fixed via a real free-list (__free_ids/
+			# __free_count) plus a monotonic __next_id counter that never goes
+			# backwards. Same 10,20,30,40,50 / erase id for 30 / append 60
+			# setup that used to demonstrate the collision: id4 (50) must
+			# survive untouched, and the recycled id (from erasing 30) must be
+			# handed to 60 rather than colliding with id4
+			( 'append_after_erase_reuses_freed_id_without_aliasing', '''
 def main() -> i32:
 	x: FastList[i32] = FastList[i32]()
 	r0: Result[usize,OverflowError] = x.append( 10 )
@@ -4338,12 +3976,11 @@ def main() -> i32:
 	if v4 == 50 and v5 == 60:
 		return 0 # no aliasing - both ids resolve to their own, correct values
 	return 99
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class ChrOrdTests( CompilerTestCase ):
+class ChrOrdTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' chr()/ord() (lib/builtins/__init__.py) - built on str's own private
 	UTF-8 encode/decode helpers (the same ones upper()/lower()/case-
 	folding already use), not separate logic. '''
@@ -4351,37 +3988,13 @@ class ChrOrdTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_ascii_round_trip( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'ascii_round_trip', '''
 def main() -> i32:
 	if chr( 65 ) != "A":
 		return 1
@@ -4390,16 +4003,11 @@ def main() -> i32:
 	if ord( "0" ) != 48:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_multibyte_round_trip( self ) -> None:
-		# U+00E9 (e-acute, 2 UTF-8 bytes) and U+1F600 (grinning face emoji,
-		# 4 UTF-8 bytes) - exercises _utf8_encoded_len/_encode_utf8_at/
-		# _decode_utf8_at's own 2-byte and 4-byte branches, not just ASCII
-		self._run( '''
+''' ),
+			# U+00E9 (e-acute, 2 UTF-8 bytes) and U+1F600 (grinning face emoji,
+			# 4 UTF-8 bytes) - exercises _utf8_encoded_len/_encode_utf8_at/
+			# _decode_utf8_at's own 2-byte and 4-byte branches, not just ASCII
+			( 'multibyte_round_trip', '''
 def main() -> i32:
 	c2: str = chr( 0xE9 )
 	if c2.byte_len() != 2:
@@ -4412,9 +4020,8 @@ def main() -> i32:
 	if ord( c4 ) != 0x1F600:
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_ord_on_empty_string_panics( self ) -> None:
@@ -4449,7 +4056,7 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
 
 
-class MatchValuePatternRealCompileTests( CompilerTestCase ):
+class MatchValuePatternRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for type_resolver.py's _match_pattern
 	ast.MatchValue handling - `case Color.Red:`/`case 5:` desugaring to a
 	plain == Compare. Unlike type_resolver_test.py's own MatchValue tests
@@ -4459,37 +4066,13 @@ class MatchValuePatternRealCompileTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_match_cenum_member_value_patterns( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'match_cenum_member_value_patterns', '''
 @enum( i32 )
 class Color:
 	Red = 1
@@ -4513,13 +4096,8 @@ def main() -> i32:
 	if classify( Color.Red ) != 1:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_match_plain_literal_value_patterns( self ) -> None:
-		self._run( '''
+''' ),
+			( 'match_plain_literal_value_patterns', '''
 def classify( x: i32 ) -> i32:
 	match x:
 		case 1:
@@ -4537,12 +4115,11 @@ def main() -> i32:
 	if classify( 3 ) != 999:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class AtomicRealCompileTests( CompilerTestCase ):
+class AtomicRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for compiler.atomic_*(Ptr[T], ...)
 	(lowering.py's _lower_compiler_atomic_*, ir.py's Atomic* instructions,
 	emitter_c.py's stdatomic.h-based codegen) and lib/atomic.py's Atomic[T]
@@ -4552,37 +4129,13 @@ class AtomicRealCompileTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_load_store_add_sub_exchange_round_trip( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'load_store_add_sub_exchange_round_trip', '''
 import sys
 
 def main() -> i32:
@@ -4601,13 +4154,8 @@ def main() -> i32:
 		return 4
 	sys.free( p )
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_compare_exchange_success_and_failure( self ) -> None:
-		self._run( '''
+''' ),
+			( 'compare_exchange_success_and_failure', '''
 import sys
 
 def main() -> i32:
@@ -4630,13 +4178,8 @@ def main() -> i32:
 	sys.free( p )
 	sys.free( expected )
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_atomic_wrapper_i32_and_bool( self ) -> None:
-		self._run( '''
+''' ),
+			( 'atomic_wrapper_i32_and_bool', '''
 import atomic
 
 def main() -> i32:
@@ -4660,13 +4203,8 @@ def main() -> i32:
 	if not b.load():
 		return 6
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_atomic_wrapper_compare_exchange( self ) -> None:
-		self._run( '''
+''' ),
+			( 'atomic_wrapper_compare_exchange', '''
 import atomic
 import sys
 
@@ -4680,12 +4218,11 @@ def main() -> i32:
 		return 2
 	sys.free( expected )
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class ClosureRealCompileTests( CompilerTestCase ):
+class ClosureRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for bound-method closures
 	(Closure[[...],...] - mpy_types.ClosureType, lowering.py's
 	_lower_bound_method_closure/_get_or_create_closure_trampoline/
@@ -4700,37 +4237,13 @@ class ClosureRealCompileTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_construct_and_call_no_args( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'construct_and_call_no_args', '''
 class Worker:
 	x: i32
 
@@ -4747,13 +4260,8 @@ def main() -> i32:
 	if c() != 42:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_construct_and_call_with_args( self ) -> None:
-		self._run( '''
+''' ),
+			( 'construct_and_call_with_args', '''
 class Worker:
 	x: i32
 
@@ -4773,15 +4281,10 @@ def main() -> i32:
 	if c( 100 ) != 142:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_ordinary_method_call_unaffected( self ) -> None:
-		# the exact same class/method also called the ordinary way
-		# (w.get(), no Closure[...] anywhere) must keep working unchanged
-		self._run( '''
+''' ),
+			# the exact same class/method also called the ordinary way
+			# (w.get(), no Closure[...] anywhere) must keep working unchanged
+			( 'ordinary_method_call_unaffected', '''
 class Worker:
 	x: i32
 
@@ -4797,18 +4300,13 @@ def main() -> i32:
 	if w.get() != 7:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_refcount_incremented_once_on_construction_and_calls_are_neutral( self ) -> None:
-		# construct once, incref by exactly 1; call it 200 times in a loop
-		# (calling a closure must never touch the receiver's refcount -
-		# the cast back to the real receiver type inside the trampoline is
-		# a borrowed reinterpretation, not a new owned reference); decref
-		# once, back to the pre-construction refcount
-		self._run( '''
+''' ),
+			# construct once, incref by exactly 1; call it 200 times in a loop
+			# (calling a closure must never touch the receiver's refcount -
+			# the cast back to the real receiver type inside the trampoline is
+			# a borrowed reinterpretation, not a new owned reference); decref
+			# once, back to the pre-construction refcount
+			( 'refcount_incremented_once_on_construction_and_calls_are_neutral', '''
 class Worker:
 	x: i32
 
@@ -4841,20 +4339,15 @@ def main() -> i32:
 	if rc2 != rc0:
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_shared_closure_across_multiple_owners( self ) -> None:
-		# `d = c` (an ordinary aliasing read) makes d a SECOND owner of the
-		# SAME closure object - an ordinary RC incref on the closure
-		# itself, not a second incref of w (w's own refcount only moves at
-		# closure construction/destruction, never at aliasing) - this is
-		# exactly the "same closure handed to N places" shape Thread will
-		# need (spawn N threads off one closure), just via a local alias
-		# here rather than N constructor calls
-		self._run( '''
+''' ),
+			# `d = c` (an ordinary aliasing read) makes d a SECOND owner of the
+			# SAME closure object - an ordinary RC incref on the closure
+			# itself, not a second incref of w (w's own refcount only moves at
+			# closure construction/destruction, never at aliasing) - this is
+			# exactly the "same closure handed to N places" shape Thread will
+			# need (spawn N threads off one closure), just via a local alias
+			# here rather than N constructor calls
+			( 'shared_closure_across_multiple_owners', '''
 class Worker:
 	x: i32
 
@@ -4888,12 +4381,11 @@ def main() -> i32:
 	if rc2 != rc0:
 		return 5
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class ThreadRealCompileTests( CompilerTestCase ):
+class ThreadRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for threading.Thread (lib/threading.py),
 	built on Phase 1 (compiler.atomic_*/lib/atomic.py) and Phase 2b
 	(Closure[[...],...]) - see the approved atomics-closures-threading
@@ -4909,40 +4401,13 @@ class ThreadRealCompileTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			try:
-				run_result = subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = 30 )
-			except subprocess.TimeoutExpired:
-				self.fail( 'exe did not finish within 30s - likely a deadlocked join()' )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_spawn_one_thread_mutates_shared_state( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'spawn_one_thread_mutates_shared_state', '''
 import threading
 
 class Worker:
@@ -4962,17 +4427,12 @@ def main() -> i32:
 	if w.x != 99:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_n_threads_share_one_closure_via_atomic_counter( self ) -> None:
-		# the real end-to-end proof: one closure, shared (ordinary
-		# aliasing incref, NOT move[T]) across 8 separate Thread spawns,
-		# each running 1000 lock-free fetch_add's on the SAME Atomic[usize]
-		# - the exact shape the plan's own design discussion converged on
-		self._run( '''
+''' ),
+			# the real end-to-end proof: one closure, shared (ordinary
+			# aliasing incref, NOT move[T]) across 8 separate Thread spawns,
+			# each running 1000 lock-free fetch_add's on the SAME Atomic[usize]
+			# - the exact shape the plan's own design discussion converged on
+			( 'n_threads_share_one_closure_via_atomic_counter', '''
 import threading
 import atomic
 
@@ -5008,12 +4468,11 @@ def main() -> i32:
 	if c.n.load() != 8000:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		], timeout = 30 )
 
 
-class StrFindIndexSplitTests( CompilerTestCase ):
+class StrFindIndexSplitTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' str.find()/str.index()/str.split() (lib/builtins/__init__.py) -
 	both listed missing in TODO.txt, implemented as real general-purpose
 	methods (byte-level substring search built directly off str's own
@@ -5026,37 +4485,13 @@ class StrFindIndexSplitTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_find_and_index( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'find_and_index', '''
 def main() -> i32:
 	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
 	r0: Result[usize,IndexError] = s.find( '-' )
@@ -5080,16 +4515,11 @@ def main() -> i32:
 	if r4.is_err() or r4.unwrap( 'x' ) != 13:
 		return 7
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_split_guid_like_string( self ) -> None:
-		# the exact motivating case from PLAN_SUBCLASSING_VTABLES_COM.md's
-		# own blocked-on note: GUID's constructor parsing a hyphenated hex
-		# string via str.split('-')
-		self._run( '''
+''' ),
+			# the exact motivating case from PLAN_SUBCLASSING_VTABLES_COM.md's
+			# own blocked-on note: GUID's constructor parsing a hyphenated hex
+			# string via str.split('-')
+			( 'split_guid_like_string', '''
 def main() -> i32:
 	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
 	parts: list[str] = s.split( '-' )
@@ -5113,13 +4543,8 @@ def main() -> i32:
 	if g4.unwrap( 'x' ) != 'beefdeadbeef':
 		return 6
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_split_edge_cases( self ) -> None:
-		self._run( '''
+''' ),
+			( 'split_edge_cases', '''
 def main() -> i32:
 	empty: list[str] = ''.split( ',' )
 	if empty.__len__() != 1:
@@ -5149,12 +4574,11 @@ def main() -> i32:
 	if c1.unwrap( 'x' ) != '':
 		return 8
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class StrPhase1MethodsTests( CompilerTestCase ):
+class StrPhase1MethodsTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 1 of TODO.txt's str-methods plan: startswith/endswith/
 	removeprefix/removesuffix/rfind/rindex/replace/rsplit/join/partition/
 	rpartition/isascii (lib/builtins/__init__.py) - all built directly on
@@ -5165,37 +4589,13 @@ class StrPhase1MethodsTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_startswith_endswith( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'startswith_endswith', '''
 def main() -> i32:
 	if not 'hello world'.startswith( 'hello' ):
 		return 1
@@ -5216,13 +4616,8 @@ def main() -> i32:
 	if 'short'.endswith( 'much too long' ):
 		return 9
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_removeprefix_removesuffix( self ) -> None:
-		self._run( '''
+''' ),
+			( 'removeprefix_removesuffix', '''
 def main() -> i32:
 	if 'hello world'.removeprefix( 'hello ' ) != 'world':
 		return 1
@@ -5233,13 +4628,8 @@ def main() -> i32:
 	if 'hello world'.removesuffix( 'nope' ) != 'hello world':
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rfind_rindex( self ) -> None:
-		self._run( '''
+''' ),
+			( 'rfind_rindex', '''
 def main() -> i32:
 	r1: Result[usize,IndexError] = 'abcabc'.rfind( 'abc' )
 	if r1.unwrap( 'x' ) != 3:
@@ -5252,23 +4642,8 @@ def main() -> i32:
 	if 'abcabc'.rfind( '' ).unwrap( 'x' ) != 6:
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rindex_panics_when_not_found( self ) -> None:
-		self._run( '''
-def main() -> i32:
-	'abc'.rindex( 'nope' )
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_replace( self ) -> None:
-		self._run( '''
+''' ),
+			( 'replace', '''
 def main() -> i32:
 	if 'banana'.replace( 'a', 'o' ) != 'bonono':
 		return 1
@@ -5279,13 +4654,8 @@ def main() -> i32:
 	if 'aaa'.replace( 'aa', 'b' ) != 'ba':
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rsplit_matches_split( self ) -> None:
-		self._run( '''
+''' ),
+			( 'rsplit_matches_split', '''
 def main() -> i32:
 	a: list[str] = 'a,b,c'.rsplit( ',' )
 	if a.__len__() != 3:
@@ -5295,13 +4665,8 @@ def main() -> i32:
 	if a.__getitem__( 2 ).unwrap( 'x' ) != 'c':
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_join( self ) -> None:
-		self._run( '''
+''' ),
+			( 'join', '''
 def main() -> i32:
 	parts: list[str] = 'a,b,c'.split( ',' )
 	joined: str = '-'.join( parts )
@@ -5315,13 +4680,8 @@ def main() -> i32:
 	if '-'.join( single ) != 'solo':
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_partition_rpartition( self ) -> None:
-		self._run( '''
+''' ),
+			( 'partition_rpartition', '''
 def main() -> i32:
 	p1: tuple[str,str,str] = 'key=value'.partition( '=' )
 	if p1[0] != 'key' or p1[1] != '=' or p1[2] != 'value':
@@ -5336,13 +4696,8 @@ def main() -> i32:
 	if p4[0] != '' or p4[1] != '' or p4[2] != 'noequals':
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isascii( self ) -> None:
-		self._run( '''
+''' ),
+			( 'isascii', '''
 def main() -> i32:
 	if not 'hello'.isascii():
 		return 1
@@ -5351,12 +4706,21 @@ def main() -> i32:
 	if 'héllo'.isascii():
 		return 3
 	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rindex_panics_when_not_found( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	'abc'.rindex( 'nope' )
+	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
 
 
-class StrPhase2PaddingTests( CompilerTestCase ):
+class StrPhase2PaddingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 2 of TODO.txt's str-methods plan: ljust/rjust/zfill
 	(lib/builtins/__init__.py). '''
 
@@ -5364,37 +4728,13 @@ class StrPhase2PaddingTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_ljust_rjust( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'ljust_rjust', '''
 def main() -> i32:
 	if 'hi'.ljust( 5 ) != 'hi   ':
 		return 1
@@ -5411,23 +4751,8 @@ def main() -> i32:
 	if 'exact'.ljust( 5 ) != 'exact':
 		return 7
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_ljust_rjust_bad_fillchar_panics( self ) -> None:
-		self._run( '''
-def main() -> i32:
-	'hi'.ljust( 5, 'ab' )
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_zfill( self ) -> None:
-		self._run( '''
+''' ),
+			( 'zfill', '''
 def main() -> i32:
 	if '42'.zfill( 5 ) != '00042':
 		return 1
@@ -5440,12 +4765,21 @@ def main() -> i32:
 	if '42'.zfill( 2 ) != '42':
 		return 5
 	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ljust_rjust_bad_fillchar_panics( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	'hi'.ljust( 5, 'ab' )
+	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
 
 
-class StrPhase3ClassificationTests( CompilerTestCase ):
+class StrPhase3ClassificationTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 3 of TODO.txt's str-methods plan: OS-native Unicode
 	classification (__str.py's is_alpha_cp/is_digit_cp/is_space_cp/
 	is_upper_cp/is_lower_cp/is_alnum_cp/is_printable_cp, each a real
@@ -5461,37 +4795,13 @@ class StrPhase3ClassificationTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isalpha( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'isalpha', '''
 def main() -> i32:
 	if not 'hello'.isalpha():
 		return 1
@@ -5504,13 +4814,8 @@ def main() -> i32:
 	if not 'café'.isalpha():
 		return 5
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isdigit_isdecimal_isnumeric( self ) -> None:
-		self._run( '''
+''' ),
+			( 'isdigit_isdecimal_isnumeric', '''
 def main() -> i32:
 	if not '12345'.isdigit():
 		return 1
@@ -5523,13 +4828,8 @@ def main() -> i32:
 	if not '12345'.isnumeric():
 		return 5
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isspace( self ) -> None:
-		self._run( '''
+''' ),
+			( 'isspace', '''
 def main() -> i32:
 	if not '   \\t\\n'.isspace():
 		return 1
@@ -5538,13 +4838,8 @@ def main() -> i32:
 	if ''.isspace():
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isupper_islower( self ) -> None:
-		self._run( '''
+''' ),
+			( 'isupper_islower', '''
 def main() -> i32:
 	if not 'HELLO'.isupper():
 		return 1
@@ -5563,13 +4858,8 @@ def main() -> i32:
 	if not 'école'.islower():
 		return 8
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isalnum( self ) -> None:
-		self._run( '''
+''' ),
+			( 'isalnum', '''
 def main() -> i32:
 	if not 'abc123'.isalnum():
 		return 1
@@ -5578,13 +4868,8 @@ def main() -> i32:
 	if ''.isalnum():
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isprintable( self ) -> None:
-		self._run( '''
+''' ),
+			( 'isprintable', '''
 def main() -> i32:
 	if not 'hello world'.isprintable():
 		return 1
@@ -5595,13 +4880,8 @@ def main() -> i32:
 	if '\\n'.isprintable():
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_isidentifier( self ) -> None:
-		self._run( '''
+''' ),
+			( 'isidentifier', '''
 def main() -> i32:
 	if not 'valid_name'.isidentifier():
 		return 1
@@ -5616,13 +4896,8 @@ def main() -> i32:
 	if not 'name123'.isidentifier():
 		return 6
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_strip_lstrip_rstrip( self ) -> None:
-		self._run( '''
+''' ),
+			( 'strip_lstrip_rstrip', '''
 def main() -> i32:
 	if '  hi  '.strip() != 'hi':
 		return 1
@@ -5639,19 +4914,14 @@ def main() -> i32:
 	if ''.strip() != '':
 		return 7
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_strip_lstrip_rstrip_chars_argument( self ) -> None:
-		# the real chars: str|None = None parameter - this is TODO.txt's
-		# own former "union disambiguation" blocker note (strip's chars=
-		# form couldn't get a value back OUT of a str|None parameter),
-		# resolved now that real union narrowing/extraction exists (see
-		# PLAN_MATCH_NARROWING's own capstone) - _should_strip_cp
-		# (lib/builtins/__init__.py) uses `match chars:` internally
-		self._run( '''
+''' ),
+			# the real chars: str|None = None parameter - this is TODO.txt's
+			# own former "union disambiguation" blocker note (strip's chars=
+			# form couldn't get a value back OUT of a str|None parameter),
+			# resolved now that real union narrowing/extraction exists (see
+			# PLAN_MATCH_NARROWING's own capstone) - _should_strip_cp
+			# (lib/builtins/__init__.py) uses `match chars:` internally
+			( 'strip_lstrip_rstrip_chars_argument', '''
 def main() -> i32:
 	if 'xxhixx'.strip( 'x' ) != 'hi':
 		return 1
@@ -5669,12 +4939,11 @@ def main() -> i32:
 	if '  hi  '.strip( None ) != 'hi':
 		return 7
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class StrPhase4CaseCompositeTests( CompilerTestCase ):
+class StrPhase4CaseCompositeTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 4 of TODO.txt's str-methods plan: swapcase()/title()/
 	istitle() (lib/builtins/__init__.py), built on __str.py's new
 	case_map_one primitive (a real, new small-buffer LCMapStringEx call on
@@ -5686,37 +4955,13 @@ class StrPhase4CaseCompositeTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_swapcase_ascii( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'swapcase_ascii', '''
 def main() -> i32:
 	if 'Hello World'.swapcase() != 'hELLO wORLD':
 		return 1
@@ -5725,29 +4970,19 @@ def main() -> i32:
 	if ''.swapcase() != '':
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_swapcase_non_ascii( self ) -> None:
-		# exercises the new per-codepoint Windows LCMapStringEx path
-		# (case_map_one) directly - the one genuinely new piece of Win32
-		# plumbing this whole phase adds
-		self._run( '''
+''' ),
+			# exercises the new per-codepoint Windows LCMapStringEx path
+			# (case_map_one) directly - the one genuinely new piece of Win32
+			# plumbing this whole phase adds
+			( 'swapcase_non_ascii', '''
 def main() -> i32:
 	if 'café'.swapcase() != 'CAFÉ':
 		return 1
 	if 'ÉCOLE'.swapcase() != 'école':
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_title( self ) -> None:
-		self._run( '''
+''' ),
+			( 'title', '''
 def main() -> i32:
 	if 'hello world'.title() != 'Hello World':
 		return 1
@@ -5758,13 +4993,8 @@ def main() -> i32:
 	if 'ALREADY UPPER'.title() != 'Already Upper':
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_istitle( self ) -> None:
-		self._run( '''
+''' ),
+			( 'istitle', '''
 def main() -> i32:
 	if not 'Hello World'.istitle():
 		return 1
@@ -5779,12 +5009,11 @@ def main() -> i32:
 	if not 'Abc123'.istitle():
 		return 6
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class EarlyReturnFromLoopWithLiveRCLocalTests( CompilerTestCase ):
+class EarlyReturnFromLoopWithLiveRCLocalTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' cfg.py's current_epilogue_label() shared-ladder optimization used to
 	assume every entry on the epilogue stack survives to the function's own
 	real end, where build_epilogue_ladder() walks it and emits each entry's
@@ -5803,40 +5032,16 @@ class EarlyReturnFromLoopWithLiveRCLocalTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_early_return_past_a_loop_confined_rc_local_never_taken( self ) -> None:
-		# the early return is never actually reached at runtime (v is
-		# always 'item') - this is purely a "does it even compile, and
-		# does the untaken branch not corrupt the normal exit" check
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# the early return is never actually reached at runtime (v is
+			# always 'item') - this is purely a "does it even compile, and
+			# does the untaken branch not corrupt the normal exit" check
+			( 'early_return_past_a_loop_confined_rc_local_never_taken', '''
 def main() -> i32:
 	j: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
@@ -5846,9 +5051,24 @@ def main() -> i32:
 				return 2
 			j += 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+			# break (not return) reaching the SAME loop-confined entry - a
+			# different code path (unwind_to(), not current_epilogue_label())
+			# that this fix must not have disturbed
+			( 'break_past_a_loop_confined_rc_local_still_works', '''
+def main() -> i32:
+	j: usize = 0
+	with compiler.panic_arithmetic( 'overflow' ):
+		while j < 20:
+			v: str = 'item'
+			if j == 5:
+				break
+			j += 1
+	if j != 5:
+		return 1
+	return 0
+''' ),
+		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_early_return_past_a_loop_confined_rc_local_actually_taken( self ) -> None:
@@ -5892,29 +5112,8 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 2 )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_break_past_a_loop_confined_rc_local_still_works( self ) -> None:
-		# break (not return) reaching the SAME loop-confined entry - a
-		# different code path (unwind_to(), not current_epilogue_label())
-		# that this fix must not have disturbed
-		self._run( '''
-def main() -> i32:
-	j: usize = 0
-	with compiler.panic_arithmetic( 'overflow' ):
-		while j < 20:
-			v: str = 'item'
-			if j == 5:
-				break
-			j += 1
-	if j != 5:
-		return 1
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
-
-class GUIDTests( CompilerTestCase ):
+class GUIDTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/guid.py's GUID type - PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3
 	(COM specifics). Needs import_builtins=True (str.split, list[str]). '''
 
@@ -5922,37 +5121,13 @@ class GUIDTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_from_str_parses_each_field_correctly( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'from_str_parses_each_field_correctly', '''
 import guid
 
 def main() -> i32:
@@ -5968,13 +5143,8 @@ def main() -> i32:
 	if g.data4_2 != 0xbe or g.data4_3 != 0xef or g.data4_4 != 0xde or g.data4_5 != 0xad or g.data4_6 != 0xbe or g.data4_7 != 0xef:
 		return 5
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_eq_ne_compare_by_value( self ) -> None:
-		self._run( '''
+''' ),
+			( 'eq_ne_compare_by_value', '''
 import guid
 
 def main() -> i32:
@@ -5988,12 +5158,11 @@ def main() -> i32:
 	if a == c:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class DictTests( CompilerTestCase ):
+class DictTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' dict[K,V] (lib/builtins/__init__.py's own dict class + lib/builtins/
 	__RawDict.py's RawDict/RawEntry/RawIndex) end-to-end - see
 	PLAN_CALLABLE.md: the whole point of building Callable[...]/indirect
@@ -6007,37 +5176,13 @@ class DictTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_str_key_insert_and_lookup( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'str_key_insert_and_lookup', '''
 def main() -> i32:
 	d: dict[str, i32] = dict[str, i32]()
 	d[ 'a' ] = 1
@@ -6051,13 +5196,8 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = ( va - 1 ) + ( vb - 2 )
 	return diff
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_overwrite_existing_key_replaces_value( self ) -> None:
-		self._run( '''
+''' ),
+			( 'overwrite_existing_key_replaces_value', '''
 def main() -> i32:
 	d: dict[str, i32] = dict[str, i32]()
 	d[ 'a' ] = 1
@@ -6070,13 +5210,8 @@ def main() -> i32:
 	if r.unwrap( 'missing a' ) != 100:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_missing_key_returns_key_error( self ) -> None:
-		self._run( '''
+''' ),
+			( 'missing_key_returns_key_error', '''
 def main() -> i32:
 	d: dict[str, i32] = dict[str, i32]()
 	d[ 'a' ] = 1
@@ -6084,16 +5219,11 @@ def main() -> i32:
 	if r.is_ok():
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_non_rc_key_i32_with_rc_value_str( self ) -> None:
-		# the other K/V combination - a plain value-typed key (byte-hashed
-		# via _fnv1a_hash, no __hash__ method needed) paired with an RC
-		# value, the mirror image of str-keyed dict[str,i32] above
-		self._run( '''
+''' ),
+			# the other K/V combination - a plain value-typed key (byte-hashed
+			# via _fnv1a_hash, no __hash__ method needed) paired with an RC
+			# value, the mirror image of str-keyed dict[str,i32] above
+			( 'non_rc_key_i32_with_rc_value_str', '''
 def main() -> i32:
 	d: dict[i32, str] = dict[i32, str]()
 	d[ 7 ] = 'seven'
@@ -6109,16 +5239,11 @@ def main() -> i32:
 	if r9.unwrap( 'missing 9' ) != 'nine':
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_many_entries_forces_growth_and_stays_correct( self ) -> None:
-		# 50 distinct keys forces list[T]'s own growth (both __entries and
-		# __indices) and exercises RawDict's binary search over a real
-		# range, not just a handful of entries
-		self._run( '''
+''' ),
+			# 50 distinct keys forces list[T]'s own growth (both __entries and
+			# __indices) and exercises RawDict's binary search over a real
+			# range, not just a handful of entries
+			( 'many_entries_forces_growth_and_stays_correct', '''
 def main() -> i32:
 	d: dict[i32, i32] = dict[i32, i32]()
 	i: usize = 0
@@ -6141,17 +5266,12 @@ def main() -> i32:
 				return 3
 			j += 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_key_and_rc_value_destruction_does_not_crash( self ) -> None:
-		# str keys AND str values together, insert/overwrite/destroy - a
-		# proxy for correct incref/decref bookkeeping: wrong refcounting
-		# here would double-free or leak, and a double-free would crash
-		# the process (nonzero/abnormal exit), not just misbehave quietly
-		self._run( '''
+''' ),
+			# str keys AND str values together, insert/overwrite/destroy - a
+			# proxy for correct incref/decref bookkeeping: wrong refcounting
+			# here would double-free or leak, and a double-free would crash
+			# the process (nonzero/abnormal exit), not just misbehave quietly
+			( 'rc_key_and_rc_value_destruction_does_not_crash', '''
 def main() -> i32:
 	d: dict[str, str] = dict[str, str]()
 	d[ 'a' ] = 'apple'
@@ -6163,12 +5283,11 @@ def main() -> i32:
 	if r.unwrap( 'missing a' ) != 'avocado':
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class DictThreadSafetyTests( CompilerTestCase ):
+class DictThreadSafetyTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' dict[K,V] (lib/builtins/__init__.py) is now locked by default (a
 	real FastLock, acquired/released around every method) - same split as
 	list[T]/UnsafeList[T] (see ListThreadSafetyTests above). These are the
@@ -6181,46 +5300,13 @@ class DictThreadSafetyTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			try:
-				run_result = subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = 30 )
-			except subprocess.TimeoutExpired:
-				self.fail( 'exe did not finish within 30s - likely a lost lock/update causing an infinite spin' )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exe exited {run_result.returncode}, expected {expected_exit}' )
-
-	# Layer 1: disjoint keys, isolates concurrent insert/growth correctness
-	# (RawDict's own __entries/__indices, both UnsafeList[T] under the
-	# hood) - 8 threads each insert 100 distinct, known key->value pairs
-	# (thread t owns keys t*100 .. t*100+99) with no overlap, so a wrong
-	# final count or a wrong value at any key reliably indicates a lost/
-	# corrupted insert, not just "probably fine".
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_concurrent_insert_disjoint_keys_from_8_threads( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'concurrent_insert_disjoint_keys_from_8_threads', '''
 import threading
 
 class DictWriter:
@@ -6272,22 +5358,8 @@ def main() -> i32:
 				return 3
 			key += 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	# Layer 2: SAME key, 8 threads each doing 1000 read-modify-write
-	# increments through with_lock - proves with_lock's escape hatch
-	# actually serializes a compound operation as a single atomic unit
-	# (get, +1, set, all under ONE lock acquisition). Doing this same
-	# increment as two separate locked calls (d.__getitem__ then
-	# d.__setitem__) would NOT be atomic - another thread's write could
-	# land between them - and would lose updates; with_lock is exactly
-	# the tool that closes that gap, so this is the test that actually
-	# proves it's not just a decorative API.
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_with_lock_serializes_compound_increment_from_8_threads( self ) -> None:
-		self._run( '''
+''' ),
+			( 'with_lock_serializes_compound_increment_from_8_threads', '''
 import threading
 
 class Incrementer:
@@ -6333,21 +5405,8 @@ def main() -> i32:
 	if r.unwrap( 'x' ) != 8000:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	# Layer 3: RC keys AND RC values (str->str), disjoint keys, inserted
-	# concurrently from 4 threads - the RC-bookkeeping analogue of Layer 1
-	# (incref/decref on _store_key/_store_value racing against RawDict's
-	# own concurrent growth). A double-free/leak here would show up as a
-	# nonzero/abnormal exit, not just a wrong value - the same "crash is
-	# the real assertion" reasoning DictTests' own
-	# test_rc_key_and_rc_value_destruction_does_not_crash already uses,
-	# just under real concurrent insertion instead of sequential.
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_concurrent_insert_of_rc_keys_and_values_no_leak_or_double_free( self ) -> None:
-		self._run( '''
+''' ),
+			( 'concurrent_insert_of_rc_keys_and_values_no_leak_or_double_free', '''
 import threading
 
 class StrDictWriter:
@@ -6412,12 +5471,11 @@ def main() -> i32:
 				return 3
 			n += 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		], timeout = 30 )
 
 
-class TupleTests( CompilerTestCase ):
+class TupleTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' tuple[T0, T1, ...] (tuple_storage.py's TupleStorage, discovery.py's
 	tuple[...] recognition, lowering.py's _expr_Tuple/_expr_Subscript) end-
 	to-end - see PLAN_TUPLE.md. Mirrors ListGenericTests'/DictTests' own
@@ -6431,41 +5489,17 @@ class TupleTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_construct_and_read_back_heterogeneous_elements( self ) -> None:
-		# a value element (i32), an RC element (str), and a value element
-		# again (bool) - constant-index reads each one back correctly, and
-		# a deliberately WRONG expected value on each check (return 1/2/3)
-		# rules out a vacuous pass (every check actually has to fire)
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# a value element (i32), an RC element (str), and a value element
+			# again (bool) - constant-index reads each one back correctly, and
+			# a deliberately WRONG expected value on each check (return 1/2/3)
+			# rules out a vacuous pass (every check actually has to fire)
+			( 'construct_and_read_back_heterogeneous_elements', '''
 def main() -> i32:
 	t: tuple[i32, str, bool] = ( 10, "hi", True )
 	if t[0] != 10:
@@ -6475,50 +5509,35 @@ def main() -> i32:
 	if t[2] != True:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_unannotated_local_infers_element_types( self ) -> None:
-		# no annotation at all - each element's own type is inferred
-		# independently (bare int literals default to i32), same as any
-		# other unannotated local declaration
-		self._run( '''
+''' ),
+			# no annotation at all - each element's own type is inferred
+			# independently (bare int literals default to i32), same as any
+			# other unannotated local declaration
+			( 'unannotated_local_infers_element_types', '''
 def main() -> i32:
 	t = ( 1, 2, 3 )
 	if t[0] != 1 or t[1] != 2 or t[2] != 3:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_element_constructed_and_dropped_without_crashing( self ) -> None:
-		# an RC element (str) constructed into a tuple that's never read
-		# again after construction - exercises the synthesized backing
-		# RCClass's own destructor cascade (type_resolver.py's
-		# _synthesize_rcclass_destructor, triggered here via the ordinary
-		# scope-exit path, same as any other RC-holding local) tearing down
-		# the str field correctly. No leak/double-free assertion is made
-		# directly (this file has no ASan integration) - a clean exit code
-		# 0 from a real compiled-and-linked binary is the same correctness
-		# signal ListGenericTests'/DictTests' own RC-element tests rely on.
-		self._run( '''
+''' ),
+			# an RC element (str) constructed into a tuple that's never read
+			# again after construction - exercises the synthesized backing
+			# RCClass's own destructor cascade (type_resolver.py's
+			# _synthesize_rcclass_destructor, triggered here via the ordinary
+			# scope-exit path, same as any other RC-holding local) tearing down
+			# the str field correctly. No leak/double-free assertion is made
+			# directly (this file has no ASan integration) - a clean exit code
+			# 0 from a real compiled-and-linked binary is the same correctness
+			# signal ListGenericTests'/DictTests' own RC-element tests rely on.
+			( 'rc_element_constructed_and_dropped_without_crashing', '''
 def main() -> i32:
 	t: tuple[str, i32] = ( "owned", 5 )
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_two_distinct_tuple_shapes_construct_and_read_back_independently( self ) -> None:
-		# tuple[i32,str] and tuple[str,i32] are two different backing
-		# classes (see tuple_storage.py) - constructing/reading both in the
-		# same function proves they don't collide with each other
-		self._run( '''
+''' ),
+			# tuple[i32,str] and tuple[str,i32] are two different backing
+			# classes (see tuple_storage.py) - constructing/reading both in the
+			# same function proves they don't collide with each other
+			( 'two_distinct_tuple_shapes_construct_and_read_back_independently', '''
 def main() -> i32:
 	a: tuple[i32, str] = ( 1, "x" )
 	b: tuple[str, i32] = ( "y", 2 )
@@ -6527,26 +5546,21 @@ def main() -> i32:
 	if b[0] != "y" or b[1] != 2:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_tuple_bound_through_generic_inference_not_a_bare_literal( self ) -> None:
-		# regression test for PLAN_TUPLE.md's own "UPDATE (int.divmod()
-		# migration)" section: every OTHER test in this class constructs a
-		# tuple literal straight into an annotated local in the SAME
-		# statement - the one shape lowering.py's _expr_Tuple defensively
-		# resolves expected_type for. A tuple bound to a generic type
-		# parameter T (here, by Result.Ok((a,b)) inferring T from the
-		# tuple literal's own type) and then read back through a SEPARATE
-		# statement's .unwrap() call is structurally different - exactly
-		# the shape that broke int.divmod()'s own real migration (a bare,
-		# unresolved TupleType reached emitter_c.py three different ways,
-		# each fixed in monomorphize.py/lowering.py/emitter_c.py/cfg.py -
-		# see the plan doc for the full account). This guards those fixes
-		# directly, independent of int itself.
-		self._run( '''
+''' ),
+			# regression test for PLAN_TUPLE.md's own "UPDATE (int.divmod()
+			# migration)" section: every OTHER test in this class constructs a
+			# tuple literal straight into an annotated local in the SAME
+			# statement - the one shape lowering.py's _expr_Tuple defensively
+			# resolves expected_type for. A tuple bound to a generic type
+			# parameter T (here, by Result.Ok((a,b)) inferring T from the
+			# tuple literal's own type) and then read back through a SEPARATE
+			# statement's .unwrap() call is structurally different - exactly
+			# the shape that broke int.divmod()'s own real migration (a bare,
+			# unresolved TupleType reached emitter_c.py three different ways,
+			# each fixed in monomorphize.py/lowering.py/emitter_c.py/cfg.py -
+			# see the plan doc for the full account). This guards those fixes
+			# directly, independent of int itself.
+			( 'tuple_bound_through_generic_inference_not_a_bare_literal', '''
 class PairError:
 	pass
 
@@ -6558,12 +5572,11 @@ def main() -> i32:
 	if pair[0] != 3 or pair[1] != 4:
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class UnionLeafCoercionTests( CompilerTestCase ):
+class UnionLeafCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' a plain leaf value (a literal, a variable, bare None) flowing into
 	a T|None (TaggedUnion)-typed slot - a call argument, a default value,
 	or a variable declaration/assignment. Never worked before (confirmed:
@@ -6584,37 +5597,13 @@ class UnionLeafCoercionTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_literal_variable_and_none_as_call_arguments( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'literal_variable_and_none_as_call_arguments', '''
 def helper( x: str|None ) -> bool:
 	return x is None
 
@@ -6627,13 +5616,8 @@ def main() -> i32:
 	if not helper( None ):
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_literal_and_none_in_variable_declarations( self ) -> None:
-		self._run( '''
+''' ),
+			( 'literal_and_none_in_variable_declarations', '''
 def main() -> i32:
 	x: str|None = "hi"
 	if x is None:
@@ -6642,35 +5626,16 @@ def main() -> i32:
 	if y is not None:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_non_leaf_type_is_a_compile_error( self ) -> None:
-		# a genuine type mismatch (not one of the union's own members) must
-		# stay a real compile error, not get silently passed through
-		self._run( '''
-def helper( x: str|None ) -> bool:
-	return x is None
-
-def main() -> i32:
-	helper( 5 )
-	return 0
-''' )
-		self.assertNotEqual( self.discovery.errors.errors, [] )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_bool_leaf_matches_lib_File_py_own_exists_parameter_shape( self ) -> None:
-		# spot-checks a real pre-existing site, not just a synthetic
-		# example: lib/builtins/__File.py's binary_writer()/etc all take
-		# exists: bool|None = None and branch `if exists is None: ...
-		# elif exists: ... else: ...` - this mirrors that exact shape
-		# (own `is None`/truthiness checks directly on the union value,
-		# no leaf EXTRACTION needed, so no further gap blocks it) with a
-		# real True/False override at the call site, never exercised
-		# anywhere in the codebase before this fix
-		self._run( '''
+''' ),
+			# spot-checks a real pre-existing site, not just a synthetic
+			# example: lib/builtins/__File.py's binary_writer()/etc all take
+			# exists: bool|None = None and branch `if exists is None: ...
+			# elif exists: ... else: ...` - this mirrors that exact shape
+			# (own `is None`/truthiness checks directly on the union value,
+			# no leaf EXTRACTION needed, so no further gap blocks it) with a
+			# real True/False override at the call site, never exercised
+			# anywhere in the codebase before this fix
+			( 'bool_leaf_matches_lib_File_py_own_exists_parameter_shape', '''
 def resolve( exists: bool|None = None ) -> i32:
 	if exists is None:
 		return 0
@@ -6690,24 +5655,19 @@ def main() -> i32:
 	if resolve( e ) != 1:
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_leaf_refcount_correct_after_repeated_calls( self ) -> None:
-		# a real RC-lifetime check, not just "doesn't crash once" - calls a
-		# str|None-taking function in a loop, each iteration constructing a
-		# fresh str and letting it flow through the union wrap/unwrap
-		# round trip; a leaked or double-released reference here would
-		# drift the refcount or crash under repetition, not just once.
-		# 'hello'.upper() (not the bare literal 'hello') - a bare string
-		# literal binds straight to its own static, immortal storage (no
-		# allocation, refcount reads as a sentinel, never 1), so it can't
-		# tell a leak/double-release apart from doing nothing; .upper()
-		# always allocates a genuine, freshly refcounted buffer (__str.py's
-		# case_map), independent of this fix
-		self._run( '''
+''' ),
+			# a real RC-lifetime check, not just "doesn't crash once" - calls a
+			# str|None-taking function in a loop, each iteration constructing a
+			# fresh str and letting it flow through the union wrap/unwrap
+			# round trip; a leaked or double-released reference here would
+			# drift the refcount or crash under repetition, not just once.
+			# 'hello'.upper() (not the bare literal 'hello') - a bare string
+			# literal binds straight to its own static, immortal storage (no
+			# allocation, refcount reads as a sentinel, never 1), so it can't
+			# tell a leak/double-release apart from doing nothing; .upper()
+			# always allocates a genuine, freshly refcounted buffer (__str.py's
+			# case_map), independent of this fix
+			( 'rc_leaf_refcount_correct_after_repeated_calls', '''
 def identity_len( x: str|None ) -> usize:
 	if x is None:
 		return 0
@@ -6725,24 +5685,19 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			i += 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_call_result_as_leaf_coerces_into_union( self ) -> None:
-		# a CALL's return value (not a literal/bare-name/None) flowing into
-		# a T|None slot - the one leaf-value kind d712226 missed. Covers an
-		# AnnAssign RHS, a call argument, and a function's own return
-		# statement. Before the fix, lowering.py's _lower_call shared tail
-		# typed the call's dest as expected_type (the UNION) up front
-		# instead of target.return_type (str, the call's REAL C return
-		# type), so _lower_expr's post-hoc _coerce_into_union never even
-		# ran - dest ended up declared as the union struct while the
-		# emitted call actually assigned a raw str* into it, a real clang
-		# type error ("assigning to 'struct ...NoneType' from incompatible
-		# type 'struct builtins$str *'")
-		self._run( '''
+''' ),
+			# a CALL's return value (not a literal/bare-name/None) flowing into
+			# a T|None slot - the one leaf-value kind d712226 missed. Covers an
+			# AnnAssign RHS, a call argument, and a function's own return
+			# statement. Before the fix, lowering.py's _lower_call shared tail
+			# typed the call's dest as expected_type (the UNION) up front
+			# instead of target.return_type (str, the call's REAL C return
+			# type), so _lower_expr's post-hoc _coerce_into_union never even
+			# ran - dest ended up declared as the union struct while the
+			# emitted call actually assigned a raw str* into it, a real clang
+			# type error ("assigning to 'struct ...NoneType' from incompatible
+			# type 'struct builtins$str *'")
+			( 'call_result_as_leaf_coerces_into_union', '''
 def make_or_none( n: i32 ) -> str|None:
 	if n < 0:
 		return None
@@ -6764,12 +5719,25 @@ def main() -> i32:
 	if z is None:
 		return 4
 	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_non_leaf_type_is_a_compile_error( self ) -> None:
+		# a genuine type mismatch (not one of the union's own members) must
+		# stay a real compile error, not get silently passed through
+		self._run( '''
+def helper( x: str|None ) -> bool:
+	return x is None
+
+def main() -> i32:
+	helper( 5 )
+	return 0
 ''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+		self.assertNotEqual( self.discovery.errors.errors, [] )
 
 
-class MatchArmSameNameNarrowingTests( CompilerTestCase ):
+class MatchArmSameNameNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' `match x: case T(x): ...` - the arm rebinds the SAME name as its
 	own subject - used to crash outright (monomorphize.py silently
 	clobbering a monomorphized generic union's own per-member constructor
@@ -6792,43 +5760,19 @@ class MatchArmSameNameNarrowingTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_same_name_rebind_narrows_type_in_each_arm( self ) -> None:
-		# both arms actually exercised (a real Ok and a real Err value, not
-		# just one) - a same-named Ok(r) that silently kept r's OLD
-		# (whole-union) type would fail to resolve r.byte_len() at all
-		# (Result has no byte_len()), so a clean compile here is already
-		# meaningful; the exit-code checks confirm the NARROWED value
-		# (the payload, not the union) is what's actually read
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# both arms actually exercised (a real Ok and a real Err value, not
+			# just one) - a same-named Ok(r) that silently kept r's OLD
+			# (whole-union) type would fail to resolve r.byte_len() at all
+			# (Result has no byte_len()), so a clean compile here is already
+			# meaningful; the exit-code checks confirm the NARROWED value
+			# (the payload, not the union) is what's actually read
+			( 'same_name_rebind_narrows_type_in_each_arm', '''
 class MyError:
 	pass
 
@@ -6853,17 +5797,12 @@ def main() -> i32:
 	if helper( -1 ) != 0:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_narrowing_confined_to_match_arm_reverts_after( self ) -> None:
-		# narrowing must NOT survive past the match statement's own block -
-		# a second, independent match reusing the same name right after the
-		# first must see the WHOLE union again (cfg.py's restore() pops
-		# _narrowed back to whatever it was before the branch, unconditionally)
-		self._run( '''
+''' ),
+			# narrowing must NOT survive past the match statement's own block -
+			# a second, independent match reusing the same name right after the
+			# first must see the WHOLE union again (cfg.py's restore() pops
+			# _narrowed back to whatever it was before the branch, unconditionally)
+			( 'narrowing_confined_to_match_arm_reverts_after', '''
 class MyError:
 	pass
 
@@ -6894,29 +5833,24 @@ def main() -> i32:
 	if helper( -1 ) != 100:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_nested_match_preserves_outer_narrowing( self ) -> None:
-		# an UNRELATED match nested inside a match arm's own body - the
-		# inner match's own snapshot()/restore() cycle (around its own
-		# if/elif branches) must not clobber the OUTER arm's still-active
-		# narrowing of r: restore() reverts _narrowed back to whatever it
-		# was AT THAT BRANCH's OWN ENTRY (which already includes the
-		# outer r->Ok narrowing), not wipe the whole dict. r.byte_len()
-		# after the inner match, still inside the outer Ok arm, only
-		# resolves at all if the outer narrowing survived the inner
-		# match's own push/pop cycle
-		# NB: outcome is ASSIGNED to an outer variable rather than returned
-		# directly from inside the match arms - kept that way to isolate
-		# THIS test's own narrowing concern from a `return` statement's own
-		# epilogue-label handling (see MatchArmSameNameNarrowingTests's own
-		# test_return_directly_inside_match_arm_compiles_and_runs, a
-		# formerly-dangling-label bug now fixed by cfg.py's
-		# enter_branch()/exit_branch()).
-		self._run( '''
+''' ),
+			# an UNRELATED match nested inside a match arm's own body - the
+			# inner match's own snapshot()/restore() cycle (around its own
+			# if/elif branches) must not clobber the OUTER arm's still-active
+			# narrowing of r: restore() reverts _narrowed back to whatever it
+			# was AT THAT BRANCH's OWN ENTRY (which already includes the
+			# outer r->Ok narrowing), not wipe the whole dict. r.byte_len()
+			# after the inner match, still inside the outer Ok arm, only
+			# resolves at all if the outer narrowing survived the inner
+			# match's own push/pop cycle
+			# NB: outcome is ASSIGNED to an outer variable rather than returned
+			# directly from inside the match arms - kept that way to isolate
+			# THIS test's own narrowing concern from a `return` statement's own
+			# epilogue-label handling (see MatchArmSameNameNarrowingTests's own
+			# test_return_directly_inside_match_arm_compiles_and_runs, a
+			# formerly-dangling-label bug now fixed by cfg.py's
+			# enter_branch()/exit_branch()).
+			( 'nested_match_preserves_outer_narrowing', '''
 class MyError:
 	pass
 
@@ -6944,42 +5878,37 @@ def main() -> i32:
 	if helper( Result.Err( MyError() ), Result.Ok( "x" )) != -2:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
-		# a real RC-lifetime stress check, not just "doesn't crash once" -
-		# if the narrowed read (lowering.py's _expr_Name rewrite, meant to
-		# be a BORROWED GetAttr chain with no incref) instead double-
-		# released the payload (the abandoned shadow-Variable design this
-		# replaced would have), repeated construction/match/decref cycles
-		# would corrupt the heap under repetition even if a single
-		# iteration looked fine - checking the extracted value's actual
-		# CONTENT (not just that it exists) every iteration catches a
-		# use-after-free that a bare "did it crash" check could miss.
-		# 'hello'.upper() (not the bare literal) forces a real heap
-		# allocation - a literal binds to immortal static storage and
-		# can't distinguish a leak/double-release from doing nothing.
-		#
-		# NB: still does NOT assert compiler.refcount(r) == 1 inside the
-		# arm, even though the bug this comment used to describe (match-
-		# statement lowering taking out a spurious extra retain of the
-		# first case's own payload, computed from the raw subject before
-		# __match_subj_N's own assignment even ran - see cfg.py's assign()
-		# borrow= parameter) is now fixed - see
-		# test_rc_lifetime_repeated_match_exact_refcount below for the
-		# exact-count regression test that fix enabled. This test still
-		# can't assert an exact count because of a SEPARATE, still-open
-		# bug: make()'s own `return Result.Ok('hello'.upper())` - a single-
-		# statement body - leaves the intermediate str temp's own release
-		# instruction emitted AFTER the ir.Return in the generated C
-		# (unreachable dead code), permanently inflating every Result
-		# make() returns by one extra retain. Confirmed via direct
-		# inspection of emit_c's output for make() alone; unrelated to
-		# match/narrowing, flagged separately.
-		self._run( '''
+''' ),
+			# a real RC-lifetime stress check, not just "doesn't crash once" -
+			# if the narrowed read (lowering.py's _expr_Name rewrite, meant to
+			# be a BORROWED GetAttr chain with no incref) instead double-
+			# released the payload (the abandoned shadow-Variable design this
+			# replaced would have), repeated construction/match/decref cycles
+			# would corrupt the heap under repetition even if a single
+			# iteration looked fine - checking the extracted value's actual
+			# CONTENT (not just that it exists) every iteration catches a
+			# use-after-free that a bare "did it crash" check could miss.
+			# 'hello'.upper() (not the bare literal) forces a real heap
+			# allocation - a literal binds to immortal static storage and
+			# can't distinguish a leak/double-release from doing nothing.
+			#
+			# NB: still does NOT assert compiler.refcount(r) == 1 inside the
+			# arm, even though the bug this comment used to describe (match-
+			# statement lowering taking out a spurious extra retain of the
+			# first case's own payload, computed from the raw subject before
+			# __match_subj_N's own assignment even ran - see cfg.py's assign()
+			# borrow= parameter) is now fixed - see
+			# test_rc_lifetime_repeated_match_exact_refcount below for the
+			# exact-count regression test that fix enabled. This test still
+			# can't assert an exact count because of a SEPARATE, still-open
+			# bug: make()'s own `return Result.Ok('hello'.upper())` - a single-
+			# statement body - leaves the intermediate str temp's own release
+			# instruction emitted AFTER the ir.Return in the generated C
+			# (unreachable dead code), permanently inflating every Result
+			# make() returns by one extra retain. Confirmed via direct
+			# inspection of emit_c's output for make() alone; unrelated to
+			# match/narrowing, flagged separately.
+			( 'rc_lifetime_repeated_calls_no_leak', '''
 class MyError:
 	pass
 
@@ -6999,39 +5928,34 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			i += 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_match_exact_refcount( self ) -> None:
-		# regression test for the match-subject-alias bug fixed via cfg.py's
-		# assign() borrow= parameter: `match r:` used to lower
-		# `__match_subj_N = r` as an owning COPY (its own Incref, paired
-		# with its own epilogue Decref) even though r itself already owns a
-		# live reference for the whole rest of its (function-scoped)
-		# lifetime - the synthesized subject temp never needed an
-		# independent one. That extra, always-superfluous retain showed up
-		# in the generated C as a real retain_object() call computed
-		# straight from the raw subject BEFORE __match_subj_N's own
-		# assignment even ran (no tag check, always the union's first
-		# member) - harmless in the sense that it was eventually balanced
-		# by r's own release at scope exit, but it inflated every
-		# compiler.refcount() read taken inside a match arm by exactly one,
-		# and paid for a wholly unneeded retain/release pair on every match
-		# execution.
-		#
-		# Unlike test_rc_lifetime_repeated_calls_no_leak above, this
-		# constructs the Result INLINE in the same function as the match
-		# (no separate make()-style helper returning it) specifically to
-		# avoid that other, still-open, unrelated return-statement temp-
-		# cleanup bug documented on that test - keeping this assertion an
-		# exact, uncontaminated check of match-subject aliasing alone: r's
-		# own ownership (1) plus x's own separately-tracked extraction-bind
-		# (1) is exactly 2, every single one of 1000 iterations, on a real
-		# heap allocation ('hello'.upper(), not a literal - see that test's
-		# own comment for why).
-		self._run( '''
+''' ),
+			# regression test for the match-subject-alias bug fixed via cfg.py's
+			# assign() borrow= parameter: `match r:` used to lower
+			# `__match_subj_N = r` as an owning COPY (its own Incref, paired
+			# with its own epilogue Decref) even though r itself already owns a
+			# live reference for the whole rest of its (function-scoped)
+			# lifetime - the synthesized subject temp never needed an
+			# independent one. That extra, always-superfluous retain showed up
+			# in the generated C as a real retain_object() call computed
+			# straight from the raw subject BEFORE __match_subj_N's own
+			# assignment even ran (no tag check, always the union's first
+			# member) - harmless in the sense that it was eventually balanced
+			# by r's own release at scope exit, but it inflated every
+			# compiler.refcount() read taken inside a match arm by exactly one,
+			# and paid for a wholly unneeded retain/release pair on every match
+			# execution.
+			#
+			# Unlike test_rc_lifetime_repeated_calls_no_leak above, this
+			# constructs the Result INLINE in the same function as the match
+			# (no separate make()-style helper returning it) specifically to
+			# avoid that other, still-open, unrelated return-statement temp-
+			# cleanup bug documented on that test - keeping this assertion an
+			# exact, uncontaminated check of match-subject aliasing alone: r's
+			# own ownership (1) plus x's own separately-tracked extraction-bind
+			# (1) is exactly 2, every single one of 1000 iterations, on a real
+			# heap allocation ('hello'.upper(), not a literal - see that test's
+			# own comment for why).
+			( 'rc_lifetime_repeated_match_exact_refcount', '''
 class MyError:
 	pass
 
@@ -7048,25 +5972,20 @@ def main() -> i32:
 					return 2
 			i += 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_return_directly_inside_match_arm_compiles_and_runs( self ) -> None:
-		# a `return` as a match arm's own body (not assigned to an outer
-		# variable first) - regression test for a real "undeclared label"
-		# compile failure: the arm's own payload binding (s/e below) pushes
-		# a fresh RC epilogue entry, and current_epilogue_label() used to
-		# hand the `return` that entry's own label as its shared jump
-		# target without knowing _stmt_If's own restore() was about to
-		# silently discard that entry (branch-local, never merged past the
-		# arm) - leaving a `goto` into a label build_epilogue_ladder()
-		# never emitted. cfg.py's enter_branch()/exit_branch() now confine
-		# it the same way enter_loop()/exit_loop() already did for a
-		# loop-local RC entry, forcing an inline unwind instead of a
-		# dangling shared label.
-		self._run( '''
+''' ),
+			# a `return` as a match arm's own body (not assigned to an outer
+			# variable first) - regression test for a real "undeclared label"
+			# compile failure: the arm's own payload binding (s/e below) pushes
+			# a fresh RC epilogue entry, and current_epilogue_label() used to
+			# hand the `return` that entry's own label as its shared jump
+			# target without knowing _stmt_If's own restore() was about to
+			# silently discard that entry (branch-local, never merged past the
+			# arm) - leaving a `goto` into a label build_epilogue_ladder()
+			# never emitted. cfg.py's enter_branch()/exit_branch() now confine
+			# it the same way enter_loop()/exit_loop() already did for a
+			# loop-local RC entry, forcing an inline unwind instead of a
+			# dangling shared label.
+			( 'return_directly_inside_match_arm_compiles_and_runs', '''
 class MyError:
 	pass
 
@@ -7089,29 +6008,24 @@ def main() -> i32:
 	if helper( -1 ) != 0:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_is_none_recheck_on_already_narrowed_name_in_same_arm( self ) -> None:
-		# regression test for a real, previously-confirmed gap: a SECOND
-		# union-shaped check (here, `x is None`) on a name the SAME arm
-		# already narrowed via same-name reuse (`case str(x):`) used to
-		# crash with "builtins.str has no attribute 'tag'" -
-		# type_resolver.py's own is-None rewrite (visit_Compare) runs in an
-		# earlier, purely AST-level pass that had no knowledge of cfg.py's
-		# _narrowed state at all, so it kept reading x's OUTER declared
-		# type (str|None, a TaggedUnion) and built a `.tag` access even
-		# though x is already narrowed to plain `str` by the time
-		# lowering.py actually processes this arm's body. Fixed by giving
-		# _ReferenceResolver its own parallel self._narrowed dict (pushed
-		# on entering a narrowing arm, popped on leaving it - see
-		# visit_Match), consulted by _type_of_expr before falling back to
-		# self.locals - flagged in the codebase's own comments (see
-		# TypeIsInstanceofTests.test_rc_lifetime_repeated_calls_no_leak)
-		# as "out of scope" until this test closed it.
-		self._run( '''
+''' ),
+			# regression test for a real, previously-confirmed gap: a SECOND
+			# union-shaped check (here, `x is None`) on a name the SAME arm
+			# already narrowed via same-name reuse (`case str(x):`) used to
+			# crash with "builtins.str has no attribute 'tag'" -
+			# type_resolver.py's own is-None rewrite (visit_Compare) runs in an
+			# earlier, purely AST-level pass that had no knowledge of cfg.py's
+			# _narrowed state at all, so it kept reading x's OUTER declared
+			# type (str|None, a TaggedUnion) and built a `.tag` access even
+			# though x is already narrowed to plain `str` by the time
+			# lowering.py actually processes this arm's body. Fixed by giving
+			# _ReferenceResolver its own parallel self._narrowed dict (pushed
+			# on entering a narrowing arm, popped on leaving it - see
+			# visit_Match), consulted by _type_of_expr before falling back to
+			# self.locals - flagged in the codebase's own comments (see
+			# TypeIsInstanceofTests.test_rc_lifetime_repeated_calls_no_leak)
+			# as "out of scope" until this test closed it.
+			( 'is_none_recheck_on_already_narrowed_name_in_same_arm', '''
 def describe( x: str|None ) -> i32:
 	match x:
 		case str( x ):
@@ -7128,20 +6042,15 @@ def main() -> i32:
 	if describe( None ) != 2:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_narrowed_name_reverts_after_arm_even_when_rechecked_inside( self ) -> None:
-		# combines the previous test's in-arm recheck with
-		# test_narrowing_confined_to_match_arm_reverts_after's own concern:
-		# an already-narrowed x rechecked with `x is None` INSIDE its own
-		# arm must not leave self._narrowed poisoned for code AFTER the
-		# match - a second, independent `x is None` check right after the
-		# match must still see the WHOLE str|None union again, exactly as
-		# if the in-arm recheck had never happened
-		self._run( '''
+''' ),
+			# combines the previous test's in-arm recheck with
+			# test_narrowing_confined_to_match_arm_reverts_after's own concern:
+			# an already-narrowed x rechecked with `x is None` INSIDE its own
+			# arm must not leave self._narrowed poisoned for code AFTER the
+			# match - a second, independent `x is None` check right after the
+			# match must still see the WHOLE str|None union again, exactly as
+			# if the in-arm recheck had never happened
+			( 'narrowed_name_reverts_after_arm_even_when_rechecked_inside', '''
 def describe( x: str|None ) -> i32:
 	with compiler.wrap_arithmetic:
 		result: i32 = 0
@@ -7163,12 +6072,11 @@ def main() -> i32:
 	if describe( None ) != 1999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class MatchAnonymousUnionTests( CompilerTestCase ):
+class MatchAnonymousUnionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 2 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md): match
 	support for anonymous unions - `case None:` (ast.MatchSingleton) and
 	`case str(c):` (ast.MatchClass whose .cls is a bare ast.Name, not the
@@ -7194,39 +6102,15 @@ class MatchAnonymousUnionTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_none_and_leaf_type_patterns_both_arms( self ) -> None:
-		# both `case None:` and `case str(s):` exercised for real, against
-		# both a None and a non-None value passed through
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# both `case None:` and `case str(s):` exercised for real, against
+			# both a None and a non-None value passed through
+			( 'none_and_leaf_type_patterns_both_arms', '''
 def describe( x: str|None ) -> i32:
 	match x:
 		case None:
@@ -7241,15 +6125,10 @@ def main() -> i32:
 	if describe( "hi" ) != 1:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_wildcard_fallback_arm( self ) -> None:
-		# case _: as the fallback arm, no case None: at all - confirms the
-		# leaf-type-identity path doesn't require an exhaustive None arm
-		self._run( '''
+''' ),
+			# case _: as the fallback arm, no case None: at all - confirms the
+			# leaf-type-identity path doesn't require an exhaustive None arm
+			( 'wildcard_fallback_arm', '''
 def describe( x: str|None ) -> i32:
 	match x:
 		case str( s ):
@@ -7263,17 +6142,12 @@ def main() -> i32:
 	if describe( None ) != 2:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_same_name_reuse_narrows_leaf_type_pattern( self ) -> None:
-		# Phase 1's same-name narrowing, now reachable through the NEW
-		# leaf-type-identity path too (match x: case str(x): ...) - x.
-		# byte_len() only resolves at all if x was actually narrowed to
-		# str, not left at its original str|None type
-		self._run( '''
+''' ),
+			# Phase 1's same-name narrowing, now reachable through the NEW
+			# leaf-type-identity path too (match x: case str(x): ...) - x.
+			# byte_len() only resolves at all if x was actually narrowed to
+			# str, not left at its original str|None type
+			( 'same_name_reuse_narrows_leaf_type_pattern', '''
 def describe( x: str|None ) -> usize:
 	result: usize = 0
 	match x:
@@ -7289,9 +6163,34 @@ def main() -> i32:
 	if describe( None ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# MatchArmSameNameNarrowingTests' own. 'hello'.upper() is assigned
+			# to a plain `str`-typed local FIRST, then that local assigned into
+			# the str|None-typed slot - NOT `x: str|None = 'hello'.upper()`
+			# directly, which hits a separate, unrelated, pre-existing bug
+			# (lowering.py's _lower_call shared tail using expected_type
+			# directly for a call's own destination type instead of the
+			# call's real return type, skipping union-coercion entirely -
+			# confirmed via git-independent tracing, flagged separately, out
+			# of scope here)
+			( 'rc_lifetime_repeated_calls_no_leak', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			match x:
+				case None:
+					return 1
+				case str( c ):
+					if c.byte_len() != 5:
+						return 2
+			i += 1
+		return 0
+''' ),
+		] )
 
 	def test_leaf_type_not_a_union_member_is_a_compile_error( self ) -> None:
 		# a genuine mismatch (int is not a member of str|None) must stay a
@@ -7312,39 +6211,8 @@ def main() -> i32:
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# MatchArmSameNameNarrowingTests' own. 'hello'.upper() is assigned
-		# to a plain `str`-typed local FIRST, then that local assigned into
-		# the str|None-typed slot - NOT `x: str|None = 'hello'.upper()`
-		# directly, which hits a separate, unrelated, pre-existing bug
-		# (lowering.py's _lower_call shared tail using expected_type
-		# directly for a call's own destination type instead of the
-		# call's real return type, skipping union-coercion entirely -
-		# confirmed via git-independent tracing, flagged separately, out
-		# of scope here)
-		self._run( '''
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		i: i32 = 0
-		while i < 1000:
-			s: str = 'hello'.upper()
-			x: str|None = s
-			match x:
-				case None:
-					return 1
-				case str( c ):
-					if c.byte_len() != 5:
-						return 2
-			i += 1
-		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
-
-class TypeIsInstanceofTests( CompilerTestCase ):
+class TypeIsInstanceofTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 3 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
 	`type(x) is T` / `type(x) is not T` / `instanceof(x, T)` syntax
 	recognition. This compiler has no runtime reflection/RTTI (no
@@ -7373,37 +6241,13 @@ class TypeIsInstanceofTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_type_is_and_is_not( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'type_is_and_is_not', '''
 def describe( x: str|None ) -> i32:
 	if type( x ) is str:
 		return 1
@@ -7417,14 +6261,9 @@ def main() -> i32:
 	if describe( None ) != 2:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_type_call_on_either_side( self ) -> None:
-		# T is type(x) - the type() call may be on either side of `is`
-		self._run( '''
+''' ),
+			# T is type(x) - the type() call may be on either side of `is`
+			( 'type_call_on_either_side', '''
 def describe( x: str|None ) -> i32:
 	if str is type( x ):
 		return 1
@@ -7433,13 +6272,8 @@ def describe( x: str|None ) -> i32:
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		return describe( "hi" ) - 1
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_instanceof_sugar( self ) -> None:
-		self._run( '''
+''' ),
+			( 'instanceof_sugar', '''
 def describe( x: str|None ) -> i32:
 	if instanceof( x, str ):
 		return 1
@@ -7451,15 +6285,10 @@ def main() -> i32:
 	if describe( None ) != 0:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_usable_as_plain_bool_value( self ) -> None:
-		# not just an if-condition - assignable to a bool local, same as
-		# any other boolean expression
-		self._run( '''
+''' ),
+			# not just an if-condition - assignable to a bool local, same as
+			# any other boolean expression
+			( 'usable_as_plain_bool_value', '''
 def describe( x: str|None ) -> bool:
 	b: bool = type( x ) is str
 	return b
@@ -7470,9 +6299,39 @@ def main() -> i32:
 	if describe( None ):
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# MatchAnonymousUnionTests' own (see that test's own comment for
+			# why the call result is assigned to a plain `str` local first,
+			# not directly into the str|None-typed slot).
+			#
+			# NB: does NOT check `x is None` (or any other union-shaped
+			# recheck of x) inside the type(x) is str branch - this test just
+			# confirms x is correctly usable AS its narrowed str type. A
+			# second union-shaped check on an already-narrowed name in the
+			# same arm used to crash outright (type_resolver.py's own is-
+			# None/type-is rewrites ran before lowering with no awareness of
+			# cfg.py's narrowing state) - now fixed via _ReferenceResolver's
+			# own self._narrowed tracking; see
+			# TypeIsIfDesugaringTests.test_is_none_recheck_on_already_narrowed_name_in_type_branch
+			# and MatchArmSameNameNarrowingTests.test_is_none_recheck_on_already_narrowed_name_in_same_arm
+			# for the dedicated regression coverage.
+			( 'rc_lifetime_repeated_calls_no_leak', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			if type( x ) is str:
+				if x.byte_len() != 5:
+					return 1
+			else:
+				return 2
+			i += 1
+		return 0
+''' ),
+		] )
 
 	def test_leaf_type_not_a_union_member_is_a_compile_error( self ) -> None:
 		# a genuine mismatch (int is not a member of str|None) must stay a
@@ -7505,44 +6364,8 @@ def main() -> i32:
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# MatchAnonymousUnionTests' own (see that test's own comment for
-		# why the call result is assigned to a plain `str` local first,
-		# not directly into the str|None-typed slot).
-		#
-		# NB: does NOT check `x is None` (or any other union-shaped
-		# recheck of x) inside the type(x) is str branch - this test just
-		# confirms x is correctly usable AS its narrowed str type. A
-		# second union-shaped check on an already-narrowed name in the
-		# same arm used to crash outright (type_resolver.py's own is-
-		# None/type-is rewrites ran before lowering with no awareness of
-		# cfg.py's narrowing state) - now fixed via _ReferenceResolver's
-		# own self._narrowed tracking; see
-		# TypeIsIfDesugaringTests.test_is_none_recheck_on_already_narrowed_name_in_type_branch
-		# and MatchArmSameNameNarrowingTests.test_is_none_recheck_on_already_narrowed_name_in_same_arm
-		# for the dedicated regression coverage.
-		self._run( '''
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		i: i32 = 0
-		while i < 1000:
-			s: str = 'hello'.upper()
-			x: str|None = s
-			if type( x ) is str:
-				if x.byte_len() != 5:
-					return 1
-			else:
-				return 2
-			i += 1
-		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
-
-class TypeIsIfDesugaringTests( CompilerTestCase ):
+class TypeIsIfDesugaringTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 4 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
 	desugar `if type(x) is T: A else: B` into the equivalent `match x:
 	case T(x): A \n case _: B` BEFORE lowering ever sees it -
@@ -7570,39 +6393,15 @@ class TypeIsIfDesugaringTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_narrows_inside_the_type_branch( self ) -> None:
-		# x.byte_len() only resolves at all if x was actually narrowed to
-		# str inside the branch, not left at its original str|None type
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# x.byte_len() only resolves at all if x was actually narrowed to
+			# str inside the branch, not left at its original str|None type
+			( 'narrows_inside_the_type_branch', '''
 def describe( x: str|None ) -> usize:
 	if type( x ) is str:
 		return x.byte_len()
@@ -7615,16 +6414,11 @@ def main() -> i32:
 	if describe( None ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_narrowing_does_not_survive_past_the_if( self ) -> None:
-		# ordinary code AFTER the if must still see x at its original,
-		# unnarrowed type - a second, independent `x is None` check right
-		# after the if must still work as an ordinary union check
-		self._run( '''
+''' ),
+			# ordinary code AFTER the if must still see x at its original,
+			# unnarrowed type - a second, independent `x is None` check right
+			# after the if must still work as an ordinary union check
+			( 'narrowing_does_not_survive_past_the_if', '''
 def describe( x: str|None ) -> usize:
 	with compiler.wrap_arithmetic:
 		result: usize = 0
@@ -7642,13 +6436,8 @@ def main() -> i32:
 	if describe( None ) != 1999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_no_else_clause( self ) -> None:
-		self._run( '''
+''' ),
+			( 'no_else_clause', '''
 def describe( x: str|None ) -> usize:
 	result: usize = 999
 	if type( x ) is str:
@@ -7661,15 +6450,10 @@ def main() -> i32:
 	if describe( None ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_negated_type_is_not( self ) -> None:
-		# type(x) is not T swaps which body lands in the T-arm vs the
-		# wildcard arm - the else branch (T-arm) still narrows x
-		self._run( '''
+''' ),
+			# type(x) is not T swaps which body lands in the T-arm vs the
+			# wildcard arm - the else branch (T-arm) still narrows x
+			( 'negated_type_is_not', '''
 def describe( x: str|None ) -> usize:
 	if type( x ) is not str:
 		return 999
@@ -7682,15 +6466,10 @@ def main() -> i32:
 	if describe( None ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_instanceof_as_if_condition( self ) -> None:
-		# instanceof(x, T) directly as an if's own condition - recognized
-		# without ever detouring through visit_Call's own Compare rewrite
-		self._run( '''
+''' ),
+			# instanceof(x, T) directly as an if's own condition - recognized
+			# without ever detouring through visit_Call's own Compare rewrite
+			( 'instanceof_as_if_condition', '''
 def describe( x: str|None ) -> usize:
 	if instanceof( x, str ):
 		return x.byte_len()
@@ -7703,16 +6482,11 @@ def main() -> i32:
 	if describe( None ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_elif_chain_desugars_to_nested_match( self ) -> None:
-		# a three-member, non-None-paired union (i32|str|None) with a real
-		# elif chain - each arm narrows independently, the final else
-		# still reachable
-		self._run( '''
+''' ),
+			# a three-member, non-None-paired union (i32|str|None) with a real
+			# elif chain - each arm narrows independently, the final else
+			# still reachable
+			( 'elif_chain_desugars_to_nested_match', '''
 def describe( x: i32|str|None ) -> i32:
 	with compiler.wrap_arithmetic:
 		if type( x ) is i32:
@@ -7730,9 +6504,53 @@ def main() -> i32:
 	if describe( None ) != -1:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# every other RC test this session established
+			( 'rc_lifetime_repeated_calls_no_leak', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			if type( x ) is str:
+				if x.byte_len() != 5:
+					return 1
+			else:
+				return 2
+			i += 1
+		return 0
+''' ),
+			# regression test for the same gap MatchArmSameNameNarrowingTests.
+			# test_is_none_recheck_on_already_narrowed_name_in_same_arm covers
+			# for a literal `match` statement, reached here through if-
+			# desugaring instead: `if type(x) is str:` desugars to `match x:
+			# case str(x): ...` (this class's own docstring), which narrows x
+			# the same way - a SECOND union-shaped check (`x is None`) on that
+			# already-narrowed x, inside the SAME branch, used to crash with
+			# "builtins.str has no attribute 'tag'" since type_resolver.py's
+			# own rewrites ran with no knowledge of the narrowing their own
+			# desugaring had just introduced. Previously flagged as out of
+			# scope on TypeIsInstanceofTests.test_rc_lifetime_repeated_calls_
+			# no_leak's own comment; fixed by _ReferenceResolver's new
+			# self._narrowed tracking (see type_resolver.py's visit_Match).
+			( 'is_none_recheck_on_already_narrowed_name_in_type_branch', '''
+def describe( x: str|None ) -> i32:
+	if type( x ) is str:
+		if x is None:
+			return 1
+		return 0
+	return 2
+
+def main() -> i32:
+	if describe( "hello" ) != 0:
+		return 1
+	if describe( None ) != 2:
+		return 2
+	return 0
+''' ),
+		] )
 
 	def test_leaf_type_not_a_union_member_is_a_compile_error( self ) -> None:
 		# a genuine mismatch must stay a real compile error even when the
@@ -7748,63 +6566,8 @@ def main() -> i32:
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# every other RC test this session established
-		self._run( '''
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		i: i32 = 0
-		while i < 1000:
-			s: str = 'hello'.upper()
-			x: str|None = s
-			if type( x ) is str:
-				if x.byte_len() != 5:
-					return 1
-			else:
-				return 2
-			i += 1
-		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_is_none_recheck_on_already_narrowed_name_in_type_branch( self ) -> None:
-		# regression test for the same gap MatchArmSameNameNarrowingTests.
-		# test_is_none_recheck_on_already_narrowed_name_in_same_arm covers
-		# for a literal `match` statement, reached here through if-
-		# desugaring instead: `if type(x) is str:` desugars to `match x:
-		# case str(x): ...` (this class's own docstring), which narrows x
-		# the same way - a SECOND union-shaped check (`x is None`) on that
-		# already-narrowed x, inside the SAME branch, used to crash with
-		# "builtins.str has no attribute 'tag'" since type_resolver.py's
-		# own rewrites ran with no knowledge of the narrowing their own
-		# desugaring had just introduced. Previously flagged as out of
-		# scope on TypeIsInstanceofTests.test_rc_lifetime_repeated_calls_
-		# no_leak's own comment; fixed by _ReferenceResolver's new
-		# self._narrowed tracking (see type_resolver.py's visit_Match).
-		self._run( '''
-def describe( x: str|None ) -> i32:
-	if type( x ) is str:
-		if x is None:
-			return 1
-		return 0
-	return 2
-
-def main() -> i32:
-	if describe( "hello" ) != 0:
-		return 1
-	if describe( None ) != 2:
-		return 2
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-
-class NarrowingSurvivalTests( CompilerTestCase ):
+class NarrowingSurvivalTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phases 5-6 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
 	narrowing surviving PAST its own match/if statement, not just confined
 	to one arm - the piece explicitly deferred at the end of Phase 4.
@@ -7836,42 +6599,18 @@ class NarrowingSurvivalTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_headline_example_isinstance_return_no_else( self ) -> None:
-		# the user's own motivating example: no else at all - x is
-		# narrowed to str for the rest of the function purely because the
-		# int branch terminates. instanceof(x, T) (not Python's real
-		# isinstance, which this compiler doesn't recognize) is this
-		# compiler's own sugar for type(x) is T - see Phase 3
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# the user's own motivating example: no else at all - x is
+			# narrowed to str for the rest of the function purely because the
+			# int branch terminates. instanceof(x, T) (not Python's real
+			# isinstance, which this compiler doesn't recognize) is this
+			# compiler's own sugar for type(x) is T - see Phase 3
+			( 'headline_example_isinstance_return_no_else', '''
 def describe( x: i32|str ) -> usize:
 	with compiler.wrap_arithmetic:
 		if instanceof( x, i32 ):
@@ -7884,17 +6623,12 @@ def main() -> i32:
 	if describe( 42 ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_both_arms_explicit_one_terminates( self ) -> None:
-		# a real match, both members named explicitly (no wildcard at
-		# all) - the surviving (non-terminating) arm's own narrowing still
-		# carries forward, exercising merge_if's own survivor-wins path
-		# directly rather than the wildcard/negation trick
-		self._run( '''
+''' ),
+			# a real match, both members named explicitly (no wildcard at
+			# all) - the surviving (non-terminating) arm's own narrowing still
+			# carries forward, exercising merge_if's own survivor-wins path
+			# directly rather than the wildcard/negation trick
+			( 'both_arms_explicit_one_terminates', '''
 def describe( x: i32|str ) -> usize:
 	with compiler.wrap_arithmetic:
 		match x:
@@ -7910,22 +6644,17 @@ def main() -> i32:
 	if describe( 42 ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_disagreeing_arms_union_instead_of_discard( self ) -> None:
-		# neither arm terminates and they narrow to DIFFERENT members
-		# (i32 vs str) - the merged post-match state is neither "i32
-		# only" nor "unnarrowed", it's "one of i32|str" (None ruled out) -
-		# a subsequent type(x) is i32 check must still resolve correctly
-		# (i32 IS one of the remaining possibilities, ambiguous, so this
-		# falls through to an ordinary tag check against x's own full
-		# declared type rather than being folded outright - the important
-		# thing is it doesn't error as "not a union type", which is
-		# exactly what happened before the union-instead-of-discard fix)
-		self._run( '''
+''' ),
+			# neither arm terminates and they narrow to DIFFERENT members
+			# (i32 vs str) - the merged post-match state is neither "i32
+			# only" nor "unnarrowed", it's "one of i32|str" (None ruled out) -
+			# a subsequent type(x) is i32 check must still resolve correctly
+			# (i32 IS one of the remaining possibilities, ambiguous, so this
+			# falls through to an ordinary tag check against x's own full
+			# declared type rather than being folded outright - the important
+			# thing is it doesn't error as "not a union type", which is
+			# exactly what happened before the union-instead-of-discard fix)
+			( 'disagreeing_arms_union_instead_of_discard', '''
 def describe( x: i32|str|None ) -> i32:
 	with compiler.wrap_arithmetic:
 		match x:
@@ -7947,15 +6676,10 @@ def main() -> i32:
 	if describe( None ) != -1:
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_no_explicit_else_still_narrows( self ) -> None:
-		# no else clause at all - the implicit "fell through" path IS the
-		# match's own second arm once the union is fully covered
-		self._run( '''
+''' ),
+			# no else clause at all - the implicit "fell through" path IS the
+			# match's own second arm once the union is fully covered
+			( 'no_explicit_else_still_narrows', '''
 def describe( x: i32|str ) -> usize:
 	with compiler.wrap_arithmetic:
 		result: usize = 0
@@ -7969,9 +6693,77 @@ def main() -> i32:
 	if describe( 1 ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+			# a 3+-member union can't express "one of the two remaining
+			# possibilities" with the single-member narrowing design (that's
+			# the abandoned UnionView scope) - the wildcard arm correctly
+			# stays UNNARROWED rather than guessing, which is still a real,
+			# valid compile (not an error). Both a str AND an i32 argument are
+			# passed at real call sites (not just i32) - a union member that's
+			# never actually constructed anywhere reachable hits a separate,
+			# pre-existing, unrelated scheduling gap (confirmed independent of
+			# this work: reproduces for an i32|str|bool parameter with no
+			# narrowing/matching involved at all) where its own RC cleanup
+			# code fails to compile against an incomplete forward declaration
+			( 'three_member_union_wildcard_declines_gracefully', '''
+def describe( x: i32|str|bool ) -> i32:
+	if type( x ) is i32:
+		return 1
+	return 0
+
+def main() -> i32:
+	if describe( 5 ) != 1:
+		return 1
+	return describe( "hi" )
+''' ),
+			# TODO.txt's own original worked example (now with real syntax) -
+			# an elif chain over a 3-member union desugars into nested
+			# matches, each arm narrowing independently within its own scope;
+			# a 3-member union can't narrow the FINAL else (see the 3-member
+			# decline test above) but the two explicit arms still work
+			# correctly on their own
+			( 'todo_elif_chain_worked_example', '''
+def describe( x: i32|str|bool ) -> i32:
+	with compiler.wrap_arithmetic:
+		if type( x ) is i32:
+			return x + 100
+		elif type( x ) is str:
+			return i32( x.byte_len() )
+		else:
+			return -1
+
+def main() -> i32:
+	if describe( 5 ) != 105:
+		return 1
+	if describe( "hello" ) != 5:
+		return 2
+	if describe( True ) != -1:
+		return 3
+	return 0
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# every other RC test this session established - narrowing
+			# surviving past the if (via type(x) is str, not a plain `is
+			# None` check - Phase 5/6's own narrowing-survival mechanism
+			# doesn't extend to the ordinary is-None rewrite, only type(x) is
+			# T/instanceof and match), then reading the narrowed str repeatedly
+			( 'rc_lifetime_repeated_calls_no_leak', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			if type( x ) is str:
+				pass
+			else:
+				return 1
+			if x.byte_len() != 5:
+				return 2
+			i += 1
+		return 0
+''' ),
+		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_named_wildcard_does_not_narrow( self ) -> None:
@@ -7992,92 +6784,8 @@ def main() -> i32:
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_three_member_union_wildcard_declines_gracefully( self ) -> None:
-		# a 3+-member union can't express "one of the two remaining
-		# possibilities" with the single-member narrowing design (that's
-		# the abandoned UnionView scope) - the wildcard arm correctly
-		# stays UNNARROWED rather than guessing, which is still a real,
-		# valid compile (not an error). Both a str AND an i32 argument are
-		# passed at real call sites (not just i32) - a union member that's
-		# never actually constructed anywhere reachable hits a separate,
-		# pre-existing, unrelated scheduling gap (confirmed independent of
-		# this work: reproduces for an i32|str|bool parameter with no
-		# narrowing/matching involved at all) where its own RC cleanup
-		# code fails to compile against an incomplete forward declaration
-		self._run( '''
-def describe( x: i32|str|bool ) -> i32:
-	if type( x ) is i32:
-		return 1
-	return 0
 
-def main() -> i32:
-	if describe( 5 ) != 1:
-		return 1
-	return describe( "hi" )
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_todo_elif_chain_worked_example( self ) -> None:
-		# TODO.txt's own original worked example (now with real syntax) -
-		# an elif chain over a 3-member union desugars into nested
-		# matches, each arm narrowing independently within its own scope;
-		# a 3-member union can't narrow the FINAL else (see the 3-member
-		# decline test above) but the two explicit arms still work
-		# correctly on their own
-		self._run( '''
-def describe( x: i32|str|bool ) -> i32:
-	with compiler.wrap_arithmetic:
-		if type( x ) is i32:
-			return x + 100
-		elif type( x ) is str:
-			return i32( x.byte_len() )
-		else:
-			return -1
-
-def main() -> i32:
-	if describe( 5 ) != 105:
-		return 1
-	if describe( "hello" ) != 5:
-		return 2
-	if describe( True ) != -1:
-		return 3
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_calls_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# every other RC test this session established - narrowing
-		# surviving past the if (via type(x) is str, not a plain `is
-		# None` check - Phase 5/6's own narrowing-survival mechanism
-		# doesn't extend to the ordinary is-None rewrite, only type(x) is
-		# T/instanceof and match), then reading the narrowed str repeatedly
-		self._run( '''
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		i: i32 = 0
-		while i < 1000:
-			s: str = 'hello'.upper()
-			x: str|None = s
-			if type( x ) is str:
-				pass
-			else:
-				return 1
-			if x.byte_len() != 5:
-				return 2
-			i += 1
-		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-
-class WhileNarrowingTests( CompilerTestCase ):
+class WhileNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 7 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
 	`while type(x) is T:`/`while type(x) is not T:`/`while instanceof(x,
 	T):` against a bare-Name, union-typed x - narrows x for the loop
@@ -8102,37 +6810,13 @@ class WhileNarrowingTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_narrows_the_loop_body( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'narrows_the_loop_body', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		x: i32|str = 5
@@ -8143,15 +6827,10 @@ def main() -> i32:
 		if total != 5:
 			return 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_is_not_narrows_the_loop_body_to_the_other_member( self ) -> None:
-		# a 2-member union, `is not` form - the body is only entered while
-		# x is NOT i32, i.e. while it's str
-		self._run( '''
+''' ),
+			# a 2-member union, `is not` form - the body is only entered while
+			# x is NOT i32, i.e. while it's str
+			( 'is_not_narrows_the_loop_body_to_the_other_member', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		x: i32|str = "hi"
@@ -8164,16 +6843,11 @@ def main() -> i32:
 		if count != 1:
 			return 2
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_narrows_after_the_loop_exits( self ) -> None:
-		# post-loop exit narrowing - x.byte_len() only resolves at all if
-		# x was actually narrowed to str once the loop's own condition
-		# went false
-		self._run( '''
+''' ),
+			# post-loop exit narrowing - x.byte_len() only resolves at all if
+			# x was actually narrowed to str once the loop's own condition
+			# went false
+			( 'narrows_after_the_loop_exits', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		x: i32|str = 5
@@ -8182,17 +6856,12 @@ def main() -> i32:
 		if x.byte_len() != 4:
 			return 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_user_worked_example_return_inside_while( self ) -> None:
-		# the user's own example: a `return` inside the loop body
-		# contributes NOTHING to post-loop narrowing (it exits the
-		# function, never reaches "after the loop") - x is narrowed to
-		# str after the loop purely via the natural exit path
-		self._run( '''
+''' ),
+			# the user's own example: a `return` inside the loop body
+			# contributes NOTHING to post-loop narrowing (it exits the
+			# function, never reaches "after the loop") - x is narrowed to
+			# str after the loop purely via the natural exit path
+			( 'user_worked_example_return_inside_while', '''
 def describe( x: i32|str ) -> i32:
 	with compiler.wrap_arithmetic:
 		while type( x ) is i32:
@@ -8205,17 +6874,12 @@ def main() -> i32:
 	if describe( 1 ) != 999:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_three_member_union_body_narrows_but_exit_declines( self ) -> None:
-		# a 3+-member union: the `is` form still narrows the BODY
-		# correctly (single-member narrowing to the matched member is
-		# always well-defined), even though exit-narrowing can't apply
-		# (declines gracefully, no error, x just stays unnarrowed after)
-		self._run( '''
+''' ),
+			# a 3+-member union: the `is` form still narrows the BODY
+			# correctly (single-member narrowing to the matched member is
+			# always well-defined), even though exit-narrowing can't apply
+			# (declines gracefully, no error, x just stays unnarrowed after)
+			( 'three_member_union_body_narrows_but_exit_declines', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		x: i32|str|bool = 5
@@ -8226,16 +6890,11 @@ def main() -> i32:
 		if total != 5:
 			return 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_loop_executions_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# every other RC test this session established - the outer loop
-		# runs the whole while-narrowing construct 1000 times
-		self._run( '''
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# every other RC test this session established - the outer loop
+			# runs the whole while-narrowing construct 1000 times
+			( 'rc_lifetime_repeated_loop_executions_no_leak', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		i: i32 = 0
@@ -8247,12 +6906,11 @@ def main() -> i32:
 				return 2
 			i += 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class LoopBreakNarrowingTests( CompilerTestCase ):
+class LoopBreakNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 8 of PLAN_MATCH_NARROWING (see steady-dancing-haven.md):
 	`break`-based narrowing survival past a `while`/`for` loop, generalizing
 	Phase 7's own condition-based exit narrowing to loops whose exit isn't
@@ -8280,41 +6938,17 @@ class LoopBreakNarrowingTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_while_true_break_narrows( self ) -> None:
-		# while True: has no natural exit at all (provably unreachable) -
-		# the single break is the ONLY way out, so its own narrowing
-		# survives unconditionally. s: str = x only compiles if x was
-		# actually narrowed to str (its raw type is the whole union)
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# while True: has no natural exit at all (provably unreachable) -
+			# the single break is the ONLY way out, so its own narrowing
+			# survives unconditionally. s: str = x only compiles if x was
+			# actually narrowed to str (its raw type is the whole union)
+			( 'while_true_break_narrows', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		x: i32|str = "hello"
@@ -8325,18 +6959,13 @@ def main() -> i32:
 		if s.byte_len() != 5:
 			return 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_for_loop_break_survives_when_already_narrowed( self ) -> None:
-		# x is narrowed to str BEFORE the for-loop even starts (Phase 5's
-		# own if-survival) - the for-loop's own natural exit (range
-		# exhausted, or zero iterations) inherits that same fact from
-		# loop_snapshot, and the break inside doesn't disturb it, so both
-		# the natural-exit and break candidates agree
-		self._run( '''
+''' ),
+			# x is narrowed to str BEFORE the for-loop even starts (Phase 5's
+			# own if-survival) - the for-loop's own natural exit (range
+			# exhausted, or zero iterations) inherits that same fact from
+			# loop_snapshot, and the break inside doesn't disturb it, so both
+			# the natural-exit and break candidates agree
+			( 'for_loop_break_survives_when_already_narrowed', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		x: i32|str = "hello"
@@ -8348,19 +6977,14 @@ def main() -> i32:
 			if s.byte_len() != 5:
 				return 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_ordinary_loop_natural_exit_drops_break_narrowing( self ) -> None:
-		# an ordinary while loop (condition unrelated to x) - the natural,
-		# condition-false exit is a real, reachable path that proves
-		# NOTHING about x, so even a single break's own narrowing is
-		# correctly dropped by the merge (not every way of reaching this
-		# point agrees) - the code still compiles and runs correctly via
-		# the ordinary, un-narrowed path, it's just not narrowed
-		self._run( '''
+''' ),
+			# an ordinary while loop (condition unrelated to x) - the natural,
+			# condition-false exit is a real, reachable path that proves
+			# NOTHING about x, so even a single break's own narrowing is
+			# correctly dropped by the merge (not every way of reaching this
+			# point agrees) - the code still compiles and runs correctly via
+			# the ordinary, un-narrowed path, it's just not narrowed
+			( 'ordinary_loop_natural_exit_drops_break_narrowing', '''
 def describe( x: i32|str ) -> i32:
 	with compiler.wrap_arithmetic:
 		i: usize = 0
@@ -8378,19 +7002,14 @@ def main() -> i32:
 	if describe( 5 ) != 2:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_disagreeing_breaks_drop_narrowing_not_error( self ) -> None:
-		# two DIFFERENT breaks (different source locations, only one ever
-		# actually reachable for a given call) narrowing to DIFFERENT
-		# members - the compiler conservatively treats both as real,
-		# competing candidates and the soft-merge drops the disagreement,
-		# same as merge_if's own disagreeing-branches behavior - genuine
-		# disagreement silently stays unnarrowed, never a compile error
-		self._run( '''
+''' ),
+			# two DIFFERENT breaks (different source locations, only one ever
+			# actually reachable for a given call) narrowing to DIFFERENT
+			# members - the compiler conservatively treats both as real,
+			# competing candidates and the soft-merge drops the disagreement,
+			# same as merge_if's own disagreeing-branches behavior - genuine
+			# disagreement silently stays unnarrowed, never a compile error
+			( 'disagreeing_breaks_drop_narrowing_not_error', '''
 def describe( x: i32|str ) -> i32:
 	with compiler.wrap_arithmetic:
 		i: usize = 0
@@ -8410,17 +7029,12 @@ def main() -> i32:
 	if describe( "hi" ) != 2:
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rc_lifetime_repeated_break_narrowing_no_leak( self ) -> None:
-		# real RC-lifetime stress check under repetition, same rigor as
-		# every other RC test this session established - the break-
-		# narrowed str is read (and its own real content checked) every
-		# iteration of the outer stress loop
-		self._run( '''
+''' ),
+			# real RC-lifetime stress check under repetition, same rigor as
+			# every other RC test this session established - the break-
+			# narrowed str is read (and its own real content checked) every
+			# iteration of the outer stress loop
+			( 'rc_lifetime_repeated_break_narrowing_no_leak', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		i: i32 = 0
@@ -8434,9 +7048,8 @@ def main() -> i32:
 				return 1
 			i += 1
 		return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
 class ReturnStatementTempLifetimeTests( CompilerTestCase ):
@@ -8566,7 +7179,7 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
-class CallableTests( CompilerTestCase ):
+class CallableTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never
 	compiled anywhere before this), stored/passed as a real C function
@@ -8576,34 +7189,6 @@ class CallableTests( CompilerTestCase ):
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
-
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_function_reference_stored_and_called_indirectly( self ) -> None:
@@ -8632,19 +7217,23 @@ def main() -> i32:
 		self.assertIn( '(f)( v )', src ) # a call THROUGH the pointer, no explicit deref needed
 		self._assert_compiles_and_runs( src )
 
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_staticmethod_reference_called_indirectly( self ) -> None:
-		# the exact shape dict[K,V]'s own comparator/hasher helpers will
-		# use: a @staticmethod referenced bare from a sibling method of the
-		# same class, stored in a local, called indirectly from there.
-		# NOTE: deliberately does NOT return the Ptr[Callable[...]] value
-		# from a function - that's a real, separate gap (a function
-		# RETURNING a function pointer is C's gnarliest declarator shape,
-		# `RetType (*name(Params))(InnerParams)` - _declarator only covers
-		# parameter/local declarations, per PLAN_CALLABLE.md's own scope).
-		# Not needed here: dict[K,V] only ever passes a callback as a
-		# parameter, never returns one.
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# the exact shape dict[K,V]'s own comparator/hasher helpers will
+			# use: a @staticmethod referenced bare from a sibling method of the
+			# same class, stored in a local, called indirectly from there.
+			# NOTE: deliberately does NOT return the Ptr[Callable[...]] value
+			# from a function - that's a real, separate gap (a function
+			# RETURNING a function pointer is C's gnarliest declarator shape,
+			# `RetType (*name(Params))(InnerParams)` - _declarator only covers
+			# parameter/local declarations, per PLAN_CALLABLE.md's own scope).
+			# Not needed here: dict[K,V] only ever passes a callback as a
+			# parameter, never returns one.
+			( 'staticmethod_reference_called_indirectly', '''
 class Ops:
 	@staticmethod
 	def double( x: i32 ) -> i32:
@@ -8661,20 +7250,15 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 42
 	return diff
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_generic_call_infers_type_params_through_callable_parameter( self ) -> None:
-		# regression test for a real compiler bug found while exploring
-		# PLAN_LAMBDA.md's own zoneinfo.py blocker: _unify_type_param/
-		# substitute_type_params used to stop recursing at a CallableType
-		# (not a Specialization, so the Ptr[T]-vs-Ptr[i32] recursion never
-		# looked inside a Ptr[Callable[[T],K]] parameter's own arg_types/
-		# return_type) - even a plain function reference argument (no
-		# lambda at all) failed to infer K this way before the fix
-		self._run( '''
+''' ),
+			# regression test for a real compiler bug found while exploring
+			# PLAN_LAMBDA.md's own zoneinfo.py blocker: _unify_type_param/
+			# substitute_type_params used to stop recursing at a CallableType
+			# (not a Specialization, so the Ptr[T]-vs-Ptr[i32] recursion never
+			# looked inside a Ptr[Callable[[T],K]] parameter's own arg_types/
+			# return_type) - even a plain function reference argument (no
+			# lambda at all) failed to infer K this way before the fix
+			( 'generic_call_infers_type_params_through_callable_parameter', '''
 def identity_i32( v: i32 ) -> i32:
 	return v
 
@@ -8686,24 +7270,19 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 5
 	return diff
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_lambda_eagerly_lowered_infers_generic_return_type( self ) -> None:
-		# real compile-and-run version of PLAN_LAMBDA.md's "eager lambda
-		# lowering" piece: unlike the function-reference case just above, K
-		# is only knowable from the LAMBDA's own inferred return type -
-		# _expr_Lambda has to lower the lambda's body right now, at this
-		# call site, instead of only ever deferring it onto the work queue
-		# (see FunctionLowering/Compiler._lower's own _compile_now
-		# backreference). Checking the actual returned value (not just that
-		# it compiles) matters here specifically: if the eager path got the
-		# wrong return type, or clobbered the enclosing function's own
-		# in-progress lowering state, this is the kind of bug that would
-		# still compile and link, just produce a silently wrong answer
-		self._run( '''
+''' ),
+			# real compile-and-run version of PLAN_LAMBDA.md's "eager lambda
+			# lowering" piece: unlike the function-reference case just above, K
+			# is only knowable from the LAMBDA's own inferred return type -
+			# _expr_Lambda has to lower the lambda's body right now, at this
+			# call site, instead of only ever deferring it onto the work queue
+			# (see FunctionLowering/Compiler._lower's own _compile_now
+			# backreference). Checking the actual returned value (not just that
+			# it compiles) matters here specifically: if the eager path got the
+			# wrong return type, or clobbered the enclosing function's own
+			# in-progress lowering state, this is the kind of bug that would
+			# still compile and link, just produce a silently wrong answer
+			( 'lambda_eagerly_lowered_infers_generic_return_type', '''
 def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:
 	return key( x )
 
@@ -8712,9 +7291,8 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 5
 	return diff
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_self_dot_staticmethod_call_passes_no_receiver( self ) -> None:
@@ -8789,7 +7367,7 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
 
 
-class NestedFunctionTests( CompilerTestCase ):
+class NestedFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' non-capturing nested function defs - see PLAN_LAMBDA.md. Never
 	compiled anywhere before this (previously hit lowering.py's generic
 	"unsupported statement" fallback). Mirrors CallableTests' own
@@ -8799,37 +7377,13 @@ class NestedFunctionTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_nested_def_called_directly( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'nested_def_called_directly', '''
 def outer() -> i32:
 	def inner( x: i32 ) -> i32:
 		with compiler.wrap_arithmetic:
@@ -8840,13 +7394,8 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = outer() - 6
 	return diff
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_nested_def_bare_reference_called_indirectly( self ) -> None:
-		self._run( '''
+''' ),
+			( 'nested_def_bare_reference_called_indirectly', '''
 def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:
 	return f( v )
 
@@ -8861,13 +7410,8 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = outer() - 6
 	return diff
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_lambda_param_types_inferred_and_called_indirectly( self ) -> None:
-		self._run( '''
+''' ),
+			( 'lambda_param_types_inferred_and_called_indirectly', '''
 def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:
 	return f( v )
 
@@ -8876,11 +7420,10 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 5
 	return diff
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
-class ComTests( CompilerTestCase ):
+class ComTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/windows/com.py's HRESULT/IUnknown pattern -
 	PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3 worked example: a
 	metalpy-implemented COM interface (IUnknown -> IFoo, adding a method -
@@ -8893,36 +7436,13 @@ class ComTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	def test_succeeded_failed_helpers( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'succeeded_failed_helpers', '''
 from windows.com import S_OK, E_FAIL, SUCCEEDED, FAILED
 
 def main() -> i32:
@@ -8935,21 +7455,16 @@ def main() -> i32:
 	if not FAILED( E_FAIL ):
 		return 4
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_iunknown_subclass_construct_dispatch_queryinterface_addref_release( self ) -> None:
-		# IFoo(IUnknown) adds get_value - the exact COM pattern that
-		# motivated the per-level-Vtbl-types revision (IUnknown's own 3
-		# slots first, then IFoo's own new one, all in IFoo's own
-		# FooImpl-shared Vtbl type). Hand-written QueryInterface/AddRef/
-		# Release (no compiler synthesis, per the plan's own "hand-rolling
-		# first" decision) - QueryInterface writes a real pointer through
-		# its Ptr[Ptr[None]] out-param and calls AddRef itself, matching
-		# real COM QueryInterface semantics.
-		self._run( '''
+''' ),
+			# IFoo(IUnknown) adds get_value - the exact COM pattern that
+			# motivated the per-level-Vtbl-types revision (IUnknown's own 3
+			# slots first, then IFoo's own new one, all in IFoo's own
+			# FooImpl-shared Vtbl type). Hand-written QueryInterface/AddRef/
+			# Release (no compiler synthesis, per the plan's own "hand-rolling
+			# first" decision) - QueryInterface writes a real pointer through
+			# its Ptr[Ptr[None]] out-param and calls AddRef itself, matching
+			# real COM QueryInterface semantics.
+			( 'iunknown_subclass_construct_dispatch_queryinterface_addref_release', '''
 from windows.com import IUnknown, HRESULT, S_OK, E_NOINTERFACE, SUCCEEDED, FAILED
 import guid
 
@@ -9012,30 +7527,24 @@ def main() -> i32:
 		return 6
 
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( sys.platform == 'win32', 'real Windows COM interop - windows-only' )
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_real_windows_com_service_shelllink_getclassid( self ) -> None:
-		# consumes a REAL foreign Windows COM object - CoCreateInstance's
-		# own CLSID_ShellLink (shell32's IShellLinkW implementation,
-		# always present on any real Windows install), requesting its
-		# IPersist view. IPersist is about as minimal as a real, standard
-		# COM interface gets: IUnknown's 3 slots plus exactly one method,
-		# GetClassID(CLSID*) -> HRESULT (verified directly against
-		# Microsoft Learn's own IPersist::GetClassID docs, not just
-		# memory, given a wrong vtable slot COUNT/ORDER here would be
-		# calling into whatever real function actually sits at that
-		# offset - not a graceful failure). Querying an object for its
-		# OWN class id and checking it matches the well-known,
-		# published CLSID_ShellLink is the "queries for a piece of
-		# data" the whole point of this test is to prove: the metalpy-
-		# declared vtable shape genuinely lines up with a real, foreign,
-		# already-compiled COM object's actual in-memory layout - not
-		# just with other metalpy code.
-		self._run( '''
+''' ),
+			# consumes a REAL foreign Windows COM object - CoCreateInstance's
+			# own CLSID_ShellLink (shell32's IShellLinkW implementation,
+			# always present on any real Windows install), requesting its
+			# IPersist view. IPersist is about as minimal as a real, standard
+			# COM interface gets: IUnknown's 3 slots plus exactly one method,
+			# GetClassID(CLSID*) -> HRESULT (verified directly against
+			# Microsoft Learn's own IPersist::GetClassID docs, not just
+			# memory, given a wrong vtable slot COUNT/ORDER here would be
+			# calling into whatever real function actually sits at that
+			# offset - not a graceful failure). Querying an object for its
+			# OWN class id and checking it matches the well-known,
+			# published CLSID_ShellLink is the "queries for a piece of
+			# data" the whole point of this test is to prove: the metalpy-
+			# declared vtable shape genuinely lines up with a real, foreign,
+			# already-compiled COM object's actual in-memory layout - not
+			# just with other metalpy code.
+			( 'real_windows_com_service_shelllink_getclassid', '''
 from windows.com import HRESULT, SUCCEEDED, CoInitializeEx, CoUninitialize, CoCreateInstance, COINIT_APARTMENTTHREADED, CLSCTX_INPROC_SERVER
 from windows.com.ipersist import IPersist
 import guid
@@ -9073,12 +7582,11 @@ def main() -> i32:
 		return 4
 
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 
-class FStringTests( CompilerTestCase ):
+class FStringTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' f-string (PEP 498) real end-to-end compile-and-run tests
 	(PLAN_FSTRINGS.md). Mirrors StrUpperLowerTests/ListGenericTests' own
 	import_builtins=True + real compile-and-run convention - the runtime
@@ -9088,41 +7596,17 @@ class FStringTests( CompilerTestCase ):
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
 
-	def _extern_ldflags( self ) -> str:
-		flags: list[str] = []
-		for lib in sorted( self.compiler.extern_libs ):
-			if lib == 'c':
-				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
-		return ' '.join( flags )
-
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
-		with tempfile.TemporaryDirectory() as tmp:
-			src_path = Path( tmp ) / 'generated.c'
-			obj_path = Path( tmp ) / 'generated.o'
-			exe_path = Path( tmp ) / 'test_exe'
-			src_path.write_text( c_source, encoding = 'utf-8' )
-			cc_result = _CC.compile( src_path, obj_path )
-			self.assertEqual( cc_result.returncode, 0,
-				f'{_CC.name} compile failed:\nstdout: {cc_result.stdout}\nstderr: {cc_result.stderr}\n\n--- generated.c ---\n{c_source}' )
-			ldflags = self._extern_ldflags()
-			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags )
-			self.assertEqual( link_result.returncode, 0,
-				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
-			run_result = subprocess.run( [ str( exe_path ) ], capture_output = True )
-			self.assertEqual( run_result.returncode, expected_exit,
-				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_multipart_runtime_fstring( self ) -> None:
-		# exercises the real N-part runtime path (UnsafeList[str]/slice[str]/
-		# str.concat) - a and b are real runtime parameters (not folded away
-		# by compile_time_transformer.py), so this is the test that actually
-		# proves the whole pass end to end, not just compile-time folding
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# exercises the real N-part runtime path (UnsafeList[str]/slice[str]/
+			# str.concat) - a and b are real runtime parameters (not folded away
+			# by compile_time_transformer.py), so this is the test that actually
+			# proves the whole pass end to end, not just compile-time folding
+			( 'multipart_runtime_fstring', '''
 def build( a: str, b: str ) -> str:
 	return f"{a} {b}!"
 
@@ -9130,15 +7614,10 @@ def main() -> i32:
 	if build( 'hello', 'world' ) != 'hello world!':
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_single_interpolation_short_circuit( self ) -> None:
-		# len(node.values) == 1 - no UnsafeList/slice/concat machinery at
-		# all, just the FormattedValue's own str-typed operand directly
-		self._run( '''
+''' ),
+			# len(node.values) == 1 - no UnsafeList/slice/concat machinery at
+			# all, just the FormattedValue's own str-typed operand directly
+			( 'single_interpolation_short_circuit', '''
 def build( a: str ) -> str:
 	return f"{a}"
 
@@ -9146,15 +7625,10 @@ def main() -> i32:
 	if build( 'solo' ) != 'solo':
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_non_str_value_uses_str_dunder( self ) -> None:
-		# an int value has no natural str type - resolved via int.__str__()
-		# (PLAN_FSTRINGS.md's own value-to-str resolution rules)
-		self._run( '''
+''' ),
+			# an int value has no natural str type - resolved via int.__str__()
+			# (PLAN_FSTRINGS.md's own value-to-str resolution rules)
+			( 'non_str_value_uses_str_dunder', '''
 def build( n: int ) -> str:
 	return f"n={n}"
 
@@ -9164,13 +7638,8 @@ def main() -> i32:
 	if build( int( -7 )) != 'n=-7':
 		return 2
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_repr_conversion_uses_repr_dunder( self ) -> None:
-		self._run( '''
+''' ),
+			( 'repr_conversion_uses_repr_dunder', '''
 def build( n: int ) -> str:
 	return f"{n!r}"
 
@@ -9178,35 +7647,25 @@ def main() -> i32:
 	if build( int( 5 )) != '5':
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_compile_time_constant_fstring_folds_away( self ) -> None:
-		# fully compile-time-known - compile_time_transformer.py's own
-		# visit_JoinedStr already collapsed this to a plain str Constant
-		# before lowering.py ever sees a JoinedStr node at all; this is an
-		# end-to-end proof the fold produces correct, runnable output, not
-		# just the right ast.unparse() text (compile_time_transformer_
-		# test.py already covers that in isolation)
-		self._run( '''
+''' ),
+			# fully compile-time-known - compile_time_transformer.py's own
+			# visit_JoinedStr already collapsed this to a plain str Constant
+			# before lowering.py ever sees a JoinedStr node at all; this is an
+			# end-to-end proof the fold produces correct, runnable output, not
+			# just the right ast.unparse() text (compile_time_transformer_
+			# test.py already covers that in isolation)
+			( 'compile_time_constant_fstring_folds_away', '''
 def main() -> i32:
 	if f"answer={1+41}" != 'answer=42':
 		return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_repeated_fstring_construction_does_not_leak_or_double_free( self ) -> None:
-		# runs the N-part runtime path many times over - a real stress
-		# check for the UnsafeList[str] scratch buffer's own lifecycle
-		# (construction, N appends, get_ptr, destruction) - matches this
-		# codebase's own "repeat-run stress test, not just reasoning"
-		# verification convention (see ListThreadSafetyTests)
-		self._run( '''
+''' ),
+			# runs the N-part runtime path many times over - a real stress
+			# check for the UnsafeList[str] scratch buffer's own lifecycle
+			# (construction, N appends, get_ptr, destruction) - matches this
+			# codebase's own "repeat-run stress test, not just reasoning"
+			# verification convention (see ListThreadSafetyTests)
+			( 'repeated_fstring_construction_does_not_leak_or_double_free', '''
 def build( n: int ) -> str:
 	return f"iteration: value={n}"
 
@@ -9216,23 +7675,18 @@ def main() -> i32:
 		if s != 'iteration: value=7':
 			return 1
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
-
-	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_bang_a_conversion_escapes_non_ascii( self ) -> None:
-		# !a (PLAN_FSTRINGS.md follow-up) - a dedicated real compile-and-run
-		# test against non-ASCII input, per the plan's own verification
-		# section. Expected text is real Python's own ascii()-equivalent
-		# escaping (repr() here has no surrounding quotes to strip since
-		# !a's own metalpy semantics never add quotes - see lowering.py's
-		# _lower_ascii_escape comment): a 2-byte-UTF8 codepoint (café,
-		# U+00E9) escapes as \xE9-style... actually str._ascii_escape's
-		# own lowercase-hex convention is checked directly against real
-		# Python's escaping of the bare codepoints, not against repr()'s
-		# own quoting.
-		self._run( '''
+''' ),
+			# !a (PLAN_FSTRINGS.md follow-up) - a dedicated real compile-and-run
+			# test against non-ASCII input, per the plan's own verification
+			# section. Expected text is real Python's own ascii()-equivalent
+			# escaping (repr() here has no surrounding quotes to strip since
+			# !a's own metalpy semantics never add quotes - see lowering.py's
+			# _lower_ascii_escape comment): a 2-byte-UTF8 codepoint (café,
+			# U+00E9) escapes as \xE9-style... actually str._ascii_escape's
+			# own lowercase-hex convention is checked directly against real
+			# Python's escaping of the bare codepoints, not against repr()'s
+			# own quoting.
+			( 'bang_a_conversion_escapes_non_ascii', '''
 def build( s: str ) -> str:
 	return f"{s!a}"
 
@@ -9244,9 +7698,8 @@ def main() -> i32:
 	if build( 'plain ascii' ) != 'plain ascii':
 		return 3
 	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+''' ),
+		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_str_format_spec_width_align_fill( self ) -> None:
