@@ -3175,7 +3175,7 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
-		self.assertIn( '(p)[1] = $t1;', src ) # real write-back, not a copy-mutate-discard
+		self.assertIn( '(p)[((uintptr_t)1)] = $t1;', src ) # real write-back, not a copy-mutate-discard
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )

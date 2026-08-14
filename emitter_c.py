@@ -802,6 +802,40 @@ def _emit_operand( op: ir.Operand ) -> str:
 		return _c_local_name( op.stem ) if not op.is_global else mangle_qualname( op.qualname )
 	raise NotImplementedError( f'_emit_operand: unsupported operand {op!r}' )
 
+# stems wider than plain C `int` - a bare, un-cast literal like `1` silently
+# defaults to `int` (C's own "usual arithmetic conversions") when used
+# directly as an operand inside an expression (as opposed to being a properly
+# declared variable's own initializer, which isn't affected the same way) -
+# confirmed to cause real UB: `i128(1) << 127` emitted as `(1) << (127)`,
+# shifting a plain 32-bit int by 127 bits. i8/i16/i32/u8/u16/u32/bool are
+# deliberately excluded - C's own default `int` width already matches or
+# covers those, so casting them is unnecessary churn (also would break
+# existing exact-string test assertions on ordinary i32 field literals)
+_WIDE_INT_STEMS: frozenset[str] = frozenset([ 'i64', 'u64', 'i128', 'u128', 'isize', 'usize' ])
+
+def _emit_wide_int_const( value: int, stem: str ) -> str:
+	''' a _WIDE_INT_STEMS constant, cast to its own C type. A bare C integer
+	literal token can represent at most 64 bits of magnitude (stdint.h
+	guarantees `unsigned long long` is >=64-bit; nothing wider has portable
+	literal syntax) - within that budget, a plain cast suffices. Beyond it
+	(only reachable for i128/u128 - every other stem's own real range is
+	<=64 bits, see _FIXED_INT_BITS), no token can spell the value at all, cast
+	or not (confirmed: `(unsigned __int128)999999999999999999999999999999`
+	still fails to compile - the LITERAL TOKEN itself is rejected before any
+	cast applies) - split into 64-bit hi/lo halves and reconstruct via shift,
+	the same bit-pattern technique _int_min_max_bit_pattern/_signed_min_max
+	already use for i128 MIN/MAX. '''
+	ctype = _SCALAR_C_TYPES[stem]
+	if -1 * ( 2**64 - 1 ) <= value <= 2**64 - 1:
+		return f'(({ctype}){value})'
+	magnitude = abs( value )
+	hi, lo = magnitude >> 64, magnitude & 0xFFFFFFFFFFFFFFFF
+	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << 64 ) | (__metalpy_wideuint){lo}ULL )'
+	if _is_unsigned_stem( stem ):
+		return unsigned_expr
+	signed_expr = f'(__metalpy_wideint){unsigned_expr}'
+	return f'(-{signed_expr})' if value < 0 else signed_expr
+
 def _emit_const( c: ir.Const ) -> str:
 	if isinstance( c.value, bool ):
 		return 'true' if c.value else 'false'
@@ -833,6 +867,9 @@ def _emit_const( c: ir.Const ) -> str:
 			base = c.type.base
 			if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
 				return f'({c_type(c.type)}){c.value}'
+		stem = c.type.stem if isinstance( c.type, Scalar ) else None
+		if stem in _WIDE_INT_STEMS:
+			return _emit_wide_int_const( c.value, stem )
 		return str( c.value )
 	if c.value is None:
 		return '0' # NOTE: we would like to put 'nullptr' or 'NULL' here but its causing issues
@@ -1152,9 +1189,7 @@ def _emit_float_div_check( instr ) -> list[str]:
 
 def _emit_saturate_arith( dest: str, left: ir.Operand, right: ir.Operand, kind: str, dest_type: Type ) -> list[str]:
 	stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
-	if stem not in _SATURATE_LIMITS:
-		raise NotImplementedError( f'saturating {kind} on {stem!r} is not supported yet (no MIN/MAX for i128/u128)' )
-	min_c, max_c = _SATURATE_LIMITS[stem]
+	min_c, max_c = _int_min_max_bit_pattern( stem )
 	ctype = c_type( dest_type )
 	builtin = _ARITH_BUILTIN[kind]
 	l, r = _emit_operand( left ), _emit_operand( right )
@@ -1203,9 +1238,7 @@ def _emit_shl( instr ) -> list[str]:
 		]
 	# ShlSaturate
 	stem = instr.dest.type.stem if isinstance( instr.dest.type, Scalar ) else None
-	if stem not in _SATURATE_LIMITS:
-		raise NotImplementedError( f'saturating shl on {stem!r} is not supported yet' )
-	_min_c, max_c = _SATURATE_LIMITS[stem]
+	_min_c, max_c = _int_min_max_bit_pattern( stem )
 	ctype = c_type( instr.dest.type )
 	dest = _emit_operand( instr.dest )
 	return [
@@ -1234,11 +1267,9 @@ def _emit_neg( instr ) -> list[str]:
 		return [ f'\t{dest} = 0;' ] # unsigned wrap-negation: only 0 maps to itself, everything else wraps to (TYPE_MAX - x + 1) - see note below
 	if mode == 'saturate':
 		dest = _emit_operand( instr.dest )
-		if stem not in _SATURATE_LIMITS:
-			raise NotImplementedError( f'saturating negation on {stem!r} is not supported yet' )
 		if _is_unsigned_stem( stem ):
 			return [ f'\t{dest} = 0;' ] # unsigned negation always saturates to 0 (can never go negative)
-		_min_c, max_c = _SATURATE_LIMITS[stem]
+		_min_c, max_c = _int_min_max_bit_pattern( stem )
 		return [
 			'\t{',
 			f'\t\t{ctype} __tmp;',
@@ -1292,30 +1323,74 @@ def _emit_cast( instr ) -> list[str]:
 		# plain cast is all this needs, no unsigned-roundtrip trick required
 		dest = _emit_operand( instr.dest )
 		return [ f'\t{dest} = ({ctype})({operand});' ]
-	if stem not in _SATURATE_LIMITS:
-		raise NotImplementedError( f'{mode} cast to {stem!r} is not supported yet (no MIN/MAX for i128/u128)' )
-	min_c, max_c = _SATURATE_LIMITS[stem]
-	# promoted to __metalpy_wideint for the range comparison - every scalar width
-	# this compiler supports OTHER than i128/u128 themselves (excluded
-	# just above) fits inside __metalpy_wideint without loss, sidestepping the
-	# usual signed/unsigned-pairing headache a same-width comparison
-	# would otherwise need (source and target can differ in both width
-	# AND signedness - e.g. i32 -> u8, or u64 -> i16)
-	if mode == 'saturate':
-		dest = _emit_operand( instr.dest )
+	min_c, max_c = _int_min_max_bit_pattern( stem )
+	source_stem = instr.operand.type.stem if isinstance( instr.operand.type, Scalar ) else None
+	# u128 is the only stem whose own range (0..2**128-1) exceeds
+	# __metalpy_wideint's signed positive capacity (0..2**127-1) - as a
+	# SOURCE, a large value reinterpreted as signed wraps NEGATIVE,
+	# corrupting a wideint-space comparison; as a TARGET, its own MAX
+	# (_int_min_max_bit_pattern('u128')'s ~(wideuint)0) reinterpreted as
+	# signed becomes -1, equally corrupt. Same-type casts (u128 -> u128)
+	# never reach this function, so at most ONE side is ever u128 here.
+	if stem == 'u128' and source_stem != 'u128':
+		# target is u128, source isn't - no OTHER stem's own range can ever
+		# exceed u128's, so the upper bound can never actually fire; only a
+		# NEGATIVE source is out of range, checked directly on its own
+		# native type (a signed-vs-0 comparison needs no wide promotion at
+		# any width) - entirely skipping __metalpy_wide* machinery
+		out_of_range = None if source_stem is not None and _is_unsigned_stem( source_stem ) else f'( ({operand}) < 0 )'
+		if mode == 'saturate':
+			dest = _emit_operand( instr.dest )
+			clamp = f'{out_of_range} ? {min_c} : ({ctype})({operand})' if out_of_range else f'({ctype})({operand})'
+			return [ f'\t{dest} = {clamp};' ]
+		dest = _temp_name( instr.dest.id )
+		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+		if out_of_range is None:
+			return [ f'\t{dest}.{tag_f} = 0;', f'\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});' ]
 		return [
 			'\t{',
-			f'\t\t__metalpy_wideint __wide = (__metalpy_wideint)({operand});',
-			f'\t\t{dest} = ( __wide < (__metalpy_wideint)({min_c}) ) ? {min_c} : ( __wide > (__metalpy_wideint)({max_c}) ) ? {max_c} : ({ctype})({operand});',
+			f'\t\tbool __overflow = {out_of_range};',
+			'\t\tif ( __overflow ) {',
+			f'\t\t\t{dest}.{tag_f} = 1;',
+			'\t\t} else {',
+			f'\t\t\t{dest}.{tag_f} = 0;',
+			f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+			'\t\t}',
+			'\t}',
+		]
+	# every other combination (including target u128 paired with source
+	# u128, unreachable per the same-type-cast note above) fits safely in
+	# __metalpy_wideint, EXCEPT a u128 source, which needs __metalpy_wideuint
+	# instead (non-negative by construction, so its own lower-bound/MIN
+	# comparison would misfire if attempted and is skipped entirely - a
+	# non-negative source can never actually be "below" any real MIN anyway)
+	wide_ctype = '__metalpy_wideuint' if source_stem == 'u128' else '__metalpy_wideint'
+	wide_decl = f'{wide_ctype} __wide = ({wide_ctype})({operand});'
+	if mode == 'saturate':
+		dest = _emit_operand( instr.dest )
+		clamp = (
+			f'( __wide > ({wide_ctype})({max_c}) ) ? {max_c} : ({ctype})({operand})'
+			if wide_ctype == '__metalpy_wideuint' else
+			f'( __wide < ({wide_ctype})({min_c}) ) ? {min_c} : ( __wide > ({wide_ctype})({max_c}) ) ? {max_c} : ({ctype})({operand})'
+		)
+		return [
+			'\t{',
+			f'\t\t{wide_decl}',
+			f'\t\t{dest} = {clamp};',
 			'\t}',
 		]
 	# check
 	dest = _temp_name( instr.dest.id )
 	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+	overflow = (
+		f'( __wide > ({wide_ctype})({max_c}) )'
+		if wide_ctype == '__metalpy_wideuint' else
+		f'( __wide < ({wide_ctype})({min_c}) ) || ( __wide > ({wide_ctype})({max_c}) )'
+	)
 	return [
 		'\t{',
-		f'\t\t__metalpy_wideint __wide = (__metalpy_wideint)({operand});',
-		f'\t\tbool __overflow = ( __wide < (__metalpy_wideint)({min_c}) ) || ( __wide > (__metalpy_wideint)({max_c}) );',
+		f'\t\t{wide_decl}',
+		f'\t\tbool __overflow = {overflow};',
 		'\t\tif ( __overflow ) {',
 		f'\t\t\t{dest}.{tag_f} = 1;',
 		'\t\t} else {',
