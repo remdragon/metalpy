@@ -42,11 +42,13 @@ Features that exist now:
 	* on Windows, the stdlib avoids linking against msvcrt. However, use of any
 		feature that requires the C runtime will bring it in.
 	* lazily scan source file and only compile things actually needed
+	* f-strings
+		most common use-cases are implemented and working
+	* inline functions
+		right now restricted to simple bodies (WIP extending this)
 
 Features that are being scoped and built right now:
-	* f-strings
 	* global object initialization on startup
-	* inline functions
 	* generators
 
 Features that are planned but not built yet:
