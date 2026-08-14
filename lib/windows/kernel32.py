@@ -137,6 +137,39 @@ def SetEndOfFile(
 
 
 # ---------------------------------------------------------------------------
+# High-resolution timing — lib/time.py's monotonic() and time().
+#
+# QueryPerformanceCounter/QueryPerformanceFrequency are Microsoft's documented,
+# recommended monotonic high-resolution timestamp (a fixed ~10 MHz counter on
+# modern Windows, read largely in user mode). GetSystemTimePreciseAsFileTime is
+# the sub-microsecond wall clock (Win8 / Server 2012+). All three live in
+# kernel32 (always loaded, not C-runtime functions) so using them keeps Windows
+# builds CRT-free, same as everything else here - no need to reach into ntdll's
+# undocumented Rtl* equivalents. LARGE_INTEGER*/FILETIME* are each a single
+# 8-byte little-endian value, so Ptr[i64]/Ptr[u64] are ABI-identical to the real
+# out-parameter types (no @cstruct needed, same as WriteFile's Ptr[u32] count).
+# ---------------------------------------------------------------------------
+
+@extern('kernel32', 'QueryPerformanceCounter')
+def QueryPerformanceCounter(
+	lpPerformanceCount: Ptr[i64],  # LARGE_INTEGER*
+) -> bool:
+	...
+
+@extern('kernel32', 'QueryPerformanceFrequency')
+def QueryPerformanceFrequency(
+	lpFrequency: Ptr[i64],  # LARGE_INTEGER*
+) -> bool:
+	...
+
+@extern('kernel32', 'GetSystemTimePreciseAsFileTime')
+def GetSystemTimePreciseAsFileTime(
+	lpSystemTimeAsFileTime: Ptr[u64],  # LPFILETIME
+) -> None:
+	...
+
+
+# ---------------------------------------------------------------------------
 # SRWLOCK — slim reader/writer lock (exclusive-only for FastLock)
 # ---------------------------------------------------------------------------
 
