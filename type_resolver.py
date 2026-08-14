@@ -522,11 +522,6 @@ class TypeResolver:
 		members = self.monomorphizer.monomorphize_class( t ).attributes if isinstance( t, Specialization ) else base.attributes
 		return base, members
 
-	def _lookup_result_and_error_types( self, node: ast.AST, error_name: str ) -> tuple[ClassLike,ClassLike]:
-		result_cls = self.discovery.find_name( 'Result', node )
-		error_cls = self.discovery.find_name( error_name, node )
-		return result_cls, error_cls
-
 	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, alternatives: str, fn: Function|None = None ) -> None:
 		# the enclosing function must return Result[_, E_fn] where E_fn COVERS
 		# the op/receiver's error type E_op (error_cls) - every leaf of E_op is

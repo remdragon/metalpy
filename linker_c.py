@@ -56,7 +56,18 @@ class CcTool:
 			if no_crt:
 				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
 		else:
-			cmd = [ self.path ] + extra + obj_args + [ '-o', str( exe ) ]
+			# a program using an f32/f64<->i128/u128 cast needs GCC/Clang's own
+			# runtime helpers (__fixdfti/__fixunsdfti/__floattidf/... - see
+			# _find_wide_int_runtime_lib) - added as a full PATH positional
+			# arg, not a bare -l<name> flag: its own directory can contain
+			# spaces (a stock Windows LLVM install does), which `extra`'s
+			# plain-whitespace ldflags.split() above can't represent, and
+			# clang/gcc both accept a literal .a/.lib path as an ordinary
+			# linker input. Harmless to add even when unused - a static
+			# archive only pulls in symbols something else in the link
+			# actually references
+			wide_int_lib = _find_wide_int_runtime_lib( self )
+			cmd = [ self.path ] + extra + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + [ '-o', str( exe ) ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,
@@ -112,6 +123,70 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 
 	cache_file.write_text( '1' if available else '0', encoding = 'utf-8' )
 	return available
+
+
+def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
+	'''
+	Locates the static runtime library providing GCC/Clang's own float<->
+	128-bit-int conversion helpers (__fixdfti, __fixunsdfti, __floattidf,
+	...) - no hardware instruction does an f32/f64<->i128/u128 conversion
+	directly, so GCC/Clang emit a CALL to one of these instead (confirmed:
+	linking without this library fails with "unresolved external symbol
+	__fixdfti/__fixunsdfti"). MSVC's cl.exe needs none of this - i128/u128
+	fall back to plain 64-bit under cl.exe instead (see emitter_c.py's
+	__metalpy_wideint typedef and its own comment on why).
+
+	Returns None (best-effort, never fails the build) when not found - only
+	a program that actually performs one of these conversions needs the
+	symbols at all; every other program links exactly as it did before this
+	lookup existed.
+
+	Cached to disk under %TEMP%/metalpy/wide_int_runtime_lib/, same spirit
+	and location as has_symbol's own cache, since each lookup pays a real
+	subprocess.
+	'''
+	import hashlib
+	import tempfile
+
+	if cc.name not in ( 'clang', 'gcc' ):
+		return None
+
+	key = hashlib.sha256( f'{cc.name}\0{cc.path}'.encode() ).hexdigest()[:16]
+	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'wide_int_runtime_lib'
+	cache_dir.mkdir( parents = True, exist_ok = True )
+	cache_file = cache_dir / key
+	if cache_file.is_file():
+		return cache_file.read_text( encoding = 'utf-8' ).strip() or None
+
+	found: str|None = None
+	if cc.name == 'clang':
+		# clang -print-runtime-dir gives compiler-rt's own lib directory
+		# (e.g. .../lib/clang/<ver>/lib/windows) - the builtins archive in
+		# there is named clang_rt.builtins-<arch>.lib (Windows) or
+		# libclang_rt.builtins-<arch>.a (Linux/macOS); glob for it rather
+		# than hardcoding <arch>, excluding the "_dynamic"-suffixed DLL-
+		# import variant (this needs the STATIC archive, linked directly)
+		result = subprocess.run( [ cc.path, '-print-runtime-dir' ], capture_output = True, text = True )
+		rt_dir = Path( result.stdout.strip() ) if result.stdout.strip() else None
+		if result.returncode == 0 and rt_dir is not None and rt_dir.is_dir():
+			candidates = sorted(
+				p for p in rt_dir.glob( '*builtins*' )
+				if p.suffix in ( '.lib', '.a' ) and '_dynamic' not in p.stem
+			)
+			if candidates:
+				found = str( candidates[0] )
+	elif cc.name == 'gcc':
+		# the standard, portable way to ask gcc where its own libgcc.a is -
+		# gcc's own driver normally auto-links this already, but adding it
+		# explicitly here costs nothing and keeps this function's contract
+		# (a real path when found) uniform across both compilers
+		result = subprocess.run( [ cc.path, '-print-libgcc-file-name' ], capture_output = True, text = True )
+		path = Path( result.stdout.strip() ) if result.stdout.strip() else None
+		if result.returncode == 0 and path is not None and path.is_file():
+			found = str( path )
+
+	cache_file.write_text( found or '', encoding = 'utf-8' )
+	return found
 
 
 def detect_cc() -> CcTool|None:

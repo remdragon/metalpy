@@ -226,6 +226,37 @@ def main() -> i32:
 	return 0
 ''', checks )
 
+	# a numeric literal that overflows at PARSE TIME (Python's own ast.parse
+	# turns `1e400`/`-1e400` into a Constant carrying float('inf')/float('-inf')
+	# directly, before any lowering pass runs) reaches emitter_c.py's
+	# _emit_const, whose float branch used to do `repr(float(c.value))` -
+	# `repr(float('inf'))` is the Python string 'inf', not a valid C token, so
+	# the generated C failed to compile at all
+	def test_non_finite_float_literals( self ) -> None:
+		checks = [
+			'1e400 f64 literal is +inf',
+			'-1e400 f64 literal is -inf',
+			'1e400 f32 literal is +inf',
+			'-1e400 f32 literal is -inf',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		pos_inf: f64 = 1e400
+		if not ( pos_inf > 1.0e307 ):
+			return 1
+		neg_inf: f64 = -1e400
+		if not ( neg_inf < -1.0e307 ):
+			return 2
+		pos_inf32: f32 = 1e400
+		if not ( pos_inf32 > 1.0e37 ):
+			return 3
+		neg_inf32: f32 = -1e400
+		if not ( neg_inf32 < -1.0e37 ):
+			return 4
+	return 0
+''', checks )
+
 	# --- casts: int<->float, float<->float, clamping float->int -------------
 
 	def test_casts( self ) -> None:
@@ -343,6 +374,113 @@ def main() -> i32:
 		z: f64 = 0.0
 		nan: f64 = z / z
 		n: i32 = i32(nan)
+	return 0
+''' )
+
+	# f32/f64<->i128/u128 checked/clamping casts used to raise NotImplementedError
+	# outright at compile time (no portable stdint MIN/MAX macro exists for
+	# 128-bit ints) - fixed by comparing against the exact power-of-two
+	# boundary instead of a MIN/MAX macro (see emitter_c.py's
+	# _float_int_range_bounds), which needs no macro at all. Also required
+	# teaching linker_c.py to link GCC/Clang's own runtime helpers
+	# (__fixdfti/__fixunsdfti/...) that these conversions call into - no
+	# hardware instruction does an f32/f64<->128-bit-int conversion directly.
+	def test_checked_cast_i128_u128_in_range( self ) -> None:
+		checks = [ 'checked in-range f64->i128', 'checked in-range f64->u128' ]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("fp"):
+		a: f64 = 12345.0
+		x: i128 = i128(a)
+		if x != 12345:
+			return 1
+		y: u128 = u128(a)
+		if y != 12345:
+			return 2
+	return 0
+''', checks )
+
+	def test_checked_cast_i128_out_of_range_panics( self ) -> None:
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("fp"):
+		big: f64 = 1.0e40
+		n: i128 = i128(big)
+	return 0
+''' )
+
+	def test_checked_cast_u128_negative_panics( self ) -> None:
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("fp"):
+		neg: f64 = -1.0
+		n: u128 = u128(neg)
+	return 0
+''' )
+
+	def test_wrap_mode_clamp_i128_u128( self ) -> None:
+		# expected MIN/MAX are constructed via shifts of a properly i128/
+		# u128-TYPED variable, deliberately never a bare literal shifted by
+		# 127 directly - a separate, unrelated bug in this compiler's own
+		# shift-operator codegen leaves a shift LITERAL's left operand
+		# un-widened before shifting (out of scope here). u128_max is built
+		# under wrap semantics too (`(1<<127)*2 - 1` briefly overflows past
+		# u128's own range before the final `-1` brings it back in range -
+		# well-defined and correct under wraparound, unlike checked mode,
+		# which would panic on that intermediate overflow).
+		checks = [
+			'wrap-mode clamp: f64(1e40)->i128 == i128 MAX',
+			'wrap-mode clamp: f64(-1e40)->i128 == i128 MIN',
+			'wrap-mode clamp: f64(1e40)->u128 == u128 MAX',
+			'wrap-mode clamp: f64(-1e40)->u128 == 0',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		one: i128 = 1
+		i128_max: i128 = (one << 127) - 1
+		i128_min: i128 = -(one << 127)
+		one_u: u128 = 1
+		u128_max: u128 = (one_u << 127) * 2 - 1
+
+		big: f64 = 1.0e40
+		neg_big: f64 = -1.0e40
+		if i128(big) != i128_max:
+			return 1
+		if i128(neg_big) != i128_min:
+			return 2
+		if u128(big) != u128_max:
+			return 3
+		if u128(neg_big) != 0:
+			return 4
+	return 0
+''', checks )
+
+	# the upper-bound comparison used to compare against (fctype)INT64_MAX,
+	# which ROUNDS UP to exactly 2**63 when converted to f64 (INT64_MAX has
+	# more significant bits than f64's 53-bit mantissa can hold) - silently
+	# admitting exactly 2**63 as "in range", even though converting it to i64
+	# is undefined behavior (i64's real range tops out at 2**63 - 1). Fixed by
+	# comparing against the exact power-of-two boundary (2**63 itself, always
+	# exactly representable) with `>=` instead of `(f64)INT64_MAX` with `>`.
+	def test_checked_cast_i64_boundary_precision( self ) -> None:
+		checks = [
+			'f64(2**63 - 1024)->i64 in range (just below the true boundary)',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("fp"):
+		below: f64 = 9223372036854774784.0
+		n: i64 = i64(below)
+		if n != 9223372036854774784:
+			return 1
+	return 0
+''', checks )
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.panic_arithmetic("fp"):
+		boundary: f64 = 9223372036854775808.0
+		n: i64 = i64(boundary)
 	return 0
 ''' )
 

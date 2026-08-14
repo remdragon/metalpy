@@ -346,5 +346,67 @@ class UnionLeafRCTests( RealCompileMixin, unittest.TestCase ):
 		self.assert_programs_run([ ( 'union_leaf_rc_alias_delta', _UNION_LEAF_RC_ALIAS_DELTA ) ])
 
 
+# --- fresh-construction-into-inferred-union crash (lowering.py's
+# _lower_allocate_fields) ----------------------------------------------------
+#
+# Result.Err( ParseError( code = 42 ) ) - a FRESH construction of a plain leaf
+# class, passed directly as the argument to a call whose own type parameter
+# (E) is inferred from the surrounding declared return type to a multi-leaf
+# anonymous union (ParseError|OtherError) - used to crash the emitter with a
+# bare AssertionError. Root cause: _lower_allocate_fields blindly trusted
+# expected_type (hinted from the substituted, unified E, i.e. the UNION) as
+# the constructed temp's own type, producing a self-inconsistent ir.Allocate
+# (cls=ParseError, dest.type=the union) that also silently skipped
+# _lower_expr's own union-coercion check (operand.type was, by accident,
+# ALREADY identical to expected_type). Confirmed present on a fully unmodified
+# checkout via git stash - pre-existing, not introduced by any of this
+# session's own work. Fixed by only trusting expected_type as dest's type when
+# it's actually rooted at target_cls (itself, or a Specialization of it);
+# otherwise dest falls back to target_cls, so the real mismatch survives back
+# in _lower_expr and correctly triggers _coerce_into_union instead.
+#
+# Both directions matter: pre-binding the leaf to a local (`e = ParseError(...);
+# return Result.Err(e)`) already worked (never hits _lower_allocate_fields with
+# a mismatched expected_type), so this test specifically keeps the FRESH
+# construction expression inline as the call argument.
+
+_FRESH_CONSTRUCTION_INTO_INFERRED_UNION = '''
+class ParseError:
+	code: i32
+
+class OtherError:
+	code: i32
+
+def outer( fail: bool ) -> Result[bool, ParseError | OtherError]:
+	if fail:
+		return Result.Err( ParseError( code = 42 ) )
+	return Result.Ok( True )
+
+def main() -> i32:
+	r_ok: Result[bool, ParseError | OtherError] = outer( False )
+	if r_ok.is_err():
+		return 1
+	r_err: Result[bool, ParseError | OtherError] = outer( True )
+	match r_err:
+		case Result.Ok( v ):
+			return 2
+		case Result.Err( e ):
+			err: ParseError | OtherError = e
+			match err:
+				case ParseError( pe ):
+					if pe.code != 42:
+						return 3
+				case OtherError( oe ):
+					return 4
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class FreshConstructionIntoInferredUnionTests( RealCompileMixin, unittest.TestCase ):
+	def test_fresh_construction_into_inferred_union( self ) -> None:
+		self.assert_programs_run([ ( 'fresh_construction_into_inferred_union', _FRESH_CONSTRUCTION_INTO_INFERRED_UNION ) ])
+
+
 if __name__ == '__main__':
 	unittest.main()

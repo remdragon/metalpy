@@ -5260,7 +5260,36 @@ class FunctionLowering:
 			self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
 			return dest
 
-		dest = self._new_temp( expected_type or target_cls )
+		# expected_type is only trustworthy as dest's type when it's actually
+		# ROOTED AT target_cls (itself, a Specialization of it, or - inside a
+		# generic class's own method body, e.g. this exact __allocate__ call
+		# from Result's own synthesized Err/Ok constructor - the MONOMORPHIZED
+		# concrete class fn_cls's own Specialization already substitutes to;
+		# substitute_type_params eagerly monomorphizes a ClassLike-shaped
+		# type param instead of leaving it wrapped in a Specialization - see
+		# monomorphize_class's own "_building" comment - so a generic method's
+		# `self._current_fn.return_type` surfaces here already as that bare,
+		# concrete ClassLike, not a Specialization wrapping target_cls, even
+		# though fn_cls (this same call's own substituted class context,
+		# already used just above to resolve tag_field/data_field/declared)
+		# IS a Specialization of target_cls). Otherwise, expected_type can be
+		# hinted from an unrelated surrounding union context (a generic
+		# method call's own type-param unification substituting E in
+		# `Result.Err(ParseError(...))` to the inferred `ParseError|OtherError`
+		# union BEFORE this argument is even lowered - see
+		# _lower_and_infer_call_args). Blindly trusting it there produced a
+		# self-inconsistent ir.Allocate (cls=ParseError but dest.type=the
+		# union), silently bypassing _lower_expr's own union-coercion check
+		# (operand.type is expected_type by accidental identity) and crashing
+		# the emitter's isinstance(concrete_cls, RCClass) assert. Mirrors the
+		# same "pinning_type.base is target_cls" discipline
+		# _lower_generic_construction_args already applies before trusting
+		# expected_type for type-param inference.
+		compatible = ( expected_type is target_cls
+			or ( isinstance( expected_type, Specialization ) and expected_type.base is target_cls )
+			or ( isinstance( fn_cls, Specialization ) and fn_cls.base is target_cls
+				and expected_type is self.lowering.monomorphize_class( fn_cls ) ))
+		dest = self._new_temp( expected_type if compatible else target_cls )
 		# dest.type can be a concrete Specialization (ResultPayload[i32,
 		# OverflowError], inferred from the substituted field type this
 		# construction call is being assigned into - see the field.type

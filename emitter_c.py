@@ -1,6 +1,7 @@
 # stdlib imports:
 import dataclasses
 import hashlib
+import math
 import re
 
 # local imports:
@@ -185,13 +186,24 @@ typedef unsigned __int128 __metalpy_wideuint;
 // float-involving casts (FAddCheck/.../FloatCastCheck). GCC/Clang expose these
 // as builtins (no <math.h> needed); real MSVC (cl.exe) needs <math.h>, whose
 // isnan/isinf are C99 type-generic macros that work on float and double alike.
+// same MSVC-vs-GCC/Clang split for CONSTRUCTING a non-finite value (a source
+// literal that overflows at parse time, e.g. 1e400 -> float('inf')) - INFINITY/
+// NAN are <math.h> macros; __builtin_inf[f]/__builtin_nan[f] need no header.
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <math.h>
 #define __metalpy_isnan(x) isnan(x)
 #define __metalpy_isinf(x) isinf(x)
+#define __metalpy_inff() ((float)INFINITY)
+#define __metalpy_inf()  ((double)INFINITY)
+#define __metalpy_nanf() ((float)NAN)
+#define __metalpy_nan()  ((double)NAN)
 #else
 #define __metalpy_isnan(x) __builtin_isnan(x)
 #define __metalpy_isinf(x) __builtin_isinf(x)
+#define __metalpy_inff() __builtin_inff()
+#define __metalpy_inf()  __builtin_inf()
+#define __metalpy_nanf() __builtin_nanf("")
+#define __metalpy_nan()  __builtin_nan("")
 #endif
 // Windows: call SetConsoleOutputCP(CP_UTF8) so Unicode print() works.
 // Called from __metalpy_init() (synthesized below, in emit_c()) on every
@@ -800,8 +812,21 @@ def _emit_const( c: ir.Const ) -> str:
 		# `f` suffix on an f32 avoids a double->float narrowing warning and
 		# pins the constant to single precision. int values (1 -> "1.0f")
 		# are formatted through float() so they always carry a decimal point
-		text = repr( float( c.value ))
-		return text + 'f' if _is_float_type( c.type ) and c.type.stem == 'f32' else text
+		value = float( c.value )
+		is_f32 = _is_float_type( c.type ) and c.type.stem == 'f32'
+		# a source literal that overflows AT PARSE TIME (Python's ast.parse
+		# itself turns e.g. `1e400` into a Constant carrying float('inf'),
+		# well before any lowering pass runs) has no valid C spelling via
+		# repr() - 'inf'/'-inf'/'nan' aren't C tokens. Use the same
+		# MSVC-vs-GCC/Clang-portable macros __metalpy_isnan/__metalpy_isinf
+		# already rely on for classification, here for construction.
+		if math.isinf( value ):
+			sign = '-' if value < 0 else ''
+			return f'{sign}__metalpy_inff()' if is_f32 else f'{sign}__metalpy_inf()'
+		if math.isnan( value ):
+			return '__metalpy_nanf()' if is_f32 else '__metalpy_nan()'
+		text = repr( value )
+		return text + 'f' if is_f32 else text
 	if isinstance( c.value, int ):
 		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast
 		if isinstance( c.type, Specialization ):
@@ -925,15 +950,66 @@ def _emit_float_check_arith( instr ) -> list[str]:
 		'\t}',
 	]
 
+# fixed-width integer scalar stem -> bit width - used only by
+# _float_int_range_bounds/_int_min_max_bit_pattern below, for a float<->int
+# range check's exact power-of-two boundary. isize/usize are handled
+# separately there (their width isn't known to the Python emitter, only to
+# the C compiler, via sizeof(intptr_t))
+_FIXED_INT_BITS: dict[str,int] = {
+	'i8': 8, 'u8': 8, 'i16': 16, 'u16': 16, 'i32': 32, 'u32': 32,
+	'i64': 64, 'u64': 64, 'i128': 128, 'u128': 128,
+}
+
+def _float_int_range_bounds( stem: str, fctype: str ) -> tuple[str,str]:
+	''' (min_expr, exclusive_max_expr): the exact range, as `fctype` C
+	expressions, a float source value must satisfy before converting to the
+	integer stem `stem` is defined (UB otherwise). exclusive_max_expr is the
+	exact power-of-two ONE PAST the stem's real MAX (2**(n-1) signed, 2**n
+	unsigned) rather than (fctype)MAX itself: MAX as an int literal rounds UP
+	when converted to a float whose mantissa is narrower than n bits (e.g.
+	(f64)INT64_MAX rounds to exactly 2**63, silently admitting one
+	out-of-range value as in-range) - a power-of-two boundary is always
+	exactly representable in a binary float instead, sidestepping the
+	rounding entirely and needing no stdint MIN/MAX macro at all (unlike
+	_SATURATE_LIMITS, this covers i128/u128 too, with no separate case
+	needed). Compare with `< min_expr` / `>= exclusive_max_expr` to reject -
+	never `> max_expr`, the imprecise comparison this replaces. '''
+	if stem not in _FIXED_INT_BITS and stem not in ( 'isize', 'usize' ):
+		raise NotImplementedError( f'float<->int range check: unsupported target stem {stem!r}' )
+	shift = 'sizeof(intptr_t)*8 - 1' if stem in ( 'isize', 'usize' ) else str( _FIXED_INT_BITS[stem] - 1 )
+	half = f'(({fctype})((__metalpy_wideuint)1 << ({shift})))' # exact 2**(n-1)
+	if _is_unsigned_stem( stem ):
+		return f'({fctype})0', f'(({fctype})2.0 * {half})' # exact 2**n
+	return f'(-{half})', half
+
+def _int_min_max_bit_pattern( stem: str ) -> tuple[str,str]:
+	''' (MIN, MAX) as C expressions typed for stem's own ctype - covers every
+	integer stem including i128/u128 (no stdint MIN/MAX macro exists for
+	those; the two's-complement/all-ones bit pattern is used instead,
+	matching _signed_min_max's existing technique for i128's own MIN/MAX,
+	extended here to the unsigned side too since a float->int CLAMP needs
+	both signed and unsigned targets, unlike _signed_min_max's own single
+	(division INT_MIN/-1 UB check) caller). '''
+	if stem in _SATURATE_LIMITS:
+		return _SATURATE_LIMITS[stem]
+	if stem == 'i128':
+		return ( '(__metalpy_wideint)((__metalpy_wideuint)1 << 127)',
+			'(__metalpy_wideint)(((__metalpy_wideuint)1 << 127) - 1)' )
+	if stem == 'u128':
+		return ( '(__metalpy_wideuint)0', '(~(__metalpy_wideuint)0)' )
+	raise NotImplementedError( f'no MIN/MAX for stem {stem!r}' )
+
 def _emit_float_cast_check( instr ) -> list[str]:
 	# checked/panic-mode float-involving cast (FloatCastCheck). dest.type is
 	# Result[target,FloatingPointError]. Two directions:
 	#  - to-float (int->float, f64->f32): convert, then flag an inf/nan RESULT
 	#    (overflow to inf, or a nan source surviving f64->f32).
 	#  - float->int: a source that's nan or outside the int's range is UB to
-	#    convert in C, so flag it BEFORE converting. Range compared in the
-	#    source float type (exact for i8..u32; approximate at 64/128-bit
-	#    extremes - a documented edge, same spirit as the saturate limits).
+	#    convert in C, so flag it BEFORE converting. Range compared via
+	#    _float_int_range_bounds's exact power-of-two boundaries (every
+	#    width, i128/u128 included - see its own docstring for why the naive
+	#    (fctype)MAX comparison this replaces was imprecise at 64/128-bit
+	#    extremes).
 	ok_type = instr.dest.type.args[0]
 	ctype = c_type( ok_type )
 	operand = _emit_operand( instr.operand )
@@ -953,13 +1029,11 @@ def _emit_float_cast_check( instr ) -> list[str]:
 		]
 	# float -> int
 	stem = ok_type.stem if isinstance( ok_type, Scalar ) else None
-	if stem not in _SATURATE_LIMITS:
-		raise NotImplementedError( f'checked float->{stem!r} cast is not supported yet (no MIN/MAX for i128/u128)' )
-	min_c, max_c = _SATURATE_LIMITS[stem]
 	fctype = c_type( instr.operand.type ) # the source float type (f32/f64)
+	min_c, max_c = _float_int_range_bounds( stem, fctype )
 	return [
 		'\t{',
-		f'\t\tif ( __metalpy_isnan( {operand} ) || ({operand}) < ({fctype}){min_c} || ({operand}) > ({fctype}){max_c} ) {{',
+		f'\t\tif ( __metalpy_isnan( {operand} ) || ({operand}) < {min_c} || ({operand}) >= {max_c} ) {{',
 		f'\t\t\t{dest}.{tag_f} = 1;',
 		'\t\t} else {',
 		f'\t\t\t{dest}.{tag_f} = 0;',
@@ -971,20 +1045,23 @@ def _emit_float_cast_check( instr ) -> list[str]:
 def _emit_float_to_int_clamp( instr ) -> list[str]:
 	# wrap/saturate-mode float->int cast (FloatToIntClamp): clamp so it's never
 	# UB - nan->0, below-range->MIN, above-range->MAX, else a plain truncating
-	# cast. dest.type is the int scalar directly (no Result).
+	# cast. dest.type is the int scalar directly (no Result). Whether a value
+	# needs clamping is decided via the exact float-typed boundaries
+	# (_float_int_range_bounds); the CLAMPED RESULT itself uses the real
+	# integer MIN/MAX (_int_min_max_bit_pattern) - two different types for two
+	# different purposes, both exact.
 	dest_type = instr.dest.type
 	stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
-	if stem not in _SATURATE_LIMITS:
-		raise NotImplementedError( f'clamping float->{stem!r} cast is not supported yet (no MIN/MAX for i128/u128)' )
-	min_c, max_c = _SATURATE_LIMITS[stem]
 	ctype = c_type( dest_type )
 	fctype = c_type( instr.operand.type )
 	operand = _emit_operand( instr.operand )
 	dest = _emit_operand( instr.dest )
+	cmp_min, cmp_max = _float_int_range_bounds( stem, fctype )
+	int_min, int_max = _int_min_max_bit_pattern( stem )
 	return [
 		f'\t{dest} = __metalpy_isnan( {operand} ) ? 0 : '
-		f'( ({operand}) < ({fctype}){min_c} ? {min_c} : '
-		f'( ({operand}) > ({fctype}){max_c} ? {max_c} : ({ctype})({operand}) ) );',
+		f'( ({operand}) < {cmp_min} ? ({ctype}){int_min} : '
+		f'( ({operand}) >= {cmp_max} ? ({ctype}){int_max} : ({ctype})({operand}) ) );',
 	]
 
 # --- division / modulo (mode-aware, union errors) -------------------------
