@@ -5332,7 +5332,22 @@ class FunctionLowering:
 		# when expected_type isn't usable, falling back to the bare ABSTRACT
 		# target_cls (unspecialized type_params and all) is only actually
 		# correct when target_cls isn't generic in the first place - see
-		# _infer_allocate_type_args
+		# _infer_allocate_type_args. TaggedUnion is included here even though
+		# _infer_allocate_type_args can never actually bind anything through
+		# it (this branch's own `declared` is always {tag, data} - tag_field.
+		# type is a plain intrinsic and data_field.type is a synthesized
+		# anonymous CUnion whose own type_params is never set by union_
+		# storage.py's UnionStorage.get(), so neither shape is one
+		# _unify_type_param can recurse through). That's a harmless no-op
+		# today, not a live gap: every REAL generic-union construction goes
+		# through union_storage.py's synthesized per-member constructor,
+		# whose own fn_cls/expected_type relationship always satisfies
+		# `compatible` above BEFORE inference would ever run. If some future
+		# path ever did reach here uncompatible, _infer_allocate_type_args's
+		# own "cannot infer type parameter(s)" fits this function's
+		# established fail-loudly-not-silently-wrong discipline - which is
+		# exactly why TaggedUnion stays in this isinstance check rather than
+		# being carved out back to the bare-abstract-class fallback
 		class_type_params: list[TypeVar] = (
 			target_cls.type_params or []
 		) if isinstance( target_cls, ( RCClass, CStruct, CUnion, TaggedUnion )) else []

@@ -4306,6 +4306,76 @@ class Tests( unittest.TestCase ):
 		payload_allocs = [ i for i in ctor_lf.instructions if isinstance( i, ir.Allocate ) and i.cls.stem == 'Foo$data' ]
 		self.assertEqual( len( payload_allocs ), 1 )
 
+	# --- direct @cunion construction (bare, not through a @union's own
+	# synthesized per-member constructor) - a @cunion can never declare
+	# __init__, so this always goes through _lower_allocate_fields's own
+	# "exactly one field" validation (the isinstance(target_cls, CUnion)
+	# branch), reachable from ordinary user code, not just union_storage.py's
+	# own internal payload-class synthesis. Previously only exercised
+	# indirectly through @union's own constructors (the tests just above) -
+	# these hit the validation directly
+
+	def test_cunion_construct_with_one_field_succeeds( self ) -> None:
+		code = '\n'.join([
+			'@cunion',
+			'class Payload:',
+			'	a: i32',
+			'	b: f32',
+			'',
+			'def main() -> None:',
+			'	p: Payload = Payload( a = 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_cunion_construct_with_two_fields_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cunion',
+			'class Payload:',
+			'	a: i32',
+			'	b: f32',
+			'',
+			'def main() -> None:',
+			'	p: Payload = Payload( a = 1, b = 2.0 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'takes exactly one field', self.discovery.errors.errors[0] )
+
+	def test_cunion_construct_with_no_fields_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cunion',
+			'class Payload:',
+			'	a: i32',
+			'	b: f32',
+			'',
+			'def main() -> None:',
+			'	p: Payload = Payload()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'takes exactly one field', self.discovery.errors.errors[0] )
+
+	def test_cunion_construct_with_unknown_field_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'@cunion',
+			'class Payload:',
+			'	a: i32',
+			'	b: f32',
+			'',
+			'def main() -> None:',
+			'	p: Payload = Payload( c = 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'has no field(s)', self.discovery.errors.errors[0] )
+		self.assertIn( 'c', self.discovery.errors.errors[0] )
+
 	# --- attributes / subscripts --------------------------------------------
 
 	def test_getattr_setattr( self ) -> None:
