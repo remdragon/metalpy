@@ -262,11 +262,28 @@ class str:
 	
 	@staticmethod
 	def concat( parts: slice[str] ) -> str:
+		# get_unchecked(i) is a bare borrow (see its own comment - no incref of
+		# its own), but binding a Call's return into a named local like `part`
+		# is always treated as a fresh, OWNED value by the general RC
+		# convention (matching how a genuinely fresh Call result normally
+		# works) - part's own unconditional scope-exit decref (once per loop
+		# iteration) then releases a reference this function never actually
+		# took, over-releasing the SAME string the caller's own slice/
+		# UnsafeList still holds. compiler.incref(part) right after the borrow
+		# gives part a real +1 of its own, which its own scope-exit decref
+		# then correctly cancels - net zero, a pure borrow, exactly what a
+		# read-only scan needs (the same explicit-incref-after-a-borrowing-
+		# Call pattern UnsafeList.__getitem__ already uses). Confirmed via a
+		# real UAF/AddressSanitizer repro: an f-string with more than one
+		# interpolation (this is concat's only real caller) freed one of its
+		# own parts mid-scan, then double-freed it again when the scratch
+		# UnsafeList[str] was destroyed.
 		new_size: usize = 1 # for the zero terminator
 		i: usize = 0
 		count: usize = parts.__len__()
 		for i in range( count ):
 			part: str = parts.get_unchecked( i )
+			compiler.incref( part )
 			with compiler.panic_arithmetic( 'irrational string length' ):
 				new_size += part.__byte_size - 1
 
@@ -275,14 +292,15 @@ class str:
 
 		for i in range( count ):
 			part: str = parts.get_unchecked( i )
+			compiler.incref( part )
 			with compiler.panic_arithmetic( 'irrational string length' ):
 				part_len: usize = part.__byte_size - 1
 			with compiler.wrap_arithmetic:
 				sys.memcpy( new_buf + offset, part.__data, part_len )
 				offset += part_len
-		
+
 		new_buf[offset] = 0 # guarantee null termination
-		
+
 		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in concat' )
 	
 	def encode( self, codec: Codec = utf8 ) -> Result[bytes,CodecError]:
