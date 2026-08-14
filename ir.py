@@ -17,7 +17,7 @@ class Temp( Value ):
 
 @dataclass( kw_only = True )
 class Const( Value ):
-	value: bool|int|str|bytes|None # no float type exists in the language today
+	value: bool|int|str|bytes|float|None # float: an f32/f64 literal (3.14, 1.5, ...)
 
 @dataclass( kw_only = True )
 class FunctionRef( Value ):
@@ -168,6 +168,21 @@ class ShlSaturate( BinOp ): pass
 class Div( BinOp ): checked_error = 'ZeroDivisionError' # dest.type is Result[T,ZeroDivisionError]
 class Mod( BinOp ): checked_error = 'ZeroDivisionError' # dest.type is Result[T,ZeroDivisionError]
 
+# --- floating-point (f32/f64) arithmetic ---
+# Floats have no integer overflow concept - IEEE 754 yields inf/nan, never
+# traps - so they don't reuse the Wrap/Check/Saturate integer opcodes. Instead:
+# checked/panic mode uses the *Check variants below (result inf/nan -> Result[T,
+# FloatingPointError]); wrap/saturate mode uses the plain variants (raw IEEE, no
+# error). See arithmetic_mode.py (GetFloatBinOp/GetFloatUnaryOp/GetFloatCast)
+# for the mode->opcode mapping, and lowering.py's _is_float_scalar for routing.
+# NOTE division reuses the integer Div opcode in checked/panic mode (its r==0 ->
+# ZeroDivisionError check works verbatim for a float divisor - see the plan's
+# documented gap on division-result inf/nan); only wrap/saturate needs FloatDiv.
+class FloatDiv( BinOp ): pass # plain IEEE l/r, no zero-check (wrap/saturate)
+class FAddCheck( BinOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
+class FSubCheck( BinOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
+class FMulCheck( BinOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
+
 class BitAnd( BinOp ): pass
 class BitOr( BinOp ): pass
 class BitXor( BinOp ): pass
@@ -193,6 +208,16 @@ class NegSaturate( UnaryOp ): pass
 class CastWrap( UnaryOp ): pass
 class CastCheck( UnaryOp ): checked_error = 'OverflowError' # dest.type is Result[T,OverflowError]
 class CastSaturate( UnaryOp ): pass
+
+# float-involving scalar casts (see the float-arithmetic note above). Unary `-`
+# on a float always reuses the plain NegWrap opcode (negation never introduces
+# inf/nan, so there's nothing to check), so no float negate opcode is needed.
+# FloatCastCheck covers BOTH directions (to-float: result inf/nan check; float->
+# int: source out-of-range/nan check) - the emitter branches on target/source.
+# FloatToIntClamp is the wrap/saturate float->int cast (clamps nan->0 and out-of-
+# range->MIN/MAX so it's never UB - wrap==saturate here per the plan).
+class FloatCastCheck( UnaryOp ): checked_error = 'FloatingPointError' # dest.type is Result[T,FloatingPointError]
+class FloatToIntClamp( UnaryOp ): pass # plain clamping float->int, no error
 
 @dataclass( kw_only = True )
 class Not( Instruction ): # boolean negation: dest = !operand

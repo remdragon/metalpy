@@ -181,6 +181,18 @@ typedef unsigned __int128 __metalpy_wideuint;
 #define __metalpy_sub_overflow(a,b,r) __builtin_sub_overflow(a,b,r)
 #define __metalpy_mul_overflow(a,b,r) __builtin_mul_overflow(a,b,r)
 #endif
+// floating-point classification for checked/panic-mode float arithmetic and
+// float-involving casts (FAddCheck/.../FloatCastCheck). GCC/Clang expose these
+// as builtins (no <math.h> needed); real MSVC (cl.exe) needs <math.h>, whose
+// isnan/isinf are C99 type-generic macros that work on float and double alike.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <math.h>
+#define __metalpy_isnan(x) isnan(x)
+#define __metalpy_isinf(x) isinf(x)
+#else
+#define __metalpy_isnan(x) __builtin_isnan(x)
+#define __metalpy_isinf(x) __builtin_isinf(x)
+#endif
 // Windows: call SetConsoleOutputCP(CP_UTF8) so Unicode print() works.
 // Called from main() on every Windows build, and from the custom entry
 // point (mainCRTStartup below) when the CRT is not linked.
@@ -321,7 +333,20 @@ _SCALAR_C_TYPES: dict[str,str] = {
 	'i128': '__metalpy_wideint', 'u128': '__metalpy_wideuint',
 	'isize': 'intptr_t', 'usize': 'uintptr_t',
 	'bool': 'bool',
+	# IEEE 754 single/double precision. Only the canonical stems appear here -
+	# `float`/`double` are aliases that resolve to the SAME Scalar object whose
+	# .stem is 'f32'/'f64' (see discovery.py's get_intrinsics), so they map
+	# through these entries automatically
+	'f32': 'float', 'f64': 'double',
 }
+
+# the floating-point scalar stems - neither signed nor unsigned integers, so
+# they bypass the whole checked/wrap/saturate integer machinery (see the float
+# opcode handling below and lowering.py's own _is_float_scalar)
+_FLOAT_STEMS: frozenset[str] = frozenset([ 'f32', 'f64' ])
+
+def _is_float_type( t: Type|None ) -> bool:
+	return isinstance( t, Scalar ) and t.stem in _FLOAT_STEMS
 
 # signed stem -> its same-width unsigned counterpart - used to compute
 # Wrap-mode arithmetic via the standard defined-behavior idiom (C's signed
@@ -655,6 +680,15 @@ def _emit_operand( op: ir.Operand ) -> str:
 def _emit_const( c: ir.Const ) -> str:
 	if isinstance( c.value, bool ):
 		return 'true' if c.value else 'false'
+	if isinstance( c.value, float ) or ( isinstance( c.value, int ) and _is_float_type( c.type )):
+		# a float literal, OR an int literal that was hinted to a float type
+		# (e.g. the `1` in `f + 1`, typed f32 by _lower_binary_operands's
+		# constant-hinting). repr() round-trips a Python float exactly; the
+		# `f` suffix on an f32 avoids a double->float narrowing warning and
+		# pins the constant to single precision. int values (1 -> "1.0f")
+		# are formatted through float() so they always carry a decimal point
+		text = repr( float( c.value ))
+		return text + 'f' if _is_float_type( c.type ) and c.type.stem == 'f32' else text
 	if isinstance( c.value, int ):
 		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast
 		if isinstance( c.type, Specialization ):
@@ -751,6 +785,95 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 		'\t}',
 	]
 
+# checked/panic-mode float +,-,* (FAddCheck/FSubCheck/FMulCheck) - the float
+# analogue of _emit_check_arith. There's no overflow builtin for floats: compute
+# the plain IEEE result, then flag it if it came out inf/nan (which also catches
+# a nan/inf operand propagating through). dest.type is Result[float,
+# FloatingPointError]. Division is NOT here (checked float / reuses ir.Div ->
+# ZeroDivisionError; see that block).
+_FLOAT_CHECK_SYMBOL: dict[type,str] = { ir.FAddCheck: '+', ir.FSubCheck: '-', ir.FMulCheck: '*' }
+
+def _emit_float_check_arith( instr ) -> list[str]:
+	symbol = _FLOAT_CHECK_SYMBOL[type(instr)]
+	ok_type = instr.dest.type.args[0]
+	ctype = c_type( ok_type )
+	dest = f't{instr.dest.id}'
+	l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
+	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+	return [
+		'\t{',
+		f'\t\t{ctype} __tmp = ({l}) {symbol} ({r});',
+		'\t\tif ( __metalpy_isinf( __tmp ) || __metalpy_isnan( __tmp ) ) {',
+		f'\t\t\t{dest}.{tag_f} = 1;',
+		'\t\t} else {',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
+		'\t\t}',
+		'\t}',
+	]
+
+def _emit_float_cast_check( instr ) -> list[str]:
+	# checked/panic-mode float-involving cast (FloatCastCheck). dest.type is
+	# Result[target,FloatingPointError]. Two directions:
+	#  - to-float (int->float, f64->f32): convert, then flag an inf/nan RESULT
+	#    (overflow to inf, or a nan source surviving f64->f32).
+	#  - float->int: a source that's nan or outside the int's range is UB to
+	#    convert in C, so flag it BEFORE converting. Range compared in the
+	#    source float type (exact for i8..u32; approximate at 64/128-bit
+	#    extremes - a documented edge, same spirit as the saturate limits).
+	ok_type = instr.dest.type.args[0]
+	ctype = c_type( ok_type )
+	operand = _emit_operand( instr.operand )
+	dest = f't{instr.dest.id}'
+	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+	if _is_float_type( ok_type ):
+		return [
+			'\t{',
+			f'\t\t{ctype} __tmp = ({ctype})({operand});',
+			'\t\tif ( __metalpy_isinf( __tmp ) || __metalpy_isnan( __tmp ) ) {',
+			f'\t\t\t{dest}.{tag_f} = 1;',
+			'\t\t} else {',
+			f'\t\t\t{dest}.{tag_f} = 0;',
+			f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
+			'\t\t}',
+			'\t}',
+		]
+	# float -> int
+	stem = ok_type.stem if isinstance( ok_type, Scalar ) else None
+	if stem not in _SATURATE_LIMITS:
+		raise NotImplementedError( f'checked float->{stem!r} cast is not supported yet (no MIN/MAX for i128/u128)' )
+	min_c, max_c = _SATURATE_LIMITS[stem]
+	fctype = c_type( instr.operand.type ) # the source float type (f32/f64)
+	return [
+		'\t{',
+		f'\t\tif ( __metalpy_isnan( {operand} ) || ({operand}) < ({fctype}){min_c} || ({operand}) > ({fctype}){max_c} ) {{',
+		f'\t\t\t{dest}.{tag_f} = 1;',
+		'\t\t} else {',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+		'\t\t}',
+		'\t}',
+	]
+
+def _emit_float_to_int_clamp( instr ) -> list[str]:
+	# wrap/saturate-mode float->int cast (FloatToIntClamp): clamp so it's never
+	# UB - nan->0, below-range->MIN, above-range->MAX, else a plain truncating
+	# cast. dest.type is the int scalar directly (no Result).
+	dest_type = instr.dest.type
+	stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
+	if stem not in _SATURATE_LIMITS:
+		raise NotImplementedError( f'clamping float->{stem!r} cast is not supported yet (no MIN/MAX for i128/u128)' )
+	min_c, max_c = _SATURATE_LIMITS[stem]
+	ctype = c_type( dest_type )
+	fctype = c_type( instr.operand.type )
+	operand = _emit_operand( instr.operand )
+	dest = _emit_operand( instr.dest )
+	return [
+		f'\t{dest} = __metalpy_isnan( {operand} ) ? 0 : '
+		f'( ({operand}) < ({fctype}){min_c} ? {min_c} : '
+		f'( ({operand}) > ({fctype}){max_c} ? {max_c} : ({ctype})({operand}) ) );',
+	]
+
 def _emit_saturate_arith( dest: str, left: ir.Operand, right: ir.Operand, kind: str, dest_type: Type ) -> list[str]:
 	stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
 	if stem not in _SATURATE_LIMITS:
@@ -827,6 +950,8 @@ def _emit_neg( instr ) -> list[str]:
 	ctype = c_type( dest_type )
 	if mode == 'wrap':
 		dest = _emit_operand( instr.dest )
+		if _is_float_type( dest_type ):
+			return [ f'\t{dest} = -({operand});' ] # IEEE negation: exact, just flips the sign bit (all modes route float `-` through NegWrap)
 		if stem in _SIGNED_TO_UNSIGNED:
 			uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
 			return [ f'\t{dest} = ({ctype})(-({uctype})({operand}));' ]
@@ -1161,6 +1286,23 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			f'\t\t{dest}.{data_f}.{ok_f} = ({l}) {symbol} ({r});',
 			'\t}',
 		]
+
+	if isinstance( instr, ir.FloatDiv ):
+		# wrap/saturate-mode float `/`: raw IEEE, no zero-check (x/0.0 -> inf,
+		# 0.0/0.0 -> nan, produced silently). checked/panic-mode float `/` uses
+		# ir.Div above instead (-> ZeroDivisionError)
+		dest = _emit_operand( instr.dest )
+		l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
+		return [ f'\t{dest} = ({l}) / ({r});' ]
+
+	if type( instr ) in _FLOAT_CHECK_SYMBOL:
+		return _emit_float_check_arith( instr )
+
+	if isinstance( instr, ir.FloatCastCheck ):
+		return _emit_float_cast_check( instr )
+
+	if isinstance( instr, ir.FloatToIntClamp ):
+		return _emit_float_to_int_clamp( instr )
 
 	if type( instr ) in _PLAIN_BITWISE_SYMBOL:
 		dest = _emit_operand( instr.dest )

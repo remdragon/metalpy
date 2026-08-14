@@ -320,6 +320,23 @@ class Discovery( ast.NodeVisitor ):
 					line = None,
 					sizeof = sizeof,
 				)
+			# the two floating-point intrinsics live in the same tier as the
+			# fixed-width integers above (not lib/-defined classes) - IEEE 754
+			# single/double precision. `float`/`double` are NOT distinct types
+			# from f32/f64: they're two spellings of the same type, so the
+			# alias entries below point at the very same Scalar object (identity
+			# comparisons everywhere then treat `float` and `f32` as one type -
+			# a value typed `float` satisfies an `f32` parameter, and vice versa)
+			for name, sizeof in [ ( 'f32', 4 ), ( 'f64', 8 ) ]:
+				intrinsics[name] = Scalar(
+					stem = name,
+					qualname = f'intrinsics.{name}',
+					file = None,
+					line = None,
+					sizeof = sizeof,
+				)
+			intrinsics['float'] = intrinsics['f32']
+			intrinsics['double'] = intrinsics['f64']
 			# not a fixed-width integer, but the same tier as the numeric
 			# scalars above rather than a lib/-defined class: ir.py's own
 			# Const.value (bool|int|str|bytes|None) already treats it as a
