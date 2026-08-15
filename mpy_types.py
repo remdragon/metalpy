@@ -301,6 +301,30 @@ class Parameter( Variable ):
 	is_move: bool = False
 	is_copy: bool = False
 
+def _ownership_annotation_error( t: 'Type', question: str ) -> AssertionError:
+	''' move[T]/copy[T] are an ownership STATUS on a binding, not types (see
+	Move's own docstring) - asking one whether it's reference-counted, or how
+	it's laid out in memory, is a category error, and the only honest answer
+	is that whoever asked is holding a PARAMETER's declared annotation where
+	they meant to hold a real runtime type.
+
+	Deliberately raises rather than politely delegating to .inner. Delegating
+	would make every such call quietly WORK, which permanently hides whether
+	any path in the compiler treats an ownership annotation as a runtime type
+	- and a wrapper reaching, say, cfg.py's refcount emission is a genuine
+	bug worth seeing, not something to paper over. Callers that legitimately
+	hold one (cfg.py's _enter_parameter, which needs the Move/Copy-ness
+	itself to pick an OwnState) call .unwrap_ownership() first.
+
+	AssertionError, not CompileError: there is no user error to report here -
+	CompileError's contract is that the failure is already recorded in an
+	ErrorCollector - this is strictly a compiler-internal invariant. '''
+	return AssertionError(
+		f'{type(t).__name__}[{t.inner.qualname}] was asked {question}() - '
+		f'move[T]/copy[T] are ownership annotations, not types. '
+		f'Call .unwrap_ownership() first.'
+	)
+
 @dataclass( kw_only = True )
 class Move( Type ):
 	''' `move[T]` in annotation position - ownership of a T is transferred into this binding rather than borrowed/copied. The CFG uses this to know the source binding must be invalidated after the transfer.
@@ -317,6 +341,13 @@ class Move( Type ):
 	def unwrap_ownership( self ) -> Type:
 		return self.inner
 
+	# see _ownership_annotation_error
+	def is_rc( self ) -> bool: raise _ownership_annotation_error( self, 'is_rc' )
+	def is_rc_pointer( self ) -> bool: raise _ownership_annotation_error( self, 'is_rc_pointer' )
+	def rc_leaves( self ) -> list[Type]: raise _ownership_annotation_error( self, 'rc_leaves' )
+	def has_object_header( self ) -> bool: raise _ownership_annotation_error( self, 'has_object_header' )
+	def has_vtable( self ) -> bool: raise _ownership_annotation_error( self, 'has_vtable' )
+
 @dataclass( kw_only = True )
 class Copy( Type ):
 	''' `copy[T]` in annotation position - the callee wants its own
@@ -330,6 +361,13 @@ class Copy( Type ):
 
 	def unwrap_ownership( self ) -> Type:
 		return self.inner
+
+	# see _ownership_annotation_error
+	def is_rc( self ) -> bool: raise _ownership_annotation_error( self, 'is_rc' )
+	def is_rc_pointer( self ) -> bool: raise _ownership_annotation_error( self, 'is_rc_pointer' )
+	def rc_leaves( self ) -> list[Type]: raise _ownership_annotation_error( self, 'rc_leaves' )
+	def has_object_header( self ) -> bool: raise _ownership_annotation_error( self, 'has_object_header' )
+	def has_vtable( self ) -> bool: raise _ownership_annotation_error( self, 'has_vtable' )
 
 @dataclass( kw_only = True )
 class CallableType( Type ):

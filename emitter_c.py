@@ -9,7 +9,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
@@ -699,8 +699,7 @@ def c_type( t: Type|None ) -> str:
 	first (ownership is a compile-time/CFG-only concept, invisible in C). '''
 	if t is None:
 		return 'void'
-	if isinstance( t, ( Move, Copy )):
-		return c_type( t.inner )
+	t = t.unwrap_ownership() # move[T]/copy[T] are compile-time only, invisible in C
 	if isinstance( t, Specialization ):
 		base = t.base
 		if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
@@ -826,8 +825,7 @@ def _value_spelling( t: Type ) -> str:
 	is an RCClass - sys.alloc[Foo]'s own real return type), and sizeof(T)
 	(sizeof(struct Foo), never sizeof(struct Foo*) - see ir.SizeOf's
 	handling in _emit_instruction). '''
-	if isinstance( t, ( Move, Copy )):
-		return _value_spelling( t.inner )
+	t = t.unwrap_ownership()
 	base = t.base if isinstance( t, Specialization ) else t
 	if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion, TupleType )):
 		return f'{_class_keyword(base)} {mangle_type(t)}'
