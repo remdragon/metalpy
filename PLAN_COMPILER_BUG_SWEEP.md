@@ -109,18 +109,32 @@ specifically to treat these as equal, and several call sites use it correctly
   stays as a hand-derived exemption, matching the existing pattern, rather
   than folding in the shared helper.
 
-  **Incidentally found, unrelated, NOT fixed (out of scope, flagged for a
-  future pass):** `lowering.py`'s `_expr_Constant`/`emitter_c.py`'s
-  `_emit_const` crash with an uncaught Python `NotImplementedError` (not a
-  clean `CompileError`) for a kind-mismatched literal returned where a
-  CEnum is expected (e.g. `return 'not a color'` from a function declared
-  `-> Color`) - the literal gets mistagged with the CEnum's own type by
-  `_expr_Constant` somewhere upstream of `_stmt_Return`'s own check (which
-  never gets a chance to reject it, since `value.type is fn_type` already
-  holds by the time it runs), then crashes at C-emission with a raw
-  Python traceback instead of a clean compile error. Confirmed pre-existing
-  on `master`, unrelated to this fix (reproduces identically with this
-  fix reverted).
+  **Fixed** (was flagged, not fixed, when the `_stmt_Return` bug above was
+  found - now fixed): `lowering.py`'s `_expr_Constant` unconditionally
+  exempted every `CEnum` `expected_type` from its own kind-compatibility
+  validation, on the theory that "a CEnum has exactly the same runtime
+  representation as its underlying type" (true, but that reasoning only
+  covers a literal whose KIND already matches the underlying scalar - an
+  int for an i32-backed CEnum - not literally any literal). A
+  kind-mismatched literal (e.g. a string) sailed through unchecked, tagging
+  the resulting `ir.Const` with the CEnum type while its own `.value`
+  stayed the mismatched Python value - confirmed to reach TWO separate call
+  sites (a bare literal via `return`/assignment, AND an explicit
+  `Color(...)` construction call, whose own magnitude-only check at
+  `_try_lower_construct_call` defers everything else to `_expr_Constant`),
+  both crashing `emitter_c.py`'s `_emit_const` with an uncaught Python
+  `NotImplementedError` instead of a clean `CompileError`. Fixed by
+  validating a CEnum-expected literal against the CEnum's own
+  `.value_type`'s stem (kind AND magnitude) instead of exempting it
+  outright; both crash sites now report a clean `CompileError`. Valid
+  cases (an in-range int literal via either return or construction)
+  confirmed still working. Regression tests: new
+  `CEnumReturnCoercionTests.test_bare_literal_via_return_and_construction`
+  / `.test_kind_mismatched_literal_rejected_cleanly_not_crashed` /
+  `.test_kind_mismatched_construction_literal_rejected_cleanly_not_crashed`
+  / `.test_out_of_range_literal_rejected` (emitter_c_test.py) - the two
+  crash-shape tests independently confirmed to fail (silently accept, no
+  error recorded) without the fix and pass with it.
 - `lowering.py`'s `_expr_Name` escape hatch (`expected_type is not
   name.type`) - fixed via `_same_type` for consistency, but **no repro
   could be constructed** despite several attempts (generic-substituted vs.
@@ -298,12 +312,9 @@ which needs no hint).
    was found incidentally and flagged, not fixed.
 4. ~~`lowering.py:683` (Shape 3, `_body_may_fall_off_the_end`)~~ - **fixed
    (comment only)**, see above. Behavior deliberately unchanged.
-5. **`lowering.py`'s `_expr_Constant`/`_emit_const` crash** - incidentally
-   found while verifying the `_stmt_Return` fix, not yet investigated.
-   Crashes with an uncaught Python `NotImplementedError` instead of a clean
-   `CompileError` for a kind-mismatched literal (e.g. a string) returned/
-   assigned where a CEnum is expected - confirmed via a real repro,
-   pre-existing on `master`. Next up - worth its own root-cause pass.
+5. ~~`lowering.py`'s `_expr_Constant`/`_emit_const` crash~~ - **fixed**, see
+   above. Found reachable via TWO call sites (bare literal return/assignment,
+   and explicit `Color(...)` construction), both now cleanly rejected.
 6. Everything under "awareness only" - do not fix without first confirming with
    the user that the documented deliberate-design reasoning no longer holds.
    Note: `overload_resolution.py`'s `_leaf_is_accepted`/`_contains` (its own

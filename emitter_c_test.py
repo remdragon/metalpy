@@ -4706,6 +4706,105 @@ def main() -> i32:
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bare_literal_via_return_and_construction( self ) -> None:
+		# _expr_Constant's own CEnum handling (distinct from _stmt_Return's
+		# coercion tested above) - a BARE integer literal, not a named local,
+		# validated/typed against the CEnum's own underlying scalar, both via
+		# a plain `return 1` and via an explicit Color(1) construction call
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_via_return() -> Color:
+	return 1
+
+def get_via_construct() -> Color:
+	return Color( 1 )
+
+def main() -> i32:
+	a: Color = get_via_return()
+	if a != Color.Blue:
+		return 1
+	b: Color = get_via_construct()
+	if b != Color.Blue:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_kind_mismatched_literal_rejected_cleanly_not_crashed( self ) -> None:
+		# _expr_Constant's own CEnum branch used to exempt EVERY CEnum
+		# expected_type from kind-validation outright (meant only for a raw
+		# INT literal's own magnitude, per the construction-call comment) -
+		# a kind-mismatched literal (a bare string, here) sailed through
+		# untyped-checked, tagging the resulting Const with the CEnum type
+		# while its own .value stayed the Python string - confirmed to crash
+		# emitter_c.py's _emit_const with an uncaught Python
+		# NotImplementedError (a raw traceback, not a compile error) rather
+		# than being cleanly rejected. Exercises the bare-literal-via-return
+		# shape directly (distinct from test_genuinely_mismatched_return_
+		# type_still_rejected above, which uses a named local of the wrong
+		# type, not a mismatched literal)
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_wrong() -> Color:
+	return 'not a color'
+
+def main() -> i32:
+	c: Color = get_wrong()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_kind_mismatched_construction_literal_rejected_cleanly_not_crashed( self ) -> None:
+		# same bug, the OTHER call site that reaches _expr_Constant's CEnum
+		# branch: an explicit Color(...) construction call whose own argument
+		# is a kind-mismatched literal. _try_lower_construct_call's own CEnum
+		# branch only validates an INT literal's own magnitude directly -
+		# anything else is deferred entirely to _expr_Constant, so this
+		# crashed the identical way before the fix
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def main() -> i32:
+	c: Color = Color( 'bad' )
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_out_of_range_literal_rejected( self ) -> None:
+		# the magnitude check (previously only reachable via the
+		# construction-call path's own separate, duplicate check) now also
+		# applies via the bare-literal-return path, using the CEnum's own
+		# underlying scalar's real range rather than skipping validation
+		self._run( '''
+@enum( u8 )
+class Small:
+	A = 0
+	B = 1
+
+def get_bad() -> Small:
+	return 999
+
+def main() -> i32:
+	s: Small = get_bad()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
 
 class AtomicRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for compiler.atomic_*(Ptr[T], ...)
