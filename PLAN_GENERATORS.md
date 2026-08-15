@@ -1,6 +1,62 @@
 Generator functions (`yield`, state-machine transform)
 
-STATUS: planning only, nothing implemented yet.
+STATUS: v1 landed and real-compile-and-run tested (emitter_c_test.py's
+GeneratorFunctionTests) - Phases 0-1 below, restricted further than
+originally scoped: every `yield` must be a direct top-level statement of
+the function body (not nested inside if/while/for/with/try - loops are
+Phase 2, not yet attempted). Within that restriction, straight-line bodies
+with multiple sequential yields work end to end, including the RC-
+correctness payoff this whole plan is about (a generator dropped mid-
+iteration correctly decrefs a captured RC-typed PARAMETER via the
+ordinary, completely unmodified $$__destructor__ synthesis - see "The
+$$__del__ problem" below for why parameters specifically, not yet
+arbitrary locals).
+
+Landed design deviates from the plan's original sketch in three ways,
+each because the simpler thing turned out to already be sufficient:
+
+1. No new `ir.Yield` instruction, no emitter changes at all. `yield expr`
+   inside a segment decomposes into ordinary, already-existing statements
+   (`self.__state = N`, `return expr`) built directly as synthesized AST
+   handed to the ordinary statement-lowering pipeline - emitter_c.py was
+   never touched.
+2. No per-state-gated destructor. v1 restricts a promoted LOCAL (as
+   opposed to a captured parameter) to scalar types only (bool/integer) -
+   scalars need no decref at all, so the existing unconditional
+   `_synthesize_rcclass_destructor` cascade is correct completely
+   unchanged. An RC-typed local surviving a yield (needing the state-
+   gated cascade this doc originally sketched) is deferred, no forcing
+   use case yet.
+3. Dispatch is a flat sequence of `if self.__state <= i:` guards (each
+   ending in an unconditional `return`), not a goto/switch - discovered
+   while implementing that emitter_c.py already lowers Jump/Label/
+   JumpIfFalse as flat C goto/label pairs (not reconstructed structured
+   control flow), so a real dispatch mechanism was available for free,
+   but the recursive-AST-If approach turned out simpler to generate
+   correctly and needed zero emitter work either way. Confirmed this
+   still works correctly THROUGH ordinary nested if/while inside a
+   segment (cfg.py's structured lowering doesn't care that the whole
+   thing is wrapped in one more `if self.__state <= i:`), so Phase 2
+   (loops) is likely much less work than originally estimated - the
+   segment-splitting-at-top-level-yields restriction is the only thing
+   standing in the way now, not the dispatch mechanism itself.
+
+A genuine, pre-existing, unrelated gap found while testing this (not
+fixed, not in scope): reading a `T|None` value back out in NARROWED form
+after an `is None`/`is not None` check does not work today - confirmed via
+a minimal non-generator repro (`if a is None: ... else: ... a != 5 ...`
+fails to compile: "invalid operands to binary expression", the union
+struct itself, not i32) - both plain if-narrowing and `match a: case v:`
+wildcard binding hit this identically. This meant GeneratorFunctionTests
+can only verify a `__next__()` result via `is None`/`is not None` (proven
+sufficient for exhaustion/state-transition correctness; exact yielded
+VALUES were cross-checked by hand against the emitted C instead - see the
+test's own comment). Whoever picks up real union narrowing next should
+know `T|None` specifically is affected, not just named multi-member
+unions.
+
+Original planning notes follow, kept for the phases not yet attempted
+(loops, fallible generators, `for`-loop consumption, generic generators).
 
 Why
 

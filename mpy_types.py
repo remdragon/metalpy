@@ -211,6 +211,22 @@ class TupleType( Type ):
 	elem_types: list[Type]
 	backing: 'RCClass|None' = None
 
+@dataclass( kw_only = True )
+class GeneratorType( Type ):
+	''' `Iterator[T]` in a function's own return annotation - PLAN_GENERATORS.md.
+	Recognized textually in visit_Subscript, same posture as CallableType/
+	TupleType above. Deliberately NOT interned/shared the way those are:
+	two unrelated generator functions both declaring `-> Iterator[i32]`
+	still need two independent backing RCClasses (each function's own,
+	private state machine/fields) - unifying them by elem_type alone would
+	wrongly conflate two functions' unrelated local state. A fresh
+	GeneratorType is built for every annotation occurrence; .backing is
+	populated once lowering.py recognizes the owning Function actually
+	contains a `yield` and synthesizes its backing class (keyed to that
+	one Function, not to this type). '''
+	elem_type: Type
+	backing: 'RCClass|None' = None
+
 # a class's own body scan (revealing its attribute/method *names*) is
 # deferred behind .resolve, exactly like a Function's parameters or a
 # Variable's type - nothing about a class's members is known until something

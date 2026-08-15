@@ -236,7 +236,19 @@ class Lowering:
 		# every call, including a nested/reentrant call made mid-way through
 		# lowering an enclosing function (see _expr_Lambda's eager lowering
 		# path, PLAN_LAMBDA.md) - there is no shared mutable state between
-		# an outer and inner call to worry about saving/restoring at all
+		# an outer and inner call to worry about saving/restoring at all.
+		#
+		# PLAN_GENERATORS.md: ensure_generator_synthesized is idempotent and a
+		# no-op for an ordinary function - for a generator, it MUST have
+		# already run by now (every caller resolving this fn's own return
+		# type via TypeResolver.ensure_resolved triggers it eagerly, before
+		# this fn is ever dequeued for its own lowering - a call site needs
+		# the REAL return type immediately, it can't wait for this fn's own
+		# turn on the work queue), so fn.node.body is already the rewritten,
+		# yield-free constructor body by the time this runs - this call is
+		# just a safety net for a generator reached with no earlier caller
+		# (e.g. main() itself).
+		self._type_resolver.ensure_generator_synthesized( fn )
 		return FunctionLowering( self, fn ).run()
 
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
@@ -5587,6 +5599,19 @@ class FunctionLowering:
 		self._emit( ir.Allocate( dest = dest, cls = target_cls, fields = fields ))
 		return dest
 
+	def _try_lower_generator_allocate_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
+		# PLAN_GENERATORS.md - Lowering._rewrite_generator_constructor's own
+		# synthesized `BackingClass(__state=0, ...)` call, tagged directly
+		# with the target RCClass object itself (generator_backing_cls)
+		# rather than something resolvable by name through any real scope -
+		# same escape-hatch spirit as node.resolved_callee/resolved_
+		# construction elsewhere in this file, just for a class instead of
+		# a function.
+		target_cls = getattr( node, 'generator_backing_cls', None )
+		if target_cls is None:
+			return None
+		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
+
 	def _try_lower_allocate_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
 		# Class.__allocate__(field=value, ...) - a compiler-synthesized
 		# pseudo-method (SYNTAX.md: "strictly private... can only be called
@@ -6703,6 +6728,7 @@ class FunctionLowering:
 		# the next; a real error inside a matched shape (e.g. a malformed
 		# __allocate__ call) still raises/records normally
 		construction_recognizers = (
+			self._try_lower_generator_allocate_call,
 			self._try_lower_allocate_call,
 			self._try_lower_construct_call,
 			self._try_lower_scalar_construct_call,

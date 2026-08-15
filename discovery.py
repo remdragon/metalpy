@@ -10,7 +10,7 @@ from typing import Any, Callable, Generator, NoReturn
 import compile_time_transformer
 from errors import CompileError, ErrorCollector
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, GeneratorType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
 	Module, _is_covered_by, _overlaps, chain_lookup,
 )
@@ -578,7 +578,7 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType:
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType|GeneratorType:
 		# move[T]/copy[T] are compiler syntax, not a real generic lookup -
 		# recognized textually here the same way @move is recognized
 		# textually as a decorator name in _parse_function, rather than
@@ -652,6 +652,24 @@ class Discovery( ast.NodeVisitor ):
 				self.fail( f'tuple[...] needs at least 2 type arguments: {ast.unparse(node)}', node )
 			elem_types = [ self.visit( elt ) for elt in node.slice.elts ]
 			return self._get_or_create_tuple_type( elem_types )
+
+		# Iterator[T] - PLAN_GENERATORS.md. Recognized textually, same
+		# posture as move/copy/Callable/Closure/tuple above - there's no
+		# real generic class with type_params to subscript against (a
+		# generator function's own backing representation doesn't exist
+		# until lowering.py actually finds a `yield` in the function body
+		# this annotates). Deliberately NOT interned (see GeneratorType's
+		# own docstring) - a fresh instance every occurrence.
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Iterator':
+			if isinstance( node.slice, ast.Tuple ):
+				self.fail( f'Iterator[...] takes exactly one type argument: {ast.unparse(node)}', node )
+			elem_type = self.visit( node.slice )
+			return GeneratorType(
+				stem = f'Iterator[{elem_type.qualname}]',
+				qualname = f'Iterator[{elem_type.qualname}]',
+				file = elem_type.file, line = elem_type.line,
+				elem_type = elem_type,
+			)
 
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )

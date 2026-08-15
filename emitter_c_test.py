@@ -8074,5 +8074,88 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class GeneratorFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' PLAN_GENERATORS.md, v1 scope: a plain function containing `yield`,
+	every yield a direct top-level statement (no yield nested inside if/
+	while/for/with/try yet). Real compile-and-run - not just "does it
+	lower", the whole point is the generated C state machine actually
+	behaves like Python's own generator semantics, including RC correctness
+	on early abandonment (the "function epilogue moves into __del__" idea
+	this plan doc is built around). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'multi_yield_state_transitions_and_exhaustion', '''
+def counter() -> Iterator[i32]:
+	x: i32 = 1
+	yield x
+	x = 2
+	yield x
+	x = 3
+	yield x
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = counter()
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__()
+		if c is None:
+			return 3
+		d = g.__next__()
+		if d is not None:
+			return 4
+		return 0
+''' ),
+			( 'calling_the_generator_function_runs_no_body_code', '''
+def only_yields_if_called() -> Iterator[i32]:
+	yield 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = only_yields_if_called() # constructing it must not run any body code
+		return 0
+''' ),
+			( 'dropped_mid_iteration_decrefs_captured_parameter', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box ) -> Iterator[i32]:
+	yield b.v
+	yield b.v
+
+def make_and_partially_consume( b: Box ) -> None:
+	g = gen( b )
+	first = g.__next__() # only one of the two yields is ever consumed
+	# g goes out of scope here, still mid-iteration - PLAN_GENERATORS.md's
+	# own point: dropping it must still decref its captured Box parameter,
+	# via the ordinary, unmodified $$__destructor__ cascade every other
+	# RCClass already gets (see type_resolver.py's ensure_generator_
+	# synthesized - ordinary destructor synthesis is untouched, a captured
+	# parameter is valid from construction onward unconditionally)
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 42 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		make_and_partially_consume( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
+		])
+
+
 if __name__ == '__main__':
 	unittest.main()

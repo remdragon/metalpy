@@ -9,7 +9,7 @@ from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CUnion, Function, Module, Name, Overload,
+	CallableType, CEnum, ClassLike, CStruct, CUnion, Function, GeneratorType, Module, Name, Overload,
 	Parameter, RCClass, Scalar, Specialization, TaggedUnion, Type,
 	TupleType, TypeVar, Variable,
 )
@@ -92,6 +92,52 @@ def _build_field_teardown_ast( field_expr: ast.Attribute, field_type: Type ) -> 
 	return []
 
 
+class _GeneratorNameRenamer( ast.NodeTransformer ):
+	''' PLAN_GENERATORS.md - rewrites every ast.Name(id=stem) reference
+	(Load or Store) for a promoted stem (a generator's own parameter or
+	local - see TypeResolver._collect_generator_locals) into self.<stem>,
+	since each is now a field on the backing class rather than a stack
+	local/parameter of $$__next__ itself. Does not recurse into a nested
+	def/lambda (matches PLAN_LAMBDA.md's own scope boundary - a nested
+	def/lambda referencing one of these names was never a supported
+	capture to begin with; leaving it untouched means it fails name
+	resolution or the existing no-capture check normally, not silently
+	miscompiled). '''
+	def __init__( self, targets: set ) -> None:
+		self.targets = targets
+	def visit_FunctionDef( self, node ): return node
+	def visit_AsyncFunctionDef( self, node ): return node
+	def visit_Lambda( self, node ): return node
+	def visit_Name( self, node ):
+		if node.id in self.targets:
+			inner = ast.Name( id = 'self', ctx = ast.Load() )
+			ast.copy_location( inner, node )
+			attr = ast.Attribute( value = inner, attr = node.id, ctx = node.ctx )
+			ast.copy_location( attr, node )
+			return attr
+		return node
+	def visit_AnnAssign( self, node ):
+		# a generator local's OWN declaring `x: T = expr` becomes `self.x =
+		# expr` (an ordinary Assign, not AnnAssign - self.x's type already
+		# lives on the backing class's own field declaration, and this
+		# compiler's AnnAssign lowering doesn't support an Attribute target
+		# at all, confirmed via a real repro: "unsupported AnnAssign
+		# target: self.x: i32 = 1"). Every AnnAssign inside a generator
+		# body targets a promoted local by construction (TypeResolver.
+		# _collect_generator_locals requires exactly this shape), so the
+		# target is always renamed to self.<x> here - no need to check
+		# self.targets first. A bare `x: T` with no value (rare, and inert
+		# in real Python too) becomes a no-op Pass rather than an invalid
+		# valueless Assign.
+		target = self.visit( node.target )
+		if node.value is None:
+			result = ast.Pass()
+		else:
+			result = ast.Assign( targets = [ target ], value = self.visit( node.value ))
+		ast.copy_location( result, node )
+		return result
+
+
 class TypeResolver:
 	'''
 	stage 1.5: sits between discovery.py (lazy name-binding + skeleton type
@@ -148,6 +194,13 @@ class TypeResolver:
 		# RC-typed member (including Result itself, Ok: T/Err: E), since
 		# get()'s own memoization cache isn't populated until get() finishes
 		self._union_storage_scheduling: set[int] = set()
+		# PLAN_GENERATORS.md - id(fn) of every generator function already
+		# rewritten by ensure_generator_synthesized (keyed by id(fn), not
+		# id(fn.node): unlike a generic function's body, a generator is
+		# never monomorphized, so fn.node is never copied for it - this
+		# still mirrors _destructors_synthesized's own "idempotent, once
+		# per real object" spirit)
+		self._generators_synthesized: set[int] = set()
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -161,6 +214,310 @@ class TypeResolver:
 		free_fn = module.get_local( 'free' )
 		assert isinstance( free_fn, Function ), f'sys.free is required but was not found: {free_fn!r}'
 		self.schedule( free_fn )
+
+	# --- generator functions (PLAN_GENERATORS.md) ---------------------------
+	#
+	# v1 scope: a plain (non-generic, non-method) function containing at
+	# least one `yield`, where every `yield` is a direct top-level statement
+	# of the function's own body (not nested inside if/while/for/with/try) -
+	# this is what lets the whole state machine be expressed as a flat
+	# sequence of `if self.__state <= i:` guards (below) instead of needing
+	# real goto/switch machinery: each guard is just an ordinary, already-
+	# correct nested CFG scope, so cfg.py's epilogue/RC tracking (lowering.py/
+	# cfg.py) needs no changes at all. Every local assigned anywhere in the
+	# body is unconditionally promoted to a field on a synthesized backing
+	# RCClass (over-promotion is safe, avoids a separate liveness pass - see
+	# _collect_generator_locals), restricted for now to scalar types only
+	# (an RC-typed LOCAL surviving a yield would need a state-gated
+	# destructor cascade this pass doesn't build). A captured PARAMETER has
+	# no such restriction: it's valid from construction onward
+	# unconditionally, so the ORDINARY, unmodified $$__destructor__
+	# synthesis (_synthesize_rcclass_destructor below, wired in
+	# automatically via compiler.py's own RCClass scheduling once the
+	# backing class is scheduled) already decrefs it correctly on drop, mid-
+	# iteration or not - this IS the "epilogue moves into __del__" mechanism
+	# the plan doc describes, just scoped to parameters in this first pass
+	# rather than every promoted local.
+	#
+	# Runs eagerly, from ensure_resolved (not lower_function/lowering.py) -
+	# a call site needs a generator function's REAL return type (the
+	# synthesized backing class) the moment it resolves that function as a
+	# callee, which can happen long before - or never relative to - that
+	# function's own turn on the work queue (see ensure_resolved's own
+	# comment on this).
+
+	def _walk_generator_body( self, nodes ):
+		''' yields every node reachable from `nodes` in program (pre-)order -
+		parent before children, siblings left to right - NOT recursing into
+		a nested def/lambda/async def (PLAN_LAMBDA.md's own scope boundary -
+		a nested def/lambda containing yield is a separate, unrelated
+		generator; one referencing a name from here is already rejected by
+		that machinery's own no-capture check once it's lowered). Program
+		order matters here, not just reachability: _collect_generator_locals
+		relies on seeing a local's own declaring AnnAssign before any later
+		statement that merely reassigns it (a plain stack/LIFO walk visits
+		siblings in REVERSE order, which - confirmed by a real repro, `x: i32
+		= 1` followed by two later `x = ...` reassignments - wrongly reports
+		the reassignments as coming before the declaration). Shared by every
+		generator-body scan below. '''
+		for node in nodes:
+			if isinstance( node, ( ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda )):
+				continue
+			yield node
+			yield from self._walk_generator_body( ast.iter_child_nodes( node ))
+
+	def _find_all_yield_nodes( self, fn: Function ) -> list[ast.expr]:
+		return [ n for n in self._walk_generator_body( fn.node.body ) if isinstance( n, ( ast.Yield, ast.YieldFrom )) ]
+
+	def _function_contains_yield( self, fn: Function ) -> bool:
+		return any( isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( fn.node.body ))
+
+	# v1 restriction: a promoted local must be one of these scalar stems
+	# (mpy_types.Scalar.stem) - see this section's own docstring above for why
+	_GENERATOR_LOCAL_STEMS = {
+		'bool', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'isize', 'usize', 'i128', 'u128',
+	}
+
+	def _self_attr( self, name: str, node: ast.AST ) -> ast.Attribute:
+		inner = ast.Name( id = 'self', ctx = ast.Load() )
+		ast.copy_location( inner, node )
+		attr = ast.Attribute( value = inner, attr = name, ctx = ast.Load() )
+		ast.copy_location( attr, node )
+		return attr
+
+	def _reject_generator_defer( self, fn: Function ) -> None:
+		for node in self._walk_generator_body( fn.node.body ):
+			if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id in ( 'defer', 'errdefer' ):
+				self.discovery.fail( f'{fn.qualname}: defer/errdefer are not supported inside a generator function body yet - see PLAN_GENERATORS.md', node )
+			if isinstance( node, ast.With ):
+				for item in node.items:
+					if isinstance( item.context_expr, ast.Name ) and item.context_expr.id in ( 'defer', 'errdefer' ):
+						self.discovery.fail( f'{fn.qualname}: defer/errdefer are not supported inside a generator function body yet - see PLAN_GENERATORS.md', node )
+
+	def _reject_generator_value_return( self, fn: Function ) -> None:
+		for node in self._walk_generator_body( fn.node.body ):
+			if isinstance( node, ast.Return ) and node.value is not None and not ( isinstance( node.value, ast.Constant ) and node.value.value is None ):
+				self.discovery.fail( f'{fn.qualname}: a generator function cannot `return` a value (a bare `return` ends iteration) - see PLAN_GENERATORS.md', node )
+
+	def _collect_top_level_yield_stmts( self, fn: Function ) -> list[ast.Expr]:
+		all_yields = self._find_all_yield_nodes( fn )
+		if any( isinstance( y, ast.YieldFrom ) for y in all_yields ):
+			self.discovery.fail( f'{fn.qualname}: yield from is not supported yet - see PLAN_GENERATORS.md', fn.node )
+		top_level = [ s for s in fn.node.body if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) ]
+		if len( top_level ) != len( all_yields ):
+			self.discovery.fail(
+				f'{fn.qualname}: yield must be a direct top-level statement of the generator function body '
+				f'(yield inside if/while/for/with/try, or as part of a larger expression, is not supported '
+				f'yet - see PLAN_GENERATORS.md)',
+				fn.node,
+			)
+		return top_level
+
+	def _collect_generator_locals( self, fn: Function ) -> dict[str,Type]:
+		''' every local assigned anywhere in the body becomes a field - see
+		this section's own docstring above. A local's TYPE comes from its
+		own first `x: T = ...` annotated assignment (required - a generator
+		local can't rely on plain-assignment type inference); a later plain
+		`x = ...` reassignment is fine once `x` is already declared. '''
+		param_stems = { p.stem for p in fn.parameters or [] }
+		locals_decl: dict[str,Type] = {}
+		for node in self._walk_generator_body( fn.node.body ):
+			if isinstance( node, ast.AnnAssign ) and isinstance( node.target, ast.Name ):
+				stem = node.target.id
+				if stem in param_stems:
+					self.discovery.fail( f'{fn.qualname}: generator local {stem!r} has the same name as a parameter', node )
+				local_type = self.discovery.visit( node.annotation )
+				if not ( isinstance( local_type, Scalar ) and local_type.stem in self._GENERATOR_LOCAL_STEMS ):
+					self.discovery.fail(
+						f'{fn.qualname}: generator local {stem!r} has type {local_type.qualname} - only scalar '
+						f'locals (bool/integer types) are supported inside a generator body yet - see PLAN_GENERATORS.md',
+						node,
+					)
+				if stem in locals_decl and locals_decl[stem] is not local_type:
+					self.discovery.fail( f'{fn.qualname}: generator local {stem!r} redeclared with a different type', node )
+				locals_decl[stem] = local_type
+			elif isinstance( node, ast.Assign ):
+				for target in node.targets:
+					if isinstance( target, ast.Name ) and target.id not in param_stems and target.id not in locals_decl:
+						self.discovery.fail(
+							f'{fn.qualname}: generator local {target.id!r} must be declared with an explicit type '
+							f'annotation (`{target.id}: T = ...`) before first use',
+							node,
+						)
+		return locals_decl
+
+	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type] ) -> RCClass:
+		''' the per-function backing RCClass a generator's constructor
+		allocates and its own $$__next__ method operates on - fields:
+		`__state` (resume discriminant) + one per parameter + one per
+		promoted local (_collect_generator_locals). resolve=None/every
+		attribute's own resolve=None (mirrors tuple_storage.TupleStorage.
+		get()'s identical "already fully known, nothing to defer" shape) -
+		once scheduled (see ensure_generator_synthesized), compiler.py's own
+		ordinary RCClass handling (Compiler._lower) synthesizes its
+		$$__destructor__ completely unmodified, same as any other class -
+		see this section's own top docstring for why that's correct here
+		with zero changes. '''
+		usize_cls = self.discovery.get_intrinsics()['usize']
+		qualname = f'{fn.qualname}$$generator'
+		state_attr = Variable( stem = '__state', qualname = f'{qualname}.__state', file = fn.file, line = fn.line, type = usize_cls )
+		param_attrs = [
+			Variable( stem = p.stem, qualname = f'{qualname}.{p.stem}', file = fn.file, line = fn.line, type = p.type )
+			for p in fn.parameters or []
+		]
+		local_attrs = [
+			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
+			for stem, t in locals_decl.items()
+		]
+		attributes = [ state_attr ] + param_attrs + local_attrs
+		return RCClass(
+			stem = qualname, qualname = qualname, file = fn.file, line = fn.line,
+			base = None, type_params = None,
+			attributes = attributes, methods = [], names = { a.stem: a for a in attributes },
+			resolve = None,
+		)
+
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, yield_stmts: list[ast.Expr], locals_decl: dict[str,Type], result_union: TaggedUnion ) -> Function:
+		''' builds $$__next__: self.__state == DONE short-circuits to `return
+		None`, then a flat sequence of `if self.__state <= i:` guards, one
+		per segment (the statements between two consecutive top-level
+		yields, inclusive of the yield itself, which becomes `self.__state =
+		i+1; return <value>`) plus a final tail guard (the statements after
+		the last yield, ending `self.__state = DONE; return None`). Every
+		branch unconditionally returns, so the redundant later comparisons
+		once an earlier one has already matched are never reached - no
+		elif/goto/switch needed (see this section's own top docstring). '''
+		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() )
+		renamer = _GeneratorNameRenamer( rename_targets )
+
+		body = fn.node.body
+		yield_index = { id( s ): i for i, s in enumerate( yield_stmts ) }
+		segments: list[list[ast.stmt]] = []
+		current: list[ast.stmt] = []
+		for stmt in body:
+			current.append( stmt )
+			if id( stmt ) in yield_index:
+				segments.append( current )
+				current = []
+		tail = current
+		done_state = len( yield_stmts ) + 1
+
+		next_body: list[ast.stmt] = [
+			ast.If(
+				test = ast.Compare( left = self._self_attr( '__state', fn.node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = done_state ) ] ),
+				body = [ ast.Return( value = ast.Constant( value = None ) ) ],
+				orelse = [],
+			),
+		]
+		for i, segment in enumerate( segments ):
+			yield_node = segment[-1].value
+			assert isinstance( yield_node, ast.Yield )
+			seg_stmts = [ renamer.visit( s ) for s in segment[:-1] ]
+			yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
+			guard_body = seg_stmts + [
+				ast.Assign( targets = [ self._self_attr( '__state', segment[-1] ) ], value = ast.Constant( value = i + 1 ) ),
+				ast.Return( value = yielded ),
+			]
+			next_body.append( ast.If(
+				test = ast.Compare( left = self._self_attr( '__state', segment[-1] ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = i ) ] ),
+				body = guard_body, orelse = [],
+			))
+
+		anchor = tail[0] if tail else fn.node
+		tail_stmts = [ renamer.visit( s ) for s in tail ]
+		tail_body = tail_stmts + [
+			ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) ),
+			ast.Return( value = ast.Constant( value = None ) ),
+		]
+		next_body.append( ast.If(
+			test = ast.Compare( left = self._self_attr( '__state', anchor ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = len( segments )) ] ),
+			body = tail_body, orelse = [],
+		))
+		next_body.append( ast.Return( value = ast.Constant( value = None ) )) # unreachable safety net - every branch above already returns
+
+		node = ast.FunctionDef(
+			name = '$$__next__',
+			args = ast.arguments( posonlyargs = [], args = [], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
+			body = next_body, decorator_list = [], returns = None, type_params = [],
+			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+
+		next_fn = Function(
+			stem = '__next__', qualname = f'{backing_cls.qualname}.__next__', file = fn.file, line = fn.line,
+			cls = backing_cls, node = node,
+			parameters = [], return_type = result_union,
+			is_static = False, resolve = None,
+		)
+		backing_cls.methods.append( next_fn )
+		backing_cls.names[ next_fn.stem ] = next_fn
+		return next_fn
+
+	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type] ) -> None:
+		''' replaces the original generator def's own body with a single
+		`return <allocate the backing class, state=0, fields=args/zeros>` -
+		matches Python's own "calling a generator function doesn't run any
+		of the body" semantics for free, since __next__ (built separately
+		above) is where the real body now lives. Routed through
+		Lowering._lower_allocate_fields (the same field-value-lowering/
+		incref logic an ordinary no-__init__ `ClassName(field=value,...)`
+		construction call already uses) via the `generator_backing_cls`
+		escape-hatch tag - see lowering.py's own
+		_try_lower_generator_allocate_call - rather than requiring this
+		synthesized class to be resolvable by name through any real scope,
+		mirroring the established resolved_callee/resolved_construction
+		convention that file already uses for other compiler-synthesized
+		call sites. '''
+		keywords = [ ast.keyword( arg = '__state', value = ast.Constant( value = 0 ) ) ]
+		for p in fn.parameters or []:
+			name_node = ast.Name( id = p.stem, ctx = ast.Load() )
+			ast.copy_location( name_node, fn.node )
+			keywords.append( ast.keyword( arg = p.stem, value = name_node ) )
+		for stem, t in locals_decl.items():
+			zero = ast.Constant( value = False if ( isinstance( t, Scalar ) and t.stem == 'bool' ) else 0 )
+			keywords.append( ast.keyword( arg = stem, value = zero ) )
+		call = ast.Call( func = ast.Name( id = backing_cls.stem, ctx = ast.Load() ), args = [], keywords = keywords )
+		call.generator_backing_cls = backing_cls
+		fn.node.body = [ ast.Return( value = call ) ]
+		ast.fix_missing_locations( fn.node )
+
+	def ensure_generator_synthesized( self, fn: Function ) -> None:
+		''' idempotent (id(fn)-memoized) - a no-op unless fn's own body
+		actually contains a `yield` (checked first, cheaply). See this
+		section's own top docstring for the full design and why this runs
+		from ensure_resolved rather than lowering.py. '''
+		if id( fn ) in self._generators_synthesized:
+			return
+		if not self._function_contains_yield( fn ):
+			return
+		self._generators_synthesized.add( id( fn ))
+
+		if fn.type_params:
+			self.discovery.fail( f'{fn.qualname}: generic generator functions are not supported yet - see PLAN_GENERATORS.md', fn.node )
+		if fn.cls is not None:
+			self.discovery.fail( f'{fn.qualname}: a generator method is not supported yet - only a plain function may contain yield - see PLAN_GENERATORS.md', fn.node )
+		if not isinstance( fn.return_type, GeneratorType ):
+			self.discovery.fail( f'{fn.qualname} contains yield but is not declared -> Iterator[T]', fn.node )
+		elem_type = fn.return_type.elem_type
+		self.schedule( elem_type )
+
+		yield_stmts = self._collect_top_level_yield_stmts( fn )
+		self._reject_generator_defer( fn )
+		self._reject_generator_value_return( fn )
+		locals_decl = self._collect_generator_locals( fn )
+
+		none_type = self.discovery.get_none_type()
+		result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
+
+		backing_cls = self._build_generator_backing_class( fn, locals_decl )
+		self._build_generator_next_function( fn, backing_cls, yield_stmts, locals_decl, result_union )
+
+		self.schedule( backing_cls )
+		self.schedule( backing_cls.names['__next__'] )
+		self.schedule( result_union )
+
+		self._rewrite_generator_constructor( fn, backing_cls, locals_decl )
+		fn.return_type = backing_cls
 
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:
 		''' the emitter always synthesizes a destructor for every
@@ -846,6 +1203,16 @@ class TypeResolver:
 		resolve = getattr( obj, 'resolve', None )
 		if resolve is not None:
 			resolve()
+		if isinstance( obj, Function ):
+			# PLAN_GENERATORS.md - must happen HERE, not deferred until obj's
+			# own turn on the work queue: a call site needs obj's REAL return
+			# type (the synthesized backing RCClass, once obj turns out to
+			# contain a yield) immediately, to type its own call-result
+			# binding - it can't wait for obj to actually be dequeued and
+			# lowered, which might happen much later (or never, if nothing
+			# else reaches it). A no-op for an ordinary, non-generator
+			# function (checked first, cheaply, inside the method itself).
+			self.ensure_generator_synthesized( obj )
 		self.schedule( obj )
 		if isinstance( obj, Specialization ):
 			if isinstance( obj.base, Function ):
