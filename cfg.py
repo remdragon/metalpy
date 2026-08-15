@@ -1001,6 +1001,27 @@ class CFGState:
 			instructions += self._replay( entry, get_is_err_check )
 		return instructions
 
+	def has_live_entry( self, operand: ir.Operand | None ) -> bool:
+		''' whether `operand`'s identity matches a still-live (non-cancelled)
+		epilogue entry - the exact identity test current_epilogue_label()/
+		return_() already use to recognize "this really is an ownership move,
+		its own eventual decref is already accounted for by matching/skipping
+		this entry" rather than a borrow. Used by lowering.py's _stmt_Return
+		to decide whether an ALIASING return expression (self.lowering.
+		_is_aliasing_expr) needs its own Incref before being handed to the
+		caller: an OWNED/COPY local or a copy[T]/move[T] parameter has a live
+		entry here (a genuine move, no Incref needed - the source's own
+		decref is what's being skipped), but a BORROWED parameter/self (never
+		pushed - see _enter_parameter()'s own BORROWED branch) and an
+		attribute/tuple-element read (a fresh GetAttr temp, never pushed
+		either - fields are never separately tracked, see field_value()'s own
+		comment) both have NO entry at all here even though _is_aliasing_expr
+		says they alias existing state - those need a real Incref, since
+		nothing downstream is skipping a decref on their behalf. '''
+		return operand is not None and any(
+			not entry.cancelled and entry.operand is operand for entry in self._epilogue_stack
+		)
+
 	def current_epilogue_label( self, returned_operand: ir.Operand | None = None ) -> str | None:
 		''' the label a `return` (or the function's own fall-off-the-end)
 		should jump to instead of unwinding inline via return_() - the

@@ -1815,6 +1815,30 @@ class FunctionLowering:
 		# own comment below already expects still apply regardless (not
 		# gated on strict - see _lower_expr's own comment)
 		value = self._lower_expr( node.value, self._current_fn.return_type, strict = False ) if node.value is not None else None
+		# an ALIASING return expression (self._is_aliasing_expr - a plain
+		# Name/Attribute read, or a tuple-element Subscript) that does NOT
+		# correspond to a live, skippable epilogue entry (self._cfg.
+		# has_live_entry) needs its own Incref right here, before it's
+		# handed off below: `return self.x` (an attribute read) and
+		# `return self`/`return some_borrowed_param` (a BORROWED Name,
+		# never pushed onto the epilogue stack - see cfg.py's
+		# _enter_parameter()) both alias a reference that SOMEONE ELSE
+		# still independently owns and will decref on their own schedule,
+		# so the caller needs a genuinely separate +1, not a bare pointer
+		# copy. An OWNED/COPY local (or a copy[T]/move[T] parameter) DOES
+		# have a live entry - that's a real move (its own decref is what
+		# current_epilogue_label()/return_() skip below, by this same
+		# identity), and must NOT also get an Incref here, or the moved-
+		# out reference would be permanently over-counted by one.
+		# Confirmed by direct compile-and-run testing with compiler.
+		# refcount(): `Holder.get(self) -> Box: return self.x` previously
+		# hung onto only 2 references (the field + the caller's own new
+		# holder of the returned value, double-counted as the SAME
+		# reference) where 3 are live once the caller's copy exists,
+		# leading to a premature free the moment either one dropped.
+		if value is not None and self.lowering._is_aliasing_expr( node.value, value.type ) and not self._cfg.has_live_entry( value ):
+			for instr in self._cfg.incref( value.type, value ):
+				self._emit( instr )
 		# what actually gets returned/assigned into the return-value slot
 		# below - defaults to `value` itself, reassigned to a widened temp
 		# further down when the covered-Result-error-widening case applies.
