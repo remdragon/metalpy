@@ -1,6 +1,8 @@
 # stdlib imports
+import contextlib
 import hashlib
 import logging
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -2372,6 +2374,82 @@ def get_error() -> i32:
 		self.assertNotIsInstance( fn, Overload )
 		self.assertEqual( fn.node.body[0].value.value, 1 )
 
+	@contextlib.contextmanager
+	def _private_cache_dir( self ):
+		''' redirect linker_c's has_symbol cache to a throwaway directory for
+		the duration of a test.
+
+		Load-bearing for the tests below, which write to and delete cache
+		entries: the real cache lives in one shared %TEMP%/metalpy dir that all
+		16 test shards hammer CONCURRENTLY, so a test mutating it there is both
+		flaky (its own unlink loses to another shard's open handle - observed,
+		WinError 32) and a source of flakiness for everyone else. has_symbol
+		derives its cache dir from tempfile.gettempdir() at call time, so
+		patching that is enough. '''
+		real = tempfile.gettempdir
+		private = tempfile.mkdtemp() # call BEFORE patching - mkdtemp uses gettempdir itself
+		tempfile.gettempdir = lambda: private
+		try:
+			yield Path( private ) / 'metalpy' / 'has_symbol'
+		finally:
+			tempfile.gettempdir = real
+
+	def test_cache_publish_failure_does_not_break_the_probe( self ) -> None:
+		''' failing to PUBLISH a cache entry must never fail the compile.
+
+		On Windows os.replace raises PermissionError (WinError 5) when the
+		destination is open - which a concurrent shard doing read_text() briefly
+		makes it. The first version of atomic_write_cache let that propagate,
+		turning a rare wrong answer into a rare hard crash; this is the
+		deterministic stand-in for that race. Losing the publish is harmless
+		because the cache is idempotent - every writer for a key computes the
+		same value - and the caller already holds its own correct result. '''
+		import linker_c
+		cc = linker_c.detect_cc()
+		if cc is None:
+			self.skipTest( 'no C compiler to probe with' )
+		lib, symbol = test_support.KNOWN_LIB, test_support.KNOWN_SYMBOL
+		key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
+		with self._private_cache_dir() as cache_dir:
+			real_replace = os.replace
+			def always_denied( src, dst, *a, **kw ):
+				raise PermissionError( 5, 'Access is denied' )
+			os.replace = always_denied
+			try:
+				self.assertTrue( linker_c.has_symbol( cc, lib, symbol )) # still the right answer
+			finally:
+				os.replace = real_replace
+
+			# and no .tmp litter left behind in the cache dir
+			leftovers = [ p.name for p in cache_dir.glob( f'{key}.*.tmp' ) ]
+			self.assertEqual( leftovers, [], f'stray temp files: {leftovers}' )
+
+	def test_cache_read_failure_does_not_break_the_probe( self ) -> None:
+		''' the same tolerance from the READER's side. On Windows, opening a
+		cache file fails with PermissionError while another process's
+		os.replace of it is in flight - so contention is racy in BOTH
+		directions, and an unreadable cache entry has to degrade to a re-probe
+		rather than aborting the compile. (Found the hard way: fixing only the
+		writer moved the identical failure onto this line.) '''
+		import linker_c
+		cc = linker_c.detect_cc()
+		if cc is None:
+			self.skipTest( 'no C compiler to probe with' )
+		lib, symbol = test_support.KNOWN_LIB, test_support.KNOWN_SYMBOL
+		with self._private_cache_dir():
+			linker_c.has_symbol( cc, lib, symbol ) # populate, so the read is really attempted
+
+			real_read_text = Path.read_text
+			def denied( self, *a, **kw ):
+				if 'has_symbol' in str( self ):
+					raise PermissionError( 13, 'Permission denied' )
+				return real_read_text( self, *a, **kw )
+			Path.read_text = denied
+			try:
+				self.assertTrue( linker_c.has_symbol( cc, lib, symbol )) # re-probed, still correct
+			finally:
+				Path.read_text = real_read_text
+
 	def test_torn_cache_file_is_re_probed_not_read_as_a_negative( self ) -> None:
 		''' a half-written has_symbol cache entry must be treated as a MISS,
 		not as "symbol unavailable".
@@ -2395,22 +2473,22 @@ def get_error() -> i32:
 			self.skipTest( 'no C compiler to probe with' )
 		lib, symbol = test_support.KNOWN_LIB, test_support.KNOWN_SYMBOL
 		key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
-		cache_file = Path( tempfile.gettempdir() ) / 'metalpy' / 'has_symbol' / key
-
-		real_has_symbol = linker_c.has_symbol
 		calls = [ 0 ]
-		def torn_between_probes( *args, **kwargs ):
-			result = real_has_symbol( *args, **kwargs )
-			# leave the cache in the exact mid-write state (exists, empty) that
-			# the next probe would observe
-			calls[0] += 1
-			if calls[0] == 1 and cache_file.is_file():
-				cache_file.write_text( '' )
-			return result
+		with self._private_cache_dir() as cache_dir:
+			cache_file = cache_dir / key
+			real_has_symbol = linker_c.has_symbol
+			def torn_between_probes( *args, **kwargs ):
+				result = real_has_symbol( *args, **kwargs )
+				# leave the cache in the exact mid-write state (exists, empty)
+				# that the next probe would observe
+				calls[0] += 1
+				if calls[0] == 1 and cache_file.is_file():
+					cache_file.write_text( '' )
+				return result
 
-		linker_c.has_symbol = torn_between_probes
-		try:
-			disco, mod = self._import( f'''
+			linker_c.has_symbol = torn_between_probes
+			try:
+				disco, mod = self._import( f'''
 @compiler.target( has_library = ( '{lib}', '{symbol}' ))
 def get_error() -> i32:
 	return 1
@@ -2419,9 +2497,8 @@ def get_error() -> i32:
 def get_error() -> i32:
 	return 2
 ''' )
-		finally:
-			linker_c.has_symbol = real_has_symbol
-			cache_file.unlink( missing_ok = True ) # never leave the torn file for other tests
+			finally:
+				linker_c.has_symbol = real_has_symbol
 
 		self.assertGreaterEqual( calls[0], 2, 'both decorators should have probed' )
 		fn = mod.get_local( 'get_error' )
