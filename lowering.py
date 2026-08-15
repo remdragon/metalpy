@@ -8791,7 +8791,14 @@ class FunctionLowering:
 			if shape is None:
 				self.lowering.discovery.fail( f'{target.qualname}: conditional dispatch on a non-union argument: {ast.unparse(node)}', node )
 			base, members = shape
-			member = next( ( attr for attr in members if attr.type is leaf_type ), None )
+			# _same_type, not raw `is` - leaf_type (from overload_resolution.
+			# py's own call-site-argument-derived condition) and a member's
+			# own .type (re-derived here from operand.type via
+			# _tagged_union_shape) can be two different Specialization
+			# objects for the identical generic instantiation - same
+			# duality _check_assignable/_unify_type_param/_coerce_into_union
+			# already guard against elsewhere (see PLAN_COMPILER_BUG_SWEEP.md)
+			member = next( ( attr for attr in members if self.lowering._type_resolver._same_type( attr.type, leaf_type ) ), None )
 			if member is None:
 				self.lowering.discovery.fail( f'{target.qualname}: {leaf_type.qualname if leaf_type else "?"} is not a member of {operand.type.qualname}', node )
 			tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( base )
@@ -8824,7 +8831,15 @@ class FunctionLowering:
 		if shape is None:
 			return operand
 		base, members = shape
-		member = next( ( attr for attr in members if attr.type is target_type ), None )
+		# _same_type, not raw `is` - same duality as _lower_dispatch_tests'
+		# own identical fix just above (target_type and a member's own
+		# .type can be two different Specialization objects for the same
+		# generic instantiation). Silently returning operand UNCHANGED
+		# when no member matches (rather than failing loudly) makes this
+		# one worse than _lower_dispatch_tests' own version if it ever
+		# misfires - a wrong, still-union-typed argument passed through
+		# to a call expecting a concrete leaf, not a compile error
+		member = next( ( attr for attr in members if self.lowering._type_resolver._same_type( attr.type, target_type ) ), None )
 		if member is None:
 			return operand
 		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( base )

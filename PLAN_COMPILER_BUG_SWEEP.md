@@ -58,32 +58,33 @@ specifically to treat these as equal, and several call sites use it correctly
 (`_check_assignable`, `_unify_type_param`). The fixed bug (`_coerce_into_union`,
 `lowering.py`) didn't.
 
-**High confidence - same shape, not yet fixed:**
+**Fixed** (all three, this pass):
 
-- [type_resolver.py:2834](type_resolver.py:2834) - union-receiver-dispatch
-  leaf-agreement check: `if fn.return_type is not reference.return_type:` inside
-  the loop building `per_leaf` (~2810-2843). Compares two *different* leaf
-  classes' own independently-resolved method return-type annotations by identity
-  before declaring them "disagree" and failing the compile. Two leaves whose
-  `-> list[Op]`-shaped (or any generic/tuple-shaped) return annotations are
-  structurally identical but resolved via different `Specialization` objects
-  would trigger a false-positive "leaf implementations disagree on return type"
-  error. Repro sketch: a union with two leaf classes, both declaring a method
-  `-> list[SomeClass]`, called through the union receiver.
-- [lowering.py:8594](lowering.py:8594) (`_lower_dispatch_tests`) - `member =
-  next((attr for attr in members if attr.type is leaf_type), None)`. Same shape
-  as the fixed `_coerce_into_union` bug: `leaf_type` comes from
-  `overload_resolution.py`'s `ConditionalDispatch.conditions` (derived from
-  `Type.leaves()` on call-site argument types), a different resolution path than
-  `members` (derived from `_tagged_union_shape`/`monomorphize_class`). If the
-  union is a generic instantiation, a genuine-but-non-identical match would
-  wrongly report `"{leaf_type} is not a member of {operand.type}"`.
-- [lowering.py:8627](lowering.py:8627) (`_maybe_unwrap_union_arg`) - `member =
-  next((attr for attr in members if attr.type is target_type), None)`. Same
-  shape, different member-lookup site (`target_type` from `Parameter.type`). A
-  non-identical-but-equal match here doesn't error - it silently falls through
-  to `return operand` unwrapped (line ~8629), which is arguably worse: a wrong
-  answer instead of a compile failure.
+- `type_resolver.py`'s union-receiver-dispatch leaf-agreement check (was
+  `if fn.return_type is not reference.return_type:`) - confirmed with a real
+  repro (two leaves, a generic `Box[T].get_list() -> list[T]` monomorphized
+  to `list[i32]` and a concrete `Other.get_list() -> list[i32]` resolved
+  fresh, both textually identical, wrongly reported as "disagree"). Fixed via
+  `_same_type`; genuine mismatches (verified with a negative-test repro)
+  still correctly rejected. Regression tests:
+  `UnionReceiverDispatchCoercionTests.test_generic_leaves_with_equal_return_types_do_not_false_positive`
+  / `.test_genuinely_disagreeing_leaf_return_types_still_rejected`
+  (emitter_c_test.py).
+- `lowering.py`'s `_lower_dispatch_tests` and `_maybe_unwrap_union_arg` (both
+  `attr.type is leaf_type`/`attr.type is target_type`) - fixed via
+  `_same_type` for consistency with the rest of the codebase, but **no
+  positive repro could be constructed for either**: both are only ever
+  reached through the overload-dispatch mechanism
+  (`_lower_conditional_dispatch`), which is gated by `overload_resolution.py`'s
+  own SEPARATE identity-based leaf matching (`_leaf_is_accepted`, the
+  "awareness only" item below) - a call site that would trigger THIS
+  duality gets rejected by THAT earlier check first, before ever reaching
+  these two lines. The fix is a strict superset of the old behavior (only
+  accepts more correct programs, can never wrongly reject one already
+  accepted), so applied anyway for consistency; full suite green regardless.
+  No dedicated regression test added for these two specifically, since none
+  could be constructed - would need the `overload_resolution.py` item fixed
+  first to ever exercise them with a legitimately-mismatched-but-equal leaf.
 
 **Medium confidence:**
 
@@ -163,17 +164,45 @@ trailing call to a `-> NoReturn` function (`sys.panic(...)`). Fixed via a new
 `_stmt_diverges` helper that also resolves the last statement's callee (via
 `_resolve_callee_target`) and checks for a `NoReturn`-typed return.
 
-**Confirmed, not yet fixed - same pattern, same fix shape available:**
+**Fixed:**
 
-- [type_resolver.py:4593](type_resolver.py:4593) (`visit_Match`, inside the
-  per-case narrowing-merge logic starting ~4585) - `terminates = bool(case.body)
-  and isinstance(case.body[-1], (ast.Return, ast.Break, ast.Continue))`. A
-  `case ...: sys.panic(...)` arm would have the identical narrowing-survival gap
-  `_stmt_If` had. This is the single highest-priority item in this whole
-  document: it's the same "silently accepted, breaks at C-emission" failure
-  mode as the original Bug 3, not merely a spurious rejection. Repro sketch:
-  mirror the original `span()` repro but with the two narrowing checks written
-  as a `match`/`case` instead of `if`.
+- `type_resolver.py`'s `visit_Match` (`terminates` computation) - added a
+  type_resolver.py-level `_stmt_diverges` mirroring `lowering.py`'s own,
+  wired into the per-case `terminates` flag. Confirmed with a real repro:
+  the observable effect is narrower than `_stmt_If`'s bug turned out to be -
+  ordinary post-match expressions are protected by `lowering.py`'s own
+  independent, already-correct narrowing over the desugared if-chain
+  regardless; the actual break is in `type_resolver.py`'s own
+  `_rewrite_type_is_comparison` fold-to-constant optimization for a LATER
+  `type(x) is T` check, which assumed `x` was still union-typed and emitted
+  an invalid `.tag` access once `lowering.py` had already narrowed it out
+  from under that assumption (`intrinsics.usize has no attribute 'tag'`).
+
+  **Caught a second, more serious bug building this first one, already
+  landed on `master` before it was caught:** calling `_resolve_callee_target`
+  unconditionally on a case arm's last statement crashes the compiler for an
+  ordinary receiver call (`self.foo()`) OR a match-pattern-bound receiver
+  (`case Result.Ok(w): ... w.close()`) - `discovery.find_name` raises rather
+  than returning `None` for a name rooted in a local, and (this cost real
+  time to discover) catching the exception isn't enough, since
+  `discovery.fail()` permanently records the error message before raising.
+  The FIRST fix attempt (a `self.locals` membership pre-check) caught the
+  `self.foo()` case but missed the match-bound-name case, since a match
+  pattern's own binding is spliced into the output as a bare `ast.Assign`
+  that's never routed through `self.visit()`/`visit_Assign`, so it never
+  updates `self.locals` - this real regression escaped review and landed on
+  `master`, then surfaced as a genuine break in 3 real CSV-module tests
+  (`csv_dict_test.py`/`csv_linereader_test.py`/`csv_reader_test.py`, via
+  `lib/builtins/__File.py`'s `File.binary_writer`) once a concurrent
+  session's new tests happened to exercise the exact shape. Fixed by
+  checking `discovery.find_name_or_none` directly instead of a hand-tracked
+  "known locals" set. Regression tests:
+  `NarrowingSurvivalTests.test_programs_compile_and_run`'s
+  `match_arm_sys_panic_narrows_past_the_match` /
+  `match_arm_receiver_call_does_not_crash_the_compiler` /
+  `match_bound_name_receiver_call_does_not_crash_the_compiler`
+  (emitter_c_test.py) - each independently confirmed to fail without its
+  fix and pass with it.
 - [lowering.py:683](lowering.py:683) (`_body_may_fall_off_the_end`) - `return
   not body or not isinstance(body[-1], ast.Return)`, used to decide whether to
   synthesize an implicit `return None` at a function's close. Lower priority:
@@ -225,23 +254,20 @@ which needs no hint).
 
 ## Priority order for follow-up work
 
-1. **`type_resolver.py:4593` (Shape 3, `visit_Match`)** - highest priority,
-   identical failure mode to the original highest-priority bug (silently
-   accepted, breaks at C emission instead of at type-check time). The fix
-   pattern (`_stmt_diverges`) already exists and just needs wiring into
-   `visit_Match`'s `terminates` computation the same way it was wired into
-   `_stmt_If`.
-2. **Shape 1's three high-confidence candidates** (`type_resolver.py:2834`,
-   `lowering.py:8594`, `lowering.py:8627`) - same `is`-vs-`_same_type` shape as
-   an already-fixed bug, in the same two files, with `_same_type` already
-   available to swap in directly.
+1. ~~`type_resolver.py:4593` (Shape 3, `visit_Match`)~~ - **fixed**, see above.
+2. ~~Shape 1's three high-confidence candidates~~ - **fixed**, see above.
 3. **Shape 1's two medium-confidence candidates** (`lowering.py:2061-2062`,
    `lowering.py:4281`) - worth a repro attempt each; the `_stmt_Return` one may
-   turn out to be correct-but-duplicated rather than actually broken.
+   turn out to be correct-but-duplicated rather than actually broken. Next up.
 4. **`lowering.py:683` (Shape 3, `_body_may_fall_off_the_end`)** - low risk, low
    priority; at minimum update its stale comment.
 5. Everything under "awareness only" - do not fix without first confirming with
    the user that the documented deliberate-design reasoning no longer holds.
+   Note: `overload_resolution.py`'s `_leaf_is_accepted`/`_contains` (its own
+   identity-based design, documented as relying on the dedup caches) is now
+   the more load-bearing of the two "awareness only" items - it's the reason
+   the two fixed-but-unverified `lowering.py` candidates above couldn't get a
+   positive repro; worth reconsidering whether it should move up in priority.
 
 ## Verification plan for any fix made from this list
 
