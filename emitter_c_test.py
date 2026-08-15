@@ -10401,12 +10401,13 @@ def main() -> i32:
 		# garbage) via a state/flag-gated destructor - each RC-typed
 		# promoted local gets its own `__<stem>_live` companion field,
 		# set once actually assigned, checked by the generator's own
-		# custom-built destructor before decref-ing it. A yielded RC
-		# value is routed through two chained, ALREADY-correctly-RC'd
-		# intermediate locals (see _maybe_route_yield_through_temp's own
-		# docstring for exactly which two, and why - two separate real,
-		# pre-existing, generator-unrelated RC bugs were found and
-		# routed around building this, both flagged separately). Values
+		# custom-built destructor before decref-ing it. A yielded RC value
+		# now returns straight through (no intermediate temp routing -
+		# see 048af0f, "Fix double-incref/masked-decref when coercing a
+		# value into a union type": the union-coercion path this compiles
+		# down to, `return <yielded>` against __next__'s own elem_type|
+		# None return type, already increfs correctly on its own, whether
+		# `yielded` is a field read or a tracked local/parameter). Values
 		# are read back correctly across MULTIPLE reassignment cycles of
 		# the SAME promoted local (not just constructed once) - the
 		# generator's own field is reassigned fresh each loop iteration,
@@ -10469,6 +10470,47 @@ def main() -> i32:
 			return 3
 		if compiler.refcount( b1 ) != 1: # g's own captured parameter released
 			return 4
+		return 0
+''' ),
+		# 048af0f regression guard: a yielded RC value now returns straight
+		# through with no intermediate temp routing (see the comment above
+		# this section's own list) - `yield b` compiles to a bare `return
+		# self.b` against __next__'s own elem_type|None return type,
+		# exactly the shape union_coercion_rc_test.py's own
+		# _UNION_COERCE_FIELD_READ proves increfs exactly once for a plain
+		# (non-generator) field read. Mirrors that test's own before/after-
+		# on-the-SOURCE methodology (never compiler.refcount() on the
+		# union-typed result itself - see that test's own comment on why)
+		# plus its del-then-still-valid check: if the return had silently
+		# stopped increfing (the pre-048af0f bug), dropping g1 here would
+		# free the captured parameter out from under got, and reading
+		# got.v right after would be a real use-after-free, not just a
+		# wrong number.
+		( 'yielded_rc_value_increfs_exactly_once_caller_side', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def yield_param_directly( b: Box ) -> Iterator[Box]:
+	yield b
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p = Box( v = 1 )
+		g1 = yield_param_directly( p )
+		before: usize = compiler.refcount( p ) # p itself + g1's own captured field
+		r = g1.__next__()
+		after: usize = compiler.refcount( p )
+		if after != before + 1:
+			return 1
+		del g1
+		match r:
+			case Box( got ):
+				if got.v != 1:
+					return 2
+			case None:
+				return 3
 		return 0
 ''' ),
 		( 'generator_for_loop_over_rc_typed_list_element', '''

@@ -487,6 +487,25 @@ loop target is just another promoted local by the time it reaches that
 check - confirmed via a real for-loop-over-`list[RCClass]`-inside-a-
 generator repro, no separate code change needed for that part.
 
+**Follow-up cleanup (post-Phase 9): `_maybe_route_yield_through_temp`
+removed entirely.** It existed only to dodge three real, generator-
+unrelated RC bugs in how a bare value coerces into a declared union
+return type (`return self.<field>`, `return <bare tracked value>`, and
+an AnnAssign coercing a field read into a union local, all documented in
+its own now-deleted docstring). All three were root-caused and fixed by
+048af0f ("Fix double-incref/masked-decref when coercing a value into a
+union type" - `lowering.py`'s `_is_aliasing_expr` now checks the actual
+coerced operand via `_coerce_into_union`'s own `is_union_coerce_result`
+tag, not the pre-coercion ast node), on a branch this generator work
+hadn't merged yet. Confirmed safe via a direct repro of the exact
+`return self.<field>` shape plus a new real-compile-and-run regression
+test (`emitter_c_test.py`'s `yielded_rc_value_increfs_exactly_once_
+caller_side`) before removing the routing and the `elem_type`/
+`elem_is_rc` plumbing that only ever fed it from `_build_yield_unit_
+guard`/`_build_while_unit_guard`/`_build_if_unit_guard`/
+`_build_generator_next_function` - a yield's own return value now flows
+through unmodified, same as any other union-typed return.
+
 **Design pivot from the original sketch**: the ORIGINAL plan (see below)
 sketched a per-STATE validity table (a `switch` on `self.__state`,
 decref-ing exactly the fields "valid from state N onward", computed from

@@ -939,21 +939,6 @@ class TypeResolver:
 		param_stems = { p.stem for p in fn.parameters or [] }
 		locals_decl: dict[str,Type] = {}
 		for node in self._walk_generator_body( fn.node.body ):
-			if getattr( node, 'compiler_synthesized_for_loop_temp', False ):
-				# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a synthesized
-				# yield-return temp (_maybe_route_yield_through_temp) is the
-				# FIRST synthesized temp in this file to need an AnnAssign
-				# shape (an explicit `: T|None` annotation, to route the
-				# union-coercion through the ALREADY-correctly-RC'd
-				# assignment path rather than the KNOWN-broken bare-value-
-				# into-declared-return-type coercion `return <bare value>`
-				# hits - see that method's own docstring) - every earlier
-				# synthesized temp (__gen_resuming_N/__for_next_N) used a
-				# bare Assign instead, specifically to duck this same
-				# exemption check via the Assign-only branch below. An
-				# ordinary $$__next__-scoped local, never a field - same
-				# posture as those, just needing the check up here too now
-				continue
 			if isinstance( node, ast.AnnAssign ) and isinstance( node.target, ast.Name ):
 				stem = node.target.id
 				if stem in param_stems:
@@ -1124,87 +1109,26 @@ class TypeResolver:
 				result.append( renamed )
 		return result
 
-	def _maybe_route_yield_through_temp( self, yielded: ast.expr, node: ast.AST, temp_key: str, elem_type: Type, elem_is_rc: bool ) -> 'tuple[list[ast.stmt],ast.expr]':
-		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a yielded RC-
-		typed value needs an INCREF: the caller receives a real, counted
-		reference, but the generator's OWN field the value came from
-		(self.<local>, or a captured parameter) keeps its own reference
-		too - both now genuinely alive.
-
-		THREE real, pre-existing, generator-unrelated RC bugs were found
-		and worked around while building this (all flagged separately,
-		out of scope to fix here - see PLAN_GENERATORS.md's own note):
-		(1) `return self.<field>` does not incref at all; (2) `return
-		<bare value>` where the function's OWN declared return type is a
-		union (elem_type|None, exactly __next__'s own shape) ALSO does
-		not incref, even for an ordinary tracked parameter/local; (3) an
-		annotated local assignment that coerces a value INTO a union
-		(`x: T|None = value`) only correctly increfs when `value` is
-		itself already a tracked binding (a parameter/local Name) - when
-		`value` is instead a FIELD READ (`self.foo`) or other untracked
-		expression, the intermediate union-wrap temp ends up DECREF'd
-		once (as if it were a fresh owned temp needing cleanup) with NO
-		matching incref ever having fired for it - confirmed via a real
-		repro that crashed with STATUS_ACCESS_VIOLATION (the field's own
-		reference count silently dropped below the number of live
-		holders). All three sidestepped by chaining TWO ordinary,
-		already-correct steps: (a) `__yield_raw_<temp_key>: elem_type =
-		<yielded>` - an annotated local assignment with a BARE (non-
-		union) type, which correctly increfs regardless of whether
-		`yielded` is a field read or a tracked binding (confirmed via a
-		real repro); (b) `__yield_val_<temp_key>: elem_type|None =
-		__yield_raw_<temp_key>` - coercing THAT tracked local (never a
-		field read) into the union, which is exactly the shape bug (3)
-		above confirmed DOES correctly incref. Returning the ALREADY-
-		union-typed __yield_val_<temp_key> is then a plain "move" of a
-		tracked local - the one return shape this compiler already gets
-		right, per every existing RC test in or_return_rc_test.py. Both
-		intermediate locals are ordinary, non-promoted $$__next__-locals
-		(compiler_synthesized_for_loop_temp-exempted - see
-		_collect_generator_locals' own AnnAssign-branch check, added for
-		this - every EARLIER synthesized temp in this file used a bare
-		Assign specifically to avoid needing that check at all; these are
-		the first that need a real `: T` annotation for the right
-		coercion behavior) - never fields, never cross a resume boundary,
-		recomputed fresh every yield.
-
-		temp_key is the unit's own start_state for a bare yield/while-
-		unit, but an if-unit's two branches SHARE one start_state
-		(build_branch runs once per branch, same start_state both times)
-		- its own callers suffix with '_if'/'_else' so the two branches'
-		own temps never collide (harmless either way, since only one
-		branch ever actually runs per call, but avoiding the same-named
-		local in two sibling if/else arms sidesteps relying on that being
-		fine at the C level).
-
-		A no-op (returns `yielded` unchanged, no extra statements) when
-		elem_is_rc is False - scalars need no incref, matching every
-		generator built before this phase. '''
-		if not elem_is_rc:
-			return [], yielded
-		elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() )
-		ast.copy_location( elem_type_name, node )
-		raw_name = f'__yield_raw_{temp_key}'
-		raw_assign = ast.AnnAssign(
-			target = ast.Name( id = raw_name, ctx = ast.Store() ),
-			annotation = elem_type_name, value = yielded, simple = 1,
-		)
-		ast.copy_location( raw_assign, node )
-		raw_assign.compiler_synthesized_for_loop_temp = True
-
-		val_name = f'__yield_val_{temp_key}'
-		elem_type_name2 = ast.Name( id = elem_type.stem, ctx = ast.Load() )
-		ast.copy_location( elem_type_name2, node )
-		union_annotation = ast.BinOp( left = elem_type_name2, op = ast.BitOr(), right = ast.Constant( value = None ) )
-		ast.copy_location( union_annotation, node )
-		val_assign = ast.AnnAssign(
-			target = ast.Name( id = val_name, ctx = ast.Store() ),
-			annotation = union_annotation, value = ast.Name( id = raw_name, ctx = ast.Load() ), simple = 1,
-		)
-		ast.copy_location( val_assign, node )
-		val_assign.compiler_synthesized_for_loop_temp = True
-
-		return [ raw_assign, val_assign ], ast.Name( id = val_name, ctx = ast.Load() )
+	# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) used to route every
+	# RC-typed yielded value through two chained intermediate locals here
+	# (_maybe_route_yield_through_temp) to dodge three real, generator-
+	# unrelated RC bugs in how a bare value coerces into a declared union
+	# return type (elem_type|None, exactly __next__'s own shape):
+	# `return self.<field>`, `return <bare tracked value>`, and an
+	# AnnAssign coercing a field read into a union local all under- or
+	# over-counted the incref the union-member constructor already does
+	# internally. All three were root-caused and fixed by 048af0f ("Fix
+	# double-incref/masked-decref when coercing a value into a union
+	# type" - lowering.py's _is_aliasing_expr now checks the actual
+	# coerced operand via _coerce_into_union's own is_union_coerce_result
+	# tag, not the pre-coercion ast node) - a plain `return <yielded>`
+	# through elem_type|None now increfs exactly once regardless of
+	# whether `yielded` is a field read, a tracked local, or a bare
+	# parameter, confirmed both by 048af0f's own union_coercion_rc_test.py
+	# and directly against this exact self.<field>-return shape. The
+	# routing (and the elem_type/elem_is_rc plumbing that only ever fed
+	# it) was removed once that was confirmed - yield sites below just
+	# return the renamed value straight through.
 
 	def _pessimistic_done_prefix( self, stmts: list[ast.stmt], node: ast.AST, pending_done_assigns: 'list[ast.Assign]|None' ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
@@ -1241,7 +1165,7 @@ class TypeResolver:
 		pending_done_assigns.append( assign )
 		return [ assign ] + stmts
 
-	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, elem_is_rc: bool = False, elem_type: 'Type|None' = None ) -> tuple[ast.If,int]:
+	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None ) -> tuple[ast.If,int]:
 		''' a bare top-level `yield expr` (v1), or the SAME shape wrapped
 		in `with compiler.wrap_arithmetic/saturate_arithmetic/
 		panic_arithmetic(...):` (Phase 2 - see _yield_with_wrapper's own
@@ -1253,8 +1177,7 @@ class TypeResolver:
 		unguarded: this guard only ever fires when __state == start_state
 		exactly (every smaller state was already caught and returned by an
 		earlier guard). pending_done_assigns: see _pessimistic_done_prefix -
-		non-None only for a fallible (Generator[T,E]) generator.
-		elem_is_rc: see _maybe_route_yield_through_temp. '''
+		non-None only for a fallible (Generator[T,E]) generator. '''
 		if isinstance( stmt, ast.With ):
 			yield_stmt = stmt.body[0]
 			assert isinstance( yield_stmt, ast.Expr )
@@ -1264,8 +1187,7 @@ class TypeResolver:
 		assert isinstance( yield_node, ast.Yield )
 		seg_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems or set() ), stmt, pending_done_assigns )
 		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-		temp_stmts, yielded = self._maybe_route_yield_through_temp( yielded, stmt, str( start_state ), elem_type, elem_is_rc )
-		yield_stmts: list[ast.stmt] = temp_stmts + [
+		yield_stmts: list[ast.stmt] = [
 			ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = start_state + 1 ) ),
 			ast.Return( value = yielded ),
 		]
@@ -1287,7 +1209,7 @@ class TypeResolver:
 		)
 		return guard, start_state + 1
 
-	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, elem_is_rc: bool = False, elem_type: 'Type|None' = None ) -> tuple[ast.If,int]:
+	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None ) -> tuple[ast.If,int]:
 		''' a `while cond: PRE_ITER; yield V; POST_ITER` loop occupies TWO
 		states: start_state ("not yet entered") and start_state+1
 		("paused mid-loop, resuming"). Restructured as the standard
@@ -1343,8 +1265,7 @@ class TypeResolver:
 		]
 		inner_if = ast.If( test = ast.Name( id = resume_var, ctx = ast.Load() ), body = resume_body, orelse = [] )
 		break_if = ast.If( test = ast.UnaryOp( op = ast.Not(), operand = cond ), body = [ ast.Break() ], orelse = [] )
-		temp_stmts, yielded = self._maybe_route_yield_through_temp( yielded, node, str( start_state ), elem_type, elem_is_rc )
-		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns ) + temp_stmts + [
+		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns ) + [
 			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
 			ast.Return( value = yielded ),
 		]
@@ -1363,7 +1284,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, elem_is_rc: bool = False, elem_type: 'Type|None' = None ) -> tuple[ast.If,int]:
+	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None ) -> tuple[ast.If,int]:
 		''' `if cond: [...yield...] else: [...yield...]` (at most one
 		yield per branch, at least one branch having one - see
 		_validate_if_yield_unit) occupies TWO states, same as a while-unit
@@ -1392,7 +1313,7 @@ class TypeResolver:
 		resume_var = f'__gen_if_resuming_{start_state}'
 		rc_local_stems = rc_local_stems or set()
 
-		def build_branch( branch_stmts: list[ast.stmt], branch_label: str ) -> list[ast.stmt]:
+		def build_branch( branch_stmts: list[ast.stmt] ) -> list[ast.stmt]:
 			yield_index = next(
 				( i for i, s in enumerate( branch_stmts ) if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield )),
 				None,
@@ -1410,8 +1331,7 @@ class TypeResolver:
 			yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
 			post_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[ yield_index + 1: ], renamer, rc_local_stems ), node, pending_done_assigns )
 			resuming_branch = post_stmts or [ ast.Pass() ]
-			temp_stmts, yielded = self._maybe_route_yield_through_temp( yielded, node, f'{start_state}_{branch_label}', elem_type, elem_is_rc )
-			fresh_branch = pre_stmts + temp_stmts + [
+			fresh_branch = pre_stmts + [
 				ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
 				ast.Return( value = yielded ),
 			]
@@ -1426,8 +1346,8 @@ class TypeResolver:
 			targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ],
 			value = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
 		)
-		if_body = build_branch( node.body, 'if' )
-		else_body = build_branch( node.orelse, 'else' ) if node.orelse else []
+		if_body = build_branch( node.body )
+		else_body = build_branch( node.orelse ) if node.orelse else []
 		outer_if = ast.If( test = cond, body = if_body, orelse = else_body )
 
 		end_state = start_state + 2
@@ -1443,7 +1363,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', elem_type: Type ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None' ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
@@ -1486,21 +1406,16 @@ class TypeResolver:
 		# scalar/non-RC locals need nothing, same posture as before this
 		# phase
 		rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
-		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - every yield in ONE
-		# generator shares the SAME declared elem_type, so this is computed
-		# once here rather than per-yield-site (see _maybe_route_yield_
-		# through_temp for what it gates)
-		elem_is_rc = is_rc( elem_type )
 
 		guards: list[ast.If] = []
 		state = 0
 		for preamble, ( kind, stmt ) in segments:
 			if kind == 'yield':
-				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, elem_is_rc, elem_type )
+				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems )
 			elif kind == 'if':
-				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, elem_is_rc, elem_type )
+				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems )
 			else:
-				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, elem_is_rc, elem_type )
+				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems )
 			guards.append( guard )
 		done_state = state + 1
 		if pending_done_assigns is not None:
@@ -1881,7 +1796,7 @@ class TypeResolver:
 			next_return_type = result_union
 
 		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, elem_type )
+		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type )
 		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 		# backing_cls is ever scheduled below, so its own pre-mark of
 		# id(backing_cls) in self._destructors_synthesized (see its own
