@@ -2041,6 +2041,16 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			return [ '\treturn;' ]
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
+	if isinstance( instr, ir.Yield ):
+		# PLAN_GENERATORS.md Phase F - see ir.Yield's own docstring: the
+		# state store and resume label are separate, adjacent instructions
+		# (ir.SetAttr/ir.Label) lowering.py already emits around this one -
+		# this is deliberately just a plain `return`, the same shape
+		# ir.Return's own non-void/non-entry-point branch emits (always
+		# correct here: a generator's own $$__next__ always has a
+		# concrete, non-void return type, and is never the entry point)
+		return [ f'\treturn {_emit_operand(instr.value)};' ]
+
 	if isinstance( instr, ir.DeclareTemp ):
 		return [ f'\t{_declarator( instr.temp.type, _temp_name( instr.temp.id ) )};' ]
 	if isinstance( instr, ir.DeleteTemp ):

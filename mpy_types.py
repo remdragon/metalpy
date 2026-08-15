@@ -827,6 +827,7 @@ class Function( Type, ScopeMixin ):
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
 	is_destructor: bool = False # synthesized $$__destructor__ body — emitter uses void(void*) signature + cast prologue
 	is_generator_next: bool = False # PLAN_GENERATORS.md Phase F - synthesized $$__next__/$$__resume__ body of a generator's backing class: lowering.py's own generator-body entry point handles ast.Yield (emits ir.Yield + a resume ir.Label) and builds the self.__state dispatch prologue in front of the ordinary lowered body, mirroring is_destructor's own precedent of a Function-level flag gating a special-cased prologue
+	generator_done_state: int|None = None # is_generator_next only - the concrete "permanently exhausted" self.__state value, computed once at synthesis time (type_resolver.py's _build_generator_next_function: 1 + total yield count) and reused as-is at lowering time (dispatch prologue's own done-check, and _consume_checked_result's pessimistic-done OrReturn.epilogue injection) rather than trusting a second independent count to agree
 
 	# implementations only (never set on a stub - stubs are never scheduled
 	# as real compile units, so they never need a C symbol of their own) -

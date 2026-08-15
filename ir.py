@@ -621,23 +621,25 @@ class Return( Instruction ):
 class Yield( Instruction ):
 	''' PLAN_GENERATORS.md Phase F - a real `yield` suspend point inside a
 	generator's $$__next__/$$__resume__ body (Function.is_generator_next).
-	Codegen (emitter_c.py) stores `state` into self.__state, then returns
-	`value` - exactly the "state store + return" shape the OLD AST-
-	synthesis mechanism used to hand-build per yield unit
-	(type_resolver.py's _build_yield_unit_guard/_build_while_unit_guard/
-	_build_if_unit_guard, all removed by Phase F), now emitted once,
-	directly, by real lowering instead. Immediately after this instruction
-	in the lowered stream is an ordinary ir.Label(name=resume_label) -
-	existing, unmodified machinery - which is exactly where a LATER call,
-	dispatched via the function's own state-check prologue jumping
-	straight to that label, resumes execution. state is this yield's own
-	dispatch discriminant (unique per textual yield site, assigned in
-	source order starting at 1 - state 0 means "not yet started", matching
-	the old mechanism's own convention) and by convention doubles as
-	resume_label's numeric suffix, but both are carried explicitly here
-	(mirroring Jump/JumpIfFalse's own explicit `target` field) rather than
-	derived, so codegen never needs to know the label-naming convention
-	itself. '''
+	Codegen (emitter_c.py) is deliberately trivial - `return value;`, the
+	exact same shape ir.Return's own non-void/non-entry-point branch
+	already emits (a generator's own $$__next__ always has a concrete,
+	non-void return type, and is never the program's entry point, so none
+	of ir.Return's other special cases ever apply here) - the state store
+	(self.__state = state) is an ordinary, separate ir.SetAttr emitted
+	immediately BEFORE this instruction, and the resume point is an
+	ordinary, separate ir.Label(name=resume_label) emitted immediately
+	AFTER it (lowering.py's own _lower_generator_yield emits all three,
+	back to back) - both already-proven, unmodified machinery, reused
+	as-is rather than reimplemented inside this instruction's own codegen.
+	A LATER call, dispatched via the function's own state-check prologue
+	jumping straight to that label, resumes execution there. state/
+	resume_label are carried here anyway (not read back by codegen at
+	all) purely so a dumped/test_repr'd instruction stream is self-
+	describing - state is this yield's own dispatch discriminant (unique
+	per textual yield site, assigned by FunctionLowering._emit_generator_
+	dispatch_prologue's own AST-walk, starting at 1 - state 0 means "not
+	yet started"). '''
 	value: Operand # already coerced/wrapped to match the function's own declared return type (elem_type|None, or Result[elem_type|None,error_type] when fallible) - same convention ir.Return's own `value` field expects
 	state: int
 	resume_label: str
