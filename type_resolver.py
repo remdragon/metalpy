@@ -994,7 +994,42 @@ class TypeResolver:
 			resolve = None,
 		)
 
-	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer' ) -> tuple[ast.If,int]:
+	def _pessimistic_done_prefix( self, stmts: list[ast.stmt], node: ast.AST, pending_done_assigns: 'list[ast.Assign]|None' ) -> list[ast.stmt]:
+		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
+		generator's __next__ needs "permanently done" set BEFORE any block
+		of user code that might contain an or_return()/checked-arithmetic
+		early return, not after: OrReturn's own error exit returns directly
+		out of __next__ WITHOUT running whatever would normally advance
+		self.__state afterward, so without this, self.__state stays at
+		whatever it was BEFORE the failing statement - a later .__next__()
+		call would re-enter the SAME guard and re-run the SAME (partially-
+		applied, possibly already-consumed-a-moved-value) code from
+		scratch. Pessimistically setting state to "done" FIRST, then
+		letting the unit's own normal success path overwrite it with the
+		real next-state value right before its own yield/fall-through,
+		means an early return anywhere in between is automatically correct
+		with zero new IR/lowering machinery - purely a reordering of
+		existing AST.
+
+		pending_done_assigns is None for an infallible (Iterator[T])
+		generator - a no-op, `stmts` returned unchanged (nothing can fail,
+		nothing to guard against). For a fallible one, it's the SAME list
+		object threaded through every call site across all three guard
+		builders for one __next__ build - the real "done" value isn't
+		known yet at guard-building time (it depends on the FINAL state
+		count, computed only after every unit is built), so each inserted
+		Assign's own placeholder value gets recorded here and patched to
+		the real done_state by _build_generator_next_function once that's
+		known, rather than sharing one mutable Constant node across every
+		insertion point. '''
+		if pending_done_assigns is None:
+			return stmts
+		assign = ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = 0 ) )
+		ast.copy_location( assign, node )
+		pending_done_assigns.append( assign )
+		return [ assign ] + stmts
+
+	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None ) -> tuple[ast.If,int]:
 		''' a bare top-level `yield expr` (v1), or the SAME shape wrapped
 		in `with compiler.wrap_arithmetic/saturate_arithmetic/
 		panic_arithmetic(...):` (Phase 2 - see _yield_with_wrapper's own
@@ -1005,7 +1040,8 @@ class TypeResolver:
 		ordinary statements immediately before this yield) can run
 		unguarded: this guard only ever fires when __state == start_state
 		exactly (every smaller state was already caught and returned by an
-		earlier guard). '''
+		earlier guard). pending_done_assigns: see _pessimistic_done_prefix -
+		non-None only for a fallible (Generator[T,E]) generator. '''
 		if isinstance( stmt, ast.With ):
 			yield_stmt = stmt.body[0]
 			assert isinstance( yield_stmt, ast.Expr )
@@ -1013,7 +1049,7 @@ class TypeResolver:
 		else:
 			yield_node = stmt.value
 		assert isinstance( yield_node, ast.Yield )
-		seg_stmts = [ renamer.visit( s ) for s in pre ]
+		seg_stmts = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in pre ], stmt, pending_done_assigns )
 		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
 		yield_stmts: list[ast.stmt] = [
 			ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = start_state + 1 ) ),
@@ -1037,7 +1073,7 @@ class TypeResolver:
 		)
 		return guard, start_state + 1
 
-	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer' ) -> tuple[ast.If,int]:
+	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None ) -> tuple[ast.If,int]:
 		''' a `while cond: PRE_ITER; yield V; POST_ITER` loop occupies TWO
 		states: start_state ("not yet entered") and start_state+1
 		("paused mid-loop, resuming"). Restructured as the standard
@@ -1080,19 +1116,19 @@ class TypeResolver:
 		resume_var = f'__gen_resuming_{start_state}' # unique per while-unit (keyed by its own start_state) - an ordinary $$__next__-scoped local, never a field: only needs to survive within ONE call
 		first_entry_guard = ast.If(
 			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = [ renamer.visit( s ) for s in pre ] or [ ast.Pass() ],
+			body = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in pre ], node, pending_done_assigns ) or [ ast.Pass() ],
 			orelse = [],
 		)
 		resuming_init = ast.Assign(
 			targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ],
 			value = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
 		)
-		resume_body = post_iter_stmts + [
+		resume_body = self._pessimistic_done_prefix( post_iter_stmts, node, pending_done_assigns ) + [
 			ast.Assign( targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ], value = ast.Constant( value = False ) ),
 		]
 		inner_if = ast.If( test = ast.Name( id = resume_var, ctx = ast.Load() ), body = resume_body, orelse = [] )
 		break_if = ast.If( test = ast.UnaryOp( op = ast.Not(), operand = cond ), body = [ ast.Break() ], orelse = [] )
-		yield_stmts = pre_iter_stmts + [
+		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns ) + [
 			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
 			ast.Return( value = yielded ),
 		]
@@ -1111,7 +1147,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer' ) -> tuple[ast.If,int]:
+	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None ) -> tuple[ast.If,int]:
 		''' `if cond: [...yield...] else: [...yield...]` (at most one
 		yield per branch, at least one branch having one - see
 		_validate_if_yield_unit) occupies TWO states, same as a while-unit
@@ -1145,12 +1181,17 @@ class TypeResolver:
 				None,
 			)
 			if yield_index is None:
-				return [ renamer.visit( s ) for s in branch_stmts ]
-			pre_stmts = [ renamer.visit( s ) for s in branch_stmts[:yield_index] ]
+				# a non-yielding branch only ever runs on the FIRST entry
+				# (state == start_state - see this method's own docstring),
+				# but its own code can still fail partway through, so it
+				# needs the same pessimistic-done guarding as any other
+				# fallible block, same reasoning as first_entry_guard below
+				return self._pessimistic_done_prefix( [ renamer.visit( s ) for s in branch_stmts ], node, pending_done_assigns )
+			pre_stmts = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in branch_stmts[:yield_index] ], node, pending_done_assigns )
 			yield_node = branch_stmts[ yield_index ].value
 			assert isinstance( yield_node, ast.Yield )
 			yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-			post_stmts = [ renamer.visit( s ) for s in branch_stmts[ yield_index + 1: ] ]
+			post_stmts = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in branch_stmts[ yield_index + 1: ] ], node, pending_done_assigns )
 			resuming_branch = post_stmts or [ ast.Pass() ]
 			fresh_branch = pre_stmts + [
 				ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
@@ -1160,7 +1201,7 @@ class TypeResolver:
 
 		first_entry_guard = ast.If(
 			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = [ renamer.visit( s ) for s in pre ] or [ ast.Pass() ],
+			body = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in pre ], node, pending_done_assigns ) or [ ast.Pass() ],
 			orelse = [],
 		)
 		resuming_init = ast.Assign(
@@ -1184,7 +1225,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], result_union: TaggedUnion ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None' ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
@@ -1195,23 +1236,47 @@ class TypeResolver:
 		once its own construct naturally finishes (correct - see each
 		builder's own docstring) into whatever guard covers the state it
 		just advanced to - no elif/goto/switch needed anywhere (see this
-		section's own top docstring). '''
+		section's own top docstring).
+
+		next_return_type/error_type: PLAN_GENERATORS.md Phase 4 (roadmap
+		Phase 4) - error_type is None for an infallible Iterator[T]
+		generator (next_return_type is just result_union, unchanged from
+		before this phase) or set for a fallible Generator[T,E] one
+		(next_return_type is Result[result_union,error_type]). When
+		fallible: every guard builder gets a SHARED pending_done_assigns
+		list to record a pessimistic "self.__state = <placeholder>"
+		inserted immediately before every block of user code that might
+		contain an or_return()/checked-arithmetic early return (see
+		_pessimistic_done_prefix's own docstring for why this needs to run
+		BEFORE, not after) - the real done_state value isn't known until
+		AFTER every unit is built, so every placeholder gets patched to it
+		here, once, right below. Every ast.Return in the assembled body
+		(including this DONE short-circuit's own, and the tail's) then
+		gets its value wrapped in Result.Ok(...) - or_return()'s own Err
+		return is untouched (it's an IR-level OrReturn, built later during
+		real lowering, never a literal ast.Return node this pass ever
+		sees). '''
 		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
 		renamer = _GeneratorNameRenamer( rename_targets )
 
 		segments, tail = self._split_generator_segments( fn, units )
+		is_fallible = error_type is not None
+		pending_done_assigns: 'list[ast.Assign]|None' = [] if is_fallible else None
 
 		guards: list[ast.If] = []
 		state = 0
 		for preamble, ( kind, stmt ) in segments:
 			if kind == 'yield':
-				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer )
+				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns )
 			elif kind == 'if':
-				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer )
+				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns )
 			else:
-				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer )
+				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns )
 			guards.append( guard )
 		done_state = state + 1
+		if pending_done_assigns is not None:
+			for pending in pending_done_assigns:
+				pending.value = ast.Constant( value = done_state )
 
 		next_body: list[ast.stmt] = [
 			ast.If(
@@ -1224,6 +1289,14 @@ class TypeResolver:
 
 		anchor = tail[0] if tail else fn.node
 		tail_stmts = [ renamer.visit( s ) for s in tail ]
+		if is_fallible:
+			# the real done_state is already known here (unlike each unit's
+			# own placeholder above) - tail_stmts is ordinary user code
+			# (whatever follows the last unit) and can fail just like any
+			# other block, so it needs the same pessimistic guarding
+			pessimistic = ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) )
+			ast.copy_location( pessimistic, anchor )
+			tail_stmts = [ pessimistic ] + tail_stmts
 		tail_body = tail_stmts + [
 			ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) ),
 			ast.Return( value = ast.Constant( value = None ) ),
@@ -1233,6 +1306,9 @@ class TypeResolver:
 			body = tail_body, orelse = [],
 		))
 		next_body.append( ast.Return( value = ast.Constant( value = None ) )) # unreachable safety net - every path above already returns
+
+		if is_fallible:
+			self._wrap_generator_next_returns_in_ok( next_body )
 
 		node = ast.FunctionDef(
 			name = '$$__next__',
@@ -1245,12 +1321,44 @@ class TypeResolver:
 		next_fn = Function(
 			stem = '__next__', qualname = f'{backing_cls.qualname}.__next__', file = fn.file, line = fn.line,
 			cls = backing_cls, node = node,
-			parameters = [], return_type = result_union,
+			parameters = [], return_type = next_return_type,
 			is_static = False, resolve = None,
 		)
 		backing_cls.methods.append( next_fn )
 		backing_cls.names[ next_fn.stem ] = next_fn
 		return next_fn
+
+	def _wrap_generator_next_returns_in_ok( self, next_body: list[ast.stmt] ) -> None:
+		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
+		Generator[T,E]'s $$__next__ declares -> Result[elem_type|None,E],
+		so every `return <value>` built anywhere above (the DONE short-
+		circuit's `return None`, every yield-unit's `return <yielded>`,
+		the tail's/safety-net's `return None`) needs to become `return
+		Result.Ok(<value>)` instead. Run once, after the WHOLE body is
+		assembled, rather than threading Result-wrapping through every
+		individual guard builder - simpler, and correct because $$__next__
+		can never contain a nested def/lambda (generator bodies already
+		reject those), so a plain ast.walk (no "don't recurse into a
+		nested scope" concern, unlike _walk_generator_body elsewhere in
+		this file) safely reaches every ast.Return belonging to THIS
+		function. Result.Ok(...)'s own payload argument is coerced the
+		ordinary way (same _lower_expr(arg,expected_type) machinery any
+		other call argument gets, confirmed via a real repro: a bare
+		elem_type value OR a bare None constant both coerce into the
+		declared elem_type|None payload with no extra wrapping needed
+		here) - so this never needs to know what shape `value` already is. '''
+		for stmt in next_body:
+			for n in ast.walk( stmt ):
+				if isinstance( n, ast.Return ):
+					value = n.value if n.value is not None else ast.Constant( value = None )
+					ok_call = ast.Call(
+						func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+						args = [ value ], keywords = [],
+					)
+					ast.copy_location( ok_call, n )
+					ast.copy_location( ok_call.func, n )
+					ast.copy_location( ok_call.func.value, n )
+					n.value = ok_call
 
 	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> None:
 		''' replaces the original generator def's own body with a single
@@ -1371,6 +1479,7 @@ class TypeResolver:
 		if not isinstance( fn.return_type, GeneratorType ):
 			self.discovery.fail( f'{fn.qualname} contains yield but is not declared -> Iterator[T]', fn.node )
 		elem_type = fn.return_type.elem_type
+		error_type = fn.return_type.error_type
 		self.schedule( elem_type )
 
 		extra_fields = self._desugar_generator_for_loops( fn )
@@ -1382,8 +1491,26 @@ class TypeResolver:
 		none_type = self.discovery.get_none_type()
 		result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
 
+		# PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - Generator[T,E]
+		# (error_type set) makes __next__ fallible: it returns
+		# Result[elem_type|None, error_type] instead of the bare union, so
+		# or_return()/checked-arithmetic inside the body engage the
+		# existing _require_result_return machinery for free (no special
+		# generator-side flag needed - it's purely a consequence of
+		# __next__'s own declared return type, exactly like any other
+		# fallible function). Iterator[T] (error_type None) is unaffected -
+		# next_return_type stays the bare union, same as before this phase.
+		if error_type is not None:
+			self.schedule( error_type )
+			result_cls = self.discovery.find_name_or_none( 'Result' )
+			assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for Generator[T,E] but was not found'
+			next_return_type = self.discovery._get_or_create_specialization( result_cls, [ result_union, error_type ] )
+			self.schedule( next_return_type )
+		else:
+			next_return_type = result_union
+
 		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, result_union )
+		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type )
 
 		self.schedule( backing_cls )
 		self.schedule( backing_cls.names['__next__'] )

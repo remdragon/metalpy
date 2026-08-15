@@ -8696,6 +8696,124 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+		# --- Phase 4: fallible generators (`Generator[T,E]`, TODO.txt's
+		# original open question). __next__ returns Result[elem_type|None,
+		# E] instead of the bare union - or_return() inside the body
+		# engages the EXISTING checked-arithmetic/_require_result_return
+		# machinery for free (no special generator-side flag - purely a
+		# consequence of __next__'s own declared return type, same as any
+		# other fallible function). The one genuinely new piece
+		# (type_resolver.py's _pessimistic_done_prefix): self.__state gets
+		# set to the "permanently done" sentinel BEFORE, not after, every
+		# block of user code that might contain a fallible early return -
+		# so an or_return() failure partway through a unit leaves the
+		# generator correctly, permanently exhausted (Ok(None) forever
+		# after) rather than re-entering and re-running the same
+		# (possibly already-mutated-state) code again on the next call.
+		( 'fallible_generator_or_return_propagates_and_then_stays_done', '''
+@union
+class BoomError:
+	Boom: None
+
+def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
+	if i == boom_at:
+		return Result.Err( BoomError.Boom( None ))
+	return Result.Ok( i )
+
+def counter( limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+	i: usize = 0
+	while i < limit:
+		v: usize = maybe_bad( i, boom_at ).or_return()
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = counter( 5, 2 )
+		r0 = g.__next__() # i=0 - succeeds
+		match r0:
+			case Result.Err( e ):
+				return 1
+			case Result.Ok( a ):
+				pass
+		r1 = g.__next__() # i=1 - succeeds
+		match r1:
+			case Result.Err( e ):
+				return 2
+			case Result.Ok( b ):
+				pass
+		r2 = g.__next__() # i=2 == boom_at - or_return() fires
+		errored = False
+		match r2:
+			case Result.Err( e ):
+				errored = True
+			case Result.Ok( c ):
+				return 3
+		if not errored:
+			return 4
+		r3 = g.__next__() # permanently done - Ok(None), not a re-run of the failing code
+		match r3:
+			case Result.Err( e ):
+				return 5
+			case Result.Ok( d ):
+				pass
+		r4 = g.__next__() # still permanently done, still no crash
+		match r4:
+			case Result.Err( e ):
+				return 6
+			case Result.Ok( f ):
+				pass
+		return 0
+''' ),
+		( 'fallible_generator_or_return_error_releases_captured_parameter', '''
+@union
+class BoomError:
+	Boom: None
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
+	if i == boom_at:
+		return Result.Err( BoomError.Boom( None ))
+	return Result.Ok( i )
+
+def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+	i: usize = 0
+	while i < limit:
+		v: usize = maybe_bad( i, boom_at ).or_return()
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def make_and_partially_consume( b: Box ) -> None:
+	g = gen( b, 5, 1 )
+	first = g.__next__() # i=0, succeeds
+	first.unwrap( 'unexpected error' )
+	second = g.__next__() # i=1 == boom_at - or_return() fires, Err returned
+	match second:
+		case Result.Ok( x ):
+			pass
+		case Result.Err( e ):
+			pass
+	# g goes out of scope here, permanently done via or_return()'s own
+	# error exit (not normal exhaustion) - its own captured Box parameter
+	# must still be released via the ordinary, unmodified $$__destructor__
+	# cascade, exactly like every other generator abandoned mid-iteration
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 42 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		make_and_partially_consume( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -8835,6 +8953,35 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
+
+	def test_or_return_inside_infallible_iterator_is_rejected( self ) -> None:
+		# Phase 4 (roadmap Phase 4) - or_return() stays rejected inside a
+		# plain Iterator[T] (infallible) generator, exactly as before this
+		# phase - unchanged, since it's purely a consequence of __next__'s
+		# own declared return type (elem_type|None, not Result-shaped),
+		# same _require_result_return check every other non-Result-
+		# returning function already hits. Generator[T,E] is what lifts
+		# this - see test_programs_compile_and_run's own fallible_generator_
+		# ... test cases.
+		self._run( '''
+@union
+class BoomError:
+	Boom: None
+
+def maybe_bad( flag: bool ) -> Result[i32, BoomError]:
+	if flag:
+		return Result.Err( BoomError.Boom( None ))
+	return Result.Ok( 1 )
+
+def gen( flag: bool ) -> Iterator[i32]:
+	v: i32 = maybe_bad( flag ).or_return()
+	yield v
+
+def main() -> None:
+	g = gen( True )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
 
 
 if __name__ == '__main__':

@@ -223,13 +223,20 @@ class Monomorphizer:
 			# monomorphized copy's own ensure_generator_synthesized call
 			# populates it fresh, same as any other generator function
 			substituted_elem = self.substitute_type_params( t.elem_type, type_params, args )
-			if substituted_elem is t.elem_type:
+			# Generator[T,E]'s own error_type (PLAN_GENERATORS.md Phase 4/
+			# roadmap Phase 4) needs the identical substitution - None stays
+			# None (Iterator[T]'s own infallible shape, nothing to substitute)
+			substituted_error = self.substitute_type_params( t.error_type, type_params, args ) if t.error_type is not None else None
+			if substituted_elem is t.elem_type and substituted_error is t.error_type:
 				return t
+			if substituted_error is not None:
+				stem = f'Generator[{substituted_elem.qualname},{substituted_error.qualname}]'
+			else:
+				stem = f'Iterator[{substituted_elem.qualname}]'
 			return GeneratorType(
-				stem = f'Iterator[{substituted_elem.qualname}]',
-				qualname = f'Iterator[{substituted_elem.qualname}]',
+				stem = stem, qualname = stem,
 				file = substituted_elem.file, line = substituted_elem.line,
-				elem_type = substituted_elem,
+				elem_type = substituted_elem, error_type = substituted_error,
 			)
 		if isinstance( t, TaggedUnion ) and t.file is None:
 			# an ANONYMOUS union (T|None, synthesized by discovery.py's own

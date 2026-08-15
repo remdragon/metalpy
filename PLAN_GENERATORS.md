@@ -7,12 +7,14 @@ generator) + Phase 6 (yield inside `if`/`if-else`, and yield wrapped in
 an arithmetic-mode `with` block) + Phase 7 (generic generator functions,
 `def gen[T](x: T) -> Iterator[T]:`, both explicit `gen[i32](...)` and
 inferred `gen(...)` instantiation, interim-scoped to reject a body that
-references its own type param outside a parameter/return annotation)
-landed and real-compile-and-run tested (emitter_c_test.py's
-GeneratorFunctionTests). Phase 5 matches the "remaining phases roadmap"
-section's own Phase 1, Phase 6 matches that roadmap's own Phase 2, and
-Phase 7 matches that roadmap's own Phase 3 (below) - kept the SEQUENTIAL
-landed-phase numbering here (v1, Phase 2, 3, 4, 5, 6, 7) rather than
+references its own type param outside a parameter/return annotation) +
+Phase 8 (fallible generators, `Generator[T,E]`, `or_return()` inside a
+generator body) landed and real-compile-and-run tested
+(emitter_c_test.py's GeneratorFunctionTests). Phase 5 matches the
+"remaining phases roadmap" section's own Phase 1, Phase 6 matches that
+roadmap's own Phase 2, Phase 7 matches that roadmap's own Phase 3, and
+Phase 8 matches that roadmap's own Phase 4 (below) - kept the SEQUENTIAL
+landed-phase numbering here (v1, Phase 2, 3, 4, 5, 6, 7, 8) rather than
 renaming it, since that roadmap's own 1-5 numbering is a separate, later
 scoping pass over what was still left, not a renumbering of what had
 already landed; the two schemes overlap in NAME but not in MEANING -
@@ -362,6 +364,114 @@ generic function (`ident(7)` fails the same way `ident[T](x: T) -> T:`
 does) - a typed local works fine. Out of scope here; noted for whoever
 next touches generic-call inference.
 
+Phase 8 design (discovery.py's `Generator[T,E]` recognition;
+mpy_types.py's `GeneratorType.error_type`; monomorphize.py's
+`substitute_type_params` GeneratorType branch, extended;
+type_resolver.py's `ensure_generator_synthesized`,
+`_pessimistic_done_prefix`, `_wrap_generator_next_returns_in_ok`, and all
+three guard builders): landed fallible generators - `Generator[T,E]` is
+the fallible sibling of `Iterator[T]` (same textual recognition, one
+extra type arg), whose `__next__` returns `Result[elem_type|None,E]`
+instead of the bare union. `or_return()`/unguarded checked arithmetic
+inside the body engage the EXISTING `_require_result_return` machinery
+for FREE - no new Function flag, no special generator-side check at all;
+it's purely a consequence of `__next__`'s own declared return type,
+identical to how any other ordinary fallible function already works. A
+plain `Iterator[T]` generator continues to reject both, unchanged, for
+the SAME reason (its `__next__` isn't Result-shaped).
+
+The "no existing analog to reuse" risk flagged in the roadmap below
+turned out to have a much simpler answer than the IR-level one
+originally sketched (a new OrReturn.epilogue-injected SetAttr, or an
+errdefer-style OrJump repurposing) - realized once actually design
+before implementing: **set "permanently done" BEFORE running any block
+of user code that might fail, not after.** Every unit's own guard
+already has exactly one success path (advance state, then yield/fall
+through) - inserting `self.__state = <done>` as the FIRST statement of
+every block that MIGHT contain a fallible early return means an
+or_return()'s own OrReturn (completely UNMODIFIED, zero new IR) already
+does the right thing: it returns Err(...) immediately, and self.__state
+is ALREADY the permanent-done value at that exact moment, because
+nothing runs between the pessimistic write and the point of failure that
+could still succeed. The unit's own EXISTING success-path state-advance
+(already present, unchanged) simply overwrites the pessimistic value
+right before yielding - a pure reordering of existing AST, no new
+IR/lowering machinery, no way to distinguish "was this an error exit"
+needed at all. The one wrinkle: the real "done" state value isn't known
+until AFTER every unit is built (it's `final_state + 1`), but each
+unit's own pessimistic assignment has to be inserted WHILE building that
+very unit - solved by recording each inserted Assign node in a shared
+list (`pending_done_assigns`) and patching every one's `.value` to the
+real done_state once it's known, rather than trying to compute it
+earlier or share one mutable Constant node across every insertion point.
+
+Every block of user code that can run before a unit's own success path
+needed this treatment - more insertion points than the "one obvious
+spot" intuition suggests: a bare yield-unit's own preamble (one spot); a
+while-unit's `pre` (first entry only), its post-yield resume code, AND
+its pre-yield code each iteration (three spots); an if-unit's shared
+outer preamble, plus per-branch pre-yield/post-yield code for a yielding
+branch OR the whole body for a non-yielding one (up to five spots across
+both branches). All covered via one shared helper
+(`_pessimistic_done_prefix`), not duplicated per builder.
+
+Every `ast.Return` in the fully-assembled `__next__` body (the DONE
+short-circuit, every yield-unit's own return, the tail's, the safety
+net's) then needs wrapping in `Result.Ok(...)` - done as ONE uniform
+post-process pass over the whole assembled body (`_wrap_generator_next_
+returns_in_ok`, a plain `ast.walk` - safe here specifically because a
+generator body can never contain a nested def/lambda, unlike
+`_walk_generator_body`'s own careful non-recursion elsewhere in this
+file) rather than threading Result-wrapping through every individual
+guard builder. `Result.Ok(...)`'s own payload argument coerces the
+ordinary way (same `_lower_expr(arg,expected_type)` machinery any other
+call argument gets - confirmed via a real repro that a bare elem_type
+value AND a bare `None` constant both coerce correctly with no special
+handling needed here).
+
+Once "permanently done" fires (via error OR normal exhaustion), EVERY
+later `.__next__()` call returns `Ok(None)` - it does NOT re-surface the
+specific error value again. This is a deliberate simplification, not an
+oversight: re-surfacing the same `Err` on every subsequent call would
+need an extra stored field (the pending error value) for a purely
+cosmetic gain, and the roadmap's own verification bar explicitly accepts
+"or is otherwise well-defined" - not strictly "returns Err again" -
+which `Ok(None)` forever after satisfies with zero extra machinery,
+reusing the exact same done-state short-circuit normal exhaustion
+already needed.
+
+Verified via real compile-and-run: `or_return()` propagating a real,
+properly-allocated error class through two successful yields then a
+failure, then permanent `Ok(None)` on every subsequent call (not a
+crash, not a re-run of the failing code); RC correctness (a captured RC
+parameter still releases correctly via the ordinary $$__destructor__
+cascade when the generator is abandoned after an or_return() error, not
+just after normal exhaustion); `Iterator[T]` (infallible) continuing to
+reject `or_return()` exactly as before this phase, unchanged.
+
+**Found, but explicitly out of scope, a real PRE-EXISTING bug unrelated
+to generators:** unguarded (Check-mode) arithmetic that overflows
+produces a `Result[T,OverflowError]` whose Err payload is genuinely
+UNINITIALIZED (emitter_c.py's `_emit_check_arith` only ever sets the tag
+on overflow, per `_emit_widen_error`'s own "zero-payload marker" design
+intent for the built-in arithmetic error classes) - and nothing in the
+RC-cleanup codegen honors that assumption: the moment such a Result
+value's own scope ends, ordinary decref dereferences the garbage
+pointer and crashes (confirmed via TWO minimal repros, both crashing
+with STATUS_ACCESS_VIOLATION, NEITHER involving a generator at all - a
+plain function returning `Result[i32,OverflowError]` from unguarded
+overflow, consumed via `match ... case Result.Err(e):` OR merely
+`.is_err()`, both crash once the value's own scope ends). This is why
+this phase's own positive tests use `or_return()` with a REAL,
+properly-allocated error class (`@union ... Boom: None`) throughout,
+never the built-in arithmetic error classes directly - the mechanism
+this phase actually built (pessimistic-done + Result.Ok wrapping) is
+NOT the cause and structurally works fine either way (confirmed by
+tracing the generated C by hand before finding the crash was in
+_emit_check_arith, entirely outside anything this phase touched) - this
+is a pre-existing gap in the CORE checked-arithmetic-error machinery,
+flagged as a separate task, not fixed here.
+
 Remaining phases roadmap (scoped 2026-08-15)
 
 Phase 1: LANDED (same session it was scoped in) - see "Phase 5 design"
@@ -394,23 +504,14 @@ generic function through it) is a clear compile error, not yet
 supported - the roadmap's own flagged ordering risk turned out to be a
 real bug, confirmed by exactly the minimal repro recommended below.
 
-Phase 4: fallible generators (`Generator[T, E]`, TODO.txt's original open
-question). Confirmed groundwork: "returns Result[T,E]" is purely
-structural (_result_shape, type_resolver.py:1158-1164) - no Function flag
-to set, so making __next__ return Result[T|None,E] engages the existing
-checked-arithmetic/_require_result_return machinery for free. Open,
-unresolved risk (the one piece of this whole roadmap with no existing
-analog to reuse): or_return() firing inside a generator body needs to
-BOTH return Err(e) from __next__ AND permanently set self.__state = DONE
-- but OrReturn's shape has no room for "also run this statement first",
-and a blanket always-set-DONE epilogue entry is wrong (it would fire on
-the normal yield-return path too). Needs either a way to distinguish the
-error exit specifically (errdefer's own `.is_err()` check on the stowed
-return value, ir.py's OrJump docstring ~304-306, is the closest existing
-precedent for "tell error exits apart from success exits", but errdefer
-needs OrJump, which today's generator bodies never naturally reach) or a
-small generator-specific IR/lowering addition. Resolve with a minimal
-repro before committing to a direction.
+Phase 4: LANDED (same session it was scoped in) - see "Phase 8 design"
+below (kept the sequential landed-phase numbering there; see the STATUS
+section's own note on why the two schemes overlap in name but not
+meaning). fallible generators (`Generator[T, E]`, TODO.txt's original
+open question) - the one piece of this whole roadmap flagged as having
+"no existing analog to reuse" turned out to have a MUCH simpler fix than
+the IR-level one sketched here originally: a pure AST-level reordering
+(see "Phase 8 design"), not a new OrReturn/OrJump/IR primitive at all.
 
 Phase 5 (not explicitly requested, proposed as the most load-bearing
 remaining gap): RC-typed locals crossing a yield. v1 restricted promoted

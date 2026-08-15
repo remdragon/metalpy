@@ -671,6 +671,24 @@ class Discovery( ast.NodeVisitor ):
 				elem_type = elem_type,
 			)
 
+		# Generator[T,E] - PLAN_GENERATORS.md Phase 4 (roadmap Phase 4), the
+		# FALLIBLE sibling of Iterator[T] above - same textual recognition,
+		# just two type args instead of one, carried as GeneratorType's own
+		# error_type (None for Iterator[T] means infallible). __next__'s
+		# return type becomes Result[elem_type|None, error_type] instead of
+		# plain elem_type|None once ensure_generator_synthesized sees this
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Generator':
+			if not isinstance( node.slice, ast.Tuple ) or len( node.slice.elts ) != 2:
+				self.fail( f'Generator[...] takes exactly two type arguments (element, error): {ast.unparse(node)}', node )
+			elem_type = self.visit( node.slice.elts[0] )
+			error_type = self.visit( node.slice.elts[1] )
+			return GeneratorType(
+				stem = f'Generator[{elem_type.qualname},{error_type.qualname}]',
+				qualname = f'Generator[{elem_type.qualname},{error_type.qualname}]',
+				file = elem_type.file, line = elem_type.line,
+				elem_type = elem_type, error_type = error_type,
+			)
+
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
 		if not type_params:

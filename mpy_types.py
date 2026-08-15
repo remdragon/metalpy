@@ -213,18 +213,20 @@ class TupleType( Type ):
 
 @dataclass( kw_only = True )
 class GeneratorType( Type ):
-	''' `Iterator[T]` in a function's own return annotation - PLAN_GENERATORS.md.
-	Recognized textually in visit_Subscript, same posture as CallableType/
-	TupleType above. Deliberately NOT interned/shared the way those are:
-	two unrelated generator functions both declaring `-> Iterator[i32]`
-	still need two independent backing RCClasses (each function's own,
-	private state machine/fields) - unifying them by elem_type alone would
-	wrongly conflate two functions' unrelated local state. A fresh
-	GeneratorType is built for every annotation occurrence; .backing is
-	populated once lowering.py recognizes the owning Function actually
-	contains a `yield` and synthesizes its backing class (keyed to that
-	one Function, not to this type). '''
+	''' `Iterator[T]` (infallible) or `Generator[T,E]` (fallible,
+	PLAN_GENERATORS.md Phase 4/roadmap Phase 4) in a function's own return
+	annotation. Recognized textually in visit_Subscript, same posture as
+	CallableType/TupleType above. Deliberately NOT interned/shared the way
+	those are: two unrelated generator functions both declaring `->
+	Iterator[i32]` still need two independent backing RCClasses (each
+	function's own, private state machine/fields) - unifying them by
+	elem_type alone would wrongly conflate two functions' unrelated local
+	state. A fresh GeneratorType is built for every annotation occurrence;
+	.backing is populated once lowering.py recognizes the owning Function
+	actually contains a `yield` and synthesizes its backing class (keyed
+	to that one Function, not to this type). '''
 	elem_type: Type
+	error_type: 'Type|None' = None # None: Iterator[T] (infallible); set: Generator[T,error_type] - __next__ returns Result[elem_type|None, error_type] instead of plain elem_type|None
 	backing: 'RCClass|None' = None
 
 # a class's own body scan (revealing its attribute/method *names*) is
