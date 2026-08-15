@@ -1,5 +1,6 @@
 # stdlib imports:
 import ast
+import copy
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Callable
@@ -1288,6 +1289,13 @@ class FunctionLowering:
 		# return, CEnum construction) leaves this False and gets validated
 		self._allow_literal_bit_reinterpret = False
 		self._defer_flags: list[Variable] = []
+		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - whatever
+		# type_resolver.py's _tag_armed_defer_sites tagged the statement
+		# CURRENTLY being lowered with (see _lower_stmt's own push/pop),
+		# or inherited from an enclosing tagged statement if this one
+		# carries no tag of its own. Always [] outside a generator's own
+		# $$__next__ - nothing else ever sets the tag this reads
+		self._generator_armed_defer_sites: list[tuple[str,bool,list[ast.stmt]]] = []
 		self._return_value_var = None
 		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
 		# _inlining_stack (by id(target)) is the reentrancy guard - a target
@@ -1861,6 +1869,18 @@ class FunctionLowering:
 		# the whole thing, same idea as scope_context's stack push/pop
 		outer_pending = self._pending_temps
 		self._pending_temps = []
+		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - only
+		# OVERRIDES self._generator_armed_defer_sites when `node` itself
+		# carries type_resolver.py's own tag (_tag_armed_defer_sites tags
+		# only the top-level statement of each preamble/segment slice, not
+		# every nested descendant); otherwise this statement's own
+		# recursive lowering (e.g. an ordinary nested if's own body)
+		# simply inherits whatever an ENCLOSING tagged statement already
+		# pushed, exactly like _arithmetic_mode's own stack semantics
+		outer_armed = self._generator_armed_defer_sites
+		tagged = getattr( node, 'generator_armed_defer_sites', None )
+		if tagged is not None:
+			self._generator_armed_defer_sites = tagged
 		try:
 			method = getattr( self, f'_stmt_{node.__class__.__name__}', None )
 			if method is None:
@@ -1875,6 +1895,7 @@ class FunctionLowering:
 			self._flush_pending_temps()
 		finally:
 			self._pending_temps = outer_pending
+			self._generator_armed_defer_sites = outer_armed
 
 	def _flush_pending_temps( self ) -> None:
 		''' decref+DeleteTemp every still-pending temp (reverse declaration
@@ -5768,6 +5789,78 @@ class FunctionLowering:
 		self._emit( opcode( dest = check_dest, **operand_kwargs ))
 		return self._consume_checked_result( node, check_dest, result_type, extra )
 
+	def _build_generator_error_defer_replay( self ) -> list[ir.Instruction]:
+		''' PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - lowers
+		every site in self._generator_armed_defer_sites (LIFO - deepest/
+		most-recently-armed first, same convention Mechanism 1's own
+		_build_defer_replay_guards uses), wrapped in `if self.
+		__defer_armed_N: <body>`, for splicing into an OrReturn's own
+		epilogue (see this method's one call site). A no-op (empty list,
+		no lowering work at all) whenever the list is empty - true for
+		EVERY ordinary, non-generator function, and for a generator body
+		with no armed defer/errdefer site reaching this exact position.
+
+		Reuses AST synthesis + the swap-the-instruction-buffer technique
+		_register_defer_block already established (lower once into a
+		fresh buffer, splice the result) rather than hand-building IR
+		directly - the body statements are ALREADY self.<field>-qualified
+		(type_resolver.py's _build_generator_next_function renamed them
+		once, via the same renamer used for everything else in $$__next__,
+		before ever tagging a node with them), so ordinary statement
+		lowering already does the right thing with zero new machinery.
+
+		Each site's own body is deep-copied FRESH here (same reasoning as
+		_build_defer_replay_guards - lowering attaches mutable per-
+		occurrence attributes like resolved_* that would corrupt a shared
+		node if two OrReturn sites, or this site and a Mechanism-1 normal-
+		exit site, shared one). self._generator_armed_defer_sites is reset
+		to empty while lowering each body - a defer/errdefer body is
+		expected to be simple cleanup, not itself something needing its
+		OWN error-defer replay; without this, a fallible operation nested
+		inside a defer body would recurse into this same method against
+		the SAME still-armed site, unboundedly.
+
+		Each guard ALSO unsets its own flag right after replaying (self.
+		__defer_armed_N = False) - same reasoning as _build_defer_replay_
+		guards' own identical unset: this error exit permanently pins
+		self.__state to done, but the generator OBJECT itself often isn't
+		freed until later (whatever reference the caller still holds), at
+		which point $$__destructor__'s own Mechanism-1 replay would
+		otherwise see this SAME flag still True and fire the (non-
+		errdefer) body a second time. '''
+		if not self._generator_armed_defer_sites:
+			return []
+		instructions: list[ir.Instruction] = []
+		outer_armed = self._generator_armed_defer_sites
+		self._generator_armed_defer_sites = []
+		try:
+			for flag_stem, _is_errdefer, body_stmts in reversed( outer_armed ):
+				body_copy = [ copy.deepcopy( s ) for s in body_stmts ]
+				unset = ast.Assign(
+					targets = [ ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = flag_stem, ctx = ast.Store() ) ],
+					value = ast.Constant( value = False ),
+				)
+				guard = ast.If(
+					test = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = flag_stem, ctx = ast.Load() ),
+					body = ( body_copy or [ ast.Pass() ] ) + [ unset ], orelse = [],
+				)
+				if body_stmts:
+					ast.copy_location( guard, body_stmts[0] )
+				else:
+					guard.lineno = 1; guard.col_offset = 0
+				ast.fix_missing_locations( guard )
+				outer_instructions = self._instructions
+				self._instructions = []
+				try:
+					self._lower_stmt( guard )
+				finally:
+					captured = self._instructions
+					self._instructions = outer_instructions
+				instructions += captured
+		finally:
+			self._generator_armed_defer_sites = outer_armed
+		return instructions
+
 	def _consume_checked_result( self, node: ast.AST, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
 		# shared by both binop (AddCheck/.../Div/Mod) and unary (NegCheck)
 		# Check-mode ops, _maybe_consume_result's __len__/__getitem__ auto-
@@ -5857,6 +5950,16 @@ class FunctionLowering:
 				# actual conditional replay logic) is embedded below, to run
 				# strictly inside the Err branch
 				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+				# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) -
+				# ir.OrReturn.epilogue is ALREADY Err-branch-exclusive by
+				# construction (unlike an ordinary function's own shared
+				# epilogue, which is reached by success AND error paths
+				# alike, needing its own is_err() guard) - so both `defer`
+				# and `errdefer` sites currently armed at this fallible
+				# operation's own position just get appended here, no extra
+				# guard needed. See _build_generator_error_defer_replay's
+				# own docstring for why this is a no-op outside a generator.
+				replay = replay + self._build_generator_error_defer_replay()
 				if inline_scope is not None:
 					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay, inline_exit = inline_scope ))
 				else:

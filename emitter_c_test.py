@@ -10603,6 +10603,312 @@ def main() -> i32:
 			return 3
 		return 0
 ''' ),
+			# --- defer/errdefer in generators (PLAN_GENERATORS.md) - Mechanism
+			# 1 (normal exits): a promoted __defer_armed_N flag field is set
+			# True in place of the `with defer:` statement, and every armed,
+			# PLAIN `defer` site (never `errdefer` - that only ever fires via
+			# mechanism 2's OrReturn.epilogue hook, not landed yet) replays
+			# LIFO at the tail's own natural exhaustion, a bare-return exit, or
+			# the destructor (abandonment) - real refcount-observable side
+			# effects, same "before/after a helper call" style every other RC
+			# test in this class already uses
+			( 'defer_replays_exactly_once_at_natural_exhaustion', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	with defer:
+		compiler.incref( b )
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		g = gen( b, 2 )
+		if compiler.refcount( b ) != 2: # caller + generator's own captured param
+			return 1
+		a = g.__next__()
+		if a is None:
+			return 2
+		if compiler.refcount( b ) != 2: # defer must not have fired yet
+			return 3
+		c = g.__next__()
+		if c is None:
+			return 4
+		d = g.__next__() # exhausts here - tail's own exit replays the armed defer
+		if d is not None:
+			return 5
+		if compiler.refcount( b ) != 3: # defer fired exactly once
+			return 6
+		e = g.__next__() # already done - must not re-fire
+		if e is not None:
+			return 7
+		if compiler.refcount( b ) != 3:
+			return 8
+		return 0
+''' ),
+			( 'defer_replays_exactly_once_at_bare_return_exit', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, limit: usize ) -> Iterator[usize]:
+	i: usize = 0
+	with defer:
+		compiler.incref( b )
+	while i < limit:
+		if i == 1:
+			return
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		g = gen( b, 5 )
+		if compiler.refcount( b ) != 2:
+			return 1
+		a = g.__next__() # i=0, yields 0
+		if a is None:
+			return 2
+		if compiler.refcount( b ) != 2: # defer must not have fired yet
+			return 3
+		c = g.__next__() # i becomes 1, hits the bare `return` inside the loop - defer fires
+		if c is not None:
+			return 4
+		if compiler.refcount( b ) != 3:
+			return 5
+		return 0
+''' ),
+			( 'defer_replays_exactly_once_on_abandonment_via_destructor', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	with defer:
+		compiler.incref( b )
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def make_and_partially_consume( b: Box ) -> None:
+	g = gen( b, 5 )
+	first = g.__next__() # only 1 of 5 iterations consumed
+	# g goes out of scope here, still mid-iteration - abandonment must still
+	# replay the armed defer, via the destructor, before its own ordinary
+	# captured-parameter teardown
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		make_and_partially_consume( b )
+		if compiler.refcount( b ) != 2: # captured param released, defer's own incref remains
+			return 2
+		return 0
+''' ),
+			( 'two_defer_sites_replay_in_lifo_order', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, c: Box, count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	with defer:
+		compiler.incref( b )
+	with defer:
+		compiler.incref( c )
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		c = Box( v = 2 )
+		g = gen( b, c, 1 )
+		a = g.__next__()
+		if a is None:
+			return 1
+		d = g.__next__() # exhausts - both defers replay LIFO: c's own first, then b's
+		if d is not None:
+			return 2
+		if compiler.refcount( b ) != 3: # captured param + b's own armed defer
+			return 3
+		if compiler.refcount( c ) != 3: # captured param + c's own armed defer
+			return 4
+		return 0
+''' ),
+			# --- Mechanism 2 (PLAN_GENERATORS.md's defer/errdefer phase) -
+			# error exits (or_return()/checked-arithmetic failure): a real,
+			# targeted lowering.py change (_build_generator_error_defer_replay,
+			# hooked into _consume_checked_result's own OrReturn.epilogue
+			# construction) - errdefer only EVER fires here, never at a normal
+			# exit (Mechanism 1 explicitly skips errdefer sites)
+			( 'errdefer_fires_on_error_exit_only', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+@union
+class BoomError:
+	Boom: None
+
+def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
+	if i == boom_at:
+		return Result.Err( BoomError.Boom( None ))
+	return Result.Ok( i )
+
+def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+	with errdefer:
+		compiler.incref( b )
+	i: usize = 0
+	while i < limit:
+		v: usize = maybe_bad( i, boom_at ).or_return()
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		g = gen( b, 5, 2 )
+		if compiler.refcount( b ) != 2:
+			return 1
+		r0 = g.__next__() # i=0 succeeds
+		match r0:
+			case Result.Err( e ):
+				return 2
+			case Result.Ok( a ):
+				pass
+		if compiler.refcount( b ) != 2: # errdefer must not have fired yet
+			return 3
+		r1 = g.__next__() # i=1 succeeds
+		match r1:
+			case Result.Err( e ):
+				return 4
+			case Result.Ok( a ):
+				pass
+		r2 = g.__next__() # i becomes 2 == boom_at - or_return() fires, errdefer replays
+		match r2:
+			case Result.Err( e ):
+				pass
+			case Result.Ok( a ):
+				return 5
+		if compiler.refcount( b ) != 3: # errdefer fired exactly once
+			return 6
+		r3 = g.__next__() # permanently done - Ok(None), errdefer must not re-fire
+		match r3:
+			case Result.Err( e ):
+				return 7
+			case Result.Ok( a ):
+				pass
+		if compiler.refcount( b ) != 3:
+			return 9
+		return 0
+''' ),
+			( 'defer_and_errdefer_both_fire_on_same_error_exit', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+@union
+class BoomError:
+	Boom: None
+
+def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
+	if i == boom_at:
+		return Result.Err( BoomError.Boom( None ))
+	return Result.Ok( i )
+
+def gen( b: Box, c: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+	with defer:
+		compiler.incref( b )
+	with errdefer:
+		compiler.incref( c )
+	i: usize = 0
+	while i < limit:
+		v: usize = maybe_bad( i, boom_at ).or_return()
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		c = Box( v = 2 )
+		g = gen( b, c, 5, 1 )
+		r0 = g.__next__() # i=0 succeeds
+		match r0:
+			case Result.Err( e ):
+				return 1
+			case Result.Ok( a ):
+				pass
+		r1 = g.__next__() # i becomes 1 == boom_at - or_return() fires, BOTH replay
+		match r1:
+			case Result.Err( e ):
+				pass
+			case Result.Ok( a ):
+				return 2
+		if compiler.refcount( b ) != 3: # plain defer also fired on this SAME error exit
+			return 3
+		if compiler.refcount( c ) != 3: # errdefer fired here too
+			return 4
+		return 0
+''' ),
+			( 'defer_does_not_replay_again_when_generator_later_dropped', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	with defer:
+		compiler.incref( b )
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def drain_fully( b: Box, count: usize ) -> None:
+	g = gen( b, count )
+	i: usize = 0
+	while i < count:
+		v = g.__next__()
+		with compiler.wrap_arithmetic:
+			i += 1
+	last = g.__next__() # natural exhaustion - tail replay fires the defer, unsets its own flag
+	# g goes out of scope HERE - $$__destructor__ must see the flag already
+	# unset and must NOT replay the same defer body a second time
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		drain_fully( b, 2 )
+		if compiler.refcount( b ) != 2: # captured param released, defer fired EXACTLY once (not twice)
+			return 2
+		return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -10718,6 +11024,42 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'at most one yield per branch', str( self.discovery.errors.errors[0] ))
+
+	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
+		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
+		# level statement (preamble/tail) is supported for now, same start-
+		# narrow posture as break/continue inside a yield-containing loop
+		self._run( '''
+def gen( count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	while i < count:
+		with defer:
+			i = i
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> None:
+	g = gen( 3 )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'direct top-level statement', str( self.discovery.errors.errors[0] ))
+
+	def test_errdefer_inside_if_unit_branch_is_rejected( self ) -> None:
+		self._run( '''
+def gen( flag: bool ) -> Generator[i32,str]:
+	if flag:
+		with errdefer:
+			pass
+		yield 1
+	else:
+		yield 2
+
+def main() -> None:
+	g = gen( True )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'direct top-level statement', str( self.discovery.errors.errors[0] ))
 
 	def test_generic_generator_referencing_own_type_param_in_body_is_rejected( self ) -> None:
 		# Phase 3's recommended interim scope (PLAN_GENERATORS.md) - a

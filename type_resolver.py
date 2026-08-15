@@ -290,21 +290,209 @@ class TypeResolver:
 		ast.copy_location( attr, node )
 		return attr
 
-	def _reject_generator_defer( self, fn: Function ) -> None:
+	def _generator_defer_site_kind( self, node: ast.stmt ) -> 'str|None':
+		''' 'defer'/'errdefer' if `node` is ITSELF a defer/errdefer site, in
+		either syntax lowering.py's own _defer_kind_of_with/_defer_kind_of_
+		call recognize: the `with defer:`/`with errdefer:` block form, or
+		the single-statement `defer(expr)`/`errdefer(expr)` call form
+		(always wrapped in an ast.Expr statement - _stmt_Expr's own
+		handling). None for anything else, including a nested Name/Call
+		reachable INSIDE a defer body that happens to reference the name
+		`defer`/`errdefer` some other way - only the statement shape itself
+		counts. '''
+		if isinstance( node, ast.With ) and len( node.items ) == 1:
+			expr = node.items[0].context_expr
+			if isinstance( expr, ast.Name ) and expr.id in ( 'defer', 'errdefer' ):
+				return expr.id
+		if isinstance( node, ast.Expr ) and isinstance( node.value, ast.Call ) and isinstance( node.value.func, ast.Name ) and node.value.func.id in ( 'defer', 'errdefer' ):
+			return node.value.func.id
+		return None
+
+	def _validate_generator_defer_sites( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md's defer/errdefer-in-generators phase - a
+		`with defer:`/`with errdefer:`/`defer(...)`/`errdefer(...)` site is
+		only allowed as a DIRECT TOP-LEVEL statement of the generator's own
+		body: `fn.node.body` is exactly what _split_generator_segments
+		groups into (preamble, unit) pairs (every non-unit top-level
+		statement becomes part of some preamble or the trailing tail), so
+		"top-level" here already means "preamble or tail" - no separate
+		unit-membership check needed. Nested one level further in - a
+		while-unit's own loop body, an if-unit's own branch, or any other
+		ordinary nested if/for/while/with - is rejected: same "start
+		narrow, no obviously-correct place to run a resumable loop's own
+		per-iteration arming/replay yet" posture _validate_while_yield_unit
+		already takes for break/continue inside a yield-containing loop. '''
+		top_level_ids = { id( s ) for s in fn.node.body }
 		for node in self._walk_generator_body( fn.node.body ):
-			if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id in ( 'defer', 'errdefer' ):
-				self.discovery.fail( f'{fn.qualname}: defer/errdefer are not supported inside a generator function body yet - see PLAN_GENERATORS.md', node )
-			if isinstance( node, ast.With ):
-				for item in node.items:
-					if isinstance( item.context_expr, ast.Name ) and item.context_expr.id in ( 'defer', 'errdefer' ):
-						self.discovery.fail( f'{fn.qualname}: defer/errdefer are not supported inside a generator function body yet - see PLAN_GENERATORS.md', node )
+			kind = self._generator_defer_site_kind( node )
+			if kind is None:
+				continue
+			if id( node ) not in top_level_ids:
+				self.discovery.fail(
+					f'{fn.qualname}: {kind} is only supported as a direct top-level statement of a generator '
+					f'body (not nested inside a while/if/for/with) - see PLAN_GENERATORS.md',
+					node,
+				)
+
+	def _capture_defer_site_body( self, node: ast.stmt ) -> list[ast.stmt]:
+		''' the ORIGINAL (un-renamed, un-copied - callers deep-copy per
+		insertion site themselves) statement list a defer/errdefer site's
+		own body is made of: the `with defer: BODY` form's own node.body
+		directly, or the single-statement `defer(expr)` call form's own
+		lone argument, wrapped in an ast.Expr the same way lowering.py's
+		own _stmt_Expr already decomposes that call form (_register_defer_
+		block, ordinary non-generator defer) - so both syntaxes end up
+		with an identical downstream shape here too. '''
+		if isinstance( node, ast.With ):
+			return node.body
+		assert isinstance( node, ast.Expr ) and isinstance( node.value, ast.Call )
+		single_stmt = ast.Expr( value = node.value.args[0] )
+		ast.copy_location( single_stmt, node )
+		return [ single_stmt ]
+
+	def _desugar_generator_defer_sites( self, fn: Function ) -> list[tuple[str,bool,list[ast.stmt]]]:
+		''' Mechanism 1 (PLAN_GENERATORS.md's defer/errdefer phase) - every
+		top-level defer/errdefer site (already validated by _validate_
+		generator_defer_sites to be exactly that - a direct top-level
+		statement of fn.node.body, i.e. living in some preamble or the
+		tail) gets a promoted boolean "armed" flag field, self.
+		__defer_armed_N (N = this site's own index, 0-based, in the order
+		found), and is replaced IN PLACE with `self.__defer_armed_N =
+		True` - an ordinary assignment, transparent to every later pass
+		(unit-collection already ran; locals-collection, segment-
+		splitting, bare-return rewriting all still run AFTER this and see
+		nothing but an ordinary Assign here).
+
+		The site's own BODY is captured (still bare-named, not yet
+		renamed - see _capture_defer_site_body) and returned alongside its
+		flag field name and whether it's an errdefer, in PROGRAM order;
+		callers needing LIFO replay (every insertion site does - see
+		_build_defer_replay_guards) reverse this list themselves. Because
+		arming is a FIELD, not a call-stack entry, this only has to run
+		ONCE here regardless of how many separate places/how much later
+		each site's own replay ends up firing (_build_generator_next_
+		function's tail/bare-return replay, _build_generator_destructor's
+		abandonment replay, or - for errdefer - lowering.py's OrReturn.
+		epilogue hook, task #40/#41) - the field stays armed correctly
+		across however many further $$__next__() calls happen first. '''
+		sites: list[tuple[str,bool,list[ast.stmt]]] = []
+		new_body: list[ast.stmt] = []
+		for stmt in fn.node.body:
+			kind = self._generator_defer_site_kind( stmt )
+			if kind is None:
+				new_body.append( stmt )
+				continue
+			flag_stem = f'__defer_armed_{len( sites )}'
+			sites.append( ( flag_stem, kind == 'errdefer', self._capture_defer_site_body( stmt )))
+			arm = ast.Assign( targets = [ self._self_attr( flag_stem, stmt ) ], value = ast.Constant( value = True ))
+			ast.copy_location( arm, stmt )
+			new_body.append( arm )
+		fn.node.body = new_body
+		return sites
+
+	def _build_defer_replay_guards( self, defer_sites: list[tuple[str,bool,list[ast.stmt]]], anchor: ast.AST ) -> list[ast.stmt]:
+		''' LIFO `if self.__defer_armed_N: <deep-copied BODY>` for every
+		ARMED, PLAIN `defer` site - `errdefer` sites are skipped entirely
+		here (kind[1] True): they only ever replay via mechanism 2's
+		OrReturn.epilogue hook (task #40/#41), never at a normal exit.
+		Each site's own captured body is deep-copied FRESH per call - see
+		_rename_and_track_liveness's own docstring for why sharing one
+		node object across insertion sites is unsafe (lowering attaches
+		mutable per-occurrence attributes like resolved_* that would
+		corrupt a shared node).
+
+		Callers still owe the result a rename pass: either explicitly, via
+		_rename_and_track_liveness (the tail/destructor call sites, which
+		have a renamer in hand already and want RC-local-reassignment-
+		inside-a-defer-body to get the same live-flag-split treatment
+		everything else gets), or implicitly, by embedding this raw result
+		inside a still-to-be-renamed segment/tail list a LATER renamer.
+		visit(...)/_rename_and_track_liveness call already covers end to
+		end (_rewrite_bare_return_stmts's own call site - see its own
+		comment for why that's safe: ast.NodeTransformer.generic_visit
+		recurses into a nested If's own body/orelse automatically, no
+		special-casing needed).
+
+		Each guard ALSO unsets its own flag (self.__defer_armed_N = False)
+		right after replaying the body: a plain `defer` armed at, say, a
+		bare-return exit fires HERE, but the object itself often isn't
+		actually freed until later (whatever reference the caller still
+		holds), at which point $$__destructor__'s OWN replay (this same
+		method, called again from there) would see the SAME flag still
+		True and fire the identical body a SECOND time - a real double-
+		replay bug, confirmed by reasoning through exactly this sequence
+		(natural exhaustion replays a defer, main() later lets the
+		generator go out of scope too). Clearing it here is a no-op the
+		one time this method is actually called FROM the destructor
+		itself (nothing reads the field again before sys.free(self)). '''
+		guards: list[ast.stmt] = []
+		for flag_stem, is_errdefer, body_stmts in reversed( defer_sites ):
+			if is_errdefer:
+				continue
+			body_copy = [ copy.deepcopy( s ) for s in body_stmts ]
+			unset = ast.Assign( targets = [ self._self_attr( flag_stem, anchor ) ], value = ast.Constant( value = False ) )
+			ast.copy_location( unset, anchor )
+			guard = ast.If( test = self._self_attr( flag_stem, anchor ), body = ( body_copy or [ ast.Pass() ] ) + [ unset ], orelse = [] )
+			ast.copy_location( guard, anchor )
+			guards.append( guard )
+		return guards
+
+	def _armed_flag_stem_of( self, stmt: ast.stmt ) -> 'str|None':
+		''' recognizes one of _desugar_generator_defer_sites' own arm-assign
+		statements (`self.__defer_armed_N = True`, which replaced the
+		original `with defer:`/`defer(...)` site in place) - used by
+		_tag_armed_defer_sites below to track, while walking a generator
+		body in program order, exactly which prefix of `defer_sites` is
+		"currently armed" at any later point (arming only ever happens at
+		a direct top-level statement - see _validate_generator_defer_
+		sites - so a simple in-order scan is enough, no separate control-
+		flow analysis needed). '''
+		if isinstance( stmt, ast.Assign ) and len( stmt.targets ) == 1:
+			target = stmt.targets[0]
+			if ( isinstance( target, ast.Attribute ) and isinstance( target.value, ast.Name )
+				and target.value.id == 'self' and target.attr.startswith( '__defer_armed_' )):
+				return target.attr
+		return None
+
+	def _tag_armed_defer_sites( self, stmts: list[ast.stmt], defer_sites: list[tuple[str,bool,list[ast.stmt]]], armed_count: list[int] ) -> None:
+		''' Mechanism 2 (PLAN_GENERATORS.md's defer/errdefer phase) - tags
+		every statement in `stmts` (a preamble, or a while/if-unit's own
+		pre-/post-yield slice - the exact same granularity _pessimistic_
+		done_prefix already wraps, called from the same call sites) with
+		`generator_armed_defer_sites`: the PREFIX of `defer_sites` armed by
+		the time this statement runs. `armed_count` is a shared, mutable
+		single-element list (a plain int can't be mutated through a
+		function boundary) threaded through every call across one
+		$$__next__ build, advanced in place whenever an arm-assign
+		(_armed_flag_stem_of) is crossed - since arming only ever happens
+		at a top-level statement, and this method is only ever called on
+		top-level-or-unit-slice statement lists in PROGRAM order, a simple
+        running count is sufficient; no separate control-flow walk needed.
+
+		Tagging only the TOP-LEVEL statement in each slice (not descending
+		into a nested if/while's own body) is sufficient: lowering.py's own
+		hook (task #41) reads this tag once, in its per-statement dispatch,
+		and keeps it active for that ENTIRE statement's own recursive
+		lowering (mirroring how _arithmetic_mode is already pushed/popped
+		around a whole statement, not re-read per sub-expression) - so a
+		fallible operation nested inside an ordinary if/call within a
+		tagged statement still sees the right armed set.
+
+		A no-op when defer_sites is empty (nothing to ever tag) - every
+		call site already guards on this to skip the work entirely. '''
+		for stmt in stmts:
+			flag_stem = self._armed_flag_stem_of( stmt )
+			if flag_stem is not None:
+				armed_count[0] += 1
+				continue
+			stmt.generator_armed_defer_sites = defer_sites[ : armed_count[0] ]
 
 	def _reject_generator_value_return( self, fn: Function ) -> None:
 		for node in self._walk_generator_body( fn.node.body ):
 			if isinstance( node, ast.Return ) and node.value is not None and not ( isinstance( node.value, ast.Constant ) and node.value.value is None ):
 				self.discovery.fail( f'{fn.qualname}: a generator function cannot `return` a value (a bare `return` ends iteration) - see PLAN_GENERATORS.md', node )
 
-	def _rewrite_generator_bare_returns( self, fn: Function ) -> list[ast.Assign]:
+	def _rewrite_generator_bare_returns( self, fn: Function, defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> list[ast.Assign]:
 		''' a bare `return` inside a generator body (already confirmed, by
 		_reject_generator_value_return running just before this, to carry no
 		value) compiles today but doesn't end iteration the way real Python
@@ -321,15 +509,21 @@ class TypeResolver:
 		`return` - wherever it's reachable, including nested inside an
 		ordinary if/while/with/match, a while-unit's own loop body, or an
 		if-unit's own branch (today only break/continue get checked inside
-		those - see _validate_while_yield_unit) - into `self.__state =
-		<placeholder>; return None`, mutating fn.node.body itself, IN PLACE,
-		BEFORE _collect_generator_units/_split_generator_segments/the guard
-		builders ever consume it. Each guard builder already renames/wraps
-		whatever it's handed (_rename_and_track_liveness, _pessimistic_done_
-		prefix) without caring how many statements are in a given segment,
-		so no changes are needed there - this only has to run early enough
-		that the extra statements are already sitting in the body by the
-		time those methods slice/copy it.
+		those - see _validate_while_yield_unit) - into `<armed-defer-replay
+		guards>; self.__state = <placeholder>; return None`, mutating
+		fn.node.body itself, IN PLACE, BEFORE _collect_generator_units/
+		_split_generator_segments/the guard builders ever consume it. Each
+		guard builder already renames/wraps whatever it's handed (_rename_
+		and_track_liveness, _pessimistic_done_prefix) without caring how
+		many statements are in a given segment, so no changes are needed
+		there - this only has to run early enough that the extra statements
+		are already sitting in the body by the time those methods slice/
+		copy it. This is also why the defer-replay guards inserted here are
+		left RAW (un-renamed) - see _build_defer_replay_guards's own
+		docstring: whatever segment/tail this bare return ends up part of
+		gets renamed as a WHOLE, later, by the ordinary per-segment
+		renamer.visit(...)/_rename_and_track_liveness call every other
+		statement in it already goes through.
 
 		The real done_state value isn't known until AFTER every unit is
 		built (same reason _pessimistic_done_prefix's own pending_done_
@@ -340,10 +534,10 @@ class TypeResolver:
 		gets its OWN always-populated pending list, patched to done_state by
 		_build_generator_next_function alongside pending_done_assigns. '''
 		pending: list[ast.Assign] = []
-		fn.node.body = self._rewrite_bare_return_stmts( fn.node.body, pending )
+		fn.node.body = self._rewrite_bare_return_stmts( fn.node.body, pending, defer_sites )
 		return pending
 
-	def _rewrite_bare_return_stmts( self, stmts: list[ast.stmt], pending: list[ast.Assign] ) -> list[ast.stmt]:
+	def _rewrite_bare_return_stmts( self, stmts: list[ast.stmt], pending: list[ast.Assign], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> list[ast.stmt]:
 		''' helper for _rewrite_generator_bare_returns - see its own
 		docstring. Recurses into every nested statement-list-bearing field
 		this language's statements can have (If/While/With's own `body`/
@@ -370,6 +564,13 @@ class TypeResolver:
 					# ... should return a value")
 					stmt.value = ast.Constant( value = None )
 					ast.copy_location( stmt.value, stmt )
+				# PLAN_GENERATORS.md's defer/errdefer phase - a bare return
+				# is a real generator-ending exit, exactly like the tail's
+				# own natural exhaustion, so every currently-armed plain
+				# `defer` site (LIFO) replays here too, right before the
+				# state gets pinned to done - see _build_defer_replay_
+				# guards's own docstring for why these are left un-renamed
+				result.extend( self._build_defer_replay_guards( defer_sites, stmt ))
 				result.append( assign )
 				result.append( stmt )
 				continue
@@ -378,11 +579,11 @@ class TypeResolver:
 				continue
 			if isinstance( stmt, ast.Match ):
 				for case in stmt.cases:
-					case.body = self._rewrite_bare_return_stmts( case.body, pending )
+					case.body = self._rewrite_bare_return_stmts( case.body, pending, defer_sites )
 			elif hasattr( stmt, 'body' ):
-				stmt.body = self._rewrite_bare_return_stmts( stmt.body, pending )
+				stmt.body = self._rewrite_bare_return_stmts( stmt.body, pending, defer_sites )
 			if hasattr( stmt, 'orelse' ):
-				stmt.orelse = self._rewrite_bare_return_stmts( stmt.orelse, pending )
+				stmt.orelse = self._rewrite_bare_return_stmts( stmt.orelse, pending, defer_sites )
 			result.append( stmt )
 		return result
 
@@ -1047,7 +1248,7 @@ class TypeResolver:
 		used for a scalar/non-RC local (nothing to gate - see is_rc). '''
 		return f'__{local_stem}_live'
 
-	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> RCClass:
+	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> RCClass:
 		''' the per-function backing RCClass a generator's constructor
 		allocates and its own $$__next__ method operates on - fields:
 		`__state` (resume discriminant) + one per parameter + one per
@@ -1059,7 +1260,9 @@ class TypeResolver:
 		destructor machinery) + one `__<stem>_live: bool` companion field
 		per RC-typed promoted LOCAL (PLAN_GENERATORS.md Phase 5/roadmap
 		Phase 5 - NOT for parameters/extra_fields, which stay always-valid
-		from construction onward, unchanged). resolve=None/every
+		from construction onward, unchanged) + one `__defer_armed_N: bool`
+		field per defer/errdefer site (PLAN_GENERATORS.md's defer/errdefer
+		phase - see _desugar_generator_defer_sites). resolve=None/every
 		attribute's own resolve=None (mirrors tuple_storage.TupleStorage.
 		get()'s identical "already fully known, nothing to defer" shape).
 		Unlike every other RCClass, this one's own $$__destructor__ is
@@ -1089,7 +1292,11 @@ class TypeResolver:
 			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
 			for stem, ( t, _expr ) in extra_fields.items()
 		]
-		attributes = [ state_attr ] + param_attrs + local_attrs + live_flag_attrs + extra_attrs
+		defer_armed_attrs = [
+			Variable( stem = flag_stem, qualname = f'{qualname}.{flag_stem}', file = fn.file, line = fn.line, type = bool_cls )
+			for flag_stem, _is_errdefer, _body in defer_sites
+		]
+		attributes = [ state_attr ] + param_attrs + local_attrs + live_flag_attrs + extra_attrs + defer_armed_attrs
 		return RCClass(
 			stem = qualname, qualname = qualname, file = fn.file, line = fn.line,
 			base = None, type_params = None,
@@ -1212,7 +1419,7 @@ class TypeResolver:
 	# it) was removed once that was confirmed - yield sites below just
 	# return the renamed value straight through.
 
-	def _pessimistic_done_prefix( self, stmts: list[ast.stmt], node: ast.AST, pending_done_assigns: 'list[ast.Assign]|None' ) -> list[ast.stmt]:
+	def _pessimistic_done_prefix( self, stmts: list[ast.stmt], node: ast.AST, pending_done_assigns: 'list[ast.Assign]|None', defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
 		generator's __next__ needs "permanently done" set BEFORE any block
 		of user code that might contain an or_return()/checked-arithmetic
@@ -1239,15 +1446,26 @@ class TypeResolver:
 		Assign's own placeholder value gets recorded here and patched to
 		the real done_state by _build_generator_next_function once that's
 		known, rather than sharing one mutable Constant node across every
-		insertion point. '''
+		insertion point.
+
+		PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - when
+		`defer_sites` is non-empty, ALSO tags every statement in `stmts`
+		with the "currently armed" prefix of defer_sites (see _tag_armed_
+		defer_sites) before returning - every call site here is exactly
+		the granularity ("a block of user code that might fail") Mechanism
+		2 needs to know the armed set for too, so this is the natural
+		place to piggyback the tagging pass rather than a separate walk. '''
 		if pending_done_assigns is None:
 			return stmts
+		if defer_sites:
+			assert armed_count is not None
+			self._tag_armed_defer_sites( stmts, defer_sites, armed_count )
 		assign = ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = 0 ) )
 		ast.copy_location( assign, node )
 		pending_done_assigns.append( assign )
 		return [ assign ] + stmts
 
-	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None ) -> tuple[ast.If,int]:
+	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> tuple[ast.If,int]:
 		''' a bare top-level `yield expr` (v1), or the SAME shape wrapped
 		in `with compiler.wrap_arithmetic/saturate_arithmetic/
 		panic_arithmetic(...):` (Phase 2 - see _yield_with_wrapper's own
@@ -1267,7 +1485,7 @@ class TypeResolver:
 		else:
 			yield_node = stmt.value
 		assert isinstance( yield_node, ast.Yield )
-		seg_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems or set() ), stmt, pending_done_assigns )
+		seg_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems or set() ), stmt, pending_done_assigns, defer_sites, armed_count )
 		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
 		yield_stmts: list[ast.stmt] = [
 			ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = start_state + 1 ) ),
@@ -1291,7 +1509,7 @@ class TypeResolver:
 		)
 		return guard, start_state + 1
 
-	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None ) -> tuple[ast.If,int]:
+	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> tuple[ast.If,int]:
 		''' a `while cond: PRE_ITER; yield V; POST_ITER` loop occupies TWO
 		states: start_state ("not yet entered") and start_state+1
 		("paused mid-loop, resuming"). Restructured as the standard
@@ -1335,19 +1553,19 @@ class TypeResolver:
 		resume_var = f'__gen_resuming_{start_state}' # unique per while-unit (keyed by its own start_state) - an ordinary $$__next__-scoped local, never a field: only needs to survive within ONE call
 		first_entry_guard = ast.If(
 			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns ) or [ ast.Pass() ],
+			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count ) or [ ast.Pass() ],
 			orelse = [],
 		)
 		resuming_init = ast.Assign(
 			targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ],
 			value = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
 		)
-		resume_body = self._pessimistic_done_prefix( post_iter_stmts, node, pending_done_assigns ) + [
+		resume_body = self._pessimistic_done_prefix( post_iter_stmts, node, pending_done_assigns, defer_sites, armed_count ) + [
 			ast.Assign( targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ], value = ast.Constant( value = False ) ),
 		]
 		inner_if = ast.If( test = ast.Name( id = resume_var, ctx = ast.Load() ), body = resume_body, orelse = [] )
 		break_if = ast.If( test = ast.UnaryOp( op = ast.Not(), operand = cond ), body = [ ast.Break() ], orelse = [] )
-		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns ) + [
+		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns, defer_sites, armed_count ) + [
 			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
 			ast.Return( value = yielded ),
 		]
@@ -1366,7 +1584,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None ) -> tuple[ast.If,int]:
+	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> tuple[ast.If,int]:
 		''' `if cond: [...yield...] else: [...yield...]` (at most one
 		yield per branch, at least one branch having one - see
 		_validate_if_yield_unit) occupies TWO states, same as a while-unit
@@ -1406,12 +1624,12 @@ class TypeResolver:
 				# but its own code can still fail partway through, so it
 				# needs the same pessimistic-done guarding as any other
 				# fallible block, same reasoning as first_entry_guard below
-				return self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts, renamer, rc_local_stems ), node, pending_done_assigns )
-			pre_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[:yield_index], renamer, rc_local_stems ), node, pending_done_assigns )
+				return self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts, renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count )
+			pre_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[:yield_index], renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count )
 			yield_node = branch_stmts[ yield_index ].value
 			assert isinstance( yield_node, ast.Yield )
 			yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-			post_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[ yield_index + 1: ], renamer, rc_local_stems ), node, pending_done_assigns )
+			post_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[ yield_index + 1: ], renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count )
 			resuming_branch = post_stmts or [ ast.Pass() ]
 			fresh_branch = pre_stmts + [
 				ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
@@ -1421,7 +1639,7 @@ class TypeResolver:
 
 		first_entry_guard = ast.If(
 			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns ) or [ ast.Pass() ],
+			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count ) or [ ast.Pass() ],
 			orelse = [],
 		)
 		resuming_init = ast.Assign(
@@ -1445,7 +1663,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]' ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
@@ -1479,6 +1697,25 @@ class TypeResolver:
 		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
 		renamer = _GeneratorNameRenamer( rename_targets )
 
+		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - a
+		# SEPARATE, already-renamed copy of defer_sites, used ONLY for
+		# tagging (_tag_armed_defer_sites, below) - lowering.py's own
+		# Mechanism 2 hook (_build_generator_error_defer_replay) has no
+		# access to this file's _GeneratorNameRenamer/_rename_and_track_
+		# liveness, so unlike Mechanism 1's own _build_defer_replay_guards
+		# (which embeds the RAW body and relies on a later renamer.visit(
+		# ...) call to cover it - see that method's own docstring), the
+		# tag itself has to already carry self.<field>-qualified
+		# statements. Rendered ONCE here (not per insertion site - a
+		# single canonical copy is enough for tagging; lowering.py's own
+		# hook deep-copies its own fresh instance per OrReturn site that
+		# actually consumes it, same reasoning as Mechanism 1's per-site
+		# copies).
+		rendered_defer_sites: list[tuple[str,bool,list[ast.stmt]]] = [
+			( flag_stem, is_errdefer, [ renamer.visit( copy.deepcopy( s )) for s in body_stmts ] )
+			for flag_stem, is_errdefer, body_stmts in defer_sites
+		]
+
 		segments, tail = self._split_generator_segments( fn, units )
 		is_fallible = error_type is not None
 		pending_done_assigns: 'list[ast.Assign]|None' = [] if is_fallible else None
@@ -1489,15 +1726,21 @@ class TypeResolver:
 		# phase
 		rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
 
+		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - a single
+		# shared mutable cell, advanced in program order as each guard
+		# builder crosses one of defer_sites' own arm-assigns (see
+		# _tag_armed_defer_sites) - tags every fallible-eligible statement
+		# it's handed with "the prefix of defer_sites armed by this point"
+		armed_count: list[int] = [ 0 ]
 		guards: list[ast.If] = []
 		state = 0
 		for preamble, ( kind, stmt ) in segments:
 			if kind == 'yield':
-				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems )
+				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, rendered_defer_sites, armed_count )
 			elif kind == 'if':
-				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems )
+				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, rendered_defer_sites, armed_count )
 			else:
-				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems )
+				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, rendered_defer_sites, armed_count )
 			guards.append( guard )
 		done_state = state + 1
 		if pending_done_assigns is not None:
@@ -1522,10 +1765,20 @@ class TypeResolver:
 			# own placeholder above) - tail_stmts is ordinary user code
 			# (whatever follows the last unit) and can fail just like any
 			# other block, so it needs the same pessimistic guarding
+			if defer_sites:
+				self._tag_armed_defer_sites( tail_stmts, rendered_defer_sites, armed_count )
 			pessimistic = ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) )
 			ast.copy_location( pessimistic, anchor )
 			tail_stmts = [ pessimistic ] + tail_stmts
-		tail_body = tail_stmts + [
+		# PLAN_GENERATORS.md's defer/errdefer phase - the tail's own
+		# natural-exhaustion exit is a real generator-ending exit like any
+		# other, so every currently-armed plain `defer` site replays here
+		# too (LIFO), right before the state gets pinned to done. Unlike
+		# the bare-return call site (which embeds these raw and relies on
+		# a LATER bulk rename), this one renames explicitly right now -
+		# renamer/rc_local_stems are already in hand here
+		defer_replay = self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, anchor ), renamer, rc_local_stems )
+		tail_body = tail_stmts + defer_replay + [
 			ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) ),
 			ast.Return( value = ast.Constant( value = None ) ),
 		]
@@ -1588,7 +1841,7 @@ class TypeResolver:
 					ast.copy_location( ok_call.func.value, n )
 					n.value = ok_call
 
-	def _build_generator_destructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> None:
+	def _build_generator_destructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> None:
 		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a generator's
 		backing class does NOT get the ordinary, unconditional
 		$$__destructor__ cascade _synthesize_rcclass_destructor builds
@@ -1616,6 +1869,17 @@ class TypeResolver:
 		_synthesize_rcclass_destructor this never needs to walk an
 		inheritance chain.
 
+		PLAN_GENERATORS.md's defer/errdefer phase - dropping the generator
+		mid-iteration (abandonment, never reaching exhaustion or a bare
+		return) is ALSO a real generator-ending exit, so every currently-
+		armed plain `defer` site replays here too (LIFO), BEFORE step 1's
+		own field teardown - not after, and not interleaved: under the
+		preamble/tail-only restriction (_validate_generator_defer_sites),
+		every defer site can only ever reference a local/parameter declared
+		BEFORE it in program order, so running every armed defer body
+		first, then the existing decref cascade, guarantees nothing a
+		defer body touches has already been freed.
+
 		Called directly from ensure_generator_synthesized, which also
 		pre-marks id(backing_cls) in self._destructors_synthesized so
 		compiler.py's own ordinary, unconditional RCClass handling (which
@@ -1629,6 +1893,17 @@ class TypeResolver:
 		qualname = f'{backing_cls.qualname}$$__destructor__'
 
 		body: list[ast.stmt] = []
+
+		# 0. defer replay (abandonment) - see this method's own docstring
+		# for why it must run before ANY teardown below, not just the RC-
+		# local one. Needs its own renamer (destructor otherwise never
+		# renames arbitrary user-authored statements - every OTHER
+		# statement here is built directly against self.<field>)
+		if defer_sites:
+			rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
+			dtor_renamer = _GeneratorNameRenamer( rename_targets )
+			rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
+			body.extend( self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, fn.node ), dtor_renamer, rc_local_stems ))
 
 		# 1. captured parameters - unconditional, always valid from
 		# construction onward (unchanged from every earlier phase)
@@ -1719,7 +1994,7 @@ class TypeResolver:
 		dtor_fn.add_name( 'self', self_param )
 		self.schedule( dtor_fn )
 
-	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> None:
+	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> None:
 		''' replaces the original generator def's own body with a single
 		`return <allocate the backing class, state=0, fields=args/zeros>` -
 		matches Python's own "calling a generator function doesn't run any
@@ -1765,6 +2040,8 @@ class TypeResolver:
 				keywords.append( ast.keyword( arg = self._live_flag_stem( stem ), value = ast.Constant( value = False ) ) )
 		for stem, ( _t, expr ) in extra_fields.items():
 			keywords.append( ast.keyword( arg = stem, value = expr ) )
+		for flag_stem, _is_errdefer, _body in defer_sites:
+			keywords.append( ast.keyword( arg = flag_stem, value = ast.Constant( value = False ) ) )
 		call = ast.Call( func = ast.Name( id = backing_cls.stem, ctx = ast.Load() ), args = [], keywords = keywords )
 		call.generator_backing_cls = backing_cls
 		fn.node.body = [ ast.Return( value = call ) ]
@@ -1854,9 +2131,10 @@ class TypeResolver:
 
 		extra_fields = self._desugar_generator_for_loops( fn )
 		units = self._collect_generator_units( fn )
-		self._reject_generator_defer( fn )
+		self._validate_generator_defer_sites( fn )
+		defer_sites = self._desugar_generator_defer_sites( fn )
 		self._reject_generator_value_return( fn )
-		pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn )
+		pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
 		locals_decl = self._collect_generator_locals( fn )
 
 		none_type = self.discovery.get_none_type()
@@ -1880,8 +2158,8 @@ class TypeResolver:
 		else:
 			next_return_type = result_union
 
-		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns )
+		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
+		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
 		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 		# backing_cls is ever scheduled below, so its own pre-mark of
 		# id(backing_cls) in self._destructors_synthesized (see its own
@@ -1889,13 +2167,13 @@ class TypeResolver:
 		# handling to the punch - that path checks the SAME memo set
 		# before ever building its own (wrong, unconditional-decref)
 		# destructor for this class
-		self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields )
+		self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
 
 		self.schedule( backing_cls )
 		self.schedule( backing_cls.names['__next__'] )
 		self.schedule( result_union )
 
-		self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields )
+		self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
 		fn.return_type = backing_cls
 
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:

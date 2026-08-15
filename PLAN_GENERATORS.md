@@ -24,6 +24,12 @@ watch for this when
 reading older commit messages/comments that say "Phase 1" or "Phase 2"
 meaning something other than the roadmap's own numbering.
 
+Past the original roadmap's own 9 phases, `defer`/`errdefer` support
+inside a generator body has ALSO landed (own separate mini-plan, not
+part of the numbered sequence above - see "defer/errdefer phase design"
+below), including a prerequisite fix (a bare `return` inside a generator
+body now correctly ends iteration permanently, not just once).
+
 PLAN_GENERATORS.md's own motivating example now compiles and runs in its
 most natural, idiomatic spelling: `for i in range(count): yield i`,
 consumed the equally natural way: `for x in counter(5):`. `range()`
@@ -632,8 +638,9 @@ above (kept the sequential landed-phase numbering there; see the STATUS
 section's own note on why the two schemes overlap in name but not
 meaning). yield inside `if`/`with`. ("try" doesn't exist in this
 language - no exception handling anywhere in lowering.py's statement
-dispatch; the closer analog, `with defer/errdefer:`, stays out of scope,
-see below.) Landed exactly the recommended first cut: a single if/else,
+dispatch; the closer analog, `with defer/errdefer:`, stayed out of scope
+at the time this phase landed - see "defer/errdefer phase design"
+below for where it later landed.) Landed exactly the recommended first cut: a single if/else,
 at most one yield per branch - elif chains and nested loops-inside-
 branches are explicit compile errors, not yet supported.
 
@@ -670,11 +677,138 @@ through). Lifts the scalar-only restriction everywhere it applied,
 including Phase 1's own for-loop element type.
 
 Explicitly not planned, no forcing use case: `yield from`; `.send()`/
-`.throw()`/`.close()`; defer/errdefer inside a generator body (a real,
-already-flagged combinatorial hazard, see "Body restrictions for v1"
-below); generator methods (a generator must stay a plain function for
-now, same posture as PLAN_CALLABLE.md/PLAN_LAMBDA.md's own deferred
-closures); async/await (unrelated mechanism entirely).
+`.throw()`/`.close()`; generator methods (a generator must stay a plain
+function for now, same posture as PLAN_CALLABLE.md/PLAN_LAMBDA.md's own
+deferred closures); async/await (unrelated mechanism entirely).
+(`defer`/`errdefer` inside a generator body WAS in this "not planned"
+list - it has since landed, own separate mini-plan below.)
+
+defer/errdefer phase design (own separate mini-plan, past the original
+9-phase roadmap above)
+
+The user's own framing, confirmed exactly right as the mechanism's own
+starting point, but only half the story: a generator's synthesized
+`$$__destructor__` IS where abandonment-time cleanup belongs, but a
+generator's own LOGICAL "call" (for defer purposes) spans MANY
+`$$__next__()` invocations, most of which are yield-SUSPENDS, not exits
+- naively letting ordinary (non-generator) defer machinery see a yield's
+own synthesized `self.__state = N; return expr` would fire the defer on
+every suspend, not just a real exit. Landed in two genuinely different
+mechanisms, matching the two ways a generator's own call can actually
+end:
+
+**Prerequisite, found during scoping, fixed first, own commit**: a bare
+`return` inside a generator body compiled but never set `self.__state`
+to the DONE sentinel (`_reject_generator_value_return` only ever
+rejected a VALUE return) - a later manual `.__next__()` call would
+wrongly resume and re-run code. Fixed via `_rewrite_generator_bare_
+returns`/`_rewrite_bare_return_stmts` (type_resolver.py): every bare/
+explicit-`return None` reachable in the body - including nested inside a
+while-unit's own loop body or an if-unit's own branch, which nothing
+validated for this shape before - gets rewritten into `self.__state =
+<placeholder>; return None`, using the exact `pending_done_assigns`-
+style patch-later list `_pessimistic_done_prefix` (Phase 8) already
+established, since the real done_state isn't known until every unit is
+built. A truly bare `return` (no expression at all) ALSO needed its
+`.value` normalized to an explicit `ast.Constant(None)` - a real,
+separate finding: it lowers to a void C `return;`, which doesn't compile
+against `$$__next__`'s own never-void declared return type (confirmed
+via a real repro that failed with "non-void function ... should return
+a value").
+
+**Mechanism 1 (normal exits - tail exhaustion, a bare-return exit,
+abandonment)**: pure AST synthesis, no lowering.py involvement, exactly
+this whole plan's established discipline. `_desugar_generator_defer_
+sites` replaces each top-level `with defer:`/`with errdefer:`/
+`defer(...)`/`errdefer(...)` site (validated to be exactly that - a
+direct top-level statement, i.e. living in a preamble or the tail; never
+inside a while-unit's own loop body or an if-unit's own branch,
+`_validate_generator_defer_sites` - same "start narrow" posture as
+break/continue inside a yield-containing loop) with `self.
+__defer_armed_N = True`, capturing the site's own body separately.
+`_build_defer_replay_guards` builds `if self.__defer_armed_N: <body>` -
+LIFO, and PLAIN `defer` only (never `errdefer` - see Mechanism 2) -
+deep-copied fresh per insertion site (mutable per-occurrence lowering
+attributes like `resolved_*` would corrupt a shared node otherwise,
+same reasoning `_rename_and_track_liveness` already documents), inserted
+at the tail's own natural-exhaustion exit, every bare-return exit (once
+the prerequisite above lands), and `$$__destructor__` (before its
+existing field teardown - safe under the preamble/tail-only restriction,
+since a defer site can only ever reference a local/parameter declared
+before it in program order).
+
+**A real double-replay bug found and fixed here**: a plain `defer`
+replayed via Mechanism 1 (say, at natural exhaustion) pins `self.__state`
+to done but does NOT free the generator object itself - whatever
+reference the caller still holds keeps it alive until IT drops, at which
+point `$$__destructor__` runs and, without a fix, would see the SAME
+`self.__defer_armed_N` still `True` and replay the identical body a
+SECOND time. Every replay guard (Mechanism 1's own, AND Mechanism 2's,
+below) now unsets its own flag (`self.__defer_armed_N = False`) right
+after replaying - confirmed via a real repro (`defer_does_not_replay_
+again_when_generator_later_dropped`: fully drain a generator with an
+armed defer, THEN let it go out of scope, refcount-verify the defer's
+own side effect happened exactly once, not twice).
+
+**Mechanism 2 (error exits - `or_return()`/checked-arithmetic failure,
+both `defer` AND `errdefer`)**: the one piece needing a real, targeted
+lowering.py change, matching this hazard's own nature - "did this exit
+happen via an error" is genuine lowering-time information (whether
+`or_return()`'s Err branch fired), not derivable from the AST alone, and
+the existing fallible-generator `_pessimistic_done_prefix` trick (Phase
+8) only works for a VALUE (safely overwritten on success), not a SIDE
+EFFECT like a defer replay (would wrongly fire on success too). The key
+insight making this tractable: `ir.OrReturn.epilogue` is ALREADY Err-
+branch-exclusive by construction (same field ordinary, non-generator
+errdefer already uses) - hooking into it directly means errdefer needs
+NO separate `is_err()` check at all here, unlike an ordinary function's
+own shared epilogue (reached by success AND error alike).
+
+Two-file split: type_resolver.py's `_tag_armed_defer_sites` (called from
+the exact same call sites `_pessimistic_done_prefix` already runs at -
+every block of user code that might fail) tags each such block's own
+top-level statements with `generator_armed_defer_sites`: the PREFIX of
+defer_sites armed by that point (tracked via a single shared mutable
+`armed_count` cell advanced past each arm-assign crossed, in program
+order - arming only ever happens at a top-level statement, so a simple
+running count suffices). Tagged with an ALREADY-RENAMED copy
+(`rendered_defer_sites`, built once via the same renamer used for
+everything else in this `$$__next__` build) - lowering.py's own hook has
+no access to `_GeneratorNameRenamer`, so unlike Mechanism 1 (which embeds
+the raw body and relies on a LATER bulk rename pass to cover it), the tag
+itself has to already be self.<field>-qualified.
+
+lowering.py's `_lower_stmt` pushes/pops `self._generator_armed_defer_
+sites` around whatever statement it's currently lowering, based on that
+tag (inherits the enclosing context when the current node carries none -
+mirrors `_arithmetic_mode`'s own stack semantics, so a fallible operation
+nested inside an ordinary if/call within a tagged statement still sees
+the right armed set). `_consume_checked_result`'s own `OrReturn`-building
+branch calls the new `_build_generator_error_defer_replay`: LIFO over
+whatever's currently armed, each site lowered via the SAME swap-the-
+instruction-buffer technique `_register_defer_block` already established
+(AST-If-wrap + `_lower_stmt`, not hand-built IR - the body is already
+self.<field>-qualified, so ordinary statement lowering does the right
+thing for free), spliced into the SAME `replay` list `cfg.return_()`
+already builds for `OrReturn.epilogue`. `self._generator_armed_defer_
+sites` is reset to empty while lowering each site's own body - a defer
+body is expected to be simple cleanup, not itself something needing its
+OWN error-defer replay; without this a fallible op nested inside a defer
+body would recurse into this same method against the SAME still-armed
+site, unboundedly.
+
+Verified via real compile-and-run (emitter_c_test.py's
+GeneratorFunctionTests): plain `defer` at natural exhaustion, a bare-
+return exit, and abandonment (each refcount-checked not-fired-early/
+fired-exactly-once/not-refired-after-done); the double-replay-after-
+later-drop fix specifically; two `defer` sites replayed LIFO; `errdefer`
+firing exactly on an `or_return()` error exit and NOT on a separate,
+successful full drain (`errdefer_fires_on_error_exit_only`); `defer` AND
+`errdefer` both armed, both firing on the SAME error exit
+(`defer_and_errdefer_both_fire_on_same_error_exit`); `with defer:`/
+`with errdefer:` directly inside a while-unit's own loop body and an
+if-unit's own branch both rejected with a clear message, not silently
+wrong.
 
 Original planning notes follow, kept for historical context and for the
 phases not yet attempted (the fallible-generator sketch below predates,
