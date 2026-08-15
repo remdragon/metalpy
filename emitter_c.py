@@ -1721,11 +1721,22 @@ def _emit_cast( instr ) -> list[str]:
 		]
 	# every other combination (including target u128 paired with source
 	# u128, unreachable per the same-type-cast note above) fits safely in
-	# __metalpy_wideint, EXCEPT a u128 source, which needs __metalpy_wideuint
-	# instead (non-negative by construction, so its own lower-bound/MIN
-	# comparison would misfire if attempted and is skipped entirely - a
-	# non-negative source can never actually be "below" any real MIN anyway)
-	wide_ctype = '__metalpy_wideuint' if source_stem == 'u128' else '__metalpy_wideint'
+	# __metalpy_wideint, EXCEPT an UNSIGNED source, which needs
+	# __metalpy_wideuint instead (non-negative by construction, so its own
+	# lower-bound/MIN comparison would misfire if attempted and is skipped
+	# entirely - a non-negative source can never actually be "below" any
+	# real MIN anyway). Not just u128: any unsigned source's own MAX can
+	# exceed __metalpy_wideint's real (backend-dependent - 64-bit under
+	# MSVC's fallback, 128-bit under gcc/clang) signed positive capacity,
+	# corrupting __wide to negative before any comparison even runs -
+	# confirmed for u64/usize specifically (a near-MAX u64 cast down to a
+	# narrower signed target silently passed as "in range" under MSVC).
+	# _is_unsigned_stem is safe to use unconditionally here even for
+	# stems that never actually need it on a given backend (u8/u16/u32,
+	# or u64/usize under gcc/clang's true 128-bit wideint) - promoting to
+	# wideuint when wideint would have worked anyway gives the identical,
+	# correct comparison result either way.
+	wide_ctype = '__metalpy_wideuint' if source_stem is not None and _is_unsigned_stem( source_stem ) else '__metalpy_wideint'
 	wide_decl = f'{wide_ctype} __wide = ({wide_ctype})({operand});'
 	# u64/usize's own MAX (UINT64_MAX/UINTPTR_MAX) doesn't fit as a positive
 	# value in a SIGNED __metalpy_wideint once its own width matches the
