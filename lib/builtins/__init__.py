@@ -400,6 +400,19 @@ class str:
 				i += 1
 		return count
 
+	def __bool__( self ) -> bool:
+		# Python-style str truthiness: empty string is falsy. byte_len()
+		# (not __len__()'s codepoint-counting UTF-8 scan) is enough here -
+		# a string with zero content bytes has zero codepoints and vice
+		# versa - so this stays O(1). Lets type_resolver.py's
+		# _rewrite_tagged_union_truthiness synthesize a real `.__bool__()`
+		# call for a str|None-typed `if x:`/`while x:` (previously the
+		# only leaf type it ever reached for was bool, which needs no
+		# dunder call at all - see print()'s own end-parameter comment
+		# just below for the bare, non-union str truthiness gap this
+		# doesn't touch).
+		return self.byte_len() != 0
+
 	def find( self, sub: str, start: usize = 0 ) -> Result[usize,IndexError]:
 		''' byte offset of the first occurrence of sub in self, searching
 		from byte offset start onward (default 0 - the whole string; used

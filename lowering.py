@@ -7868,6 +7868,11 @@ class FunctionLowering:
 			moved_kw = { name: was_moved for name, ( _, was_moved ) in peeled_kwargs.items() }
 			arg_types = [ op.type for op in args ]
 			kwarg_types = { name: op.type for name, op in kwargs.items() }
+			call_slots: list[int|str] = [ *range( len( arg_types )), *kwarg_types.keys() ]
+			arg_leaves: dict[int|str,tuple[Type,...]] = {
+				**{ i: tuple( t.leaves() ) for i, t in enumerate( arg_types ) },
+				**{ name: tuple( t.leaves() ) for name, t in kwarg_types.items() },
+			}
 
 			# an @overload group declared inside a generic CLASS (e.g.
 			# Result[T,E].unwrap_or's `default: T` stub) is now pre-
@@ -7895,9 +7900,18 @@ class FunctionLowering:
 				# stub's own `bound_to` (the real, already-monomorphized
 				# implementation) - the stub has a more specific return
 				# type than the impl (e.g. T vs T|None), so use the
-				# stub's return type while still calling through to the impl
+				# stub's return type while still calling through to the impl.
+				# `bound_to` is a static, unconditional relationship (one
+				# stub always resolves to the same implementation), so it
+				# alone can't tell whether THIS call's own arguments
+				# actually matched the stub's narrower signature or fell
+				# through to the implementation's own wider one (e.g.
+				# unwrap_or()'s zero-argument form only ever matches the
+				# plain `default: T|None = None` impl, never the `default:
+				# T` stub bound to it) - stub_covers_call re-checks that
+				# against this call's real argument types before narrowing
 				winning_stub = next( ( s for s in target.stubs if s.bound_to is fn ), None )
-				if winning_stub is not None:
+				if winning_stub is not None and overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves ):
 					return replace( fn, return_type = winning_stub.return_type )
 				return fn
 
@@ -7967,6 +7981,23 @@ class FunctionLowering:
 					)
 				if param.is_move:
 					self._apply_move_hook( param, kwargs[param.stem], target.qualname )
+
+			# fill in default values for any of target's OWN parameters the
+			# call site didn't supply - mirrors _lower_call_args's identical
+			# tail for the plain (non-Overload) path just below, which this
+			# branch never goes through (an Overload target builds args/
+			# kwargs itself, above, straight from node.args/node.keywords,
+			# with no equivalent step). Without this, a zero-argument
+			# unwrap_or() call (its own `default: T|None = None` impl
+			# parameter never supplied) reached real emission with no
+			# 'default' entry in instr.kwargs at all, crashing emitter_c.py's
+			# _emit_call_args with a bare KeyError
+			given = { p.stem for i, p in enumerate( target.parameters or [] ) if i < len( args ) }
+			given.update( kwargs.keys() )
+			for param in target.parameters or []:
+				if param.stem not in given and param.default is not None:
+					default_operand = self._lower_expr( param.default, param.type )
+					kwargs[param.stem] = default_operand
 		else:
 			self.lowering._resolve_call_target( target )
 			args, kwargs = self._lower_call_args( target, node )

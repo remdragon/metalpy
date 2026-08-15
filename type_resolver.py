@@ -13,6 +13,7 @@ from mpy_types import (
 	Parameter, RCClass, Scalar, Specialization, TaggedUnion, Type,
 	TupleType, TypeVar, Variable,
 )
+import overload_resolution
 from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
@@ -1132,6 +1133,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if isinstance( target, Function ):
 				target = self.resolver.ensure_resolved( target )
 				return target.return_type if isinstance( target, Function ) else None
+			if isinstance( target, Overload ):
+				# an @overload-decorated method group (e.g. Result[T,E].
+				# unwrap_or) - previously fell all the way through to the
+				# `return None` below (neither a Function nor a ClassLike),
+				# which meant a local assigned from one of these calls never
+				# got its type tracked at all, silently disabling the
+				# TaggedUnion truthiness rewrite (and any other rewrite in
+				# this class) for it further down the same body
+				return self._overload_call_return_type( target, node )
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				# a plain (non-generic) construction call, Foo(...) - its own
 				# type is just the class itself. A GENERIC construction
@@ -1141,6 +1151,55 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return target
 			return None
 		return None
+
+	def _overload_call_return_type( self, group: Overload, node: ast.Call ) -> Type|None:
+		''' best-effort return type of a call to an @overload group, for
+		_type_of_expr's Call branch above. Mirrors lowering.py's own
+		Overload dispatch (_lower_call's _resolve_original/stub_covers_call)
+		closely enough that a local's TRACKED type here never disagrees with
+		what lowering.py itself actually resolves it to - disagreeing would
+		either wrongly trigger _rewrite_tagged_union_truthiness's rewrite for
+		a name lowering later types as a plain scalar (synthesizing a bogus
+		`.tag`/`.data` access on it) or wrongly skip the rewrite for one it
+		types as a nullable union (see the unwrap_or()-with-no-arguments bug
+		this whole call chain was added for: Result[T,E].unwrap_or's `default:
+		T` stub is bound_to the plain `default: T|None = None` impl, but a
+		zero-argument call only ever matches the impl's own broader
+		signature, never the stub's - stub_covers_call is what tells the two
+		cases apart). Any doubt at all - an argument this pass can't type,
+		resolve_call itself raising - just returns None, same discipline as
+		every other branch of _type_of_expr. '''
+		for fn in ( *group.stubs, *group.implementations ):
+			if fn.resolve is not None:
+				fn.resolve()
+		if any( kw.arg is None for kw in node.keywords ):
+			return None
+		arg_types = [ self._type_of_expr( a ) for a in node.args ]
+		if any( t is None for t in arg_types ):
+			return None
+		kwarg_types: dict[str,Type] = {}
+		for kw in node.keywords:
+			kw_type = self._type_of_expr( kw.value )
+			if kw_type is None:
+				return None
+			kwarg_types[kw.arg] = kw_type
+		try:
+			_, resolved = overload_resolution.resolve_call(
+				group.stubs, group.implementations, arg_types, kwarg_types, qualname = group.qualname,
+			)
+		except CompileError:
+			return None
+		winning_stub = next( ( s for s in group.stubs if s.bound_to is resolved ), None )
+		if winning_stub is None:
+			return resolved.return_type
+		call_slots: list[int|str] = [ *range( len( arg_types )), *kwarg_types.keys() ]
+		arg_leaves: dict[int|str,tuple[Type,...]] = {
+			**{ i: tuple( t.leaves() ) for i, t in enumerate( arg_types ) },
+			**{ name: tuple( t.leaves() ) for name, t in kwarg_types.items() },
+		}
+		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves ):
+			return winning_stub.return_type
+		return resolved.return_type
 
 	# --- namespace resolution (Name/Attribute only - no Subscript here; ---
 	# --- rewrite 3 below needs Subscript too, for Name[T](...)/Attribute ---
