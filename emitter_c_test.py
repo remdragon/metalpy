@@ -11340,6 +11340,100 @@ def main() -> i32:
 		return 7
 	return 0
 ''' ),
+			# PLAN_GENERATORS.md Phase C - .send(): a captured yield
+			# expression (`x = yield v`) receives whatever value the NEXT
+			# .send(value) call delivers - proven with an accumulator that
+			# echoes its own running total back on each resume.
+			( 'send_delivers_value_into_captured_yield_expression', '''
+def echo() -> Generator[i32, i32, OverflowError]:
+	total: i32 = 0
+	while True:
+		received: i32 = yield total
+		with compiler.wrap_arithmetic:
+			total = total + received
+
+def main() -> i32:
+	g = echo()
+	result_a: i32 = -1
+	match g.__next__(): # primes it - total starts at 0
+		case Result.Ok( v ):
+			xa: i32|None = v
+			if xa is not None:
+				result_a = xa
+		case Result.Err( e ):
+			return 1
+	if result_a != 0:
+		return 2
+	result_b: i32 = -1
+	match g.send( 5 ): # received=5, total becomes 5, yields 5
+		case Result.Ok( v ):
+			xb: i32|None = v
+			if xb is not None:
+				result_b = xb
+		case Result.Err( e ):
+			return 3
+	if result_b != 5:
+		return 4
+	result_c: i32 = -1
+	match g.send( 10 ): # received=10, total becomes 15, yields 15
+		case Result.Ok( v ):
+			xc: i32|None = v
+			if xc is not None:
+				result_c = xc
+		case Result.Err( e ):
+			return 5
+	if result_c != 15:
+		return 6
+	return 0
+''' ),
+			( 'send_rc_typed_value_captured_into_promoted_local', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( count: i32 ) -> Generator[i32, Box, OverflowError]:
+	i: i32 = 0
+	held: Box = Box( v = -1 )
+	while i < count:
+		held = yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b1 = Box( v = 1 )
+		if compiler.refcount( b1 ) != 1:
+			return 1
+		g = gen( 3 )
+		match g.__next__(): # primes it - i=0 yielded
+			case Result.Ok( v ):
+				pass
+			case Result.Err( e ):
+				return 2
+		match g.send( b1 ): # held = b1 - captured, live-flag-first-assign path
+			case Result.Ok( v ):
+				pass
+			case Result.Err( e ):
+				return 3
+		# three independent owners now: b1's own binding, __send_slot (the
+		# field, keeps the sent value alive until the NEXT send() overwrites
+		# it), and held (gen's own promoted local, a SEPARATE copy the body
+		# itself assigned into via `held = yield i`)
+		if compiler.refcount( b1 ) != 3:
+			return 4
+		b2 = Box( v = 2 )
+		match g.send( b2 ): # held = b2, __send_slot = b2 - both reassignments must decref b1's own two references
+			case Result.Ok( v ):
+				pass
+			case Result.Err( e ):
+				return 5
+		if compiler.refcount( b1 ) != 1:
+			return 6
+		if compiler.refcount( b2 ) != 3:
+			return 7
+	return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -11506,6 +11600,64 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
 
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_send_before_first_yield_panics( self ) -> None:
+		# PLAN_GENERATORS.md Phase C - .send() on a generator that has never
+		# yielded (self.__state == 0) panics, mirroring Python's own
+		# TypeError ("can't send non-None value to a just-started generator")
+		self._run( '''
+def gen( n: i32 ) -> Generator[i32, str, OverflowError]:
+	i: i32 = 0
+	while i < n:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	g = gen( 3 )
+	b = g.send( "too early" )
+	match b:
+		case Result.Ok( v ):
+			pass
+		case Result.Err( e ):
+			pass
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_next_on_captured_yield_instead_of_send_panics( self ) -> None:
+		# PLAN_GENERATORS.md Phase C - resuming a CAPTURED yield expression
+		# via a bare .__next__() (instead of .send()) panics too - the
+		# generator body has nothing to bind `received` to, since __send_
+		# ready is only ever set True by send() itself
+		self._run( '''
+def echo() -> Generator[i32, i32, OverflowError]:
+	total: i32 = 0
+	while True:
+		received: i32 = yield total
+		with compiler.wrap_arithmetic:
+			total = total + received
+
+def main() -> i32:
+	g = echo()
+	match g.__next__():
+		case Result.Ok( v ):
+			pass
+		case Result.Err( e ):
+			return 1
+	# calling __next__() again (not send()) on a captured yield must panic
+	match g.__next__():
+		case Result.Ok( v ):
+			pass
+		case Result.Err( e ):
+			pass
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
 
 class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' regression test for a real, confirmed bug: Result[T,E].unwrap_or()
