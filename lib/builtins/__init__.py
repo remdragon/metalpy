@@ -8,7 +8,8 @@ from .__fastlist import FastList
 from .__float import _f64_sign_prefix, _f64_fixed_digits
 from .__int import int, IntError
 from .__list import list, UnsafeList
-from .__RawDict import RawDict
+from .__RawDict import RawDict, RawEntry
+from .__set import set
 from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
@@ -1391,6 +1392,11 @@ class str:
 	def __ne__( self, other: str ) -> bool:
 		return self.__cmp__( other ) != 0
 
+	# supports `sub in some_str` (see lowering.py's _lower_in_comparison) -
+	# reuses find()'s own byte-level scan rather than duplicating it
+	def __contains__( self, sub: str ) -> bool:
+		return self.find( sub ).is_ok()
+
 	def __hash__( self ) -> u64:
 		# content-based (never the pointer's own address) - two equal
 		# strings must hash equally regardless of where each one lives, or
@@ -1874,14 +1880,48 @@ class UnsafeDict[K, V]:
 	@staticmethod
 	def _owned_value( value_ptr: Ptr[None] ) -> V:
 		# returned OUT to the caller (__getitem__) - an RC value needs its
-		# own incref (the dict's own stored reference stays valid too)
+		# own incref (the dict's own stored reference stays valid too).
+		# compiler.incref(...) is called UNCONDITIONALLY in both branches,
+		# not just the is_rc(V) one - compiler.is_rc(V) is deliberately
+		# is_rc_POINTER (true only when V's own runtime representation IS a
+		# bare pointer), which answers the STORAGE-LAYOUT question below
+		# (handle vs real heap-allocated struct copy) but NOT "does V need
+		# RC bookkeeping at all" - a @union V whose RC-carrying leaf is a
+		# plain RCClass (e.g. the builtin int) is exactly the is_rc(V)-
+		# false-but-still-has-RC-leaves case: it takes the value-typed
+		# struct-copy branch below for STORAGE, yet still owns a real RC
+		# reference through its tag-gated leaf that must be incref'd here.
+		# compiler.incref(...) itself already no-ops for a genuinely non-RC
+		# V (a plain scalar/CStruct), so calling it unconditionally is safe
+		# for every V - confirmed via a real repro (dict[str,Val] with Val a
+		# @union whose RC leaf is int): skipping this incref for the value-
+		# typed branch left the dict's own stored value under-retained,
+		# heap-corruption-on-free.
 		if compiler.is_rc( V ):
 			v: V = compiler.cast( V, value_ptr )
 			compiler.incref( v )
 			return v
 		else:
 			ptr: Ptr[V] = compiler.cast( Ptr[V], value_ptr )
-			return ptr[0]
+			v: V = ptr[0]
+			compiler.incref( v )
+			return v
+
+	@staticmethod
+	def _owned_key( key_ptr: Ptr[None] ) -> K:
+		# mirrors _owned_value above, for K instead of V - returned OUT to
+		# the caller (key_at), so an RC key needs its own incref the same
+		# way, unconditionally in both branches (see _owned_value's own
+		# comment on why is_rc(K) alone isn't the right gate for this)
+		if compiler.is_rc( K ):
+			k: K = compiler.cast( K, key_ptr )
+			compiler.incref( k )
+			return k
+		else:
+			ptr: Ptr[K] = compiler.cast( Ptr[K], key_ptr )
+			k: K = ptr[0]
+			compiler.incref( k )
+			return k
 
 	@staticmethod
 	def _store_key( key: K ) -> Ptr[None]:
@@ -1889,11 +1929,15 @@ class UnsafeDict[K, V]:
 		# just gets increfed (the object is already heap-owned, storing
 		# its handle is enough); a value-typed key needs a real heap copy,
 		# since RawEntry can't hold its bytes inline (it works on opaque
-		# Ptr[None], see its own module docstring)
+		# Ptr[None], see its own module docstring). compiler.incref(key) is
+		# unconditional here too (see _owned_value's own comment) - the
+		# value-typed branch's heap copy still needs its own leaf(s)
+		# incref'd if K is itself a union with an RC leaf.
 		if compiler.is_rc( K ):
 			compiler.incref( key )
 			return compiler.cast( Ptr[None], key )
 		else:
+			compiler.incref( key )
 			buf: Ptr[None] = compiler.cast( Ptr[None], sys.alloc[u8]( compiler.sizeof( K )))
 			ptr: Ptr[K] = compiler.cast( Ptr[K], buf )
 			ptr[0] = key
@@ -1901,10 +1945,12 @@ class UnsafeDict[K, V]:
 
 	@staticmethod
 	def _store_value( value: V ) -> Ptr[None]:
+		# see _store_key's own comment - identical reasoning, mirrored for V.
 		if compiler.is_rc( V ):
 			compiler.incref( value )
 			return compiler.cast( Ptr[None], value )
 		else:
+			compiler.incref( value )
 			buf: Ptr[None] = compiler.cast( Ptr[None], sys.alloc[u8]( compiler.sizeof( V )))
 			ptr: Ptr[V] = compiler.cast( Ptr[V], buf )
 			ptr[0] = value
@@ -1928,9 +1974,20 @@ class UnsafeDict[K, V]:
 		# (masked in every existing dict test before this - they all only
 		# ever used immortal string literal keys/values, whose release_object
 		# is a guarded no-op regardless of how many times it's called).
+		#
+		# compiler.decref(...) is reached unconditionally now (both
+		# branches), not just the is_rc(K) one - see _owned_value's own
+		# comment on why is_rc(K) alone under-covers a value-typed K that's
+		# still a union with an RC leaf. compiler.decref(...) itself already
+		# no-ops for a genuinely non-RC K. The value-typed branch's own
+		# decref target is a BARE `compiler.cast(Ptr[K], key_ptr)[0]`
+		# expression, deliberately never bound to a name - same "a bound
+		# local gets its own auto-decref too, double-releasing" pitfall this
+		# comment already explains for the is_rc(K) branch above.
 		if compiler.is_rc( K ):
 			compiler.decref( compiler.cast( K, key_ptr ))
 		else:
+			compiler.decref( compiler.cast( Ptr[K], key_ptr )[0] )
 			sys.free( compiler.cast( Ptr[u8], key_ptr ))
 
 	@staticmethod
@@ -1939,6 +1996,7 @@ class UnsafeDict[K, V]:
 		if compiler.is_rc( V ):
 			compiler.decref( compiler.cast( V, value_ptr ))
 		else:
+			compiler.decref( compiler.cast( Ptr[V], value_ptr )[0] )
 			sys.free( compiler.cast( Ptr[u8], value_ptr ))
 
 	# --- hashing/equality - the only crossing into RawDict's own code ----
@@ -2002,6 +2060,66 @@ class UnsafeDict[K, V]:
 		entry_idx: usize = self.__raw._find_entry_idx( h, key_ptr, _key_eq ).or_return()
 		return Result.Ok( self._owned_value( self.__raw.value_ptr_at( entry_idx )))
 
+	# deliberately does its OWN hash + _find_entry_idx call rather than
+	# calling __getitem__ and discarding the Result - that path would
+	# incref a found V via _owned_value for no reason, relying on
+	# Result[T,E]'s own discarded-payload-decref to balance it back out.
+	# A pure membership check never needs to touch _owned_value/_owned_key
+	# at all, so there's nothing to balance and nothing to get wrong.
+	def __contains__( self, key: K ) -> bool:
+		h: u64 = self._hash_key( key )
+		key_ptr: Ptr[None] = 0
+		if compiler.is_rc( K ):
+			key_ptr = compiler.cast( Ptr[None], key )
+		else:
+			key_ptr = compiler.cast( Ptr[None], compiler.addrof( key ))
+		return self.__raw._find_entry_idx( h, key_ptr, _key_eq ).is_ok()
+
+	# d[key] syntax (subscript del) isn't wired up - lowering.py's
+	# _stmt_Delete only accepts a bare local name - so this must be called
+	# directly (d.__delitem__(key)) for now, same situation as
+	# __contains__/`x in y`. The name is still right: Python convention,
+	# forward-compatible if subscript-del sugar is ever added.
+	def __delitem__( self, key: K ) -> Result[None, KeyError]:
+		h: u64 = self._hash_key( key )
+		key_ptr: Ptr[None] = 0
+		if compiler.is_rc( K ):
+			key_ptr = compiler.cast( Ptr[None], key )
+		else:
+			key_ptr = compiler.cast( Ptr[None], compiler.addrof( key ))
+		removed: RawEntry = self.__raw.remove_entry( h, key_ptr, _key_eq ).or_return()
+		# removed.key_ptr/value_ptr are raw Ptr[None]s straight off RawEntry,
+		# handed bare into _release_key/_release_value - same discipline
+		# __del__ already follows (see _release_key's own comment: casting
+		# a Ptr[None] back to K/V and binding it to a named local would
+		# double-decref via the compiler's own scope-exit RC tracking).
+		# Binding `removed` itself to a name IS safe - RawEntry is a plain
+		# non-RC @cstruct of two Ptr[None] fields, not a K/V-typed value,
+		# so that pitfall doesn't apply to it.
+		self._release_key( removed.key_ptr )
+		self._release_value( removed.value_ptr )
+		return Result.Ok( None )
+
+	def key_at( self, index: usize ) -> Result[K, IndexError]:
+		# positional access into CURRENT LIVE-ENTRY order - not a fixed
+		# mapping for the dict's whole lifetime any more. Still valid for
+		# every index in [0, len): RawDict.remove_entry always keeps
+		# __entries fully compacted (erase_at shifts left, never leaves a
+		# hole), so there's no gap. But a removal renumbers every entry
+		# AFTER the removed one down by one slot - key_at(i) can return a
+		# different key after a removal than before, even for an i whose
+		# own entry was never touched. Relative order among SURVIVING
+		# entries is preserved (shift, not reorder).
+		if index >= len( self.__raw ):
+			return Result.Err( IndexError() )
+		return Result.Ok( self._owned_key( self.__raw.key_ptr_at( index )))
+
+	def value_at( self, index: usize ) -> Result[V, IndexError]:
+		# see key_at's own comment - same positional access, for V
+		if index >= len( self.__raw ):
+			return Result.Err( IndexError() )
+		return Result.Ok( self._owned_value( self.__raw.value_ptr_at( index )))
+
 	def __setitem__( self, key: K, value: V ) -> None:
 		h: u64 = self._hash_key( key )
 		key_ptr: Ptr[None] = 0
@@ -2044,6 +2162,26 @@ class dict[K, V]:
 		defer( self.__lock.release() )
 		return self.__inner.__getitem__( key )
 
+	def __contains__( self, key: K ) -> bool:
+		self.__lock.acquire().unwrap( 'dict.__contains__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__contains__( key )
+
+	def __delitem__( self, key: K ) -> Result[None, KeyError]:
+		self.__lock.acquire().unwrap( 'dict.__delitem__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__delitem__( key )
+
+	def key_at( self, index: usize ) -> Result[K, IndexError]:
+		self.__lock.acquire().unwrap( 'dict.key_at: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.key_at( index )
+
+	def value_at( self, index: usize ) -> Result[V, IndexError]:
+		self.__lock.acquire().unwrap( 'dict.value_at: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.value_at( index )
+
 	def __setitem__( self, key: K, value: V ) -> None:
 		self.__lock.acquire().unwrap( 'dict.__setitem__: lock failed' )
 		defer( self.__lock.release() )
@@ -2061,5 +2199,11 @@ class dict[K, V]:
 		defer( self.__lock.release() )
 		body( self.__inner )
 
-# import this at the end because it depends on str etc to already be pre-parsed:
-from .__File import File
+# import this at the end because it depends on str etc to already be pre-parsed.
+# BinaryReader/BinaryWriter/BinaryReadWriter are re-exported alongside File
+# (not just File itself) because File's own factory methods hand them back
+# to the caller as Result payloads - a caller holding one across multiple
+# calls (e.g. a buffered reader keeping a handle alive) needs to be able to
+# name the type in a field/parameter annotation, which an unexported name
+# does not allow from outside lib/builtins.
+from .__File import File, BinaryReader, BinaryWriter, BinaryReadWriter

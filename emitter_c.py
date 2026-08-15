@@ -2197,7 +2197,20 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		else:
 			has_args = bool( arg_texts )
 			call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
-		if instr.dest is not None:
+		# _returns_void_in_c, not just `instr.dest is not None`: a generic
+		# method's declared return type can be a real, non-None type T
+		# that just happens to RESOLVE to NoneType for THIS
+		# monomorphization (e.g. UnsafeDict._owned_value's V, for a
+		# dict[K, None]) - lowering.py still creates a real dest temp for
+		# it (the declared type isn't literally the bare `None` annotation
+		# lowering.py's OWN NoneType-return special-casing checks
+		# elsewhere), but the CALLEE's own C function is void
+		# (_returns_void_in_c already makes it so, for both its prototype
+		# and its own `return;` - see that helper's own comment).
+		# Assigning `dest = <call to a void function>;` anyway is a
+		# straight C type error. Mirrors that exact existing rule rather
+		# than inventing a new one.
+		if instr.dest is not None and not _returns_void_in_c( instr.target.return_type ):
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
 		return [ f'\t{call_expr};' ]
 

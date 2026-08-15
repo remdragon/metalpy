@@ -581,7 +581,17 @@ class Discovery( ast.NodeVisitor ):
 				qualname = 'intrinsics.NoneType',
 				file = None,
 				line = None,
-				sizeof = 0, # TODO FIXME: None isn't a Scalar
+				# 1, NOT 0: a NoneType-typed VALUE (e.g. a generic V=None
+				# slot, distinct from a `-> None` return, which is a real
+				# C void with no storage at all) genuinely occupies one
+				# real byte in generated C - emitter_c.py's c_type() maps
+				# it to MetalpyNone (`typedef unsigned char MetalpyNone`),
+				# not void. sizeof=0 here used to silently disagree with
+				# that: any sys.alloc[u8](compiler.sizeof(V))-then-write
+				# call site (e.g. UnsafeDict._store_value/_store_key) would
+				# allocate a 0-byte buffer and then write MetalpyNone's one
+				# real byte into it - a genuine heap buffer overflow.
+				sizeof = 1,
 			)
 		return self._none_type
 

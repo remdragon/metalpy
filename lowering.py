@@ -52,13 +52,19 @@ _ALTERNATIVES_BY_ERROR: dict[str,str] = {
 
 # ast.BinOp operator -> the dunder method name to dispatch to for a
 # non-scalar left operand (str.__add__, etc.). Scalar operands always
-# go through arithmetic mode instead.
+# go through arithmetic mode instead. The three bitwise entries exist
+# purely for set[T]'s own algebra (__or__/__and__/__xor__ - union/
+# intersection/symmetric_difference); ast.Sub (__sub__, difference) was
+# already here for str/int's own use.
 _BINOP_DUNDER: dict[type,str] = {
 	ast.Add: '__add__',
 	ast.Sub: '__sub__',
 	ast.Mult: '__mul__',
 	ast.FloorDiv: '__floordiv__',
 	ast.Mod: '__mod__',
+	ast.BitOr: '__or__',
+	ast.BitAnd: '__and__',
+	ast.BitXor: '__xor__',
 }
 
 # ast comparison operator -> the dunder method name to dispatch to for a
@@ -635,6 +641,128 @@ class Lowering:
 		which = node.args[0].value
 		data = self._fetch_unicode_data_txt( node )
 		table = self._build_unicode_simple_table( data, which, node )
+		bytes_cls = self.discovery.find_name( 'bytes', node )
+		return ir.Const( type = bytes_cls, value = table )
+
+	_WINDOWS_ZONES_URL = 'https://raw.githubusercontent.com/unicode-org/cldr/main/common/supplemental/windowsZones.xml'
+
+	def _fetch_windows_zones_xml( self, node: ast.AST ) -> bytes:
+		''' downloads (or reads a locally-cached/overridden copy of)
+		windowsZones.xml - CLDR's Windows-zone-name <-> IANA-zone-name
+		mapping table (deliberately the RAW content host, not the
+		github.com/.../blob/... viewer URL, which serves an HTML page, not
+		XML). Same caching shape as _fetch_unicode_data_txt above: cached
+		indefinitely once fetched, with METALPY_WINDOWS_ZONES_DIR (mirroring
+		METALPY_UNICODE_DATA_DIR's existing override convention) letting an
+		offline/CI build point at a local copy instead of ever reaching the
+		network. '''
+		import os
+		import tempfile
+		from pathlib import Path
+
+		override_dir = os.environ.get( 'METALPY_WINDOWS_ZONES_DIR', '' ).strip()
+		if override_dir:
+			local_path = Path( override_dir ) / 'windowsZones.xml'
+			if not local_path.is_file():
+				self.discovery.fail(
+					f'METALPY_WINDOWS_ZONES_DIR={override_dir!r} is set but {local_path} does not exist',
+					node,
+				)
+			return local_path.read_bytes()
+
+		cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'windows_zones'
+		cache_dir.mkdir( parents = True, exist_ok = True )
+		cache_file = cache_dir / 'windowsZones.xml'
+		if cache_file.is_file():
+			# same "empty file is a torn write, re-download" posture as
+			# _fetch_unicode_data_txt - see its own comment
+			try:
+				cached = cache_file.read_bytes()
+			except OSError:
+				cached = b''
+			if cached:
+				return cached
+
+		import urllib.error
+		import urllib.request
+		request = urllib.request.Request( self._WINDOWS_ZONES_URL, headers = { 'User-Agent': 'metalpy-compiler' } )
+		try:
+			with urllib.request.urlopen( request, timeout = 30 ) as response:
+				data = response.read()
+		except ( urllib.error.URLError, OSError ) as e:
+			self.discovery.fail(
+				f'compiler.fetch_windows_zones_table(): failed to download {self._WINDOWS_ZONES_URL} ({e}) - '
+				f'set METALPY_WINDOWS_ZONES_DIR to a local directory containing windowsZones.xml to avoid the network entirely',
+				node,
+			)
+		import linker_c as _linker_c
+		_linker_c.atomic_write_cache( cache_file, data )
+		return data
+
+	def _build_windows_zones_table( self, data: bytes, node: ast.AST ) -> bytes:
+		''' parses windowsZones.xml's <mapZone other="Win Name"
+		territory="001" type="Iana/Name"/> elements - territory="001" only
+		(the default/world mapping: one canonical IANA zone per Windows
+		key; territory-specific overrides are an explicit v1 scope cut,
+		same posture case-folding took on SpecialCasing.txt's one-to-many
+		mappings) - into a linear-scan table: repeated [u16 win_len LE]
+		[win_name utf-8][u16 iana_len LE][iana_name utf-8] records, packed
+		back to back with no count/header prefix - the caller already knows
+		the total byte length via bytes.byte_len(), and windows_zones.
+		WindowsZoneMap's own runtime lookup (lib/windows_zones.py) just
+		scans until it hits that length. ~150 entries at this writing - far
+		too few to justify sorting + binary search over a variable-width
+		record layout. '''
+		import xml.etree.ElementTree as ET
+		try:
+			root = ET.fromstring( data )
+		except ET.ParseError as e:
+			self.discovery.fail(
+				f'compiler.fetch_windows_zones_table(): failed to parse windowsZones.xml ({e})',
+				node,
+			)
+		entries: list[tuple[str,str]] = []
+		for map_zone in root.iter( 'mapZone' ):
+			if map_zone.get( 'territory' ) != '001':
+				continue
+			win_name = map_zone.get( 'other' )
+			iana_name = map_zone.get( 'type' )
+			if not win_name or not iana_name:
+				continue
+			entries.append( ( win_name, iana_name ) )
+		if not entries:
+			self.discovery.fail(
+				f"compiler.fetch_windows_zones_table(): parsed windowsZones.xml but found zero territory='001' "
+				f"<mapZone> entries - the file is probably not what was expected (wrong format, truncated download, ...)",
+				node,
+			)
+		table = bytearray()
+		for win_name, iana_name in entries:
+			win_bytes = win_name.encode( 'utf-8' )
+			iana_bytes = iana_name.encode( 'utf-8' )
+			table += len( win_bytes ).to_bytes( 2, 'little' )
+			table += win_bytes
+			table += len( iana_bytes ).to_bytes( 2, 'little' )
+			table += iana_bytes
+		return bytes( table )
+
+	def _lower_compiler_fetch_windows_zones_table( self, node: ast.Call ) -> ir.Operand:
+		''' compiler.fetch_windows_zones_table() - downloads/caches
+		windowsZones.xml (see _fetch_windows_zones_xml) and folds to an
+		ir.Const(type=bytes, value=<the encoded table>) - the SAME program-
+		wide static-embedding path compiler.fetch_unicode_table() already
+		uses (see its own docstring, and emitter_c.py's _emit_string_
+		literals) - no new emitter support needed. Only actually reached
+		(and only actually pays the download/parse cost) for a program that
+		references compiler.fetch_windows_zones_table() itself - nothing in
+		builtins does, only lib/windows_zones.py's own install(). '''
+		if len( node.args ) != 0 or node.keywords:
+			self.discovery.fail(
+				f"compiler.fetch_windows_zones_table() takes no arguments: {ast.unparse(node)}",
+				node,
+			)
+		data = self._fetch_windows_zones_xml( node )
+		table = self._build_windows_zones_table( data, node )
 		bytes_cls = self.discovery.find_name( 'bytes', node )
 		return ir.Const( type = bytes_cls, value = table )
 
@@ -2329,9 +2457,24 @@ class FunctionLowering:
 			# exactly the same runtime representation as its underlying
 			# type" (see the CEnum construction-call comment above), so
 			# returning one where the underlying type is declared is a
-			# value-preserving reinterpretation, not a mismatch
+			# value-preserving reinterpretation, not a mismatch. Both
+			# directions, mirroring _check_assignable's own bidirectional
+			# CEnum<->value_type exemption (lines ~4169/4171) - this method
+			# can't just delegate to _check_assignable itself (see this
+			# method's own strict=False comment above, on why that would
+			# incorrectly reject the covered-Result-error widening case
+			# before it's even attempted), so it has to re-derive every
+			# exemption _check_assignable would apply; PLAN_COMPILER_BUG_
+			# SWEEP.md's own audit found this had only ever re-derived ONE
+			# of the two directions - `return raw_scalar` from a function
+			# declared `-> SomeCEnum` (the OTHER direction) was wrongly
+			# rejected, confirmed via a real repro
 			is_cenum_to_underlying = isinstance( value.type, CEnum ) and value.type.value_type is fn_type
-			if value.type is not fn_type and value.type is not expected_concrete and not is_cenum_to_underlying:
+			is_underlying_to_cenum = isinstance( fn_type, CEnum ) and value.type is fn_type.value_type
+			if (
+				value.type is not fn_type and value.type is not expected_concrete
+				and not is_cenum_to_underlying and not is_underlying_to_cenum
+			):
 				widened = self._maybe_widen_return_result( node, value, fn_type )
 				if widened is None:
 					self.lowering.discovery.fail(
@@ -3131,8 +3274,16 @@ class FunctionLowering:
 				node,
 			)
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
-		if size := getattr( target_type, 'sizeof', None ):
-			return ir.Const( type = expected_type or usize_cls, value = size )
+		# `is not None`, NOT a truthy `:=` check - NoneType's own sizeof is
+		# a legitimate 0 (see discovery.py's get_none_type()), and 0 is
+		# falsy, so a truthy check here wrongly fell through to the
+		# RCClass/CStruct/CUnion/TaggedUnion-only branch below and failed
+		# with "compiler.sizeof(NoneType) is not supported yet" - see that
+		# type's own sizeof field for why 0 there is real, not a "missing"
+		# sentinel
+		sizeof_attr = getattr( target_type, 'sizeof', None )
+		if sizeof_attr is not None:
+			return ir.Const( type = expected_type or usize_cls, value = sizeof_attr )
 		# Ptr[T]/ConstPtr[T] is always exactly one machine pointer wide, whatever
 		# T is - fold to the Ptr/ConstPtr intrinsic's own sizeof. A Specialization
 		# carries no sizeof of its own, so the plain getattr above misses it;
@@ -3577,7 +3728,12 @@ class FunctionLowering:
 		return isinstance( cls, Specialization )
 
 	def _lower_compiler_decref( self, node: ast.Call ) -> None:
-		# compiler.decref(x) — emit an ir.Decref for x. Used inside
+		# compiler.decref(x) — emit the real Decref sequence for x, via
+		# cfg.py's own union-aware decref() (NOT a bare ir.Decref emitted
+		# directly here - that's only correct for a plain RC pointer; a
+		# TaggedUnion operand with RC leaves needs the tag-gated release
+		# ladder instead, exactly like every other decref site in this
+		# compiler - see cfg.py's _refcount_instructions). Used inside
 		# synthesized destructor bodies to tear down each RC field, and by
 		# generic containers (list[T]) that need to conditionally RC-manage
 		# elements whose T may or may not turn out to be an RC type once
@@ -3587,12 +3743,29 @@ class FunctionLowering:
 		# body stays correct for both list[SomeRCClass] and list[i32]
 		# without the class itself branching on whether T is RC - an
 		# ordinary, non-generic call site with a genuinely wrong (always
-		# non-RC) argument is still rejected, same as before
+		# non-RC) argument is still rejected, same as before.
+		#
+		# Gated on cfg.rc_leaves(operand.type), not the narrower
+		# type_resolver._is_RC (is_rc_pointer) - _is_RC is False for a
+		# TaggedUnion with RC members (its runtime shape is a tag+data value
+		# struct, never a bare pointer), which used to make this whole
+		# branch treat "T monomorphized to a union with RC leaves" exactly
+		# like "T monomorphized to a genuinely non-RC scalar" - a silent
+		# no-op inside _in_generic_class_method(), the SAME no-op posture
+		# that's actually correct for list[i32]. Confirmed via a real repro
+		# (list[T].append/__getitem__ with T a @union whose RC-carrying leaf
+		# is a plain RCClass like the builtin int): the missing incref/decref
+		# left every such element under-retained by exactly one reference,
+		# a real heap-corruption-on-free bug - masked whenever the leaf
+		# happened to be an IMMORTAL-refcount value (a string literal),
+		# which is why this surfaced as "str leaves work, int leaves crash"
+		# rather than an unconditional failure.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.decref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is not None and self.lowering._type_resolver._is_RC( operand.type ):
-			self._emit( ir.Decref( value = operand ))
+		if operand.type is not None and cfg.rc_leaves( operand.type ):
+			for instr in self._cfg.decref( operand.type, operand ):
+				self._emit( instr )
 			# stop the scope-exit epilogue from decref'ing operand a SECOND
 			# time - see cfg.py's manually_decreffed's own comment for why
 			# this is required, not optional (a real, always-on double
@@ -3614,13 +3787,16 @@ class FunctionLowering:
 		)
 
 	def _lower_compiler_incref( self, node: ast.Call ) -> None:
-		# compiler.incref(x) — emit an ir.Incref for x. Same conditional
-		# no-op-for-non-RC-T posture as _lower_compiler_decref above.
+		# compiler.incref(x) — emit the real Incref sequence for x, via
+		# cfg.py's own union-aware incref(). Same conditional no-op-for-
+		# non-RC-T posture, and the same rc_leaves(...)-vs-_is_RC fix, as
+		# _lower_compiler_decref above.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.incref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is not None and self.lowering._type_resolver._is_RC( operand.type ):
-			self._emit( ir.Incref( value = operand ))
+		if operand.type is not None and cfg.rc_leaves( operand.type ):
+			for instr in self._cfg.incref( operand.type, operand ):
+				self._emit( instr )
 			return
 		if operand.type is not None and self._in_generic_class_method():
 			return
@@ -4135,6 +4311,33 @@ class FunctionLowering:
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
+	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
+		''' true if `stmt` never falls through to the statement after it -
+		either structurally (return/break/continue) or because it's a bare
+		call expression to a function declared -> NoReturn (sys.panic, most
+		commonly). Used by _stmt_If (true_terminates/false_terminates) to
+		decide whether a branch's own ending narrowed/bindings state can
+		reach the if's join point at all - see merge_if()'s own docstring.
+		Resolved via _resolve_callee_target rather than a full _lower_call -
+		this only needs the CALLEE's declared return type, not a real
+		lowered call (the statement was already lowered by the caller's own
+		loop before this runs), and _resolve_callee_target is a pure lookup
+		with no scheduling side effects beyond _resolve_callable's ordinary
+		signature-resolution. A receiver call (x.method()) or anything
+		_resolve_callee_target can't resolve without a receiver just isn't
+		recognized here - NoReturn is overwhelmingly a free-function/sys.*
+		shape (sys.panic, sys.exit, ...), and misses just fall back to
+		today's existing (safe, if incomplete) behavior. '''
+		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
+			return True
+		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
+			return False
+		target = self.lowering._type_resolver._resolve_callee_target( stmt.value.func )
+		fn = target.base if isinstance( target, Specialization ) else target
+		if not isinstance( fn, Function ):
+			return False
+		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
+
 	def _stmt_If( self, node: ast.If ) -> None:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		test = self._lower_expr( node.test, bool_cls )
@@ -4178,7 +4381,7 @@ class FunctionLowering:
 		# differently from an ordinary falling-through branch (full
 		# terminator/dead-code analysis for anything deeper - nested ifs
 		# that both terminate, etc - is future work, not attempted here)
-		true_terminates = bool( node.body ) and isinstance( node.body[-1], ( ast.Return, ast.Break, ast.Continue ))
+		true_terminates = bool( node.body ) and self._stmt_diverges( node.body[-1] )
 
 		if node.orelse:
 			self._cfg.restore( entry_snapshot )
@@ -4196,7 +4399,7 @@ class FunctionLowering:
 			false_end = dict( self._cfg.bindings )
 			false_end_results = self._cfg.unchecked_results()
 			false_end_narrowed = self._cfg.narrowed_snapshot()
-			false_terminates = bool( node.orelse ) and isinstance( node.orelse[-1], ( ast.Return, ast.Break, ast.Continue ))
+			false_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
 		else:
 			false_captured = []
 			false_end = dict( entry_snapshot.bindings )
@@ -4513,7 +4716,16 @@ class FunctionLowering:
 		# type isn't a member of the union at all) is a real compile
 		# error, not silently passed through.
 		self.lowering._union_storage.get( union ) # ensures union.names[leaf.stem] exists
-		leaf = next( ( attr for attr in union.attributes if attr.type is operand.type ), None )
+		# _same_type, not raw `is` - a leaf's declared type (e.g. list[Op]
+		# substituted into a generic union's own attributes) and operand's own
+		# type can be two different Specialization objects for the identical
+		# instantiation (one already-monomorphized, one freshly built from an
+		# annotation) - see TypeResolver._same_type's own docstring, the exact
+		# same duality _unify_type_param/_check_assignable already guard
+		# against elsewhere. Without this, a bare `list[Op]` return against a
+		# declared `list[Op]|None` return type wrongly fell through to the
+		# "not one of its members" failure below.
+		leaf = next( ( attr for attr in union.attributes if self.lowering._type_resolver._same_type( attr.type, operand.type ) ), None )
 		if leaf is None:
 			self.lowering.discovery.fail(
 				f'{ast.unparse(node)}: expected {union.qualname}, got a type that is not one of its members',
@@ -4542,7 +4754,24 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
 		self.lowering._ensure_resolved( name )
 		member = self._cfg.narrowed_member( node.id )
-		if member is not None and expected_type is not name.type:
+		# _same_type, not raw `is` - same PLAN_COMPILER_BUG_SWEEP.md audit
+		# that found the other Shape 1 candidates flagged this escape-hatch
+		# comparison too, on the theory that expected_type and name.type
+		# could be two different objects for the identical union
+		# instantiation. No repro could be constructed for it despite
+		# several attempts (generic-substituted vs fresh-annotation
+		# parameter types, local-variable-annotation vs fresh-annotation) -
+		# unlike the OTHER unconfirmed Shape 1 candidates (gated by a
+		# separate, already-known upstream bug), this one looks like it may
+		# genuinely be unreachable: _get_or_create_union caches by a
+		# qualname-text key (ARCHITECTURE.md), which is insensitive to
+		# whether the union's own MEMBER Specializations are identical
+		# objects, so two structurally-identical union ANNOTATIONS seem to
+		# always land on the same cached union object regardless. Applied
+		# anyway for consistency/defense-in-depth - strictly safer than
+		# `is` (accepts everything `is` did, plus more), so this can only
+		# widen when the escape hatch correctly fires, never narrow it.
+		if member is not None and not self.lowering._type_resolver._same_type( expected_type, name.type ):
 			# name is currently proven to hold this union member (cfg.py's
 			# narrow(), from a `match x: case T(x):` arm reusing x's own
 			# name) - read through the union's own payload instead of
@@ -5608,7 +5837,21 @@ class FunctionLowering:
 				)
 				value = obj.members.get( attr )
 				if value is not None:
-					return ir.Const( type = obj.value_type, value = value )
+					# tag the Const with the CEnum's own nominal type, not its
+					# underlying scalar, whenever the surrounding context already
+					# expects exactly that CEnum (e.g. a generic type param
+					# already bound to it by the enclosing return-type context -
+					# see _unify_type_param, which has no CEnum<->value_type
+					# exemption the way _check_assignable does at line ~4169/4171
+					# and so would wrongly see this as a conflicting inference).
+					# Falls back to the scalar for every other context (None, the
+					# raw value_type itself, an unrelated/unbound TypeVar) -
+					# _check_assignable's own bidirectional CEnum<->value_type
+					# exemption already makes both spellings interchangeable
+					# there, so this only changes behavior where the exemption
+					# doesn't already exist.
+					const_type = obj if expected_type is obj else obj.value_type
+					return ir.Const( type = const_type, value = value )
 			# scope-like terminal (Module, RCClass, etc.) — look up the
 			# final attribute as a value directly, without recursing into
 			# _lower_expr (which would fail for `sys` when the base is a
@@ -5782,6 +6025,41 @@ class FunctionLowering:
 			# for a call whose result isn't used" convention _stmt_Expr's
 			# own bare-call-statement handling already relies on
 			self._emit( ir.Call( dest = None, target = unwrap_fn, receiver = append_dest, args = [ errmsg ], kwargs = {} ))
+		return dest
+
+	def _expr_Set( self, node: ast.Set, expected_type: Type|None ) -> ir.Operand:
+		''' {a, b, c} - mirrors _expr_List's own shape (requires expected_type
+		to already be a concrete set[T] Specialization - element-driven
+		inference deferred, same precedent as list/tuple literals above).
+		Builds one set[T] instance via _construct_generic_instance, then a
+		real add(elt) call per element - unlike list[T].append, set[T].add
+		returns plain None (no Result[None,OverflowError] to unwrap), so
+		this skips _expr_List's errmsg/unwrap dance entirely. '''
+		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
+		if not ( isinstance( expected_type, Specialization ) and isinstance( resolved, RCClass )
+				and expected_type.base.stem == 'set' and len( expected_type.args ) == 1 ):
+			self.lowering.discovery.fail(
+				f'set literal needs a known set[T] target type from context (e.g. an annotation or return type): {ast.unparse(node)}',
+				node,
+			)
+		elem_type = expected_type.args[0]
+		dest = self._construct_generic_instance( expected_type, node )
+		if not node.elts:
+			# the standard parser never actually produces an empty ast.Set
+			# from source text (`{}` always parses as ast.Dict) - kept for
+			# robustness against a synthetically-built empty node, same
+			# defensive guard _expr_List keeps for its own analogous case
+			return dest
+		add_fn = self.lowering._find_method( dest.type, 'add' )
+		assert add_fn is not None, 'internal compiler error: set[T] has no add method'
+		self.lowering._ensure_resolved( add_fn )
+		self.lowering.schedule( add_fn.return_type )
+		for elt in node.elts:
+			operand = self._lower_expr( elt, elem_type )
+			# dest=None: add()'s return value (None) is never read, only its
+			# side effect - same "dest=None for a call whose result isn't
+			# used" convention _expr_List's own unwrap() call above relies on
+			self._emit( ir.Call( dest = None, target = add_fn, receiver = dest, args = [ operand ], kwargs = {} ))
 		return dest
 
 	# obj.type.stem -> its own length-accessor method name, for slice
@@ -6470,15 +6748,18 @@ class FunctionLowering:
 		return dest
 
 	def _expr_Compare( self, node: ast.Compare, expected_type: Type|None ) -> ir.Operand:
-		# ast.In/NotIn are deliberately not handled here - `in`/`not in`
-		# need a real container protocol that doesn't exist yet, guessing
-		# would bake in the wrong semantics. ast.Is/IsNot ARE handled (see
-		# _lower_is_comparison) - identity happens to coincide with value
-		# equality for every value kind this language has today
+		# ast.Is/IsNot ARE handled (see _lower_is_comparison) - identity
+		# happens to coincide with value equality for every value kind this
+		# language has today. ast.In/NotIn ARE ALSO handled (see
+		# _lower_in_comparison) but needed their own dispatch method rather
+		# than falling through _COMP_DUNDER below - see that method's own
+		# comment for why
 		if len( node.ops ) != 1 or len( node.comparators ) != 1:
 			self.lowering.discovery.fail( f'chained comparisons are not yet supported: {ast.unparse(node)}', node )
 		if isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
 			return self._lower_is_comparison( node, negate = isinstance( node.ops[0], ast.IsNot ))
+		if isinstance( node.ops[0], ( ast.In, ast.NotIn )):
+			return self._lower_in_comparison( node, negate = isinstance( node.ops[0], ast.NotIn ))
 
 		# non-scalar left operand — try the dunder method (str.__eq__, ...)
 		left = self._lower_expr( node.left, None )
@@ -6547,6 +6828,46 @@ class FunctionLowering:
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
 		return dest
+
+	def _lower_in_comparison( self, node: ast.Compare, negate: bool ) -> ir.Operand:
+		# `x in y` / `x not in y` mean `y.__contains__(x)` (negated for
+		# NotIn) - the REVERSE of every other _COMP_DUNDER-driven comparison
+		# (==, <, ...), where the LEFT operand is always the receiver. That
+		# reversal is exactly why In/NotIn can't just be added as two more
+		# _COMP_DUNDER entries and fall through the generic left-operand
+		# dispatch above: this lowers the RIGHT operand first and dispatches
+		# on ITS type instead.
+		right = self._lower_expr( node.comparators[0], None )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if not isinstance( right.type, Scalar ):
+			method = self.lowering._find_method( right.type, '__contains__' )
+			if method is not None:
+				self.lowering._ensure_resolved( method )
+				self.lowering.schedule( method.return_type )
+				for p in ( method.parameters or [] ):
+					self.lowering.schedule( p.type )
+				param_type = method.parameters[0].type if method.parameters else None
+				left = self._lower_expr( node.left, param_type )
+				call_dest = self._new_temp( method.return_type )
+				self._emit( ir.Call( dest = call_dest, target = method, receiver = right, args = [ left ], kwargs = {} ))
+				if not negate:
+					return call_dest
+				# NotIn: negate __contains__'s plain bool result - ir.Not
+				# (same as _expr_UnaryOp's `not x`), NOT
+				# _lower_is_comparison's tagged-union-aware EQ/NE flip,
+				# which solves an unrelated problem (`is None` narrowing)
+				dest = self._new_temp( bool_cls )
+				self._emit( ir.Not( dest = dest, operand = call_dest ))
+				return dest
+		# no __contains__ on a non-scalar right operand, or a scalar right
+		# operand entirely (e.g. `x in 5`) - unlike ==, there's no sane
+		# degraded fallback (a raw pointer/value compare is never what `in`
+		# means), so this is a hard error rather than a silent Cmp fallback
+		self.lowering.discovery.fail(
+			f'{"not " if negate else ""}in requires a __contains__ method on '
+			f'{right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+			node,
+		)
 
 	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization|_ReceiverDispatch,ir.Operand|None]:
 		target = self.lowering._type_resolver._resolve_callee_target( func_node )
@@ -8363,6 +8684,10 @@ class FunctionLowering:
 				result = self.lowering._lower_compiler_fetch_unicode_table( node )
 				return result if want_result else None
 
+			case 'fetch_windows_zones_table':
+				result = self.lowering._lower_compiler_fetch_windows_zones_table( node )
+				return result if want_result else None
+
 			case 'format_f64':
 				result = self._lower_compiler_format_f64( node, expected_type )
 				return result if want_result else None
@@ -8705,6 +9030,29 @@ class FunctionLowering:
 			self.lowering._resolve_call_target( target )
 			args, kwargs = self._lower_call_args( target, node )
 
+		if receiver is not None and isinstance( target, Function ) and target.cls is None:
+			# a Scalar-registered method (`SomeScalar.method = some_free_
+			# function` - discovery.py's visit_Assign, e.g. lib/builtins/
+			# __float.py's `f64.__str__ = _f64_str`) is a genuine free
+			# Function, unlike a real CStruct/RCClass method - discovery
+			# never strips a "self" off its .parameters the way
+			# _make_function_resolver does for an actual class body (there
+			# IS no class body here), so ir.Call's own receiver field
+			# (meant for real bound-method calls only) would make
+			# emitter_c.py's own _emit_call_args (which walks
+			# target.parameters assuming it already excludes the receiver)
+			# double-count the receiver against the first declared
+			# parameter - confirmed by a real KeyError crash on ordinary
+			# `f.__str__()` call syntax. _lower_method_call above (used by
+			# f-string dunder-dispatch/format-spec call sites) already
+			# carries this exact fix for its own narrower set of callers;
+			# this is the same fix for the general call-lowering path every
+			# other Scalar-attached-method call site (including ordinary
+			# user-written `receiver.method()` syntax) actually goes
+			# through.
+			args = [ receiver ] + args
+			receiver = None
+
 		if isinstance( target, Function ) and target.is_inline:
 			# PLAN_INLINE.md - reaches this shared tail from either the
 			# plain (non-generic, non-Overload) `else` branch above, the
@@ -8837,7 +9185,14 @@ class FunctionLowering:
 			if shape is None:
 				self.lowering.discovery.fail( f'{target.qualname}: conditional dispatch on a non-union argument: {ast.unparse(node)}', node )
 			base, members = shape
-			member = next( ( attr for attr in members if attr.type is leaf_type ), None )
+			# _same_type, not raw `is` - leaf_type (from overload_resolution.
+			# py's own call-site-argument-derived condition) and a member's
+			# own .type (re-derived here from operand.type via
+			# _tagged_union_shape) can be two different Specialization
+			# objects for the identical generic instantiation - same
+			# duality _check_assignable/_unify_type_param/_coerce_into_union
+			# already guard against elsewhere (see PLAN_COMPILER_BUG_SWEEP.md)
+			member = next( ( attr for attr in members if self.lowering._type_resolver._same_type( attr.type, leaf_type ) ), None )
 			if member is None:
 				self.lowering.discovery.fail( f'{target.qualname}: {leaf_type.qualname if leaf_type else "?"} is not a member of {operand.type.qualname}', node )
 			tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( base )
@@ -8870,7 +9225,15 @@ class FunctionLowering:
 		if shape is None:
 			return operand
 		base, members = shape
-		member = next( ( attr for attr in members if attr.type is target_type ), None )
+		# _same_type, not raw `is` - same duality as _lower_dispatch_tests'
+		# own identical fix just above (target_type and a member's own
+		# .type can be two different Specialization objects for the same
+		# generic instantiation). Silently returning operand UNCHANGED
+		# when no member matches (rather than failing loudly) makes this
+		# one worse than _lower_dispatch_tests' own version if it ever
+		# misfires - a wrong, still-union-typed argument passed through
+		# to a call expecting a concrete leaf, not a compile error
+		member = next( ( attr for attr in members if self.lowering._type_resolver._same_type( attr.type, target_type ) ), None )
 		if member is None:
 			return operand
 		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( base )

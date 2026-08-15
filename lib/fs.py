@@ -143,7 +143,7 @@ def open_raw(
 	use CreateFileW + MultiByteToWideChar (or manual UTF-8→UTF-16 conversion).
 	'''
 	from windows.kernel32 import CreateFileA, GetLastError, INVALID_HANDLE_VALUE
-	handle: HANDLE = CreateFileA(
+	handle: FD = CreateFileA(
 		path, access,
 		FILE_SHARE_READ | FILE_SHARE_WRITE,
 		None, creation,

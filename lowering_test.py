@@ -1384,6 +1384,66 @@ class Tests( unittest.TestCase ):
 		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
 		self.assertTrue( any( c.op == ir.CmpOp.NE for c in cmp_instrs ))
 
+	# --- in / not in (dispatch to __contains__, receiver/arg order reversed) --
+
+	def test_in_dispatches_to_contains_with_reversed_receiver( self ) -> None:
+		# `x in y` means y.__contains__(x) - y (the RIGHT operand) is the
+		# receiver, x (the LEFT operand) is the sole argument, the reverse
+		# of every _COMP_DUNDER-driven comparison (==, <, ...)
+		code = '\n'.join([
+			'class Bag:',
+			'	def __contains__( self, value: i32 ) -> bool:',
+			'		return value == 1',
+			'',
+			'def main() -> None:',
+			'	b = Bag()',
+			'	found: bool = 1 in b',
+			'	return',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].target.stem, '__contains__' )
+		b_var = mod.get_local( 'main' ).names['b']
+		self.assertIs( calls[0].receiver, b_var )
+		self.assertEqual( len( calls[0].args ), 1 )
+		self.assertEqual( calls[0].args[0].value, 1 )
+		self.assertFalse( any( isinstance( i, ir.Not ) for i in lowered.instructions ))
+
+	def test_not_in_negates_contains_result( self ) -> None:
+		code = '\n'.join([
+			'class Bag:',
+			'	def __contains__( self, value: i32 ) -> bool:',
+			'		return value == 1',
+			'',
+			'def main() -> None:',
+			'	b = Bag()',
+			'	missing: bool = 1 not in b',
+			'	return',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].target.stem, '__contains__' )
+		not_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Not ) ]
+		self.assertEqual( len( not_instrs ), 1 )
+		self.assertIs( not_instrs[0].operand, calls[0].dest )
+
+	def test_in_without_contains_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Bar: pass',
+			'',
+			'def main() -> None:',
+			'	b = Bar()',
+			'	found: bool = 1 in b',
+			'	return',
+		])
+		mod = self._import( code )
+		self.compiler._lower( mod.get_local( 'main' ))
+		self.assertTrue( any( '__contains__' in e for e in self.discovery.errors.errors ))
+
 	# --- boolean operators (and/or) -------------------------------------------
 
 	def test_boolop_and_shape( self ) -> None:
@@ -4639,6 +4699,36 @@ class Tests( unittest.TestCase ):
 		self.assertIsNot( allocs[0].cls, allocs[1].cls )
 		self.assertNotEqual( allocs[0].cls.qualname, allocs[1].cls.qualname )
 
+	def test_tuple_as_nested_explicit_type_argument_to_generic_construction_call( self ) -> None:
+		# regression test: tuple[...] (and every other textually-special
+		# subscript form - move/copy/Callable/Closure/Iterator/Generator)
+		# used to fail with "name 'tuple' is not defined" when it appeared as
+		# a NESTED, EXPLICIT type argument to another generic class's own
+		# constructor CALL - Box[tuple[i32,i32]](...) - even though the exact
+		# same tuple[tuple[i32,i32]] shape resolves fine as a plain
+		# ANNOTATION. Root cause: type_resolver.py's own _try_resolve_
+		# namespace (the generic-construction-call counterpart to discovery.
+		# py's visit_Subscript, used by Lowering._try_lower_construct_call)
+		# only special-cased Callable/Closure textually, so a nested tuple[...]
+		# argument fell through to the "ordinary generic base" branch and
+		# tried (and failed) to find_name('tuple') as if it were a real,
+		# registered class - see type_resolver.py's _try_resolve_namespace
+		# for the fix, which now delegates every textually-special subscript
+		# form to discovery.py's own visit_Subscript directly
+		code = '\n'.join([
+			'class Box[T]:',
+			'	value: T',
+			'	def __init__( self, value: T ) -> None:',
+			'		self.value = value',
+			'',
+			'def main() -> None:',
+			'	b = Box[tuple[i32,i32]]( ( 1, 2 ) )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	# --- globals -------------------------------------------------------------
 
 	def test_reads_module_global( self ) -> None:
@@ -6615,6 +6705,35 @@ class Tests( unittest.TestCase ):
 		# (canonicalized asciibetically by qualname - 'bool' < 'i32')
 		self.assertEqual( call.dest.type.stem, 'intrinsics.bool|intrinsics.i32' )
 
+# --- in / not in against real builtin types --------------------------------
+
+class InOperatorRealBuiltinsTests( unittest.TestCase ):
+	''' the reversed-receiver __contains__ dispatch tests above (in the main
+	Tests class) use cheap user-defined classes under import_builtins=False.
+	str.__contains__ is a real lib/builtins/__init__.py method, so exercising
+	`x in some_str` needs the real builtins loaded - same reason
+	JoinedStrLoweringTests/WalrusOperatorTests keep their own
+	import_builtins=True setUp instead of sharing the main Tests class's. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_in_on_str_dispatches_to_str_contains( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			"	s: str = 'hello world'",
+			"	found: bool = 'world' in s",
+			'	return',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertTrue( any( c.target.stem == '__contains__' for c in calls ))
+
 # --- @inline (PLAN_INLINE.md) -------------------------------------------
 
 class InlineTests( unittest.TestCase ):
@@ -8485,6 +8604,68 @@ class ListLiteralTests( unittest.TestCase ):
 			"	x = [ 'a', 'b' ]",
 			'	return',
 		]), needle = 'list literal needs a known list[T] target type' )
+
+
+class SetLiteralTests( unittest.TestCase ):
+	''' _expr_Set (ast.Set, `{a, b, c}`) - mirrors ListLiteralTests above.
+	Requires expected_type to already be a concrete set[T] Specialization -
+	no element-driven inference, same precedent as list literals. No
+	empty-literal test here (unlike ListLiteralTests' own
+	test_empty_list_literal_is_construction_only): `{}` is unconditionally
+	an empty ast.Dict in Python's own grammar, never an empty ast.Set - the
+	defensive `if not node.elts` guard in _expr_Set exists only for a
+	synthetically-built AST node, not reachable from real source text. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def _assert_rejected( self, code: str, needle: str ) -> None:
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( needle in e for e in self.discovery.errors.errors ),
+			f'expected an error containing {needle!r}, got: {self.discovery.errors.errors}',
+		)
+
+	def test_construction_and_add_shape( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			"	x: set[str] = { 'a', 'b' }",
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		add_calls = [ c for c in calls if c.target.stem == 'add' ]
+		self.assertEqual( len( add_calls ), 2 )
+		# both add calls target the SAME constructed set instance
+		self.assertIs( add_calls[0].receiver, add_calls[1].receiver )
+		# unlike list[T].append, set[T].add returns plain None - no
+		# unwrap()/Result dance needed for a set literal
+		self.assertFalse( any( c.target.stem == 'unwrap' for c in calls ) )
+
+	def test_wrong_element_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x: set[str] = { 'a', 5 }",
+			'	return',
+		]), needle = 'expected' )
+
+	def test_no_expected_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x = { 'a', 'b' }",
+			'	return',
+		]), needle = 'set literal needs a known set[T] target type' )
 
 
 class MoveParameterTests( unittest.TestCase ):

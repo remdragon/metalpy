@@ -585,6 +585,59 @@ def main() -> i32:
 ''' ),
 		] )
 
+class CStructNestedByValueOnlyReachedViaSizeofTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression coverage for task_421ed8be: a small @cstruct (Inner)
+	nested BY VALUE inside another @cstruct (Outer), where Outer is only
+	ever reached through compiler.sizeof(Outer)/Ptr[Outer] - never actually
+	CONSTRUCTED (Outer(...)) anywhere reachable, and Inner is never
+	independently constructed/sized/pointed-to either. Used to fail real C
+	compilation outright - "field has incomplete type 'struct ...Inner'",
+	"forward declaration of ..." - because Inner never got scheduled as a
+	real compile unit at all: resolving Outer's own `nested: Inner` field
+	(compiler.py's `for attr in unit.attributes: self.lowering.
+	_ensure_resolved(attr)` loop) only resolves the ATTRIBUTE Variable
+	itself, never attr.type - schedule()'s own guard silently ignores a
+	class-attribute Variable (is_global=False), so Inner was never added to
+	compiler.cstructs, and _emit_value_type_bodies had nothing to emit a
+	definition for, even though Outer's own struct body still references
+	it by name. The exact same root cause union_storage.py's UnionStorage.
+	get() was already fixed for once (see UnionAsUnconstructedResultErrorTypeTests
+	above, "union_member_never_constructed_still_gets_full_struct") - this
+	is the general case, fixed in compiler.py's CStruct/CUnion/TaggedUnion
+	branches and monomorphize.py's monomorphize_class (mpy_types.py's new
+	by_value_dependency helper). Confirmed this exact minimal shape crashes
+	on a clean checkout (reverting the fix reproduces the real clang error
+	directly - a 3-field Outer, no ~70-field struct needed; the original
+	report's large real-world struct just happened to be the shape that
+	first surfaced it). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'nested_by_value_cstruct_only_reached_via_sizeof_compiles', '''
+@cstruct
+class Inner:
+	a: u16 = 0
+	b: u16 = 0
+
+@cstruct
+class Outer:
+	x: i32 = 0
+	nested: Inner = Inner( a = 0, b = 0 )
+	y: i32 = 0
+
+def main() -> i32:
+	struct_size: usize = compiler.sizeof( Outer )
+	raw: Ptr[u8] = sys.alloc[u8]( struct_size )
+	sys.memzero( raw, struct_size )
+	sys.free( raw )
+	return 0
+''' ),
+		] )
+
 class RCClassSubclassingPhase1Tests( CompilerTestCase ):
 	''' Phase 1 of the RCClass-subclassing plan (base-chain lookup +
 	attribute-shadowing rejection, no constructor chaining/@virtual/
@@ -4584,6 +4637,76 @@ def main() -> i32:
 		] )
 
 
+class CEnumReturnCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for _stmt_Return's own CEnum<->underlying-
+	scalar coercion - "a CEnum has exactly the same runtime representation as
+	its underlying type" (see _try_lower_construct_call's own CEnum-
+	construction comment), so returning one where the other is declared is a
+	value-preserving reinterpretation in EITHER direction, mirroring
+	_check_assignable's own bidirectional exemption elsewhere. _stmt_Return
+	can't just delegate to _check_assignable (strict=False is deliberate, to
+	avoid it firing before the covered-Result-error-widening case gets a
+	chance - see that method's own comment), so it re-derives every exemption
+	_check_assignable would apply - PLAN_COMPILER_BUG_SWEEP.md's own audit
+	found this had only ever re-derived ONE of the two directions: returning
+	a CEnum value where the function declares its own underlying scalar type
+	worked, but the REVERSE (returning a raw scalar where the function
+	declares the CEnum) was wrongly rejected - confirmed via a real repro
+	before the fix ("function returns X, not Y" for a case that should be a
+	legitimate reinterpretation). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'both_cenum_underlying_return_directions_work', '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_underlying() -> i32:
+	return Color.Blue
+
+def get_red() -> Color:
+	x: i32 = 0
+	return x
+
+def main() -> i32:
+	if get_underlying() != 1:
+		return 1
+	c: Color = get_red()
+	if c != Color.Red:
+		return 2
+	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_genuinely_mismatched_return_type_still_rejected( self ) -> None:
+		# negative companion - a completely unrelated type (str) returned
+		# where a CEnum is declared must still be rejected, not silently
+		# accepted by an over-broadened coercion
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_wrong() -> Color:
+	s: str = 'not a color'
+	return s
+
+def main() -> i32:
+	c: Color = get_wrong()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+
 class AtomicRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for compiler.atomic_*(Ptr[T], ...)
 	(lowering.py's _lower_compiler_atomic_*, ir.py's Atomic* instructions,
@@ -5038,6 +5161,25 @@ def main() -> i32:
 	c1: Result[str,IndexError] = consecutive.__getitem__( 1 )
 	if c1.unwrap( 'x' ) != '':
 		return 8
+	return 0
+''' ),
+			# str.__contains__ (find().is_ok()) plus the `in`/`not in`
+			# operator dispatch to it (lowering.py's _lower_in_comparison)
+			( 'contains_and_in_operator', '''
+def main() -> i32:
+	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
+	if not s.__contains__( 'beef' ):
+		return 1
+	if s.__contains__( 'zzz' ):
+		return 2
+	if not ( 'beef' in s ):
+		return 3
+	if 'zzz' in s:
+		return 4
+	if not ( 'zzz' not in s ):
+		return 5
+	if 'beef' not in s:
+		return 6
 	return 0
 ''' ),
 		] )
@@ -5902,6 +6044,474 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# key_at/value_at - positional access into insertion order
+			# (__entries is append-only with no removal, so index i always
+			# names the i-th inserted entry)
+			( 'key_at_value_at_positional_access_in_insertion_order', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	d[ 'b' ] = 2
+	d[ 'c' ] = 3
+	k0: Result[str,IndexError] = d.key_at( 0 )
+	v0: Result[i32,IndexError] = d.value_at( 0 )
+	k2: Result[str,IndexError] = d.key_at( 2 )
+	v2: Result[i32,IndexError] = d.value_at( 2 )
+	if k0.is_err() or v0.is_err() or k2.is_err() or v2.is_err():
+		return 8
+	if k0.unwrap( 'x' ) != 'a' or v0.unwrap( 'x' ) != 1:
+		return 1
+	if k2.unwrap( 'x' ) != 'c' or v2.unwrap( 'x' ) != 3:
+		return 2
+	return 0
+''' ),
+			( 'key_at_value_at_out_of_bounds_returns_index_error', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if d.key_at( 1 ).is_ok():
+		return 1
+	if d.value_at( 1 ).is_ok():
+		return 2
+	if d.key_at( 0 ).is_err():
+		return 3
+	return 0
+''' ),
+			# overwriting an existing key must not shift/duplicate its
+			# position - key_at(0) stays 'a', len stays 1
+			( 'key_at_value_at_after_overwrite_keeps_same_position', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	d[ 'a' ] = 100
+	if d.__len__() != 1:
+		return 1
+	k0: Result[str,IndexError] = d.key_at( 0 )
+	v0: Result[i32,IndexError] = d.value_at( 0 )
+	if k0.is_err() or v0.is_err():
+		return 8
+	if k0.unwrap( 'x' ) != 'a' or v0.unwrap( 'x' ) != 100:
+		return 2
+	return 0
+''' ),
+			# RC key AND RC value, repeatedly borrowed out via key_at/value_at
+			# then dropped - a proxy for correct incref/decref bookkeeping,
+			# same posture as rc_key_and_rc_value_destruction_does_not_crash
+			# above (wrong refcounting here would double-free or leak)
+			( 'key_at_value_at_rc_key_and_value_does_not_crash', '''
+def main() -> i32:
+	d: dict[str, str] = dict[str, str]()
+	d[ 'a' ] = 'apple'
+	d[ 'b' ] = 'banana'
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 2:
+			k: Result[str,IndexError] = d.key_at( i )
+			v: Result[str,IndexError] = d.value_at( i )
+			if k.is_err() or v.is_err():
+				return 8
+			ks: str = k.unwrap( 'x' )
+			vs: str = v.unwrap( 'x' )
+			i += 1
+	return 0
+''' ),
+			# __contains__ - RC key (str), found and missing
+			( 'contains_found_and_missing_rc_key', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if not d.__contains__( 'a' ):
+		return 1
+	if d.__contains__( 'nope' ):
+		return 2
+	return 0
+''' ),
+			# __contains__ - non-RC key (i32), found and missing
+			( 'contains_found_and_missing_non_rc_key', '''
+def main() -> i32:
+	d: dict[i32, str] = dict[i32, str]()
+	d[ 7 ] = 'seven'
+	if not d.__contains__( 7 ):
+		return 1
+	if d.__contains__( 8 ):
+		return 2
+	return 0
+''' ),
+			# __delitem__ on a missing key returns Err, and leaves the dict untouched
+			( 'delitem_missing_key_returns_key_error', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	r: Result[None,KeyError] = d.__delitem__( 'nope' )
+	if r.is_ok():
+		return 1
+	if d.__len__() != 1:
+		return 2
+	return 0
+''' ),
+			# __delitem__ removing the MIDDLE entry of a real hash-collision
+			# bucket - CollidingKey.__hash__ always returns the same value,
+			# forcing every insert into one bucket, so this directly
+			# exercises RawDict.remove_entry/_fixup_indices_after_removal's
+			# collision-scan + entry_idx renumbering, not just the common
+			# no-collision case
+			( 'delitem_middle_of_hash_collision_bucket', '''
+class CollidingKey:
+	value: i32
+	def __init__( self, value: i32 ) -> None:
+		self.value = value
+	def __hash__( self ) -> u64:
+		return 42
+	def __eq__( self, other: CollidingKey ) -> bool:
+		return self.value == other.value
+
+def main() -> i32:
+	d: dict[CollidingKey, i32] = dict[CollidingKey, i32]()
+	d[ CollidingKey( 0 ) ] = 100
+	d[ CollidingKey( 1 ) ] = 200
+	d[ CollidingKey( 2 ) ] = 300
+	if d.__len__() != 3:
+		return 1
+	r: Result[None,KeyError] = d.__delitem__( CollidingKey( 1 ) )
+	if r.is_err():
+		return 2
+	if d.__len__() != 2:
+		return 3
+	if d.__contains__( CollidingKey( 1 ) ):
+		return 4
+	r0: Result[i32,KeyError] = d.__getitem__( CollidingKey( 0 ) )
+	r2: Result[i32,KeyError] = d.__getitem__( CollidingKey( 2 ) )
+	if r0.is_err() or r2.is_err():
+		return 5
+	if r0.unwrap( 'x' ) != 100 or r2.unwrap( 'x' ) != 300:
+		return 6
+	return 0
+''' ),
+			# RC key AND RC value, repeatedly inserted then deleted - a
+			# double-free/leak proxy for __delitem__'s own release path
+			# (wrong refcounting here would crash the process, not just
+			# misbehave quietly)
+			( 'delitem_rc_key_and_rc_value_repeated_does_not_crash', '''
+def main() -> i32:
+	d: dict[str, str] = dict[str, str]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			d[ 'a' ] = 'apple'
+			d[ 'b' ] = 'banana'
+			ra: Result[None,KeyError] = d.__delitem__( 'a' )
+			rb: Result[None,KeyError] = d.__delitem__( 'b' )
+			if ra.is_err() or rb.is_err():
+				return 1
+			if d.__len__() != 0:
+				return 2
+			i += 1
+	return 0
+''' ),
+			# `in`/`not in` dispatch to __contains__ (lowering.py's
+			# _lower_in_comparison) - the reversed receiver/arg order
+			( 'in_and_not_in_operator', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if not ( 'a' in d ):
+		return 1
+	if 'nope' in d:
+		return 2
+	if not ( 'nope' not in d ):
+		return 3
+	if 'a' not in d:
+		return 4
+	return 0
+''' ),
+		] )
+
+
+class SetTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' set[T] (lib/builtins/__set.py) - a thin wrapper around dict[T, bool],
+	built on top of the __contains__/__delitem__ added to dict[K,V] above.
+	Mirrors DictTests' own real compile-and-run convention. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'add_and_contains_non_rc_element', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 7 )
+	s.add( 9 )
+	if not s.__contains__( 7 ):
+		return 1
+	if not s.__contains__( 9 ):
+		return 2
+	if s.__contains__( 8 ):
+		return 3
+	return 0
+''' ),
+			( 'add_and_contains_rc_element', '''
+def main() -> i32:
+	s: set[str] = set[str]()
+	s.add( 'apple' )
+	s.add( 'banana' )
+	if not s.__contains__( 'apple' ):
+		return 1
+	if not s.__contains__( 'banana' ):
+		return 2
+	if s.__contains__( 'cherry' ):
+		return 3
+	return 0
+''' ),
+			# duplicate add is a no-op, matching Python set.add semantics
+			( 'duplicate_add_is_noop', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 5 )
+	s.add( 5 )
+	s.add( 5 )
+	if s.__len__() != 1:
+		return 1
+	if not s.__contains__( 5 ):
+		return 2
+	return 0
+''' ),
+			( 'contains_returns_false_for_never_added_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	if s.__contains__( 42 ):
+		return 1
+	return 0
+''' ),
+			# discard: no-op on a missing value, actually removes a present one
+			( 'discard_present_and_absent_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	s.add( 2 )
+	s.discard( 1 )
+	if s.__contains__( 1 ):
+		return 1
+	if not s.__contains__( 2 ):
+		return 2
+	if s.__len__() != 1:
+		return 3
+	s.discard( 999 )  # absent - must be a silent no-op, not an error
+	if s.__len__() != 1:
+		return 4
+	return 0
+''' ),
+			# remove: succeeds on a present value, reports Err on an absent one
+			( 'remove_present_and_absent_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	r: Result[None,KeyError] = s.remove( 1 )
+	if r.is_err():
+		return 1
+	if s.__contains__( 1 ):
+		return 2
+	r2: Result[None,KeyError] = s.remove( 999 )
+	if r2.is_ok():
+		return 3
+	return 0
+''' ),
+			# 50 distinct elements forces RawDict's own growth path (both
+			# __entries and __indices), same rationale as DictTests'
+			# many_entries_forces_growth_and_stays_correct
+			( 'many_elements_forces_growth_and_stays_correct', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 50:
+			s.add( compiler.cast( i32, i ))
+			i += 1
+	if s.__len__() != 50:
+		return 1
+	j: usize = 0
+	with compiler.wrap_arithmetic:
+		while j < 50:
+			if not s.__contains__( compiler.cast( i32, j )):
+				return 2
+			j += 1
+	return 0
+''' ),
+			# RC element (str) add/discard/re-add repeated several times - a
+			# double-free/leak proxy, same posture as DictTests'
+			# delitem_rc_key_and_rc_value_repeated_does_not_crash
+			( 'rc_element_add_discard_repeated_does_not_crash', '''
+def main() -> i32:
+	s: set[str] = set[str]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			s.add( 'apple' )
+			s.add( 'banana' )
+			if s.__len__() != 2:
+				return 1
+			s.discard( 'apple' )
+			s.discard( 'banana' )
+			if s.__len__() != 0:
+				return 2
+			i += 1
+	return 0
+''' ),
+			# for x in my_set: - proves the __len__ + __getitem__(usize)
+			# "indexable" for-loop protocol wiring (lowering.py's
+			# _lower_for_over_indexable) actually works for set[T], with no
+			# compiler changes of its own. The per-iteration bind desugars
+			# to obj[i].or_return() (since __getitem__ returns
+			# Result[T,IndexError]), which requires the ENCLOSING function
+			# to itself return a Result[_,IndexError]-shaped type - main()
+			# returns plain i32 (needed for this test harness's own exit-
+			# code dispatch), so the loop lives in a small helper instead,
+			# unwrapped by main(). xor-checksum the visited elements
+			# against the expected total (order-independent, since sets
+			# are unordered) as proof every element was visited exactly once.
+			( 'for_loop_over_set_visits_every_element_once', '''
+def checksum_set( s: set[i32] ) -> Result[i32, IndexError]:
+	checksum: i32 = 0
+	with compiler.wrap_arithmetic:
+		for x in s:
+			checksum = checksum ^ x
+	return Result.Ok( checksum )
+
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	s.add( 2 )
+	s.add( 4 )
+	s.add( 8 )
+	if s.__len__() != 4:
+		return 1
+	r: Result[i32,IndexError] = checksum_set( s )
+	if r.is_err():
+		return 2
+	if r.unwrap( 'x' ) != 15:  # 1 ^ 2 ^ 4 ^ 8 == 15
+		return 3
+	return 0
+''' ),
+			# `in`/`not in` dispatch to __contains__ (lowering.py's
+			# _lower_in_comparison) - the reversed receiver/arg order
+			( 'in_and_not_in_operator', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 7 )
+	if not ( 7 in s ):
+		return 1
+	if 8 in s:
+		return 2
+	if not ( 8 not in s ):
+		return 3
+	if 7 not in s:
+		return 4
+	return 0
+''' ),
+			# union/intersection/difference/symmetric_difference, via both
+			# the named methods and the operators (|/&/-/^, wired through
+			# _BINOP_DUNDER) - a: {1,2,3}, b: {2,3,4}
+			( 'set_algebra_named_methods_and_operators', '''
+def main() -> i32:
+	a: set[i32] = { 1, 2, 3 }
+	b: set[i32] = { 2, 3, 4 }
+
+	u: set[i32] = a.union( b )
+	if u.__len__() != 4:
+		return 1
+	if not ( u.__contains__( 1 ) and u.__contains__( 2 ) and u.__contains__( 3 ) and u.__contains__( 4 )):
+		return 2
+
+	x: set[i32] = a.intersection( b )
+	if x.__len__() != 2:
+		return 3
+	if not ( x.__contains__( 2 ) and x.__contains__( 3 )):
+		return 4
+
+	d: set[i32] = a.difference( b )
+	if d.__len__() != 1 or not d.__contains__( 1 ):
+		return 5
+
+	sd: set[i32] = a.symmetric_difference( b )
+	if sd.__len__() != 2:
+		return 6
+	if not ( sd.__contains__( 1 ) and sd.__contains__( 4 )):
+		return 7
+
+	# same results via the operator forms
+	u2: set[i32] = a | b
+	if u2.__len__() != 4:
+		return 8
+	x2: set[i32] = a & b
+	if x2.__len__() != 2:
+		return 9
+	d2: set[i32] = a - b
+	if d2.__len__() != 1 or not d2.__contains__( 1 ):
+		return 10
+	sd2: set[i32] = a ^ b
+	if sd2.__len__() != 2:
+		return 11
+
+	# neither a nor b was mutated by any of the above
+	if a.__len__() != 3 or b.__len__() != 3:
+		return 12
+	return 0
+''' ),
+			# __eq__/__ne__ - unordered-set equality (same length + one-
+			# directional containment), and _COMP_DUNDER's need for an
+			# EXPLICIT __ne__ (never auto-derived from __eq__)
+			( 'set_equality_and_inequality', '''
+def main() -> i32:
+	a: set[i32] = { 1, 2, 3 }
+	b: set[i32] = { 3, 2, 1 }  # same members, different insertion order
+	c: set[i32] = { 1, 2, 4 }
+
+	if not ( a == b ):
+		return 1
+	if a != b:
+		return 2
+	if a == c:
+		return 3
+	if not ( a != c ):
+		return 4
+
+	empty1: set[i32] = set[i32]()
+	empty2: set[i32] = set[i32]()
+	if not ( empty1 == empty2 ):
+		return 5
+
+	# different length alone must be enough to reject equality, even
+	# with no element mismatch scanned yet
+	small: set[i32] = { 1, 2 }
+	if small == a:
+		return 6
+	return 0
+''' ),
+			# RC element type (str) through the algebra methods - a
+			# double-free/leak proxy, same posture as the earlier RC
+			# add/discard repeated-cycle test
+			( 'set_algebra_rc_element_does_not_crash', '''
+def main() -> i32:
+	a: set[str] = { 'a', 'b', 'c' }
+	b: set[str] = { 'b', 'c', 'd' }
+	u: set[str] = a | b
+	x: set[str] = a & b
+	d: set[str] = a - b
+	sd: set[str] = a ^ b
+	if u.__len__() != 4 or x.__len__() != 2 or d.__len__() != 1 or sd.__len__() != 2:
+		return 1
+	# a itself must be untouched by any of the algebra calls above
+	original: set[str] = { 'a', 'b', 'c' }
+	if not ( a == original ):
+		return 2
+	return 0
+''' ),
 		] )
 
 
@@ -6191,6 +6801,31 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# regression test: tuple[...] as a NESTED, EXPLICIT type argument
+			# to another generic class's own constructor CALL -
+			# list[tuple[str,str]]() - used to fail with "name 'tuple' is not
+			# defined" even though the exact same list[tuple[str,str]]
+			# ANNOTATION resolved fine one line above it (see type_resolver.
+			# py's _try_resolve_namespace - the constructor-call counterpart
+			# to discovery.py's own visit_Subscript, which already recognized
+			# tuple[...] textually for annotations). Mirrors the real
+			# lib/http/client.py HTTPHeaders shape this bug was found in:
+			# construct a list of pairs, append, read each field back
+			( 'list_of_tuple_as_explicit_constructor_type_argument', '''
+def main() -> i32:
+	entries: list[tuple[str,str]] = list[tuple[str,str]]()
+	entries.append( ( "Content-Type", "text/plain" ) ).unwrap( 'append' )
+	entries.append( ( "X-Test", "1" ) ).unwrap( 'append' )
+	if len( entries ) != 2:
+		return 1
+	first: tuple[str,str] = entries.__getitem__( 0 ).unwrap( 'idx' )
+	if first[0] != "Content-Type" or first[1] != "text/plain":
+		return 2
+	second: tuple[str,str] = entries.__getitem__( 1 ).unwrap( 'idx' )
+	if second[0] != "X-Test" or second[1] != "1":
+		return 3
+	return 0
+''' ),
 		] )
 
 
@@ -6363,15 +6998,18 @@ class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, Compile
 	right shape.
 
 	Uses two plain, unrelated classes (not two Specializations of one
-	generic class, unlike the lowering-level test) deliberately: assigning
-	a freshly-constructed generic RCClass value into a union of that same
-	generic class's own instantiations hits a real, separate, pre-existing
-	bug (_coerce_into_union's leaf lookup is identity-based - `attr.type is
-	operand.type` - and a Specialization built by a constructor call is
-	apparently never reconciled with the one the union's own member list
-	holds), confirmed via a standalone repro and confirmed unrelated to
-	this fix (plain, non-generic union members hit no such issue). Flagged
-	here, not fixed - out of scope for this plan. '''
+	generic class, unlike the lowering-level test) deliberately - this was
+	written before _coerce_into_union's own identity-based leaf lookup
+	(`attr.type is operand.type`) was fixed to use _same_type instead (see
+	PLAN_COMPILER_BUG_SWEEP.md), at a time when assigning a freshly-
+	constructed generic RCClass value into a union of that same generic
+	class's own instantiations (a Specialization built by a constructor
+	call never reconciled with the one the union's own member list held)
+	was a real, separate, confirmed bug, flagged but deliberately not
+	fixed as out of scope for the plan active at the time. That fix has
+	since landed - see test_generic_union_member_construction_and_
+	assignment below, added once this class was revisited and the bug
+	confirmed already resolved. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -6416,6 +7054,86 @@ def main() -> i32:
 	return 0
 ''' ),
 		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_union_member_construction_and_assignment( self ) -> None:
+		# the case this class's own docstring used to flag as a separate,
+		# unfixed bug: a freshly-constructed generic RCClass value (Box[i32](5),
+		# built via a real constructor call) assigned into a union of that
+		# same generic class's own DIFFERENT instantiations (Box[i32]|Box[i64]).
+		# The constructed value's own Specialization and the union's own member
+		# list's Specialization for Box[i32] used to be two different objects
+		# for the identical instantiation - _coerce_into_union's identity-based
+		# leaf lookup rejected this outright before its _same_type fix
+		self._run( '''
+class Box[T]:
+	v: T
+	def __init__( self, v: T ) -> None:
+		self.v = v
+
+def main() -> i32:
+	u: Box[i32]|Box[i64] = Box[i32]( 5 )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_leaves_with_equal_return_types_do_not_false_positive( self ) -> None:
+		# _resolve_union_receiver_members' own leaf-agreement check
+		# (type_resolver.py, "leaf implementations disagree on return type")
+		# used to compare each leaf's own resolved return type via raw `is`.
+		# Box[i32].get_list's own -> list[T] gets EAGERLY monomorphized to
+		# list[i32] as part of specializing Box[i32] itself, while Other.
+		# get_list's own -> list[i32] is resolved fresh, straight from its
+		# own annotation - two different Specialization objects for the
+		# textually-identical list[i32], wrongly reported as "disagreeing"
+		# before the _same_type fix (see PLAN_COMPILER_BUG_SWEEP.md)
+		self._run( '''
+class Box[T]:
+	def get_list( self ) -> list[T]:
+		return list[T]()
+
+class Other:
+	def get_list( self ) -> list[i32]:
+		return list[i32]()
+
+def pick( flag: bool ) -> Box[i32]|Other:
+	if flag:
+		return Box[i32]()
+	return Other()
+
+def main() -> i32:
+	u: Box[i32]|Other = pick( True )
+	l: list[i32] = u.get_list()
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_genuinely_disagreeing_leaf_return_types_still_rejected( self ) -> None:
+		# negative companion to the test above - the _same_type fix must not
+		# make this check too permissive: two leaves with GENUINELY different
+		# return types must still be rejected
+		self._run( '''
+class LeafA:
+	def make( self ) -> i32:
+		return 1
+
+class LeafB:
+	def make( self ) -> str:
+		return 'x'
+
+def pick( flag: bool ) -> LeafA|LeafB:
+	if flag:
+		return LeafA()
+	return LeafB()
+
+def main() -> i32:
+	u: LeafA|LeafB = pick( True )
+	x = u.make()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
 
 
 class WalrusOperatorRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -6625,6 +7343,69 @@ def main() -> i32:
 	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
 		return 2
 	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
+		return 3
+	return 0
+''' ),
+		] )
+
+
+class SetLiteralRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_Set (ast.Set, `{a, b, c}`) - real compile-and-run companion to
+	lowering_test.py's SetLiteralTests. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_set_literal', '''
+def main() -> i32:
+	x: set[str] = { 'a', 'b', 'c' }
+	if x.__len__() != 3:
+		return 1
+	if not ( x.__contains__( 'a' ) and x.__contains__( 'b' ) and x.__contains__( 'c' )):
+		return 2
+	if x.__contains__( 'z' ):
+		return 3
+	return 0
+''' ),
+			( 'i32_set_literal', '''
+def main() -> i32:
+	x: set[i32] = { 10, 20, 30 }
+	if x.__len__() != 3:
+		return 1
+	if not ( x.__contains__( 10 ) and x.__contains__( 20 ) and x.__contains__( 30 )):
+		return 2
+	if x.__contains__( 40 ):
+		return 3
+	return 0
+''' ),
+			# a repeated literal element is exactly one dedup add(), not a
+			# real duplicate - the same overwrite-existing-key semantics
+			# set[T].add already relies on, just reached through literal
+			# syntax instead of explicit .add() calls
+			( 'duplicate_elements_in_literal_are_deduped', '''
+def main() -> i32:
+	x: set[i32] = { 1, 1, 2 }
+	if x.__len__() != 2:
+		return 1
+	if not ( x.__contains__( 1 ) and x.__contains__( 2 )):
+		return 2
+	return 0
+''' ),
+			( 'set_literal_returned_from_function', '''
+def codes() -> set[i32]:
+	return { 200, 201, 204 }
+
+def main() -> i32:
+	c = codes()
+	if c.__len__() != 3:
+		return 1
+	if not ( c.__contains__( 200 ) and c.__contains__( 201 ) and c.__contains__( 204 )):
+		return 2
+	if c.__contains__( 404 ):
 		return 3
 	return 0
 ''' ),
@@ -7097,6 +7878,145 @@ def main() -> i32:
 			return 1
 		case Result.Err( e ):
 			pass
+	return 0
+''' ),
+		] )
+
+
+class Base64Tests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Real compile-and-run coverage for lib/base64.py - b64encode/b64decode,
+	urlsafe_b64encode/urlsafe_b64decode, and b16encode/b16decode. See
+	PLAN_HTTP_CLIENT.md, which names base64 as a zero-prerequisite piece
+	needed for auth= (HTTP Basic -> base64 Authorization header). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# RFC 4648 known-answer vectors - the standard "f"/"fo"/"foo"/
+			# "foob"/"fooba"/"foobar" test vectors, each checked round-trip
+			# (encode matches the known string, decode recovers the original)
+			( 'b64_rfc4648_vectors_round_trip', '''
+import base64
+
+def check( plain: str, encoded: str ) -> bool:
+	pb: bytes = plain.encode().unwrap( 'encode failed' )
+	eb: bytes = base64.b64encode( pb )
+	es: str = eb.decode().unwrap( 'decode of encoded output failed' )
+	if es != encoded:
+		return False
+	db: bytes = base64.b64decode( eb ).unwrap( 'decode failed' )
+	ds: str = db.decode().unwrap( 'decode of decoded output failed' )
+	return ds == plain
+
+def main() -> i32:
+	if not check( '', '' ): return 1
+	if not check( 'f', 'Zg==' ): return 2
+	if not check( 'fo', 'Zm8=' ): return 3
+	if not check( 'foo', 'Zm9v' ): return 4
+	if not check( 'foob', 'Zm9vYg==' ): return 5
+	if not check( 'fooba', 'Zm9vYmE=' ): return 6
+	if not check( 'foobar', 'Zm9vYmFy' ): return 7
+	return 0
+''' ),
+			# standard vs urlsafe alphabets diverge exactly on '+'/'/' vs
+			# '-'/'_' - bytes 0xFB,0xFF,0xBF hit both symbols in both
+			# alphabets, and urlsafe_b64decode must recover the original bytes
+			( 'urlsafe_vs_standard_alphabet_divergence', '''
+import base64
+
+def main() -> i32:
+	raw = bytearray( 3 )
+	rp: Ptr[u8] = raw.get_ptr()
+	rp[0] = 0xFB
+	rp[1] = 0xFF
+	rp[2] = 0xBF
+	rb: bytes = bytes.from_bytearray( move( raw ) )
+
+	std: bytes = base64.b64encode( rb )
+	safe: bytes = base64.urlsafe_b64encode( rb )
+	std_s: str = std.decode().unwrap( 'x' )
+	safe_s: str = safe.decode().unwrap( 'x' )
+	if std_s != '+/+/':
+		return 1
+	if safe_s != '-_-_':
+		return 2
+
+	back: bytes = base64.urlsafe_b64decode( safe ).unwrap( 'urlsafe decode failed' )
+	if len( back ) != 3:
+		return 3
+	bp: ConstPtr[u8] = back.get_const_ptr()
+	if bp[0] != 0xFB or bp[1] != 0xFF or bp[2] != 0xBF:
+		return 4
+	return 0
+''' ),
+			( 'b16_round_trip_and_casefold', '''
+import base64
+
+def main() -> i32:
+	fb: bytes = 'foobar'.encode().unwrap( 'x' )
+	hx: bytes = base64.b16encode( fb )
+	hx_s: str = hx.decode().unwrap( 'x' )
+	if hx_s != '666F6F626172':
+		return 1
+
+	unhex: bytes = base64.b16decode( hx ).unwrap( 'b16decode failed' )
+	unhex_s: str = unhex.decode().unwrap( 'x' )
+	if unhex_s != 'foobar':
+		return 2
+
+	# lowercase hex rejected by default (casefold=False)...
+	lh: bytes = '666f6f626172'.encode().unwrap( 'x' )
+	if base64.b16decode( lh ).is_ok():
+		return 3
+	# ...but accepted with casefold=True
+	lh_ok: bytes = base64.b16decode( lh, casefold = True ).unwrap( 'casefold decode failed' )
+	lh_ok_s: str = lh_ok.decode().unwrap( 'x' )
+	if lh_ok_s != 'foobar':
+		return 4
+	return 0
+''' ),
+			# validate=True is the default (this codebase's own convention -
+			# see guid.py/ascii.py - overriding Python's own lenient default),
+			# so malformed input must be Result.Err in every case below
+			( 'b64_and_b16_decode_error_cases', '''
+import base64
+
+def main() -> i32:
+	bad_len: bytes = 'Zg'.encode().unwrap( 'x' ) # length 2, not a multiple of 4
+	if base64.b64decode( bad_len ).is_ok():
+		return 1
+
+	bad_char: bytes = 'Z!=='.encode().unwrap( 'x' ) # '!' not in the alphabet
+	if base64.b64decode( bad_char ).is_ok():
+		return 2
+
+	bad_pad: bytes = 'Zg=g'.encode().unwrap( 'x' ) # '=' not at the very end
+	if base64.b64decode( bad_pad ).is_ok():
+		return 3
+
+	odd_hex: bytes = 'ABC'.encode().unwrap( 'x' ) # odd length
+	if base64.b16decode( odd_hex ).is_ok():
+		return 4
+	return 0
+''' ),
+			# validate=False (opt-in) matches Python's own lenient default:
+			# non-alphabet bytes (e.g. embedded whitespace) are discarded
+			# before decoding, rather than rejected
+			( 'b64_decode_lenient_mode', '''
+import base64
+
+def main() -> i32:
+	with_ws: bytes = 'Zm9v\\nYmFy'.encode().unwrap( 'x' )
+	if base64.b64decode( with_ws ).is_ok(): # strict default must reject the embedded newline
+		return 1
+	lenient: bytes = base64.b64decode( with_ws, validate = False ).unwrap( 'lenient decode failed' )
+	lenient_s: str = lenient.decode().unwrap( 'x' )
+	if lenient_s != 'foobar':
+		return 2
 	return 0
 ''' ),
 		] )
@@ -8148,6 +9068,124 @@ def main() -> i32:
 			i += 1
 		return 0
 ''' ),
+			# a match's own case arm, not just an if-branch, ending in a call
+			# to a -> NoReturn function (sys.panic) must ALSO count as
+			# "never reaches the match's own join point" - type_resolver.py's
+			# visit_Match had the identical syntactic-only terminates check
+			# _stmt_If had before its own NoReturn fix (see PLAN_COMPILER_
+			# BUG_SWEEP.md). Ordinary expressions (arithmetic, attribute
+			# access, ...) after the match are NOT a useful test here - those
+			# are type-checked by lowering.py's OWN, separate, already-correct
+			# cfg-based narrowing over the if-chain visit_Match desugars into,
+			# regardless of whether THIS bug is fixed. The observable effect is
+			# narrower: type_resolver.py's own _narrowed dict backs its
+			# _rewrite_type_is_comparison fold-to-constant optimization for a
+			# LATER type(x) is T check - without the fix, that rewrite assumes
+			# s is STILL union-typed at this point (since its own bookkeeping
+			# never recorded the narrowing) and emits a tag-comparison against
+			# it, while lowering.py's OWN independent narrowing has ALREADY
+			# narrowed s's real, lowered type to plain usize by here - the
+			# mismatch produces invalid C ('usize' has no '.tag' member),
+			# confirmed via a real repro before this fix existed
+			( 'match_arm_sys_panic_narrows_past_the_match', '''
+def classify( s: usize|None ) -> bool:
+	match s:
+		case None:
+			sys.panic( 'unreachable' )
+		case _:
+			pass
+	return type( s ) is usize
+
+def main() -> i32:
+	if not classify( usize( 5 ) ):
+		return 1
+	return 0
+''' ),
+			# a case arm ending in an ORDINARY receiver method call
+			# (self.touch(), not sys.panic) must NOT be mistaken for a
+			# diverging arm, and - the actual regression caught while
+			# building the above fix - must not crash the compiler either.
+			# _stmt_diverges resolves a bare call's callee via
+			# _resolve_callee_target, which walks discovery's scope-stack-
+			# based find_name - that raises (not returns None) for a
+			# receiver rooted in a local like self, since locals live in
+			# this resolver's own self.locals dict, never in discovery's
+			# scope stack. The raise ALSO permanently records a bogus "name
+			# 'self' is not defined" error (discovery.fail's own contract),
+			# so even catching the exception wasn't enough to fix the first
+			# attempt at this. Guarded via discovery.find_name_or_none directly
+			# (not a self.locals membership check, which turned out to be an
+			# incomplete record of "this name is local" - see the next test)
+			( 'match_arm_receiver_call_does_not_crash_the_compiler', '''
+class Widget:
+	touched: i32
+
+	def __init__( self ) -> None:
+		self.touched = 0
+
+	def touch( self ) -> None:
+		self.touched = 1
+
+	# the last statement of a case arm being a BARE receiver call
+	# (self.touch(), no return/assignment wrapping it) is the exact shape
+	# that crashed - _stmt_diverges only even LOOKS at a stmt shaped like
+	# ast.Expr(ast.Call(...)); a return/assign short-circuits before ever
+	# reaching the receiver-call resolution this test guards
+	def maybe_touch( self, r: Result[i32,i32] ) -> None:
+		match r:
+			case Result.Ok( v ):
+				self.touch()
+			case Result.Err( e ):
+				pass
+
+def main() -> i32:
+	w: Widget = Widget()
+	w.maybe_touch( Result.Ok( 5 ) )
+	if w.touched != 1:
+		return 1
+	return 0
+''' ),
+			# a case arm's own PATTERN-BOUND name (case Result.Ok(w):, w bound
+			# fresh by the match itself, not a pre-existing local/parameter)
+			# used as a receiver in the arm's last statement - the real,
+			# already-merged regression this whole test class caught: w's own
+			# binding is a plain ast.Assign spliced directly into the case
+			# body by _match_pattern/_match_union_member, never routed through
+			# self.visit()/visit_Assign, so it never updated self.locals -
+			# the ORIGINAL fix's self.locals membership check let w.close()
+			# through uncaught, same crash as the self.touch() case above,
+			# just for a different reason. Matches the exact real-world shape
+			# that surfaced this (lib/builtins/__File.py's File.binary_writer
+			# used via `match ...: case Result.Ok(w): w.write(...); w.close()`)
+			( 'match_bound_name_receiver_call_does_not_crash_the_compiler', '''
+class Widget:
+	def touch( self ) -> None:
+		pass
+
+	# w.close(), with NOTHING after it in this arm, is the exact shape
+	# that crashed - a return/assign wrapping it would short-circuit
+	# _stmt_diverges before ever reaching the receiver-call resolution
+	# this test guards, same reasoning as the self.touch() case above
+	def close( self ) -> None:
+		pass
+
+def get( ok: bool ) -> Result[Widget,i32]:
+	if ok:
+		return Result.Ok( Widget() )
+	return Result.Err( -1 )
+
+def use( ok: bool ) -> None:
+	match get( ok ):
+		case Result.Ok( w ):
+			w.touch()
+			w.close()
+		case Result.Err( e ):
+			sys.panic( 'unreachable in this test' )
+
+def main() -> i32:
+	use( True )
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -9075,6 +10113,78 @@ def main() -> i32:
 	if returned_clsid != clsid_shelllink:
 		return 4
 
+	return 0
+''' ),
+		] )
+
+
+class LocalImportAnnotationResolutionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' A function-body-local `from X import Y` immediately followed by a
+	same-function annotation using Y (`h: Y = ...`) previously failed to
+	compile with a spurious "name 'Y' is not defined", even though the
+	identical import resolves fine written at module level, and even though
+	an UNANNOTATED use of the same locally-imported name (`x = Y`) was
+	unaffected. Root cause: type_resolver.py's _ReferenceResolver (the AST-
+	rewrite pass resolve_function_body runs over a function body) never
+	registered a local ImportFrom's own names into fn.names - only lowering.
+	py's own _stmt_ImportFrom did that, which runs in a separate, LATER pass
+	(real codegen), too late for THIS pass's own visit_AnnAssign, which
+	resolves its annotation via self.discovery.visit() - walking self.
+	discovery.scope_stack, which fn IS already pushed onto for the whole of
+	resolve_function_body's walk (see its own scope_context(fn)) - just
+	nothing had populated fn.names from the import yet by the time the very
+	next statement's annotation was resolved. Hit for real in lib/fs.py's
+	own open_raw (Windows branch): `from windows.kernel32 import ...,
+	HANDLE, ...` immediately followed by `handle: HANDLE = CreateFileA(...)`
+	- worked around there by dropping the redundant `: HANDLE` annotation
+	(CreateFileA's own declared return type already IS HANDLE), which is
+	fine to leave as-is, but left this general resolver gap itself
+	unfixed until now. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'local_import_immediately_used_in_annotation', '''
+def main() -> i32:
+	from windows.kernel32 import HANDLE, INVALID_HANDLE_VALUE
+	h: HANDLE = INVALID_HANDLE_VALUE
+	if h != INVALID_HANDLE_VALUE:
+		return 1
+	return 0
+''' ),
+			# an aliased import (`as`), with unrelated statements between the
+			# import and the annotation that uses it - guards against a fix
+			# that only special-cases "the very next statement" or the
+			# original (non-aliased) name.
+			( 'aliased_local_import_used_in_annotation_after_a_gap', '''
+def main() -> i32:
+	from windows.kernel32 import HANDLE as H, INVALID_HANDLE_VALUE
+	x: i32 = 1
+	y: i32 = 2
+	h: H = INVALID_HANDLE_VALUE
+	if x != 1 or y != 2:
+		return 1
+	if h != INVALID_HANDLE_VALUE:
+		return 2
+	return 0
+''' ),
+			# the identical name, used as a plain VALUE rather than a type
+			# annotation, must keep compiling too (this path never broke -
+			# see this class's own docstring - but a fix that regresses it
+			# would be just as real a bug).
+			( 'local_import_used_as_a_value_not_just_a_type', '''
+def main() -> i32:
+	from windows.kernel32 import INVALID_HANDLE_VALUE
+	x = INVALID_HANDLE_VALUE
+	if x != INVALID_HANDLE_VALUE:
+		return 1
 	return 0
 ''' ),
 		] )
