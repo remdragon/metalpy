@@ -20,17 +20,14 @@
 # own ScalarMethodRegistrationTests example (`def my_func(x: usize)`) uses
 # an ordinary name for exactly this reason.
 #
-# Scoped to exactly what f-string format specs need (lowering.py's
-# _lower_float_format_spec) - 'f'/'F'/'e'/'E'/'g'/'G'/'%' (fixed-point,
-# exponential, general, percent - every float type char fstring_format_
-# spec.FORMAT_SPEC_TYPE_CHARS recognizes). __str__/__repr__ (bare f"{x}",
-# needing Python's own shortest-round-trip default formatting - a
-# materially harder, separate problem) stay deferred, same as every OTHER
-# scalar's bare f"{x}" (PLAN_STR_FORMAT.md item 6) - f'{1.0:.1f}' never
-# reaches __str__/__repr__ at all (_lower_fstring_part dispatches an
-# explicit format spec straight against the operand's own type, only
-# falling back to __str__/__repr__ for a spec-less interpolation or an
-# explicit !s/!r).
+# Scoped to what f-string format specs need (lowering.py's _lower_float_
+# format_spec) - 'f'/'F'/'e'/'E'/'g'/'G'/'%' (fixed-point, exponential,
+# general, percent - every float type char fstring_format_spec.
+# FORMAT_SPEC_TYPE_CHARS recognizes), PLUS __str__/__repr__ (bare f"{x}")
+# and the "no type char, no precision" format-spec shape (f"{x:10}"), both
+# needing Python's own shortest-round-trip repr algorithm - see
+# _f64_repr_digits_raw below (PLAN_STR_FORMAT.md item 4's own writeup on
+# why this was deferred initially, then picked up as a real follow-up).
 
 import sys
 
@@ -49,6 +46,18 @@ _MAX_INTEGER_DIGITS: usize = 320
 # format_spec based on the f-string's own literal spec.type.
 _TYPE_CHAR_F: i32 = 102 # ord('f')
 _TYPE_CHAR_G: i32 = 103 # ord('g') - the "no type char at all" default's own underlying conversion, see _f64_none_type_digits_raw
+_TYPE_CHAR_E: i32 = 101 # ord('e') - _f64_repr_digits_raw's own shortest-round-trip search always uses this conversion (see its own comment on why 'e', not 'f'/'g')
+
+_DECIMAL_DIGIT_CHARS: str = str( '0123456789' ) # _f64_exponent_text's own hand-built int-to-string table - see its own comment on why not a general-purpose one
+
+# 17 significant digits is always enough to exactly round-trip any IEEE754
+# double (the standard DBL_DECIMAL_DIG guarantee) - _f64_repr_digits_raw's
+# own search never needs to go further.
+_MAX_REPR_SIGNIFICANT_DIGITS: usize = 17
+# "d.ddddddddddddddddde+308\0" - 1 leading digit + '.' + up to 16 more +
+# 'e' + sign + up to 3 exponent digits + a zero terminator - generous, not
+# tightly computed, matching this file's other buffer-sizing constants.
+_REPR_SEARCH_BUF_SIZE: usize = 32
 
 
 @private
@@ -295,6 +304,203 @@ f64._none_type_digits_raw = _f64_none_type_digits_raw
 
 
 @private
+def _f64_exponent_text( magnitude: i32 ) -> str:
+	''' magnitude is always 0..308 (f64's own decimal exponent range) -
+	Python's own repr always shows AT LEAST 2 exponent digits (e.g.
+	"e+06", never "e+6"), and never more than the value actually needs
+	beyond that (e.g. "e+300", never "e+0300") - hand-built directly
+	(3 digits is the most this can ever need) rather than a general-
+	purpose int-to-string loop, the same "small bounded case, hand-build
+	it" choice _pad_and_group_after_prefix's own width-search loop makes
+	elsewhere in this codebase. '''
+	with compiler.panic_arithmetic( 'dividing/moduloing by the literals 100/10 never zero-divides' ):
+		hundreds: i32 = magnitude // 100
+		remainder: i32 = magnitude % 100
+		tens: i32 = remainder // 10
+		ones: i32 = remainder % 10
+	with compiler.panic_arithmetic( 'each of hundreds/tens/ones is always a single decimal digit (0-9), by construction above' ):
+		hundreds_i: usize = usize( hundreds )
+		tens_i: usize = usize( tens )
+		ones_i: usize = usize( ones )
+		ones_end: usize = ones_i + 1
+		tens_end: usize = tens_i + 1
+	one_digit: str = _DECIMAL_DIGIT_CHARS._byte_slice( ones_i, ones_end )
+	ten_digit: str = _DECIMAL_DIGIT_CHARS._byte_slice( tens_i, tens_end )
+	if hundreds > 0:
+		with compiler.panic_arithmetic( 'bounded by hundreds_i, cannot overflow' ):
+			hundreds_end: usize = hundreds_i + 1
+		hundred_digit: str = _DECIMAL_DIGIT_CHARS._byte_slice( hundreds_i, hundreds_end )
+		return hundred_digit + ten_digit + one_digit
+	return ten_digit + one_digit
+
+
+@private
+def _f64_repr_from_scientific( sci_text: str ) -> str:
+	''' converts compiler.format_f64's own 'e'-conversion output (e.g.
+	"1.234568e+06" or "5e+00" - always ASCII digits plus at most one '.',
+	one 'e', and one exponent sign, courtesy of compiler.format_f64/real
+	snprintf) into Python's own repr text: FIXED notation when
+	-4 <= exponent < 16 (confirmed against real Python as the exact
+	threshold - 1e15 stays fixed, 1e16 switches to scientific; 1e-4 stays
+	fixed, 1e-5 switches - a FIXED threshold, notably NOT tied to how many
+	significant digits the value actually needed, unlike plain '%g' - see
+	_f64_repr_digits_raw's own comment for why this function exists
+	separately from just reusing 'g'), SCIENTIFIC otherwise (mantissa +
+	'e' + sign + >=2-digit exponent, e.g. "1e+16"/"5e-324"). Fixed-point
+	results always keep at least one fractional digit (Python's own
+	"100.0", not "100"), matching _f64_none_type_digits_raw's own "g"
+	tweak - unlike that function though, there are no trailing zeros left
+	to strip here in the first place, since the digit text this receives
+	is already the FEWEST significant digits that round-trip exactly (see
+	this function's only caller). '''
+	e_index: usize = sci_text.byte_len()
+	match sci_text.find( str( 'e' )):
+		case Result.Ok( idx ):
+			e_index = idx
+		case Result.Err( _ ):
+			pass
+	mantissa: str = sci_text._byte_slice( 0, e_index )
+	dot_index: usize = mantissa.byte_len()
+	match mantissa.find( str( '.' )):
+		case Result.Ok( idx ):
+			dot_index = idx
+		case Result.Err( _ ):
+			pass
+	digits: str
+	if dot_index < mantissa.byte_len():
+		with compiler.panic_arithmetic( 'bounded by mantissa length' ):
+			after_dot: usize = dot_index + 1
+		digits = mantissa._byte_slice( 0, dot_index ) + mantissa._byte_slice( after_dot, mantissa.byte_len() )
+	else:
+		digits = mantissa
+	digit_count: usize = digits.byte_len()
+
+	with compiler.panic_arithmetic( 'bounded by sci_text length' ):
+		exp_start: usize = e_index + 1
+	exp_text: str = sci_text._byte_slice( exp_start, sci_text.byte_len() )
+	exp_cstr: ConstPtr[u8] = exp_text.get_cstr()
+	exp_negative: bool = exp_cstr[0] == 45 # '-'
+	exp_len: usize = exp_text.byte_len()
+	with compiler.wrap_arithmetic:
+		exponent: i32 = 0
+		i: usize = 1 # skip the leading sign byte - compiler.format_f64's 'e' output always has one
+		while i < exp_len:
+			digit: i32 = i32( exp_cstr[i] ) - 48 # '0'
+			exponent = exponent * 10 + digit
+			i += 1
+		if exp_negative:
+			exponent = -exponent
+
+	if exponent >= -4 and exponent < 16:
+		if exponent >= 0:
+			with compiler.wrap_arithmetic:
+				int_digit_count: usize = usize( exponent ) + 1
+			if int_digit_count >= digit_count:
+				return digits.ljust( int_digit_count, str( '0' )) + str( '.0' )
+			int_part: str = digits._byte_slice( 0, int_digit_count )
+			frac_part: str = digits._byte_slice( int_digit_count, digit_count )
+			return int_part + str( '.' ) + frac_part
+		with compiler.wrap_arithmetic:
+			zero_count: usize = usize( -exponent ) - 1
+		leading_zeros: str = str( '' ).rjust( zero_count, str( '0' ))
+		return str( '0.' ) + leading_zeros + digits
+
+	mantissa_text: str
+	if digit_count > 1:
+		mantissa_text = digits._byte_slice( 0, 1 ) + str( '.' ) + digits._byte_slice( 1, digit_count )
+	else:
+		mantissa_text = digits
+	exp_sign: str = str( '-' ) if exponent < 0 else str( '+' )
+	with compiler.wrap_arithmetic:
+		exp_magnitude: i32 = -exponent if exponent < 0 else exponent
+	return mantissa_text + str( 'e' ) + exp_sign + _f64_exponent_text( exp_magnitude )
+
+
+@private
+def _f64_repr_digits_raw( value: f64 ) -> str:
+	''' value's own MAGNITUDE (sign ignored - same split every other
+	digit-producing function in this file keeps) as Python's own
+	shortest-round-trip repr text - what bare f"{x}" (no format spec at
+	all, dispatched via __str__/__repr__ below) and f"{x:10}"/f"{x:.2}"'s
+	OWN "no type char AND no precision" combination (the one shape
+	_f64_none_type_digits_raw's 'g'-based approach doesn't cover - see its
+	own comment) both need. Tries increasing precision (1 to 17
+	significant digits - always enough, see _MAX_REPR_SIGNIFICANT_DIGITS)
+	via compiler.format_f64's own 'e' conversion, re-parsing each
+	candidate with compiler.parse_f64 and stopping at the first EXACT
+	round-trip - the same "verify by reparsing" technique real dtoa
+	implementations are checked against, not a full from-scratch Grisu/
+	Ryu-style shortest-digit-string algorithm (substantially more code to
+	get right, for no benefit this compiler has any other use for). 'e'
+	specifically (not 'f' or 'g'): a fixed conversion type keeps the
+	SIGNIFICANT-DIGIT COUNT search independent of DISPLAY FORMAT (fixed
+	vs scientific) - Python's own display threshold is fixed at exponent
+	16 regardless of how many significant digits were actually needed
+	(confirmed against real Python: repr(1e16) == '1e+16', a single
+	significant digit, still switches to scientific - if the search used
+	'%g' instead, its OWN scientific-notation threshold is tied to
+	precision, so searching over 'g' precision would make DISPLAY FORMAT
+	change together with digit count, not matching Python at all) -
+	_f64_repr_from_scientific applies Python's own real threshold
+	separately, afterward, once the true minimal digit count is known.
+	NaN/infinity/zero are special-cased first, same as every other digit-
+	producing function here - zero specifically because it has no
+	meaningful "significant digits" to search for (compiler.format_f64's
+	own 'e' conversion of 0.0 is always just "0e+00" regardless of
+	precision, which _f64_repr_from_scientific would otherwise turn into
+	"0.0" anyway, but skipping the search entirely for a known, constant
+	answer is simpler and cheaper). '''
+	if compiler.is_nan( value ):
+		return str( 'nan' )
+	if compiler.is_inf( value ):
+		return str( 'inf' )
+	if value == 0.0:
+		return str( '0.0' )
+	with compiler.wrap_arithmetic:
+		magnitude: f64 = -value if value < 0.0 else value
+		buf: Ptr[u8] = sys.alloc[u8]( _REPR_SEARCH_BUF_SIZE )
+		precision: usize = 0
+		n: i32 = 0
+		while True:
+			n = compiler.format_f64( buf, _REPR_SEARCH_BUF_SIZE, i32( precision ), _TYPE_CHAR_E, False, magnitude )
+			if n < 0:
+				sys.free( buf )
+				sys.panic( 'f-string float repr formatting failed' )
+			parsed: f64 = compiler.parse_f64( compiler.cast( ConstPtr[u8], buf ))
+			if parsed == magnitude or precision >= _MAX_REPR_SIGNIFICANT_DIGITS - 1:
+				break
+			precision += 1
+		sci_text: str = str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
+			'compiler.format_f64 produced invalid utf-8 (unreachable - only ASCII digits, \'.\', \'e\'/\'+\'/\'-\' are ever written)'
+		)
+	return _f64_repr_from_scientific( sci_text )
+
+
+@private
+def _f64_repr_digits( value: f64, sep: str ) -> str:
+	return _group_integer_part( _f64_repr_digits_raw( value ), sep )
+
+
+@private
+def _f64_str( value: f64 ) -> str:
+	''' bare f"{x}" (no format spec at all) / str(x) - real Python's own
+	str(float)/repr(float) are identical, always (unlike int, where they
+	merely happen to coincide) - see _f64_repr below. '''
+	return _f64_sign_prefix( value, str( '-' )) + _f64_repr_digits_raw( value )
+
+
+@private
+def _f64_repr( value: f64 ) -> str:
+	return _f64_str( value )
+
+
+f64.__str__ = _f64_str
+f64.__repr__ = _f64_repr
+f64._repr_digits = _f64_repr_digits
+f64._repr_digits_raw = _f64_repr_digits_raw
+
+
+@private
 def _f32_sign_prefix( value: f32, mode: str ) -> str:
 	''' f32 has no format-spec digit conversion of its own - widens to f64
 	and delegates, same as _f32_fixed_digits/_f32_percent_digits below.
@@ -334,6 +540,26 @@ def _f32_none_type_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
 	return f64( value )._none_type_digits_raw( precision, alt )
 
 
+@private
+def _f32_repr_digits( value: f32, sep: str ) -> str:
+	return f64( value )._repr_digits( sep )
+
+
+@private
+def _f32_repr_digits_raw( value: f32 ) -> str:
+	return f64( value )._repr_digits_raw()
+
+
+@private
+def _f32_str( value: f32 ) -> str:
+	return f64( value ).__str__()
+
+
+@private
+def _f32_repr( value: f32 ) -> str:
+	return f64( value ).__repr__()
+
+
 f32._sign_prefix = _f32_sign_prefix
 f32._fixed_digits = _f32_fixed_digits
 f32._fixed_digits_raw = _f32_fixed_digits_raw
@@ -341,3 +567,7 @@ f32._percent_digits = _f32_percent_digits
 f32._percent_digits_raw = _f32_percent_digits_raw
 f32._none_type_digits = _f32_none_type_digits
 f32._none_type_digits_raw = _f32_none_type_digits_raw
+f32._repr_digits = _f32_repr_digits
+f32._repr_digits_raw = _f32_repr_digits_raw
+f32.__str__ = _f32_str
+f32.__repr__ = _f32_repr
