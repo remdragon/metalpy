@@ -208,6 +208,19 @@ class _Binding:
 Bindings = dict[str,_Binding]
 
 @dataclass
+class InlineScope:
+	''' one active multi-statement @inline splice's own local "epilogue" -
+	pushed by push_inline_scope() when lowering.py's _splice_multi_statement_
+	inline_body begins lowering a target's pre-return statements, popped once
+	it's done. current_epilogue_label()/return_() both stop at boundary_depth
+	instead of continuing into the CALLER's own older entries - see their own
+	comments. A stack (not a single field) because a spliced body can itself
+	call another @inline function - the innermost entry is always the one
+	that matters. '''
+	boundary_depth: int # len(self._epilogue_stack) at push time - entries below this belong to an outer scope (the caller, or an outer splice) and must never be inspected/replayed from inside this one
+	label: str # this scope's own shared-ladder fallback target - see current_epilogue_label()'s own comment
+
+@dataclass
 class _Snapshot:
 	''' captured by snapshot(), consumed by restore() - see the IF/loop
 	orchestration lowering.py performs around branches/loop bodies. '''
@@ -252,6 +265,7 @@ class CFGState:
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
+		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
 		self.bindings: Bindings = {}
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
@@ -340,6 +354,33 @@ class CFGState:
 		self._epilogue_stack.append( Epilogue(
 			instructions = instructions, name = self._new_label( 'epilogue' ), flag = flag, is_err_only = is_err_only,
 		))
+
+	def push_inline_scope( self ) -> str:
+		''' called once by lowering.py's own _splice_multi_statement_inline_
+		body, right before it starts lowering a target's pre-return
+		statements - marks the CURRENT stack depth as this splice's own
+		boundary. current_epilogue_label()/return_() both stop here instead
+		of continuing into the CALLER's own older entries (see their own
+		comments) - this is the entire fix that lets an early `return`/
+		`.or_return()`/checked-arithmetic inside a spliced body jump to a
+		label that's genuinely local to the splice, never the caller's real
+		epilogue. Returns the fresh label current_epilogue_label() falls back
+		to once nothing shallower (within this scope) qualifies - the caller
+		(lowering.py) emits this as a real ir.Label at the end of the splice,
+		right where its own local ladder begins. '''
+		scope = InlineScope( boundary_depth = len( self._epilogue_stack ), label = self._new_label( 'inline_epilogue' ))
+		self._inline_scope_stack.append( scope )
+		return scope.label
+
+	def pop_inline_scope( self ) -> None:
+		''' called once the splice's own local ladder has been fully emitted
+		(lowering.py's own responsibility - this just stops
+		current_epilogue_label()/return_() from consulting this scope's
+		boundary any further, restoring the immediately-enclosing scope, if
+		any, to visibility - the caller/outer splice's own entries were never
+		touched while this scope was active, so there's nothing left to
+		reconcile here beyond popping the stack entry itself. '''
+		self._inline_scope_stack.pop()
 
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
 
@@ -940,10 +981,19 @@ class CFGState:
 		otherwise the DeleteTemp _lower_stmt's own wrapper emits for it
 		right after this statement would decref the very value we just
 		handed to the caller. get_is_err_check is only ever actually called
-		if an errdefer entry is genuinely live here - see _replay(). '''
+		if an errdefer entry is genuinely live here - see _replay().
+
+		Bounded to the innermost active multi-statement @inline splice's own
+		boundary_depth when one is active (self._inline_scope_stack - see
+		push_inline_scope()) - "the ENTIRE current stack" above means the
+		entire stack of the CURRENT scope (the splice, if inside one), never
+		reaching down into the caller's (or an outer splice's) own older,
+		still-pending entries: those aren't this call's to unwind, they'll
+		get their own replay whenever THEIR OWN scope eventually exits. '''
 		self.untrack_temp( returned_operand )
 		instructions: list[ir.Instruction] = []
-		for entry in reversed( self._epilogue_stack ):
+		floor = self._inline_scope_stack[-1].boundary_depth if self._inline_scope_stack else 0
+		for entry in reversed( self._epilogue_stack[floor:] ):
 			if entry.cancelled:
 				continue
 			if returned_operand is not None and entry.operand is returned_operand:
@@ -994,7 +1044,20 @@ class CFGState:
 		INNER branch/loop was even entered, is still doomed by the OUTER
 		scope's own eventual restore() even though it predates the inner
 		one - using only the top of the stack would miss exactly that
-		entry and hand out a label for it anyway. '''
+		entry and hand out a label for it anyway.
+
+		While a multi-statement @inline splice is active (self.
+		_inline_scope_stack non-empty - see push_inline_scope()), this never
+		returns None purely for "nothing's left pending": the innermost
+		scope's own boundary_depth acts as a hard floor the walk below never
+		crosses, falling back to that scope's own label instead of either
+		returning None or continuing into the caller's own older entries.
+		The confinement-floor and returned-operand-identity None-cases above
+		still apply exactly as before, scoped to the splice's own portion of
+		the stack the same way they'd apply to a real function's - see
+		return_()'s own matching comment for why THOSE cases still need a
+		self-contained inline unwind rather than the shared label even
+		inside a splice. '''
 		if returned_operand is not None and any(
 			not entry.cancelled and entry.operand is returned_operand
 			for entry in self._epilogue_stack
@@ -1006,12 +1069,30 @@ class CFGState:
 		# wrongly treat EVERY entry as confined, since every valid index
 		# is >= 0)
 		confinement_floor = min( self._confinement_depths ) if self._confinement_depths else None
+		# the innermost active multi-statement @inline splice, if any (see
+		# push_inline_scope()'s own comment) - entries BELOW its own
+		# boundary_depth belong to the CALLER (or an outer splice), and must
+		# never be inspected here, let alone handed back as this return's own
+		# jump target: that's exactly the bug that used to make .or_return()/
+		# checked arithmetic unsupported inside a spliced body (it would
+		# otherwise silently jump into the caller's own real epilogue,
+		# short-circuiting the caller's own remaining code). Once the walk
+		# below reaches the scope's own boundary with nothing shallower
+		# eligible, its own label is always a valid fallback target - unlike
+		# the plain "nothing pending" case (a bare ir.Return is fine there),
+		# a splice never gets to just fall through to a caller-level ir.
+		# Return; it always needs a real, local landing point
+		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
 		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
+			if inline_scope is not None and i < inline_scope.boundary_depth:
+				return inline_scope.label
 			if entry.cancelled:
 				continue
 			if confinement_floor is not None and not entry.is_flag_guarded and i >= confinement_floor:
 				return None
 			return entry.name
+		if inline_scope is not None:
+			return inline_scope.label
 		return None
 
 	def build_epilogue_ladder(
@@ -1032,6 +1113,35 @@ class CFGState:
 			instructions.append( ir.Label( name = entry.name ))
 			if not entry.cancelled:
 				instructions += self._replay( entry, get_is_err_check )
+		return instructions
+
+	def build_inline_scope_ladder(
+		self, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' = None,
+	) -> list[ir.Instruction]:
+		''' the multi-statement @inline splice analogue of build_epilogue_
+		ladder() - same shape (one Label + still-live replay per pending
+		entry, deepest first), bounded to just the innermost active
+		InlineScope's own segment of the stack (self._epilogue_stack[scope.
+		boundary_depth:]) instead of the whole thing - entries belonging to
+		the caller (or an outer splice) are never touched, exactly like
+		current_epilogue_label()/return_() are now scoped (see their own
+		comments). Called once, right after lowering.py finishes lowering a
+		splice's own pre-return statements - the caller (lowering.py) is
+		responsible for emitting the scope's own leading Label (push_inline_
+		scope()'s own return value) itself first; this only emits what
+		follows it. Truncates _epilogue_stack back to boundary_depth once
+		built - this scope's own entries are now fully consumed, whether by
+		this ladder or by an earlier inline-unwind return_() call reached
+		during the splice itself (those already removed nothing from the
+		stack themselves - see return_()'s own docstring - so this is the
+		one place a splice's own entries actually get popped). '''
+		scope = self._inline_scope_stack[-1]
+		instructions: list[ir.Instruction] = []
+		for entry in reversed( self._epilogue_stack[scope.boundary_depth:] ):
+			instructions.append( ir.Label( name = entry.name ))
+			if not entry.cancelled:
+				instructions += self._replay( entry, get_is_err_check )
+		del self._epilogue_stack[scope.boundary_depth:]
 		return instructions
 
 	def _replay( self, entry: Epilogue, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' ) -> list[ir.Instruction]:

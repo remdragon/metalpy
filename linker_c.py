@@ -29,26 +29,50 @@ class CcTool:
 		self.name = name
 		self.path = path
 
-	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False, debug: bool = True ) -> subprocess.CompletedProcess[bytes]:
+	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, cflags: str = '' ) -> subprocess.CompletedProcess[bytes]:
 		''' compile a single .c file to a .o object file '''
+		# asan forces debug INFO on regardless of debug/release, so a crash
+		# report is symbolized - optimization level still follows debug/release
+		# normally (asan works fine instrumented+optimized, a common combo for
+		# fuzzing performance)
+		want_debug_info = debug or asan
 		if self.name == 'cl':
 			cmd = [ self.path, '/nologo', '/std:c11',
 				'/experimental:c11atomics',
 				'/W4', '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
+			if want_debug_info:
+				# /Fd points the PDB at obj's own directory instead of cl's
+				# default (a shared vc140.pdb in the CURRENT directory) - since
+				# every caller already compiles into its own unique temp dir
+				# (mpy.py, test_support.py, etc.), this makes concurrent cl.exe
+				# processes (parallel test shards) never share a PDB path in the
+				# first place, rather than relying on /FS to merely serialize
+				# writes through mspdbsrv.exe (which alone still produced
+				# C1041 "cannot open program database" under this project's
+				# full parallel test suite - /FS is kept too, since it's still
+				# correct/harmless for the rarer case of two compiles that DO
+				# legitimately share one obj directory)
+				cmd += [ '/Zi', '/FS', f'/Fd:{obj.with_name( "vc140.pdb" )}' ]
 			if debug:
-				cmd += [ '/Zi', '/Od' ]
+				cmd += [ '/Od' ]
 				# /RTC1 (stack-frame + uninitialized-variable checks) needs the
 				# _RTC_* support routines that live in the CRT - the no_crt
 				# freestanding path already passes /NODEFAULTLIB at link time,
-				# which would leave those symbols unresolved
-				if not no_crt:
+				# which would leave those symbols unresolved. Also mutually
+				# exclusive with /fsanitize=address (MSVC hard-errors if both
+				# are given), so asan wins when both would otherwise apply.
+				if not no_crt and not asan:
 					cmd += [ '/RTC1' ]
 			else:
 				cmd += [ '/O2', '/DNDEBUG' ]
+			if asan:
+				cmd += [ '/fsanitize=address' ]
 		else:
 			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
+			if want_debug_info:
+				cmd += [ '-g' ]
 			if debug:
 				# -fsanitize-trap=undefined compiles each UBSan check straight to
 				# a trap instruction instead of calling a runtime-library
@@ -63,10 +87,26 @@ class CcTool:
 				# UB-clean alternative short of a trampoline per override.
 				# (the analogous ShlCheck/ShlSaturate false positive on
 				# shift-base was fixed at the source instead - see _shl_expr
-				# in emitter_c.py - so no exclusion is needed for that one)
-				cmd += [ '-g', '-O0', '-fsanitize=undefined', '-fsanitize-trap=undefined', '-fno-sanitize=function' ]
+				# in emitter_c.py - so no exclusion is needed for that one).
+				# -fno-sanitize=function is clang-only: GCC never implemented
+				# -fsanitize=function (no function-pointer-type check in its
+				# own -fsanitize=undefined group at all), so it has nothing to
+				# exclude and rejects the flag outright - gcc's vtable dispatch
+				# was never going to trip this check in the first place.
+				cmd += [ '-O0', '-fsanitize=undefined', '-fsanitize-trap=undefined' ]
+				if self.name == 'clang':
+					cmd += [ '-fno-sanitize=function' ]
 			else:
 				cmd += [ '-O2', '-DNDEBUG' ]
+			if asan:
+				# clang/gcc accumulate multiple -fsanitize= flags (this adds to,
+				# not replaces, the debug-mode -fsanitize=undefined above) -
+				# -fsanitize-trap=undefined still scopes its trap behavior to
+				# only the undefined group, so asan keeps its normal runtime-
+				# reporting behavior (it has no trap-mode equivalent)
+				cmd += [ '-fsanitize=address', '-fno-omit-frame-pointer' ]
+		if cflags:
+			cmd += cflags.split()
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,
@@ -75,7 +115,7 @@ class CcTool:
 			text = True,
 		)
 
-	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True ) -> subprocess.CompletedProcess[bytes]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False ) -> subprocess.CompletedProcess[bytes]:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
@@ -83,8 +123,20 @@ class CcTool:
 			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
 			if no_crt:
 				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
-			if debug:
+			if debug or asan:
 				cmd += [ '/DEBUG' ]
+			if strip:
+				# PE has no ELF-style embedded symbol table to strip in the
+				# first place (a binary built without /DEBUG already carries
+				# none) - /OPT:REF /OPT:ICF (dead-code elimination + identical-
+				# COMDAT folding) is the closest MSVC analog to what people
+				# actually mean by a "stripped" release build
+				cmd += [ '/OPT:REF', '/OPT:ICF' ]
+			# no /fsanitize=address here: that's a cl.exe compiler-frontend
+			# flag, not understood by link.exe directly - cl.exe embeds the
+			# necessary /DEFAULTLIB directive for the ASan runtime straight
+			# into the .obj itself, so the separate link step needs nothing
+			# extra (verified empirically - see plan's verification section)
 		else:
 			# a program using an f32/f64<->i128/u128 cast needs GCC/Clang's own
 			# runtime helpers (__fixdfti/__fixunsdfti/__floattidf/... - see
@@ -98,6 +150,14 @@ class CcTool:
 			# actually references
 			wide_int_lib = _find_wide_int_runtime_lib( self )
 			cmd = [ self.path ] + extra + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + [ '-o', str( exe ) ]
+			if asan:
+				# clang/gcc's own driver acts as the linker frontend even for
+				# an objects-only link, and only links the ASan runtime when
+				# -fsanitize=address is present at THIS invocation too, not
+				# just at compile time
+				cmd += [ '-fsanitize=address' ]
+			if strip:
+				cmd += [ '-s' ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,
@@ -105,6 +165,38 @@ class CcTool:
 			stderr = subprocess.STDOUT,
 			text = True,
 		)
+
+
+def implicit_ldflags( no_crt: bool, target_os: str ) -> set[str]:
+	'''
+	Libs the generated mainCRTStartup boilerplate itself needs regardless of
+	what the user's program imports - a no_crt (freestanding) Windows build's
+	synthesized entry point unconditionally calls ExitProcess (see
+	emitter_c.py's emit_c), which lives in kernel32, but nothing in the
+	user's own program necessarily references kernel32 to pull it into
+	compiler.extern_libs on its own. (SetConsoleOutputCP used to need the
+	same treatment, back when it was hardcoded the same way - it's now an
+	ordinary @extern call reached through windows/_console.py's
+	compiler-forced global, so compiler.extern_libs already has 'kernel32'
+	from that alone by the time this runs; this function's return value
+	would be identical either way, since ExitProcess still needs it.)
+	'''
+	if no_crt and target_os == 'windows':
+		return { 'kernel32' }
+	return set()
+
+
+def has_i128( cc: CcTool|None ) -> bool:
+	'''
+	True 128-bit i128/u128 range/semantics, vs MSVC's documented 64-bit
+	fallback (see emitter_c.py's __metalpy_wideint/__metalpy_wideuint
+	typedefs, `#if defined(_MSC_VER) && !defined(__clang__)`) - this is the
+	direct Python-side mirror of that same C-preprocessor condition. `cc is
+	None` (no compiler found at all) defaults to True: permissive, and moot
+	anyway since an actual build with no compiler dies with a clear error
+	regardless of what this said.
+	'''
+	return cc is None or cc.name != 'cl'
 
 
 def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:

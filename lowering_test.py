@@ -544,20 +544,18 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_or_return_call_expands_to_or_return_ir_at_call_site( self ) -> None:
-		# <result_expr>.or_return() is recognized at the call site and
-		# expanded directly to OrReturn - Result.or_return's own declared
-		# body (`return self.x` here) is never itself scheduled/lowered as
-		# a Call target, since it would need to return from ITS CALLER, not
-		# itself (see _lower_or_return's own comment)
+		# <result_expr>.or_return() is recognized at the call site purely by
+		# AST shape and expanded directly to OrReturn - it has no declared
+		# body at all (a user-written `def or_return(...)` is a discovery-
+		# time compile error, see discovery.py's _parse_function), since a
+		# real one would need to return from ITS CALLER, not itself (see
+		# _lower_or_return's own comment)
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
 			'@cstruct',
 			'class Result[T,E]:',
 			'	x: T',
-			'',
-			'	def or_return( self ) -> T:',
-			'		return self.x',
 			'',
 			'def get_result() -> Result[i32,MyError]:',
 			'	pass',
@@ -576,7 +574,7 @@ class Tests( unittest.TestCase ):
 			result_cls.resolve()
 		result_i32_myerror = self.discovery._get_or_create_specialization( result_cls, [ i32, myerror_cls ] )
 
-		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 14, type = i32 )
+		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 11, type = i32 )
 		t0 = ir.Temp( type = result_i32_myerror, id = 0 ) # get_result()'s Result
 		t1 = ir.Temp( type = i32, id = 1 )                # unwrapped via OrReturn
 
@@ -595,6 +593,38 @@ class Tests( unittest.TestCase ):
 		])
 		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
 
+	def test_or_return_on_bare_union_result_with_no_declared_method_still_lowers( self ) -> None:
+		# regression: a bare @union Result[T,E] with only Ok/Err members and
+		# NO explicit or_return method (matching lib/builtins's own real
+		# Result post-fix - see its own comment) used to fail to resolve
+		# .or_return() at all ("'or_return' is not callable on ..."), since
+		# the old dispatch required first finding a real declared method via
+		# ordinary attribute lookup. or_return() never needed one - it's
+		# recognized purely by AST shape plus the receiver's own type
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'def risky() -> Result[i32,MyError]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def bad() -> Result[i32,MyError]:',
+			'	tmp: i32 = risky().or_return()',
+			'	return Result.Ok( tmp )',
+		])
+		mod = self._import( code )
+		bad_fn = mod.get_local( 'bad' )
+		if bad_fn.resolve is not None:
+			bad_fn.resolve()
+		fn = self.compiler._lower( bad_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertTrue( any( isinstance( i, ir.OrReturn ) for i in fn.instructions ))
+		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
+
 	def test_or_return_outside_result_returning_function_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'class MyError: pass',
@@ -602,9 +632,6 @@ class Tests( unittest.TestCase ):
 			'@cstruct',
 			'class Result[T,E]:',
 			'	x: T',
-			'',
-			'	def or_return( self ) -> T:',
-			'		return self.x',
 			'',
 			'def get_result() -> Result[i32,MyError]:',
 			'	pass',
@@ -6520,6 +6547,15 @@ class InlineTests( unittest.TestCase ):
 	def _ir_repr( self, fn: LoweredFunction ) -> list[str]:
 		return [ op.test_repr() for op in fn.instructions ]
 
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target (see compiler.py's own comment) - real
+	# but incidental to what these tests check, and absent entirely on
+	# non-Windows targets, so exact-set assertions filter it back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
+
 	def test_inline_method_call_compiles_identically_to_calling_the_body_directly( self ) -> None:
 		# @inline def get_len(self): return self.__len__() called as
 		# b.get_len() must produce the SAME instruction shape as writing
@@ -6606,7 +6642,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 		main_fn = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
@@ -6633,7 +6669,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 
 	def test_inline_receiver_with_side_effect_evaluated_once( self ) -> None:
@@ -6757,6 +6793,362 @@ class InlineTests( unittest.TestCase ):
 		self.assertIn( 'Cmp', kinds )
 		qualnames = { lf.function.qualname for lf in self.compiler.functions }
 		self.assertNotIn( '__test__.Result.is_ok[intrinsics.i32,__test__.MyError]', qualnames )
+
+# --- multi-statement @inline bodies (generalization of PLAN_INLINE.md) -------
+
+class InlineMultiStatementTests( unittest.TestCase ):
+	''' @inline generalized to accept locals/if/for/while before a single,
+	final, un-nested `return <expr>` - see _splice_multi_statement_inline_
+	body. import_builtins=False, same as InlineTests. '''
+	maxDiff = None
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ) -> LoweredFunction:
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		return fn
+
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target (see compiler.py's own comment) - real
+	# but incidental to what these tests check, and absent entirely on
+	# non-Windows targets, so exact-set assertions filter it back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
+
+	def test_multistatement_body_emits_no_call_funcstart_funcend_for_target( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return w.doubled()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'Call', kinds ) # doubled() itself never becomes a real call
+		self.assertIn( 'GetAttr', kinds ) # ...just self.y spliced directly
+		# the alpha-renamed local must be a real, uniquely-named Variable,
+		# not the callee's own literal 'tmp'
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) ]
+		self.assertTrue( any( a.dest.stem.startswith( '$inline' ) and 'tmp' in a.dest.stem for a in assigns ) )
+
+	def test_caller_local_with_same_name_as_inline_local_not_corrupted( self ) -> None:
+		# Hazard 1 regression: without alpha-renaming + the provisional-
+		# Function fix, the inlined body's own `tmp` would silently
+		# overwrite main's OWN `tmp` in the shared names dict
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	tmp: usize = 100',
+			'	result: usize = w.doubled()',
+			'	with compiler.wrap_arithmetic:',
+			'		return tmp + result',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = { i.dest.qualname for i in fn.instructions if hasattr( i, 'dest' ) and isinstance( getattr( i, 'dest', None ), Variable ) }
+		self.assertIn( 'main.tmp', qualnames )
+		# main's own `tmp` must still be the operand referenced by the
+		# final AddWrap - not silently replaced by the inlined one
+		add = next( i for i in fn.instructions if type( i ).__name__ == 'AddWrap' )
+		self.assertEqual( add.left.qualname, 'main.tmp' )
+
+	def test_reassigning_own_local_reuses_the_same_variable( self ) -> None:
+		# Hazard 2 regression: a SECOND assignment to an already-alpha-
+		# renamed local must find and replace the FIRST binding (one
+		# decref-then-replace), not silently create a second, independent
+		# Variable under the same stem (a leak - cfg.py's own fresh-vs-
+		# replace machinery depends on finding the SAME Variable object
+		# both times)
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def other( self ) -> usize:',
+			'		return self.y',
+			'	@inline',
+			'	def pick( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		tmp = self.other()',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return w.pick()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'tmp' in i.dest.stem ]
+		self.assertEqual( len( assigns ), 2 )
+		self.assertIs( assigns[0].dest, assigns[1].dest ) # SAME Variable object, not two independent bindings
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Widget.other' ] )
+
+	def test_spliced_if_nests_inside_callers_own_if( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		if tmp == 0:',
+			'			tmp = 1',
+			'		return tmp',
+			'',
+			'def main( w: Widget, flag: bool ) -> usize:',
+			'	if flag:',
+			'		return w.doubled()',
+			'	return 0',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_match_statement_in_pre_return_statement( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Choice:',
+			'	A: i32',
+			'	B: usize',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	c: Choice',
+			'	@inline',
+			'	def resolve_choice( self ) -> i32:',
+			'		result: i32 = 0',
+			'		match self.c:',
+			'			case Choice.A( x ):',
+			'				result = x',
+			'			case Choice.B( y ):',
+			'				result = 1',
+			'		return result',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	return w.resolve_choice()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'Call', kinds ) # resolve_choice() itself never becomes a real call
+
+	def test_or_return_in_pre_return_statement_now_works( self ) -> None:
+		# early/nested-return + defer/errdefer/.or_return() generalization -
+		# a pre-return statement's own .or_return() early exit now jumps to
+		# the SPLICE's own local epilogue (cfg.py's push_inline_scope/
+		# current_epilogue_label), never the caller's real one. This is the
+		# exact regression the user specifically flagged as "notably
+		# important": .or_return() from inside an @inline must NOT trigger
+		# a return from the calling function - only jump to the end of the
+		# spliced/embedded scope, letting the caller's OWN subsequent code
+		# still run. Result is a bare @union with no declared or_return
+		# method (matching lib/builtins's own real shape - or_return() is
+		# recognized structurally, never a real method - see discovery.py's
+		# reserved-name rejection)
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'	def is_err( self ) -> bool:',
+			'		return self.tag == 1',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	def risky( self ) -> Result[usize,MyError]:',
+			'		return Result.Ok( 1 )',
+			'	@inline',
+			'	def bad( self ) -> Result[usize,MyError]:',
+			'		tmp: usize = self.risky().or_return()',
+			'		return Result.Ok( tmp )',
+			'',
+			'def main( w: Widget ) -> Result[usize,MyError]:',
+			'	if w.bad().is_err():',
+			'		pass',
+			'	return Result.Ok( 5 )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one OrJump (bad()'s own risky().or_return()), and its
+		# target is a real, declared label local to the splice
+		or_jumps = [ i for i in fn.instructions if isinstance( i, ir.OrJump ) ]
+		self.assertEqual( len( or_jumps ), 1 )
+		labels = { i.name for i in fn.instructions if isinstance( i, ir.Label ) }
+		self.assertIn( or_jumps[0].target, labels ) # a real, declared label - not a dangling reference
+		# the decisive check: main() must still have exactly ONE real
+		# ir.Return and ONE ir.FuncEnd - bad()'s own internal early exit
+		# must never produce a SEPARATE return/funcend for the CALLER, and
+		# main's own trailing `return Result.Ok( 5 )` must be the only one
+		returns = [ i for i in fn.instructions if isinstance( i, ir.Return ) ]
+		func_ends = [ i for i in fn.instructions if isinstance( i, ir.FuncEnd ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( len( func_ends ), 1 )
+		self.assertIs( fn.instructions[-1], func_ends[0] ) # main's own real end, not cut short mid-body
+
+	def test_early_return_nested_in_if_jumps_to_local_scope_not_caller( self ) -> None:
+		# early/nested-return generalization - a `return` nested inside a
+		# spliced if must land at a label local to the splice, not the
+		# caller's own shared epilogue label, and must never produce a real
+		# ir.Return/ir.FuncEnd mid-body (those belong to the caller alone)
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	@inline',
+			'	def clamped( self ) -> i32:',
+			'		if self.y < 0:',
+			'			return 0',
+			'		return self.y',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	x: i32 = w.clamped()',
+			'	y: i32 = x',
+			'	return y',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one real ir.Return (main's own trailing `return y`) -
+		# clamped()'s own internal early `return 0` must never produce a
+		# SECOND one - and it's the second-to-last instruction, immediately
+		# before ir.FuncEnd, not buried mid-body ahead of dead code
+		returns = [ i for i in fn.instructions if isinstance( i, ir.Return ) ]
+		func_ends = [ i for i in fn.instructions if isinstance( i, ir.FuncEnd ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( len( func_ends ), 1 )
+		self.assertIs( fn.instructions[-1], func_ends[0] )
+		self.assertIs( fn.instructions[-2], returns[0] )
+		# main's own trailing statement (x + 1) must actually be reachable/
+		# present - not skipped by clamped()'s own internal early return
+		self.assertTrue( any(
+			isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'x' in i.dest.stem
+			for i in fn.instructions
+		))
+
+	def test_defer_in_spliced_body_replayed_once_at_splice_ladder( self ) -> None:
+		# defer/errdefer generalization - a defer registered inside a
+		# spliced body's own pre-return statements is now allowed, and must
+		# be replayed exactly once, at the splice's own local ladder - not
+		# at the caller's real epilogue, and not duplicated between an
+		# early exit and the normal fallthrough path
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	@inline',
+			'	def traced( self ) -> i32:',
+			'		result: i32 = self.y',
+			'		with defer:',
+			'			result = result',
+			'		return result',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	return w.traced()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one defer flag armed (Const True Assign into a
+		# $defer_flag-named Variable), matching exactly one defer statement
+		flag_arms = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'defer_flag' in i.dest.stem
+			and isinstance( i.src, ir.Const ) and i.src.value is True
+		]
+		self.assertEqual( len( flag_arms ), 1 )
+
+	def test_direct_recursion_in_pre_return_statement_rejected( self ) -> None:
+		code = '\n'.join([
+			'@inline',
+			'def foo( x: i32 ) -> i32:',
+			'	tmp: i32 = foo( x )',
+			'	return tmp',
+			'',
+			'def main() -> i32:',
+			'	return foo( 1 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'recursive inlining' in e for e in self.discovery.errors.errors ))
+
+	def test_generic_multistatement_inline_splices_bare_call( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def get( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def wrap[T]( t: T ) -> usize:',
+			'	tmp: usize = t.get()',
+			'	return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return wrap( w )',
+		])
+		self._import( code )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = self._function_qualnames()
+		self.assertEqual( qualnames, { 'main', '__test__.Widget.get' } ) # never a real wrap[Widget] function
+
+	def test_multistatement_inline_with_return_only_type_param( self ) -> None:
+		# composes with PLAN_RETURN_INFERENCE.md - R is inferred from the
+		# body's own final return, even though R never appears in any
+		# parameter, and the body is multi-statement
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def get( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def wrap[T,R]( t: T ) -> R:',
+			'	tmp = t.get()',
+			'	return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return wrap( w )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# t.get() is a real (non-@inline) method - a real Call to it is
+		# expected; wrap() ITSELF must never become one
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Widget.get' ] )
+		self.assertEqual( fn.function.return_type.stem, 'usize' )
 
 # --- return-only generic type-parameter inference (PLAN_RETURN_INFERENCE.md) -
 
@@ -7354,6 +7746,78 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 			self.discovery.errors.errors,
 		)
 
+	def test_float_format_spec_dispatches_to_fixed_digits_and_sign_prefix( self ) -> None:
+		# f"{x:.1f}" (f64) - dispatches to lib/builtins/__float.py's own
+		# _fixed_digits/_sign_prefix (Scalar-registered methods, not
+		# __str__/__repr__ - a format spec formats the operand's own type
+		# directly, matching Python's format(x, spec) == type(x).
+		# __format__(x, spec) semantics, same as int's own dispatch)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.1f}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_fixed_digits' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+		self.assertEqual( self._calls_to( fn, '__str__' ), [] )
+
+	def test_float_format_spec_exponential_dispatches_to_fixed_digits( self ) -> None:
+		# f"{x:.2e}" - dispatches through the same _fixed_digits as 'f'/'F',
+		# just with a different type_char argument (PLAN_STR_FORMAT.md item 4)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2e}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_fixed_digits' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_float_format_spec_percent_dispatches_to_percent_digits( self ) -> None:
+		# f"{x:.2%}" - '%' has no printf equivalent, so it goes through its
+		# own dedicated _percent_digits (lib/builtins/__float.py) instead of
+		# _fixed_digits - the *100 scaling + 'f' + '%' suffix all happen
+		# there, not here
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2%}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_percent_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_float_format_spec_none_type_with_precision_dispatches_to_none_type_digits( self ) -> None:
+		# f"{x:.2}" - a literal spec with a precision but no type char at
+		# all goes through its own dedicated _none_type_digits (lib/
+		# builtins/__float.py, real Python's own "None" presentation type -
+		# closer to 'g' than 'f', see its own comment), not the plain
+		# _fixed_digits('f') fallback f"{x:.2f}" itself would dispatch to
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_none_type_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_percent_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_invalid_float_type_char_is_a_compile_error( self ) -> None:
+		# f"{x:x}" - 'x' is a valid int type char but not a float one
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:x}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( "'x' is not valid for float" in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
 	def test_int_type_char_on_str_is_a_compile_error( self ) -> None:
 		# f"{s:x}" - 'x' parses fine but validate_str_spec rejects any
 		# type char other than 's'/None for a str operand
@@ -7426,19 +7890,25 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
 
 	def test_literal_int_format_spec_decimal_dispatches_to_sign_and_digits( self ) -> None:
-		# f"{n:05d}" - decimal path: _decimal_digits_with_grouping (empty
-		# separator) + _sign_prefix, then zero-pad via _pad_after_prefix
-		# (the '=' align implied by the '0' shorthand) rather than a
-		# generic ljust/rjust/center call
+		# f"{n:05d}" - decimal path: _decimal_digits (raw, ungrouped) +
+		# _sign_prefix, then grouping-aware zero-pad via
+		# _pad_and_group_after_prefix (the '=' align implied by the '0'
+		# shorthand) rather than a generic ljust/rjust/center call or the
+		# plain (non-grouping-aware) _pad_after_prefix - see str._pad_and_
+		# group_after_prefix's own comment on why the zero-pad path needs
+		# raw digits and grouping-aware padding, not pre-grouped digits
+		# plus a naive rjust (PLAN_STR_FORMAT.md item 4's own bugfix note)
 		self._import( '\n'.join([
 			'def main( n: int ) -> str:',
 			'	return f"{n:05d}"',
 		]))
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		self.assertEqual( len( self._calls_to( fn, '_decimal_digits_with_grouping' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_decimal_digits' )), 1 )
 		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
-		self.assertEqual( len( self._calls_to( fn, '_pad_after_prefix' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_pad_and_group_after_prefix' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
+		self.assertEqual( self._calls_to( fn, '_pad_after_prefix' ), [] )
 		self.assertEqual( self._calls_to( fn, '_to_radix_digits' ), [] )
 
 	def test_literal_int_format_spec_hex_dispatches_to_radix_digits( self ) -> None:

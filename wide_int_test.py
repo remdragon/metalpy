@@ -21,9 +21,10 @@ import emitter_c
 import linker_c
 import test_support
 from compiler import Compiler
-from discovery import Discovery
+from discovery import Discovery, _detect_active_target
 
 _CC = linker_c.detect_cc()
+_HAS_I128 = linker_c.has_i128( _CC )
 
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping real-compile wide-int tests' )
@@ -31,7 +32,9 @@ class WideIntBehaviorTests( unittest.TestCase ):
 	def _run_program( self, code: str ) -> subprocess.CompletedProcess:
 		''' compiles `code` (a full MetalPy source with its own def main() ->
 		i32), links it, runs it, and returns the finished CompletedProcess. '''
-		discovery = Discovery( import_builtins = True )
+		active_target = _detect_active_target()
+		active_target['has_i128'] = _HAS_I128
+		discovery = Discovery( import_builtins = True, active_target = active_target )
 		compiler = Compiler( discovery )
 		compiler.import_code( code, Path( '__main__.py' ), scope = None )
 		compiler.run()
@@ -49,9 +52,7 @@ class WideIntBehaviorTests( unittest.TestCase ):
 			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
 			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
-			libs = set( compiler.extern_libs )
-			if no_crt and os.name == 'nt':
-				libs.add( 'kernel32' )
+			libs = set( compiler.extern_libs ) | linker_c.implicit_ldflags( no_crt, 'windows' if os.name == 'nt' else os.name )
 			ldflags = ''
 			for lib in sorted( libs ):
 				if lib == 'c':
@@ -104,6 +105,7 @@ class WideIntBehaviorTests( unittest.TestCase ):
 	# Compared against a variable-based shift (`one: i128 = 1; one << 100`),
 	# which was already correct before this fix (a variable's own declaration
 	# already carries the right C type).
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_shift_literal_operand_uses_correct_width( self ) -> None:
 		checks = [ 'i128(1) << 100 == a named i128 variable shifted the same way' ]
 		self._assert_program_succeeds( '''
@@ -123,6 +125,7 @@ def main() -> i32:
 	# independently constructed via shifts of a typed variable (not literals),
 	# so this test doesn't depend on the fix under test to compute what
 	# "correct" even means.
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_large_magnitude_literals_compile_and_round_trip( self ) -> None:
 		checks = [
 			'positive >64-bit-magnitude u128 literal round-trips',
@@ -147,6 +150,7 @@ def main() -> i32:
 
 	# --- Stage 2: saturating arithmetic on i128/u128 (previously NotImplementedError) --
 
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_saturating_add_sub_mul_i128( self ) -> None:
 		checks = [
 			'saturating add near i128 MAX clamps to MAX',
@@ -171,6 +175,7 @@ def main() -> i32:
 	return 0
 ''', checks )
 
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_saturating_add_sub_mul_u128( self ) -> None:
 		checks = [
 			'saturating add near u128 MAX clamps to MAX',
@@ -194,6 +199,7 @@ def main() -> i32:
 	return 0
 ''', checks )
 
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_saturating_shl_i128_u128( self ) -> None:
 		checks = [ 'saturating shl overflow on i128 clamps to MAX', 'saturating shl overflow on u128 clamps to MAX' ]
 		self._assert_program_succeeds( '''
@@ -213,6 +219,7 @@ def main() -> i32:
 	return 0
 ''', checks )
 
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_saturating_negate_i128( self ) -> None:
 		# negating i128 MIN is the only way signed negation overflows -
 		# should saturate to MAX. An ordinary in-range negation is unaffected.
@@ -232,6 +239,7 @@ def main() -> i32:
 	return 0
 ''', checks )
 
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_saturate_and_checked_cast_involving_i128_u128( self ) -> None:
 		checks = [
 			'saturating i32->i128 in-range preserves value',
@@ -280,6 +288,55 @@ def main() -> i32:
 	return 0
 ''' )
 
+	# regression test for the u64/usize-SOURCE promotion bug: the u128-source
+	# fix below promoted ONLY a literal u128 source to __metalpy_wideuint -
+	# but under MSVC's 64-bit __metalpy_wideint fallback, u64/usize sources
+	# have the IDENTICAL problem (their own MAX also doesn't fit a SIGNED
+	# 64-bit wideint). Confirmed via a real repro: a near-MAX u64 cast down
+	# to i32 silently reported "in range" under MSVC instead of overflowing.
+	# Deliberately NOT _HAS_I128-gated - u64/usize's own MAX needs no true
+	# 128-bit range to construct (unlike the u128 tests below), so this
+	# exercises the bug on every backend, MSVC included.
+	def test_cast_from_u64_usize_max_saturates_and_panics_correctly( self ) -> None:
+		checks = [
+			'saturating u64 MAX -> i32 clamps to i32 MAX (not silently in-range)',
+			'saturating usize MAX -> i32 clamps to i32 MAX (not silently in-range)',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		one: u64 = 1
+		u64_max: u64 = one - 2
+		one_sz: usize = 1
+		usize_max: usize = one_sz - 2
+	with compiler.saturate_arithmetic:
+		clamped: i32 = i32(u64_max)
+		if clamped != 2147483647:
+			return 1
+		clamped_sz: i32 = i32(usize_max)
+		if clamped_sz != 2147483647:
+			return 2
+	return 0
+''', checks )
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		one: u64 = 1
+		u64_max: u64 = one - 2
+	with compiler.panic_arithmetic("ov"):
+		bad: i32 = i32(u64_max)
+	return 0
+''' )
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		one: usize = 1
+		usize_max: usize = one - 2
+	with compiler.panic_arithmetic("ov"):
+		bad: i32 = i32(usize_max)
+	return 0
+''' )
+
 	# regression test for the u128-SOURCE promotion bug: the old code always
 	# promoted the source operand to __metalpy_wideint (signed 128-bit) for
 	# the range comparison - reinterpreting u128's own MAX (all 128 bits set)
@@ -289,6 +346,7 @@ def main() -> i32:
 	# been silently wrong). Confirmed the fix specifically promotes a u128
 	# SOURCE to __metalpy_wideuint instead, where this reinterpretation can't
 	# happen.
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_cast_from_u128_max_saturates_and_panics_correctly( self ) -> None:
 		checks = [
 			'saturating u128 MAX -> i32 clamps to i32 MAX (not -1)',

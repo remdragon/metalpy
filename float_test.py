@@ -55,13 +55,11 @@ class FloatBehaviorTests( unittest.TestCase ):
 			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
 			# every extern library the program pulled in needs an explicit link
-			# flag ('c' is the CRT, handled by no_crt). A no-CRT program on
-			# Windows still calls SetConsoleOutputCP/ExitProcess, so it needs
-			# kernel32 - normally pulled in transitively by a program that uses
-			# builtins, but these float-only programs use none, so add it here.
-			libs = set( compiler.extern_libs )
-			if no_crt and os.name == 'nt':
-				libs.add( 'kernel32' )
+			# flag ('c' is the CRT, handled by no_crt), plus whatever the
+			# generated boilerplate itself always needs (kernel32 on a no-CRT
+			# Windows build - these float-only programs use no builtins, so
+			# nothing would otherwise pull it in - see linker_c.implicit_ldflags)
+			libs = set( compiler.extern_libs ) | linker_c.implicit_ldflags( no_crt, 'windows' if os.name == 'nt' else os.name )
 			ldflags = ''
 			for lib in sorted( libs ):
 				if lib == 'c':

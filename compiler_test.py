@@ -9,6 +9,14 @@ from compiler import Compiler
 from mpy_types import Module, Variable, RCClass, Specialization
 
 class CompilerTestCase( unittest.TestCase ):
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target (see compiler.py's own comment) - real
+	# but incidental to what these tests are actually checking, and absent
+	# entirely on non-Windows targets, so every helper below that turns
+	# compiler.functions/.extern_libs into a comparable value filters it back
+	# out first, keeping assertions host-OS-independent
+	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = False )
 		self.compiler = Compiler( self.discovery )
@@ -18,7 +26,15 @@ class CompilerTestCase( unittest.TestCase ):
 		self.compiler.run()
 
 	def _function_names( self ) -> list[str]:
-		return [ f.function.qualname for f in self.compiler.functions ]
+		return [ f.function.qualname for f in self.compiler.functions if f.function.qualname not in self._CONSOLE_INIT_QUALNAMES ]
+
+	def _extern_libs( self ) -> dict[str, set[str]]:
+		libs = { lib: set( syms ) for lib, syms in self.compiler.extern_libs.items() }
+		if 'kernel32' in libs:
+			libs['kernel32'].discard( 'SetConsoleOutputCP' )
+			if not libs['kernel32']:
+				del libs['kernel32']
+		return libs
 
 	def _instructions_for( self, qualname: str ) -> list[ir.Instruction]:
 		for f in self.compiler.functions:
@@ -474,14 +490,14 @@ def main() -> None:
 		# HeapAlloc is declared but never called - never scheduled/lowered,
 		# so it never registers, matching how any other unused Function is
 		# quietly dropped by _enqueue's filtering
-		self.assertEqual( self.compiler.extern_libs, { 'c': { 'malloc', 'free' } } )
+		self.assertEqual( self._extern_libs(), { 'c': { 'malloc', 'free' } } )
 
 	def test_no_extern_calls_leaves_the_registry_empty( self ) -> None:
 		self._run( '''
 def main() -> None:
 	pass
 ''' )
-		self.assertEqual( self.compiler.extern_libs, {} )
+		self.assertEqual( self._extern_libs(), {} )
 
 if __name__ == '__main__':
 	unittest.main()

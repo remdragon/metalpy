@@ -212,27 +212,6 @@ _RESULT_FIXTURE = '\n'.join([
 	'\t\treturn self.tag == 1',
 ])
 
-_RESULT_FIXTURE_WITH_OR_RETURN = '\n'.join([
-	'@cstruct',
-	'class OverflowError: pass',
-	'',
-	'@union',
-	'class Result[T,E]:',
-	'\tOk: T',
-	'\tErr: E',
-	'',
-	'\tdef is_ok( self ) -> bool:',
-	'\t\treturn self.tag == 0',
-	'',
-	'\tdef is_err( self ) -> bool:',
-	'\t\treturn self.tag == 1',
-	'',
-	'\tdef or_return( self ) -> T:',
-	'\t\tif self.is_err():',
-	'\t\t\tcompiler.early_return( self.data.v_Err )',
-	'\t\treturn self.data.v_Ok',
-])
-
 class SpecializationSynthesisTests( CompilerTestCase ):
 	def test_result_specialization_is_a_real_compiler_tagged_unions_entry( self ) -> None:
 		# a concrete generic class specialization (Result[i32,
@@ -288,13 +267,15 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 
 	def test_or_return_on_concrete_result_receiver_still_lowers_textually( self ) -> None:
 		# or_return() must never become a real compiled function or a real
-		# Call to one - Result.or_return's own declared body is a spec of
-		# the intended behavior, not literally compilable (see Lowering.
-		# _lower_or_return's own comment) - this is the exact regression
-		# the eager-substitution work risked: target.cls became a
-		# Specialization for a concrete receiver, breaking the `target.cls
-		# is Result` identity check _lower_call used to route here
-		self._run( _RESULT_FIXTURE_WITH_OR_RETURN + '\n' + '\n'.join([
+		# Call to one - it has no declared body at all (a user-written
+		# `def or_return(...)` is a discovery-time compile error, see
+		# discovery.py's _parse_function) and is recognized purely by AST
+		# shape in Lowering._lower_call, before ordinary call resolution
+		# ever runs (see that check's own comment) - this is the exact
+		# regression the eager-substitution work risked: target.cls became
+		# a Specialization for a concrete receiver, breaking the old
+		# `target.cls is Result` identity check that used to route here
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def get() -> Result[i32,OverflowError]:',
 			'\treturn Result.Ok( 1 )',
 			'',
@@ -1691,7 +1672,7 @@ class RCClassConstructTests( RCClassTestCase ):
 		# destructor argument, no _rcclass_destructor_name reference here
 		main2_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		main_src = emitter_c.emit_function( main2_lf )
-		self.assertIn( 'release_object( &(foo)->$header )', main_src )
+		self.assertIn( 'release_object( (ObjectHeader*)(foo) )', main_src )
 		self.assertNotIn( '__main__$Foo$$__destructor__', main_src )
 
 	def test_release_object_reads_destructor_from_header( self ) -> None:
@@ -2031,7 +2012,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime (see ObjectHeader's own comment) rather
 		# than this call site naming it as a literal argument
-		self.assertIn( 'release_object( &($t0)->$header )', destructor_src )
+		self.assertIn( 'release_object( (ObjectHeader*)($t0) )', destructor_src )
 		# see test_del_method_is_called_from_synthesized_destructor's own
 		# comment on why this is a real temp ($t1, following the field
 		# decref's own $t0) rather than `self` passed bare
@@ -2094,7 +2075,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime rather than this call site naming it
-		self.assertIn( 'release_object( &($t1)->$header )', destructor_src )
+		self.assertIn( 'release_object( (ObjectHeader*)($t1) )', destructor_src )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
@@ -2695,12 +2676,16 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 				src = self._compiled_source( target )
 				self.assertEqual( src.count( 'static void __metalpy_init( void ) {' ), 1 )
 
-	def test_windows_console_codepage_call_is_gated_inside_the_one_function( self ) -> None:
+	def test_windows_console_codepage_call_is_an_ordinary_global_init_call( self ) -> None:
+		# SetConsoleOutputCP is no longer hardcoded/gated inside __metalpy_init
+		# itself - it's windows/_console.py's _console_init global (forced
+		# reachable on every Windows target by Compiler.run()), called from
+		# here exactly like any other global's own init function
 		src = self._compiled_source( self._WINDOWS_TARGET )
 		body = self._metalpy_init_body( src )
-		self.assertIn( '#ifdef _WIN32', body )
-		self.assertIn( 'SetConsoleOutputCP( CP_UTF8 );', body )
-		self.assertIn( '#endif', body )
+		self.assertIn( '__metalpy_init_windows$_console$_console_init();', body )
+		self.assertIn( 'SetConsoleOutputCP(', src )
+		self.assertNotIn( '#ifdef _WIN32', body )
 
 	def test_main_prepends_metalpy_init_call_on_every_target( self ) -> None:
 		# not just Windows - global initializers must run everywhere now,
@@ -3226,7 +3211,7 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
-		self.assertIn( '(p)[((uintptr_t)1)] = $t1;', src ) # real write-back, not a copy-mutate-discard
+		self.assertIn( '(p)[((uintptr_t)1ULL)] = $t1;', src ) # real write-back, not a copy-mutate-discard
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -8538,6 +8523,413 @@ def main() -> i32:
 		return 2
 	if f"{{int(-5):05d}}" != {f"{-5:05d}"!r}:
 		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_int_format_spec_zero_pad_is_grouping_aware( self ) -> None:
+		# the '0' shorthand COMBINED with grouping (,/_) - a real, confirmed
+		# bug (PLAN_STR_FORMAT.md item 4's own writeup): the padding zeros
+		# themselves need their own separators too, matching real Python's
+		# f"{1234567:015,d}" == '000,001,234,567', NOT '0000001,234,567'
+		# (raw zeros in front of an already-grouped string, what a naive
+		# "group first, then rjust-pad" two-step gives instead)
+		self._run( f'''
+def main() -> i32:
+	if f"{{int(1234567):015,d}}" != {f"{1234567:015,d}"!r}:
+		return 1
+	if f"{{int(1234567):013,d}}" != {f"{1234567:013,d}"!r}:
+		return 2
+	if f"{{int(-1234567):016,d}}" != {f"{-1234567:016,d}"!r}:
+		return 3
+	if f"{{int(0):06,d}}" != {f"{0:06,d}"!r}:
+		return 4
+	if f"{{int(1234567):015_d}}" != {f"{1234567:015_d}"!r}:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_precision( self ) -> None:
+		# 'f'/'F' fixed-point only (PLAN_STR_FORMAT.md item 4) - real
+		# Python's own f-string output is the oracle, same convention as
+		# every str/int format-spec test above. f"{1.0:.1f}" is the exact
+		# motivating case this pass exists for.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x:.1f}}"
+
+def main() -> i32:
+	if build( 1.0 ) != {f"{1.0:.1f}"!r}:
+		return 1
+	if f"{{3.14159:.3f}}" != {f"{3.14159:.3f}"!r}:
+		return 2
+	if f"{{7.0:.0f}}" != {f"{7.0:.0f}"!r}:
+		return 3
+	if f"{{0.0:.2f}}" != {f"{0.0:.2f}"!r}:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_sign_and_width( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{-2.5:.1f}}" != {f"{-2.5:.1f}"!r}:
+		return 1
+	if f"{{2.5:+.1f}}" != {f"{2.5:+.1f}"!r}:
+		return 2
+	if f"{{2.5: .1f}}" != {f"{2.5: .1f}"!r}:
+		return 3
+	if f"{{1.5:>10.1f}}" != {f"{1.5:>10.1f}"!r}:
+		return 4
+	if f"{{1.5:<10.1f}}" != {f"{1.5:<10.1f}"!r}:
+		return 5
+	if f"{{1.5:*^10.1f}}" != {f"{1.5:*^10.1f}"!r}:
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_zero_pad_is_sign_aware( self ) -> None:
+		# the '0' shorthand's own sign-aware zero-fill, same shape int's own
+		# equivalent test already covers - the '-' stays in front, zeros
+		# fill AFTER it, not before ('-00001.5', not '0000-1.5')
+		self._run( f'''
+def main() -> i32:
+	if f"{{1.5:08.1f}}" != {f"{1.5:08.1f}"!r}:
+		return 1
+	if f"{{-1.5:08.1f}}" != {f"{-1.5:08.1f}"!r}:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_str_type_char_on_float_is_a_compile_error( self ) -> None:
+		# 'x' is a valid type char for int/radix, but not for float - a
+		# clear, named error, not a crash or silently wrong output
+		self._run( '''
+def main() -> i32:
+	return len( f"{1.0:x}" )
+''' )
+		self.assertTrue( any( "'x' is not valid for float" in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_exponential( self ) -> None:
+		# 'e'/'E' (PLAN_STR_FORMAT.md item 4) - real Python's own f-string
+		# output is the oracle, same convention as every other format-spec
+		# test in this class. Backed by real snprintf/msvcrt _snprintf -
+		# msvcrt's own exponent is always 3 digits ("e+003"), unlike Python/
+		# C99's 2-digit floor ("e+03") - emitter_c.py's PROLOGUE fixes this
+		# up on Windows (__metalpy_fixup_msvcrt_exponent); this test is the
+		# real end-to-end proof that fixup actually produces Python-matching
+		# output, not just that it compiles.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x:.2e}}"
+
+def main() -> i32:
+	if build( 1234.5 ) != {f"{1234.5:.2e}"!r}:
+		return 1
+	if f"{{1234.5:.2E}}" != {f"{1234.5:.2E}"!r}:
+		return 2
+	if f"{{1234.5:e}}" != {f"{1234.5:e}"!r}:
+		return 3
+	if f"{{0.0001234:e}}" != {f"{0.0001234:e}"!r}:
+		return 4
+	if f"{{-1234.5:.2e}}" != {f"{-1234.5:.2e}"!r}:
+		return 5
+	if f"{{5.0:.0e}}" != {f"{5.0:.0e}"!r}:
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_exponential_sign_and_width( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234.5:+.2e}}" != {f"{1234.5:+.2e}"!r}:
+		return 1
+	if f"{{1234.5:012.2e}}" != {f"{1234.5:012.2e}"!r}:
+		return 2
+	if f"{{-1234.5:012.2e}}" != {f"{-1234.5:012.2e}"!r}:
+		return 3
+	if f"{{1234.5:>15.2e}}" != {f"{1234.5:>15.2e}"!r}:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_general( self ) -> None:
+		# 'g'/'G' - precision means SIGNIFICANT digits here, not fractional
+		# digits like 'f'/'e' (real snprintf handles this distinction
+		# itself), and switches between fixed/exponential notation based on
+		# magnitude, stripping trailing zeros - all exercised against real
+		# Python's own output
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234.5:.3g}}" != {f"{1234.5:.3g}"!r}:
+		return 1
+	if f"{{0.0001234:.3g}}" != {f"{0.0001234:.3g}"!r}:
+		return 2
+	if f"{{1234.5:g}}" != {f"{1234.5:g}"!r}:
+		return 3
+	if f"{{100000.0:g}}" != {f"{100000.0:g}"!r}:
+		return 4
+	if f"{{1000000.0:g}}" != {f"{1000000.0:g}"!r}:
+		return 5
+	if f"{{0.0:.3g}}" != {f"{0.0:.3g}"!r}:
+		return 6
+	if f"{{123.456:.3G}}" != {f"{123.456:.3G}"!r}:
+		return 7
+	if f"{{5.0:.0g}}" != {f"{5.0:.0g}"!r}:
+		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_percent( self ) -> None:
+		# '%' has no printf equivalent - lib/builtins/__float.py's own
+		# _percent_digits scales by 100 and formats as 'f' in metalpy
+		# source, then appends the literal '%' - this is the real end-to-
+		# end proof that scaling + suffix + sign/width assembly all compose
+		# correctly, matching real Python's own f"{x:%}" output
+		self._run( f'''
+def main() -> i32:
+	if f"{{0.1234:.2%}}" != {f"{0.1234:.2%}"!r}:
+		return 1
+	if f"{{0.1234:%}}" != {f"{0.1234:%}"!r}:
+		return 2
+	if f"{{-0.1234:8.2%}}" != {f"{-0.1234:8.2%}"!r}:
+		return 3
+	if f"{{0.1234:8.2%}}" != {f"{0.1234:8.2%}"!r}:
+		return 4
+	if f"{{1.0:%}}" != {f"{1.0:%}"!r}:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_alt_flag( self ) -> None:
+		# '#' (always show the decimal point for 'f'/'F'/'e'/'E', keep
+		# trailing zeros for 'g'/'G') - passed straight through to real
+		# snprintf/msvcrt _snprintf, which already matches Python's own
+		# semantics exactly for every type char, confirmed against real
+		# Python's own output
+		self._run( f'''
+def main() -> i32:
+	if f"{{5.0:#.0f}}" != {f"{5.0:#.0f}"!r}:
+		return 1
+	if f"{{5.0:#f}}" != {f"{5.0:#f}"!r}:
+		return 2
+	if f"{{5.0:#.0e}}" != {f"{5.0:#.0e}"!r}:
+		return 3
+	if f"{{5.0:#g}}" != {f"{5.0:#g}"!r}:
+		return 4
+	if f"{{100000.0:#g}}" != {f"{100000.0:#g}"!r}:
+		return 5
+	if f"{{5.0:#.0%}}" != {f"{5.0:#.0%}"!r}:
+		return 6
+	if f"{{5.0:#.0F}}" != {f"{5.0:#.0F}"!r}:
+		return 7
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_grouping( self ) -> None:
+		# ','/'_' grouping - has no printf equivalent at all (unlike '#'),
+		# so it's a separate post-processing pass (lib/builtins/__float.py's
+		# _group_integer_part) applied to whatever snprintf already
+		# returned, touching only the digits before the first '.' - a
+		# correct no-op for 'e'/'E' and for 'g'/'G' in exponential form
+		# (only ever one digit there), confirmed against real Python
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234567.891:,.2f}}" != {f"{1234567.891:,.2f}"!r}:
+		return 1
+	if f"{{1234567.891:_.2f}}" != {f"{1234567.891:_.2f}"!r}:
+		return 2
+	if f"{{-1234567.891:,.2f}}" != {f"{-1234567.891:,.2f}"!r}:
+		return 3
+	if f"{{1234567.891:,.0f}}" != {f"{1234567.891:,.0f}"!r}:
+		return 4
+	if f"{{1234.5:,e}}" != {f"{1234.5:,e}"!r}:
+		return 5
+	if f"{{1234567.891:,g}}" != {f"{1234567.891:,g}"!r}:
+		return 6
+	if f"{{1234.56:,g}}" != {f"{1234.56:,g}"!r}:
+		return 7
+	if f"{{1234567.891:,.2%}}" != {f"{1234567.891:,.2%}"!r}:
+		return 8
+	if f"{{1234567.891:20,.2f}}" != {f"{1234567.891:20,.2f}"!r}:
+		return 9
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_zero_pad_is_grouping_aware( self ) -> None:
+		# the '0' shorthand COMBINED with grouping (,/_) - same real,
+		# confirmed bug int's own equivalent test documents
+		# (PLAN_STR_FORMAT.md item 4), just for float: only the digits
+		# BEFORE the first '.' (or, for '%', before the trailing '%') are
+		# the groupable "integer part" that gets padded+grouped together -
+		# the fractional digits/exponent/'%' suffix are left untouched and
+		# reappended, confirmed against real Python's own output, which
+		# groups the zero-fill itself just like the plain digits
+		# (f"{1234567.89:018,.2f}" == '000,001,234,567.89')
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234567.89:018,.2f}}" != {f"{1234567.89:018,.2f}"!r}:
+		return 1
+	if f"{{1234567.89:017,.2f}}" != {f"{1234567.89:017,.2f}"!r}:
+		return 2
+	if f"{{-1234567.89:018,.2f}}" != {f"{-1234567.89:018,.2f}"!r}:
+		return 3
+	if f"{{1234567.891:020,e}}" != {f"{1234567.891:020,e}"!r}:
+		return 4
+	if f"{{1234567.891:020,g}}" != {f"{1234567.891:020,g}"!r}:
+		return 5
+	if f"{{1234567.891:015,.2%}}" != {f"{1234567.891:015,.2%}"!r}:
+		return 6
+	if f"{{-1234.5:020,.2%}}" != {f"{-1234.5:020,.2%}"!r}:
+		return 7
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_uppercase_F( self ) -> None:
+		# uppercase 'F' specifically - legacy msvcrt.dll's own _snprintf
+		# silently produces empty output for "%F" (confirmed by a real
+		# test against this system's own msvcrt.dll: unlike 'E'/'G', which
+		# it supports fine, 'F' was only added to printf in C99, after
+		# legacy msvcrt), a real, already-shipped bug this test would have
+		# caught immediately - emitter_c.py's PROLOGUE now substitutes
+		# lowercase 'f' internally on Windows for this one conversion
+		# character, correct for every finite value. inf/nan display
+		# (see test_float_format_spec_inf_nan below) is handled entirely
+		# separately, in metalpy source, before compiler.format_f64 (and
+		# so this 'f'-vs-'F' substitution) is ever reached - Python shows
+		# "inf"/"nan" identically regardless of 'f' vs 'F', so there's no
+		# capitalization difference left to worry about here either
+		self._run( f'''
+def main() -> i32:
+	if f"{{1.0:.1F}}" != {f"{1.0:.1F}"!r}:
+		return 1
+	if f"{{-2.5:8.1F}}" != {f"{-2.5:8.1F}"!r}:
+		return 2
+	if f"{{5.0:#.0F}}" != {f"{5.0:#.0F}"!r}:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_inf_nan( self ) -> None:
+		# a real, confirmed bug (PLAN_STR_FORMAT.md item 4): legacy
+		# msvcrt.dll's own _snprintf produces outright GARBAGE for
+		# infinity ("1.$" for "%.1f" of +inf, confirmed against this
+		# system's own msvcrt.dll - not merely untested, actually wrong).
+		# lib/builtins/__float.py now special-cases NaN/infinity (via the
+		# new compiler.is_nan/is_inf intrinsics) before ever calling
+		# compiler.format_f64 at all, matching real Python: precision/
+		# type_char/alt are all ignored ("inf" regardless of 'f'/'e'/'g'),
+		# but sign/width/zero-pad still apply, and grouping is a no-op
+		# even when requested (no comma ever appears inside "inf")
+		self._run( f'''
+def get_pos_inf() -> f64:
+	with compiler.saturate_arithmetic:
+		big: f64 = 1.0e300
+		return big * big
+
+def get_neg_inf() -> f64:
+	return -get_pos_inf()
+
+def get_nan() -> f64:
+	with compiler.wrap_arithmetic:
+		return get_pos_inf() + get_neg_inf()
+
+def main() -> i32:
+	if f"{{get_pos_inf():.1f}}" != {f"{float('inf'):.1f}"!r}:
+		return 1
+	if f"{{get_neg_inf():.1f}}" != {f"{float('-inf'):.1f}"!r}:
+		return 2
+	if f"{{get_nan():.1f}}" != {f"{float('nan'):.1f}"!r}:
+		return 3
+	if f"{{get_pos_inf():.1e}}" != {f"{float('inf'):.1e}"!r}:
+		return 4
+	if f"{{get_nan():.1g}}" != {f"{float('nan'):.1g}"!r}:
+		return 5
+	if f"{{get_pos_inf():+.1f}}" != {f"{float('inf'):+.1f}"!r}:
+		return 6
+	if f"{{get_pos_inf():08.1f}}" != {f"{float('inf'):08.1f}"!r}:
+		return 7
+	if f"{{get_pos_inf():.1%}}" != {f"{float('inf'):.1%}"!r}:
+		return 8
+	if f"{{get_pos_inf():015,.1f}}" != {f"{float('inf'):015,.1f}"!r}:
+		return 9
+	if f"{{get_neg_inf():015,.1f}}" != {f"{float('-inf'):015,.1f}"!r}:
+		return 10
+	if f"{{get_neg_inf():08.1%}}" != {f"{float('-inf'):08.1%}"!r}:
+		return 11
+	if f"{{get_nan():+.1f}}" != {f"{float('nan'):+.1f}"!r}:
+		return 12
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_none_type_with_precision( self ) -> None:
+		# f"{x:.2}" (a literal spec with a precision but no type char) -
+		# real Python's own "None" presentation type, closer to 'g' than
+		# to plain 'f' (PLAN_STR_FORMAT.md item 4's own note), except
+		# fixed-point results always keep at least one fractional digit
+		# (f"{5.0:.2}" == '5.0', not 'g''s own '5') - confirmed against
+		# real Python. No-precision-no-type (f"{x:10}"/bare f"{x}") still
+		# falls back to plain 'f' - that needs Python's real shortest-
+		# round-trip repr algorithm instead, not implemented yet
+		self._run( f'''
+def main() -> i32:
+	if f"{{5.0:.2}}" != {f"{5.0:.2}"!r}:
+		return 1
+	if f"{{1234.5:.2}}" != {f"{1234.5:.2}"!r}:
+		return 2
+	if f"{{0.0001234:.2}}" != {f"{0.0001234:.2}"!r}:
+		return 3
+	if f"{{1234.5:10.2}}" != {f"{1234.5:10.2}"!r}:
+		return 4
+	if f"{{1234.5:.6}}" != {f"{1234.5:.6}"!r}:
+		return 5
+	if f"{{1234.5:#.2}}" != {f"{1234.5:#.2}"!r}:
+		return 6
+	if f"{{-5.0:.2}}" != {f"{-5.0:.2}"!r}:
+		return 7
+	if f"{{5.0:015,.2}}" != {f"{5.0:015,.2}"!r}:
+		return 8
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

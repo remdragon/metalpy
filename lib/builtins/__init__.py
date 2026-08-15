@@ -5,6 +5,7 @@ import sys
 import threading
 from .__errors import OSError
 from .__fastlist import FastList
+from .__float import _f64_sign_prefix, _f64_fixed_digits
 from .__int import int, IntError
 from .__list import list, UnsafeList
 from .__RawDict import RawDict
@@ -63,18 +64,24 @@ class Result[T,E]:
 	# expression, a named receiver's is at scope exit) - see cfg.py's
 	# rc_leaves()/_refcount_instructions for the matching fix that makes a
 	# Result value's own payload actually get tracked/decref'd at all (a
-	# separate, previously-missing half of this same balance). NOTE: this
-	# declared body is what actually runs for unwrap()/unwrap_or() (real
-	# function calls) - but NOT for or_return(), which is recognized
-	# textually and compiled to raw OrReturn/OrJump IR instead (see
-	# lowering.py's _lower_or_return); or_return's own matching incref lives
-	# in lowering.py's _consume_checked_result, which every or_return() call
+	# separate, previously-missing half of this same balance). This declared
+	# body is what actually runs for unwrap()/unwrap_or() below (real
+	# function calls).
+
+	# or_return() is compiler magic, not a real method - deliberately NOT
+	# declared here (or anywhere: 'or_return' is a reserved name, rejected
+	# outright by discovery.py's _parse_function on ANY class, since a
+	# user-written one could never actually run). `<result_expr>.or_return()`
+	# is recognized purely by its AST shape (lowering.py's _lower_call,
+	# before ordinary call resolution ever runs) and compiled directly to
+	# raw OrReturn/OrJump IR (see _lower_or_return) - equivalent to:
+	#     if self.is_err():
+	#         compiler.early_return( self.data.v_Err )
+	#     ok: T = self.data.v_Ok
+	#     return ok
+	# or_return's own matching incref (see the accessor NOTE above) lives in
+	# lowering.py's _consume_checked_result, which every or_return() call
 	# actually goes through.
-	def or_return( self ) -> T:
-		if self.is_err():
-			compiler.early_return( self.data.v_Err )
-		ok: T = self.data.v_Ok
-		return ok
 
 	def unwrap( self, errmsg: str ) -> T:
 		if self.is_ok():
@@ -887,6 +894,146 @@ class str:
 		with compiler.saturate_arithmetic:
 			inner_width: usize = width - prefix_count
 		return prefix + self.rjust( inner_width, fill )
+
+	@private
+	def _insert_thousands_sep( self, sep: str ) -> str:
+		''' self (a plain, ASCII-only digit string - no sign, no radix/
+		decimal-point punctuation) with `sep` inserted every 3 digits from
+		the right, matching Python's own f"{1234567:,}" == '1,234,567'
+		semantics - the shared grouping algorithm _pad_and_group_after_
+		prefix below needs applied to an already-zero-padded digit string,
+		not just a bare magnitude (int._decimal_digits_with_grouping and
+		float's own _group_integer_part, lib/builtins/__float.py, each
+		still carry their own earlier, narrower inline copy of this same
+		loop shape - written before this method existed - rather than
+		being retrofitted onto it here, to avoid touching already-shipped,
+		tested code for a pure refactor). sep='' reconstructs the original
+		text unchanged (splitting into groups of 3 and joining with
+		nothing is a no-op), so callers never need to special-case "no
+		grouping requested". '''
+		count: usize = self.byte_len() # ASCII-only digit text - byte length is codepoint count here
+		if count <= 3:
+			# self is a BORROWED parameter - returning it directly needs an
+			# explicit incref first, the same "explicit incref after a
+			# borrowing return" pattern str.concat's own comment documents
+			# (a real, confirmed use-after-free was found taking this
+			# shortcut without it elsewhere - see float._group_integer_
+			# part's own comment for the full account).
+			compiler.incref( self )
+			return self
+		groups: list[str] = list[str]() # least-significant GROUP first
+		end: usize = count
+		with compiler.wrap_arithmetic:
+			while end > 3:
+				with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+					start: usize = end - 3
+				groups.append( self._byte_slice( start, end )).unwrap( '_insert_thousands_sep: append failed' )
+				end = start
+			groups.append( self._byte_slice( 0, end )).unwrap( '_insert_thousands_sep: append failed' )
+			group_count: usize = groups.__len__()
+			ordered: list[str] = list[str]() # most-significant GROUP first
+			i: usize = group_count
+			with compiler.panic_arithmetic( 'bounded by group_count, cannot underflow' ):
+				while i > 0:
+					i -= 1
+					ordered.append( groups.__getitem__( i ).unwrap( '_insert_thousands_sep: index in bounds by construction' )).unwrap( '_insert_thousands_sep: append failed' )
+		return sep.join( ordered )
+
+	@private
+	def _pad_and_group_after_prefix( self, prefix: str, width: usize, fill: str, sep: str ) -> str:
+		''' the '0' zero-pad shorthand's own behavior when COMBINED with
+		grouping (,/_), fixing a real bug: self (RAW, UNGROUPED magnitude
+		digits - unlike _pad_after_prefix's own typical caller, which
+		hands it an already-grouped string) is padded on the left with
+		`fill` until, once the WHOLE padded field is grouped with `sep`
+		every 3 digits from the right, it reaches (width - prefix's own
+		codepoint count) - then `prefix` is prepended. Matches real Python:
+		f"{1234567:015,d}" == '000,001,234,567', where the padding zeros
+		themselves pick up their own comma separators too - NOT
+		'0000001,234,567' (raw fill characters prepended in front of an
+		ALREADY-grouped string), which is what pre-grouping self and then
+		calling the plain _pad_after_prefix above would give instead (a
+		real, confirmed bug found in exactly that shape - see
+		PLAN_STR_FORMAT.md item 4's own writeup for the repro). Deliberately
+		saturating/leniently overshooting the nominal width when prefix
+		alone already reaches it, or when no padded digit count lands on
+		an EXACT grouped-width match (grouping separators don't land at
+		every digit count) - same leniency _pad_after_prefix's own comment
+		documents, confirmed against real Python as the oracle for this
+		"overshoots the nominal width" case too, not just the ordinary
+		one. sep='' behaves identically to a plain _pad_after_prefix call
+		(see _insert_thousands_sep's own "no grouping requested"
+		convention) - callers never need to special-case "no grouping". '''
+		prefix_count: usize = prefix.__len__()
+		with compiler.saturate_arithmetic:
+			inner_width: usize = width - prefix_count
+		d: usize = self.__len__()
+		sep_len: usize = sep.__len__()
+		with compiler.wrap_arithmetic:
+			total_count: usize = d
+			while True:
+				grouped_width: usize = total_count
+				if total_count > 0:
+					with compiler.panic_arithmetic( 'bounded by total_count, cannot overflow' ):
+						grouped_width += ( ( total_count - 1 ) // 3 ) * sep_len
+				if grouped_width >= inner_width:
+					break
+				total_count += 1
+		padded: str = self.rjust( total_count, fill )
+		return prefix + padded._insert_thousands_sep( sep )
+
+	@private
+	def _pad_and_group_before_dot( self, prefix: str, width: usize, fill: str, sep: str ) -> str:
+		''' float's own equivalent of _pad_and_group_after_prefix above -
+		self may contain a '.' (and, for 'e'/'E'/'g'/'G' text, an exponent
+		suffix after that); only the portion BEFORE the first '.' is the
+		groupable "integer part" that gets padded+grouped, everything from
+		the '.' onward (fractional digits, any exponent) is left
+		completely untouched and simply reappended - int has no such
+		suffix to protect, hence the separate method rather than one
+		shared shape. width already accounts for the untouched suffix's
+		own length internally (subtracted before delegating to
+		_pad_and_group_after_prefix), so callers pass the SAME nominal
+		width the whole result should reach, same as every other format-
+		spec width parameter in this codebase (callers wanting to reserve
+		room for something this method doesn't know about, like '%'s own
+		trailing literal character, subtract that themselves before
+		calling - see lowering.py's _lower_float_format_spec). '''
+		dot_index: usize = self.byte_len()
+		match self.find( str( '.' )):
+			case Result.Ok( idx ):
+				dot_index = idx
+			case Result.Err( _ ):
+				pass
+		int_part: str = self._byte_slice( 0, dot_index )
+		rest: str = self._byte_slice( dot_index, self.byte_len() )
+		rest_len: usize = rest.__len__()
+		with compiler.saturate_arithmetic:
+			effective_width: usize = width - rest_len
+		return int_part._pad_and_group_after_prefix( prefix, effective_width, fill, sep ) + rest
+
+	@private
+	def _pad_maybe_special( self, prefix: str, width: usize, fill: str, sep: str ) -> str:
+		''' the '0' zero-pad shorthand's own dispatch for float digit text
+		that might be "nan"/"inf" (lib/builtins/__float.py's own _f64_
+		fixed_digits_raw/_f64_percent_digits_raw/_f64_none_type_digits_raw,
+		special-cased there for non-finite values) instead of real digits.
+		Real Python still zero-pads "nan"/"inf" (right-justified with
+		fill, sign-aware - f"{inf:015,.1f}" == '000000000000inf'), but
+		grouping and any '.'-based dot-splitting never apply to them EVEN
+		when requested (no comma ever appears in that padded "inf" - not
+		'000,000,000,inf') - _pad_and_group_before_dot's own grouping-
+		aware machinery would incorrectly try to treat "nan"/"inf" as
+		digits needing exactly that treatment (it has no way to know they
+		aren't), so this checks first and routes to the plain (non-
+		grouping, non-dot-aware) _pad_after_prefix instead when self isn't
+		real digits. Lives here, not in __float.py, despite being float-
+		motivated - self is the receiver float's code needs to dispatch
+		on, and only a real str method (not a Scalar.names-registered free
+		function) can be reached that way. '''
+		if self == str( 'nan' ) or self == str( 'inf' ):
+			return self._pad_after_prefix( prefix, width, fill )
+		return self._pad_and_group_before_dot( prefix, width, fill, sep )
 
 	def zfill( self, width: usize ) -> str:
 		''' like rjust(width, '0'), except a leading '+'/'-' byte stays

@@ -10,7 +10,7 @@ import cfg
 import ir
 from discovery import Discovery, is_stub_body
 from errors import CompileError
-from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec
+from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec, validate_float_spec
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
@@ -1204,6 +1204,34 @@ class FunctionLowering:
 		# by object identity - see _lower_inline_call's own comment).
 		self._inlining_stack: list[int] = []
 		self._inline_binding_id = 0
+		# set (briefly, restored in a finally) only around lowering a
+		# multi-statement @inline body's own PRE-RETURN statements (see
+		# _splice_multi_statement_inline_body) - an .or_return()/checked-
+		# arithmetic early exit reached from one of those statements would
+		# otherwise jump to the CALLER's own real epilogue mid-splice
+		# (self._current_fn is briefly the caller during that window too),
+		# silently skipping the rest of the splice AND the rest of the
+		# caller's own subsequent statements - _consume_checked_result
+		# checks this and fails clearly instead. The trailing return-
+		# expression itself is lowered with this already restored to
+		# False, unaffected - nothing of the splice remains after it to
+		# skip past, so jumping to the caller's own epilogue is correct
+		# there, exactly as it always has been.
+		self._in_inline_splice_prelude = False
+		# parallel to self._cfg's own _inline_scope_stack (cfg.py), pushed/
+		# popped in lockstep by _splice_multi_statement_inline_body - cfg.py's
+		# InlineScope only carries the CFG-level boundary_depth/label; these
+		# are the LOWERING-level artifacts _stmt_Return/_consume_checked_
+		# result need once current_epilogue_label() hands back a splice-local
+		# label: (result_var, exited_flag). result_var is where an early exit
+		# (return/or_return/checked-arithmetic) inside the splice's pre-
+		# return statements stows its value - the splice-local analogue of
+		# self._return_value_var. exited_flag is armed (Assign, Const(True))
+		# right before jumping there, so the ladder's own tail can tell
+		# "early exit vs normal fallthrough" apart and decide whether to
+		# still lower the trailing return-expression - see
+		# _splice_multi_statement_inline_body's own comment
+		self._inline_scope_vars: list[tuple[Variable,Variable]] = []
 
 	def run( self ) -> list[ir.Instruction]:
 		fn = self._current_fn
@@ -1890,14 +1918,33 @@ class FunctionLowering:
 			if is_success:
 				self._complete_construction_or_fail( self._current_fn )
 		label = self._cfg.current_epilogue_label( value )
+		# the innermost active multi-statement @inline splice, if this
+		# return is reached from one of its own pre-return statements (see
+		# _splice_multi_statement_inline_body/self._inline_scope_vars' own
+		# comment) - value-computation/widening above is already correct
+		# unchanged (self._current_fn.return_type is provisional's, i.e.
+		# the INLINED function's own declared type), only the TERMINAL
+		# emission below needs to redirect: into the scope's own result_var
+		# instead of self._return_value_var, arming its exited_flag, and
+		# (inline-unwind branch only) jumping to the scope's own merge_label
+		# instead of emitting a real ir.Return - this early return must
+		# never become the CALLER's own return
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
 		if label is not None:
 			# whatever's still pending (RC decrefs, defer/errdefer replays)
 			# gets unwound once, later, by the shared ladder every other
 			# return reaching this same label also jumps into
 			# (build_epilogue_ladder(), emitted at the function's own
-			# closing brace - see _emit_epilogue) - value has to survive
-			# the jump some other way than a direct ir.Return
-			if self._return_value_var is not None and value is not None:
+			# closing brace - see _emit_epilogue; or, inside a splice, the
+			# scope's own local ladder - see _splice_multi_statement_
+			# inline_body) - value has to survive the jump some other way
+			# than a direct ir.Return
+			if inline_scope is not None:
+				result_var, exited_flag, _merge_label = inline_scope
+				if result_var is not None and value is not None:
+					self._emit( ir.Assign( dest = result_var, src = return_value ))
+				self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = exited_flag.type, value = True )))
+			elif self._return_value_var is not None and value is not None:
 				self._emit( ir.Assign( dest = self._return_value_var, src = return_value ))
 			# value's own ownership (if it's a bare temp - `return
 			# SomeConstructor(...)`, never assigned to a name) just
@@ -1922,18 +1969,31 @@ class FunctionLowering:
 			# either nothing is pending, or `value` IS itself one of the
 			# still-live entries current_epilogue_label() can't route
 			# through a shared label (see its own comment) - unwind inline,
-			# right here, same as always. Still has to replay any pending
+			# right here, same as always (bounded to the splice's own
+			# portion of the stack when inline_scope is set - see cfg.py's
+			# return_() own comment). Still has to replay any pending
 			# defer/errdefer entries itself (return_() does this now too -
 			# they're just as "pending" as an RC decref from here)
 			for instr in self._cfg.return_( value, lambda: self._build_is_err_check( node )):
 				self._emit( instr )
 			# same reasoning as the label-is-not-None branch above - flush
-			# BEFORE this branch's own unconditional ir.Return, not after
+			# BEFORE this branch's own unconditional terminator, not after
 			# (return_() already untracked `value` itself, so this only
 			# ever cleans up OTHER still-pending temps - e.g. an
 			# intermediate argument consumed into constructing `value`)
 			self._flush_pending_temps()
-			self._emit( ir.Return( value = return_value ))
+			if inline_scope is not None:
+				result_var, exited_flag, merge_label = inline_scope
+				if result_var is not None and value is not None:
+					self._emit( ir.Assign( dest = result_var, src = return_value ))
+				self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = exited_flag.type, value = True )))
+				# jumps PAST the scope's own ladder (already replayed
+				# inline, right above - re-entering it via its own label
+				# would replay the same entries a second time) straight to
+				# where the early-exit-vs-normal-fallthrough merge begins
+				self._emit( ir.Jump( target = merge_label ))
+			else:
+				self._emit( ir.Return( value = return_value ))
 
 	def _maybe_widen_return_result( self, node: ast.Return, value: ir.Operand, fn_type: Type ) -> ir.Temp|None:
 		''' `return x` where x is Result[T,NarrowE] and this function is
@@ -2695,6 +2755,67 @@ class FunctionLowering:
 		pointee = self.lowering._atomic_pointee_type( ptr.type, node )
 		dest = self._new_temp( expected_type or pointee )
 		self._emit( ir.AtomicLoad( dest = dest, ptr = ptr ))
+		return dest
+
+	def _lower_compiler_format_f64( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.format_f64(buf, size, precision, type_char, alt, value) ->
+		# i32 - writes value's fixed-precision decimal digits (magnitude
+		# only, no sign - lib/builtins/__float.py's own callers split the
+		# sign out first, the same split int's __str__/_to_radix_digits/
+		# _decimal_digits_with_grouping already keep) into buf[0:size),
+		# returns the byte count written. type_char is a printf-style
+		# conversion character's ASCII code ('f'/'F'/'e'/'E'/'g'/'G' - see
+		# fstring_format_spec.FORMAT_SPEC_TYPE_CHARS; '%' is handled entirely
+		# in metalpy source instead, by scaling the value and formatting as
+		# 'f' - see lib/builtins/__float.py's _percent_digits). alt is the
+		# '#' flag (always show the decimal point for 'f'/'F'/'e'/'E', keep
+		# trailing zeros for 'g'/'G' - real snprintf's own '#' flag already
+		# matches Python's semantics for every one of these exactly, so it's
+		# passed straight through rather than needing its own post-
+		# processing the way grouping does). Backed by a hand-written C
+		# helper in emitter_c.py's PROLOGUE (real snprintf/msvcrt _snprintf,
+		# called there with its true variadic prototype) - deliberately NOT
+		# an ordinary @extern binding: emitter_c.py's extern codegen only
+		# ever emits fixed-arity C prototypes, which is an ABI hazard for a
+		# genuinely variadic callee, and tagging this under the 'c' extern
+		# lib would flip compiler.extern_libs and break the no-crt Windows
+		# build (float_test.py's own no_crt = 'c' not in compiler.
+		# extern_libs).
+		if len( node.args ) != 6 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.format_f64(...) takes exactly 6 arguments (buf, size, precision, type_char, alt, value): {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		ptr_cls = intrinsics['Ptr']
+		buf_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ intrinsics['u8'] ] )
+		buf = self._lower_expr( node.args[0], buf_type )
+		size = self._lower_expr( node.args[1], intrinsics['usize'] )
+		precision = self._lower_expr( node.args[2], intrinsics['i32'] )
+		type_char = self._lower_expr( node.args[3], intrinsics['i32'] )
+		alt = self._lower_expr( node.args[4], intrinsics['bool'] )
+		value = self._lower_expr( node.args[5], intrinsics['f64'] )
+		dest = self._new_temp( expected_type or intrinsics['i32'] )
+		self._emit( ir.FormatFloat( dest = dest, buf = buf, size = size, precision = precision, type_char = type_char, alt = alt, value = value ))
+		return dest
+
+	def _lower_compiler_is_nan_or_inf( self, node: ast.Call, expected_type: Type|None, name: str ) -> ir.Operand:
+		# compiler.is_nan(x)/compiler.is_inf(x) - x: f32|f64 -> bool. Reuses
+		# __metalpy_isnan/__metalpy_isinf (emitter_c.py's PROLOGUE, already
+		# there for checked/panic-mode float arithmetic) - exposed directly
+		# so f-string format specs can special-case inf/nan display
+		# (lib/builtins/__float.py), since real snprintf/msvcrt don't
+		# reliably produce "inf"/"nan" text for these themselves (confirmed:
+		# legacy msvcrt's own _snprintf gives outright garbage like "1.$"
+		# for +infinity, not "inf" - unlike the exponent-padding/missing-'F'
+		# quirks found earlier, this one isn't even close to right).
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{name}(...) takes exactly one argument: {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		value = self._lower_expr( node.args[0], None )
+		if value.type is not intrinsics.get( 'f32' ) and value.type is not intrinsics.get( 'f64' ):
+			type_name = value.type.qualname if value.type is not None else '?'
+			self.lowering.discovery.fail( f'compiler.{name}(...) argument must be f32 or f64, not {type_name}: {ast.unparse(node)}', node )
+		dest = self._new_temp( expected_type or intrinsics['bool'] )
+		ir_cls = ir.IsNan if name == 'is_nan' else ir.IsInf
+		self._emit( ir_cls( dest = dest, value = value ))
 		return dest
 
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
@@ -4249,7 +4370,24 @@ class FunctionLowering:
 		for p in ( method.parameters or [] ):
 			self.lowering.schedule( p.type )
 		dest = self._new_temp( result_type )
-		self._emit( ir.Call( dest = dest, target = method, receiver = receiver, args = args, kwargs = {} ))
+		if method.cls is None:
+			# a Scalar-registered method (`SomeScalar.method = some_free_
+			# function` - discovery.py's visit_Assign, e.g. this file's own
+			# float format-spec dispatch onto f64._sign_prefix/_fixed_digits,
+			# lib/builtins/__float.py) is a genuine free Function, unlike a
+			# real CStruct/RCClass method - discovery never strips a "self"
+			# off its .parameters the way _make_function_resolver does for
+			# an actual class body (there IS no class body here), so
+			# emitter_c.py's _emit_call_args (which walks target.parameters
+			# assuming it already excludes the receiver) would double-count
+			# the receiver against the first declared parameter otherwise -
+			# confirmed by a real KeyError crash while wiring this up.
+			# ir.Call's own receiver field is for real bound-method calls
+			# only; a free function just takes the receiver as an ordinary
+			# leading positional argument instead.
+			self._emit( ir.Call( dest = dest, target = method, receiver = None, args = [ receiver ] + args, kwargs = {} ))
+		else:
+			self._emit( ir.Call( dest = dest, target = method, receiver = receiver, args = args, kwargs = {} ))
 		return dest
 
 	def _const_usize( self, value: int ) -> ir.Const:
@@ -4342,6 +4480,9 @@ class FunctionLowering:
 		int_type = self.lowering.discovery.find_name_or_none( 'int' )
 		if int_type is not None and operand.type is int_type:
 			return self._lower_int_format_spec( operand, spec, str_type, node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		if operand.type is intrinsics.get( 'f32' ) or operand.type is intrinsics.get( 'f64' ):
+			return self._lower_float_format_spec( operand, spec, str_type, node )
 		type_name = operand.type.qualname if operand.type is not None else '?'
 		if spec.type in ( 'f', 'F', 'e', 'E', 'g', 'G', '%' ):
 			self.lowering.discovery.fail(
@@ -4349,7 +4490,7 @@ class FunctionLowering:
 				node,
 			)
 		self.lowering.discovery.fail(
-			f'f-string format spec: {type_name} does not support format specs yet (only str and int do): {ast.unparse(node)}',
+			f'f-string format spec: {type_name} does not support format specs yet (only str, int, and float do): {ast.unparse(node)}',
 			node,
 		)
 
@@ -4383,12 +4524,14 @@ class FunctionLowering:
 		if type_char in ( 'b', 'o', 'x', 'X' ):
 			base = self._RADIX_BY_TYPE_CHAR[type_char]
 			uppercase = type_char == 'X'
-			digits = self._lower_method_call( operand, '_to_radix_digits', [ self._const_i32( base ), self._const_bool( uppercase ) ], str_type, node )
+			raw_digits = self._lower_method_call( operand, '_to_radix_digits', [ self._const_i32( base ), self._const_bool( uppercase ) ], str_type, node )
 			prefix_text = self._RADIX_PREFIX_BY_TYPE_CHAR[type_char] if spec.alt else ''
+			sep_text = '' # grouping is never valid for a radix type char (validate_int_spec)
 		else:
-			sep = spec.grouping or '' # '' still goes through _decimal_digits_with_grouping correctly - splitting into groups of 3 and joining with nothing reconstructs the plain digit text unchanged
-			digits = self._lower_method_call( operand, '_decimal_digits_with_grouping', [ ir.Const( type = str_type, value = sep ) ], str_type, node )
+			raw_digits = self._lower_method_call( operand, '_decimal_digits', [], str_type, node )
 			prefix_text = ''
+			sep_text = spec.grouping or ''
+		sep = ir.Const( type = str_type, value = sep_text ) # '' still groups correctly - see str._insert_thousands_sep's own comment
 
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
 		if prefix_text:
@@ -4396,11 +4539,96 @@ class FunctionLowering:
 		else:
 			sign_and_prefix = sign_char
 
+		if spec.width is not None and spec.align == '=':
+			# the '0' shorthand - zero-padding goes BETWEEN sign/prefix and
+			# digits, grouping-aware (str._pad_and_group_after_prefix - a
+			# plain "group first, then _pad_after_prefix" two-step gives
+			# the wrong answer once grouping is combined with zero-pad, see
+			# its own comment) - needs the RAW, ungrouped digits, not the
+			# _insert_thousands_sep'd ones the other two branches below want
+			return self._lower_method_call(
+				raw_digits, '_pad_and_group_after_prefix',
+				[ sign_and_prefix, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ), sep ],
+				str_type, node,
+			)
+		digits = self._lower_method_call( raw_digits, '_insert_thousands_sep', [ sep ], str_type, node )
 		if spec.width is None:
 			return self._lower_str_add( sign_and_prefix, digits, str_type, node )
-		if spec.align == '=': # the '0' shorthand - zero-padding goes BETWEEN sign/prefix and digits
-			return self._lower_method_call( digits, '_pad_after_prefix', [ sign_and_prefix, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ) ], str_type, node )
 		body = self._lower_str_add( sign_and_prefix, digits, str_type, node )
+		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
+
+	def _lower_float_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
+		# 'f'/'F'/'e'/'E'/'g'/'G'/'%' (PLAN_STR_FORMAT.md item 4 - every
+		# float type char fstring_format_spec.FORMAT_SPEC_TYPE_CHARS
+		# recognizes). Same sign+digits+pad assembly shape as
+		# _lower_int_format_spec above (no radix/grouping prefix to worry
+		# about here, so it's simpler), calling into lib/builtins/
+		# __float.py's own _sign_prefix/_fixed_digits/_percent_digits
+		# methods - real control flow lives there, not hand-built IR here,
+		# matching int's own _sign_prefix/_to_radix_digits split.
+		try:
+			validate_float_spec( spec )
+		except FormatSpecError as e:
+			self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
+		precision = spec.precision if spec.precision is not None else 6 # Python's own f"{x:f}"/f"{x:e}"/f"{x:g}"/f"{x:%}" all share this default
+		alt = self._const_bool( spec.alt )
+		sep = ir.Const( type = str_type, value = spec.grouping or '' ) # '' still groups correctly - see str._insert_thousands_sep's own comment
+		is_percent = spec.type == '%'
+		# None type char WITH an explicit precision behaves like 'g' (plus
+		# its own "always show a fractional digit in fixed form" tweak) -
+		# real Python's own "None" presentation, not plain 'f' (see
+		# validate_float_spec's own comment and lib/builtins/__float.py's
+		# _none_type_digits_raw). None type char with NO precision would
+		# need Python's real shortest-round-trip repr algorithm instead -
+		# not implemented (PLAN_STR_FORMAT.md item 4's own note), so that
+		# specific combination still falls back to plain 'f' below,
+		# unchanged from before.
+		is_none_type_with_precision = spec.type is None and spec.precision is not None and not is_percent
+		type_char = self._const_i32( ord( spec.type or 'f' ) ) if not is_percent and not is_none_type_with_precision else None
+		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
+
+		if is_percent:
+			digits_method, digits_args = '_percent_digits', [ self._const_usize( precision ), alt ]
+		elif is_none_type_with_precision:
+			digits_method, digits_args = '_none_type_digits', [ self._const_usize( precision ), alt ]
+		else:
+			digits_method, digits_args = '_fixed_digits', [ self._const_usize( precision ), type_char, alt ]
+
+		if spec.width is not None and spec.align == '=':
+			# the '0' shorthand - zero-padding goes BETWEEN sign and
+			# digits, grouping-aware AND special-value-aware (str._pad_
+			# maybe_special - a plain "group first, then _pad_after_prefix"
+			# two-step gives the wrong answer once grouping is combined
+			# with zero-pad, and "nan"/"inf" text needs to skip grouping
+			# entirely even when requested - see str._pad_and_group_after_
+			# prefix's own comment and _pad_maybe_special's own comment) -
+			# needs the RAW, ungrouped digits (the '_raw' variant of
+			# whichever digits_method was picked above), not the already-
+			# grouped ones the other branch below wants
+			raw = self._lower_method_call( operand, digits_method + '_raw', digits_args, str_type, node )
+			if is_percent:
+				# str._pad_maybe_special has no notion of '%' - reserve 1
+				# char of the nominal width for it here, then append it
+				# after, the same "caller reserves room for what this
+				# method doesn't know about" convention _pad_and_group_
+				# before_dot's own comment documents
+				inner_width = max( spec.width - 1, 0 )
+				padded = self._lower_method_call(
+					raw, '_pad_maybe_special',
+					[ sign_char, self._const_usize( inner_width ), ir.Const( type = str_type, value = spec.fill ), sep ],
+					str_type, node,
+				)
+				return self._lower_str_add( padded, ir.Const( type = str_type, value = '%' ), str_type, node )
+			return self._lower_method_call(
+				raw, '_pad_maybe_special',
+				[ sign_char, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ), sep ],
+				str_type, node,
+			)
+
+		digits = self._lower_method_call( operand, digits_method, digits_args + [ sep ], str_type, node )
+		if spec.width is None:
+			return self._lower_str_add( sign_char, digits, str_type, node )
+		body = self._lower_str_add( sign_char, digits, str_type, node )
 		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
 
 	def _lower_str_add( self, left: ir.Operand, right: ir.Operand, str_type: Type, node: ast.AST ) -> ir.Operand:
@@ -5195,6 +5423,38 @@ class FunctionLowering:
 		# check_dest is sometimes a real, named Variable (or_return()'s own
 		# receiver) and sometimes a bare Temp (checked arithmetic, __len__/
 		# __getitem__'s auto-unwrap) - isinstance covers both uniformly
+		# the innermost active multi-statement @inline splice, if this
+		# early-exit-shaped construct (.or_return(), checked arithmetic
+		# under the default Check mode, or the __len__/__getitem__ auto-
+		# consume path) is reached from one of a spliced body's own pre-
+		# return statements (self._current_fn is briefly the caller during
+		# this window too - see _splice_multi_statement_inline_body's own
+		# comment). Left unredirected, the OrReturn/OrJump path below would
+		# jump to/return from the CALLER's own real epilogue - a real
+		# correctness bug (silently skipping the rest of THIS splice AND
+		# the caller's own subsequent statements), not just an unsupported
+		# case - so both branches below stow into the SPLICE's own result
+		# var/exited flag instead of self._return_value_var/a real return
+		# whenever this is set. The trailing return-EXPRESSION itself is
+		# lowered with this restored to None first, so it's unaffected -
+		# nothing of the splice remains after it to skip past there, so
+		# jumping to the caller's own epilogue is already correct, exactly
+		# as the single-statement case already relies on
+		if self._in_inline_splice_prelude and not self._inline_scope_vars:
+			# PLAN_RETURN_INFERENCE.md's own @inline variant reached here
+			# with target.return_type still the "infer it" sentinel (see
+			# _splice_multi_statement_inline_body's own top-of-function
+			# comment) - no inline scope exists to redirect into (result_
+			# var's type isn't known yet, by construction), so this narrow
+			# combination stays rejected, exactly as the single, blanket
+			# guard this method used to have always rejected every
+			# multi-statement splice's own pre-return statements
+			self.lowering.discovery.fail(
+				f'@inline: .or_return()/checked arithmetic that could propagate an error is not yet supported before the '
+				f'final return of a multi-statement body whose own return type is still being inferred: {ast.unparse(node)}',
+				node,
+			)
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
 			if isinstance( check_dest, Variable ):
@@ -5225,7 +5485,11 @@ class FunctionLowering:
 			tracked_operand = check_dest if isinstance( check_dest, Variable ) else None
 			label = self._cfg.current_epilogue_label( tracked_operand )
 			if label is not None:
-				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
+				if inline_scope is not None:
+					result_var, exited_flag, _merge_label = inline_scope
+					self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = result_var, exited_flag = exited_flag ))
+				else:
+					self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
 			else:
 				# either check_dest's own entry needed excluding (the bug above),
 				# or (matching _stmt_Return's own inline path for the identical
@@ -5240,7 +5504,10 @@ class FunctionLowering:
 				# actual conditional replay logic) is embedded below, to run
 				# strictly inside the Err branch
 				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
-				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
+				if inline_scope is not None:
+					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay, inline_exit = inline_scope ))
+				else:
+					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
 		else:
 			panic_fn = self.lowering._type_resolver._resolve_sys_function( 'panic' )
 			self.lowering.schedule( panic_fn )
@@ -6360,16 +6627,16 @@ class FunctionLowering:
 		return args, kwargs
 
 	def _lower_inline_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
-		# PLAN_INLINE.md - target.is_inline: splice target's own single
-		# `return <expr>` body directly here instead of ever emitting a
-		# real ir.Call. `args`/`kwargs` are already-lowered operands (the
-		# caller already ran _lower_call_args, or the interleaved generic
-		# lower_and_unify - same move-hook/argument-lowering either way,
-		# only the tail differs). target may be a plain Function, OR an
-		# already-monomorphized one (target.node was deep-copied per
-		# Specialization by monomorphize.py - see its own docstring), so
-		# target.node.body is always safe to read directly here regardless
-		# of which caller reached this
+		# PLAN_INLINE.md, generalized for multi-statement bodies - target.
+		# is_inline: splice target's own body directly here instead of
+		# ever emitting a real ir.Call. `args`/`kwargs` are already-lowered
+		# operands (the caller already ran _lower_call_args, or the
+		# interleaved generic lower_and_unify - same move-hook/argument-
+		# lowering either way, only the tail differs). target may be a
+		# plain Function, OR an already-monomorphized one (target.node was
+		# deep-copied per Specialization by monomorphize.py - see its own
+		# docstring), so target.node.body is always safe to read directly
+		# here regardless of which caller reached this
 		if id( target ) in self._inlining_stack:
 			self.lowering.discovery.fail(
 				f'@inline {target.qualname}: recursive inlining (directly or through another @inline function) is not supported: {ast.unparse(node)}',
@@ -6378,61 +6645,201 @@ class FunctionLowering:
 		if not want_result and cfg.is_result_type( target.return_type ):
 			# same discard check the ordinary call tails already apply -
 			# discovery.py's _is_inline_eligible_body already guarantees
-			# target.node.body is exactly one `return <expr>`, so this can't
-			# be sidestepped by inlining instead of calling for real
+			# target.node.body ends in exactly one `return <expr>`, so this
+			# can't be sidestepped by inlining instead of calling for real
 			self.lowering.discovery.fail(
 				f'{target.qualname}(...) returns a Result that is discarded here - '
 				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
 				node,
 			)
+		stmts = target.node.body
+		if stmts and isinstance( stmts[0], ast.Expr ) and isinstance( stmts[0].value, ast.Constant ) and isinstance( stmts[0].value.value, str ):
+			stmts = stmts[1:] # strip a leading docstring, same shape discovery.py's _is_inline_eligible_body already validated
+		# the reentrancy guard wraps the WHOLE call - both branches below,
+		# not just the single-expression case's own return-expression -
+		# so a recursive @inline call reached from a pre-return statement
+		# in the multi-statement path is caught identically
+		self._inlining_stack.append( id( target ))
+		try:
+			if len( stmts ) > 1:
+				return self._splice_multi_statement_inline_body( node, target, receiver, args, kwargs, expected_type, want_result, stmts )
+
+			bindings: dict[str,ir.Operand] = {} if receiver is None else { 'self': receiver }
+			for i, param in enumerate( target.parameters or [] ):
+				bindings[param.stem] = args[i] if i < len( args ) else kwargs[param.stem]
+
+			# each binding becomes a REAL local Variable, registered under its
+			# ordinary name ('self', a parameter's own stem) directly into
+			# target.names - not just an _expr_Name-level shortcut - because
+			# discovery.find_name is reached from more than one place while
+			# lowering a Call (e.g. _try_resolve_namespace, used by the
+			# construction-call recognizers to probe whether `self.foo(...)`
+			# might be construction sugar, BEFORE ordinary attribute/method
+			# resolution ever runs) - anything less than a real registry entry
+			# left those other paths seeing an unresolved 'self'/param name
+			# (confirmed by a real repro, not just reasoning: self.__len__()
+			# inside an inlined body failed exactly this way, from inside a
+			# construction-sugar probe, not from _expr_Name at all).
+			#
+			# the Variable's own .stem (what emitter_c.py actually declares as
+			# a C local, keyed by NAME not by object identity - see its own
+			# "declared" set) is deliberately NOT 'self'/the parameter's own
+			# stem - reusing those would silently collide with and overwrite
+			# the ENCLOSING function's own real `self`/parameter of the same
+			# name the moment one method's @inline body gets spliced into
+			# another method's own body. _inline_binding_id makes every
+			# splice's own bindings unique instead.
+			#
+			# no _cfg_assign/incref here, deliberately - this must behave
+			# exactly like an ordinary (non-@move) function parameter already
+			# does at a REAL call boundary: borrowed, no incref at the
+			# boundary, no independent decref responsibility (the caller's own
+			# argument operand keeps whatever cleanup it already had, e.g. an
+			# argument Temp's own DeleteTemp - untouched by any of this). A
+			# bare ir.Assign against a fresh Variable is exactly that: a named
+			# alias for the call's own duration, nothing more.
+			#
+			# when the operand is ALREADY a Variable (by far the common case -
+			# a bare-name receiver/argument, e.g. b.get_len()/some_result.
+			# is_ok()), it's registered directly, no fresh copy and no Assign
+			# at all - true zero overhead, and what makes the "compiles
+			# identically to writing the callee's body directly at the call
+			# site" guarantee exact, not just "close". Only a genuinely
+			# computed operand (a Temp from a sub-expression like make_box().
+			# get_len(), or a Const) needs the synthesized-local fallback -
+			# both to give it a referenceable name at all (Temp/Const aren't
+			# Name subtypes, discovery.find_name's registry requires one - see
+			# above) and to guarantee it's evaluated exactly once even if the
+			# spliced body references self/that parameter more than once
+			saved: dict[str,object] = {}
+			for stem, operand in bindings.items():
+				if isinstance( operand, Variable ):
+					fresh = operand
+				else:
+					fresh = Variable(
+						stem = f'$inline{self._inline_binding_id}${stem}',
+						qualname = f'{target.qualname}$$inline{self._inline_binding_id}${stem}',
+						file = target.file, line = target.line,
+						type = operand.type,
+					)
+					self._inline_binding_id += 1
+					self._emit( ir.Assign( dest = fresh, src = operand ))
+				saved[stem] = target.names.get( stem )
+				target.names[stem] = fresh
+
+			return_expr = stmts[-1].value
+			module = self.lowering._find_module_for( target )
+			try:
+				with self.lowering.discovery.module_context( module ):
+					with self.lowering.discovery.scope_context( target ):
+						result = self._lower_expr( return_expr, expected_type or target.return_type )
+			finally:
+				for stem, old in saved.items():
+					if old is None:
+						target.names.pop( stem, None )
+					else:
+						target.names[stem] = old
+			return result if want_result else None
+		finally:
+			self._inlining_stack.pop()
+
+	def _splice_multi_statement_inline_body( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, stmts: list[ast.stmt] ) -> ir.Operand|None:
+		# PLAN_INLINE.md multi-statement generalization - target's own
+		# body (already docstring-stripped by _lower_inline_call, the only
+		# caller) has more than the single `return <expr>` statement the
+		# original @inline design handled. discovery.py's _is_inline_
+		# eligible_body already guarantees `stmts` ends in exactly one,
+		# un-nested `return <expr>`, no other Return anywhere else in it,
+		# no defer/errdefer, and no reassignment of self/a parameter
+		# anywhere among the pre-return statements - this method doesn't
+		# re-check any of that. The reentrancy guard was already pushed by
+		# _lower_inline_call, covering this whole splice.
 		bindings: dict[str,ir.Operand] = {} if receiver is None else { 'self': receiver }
 		for i, param in enumerate( target.parameters or [] ):
 			bindings[param.stem] = args[i] if i < len( args ) else kwargs[param.stem]
 
-		# each binding becomes a REAL local Variable, registered under its
-		# ordinary name ('self', a parameter's own stem) directly into
-		# target.names - not just an _expr_Name-level shortcut - because
-		# discovery.find_name is reached from more than one place while
-		# lowering a Call (e.g. _try_resolve_namespace, used by the
-		# construction-call recognizers to probe whether `self.foo(...)`
-		# might be construction sugar, BEFORE ordinary attribute/method
-		# resolution ever runs) - anything less than a real registry entry
-		# left those other paths seeing an unresolved 'self'/param name
-		# (confirmed by a real repro, not just reasoning: self.__len__()
-		# inside an inlined body failed exactly this way, from inside a
-		# construction-sugar probe, not from _expr_Name at all).
-		#
-		# the Variable's own .stem (what emitter_c.py actually declares as
-		# a C local, keyed by NAME not by object identity - see its own
-		# "declared" set) is deliberately NOT 'self'/the parameter's own
-		# stem - reusing those would silently collide with and overwrite
-		# the ENCLOSING function's own real `self`/parameter of the same
-		# name the moment one method's @inline body gets spliced into
-		# another method's own body. _inline_binding_id makes every
-		# splice's own bindings unique instead.
-		#
-		# no _cfg_assign/incref here, deliberately - this must behave
-		# exactly like an ordinary (non-@move) function parameter already
-		# does at a REAL call boundary: borrowed, no incref at the
-		# boundary, no independent decref responsibility (the caller's own
-		# argument operand keeps whatever cleanup it already had, e.g. an
-		# argument Temp's own DeleteTemp - untouched by any of this). A
-		# bare ir.Assign against a fresh Variable is exactly that: a named
-		# alias for the call's own duration, nothing more.
-		#
-		# when the operand is ALREADY a Variable (by far the common case -
-		# a bare-name receiver/argument, e.g. b.get_len()/some_result.
-		# is_ok()), it's registered directly, no fresh copy and no Assign
-		# at all - true zero overhead, and what makes the "compiles
-		# identically to writing the callee's body directly at the call
-		# site" guarantee exact, not just "close". Only a genuinely
-		# computed operand (a Temp from a sub-expression like make_box().
-		# get_len(), or a Const) needs the synthesized-local fallback -
-		# both to give it a referenceable name at all (Temp/Const aren't
-		# Name subtypes, discovery.find_name's registry requires one - see
-		# above) and to guarantee it's evaluated exactly once even if the
-		# spliced body references self/that parameter more than once
-		saved: dict[str,object] = {}
+		# a fresh, per-call-site provisional Function - independent deep-
+		# copied .node, independent .names dict, never touching `target`
+		# itself (unlike the single-statement path's target.names
+		# monkeypatch above - no save/restore needed anywhere in this
+		# path, provisional is single-use, discarded once this call
+		# returns). type_params=[]/args=[] is a no-op substitution: target
+		# is already type-parameter-free by the time it reaches here
+		# regardless of whether it was originally generic (monomorphize.py
+		# already did that substitution before _lower_inline_call was ever
+		# reached - see PLAN_RETURN_INFERENCE.md/monomorphize_function)
+		provisional = self.lowering._monomorphizer._build_monomorphized_function( target, [], [], target.qualname )
+
+		# run BEFORE alpha-renaming: match-statement desugaring (rewrite 2
+		# - there is no _stmt_Match anywhere in this file, so a match
+		# statement in a spliced body can only ever lower after this runs)
+		# needs to see the ORIGINAL names (the alpha-renamer below only
+		# understands plain ast.Name, never match-pattern capture shapes);
+		# generic-call tagging (rewrite 3) is genuinely per-copy already -
+		# needed for a nested generic call inside the pre-return
+		# statements to resolve against THIS call site's own bindings, not
+		# some other call site's
+		self.lowering._type_resolver.resolve_function_body( provisional )
+
+		provisional_stmts = provisional.node.body
+		if provisional_stmts and isinstance( provisional_stmts[0], ast.Expr ) and isinstance( provisional_stmts[0].value, ast.Constant ) and isinstance( provisional_stmts[0].value.value, str ):
+			provisional_stmts = provisional_stmts[1:]
+		pre_return_stmts = provisional_stmts[:-1]
+		return_stmt = provisional_stmts[-1]
+
+		# alpha-rename every local the pre-return statements themselves
+		# declare (a Store-context Name that isn't already self/a
+		# parameter - those are bound via the names-dict substitution
+		# below instead, never renamed here, since that mechanism still
+		# keys off the literal original name) to a fresh, globally-unique
+		# name, reusing the same $inline{id}$stem convention self/param
+		# bindings already use (so the two can never collide). No
+		# shadowing subtlety needed: this language has no block scoping
+		# (cfg.py's own docstring: "structural, not a reference scan"),
+		# and a nested def/lambda's own free variables are already
+		# rejected elsewhere (PLAN_LAMBDA.md) - a flat, uniform rename
+		# across every occurrence, Store and Load alike, is exactly
+		# correct here, not an approximation. In-place mutation of ast.
+		# Name.id suffices (no NodeTransformer needed) since provisional.
+		# node is already a private, freshly-deep-copied-per-call-site
+		# object - this only ever changes a string field, never
+		# restructures the tree
+		fl = self
+		rename_map: dict[str,str] = {}
+		class _LocalCollector( ast.NodeVisitor ):
+			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+				pass
+			def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+				pass
+			def visit_Lambda( self, lam: ast.Lambda ) -> None:
+				pass
+			def visit_Name( self, n: ast.Name ) -> None:
+				if isinstance( n.ctx, ast.Store ) and n.id not in bindings and n.id not in rename_map:
+					rename_map[n.id] = f'$inline{fl._inline_binding_id}${n.id}'
+					fl._inline_binding_id += 1
+		collector = _LocalCollector()
+		for stmt in pre_return_stmts:
+			collector.visit( stmt )
+
+		if rename_map:
+			class _LocalRenamer( ast.NodeVisitor ):
+				def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+					pass
+				def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+					pass
+				def visit_Lambda( self, lam: ast.Lambda ) -> None:
+					pass
+				def visit_Name( self, n: ast.Name ) -> None:
+					if n.id in rename_map:
+						n.id = rename_map[n.id]
+			renamer = _LocalRenamer()
+			for stmt in pre_return_stmts:
+				renamer.visit( stmt )
+			renamer.visit( return_stmt ) # a later pre-return statement, or the return-expression itself, may reference an earlier pre-return-declared local
+
+		# bind self/params into the PROVISIONAL's own names dict - same
+		# logic the single-statement path above uses for target.names,
+		# just no save/restore needed (provisional is single-use)
 		for stem, operand in bindings.items():
 			if isinstance( operand, Variable ):
 				fresh = operand
@@ -6445,27 +6852,191 @@ class FunctionLowering:
 				)
 				self._inline_binding_id += 1
 				self._emit( ir.Assign( dest = fresh, src = operand ))
-			saved[stem] = target.names.get( stem )
-			target.names[stem] = fresh
+			provisional.names[stem] = fresh
 
-		# discovery.py's _is_inline_eligible_body already guaranteed
-		# target.node.body is exactly one `return <expr>`, optionally
-		# preceded by a docstring - the Return is always the LAST statement
-		# either way, so no need to re-strip the docstring here
-		return_expr = target.node.body[-1].value
+		# early/nested-return + defer/errdefer/.or_return() generalization -
+		# a splice-local "epilogue" scope for the pre-return statements: an
+		# early return, or a .or_return()/checked-arithmetic early exit,
+		# reached from one of them must never jump into/return from the
+		# CALLER's own real epilogue - it needs its OWN local landing point.
+		# result_var carries whichever value flowed through an early exit
+		# (the splice-local analogue of self._return_value_var); exited_flag
+		# (armed alongside it, same mechanism defer/errdefer's own flags
+		# use) lets the tail below tell "early exit vs normal fallthrough"
+		# apart once everything converges - see cfg.py's push_inline_scope()
+		# and current_epilogue_label()/return_()'s own comments for the CFG
+		# half of this, and ir.OrReturn.inline_exit/ir.OrJump.exited_flag
+		# for how or_return()/checked-arithmetic feed into it
+		# PLAN_RETURN_INFERENCE.md's own @inline variant (_infer_return_
+		# only_type_params_inline) reaches here with target.return_type set
+		# to Python None as a DELIBERATE SENTINEL (not none_type - the real
+		# NoneType class), specifically so the trailing return-expression's
+		# own _lower_expr(..., None) call can take its own natural type,
+		# later read back via result.type to discover R. None of the new
+		# early-exit machinery below can run in that state - result_var/
+		# result would need a REAL type up front, which is exactly the one
+		# thing not known yet. This is safe to skip entirely rather than
+		# work around: _is_eager_return_inferable_body (the ONLY gate that
+		# lets return-only inference even be attempted) already requires
+		# EXACTLY ONE reachable return, so a body reaching here with this
+		# sentinel can never have an early return to support in the first
+		# place - only .or_return()/checked-arithmetic in a pre-return
+		# statement remains a real (if narrow) hazard, still explicitly
+		# rejected below, exactly as the single, blanket guard this
+		# replaces always did for every multi-statement splice
+		none_type = self.lowering.discovery.get_none_type()
+		noreturn_type = self.lowering.discovery.get_intrinsics()['NoReturn']
+		supports_early_exit = target.return_type is not None
+		result_var: Variable|None = None
+		exited_flag: Variable|None = None
+		merge_label: str|None = None
+		bool_cls: Type|None = None
+		if supports_early_exit:
+			result_var = (
+				Variable(
+					stem = f'$inline{self._inline_binding_id}$result', qualname = f'{target.qualname}$$inline{self._inline_binding_id}$result',
+					file = target.file, line = target.line, type = target.return_type,
+				)
+				if target.return_type not in ( none_type, noreturn_type )
+				else None
+			)
+			bool_cls = self.lowering.discovery.find_name( 'bool', node )
+			exited_flag = Variable(
+				stem = f'$inline{self._inline_binding_id}$exited', qualname = f'{target.qualname}$$inline{self._inline_binding_id}$exited',
+				file = target.file, line = target.line, type = bool_cls,
+			)
+			self._inline_binding_id += 1
+			merge_label = self._new_label( 'inline_merge' )
+
 		module = self.lowering._find_module_for( target )
-		self._inlining_stack.append( id( target ))
-		try:
-			with self.lowering.discovery.module_context( module ):
-				with self.lowering.discovery.scope_context( target ):
-					result = self._lower_expr( return_expr, expected_type or target.return_type )
-		finally:
-			self._inlining_stack.pop()
-			for stem, old in saved.items():
-				if old is None:
-					target.names.pop( stem, None )
-				else:
-					target.names[stem] = old
+		with self.lowering.discovery.module_context( module ):
+			with self.lowering.discovery.scope_context( provisional ):
+				# the ONE place self._current_fn is ever reassigned in this
+				# file - narrowly scoped to this window, restored in a
+				# finally. Needed because _stmt_AnnAssign/_stmt_Assign's
+				# fresh-declaration branch registers a new local into
+				# self._current_fn (see their own code) while their
+				# "already exists?" check instead goes through discovery.
+				# find_name_or_none (walking discovery.scope_stack, which
+				# module_context/scope_context above already point at
+				# `provisional`) - without this reassignment those two
+				# would disagree: a pre-return local would silently
+				# register into the CALLER's own namespace (self._current_
+				# fn, unless reassigned, stays whatever the caller's own
+				# top-level function is - confirmed by grep, it's assigned
+				# exactly once, in __init__, and never touched anywhere
+				# else in this file), corrupting any later caller-side
+				# reference to a same-named local; and reassigning that
+				# same pre-return local a second time within the SAME
+				# spliced body would fail to find its own first
+				# registration, creating a second, independent binding
+				# instead of a replace (a silent decref/leak, not just a
+				# cosmetic issue - cfg.py's own fresh-vs-replace machinery
+				# depends on finding the SAME Variable object both times).
+				# Making self._current_fn and the active scope_context
+				# point at the same `provisional` object for this whole
+				# window fixes both at once.
+				#
+				# result_var/exited_flag are both given a real, flat,
+				# unconditional declaration/init RIGHT HERE - before the
+				# pre-return statements (and therefore before any .or_
+				# return()/checked-arithmetic early exit nested inside
+				# emitter_c.py's own hand-emitted C `{ }` blocks - see ir.
+				# DeclareLocal's own docstring) could otherwise become
+				# result_var's first, block-scoped-and-therefore-unsafe
+				# write. exited_flag has a trivial default (False) an
+				# ordinary ir.Assign already declares safely; result_var's
+				# type has no generic default, hence DeclareLocal
+				scope_label: str|None = None
+				if supports_early_exit:
+					assert exited_flag is not None and bool_cls is not None and merge_label is not None
+					if result_var is not None:
+						self._emit( ir.DeclareLocal( variable = result_var ))
+					self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = bool_cls, value = False )))
+					scope_label = self._cfg.push_inline_scope()
+					self._inline_scope_vars.append(( result_var, exited_flag, merge_label ))
+				outer_fn = self._current_fn
+				outer_prelude = self._in_inline_splice_prelude
+				self._current_fn = provisional
+				self._in_inline_splice_prelude = True
+				try:
+					for stmt in pre_return_stmts:
+						# mirrors FunctionLowering.run()'s own identical
+						# per-statement recovery boundary - one bad
+						# statement doesn't stop the rest of this splice
+						# from being lowered (and error-collected)
+						try:
+							self._lower_stmt( stmt )
+						except CompileError:
+							continue
+				finally:
+					self._current_fn = outer_fn
+					self._in_inline_splice_prelude = outer_prelude
+
+				if not supports_early_exit:
+					# PLAN_RETURN_INFERENCE.md's own @inline variant - see
+					# this method's own top-of-function comment. No scope
+					# was pushed, nothing to merge - the trailing return-
+					# expression's own natural type IS the answer being
+					# discovered here, exactly as the pre-existing
+					# single-statement/original multi-statement code always
+					# computed it
+					result = self._lower_expr( return_stmt.value, expected_type )
+					return result if want_result else None
+
+				assert scope_label is not None and exited_flag is not None and merge_label is not None
+				# current_epilogue_label()'s own fallback target once
+				# nothing shallower within THIS splice qualified (push_
+				# inline_scope()'s own label) - an inline-unwind return_()
+				# call reached during the splice already replayed
+				# everything itself and jumps straight past this, to
+				# merge_label below (see _stmt_Return/_consume_checked_
+				# result's own splice branches)
+				self._emit( ir.Label( name = scope_label ))
+				for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
+					self._emit( instr )
+				self._cfg.pop_inline_scope()
+				self._inline_scope_vars.pop()
+
+				# early exit vs normal fallthrough - both converge into ONE
+				# result operand from here, same "shared dest temp, two
+				# Assign sites, converge at one label" shape _expr_IfExp
+				# already uses for Python's own ternary. self._current_fn/
+				# _in_inline_splice_prelude are already restored to the
+				# REAL caller above, before this point - the trailing
+				# return-expression's own .or_return()/checked-arithmetic
+				# behavior is therefore unchanged from the single-statement
+				# case (validates and jumps against the CALLER's own
+				# epilogue/return type, exactly as already tested), while
+				# scope_context(provisional) stays active so it can still
+				# resolve pre-return-declared locals it references
+				self._emit( ir.Label( name = merge_label ))
+				result = self._new_temp( target.return_type )
+				normal_label = self._new_label( 'inline_normal' )
+				converge_label = self._new_label( 'inline_converge' )
+				self._emit( ir.JumpIfFalse( cond = exited_flag, target = normal_label ))
+				if result_var is not None:
+					self._emit( ir.Assign( dest = result, src = result_var ))
+				self._emit( ir.Jump( target = converge_label ))
+				self._emit( ir.Label( name = normal_label ))
+				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+				self._emit( ir.Assign( dest = result, src = trailing_value ))
+				# trailing_value's own ownership (if it's a bare temp - e.g.
+				# the Result.Ok(x) construction temp a trailing `return
+				# Result.Ok(x)` produces) just transferred into `result`
+				# above via the plain ir.Assign - untrack it, or whatever
+				# later cleans up STILL-pending temps (_flush_pending_temps,
+				# called by _lower_stmt's own post-statement wrapper once
+				# this whole splice call returns) would emit a SECOND,
+				# unconditional RC-check for it outside the "normal" arm's
+				# own guard - reading trailing_value's memory even on the
+				# early-exit path, where it was never assigned at all (a
+				# real uninitialized-read bug, not just a redundant decref -
+				# confirmed by a real repro under MSVC's /RTC1). Exactly the
+				# same concern _stmt_Return's own identical transfer already
+				# guards against via this same call
+				self._cfg.untrack_temp( trailing_value )
+				self._emit( ir.Label( name = converge_label ))
 		return result if want_result else None
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -6918,6 +7489,38 @@ class FunctionLowering:
 				result = self.lowering._lower_compiler_fetch_unicode_table( node )
 				return result if want_result else None
 
+			case 'format_f64':
+				result = self._lower_compiler_format_f64( node, expected_type )
+				return result if want_result else None
+
+			case 'is_nan':
+				result = self._lower_compiler_is_nan_or_inf( node, expected_type, 'is_nan' )
+				return result if want_result else None
+
+			case 'is_inf':
+				result = self._lower_compiler_is_nan_or_inf( node, expected_type, 'is_inf' )
+				return result if want_result else None
+
+		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_return':
+			# <result_expr>.or_return() - recognized by AST shape alone,
+			# BEFORE _resolve_callee/_attr_lookup_callable ever look for a
+			# real declared 'or_return' method on the receiver's class -
+			# there is none to find (discovery.py's _parse_function now
+			# rejects any user-written `def or_return(...)` outright, on
+			# ANY class, since one could never actually be called - see its
+			# own comment). Without this, a receiver whose class has no
+			# such method (the ordinary, correct case - nobody is expected
+			# to write one) failed to resolve at all ("'or_return' is not
+			# callable on ..."), confirmed by a real repro: this bug
+			# predates and is unrelated to that new rejection, which just
+			# makes the fix here airtight instead of merely "the common
+			# case works". _lower_or_return itself already validates the
+			# receiver is actually Result[_,_]-shaped (and that no
+			# arguments were given) - a non-Result receiver correctly still
+			# fails there, with the same message as before.
+			receiver = self._lower_expr( node.func.value, None )
+			return self._lower_or_return( node, receiver, want_result )
+
 		# each recognizer returns None (not an error) when this call doesn't
 		# match its own construction-sugar shape at all, falling through to
 		# the next; a real error inside a matched shape (e.g. a malformed
@@ -7019,19 +7622,9 @@ class FunctionLowering:
 		if isinstance( target, _ReceiverDispatch ):
 			return self._lower_union_receiver_call( node, target, receiver, expected_type, want_result )
 
-		if isinstance( target, Function ) and target.stem == 'or_return':
-			# target.cls is a Specialization, not bare Result, whenever the
-			# receiver already pinned concrete args (the common case, e.g.
-			# some_result.or_return() where some_result: Result[i32,E]) -
-			# unwrap before the identity check, or a concrete receiver's own
-			# or_return() would stop being recognized at all and fall
-			# through to actually CALLING Result.or_return's literal
-			# declared body, which is a spec of the intended behavior, not
-			# something literally compilable (see _lower_or_return's own
-			# comment)
-			target_cls_base = target.cls.base if isinstance( target.cls, Specialization ) else target.cls
-			if target_cls_base is self.lowering.discovery.find_name( 'Result', node ):
-				return self._lower_or_return( node, receiver, want_result )
+		# `.or_return()` no longer reaches here at all - it's recognized and
+		# fully handled at the top of this method, before target/receiver
+		# were even resolved (see that check's own comment for why)
 
 		if isinstance( target, Specialization ) and isinstance( target.base, Function ):
 			return self._lower_generic_function_call( node, target, receiver, expected_type, want_result )

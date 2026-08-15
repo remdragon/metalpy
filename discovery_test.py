@@ -1001,6 +1001,183 @@ class Foo:
 		self.assertIn( 'cannot also be @abstractmethod', self.discovery.errors.errors[0] )
 		self.assertNotIn( 'cannot also be @virtual', self.discovery.errors.errors[0] )
 
+	def test_inline_multistatement_body_accepted( self ) -> None:
+		# the multi-statement generalization: locals/branches before a
+		# single, final, un-nested return
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		y: i32 = x
+		if y == 0:
+			y = 1
+		return y
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_return_nested_in_if_accepted( self ) -> None:
+		# early/nested return generalization - the spliced body now has its
+		# own local epilogue to jump into (see lowering.py's _splice_multi_
+		# statement_inline_body/cfg.py's push_inline_scope), so a `return`
+		# nested inside an if is no longer rejected outright
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			return 0
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_return_not_last_rejected( self ) -> None:
+		# unchanged: the body must still structurally END in a `return
+		# <expr>` - a return followed by dead-but-still-textually-present
+		# code stays rejected, only the ERROR MESSAGE changed to reflect
+		# that earlier returns are now otherwise allowed
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		return x
+		y: i32 = 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_bare_return_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self ) -> i32:
+		y: i32 = 1
+		return
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_bare_early_return_rejected( self ) -> None:
+		# every reachable return needs a value, not just the trailing one -
+		# an early bare `return` has no well-defined meaning for an inline
+		# function's own overall value
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			return
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_defer_accepted( self ) -> None:
+		# defer/errdefer generalization - the spliced body now has a
+		# well-defined local boundary of its own to run against (see
+		# lowering.py's _splice_multi_statement_inline_body), so it's no
+		# longer rejected at parse time. resolve() alone doesn't reach
+		# lowering/splicing (that only happens at an actual call site), so
+		# this only confirms the DISCOVERY-time rejection is gone
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		with defer:
+			pass
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_errdefer_call_form_accepted( self ) -> None:
+		# the OTHER recognized spelling, `errdefer(...)` as a bare call
+		# statement, not just `with defer:`
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		errdefer( x )
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_defer_nested_in_if_accepted( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			with defer:
+				pass
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_reassigning_self_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self ) -> i32:
+		self = self
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_parameter_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		x = x + 1
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_parameter_nested_in_if_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			x = 1
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_own_local_accepted( self ) -> None:
+		# unlike self/a parameter, reassigning a local the BODY ITSELF
+		# declared is fine - only self/params are restricted (they might
+		# alias the caller's own argument; a fresh local never does)
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		y: i32 = x
+		y = y + 1
+		return y
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_virtual_with_second_plain_signature_is_a_compile_error( self ) -> None:
 		# NOT just the already-rejected @virtual+@overload-on-the-SAME-def
 		# combo - metalpy also allows multiple PLAIN (non-@overload) defs
@@ -1590,6 +1767,39 @@ class Foo:
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
 		self.assertIn( 'unsupported function decorator', self.discovery.errors.errors[0] )
+
+
+class OrReturnReservedNameTests( unittest.TestCase ):
+	''' 'or_return' is reserved for the compiler's own Result[T,E].or_return()
+	- <result_expr>.or_return() is recognized purely by AST shape (lowering.
+	py's _lower_call, before ordinary call resolution ever runs), never by
+	looking up a real declared method the way is_ok()/is_err()/unwrap()/
+	unwrap_or() genuinely are - a user-written `def or_return(...)` could
+	never actually run, at any receiver type, so it's rejected outright here
+	rather than silently accepted as dead code '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_plain_function_named_or_return_is_rejected( self ) -> None:
+		self._import( '''
+def or_return() -> i32:
+	return 1
+''' )
+		self.assertIn( "'or_return' is reserved", self.discovery.errors.errors[0] )
+
+	def test_method_named_or_return_is_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	def or_return( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( "'or_return' is reserved", self.discovery.errors.errors[0] )
 
 
 class CircularImportTests( unittest.TestCase ):
