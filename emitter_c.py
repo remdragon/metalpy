@@ -218,6 +218,74 @@ int __stdcall SetConsoleOutputCP(unsigned int);
 int __stdcall SetConsoleOutputCP(unsigned int);
 #endif
 #endif
+// backs compiler.format_f64(buf, size, precision, value) (lowering.py's
+// _lower_compiler_format_f64 / ir.FormatFloat) - writes value's fixed-
+// precision decimal digits into buf (a plain "%.*f", so magnitude only;
+// callers split the sign out themselves - see lib/builtins/__float.py),
+// returns the byte count written, or a negative value on failure. Always
+// present (like retain_object/__metalpy_isnan above) whether or not a
+// given program actually formats a float - dead code if unused, same as
+// every other PROLOGUE helper.
+//
+// Deliberately NOT declared via metalpy's own @extern mechanism: that
+// only ever emits a FIXED-arity C prototype (see _function_prototype),
+// which is an ABI hazard for a genuinely variadic callee - both the
+// Microsoft x64 and SysV x86-64 calling conventions require the CALL
+// SITE itself to know it's targeting a variadic function (to duplicate
+// float args into the matching integer register / set %al respectively),
+// which a fixed-arity declaration never triggers. Real snprintf/_snprintf
+// is called here, in hand-written C, with its own true variadic
+// prototype, so the real C compiler generates the correct call - metalpy
+// itself only ever calls this fixed, ordinary-looking wrapper.
+//
+// On Windows this calls msvcrt.dll's own exported _snprintf, loaded and
+// resolved dynamically (LoadLibraryA/GetProcAddress, both kernel32 - never
+// a static `msvcrt.lib` import). msvcrt.dll itself (NOT the redistributable
+// Universal CRT/ucrtbase.dll) has shipped as a genuine OS component since
+// Windows 2000 - always present, nothing to redistribute - so this reads a
+// DLL that's already on the machine rather than linking a CRT the build
+// brought with it. This was NOT the first thing tried: ntdll.dll's own
+// exported _snprintf (same dynamic-resolution technique, and genuinely
+// present per `dumpbin /exports ntdll.dll`) was tried first, on the
+// (wrong) assumption that a symbol with the right name and the right
+// export table entry would behave the same everywhere - a real functional
+// test caught that ntdll's copy silently fails on ANY float conversion
+// (confirmed: "%.*f"/"%f"/"%.1f" all just emit a stray "f", 1 byte, no
+// digits at all - "%d"/"%s" work fine through it) - consistent with NT's
+// kernel-adjacent runtime code traditionally avoiding the FPU altogether.
+// msvcrt.dll's own _snprintf was verified correct the same way (real
+// compile+link+run, not just symbol presence): "%.1f" of 1.0 -> "1.0",
+// "%.3f" of 3.14159 -> "3.142". GetModuleHandleA/GetProcAddress are
+// kernel32 exports (emit_c()'s own extern_libs bookkeeping tags this
+// 'kernel32', which is either already linked for any real program, or
+// added the same way float_test.py already adds 'kernel32' for the
+// no-crt entry point's own ExitProcess call). NOTE: legacy _snprintf
+// (unlike C99 snprintf) returns -1 on truncation instead of the would-
+// have-been-written length - callers must size buf generously enough
+// that truncation never actually happens (a fixed-precision f64 can need
+// at most ~309 integer digits + '.' + precision fractional digits + sign
+// + NUL).
+#ifdef _WIN32
+void* __stdcall GetModuleHandleA( const char* lpModuleName );
+void* __stdcall LoadLibraryA( const char* lpLibFileName );
+void* __stdcall GetProcAddress( void* hModule, const char* lpProcName );
+typedef int ( __cdecl *__metalpy_snprintf_fn )( char*, size_t, const char*, ... );
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, double value ) {
+	static __metalpy_snprintf_fn fn = 0;
+	if ( !fn ) {
+		void* msvcrt = GetModuleHandleA( "msvcrt.dll" );
+		if ( !msvcrt ) msvcrt = LoadLibraryA( "msvcrt.dll" );
+		fn = msvcrt ? (__metalpy_snprintf_fn)GetProcAddress( msvcrt, "_snprintf" ) : 0;
+		if ( !fn ) return -1;
+	}
+	return fn( buf, size, "%.*f", precision, value );
+}
+#else
+#include <stdio.h>
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, double value ) {
+	return snprintf( buf, size, "%.*f", precision, value );
+}
+#endif
 '''
 
 
@@ -1815,6 +1883,16 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			f'(_Atomic({pointee_c_type})*){_emit_operand(instr.ptr)}, {_emit_operand(instr.expected)}, {_emit_operand(instr.desired)});'
 		]
 
+	if isinstance( instr, ir.FormatFloat ):
+		# __metalpy_format_f64 lives in PROLOGUE, not behind @extern - see
+		# ir.FormatFloat's own comment on why (fixed-arity-only extern codegen
+		# can't safely reach a genuinely variadic snprintf/_snprintf, and an
+		# @extern('c', ...) tag would wrongly flip the no-crt Windows build)
+		return [
+			f'\t{_emit_operand(instr.dest)} = __metalpy_format_f64('
+			f'(char*){_emit_operand(instr.buf)}, {_emit_operand(instr.size)}, {_emit_operand(instr.precision)}, {_emit_operand(instr.value)});'
+		]
+
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
 			# routed through sys.alloc[cls] - the SAME allocation path
@@ -2760,6 +2838,35 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
 	program is already collected into one Compiler instance, so there's no
 	reason to split output across files. '''
+	# __metalpy_format_f64 (PROLOGUE, always present) resolves ntdll's own
+	# exported _snprintf via GetProcAddress on Windows, to avoid linking
+	# msvcrt (see its own comment for why not a static ntdll.lib import).
+	# But unlike every OTHER Windows call in this codebase, it's reached
+	# through the compiler.format_f64(...) intrinsic (lowering.py), not an
+	# ordinary @extern binding (a fixed-arity extern can't safely reach a
+	# genuinely variadic callee - see ir.FormatFloat's own comment), so it
+	# never goes through compiler.py's normal `extern_libs.setdefault(
+	# unit.extern_lib, ...)` bookkeeping (compiler.py:184) either.
+	# Registering it here instead - tagged 'kernel32' (GetModuleHandleA/
+	# GetProcAddress are kernel32 exports), deliberately never 'c'
+	# (float_test.py's own no_crt = 'c' not in compiler.extern_libs must
+	# stay true on Windows regardless of whether float formatting is used)
+	# - keeps every existing caller's `for lib in sorted(compiler.
+	# extern_libs): ...` linking loop (mpy.py, test_support.py,
+	# float_test.py, ...) picking up the right `kernel32.lib`/`-lkernel32`
+	# flag with no changes needed there: they all read compiler.extern_libs
+	# AFTER calling emit_c(), so this mutation lands in time. POSIX needs no
+	# equivalent entry: linker_c.py's gcc/clang link branch never special-
+	# cases no_crt at all - libc (real snprintf, the non-Windows half of
+	# __metalpy_format_f64) is always linked there regardless, so the 'c'
+	# tag would be pure bookkeeping noise, not a needed flag - and, unlike
+	# Windows, adding it would incorrectly flip no_crt for any caller that
+	# reads compiler.extern_libs before emit_c().
+	if compiler.disco.active_target['os'] == 'windows' and any(
+		isinstance( instr, ir.FormatFloat ) for lf in compiler.functions for instr in lf.instructions
+	):
+		compiler.extern_libs.setdefault( 'kernel32', set() ).add( 'GetProcAddress' )
+
 	parts: list[str] = [ PROLOGUE ]
 
 	# collect #include requirements from all modules whose symbols are

@@ -7240,6 +7240,37 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 			self.discovery.errors.errors,
 		)
 
+	def test_float_format_spec_dispatches_to_fixed_digits_and_sign_prefix( self ) -> None:
+		# f"{x:.1f}" (f64) - dispatches to lib/builtins/__float.py's own
+		# _fixed_digits/_sign_prefix (Scalar-registered methods, not
+		# __str__/__repr__ - a format spec formats the operand's own type
+		# directly, matching Python's format(x, spec) == type(x).
+		# __format__(x, spec) semantics, same as int's own dispatch)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.1f}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_fixed_digits' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+		self.assertEqual( self._calls_to( fn, '__str__' ), [] )
+
+	def test_unimplemented_float_type_char_is_a_compile_error( self ) -> None:
+		# f"{x:.2e}" - 'e' parses fine (a real float type now exists to
+		# reach validate_float_spec at all) but validate_float_spec rejects
+		# 'e'/'E'/'g'/'G'/'%' with a dedicated "not implemented yet" message
+		# (PLAN_STR_FORMAT.md item 4) - only 'f'/'F' are dispatchable so far
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2e}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( "'e' is not implemented for float yet" in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
 	def test_int_type_char_on_str_is_a_compile_error( self ) -> None:
 		# f"{s:x}" - 'x' parses fine but validate_str_spec rejects any
 		# type char other than 's'/None for a str operand

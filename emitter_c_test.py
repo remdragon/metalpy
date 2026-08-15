@@ -8055,6 +8055,77 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_precision( self ) -> None:
+		# 'f'/'F' fixed-point only (PLAN_STR_FORMAT.md item 4) - real
+		# Python's own f-string output is the oracle, same convention as
+		# every str/int format-spec test above. f"{1.0:.1f}" is the exact
+		# motivating case this pass exists for.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x:.1f}}"
+
+def main() -> i32:
+	if build( 1.0 ) != {f"{1.0:.1f}"!r}:
+		return 1
+	if f"{{3.14159:.3f}}" != {f"{3.14159:.3f}"!r}:
+		return 2
+	if f"{{7.0:.0f}}" != {f"{7.0:.0f}"!r}:
+		return 3
+	if f"{{0.0:.2f}}" != {f"{0.0:.2f}"!r}:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_sign_and_width( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{-2.5:.1f}}" != {f"{-2.5:.1f}"!r}:
+		return 1
+	if f"{{2.5:+.1f}}" != {f"{2.5:+.1f}"!r}:
+		return 2
+	if f"{{2.5: .1f}}" != {f"{2.5: .1f}"!r}:
+		return 3
+	if f"{{1.5:>10.1f}}" != {f"{1.5:>10.1f}"!r}:
+		return 4
+	if f"{{1.5:<10.1f}}" != {f"{1.5:<10.1f}"!r}:
+		return 5
+	if f"{{1.5:*^10.1f}}" != {f"{1.5:*^10.1f}"!r}:
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_zero_pad_is_sign_aware( self ) -> None:
+		# the '0' shorthand's own sign-aware zero-fill, same shape int's own
+		# equivalent test already covers - the '-' stays in front, zeros
+		# fill AFTER it, not before ('-00001.5', not '0000-1.5')
+		self._run( f'''
+def main() -> i32:
+	if f"{{1.5:08.1f}}" != {f"{1.5:08.1f}"!r}:
+		return 1
+	if f"{{-1.5:08.1f}}" != {f"{-1.5:08.1f}"!r}:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_float_type_char_not_implemented_is_a_compile_error( self ) -> None:
+		# 'e'/'E'/'g'/'G'/'%' stay deliberately unimplemented for now
+		# (PLAN_STR_FORMAT.md item 4) - a clear, named error, not a crash or
+		# silently wrong output
+		self._run( '''
+def main() -> i32:
+	return len( f"{1.0:.2e}" )
+''' )
+		self.assertTrue( any( "'e' is not implemented for float yet" in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_explicit_conversion_plus_format_spec_runtime( self ) -> None:
 		# f"{n!r:>8}" against a real runtime int - the spec formats the
 		# ALREADY-converted str (padding), not n's own int-typed value, so

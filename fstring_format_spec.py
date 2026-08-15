@@ -48,13 +48,15 @@ class FStringFormatSpec:
 
 
 # int: decimal (default/'d'), radix ('b'/'o'/'x'/'X'). float: fixed/
-# exponential/general/percent ('f'/'F'/'e'/'E'/'g'/'G'/'%') - recognized by
-# the PARSER (so a clear "float format specs need the boxed float class"
-# error can name the type char precisely) even though no boxed float class
-# exists yet to actually DISPATCH one to (see PLAN_FSTRINGS.md's own
-# Context section). str only ever uses 's' or no type char. 'c' (int-as-
-# codepoint) and 'n' (locale-aware) are deliberately NOT included - this
-# compiler has no locale-awareness anywhere else either, and 'c' is rare.
+# exponential/general/percent ('f'/'F'/'e'/'E'/'g'/'G'/'%') - all recognized
+# by the PARSER (so a clear, named error can be produced for whichever of
+# these isn't implemented for the operand's own type, rather than a generic
+# one), even though only 'f'/'F' (fixed-point) are actually dispatchable for
+# float today - validate_float_spec names 'e'/'E'/'g'/'G'/'%' explicitly as
+# "not implemented yet" (PLAN_STR_FORMAT.md item 4). str only ever uses 's'
+# or no type char. 'c' (int-as-codepoint) and 'n' (locale-aware) are
+# deliberately NOT included - this compiler has no locale-awareness anywhere
+# else either, and 'c' is rare.
 FORMAT_SPEC_TYPE_CHARS = frozenset( 's' 'bdoxX' 'fFeEgG%' )
 FORMAT_SPEC_ALIGN_CHARS = frozenset( '<>=^' )
 FORMAT_SPEC_SIGN_CHARS = frozenset( '+- ' )
@@ -178,3 +180,26 @@ def validate_int_spec( spec: FStringFormatSpec ) -> None:
 		raise FormatSpecError( 'f-string format spec: precision is not allowed for int' )
 	if spec.grouping is not None and type_char not in ( None, 'd' ):
 		raise FormatSpecError( f"f-string format spec: cannot specify {spec.grouping!r} grouping with {type_char!r}" )
+
+
+def validate_float_spec( spec: FStringFormatSpec ) -> None:
+	''' raises FormatSpecError if `spec` isn't valid for a float operand.
+	Scoped to 'f'/'F' (fixed-point, explicit precision) only for now -
+	PLAN_STR_FORMAT.md item 4's 'e'/'E'/'g'/'G'/'%' (exponential/general/
+	percent) stay unimplemented, same "not there yet" shape validate_int_spec
+	already gives a float type char reaching int, just the other direction:
+	the float type itself now exists (unlike when validate_int_spec's own
+	message was written), only most of its format-spec type chars don't yet.
+	Precision here means DIGIT COUNT (fractional digits after the point),
+	not truncation like str's own precision - sign/'#'/width/fill/align all
+	reuse the existing FStringFormatSpec fields unchanged, validated the
+	same way str/int's own specs already are. '''
+	type_char = spec.type
+	if type_char not in ( None, 'f', 'F' ):
+		if type_char in ( 'e', 'E', 'g', 'G', '%' ):
+			raise FormatSpecError( f"f-string format spec: {type_char!r} is not implemented for float yet (only 'f'/'F' fixed-point are)" )
+		raise FormatSpecError( f"f-string format spec: {type_char!r} is not valid for float" )
+	if spec.grouping is not None:
+		raise FormatSpecError( f"f-string format spec: cannot specify {spec.grouping!r} grouping with float yet" )
+	if spec.alt:
+		raise FormatSpecError( "f-string format spec: '#' is not implemented for float yet" )
