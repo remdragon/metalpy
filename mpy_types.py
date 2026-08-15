@@ -768,6 +768,21 @@ class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backin
 		# _refcount_instructions, which forks on exactly this
 		return [ leaf for leaf in self._resolved_leaves() if leaf.is_rc() ]
 
+def by_value_dependency( t: 'Type|None' ) -> 'CStruct|CUnion|TaggedUnion|None':
+	''' the CStruct/CUnion/TaggedUnion `t` embeds BY VALUE, if any - i.e.
+	exactly the kind of dependency emitter_c.py's _emit_value_type_bodies
+	topologically sorts on (a struct member needs its own type's FULL C
+	definition already emitted, unlike an RCClass field, which is always a
+	pointer and never forces an ordering - see that function's own
+	docstring). Unwraps a Specialization first (a generic field's own
+	declared type, e.g. `x: Result[i32,E]`) - same `t.base if isinstance(t,
+	Specialization) else t` idiom Type.is_rc_pointer's own delegation
+	retired elsewhere, needed again here since this asks a different
+	question (layout dependency, not RC-ness). Returns None for anything
+	else (a scalar, an RCClass, ...). '''
+	base = t.base if isinstance( t, Specialization ) else t
+	return base if isinstance( base, ( CStruct, CUnion, TaggedUnion )) else None
+
 @dataclass( kw_only = True )
 class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	value_type: Type

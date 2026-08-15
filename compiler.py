@@ -8,7 +8,7 @@ import ir
 from discovery import Discovery, is_stub_body
 from errors import CompileError
 from lowering import Lowering
-from mpy_types import Module, Function, Overload, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization
+from mpy_types import Module, Function, Overload, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization, by_value_dependency
 from type_resolver import TypeResolver
 
 @dataclass( kw_only = True )
@@ -266,6 +266,22 @@ class Compiler:
 				unit.resolve()
 			for attr in unit.attributes:
 				self.lowering._ensure_resolved( attr )
+				# a by-value-embedded field (e.g. SYSTEMTIME nested inside a
+				# larger cstruct) is only reachable THROUGH this attribute -
+				# unlike a Function/global Variable, merely resolving attr's
+				# own .type never schedules attr.type itself (schedule()
+				# ignores class-attribute Variables, is_global=False - see its
+				# own comment), so a field type referenced ONLY as another
+				# struct's own member, never independently constructed/sized/
+				# pointed-to anywhere else in the reachable program, would
+				# otherwise never land in compiler.cstructs/cunions/
+				# tagged_unions at all. _emit_value_type_bodies's topological
+				# sort then has nothing to order it against - not a wrong
+				# order, a MISSING definition entirely (confirmed directly: a
+				# real clang "field has incomplete type" error, task_421ed8be)
+				dep = by_value_dependency( attr.type )
+				if dep is not None:
+					self.lowering._ensure_resolved( attr.type )
 			if unit.base is not None: # @interface subclass - base interface needs to be a real compile unit too (its Vtbl type is what $vtable actually points to), same as RCClass.base above
 				self._enqueue( unit.base )
 			if unit.is_interface:
@@ -279,6 +295,9 @@ class Compiler:
 				unit.resolve()
 			for attr in unit.attributes:
 				self.lowering._ensure_resolved( attr )
+				dep = by_value_dependency( attr.type ) # see the identical CStruct branch above for why this is needed
+				if dep is not None:
+					self.lowering._ensure_resolved( attr.type )
 			if unit not in self.cunions:
 				self.cunions.append( unit )
 			return unit
@@ -287,6 +306,9 @@ class Compiler:
 				unit.resolve()
 			for attr in unit.attributes:
 				self.lowering._ensure_resolved( attr )
+				dep = by_value_dependency( attr.type ) # see the identical CStruct branch above for why this is needed
+				if dep is not None:
+					self.lowering._ensure_resolved( attr.type )
 			if unit not in self.tagged_unions:
 				self.tagged_unions.append( unit )
 			return unit

@@ -585,6 +585,59 @@ def main() -> i32:
 ''' ),
 		] )
 
+class CStructNestedByValueOnlyReachedViaSizeofTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression coverage for task_421ed8be: a small @cstruct (Inner)
+	nested BY VALUE inside another @cstruct (Outer), where Outer is only
+	ever reached through compiler.sizeof(Outer)/Ptr[Outer] - never actually
+	CONSTRUCTED (Outer(...)) anywhere reachable, and Inner is never
+	independently constructed/sized/pointed-to either. Used to fail real C
+	compilation outright - "field has incomplete type 'struct ...Inner'",
+	"forward declaration of ..." - because Inner never got scheduled as a
+	real compile unit at all: resolving Outer's own `nested: Inner` field
+	(compiler.py's `for attr in unit.attributes: self.lowering.
+	_ensure_resolved(attr)` loop) only resolves the ATTRIBUTE Variable
+	itself, never attr.type - schedule()'s own guard silently ignores a
+	class-attribute Variable (is_global=False), so Inner was never added to
+	compiler.cstructs, and _emit_value_type_bodies had nothing to emit a
+	definition for, even though Outer's own struct body still references
+	it by name. The exact same root cause union_storage.py's UnionStorage.
+	get() was already fixed for once (see UnionAsUnconstructedResultErrorTypeTests
+	above, "union_member_never_constructed_still_gets_full_struct") - this
+	is the general case, fixed in compiler.py's CStruct/CUnion/TaggedUnion
+	branches and monomorphize.py's monomorphize_class (mpy_types.py's new
+	by_value_dependency helper). Confirmed this exact minimal shape crashes
+	on a clean checkout (reverting the fix reproduces the real clang error
+	directly - a 3-field Outer, no ~70-field struct needed; the original
+	report's large real-world struct just happened to be the shape that
+	first surfaced it). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'nested_by_value_cstruct_only_reached_via_sizeof_compiles', '''
+@cstruct
+class Inner:
+	a: u16 = 0
+	b: u16 = 0
+
+@cstruct
+class Outer:
+	x: i32 = 0
+	nested: Inner = Inner( a = 0, b = 0 )
+	y: i32 = 0
+
+def main() -> i32:
+	struct_size: usize = compiler.sizeof( Outer )
+	raw: Ptr[u8] = sys.alloc[u8]( struct_size )
+	sys.memzero( raw, struct_size )
+	sys.free( raw )
+	return 0
+''' ),
+		] )
+
 class RCClassSubclassingPhase1Tests( CompilerTestCase ):
 	''' Phase 1 of the RCClass-subclassing plan (base-chain lookup +
 	attribute-shadowing rejection, no constructor chaining/@virtual/
@@ -5040,6 +5093,25 @@ def main() -> i32:
 		return 8
 	return 0
 ''' ),
+			# str.__contains__ (find().is_ok()) plus the `in`/`not in`
+			# operator dispatch to it (lowering.py's _lower_in_comparison)
+			( 'contains_and_in_operator', '''
+def main() -> i32:
+	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
+	if not s.__contains__( 'beef' ):
+		return 1
+	if s.__contains__( 'zzz' ):
+		return 2
+	if not ( 'beef' in s ):
+		return 3
+	if 'zzz' in s:
+		return 4
+	if not ( 'zzz' not in s ):
+		return 5
+	if 'beef' not in s:
+		return 6
+	return 0
+''' ),
 		] )
 
 
@@ -5973,6 +6045,305 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
+			# __contains__ - RC key (str), found and missing
+			( 'contains_found_and_missing_rc_key', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if not d.__contains__( 'a' ):
+		return 1
+	if d.__contains__( 'nope' ):
+		return 2
+	return 0
+''' ),
+			# __contains__ - non-RC key (i32), found and missing
+			( 'contains_found_and_missing_non_rc_key', '''
+def main() -> i32:
+	d: dict[i32, str] = dict[i32, str]()
+	d[ 7 ] = 'seven'
+	if not d.__contains__( 7 ):
+		return 1
+	if d.__contains__( 8 ):
+		return 2
+	return 0
+''' ),
+			# __delitem__ on a missing key returns Err, and leaves the dict untouched
+			( 'delitem_missing_key_returns_key_error', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	r: Result[None,KeyError] = d.__delitem__( 'nope' )
+	if r.is_ok():
+		return 1
+	if d.__len__() != 1:
+		return 2
+	return 0
+''' ),
+			# __delitem__ removing the MIDDLE entry of a real hash-collision
+			# bucket - CollidingKey.__hash__ always returns the same value,
+			# forcing every insert into one bucket, so this directly
+			# exercises RawDict.remove_entry/_fixup_indices_after_removal's
+			# collision-scan + entry_idx renumbering, not just the common
+			# no-collision case
+			( 'delitem_middle_of_hash_collision_bucket', '''
+class CollidingKey:
+	value: i32
+	def __init__( self, value: i32 ) -> None:
+		self.value = value
+	def __hash__( self ) -> u64:
+		return 42
+	def __eq__( self, other: CollidingKey ) -> bool:
+		return self.value == other.value
+
+def main() -> i32:
+	d: dict[CollidingKey, i32] = dict[CollidingKey, i32]()
+	d[ CollidingKey( 0 ) ] = 100
+	d[ CollidingKey( 1 ) ] = 200
+	d[ CollidingKey( 2 ) ] = 300
+	if d.__len__() != 3:
+		return 1
+	r: Result[None,KeyError] = d.__delitem__( CollidingKey( 1 ) )
+	if r.is_err():
+		return 2
+	if d.__len__() != 2:
+		return 3
+	if d.__contains__( CollidingKey( 1 ) ):
+		return 4
+	r0: Result[i32,KeyError] = d.__getitem__( CollidingKey( 0 ) )
+	r2: Result[i32,KeyError] = d.__getitem__( CollidingKey( 2 ) )
+	if r0.is_err() or r2.is_err():
+		return 5
+	if r0.unwrap( 'x' ) != 100 or r2.unwrap( 'x' ) != 300:
+		return 6
+	return 0
+''' ),
+			# RC key AND RC value, repeatedly inserted then deleted - a
+			# double-free/leak proxy for __delitem__'s own release path
+			# (wrong refcounting here would crash the process, not just
+			# misbehave quietly)
+			( 'delitem_rc_key_and_rc_value_repeated_does_not_crash', '''
+def main() -> i32:
+	d: dict[str, str] = dict[str, str]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			d[ 'a' ] = 'apple'
+			d[ 'b' ] = 'banana'
+			ra: Result[None,KeyError] = d.__delitem__( 'a' )
+			rb: Result[None,KeyError] = d.__delitem__( 'b' )
+			if ra.is_err() or rb.is_err():
+				return 1
+			if d.__len__() != 0:
+				return 2
+			i += 1
+	return 0
+''' ),
+			# `in`/`not in` dispatch to __contains__ (lowering.py's
+			# _lower_in_comparison) - the reversed receiver/arg order
+			( 'in_and_not_in_operator', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if not ( 'a' in d ):
+		return 1
+	if 'nope' in d:
+		return 2
+	if not ( 'nope' not in d ):
+		return 3
+	if 'a' not in d:
+		return 4
+	return 0
+''' ),
+		] )
+
+
+class SetTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' set[T] (lib/builtins/__set.py) - a thin wrapper around dict[T, bool],
+	built on top of the __contains__/__delitem__ added to dict[K,V] above.
+	Mirrors DictTests' own real compile-and-run convention. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'add_and_contains_non_rc_element', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 7 )
+	s.add( 9 )
+	if not s.__contains__( 7 ):
+		return 1
+	if not s.__contains__( 9 ):
+		return 2
+	if s.__contains__( 8 ):
+		return 3
+	return 0
+''' ),
+			( 'add_and_contains_rc_element', '''
+def main() -> i32:
+	s: set[str] = set[str]()
+	s.add( 'apple' )
+	s.add( 'banana' )
+	if not s.__contains__( 'apple' ):
+		return 1
+	if not s.__contains__( 'banana' ):
+		return 2
+	if s.__contains__( 'cherry' ):
+		return 3
+	return 0
+''' ),
+			# duplicate add is a no-op, matching Python set.add semantics
+			( 'duplicate_add_is_noop', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 5 )
+	s.add( 5 )
+	s.add( 5 )
+	if s.__len__() != 1:
+		return 1
+	if not s.__contains__( 5 ):
+		return 2
+	return 0
+''' ),
+			( 'contains_returns_false_for_never_added_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	if s.__contains__( 42 ):
+		return 1
+	return 0
+''' ),
+			# discard: no-op on a missing value, actually removes a present one
+			( 'discard_present_and_absent_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	s.add( 2 )
+	s.discard( 1 )
+	if s.__contains__( 1 ):
+		return 1
+	if not s.__contains__( 2 ):
+		return 2
+	if s.__len__() != 1:
+		return 3
+	s.discard( 999 )  # absent - must be a silent no-op, not an error
+	if s.__len__() != 1:
+		return 4
+	return 0
+''' ),
+			# remove: succeeds on a present value, reports Err on an absent one
+			( 'remove_present_and_absent_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	r: Result[None,KeyError] = s.remove( 1 )
+	if r.is_err():
+		return 1
+	if s.__contains__( 1 ):
+		return 2
+	r2: Result[None,KeyError] = s.remove( 999 )
+	if r2.is_ok():
+		return 3
+	return 0
+''' ),
+			# 50 distinct elements forces RawDict's own growth path (both
+			# __entries and __indices), same rationale as DictTests'
+			# many_entries_forces_growth_and_stays_correct
+			( 'many_elements_forces_growth_and_stays_correct', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 50:
+			s.add( compiler.cast( i32, i ))
+			i += 1
+	if s.__len__() != 50:
+		return 1
+	j: usize = 0
+	with compiler.wrap_arithmetic:
+		while j < 50:
+			if not s.__contains__( compiler.cast( i32, j )):
+				return 2
+			j += 1
+	return 0
+''' ),
+			# RC element (str) add/discard/re-add repeated several times - a
+			# double-free/leak proxy, same posture as DictTests'
+			# delitem_rc_key_and_rc_value_repeated_does_not_crash
+			( 'rc_element_add_discard_repeated_does_not_crash', '''
+def main() -> i32:
+	s: set[str] = set[str]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			s.add( 'apple' )
+			s.add( 'banana' )
+			if s.__len__() != 2:
+				return 1
+			s.discard( 'apple' )
+			s.discard( 'banana' )
+			if s.__len__() != 0:
+				return 2
+			i += 1
+	return 0
+''' ),
+			# for x in my_set: - proves the __len__ + __getitem__(usize)
+			# "indexable" for-loop protocol wiring (lowering.py's
+			# _lower_for_over_indexable) actually works for set[T], with no
+			# compiler changes of its own. The per-iteration bind desugars
+			# to obj[i].or_return() (since __getitem__ returns
+			# Result[T,IndexError]), which requires the ENCLOSING function
+			# to itself return a Result[_,IndexError]-shaped type - main()
+			# returns plain i32 (needed for this test harness's own exit-
+			# code dispatch), so the loop lives in a small helper instead,
+			# unwrapped by main(). xor-checksum the visited elements
+			# against the expected total (order-independent, since sets
+			# are unordered) as proof every element was visited exactly once.
+			( 'for_loop_over_set_visits_every_element_once', '''
+def checksum_set( s: set[i32] ) -> Result[i32, IndexError]:
+	checksum: i32 = 0
+	with compiler.wrap_arithmetic:
+		for x in s:
+			checksum = checksum ^ x
+	return Result.Ok( checksum )
+
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	s.add( 2 )
+	s.add( 4 )
+	s.add( 8 )
+	if s.__len__() != 4:
+		return 1
+	r: Result[i32,IndexError] = checksum_set( s )
+	if r.is_err():
+		return 2
+	if r.unwrap( 'x' ) != 15:  # 1 ^ 2 ^ 4 ^ 8 == 15
+		return 3
+	return 0
+''' ),
+			# `in`/`not in` dispatch to __contains__ (lowering.py's
+			# _lower_in_comparison) - the reversed receiver/arg order
+			( 'in_and_not_in_operator', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 7 )
+	if not ( 7 in s ):
+		return 1
+	if 8 in s:
+		return 2
+	if not ( 8 not in s ):
+		return 3
+	if 7 not in s:
+		return 4
+	return 0
+''' ),
 		] )
 
 
@@ -6260,6 +6631,31 @@ def main() -> i32:
 	pair: tuple[i32,i32] = make_pair( 3, 4 ).unwrap( 'x' )
 	if pair[0] != 3 or pair[1] != 4:
 		return 1
+	return 0
+''' ),
+			# regression test: tuple[...] as a NESTED, EXPLICIT type argument
+			# to another generic class's own constructor CALL -
+			# list[tuple[str,str]]() - used to fail with "name 'tuple' is not
+			# defined" even though the exact same list[tuple[str,str]]
+			# ANNOTATION resolved fine one line above it (see type_resolver.
+			# py's _try_resolve_namespace - the constructor-call counterpart
+			# to discovery.py's own visit_Subscript, which already recognized
+			# tuple[...] textually for annotations). Mirrors the real
+			# lib/http/client.py HTTPHeaders shape this bug was found in:
+			# construct a list of pairs, append, read each field back
+			( 'list_of_tuple_as_explicit_constructor_type_argument', '''
+def main() -> i32:
+	entries: list[tuple[str,str]] = list[tuple[str,str]]()
+	entries.append( ( "Content-Type", "text/plain" ) ).unwrap( 'append' )
+	entries.append( ( "X-Test", "1" ) ).unwrap( 'append' )
+	if len( entries ) != 2:
+		return 1
+	first: tuple[str,str] = entries.__getitem__( 0 ).unwrap( 'idx' )
+	if first[0] != "Content-Type" or first[1] != "text/plain":
+		return 2
+	second: tuple[str,str] = entries.__getitem__( 1 ).unwrap( 'idx' )
+	if second[0] != "X-Test" or second[1] != "1":
+		return 3
 	return 0
 ''' ),
 		] )
@@ -7168,6 +7564,145 @@ def main() -> i32:
 			return 1
 		case Result.Err( e ):
 			pass
+	return 0
+''' ),
+		] )
+
+
+class Base64Tests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Real compile-and-run coverage for lib/base64.py - b64encode/b64decode,
+	urlsafe_b64encode/urlsafe_b64decode, and b16encode/b16decode. See
+	PLAN_HTTP_CLIENT.md, which names base64 as a zero-prerequisite piece
+	needed for auth= (HTTP Basic -> base64 Authorization header). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# RFC 4648 known-answer vectors - the standard "f"/"fo"/"foo"/
+			# "foob"/"fooba"/"foobar" test vectors, each checked round-trip
+			# (encode matches the known string, decode recovers the original)
+			( 'b64_rfc4648_vectors_round_trip', '''
+import base64
+
+def check( plain: str, encoded: str ) -> bool:
+	pb: bytes = plain.encode().unwrap( 'encode failed' )
+	eb: bytes = base64.b64encode( pb )
+	es: str = eb.decode().unwrap( 'decode of encoded output failed' )
+	if es != encoded:
+		return False
+	db: bytes = base64.b64decode( eb ).unwrap( 'decode failed' )
+	ds: str = db.decode().unwrap( 'decode of decoded output failed' )
+	return ds == plain
+
+def main() -> i32:
+	if not check( '', '' ): return 1
+	if not check( 'f', 'Zg==' ): return 2
+	if not check( 'fo', 'Zm8=' ): return 3
+	if not check( 'foo', 'Zm9v' ): return 4
+	if not check( 'foob', 'Zm9vYg==' ): return 5
+	if not check( 'fooba', 'Zm9vYmE=' ): return 6
+	if not check( 'foobar', 'Zm9vYmFy' ): return 7
+	return 0
+''' ),
+			# standard vs urlsafe alphabets diverge exactly on '+'/'/' vs
+			# '-'/'_' - bytes 0xFB,0xFF,0xBF hit both symbols in both
+			# alphabets, and urlsafe_b64decode must recover the original bytes
+			( 'urlsafe_vs_standard_alphabet_divergence', '''
+import base64
+
+def main() -> i32:
+	raw = bytearray( 3 )
+	rp: Ptr[u8] = raw.get_ptr()
+	rp[0] = 0xFB
+	rp[1] = 0xFF
+	rp[2] = 0xBF
+	rb: bytes = bytes.from_bytearray( move( raw ) )
+
+	std: bytes = base64.b64encode( rb )
+	safe: bytes = base64.urlsafe_b64encode( rb )
+	std_s: str = std.decode().unwrap( 'x' )
+	safe_s: str = safe.decode().unwrap( 'x' )
+	if std_s != '+/+/':
+		return 1
+	if safe_s != '-_-_':
+		return 2
+
+	back: bytes = base64.urlsafe_b64decode( safe ).unwrap( 'urlsafe decode failed' )
+	if len( back ) != 3:
+		return 3
+	bp: ConstPtr[u8] = back.get_const_ptr()
+	if bp[0] != 0xFB or bp[1] != 0xFF or bp[2] != 0xBF:
+		return 4
+	return 0
+''' ),
+			( 'b16_round_trip_and_casefold', '''
+import base64
+
+def main() -> i32:
+	fb: bytes = 'foobar'.encode().unwrap( 'x' )
+	hx: bytes = base64.b16encode( fb )
+	hx_s: str = hx.decode().unwrap( 'x' )
+	if hx_s != '666F6F626172':
+		return 1
+
+	unhex: bytes = base64.b16decode( hx ).unwrap( 'b16decode failed' )
+	unhex_s: str = unhex.decode().unwrap( 'x' )
+	if unhex_s != 'foobar':
+		return 2
+
+	# lowercase hex rejected by default (casefold=False)...
+	lh: bytes = '666f6f626172'.encode().unwrap( 'x' )
+	if base64.b16decode( lh ).is_ok():
+		return 3
+	# ...but accepted with casefold=True
+	lh_ok: bytes = base64.b16decode( lh, casefold = True ).unwrap( 'casefold decode failed' )
+	lh_ok_s: str = lh_ok.decode().unwrap( 'x' )
+	if lh_ok_s != 'foobar':
+		return 4
+	return 0
+''' ),
+			# validate=True is the default (this codebase's own convention -
+			# see guid.py/ascii.py - overriding Python's own lenient default),
+			# so malformed input must be Result.Err in every case below
+			( 'b64_and_b16_decode_error_cases', '''
+import base64
+
+def main() -> i32:
+	bad_len: bytes = 'Zg'.encode().unwrap( 'x' ) # length 2, not a multiple of 4
+	if base64.b64decode( bad_len ).is_ok():
+		return 1
+
+	bad_char: bytes = 'Z!=='.encode().unwrap( 'x' ) # '!' not in the alphabet
+	if base64.b64decode( bad_char ).is_ok():
+		return 2
+
+	bad_pad: bytes = 'Zg=g'.encode().unwrap( 'x' ) # '=' not at the very end
+	if base64.b64decode( bad_pad ).is_ok():
+		return 3
+
+	odd_hex: bytes = 'ABC'.encode().unwrap( 'x' ) # odd length
+	if base64.b16decode( odd_hex ).is_ok():
+		return 4
+	return 0
+''' ),
+			# validate=False (opt-in) matches Python's own lenient default:
+			# non-alphabet bytes (e.g. embedded whitespace) are discarded
+			# before decoding, rather than rejected
+			( 'b64_decode_lenient_mode', '''
+import base64
+
+def main() -> i32:
+	with_ws: bytes = 'Zm9v\\nYmFy'.encode().unwrap( 'x' )
+	if base64.b64decode( with_ws ).is_ok(): # strict default must reject the embedded newline
+		return 1
+	lenient: bytes = base64.b64decode( with_ws, validate = False ).unwrap( 'lenient decode failed' )
+	lenient_s: str = lenient.decode().unwrap( 'x' )
+	if lenient_s != 'foobar':
+		return 2
 	return 0
 ''' ),
 		] )
