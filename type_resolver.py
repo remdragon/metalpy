@@ -1239,7 +1239,22 @@ class TypeResolver:
 			Variable( stem = flag_stem, qualname = f'{qualname}.{flag_stem}', file = fn.file, line = fn.line, type = bool_cls )
 			for flag_stem, _is_errdefer, _body in defer_sites
 		]
-		attributes = [ state_attr ] + param_attrs + local_attrs + live_flag_attrs + extra_attrs + defer_armed_attrs
+		# PLAN_GENERATORS.md Phase C - Generator[T,SendType,E]'s own
+		# __send_slot/__send_ready pair (see _build_generator_resume_
+		# function's own docstring for the full .send() design). __send_
+		# slot participates in the exact same live-flag machinery an RC-
+		# typed promoted LOCAL already gets (live_flag_attrs above) - it's
+		# only conditionally initialized (valid once .send() has actually
+		# been called at least once), same reasoning
+		send_type = fn.return_type.send_type if isinstance( fn.return_type, GeneratorType ) else None
+		send_slot_attrs: list[Variable] = []
+		if send_type is not None:
+			send_slot_attrs.append( Variable( stem = '__send_slot', qualname = f'{qualname}.__send_slot', file = fn.file, line = fn.line, type = send_type ))
+			send_slot_attrs.append( Variable( stem = '__send_ready', qualname = f'{qualname}.__send_ready', file = fn.file, line = fn.line, type = bool_cls ))
+			if is_rc( send_type ):
+				live_stem = self._live_flag_stem( '__send_slot' )
+				send_slot_attrs.append( Variable( stem = live_stem, qualname = f'{qualname}.{live_stem}', file = fn.file, line = fn.line, type = bool_cls ))
+		attributes = [ state_attr ] + param_attrs + local_attrs + live_flag_attrs + extra_attrs + defer_armed_attrs + send_slot_attrs
 		return RCClass(
 			stem = qualname, qualname = qualname, file = fn.file, line = fn.line,
 			base = None, type_params = None,
@@ -1702,6 +1717,22 @@ class TypeResolver:
 			)
 			body.append( guard )
 
+		# 2b. PLAN_GENERATORS.md Phase C - __send_slot, gated behind its
+		# own live-flag exactly like an RC-typed promoted local above (only
+		# conditionally initialized - valid once .send() has actually been
+		# called at least once)
+		send_type = fn.return_type.send_type if isinstance( fn.return_type, GeneratorType ) else None
+		if send_type is not None and is_rc( send_type ):
+			teardown = self._build_field_teardown_ast(
+				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__send_slot', ctx = ast.Load() ),
+				send_type,
+			)
+			if teardown:
+				body.append( ast.If(
+					test = self._self_attr( self._live_flag_stem( '__send_slot' ), fn.node ),
+					body = teardown, orelse = [],
+				))
+
 		# 3. extra_fields (Phase 1's __for_obj_N - the once-evaluated
 		# iterated expression a non-range() for-loop needs) - unconditional,
 		# same reasoning/precedent as a captured parameter (see
@@ -1862,6 +1893,21 @@ class TypeResolver:
 			keywords.append( ast.keyword( arg = stem, value = expr ) )
 		for flag_stem, _is_errdefer, _body in defer_sites:
 			keywords.append( ast.keyword( arg = flag_stem, value = ast.Constant( value = False ) ) )
+		# PLAN_GENERATORS.md Phase C - __send_slot/__send_ready, same
+		# zero-placeholder-plus-live-flag posture as an RC-typed promoted
+		# local just above (send() hasn't been called yet at construction
+		# time, so __send_slot starts exactly as uninitialized as any
+		# other never-yet-assigned RC-typed field)
+		send_type = fn.return_type.send_type if isinstance( fn.return_type, GeneratorType ) else None
+		if send_type is not None:
+			if is_rc( send_type ):
+				zero = ast.Constant( value = 0 )
+				zero.generator_zero_rc_field = True
+				keywords.append( ast.keyword( arg = self._live_flag_stem( '__send_slot' ), value = ast.Constant( value = False ) ) )
+			else:
+				zero = ast.Constant( value = False if ( isinstance( send_type, Scalar ) and send_type.stem == 'bool' ) else 0 )
+			keywords.append( ast.keyword( arg = '__send_slot', value = zero ) )
+			keywords.append( ast.keyword( arg = '__send_ready', value = ast.Constant( value = False ) ) )
 		call = ast.Call( func = ast.Name( id = backing_cls.stem, ctx = ast.Load() ), args = [], keywords = keywords )
 		call.generator_backing_cls = backing_cls
 		fn.node.body = [ ast.Return( value = call ) ]
