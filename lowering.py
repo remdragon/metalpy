@@ -2185,9 +2185,24 @@ class FunctionLowering:
 			# exactly the same runtime representation as its underlying
 			# type" (see the CEnum construction-call comment above), so
 			# returning one where the underlying type is declared is a
-			# value-preserving reinterpretation, not a mismatch
+			# value-preserving reinterpretation, not a mismatch. Both
+			# directions, mirroring _check_assignable's own bidirectional
+			# CEnum<->value_type exemption (lines ~4169/4171) - this method
+			# can't just delegate to _check_assignable itself (see this
+			# method's own strict=False comment above, on why that would
+			# incorrectly reject the covered-Result-error widening case
+			# before it's even attempted), so it has to re-derive every
+			# exemption _check_assignable would apply; PLAN_COMPILER_BUG_
+			# SWEEP.md's own audit found this had only ever re-derived ONE
+			# of the two directions - `return raw_scalar` from a function
+			# declared `-> SomeCEnum` (the OTHER direction) was wrongly
+			# rejected, confirmed via a real repro
 			is_cenum_to_underlying = isinstance( value.type, CEnum ) and value.type.value_type is fn_type
-			if value.type is not fn_type and value.type is not expected_concrete and not is_cenum_to_underlying:
+			is_underlying_to_cenum = isinstance( fn_type, CEnum ) and value.type is fn_type.value_type
+			if (
+				value.type is not fn_type and value.type is not expected_concrete
+				and not is_cenum_to_underlying and not is_underlying_to_cenum
+			):
 				widened = self._maybe_widen_return_result( node, value, fn_type )
 				if widened is None:
 					self.lowering.discovery.fail(
@@ -4439,7 +4454,24 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
 		self.lowering._ensure_resolved( name )
 		member = self._cfg.narrowed_member( node.id )
-		if member is not None and expected_type is not name.type:
+		# _same_type, not raw `is` - same PLAN_COMPILER_BUG_SWEEP.md audit
+		# that found the other Shape 1 candidates flagged this escape-hatch
+		# comparison too, on the theory that expected_type and name.type
+		# could be two different objects for the identical union
+		# instantiation. No repro could be constructed for it despite
+		# several attempts (generic-substituted vs fresh-annotation
+		# parameter types, local-variable-annotation vs fresh-annotation) -
+		# unlike the OTHER unconfirmed Shape 1 candidates (gated by a
+		# separate, already-known upstream bug), this one looks like it may
+		# genuinely be unreachable: _get_or_create_union caches by a
+		# qualname-text key (ARCHITECTURE.md), which is insensitive to
+		# whether the union's own MEMBER Specializations are identical
+		# objects, so two structurally-identical union ANNOTATIONS seem to
+		# always land on the same cached union object regardless. Applied
+		# anyway for consistency/defense-in-depth - strictly safer than
+		# `is` (accepts everything `is` did, plus more), so this can only
+		# widen when the escape hatch correctly fires, never narrow it.
+		if member is not None and not self.lowering._type_resolver._same_type( expected_type, name.type ):
 			# name is currently proven to hold this union member (cfg.py's
 			# narrow(), from a `match x: case T(x):` arm reusing x's own
 			# name) - read through the union's own payload instead of

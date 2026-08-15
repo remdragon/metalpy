@@ -4637,6 +4637,76 @@ def main() -> i32:
 		] )
 
 
+class CEnumReturnCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for _stmt_Return's own CEnum<->underlying-
+	scalar coercion - "a CEnum has exactly the same runtime representation as
+	its underlying type" (see _try_lower_construct_call's own CEnum-
+	construction comment), so returning one where the other is declared is a
+	value-preserving reinterpretation in EITHER direction, mirroring
+	_check_assignable's own bidirectional exemption elsewhere. _stmt_Return
+	can't just delegate to _check_assignable (strict=False is deliberate, to
+	avoid it firing before the covered-Result-error-widening case gets a
+	chance - see that method's own comment), so it re-derives every exemption
+	_check_assignable would apply - PLAN_COMPILER_BUG_SWEEP.md's own audit
+	found this had only ever re-derived ONE of the two directions: returning
+	a CEnum value where the function declares its own underlying scalar type
+	worked, but the REVERSE (returning a raw scalar where the function
+	declares the CEnum) was wrongly rejected - confirmed via a real repro
+	before the fix ("function returns X, not Y" for a case that should be a
+	legitimate reinterpretation). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'both_cenum_underlying_return_directions_work', '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_underlying() -> i32:
+	return Color.Blue
+
+def get_red() -> Color:
+	x: i32 = 0
+	return x
+
+def main() -> i32:
+	if get_underlying() != 1:
+		return 1
+	c: Color = get_red()
+	if c != Color.Red:
+		return 2
+	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_genuinely_mismatched_return_type_still_rejected( self ) -> None:
+		# negative companion - a completely unrelated type (str) returned
+		# where a CEnum is declared must still be rejected, not silently
+		# accepted by an over-broadened coercion
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_wrong() -> Color:
+	s: str = 'not a color'
+	return s
+
+def main() -> i32:
+	c: Color = get_wrong()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+
 class AtomicRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for compiler.atomic_*(Ptr[T], ...)
 	(lowering.py's _lower_compiler_atomic_*, ir.py's Atomic* instructions,
