@@ -5973,6 +5973,273 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
+			# __contains__ - RC key (str), found and missing
+			( 'contains_found_and_missing_rc_key', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if not d.__contains__( 'a' ):
+		return 1
+	if d.__contains__( 'nope' ):
+		return 2
+	return 0
+''' ),
+			# __contains__ - non-RC key (i32), found and missing
+			( 'contains_found_and_missing_non_rc_key', '''
+def main() -> i32:
+	d: dict[i32, str] = dict[i32, str]()
+	d[ 7 ] = 'seven'
+	if not d.__contains__( 7 ):
+		return 1
+	if d.__contains__( 8 ):
+		return 2
+	return 0
+''' ),
+			# __delitem__ on a missing key returns Err, and leaves the dict untouched
+			( 'delitem_missing_key_returns_key_error', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	r: Result[None,KeyError] = d.__delitem__( 'nope' )
+	if r.is_ok():
+		return 1
+	if d.__len__() != 1:
+		return 2
+	return 0
+''' ),
+			# __delitem__ removing the MIDDLE entry of a real hash-collision
+			# bucket - CollidingKey.__hash__ always returns the same value,
+			# forcing every insert into one bucket, so this directly
+			# exercises RawDict.remove_entry/_fixup_indices_after_removal's
+			# collision-scan + entry_idx renumbering, not just the common
+			# no-collision case
+			( 'delitem_middle_of_hash_collision_bucket', '''
+class CollidingKey:
+	value: i32
+	def __init__( self, value: i32 ) -> None:
+		self.value = value
+	def __hash__( self ) -> u64:
+		return 42
+	def __eq__( self, other: CollidingKey ) -> bool:
+		return self.value == other.value
+
+def main() -> i32:
+	d: dict[CollidingKey, i32] = dict[CollidingKey, i32]()
+	d[ CollidingKey( 0 ) ] = 100
+	d[ CollidingKey( 1 ) ] = 200
+	d[ CollidingKey( 2 ) ] = 300
+	if d.__len__() != 3:
+		return 1
+	r: Result[None,KeyError] = d.__delitem__( CollidingKey( 1 ) )
+	if r.is_err():
+		return 2
+	if d.__len__() != 2:
+		return 3
+	if d.__contains__( CollidingKey( 1 ) ):
+		return 4
+	r0: Result[i32,KeyError] = d.__getitem__( CollidingKey( 0 ) )
+	r2: Result[i32,KeyError] = d.__getitem__( CollidingKey( 2 ) )
+	if r0.is_err() or r2.is_err():
+		return 5
+	if r0.unwrap( 'x' ) != 100 or r2.unwrap( 'x' ) != 300:
+		return 6
+	return 0
+''' ),
+			# RC key AND RC value, repeatedly inserted then deleted - a
+			# double-free/leak proxy for __delitem__'s own release path
+			# (wrong refcounting here would crash the process, not just
+			# misbehave quietly)
+			( 'delitem_rc_key_and_rc_value_repeated_does_not_crash', '''
+def main() -> i32:
+	d: dict[str, str] = dict[str, str]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			d[ 'a' ] = 'apple'
+			d[ 'b' ] = 'banana'
+			ra: Result[None,KeyError] = d.__delitem__( 'a' )
+			rb: Result[None,KeyError] = d.__delitem__( 'b' )
+			if ra.is_err() or rb.is_err():
+				return 1
+			if d.__len__() != 0:
+				return 2
+			i += 1
+	return 0
+''' ),
+		] )
+
+
+class SetTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' set[T] (lib/builtins/__set.py) - a thin wrapper around dict[T, bool],
+	built on top of the __contains__/__delitem__ added to dict[K,V] above.
+	Mirrors DictTests' own real compile-and-run convention. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'add_and_contains_non_rc_element', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 7 )
+	s.add( 9 )
+	if not s.__contains__( 7 ):
+		return 1
+	if not s.__contains__( 9 ):
+		return 2
+	if s.__contains__( 8 ):
+		return 3
+	return 0
+''' ),
+			( 'add_and_contains_rc_element', '''
+def main() -> i32:
+	s: set[str] = set[str]()
+	s.add( 'apple' )
+	s.add( 'banana' )
+	if not s.__contains__( 'apple' ):
+		return 1
+	if not s.__contains__( 'banana' ):
+		return 2
+	if s.__contains__( 'cherry' ):
+		return 3
+	return 0
+''' ),
+			# duplicate add is a no-op, matching Python set.add semantics
+			( 'duplicate_add_is_noop', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 5 )
+	s.add( 5 )
+	s.add( 5 )
+	if s.__len__() != 1:
+		return 1
+	if not s.__contains__( 5 ):
+		return 2
+	return 0
+''' ),
+			( 'contains_returns_false_for_never_added_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	if s.__contains__( 42 ):
+		return 1
+	return 0
+''' ),
+			# discard: no-op on a missing value, actually removes a present one
+			( 'discard_present_and_absent_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	s.add( 2 )
+	s.discard( 1 )
+	if s.__contains__( 1 ):
+		return 1
+	if not s.__contains__( 2 ):
+		return 2
+	if s.__len__() != 1:
+		return 3
+	s.discard( 999 )  # absent - must be a silent no-op, not an error
+	if s.__len__() != 1:
+		return 4
+	return 0
+''' ),
+			# remove: succeeds on a present value, reports Err on an absent one
+			( 'remove_present_and_absent_value', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	r: Result[None,KeyError] = s.remove( 1 )
+	if r.is_err():
+		return 1
+	if s.__contains__( 1 ):
+		return 2
+	r2: Result[None,KeyError] = s.remove( 999 )
+	if r2.is_ok():
+		return 3
+	return 0
+''' ),
+			# 50 distinct elements forces RawDict's own growth path (both
+			# __entries and __indices), same rationale as DictTests'
+			# many_entries_forces_growth_and_stays_correct
+			( 'many_elements_forces_growth_and_stays_correct', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 50:
+			s.add( compiler.cast( i32, i ))
+			i += 1
+	if s.__len__() != 50:
+		return 1
+	j: usize = 0
+	with compiler.wrap_arithmetic:
+		while j < 50:
+			if not s.__contains__( compiler.cast( i32, j )):
+				return 2
+			j += 1
+	return 0
+''' ),
+			# RC element (str) add/discard/re-add repeated several times - a
+			# double-free/leak proxy, same posture as DictTests'
+			# delitem_rc_key_and_rc_value_repeated_does_not_crash
+			( 'rc_element_add_discard_repeated_does_not_crash', '''
+def main() -> i32:
+	s: set[str] = set[str]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			s.add( 'apple' )
+			s.add( 'banana' )
+			if s.__len__() != 2:
+				return 1
+			s.discard( 'apple' )
+			s.discard( 'banana' )
+			if s.__len__() != 0:
+				return 2
+			i += 1
+	return 0
+''' ),
+			# for x in my_set: - proves the __len__ + __getitem__(usize)
+			# "indexable" for-loop protocol wiring (lowering.py's
+			# _lower_for_over_indexable) actually works for set[T], with no
+			# compiler changes of its own. The per-iteration bind desugars
+			# to obj[i].or_return() (since __getitem__ returns
+			# Result[T,IndexError]), which requires the ENCLOSING function
+			# to itself return a Result[_,IndexError]-shaped type - main()
+			# returns plain i32 (needed for this test harness's own exit-
+			# code dispatch), so the loop lives in a small helper instead,
+			# unwrapped by main(). xor-checksum the visited elements
+			# against the expected total (order-independent, since sets
+			# are unordered) as proof every element was visited exactly once.
+			( 'for_loop_over_set_visits_every_element_once', '''
+def checksum_set( s: set[i32] ) -> Result[i32, IndexError]:
+	checksum: i32 = 0
+	with compiler.wrap_arithmetic:
+		for x in s:
+			checksum = checksum ^ x
+	return Result.Ok( checksum )
+
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 1 )
+	s.add( 2 )
+	s.add( 4 )
+	s.add( 8 )
+	if s.__len__() != 4:
+		return 1
+	r: Result[i32,IndexError] = checksum_set( s )
+	if r.is_err():
+		return 2
+	if r.unwrap( 'x' ) != 15:  # 1 ^ 2 ^ 4 ^ 8 == 15
+		return 3
+	return 0
+''' ),
 		] )
 
 
