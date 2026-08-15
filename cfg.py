@@ -1558,16 +1558,25 @@ class CFGState:
 		self.<base_attr> before this runs), so unlike attr_assign this
 		never needs an "already exists" branch. '''
 		for attr in base_required:
-			# resolve FIRST - flattened_attributes() (unlike own_new_virtual_slots()
+			# resolve FIRST. flattened_attributes() (unlike own_new_virtual_slots()
 			# right beside it in mpy_types.py) doesn't resolve anything it returns,
-			# so a base attribute's .type is routinely still None here. Asking the
-			# RC question of an unresolved attribute silently answers "not RC" and
-			# takes the else-branch below, pushing NO epilogue entry - i.e. an
-			# early exit from the subclass __init__ after super().__init__() would
-			# never decref that base field, exactly the leak this method's own
-			# docstring says it exists to prevent. Same ordering hazard as
-			# TaggedUnion._resolved_leaves (see its docstring): "unresolved" and
-			# "has no RC leaves" are indistinguishable unless you force it first.
+			# and base attributes DO routinely arrive here with .type still None.
+			# Asking the RC question of an unresolved attribute would silently
+			# answer "not RC" and take the else-branch below, pushing NO epilogue
+			# entry - i.e. an early exit from the subclass __init__ after
+			# super().__init__() would never decref that base field, the leak this
+			# method's own docstring says it exists to prevent. Same ordering
+			# hazard as TaggedUnion._resolved_leaves (see its docstring):
+			# "unresolved" and "has no RC leaves" are indistinguishable unless you
+			# force it first.
+			#
+			# Defensive, NOT a bug currently biting: instrumenting the whole test
+			# corpus shows only i32 attributes ever arriving unresolved, while the
+			# one RC base attribute (str) is always already resolved by this point
+			# - plausibly because an RC-typed annotation has to be looked up to be
+			# scheduled at all, where an intrinsic scalar doesn't. That's an
+			# accident of resolution order, not a guarantee any of this relies on,
+			# so it gets forced rather than assumed.
 			if attr.resolve is not None:
 				attr.resolve()
 			key = f'self.{attr.stem}'
