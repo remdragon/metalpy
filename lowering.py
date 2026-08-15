@@ -10,7 +10,7 @@ import cfg
 import ir
 from discovery import Discovery, is_stub_body
 from errors import CompileError
-from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec
+from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec, validate_float_spec
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
@@ -2697,6 +2697,33 @@ class FunctionLowering:
 		self._emit( ir.AtomicLoad( dest = dest, ptr = ptr ))
 		return dest
 
+	def _lower_compiler_format_f64( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.format_f64(buf, size, precision, value) -> i32 - writes
+		# value's fixed-precision decimal digits (magnitude only, no sign -
+		# lib/builtins/__float.py's own callers split the sign out first, the
+		# same split int's __str__/_to_radix_digits/_decimal_digits_with_
+		# grouping already keep) into buf[0:size), returns the byte count
+		# written. Backed by a hand-written C helper in emitter_c.py's
+		# PROLOGUE (real snprintf/ntdll _snprintf, called there with its true
+		# variadic prototype) - deliberately NOT an ordinary @extern binding:
+		# emitter_c.py's extern codegen only ever emits fixed-arity C
+		# prototypes, which is an ABI hazard for a genuinely variadic callee,
+		# and tagging this under the 'c' extern lib would flip
+		# compiler.extern_libs and break the no-crt Windows build
+		# (float_test.py's own no_crt = 'c' not in compiler.extern_libs).
+		if len( node.args ) != 4 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.format_f64(...) takes exactly 4 arguments (buf, size, precision, value): {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		ptr_cls = intrinsics['Ptr']
+		buf_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ intrinsics['u8'] ] )
+		buf = self._lower_expr( node.args[0], buf_type )
+		size = self._lower_expr( node.args[1], intrinsics['usize'] )
+		precision = self._lower_expr( node.args[2], intrinsics['i32'] )
+		value = self._lower_expr( node.args[3], intrinsics['f64'] )
+		dest = self._new_temp( expected_type or intrinsics['i32'] )
+		self._emit( ir.FormatFloat( dest = dest, buf = buf, size = size, precision = precision, value = value ))
+		return dest
+
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
 		# statement-only (see _stmt_Expr's own dispatch) - mirrors
 		# compiler.incref/decref: no return value, nothing to hand back to
@@ -4178,7 +4205,24 @@ class FunctionLowering:
 		for p in ( method.parameters or [] ):
 			self.lowering.schedule( p.type )
 		dest = self._new_temp( result_type )
-		self._emit( ir.Call( dest = dest, target = method, receiver = receiver, args = args, kwargs = {} ))
+		if method.cls is None:
+			# a Scalar-registered method (`SomeScalar.method = some_free_
+			# function` - discovery.py's visit_Assign, e.g. this file's own
+			# float format-spec dispatch onto f64._sign_prefix/_fixed_digits,
+			# lib/builtins/__float.py) is a genuine free Function, unlike a
+			# real CStruct/RCClass method - discovery never strips a "self"
+			# off its .parameters the way _make_function_resolver does for
+			# an actual class body (there IS no class body here), so
+			# emitter_c.py's _emit_call_args (which walks target.parameters
+			# assuming it already excludes the receiver) would double-count
+			# the receiver against the first declared parameter otherwise -
+			# confirmed by a real KeyError crash while wiring this up.
+			# ir.Call's own receiver field is for real bound-method calls
+			# only; a free function just takes the receiver as an ordinary
+			# leading positional argument instead.
+			self._emit( ir.Call( dest = dest, target = method, receiver = None, args = [ receiver ] + args, kwargs = {} ))
+		else:
+			self._emit( ir.Call( dest = dest, target = method, receiver = receiver, args = args, kwargs = {} ))
 		return dest
 
 	def _const_usize( self, value: int ) -> ir.Const:
@@ -4271,6 +4315,9 @@ class FunctionLowering:
 		int_type = self.lowering.discovery.find_name_or_none( 'int' )
 		if int_type is not None and operand.type is int_type:
 			return self._lower_int_format_spec( operand, spec, str_type, node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		if operand.type is intrinsics.get( 'f32' ) or operand.type is intrinsics.get( 'f64' ):
+			return self._lower_float_format_spec( operand, spec, str_type, node )
 		type_name = operand.type.qualname if operand.type is not None else '?'
 		if spec.type in ( 'f', 'F', 'e', 'E', 'g', 'G', '%' ):
 			self.lowering.discovery.fail(
@@ -4278,7 +4325,7 @@ class FunctionLowering:
 				node,
 			)
 		self.lowering.discovery.fail(
-			f'f-string format spec: {type_name} does not support format specs yet (only str and int do): {ast.unparse(node)}',
+			f'f-string format spec: {type_name} does not support format specs yet (only str, int, and float do): {ast.unparse(node)}',
 			node,
 		)
 
@@ -4330,6 +4377,30 @@ class FunctionLowering:
 		if spec.align == '=': # the '0' shorthand - zero-padding goes BETWEEN sign/prefix and digits
 			return self._lower_method_call( digits, '_pad_after_prefix', [ sign_and_prefix, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ) ], str_type, node )
 		body = self._lower_str_add( sign_and_prefix, digits, str_type, node )
+		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
+
+	def _lower_float_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
+		# 'f'/'F' (fixed-point) only - validate_float_spec rejects
+		# 'e'/'E'/'g'/'G'/'%' with a clear "not implemented yet" error
+		# (PLAN_STR_FORMAT.md item 4). Same sign+digits+pad assembly shape
+		# as _lower_int_format_spec above (no radix/grouping prefix to
+		# worry about here, so it's simpler), calling into
+		# lib/builtins/__float.py's own _sign_prefix/_fixed_digits methods -
+		# real control flow lives there, not hand-built IR here, matching
+		# int's own _sign_prefix/_to_radix_digits split.
+		try:
+			validate_float_spec( spec )
+		except FormatSpecError as e:
+			self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
+		precision = spec.precision if spec.precision is not None else 6 # Python's own f"{x:f}" default precision
+		digits = self._lower_method_call( operand, '_fixed_digits', [ self._const_usize( precision ) ], str_type, node )
+		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
+
+		if spec.width is None:
+			return self._lower_str_add( sign_char, digits, str_type, node )
+		if spec.align == '=': # the '0' shorthand - zero-padding goes BETWEEN sign and digits
+			return self._lower_method_call( digits, '_pad_after_prefix', [ sign_char, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ) ], str_type, node )
+		body = self._lower_str_add( sign_char, digits, str_type, node )
 		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
 
 	def _lower_str_add( self, left: ir.Operand, right: ir.Operand, str_type: Type, node: ast.AST ) -> ir.Operand:
@@ -6697,6 +6768,10 @@ class FunctionLowering:
 
 			case 'fetch_unicode_table':
 				result = self.lowering._lower_compiler_fetch_unicode_table( node )
+				return result if want_result else None
+
+			case 'format_f64':
+				result = self._lower_compiler_format_f64( node, expected_type )
 				return result if want_result else None
 
 		# each recognizer returns None (not an error) when this call doesn't

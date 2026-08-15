@@ -514,6 +514,17 @@ class AtomicCompareExchange( Instruction ): # compiler.atomic_compare_exchange(p
 		return f'AtomicCompareExchange( dest={self.dest!r}, ptr={self.ptr!r}, expected={self.expected!r}, desired={self.desired!r} )'
 
 @dataclass( kw_only = True )
+class FormatFloat( Instruction ): # compiler.format_f64(buf, size, precision, value) - writes fixed-precision decimal digits (no sign) into buf, returns the byte count written (see lowering.py's _lower_compiler_format_f64)
+	dest: Temp
+	buf: Operand
+	size: Operand
+	precision: Operand
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'FormatFloat( dest={self.dest!r}, buf={self.buf!r}, size={self.size!r}, precision={self.precision!r}, value={self.value!r} )'
+
+@dataclass( kw_only = True )
 class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no field-layout
 	# algorithm exists in this compiler (nor should one - that's the C
 	# compiler's job), so unlike an intrinsic scalar's sizeof (which folds
