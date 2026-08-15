@@ -341,6 +341,19 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 		# actually expects a u32. Before Stage 1/2 this couldn't happen at
 		# all - every leaf's method stayed abstract/bare-T, so there was
 		# nothing to disagree about
+		#
+		# Re-verified, explicitly, when lowering.py gained a general
+		# assignability check (_lower_expr's _check_assignable): confirmed
+		# STILL unaffected, not just untouched by oversight -
+		# _lower_union_receiver_call lowers this call's argument exactly
+		# ONCE, against the FIRST leaf's (Box[i32].set) own parameter type,
+		# then reuses that single already-lowered operand across every
+		# leaf's own ir.Call with no second _lower_expr invocation - the
+		# general check has no opportunity to see the SECOND leaf's own
+		# mismatch at all, structurally, regardless of how strict it is.
+		# Still a real, separate, larger gap to fix another day (per-leaf
+		# argument re-lowering/re-checking in union-receiver dispatch), not
+		# something this plan's own narrower fix could reach.
 		self._run( '\n'.join([
 			'class Box[T]:',
 			'\tv: T',
@@ -1966,7 +1979,14 @@ class RCClassDestructorTests( RCClassTestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		destructor_src = self._emit_and_find_destructor( '__main__.Owner' )
 		self.assertIn( '__main__$Owner$__del__( self )', destructor_src )
-		self.assertIn( 'sys$free( (void*)(self) )', destructor_src )
+		# self (a bare RCClass) now goes through an explicit compiler.cast(...)
+		# before reaching sys.free (see type_resolver.py's _synthesize_
+		# rcclass_destructor - lowering.py's new general assignability check,
+		# _check_assignable, made the implicit self->Ptr[u8] reinterpret this
+		# destructor used to rely on into a real compile error, same as any
+		# other mismatched call site now gets), so the argument is a real
+		# temp holding the cast result, not `self` passed bare
+		self.assertIn( 'sys$free( (void*)($t0) )', destructor_src )
 		# __del__ runs BEFORE sys.free - fields must still be valid when it runs
 		self.assertLess( destructor_src.index( '__del__' ), destructor_src.index( 'sys$free' ))
 
@@ -1984,7 +2004,10 @@ class RCClassDestructorTests( RCClassTestCase ):
 		# own header at runtime (see ObjectHeader's own comment) rather
 		# than this call site naming it as a literal argument
 		self.assertIn( 'release_object( &($t0)->$header )', destructor_src )
-		self.assertIn( 'sys$free( (void*)(self) )', destructor_src )
+		# see test_del_method_is_called_from_synthesized_destructor's own
+		# comment on why this is a real temp ($t1, following the field
+		# decref's own $t0) rather than `self` passed bare
+		self.assertIn( 'sys$free( (void*)($t1) )', destructor_src )
 
 	def test_taggedunion_field_cascades_a_tag_gated_decref( self ) -> None:
 		# a TaggedUnion-typed field with an RC-leaf member (MaybeFoo.Some)

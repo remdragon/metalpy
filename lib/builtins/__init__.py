@@ -183,7 +183,7 @@ class bytes:
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		return utf8.decode( self )
 
-BYTEARRAY_INVALID: u32 = 0 # this is a sentinel to indicate a bytearray was released
+BYTEARRAY_INVALID: Ptr[u8] = 0 # this is a sentinel to indicate a bytearray was released - matches lib/windows/kernel32.py's own INVALID_HANDLE_VALUE convention (a literal assigned directly to its real pointer type, not a same-width integer alias needing its own cast at every comparison site)
 
 class bytearray:
 	__data: Ptr[u8]
@@ -1596,7 +1596,15 @@ case_folder: CaseFolding = CaseFolding(
 def print( msg: str, end: str = '\n' ) -> None:
 	# No *args/**kwargs, use f-strings instead (once implemented)
 	sys.stdout.write( msg ).unwrap( 'stdout write failed' )
-	if end:
+	# `if end:` (Python-style str truthiness - empty string is falsy) was
+	# never actually implemented: str has no __bool__/truthiness dunder, so
+	# a bare str used as a condition was silently testing its own (always
+	# non-null, since a real str is always a valid heap object once
+	# constructed) POINTER instead of its content - always true, regardless
+	# of whether end was actually empty. Real, previously-latent bug, only
+	# surfaced now that a str flowing into a bool-expected context is
+	# checked at all. len(end) != 0 is the correct, explicit content check.
+	if len( end ) != 0:
 		sys.stdout.write( end ).unwrap( 'stdout write failed' )
 
 # a single generic function now that bare-call monomorphization can infer T

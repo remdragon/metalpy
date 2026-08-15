@@ -7264,6 +7264,230 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self.assertEqual( len( self._calls_to( fn, '.append' )), 2 )
 
+class AssignabilityCheckTests( unittest.TestCase ):
+	''' lowering.py's new general assignability check (_lower_expr's
+	_check_assignable, plus the safe-scalar-widening coercion and the
+	_expr_Constant literal-kind validation) - closes a previously self-
+	documented gap ("a genuine argument-type mismatch isn't checked
+	anywhere yet"). import_builtins=True throughout: several cases need
+	real str/RCClass, and scalars/Ptr are always available as intrinsics
+	regardless, so one setUp covers every case here. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ) -> LoweredFunction:
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		return fn
+
+	def _assert_rejected( self, code: str, needle: str = 'expected' ) -> None:
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( needle in e for e in self.discovery.errors.errors ),
+			f'expected an error containing {needle!r}, got: {self.discovery.errors.errors}',
+		)
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	# --- must now reject: the original bug repro, verbatim -------------------
+
+	def test_call_argument_type_mismatch_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def foo( x: str ) -> None: return',
+			'def main() -> None:',
+			'	y: i32 = 5',
+			'	foo( y )',
+		]))
+
+	def test_annassign_type_mismatch_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			'	y: i32 = 5',
+			'	z: str = y',
+		]))
+
+	def test_reassignment_type_mismatch_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			'	y: i32 = 5',
+			"	y = 'hello'",
+		]))
+
+	# --- must now reject: the remaining call sites ----------------------------
+
+	def test_return_type_mismatch_is_rejected( self ) -> None:
+		# _stmt_Return has its OWN dedicated compatibility check (including
+		# error-union widening) rather than relying on the general
+		# _check_assignable (see lowering.py's own comment on why that
+		# call is strict=False) - own error wording, not "expected ..."
+		self._assert_rejected( '\n'.join([
+			'def main() -> str:',
+			'	y: i32 = 5',
+			'	return y',
+		]), needle = 'function returns' )
+
+	def test_attribute_assignment_type_mismatch_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'class Foo:',
+			'	s: str',
+			'	def __init__( self ) -> None:',
+			"		self.s = ''",
+			'def main() -> None:',
+			'	f: Foo = Foo()',
+			'	y: i32 = 5',
+			'	f.s = y',
+		]))
+
+	def test_augassign_type_mismatch_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			'	y: i32 = 5',
+			'	y += True',
+		]))
+
+	# --- must now reject: literal-kind mismatches -----------------------------
+
+	def test_int_literal_into_str_is_rejected( self ) -> None:
+		self._assert_rejected( "def main() -> None:\n\tz: str = 5" )
+
+	def test_int_literal_into_bool_is_rejected( self ) -> None:
+		self._assert_rejected( 'def main() -> None:\n\tflag: bool = 5' )
+
+	def test_bool_literal_into_non_bool_scalar_is_rejected( self ) -> None:
+		self._assert_rejected( 'def main() -> None:\n\tx: i32 = True' )
+
+	def test_none_literal_into_non_nullable_rcclass_is_rejected( self ) -> None:
+		self._assert_rejected( 'def main() -> None:\n\ts: str = None' )
+
+	# --- must now reject: narrowing / sign-changing / isize-usize scalars -----
+
+	def test_narrowing_scalar_assignment_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			'	big: i64 = 5',
+			'	small: i32 = big',
+		]))
+
+	def test_sign_changing_scalar_assignment_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			'	s: i32 = 5',
+			'	u: u32 = s',
+		]))
+
+	def test_usize_excluded_from_widening_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			'	s: usize = 5',
+			'	w: i64 = s',
+		]))
+
+	# --- must keep working: safe scalar widening ------------------------------
+
+	def test_i32_widens_to_i64_via_real_castwrap( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	s: i32 = 5',
+			'	w: i64 = s',
+		]))
+		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
+
+	def test_u8_widens_to_u32_via_real_castwrap( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	s: u8 = 5',
+			'	w: u32 = s',
+		]))
+		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
+
+	def test_f32_widens_to_f64_via_real_castwrap( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	s: f32 = 1.5',
+			'	w: f64 = s',
+		]))
+		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
+
+	def test_float_operand_widths_still_require_an_explicit_cast_in_arithmetic( self ) -> None:
+		# the one deliberate exception to "safe widening is always implicit":
+		# _lower_binary_operands' own hint-passing is strict=False specifically
+		# so THIS keeps failing via _lower_binop_values' own stricter float-
+		# same-type rule, not silently widened by the general mechanism above
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			'	with compiler.wrap_arithmetic:',
+			'		a: f64 = 1.0',
+			'		b: f32 = 2.0',
+			'		c: f64 = a + b',
+		]), needle = 'same type' )
+
+	# --- must keep working: pre-existing coercions, unaffected ----------------
+
+	def test_rcclass_upcast_to_base_stays_implicit( self ) -> None:
+		self._assert_accepted( '\n'.join([
+			'class Base:',
+			'	def __init__( self ) -> None: return',
+			'class Derived( Base ):',
+			'	def __init__( self ) -> None: return',
+			'def foo( b: Base ) -> None: return',
+			'def main() -> None:',
+			'	d: Derived = Derived()',
+			'	foo( d )',
+		]))
+
+	def test_tagged_union_member_coercion_stays_implicit( self ) -> None:
+		self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	a: i32|str = 5',
+			"	b: i32|str = 'x'",
+		]))
+
+	def test_explicit_scalar_cast_still_works( self ) -> None:
+		self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	s: i32 = 5',
+			'	with compiler.wrap_arithmetic:',
+			'		w: u32 = u32( s )',
+		]))
+
+	def test_literal_to_scalar_assignment_still_works( self ) -> None:
+		self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	x: i64 = 5',
+			'	y: u32 = 10',
+			'	f: f32 = 1.5',
+		]))
+
+	def test_nullable_pointer_literal_still_works( self ) -> None:
+		self._assert_accepted( 'def main() -> None:\n\tp: Ptr[u8] = None' )
+
+	def test_pointer_coercion_generalized_to_a_call_result_not_just_name_or_attribute( self ) -> None:
+		# _maybe_castwrap_pointer used to only be reachable from _expr_Name/
+		# _expr_Attribute directly - now a third _lower_expr branch applies
+		# it to ANY expression kind. compiler.addrof(x) always produces a
+		# fixed Ptr[T] regardless of expected_type (lowering.py's own
+		# _lower_compiler_addrof never consults it), dispatched through
+		# _expr_Call, not _expr_Name/_expr_Attribute - assigning it straight
+		# into a ConstPtr[T]-typed target needs the SAME interchangeable-
+		# pointer coercion those two node kinds already got on their own
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	x: u8 = 0',
+			'	p: ConstPtr[u8] = compiler.addrof( x )',
+		]))
+		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
+
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

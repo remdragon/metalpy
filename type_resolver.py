@@ -291,10 +291,10 @@ class TypeResolver:
 		from mpy_types import Overload
 		if isinstance( free_overload, Overload ):
 			free_fn = free_overload.implementations[0]
-			if free_fn.resolve is not None:
-				free_fn.resolve()
 		else:
 			free_fn = free_overload
+		if free_fn.resolve is not None:
+			free_fn.resolve()
 		free_call = ast.Call(
 			func = ast.Attribute(
 				value = ast.Name( id = 'sys', ctx = ast.Load() ),
@@ -304,6 +304,26 @@ class TypeResolver:
 		)
 		free_call.resolved_callee = free_fn
 		free_call.end_lineno = None; free_call.end_col_offset = None
+		# self (a bare RCClass) and sys.free's own declared parameter
+		# (Ptr[u8]/Ptr[None]) are both pointer-representable (same bit
+		# pattern - see TypeResolver._is_pointer_representable) but NOT the
+		# same TYPE, which lowering.py's own general assignability check
+		# (_lower_expr's _check_assignable) now correctly rejects for
+		# ordinary code - this synthesized call needs the identical explicit
+		# reinterpret a real user would have to write, via the same
+		# resolved_type escape hatch _get_or_create_closure_trampoline
+		# already uses (lowering.py's _lower_compiler_cast), rather than
+		# relying on an implicit conversion nothing used to check
+		free_param_type = free_fn.parameters[0].type
+		cast_type_ref = ast.Name( id = '<sys.free.ptr>', ctx = ast.Load() )
+		cast_type_ref.resolved_type = free_param_type
+		free_call.args = [ ast.Call(
+			func = ast.Attribute(
+				value = ast.Name( id = 'compiler', ctx = ast.Load() ),
+				attr = 'cast', ctx = ast.Load(),
+			),
+			args = [ cast_type_ref, ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+		)]
 		body.append( ast.Expr( free_call ))
 
 		self_param = Parameter(

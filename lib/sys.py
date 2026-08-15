@@ -152,7 +152,11 @@ def _exit_process( code: u32 ) -> None:
 @compiler.target( os = not 'windows' )
 def _exit_process( code: u32 ) -> None:
 	from crt import _exit
-	_exit( code )
+	# POSIX _exit(int status) takes a signed int - code is u32 (matches
+	# Windows' own u32 exit-code convention, see the sibling branch above),
+	# an explicit narrowing/sign-changing cast either way
+	with compiler.wrap_arithmetic:
+		_exit( i32( code ) )
 
 @compiler.target( os = 'windows' )
 def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:

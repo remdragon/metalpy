@@ -13,7 +13,7 @@ from errors import CompileError
 from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
-	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, RCClass, Scalar,
+	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
 	CallableType, ClosureType, TupleType,
 )
 import overload_resolution
@@ -1768,7 +1768,17 @@ class FunctionLowering:
 			# inside the defer body) since _in_deferred_body stays set for
 			# the whole capture, not just the top-level statement
 			self.lowering.discovery.fail( f'return is not allowed inside a defer/errdefer body: {ast.unparse(node)}', node )
-		value = self._lower_expr( node.value, self._current_fn.return_type ) if node.value is not None else None
+		# strict=False: this method already has its OWN, more complete
+		# compatibility check just below (monomorphized-Specialization
+		# comparison, CEnum-to-underlying, and _maybe_widen_return_result's
+		# error-union widening) - _lower_expr's own general _check_assignable
+		# would otherwise fire first and incorrectly reject exactly the
+		# widening case this method exists to allow (`return x` where x:
+		# Result[T,NarrowE] inside a function declared -> Result[T,WideE]).
+		# The pre-existing TaggedUnion/RCClass-upcast coercions this method's
+		# own comment below already expects still apply regardless (not
+		# gated on strict - see _lower_expr's own comment)
+		value = self._lower_expr( node.value, self._current_fn.return_type, strict = False ) if node.value is not None else None
 		# what actually gets returned/assigned into the return-value slot
 		# below - defaults to `value` itself, reassigned to a widened temp
 		# further down when the covered-Result-error-widening case applies.
@@ -3422,7 +3432,17 @@ class FunctionLowering:
 
 	# --- expressions -----------------------------------------------------------
 
-	def _lower_expr( self, node: ast.expr, expected_type: Type|None ) -> ir.Operand:
+	def _lower_expr( self, node: ast.expr, expected_type: Type|None, *, strict: bool = True ) -> ir.Operand:
+		''' `strict=False` (default True): `expected_type` here is a HINT for
+		inference (e.g. _lower_binary_operands passing the left operand's own
+		type down to help type an untyped literal, or to help a nested
+		generic call bind its type params) rather than a real requirement the
+		lowered operand must satisfy - skips the safe-scalar-widening
+		coercion and the final _check_assignable rejection (both new; see
+		their own comments below), but still applies the pre-existing,
+		unconditionally-safe TaggedUnion/RCClass-upcast/pointer-cast
+		coercions. Every ordinary call site (assignment, call argument,
+		return, ...) leaves this at its default True. '''
 		method = getattr( self, f'_expr_{node.__class__.__name__}', None )
 		if method is None:
 			self.lowering.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
@@ -3483,6 +3503,47 @@ class FunctionLowering:
 			dest = self._new_temp( expected_type )
 			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
 			operand = dest
+		# a same-signedness, strictly-wider scalar (i32 -> i64, u8 -> u32,
+		# f32 -> f64) is a safe, value-preserving widening - allowed
+		# implicitly, same CastWrap shape as the RCClass upcast above, but
+		# this one is a REAL value conversion (C's own sign-/zero-extension,
+		# not a pointer reinterpret) - see _is_safe_scalar_widening's own
+		# docstring for exactly which pairs qualify and why isize/usize are
+		# deliberately excluded. Gated on `strict` (see its own parameter
+		# comment) - _lower_binary_operands' own cross-operand HINTING must
+		# never trigger this: `c: f64 = a + b` (a: f64, b: f32) needs to keep
+		# hitting _lower_binop_values' own deliberately-stricter "floating-
+		# point operation requires both operands to be the SAME type, cast
+		# explicitly" rule, not have b silently widened to f64 here first.
+		elif ( strict and expected_type is not None and operand.type is not expected_type
+				and self._is_safe_scalar_widening( operand.type, expected_type ) ):
+			dest = self._new_temp( expected_type )
+			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
+			operand = dest
+		# interchangeable object-pointer types (Ptr[T]/ConstPtr[T], any T/U) -
+		# generalized here from _expr_Name/_expr_Attribute's own narrower,
+		# node-kind-specific calls to the same helper, so a pointer value
+		# reaching this point through ANY expression kind (a Call result, a
+		# ternary, ...) gets the identical treatment - _maybe_castwrap_pointer
+		# re-checks its own guard and is a no-op once operand.type already
+		# matches, so calling it unconditionally here is safe even when
+		# _expr_Name/_expr_Attribute already tried it themselves. NOT gated
+		# on `strict` - this coercion predates this change and is always
+		# safe (any two object pointers share one C representation)
+		elif expected_type is not None and operand.type is not expected_type:
+			operand = self._maybe_castwrap_pointer( operand, expected_type )
+		# the single choke point: every legitimate coercion above already had
+		# its chance to rewrite `operand` into something matching expected_type -
+		# anything still mismatched past this point is a genuine type error
+		# (lowering.py's own longstanding gap: "a genuine argument-type
+		# mismatch isn't checked anywhere yet" - see _check_assignable).
+		# Skipped when strict=False (see _lower_expr's own `strict` param
+		# comment) - a HINT passed down for inference purposes only, not a
+		# real requirement the operand must satisfy; the caller (e.g.
+		# _lower_binop_values' own float-same-type check) is responsible for
+		# validating the ACTUAL requirement itself in that case.
+		if strict:
+			self._check_assignable( operand, expected_type, node )
 		return operand
 
 	def _is_rcclass_upcast( self, sub: Type|None, sup: Type|None ) -> bool:
@@ -3500,6 +3561,85 @@ class FunctionLowering:
 				return True
 			c = getattr( c, 'base', None )
 		return False
+
+	# same-signedness scalar widening chains - isize/usize deliberately
+	# excluded (their concrete width is target-dependent, see discovery.py's
+	# get_intrinsics: sizeof = active_target['bits'] - so treating them as
+	# interchangeable with a same-width fixed type would be non-portable
+	# across targets; usize(x)/isize(x) stay explicit-cast-only), as are
+	# bool/NoneType (never "numeric" for this purpose)
+	_SIGNED_INT_WIDENING_ORDER = ( 'i8', 'i16', 'i32', 'i64', 'i128' )
+	_UNSIGNED_INT_WIDENING_ORDER = ( 'u8', 'u16', 'u32', 'u64', 'u128' )
+	_FLOAT_WIDENING_ORDER = ( 'f32', 'f64' )
+
+	def _is_safe_scalar_widening( self, operand_type: Type|None, expected_type: Type|None ) -> bool:
+		''' True if operand_type -> expected_type is a same-family (signed
+		int / unsigned int / float), strictly-growing-width scalar
+		conversion - i32->i64, u8->u32, f32->f64, etc. Narrowing, sign-
+		changing (i32->u32), bool<->numeric, and anything involving isize/
+		usize are all deliberately NOT safe widenings here - those require
+		an explicit T(x) cast, matching this language's own "no implicit
+		conversion" design (SYNTAX.md) everywhere else. `float`/`double` are
+		the SAME Scalar object as f32/f64 (see discovery.py's get_intrinsics),
+		so comparing by .stem already handles both spellings uniformly. '''
+		if not isinstance( operand_type, Scalar ) or not isinstance( expected_type, Scalar ):
+			return False
+		for order in ( self._SIGNED_INT_WIDENING_ORDER, self._UNSIGNED_INT_WIDENING_ORDER, self._FLOAT_WIDENING_ORDER ):
+			if operand_type.stem in order and expected_type.stem in order:
+				return order.index( expected_type.stem ) > order.index( operand_type.stem )
+		return False
+
+	def _check_assignable( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST ) -> None:
+		''' the single choke point for lowering.py's own longstanding,
+		self-documented gap ("a genuine argument-type mismatch isn't
+		checked anywhere yet (no general type-checking pass exists)") -
+		called last from _lower_expr, after every legitimate coercion
+		(TaggedUnion wrap, RCClass upcast, safe scalar widening,
+		interchangeable pointer cast) already had its chance to rewrite
+		`operand` into something matching expected_type. Uses _same_type,
+		not raw `is`, for the equality check: a bare Specialization and its
+		own already-monomorphized form (or a bare TupleType and its own
+		resolved backing RCClass) are the SAME type reached through two
+		different representations, not a real conflict - see
+		TypeResolver._same_type's own docstring. Also exempts two shapes
+		_expr_Constant's own pre-existing literal-kind check already treats
+		as non-mismatches for the identical reason (same precedent, applied
+		here too since this is the general case, not just the literal one):
+		a still-unbound generic TypeVar as expected_type (e.g.
+		_lower_allocate_fields lowering a generic no-__init__ field's own
+		value against its still-abstract, unsubstituted field.type - nothing
+		concrete exists yet to validate against, T is what's BEING inferred,
+		not what to check the value against), and a CEnum on either side
+		matched against its own declared underlying value_type (e.g.
+		`x: builtins.OSError = ...; return x` from a function declared -> u32
+		- "a CEnum has exactly the same runtime representation as its
+		underlying type", per _try_lower_construct_call's own CEnum-
+		construction comment, so the two are interchangeable both directions,
+		not just at construction time). Also unwraps move[T]/copy[T] on the
+		expected side: both are pure compile-time annotation wrappers (see
+		Move/Copy's own docstrings) - a real call-site VALUE is always
+		plain T, never literally typed as Move[T]/Copy[T] itself (that
+		ownership transfer is tracked separately, by _apply_move_hook/cfg.py,
+		not by the value's own .type). '''
+		if expected_type is None or operand.type is None:
+			return
+		if self.lowering._type_resolver._same_type( operand.type, expected_type ):
+			return
+		if isinstance( expected_type, TypeVar ):
+			return
+		if isinstance( expected_type, CEnum ) and operand.type is expected_type.value_type:
+			return
+		if isinstance( operand.type, CEnum ) and expected_type is operand.type.value_type:
+			return
+		if isinstance( expected_type, ( Move, Copy )):
+			self._check_assignable( operand, expected_type.inner, node )
+			return
+		self.lowering.discovery.fail(
+			f'{ast.unparse(node)}: expected {expected_type.qualname}, got {operand.type.qualname} - '
+			f'these are different types; convert explicitly if this is intentional '
+			f'(e.g. {expected_type.stem}(...) for a scalar target)',
+			node,
+		)
 
 	def _maybe_castwrap_pointer( self, operand: ir.Operand, expected_type: Type|None ) -> ir.Operand:
 		''' When a pointer-typed value flows into a context expecting a DIFFERENT
@@ -3585,14 +3725,13 @@ class FunctionLowering:
 			leaf_dest = self._new_temp( member.type )
 			self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
 			return leaf_dest
-		# when a pointer-typed local flows into a context expecting a
-		# differently-typed pointer (e.g. return ptr where ptr: Ptr[u8]
-		# but the function returns Ptr[T]), insert a CastWrap — in C all
-		# object pointers have the same representation, so this is safe
-		if expected_type is not None and name.type is not expected_type and self.lowering._type_resolver._is_ptr_specialization( name.type ) and self.lowering._type_resolver._is_ptr_specialization( expected_type ):
-			dest = self._new_temp( expected_type )
-			self._emit( ir.CastWrap( dest = dest, operand = name ))
-			return dest
+		# a pointer-typed local flowing into a context expecting a
+		# differently-typed pointer (e.g. return ptr where ptr: Ptr[u8] but
+		# the function returns Ptr[T]) used to get a CastWrap inserted right
+		# here - now handled uniformly by _lower_expr's own generalized
+		# pointer-coercion branch instead (which correctly excludes function
+		# pointers, unlike this now-removed inline copy did), so every
+		# expression kind gets identical treatment, not just a bare Name
 		return name
 
 	def _reject_free_variables( self, roots: list[ast.AST], param_names: set[str], node: ast.AST ) -> None:
@@ -3929,6 +4068,21 @@ class FunctionLowering:
 			# (float literal -> int scalar) stays rejected by the dedicated
 			# guard at the top of this method - this is one-directional
 			is_int_into_float = type( node.value ) is int and expected_stem in ( 'f32', 'f64' )
+			# a None literal is deliberately NOT a key in _LITERAL_COMPATIBLE_
+			# STEMS at all - _lower_overload_arg's own identical dict lookup
+			# relies on exactly that miss to skip straight to _lower_expr(expr,
+			# None) for overload candidate matching (a None literal's "which
+			# overload accepts it" question needs real per-candidate nullable-
+			# type matching, not this coarse stem-list check) - adding a
+			# NoneType entry there would silently break that. Validated here
+			# instead, separately: only NoneType itself is a legitimate non-
+			# pointer target (Ptr[T]/ConstPtr[T] is already exempted above -
+			# the real, common nullable-pointer idiom, e.g. `p: Ptr[u8] = None`)
+			if node.value is None and expected_stem != 'NoneType':
+				self.lowering.discovery.fail(
+					f'{ast.unparse(node)}: None cannot be used where {expected_type.qualname} is expected',
+					node,
+				)
 			if compatible_stems is not None and expected_stem not in compatible_stems and not is_int_into_float:
 				kind = type( node.value ).__name__
 				article = 'an' if kind[0] in 'aeiou' else 'a'
@@ -4616,21 +4770,32 @@ class FunctionLowering:
 		# nonsensical "checked pointer multiply"). usize is the natural
 		# offset type - same reasoning _expr_Subscript's own pointer index
 		# hint already uses
+		# every _lower_expr call below is strict=False: these are all HINTS
+		# (helping an untyped literal or a nested generic call infer its own
+		# type), never a real requirement the operand must satisfy - the
+		# real requirement, if any, is validated separately, either by _lower_
+		# binop_values' own explicit checks (e.g. its float-same-type rule)
+		# or by the OUTER _lower_expr call that invoked _expr_BinOp/_expr_
+		# Compare in the first place, re-checking the whole expression's own
+		# RESULT afterward. Without this, e.g. `c: f64 = a + b` (a: f64, b:
+		# f32) would have b silently widened to f64 right here, bypassing
+		# _lower_binop_values' own deliberately stricter "both operands must
+		# already be the SAME float type, cast explicitly" rule entirely.
 		if left_is_const and not right_is_const:
-			right = self._lower_expr( right_node, expected_type )
+			right = self._lower_expr( right_node, expected_type, strict = False )
 			left_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( right.type ) else right.type
-			left = self._lower_expr( left_node, left_hint )
+			left = self._lower_expr( left_node, left_hint, strict = False )
 		elif right_is_const and not left_is_const:
-			left = self._lower_expr( left_node, expected_type )
+			left = self._lower_expr( left_node, expected_type, strict = False )
 			right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( left.type ) else left.type
-			right = self._lower_expr( right_node, right_hint )
+			right = self._lower_expr( right_node, right_hint, strict = False )
 		else:
-			left = self._lower_expr( left_node, expected_type )
+			left = self._lower_expr( left_node, expected_type, strict = False )
 			if infer_right_from_left:
 				right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( left.type ) else ( expected_type or left.type )
 			else:
 				right_hint = expected_type
-			right = self._lower_expr( right_node, right_hint )
+			right = self._lower_expr( right_node, right_hint, strict = False )
 		return left, right
 
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
@@ -4847,7 +5012,13 @@ class FunctionLowering:
 
 	def _expr_UnaryOp( self, node: ast.UnaryOp, expected_type: Type|None ) -> ir.Operand:
 		if isinstance( node.op, ast.Not ):
-			operand = self._lower_expr( node.operand, expected_type )
+			# strict=False: `not x` applies C-style truthiness to WHATEVER
+			# scalar x already is (ir.Not/emitter_c.py's own `!operand` C
+			# emission handles any scalar type, not just bool) - expected_type
+			# here is only ever a hint for the RARE case node.operand itself
+			# still needs inference (an untyped literal/generic call), never a
+			# real requirement that x must already BE expected_type's own type
+			operand = self._lower_expr( node.operand, expected_type, strict = False )
 			dest = self._new_temp( expected_type or operand.type )
 			self._emit( ir.Not( dest = dest, operand = operand ))
 			return dest
@@ -5530,12 +5701,16 @@ class FunctionLowering:
 		# method's own receiver-vs-static distinction) to fold in here too
 		positional, keyword = self.lowering._match_call_args( callee, node )
 		partial_args = [ bindings.get( id( tv ), tv ) for tv in type_params ]
+		# strict=False on both: the substituted hint can still contain an
+		# unbound TypeVar nested inside it (a class type param not yet
+		# bound) - it's an inference HINT, not a validated requirement; the
+		# REAL validation/binding is _unify_type_param below
 		args = [
-			self._lower_expr( expr, self.lowering._substitute_type_params( param.type, type_params, partial_args ))
+			self._lower_expr( expr, self.lowering._substitute_type_params( param.type, type_params, partial_args ), strict = False )
 			for param, expr in positional
 		]
 		kwargs = {
-			param.stem: self._lower_expr( expr, self.lowering._substitute_type_params( param.type, type_params, partial_args ))
+			param.stem: self._lower_expr( expr, self.lowering._substitute_type_params( param.type, type_params, partial_args ), strict = False )
 			for param, expr in keyword
 		}
 		for ( param, _expr ), operand in zip( positional, args ):
@@ -6066,7 +6241,12 @@ class FunctionLowering:
 				# unchanged - only a hint that IS one of type_params, bare,
 				# needs this fallback
 				hint = None
-			operand = self._lower_expr( expr, hint )
+			# strict=False: `hint` can still contain an unbound TypeVar nested
+			# inside it (e.g. Ptr[Callable[[i32],K]] with K not yet bound) -
+			# it's an inference HINT here, not a validated requirement; the
+			# REAL validation/binding is _unify_type_param below, not
+			# _lower_expr's own general assignability check
+			operand = self._lower_expr( expr, hint, strict = False )
 			self.lowering._unify_type_param( type_params, param.type, operand.type, bindings, node, target.qualname )
 			return operand
 
