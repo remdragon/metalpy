@@ -108,71 +108,184 @@ typedef int64_t __metalpy_wideint;
 typedef uint64_t __metalpy_wideuint;
 
 // MSVC doesn't have __builtin_*_overflow — implement manually.
-// The emitter widens operands to int64_t/uint64_t before calling these,
-// so we only need per-signedness helpers for the widest type.
-static inline bool __metalpy_sadd_overflow(int64_t a, int64_t b, int64_t* r) {
+//
+// A real, previously-undiscovered stack buffer overflow lived here: every
+// signed/unsigned pair below used to be declared taking ONLY int64_t*/
+// uint64_t* (per a stale comment claiming "the emitter widens operands to
+// int64_t/uint64_t before calling these" - untrue of the actual call sites,
+// which pass &__tmp typed to the REAL narrow destination, e.g. int32_t*),
+// while the _Generic dispatch macros below routed EVERY width (i8/i16/i32
+// AND i64) to those same 64-bit-only functions. Passing an int32_t* where
+// int64_t* is expected is merely a warning in C (C4133), not an error - so
+// it compiled, and `*r = a * b;` inside the 64-bit function then wrote a
+// full 8 bytes through a pointer to a 4-byte (or narrower) stack local,
+// clobbering 4+ bytes of adjacent stack memory on every checked +/-/* on
+// anything narrower than i64/u64. Silent in a release build; caught here
+// as a genuine /RTC1 STATUS_BREAKPOINT ("__tmp" stack corruption) once a
+// debug build actually exercised it - confirmed with cdb: breaking on
+// _RTC_StackFailure and reading its own variable-name argument pointed
+// straight at "__tmp", and recompiling with warnings visible showed the
+// exact int32_t*->int64_t* mismatch at the failing call site.
+//
+// Fixed with one real function per (width, signedness): the 8/16/32-bit
+// versions compute in int64_t/uint64_t (always wide enough to hold the
+// exact, non-overflowing result of two <=32-bit operands, add/sub/mul
+// alike - only the true 64-bit case needs its own overflow-detection
+// technique, kept exactly as it always was) and range-check against the
+// real target width's own bounds before narrowing into *r, so *r is only
+// ever written its own declared size.
+static inline bool __metalpy_sadd_overflow64(int64_t a, int64_t b, int64_t* r) {
 	*r = a + b;
 	return (a > 0 && b > 0 && *r < 0) || (a < 0 && b < 0 && *r > 0);
 }
-static inline bool __metalpy_uadd_overflow(uint64_t a, uint64_t b, uint64_t* r) {
+static inline bool __metalpy_uadd_overflow64(uint64_t a, uint64_t b, uint64_t* r) {
 	*r = a + b;
 	return *r < a;
 }
-static inline bool __metalpy_ssub_overflow(int64_t a, int64_t b, int64_t* r) {
+static inline bool __metalpy_ssub_overflow64(int64_t a, int64_t b, int64_t* r) {
 	*r = a - b;
 	return (a >= 0 && b < 0 && *r < 0) || (a < 0 && b >= 0 && *r > 0);
 }
-static inline bool __metalpy_usub_overflow(uint64_t a, uint64_t b, uint64_t* r) {
+static inline bool __metalpy_usub_overflow64(uint64_t a, uint64_t b, uint64_t* r) {
 	*r = a - b;
 	return a < b;
 }
-static inline bool __metalpy_smul_overflow(int64_t a, int64_t b, int64_t* r) {
+static inline bool __metalpy_smul_overflow64(int64_t a, int64_t b, int64_t* r) {
 	*r = a * b;
 	if (a == 0 || b == 0) return false;
 	if (a < 0) { a = -a; b = -b; }
 	return a > INT64_MAX / (b < 0 ? -b : b);
 }
-static inline bool __metalpy_umul_overflow(uint64_t a, uint64_t b, uint64_t* r) {
+static inline bool __metalpy_umul_overflow64(uint64_t a, uint64_t b, uint64_t* r) {
 	*r = a * b;
 	if (a == 0) return false;
 	return *r / a != b;
 }
+static inline bool __metalpy_sadd_overflow32(int32_t a, int32_t b, int32_t* r) {
+	int64_t wide = (int64_t)a + (int64_t)b;
+	*r = (int32_t)wide;
+	return wide < INT32_MIN || wide > INT32_MAX;
+}
+static inline bool __metalpy_sadd_overflow16(int16_t a, int16_t b, int16_t* r) {
+	int64_t wide = (int64_t)a + (int64_t)b;
+	*r = (int16_t)wide;
+	return wide < INT16_MIN || wide > INT16_MAX;
+}
+static inline bool __metalpy_sadd_overflow8(int8_t a, int8_t b, int8_t* r) {
+	int64_t wide = (int64_t)a + (int64_t)b;
+	*r = (int8_t)wide;
+	return wide < INT8_MIN || wide > INT8_MAX;
+}
+static inline bool __metalpy_uadd_overflow32(uint32_t a, uint32_t b, uint32_t* r) {
+	uint64_t wide = (uint64_t)a + (uint64_t)b;
+	*r = (uint32_t)wide;
+	return wide > UINT32_MAX;
+}
+static inline bool __metalpy_uadd_overflow16(uint16_t a, uint16_t b, uint16_t* r) {
+	uint64_t wide = (uint64_t)a + (uint64_t)b;
+	*r = (uint16_t)wide;
+	return wide > UINT16_MAX;
+}
+static inline bool __metalpy_uadd_overflow8(uint8_t a, uint8_t b, uint8_t* r) {
+	uint64_t wide = (uint64_t)a + (uint64_t)b;
+	*r = (uint8_t)wide;
+	return wide > UINT8_MAX;
+}
+static inline bool __metalpy_ssub_overflow32(int32_t a, int32_t b, int32_t* r) {
+	int64_t wide = (int64_t)a - (int64_t)b;
+	*r = (int32_t)wide;
+	return wide < INT32_MIN || wide > INT32_MAX;
+}
+static inline bool __metalpy_ssub_overflow16(int16_t a, int16_t b, int16_t* r) {
+	int64_t wide = (int64_t)a - (int64_t)b;
+	*r = (int16_t)wide;
+	return wide < INT16_MIN || wide > INT16_MAX;
+}
+static inline bool __metalpy_ssub_overflow8(int8_t a, int8_t b, int8_t* r) {
+	int64_t wide = (int64_t)a - (int64_t)b;
+	*r = (int8_t)wide;
+	return wide < INT8_MIN || wide > INT8_MAX;
+}
+static inline bool __metalpy_usub_overflow32(uint32_t a, uint32_t b, uint32_t* r) {
+	*r = (uint32_t)(a - b);
+	return a < b;
+}
+static inline bool __metalpy_usub_overflow16(uint16_t a, uint16_t b, uint16_t* r) {
+	*r = (uint16_t)(a - b);
+	return a < b;
+}
+static inline bool __metalpy_usub_overflow8(uint8_t a, uint8_t b, uint8_t* r) {
+	*r = (uint8_t)(a - b);
+	return a < b;
+}
+static inline bool __metalpy_smul_overflow32(int32_t a, int32_t b, int32_t* r) {
+	int64_t wide = (int64_t)a * (int64_t)b;
+	*r = (int32_t)wide;
+	return wide < INT32_MIN || wide > INT32_MAX;
+}
+static inline bool __metalpy_smul_overflow16(int16_t a, int16_t b, int16_t* r) {
+	int64_t wide = (int64_t)a * (int64_t)b;
+	*r = (int16_t)wide;
+	return wide < INT16_MIN || wide > INT16_MAX;
+}
+static inline bool __metalpy_smul_overflow8(int8_t a, int8_t b, int8_t* r) {
+	int64_t wide = (int64_t)a * (int64_t)b;
+	*r = (int8_t)wide;
+	return wide < INT8_MIN || wide > INT8_MAX;
+}
+static inline bool __metalpy_umul_overflow32(uint32_t a, uint32_t b, uint32_t* r) {
+	uint64_t wide = (uint64_t)a * (uint64_t)b;
+	*r = (uint32_t)wide;
+	return wide > UINT32_MAX;
+}
+static inline bool __metalpy_umul_overflow16(uint16_t a, uint16_t b, uint16_t* r) {
+	uint64_t wide = (uint64_t)a * (uint64_t)b;
+	*r = (uint16_t)wide;
+	return wide > UINT16_MAX;
+}
+static inline bool __metalpy_umul_overflow8(uint8_t a, uint8_t b, uint8_t* r) {
+	uint64_t wide = (uint64_t)a * (uint64_t)b;
+	*r = (uint8_t)wide;
+	return wide > UINT8_MAX;
+}
 
 // _Generic dispatch: the emitter calls __metalpy_add_overflow(a,b,r)
 // where *r is a local of the concrete scalar type. This picks the right
-// signed/unsigned variant based on the type of *r.
+// width-AND-signedness variant based on the type of *r, so *r is always
+// written exactly its own declared size (see the real stack-corruption
+// bug this replaced, in the comment above).
 #define __metalpy_add_overflow(a,b,r) \
 	_Generic(*(r), \
-		uint64_t: __metalpy_uadd_overflow, \
-		uint32_t: __metalpy_uadd_overflow, \
-		uint16_t: __metalpy_uadd_overflow, \
-		uint8_t:  __metalpy_uadd_overflow, \
-		int64_t:  __metalpy_sadd_overflow, \
-		int32_t:  __metalpy_sadd_overflow, \
-		int16_t:  __metalpy_sadd_overflow, \
-		int8_t:   __metalpy_sadd_overflow  \
+		uint64_t: __metalpy_uadd_overflow64, \
+		uint32_t: __metalpy_uadd_overflow32, \
+		uint16_t: __metalpy_uadd_overflow16, \
+		uint8_t:  __metalpy_uadd_overflow8,  \
+		int64_t:  __metalpy_sadd_overflow64, \
+		int32_t:  __metalpy_sadd_overflow32, \
+		int16_t:  __metalpy_sadd_overflow16, \
+		int8_t:   __metalpy_sadd_overflow8   \
 	)(a,b,r)
 #define __metalpy_sub_overflow(a,b,r) \
 	_Generic(*(r), \
-		uint64_t: __metalpy_usub_overflow, \
-		uint32_t: __metalpy_usub_overflow, \
-		uint16_t: __metalpy_usub_overflow, \
-		uint8_t:  __metalpy_usub_overflow, \
-		int64_t:  __metalpy_ssub_overflow, \
-		int32_t:  __metalpy_ssub_overflow, \
-		int16_t:  __metalpy_ssub_overflow, \
-		int8_t:   __metalpy_ssub_overflow  \
+		uint64_t: __metalpy_usub_overflow64, \
+		uint32_t: __metalpy_usub_overflow32, \
+		uint16_t: __metalpy_usub_overflow16, \
+		uint8_t:  __metalpy_usub_overflow8,  \
+		int64_t:  __metalpy_ssub_overflow64, \
+		int32_t:  __metalpy_ssub_overflow32, \
+		int16_t:  __metalpy_ssub_overflow16, \
+		int8_t:   __metalpy_ssub_overflow8   \
 	)(a,b,r)
 #define __metalpy_mul_overflow(a,b,r) \
 	_Generic(*(r), \
-		uint64_t: __metalpy_umul_overflow, \
-		uint32_t: __metalpy_umul_overflow, \
-		uint16_t: __metalpy_umul_overflow, \
-		uint8_t:  __metalpy_umul_overflow, \
-		int64_t:  __metalpy_smul_overflow, \
-		int32_t:  __metalpy_smul_overflow, \
-		int16_t:  __metalpy_smul_overflow, \
-		int8_t:   __metalpy_smul_overflow  \
+		uint64_t: __metalpy_umul_overflow64, \
+		uint32_t: __metalpy_umul_overflow32, \
+		uint16_t: __metalpy_umul_overflow16, \
+		uint8_t:  __metalpy_umul_overflow8,  \
+		int64_t:  __metalpy_smul_overflow64, \
+		int32_t:  __metalpy_smul_overflow32, \
+		int16_t:  __metalpy_smul_overflow16, \
+		int8_t:   __metalpy_smul_overflow8   \
 	)(a,b,r)
 #else
 // GCC/Clang: use compiler builtins directly
@@ -968,6 +1081,18 @@ def _emit_operand( op: ir.Operand ) -> str:
 # existing exact-string test assertions on ordinary i32 field literals)
 _WIDE_INT_STEMS: frozenset[str] = frozenset([ 'i64', 'u64', 'i128', 'u128', 'isize', 'usize' ])
 
+# i128/u128's own top-bit shift amount, as a C sizeof expression rather than
+# a hardcoded 127 - __metalpy_wideint is only 64 bits wide under MSVC's
+# fallback (see its own typedef comment), where a literal `<< 127` is UB
+# (shift amount exceeds the operand's real width). sizeof is evaluated by
+# whichever compiler actually processes the emitted C, so this always
+# matches __metalpy_wideint's REAL width (64 under MSVC, 128 under
+# gcc/clang) - the same technique isize/usize already use for their own
+# compiler-dependent width (sizeof(intptr_t)*8 - 1). Confirmed the hardcoded
+# 127 broke EVERY i128/u128 float-cast range check under MSVC, even for
+# trivially in-range values (see test_checked_cast_i128_u128_in_range).
+_WIDEINT_TOP_BIT_SHIFT = 'sizeof(__metalpy_wideint)*8 - 1'
+
 def _emit_wide_int_const( value: int, stem: str ) -> str:
 	''' a _WIDE_INT_STEMS constant, cast to its own C type. A bare C integer
 	literal token can represent at most 64 bits of magnitude (stdint.h
@@ -1192,7 +1317,12 @@ def _float_int_range_bounds( stem: str, fctype: str ) -> tuple[str,str]:
 	never `> max_expr`, the imprecise comparison this replaces. '''
 	if stem not in _FIXED_INT_BITS and stem not in ( 'isize', 'usize' ):
 		raise NotImplementedError( f'float<->int range check: unsupported target stem {stem!r}' )
-	shift = 'sizeof(intptr_t)*8 - 1' if stem in ( 'isize', 'usize' ) else str( _FIXED_INT_BITS[stem] - 1 )
+	if stem in ( 'isize', 'usize' ):
+		shift = 'sizeof(intptr_t)*8 - 1'
+	elif stem in ( 'i128', 'u128' ):
+		shift = _WIDEINT_TOP_BIT_SHIFT  # see its own comment - not a hardcoded 127
+	else:
+		shift = str( _FIXED_INT_BITS[stem] - 1 )
 	half = f'(({fctype})((__metalpy_wideuint)1 << ({shift})))' # exact 2**(n-1)
 	if _is_unsigned_stem( stem ):
 		return f'({fctype})0', f'(({fctype})2.0 * {half})' # exact 2**n
@@ -1209,8 +1339,8 @@ def _int_min_max_bit_pattern( stem: str ) -> tuple[str,str]:
 	if stem in _SATURATE_LIMITS:
 		return _SATURATE_LIMITS[stem]
 	if stem == 'i128':
-		return ( '(__metalpy_wideint)((__metalpy_wideuint)1 << 127)',
-			'(__metalpy_wideint)(((__metalpy_wideuint)1 << 127) - 1)' )
+		return ( f'(__metalpy_wideint)((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT}))',
+			f'(__metalpy_wideint)(((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT})) - 1)' )
 	if stem == 'u128':
 		return ( '(__metalpy_wideuint)0', '(~(__metalpy_wideuint)0)' )
 	raise NotImplementedError( f'no MIN/MAX for stem {stem!r}' )
@@ -1345,8 +1475,8 @@ def _signed_min_max( stem: str ) -> tuple[str,str]:
 	if stem in _SATURATE_LIMITS:
 		return _SATURATE_LIMITS[stem]
 	if stem == 'i128':
-		return ( '(__metalpy_wideint)((__metalpy_wideuint)1 << 127)',
-			'(__metalpy_wideint)(((__metalpy_wideuint)1 << 127) - 1)' )
+		return ( f'(__metalpy_wideint)((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT}))',
+			f'(__metalpy_wideint)(((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT})) - 1)' )
 	raise NotImplementedError( f'no MIN/MAX for signed stem {stem!r}' )
 
 def _emit_int_division( instr ) -> list[str]:
