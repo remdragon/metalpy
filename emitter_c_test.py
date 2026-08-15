@@ -6928,15 +6928,18 @@ class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, Compile
 	right shape.
 
 	Uses two plain, unrelated classes (not two Specializations of one
-	generic class, unlike the lowering-level test) deliberately: assigning
-	a freshly-constructed generic RCClass value into a union of that same
-	generic class's own instantiations hits a real, separate, pre-existing
-	bug (_coerce_into_union's leaf lookup is identity-based - `attr.type is
-	operand.type` - and a Specialization built by a constructor call is
-	apparently never reconciled with the one the union's own member list
-	holds), confirmed via a standalone repro and confirmed unrelated to
-	this fix (plain, non-generic union members hit no such issue). Flagged
-	here, not fixed - out of scope for this plan. '''
+	generic class, unlike the lowering-level test) deliberately - this was
+	written before _coerce_into_union's own identity-based leaf lookup
+	(`attr.type is operand.type`) was fixed to use _same_type instead (see
+	PLAN_COMPILER_BUG_SWEEP.md), at a time when assigning a freshly-
+	constructed generic RCClass value into a union of that same generic
+	class's own instantiations (a Specialization built by a constructor
+	call never reconciled with the one the union's own member list held)
+	was a real, separate, confirmed bug, flagged but deliberately not
+	fixed as out of scope for the plan active at the time. That fix has
+	since landed - see test_generic_union_member_construction_and_
+	assignment below, added once this class was revisited and the bug
+	confirmed already resolved. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -6981,6 +6984,86 @@ def main() -> i32:
 	return 0
 ''' ),
 		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_union_member_construction_and_assignment( self ) -> None:
+		# the case this class's own docstring used to flag as a separate,
+		# unfixed bug: a freshly-constructed generic RCClass value (Box[i32](5),
+		# built via a real constructor call) assigned into a union of that
+		# same generic class's own DIFFERENT instantiations (Box[i32]|Box[i64]).
+		# The constructed value's own Specialization and the union's own member
+		# list's Specialization for Box[i32] used to be two different objects
+		# for the identical instantiation - _coerce_into_union's identity-based
+		# leaf lookup rejected this outright before its _same_type fix
+		self._run( '''
+class Box[T]:
+	v: T
+	def __init__( self, v: T ) -> None:
+		self.v = v
+
+def main() -> i32:
+	u: Box[i32]|Box[i64] = Box[i32]( 5 )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_leaves_with_equal_return_types_do_not_false_positive( self ) -> None:
+		# _resolve_union_receiver_members' own leaf-agreement check
+		# (type_resolver.py, "leaf implementations disagree on return type")
+		# used to compare each leaf's own resolved return type via raw `is`.
+		# Box[i32].get_list's own -> list[T] gets EAGERLY monomorphized to
+		# list[i32] as part of specializing Box[i32] itself, while Other.
+		# get_list's own -> list[i32] is resolved fresh, straight from its
+		# own annotation - two different Specialization objects for the
+		# textually-identical list[i32], wrongly reported as "disagreeing"
+		# before the _same_type fix (see PLAN_COMPILER_BUG_SWEEP.md)
+		self._run( '''
+class Box[T]:
+	def get_list( self ) -> list[T]:
+		return list[T]()
+
+class Other:
+	def get_list( self ) -> list[i32]:
+		return list[i32]()
+
+def pick( flag: bool ) -> Box[i32]|Other:
+	if flag:
+		return Box[i32]()
+	return Other()
+
+def main() -> i32:
+	u: Box[i32]|Other = pick( True )
+	l: list[i32] = u.get_list()
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_genuinely_disagreeing_leaf_return_types_still_rejected( self ) -> None:
+		# negative companion to the test above - the _same_type fix must not
+		# make this check too permissive: two leaves with GENUINELY different
+		# return types must still be rejected
+		self._run( '''
+class LeafA:
+	def make( self ) -> i32:
+		return 1
+
+class LeafB:
+	def make( self ) -> str:
+		return 'x'
+
+def pick( flag: bool ) -> LeafA|LeafB:
+	if flag:
+		return LeafA()
+	return LeafB()
+
+def main() -> i32:
+	u: LeafA|LeafB = pick( True )
+	x = u.make()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
 
 
 class WalrusOperatorRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -8960,8 +9043,9 @@ def main() -> i32:
 			# scope stack. The raise ALSO permanently records a bogus "name
 			# 'self' is not defined" error (discovery.fail's own contract),
 			# so even catching the exception wasn't enough to fix the first
-			# attempt at this - it takes a pre-check against self.locals to
-			# avoid calling into the raising path at all for a receiver call
+			# attempt at this. Guarded via discovery.find_name_or_none directly
+			# (not a self.locals membership check, which turned out to be an
+			# incomplete record of "this name is local" - see the next test)
 			( 'match_arm_receiver_call_does_not_crash_the_compiler', '''
 class Widget:
 	touched: i32
@@ -8989,6 +9073,47 @@ def main() -> i32:
 	w.maybe_touch( Result.Ok( 5 ) )
 	if w.touched != 1:
 		return 1
+	return 0
+''' ),
+			# a case arm's own PATTERN-BOUND name (case Result.Ok(w):, w bound
+			# fresh by the match itself, not a pre-existing local/parameter)
+			# used as a receiver in the arm's last statement - the real,
+			# already-merged regression this whole test class caught: w's own
+			# binding is a plain ast.Assign spliced directly into the case
+			# body by _match_pattern/_match_union_member, never routed through
+			# self.visit()/visit_Assign, so it never updated self.locals -
+			# the ORIGINAL fix's self.locals membership check let w.close()
+			# through uncaught, same crash as the self.touch() case above,
+			# just for a different reason. Matches the exact real-world shape
+			# that surfaced this (lib/builtins/__File.py's File.binary_writer
+			# used via `match ...: case Result.Ok(w): w.write(...); w.close()`)
+			( 'match_bound_name_receiver_call_does_not_crash_the_compiler', '''
+class Widget:
+	def touch( self ) -> None:
+		pass
+
+	# w.close(), with NOTHING after it in this arm, is the exact shape
+	# that crashed - a return/assign wrapping it would short-circuit
+	# _stmt_diverges before ever reaching the receiver-call resolution
+	# this test guards, same reasoning as the self.touch() case above
+	def close( self ) -> None:
+		pass
+
+def get( ok: bool ) -> Result[Widget,i32]:
+	if ok:
+		return Result.Ok( Widget() )
+	return Result.Err( -1 )
+
+def use( ok: bool ) -> None:
+	match get( ok ):
+		case Result.Ok( w ):
+			w.touch()
+			w.close()
+		case Result.Err( e ):
+			sys.panic( 'unreachable in this test' )
+
+def main() -> i32:
+	use( True )
 	return 0
 ''' ),
 		] )

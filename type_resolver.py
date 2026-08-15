@@ -2841,7 +2841,18 @@ class TypeResolver:
 
 		reference = per_leaf[0][1]
 		for member, fn in per_leaf[1:]:
-			if fn.return_type is not reference.return_type:
+			# _same_type, not raw `is` - two leaves' own independently-
+			# resolved return-type annotations can be genuinely equal
+			# generic instantiations (e.g. both list[i32]) reached through
+			# two different Specialization objects (one substituted during
+			# a generic leaf class's own monomorphization, one built fresh
+			# from a concrete leaf's own annotation) - the same duality
+			# _check_assignable/_unify_type_param already guard against
+			# elsewhere (see TypeResolver._same_type's own docstring).
+			# Without this, PLAN_COMPILER_BUG_SWEEP.md's own audit found a
+			# real false-positive "leaf implementations disagree" here for
+			# two leaves whose return types were textually identical.
+			if not self._same_type( fn.return_type, reference.return_type ):
 				self.discovery.fail(
 					f'{union.qualname}.{attr}(...): leaf implementations disagree on return type '
 					f'({reference.cls.qualname if reference.cls else "?"}.{attr} -> '
@@ -4532,11 +4543,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		here would still poison the overall compile into reporting failure,
 		confirmed via a real repro (case Result.Ok(v): self.touch() left
 		'name \'self\' is not defined' in the error list even after
-		wrapping the call in try/except CompileError). So this pre-checks
-		the call's own ultimate base name against self.locals - a name
-		tracked there is DEFINITELY a local/parameter, never a resolvable
-		namespace path - and skips calling _resolve_callee_target at all
-		when it is, rather than calling it and hoping nothing raises. '''
+		wrapping the call in try/except CompileError).
+
+		Originally pre-checked the call's own ultimate base name against
+		self.locals (a name tracked there is DEFINITELY a local, never a
+		resolvable namespace path) - but self.locals is NOT a complete
+		record of every local: a match-pattern binding (case Result.Ok(w):)
+		produces a plain ast.Assign via _match_pattern/_match_union_member
+		that's spliced directly into the case's own output body, never
+		routed through self.visit()/visit_Assign, so it never updates
+		self.locals at all - confirmed via a real regression (case
+		Result.Ok(w): ... w.close() as the arm's last statement crashed the
+		SAME way self.touch() originally did, self.locals notwithstanding).
+		Checks discovery.find_name_or_none directly instead - the SAME
+		safe, non-raising lookup _try_resolve_namespace's own ast.Name
+		branch SHOULD be using itself (see that branch's own comment) -
+		since that authoritatively answers "is this name resolvable as a
+		namespace path at all" without needing this method to separately
+		enumerate every way a name could turn out to be local. '''
 		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
 			return True
 		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
@@ -4544,7 +4568,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		root = stmt.value.func
 		while isinstance( root, ( ast.Attribute, ast.Subscript )):
 			root = root.value
-		if not isinstance( root, ast.Name ) or root.id in self.locals:
+		if not isinstance( root, ast.Name ) or self.discovery.find_name_or_none( root.id ) is None:
 			return False
 		target = self.resolver._resolve_callee_target( stmt.value.func )
 		fn = target.base if isinstance( target, Specialization ) else target
