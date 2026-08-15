@@ -626,6 +626,128 @@ class Lowering:
 		bytes_cls = self.discovery.find_name( 'bytes', node )
 		return ir.Const( type = bytes_cls, value = table )
 
+	_WINDOWS_ZONES_URL = 'https://raw.githubusercontent.com/unicode-org/cldr/main/common/supplemental/windowsZones.xml'
+
+	def _fetch_windows_zones_xml( self, node: ast.AST ) -> bytes:
+		''' downloads (or reads a locally-cached/overridden copy of)
+		windowsZones.xml - CLDR's Windows-zone-name <-> IANA-zone-name
+		mapping table (deliberately the RAW content host, not the
+		github.com/.../blob/... viewer URL, which serves an HTML page, not
+		XML). Same caching shape as _fetch_unicode_data_txt above: cached
+		indefinitely once fetched, with METALPY_WINDOWS_ZONES_DIR (mirroring
+		METALPY_UNICODE_DATA_DIR's existing override convention) letting an
+		offline/CI build point at a local copy instead of ever reaching the
+		network. '''
+		import os
+		import tempfile
+		from pathlib import Path
+
+		override_dir = os.environ.get( 'METALPY_WINDOWS_ZONES_DIR', '' ).strip()
+		if override_dir:
+			local_path = Path( override_dir ) / 'windowsZones.xml'
+			if not local_path.is_file():
+				self.discovery.fail(
+					f'METALPY_WINDOWS_ZONES_DIR={override_dir!r} is set but {local_path} does not exist',
+					node,
+				)
+			return local_path.read_bytes()
+
+		cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'windows_zones'
+		cache_dir.mkdir( parents = True, exist_ok = True )
+		cache_file = cache_dir / 'windowsZones.xml'
+		if cache_file.is_file():
+			# same "empty file is a torn write, re-download" posture as
+			# _fetch_unicode_data_txt - see its own comment
+			try:
+				cached = cache_file.read_bytes()
+			except OSError:
+				cached = b''
+			if cached:
+				return cached
+
+		import urllib.error
+		import urllib.request
+		request = urllib.request.Request( self._WINDOWS_ZONES_URL, headers = { 'User-Agent': 'metalpy-compiler' } )
+		try:
+			with urllib.request.urlopen( request, timeout = 30 ) as response:
+				data = response.read()
+		except ( urllib.error.URLError, OSError ) as e:
+			self.discovery.fail(
+				f'compiler.fetch_windows_zones_table(): failed to download {self._WINDOWS_ZONES_URL} ({e}) - '
+				f'set METALPY_WINDOWS_ZONES_DIR to a local directory containing windowsZones.xml to avoid the network entirely',
+				node,
+			)
+		import linker_c as _linker_c
+		_linker_c.atomic_write_cache( cache_file, data )
+		return data
+
+	def _build_windows_zones_table( self, data: bytes, node: ast.AST ) -> bytes:
+		''' parses windowsZones.xml's <mapZone other="Win Name"
+		territory="001" type="Iana/Name"/> elements - territory="001" only
+		(the default/world mapping: one canonical IANA zone per Windows
+		key; territory-specific overrides are an explicit v1 scope cut,
+		same posture case-folding took on SpecialCasing.txt's one-to-many
+		mappings) - into a linear-scan table: repeated [u16 win_len LE]
+		[win_name utf-8][u16 iana_len LE][iana_name utf-8] records, packed
+		back to back with no count/header prefix - the caller already knows
+		the total byte length via bytes.byte_len(), and windows_zones.
+		WindowsZoneMap's own runtime lookup (lib/windows_zones.py) just
+		scans until it hits that length. ~150 entries at this writing - far
+		too few to justify sorting + binary search over a variable-width
+		record layout. '''
+		import xml.etree.ElementTree as ET
+		try:
+			root = ET.fromstring( data )
+		except ET.ParseError as e:
+			self.discovery.fail(
+				f'compiler.fetch_windows_zones_table(): failed to parse windowsZones.xml ({e})',
+				node,
+			)
+		entries: list[tuple[str,str]] = []
+		for map_zone in root.iter( 'mapZone' ):
+			if map_zone.get( 'territory' ) != '001':
+				continue
+			win_name = map_zone.get( 'other' )
+			iana_name = map_zone.get( 'type' )
+			if not win_name or not iana_name:
+				continue
+			entries.append( ( win_name, iana_name ) )
+		if not entries:
+			self.discovery.fail(
+				f"compiler.fetch_windows_zones_table(): parsed windowsZones.xml but found zero territory='001' "
+				f"<mapZone> entries - the file is probably not what was expected (wrong format, truncated download, ...)",
+				node,
+			)
+		table = bytearray()
+		for win_name, iana_name in entries:
+			win_bytes = win_name.encode( 'utf-8' )
+			iana_bytes = iana_name.encode( 'utf-8' )
+			table += len( win_bytes ).to_bytes( 2, 'little' )
+			table += win_bytes
+			table += len( iana_bytes ).to_bytes( 2, 'little' )
+			table += iana_bytes
+		return bytes( table )
+
+	def _lower_compiler_fetch_windows_zones_table( self, node: ast.Call ) -> ir.Operand:
+		''' compiler.fetch_windows_zones_table() - downloads/caches
+		windowsZones.xml (see _fetch_windows_zones_xml) and folds to an
+		ir.Const(type=bytes, value=<the encoded table>) - the SAME program-
+		wide static-embedding path compiler.fetch_unicode_table() already
+		uses (see its own docstring, and emitter_c.py's _emit_string_
+		literals) - no new emitter support needed. Only actually reached
+		(and only actually pays the download/parse cost) for a program that
+		references compiler.fetch_windows_zones_table() itself - nothing in
+		builtins does, only lib/windows_zones.py's own install(). '''
+		if len( node.args ) != 0 or node.keywords:
+			self.discovery.fail(
+				f"compiler.fetch_windows_zones_table() takes no arguments: {ast.unparse(node)}",
+				node,
+			)
+		data = self._fetch_windows_zones_xml( node )
+		table = self._build_windows_zones_table( data, node )
+		bytes_cls = self.discovery.find_name( 'bytes', node )
+		return ir.Const( type = bytes_cls, value = table )
+
 	def _lower_compiler_cexpr( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.cexpr('C expression', 'header.h', [target_type])
 		# compiles a tiny C program that printf()'s the expression,
@@ -8175,6 +8297,10 @@ class FunctionLowering:
 
 			case 'fetch_unicode_table':
 				result = self.lowering._lower_compiler_fetch_unicode_table( node )
+				return result if want_result else None
+
+			case 'fetch_windows_zones_table':
+				result = self.lowering._lower_compiler_fetch_windows_zones_table( node )
 				return result if want_result else None
 
 			case 'format_f64':
