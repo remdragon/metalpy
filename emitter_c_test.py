@@ -5578,6 +5578,159 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 2 )
 
 
+class CapturedThenCancelledEpilogueEntryTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression tests for a real bug in cfg.py's shared epilogue-ladder
+	mechanism, independent of generators/defer/errdefer - pure ordinary
+	function lowering. Shape: a function-scoped RC local, TWO early `return`
+	statements (an ordinary call sandwiched between them) that both jump
+	into the SAME shared epilogue label while the local is still live, then
+	an explicit compiler.decref() of that same local, then the function's
+	own final `return`.
+
+	current_epilogue_label() correctly hands both early returns the shared
+	label (used_shared_epilogue_label() records that a real jump was
+	committed). But compiler.decref() then called cfg.py's
+	manually_decreffed(), which used to just set the entry's own
+	`cancelled` flag unconditionally - and build_epilogue_ladder() (called
+	once, at the function's real end) bakes each entry's FINAL cancelled
+	state into every jump site sharing it, not the state each jump site
+	actually saw when it was emitted. The shared label still got built
+	(used_shared_epilogue_label() already covers the "undeclared label"
+	failure mode), but empty - silently dropping the decref BOTH early
+	returns were relying on it for, a permanent refcount leak on every path
+	that takes an early return before the manual decref ever runs.
+
+	Fixed in cfg.py by tracking whether an entry's label was ever handed
+	out while still live (Epilogue.captured), and converting a cancellation
+	of a captured entry into a genuine runtime flag-guard (_neutralize())
+	instead of a compile-time-only cancel - mirroring how errdefer's own
+	flag-guarded replay already works, just armed by default instead of
+	disarmed. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_two_early_returns_then_manual_decref_compiles_and_runs( self ) -> None:
+		# the exact reported repro: two early-return refcount checks around
+		# an ordinary call, then an explicit compiler.decref() balancing the
+		# construction, then a final return - neither early-return check
+		# actually fires here (refcount stays 1 throughout), so this is
+		# first and foremost a "does it even compile" check (a naive fix
+		# attempt can leave the shared label's own goto undeclared)
+		self._run( '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def helper( b: Box ) -> None:
+	return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		helper( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		compiler.decref( b )
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_one_early_return_then_manual_decref_compiles_and_runs( self ) -> None:
+		# the simpler, single-early-return variant of the same shape - used
+		# to compile fine (only the two-return shape risked an undeclared
+		# label) but silently emitted an EMPTY shared epilogue label,
+		# dropping the early return's own decref of `b` - a real refcount
+		# leak with no compile-time symptom at all
+		self._run( '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def helper( b: Box ) -> None:
+	return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		helper( b )
+		compiler.decref( b )
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_captured_early_returns_still_release_after_later_manual_decref( self ) -> None:
+		# proves the leak is actually fixed, not just "still compiles" -
+		# `leaky` reproduces the exact reported shape (two early-return
+		# checks around an ordinary call, then compiler.decref(), then a
+		# final return) with a copy[Box] PARAMETER instead of a freshly
+		# constructed local, specifically so main() keeps its own,
+		# independently-observable reference to the same underlying object
+		# and can check its EXACT refcount right after each call - a leak
+		# on the early-return paths (the entry captured by both `if`
+		# statements never actually getting released once compiler.decref()
+		# cancelled it) shows up directly as compiler.refcount(b) != 1
+		# after a call that was supposed to have released its own copy.
+		# Exercises `trigger` == 1 (first early return), == 2 (second early
+		# return), and == 0 (falls through to the manual decref itself) in
+		# turn, so all three paths sharing the one epilogue label are each
+		# checked independently
+		self._run( '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def helper( b: Box ) -> None:
+	return
+
+def leaky( b: copy[Box], trigger: i32 ) -> i32:
+	if trigger == 1:
+		return 1
+	helper( b )
+	if trigger == 2:
+		return 2
+	compiler.decref( b )
+	return 0
+
+def main() -> i32:
+	b: Box = Box( v = 1 )
+	if compiler.refcount( b ) != 1:
+		return 1
+	r1: i32 = leaky( b, 1 )
+	if r1 != 1:
+		return 2
+	if compiler.refcount( b ) != 1:
+		return 3
+	r2: i32 = leaky( b, 2 )
+	if r2 != 2:
+		return 4
+	if compiler.refcount( b ) != 1:
+		return 5
+	r3: i32 = leaky( b, 0 )
+	if r3 != 0:
+		return 6
+	if compiler.refcount( b ) != 1:
+		return 7
+	compiler.decref( b )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+
 class GUIDTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/guid.py's GUID type - PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3
 	(COM specifics). Needs import_builtins=True (str.split, list[str]). '''

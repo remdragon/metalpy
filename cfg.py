@@ -102,6 +102,7 @@ class Epilogue:
 	flag: Variable | None = None
 	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
+	captured: bool = False # current_epilogue_label() has handed this entry's own .name out as a live jump target at least once - see manually_decreffed()/deleted()/move()'s shared _neutralize() helper for why this matters: a plain compile-time `cancelled = True` is only correct for an entry NO earlier return has already committed a goto into, since build_epilogue_ladder() bakes the entry's FINAL cancelled state into every jump site that shares it, not the state at each individual jump's own time
 
 	@property
 	def is_flag_guarded( self ) -> bool:
@@ -174,6 +175,7 @@ class CFGState:
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
 		self._any_shared_label_used: bool = False # see used_shared_epilogue_label()'s own docstring
+		self._cancel_flags: list[Variable] = [] # see _neutralize()/cancel_flags() - minted lazily, only for an entry that turns out to need one
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
@@ -1038,6 +1040,12 @@ class CFGState:
 			# second real ir.Return in the CALLER).
 			if inline_scope is None:
 				self._any_shared_label_used = True
+			# this jump is now committed to entry.name regardless of what
+			# happens to `entry` afterward - a LATER manually_decreffed()/
+			# deleted()/move() on this same entry must not silently turn this
+			# already-emitted goto into a no-op landing (see their shared
+			# _neutralize() helper)
+			entry.captured = True
 			return entry.name
 		if inline_scope is not None:
 			return inline_scope.label
@@ -1148,7 +1156,12 @@ class CFGState:
 			is_err_instructions, is_err_temp = get_is_err_check()
 			instructions += is_err_instructions
 			instructions.append( ir.JumpIfFalse( cond = is_err_temp, target = skip_label ))
-		instructions += entry.instructions
+		# entry.type is set only for a plain RC entry _neutralize() converted
+		# to flag-guarded on the fly (see its own docstring) - entry.
+		# instructions is always empty for those (never populated the way a
+		# real defer/errdefer body is), so regenerating fresh here (like the
+		# unguarded branch above) is required, not just consistent
+		instructions += self._decref_instructions( entry.type, entry.operand ) if entry.type is not None else entry.instructions
 		instructions.append( ir.Label( name = skip_label ))
 		return instructions
 
@@ -1455,7 +1468,11 @@ class CFGState:
 		''' called for a Call argument matched against a move[T] parameter
 		(already validated at the syntax level by prerequisite #2 - move()
 		was actually written at the call site). No Incref/Decref at the
-		call site itself either way - ownership transfers as-is. '''
+		call site itself either way - ownership transfers as-is; the only
+		instructions this can return are _neutralize()'s own flag-disarm,
+		for the rare case operand's entry was already captured by an
+		earlier return (see its own docstring) - lowering.py must emit
+		these at the move's own call site. '''
 		if isinstance( operand, Variable ):
 			binding = self.bindings.get( operand.stem )
 			if binding is None:
@@ -1465,17 +1482,90 @@ class CFGState:
 					f'{target_qualname}: cannot move {operand.stem!r} into parameter {param_stem!r} - '
 					f'it is {binding.state.value}, not owned here'
 				)
-			if binding.entry is not None:
-				binding.entry.cancelled = True
+			instructions = self._neutralize( binding.entry ) if binding.entry is not None else []
 			# a fresh _Binding, never mutate the existing one in place - an
 			# earlier snapshot() may still hold a reference to it (see
 			# assign()'s own "always construct fresh" discipline)
 			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )
-			return []
+			return instructions
 		if isinstance( operand, ir.Temp ):
 			self._temp_states.pop( operand.id, None )
 			return []
 		return []
+
+	# --- entry cancellation (move/del/compiler.decref) ----------------------
+
+	def _mint_cancel_flag( self ) -> Variable:
+		''' a fresh runtime bool for _neutralize()'s flag-guarded branch -
+		mirrors push_defer()'s own flag exactly (a real Variable, spliced in
+		as a body_start init by lowering.py's _emit_epilogue - see
+		cancel_flags()), except armed (True) by default instead of disarmed:
+		a defer flag starts False and gets armed by the defer statement
+		itself; this one starts True (still needs releasing) and gets
+		disarmed by whichever of move()/deleted()/manually_decreffed()
+		actually neutralizes the entry - see _neutralize(). '''
+		index = len( self._cancel_flags )
+		qualname = f'{self.fn.qualname}.__cancel_flag_{index}' if self.fn is not None else f'__cancel_flag_{index}'
+		flag = Variable(
+			stem = f'__cancel_flag_{index}', qualname = qualname,
+			file = self.fn.file if self.fn is not None else None,
+			line = self.fn.line if self.fn is not None else None,
+			type = self._bool_type,
+		)
+		self._cancel_flags.append( flag )
+		return flag
+
+	def cancel_flags( self ) -> list[Variable]:
+		''' every runtime flag _neutralize() has minted so far - lowering.py's
+		_emit_epilogue consults this (alongside self._defer_flags) to build
+		the function's own flag_inits, each initialized True (armed), unlike
+		a defer flag's False - see _mint_cancel_flag()'s own comment. Empty
+		for the overwhelming majority of functions (nothing captured-then-
+		cancelled ever happened) - this only ever grows past empty for the
+		specific shape _neutralize() documents. '''
+		return list( self._cancel_flags )
+
+	def _neutralize( self, entry: Epilogue ) -> list[ir.Instruction]:
+		''' shared by move()/deleted()/manually_decreffed(): stop entry's own
+		pending Decref from firing a SECOND time via the scope's own shared
+		epilogue, now that the caller has already emitted (or is about to
+		emit) an explicit one of its own for the control-flow path reaching
+		THIS statement.
+
+		A plain compile-time `entry.cancelled = True` is only safe when no
+		earlier return has already committed a `goto` into entry's own
+		shared label (entry.captured - see current_epilogue_label()):
+		build_epilogue_ladder() replays every entry's CURRENT (final) state
+		once, at the function's own closing brace, for every jump site that
+		shares it - not the state each jump site actually saw at the time
+		it was emitted. An entry captured by an earlier, still-live return
+		and THEN cancelled here would silently turn that earlier return's
+		own commit into a no-op landing: the label still gets built (used_
+		shared_epilogue_label() sees to that), but empty, permanently
+		leaking whatever THAT path was relying on the shared ladder to
+		release - confirmed by a real repro: two early-return checks
+		around an ordinary call, then an explicit compiler.decref() and a
+		final return - both early returns silently stopped releasing their
+		own copy/local once the trailing decref cancelled the entry they'd
+		already jumped into.
+
+		Once captured, the only correct fix is a genuine runtime
+		distinction: mint (or reuse) a flag, default-armed at the
+		function's own top (cancel_flags()), and disarm it right here
+		instead of statically cancelling - _replay() then only actually
+		runs the decref for whichever paths reach the ladder WITHOUT having
+		gone through this disarm first, exactly like an errdefer's own
+		flag already does for its own replay. Never cancelled in this
+		branch (an already-flag-guarded entry must keep being replayed -
+		by build_epilogue_ladder()'s own "cancelled entries get no
+		instructions" rule, cancelling it too would just silently drop the
+		flag check itself). '''
+		if not entry.captured:
+			entry.cancelled = True
+			return []
+		if entry.flag is None:
+			entry.flag = self._mint_cancel_flag()
+		return [ ir.Assign( dest = entry.flag, src = ir.Const( type = entry.flag.type, value = False )) ]
 
 	# --- del x -------------------------------------------------------------
 
@@ -1498,12 +1588,12 @@ class CFGState:
 		instructions: list[ir.Instruction] = []
 		if binding.state in ( OwnState.OWNED, OwnState.COPY ):
 			instructions = self._decref_instructions( binding.type, variable )
-		binding.entry.cancelled = True
+		instructions += self._neutralize( binding.entry )
 		return instructions
 
 	# --- compiler.decref(x) -------------------------------------------------
 
-	def manually_decreffed( self, operand: ir.Operand ) -> None:
+	def manually_decreffed( self, operand: ir.Operand ) -> list[ir.Instruction]:
 		''' called for compiler.decref(x) (see lowering.py's
 		_lower_compiler_decref) - x's own explicit Decref is emitted by
 		lowering.py right at the call site regardless; this only stops x's
@@ -1518,24 +1608,29 @@ class CFGState:
 		AddressSanitizer: a real, always-on (not merely heap-layout-
 		dependent) double Decref -> use-after-free -> heap corruption on
 		every single call, for exactly this shape. Mirrors move()'s own
-		cancellation exactly (same entry.cancelled flag, same transition to
-		MOVED so a later reference to x - now potentially freed - is caught
-		as a compile error same as using a moved-out value would be), but
-		without move()'s own state-mismatch error: compiler.decref(x) on a
-		BORROWED binding (an ordinary un-owned parameter, entry is None -
-		nothing to cancel) or one already MOVED/decref'd is left to whatever
-		lowering.py itself decides to allow, not rejected here. '''
+		cancellation exactly (both go through the shared _neutralize()
+		helper, same transition to MOVED so a later reference to x - now
+		potentially freed - is caught as a compile error same as using a
+		moved-out value would be), but without move()'s own state-mismatch
+		error: compiler.decref(x) on a BORROWED binding (an ordinary
+		un-owned parameter, entry is None - nothing to cancel) or one
+		already MOVED/decref'd is left to whatever lowering.py itself
+		decides to allow, not rejected here. Returns whatever _neutralize()
+		itself needs emitted (empty unless x's own entry was already
+		captured by an earlier return - see its own docstring) -
+		lowering.py must emit these right after its own explicit Decref. '''
 		if isinstance( operand, Variable ):
 			binding = self.bindings.get( operand.stem )
 			if binding is None or binding.entry is None:
-				return
+				return []
 			if binding.state not in ( OwnState.OWNED, OwnState.COPY ):
-				return
-			binding.entry.cancelled = True
+				return []
+			instructions = self._neutralize( binding.entry )
 			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )
-			return
+			return instructions
 		if isinstance( operand, ir.Temp ):
 			self._temp_states.pop( operand.id, None )
+		return []
 
 	# --- self construction (__init__) -------------------------------------
 
