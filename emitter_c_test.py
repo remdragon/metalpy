@@ -8991,6 +8991,48 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# the SAME "bare receiver call as a case arm's last statement"
+			# shape as the test just above, but this time the receiver is
+			# the match-EXTRACTED bound name itself (w, bound by `case
+			# Result.Ok(w):`) rather than self. self is always present in
+			# self.locals from function entry, so the fix above (a
+			# self.locals pre-check) happened to mask this identical gap
+			# for self specifically: _match_pattern's own plain MatchAs
+			# bind branch builds the `w = ...` Assign directly (never
+			# dispatched through self.visit()/visit_Assign), so - exactly
+			# like visit_Match's own subj_assign needed its own explicit
+			# self.locals[subj_name] assignment (see its comment) - nothing
+			# populated self.locals['w'] either, until fixed. Without that
+			# fix, _stmt_diverges's `root.id in self.locals` pre-check
+			# missed 'w' too and fell into the same raising path, PERMANENTLY
+			# recording a bogus "name 'w' is not defined" even though it's
+			# a perfectly ordinary, freshly-bound local. Confirmed via a
+			# real repro: lib/fs.py-style `match File.binary_writer(path):
+			# case Result.Ok(w): w.write(...); w.close()`.
+			( 'match_arm_bound_name_receiver_call_does_not_crash_the_compiler', '''
+class Gadget:
+	touched: i32
+
+	def __init__( self ) -> None:
+		self.touched = 0
+
+	def touch( self ) -> None:
+		self.touched = 1
+
+def maybe_touch( r: Result[Gadget,i32] ) -> None:
+	match r:
+		case Result.Ok( w ):
+			w.touch()
+		case Result.Err( e ):
+			pass
+
+def main() -> i32:
+	g: Gadget = Gadget()
+	maybe_touch( Result.Ok( g ) )
+	if g.touched != 1:
+		return 1
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
