@@ -1477,7 +1477,7 @@ class FunctionLowering:
 					except CompileError as e:
 						self.lowering.discovery.fail( str( e ), fn.node )
 
-					if self._cfg.current_epilogue_label() is not None or self._cfg.used_shared_epilogue_label():
+					if self._cfg.current_epilogue_label() is not None or self._cfg.used_shared_epilogue_label() or self._cfg.cancel_flags():
 						# some return (or OrJump) already jumped into the
 						# shared epilogue ladder (_stmt_Return/_consume_checked_
 						# result, via current_epilogue_label()), or nothing did
@@ -1495,7 +1495,17 @@ class FunctionLowering:
 						# unwind here" (None), but that earlier goto still needs
 						# its label built, or it's left dangling - see used_
 						# shared_epilogue_label()'s own docstring for the real
-						# repro this was found from
+						# repro this was found from. cancel_flags() (not just
+						# the two checks above) is ALSO required: a captured
+						# entry that got flag-guarded belonging to an already-
+						# popped @inline splice (build_inline_scope_ladder()
+						# already consumed and removed it from the stack, and
+						# never sets _any_shared_label_used - that flag is
+						# function-epilogue-specific, see current_epilogue_
+						# label()'s own comment) would otherwise leave this
+						# function's own flag_inits below never spliced in at
+						# all - a real uninitialized-bool read at the flag's
+						# own JumpIfFalse, not merely a missed decref
 						self._emit_epilogue( fn, none_type, body_start )
 					elif fn.return_type is none_type and self.lowering._body_may_fall_off_the_end( fn.node.body ):
 						# nothing pending to unwind - but falling off the end
@@ -1550,9 +1560,17 @@ class FunctionLowering:
 		# flag inits have to run before *any* code that could set them -
 		# easiest to guarantee by splicing them in right after FuncStart
 		# rather than tracking every branch that could reach a defer statement
+		# or a captured-then-cancelled epilogue entry (cancel_flags() - see
+		# cfg.py's _neutralize()). A defer flag starts False (disarmed until
+		# the defer statement itself runs); a cancel flag starts the other
+		# way, True (still needs releasing until whichever of move()/
+		# deleted()/manually_decreffed() actually neutralizes its entry runs)
 		flag_inits = [
 			ir.Assign( dest = flag, src = ir.Const( type = flag.type, value = False ))
 			for flag in self._defer_flags
+		] + [
+			ir.Assign( dest = flag, src = ir.Const( type = flag.type, value = True ))
+			for flag in self._cfg.cancel_flags()
 		]
 		self._instructions[body_start:body_start] = flag_inits
 
@@ -3173,8 +3191,14 @@ class FunctionLowering:
 			# stop the scope-exit epilogue from decref'ing operand a SECOND
 			# time - see cfg.py's manually_decreffed's own comment for why
 			# this is required, not optional (a real, always-on double
-			# Decref/use-after-free otherwise, confirmed with ASan)
-			self._cfg.manually_decreffed( operand )
+			# Decref/use-after-free otherwise, confirmed with ASan). Usually
+			# returns nothing more to emit - only non-empty when operand's
+			# own entry was already captured by an earlier return, in which
+			# case this is the flag-disarm that keeps that earlier return's
+			# own shared-ladder decref from silently going missing (see
+			# manually_decreffed's own docstring)
+			for instr in self._cfg.manually_decreffed( operand ):
+				self._emit( instr )
 			return
 		if operand.type is not None and self._in_generic_class_method():
 			return
