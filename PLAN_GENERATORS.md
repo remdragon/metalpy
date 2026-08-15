@@ -1,9 +1,13 @@
 Generator functions (`yield`, state-machine transform)
 
-STATUS: v1 + Phase 2 (while loops) landed and real-compile-and-run tested
-(emitter_c_test.py's GeneratorFunctionTests) - PLAN_GENERATORS.md's own
-motivating example (a real `range()`-shaped generator: `while i < count:
-yield i; i += 1`) now compiles and runs, not just textual `range()` sugar.
+STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption)
+landed and real-compile-and-run tested (emitter_c_test.py's
+GeneratorFunctionTests) - PLAN_GENERATORS.md's own motivating example (a
+real `range()`-shaped generator: `while i < count: yield i; i += 1`,
+consumed the natural way: `for x in counter(5):`) now compiles and runs,
+not just textual `range()` sugar. `range()` ITSELF has deliberately NOT
+been rewritten into a real generator yet (see Phase 3 note below) - the
+sugar path (`_is_range_call`/`_lower_for_range`) is untouched.
 
 `yield` may be either a direct top-level statement of the function body
 (Phase 1), or the single yield inside a direct top-level `while` loop
@@ -59,25 +63,62 @@ each because the simpler thing turned out to already be sufficient:
    wouldn't need the dispatch mechanism to change, only the unit-
    recognition/guard-building logic.
 
-A genuine, pre-existing, unrelated gap found while testing this (not
-fixed, not in scope): reading a `T|None` value back out in NARROWED form
-after an `is None`/`is not None` check does not work today - confirmed via
-a minimal non-generator repro (`if a is None: ... else: ... a != 5 ...`
-fails to compile: "invalid operands to binary expression", the union
-struct itself, not i32) - both plain if-narrowing and `match a: case v:`
-wildcard binding hit this identically. This meant GeneratorFunctionTests
-can only verify a `__next__()` result via `is None`/`is not None` (proven
-sufficient for exhaustion/state-transition correctness; exact yielded
-VALUES were cross-checked by hand against the emitted C instead - see the
-test's own comment). Whoever picks up real union narrowing next should
-know `T|None` specifically is affected, not just named multi-member
-unions.
+Phase 3 design (lowering.py's `_lower_for_over_iterator`, alongside the
+existing `_lower_for_range`/`_lower_for_over_indexable`): `for x in
+<expr>:` now recognizes a third shape - `<expr>`'s type has a `__next__()`
+returning `T|None` (checked generically, not generator-specific - any
+hand-written class implementing `__next__` this way qualifies too, see
+`test_for_loop_over_bad_next_shape_is_rejected`). `node.iter` is lowered
+exactly ONCE up front, then handed to whichever of the three paths
+applies (a pre-existing bug class this incidentally forecloses:
+`_lower_for_over_indexable` used to re-lower `node.iter` itself, which
+would have double-evaluated/double-constructed an iterable expression
+with a side effect - never triggered before because nothing passed to a
+`for` loop had a side effect worth noticing until a generator
+CONSTRUCTOR call became a realistic `node.iter`).
+
+Corrected finding from the v1 write-up above: reading a `T|None` value
+back out in narrowed form is NOT a dead end - it does NOT work via a
+plain `if x is None: ... else: ...`-style read (confirmed still broken,
+generator-unrelated, not fixed here), but DOES work via `match x: case
+T(x): ...` - a class-pattern REUSING the subject's own name as its
+capture (confirmed with a real compile-and-run repro: `match a: case
+i32(a): ... case None: ...`). This is what `_lower_for_over_iterator`
+uses under the hood: cfg.py's own `narrow()`/`narrowed_member()` API,
+called directly (bypassing match-statement syntax entirely, since that
+goes through a type_resolver.py rewrite pass this hand-built lowering
+code never runs through) to mark a hidden local's payload extractable,
+then read back via the loop target's own ordinary `_stmt_Assign`. This
+is now real, working, verified precedent for whoever picks up general
+`is None`-based narrowing next - the payload-extraction primitive itself
+works fine; what's actually missing is wiring `_ReferenceResolver`'s
+existing is/is-not-None tag-comparison rewrite up to ALSO call `cfg.
+narrow()` (today it only produces the tag comparison, never the
+narrowing fact - confirmed by reading visit_Compare's own rewrite 1).
+Also found and worked around the same way (a synthesized `x is None`
+AST node doesn't lower correctly at all outside a real function body,
+since that rewrite only runs once, early, over REAL source - not
+something built mid-lowering): `_lower_for_over_iterator` builds the
+equivalent `.tag == N` comparison directly, by hand, rather than relying
+on `is None` syntax.
+
+Not attempted this pass, deliberately: rewriting `range()` itself from
+`_is_range_call` textual sugar into a real generator. The sugar has a
+real, deliberate performance property (documented in its own comment: no
+allocation, unchecked arithmetic proven safe by construction) that a
+real generator's heap-allocated backing object would give up, and
+`range()` is used pervasively throughout lib/ and the existing test
+suite - swapping its implementation is a real risk for a cosmetic-only
+win (per this doc's own original framing, "lets range() stop being
+special-cased syntax") now that the FUNCTIONAL goal (a real, user-
+authored range()-shaped generator working end to end) is already met by
+`counter()` in the tests above. Left as an explicit follow-up, not
+folded into this pass.
 
 Original planning notes follow, kept for the phases not yet attempted
-(fallible generators, `for`-loop consumption, generic generators, `for`
-LOOPS containing yield - as opposed to `while`, still rejected: a `for`
-loop's own hidden index/length bookkeeping was never analyzed for this,
-out of scope for Phase 2).
+(fallible generators, generic generators, `for` LOOPS containing yield -
+as opposed to `while`, still rejected: a `for` loop's own hidden index/
+length bookkeeping was never analyzed for this).
 
 Why
 

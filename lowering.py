@@ -649,6 +649,15 @@ class Lowering:
 			found = names.get( name ) if isinstance( names, dict ) else None
 		return found if isinstance( found, Function ) else None
 
+	def _find_iterator_next_method( self, owner_type: Type|None ) -> Function|None:
+		# PLAN_GENERATORS.md Phase 3 - a non-failing probe (same posture as
+		# _find_method above): "this type has no __next__" is a normal
+		# outcome (falls through to the __len__/__getitem__ indexable path),
+		# not an error. Shape validation (does __next__ actually return
+		# T|None) happens once, in _lower_for_over_iterator itself, where a
+		# real error location is available.
+		return self._find_method( owner_type, '__next__' )
+
 	def _is_range_call( self, node: ast.expr ) -> str|None:
 		# range(...) is textually recognized as compiler sugar, same as
 		# compiler.wrap_arithmetic/defer/etc. - there's no real range()
@@ -3237,8 +3246,20 @@ class FunctionLowering:
 			self.lowering.discovery.fail( 'for/else is not supported', node )
 		if self.lowering._is_range_call( node.iter ) is not None:
 			self._lower_for_range( node )
+			return
+		# PLAN_GENERATORS.md Phase 3 - node.iter is lowered exactly ONCE here
+		# (not once per candidate path) and the resulting operand handed to
+		# whichever real consumption path applies, so an iterable expression
+		# with a side effect (most commonly: a generator CONSTRUCTOR call)
+		# is never evaluated twice - _lower_for_over_indexable used to lower
+		# node.iter itself; it now takes the already-lowered operand instead,
+		# the same way _lower_for_over_iterator does
+		obj = self._lower_expr( node.iter, None )
+		next_fn = self.lowering._find_iterator_next_method( obj.type )
+		if next_fn is not None:
+			self._lower_for_over_iterator( node, obj, next_fn )
 		else:
-			self._lower_for_over_indexable( node )
+			self._lower_for_over_indexable( node, obj )
 
 	def _lower_for_range( self, node: ast.For ) -> None:
 		call = node.iter
@@ -3303,16 +3324,19 @@ class FunctionLowering:
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
-	def _lower_for_over_indexable( self, node: ast.For ) -> None:
+	def _lower_for_over_indexable( self, node: ast.For, obj: ir.Operand ) -> None:
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 
-		obj = self._lower_expr( node.iter, None )
 		len_fn = self.lowering._find_method( obj.type, '__len__' )
 		getitem_fn = self.lowering._find_method( obj.type, '__getitem__' )
 		missing = [ name for name, fn in (( '__len__', len_fn ), ( '__getitem__', getitem_fn )) if fn is None ]
 		if missing:
-			self.lowering.discovery.fail( f'for loop needs {" and ".join(missing)} on {obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail(
+				f'for loop needs {" and ".join(missing)} (or a __next__() returning T|None) on '
+				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
 
 		unique = self._label_id
 		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
@@ -3370,6 +3394,104 @@ class FunctionLowering:
 		incr = self._new_temp( usize_cls )
 		self._emit( ir.AddWrap( dest = incr, left = index_var, right = ir.Const( type = usize_cls, value = 1 ) ))
 		self._emit( ir.Assign( dest = index_var, src = incr ))
+		self._emit( ir.Jump( target = start_label ))
+		self._emit( ir.Label( name = end_label ))
+
+	def _lower_for_over_iterator( self, node: ast.For, obj: ir.Operand, next_fn: Function ) -> None:
+		''' PLAN_GENERATORS.md Phase 3 - `for x in <expr with a __next__()
+		returning T|None>:`. Structurally the same shape as
+		_lower_for_over_indexable (once-evaluated iterable, start/continue/
+		end labels, snapshot-bind-lower_loop_body-back_edge-restore-merge),
+		except the "is there another element" test is __next__()'s own
+		T|None result rather than an index/length comparison, and the
+		element binding needs the union's payload extracted rather than a
+		plain __getitem__ call.
+
+		The payload extraction reuses cfg.py's REAL narrowing mechanism
+		(narrow()/narrowed_member(), the same machinery a `match x: case
+		T(x):` arm - reusing the subject's own name - already relies on;
+		confirmed working via a standalone repro, since a plain `if x is
+		None: ... else: ...`-narrowed read does NOT currently work anywhere
+		in this compiler, generator-unrelated - see PLAN_GENERATORS.md's own
+		STATUS section) directly at the IR level: __next__()'s result is
+		bound into a hidden local, narrow()'d to the union's own non-None
+		leaf, then read back through node.target's own ordinary _stmt_Assign
+		- _expr_Name's existing narrowed-read branch does the rest (extracts
+		through GetAttr(data)/GetAttr(v_<leaf>) automatically), no new
+		extraction code needed here at all.
+
+		The "was this None" test can't be spelled `x is None` in the
+		synthesized AST the way user source would: that spelling only works
+		via type_resolver.py's own _ReferenceResolver.visit_Compare rewrite
+		(is/is-not-None against a TaggedUnion -> a direct .tag comparison),
+		which runs ONCE, early, over each REAL function body - never over
+		AST built here, mid-lowering (confirmed via a real repro:
+		ast.Compare(ops=[ast.Is()]) against a union operand falls through
+		to plain scalar `==`, comparing the whole union struct against a
+		bare 0 - a C compile error). So the same tag comparison that
+		rewrite produces is built directly, by hand, below. '''
+		none_type = self.lowering.discovery.get_none_type()
+
+		self.lowering._ensure_resolved( next_fn )
+		result_type = next_fn.return_type
+		if not (
+			isinstance( result_type, TaggedUnion )
+			and len( result_type.attributes ) == 2
+			and any( a.type is none_type for a in result_type.attributes )
+		):
+			self.lowering.discovery.fail(
+				f'for loop needs __next__() to return exactly T|None on '
+				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		self.lowering.schedule( result_type )
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( result_type )
+		none_member = next( a for a in result_type.attributes if a.type is none_type )
+		elem_member = next( a for a in result_type.attributes if a.type is not none_type )
+
+		unique = self._label_id
+		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
+		self._emit( ir.Assign( dest = obj_var, src = obj ))
+		next_var = self._declare_hidden_local( f'__for_next_{unique}', result_type, node )
+
+		start_label = self._new_label( 'for_start' )
+		continue_label = self._new_label( 'for_continue' )
+		end_label = self._new_label( 'for_end' )
+
+		self._emit( ir.Label( name = start_label ))
+		next_dest = self._new_temp( result_type )
+		self._emit( ir.Call( dest = next_dest, target = next_fn, receiver = obj_var, args = [], kwargs = {} ))
+		self._emit( ir.Assign( dest = next_var, src = next_dest ))
+
+		tag_expr = ast.Attribute( value = self.lowering._synth_name( next_var.stem, node ), attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, node )
+		is_none_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ none_member.stem ] ) ] )
+		ast.copy_location( is_none_test, node )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		is_none_cond = self._lower_expr( is_none_test, bool_cls )
+		self._emit( ir.JumpIfTrue( cond = is_none_cond, target = end_label ))
+
+		# snapshot BEFORE the loop target's own binding - same reasoning
+		# _lower_for_over_indexable's identical comment gives (the binding
+		# happens fresh every iteration, not confined-and-torn-down)
+		loop_snapshot = self._cfg.snapshot()
+		self._cfg.narrow( next_var.stem, elem_member )
+		bind = ast.Assign( targets = [ node.target ], value = self.lowering._synth_name( next_var.stem, node ))
+		ast.copy_location( bind, node )
+		self._stmt_Assign( bind )
+
+		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		try:
+			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+		for instr in back_edge_instructions:
+			self._emit( instr )
+		self._cfg.restore( loop_snapshot )
+		# Phase 8 - see _lower_for_range's own identical call/comment
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
+
+		self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 

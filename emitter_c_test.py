@@ -8247,7 +8247,117 @@ def main() -> i32:
 			return 5
 		return 0
 ''' ),
+			# --- Phase 3: `for x in <generator call>:` consumption
+			# (lowering.py's _lower_for_over_iterator) - drives __next__()
+			# directly, no manual is-None/narrowing boilerplate at the call
+			# site. Also the first test to check EXACT yielded VALUES (not
+			# just is-None/is-not-None) - it does so by summing/counting
+			# through ordinary arithmetic on the for-loop's own bound target,
+			# which only works correctly if _lower_for_over_iterator's own
+			# narrow()-based payload extraction is genuinely correct, not
+			# just "is None" correct (see PLAN_GENERATORS.md's own STATUS
+			# section on why this couldn't be checked directly until now).
+			( 'for_loop_consumes_a_while_unit_generator', '''
+def counter( count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		total: usize = 0
+		n: usize = 0
+		for x in counter( 5 ):
+			total += x
+			n += 1
+		if n != 5:
+			return 1
+		if total != 10: # 0+1+2+3+4
+			return 2
+		return 0
+''' ),
+			( 'for_loop_over_generator_releases_it_and_its_captured_parameter', '''
+class Box:
+	v: usize
+	def __init__( self, v: usize ) -> None:
+		self.v = v
+
+def gen( b: Box ) -> Iterator[usize]:
+	i: usize = 0
+	while i < b.v:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def consume_fully( b: Box ) -> None:
+	with compiler.wrap_arithmetic:
+		total: usize = 0
+		for x in gen( b ):
+			total += x
+	# gen(b)'s own generator object went fully out of scope here (the loop
+	# ran to exhaustion) - the hidden __for_obj local must still be
+	# released at this function's own end, decref-ing b in turn
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 5 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		consume_fully( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
+			( 'for_loop_breaking_early_still_releases_the_generator', '''
+class Box:
+	v: usize
+	def __init__( self, v: usize ) -> None:
+		self.v = v
+
+def gen( b: Box ) -> Iterator[usize]:
+	i: usize = 0
+	while i < b.v:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def consume_partially( b: Box ) -> None:
+	for x in gen( b ):
+		if x == 2:
+			break
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 5 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		consume_partially( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
 		])
+
+	def test_for_loop_over_bad_next_shape_is_rejected( self ) -> None:
+		# a __next__() that returns something other than T|None - real, not
+		# a generator's own (compiler-synthesized __next__ always has the
+		# right shape) - must be a clear compile error, not a miscompile.
+		# Not generator-specific: any user class implementing __next__ by
+		# hand hits the same check.
+		self._run( '''
+class NotReallyAnIterator:
+	def __next__( self ) -> i32:
+		return 1
+
+def main() -> None:
+	it = NotReallyAnIterator()
+	for x in it:
+		pass
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'T|None', str( self.discovery.errors.errors[0] ))
 
 	def test_yield_nested_in_if_is_rejected( self ) -> None:
 		# Phase 2 only recognizes a bare top-level yield or a single-yield
