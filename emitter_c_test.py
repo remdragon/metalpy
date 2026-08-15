@@ -7440,6 +7440,145 @@ def main() -> i32:
 		] )
 
 
+class Base64Tests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Real compile-and-run coverage for lib/base64.py - b64encode/b64decode,
+	urlsafe_b64encode/urlsafe_b64decode, and b16encode/b16decode. See
+	PLAN_HTTP_CLIENT.md, which names base64 as a zero-prerequisite piece
+	needed for auth= (HTTP Basic -> base64 Authorization header). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# RFC 4648 known-answer vectors - the standard "f"/"fo"/"foo"/
+			# "foob"/"fooba"/"foobar" test vectors, each checked round-trip
+			# (encode matches the known string, decode recovers the original)
+			( 'b64_rfc4648_vectors_round_trip', '''
+import base64
+
+def check( plain: str, encoded: str ) -> bool:
+	pb: bytes = plain.encode().unwrap( 'encode failed' )
+	eb: bytes = base64.b64encode( pb )
+	es: str = eb.decode().unwrap( 'decode of encoded output failed' )
+	if es != encoded:
+		return False
+	db: bytes = base64.b64decode( eb ).unwrap( 'decode failed' )
+	ds: str = db.decode().unwrap( 'decode of decoded output failed' )
+	return ds == plain
+
+def main() -> i32:
+	if not check( '', '' ): return 1
+	if not check( 'f', 'Zg==' ): return 2
+	if not check( 'fo', 'Zm8=' ): return 3
+	if not check( 'foo', 'Zm9v' ): return 4
+	if not check( 'foob', 'Zm9vYg==' ): return 5
+	if not check( 'fooba', 'Zm9vYmE=' ): return 6
+	if not check( 'foobar', 'Zm9vYmFy' ): return 7
+	return 0
+''' ),
+			# standard vs urlsafe alphabets diverge exactly on '+'/'/' vs
+			# '-'/'_' - bytes 0xFB,0xFF,0xBF hit both symbols in both
+			# alphabets, and urlsafe_b64decode must recover the original bytes
+			( 'urlsafe_vs_standard_alphabet_divergence', '''
+import base64
+
+def main() -> i32:
+	raw = bytearray( 3 )
+	rp: Ptr[u8] = raw.get_ptr()
+	rp[0] = 0xFB
+	rp[1] = 0xFF
+	rp[2] = 0xBF
+	rb: bytes = bytes.from_bytearray( move( raw ) )
+
+	std: bytes = base64.b64encode( rb )
+	safe: bytes = base64.urlsafe_b64encode( rb )
+	std_s: str = std.decode().unwrap( 'x' )
+	safe_s: str = safe.decode().unwrap( 'x' )
+	if std_s != '+/+/':
+		return 1
+	if safe_s != '-_-_':
+		return 2
+
+	back: bytes = base64.urlsafe_b64decode( safe ).unwrap( 'urlsafe decode failed' )
+	if len( back ) != 3:
+		return 3
+	bp: ConstPtr[u8] = back.get_const_ptr()
+	if bp[0] != 0xFB or bp[1] != 0xFF or bp[2] != 0xBF:
+		return 4
+	return 0
+''' ),
+			( 'b16_round_trip_and_casefold', '''
+import base64
+
+def main() -> i32:
+	fb: bytes = 'foobar'.encode().unwrap( 'x' )
+	hx: bytes = base64.b16encode( fb )
+	hx_s: str = hx.decode().unwrap( 'x' )
+	if hx_s != '666F6F626172':
+		return 1
+
+	unhex: bytes = base64.b16decode( hx ).unwrap( 'b16decode failed' )
+	unhex_s: str = unhex.decode().unwrap( 'x' )
+	if unhex_s != 'foobar':
+		return 2
+
+	# lowercase hex rejected by default (casefold=False)...
+	lh: bytes = '666f6f626172'.encode().unwrap( 'x' )
+	if base64.b16decode( lh ).is_ok():
+		return 3
+	# ...but accepted with casefold=True
+	lh_ok: bytes = base64.b16decode( lh, casefold = True ).unwrap( 'casefold decode failed' )
+	lh_ok_s: str = lh_ok.decode().unwrap( 'x' )
+	if lh_ok_s != 'foobar':
+		return 4
+	return 0
+''' ),
+			# validate=True is the default (this codebase's own convention -
+			# see guid.py/ascii.py - overriding Python's own lenient default),
+			# so malformed input must be Result.Err in every case below
+			( 'b64_and_b16_decode_error_cases', '''
+import base64
+
+def main() -> i32:
+	bad_len: bytes = 'Zg'.encode().unwrap( 'x' ) # length 2, not a multiple of 4
+	if base64.b64decode( bad_len ).is_ok():
+		return 1
+
+	bad_char: bytes = 'Z!=='.encode().unwrap( 'x' ) # '!' not in the alphabet
+	if base64.b64decode( bad_char ).is_ok():
+		return 2
+
+	bad_pad: bytes = 'Zg=g'.encode().unwrap( 'x' ) # '=' not at the very end
+	if base64.b64decode( bad_pad ).is_ok():
+		return 3
+
+	odd_hex: bytes = 'ABC'.encode().unwrap( 'x' ) # odd length
+	if base64.b16decode( odd_hex ).is_ok():
+		return 4
+	return 0
+''' ),
+			# validate=False (opt-in) matches Python's own lenient default:
+			# non-alphabet bytes (e.g. embedded whitespace) are discarded
+			# before decoding, rather than rejected
+			( 'b64_decode_lenient_mode', '''
+import base64
+
+def main() -> i32:
+	with_ws: bytes = 'Zm9v\\nYmFy'.encode().unwrap( 'x' )
+	if base64.b64decode( with_ws ).is_ok(): # strict default must reject the embedded newline
+		return 1
+	lenient: bytes = base64.b64decode( with_ws, validate = False ).unwrap( 'lenient decode failed' )
+	lenient_s: str = lenient.decode().unwrap( 'x' )
+	if lenient_s != 'foobar':
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class MatchArmSameNameNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' `match x: case T(x): ...` - the arm rebinds the SAME name as its
 	own subject - used to crash outright (monomorphize.py silently
