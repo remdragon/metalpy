@@ -9074,6 +9074,103 @@ def main() -> i32:
 		] )
 
 
+class BinaryFileHandleFieldTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' BinaryWriter/BinaryReader (lib/builtins/__File.py) held as a
+	user-defined class's own field. Previously crashed the COMPILER ITSELF
+	(not a normal compile error) with `AttributeError: 'NoneType' object has
+	no attribute 'is_rc_pointer'` in type_resolver.py's
+	_build_field_teardown_ast, called from _synthesize_rcclass_destructor
+	while auto-generating the owning class's __del__. Root cause:
+	BinaryReader/BinaryWriter/BinaryReadWriter were declared in __File.py but
+	never actually exported by lib/builtins/__init__.py's own
+	`from .__File import File` (only File itself was named) - referencing
+	any of them anywhere, not just as a field, failed to resolve with a
+	CompileError that discovery.py's _resolve_guarded swallows by design
+	(a broken symbol is only ever attempted once - see its own docstring),
+	leaving the field's Variable.type permanently None instead of ever
+	surfacing the error. No prior test anywhere in the repo constructed a
+	real BinaryWriter/BinaryReader (only File.binary_writer/reader's own
+	internal factory methods touch them, as local variables, never as a
+	field), so this gap was never exercised. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		with tempfile.TemporaryDirectory() as data_dir:
+			write_path = ( Path( data_dir ) / 'written.bin' ).as_posix()
+			read_path = Path( data_dir ) / 'preexisting.bin'
+			read_path.write_bytes( b'xyz' )
+			self.assert_programs_run([
+				# the original crash repro: a class whose only field is a
+				# BinaryWriter, no user __del__ - the auto-synthesized
+				# destructor is exactly what walked into the None field_type.
+				( 'binary_writer_field_write_and_synthesized_destructor_close', f'''
+class Thing:
+	__writer: BinaryWriter
+	def __init__( self, path: str ) -> Result[None, OSError]:
+		self.__writer = File.binary_writer( path, append = False, truncate = True ).or_return()
+		return Result.Ok( None )
+	def write_all( self, buf: bytearray ) -> Result[usize, OSError]:
+		p: ConstPtr[u8] = buf.get_const_ptr()
+		return self.__writer.write( p, len( buf ))
+
+def main() -> i32:
+	r = Thing( "{write_path}" )
+	if r.is_err():
+		return 1
+	t = r.unwrap( "construct failed" )
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 65
+	p[1] = 66
+	p[2] = 67
+	wr = t.write_all( b )
+	if wr.is_err():
+		return 2
+	if wr.unwrap( "write failed" ) != 3:
+		return 3
+	return 0
+''' ),
+				# same shape with BinaryReader - a second, independently
+				# resolved field type through the identical teardown path.
+				( 'binary_reader_field_read_and_synthesized_destructor_close', f'''
+class Reader:
+	__reader: BinaryReader
+	def __init__( self, path: str ) -> Result[None, OSError]:
+		self.__reader = File.binary_reader( path ).or_return()
+		return Result.Ok( None )
+	def read_all( self, buf: bytearray ) -> Result[usize, OSError]:
+		p: Ptr[u8] = buf.get_ptr()
+		return self.__reader.read( p, len( buf ))
+
+def main() -> i32:
+	r = Reader( "{read_path.as_posix()}" )
+	if r.is_err():
+		return 1
+	rd = r.unwrap( "construct failed" )
+	b: bytearray = bytearray( 3 )
+	rr = rd.read_all( b )
+	if rr.is_err():
+		return 2
+	if rr.unwrap( "read failed" ) != 3:
+		return 3
+	p: ConstPtr[u8] = b.get_const_ptr()
+	if p[0] != 120 or p[1] != 121 or p[2] != 122: # 'x','y','z'
+		return 4
+	return 0
+''' ),
+			] )
+			# the writer program's own file survives its process exit only if
+			# the synthesized destructor actually ran close_raw() (BinaryWriter
+			# has no explicit .close() call anywhere above) - confirms the
+			# teardown path this bug lived in genuinely executed, not just
+			# that the program happened to exit 0.
+			self.assertEqual( Path( write_path ).read_bytes(), b'ABC' )
+
+
 class DictTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' dict[K,V] (lib/builtins/__init__.py's own dict class + lib/builtins/
 	__RawDict.py's RawDict/RawEntry/RawIndex) end-to-end - see
