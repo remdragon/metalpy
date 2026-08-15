@@ -124,8 +124,14 @@ def _folds_into_package( stem: str ) -> bool:
 	see import_code, which requires a non-empty scope before applying this.
 	That guard is load-bearing, not incidental: the program entry point is
 	compiled as __main__.py with scope=None, and folding it would strip the
-	prefix off every top-level name in the user's own program. '''
-	return stem == '__init__'
+	prefix off every top-level name in the user's own program.
+
+	A leading '__' marks a module as package-private, and a package-private
+	module is an implementation detail of its package rather than a namespace
+	users name: `from .__list import list` in builtins/__init__.py should
+	publish builtins.list, not builtins.__list.list. __init__ is the
+	degenerate case of the same rule rather than a separate one. '''
+	return stem.startswith( '__' )
 
 
 # every ast.stmt kind Discovery's own module-body/class-body scan loops
@@ -386,9 +392,16 @@ class Discovery( ast.NodeVisitor ):
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None, package: str|None = None ) -> Module:
 		stem = filename.stem if filename else ''
-		# a folding module (__init__.py) defines the package's own namespace,
-		# not a sub-module - see _folds_into_package for the rule and for why
-		# it's gated on there actually being an enclosing package
+		# NB `package` (the parameter) is this module's own dotted path, the
+		# key it gets registered under in self.modules ('builtins.__list') -
+		# NOT the package it lives in. That one is `scope` ('builtins'), which
+		# import_name computes by lopping the last component off the module
+		# path, and which is what Module.package below wants
+		#
+		# a folding module (__init__.py, or any package-private __foo.py)
+		# defines the package's own namespace, not a sub-module - see
+		# _folds_into_package for the rule and for why it's gated on there
+		# actually being an enclosing package
 		if scope and _folds_into_package( stem ):
 			qualname = scope
 		else:
@@ -404,6 +417,7 @@ class Discovery( ast.NodeVisitor ):
 		module = Module(
 			stem = stem,
 			qualname = qualname,
+			package = scope or '',
 			file = filename,
 			line = None,
 			intrinsics = self.get_intrinsics(),
@@ -1000,13 +1014,14 @@ class Discovery( ast.NodeVisitor ):
 		module = node.module or ''
 		parts: list[str] = []
 		if node.level:
-			qualname = self.module_stack[-1].qualname
-			# __init__.py's qualname is already the package name (see
-			# import_code), so a level=1 relative import from it means
-			# "within the same package", not "one level up from the
-			# package". Adjust: strip one fewer level when stem is __init__.
-			strip = node.level - ( 1 if self.module_stack[-1].stem == '__init__' else 0 )
-			parts.extend( qualname.split( '.' )[:-strip] if strip else qualname.split( '.' ))
+			# counted from the module's package (Python's __package__), not
+			# from its qualname: level=1 means "within my own package", so
+			# level N climbs N-1 levels above it. Deriving the package by
+			# slicing a level off the qualname instead only works for a module
+			# that doesn't fold into its package - see Module.package
+			package = self.module_stack[-1].package
+			strip = node.level - 1
+			parts.extend(( package.split( '.' )[:-strip] if strip else package.split( '.' )) if package else [] )
 			if not parts:
 				self.fail( f'unable to relative import from here: {node=} {self.module_stack[-1].qualname=} {self.module_stack[-1].file=}', node )
 		if node.module:

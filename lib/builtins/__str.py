@@ -13,6 +13,11 @@
 
 import compiler
 import sys
+# a package-private module contributes no namespace level of its own, so this
+# and __int.py share one namespace - the constant has to have a single home
+# rather than a copy per file. It lives next to _ASCII_NINE, which __int.py's
+# own digit parsing needs
+from .__int import _ASCII_ZERO
 
 def decode_utf8_at( data: ConstPtr[u8], i: usize, consumed: Ptr[usize] ) -> u32:
 	''' decodes one codepoint starting at data[i], writing the number of
@@ -97,7 +102,6 @@ def encode_utf8_at( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
 # ---------------------------------------------------------------------------
 
 _ASCII_BACKSLASH: u8 = 0x5C # '\'
-_ASCII_ZERO: u8 = 0x30 # '0'
 _ASCII_LOWER_A: u8 = 0x61 # 'a'
 
 def _hex_nibble( n: u32 ) -> u8:

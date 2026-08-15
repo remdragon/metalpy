@@ -1866,6 +1866,138 @@ class CircularImportTests( unittest.TestCase ):
 			self.assertIs( mod_a.get_local( 'b' ), mod_b )
 
 
+class PackagePrivateModuleTests( unittest.TestCase ):
+	'''
+	a module whose stem starts with '__' is package-private and contributes no
+	namespace level of its own: `from .__list import list` in builtins
+	publishes builtins.list, not builtins.__list.list. __init__.py is the
+	degenerate case of the same rule. See discovery._folds_into_package.
+	'''
+
+	def _package( self, tmp: str, files: dict[str,str], subdir: str = 'pkg' ) -> Path:
+		root = Path( tmp )
+		( root / subdir ).mkdir( parents = True )
+		for name, text in files.items():
+			( root / subdir / name ).write_text( text )
+		return root
+
+	def test_private_module_names_take_the_package_qualname( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': 'from .__impl import Widget\n',
+				'__impl.py': 'class Widget:\n\tpass\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			pkg = disco.import_name( 'pkg' )
+
+			self.assertEqual( disco.errors.errors, [] )
+			widget = pkg.get_local( 'Widget' )
+			assert widget is not None
+			self.assertEqual( widget.qualname, 'pkg.Widget' )
+			# the module still registers under its real dotted path - only the
+			# namespace it contributes to is folded
+			self.assertIn( 'pkg.__impl', disco.modules )
+			self.assertEqual( disco.modules['pkg.__impl'].qualname, 'pkg' )
+
+	def test_ordinary_submodule_still_contributes_its_stem( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': '',
+				'impl.py': 'class Widget:\n\tpass\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			mod = disco.import_name( 'pkg.impl' )
+
+			self.assertEqual( mod.qualname, 'pkg.impl' )
+			widget = mod.get_local( 'Widget' )
+			assert widget is not None
+			self.assertEqual( widget.qualname, 'pkg.impl.Widget' )
+
+	def test_entry_point_module_does_not_fold( self ) -> None:
+		# __main__ starts with '__' but has no enclosing package, and folding
+		# it would strip the prefix off every top-level name in the user's own
+		# program. import_code gates folding on a non-empty scope for exactly
+		# this case
+		disco = discovery.Discovery( import_builtins = False )
+		mod = disco.import_code( 'class Widget:\n\tpass\n', Path( '__main__.py' ), scope = None )
+
+		self.assertEqual( mod.qualname, '__main__' )
+		widget = mod.get_local( 'Widget' )
+		assert widget is not None
+		self.assertEqual( widget.qualname, '__main__.Widget' )
+
+	def test_relative_import_from_a_private_module( self ) -> None:
+		# the folded qualname is the package itself, so a level=1 import can't
+		# be resolved by lopping a level off it - Module.package is what makes
+		# this work
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': 'from .__a import Consumer\n',
+				'__a.py': 'from .__b import Widget\n\nclass Consumer:\n\tpass\n',
+				'__b.py': 'class Widget:\n\tpass\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			pkg = disco.import_name( 'pkg' )
+
+			self.assertEqual( disco.errors.errors, [] )
+			self.assertIsNotNone( pkg.get_local( 'Consumer' ))
+			widget = disco.modules['pkg.__a'].get_local( 'Widget' )
+			assert widget is not None
+			self.assertEqual( widget.qualname, 'pkg.Widget' )
+
+	def test_relative_import_from_package_init( self ) -> None:
+		# regression: this used to need a special case compensating for
+		# __init__.py's qualname already being the package name. Counting from
+		# Module.package makes it fall out of the same arithmetic as any other
+		# module
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': 'from .impl import Widget\n',
+				'impl.py': 'class Widget:\n\tpass\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			pkg = disco.import_name( 'pkg' )
+
+			self.assertEqual( disco.errors.errors, [] )
+			self.assertIsNotNone( pkg.get_local( 'Widget' ))
+
+	def test_parent_relative_import_climbs_one_package( self ) -> None:
+		# level=2 from inside pkg.sub means pkg - one above the importer's own
+		# package, whether or not the importer folds
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'pkg' ).mkdir()
+			( root / 'pkg' / '__init__.py' ).write_text( '' )
+			( root / 'pkg' / 'shared.py' ).write_text( 'class Widget:\n\tpass\n' )
+			( root / 'pkg' / 'sub' ).mkdir()
+			( root / 'pkg' / 'sub' / '__init__.py' ).write_text( 'from .__inner import Consumer\n' )
+			( root / 'pkg' / 'sub' / '__inner.py' ).write_text( 'from ..shared import Widget\n\nclass Consumer:\n\tpass\n' )
+
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			sub = disco.import_name( 'pkg.sub' )
+
+			self.assertEqual( disco.errors.errors, [] )
+			self.assertIsNotNone( sub.get_local( 'Consumer' ))
+			widget = disco.modules['pkg.sub.__inner'].get_local( 'Widget' )
+			assert widget is not None
+			self.assertEqual( widget.qualname, 'pkg.shared.Widget' )
+
+	def test_relative_import_from_a_top_level_module_is_an_error( self ) -> None:
+		# no enclosing package to count from
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'lonely.py' ).write_text( 'from . import something\n' )
+			( root / 'something.py' ).write_text( 'class Widget:\n\tpass\n' )
+
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			disco.import_name( 'lonely' )
+
+			self.assertTrue(
+				any( 'unable to relative import from here' in e for e in disco.errors.errors ),
+				disco.errors.errors,
+			)
+
+
 class QualnameCollisionTests( unittest.TestCase ):
 	'''
 	a module that folds into its package (__init__.py, and any package-private
@@ -1882,6 +2014,59 @@ class QualnameCollisionTests( unittest.TestCase ):
 		for name, text in files.items():
 			( root / 'pkg' / name ).write_text( text )
 		return root
+
+	def test_private_module_colliding_with_package_init_is_reported( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': 'from .__helper import helper\n\nclass Widget:\n\tpass\n',
+				'__helper.py': 'class Widget:\n\tpass\n\ndef helper() -> None:\n\treturn\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			disco.import_name( 'pkg' )
+
+			errors = [ e for e in disco.errors.errors if 'already defined' in e ]
+			self.assertEqual( len( errors ), 1, disco.errors.errors )
+			# reported against the second definition, naming the first, and
+			# explaining the folding rule that made two files with no name in
+			# common collide in the first place
+			self.assertIn( "'pkg.Widget' is already defined", errors[0] )
+			self.assertIn( '__init__.py:3', errors[0] )
+			self.assertIn( '__helper.py:1', errors[0] )
+			self.assertIn( 'package-private', errors[0] )
+
+	def test_two_private_modules_colliding_is_reported( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': 'from .__a import make_a\nfrom .__b import make_b\n',
+				'__a.py': 'def shared() -> None:\n\treturn\n\ndef make_a() -> None:\n\treturn\n',
+				'__b.py': 'def shared() -> None:\n\treturn\n\ndef make_b() -> None:\n\treturn\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			disco.import_name( 'pkg' )
+
+			errors = [ e for e in disco.errors.errors if 'already defined' in e ]
+			self.assertEqual( len( errors ), 1, disco.errors.errors )
+			self.assertIn( "'pkg.shared' is already defined", errors[0] )
+			self.assertIn( '__b.py:1', errors[0] ) # scanned second - reported against
+			self.assertIn( '__a.py:1', errors[0] ) # scanned first - named as the original
+
+	def test_module_level_constants_collide_too( self ) -> None:
+		# not just def/class: a module-level annotated assignment claims a
+		# qualname exactly the same way, and this is the case that actually
+		# existed in lib/builtins (_ASCII_ZERO, defined in both __int.py and
+		# __str.py) when folding was first switched on
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': 'from .__a import make_a\nfrom .__b import make_b\n',
+				'__a.py': 'K: u8 = 1\n\ndef make_a() -> None:\n\treturn\n',
+				'__b.py': 'K: u8 = 2\n\ndef make_b() -> None:\n\treturn\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			disco.import_name( 'pkg' )
+
+			errors = [ e for e in disco.errors.errors if 'already defined' in e ]
+			self.assertEqual( len( errors ), 1, disco.errors.errors )
+			self.assertIn( "'pkg.K' is already defined", errors[0] )
 
 	def test_non_folding_modules_with_same_stem_do_not_collide( self ) -> None:
 		# an ordinary (non-private) sub-module keeps its own stem in the

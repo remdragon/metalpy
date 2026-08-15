@@ -897,3 +897,13 @@ class Module( Name, ScopeMixin ):
 	intrinsics: dict[str,Name]
 	builtins: dict[str,Name]|None
 	names: dict[str,Name] = field( default_factory = dict )
+
+	# the package this module lives in, i.e. Python's own __package__ - the
+	# base a relative import counts levels up from. Deliberately NOT derivable
+	# from qualname (Python's __name__): a module that folds into its package
+	# takes the package's own qualname, so slicing a level off qualname would
+	# climb one level too far from an __init__.py or a package-private
+	# __foo.py, and there is no way to tell from the string alone whether
+	# folding happened. '' for a top-level module, which owns no package and
+	# from which any relative import is an error
+	package: str = ''
