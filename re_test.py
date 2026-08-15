@@ -1,10 +1,13 @@
-# Real-compile-and-run behavioral tests for lib/re.py, Phase 1: a
-# backtracking regex VM (literals, `.`, character classes incl. \d \w \s
-# shorthands, greedy quantifiers `* + ? {m,n}`, alternation `|`, `^ $`
-# anchors, non-capturing `(...)` grouping) plus the step-budget safety
-# valve (max_steps, MatchError.StepLimitExceeded vs MatchError.NoMatch).
-# Match.group(0)/span()/start()/end() only - named/numbered capture groups
-# beyond the whole match are a Phase 2 addition (see PLAN_RE.md).
+# Real-compile-and-run behavioral tests for lib/re.py.
+#
+# Phase 1: a backtracking regex VM (literals, `.`, character classes incl.
+# \d \w \s shorthands, greedy quantifiers `* + ? {m,n}`, alternation `|`,
+# `^ $` anchors, non-capturing `(...)` grouping) plus the step-budget
+# safety valve (max_steps, MatchError.StepLimitExceeded vs NoMatch).
+#
+# Phase 2: numbered capturing groups - bare `(...)` now allocates a real
+# slot pair (see Parser._parse_group), Match.group(n)/groups()/start(n)/
+# end(n) beyond the whole match (group 0). See PLAN_RE.md for both.
 #
 # Follows time_test.py's own template: RealCompileMixin + assert_programs_run,
 # print()-free, exit code 0 = every check passed, distinct nonzero i32 per
@@ -25,11 +28,20 @@ def main() -> i32:
 	if m.is_err():
 		return 1
 	mm: re.Match = m.unwrap( 'checked ok above' )
-	if mm.start() != 2:
+	mstart: usize|None = mm.start()
+	if mstart is None:
 		return 2
-	if mm.end() != 5:
+	if mstart != 2:
+		return 2
+	mend: usize|None = mm.end()
+	if mend is None:
 		return 3
-	if mm.group() != 'abc':
+	if mend != 5:
+		return 3
+	mg: str|None = mm.group()
+	if mg is None:
+		return 4
+	if mg != 'abc':
 		return 4
 	if p.search( 'xxxyz' ).is_ok():
 		return 5
@@ -44,7 +56,10 @@ def main() -> i32:
 	dm: Result[re.Match, re.MatchError] = d.search( 'ab123cd' )
 	if dm.is_err():
 		return 1
-	if dm.unwrap( 'checked ok above' ).group() != '123':
+	dmg: str|None = dm.unwrap( 'checked ok above' ).group()
+	if dmg is None:
+		return 2
+	if dmg != '123':
 		return 2
 
 	dot: re.Pattern = re.compile( 'a.c' ).unwrap( 'bad' )
@@ -83,21 +98,30 @@ def main() -> i32:
 	cm: Result[re.Match, re.MatchError] = cls.search( 'xxabccbaxx' )
 	if cm.is_err():
 		return 14
-	if cm.unwrap( 'checked ok above' ).group() != 'abccba':
+	cmg: str|None = cm.unwrap( 'checked ok above' ).group()
+	if cmg is None:
+		return 15
+	if cmg != 'abccba':
 		return 15
 
 	neg: re.Pattern = re.compile( '[^0-9]+' ).unwrap( 'bad' )
 	nm: Result[re.Match, re.MatchError] = neg.search( 'ab12cd' )
 	if nm.is_err():
 		return 16
-	if nm.unwrap( 'checked ok above' ).group() != 'ab':
+	nmg: str|None = nm.unwrap( 'checked ok above' ).group()
+	if nmg is None:
+		return 17
+	if nmg != 'ab':
 		return 17
 
 	word: re.Pattern = re.compile( r'\\w+' ).unwrap( 'bad' )
 	wm: Result[re.Match, re.MatchError] = word.search( '  hello_world!  ' )
 	if wm.is_err():
 		return 18
-	if wm.unwrap( 'checked ok above' ).group() != 'hello_world':
+	wmg: str|None = wm.unwrap( 'checked ok above' ).group()
+	if wmg is None:
+		return 19
+	if wmg != 'hello_world':
 		return 19
 
 	space: re.Pattern = re.compile( r'a\\sb' ).unwrap( 'bad' )
@@ -142,7 +166,10 @@ def main() -> i32:
 	um: Result[re.Match, re.MatchError] = uni.search( 'xxcaféxx' )
 	if um.is_err():
 		return 10
-	if um.unwrap( 'checked ok above' ).group() != 'café':
+	umg: str|None = um.unwrap( 'checked ok above' ).group()
+	if umg is None:
+		return 11
+	if umg != 'café':
 		return 11
 	return 0
 '''
@@ -176,6 +203,96 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_CAPTURING_GROUPS = '''
+import re
+
+def main() -> i32:
+	p: re.Pattern = re.compile( r'(\\w+)@(\\w+)' ).unwrap( 'bad pattern' )
+	m: Result[re.Match, re.MatchError] = p.search( 'user@host' )
+	if m.is_err():
+		return 1
+	mm: re.Match = m.unwrap( 'checked ok above' )
+	g0: str|None = mm.group()
+	if g0 is None:
+		return 2
+	if g0 != 'user@host':
+		return 2
+	g1: str|None = mm.group( 1 )
+	if g1 is None:
+		return 3
+	if g1 != 'user':
+		return 4
+	g2: str|None = mm.group( 2 )
+	if g2 is None:
+		return 5
+	if g2 != 'host':
+		return 6
+
+	gs: list[re.GroupResult] = mm.groups()
+	if len( gs ) != 2:
+		return 7
+
+	s1: usize|None = mm.start( 1 )
+	if s1 is None:
+		return 8
+	if s1 != 0:
+		return 8
+	e1: usize|None = mm.end( 1 )
+	if e1 is None:
+		return 9
+	if e1 != 4:
+		return 9
+
+	# an optional capturing group that doesn't participate reports None
+	opt: re.Pattern = re.compile( r'a(b)?c' ).unwrap( 'bad' )
+	om: Result[re.Match, re.MatchError] = opt.fullmatch( 'ac' )
+	if om.is_err():
+		return 10
+	omm: re.Match = om.unwrap( 'checked ok above' )
+	og1: str|None = omm.group( 1 )
+	if og1 is not None:
+		return 11
+
+	om2: Result[re.Match, re.MatchError] = opt.fullmatch( 'abc' )
+	if om2.is_err():
+		return 12
+	omm2: re.Match = om2.unwrap( 'checked ok above' )
+	og2: str|None = omm2.group( 1 )
+	if og2 is None:
+		return 13
+	if og2 != 'b':
+		return 13
+
+	# nested groups
+	nested: re.Pattern = re.compile( r'((a)(b))c' ).unwrap( 'bad' )
+	nm: Result[re.Match, re.MatchError] = nested.fullmatch( 'abc' )
+	if nm.is_err():
+		return 14
+	nmm: re.Match = nm.unwrap( 'checked ok above' )
+	n1: str|None = nmm.group( 1 )
+	if n1 is None:
+		return 15
+	if n1 != 'ab':
+		return 15
+	n2: str|None = nmm.group( 2 )
+	if n2 is None:
+		return 16
+	if n2 != 'a':
+		return 16
+	n3: str|None = nmm.group( 3 )
+	if n3 is None:
+		return 17
+	if n3 != 'b':
+		return 17
+
+	# whole-match span/start/end unaffected by adding groups
+	sp: tuple[usize,usize] = nmm.span()
+	start_of_span: usize = sp[0]
+	if start_of_span != 0:
+		return 18
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -185,6 +302,14 @@ class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
 			( 'char_classes_and_quantifiers', _RE_CHAR_CLASSES_AND_QUANTIFIERS ),
 			( 'alternation_groups_and_anchors', _RE_ALTERNATION_GROUPS_AND_ANCHORS ),
 			( 'step_budget_safety_valve', _RE_STEP_BUDGET ),
+		])
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase2BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def test_phase2_capturing_groups( self ) -> None:
+		self.assert_programs_run([
+			( 'capturing_groups', _RE_CAPTURING_GROUPS ),
 		])
 
 

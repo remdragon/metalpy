@@ -504,16 +504,38 @@ class Parser:
 
 	def _parse_group( self ) -> Result[list[Op], PatternError]:
 		self._advance_byte()  # consume '('
+		capturing: bool = True
 		if not self._at_end() and self._peek_byte() == _BYTE_QUESTION_MARK:
 			self._advance_byte()  # consume '?'
 			if self._at_end() or self._peek_byte() != _BYTE_COLON:
 				return Result.Err( PatternError( 're: unsupported group syntax (only (?:...) is recognized so far)' ))
 			self._advance_byte()  # consume ':'
+			capturing = False
+		start_slot: usize = 0
+		end_slot: usize = 0
+		if capturing:
+			# allocate this group's own slot pair: group N (1-indexed, group
+			# 0 is the whole match, reserved as slots 0/1 by compile()) gets
+			# slots 2N/2N+1 - the VM's SAVE opcode and Frame's slot_values/
+			# slot_set arrays are already sized generically off Pattern's
+			# own n_slots, so no matcher changes are needed for this, only
+			# allocating the slot numbers here and wrapping this group's
+			# fragment in SAVE(start)/SAVE(end) below.
+			start_slot = self.next_slot
+			with compiler.wrap_arithmetic:
+				end_slot = start_slot + 1
+				self.next_slot = start_slot + 2
 		inner: list[Op] = self.parse_alt().or_return()
 		if self._at_end() or self._peek_byte() != _BYTE_RPAREN:
 			return Result.Err( PatternError( 're: unbalanced parenthesis' ))
 		self._advance_byte()  # consume ')'
-		return Result.Ok( inner )
+		if not capturing:
+			return Result.Ok( inner )
+		wrapped: list[Op] = list[Op]()
+		_append_fragment( wrapped, _single_op_fragment( _op_save( start_slot )))
+		_append_fragment( wrapped, inner )
+		_append_fragment( wrapped, _single_op_fragment( _op_save( end_slot )))
+		return Result.Ok( wrapped )
 
 	def _parse_escape_atom( self ) -> Result[list[Op], PatternError]:
 		self._advance_byte()  # consume '\'
@@ -768,27 +790,93 @@ class Matcher:
 # Public API — Pattern / Match / module-level convenience functions.
 # ---------------------------------------------------------------------------
 
+class GroupResult:
+	''' one entry of Match.groups() - `list[str|None]` isn't available here
+	(a union type isn't accepted as a generic type argument: `list[str|None]`
+	itself fails to compile), so this stands in for "str, or nothing" in a
+	list context; `matched` false means the group didn't participate (an
+	optional/alternated-away capturing group), matching what a plain None
+	would have meant in Match.group(n)'s own (non-list, so union-typed
+	return is fine there) `str|None`. '''
+	text: str
+	matched: bool
+
+	def __init__( self, text: str, matched: bool ) -> None:
+		self.text = text
+		self.matched = matched
+
+
 class Match:
+	# slot 2N/2N+1 holds group N's (start,end) byte offsets (N=0 is the
+	# whole match, always set on any successful match); slot_set tracks
+	# whether a group actually participated (an optional/alternated-away
+	# capturing group leaves its pair unset, matching Python's own
+	# group(n) -> None for a group that didn't participate).
 	__source: str
-	__start: usize
-	__end: usize
+	__slot_values: list[usize]
+	__slot_set: list[bool]
 
-	def __init__( self, source: str, start: usize, end: usize ) -> None:
+	def __init__( self, source: str, slot_values: list[usize], slot_set: list[bool] ) -> None:
 		self.__source = source
-		self.__start = start
-		self.__end = end
+		self.__slot_values = slot_values
+		self.__slot_set = slot_set
 
-	def group( self ) -> str:
-		return _substr( self.__source, self.__start, self.__end )
+	def group( self, n: usize = 0 ) -> str|None:
+		with compiler.panic_arithmetic( 're: Match.group: group index overflow' ):
+			lo_slot: usize = n * 2
+			hi_slot: usize = n * 2 + 1
+		if not self.__slot_set.__getitem__( lo_slot ).unwrap( 're: Match.group: group index out of range' ):
+			return None
+		lo: usize = self.__slot_values.__getitem__( lo_slot ).unwrap( 're: Match.group slot' )
+		hi: usize = self.__slot_values.__getitem__( hi_slot ).unwrap( 're: Match.group slot' )
+		return _substr( self.__source, lo, hi )
+
+	def groups( self ) -> list[GroupResult]:
+		out: list[GroupResult] = list[GroupResult]()
+		with compiler.panic_arithmetic( 're: Match.groups: unreachable (dividing by the constant 2)' ):
+			count: usize = len( self.__slot_values ) // 2 - 1
+		i: usize = 1
+		while i <= count:
+			g: str|None = self.group( i )
+			if g is None:
+				out.append( GroupResult( '', False )).unwrap( 're: Match.groups append' )
+			else:
+				out.append( GroupResult( g, True )).unwrap( 're: Match.groups append' )
+			with compiler.wrap_arithmetic:
+				i += 1
+		return out
+
+	def start( self, n: usize = 0 ) -> usize|None:
+		with compiler.panic_arithmetic( 're: Match.start: group index overflow' ):
+			slot: usize = n * 2
+		if not self.__slot_set.__getitem__( slot ).unwrap( 're: Match.start: group index out of range' ):
+			return None
+		return self.__slot_values.__getitem__( slot ).unwrap( 're: Match.start slot' )
+
+	def end( self, n: usize = 0 ) -> usize|None:
+		with compiler.panic_arithmetic( 're: Match.end: group index overflow' ):
+			slot: usize = n * 2 + 1
+		if not self.__slot_set.__getitem__( slot ).unwrap( 're: Match.end: group index out of range' ):
+			return None
+		return self.__slot_values.__getitem__( slot ).unwrap( 're: Match.end slot' )
 
 	def span( self ) -> tuple[usize,usize]:
-		return ( self.__start, self.__end )
-
-	def start( self ) -> usize:
-		return self.__start
-
-	def end( self ) -> usize:
-		return self.__end
+		# group 0 (the whole match) is unconditionally SAVE'd by compile()'s
+		# own tail, so it is always set on any Match that exists at all -
+		# these None branches are an unreachable defensive backstop, not a
+		# real code path. Returning a dummy (0,0) rather than sys.panic()-
+		# ing here: an early `return` is what actually narrows `s`/`e` from
+		# usize|None to usize on the fallthrough path in this compiler,
+		# unlike a sys.panic() call, which isn't recognized as diverging -
+		# comparing/returning the un-narrowed union afterward is a compile
+		# error (confirmed directly; flagged for the compiler bug report).
+		s: usize|None = self.start()
+		if s is None:
+			return ( 0, 0 )
+		e: usize|None = self.end()
+		if e is None:
+			return ( 0, 0 )
+		return ( s, e )
 
 
 class Pattern:
@@ -824,9 +912,7 @@ class Pattern:
 			outcome: Result[Frame, MatchError] = matcher.run_at( pos, self.__n_slots )
 			match outcome:
 				case Result.Ok( frame ):
-					start: usize = frame.slot_values.__getitem__( 0 ).unwrap( 're: search start slot' )
-					end: usize = frame.slot_values.__getitem__( 1 ).unwrap( 're: search end slot' )
-					return Result.Ok( Match( s, start, end ))
+					return Result.Ok( Match( s, frame.slot_values, frame.slot_set ))
 				case Result.Err( e ):
 					if e == MatchError.StepLimitExceeded:
 						return Result.Err( e )
@@ -841,9 +927,7 @@ class Pattern:
 		outcome: Result[Frame, MatchError] = matcher.run_at( 0, self.__n_slots )
 		match outcome:
 			case Result.Ok( frame ):
-				start: usize = frame.slot_values.__getitem__( 0 ).unwrap( 're: match start slot' )
-				end: usize = frame.slot_values.__getitem__( 1 ).unwrap( 're: match end slot' )
-				return Result.Ok( Match( s, start, end ))
+				return Result.Ok( Match( s, frame.slot_values, frame.slot_set ))
 			case Result.Err( e ):
 				return Result.Err( e )
 
@@ -851,7 +935,14 @@ class Pattern:
 		result: Result[Match, MatchError] = self.match( s, max_steps )
 		match result:
 			case Result.Ok( m ):
-				if m.end() == s.byte_len():
+				end_pos: usize|None = m.end()
+				# group 0 is always set on a successful match - see
+				# Match.span()'s own comment on why this is an early
+				# `return`, not a sys.panic(), even though unreachable.
+				if end_pos is None:
+					no_match_err0: MatchError = MatchError.NoMatch
+					return Result.Err( no_match_err0 )
+				if end_pos == s.byte_len():
 					return Result.Ok( m )
 				no_match_err: MatchError = MatchError.NoMatch
 				return Result.Err( no_match_err )
