@@ -1866,6 +1866,85 @@ class CircularImportTests( unittest.TestCase ):
 			self.assertIs( mod_a.get_local( 'b' ), mod_b )
 
 
+class QualnameCollisionTests( unittest.TestCase ):
+	'''
+	a module that folds into its package (__init__.py, and any package-private
+	__foo.py) puts its top-level names straight into the package namespace, so
+	two files in one package can produce the same qualname - which mangles to
+	one C symbol and, without this check, surfaces only as a duplicate-symbol
+	error from the C compiler naming mangled output rather than either source
+	line. See Discovery._check_qualname_collisions.
+	'''
+
+	def _package( self, tmp: str, files: dict[str,str] ) -> Path:
+		root = Path( tmp )
+		( root / 'pkg' ).mkdir()
+		for name, text in files.items():
+			( root / 'pkg' / name ).write_text( text )
+		return root
+
+	def test_non_folding_modules_with_same_stem_do_not_collide( self ) -> None:
+		# an ordinary (non-private) sub-module keeps its own stem in the
+		# qualname, so pkg.one.shared and pkg.two.shared stay distinct and
+		# the check must stay quiet
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': '',
+				'one.py': 'def shared() -> None:\n\treturn\n',
+				'two.py': 'def shared() -> None:\n\treturn\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			one = disco.import_name( 'pkg.one' )
+			two = disco.import_name( 'pkg.two' )
+
+			self.assertEqual( one.qualname, 'pkg.one' )
+			self.assertEqual( two.qualname, 'pkg.two' )
+			self.assertEqual( disco.errors.errors, [] )
+
+	def test_reimporting_one_file_is_not_a_collision( self ) -> None:
+		# import_code with package=None isn't memoized in self.modules, and
+		# several tests re-import one fixture path per assertion (see
+		# lowering_test's FetchUnicodeTableTests). That rebuilds every Name,
+		# so the second pass re-claims what the first claimed - same file, not
+		# a collision
+		disco = discovery.Discovery( import_builtins = False )
+		code = 'class Widget:\n\tpass\n'
+		disco.import_code( code, Path( '__test__.py' ), scope = None )
+		disco.import_code( code, Path( '__test__.py' ), scope = None )
+
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_importing_a_name_into_another_module_is_not_a_claim( self ) -> None:
+		# re-binding an import (visit_ImportFrom hands over the very same Name
+		# object) must not count as defining it a second time
+		with tempfile.TemporaryDirectory() as tmp:
+			root = self._package( tmp, {
+				'__init__.py': 'from .__impl import Widget\n',
+				'__impl.py': 'class Widget:\n\tpass\n',
+			})
+			disco = discovery.Discovery( paths = [ root ], import_builtins = False )
+			pkg = disco.import_name( 'pkg' )
+
+			self.assertEqual( disco.errors.errors, [] )
+			# the same object under both names - which is exactly why the
+			# check can tell a re-binding from a definition (its .file still
+			# points at __impl.py, not at __init__.py)
+			self.assertIs( pkg.get_local( 'Widget' ), disco.modules['pkg.__impl'].get_local( 'Widget' ))
+
+	def test_module_level_overloads_are_not_a_collision( self ) -> None:
+		# two @overload defs share one qualname by design; module.names has
+		# already collapsed them into a single Overload before the check looks
+		disco = discovery.Discovery( import_builtins = False )
+		disco.import_code(
+			'@overload\n'
+			'def f( x: i32 ) -> None:\n\treturn\n'
+			'@overload\n'
+			'def f( x: u8 ) -> None:\n\treturn\n',
+			Path( '__test__.py' ), scope = None,
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+
 class OverloadTests( unittest.TestCase ):
 	def setUp( self ) -> None:
 		self.discovery = discovery.Discovery( import_builtins = False )

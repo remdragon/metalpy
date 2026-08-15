@@ -112,6 +112,22 @@ def _detect_active_target() -> dict[str,object]:
 	return { 'os': os_name, 'arch': arch, 'family': family, 'bits': 64, 'debug': True, 'posix': family == 'unix' }
 
 
+def _folds_into_package( stem: str ) -> bool:
+	''' true if a module with this stem contributes no namespace level of its
+	own - its top-level names take the enclosing package's qualname directly
+	(builtins.list, not builtins.__init__.list). The single source of truth
+	for that rule: import_code() computes qualnames from it and
+	_check_qualname_collisions() decides from it whether a collision is worth
+	explaining as a consequence of folding.
+
+	Only ever consulted for a module that actually has an enclosing package -
+	see import_code, which requires a non-empty scope before applying this.
+	That guard is load-bearing, not incidental: the program entry point is
+	compiled as __main__.py with scope=None, and folding it would strip the
+	prefix off every top-level name in the user's own program. '''
+	return stem == '__init__'
+
+
 # every ast.stmt kind Discovery's own module-body/class-body scan loops
 # (import_code, _make_class_resolver's body_fn) are prepared to hand to
 # self.visit() - anything else must be rejected BEFORE that call, not left
@@ -210,6 +226,12 @@ class Discovery( ast.NodeVisitor ):
 		self.module_stack: list[Module] = []
 		self.scope_stack: list[Module|ClassLike|Function] = []
 
+		# every module-level qualname claimed so far, mapped to the Name that
+		# claimed it - see _check_qualname_collisions() for what this is
+		# defending against and why the check can't live at the definition
+		# sites themselves
+		self._claimed_qualnames: dict[str,Name] = {}
+
 		# dedup caches for compound types built from other types on the fly
 		# (anonymous unions, generic specializations, move[T] wrappers) - never
 		# looked up by qualname from outside, only reused when the exact same
@@ -247,6 +269,64 @@ class Discovery( ast.NodeVisitor ):
 
 	def fail_loc( self, message: str, file: Path|None, line: int|None ) -> NoReturn:
 		self.errors.fail( message, file, line )
+
+	def _check_qualname_collisions( self, module: Module ) -> None:
+		''' a module's qualname is normally its own private prefix, so two
+		files can't produce the same qualname for anything. Two cases break
+		that: __init__.py takes the package's own qualname, and (see
+		import_code) so does any package-private `__foo.py`. Their top-level
+		names therefore land directly in the package namespace, where a name
+		defined by two different files in the same package mangles to one C
+		symbol - a duplicate-definition error from the C compiler, pointing at
+		mangled output rather than at either source line.
+
+		Runs once per module, after its body scan, rather than at the
+		individual definition sites: _get_qualname() is also reached from
+		class bodies, type params and parameter lists, several of them from
+		inside lazy resolve() closures, so a check there would need to
+		untangle re-entrancy and @overload members legitimately sharing one
+		qualname. At this point module.names has already collapsed each
+		@overload group into a single Overload entry (see _parse_FunctionDef),
+		so what's left is exactly the module-level namespace, and any
+		collision found here is necessarily between two different files.
+
+		Records the error and continues (never fail()) - by the time this
+		runs, import_code's own per-statement recovery boundary is behind us,
+		and raising would leave the half-scanned module cached in
+		self.modules for every later importer to trip over. '''
+		if module.file is None:
+			return # synthesized/test module with no source of its own - nothing to point at
+		for name_obj in module.names.values():
+			# an imported name is the very same Name object the defining
+			# module created (visit_ImportFrom re-binds it rather than copying
+			# it), so its .file still points at that module. Re-binding an
+			# import into another namespace isn't a claim on the qualname
+			if name_obj.file != module.file:
+				continue
+			claimed = self._claimed_qualnames.setdefault( name_obj.qualname, name_obj )
+			# only a claim from a DIFFERENT file is a real collision. Same file
+			# means the same source was imported twice into one Discovery
+			# (import_code with package=None isn't memoized in self.modules, and
+			# several tests re-import one fixture path per assertion) - that
+			# rebuilds every Name, so the second pass legitimately re-claims what
+			# the first one did. An intra-module duplicate can't reach here at
+			# all: module.names holds one entry per stem, already collapsed into
+			# a single Overload where that's what the duplicate meant
+			if claimed.file == name_obj.file:
+				continue
+			note = ''
+			if _folds_into_package( module.stem ) or ( claimed.file is not None and _folds_into_package( claimed.file.stem )):
+				note = (
+					f'\n\tnote: a module whose name begins with \'__\' is package-private - its top-level '
+					f'names go directly into package {module.qualname!r}, so they collide with names of the '
+					f'same stem defined by any sibling private module or by the package\'s own __init__.py'
+				)
+			self.errors.error(
+				f'{name_obj.qualname!r} is already defined'
+				f'\n\tfirst defined at {claimed.file}:{claimed.line}'
+				f'{note}',
+				name_obj.file, name_obj.line,
+			)
 
 	def _check_supported_statement( self, node: ast.stmt ) -> None:
 		''' called before self.visit(node) at every module-body/class-body
@@ -306,8 +386,13 @@ class Discovery( ast.NodeVisitor ):
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None, package: str|None = None ) -> Module:
 		stem = filename.stem if filename else ''
-		# __init__.py defines the package's own namespace, not a sub-module
-		qualname = scope if stem == '__init__' else ( f'{scope}.{stem}' if scope else stem )
+		# a folding module (__init__.py) defines the package's own namespace,
+		# not a sub-module - see _folds_into_package for the rule and for why
+		# it's gated on there actually being an enclosing package
+		if scope and _folds_into_package( stem ):
+			qualname = scope
+		else:
+			qualname = f'{scope}.{stem}' if scope else stem
 		# looked up from self.modules, not a dedicated Discovery.builtins
 		# attribute - self.modules['builtins'] is registered (see below)
 		# before builtins' own body is scanned, so this is already there by
@@ -347,6 +432,7 @@ class Discovery( ast.NodeVisitor ):
 				except CompileError:
 					continue
 
+		self._check_qualname_collisions( module )
 		return module
 
 	def import_name( self,
