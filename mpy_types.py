@@ -862,6 +862,15 @@ class Function( Type, ScopeMixin ):
 	# Call/FuncStart/FuncEnd for it
 	is_inline: bool = False
 
+	# @property - a zero-argument getter that reads like a plain field:
+	# `obj.attr` (no call parens) calls this method and returns its result,
+	# instead of the ordinary "bound-method closure" _expr_Attribute builds
+	# for any other method used as a value (see lowering.py's _expr_
+	# Attribute). Read-only only - no @x.setter support yet (would need its
+	# own exemption from discovery.py's duplicate-definition check, the same
+	# way @overload gets one).
+	is_property: bool = False
+
 def _leaf_is_accepted( leaf: Type, declared: Type ) -> bool:
 	# identity-based deliberately, not `==` - Type dataclasses have structural
 	# equality (comparing every field, including mutable dicts/lists), which is

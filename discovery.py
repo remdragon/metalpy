@@ -1803,6 +1803,7 @@ class Discovery( ast.NodeVisitor ):
 		is_private = False
 		is_virtual = False
 		is_inline = False
+		is_property = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
@@ -1829,6 +1830,8 @@ class Discovery( ast.NodeVisitor ):
 					is_virtual = True
 				case 'inline':
 					is_inline = True
+				case 'property':
+					is_property = True
 				case 'extern':
 					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
@@ -1877,6 +1880,24 @@ class Discovery( ast.NodeVisitor ):
 			# above already uses (reject outright rather than silently
 			# building something with no coherent meaning)
 			self.fail( f'@virtual {qualname} cannot also be @staticmethod/@classmethod - no receiver to dispatch through', node )
+
+		if is_property:
+			# read-only getter only for now - no @x.setter (that needs its
+			# own exemption from the "already defined" duplicate-name check
+			# below, the same way @overload gets one; no datetime/timedelta
+			# need is driving that yet). Must be an ordinary instance method
+			# with exactly one parameter (self) - no other positional/
+			# keyword/*args/**kwargs params, since `obj.attr` (no call
+			# parens) never supplies any.
+			if class_obj is None:
+				self.fail( f'@property {qualname} is only valid on a method, not a free function', node )
+			if is_static or is_classmethod:
+				self.fail( f'@property {qualname} cannot also be @staticmethod/@classmethod - a property reads through an instance', node )
+			if is_overload:
+				self.fail( f'@property {qualname} cannot also be @overload - a property has exactly one signature', node )
+			all_params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+			if len( all_params ) != 1 or node.args.vararg is not None or node.args.kwarg is not None:
+				self.fail( f'@property {qualname} must take exactly `self` and no other parameters', node )
 
 		if is_inline:
 			# PLAN_INLINE.md - each of these interacts with the real call
@@ -1957,6 +1978,7 @@ class Discovery( ast.NodeVisitor ):
 			is_virtual = is_virtual,
 			is_overload = is_overload,
 			is_inline = is_inline,
+			is_property = is_property,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,

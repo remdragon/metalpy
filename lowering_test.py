@@ -3436,6 +3436,56 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_property_access_lowers_to_method_call( self ) -> None:
+		# obj.attr (no call parens) for an @property getter calls the
+		# underlying method and uses its result - not a GetAttr (there's no
+		# real field named 'bar'), and not a bound-method closure the way an
+		# ordinary (non-property) method-as-value would build
+		code = '\n'.join([
+			'class Foo:',
+			'	@property',
+			'	def bar( self ) -> i32:',
+			'		return 1',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	x: i32 = f.bar',
+			'	return',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		if foo_cls.resolve is not None:
+			foo_cls.resolve()
+		bar_fn = foo_cls.get_local( 'bar' )
+		if bar_fn.resolve is not None:
+			bar_fn.resolve()
+
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and i.target is bar_fn ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertIsNotNone( calls[0].receiver )
+		self.assertFalse( any( isinstance( i, ir.GetAttr ) and i.attr == 'bar' for i in fn.instructions ))
+
+	def test_plain_field_still_lowers_to_getattr( self ) -> None:
+		# regression guard alongside the property test above: a plain
+		# (non-@property) field access must keep using GetAttr, not get
+		# swept into the new property-call branch in _expr_Attribute
+		code = '\n'.join([
+			'class Foo:',
+			'	bar: i32',
+			'',
+			'def main() -> None:',
+			'	f: Foo',
+			'	x: i32 = f.bar',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertFalse( any( isinstance( i, ir.Call ) for i in fn.instructions ))
+		self.assertTrue( any( isinstance( i, ir.GetAttr ) and i.attr == 'bar' for i in fn.instructions ))
+
 	# --- Callable[...] function references / indirect calls (PLAN_CALLABLE.md) ---
 
 	def test_bare_function_reference_lowers_to_function_ref( self ) -> None:
