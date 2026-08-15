@@ -1175,6 +1175,70 @@ def main() -> i32:
 		self.assertIn( '__main__$Derived$$vtable', src )
 		self._assert_compiles_and_runs( src )
 
+class TupleFieldTeardownTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' an RCClass holding a tuple-typed FIELD must release it in its own
+	destructor.
+
+	type_resolver.py's _build_field_teardown_ast is a separate re-derivation
+	of "which parts of this type are RC" from cfg.py's, and it used to be an
+	isinstance ladder that had no TupleType branch at all - a tuple field
+	matched nothing and fell through to `return []`, so the owner simply never
+	decref'd it. Every instance leaked its tuple, silently: the emitted
+	destructor freed the object itself and never touched the field.
+
+	Verified by refcount rather than by exit code alone - a leak does not
+	crash, so nothing short of observing the refcount can fail on it. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the shared str must come back to refcount 1 after the Holder is
+			# gone. 'x'.upper() (not a literal) forces a real heap allocation -
+			# a literal binds to immortal static storage and can't distinguish
+			# a leak from doing nothing.
+			( 'rcclass_with_a_tuple_field_releases_it', '''
+class Holder:
+	t: tuple[str, i32]
+	def __init__( self, t: tuple[str, i32] ) -> None:
+		self.t = t
+
+def main() -> i32:
+	s: str = 'x'.upper()
+	if compiler.refcount( s ) != 1:
+		return 1
+	h: Holder = Holder( t = ( s, 3 ) )
+	if compiler.refcount( s ) != 2: # the tuple now holds a reference too
+		return 2
+	compiler.decref( h )
+	if compiler.refcount( s ) != 1: # ...released again with the Holder
+		return 3
+	return 0
+''' ),
+			# and under repetition, which is what turns a missed release into
+			# unbounded growth rather than one stray allocation
+			( 'rc_lifetime_repeated_tuple_field_no_leak', '''
+class Holder:
+	t: tuple[str, i32]
+	def __init__( self, t: tuple[str, i32] ) -> None:
+		self.t = t
+	def byte_len( self ) -> usize:
+		return self.t[0].byte_len()
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			h: Holder = Holder( t = ( 'hello'.upper(), 1 ) )
+			if h.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
+
 class AugAssignRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for _stmt_AugAssign's Attribute/Subscript-
 	target support (lowering.py) - unlike the IR-shape assertions in
