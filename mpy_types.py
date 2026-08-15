@@ -73,6 +73,27 @@ class Scalar( Type, ScopeMixin ):
 	type_params: list['TypeVar']|None = None
 	names: dict[str,Name] = field( default_factory = dict )
 
+def int_stem_range( t: Scalar ) -> tuple[int,int]:
+	''' (MIN, MAX), the real inclusive range of integer stem t.stem, as
+	Python ints - used to validate a literal's magnitude against its
+	declared type (see lowering.py's _expr_Constant and discovery.py's
+	_register_enum_member, the two places a literal's value gets checked
+	against a concrete integer type). Derived from t.sizeof (already
+	resolved to the ACTIVE TARGET's real width by the time either caller
+	runs - see discovery.py's active_target-driven sizeof computation -
+	isize/usize are NOT hardcoded to 64 here), not a fixed per-stem table,
+	so this is correct for every integer stem uniformly, whatever target
+	width the compiler was configured for. Signedness is read directly off
+	the stem's own first letter (i vs u) - true for every integer stem
+	this compiler has (i8/i16/i32/i64/i128/isize vs u8/u16/u32/u64/u128/
+	usize) - rather than depending on lowering.py's own _SIGNED_INT_STEMS,
+	which this module (mpy_types.py, imported by both discovery.py and
+	lowering.py) can't reach without a circular import. '''
+	bits = t.sizeof * 8
+	if t.stem[0] == 'i':
+		return -(2**(bits-1)), 2**(bits-1) - 1
+	return 0, 2**bits - 1
+
 @dataclass( kw_only = True )
 class TypeVar( Type ):
 	''' a placeholder for one of a generic's type parameters, e.g. T in class Result[T,E] '''
