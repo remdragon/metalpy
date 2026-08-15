@@ -7098,6 +7098,69 @@ def main() -> i32:
 		] )
 
 
+class SetLiteralRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_Set (ast.Set, `{a, b, c}`) - real compile-and-run companion to
+	lowering_test.py's SetLiteralTests. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_set_literal', '''
+def main() -> i32:
+	x: set[str] = { 'a', 'b', 'c' }
+	if x.__len__() != 3:
+		return 1
+	if not ( x.__contains__( 'a' ) and x.__contains__( 'b' ) and x.__contains__( 'c' )):
+		return 2
+	if x.__contains__( 'z' ):
+		return 3
+	return 0
+''' ),
+			( 'i32_set_literal', '''
+def main() -> i32:
+	x: set[i32] = { 10, 20, 30 }
+	if x.__len__() != 3:
+		return 1
+	if not ( x.__contains__( 10 ) and x.__contains__( 20 ) and x.__contains__( 30 )):
+		return 2
+	if x.__contains__( 40 ):
+		return 3
+	return 0
+''' ),
+			# a repeated literal element is exactly one dedup add(), not a
+			# real duplicate - the same overwrite-existing-key semantics
+			# set[T].add already relies on, just reached through literal
+			# syntax instead of explicit .add() calls
+			( 'duplicate_elements_in_literal_are_deduped', '''
+def main() -> i32:
+	x: set[i32] = { 1, 1, 2 }
+	if x.__len__() != 2:
+		return 1
+	if not ( x.__contains__( 1 ) and x.__contains__( 2 )):
+		return 2
+	return 0
+''' ),
+			( 'set_literal_returned_from_function', '''
+def codes() -> set[i32]:
+	return { 200, 201, 204 }
+
+def main() -> i32:
+	c = codes()
+	if c.__len__() != 3:
+		return 1
+	if not ( c.__contains__( 200 ) and c.__contains__( 201 ) and c.__contains__( 204 )):
+		return 2
+	if c.__contains__( 404 ):
+		return 3
+	return 0
+''' ),
+		] )
+
+
 class MoveParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' move[T] is an ownership status on a binding, not a distinct type
 	from T (Parameter.is_move, not a Move-wrapped .type) - real compile-

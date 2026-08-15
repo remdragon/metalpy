@@ -5534,6 +5534,41 @@ class FunctionLowering:
 			self._emit( ir.Call( dest = None, target = unwrap_fn, receiver = append_dest, args = [ errmsg ], kwargs = {} ))
 		return dest
 
+	def _expr_Set( self, node: ast.Set, expected_type: Type|None ) -> ir.Operand:
+		''' {a, b, c} - mirrors _expr_List's own shape (requires expected_type
+		to already be a concrete set[T] Specialization - element-driven
+		inference deferred, same precedent as list/tuple literals above).
+		Builds one set[T] instance via _construct_generic_instance, then a
+		real add(elt) call per element - unlike list[T].append, set[T].add
+		returns plain None (no Result[None,OverflowError] to unwrap), so
+		this skips _expr_List's errmsg/unwrap dance entirely. '''
+		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
+		if not ( isinstance( expected_type, Specialization ) and isinstance( resolved, RCClass )
+				and expected_type.base.stem == 'set' and len( expected_type.args ) == 1 ):
+			self.lowering.discovery.fail(
+				f'set literal needs a known set[T] target type from context (e.g. an annotation or return type): {ast.unparse(node)}',
+				node,
+			)
+		elem_type = expected_type.args[0]
+		dest = self._construct_generic_instance( expected_type, node )
+		if not node.elts:
+			# the standard parser never actually produces an empty ast.Set
+			# from source text (`{}` always parses as ast.Dict) - kept for
+			# robustness against a synthetically-built empty node, same
+			# defensive guard _expr_List keeps for its own analogous case
+			return dest
+		add_fn = self.lowering._find_method( dest.type, 'add' )
+		assert add_fn is not None, 'internal compiler error: set[T] has no add method'
+		self.lowering._ensure_resolved( add_fn )
+		self.lowering.schedule( add_fn.return_type )
+		for elt in node.elts:
+			operand = self._lower_expr( elt, elem_type )
+			# dest=None: add()'s return value (None) is never read, only its
+			# side effect - same "dest=None for a call whose result isn't
+			# used" convention _expr_List's own unwrap() call above relies on
+			self._emit( ir.Call( dest = None, target = add_fn, receiver = dest, args = [ operand ], kwargs = {} ))
+		return dest
+
 	# obj.type.stem -> its own length-accessor method name, for slice
 	# syntax's own default-stop resolution (_lower_slice_subscript below).
 	# str and bytearray genuinely expose differently-named length
