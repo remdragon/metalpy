@@ -3757,7 +3757,16 @@ class FunctionLowering:
 
 	def _is_rcclass_upcast( self, sub: Type|None, sup: Type|None ) -> bool:
 		''' True if `sub` is a strict subclass (transitively) of `sup`, both being
-		RCClasses (or specializations of one) - i.e. a derived->base upcast. '''
+		RCClasses (or specializations of one) - i.e. a derived->base upcast.
+
+		Deliberately NOT expressed with Type.is_rc()/is_rc_pointer(): this asks
+		about INHERITANCE, not reference counting, and it needs the real RCClass
+		OBJECT to walk .base with. A tuple[T...] is every bit as much an RC
+		pointer as an RCClass but has no inheritance chain at all, so widening
+		this guard to is_rc_pointer() would let one into an upcast test it can
+		never meaningfully participate in. The isinstance is the right check
+		here - see mpy_types.Type's own note on the RC vs layout vs class-kind
+		distinction. '''
 		def rc_of( t: Type|None ) -> Type|None:
 			base = t.base if isinstance( t, Specialization ) else t
 			return base if isinstance( base, RCClass ) else None

@@ -712,7 +712,7 @@ def c_type( t: Type|None ) -> str:
 			else:
 				inner = _value_spelling( inner_type )
 			return f'{inner}*' if base.stem == 'Ptr' else f'const {inner}*'
-		if isinstance( base, RCClass ):
+		if t.is_rc_pointer():
 			return f'struct {mangle_type(t)}*'
 		if isinstance( base, ( CStruct, CUnion, TaggedUnion )):
 			return f'{_class_keyword(base)} {mangle_type(t)}'
@@ -730,9 +730,10 @@ def c_type( t: Type|None ) -> str:
 		if mapped is None:
 			raise NotImplementedError( f'c_type: unsupported scalar {t.qualname!r}' )
 		return mapped
-	if isinstance( t, RCClass ):
-		return f'struct {mangle_type(t)}*'
-	if isinstance( t, TupleType ):
+	if t.is_rc_pointer():
+		# RCClass and TupleType both, in one branch - a bare RC pointer is a
+		# bare RC pointer regardless of which kind produced it.
+		#
 		# PLAN_TUPLE.md, found by a real hang (not anticipated up front): a
 		# bare, unresolved TupleType can still reach here even after
 		# monomorphize.py's own substitute_type_params fix - a plain LOCAL/
@@ -748,8 +749,8 @@ def c_type( t: Type|None ) -> str:
 		# concrete backing RCClass eventually gets emitted under the SAME
 		# mangled name, since TupleType.qualname == backing.qualname by
 		# construction (tuple_storage.py's own TupleStorage.get()). Always
-		# a pointer, same as RCClass directly above - a tuple's backing is
-		# never anything else.
+		# a pointer, same as an RCClass - a tuple's backing is never
+		# anything else, which is what lets both share this branch.
 		return f'struct {mangle_type(t)}*'
 	if isinstance( t, ( CStruct, CUnion, TaggedUnion )):
 		return f'{_class_keyword(t)} {mangle_type(t)}'
@@ -1839,7 +1840,7 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 	# type, as the pointer - this is where that pointer-ness actually
 	# becomes `->` in the emitted C).
 	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
-	if isinstance( base, ( RCClass, TupleType )): # PLAN_TUPLE.md: a tuple's backing is always an RCClass, always pointer-accessed
+	if obj_type is not None and obj_type.is_rc_pointer(): # PLAN_TUPLE.md: a tuple's backing is always an RCClass, always pointer-accessed
 		return '->'
 	if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
 		return '->'
