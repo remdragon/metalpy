@@ -329,31 +329,21 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'get' ]
 		self.assertEqual( len( calls ), 1 )
 
-	def test_known_gap_union_receiver_dispatch_does_not_check_per_leaf_parameter_types( self ) -> None:
-		# documents a pre-existing gap, NOT fixed as part of this plan: a
-		# union mixing two DIFFERENT concrete instantiations of the same
+	def test_union_receiver_dispatch_rejects_incompatible_leaf_parameter_types( self ) -> None:
+		# a union mixing two DIFFERENT concrete instantiations of the same
 		# generic class (Box[i32]|Box[u32]) with a same-named method taking
-		# a generic-typed argument - the per-leaf consistency check only
-		# compares return-type identity and parameter COUNT, never
-		# per-position parameter TYPE, so this compiles with no error, and
-		# the SAME lowered argument operand (typed i32 here) is silently
-		# reused for BOTH leaves' Call, including the Box[u32] one that
-		# actually expects a u32. Before Stage 1/2 this couldn't happen at
-		# all - every leaf's method stayed abstract/bare-T, so there was
-		# nothing to disagree about
-		#
-		# Re-verified, explicitly, when lowering.py gained a general
-		# assignability check (_lower_expr's _check_assignable): confirmed
-		# STILL unaffected, not just untouched by oversight -
-		# _lower_union_receiver_call lowers this call's argument exactly
-		# ONCE, against the FIRST leaf's (Box[i32].set) own parameter type,
-		# then reuses that single already-lowered operand across every
-		# leaf's own ir.Call with no second _lower_expr invocation - the
-		# general check has no opportunity to see the SECOND leaf's own
-		# mismatch at all, structurally, regardless of how strict it is.
-		# Still a real, separate, larger gap to fix another day (per-leaf
-		# argument re-lowering/re-checking in union-receiver dispatch), not
-		# something this plan's own narrower fix could reach.
+		# a generic-typed argument - the per-leaf consistency check
+		# (type_resolver.py's _resolve_union_receiver_members) only compares
+		# return-type identity and parameter COUNT, never per-position
+		# parameter TYPE, so lowering itself has to catch a genuinely
+		# non-coercible leaf. _lower_union_receiver_call now runs
+		# _coerce_or_check_operand once per leaf (not just once overall,
+		# against the first leaf) - the Box[u32] leaf's own mismatch is
+		# caught and located, naming both types, the leaf, and the
+		# parameter. No re-lowering of the argument expression happens
+		# (side-effect safety): the SAME originally-lowered operand is still
+		# reused, unchanged, across leaves whenever no coercion applies -
+		# only now it's also validated per leaf.
 		self._run( '\n'.join([
 			'class Box[T]:',
 			'\tv: T',
@@ -366,13 +356,51 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tb.set( x )',
 			'\treturn',
 		]))
-		self.assertEqual( self.discovery.errors.errors, [] ) # no error today - this is the gap
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		error = errors[0]
+		self.assertIn( '__main__.Box.set[intrinsics.u32]', error )
+		self.assertIn( "parameter 'x'", error )
+		self.assertIn( 'expected intrinsics.u32', error )
+		self.assertIn( 'got intrinsics.i32', error )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'set' ]
+		# only the i32 leaf's own Call (checked first, and legal) got
+		# emitted - the u32 leaf's own failing _check_assignable raises,
+		# aborting the rest of this statement via the ordinary per-
+		# statement recovery boundary, same as any other lowering error
+		self.assertEqual( len( calls ), 1 )
+
+	def test_union_receiver_dispatch_applies_per_leaf_scalar_widening( self ) -> None:
+		# the real fix, on the happy path: Box[i32]|Box[i64], x: i32 - the
+		# i32 leaf keeps the original operand unchanged (exact type match,
+		# _coerce_or_check_operand's own same-type fast path), the i64 leaf
+		# gets its OWN distinct operand, fed by a real ir.CastWrap widening
+		# that SAME original x - never re-lowering/re-evaluating the
+		# argument expression itself
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'\tv: T',
+			'\tdef set( self, x: T ) -> None:',
+			'\t\tself.v = x',
+			'',
+			'def main() -> None:',
+			'\tb: Box[i32]|Box[i64]',
+			'\tx: i32 = 5',
+			'\tb.set( x )',
+			'\treturn',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'set' ]
 		self.assertEqual( len( calls ), 2 )
-		# same operand passed to both, including the Box[u32] leaf that
-		# actually declares x: u32 - the mismatch nothing catches
-		self.assertIs( calls[0].args[0], calls[1].args[0] )
+		i32_call = next( c for c in calls if c.target.qualname.endswith( '[intrinsics.i32]' ) )
+		i64_call = next( c for c in calls if c.target.qualname.endswith( '[intrinsics.i64]' ) )
+		self.assertEqual( i32_call.args[0].type.qualname, 'intrinsics.i32' )
+		self.assertIsNot( i64_call.args[0], i32_call.args[0] )
+		casts = [ i for i in main_lf.instructions if isinstance( i, ir.CastWrap ) and i.dest is i64_call.args[0] ]
+		self.assertEqual( len( casts ), 1 )
+		self.assertIs( casts[0].operand, i32_call.args[0] )
 
 class EmitArithmeticTests( CompilerTestCase ):
 	def test_wrap_arithmetic_smoke_test( self ) -> None:
@@ -5986,6 +6014,69 @@ def main() -> i32:
 	return 0
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+
+class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile-and-run companion to GenericMethodDispatchTests'
+	test_union_receiver_dispatch_applies_per_leaf_scalar_widening - proves
+	the per-leaf ir.CastWrap actually widens the runtime VALUE correctly
+	through both leaves of a union receiver, not just that the IR has the
+	right shape.
+
+	Uses two plain, unrelated classes (not two Specializations of one
+	generic class, unlike the lowering-level test) deliberately: assigning
+	a freshly-constructed generic RCClass value into a union of that same
+	generic class's own instantiations hits a real, separate, pre-existing
+	bug (_coerce_into_union's leaf lookup is identity-based - `attr.type is
+	operand.type` - and a Specialization built by a constructor call is
+	apparently never reconciled with the one the union's own member list
+	holds), confirmed via a standalone repro and confirmed unrelated to
+	this fix (plain, non-generic union members hit no such issue). Flagged
+	here, not fixed - out of scope for this plan. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		# matches() returns bool (identical across leaves) rather than each
+		# leaf's own field type deliberately: union-receiver dispatch
+		# requires every leaf's own method to share one return type, so
+		# reading the per-leaf-widened value back has to go through a
+		# same-return-type-everywhere method instead
+		self.assert_programs_run([
+			( 'per_leaf_scalar_widening_produces_correct_runtime_value', '''
+class BoxI32:
+	v: i32
+	def set( self, x: i32 ) -> None:
+		self.v = x
+	def matches( self, expected: i64 ) -> bool:
+		with compiler.wrap_arithmetic:
+			return i64( self.v ) == expected
+
+class BoxI64:
+	v: i64
+	def set( self, x: i64 ) -> None:
+		self.v = x
+	def matches( self, expected: i64 ) -> bool:
+		return self.v == expected
+
+def main() -> i32:
+	x: i32 = 5
+
+	u64: BoxI32|BoxI64 = BoxI64( v = 0 )
+	u64.set( x )
+	if not u64.matches( 5 ):
+		return 1
+
+	u32: BoxI32|BoxI64 = BoxI32( v = 0 )
+	u32.set( x )
+	if not u32.matches( 5 ):
+		return 2
+	return 0
+''' ),
+		] )
 
 
 class MatchArmSameNameNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):

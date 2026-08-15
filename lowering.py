@@ -3477,6 +3477,25 @@ class FunctionLowering:
 		if method is None:
 			self.lowering.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
 		operand = method( node, expected_type )
+		return self._coerce_or_check_operand( operand, expected_type, node, strict = strict )
+
+	def _coerce_or_check_operand( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST, *, strict: bool = True, context: str|None = None ) -> ir.Operand:
+		''' the shared post-dispatch tail: given an operand (freshly produced
+		by one of the _expr_X dispatch methods above, OR - unlike every
+		other caller - already-lowered and handed in directly, with no AST
+		node of its own left to re-dispatch) and an expected_type, applies
+		every legitimate coercion in turn and, if none apply and `strict`,
+		rejects a genuine mismatch. Factored out of _lower_expr (which calls
+		this immediately after dispatch, `node` there being the same node
+		method() was just given) specifically so _lower_union_receiver_call
+		can call this a SECOND time, once per union leaf, against an
+		operand it already has - never re-lowering/re-evaluating the
+		original argument expression (which would double its side effects
+		once per leaf) while still getting the exact same coercion-or-
+		rejection treatment an ordinary call argument gets. `context`, if
+		given, only affects _check_assignable's own failure message (see
+		its own docstring) - it plays no role in which coercion, if any,
+		applies. '''
 		# post-hoc, not a pre-emptive override of expected_type before
 		# dispatch: a node kind that already produces the right union type
 		# on its own (an explicit Result.Ok(x) call, a match-narrowed
@@ -3539,12 +3558,13 @@ class FunctionLowering:
 		# this one is a REAL value conversion (C's own sign-/zero-extension,
 		# not a pointer reinterpret) - see _is_safe_scalar_widening's own
 		# docstring for exactly which pairs qualify and why isize/usize are
-		# deliberately excluded. Gated on `strict` (see its own parameter
-		# comment) - _lower_binary_operands' own cross-operand HINTING must
-		# never trigger this: `c: f64 = a + b` (a: f64, b: f32) needs to keep
-		# hitting _lower_binop_values' own deliberately-stricter "floating-
-		# point operation requires both operands to be the SAME type, cast
-		# explicitly" rule, not have b silently widened to f64 here first.
+		# deliberately excluded. Gated on `strict` (see _lower_expr's own
+		# parameter comment) - _lower_binary_operands' own cross-operand
+		# HINTING must never trigger this: `c: f64 = a + b` (a: f64, b: f32)
+		# needs to keep hitting _lower_binop_values' own deliberately-
+		# stricter "floating-point operation requires both operands to be
+		# the SAME type, cast explicitly" rule, not have b silently widened
+		# to f64 here first.
 		elif ( strict and expected_type is not None and operand.type is not expected_type
 				and self._is_safe_scalar_widening( operand.type, expected_type ) ):
 			dest = self._new_temp( expected_type )
@@ -3573,7 +3593,7 @@ class FunctionLowering:
 		# _lower_binop_values' own float-same-type check) is responsible for
 		# validating the ACTUAL requirement itself in that case.
 		if strict:
-			self._check_assignable( operand, expected_type, node )
+			self._check_assignable( operand, expected_type, node, context = context )
 		return operand
 
 	def _is_rcclass_upcast( self, sub: Type|None, sup: Type|None ) -> bool:
@@ -3619,14 +3639,20 @@ class FunctionLowering:
 				return order.index( expected_type.stem ) > order.index( operand_type.stem )
 		return False
 
-	def _check_assignable( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST ) -> None:
+	def _check_assignable( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST, *, context: str|None = None ) -> None:
 		''' the single choke point for lowering.py's own longstanding,
 		self-documented gap ("a genuine argument-type mismatch isn't
 		checked anywhere yet (no general type-checking pass exists)") -
-		called last from _lower_expr, after every legitimate coercion
-		(TaggedUnion wrap, RCClass upcast, safe scalar widening,
-		interchangeable pointer cast) already had its chance to rewrite
-		`operand` into something matching expected_type. Uses _same_type,
+		called last from _coerce_or_check_operand (in turn called from both
+		_lower_expr and, a second time per leaf, _lower_union_receiver_call),
+		after every legitimate coercion (TaggedUnion wrap, RCClass upcast,
+		safe scalar widening, interchangeable pointer cast) already had its
+		chance to rewrite `operand` into something matching expected_type.
+		`context`, if given, is prefixed onto the failure message - used by
+		union-receiver dispatch to name which leaf/parameter disagreed,
+		since a bare "expected X, got Y" doesn't otherwise say WHICH of
+		several call targets is the one that actually declared X. Uses
+		_same_type,
 		not raw `is`, for the equality check: a bare Specialization and its
 		own already-monomorphized form (or a bare TupleType and its own
 		resolved backing RCClass) are the SAME type reached through two
@@ -3662,10 +3688,11 @@ class FunctionLowering:
 		if isinstance( operand.type, CEnum ) and expected_type is operand.type.value_type:
 			return
 		if isinstance( expected_type, ( Move, Copy )):
-			self._check_assignable( operand, expected_type.inner, node )
+			self._check_assignable( operand, expected_type.inner, node, context = context )
 			return
+		prefix = f'{context}: ' if context is not None else ''
 		self.lowering.discovery.fail(
-			f'{ast.unparse(node)}: expected {expected_type.qualname}, got {operand.type.qualname} - '
+			f'{prefix}{ast.unparse(node)}: expected {expected_type.qualname}, got {operand.type.qualname} - '
 			f'these are different types; convert explicitly if this is intentional '
 			f'(e.g. {expected_type.stem}(...) for a scalar target)',
 			node,
@@ -7098,9 +7125,42 @@ class FunctionLowering:
 			self.lowering.schedule( fn.return_type )
 			for p in fn.parameters or []:
 				self.lowering.schedule( p.type )
-			self._emit( ir.Call( dest = dest, target = fn, receiver = narrowed, args = args, kwargs = kwargs ))
+			# per-leaf argument coercion/validation - `args`/`kwargs` above
+			# were built ONCE, lowered against `reference`'s own declared
+			# parameter types only; a leaf whose own parameter type
+			# genuinely differs (Box[i32]|Box[u32]'s own two `set(x: T)`
+			# instantiations) needs the SAME coercion-or-rejection chain
+			# _lower_expr's own dispatch would already have given it, run
+			# again here against THIS leaf's own type - reusing the already-
+			# lowered operand (never re-lowering/re-evaluating the original
+			# argument expression, which would double its side effects once
+			# per leaf; see _coerce_or_check_operand's own docstring)
+			leaf_args = []
+			for ( ref_param, expr ), operand in zip( positional, args ):
+				leaf_param = self._corresponding_leaf_param( reference, fn, ref_param )
+				context = f'{fn.qualname}(...): parameter {leaf_param.stem!r}'
+				leaf_args.append( self._coerce_or_check_operand( operand, leaf_param.type, expr, context = context ))
+			leaf_kwargs = {}
+			for ref_param, expr in keyword:
+				leaf_param = self._corresponding_leaf_param( reference, fn, ref_param )
+				context = f'{fn.qualname}(...): parameter {leaf_param.stem!r}'
+				leaf_kwargs[leaf_param.stem] = self._coerce_or_check_operand( kwargs[ref_param.stem], leaf_param.type, expr, context = context )
+			self._emit( ir.Call( dest = dest, target = fn, receiver = narrowed, args = leaf_args, kwargs = leaf_kwargs ))
 			if not is_last:
 				self._emit( ir.Jump( target = end_label ))
 				self._emit( ir.Label( name = next_label ))
 		self._emit( ir.Label( name = end_label ))
 		return dest
+
+	def _corresponding_leaf_param( self, reference: Function, fn: Function, ref_param: Parameter ) -> Parameter:
+		''' the Parameter in `fn`'s own parameter list at the SAME POSITION
+		as `ref_param` in `reference`'s - used by _lower_union_receiver_call
+		to find each leaf's own declared type for an argument that was
+		matched (once, against `reference` only) by _match_call_args.
+		Index-based, not name-based: type_resolver.py's own _resolve_union_
+		receiver_members already guarantees every leaf has the SAME
+		parameter COUNT as reference, but not (yet - a real, smaller,
+		separate gap, not attempted here) the same names/kinds at each
+		position, so position is the only correspondence available. '''
+		index = next( i for i, p in enumerate( reference.parameters ) if p is ref_param )
+		return fn.parameters[index]
