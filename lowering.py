@@ -3835,6 +3835,33 @@ class FunctionLowering:
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
+	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
+		''' true if `stmt` never falls through to the statement after it -
+		either structurally (return/break/continue) or because it's a bare
+		call expression to a function declared -> NoReturn (sys.panic, most
+		commonly). Used by _stmt_If (true_terminates/false_terminates) to
+		decide whether a branch's own ending narrowed/bindings state can
+		reach the if's join point at all - see merge_if()'s own docstring.
+		Resolved via _resolve_callee_target rather than a full _lower_call -
+		this only needs the CALLEE's declared return type, not a real
+		lowered call (the statement was already lowered by the caller's own
+		loop before this runs), and _resolve_callee_target is a pure lookup
+		with no scheduling side effects beyond _resolve_callable's ordinary
+		signature-resolution. A receiver call (x.method()) or anything
+		_resolve_callee_target can't resolve without a receiver just isn't
+		recognized here - NoReturn is overwhelmingly a free-function/sys.*
+		shape (sys.panic, sys.exit, ...), and misses just fall back to
+		today's existing (safe, if incomplete) behavior. '''
+		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
+			return True
+		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
+			return False
+		target = self.lowering._type_resolver._resolve_callee_target( stmt.value.func )
+		fn = target.base if isinstance( target, Specialization ) else target
+		if not isinstance( fn, Function ):
+			return False
+		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
+
 	def _stmt_If( self, node: ast.If ) -> None:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		test = self._lower_expr( node.test, bool_cls )
@@ -3878,7 +3905,7 @@ class FunctionLowering:
 		# differently from an ordinary falling-through branch (full
 		# terminator/dead-code analysis for anything deeper - nested ifs
 		# that both terminate, etc - is future work, not attempted here)
-		true_terminates = bool( node.body ) and isinstance( node.body[-1], ( ast.Return, ast.Break, ast.Continue ))
+		true_terminates = bool( node.body ) and self._stmt_diverges( node.body[-1] )
 
 		if node.orelse:
 			self._cfg.restore( entry_snapshot )
@@ -3896,7 +3923,7 @@ class FunctionLowering:
 			false_end = dict( self._cfg.bindings )
 			false_end_results = self._cfg.unchecked_results()
 			false_end_narrowed = self._cfg.narrowed_snapshot()
-			false_terminates = bool( node.orelse ) and isinstance( node.orelse[-1], ( ast.Return, ast.Break, ast.Continue ))
+			false_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
 		else:
 			false_captured = []
 			false_end = dict( entry_snapshot.bindings )
@@ -4213,7 +4240,16 @@ class FunctionLowering:
 		# type isn't a member of the union at all) is a real compile
 		# error, not silently passed through.
 		self.lowering._union_storage.get( union ) # ensures union.names[leaf.stem] exists
-		leaf = next( ( attr for attr in union.attributes if attr.type is operand.type ), None )
+		# _same_type, not raw `is` - a leaf's declared type (e.g. list[Op]
+		# substituted into a generic union's own attributes) and operand's own
+		# type can be two different Specialization objects for the identical
+		# instantiation (one already-monomorphized, one freshly built from an
+		# annotation) - see TypeResolver._same_type's own docstring, the exact
+		# same duality _unify_type_param/_check_assignable already guard
+		# against elsewhere. Without this, a bare `list[Op]` return against a
+		# declared `list[Op]|None` return type wrongly fell through to the
+		# "not one of its members" failure below.
+		leaf = next( ( attr for attr in union.attributes if self.lowering._type_resolver._same_type( attr.type, operand.type ) ), None )
 		if leaf is None:
 			self.lowering.discovery.fail(
 				f'{ast.unparse(node)}: expected {union.qualname}, got a type that is not one of its members',
@@ -5308,7 +5344,21 @@ class FunctionLowering:
 				)
 				value = obj.members.get( attr )
 				if value is not None:
-					return ir.Const( type = obj.value_type, value = value )
+					# tag the Const with the CEnum's own nominal type, not its
+					# underlying scalar, whenever the surrounding context already
+					# expects exactly that CEnum (e.g. a generic type param
+					# already bound to it by the enclosing return-type context -
+					# see _unify_type_param, which has no CEnum<->value_type
+					# exemption the way _check_assignable does at line ~4169/4171
+					# and so would wrongly see this as a conflicting inference).
+					# Falls back to the scalar for every other context (None, the
+					# raw value_type itself, an unrelated/unbound TypeVar) -
+					# _check_assignable's own bidirectional CEnum<->value_type
+					# exemption already makes both spellings interchangeable
+					# there, so this only changes behavior where the exemption
+					# doesn't already exist.
+					const_type = obj if expected_type is obj else obj.value_type
+					return ir.Const( type = const_type, value = value )
 			# scope-like terminal (Module, RCClass, etc.) — look up the
 			# final attribute as a value directly, without recursing into
 			# _lower_expr (which would fail for `sys` when the base is a

@@ -2699,6 +2699,27 @@ class TypeResolver:
 			if getattr( result, 'resolve', None ) is not None:
 				result.resolve()
 			return result
+		if isinstance( node, ast.BinOp ) and isinstance( node.op, ast.BitOr ):
+			# T|None (or any X|Y) used as a generic type ARGUMENT
+			# (list[str|None]()) - discovery.py's own visit_BinOp already
+			# builds a TaggedUnion for this exact shape in ordinary
+			# ANNOTATION position (-> T|None, x: T|None); this function is
+			# the parallel path for a type reference reached through a
+			# subscript's [...] (Name[T], Callable[[...],T]) rather than an
+			# annotation, and previously had no case for it at all - fell
+			# through to `return None` below, which the Name[T]/Callable[...]
+			# branches just below then reported as "argument is not a type"
+			# even though X|Y is a perfectly real type. Delegates to the
+			# SAME _flatten_union/_get_or_create_union discovery.py's own
+			# visit_BinOp uses, so the two paths canonicalize identically.
+			operand_nodes = self.discovery._flatten_union( node )
+			operands: list[Type] = []
+			for operand_node in operand_nodes:
+				resolved = self._try_resolve_namespace( operand_node )
+				if not isinstance( resolved, Type ):
+					return None
+				operands.append( resolved )
+			return self.discovery._get_or_create_union( operands )
 		if (
 			isinstance( node, ast.Subscript ) and isinstance( node.value, ast.Name )
 			and node.value.id in ( 'move', 'copy', 'Callable', 'Closure', 'tuple', 'Iterator', 'Generator' )
