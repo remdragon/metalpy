@@ -1558,27 +1558,36 @@ class CFGState:
 		self.<base_attr> before this runs), so unlike attr_assign this
 		never needs an "already exists" branch. '''
 		for attr in base_required:
-			# resolve FIRST. flattened_attributes() (unlike own_new_virtual_slots()
-			# right beside it in mpy_types.py) doesn't resolve anything it returns,
-			# and base attributes DO routinely arrive here with .type still None.
-			# Asking the RC question of an unresolved attribute would silently
-			# answer "not RC" and take the else-branch below, pushing NO epilogue
-			# entry - i.e. an early exit from the subclass __init__ after
-			# super().__init__() would never decref that base field, the leak this
-			# method's own docstring says it exists to prevent. Same ordering
-			# hazard as TaggedUnion._resolved_leaves (see its docstring):
-			# "unresolved" and "has no RC leaves" are indistinguishable unless you
-			# force it first.
+			# flattened_attributes() (unlike own_new_virtual_slots() right beside
+			# it in mpy_types.py) doesn't resolve anything it returns, so base
+			# attributes DO routinely arrive here unresolved - that alone is
+			# normal and can't be asserted away (i32 fields do it constantly).
 			#
-			# Defensive, NOT a bug currently biting: instrumenting the whole test
-			# corpus shows only i32 attributes ever arriving unresolved, while the
-			# one RC base attribute (str) is always already resolved by this point
-			# - plausibly because an RC-typed annotation has to be looked up to be
-			# scheduled at all, where an intrinsic scalar doesn't. That's an
-			# accident of resolution order, not a guarantee any of this relies on,
-			# so it gets forced rather than assumed.
-			if attr.resolve is not None:
+			# What IS load-bearing is that an unresolved one is never RC. Asking
+			# the RC question of an unresolved attribute answers "not RC" and
+			# takes the else-branch below, pushing NO epilogue entry - so an
+			# early exit from the subclass __init__ after super().__init__()
+			# would never decref that base field, the leak this method's own
+			# docstring says it exists to prevent. Same "unresolved and 'has no
+			# RC leaves' are indistinguishable" hazard as
+			# TaggedUnion._resolved_leaves (see its docstring).
+			#
+			# Instrumenting the whole test corpus: only i32 attributes ever
+			# arrive unresolved; the one RC base attribute (str) is always
+			# already resolved here - plausibly because an RC-typed annotation
+			# has to be looked up to be scheduled at all, where an intrinsic
+			# scalar doesn't. That's an accident of resolution order rather than
+			# anything guaranteed, so it's a tripwire, not an assumption: if an
+			# RC attribute ever does arrive unresolved, the correct fix is to
+			# resolve it at the source, not to rely on being rescued here.
+			arrived_unresolved = attr.resolve is not None
+			if arrived_unresolved:
 				attr.resolve()
+			assert not ( arrived_unresolved and attr.type is not None and attr.type.is_rc() ), (
+				f'base attribute self.{attr.stem} ({attr.type.qualname if attr.type else "?"}) '
+				f'is RC but arrived unresolved - the RC answer here now depends on compile '
+				f'order; resolve it at the source'
+			)
 			key = f'self.{attr.stem}'
 			if rc_leaves( attr.type ):
 				self._push( attr, attr.type, OwnState.OWNED, key = key )
