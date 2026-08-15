@@ -2098,5 +2098,11 @@ class dict[K, V]:
 		defer( self.__lock.release() )
 		body( self.__inner )
 
-# import this at the end because it depends on str etc to already be pre-parsed:
-from .__File import File
+# import this at the end because it depends on str etc to already be pre-parsed.
+# BinaryReader/BinaryWriter/BinaryReadWriter are re-exported alongside File
+# (not just File itself) because File's own factory methods hand them back
+# to the caller as Result payloads - a caller holding one across multiple
+# calls (e.g. a buffered reader keeping a handle alive) needs to be able to
+# name the type in a field/parameter annotation, which an unexported name
+# does not allow from outside lib/builtins.
+from .__File import File, BinaryReader, BinaryWriter, BinaryReadWriter
