@@ -12,7 +12,7 @@ from errors import CompileError, ErrorCollector
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
-	Module, _is_covered_by, _overlaps, chain_lookup, int_stem_range,
+	Module, _is_covered_by, _overlaps, int_stem_range,
 )
 
 def _collect_reachable_returns( stmts: list[ast.stmt] ) -> list[ast.Return]:
@@ -1293,7 +1293,7 @@ class Discovery( ast.NodeVisitor ):
 		for own_name, own in class_obj.names.items():
 			if own_name == '__init__':
 				continue
-			ancestor = chain_lookup( base, own_name )
+			ancestor = base.chain_lookup( own_name )
 			if ancestor is None:
 				continue
 			if isinstance( own, Function ) and own.is_virtual and isinstance( ancestor, Function ) and ancestor.is_virtual:
