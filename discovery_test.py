@@ -12,6 +12,7 @@ import test_support
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
 	Function, Variable, Specialization, ConditionalDispatch, Scalar,
+	Move, Copy,
 )
 
 logger = logging.getLogger( __name__ )
@@ -1584,6 +1585,40 @@ class Foo:
 		make.resolve()
 		self.assertEqual( [ p.stem for p in make.parameters ], [ 'args' ])
 
+
+class OwnershipAnnotationTypeQueryTests( unittest.TestCase ):
+	''' move[T]/copy[T] are an ownership STATUS on a binding, not types - so
+	asking one an RC or memory-layout question is a category error, and
+	mpy_types raises rather than politely delegating to .inner.
+
+	Pinned by a test because the tempting "fix" when one of these raises is to
+	make it delegate, which would silently restore the very thing this is
+	meant to expose: a path in the compiler treating an ownership annotation
+	as a real runtime type. Callers that legitimately hold one call
+	.unwrap_ownership() first. '''
+
+	def _wrappers( self ) -> list:
+		i32 = Scalar( stem = 'i32', qualname = 'intrinsics.i32', file = None, line = None, sizeof = 4 )
+		return [
+			Move( stem = 'move', qualname = 'move', file = None, line = None, inner = i32 ),
+			Copy( stem = 'copy', qualname = 'copy', file = None, line = None, inner = i32 ),
+		]
+
+	def test_rc_and_layout_queries_raise( self ) -> None:
+		for w in self._wrappers():
+			for question in ( 'is_rc', 'is_rc_pointer', 'rc_leaves', 'has_object_header', 'has_vtable' ):
+				with self.subTest( wrapper = type( w ).__name__, question = question ):
+					with self.assertRaises( AssertionError ) as ctx:
+						getattr( w, question )()
+					self.assertIn( 'unwrap_ownership', str( ctx.exception ))
+
+	def test_unwrap_ownership_yields_the_real_type_which_answers_normally( self ) -> None:
+		for w in self._wrappers():
+			with self.subTest( wrapper = type( w ).__name__ ):
+				inner = w.unwrap_ownership()
+				self.assertIs( inner, w.inner )
+				self.assertFalse( inner.is_rc() ) # i32
+				self.assertEqual( inner.rc_leaves(), [] )
 
 class MoveTypeTests( unittest.TestCase ):
 	''' move[T] in annotation position - recognized textually (like @move) rather than resolved through find_name, so it works even though `move` is never a real bound name anywhere '''

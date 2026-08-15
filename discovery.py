@@ -1710,7 +1710,7 @@ class Discovery( ast.NodeVisitor ):
 				# shape @overload stubs already use
 				self.fail( f'@abstractmethod {qualname} must have a stub body (...) - it declares a required override, not a real implementation', node )
 
-		if is_virtual and not ( isinstance( class_obj, CStruct ) and class_obj.is_interface ) and not isinstance( class_obj, RCClass ):
+		if is_virtual and not ( class_obj is not None and class_obj.has_vtable() ):
 			# @interface CStructs and ordinary RCClasses both build a real
 			# vtable now (RCClass-subclassing plan Phase 4 generalized this
 			# from CStruct-only) - CUnion/TaggedUnion/CEnum/a plain, non-

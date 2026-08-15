@@ -9,7 +9,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
@@ -699,8 +699,7 @@ def c_type( t: Type|None ) -> str:
 	first (ownership is a compile-time/CFG-only concept, invisible in C). '''
 	if t is None:
 		return 'void'
-	if isinstance( t, ( Move, Copy )):
-		return c_type( t.inner )
+	t = t.unwrap_ownership() # move[T]/copy[T] are compile-time only, invisible in C
 	if isinstance( t, Specialization ):
 		base = t.base
 		if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
@@ -712,7 +711,7 @@ def c_type( t: Type|None ) -> str:
 			else:
 				inner = _value_spelling( inner_type )
 			return f'{inner}*' if base.stem == 'Ptr' else f'const {inner}*'
-		if isinstance( base, RCClass ):
+		if t.is_rc_pointer():
 			return f'struct {mangle_type(t)}*'
 		if isinstance( base, ( CStruct, CUnion, TaggedUnion )):
 			return f'{_class_keyword(base)} {mangle_type(t)}'
@@ -730,9 +729,10 @@ def c_type( t: Type|None ) -> str:
 		if mapped is None:
 			raise NotImplementedError( f'c_type: unsupported scalar {t.qualname!r}' )
 		return mapped
-	if isinstance( t, RCClass ):
-		return f'struct {mangle_type(t)}*'
-	if isinstance( t, TupleType ):
+	if t.is_rc_pointer():
+		# RCClass and TupleType both, in one branch - a bare RC pointer is a
+		# bare RC pointer regardless of which kind produced it.
+		#
 		# PLAN_TUPLE.md, found by a real hang (not anticipated up front): a
 		# bare, unresolved TupleType can still reach here even after
 		# monomorphize.py's own substitute_type_params fix - a plain LOCAL/
@@ -748,8 +748,8 @@ def c_type( t: Type|None ) -> str:
 		# concrete backing RCClass eventually gets emitted under the SAME
 		# mangled name, since TupleType.qualname == backing.qualname by
 		# construction (tuple_storage.py's own TupleStorage.get()). Always
-		# a pointer, same as RCClass directly above - a tuple's backing is
-		# never anything else.
+		# a pointer, same as an RCClass - a tuple's backing is never
+		# anything else, which is what lets both share this branch.
 		return f'struct {mangle_type(t)}*'
 	if isinstance( t, ( CStruct, CUnion, TaggedUnion )):
 		return f'{_class_keyword(t)} {mangle_type(t)}'
@@ -825,8 +825,7 @@ def _value_spelling( t: Type ) -> str:
 	is an RCClass - sys.alloc[Foo]'s own real return type), and sizeof(T)
 	(sizeof(struct Foo), never sizeof(struct Foo*) - see ir.SizeOf's
 	handling in _emit_instruction). '''
-	if isinstance( t, ( Move, Copy )):
-		return _value_spelling( t.inner )
+	t = t.unwrap_ownership()
 	base = t.base if isinstance( t, Specialization ) else t
 	if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion, TupleType )):
 		return f'{_class_keyword(base)} {mangle_type(t)}'
@@ -1839,7 +1838,7 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 	# type, as the pointer - this is where that pointer-ness actually
 	# becomes `->` in the emitted C).
 	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
-	if isinstance( base, ( RCClass, TupleType )): # PLAN_TUPLE.md: a tuple's backing is always an RCClass, always pointer-accessed
+	if obj_type is not None and obj_type.is_rc_pointer(): # PLAN_TUPLE.md: a tuple's backing is always an RCClass, always pointer-accessed
 		return '->'
 	if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
 		return '->'
@@ -2140,7 +2139,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			assert instr.receiver is not None # is_virtual only ever set on real instance methods - see discovery.py's _parse_function
 			slot_name = _field_name( instr.target.stem )
 			vtable_op = _member_access_operator( instr.receiver.type )
-			if isinstance( instr.target.cls, RCClass ):
+			# WHERE the vtable pointer lives, not whether there is one - both
+			# arms have a vtable. An RCClass reads it out of its ObjectHeader
+			# ($header.vtable, reusing the field destructor dispatch already
+			# needed); an @interface CStruct has a plain top-level $vtable
+			# member instead. has_object_header() is exactly that distinction.
+			if instr.target.cls is not None and instr.target.cls.has_object_header():
 				receiver_pointee = instr.receiver.type.base if isinstance( instr.receiver.type, Specialization ) else instr.receiver.type
 				assert isinstance( receiver_pointee, RCClass )
 				vtbl_type = _rcclass_vtbl_type_name( receiver_pointee )
@@ -2267,7 +2271,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_parse_f64( (const char*){_emit_operand(instr.buf)} );' ]
 
 	if isinstance( instr, ir.Allocate ):
-		if isinstance( instr.cls, RCClass ):
+		# has_object_header, not is_rc_pointer: this branch writes
+		# $header.ref_count and wires $header.vtable, which only exists on a
+		# type that actually LEADS with an ObjectHeader. A TupleType is an RC
+		# pointer but is never allocated under its own annotation - its
+		# synthesized backing RCClass is what reaches here, and that answers
+		# True on its own behalf.
+		if instr.cls is not None and instr.cls.has_object_header():
 			# routed through sys.alloc[cls] - the SAME allocation path
 			# every other real allocation in the language goes through, not
 			# an emitter-invented allocator (explicit user decision - see

@@ -49,54 +49,18 @@ class OwnState( Enum ):
 	COPY = 'copy'
 	MOVED = 'moved'
 
+# is_rc/rc_leaves/_is_direct_pointer_rc all used to be open-coded isinstance
+# ladders right here, which is how the same bug shipped three separate times:
+# a new Type kind appeared, this ladder wasn't updated, and the new kind
+# silently defaulted to "not RC" (nested-union leaf -> leak; generic union's
+# unsubstituted TypeVar leaves -> UAF; unresolved union -> order-dependent
+# UAF). Each type kind now answers for itself - see mpy_types.Type's own
+# is_rc/is_rc_pointer/rc_leaves, which carry the full history of those bugs.
+# These stay as module-level names purely because ~20 call sites in this file
+# and lowering.py already spell them that way.
+
 def is_rc( t: Type ) -> bool:
-	# a concrete generic RCClass instantiation (Box[i32]) is a Specialization,
-	# not an RCClass instance itself - unwrap first, or every generic-class/
-	# generic-union instance method's own `self` (already typed as a
-	# Specialization) would wrongly look untracked here
-	base = t.base if isinstance( t, Specialization ) else t
-	if isinstance( base, TupleType ):
-		# PLAN_TUPLE.md: unlike an ordinary generic (list[T]/Result[T,E]/...),
-		# where the ABSTRACT template class itself (Specialization.base)
-		# already answers "is this RC" without ever needing to monomorphize
-		# a specific instantiation, a TupleType has no such template - the
-		# only place "is a tuple RC" lives is its own synthesized backing
-		# RCClass (tuple_storage.py), which may not have been synthesized
-		# yet for this particular TupleType (a local variable's own
-		# declared annotation type is never independently re-resolved after
-		# discovery.py first builds it - see emitter_c.py's c_type() for
-		# the identical "found by a real hang, not anticipated up front"
-		# gap this mirrors). No lazy check needed here though: EVERY
-		# TupleType's backing is unconditionally an RCClass by construction
-		# (tuple_storage.TupleStorage.get() never produces anything else),
-		# so this is a structural guarantee, not something that depends on
-		# whether .backing happens to be populated yet.
-		return True
-	if isinstance( base, TaggedUnion ):
-		# a union appearing as a LEAF of an outer type (e.g. Result[T, A|B] -
-		# the error union this session's own division/widening work
-		# introduced) is "RC" whenever ANY of its own members are - is_rc()
-		# is only ever called from rc_leaves()'s own per-leaf filter below
-		# (confirmed: no other call site in this module calls it directly),
-		# so this recursion only ever changes what rc_leaves() reports for
-		# an outer type's leaves, nothing else. Before this branch, a nested
-		# union leaf was ALWAYS reported as non-RC here (TaggedUnion is
-		# never RCClass/TupleType), so rc_leaves() on an OUTER type silently
-		# dropped it entirely even when its own members carried real RC
-		# payloads - no incref/decref ever fired for that leaf's own
-		# contents, a genuine reference leak (this union's own TOP-LEVEL
-		# rc_leaves(A|B) call already worked correctly - isinstance(base,
-		# TaggedUnion) is checked there directly; the gap was specifically
-		# one level up, treating A|B as an opaque, always-non-RC leaf of
-		# something else). No type-param substitution needed here (unlike
-		# rc_leaves()'s own top-level substitution step) - every leaf that
-		# reaches this branch is either a fully concrete anonymous union
-		# (never generic/Specialization-wrapped by construction) or already
-		# had its own params substituted by whichever caller is asking.
-		if base.resolve is not None:
-			base.resolve()
-		return any( is_rc( leaf ) for leaf in base.leaves() )
-	return isinstance( base, RCClass )
+	return t.is_rc()
 
 def is_result_type( t: Type|None ) -> bool:
 	''' True when `t` is a concrete Result[T,E] specialization. '''
@@ -106,72 +70,17 @@ def is_result_type( t: Type|None ) -> bool:
 	return isinstance( base, TaggedUnion ) and base.stem == 'Result'
 
 def rc_leaves( t: Type ) -> list[Type]:
-	# a TaggedUnion's RC-relevant leaves specifically - str|i32 needs a
-	# tag-gated incref (only str); str|int (both RC) needs none of that,
-	# unconditional instead
-	base = t.base if isinstance( t, Specialization ) else t
-	if isinstance( base, TaggedUnion ):
-		# base.leaves() reads base.attributes directly - populated by the
-		# CLASS's own .resolve() (parsing its body), a separate step from
-		# leaves()'s own per-ATTRIBUTE attr.resolve() call (which only
-		# resolves each attribute's already-existing .type). Called too
-		# early (e.g. the very first time any code anywhere references a
-		# Result[...]-shaped type, before anything else has forced Result's
-		# own class body to resolve), base.attributes is still empty and
-		# leaves() silently returns [] - not "this union has no RC leaves",
-		# just "this union hasn't been read yet". Confirmed by a real UAF:
-		# this made a temp Result[str,CodecError] receiver of .unwrap() look
-		# RC-free depending on ONLY where in the compile that particular
-		# call site happened to land relative to Result's own first real use
-		# elsewhere - a real, load-bearing ordering bug, not just caution.
-		if base.resolve is not None:
-			base.resolve()
-		leaves = base.leaves()
-		if isinstance( t, Specialization ) and base.type_params:
-			# t is a Specialization of a still-GENERIC TaggedUnion (e.g.
-			# Result[str,MyError] - base is the abstract builtins.Result class
-			# itself, never independently monomorphized into its own concrete
-			# TaggedUnion instance). base.leaves() therefore returns Result's
-			# OWN declared field types verbatim - bare TypeVars T/E - and
-			# is_rc() always says no to a bare TypeVar (it's never an RCClass
-			# itself). That silently reported EVERY generic-union
-			# Specialization as having no RC leaves at all, regardless of what
-			# T/E were actually bound to - str is obviously RC, so
-			# Result[str,MyError] plainly has RC leaves, but nothing here ever
-			# saw that: cfg.py's callers (fresh_temp/assign/attr_assign/...)
-			# all gate their Incref/Decref emission on this return value being
-			# non-empty, so a generic-union value's OWN payload (structural
-			# lifetime aside - a nested RC value living IN it) never got
-			# tracked/released at all. Confirmed by a real UAF: a temp
-			# Result[str,E] receiver of .unwrap()/.unwrap_or() was never
-			# registered by fresh_temp in the first place (this same
-			# rc_leaves() gap), which is what made the old receiver-move
-			# workaround in lowering.py's _lower_call look load-bearing (it
-			# was popping a Temp that fresh_temp had never actually inserted -
-			# already a no-op) while the REAL gap (this function) went
-			# unnoticed. Substitute each leaf that IS one of base's own type
-			# params against t's own concrete args - shallow (one level) is
-			# enough: a leaf that's instead e.g. `list[T]` doesn't need T
-			# resolved at all to know list itself is RC (is_rc() only reads
-			# a Specialization's own .base), and a leaf that's already a fixed
-			# concrete type (not one of base's type params) is correct as-is.
-			substitution = { id( param ): arg for param, arg in zip( base.type_params, t.args ) }
-			leaves = [ substitution.get( id( leaf ), leaf ) for leaf in leaves ]
-		return [ leaf for leaf in leaves if is_rc( leaf ) ]
-	return [ t ] if is_rc( t ) else []
+	return t.rc_leaves()
 
 def _is_direct_pointer_rc( t: Type ) -> bool:
 	''' True for an RC leaf whose OWN runtime representation is a single, bare
-	pointer (RCClass, or a TupleType's synthesized backing RCClass) - as
-	opposed to a NESTED union leaf (is_rc() now also reports these as "RC",
-	but a union's own runtime shape is a tag+data VALUE STRUCT, not a bare
-	pointer at all). _refcount_instructions' own "every member shares the
-	same underlying pointer layout, read any ONE member's accessor" shortcut
-	is only safe when EVERY leaf satisfies this - it silently produces
-	garbage for a nested-union leaf otherwise (reading that leaf's own
-	payload accessor as if it were a bare RC pointer). '''
-	base = t.base if isinstance( t, Specialization ) else t
-	return isinstance( base, ( RCClass, TupleType ))
+	pointer - as opposed to a NESTED union leaf (also "RC", but a union's
+	runtime shape is a tag+data VALUE STRUCT, not a pointer at all).
+	_refcount_instructions' "every member shares the same underlying pointer
+	layout, read any ONE member's accessor" shortcut is only safe when EVERY
+	leaf satisfies this - it silently produces garbage for a nested-union leaf
+	otherwise (reading that leaf's payload accessor as a bare RC pointer). '''
+	return t.is_rc_pointer()
 
 UnionStorage = Callable[[TaggedUnion], tuple[Variable,Variable,CUnion,dict[str,int]]]
 
@@ -1649,6 +1558,36 @@ class CFGState:
 		self.<base_attr> before this runs), so unlike attr_assign this
 		never needs an "already exists" branch. '''
 		for attr in base_required:
+			# flattened_attributes() (unlike own_new_virtual_slots() right beside
+			# it in mpy_types.py) doesn't resolve anything it returns, so base
+			# attributes DO routinely arrive here unresolved - that alone is
+			# normal and can't be asserted away (i32 fields do it constantly).
+			#
+			# What IS load-bearing is that an unresolved one is never RC. Asking
+			# the RC question of an unresolved attribute answers "not RC" and
+			# takes the else-branch below, pushing NO epilogue entry - so an
+			# early exit from the subclass __init__ after super().__init__()
+			# would never decref that base field, the leak this method's own
+			# docstring says it exists to prevent. Same "unresolved and 'has no
+			# RC leaves' are indistinguishable" hazard as
+			# TaggedUnion._resolved_leaves (see its docstring).
+			#
+			# Instrumenting the whole test corpus: only i32 attributes ever
+			# arrive unresolved; the one RC base attribute (str) is always
+			# already resolved here - plausibly because an RC-typed annotation
+			# has to be looked up to be scheduled at all, where an intrinsic
+			# scalar doesn't. That's an accident of resolution order rather than
+			# anything guaranteed, so it's a tripwire, not an assumption: if an
+			# RC attribute ever does arrive unresolved, the correct fix is to
+			# resolve it at the source, not to rely on being rescued here.
+			arrived_unresolved = attr.resolve is not None
+			if arrived_unresolved:
+				attr.resolve()
+			assert not ( arrived_unresolved and attr.type is not None and attr.type.is_rc() ), (
+				f'base attribute self.{attr.stem} ({attr.type.qualname if attr.type else "?"}) '
+				f'is RC but arrived unresolved - the RC answer here now depends on compile '
+				f'order; resolve it at the source'
+			)
 			key = f'self.{attr.stem}'
 			if rc_leaves( attr.type ):
 				self._push( attr, attr.type, OwnState.OWNED, key = key )
