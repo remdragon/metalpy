@@ -184,15 +184,36 @@ typedef unsigned __int128 __metalpy_wideuint;
 #endif
 // floating-point classification for checked/panic-mode float arithmetic and
 // float-involving casts (FAddCheck/.../FloatCastCheck). GCC/Clang expose these
-// as builtins (no <math.h> needed); real MSVC (cl.exe) needs <math.h>, whose
-// isnan/isinf are C99 type-generic macros that work on float and double alike.
-// same MSVC-vs-GCC/Clang split for CONSTRUCTING a non-finite value (a source
-// literal that overflows at parse time, e.g. 1e400 -> float('inf')) - INFINITY/
-// NAN are <math.h> macros; __builtin_inf[f]/__builtin_nan[f] need no header.
+// as builtins (no <math.h> needed, no CRT call). Real MSVC (cl.exe) gets its
+// own self-contained, bit-pattern-based implementation instead of <math.h>'s
+// isnan/isinf macros: those can lower to a CALL into the CRT's internal
+// _dclass/_fdclass classification helper (confirmed: "unresolved external
+// symbol _dclass" linking a no_crt build, since this project deliberately
+// doesn't link the CRT - see crt.py's own comment on why). Union-based type
+// punning is well-defined in C (unlike C++) - no header, no CRT, no function
+// call MSVC might not inline needed. INFINITY/NAN (<math.h>, still needed for
+// __metalpy_inf[f]/nan[f] below) are themselves compile-time constant
+// expressions, not function calls, so they don't share this problem.
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <math.h>
-#define __metalpy_isnan(x) isnan(x)
-#define __metalpy_isinf(x) isinf(x)
+static inline bool __metalpy_isnan_f32( float x ) {
+	union { float f; uint32_t u; } v; v.f = x;
+	return ( v.u & 0x7F800000u ) == 0x7F800000u && ( v.u & 0x007FFFFFu ) != 0;
+}
+static inline bool __metalpy_isnan_f64( double x ) {
+	union { double d; uint64_t u; } v; v.d = x;
+	return ( v.u & 0x7FF0000000000000ull ) == 0x7FF0000000000000ull && ( v.u & 0x000FFFFFFFFFFFFFull ) != 0;
+}
+static inline bool __metalpy_isinf_f32( float x ) {
+	union { float f; uint32_t u; } v; v.f = x;
+	return ( v.u & 0x7FFFFFFFu ) == 0x7F800000u;
+}
+static inline bool __metalpy_isinf_f64( double x ) {
+	union { double d; uint64_t u; } v; v.d = x;
+	return ( v.u & 0x7FFFFFFFFFFFFFFFull ) == 0x7FF0000000000000ull;
+}
+#define __metalpy_isnan(x) _Generic((x), float: __metalpy_isnan_f32, double: __metalpy_isnan_f64)(x)
+#define __metalpy_isinf(x) _Generic((x), float: __metalpy_isinf_f32, double: __metalpy_isinf_f64)(x)
 #define __metalpy_inff() ((float)INFINITY)
 #define __metalpy_inf()  ((double)INFINITY)
 #define __metalpy_nanf() ((float)NAN)
@@ -3124,6 +3145,22 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			'\tint __result = main();\n'
 			'\tExitProcess( (unsigned int)__result );\n'
 			'}\n'
+			'#endif'
+		)
+		# MSVC's linker requires a _fltused symbol to exist whenever any
+		# floating-point instruction is used anywhere in the program,
+		# normally provided by the CRT's own startup code (confirmed:
+		# "unresolved external symbol _fltused" linking a no_crt build that
+		# touches a single float). Since this build deliberately doesn't
+		# link the CRT, provide it directly - 0x9875 is MSVC's own
+		# documented magic value for this marker. GCC/Clang's no_crt path
+		# needs no such marker at all, so this is _MSC_VER-guarded to a
+		# no-op there (and never emitted for a CRT-linked build at all,
+		# where the CRT's own copy already provides it - defining a second
+		# one here would conflict).
+		parts.append(
+			'#if defined(_MSC_VER) && !defined(__clang__)\n'
+			'int _fltused = 0x9875;\n'
 			'#endif'
 		)
 	return '\n\n'.join( part for part in parts if part ) + '\n'
