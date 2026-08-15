@@ -4839,6 +4839,21 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return test, []
 			bind = ast.Assign( targets = [ ast.Name( id = pattern.name, ctx = ast.Store() ) ], value = subj_expr )
 			ast.copy_location( bind, node )
+			# same reasoning as visit_Match's own subj_assign comment above:
+			# this Assign is built directly, never dispatched through
+			# self.visit()/visit_Assign, so nothing populates
+			# self.locals[pattern.name] for free. Without this, a case body
+			# statement that calls a method on the bound name as its LAST
+			# statement (`case Result.Ok(w): w.close()`) hits
+			# _stmt_diverges's `root.id in self.locals` pre-check, finds it
+			# absent, and falls through to _resolve_callee_target - which
+			# RAISES via the scope-stack-based find_name (a match-bound
+			# local was never registered there either) and permanently
+			# records a bogus "name 'w' is not defined" (discovery.fail()
+			# records before raising, same trap 876fdc0 already fixed for
+			# `self.foo()` - this is the same gap, just for an ordinary
+			# extracted payload binding instead of the `self` parameter).
+			self.locals[ pattern.name ] = self._type_of_expr( subj_expr )
 			return test, [ bind ]
 
 		if isinstance( pattern, ast.MatchValue ):
