@@ -1888,6 +1888,22 @@ class Discovery( ast.NodeVisitor ):
 							if arg.annotation is None:
 								self.fail( f'{fn.qualname} parameter {arg.arg!r} has no type annotation', arg )
 							param_type = self.visit( arg.annotation )
+							# move[T]/copy[T] is an ownership status on this
+							# binding, not a distinct type from T (see Move/
+							# Copy's own docstrings, TODO.txt's own "incref/
+							# decref" section) - unwrap here, at the one place
+							# a Parameter's real .type gets set, so every
+							# ordinary consumer downstream (attribute/method
+							# lookup, generic inference, assignability) sees
+							# plain T like any other binding; the ownership
+							# fact itself is recorded on is_move/is_copy
+							# instead, consulted only by the two things that
+							# actually care about it (the move(x) call-site
+							# syntax check, and the CFG's own decref bookkeeping)
+							is_move = isinstance( param_type, Move )
+							is_copy = isinstance( param_type, Copy )
+							if is_move or is_copy:
+								param_type = param_type.inner
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
 								stem = arg.arg,
@@ -1896,6 +1912,8 @@ class Discovery( ast.NodeVisitor ):
 								line = fn.line,
 								type = param_type,
 								default = default,
+								is_move = is_move,
+								is_copy = is_copy,
 								**kind,
 							)
 							parameters.append( param )

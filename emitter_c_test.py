@@ -6235,6 +6235,248 @@ def main() -> i32:
 		self.assertIn( 'slicing is not supported for intrinsics.i32', errors[0] )
 
 
+class ListLiteralRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_List (ast.List, `[a, b, c]`) - real compile-and-run companion
+	to lowering_test.py's ListLiteralTests. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_list_literal', '''
+def main() -> i32:
+	x: list[str] = [ 'a', 'b', 'c' ]
+	if len( x ) != 3:
+		return 1
+	if x.__getitem__( 0 ).unwrap( 'idx failed' ) != 'a':
+		return 2
+	if x.__getitem__( 2 ).unwrap( 'idx failed' ) != 'c':
+		return 3
+	return 0
+''' ),
+			( 'i32_list_literal', '''
+def main() -> i32:
+	x: list[i32] = [ 10, 20, 30 ]
+	if len( x ) != 3:
+		return 1
+	if x.__getitem__( 1 ).unwrap( 'idx failed' ) != 20:
+		return 2
+	return 0
+''' ),
+			( 'empty_list_literal', '''
+def main() -> i32:
+	x: list[i32] = []
+	if len( x ) != 0:
+		return 1
+	return 0
+''' ),
+			# mirrors the real forcing case: lib/codecs/*.py's own
+			# names(self) -> list[str]: return [...] shape
+			( 'list_literal_returned_from_function', '''
+def names() -> list[str]:
+	return [ 'utf8', 'utf-8', 'UTF8', 'UTF-8' ]
+
+def main() -> i32:
+	n = names()
+	if len( n ) != 4:
+		return 1
+	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
+		return 2
+	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
+		return 3
+	return 0
+''' ),
+		] )
+
+
+class MoveParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' move[T] is an ownership status on a binding, not a distinct type
+	from T (Parameter.is_move, not a Move-wrapped .type) - real compile-
+	and-run companion to lowering_test.py's MoveParameterTests. Exercises
+	lib/builtins/__init__.py's own real bytes.from_bytearray, previously-
+	untested dead code (nothing in lib/ ever called it before this fix)
+	that reads len(src) before consuming src via .release() - also depends
+	on bytearray.release()'s own return-type fix (bare sys.OwnershipError
+	-> sys.OwnershipError[bytearray], a separate, real, pre-existing
+	authoring bug this same investigation found: the unspecialized
+	annotation left T unbound, so Err(SharedReference(x))'s own x never
+	resolved to a real bytearray anywhere that pattern was matched).
+
+	str.from_cstr's identical move[bytearray] overload is NOT exercised
+	here - confirmed via a standalone repro that str.from_cstr(move(b))
+	fails with "name 'move' is not defined": move(...)'s own sugar isn't
+	recognized during OVERLOAD resolution (str.from_cstr has 2 signatures)
+	the way it is for an ordinary, already-resolved call - a real, separate
+	gap already flagged in TODO.txt's own "incref/decref" section
+	("Move.leaves() falls back to Type.leaves()'s default [self], never
+	exposing bytearray itself"), not something this fix touches. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'move_parameter_read_before_consume', '''
+def consume( src: move[bytearray] ) -> usize:
+	n: usize = len( src )
+	return n
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	if consume( move( b )) != 5:
+		return 1
+	return 0
+''' ),
+			( 'bytes_from_bytearray_real_usage', '''
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	bs: bytes = bytes.from_bytearray( move( b ))
+	if len( bs ) != 5:
+		return 1
+	cp: ConstPtr[u8] = bs.get_const_ptr()
+	if cp[0] != 104:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Codec.decode widened to bytes|bytearray, against the REAL utf8
+	class (not a synthetic stand-in) - constructing any real utf8()
+	instance forces its whole vtable (names/encode/decode) to compile, so
+	this also depends on: utf8.names()'s list literal (_expr_List),
+	utf8.encode()'s get_ptr()/get_const_ptr() fix, and the move[T] fix
+	above (utf8.encode() -> bytes.from_bytearray() -> len(src)/
+	src.release()). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'decode_bytes', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	bs: bytes = bytes( b )
+	codec = utf8()
+	s: str = codec.decode( bs ).unwrap( 'decode failed' )
+	if s != "hello":
+		return 1
+	return 0
+''' ),
+			( 'decode_bytearray', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 105
+	p[2] = 33
+	p[3] = 33
+	p[4] = 33
+	c: bytearray = b[:3]
+	codec = utf8()
+	s: str = codec.decode( c ).unwrap( 'decode failed' )
+	if s != "hi!":
+		return 1
+	return 0
+''' ),
+			# multi-byte UTF-8 round trip via the real utf8().encode() ->
+			# utf8().decode() path - guards the alloc/memcpy/terminate
+			# arithmetic in both directions
+			( 'decode_multibyte_utf8_round_trip', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	src: str = "héllo"
+	codec = utf8()
+	eb: bytes = codec.encode( src ).unwrap( 'encode failed' )
+	s: str = codec.decode( eb ).unwrap( 'decode failed' )
+	if s != src:
+		return 1
+	if s.byte_len() != src.byte_len():
+		return 2
+	return 0
+''' ),
+			# a genuinely bytes|bytearray-typed local (not two separately-
+			# typed locals) - exercises union-receiver dispatch for real
+			( 'decode_through_union_typed_local', '''
+from codecs.utf8 import utf8
+
+def decode_it( x: bytes|bytearray ) -> str:
+	codec = utf8()
+	return codec.decode( x ).unwrap( 'decode failed' )
+
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 97
+	p[1] = 98
+	p[2] = 99
+	if decode_it( b ) != "abc":
+		return 1
+	bs: bytes = bytes( b )
+	if decode_it( bs ) != "abc":
+		return 2
+	return 0
+''' ),
+			# mirrors the real forcing case: fs.py:24's
+			# codec.decode(buf[:nbytes]) shape
+			( 'decode_bytearray_slice_result', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 104
+	p[1] = 105
+	nbytes: usize = 2
+	codec = utf8()
+	s: str = codec.decode( buf[:nbytes] ).unwrap( 'decode failed' )
+	if s != "hi":
+		return 1
+	return 0
+''' ),
+			( 'names_list_literal', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	codec = utf8()
+	n = codec.names()
+	if len( n ) != 4:
+		return 1
+	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
+		return 2
+	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
+		return 3
+	return 0
+''' ),
+		] )
+
+
 class MatchArmSameNameNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' `match x: case T(x): ...` - the arm rebinds the SAME name as its
 	own subject - used to crash outright (monomorphize.py silently

@@ -202,33 +202,115 @@ Verification
   `lib/posix/time.py`'s `get_local_timezone_name` once all pieces land, as
   the actual forcing case this plan started from.
 
-STATUS: DONE. Both features landed (`lowering.py`'s `_expr_NamedExpr` for
-walrus; `_lower_slice_subscript` + `bytearray._byte_slice` for slice syntax,
-scoped to `str`/`bytearray` - see the follow-up plan for full design/
-verification detail). `python tests.py` green (996/996). Re-ran this doc's
-own repro (`from posix.time import get_local_timezone_name` under a
-synthetic linux `active_target`): the walrus/slice "unsupported expression"
-errors (items 3 and 4 above) are gone, replaced by clean, correctly-located
-errors for two newly-exposed, separate, still-deferred authoring bugs those
-gaps had been masking:
-- `lib/posix/fs.py:24`: `codec.decode( buf[:nbytes] )` - the slice now
-  compiles and produces a real `bytearray`, but `decode()` wants `bytes` (a
-  different type) - a real type mismatch in fs.py itself, not a slice-syntax
-  bug.
-- `lib/posix/time.py:58`: `open('/etc/timezone', 'r')` - `open` isn't a real
-  defined name anywhere in this codebase (no free `open(path,mode)` matching
-  this call shape exists; only `crt.open(path,flags,mode)`, a different
-  signature) - a real, separate authoring bug in time.py itself, not a
-  walrus bug.
-- Also newly found while chasing the above: `if x is not None: use(x)`
-  narrowing is unimplemented for a PLAIN `if` statement (confirmed via a
-  standalone, walrus-free repro) - only `while`/`match`/`type(x) is T`
-  narrow today. `_read_etc_timezone_file`'s own `if f := ...: ... if s :=
-  f.read(...): return s.strip()` would need this to fully compile even once
-  `open()` itself is fixed. A real, separate, larger gap - not attempted.
+STATUS: DONE - walrus and slice syntax both landed, and the investigation
+kept going several layers deeper than originally scoped, fixing a real
+double-free along the way. Full history below; `python tests.py` green
+throughout (final count: 1007/1007), confirmed via 12 consecutive full-suite
+runs after the deepest fix (a real double-free is exactly the kind of bug
+that only shows up intermittently under load - a single clean run doesn't
+prove it's gone).
 
-The 3 originally-deferred items (`errors.py:1`'s stray import, `fs.py:12`'s
-`utf8`-class-not-instance, and the `_lower_call_args` module-context
-misattribution bug) are all still present and still out of scope - `lib/
-posix/time.py` compiling fully clean needs those PLUS the 2 newly-found
-items above, none of which this plan touched.
+**Round 1 - the two features themselves.** `lowering.py`'s `_expr_NamedExpr`
+(walrus) and `_lower_slice_subscript`/`bytearray._byte_slice` (slice syntax,
+scoped to `str`/`bytearray`) landed. Re-running this doc's own repro
+afterward showed the walrus/slice "unsupported expression" errors gone,
+replaced by two newly-exposed, then-still-deferred authoring bugs those
+gaps had been masking: `fs.py:24`'s `codec.decode(buf[:nbytes])` (a
+`bytearray`, but `decode()` only accepted `bytes`) and `time.py:58`'s
+`open('/etc/timezone','r')` (`open` was never a real name anywhere in this
+codebase). Also found: `if x is not None: use(x)` narrowing is unimplemented
+for a plain `if` statement (only `while`/`match`/`type(x) is T` narrow) -
+confirmed independent of walrus, real, separate, not attempted.
+
+**Round 2 - chasing a real test for `decode()` down the rabbit hole.**
+Widening `decode()` to `bytes|bytearray` (`Codec`/`ascii`/`cp437`/`latin1`/
+`utf8`, `lib/codecs/*`) and fixing `utf8.decode`'s own body (it had never
+been compiled by anything real either - `b.get_bytes()` isn't a real method,
+and it fed a non-terminated buffer into `str.from_cstr`'s terminator-
+requiring overload) turned out to need a REAL compile-and-run test to
+trust. Constructing a real `utf8()` instance forces its whole vtable to
+compile (not just `decode()`), which surfaced three more previously-
+unexercised bugs, each fixed in turn:
+- `utf8.encode()`'s own `get_ptr()`/`get_const_ptr()` mixups (`lib/codecs/utf8.py`).
+- List-literal syntax (`[a, b, c]`, `ast.List`) was entirely unimplemented -
+  `utf8.names()`'s own `return ['utf8', 'utf-8', ...]` needed it. New
+  `_expr_List` + `_construct_generic_instance` in `lowering.py`, scoped to
+  `expected_type` already being a concrete `list[T]` (no element-driven
+  inference - every real site, `lib/zoneinfo.py:33` included, already has
+  one).
+- **A real, root-cause compiler bug**: `move[T]`/`copy[T]` was modeled as a
+  distinct wrapper *type* (`Move`/`Copy` in `mpy_types.py`) rather than an
+  ownership *status* on a binding - already self-documented as wrong and
+  unfixed in `Move`/`Copy`'s own docstrings and `TODO.txt`'s "incref/decref"
+  section. In practice this meant a `move[T]`-typed parameter couldn't have
+  ANY property read on it inside the function that owns it (confirmed two
+  ways: `len(src)` and a direct `src.__len__()` both failed differently).
+  Fixed at the root: `Parameter` gained `is_move`/`is_copy` flags;
+  `discovery.py`'s own parameter-construction site now unwraps `move[T]`/
+  `copy[T]` down to plain `T`, recording ownership on the new flags instead
+  - every ordinary consumer (attribute lookup, generic inference,
+  assignability) now sees a plain binding like any other. This is what
+  finally let `bytes.from_bytearray`/`str.from_cstr`'s own real
+  `move[bytearray]` parameters work (previously dead code - nothing in
+  `lib/` had ever called either).
+- **`bytearray.release()`'s own return-type bug**: `Result[Ptr[u8],
+  sys.OwnershipError]` (bare, unspecialized generic) left `T` unbound, so
+  `Err(SharedReference(x))`'s `x` never resolved to a real `bytearray`
+  anywhere that pattern was matched - fixed to
+  `sys.OwnershipError[bytearray]`.
+
+**Round 3 - a real double-free, found via test flakiness, not inspection.**
+The real-compile test for the above was intermittently flaky (~10-15%,
+never in isolation) - not noise: `@move` on a method (e.g.
+`bytearray.release()`) means calling it consumes `self`, but nothing
+anywhere transitioned the CALLER's own ownership-tracking state for the
+RECEIVER - confirmed by grepping every read site of `Function.is_move` in
+`lowering.py` (only the callee's own internal view of `self`, via `cfg.py`'s
+`enter_self`, ever consulted it). So a receiver like `src` in `str.from_cstr`
+still got an ordinary Decref at its own scope exit on top of `release()`'s
+own internal cleanup - a genuine double-free, matching the observed
+heap-corruption-flavored intermittent failures exactly. Fixed with one
+addition in `lowering.py`'s `_lower_call`: when calling an `@move` method,
+run the receiver through `cfg.py`'s own `move()` (already the exact
+mechanism used for `move[T]` argument-passing, just never invoked for a
+receiver) - confirmed via direct instruction-level inspection (the spurious
+`Decref` disappears with the fix, present without it) and via 12 consecutive
+clean full-suite runs where before there'd reliably be a failure within
+10-15.
+
+**Round 4 - `time.py`'s own rewrite, the original forcing case.**
+`_read_etc_timezone_file` rewritten to use the real `File.binary_reader`/
+`BinaryReader.read` API (`open(path,mode)` was never real), `match`-based
+Result narrowing throughout (per round 1's own narrowing finding), and an
+explicit `utf8()` codec instance (not `.decode()`'s own broken `codec: Codec
+= utf8` default - the same class of bug as `fs.py:12`, now also found on
+`bytearray.decode()`'s identical default, not fixed, out of scope). Along
+the way, fixed one more small, real, previously-dead bug it exposed:
+`lib/builtins/__File.py`'s `BinaryReader.__del__`/`.close()` both discarded
+`close_raw(...)`'s own `Result` (now `.is_ok()`'d explicitly - a destructor
+can't propagate failure, but it shouldn't silently go unchecked either).
+
+Re-ran this doc's own full repro (`get_local_timezone_name()`) after all of
+the above: `fs.py:24`'s type-mismatch and `time.py:58`'s undefined-`open`
+errors are both gone (as they were after round 1/round 2 respectively). One
+NEW error now surfaces in their place, reached specifically because
+`_read_etc_timezone_file` now compiles far enough to call `str.strip()`:
+`crt.py:162`'s `compiler.cexpr('LC_CTYPE_MASK', 'locale.h')` fails to
+compile on this (Windows) host - confirmed, via isolated repro, that this
+is a genuine, pre-existing, environment-specific cross-compilation
+limitation, not a code bug: `str.strip()` needs a real POSIX `<locale.h>`
+for `compiler.cexpr`'s own constant-probing to succeed against, which
+doesn't exist on Windows; the identical snippet compiles cleanly under the
+default (Windows) `active_target`. Out of scope - would need a real Linux
+sysroot/cross-toolchain, not a code fix.
+
+**Still deferred, out of scope, unchanged by any of this**: the original 3
+items (`errors.py:1`'s stray import, `fs.py:12`'s `utf8`-class-not-instance,
+the `_lower_call_args` module-context misattribution bug), plus 3 more found
+along the way (`str.from_cstr(move(b))`'s own separate overload-resolution
+gap - `move(...)` sugar isn't recognized during *overload* matching,
+already flagged in `TODO.txt`; `ascii`/`cp437`/`latin1`'s own dormant
+`get_ptr()`-on-`bytes` bug in their `decode()` bodies; the plain-`if`
+narrowing gap from round 1). `lib/posix/time.py` compiling fully clean on
+this host needs all of these plus a real POSIX cross-toolchain - a
+substantially bigger undertaking than this doc's own original scope.

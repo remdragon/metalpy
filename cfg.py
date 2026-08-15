@@ -266,19 +266,24 @@ class CFGState:
 	# --- prologue --------------------------------------------------------------
 
 	def _enter_parameter( self, param: Parameter ) -> None:
-		if isinstance( param.type, Move ):
+		# param.type is always the real, unwrapped T here (discovery.py's
+		# own parameter-construction site already strips move[T]/copy[T]
+		# down to T, recording the ownership fact on is_move/is_copy
+		# instead - see Parameter's own docstring) - only the OWNERSHIP
+		# STATE this prologue sets up differs by which flag is set
+		if param.is_move:
 			# the callee now fully owns the incoming reference - MOVED is
 			# the CALLER's state at the call site, not the callee's own
 			# parameter (see prerequisite #2's move() call-site check,
 			# which is what guarantees this parameter really was moved in)
-			if rc_leaves( param.type.inner ):
-				self._push( param, param.type.inner, OwnState.OWNED )
-		elif isinstance( param.type, Copy ):
+			if rc_leaves( param.type ):
+				self._push( param, param.type, OwnState.OWNED )
+		elif param.is_copy:
 			# the callee wants its own independent reference - an explicit
 			# Incref right here in the prologue, matching Decref at exit
-			if rc_leaves( param.type.inner ):
-				self.prologue_instructions += self._incref_instructions( param.type.inner, param )
-				self._push( param, param.type.inner, OwnState.COPY )
+			if rc_leaves( param.type ):
+				self.prologue_instructions += self._incref_instructions( param.type, param )
+				self._push( param, param.type, OwnState.COPY )
 		elif rc_leaves( param.type ):
 			self.bindings[param.stem] = _Binding( operand = param, type = param.type, state = OwnState.BORROWED, entry = None )
 

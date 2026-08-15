@@ -166,6 +166,17 @@ class Parameter( Variable ):
 	is_vararg: bool = False # *args
 	is_kwarg: bool = False # **kwargs
 	default: ast.expr|None = None # unresolved - stage 2's concern, same as Function.node's body
+	# move[T]/copy[T] in the ORIGINAL annotation - an ownership status on
+	# this binding, not a distinct type (see Move/Copy's own docstrings).
+	# `type` itself is always the unwrapped, real T: discovery.py's own
+	# parameter-construction site strips the Move/Copy wrapper and records
+	# the ownership fact here instead, so every ordinary consumer (
+	# attribute/method lookup, generic inference, assignability checks)
+	# sees a plain T like any other binding - only the two call-site-
+	# specific concerns (does the caller need to write move(x)? does the
+	# CFG owe this binding its own decref?) consult these flags directly.
+	is_move: bool = False
+	is_copy: bool = False
 
 @dataclass( kw_only = True )
 class Move( Type ):

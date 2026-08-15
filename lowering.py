@@ -977,10 +977,10 @@ class Lowering:
 		# Unwraps a valid move(expr) down to expr - callers only ever see
 		# the real argument expression from here on
 		is_move_call = isinstance( expr, ast.Call ) and isinstance( expr.func, ast.Name ) and expr.func.id == 'move'
-		if isinstance( param.type, Move ):
+		if param.is_move:
 			if not is_move_call:
 				self.discovery.fail(
-					f"{target.qualname}: parameter {param.stem!r} is move[{param.type.inner.qualname}] - "
+					f"{target.qualname}: parameter {param.stem!r} is move[{param.type.qualname}] - "
 					f"call site must pass move({ast.unparse(expr)}): {ast.unparse(call)}",
 					call,
 				)
@@ -4763,6 +4763,94 @@ class FunctionLowering:
 		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
 		return dest
 
+	def _construct_generic_instance( self, target_cls: Type, node: ast.AST ) -> ir.Operand:
+		''' construct a zero-argument instance of an already-fully-resolved
+		class/generic Specialization (target_cls's own type args, if any,
+		are already concrete) - used by _expr_List to build the backing
+		list[T] instance a list-literal populates via append(). Deliberately
+		narrower than _try_lower_construct_call (this file, the general
+		ClassName(...) sugar): no fresh AST Call node naming the class is
+		synthesized here (that would never have passed through type_
+		resolver.py's own pre-pass the way a real call site does, and would
+		need its own textual type-argument spelling for an arbitrary
+		target_cls) - target_cls is already the concrete type we want, so
+		this goes straight to ordinary (non-generic-inference) construction,
+		using a synthetic zero-arg Call node purely as the argument-list
+		shape _lower_call_args/_match_call_args need (never inspected for
+		its own .func) - real default-value expressions (e.g. list[T]'s own
+		initial_capacity: usize = 8) are already real AST nodes on the
+		Function's own Parameter objects, nothing to fabricate there. Only
+		supports a target whose __init__ is present, non-overloaded, and
+		non-fallible - list[T]'s own shape; a different caller needing more
+		would extend this, not work around it. '''
+		resolved_cls = self.lowering._ensure_resolved( target_cls )
+		assert isinstance( resolved_cls, ClassLike ), f'internal compiler error: {resolved_cls} is not constructible'
+		init = resolved_cls.names.get( '__init__' )
+		assert isinstance( init, Function ), f'internal compiler error: {resolved_cls.qualname} has no usable __init__'
+		self.lowering.schedule( resolved_cls )
+		self.lowering._ensure_resolved( init )
+		synth_call = ast.Call( func = node, args = [], keywords = [] )
+		ast.copy_location( synth_call, node )
+		args, kwargs = self._lower_call_args( init, synth_call )
+		self_temp = self._new_temp( resolved_cls )
+		self.lowering._schedule_rcclass_construction( resolved_cls, self_temp.type )
+		self._emit( ir.Allocate( dest = self_temp, cls = resolved_cls, fields = {} ))
+		self.lowering.schedule( init.return_type )
+		for param in init.parameters or []:
+			self.lowering.schedule( param.type )
+		assert not self.lowering._init_fallibility( init ), f'internal compiler error: {resolved_cls.qualname}.__init__ is fallible'
+		self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
+		return self_temp
+
+	def _expr_List( self, node: ast.List, expected_type: Type|None ) -> ir.Operand:
+		''' [a, b, c] - requires expected_type to already be a concrete
+		list[T] Specialization (inferring T from the elements themselves
+		when no annotation/return-type is available is deferred - every
+		real site in lib/ already has one, matching _expr_Tuple's own
+		precedent of deferring an unforced generalization (arity 0/1)
+		rather than guessing). Builds one list[T] instance via
+		_construct_generic_instance, then a real append(elt).unwrap(...)
+		method-call chain per element - list[T] has a real __init__/append,
+		unlike tuple, so this can't reuse _expr_Tuple's single-ir.Allocate
+		shape. A wrong-typed element is rejected the ordinary way by the
+		_lower_expr(elt, elem_type) call below - the general assignability
+		check already covers it, nothing extra needed here. '''
+		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
+		if not ( isinstance( expected_type, Specialization ) and isinstance( resolved, RCClass )
+				and expected_type.base.stem == 'list' and len( expected_type.args ) == 1 ):
+			self.lowering.discovery.fail(
+				f'list literal needs a known list[T] target type from context (e.g. an annotation or return type): {ast.unparse(node)}',
+				node,
+			)
+		elem_type = expected_type.args[0]
+		dest = self._construct_generic_instance( expected_type, node )
+		if not node.elts:
+			return dest
+		append_fn = self.lowering._find_method( dest.type, 'append' )
+		assert append_fn is not None, 'internal compiler error: list[T] has no append method'
+		self.lowering._ensure_resolved( append_fn )
+		self.lowering.schedule( append_fn.return_type )
+		unwrap_fn = self.lowering._find_method( append_fn.return_type, 'unwrap' )
+		assert unwrap_fn is not None, 'internal compiler error: list[T].append does not return a Result with unwrap()'
+		self.lowering._ensure_resolved( unwrap_fn )
+		self.lowering.schedule( unwrap_fn.return_type )
+		errmsg_node = ast.Constant( value = 'list literal: append failed' )
+		ast.copy_location( errmsg_node, node )
+		for elt in node.elts:
+			operand = self._lower_expr( elt, elem_type )
+			append_dest = self._new_temp( append_fn.return_type )
+			self._emit( ir.Call( dest = append_dest, target = append_fn, receiver = dest, args = [ operand ], kwargs = {} ))
+			errmsg = self._lower_expr( errmsg_node, unwrap_fn.parameters[0].type )
+			# unwrap()'s own return value (T=None here, list[T].append's own
+			# Result[None,OverflowError]) is never read - only its side
+			# effect (panic on Err) matters, so no destination temp: T=None
+			# compiles to a real C `void` return, and a real ir.Call dest
+			# expects an actual value to assign, not void - same "dest=None
+			# for a call whose result isn't used" convention _stmt_Expr's
+			# own bare-call-statement handling already relies on
+			self._emit( ir.Call( dest = None, target = unwrap_fn, receiver = append_dest, args = [ errmsg ], kwargs = {} ))
+		return dest
+
 	# obj.type.stem -> its own length-accessor method name, for slice
 	# syntax's own default-stop resolution (_lower_slice_subscript below).
 	# str and bytearray genuinely expose differently-named length
@@ -5365,7 +5453,7 @@ class FunctionLowering:
 		# value, not just the AST expr) - shared by every _match_call_args
 		# caller (plain calls, both generic call flavors, union-receiver
 		# dispatch), called right after each argument is lowered
-		if isinstance( param.type, Move ):
+		if param.is_move:
 			for instr in self._cfg.move( operand, target_qualname = target_qualname, param_stem = param.stem ):
 				self._emit( instr )
 
@@ -6877,6 +6965,24 @@ class FunctionLowering:
 			receiver = None
 		if receiver is not None:
 			self.lowering.schedule( receiver.type )
+
+		if receiver is not None and isinstance( target, Function ) and target.is_move:
+			# @move on a method means calling it consumes/invalidates self -
+			# cfg.py's own move() (already the exact mechanism _apply_move_hook
+			# uses for move[T] PARAMETER arguments) needs to run here too, for
+			# the RECEIVER: nothing else ever transitions the CALLER's own
+			# ownership-tracking state for a receiver on an @move call -
+			# confirmed via a real double-free (bytearray.release(), called
+			# through str.from_cstr's own move[bytearray] parameter: release()
+			# only invalidates ITS OWN self.__data sentinel, guarding against
+			# a double-free of the byte buffer, but does nothing about the
+			# CALLER's own binding, which still got an ordinary Decref at
+			# scope exit on top of that - two teardown paths for one struct).
+			# Also correctly rejects calling an @move method through a merely
+			# BORROWED receiver (move()'s own OWNED/COPY precondition), which
+			# was never checked before either.
+			for instr in self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' ):
+				self._emit( instr )
 
 		if isinstance( target, ( Function, Overload )) and target.stem in self.lowering._RESULT_CONSUMING_METHODS and isinstance( receiver, Variable ):
 			# .is_ok()/.is_err()/.unwrap(msg)/.unwrap_or(default) - like

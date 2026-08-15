@@ -7807,6 +7807,168 @@ class WalrusOperatorTests( unittest.TestCase ):
 		self.assertIs( assigns[0].dest, assigns[1].dest )
 
 
+class ListLiteralTests( unittest.TestCase ):
+	''' _expr_List (ast.List, `[a, b, c]`) - PLAN_POSIX_FEATURE.md's follow-up
+	scope (found while unblocking utf8.names()'s own list-literal return).
+	Requires expected_type to already be a concrete list[T] Specialization -
+	no element-driven inference. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def _assert_rejected( self, code: str, needle: str ) -> None:
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( needle in e for e in self.discovery.errors.errors ),
+			f'expected an error containing {needle!r}, got: {self.discovery.errors.errors}',
+		)
+
+	def test_construction_and_append_shape( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			"	x: list[str] = [ 'a', 'b' ]",
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		append_calls = [ c for c in calls if c.target.stem == 'append' ]
+		self.assertEqual( len( append_calls ), 2 )
+		# both append calls target the SAME constructed list instance
+		self.assertIs( append_calls[0].receiver, append_calls[1].receiver )
+		unwrap_calls = [ c for c in calls if c.target.stem == 'unwrap' ]
+		self.assertEqual( len( unwrap_calls ), 2 )
+		# unwrap()'s own return value (None) is never assigned to a dest -
+		# only its side effect (panic on Err) matters
+		self.assertTrue( all( c.dest is None for c in unwrap_calls ) )
+
+	def test_empty_list_literal_is_construction_only( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	x: list[i32] = []',
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertFalse( any( c.target.stem == 'append' for c in calls ) )
+
+	def test_wrong_element_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x: list[str] = [ 'a', 5 ]",
+			'	return',
+		]), needle = 'expected' )
+
+	def test_no_expected_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x = [ 'a', 'b' ]",
+			'	return',
+		]), needle = 'list literal needs a known list[T] target type' )
+
+
+class MoveParameterTests( unittest.TestCase ):
+	''' move[T] is an ownership status on a binding, not a distinct type
+	from T (Parameter.is_move/is_copy, not a Move/Copy-wrapped .type -
+	discovery.py's own parameter-construction site unwraps it). Before this
+	fix, NO property of a move[T]-typed parameter could be read at all
+	inside the function that owns it - confirmed via lib/builtins/
+	__init__.py's own real bytes.from_bytearray/str.from_cstr, both of
+	which read len(src) before consuming src via .release(). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def test_generic_len_call_on_move_parameter( self ) -> None:
+		# the exact reported shape: len[T](t: T) is an ORDINARY (non-move)
+		# generic free function - a move[bytearray]-typed argument flowing
+		# into its plain T parameter must infer T as the unwrapped
+		# bytearray, not the wrapped ownership annotation
+		self._assert_accepted( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	n: usize = len( src )',
+			'	return n',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+
+	def test_direct_method_call_on_move_parameter( self ) -> None:
+		# bypasses the generic len() entirely - an ordinary, direct method
+		# call on a move[T]-typed parameter must resolve through the same
+		# attribute lookup any other binding's method call would
+		self._assert_accepted( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	return src.__len__()',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+
+	def test_move_parameter_type_is_unwrapped( self ) -> None:
+		mod = self._import( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	return src.__len__()',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+		consume = mod.get_local( 'consume' )
+		consume.resolve()
+		src_param = consume.parameters[0]
+		self.assertTrue( src_param.is_move )
+		self.assertFalse( src_param.is_copy )
+		self.assertEqual( src_param.type.qualname, 'builtins.bytearray' )
+
+	def test_receiver_not_double_decreffed_after_move_method_call( self ) -> None:
+		# @move on a METHOD (bytearray.release()'s own real shape) means
+		# calling it consumes/invalidates self - before this fix, nothing
+		# transitioned the CALLER's own ownership state for the RECEIVER,
+		# so a real Decref still got emitted for b at scope exit on top of
+		# release()'s own internal cleanup (a genuine double-free,
+		# confirmed via a real intermittent ~10-15% test-suite flake).
+		# cfg.py's own move() (already used by _apply_move_hook for move[T]
+		# ARGUMENTS) cancels the receiver's own pending epilogue Decref -
+		# note this does NOT reject reading b again afterward (confirmed:
+		# neither does the pre-existing move[T]-argument mechanism this
+		# mirrors) - it only stops the double teardown, which is exactly
+		# the bug being fixed here.
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			'	b: bytearray = bytearray( 5 )',
+			'	match b.release():',
+			'		case Result.Ok( ptr ):',
+			'			return 0',
+			'		case Result.Err( _ ):',
+			'			return 1',
+		]))
+		decrefs_on_b = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Decref ) and getattr( i.value, 'stem', None ) == 'b'
+		]
+		self.assertEqual( decrefs_on_b, [] )
+
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

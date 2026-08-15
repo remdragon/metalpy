@@ -49,7 +49,7 @@ class latin1( Codec ):
 		return Result.Ok( bytes.from_bytearray( bytes, move( out )))
 	
 	@virtual
-	def decode( self, b: bytes ) -> Result[str,CodecError]:
+	def decode( self, b: bytes|bytearray ) -> Result[str,CodecError]:
 		b_len: usize = len( b )
 		b_ptr: ConstPtr[u8] = b.get_ptr()
 		

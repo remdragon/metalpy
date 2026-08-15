@@ -11,7 +11,7 @@ import linker_c
 import test_support
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
-	Function, Variable, Specialization, Move, Copy, ConditionalDispatch, Scalar,
+	Function, Variable, Specialization, ConditionalDispatch, Scalar,
 )
 
 logger = logging.getLogger( __name__ )
@@ -1417,7 +1417,13 @@ class MoveTypeTests( unittest.TestCase ):
 	def _import( self, code: str ) -> Module:
 		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
 
-	def test_move_wraps_inner_type( self ) -> None:
+	def test_move_unwraps_to_inner_type( self ) -> None:
+		# move[T] is an ownership status on the binding, not a distinct
+		# type from T (see Move's own docstring, TODO.txt's "incref/
+		# decref" section) - discovery.py's own parameter-construction
+		# site unwraps it, recording the fact on Parameter.is_move instead,
+		# so p.type here is the SAME real Foo class every other consumer
+		# (attribute lookup, generic inference, assignability) sees
 		mod = self._import( '''
 class Foo:
 	pass
@@ -1428,8 +1434,9 @@ def consume( x: move[Foo] ) -> None:
 		fn = mod.get_local( 'consume' )
 		fn.resolve()
 		p = fn.parameters[0]
-		self.assertIsInstance( p.type, Move )
-		self.assertIs( p.type.inner, mod.get_local( 'Foo' ))
+		self.assertIs( p.type, mod.get_local( 'Foo' ))
+		self.assertTrue( p.is_move )
+		self.assertFalse( p.is_copy )
 
 	def test_move_dedups_to_identical_object( self ) -> None:
 		mod = self._import( '''
@@ -1447,6 +1454,8 @@ def consume2( y: move[Foo] ) -> None:
 		consume.resolve()
 		consume2.resolve()
 		self.assertIs( consume.parameters[0].type, consume2.parameters[0].type )
+		self.assertTrue( consume.parameters[0].is_move )
+		self.assertTrue( consume2.parameters[0].is_move )
 
 	def test_move_multiple_args_errors( self ) -> None:
 		mod = self._import( '''
@@ -1472,7 +1481,7 @@ class CopyTypeTests( unittest.TestCase ):
 	def _import( self, code: str ) -> Module:
 		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
 
-	def test_copy_wraps_inner_type( self ) -> None:
+	def test_copy_unwraps_to_inner_type( self ) -> None:
 		mod = self._import( '''
 class Foo:
 	pass
@@ -1483,8 +1492,9 @@ def consume( x: copy[Foo] ) -> None:
 		fn = mod.get_local( 'consume' )
 		fn.resolve()
 		p = fn.parameters[0]
-		self.assertIsInstance( p.type, Copy )
-		self.assertIs( p.type.inner, mod.get_local( 'Foo' ))
+		self.assertIs( p.type, mod.get_local( 'Foo' ))
+		self.assertTrue( p.is_copy )
+		self.assertFalse( p.is_move )
 
 	def test_copy_dedups_to_identical_object( self ) -> None:
 		mod = self._import( '''
@@ -1502,6 +1512,8 @@ def consume2( y: copy[Foo] ) -> None:
 		consume.resolve()
 		consume2.resolve()
 		self.assertIs( consume.parameters[0].type, consume2.parameters[0].type )
+		self.assertTrue( consume.parameters[0].is_copy )
+		self.assertTrue( consume2.parameters[0].is_copy )
 
 	def test_copy_multiple_args_errors( self ) -> None:
 		mod = self._import( '''
@@ -1533,8 +1545,13 @@ def consume_move( x: move[Foo] ) -> None:
 		consume_move = mod.get_local( 'consume_move' )
 		consume_copy.resolve()
 		consume_move.resolve()
-		self.assertIsInstance( consume_copy.parameters[0].type, Copy )
-		self.assertIsInstance( consume_move.parameters[0].type, Move )
+		# both parameters' .type is the SAME plain Foo - ownership is now
+		# tracked via is_move/is_copy, not via distinct wrapper types
+		self.assertIs( consume_copy.parameters[0].type, consume_move.parameters[0].type )
+		self.assertTrue( consume_copy.parameters[0].is_copy )
+		self.assertFalse( consume_copy.parameters[0].is_move )
+		self.assertTrue( consume_move.parameters[0].is_move )
+		self.assertFalse( consume_move.parameters[0].is_copy )
 
 	def test_move_decorator_flag_on_function( self ) -> None:
 		mod = self._import( '''
@@ -2395,8 +2412,8 @@ class RealLibSmokeTest( unittest.TestCase ):
 			group.implementations[1].resolve()
 		self.assertIsNone( group.implementations[1].resolve )
 		src = group.implementations[1].parameters[0]
-		self.assertIsInstance( src.type, Move )
-		self.assertIs( src.type.inner, self.builtins_mod.get_local( 'bytearray' ))
+		self.assertIs( src.type, self.builtins_mod.get_local( 'bytearray' ))
+		self.assertTrue( src.is_move )
 
 	def test_bytearray_resolves( self ) -> None:
 		ba_cls = self.builtins_mod.get_local( 'bytearray' )

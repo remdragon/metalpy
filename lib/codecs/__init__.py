@@ -16,7 +16,7 @@ class Codec:
 		...
 
 	@abstractmethod
-	def decode( self, b: bytes ) -> Result[str,CodecError]:
+	def decode( self, b: bytes|bytearray ) -> Result[str,CodecError]:
 		...
 
 	@abstractmethod

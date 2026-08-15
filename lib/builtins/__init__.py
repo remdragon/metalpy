@@ -217,7 +217,7 @@ class bytearray:
 		return codec.decode( self )
 	
 	@move
-	def release( self ) -> Result[Ptr[u8],sys.OwnershipError]:
+	def release( self ) -> Result[Ptr[u8],sys.OwnershipError[bytearray]]:
 		if compiler.refcount( self ) != 1:
 			return Result.Err( sys.OwnershipError.SharedReference( self ))
 		ptr = self.__data
