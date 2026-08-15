@@ -1544,8 +1544,20 @@ class TypeResolver:
 		if is_fallible:
 			self._wrap_generator_next_returns_in_ok( next_body )
 
+		# PLAN_GENERATORS.md Phase C - a Generator[T,SendType,E] (send_type
+		# set) builds this SAME dispatch-prologue-plus-body under the name
+		# $$__resume__ instead of $$__next__ - an internal method, never
+		# called directly by user code, shared by the two thin public
+		# wrappers ensure_generator_synthesized builds right after this
+		# returns (see _build_generator_next_and_send_wrappers). Iterator[T]
+		# and the 2-arg Generator[T,E] (send_type None, no .send() support)
+		# are completely unaffected - $$__next__ stays the one real method,
+		# exactly as every phase before this one already built it.
+		send_type = fn.return_type.send_type if isinstance( fn.return_type, GeneratorType ) else None
+		method_stem = '__resume__' if send_type is not None else '__next__'
+		method_name = '$$__resume__' if send_type is not None else '$$__next__'
 		node = ast.FunctionDef(
-			name = '$$__next__',
+			name = method_name,
 			args = ast.arguments( posonlyargs = [], args = [], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
 			body = next_body, decorator_list = [], returns = None, type_params = [],
 			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
@@ -1553,7 +1565,7 @@ class TypeResolver:
 		ast.fix_missing_locations( node )
 
 		next_fn = Function(
-			stem = '__next__', qualname = f'{backing_cls.qualname}.__next__', file = fn.file, line = fn.line,
+			stem = method_stem, qualname = f'{backing_cls.qualname}.{method_stem}', file = fn.file, line = fn.line,
 			cls = backing_cls, node = node,
 			parameters = [], return_type = next_return_type,
 			is_static = False, resolve = None,
@@ -1592,6 +1604,105 @@ class TypeResolver:
 		# for every ordinary non-generator function.
 		self._generators_synthesized.add( id( next_fn ))
 		return next_fn, done_state
+
+	def _build_generator_next_and_send_wrappers( self, fn: Function, backing_cls: RCClass, next_return_type: Type, send_type: Type ) -> 'tuple[Function,Function]':
+		''' PLAN_GENERATORS.md Phase C - $$__resume__ (built by
+		_build_generator_next_function, just above - method_stem is
+		'__resume__' whenever send_type is set) is never called directly by
+		user code - these two THIN wrappers, referencing it purely by name
+		(self.__resume__()), are the real public surface:
+
+			def __next__(self) -> next_return_type:
+				return self.__resume__()
+
+			def send(self, v: send_type) -> next_return_type:
+				if self.__state == 0:
+					sys.panic(...)   # NoReturn - mirrors Python's own
+					                  # TypeError for sending before the
+					                  # first yield ever ran
+				self.__send_slot = v   # live-flag-guarded exactly like any
+				self.__send_ready = True   # other RC-typed promoted field
+				                  # (_build_liveness_guard) when send_type
+				                  # is RC-typed - a bare assign otherwise
+				return self.__resume__()
+
+		__next__() leaves __send_ready untouched - a captured `x = yield v`
+		expression reached via a bare .__next__() call (never preceded by
+		.send()) finds __send_ready still False from construction (or from
+		the LAST resume that consumed it - _lower_generator_yield's own
+		expression-position codegen clears it again on every read, so this
+		invariant holds across repeated .__next__() calls too) and panics
+		with a clear message - see that method's own docstring (task #57). '''
+		qualname_next = f'{backing_cls.qualname}.__next__'
+		next_node = ast.FunctionDef(
+			name = '$$__next__',
+			args = ast.arguments( posonlyargs = [], args = [], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
+			body = [ ast.Return( value = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__resume__', ctx = ast.Load() ),
+				args = [], keywords = [],
+			))],
+			decorator_list = [], returns = None, type_params = [],
+			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( next_node )
+		next_public_fn = Function(
+			stem = '__next__', qualname = qualname_next, file = fn.file, line = fn.line,
+			cls = backing_cls, node = next_node,
+			parameters = [], return_type = next_return_type,
+			is_static = False, resolve = None,
+		)
+		backing_cls.methods.append( next_public_fn )
+		backing_cls.names[ next_public_fn.stem ] = next_public_fn
+
+		qualname_send = f'{backing_cls.qualname}.send'
+		panic_fn = self._resolve_sys_function( 'panic' )
+		panic_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'sys', ctx = ast.Load() ), attr = 'panic', ctx = ast.Load() ),
+			args = [ ast.Constant( value = f'{fn.qualname}: .send() called on a generator that has not yielded yet' ) ],
+			keywords = [],
+		)
+		panic_call.resolved_callee = panic_fn
+		panic_call.end_lineno = None; panic_call.end_col_offset = None
+		not_started_guard = ast.If(
+			test = ast.Compare( left = self._self_attr( '__state', fn.node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = 0 ) ] ),
+			body = [ ast.Expr( value = panic_call ) ], orelse = [],
+		)
+		send_slot_assign = ast.Assign(
+			targets = [ ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__send_slot', ctx = ast.Store() ) ],
+			value = ast.Name( id = 'v', ctx = ast.Load() ),
+		)
+		ast.copy_location( send_slot_assign, fn.node )
+		send_slot_stmt = self._build_liveness_guard( send_slot_assign, '__send_slot' ) if is_rc( send_type ) else send_slot_assign
+		send_ready_assign = ast.Assign(
+			targets = [ self._self_attr( '__send_ready', fn.node ) ], value = ast.Constant( value = True ),
+		)
+		send_node = ast.FunctionDef(
+			name = '$$send',
+			args = ast.arguments( posonlyargs = [], args = [ ast.arg( arg = 'v' ) ], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
+			body = [
+				not_started_guard,
+				send_slot_stmt,
+				send_ready_assign,
+				ast.Return( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__resume__', ctx = ast.Load() ),
+					args = [], keywords = [],
+				)),
+			],
+			decorator_list = [], returns = None, type_params = [],
+			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( send_node )
+		v_param = Parameter( stem = 'v', qualname = f'{qualname_send}.v', file = fn.file, line = fn.line, type = send_type )
+		send_fn = Function(
+			stem = 'send', qualname = qualname_send, file = fn.file, line = fn.line,
+			cls = backing_cls, node = send_node,
+			parameters = [ v_param ], return_type = next_return_type,
+			is_static = False, resolve = None,
+		)
+		send_fn.add_name( 'v', v_param )
+		backing_cls.methods.append( send_fn )
+		backing_cls.names[ send_fn.stem ] = send_fn
+		return next_public_fn, send_fn
 
 	def _wrap_generator_next_returns_in_ok( self, next_body: list[ast.stmt] ) -> None:
 		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
@@ -2016,7 +2127,16 @@ class TypeResolver:
 			next_return_type = result_union
 
 		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
-		_next_fn, done_state = self._build_generator_next_function( fn, backing_cls, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites, origin_type_substitution )
+		next_fn, done_state = self._build_generator_next_function( fn, backing_cls, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites, origin_type_substitution )
+		# PLAN_GENERATORS.md Phase C - send_type set means next_fn is
+		# actually $$__resume__ (see _build_generator_next_function's own
+		# docstring) - build the two thin public wrappers (__next__/send)
+		# that share it. None for Iterator[T]/the 2-arg Generator[T,E] -
+		# next_fn IS $$__next__ itself there, nothing further to build
+		send_type = fn.return_type.send_type if isinstance( fn.return_type, GeneratorType ) else None
+		next_and_send_fns: 'tuple[Function,Function]|None' = None
+		if send_type is not None:
+			next_and_send_fns = self._build_generator_next_and_send_wrappers( fn, backing_cls, next_return_type, send_type )
 		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 		# backing_cls is ever scheduled below, so its own pre-mark of
 		# id(backing_cls) in self._destructors_synthesized (see its own
@@ -2034,7 +2154,13 @@ class TypeResolver:
 		self._build_generator_close_function( fn, backing_cls, locals_decl, extra_fields, defer_sites, done_state )
 
 		self.schedule( backing_cls )
-		self.schedule( backing_cls.names['__next__'] )
+		if next_and_send_fns is not None:
+			next_public_fn, send_fn = next_and_send_fns
+			self.schedule( next_fn ) # $$__resume__ itself - never called directly by user code, but still a real compile unit
+			self.schedule( next_public_fn )
+			self.schedule( send_fn )
+		else:
+			self.schedule( next_fn ) # next_fn IS $$__next__ here
 		self.schedule( backing_cls.names['close'] )
 		self.schedule( result_union )
 
