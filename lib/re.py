@@ -786,9 +786,14 @@ class Parser:
 		return self._backref_fragment( n )
 
 	def _parse_g_backref( self ) -> Result[list[Op], PatternError]:
-		# only \g<N> (numeric) is supported for now - \g<name> needs named
-		# groups (a later phase). If it doesn't look like \g<digits>, 'g'
-		# falls back to an ordinary literal codepoint, matching this
+		# \g<N> (numeric) or \g<name> (looked up against group_names, the
+		# same name->group-number map (?P<name>...) populates - a name
+		# not yet registered there is rejected the same way a numeric
+		# forward reference is: self.group_names only contains groups
+		# OPENED so far during this left-to-right parse, so "not found"
+		# and "forward reference" are naturally the same case, no extra
+		# bookkeeping needed. If it doesn't look like \g<...> at all,
+		# 'g' falls back to an ordinary literal codepoint, matching this
 		# parser's "unrecognized escape is a literal" convention.
 		save_pos: usize = self.pos
 		self._advance_byte()  # consume 'g'
@@ -797,18 +802,35 @@ class Parser:
 			cp: u32 = self._decode_cp()
 			return Result.Ok( _single_op_fragment( _op_char( cp )))
 		self._advance_byte()  # consume '<'
-		n: usize = 0
-		have_digit: bool = False
-		while not self._at_end() and self._is_digit_byte( self._peek_byte()):
-			have_digit = True
-			with compiler.wrap_arithmetic:
-				n = n * 10 + usize( self._peek_byte() - 48 )
+		content_start: usize = self.pos
+		while not self._at_end() and self._peek_byte() != 62:  # '>'
 			self._advance_byte()
-		if not have_digit:
-			return Result.Err( PatternError( 're: \\g<...> requires a numeric group reference (named groups not yet supported)' ))
-		if self._at_end() or self._peek_byte() != 62:  # '>'
+		if self._at_end():
 			return Result.Err( PatternError( 're: unterminated \\g<...>' ))
+		content: str = _substr( self.text, content_start, self.pos )
 		self._advance_byte()  # consume '>'
+		if content == '':
+			return Result.Err( PatternError( 're: \\g<...> group reference cannot be empty' ))
+		if self._is_digit_byte( content.get_cstr()[0] ):
+			return self._parse_g_backref_numeric( content )
+		idx_result: Result[usize, KeyError] = self.group_names.__getitem__( content )
+		if idx_result.is_err():
+			return Result.Err( PatternError( 're: \\g<...> references an undefined group name ' + content ))
+		idx: usize = idx_result.unwrap( 're: checked ok above' )
+		return self._backref_fragment( idx )
+
+	def _parse_g_backref_numeric( self, content: str ) -> Result[list[Op], PatternError]:
+		n: usize = 0
+		i: usize = 0
+		clen: usize = content.byte_len()
+		data: ConstPtr[u8] = content.get_cstr()
+		while i < clen:
+			b: u8 = data[i]
+			if not self._is_digit_byte( b ):
+				return Result.Err( PatternError( 're: \\g<...> numeric group reference must be all digits' ))
+			with compiler.wrap_arithmetic:
+				n = n * 10 + usize( b - 48 )
+				i += 1
 		return self._backref_fragment( n )
 
 	def _backref_fragment( self, n: usize ) -> Result[list[Op], PatternError]:
@@ -1688,44 +1710,32 @@ def _require_next_match( pattern: Pattern, s: str, pos: usize, slen: usize, max_
 def finditer( pattern: Pattern, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Iterator[Match]:
 	''' yields each successive non-overlapping match, scanning forward
 	from the end of the previous one (or by one codepoint, for a
-	zero-width match).
+	zero-width match). Externally consumable via a real for-loop as of
+	the compiler fix in 2cb18c4 ("Fix cross-module generator synthesis
+	resolving names in wrong module") - confirmed directly; previously
+	this only worked for same-module callers, which is why
+	findall/sub/subn/split below still don't call it internally (they
+	predate the fix and re-do the same scan-forward directly against
+	_find_next_match instead - no need to revisit now that it works,
+	but also no need to change working code just to share it).
 
-	KNOWN LIMITATION, confirmed with a minimal cross-module repro
-	(unrelated to re.py's own code - a plain `Iterator[Box]`-returning
-	generator in one lib/ module, consumed via `for x in othermodule.
-	gen():` from a second module, fails identically): a generator
-	function consumed via for-loop (or driven manually via .__next__())
-	from any module OTHER than the one that defines it fails to resolve
-	names local to the defining module inside the synthesized closure
-	body ("name 'X' is not defined"). Since every real caller of this
-	module imports `re` - i.e. is necessarily a different module - this
-	means `finditer` is not usable by any external caller today; it only
-	compiles and runs correctly for same-module callers (which is why
-	findall/sub/subn/split below, all real Pattern methods, deliberately
-	do NOT call this - they re-do the same scan-forward directly against
-	_find_next_match instead). Kept in the module (matching PLAN_RE.md's
-	API surface and ready to work once the compiler bug is fixed)
-	rather than removed, but re_test.py cannot exercise it via a real
-	compiled program for the same reason - flagged as a candidate for
-	the same kind of investigation as the earlier three bugs, not
-	re-litigated further here.
-
-	A free function, not a Pattern method either way - confirmed
-	directly that a generator METHOD isn't supported yet, and separately
-	that an Iterator[T] value merely returned/passed through a non-
-	generator function (even a trivial `return other_generator(...)`,
-	same module) has no usable __next__ for the receiver - only a DIRECT
-	call to the actual generator function works as a for-loop's iterable
-	expression. There is also no module-level str-pattern convenience
-	overload here (unlike search/match/fullmatch/findall/sub/subn/split
-	below): a second `finditer(pattern: str, ...)` generator that
-	re-yields from this one via `for m in finditer(p,...): yield m` was
-	tried and produced the same kind of nonsensical errors (undefined
+	A free function, not a Pattern method - confirmed directly that a
+	generator METHOD isn't supported yet, and separately that an
+	Iterator[T] value merely returned/passed through a non-generator
+	function (even a trivial `return other_generator(...)`, same
+	module) has no usable __next__ for the receiver - only a DIRECT
+	call to the actual generator function works as a for-loop's
+	iterable expression. There is also no module-level str-pattern
+	convenience overload here (unlike search/match/fullmatch/findall/
+	sub/subn/split below): a second `finditer(pattern: str, ...)`
+	generator that re-yields from this one via `for m in finditer(p,
+	...): yield m` was tried and produced nonsensical errors (undefined
 	names inside THIS function's own already-correct body) once two
 	same-named overloads were both generators - not investigated
-	further, just avoided. Compile the pattern with re.compile() first,
-	then call finditer(pattern, s) with the result (from the SAME
-	module, until the cross-module bug above is fixed).
+	further (this was before the cross-module fix landed; may be worth
+	retrying, but not revisited here since compile-then-call works
+	fine). Compile the pattern with re.compile() first, then call
+	finditer(pattern, s) with the result.
 
 	The generator body itself must also keep yield as a direct, unnested
 	statement of a single top-level while loop - nesting it inside an

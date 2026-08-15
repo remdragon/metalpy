@@ -23,32 +23,39 @@
 # back to anchor the nested match.
 #
 # Phase 5: backreferences - `\1`..`\9` and the explicit `\g<N>` form
-# (numeric only; `\g<name>` needs named groups, a later phase). A
-# backreference can only refer to a group already OPENED earlier in the
+# (`\g<name>` landed later, in Phase 7 alongside named groups - see
+# _RE_IGNORECASE_LAZY_NAMED below). A backreference can only refer to
+# a group already OPENED earlier in the
 # pattern (this parser has no separate lookahead pass), so a forward
 # reference is a compile error rather than an op that could never
 # succeed. An unmatched/non-participating group's backreference never
 # matches, same as Python re.
 #
 # Phase 6: Pattern.findall/sub/subn/split, plus module-level convenience
-# wrappers taking a pattern string directly. Module-level `finditer` is
-# NOT covered here: it's real and correct, but confirmed unusable from
-# any module other than the one that defines it (a general compiler bug
-# in cross-module generator consumption, unrelated to this module's own
-# code - see finditer()'s own docstring in lib/re.py) - since every
-# real caller necessarily imports `re` from elsewhere, there's no way to
-# exercise it via a real compiled program today. findall/sub/subn/split
-# were deliberately written to not depend on it internally for exactly
-# this reason.
+# wrappers taking a pattern string directly. Module-level `finditer` was
+# implemented here too but, at the time, confirmed unusable from any
+# module other than the one that defines it (a general compiler bug in
+# cross-module generator consumption) - findall/sub/subn/split were
+# deliberately written to not depend on it internally for that reason,
+# and it stayed untested here until that bug was fixed (see the Phase 7
+# note below) - it's exercised for real now, in _RE_FINDITER.
 #
 # Phase 7: IGNORECASE (ASCII-only case-flip, both literal CHAR ops and
 # character classes), lazy quantifiers `*? +? ?? {m,n}?` (same SPLIT-
 # based compilation as their greedy counterparts, just with the two
-# targets swapped so the VM prefers fewer repeats), and named groups
+# targets swapped so the VM prefers fewer repeats), named groups
 # `(?P<name>...)` - real numbered capturing groups underneath, plus a
 # name->group-number map threaded from Parser through Pattern to Match
-# for Match.group(name)/groupdict(). See PLAN_RE.md for all seven
-# phases - this is the last one on the original roadmap.
+# for Match.group(name)/groupdict() - and `\g<name>` (looked up
+# against that same map; landed alongside named groups rather than in
+# Phase 5 with the numeric backreferences, since it needs them to
+# exist first). See PLAN_RE.md for all seven phases - this is the
+# last one on the original roadmap.
+#
+# Also: as of the merge bringing in 2cb18c4 ("Fix cross-module
+# generator synthesis resolving names in wrong module"), finditer() IS
+# now externally consumable via a real for-loop - confirmed directly -
+# so it's exercised for real below (_RE_FINDITER), no longer skipped.
 #
 # Follows time_test.py's own template: RealCompileMixin + assert_programs_run,
 # print()-free, exit code 0 = every check passed, distinct nonzero i32 per
@@ -549,6 +556,29 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_FINDITER = '''
+import re
+
+def main() -> i32:
+	p: re.Pattern = re.compile( r'\\d+' ).unwrap( 'bad pattern' )
+	count: usize = 0
+	total_len: usize = 0
+	for m in re.finditer( p, 'a1 b22 c333' ):
+		with compiler.wrap_arithmetic:
+			count += 1
+		g: str|None = m.group()
+		if g is None:
+			return 1
+		gg: str = g
+		with compiler.wrap_arithmetic:
+			total_len += gg.byte_len()
+	if count != 3:
+		return 2
+	if total_len != 6:  # '1' + '22' + '333' = 1+2+3 chars
+		return 3
+	return 0
+'''
+
 _RE_IGNORECASE_LAZY_NAMED = '''
 import re
 
@@ -644,6 +674,24 @@ def main() -> i32:
 	dup_name: Result[re.Pattern, re.PatternError] = re.compile( r'(?P<x>a)(?P<x>b)' )
 	if dup_name.is_ok():
 		return 22
+
+	# \\g<name> backreference
+	tag: re.Pattern = re.compile( r'<(?P<tag>\\w+)></\\g<tag>>' ).unwrap( 'bad' )
+	if tag.fullmatch( '<div></div>' ).is_err():
+		return 23
+	if tag.fullmatch( '<div></span>' ).is_ok():
+		return 24
+
+	# \\g<name> referencing a name not yet defined (forward reference) is
+	# a compile error, same restriction as numeric backreferences
+	fwd: Result[re.Pattern, re.PatternError] = re.compile( r'\\g<x>(?P<x>a)' )
+	if fwd.is_ok():
+		return 25
+
+	# \\g<name> referencing an undefined name entirely is a compile error
+	undef: Result[re.Pattern, re.PatternError] = re.compile( r'(?P<y>a)\\g<nope>' )
+	if undef.is_ok():
+		return 26
 	return 0
 '''
 
@@ -696,6 +744,17 @@ class RePhase6BehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_phase6_findall_sub_split( self ) -> None:
 		self.assert_programs_run([
 			( 'findall_sub_split', _RE_FINDALL_SUB_SPLIT ),
+		])
+
+	def test_phase6_finditer( self ) -> None:
+		''' separate assert_programs_run call, not merged into the case
+		above: finditer's own cross-module generator consumption only
+		works as of the compiler fix in 2cb18c4 (see finditer()'s own
+		docstring in lib/re.py) - isolating it means a future regression
+		in just this path fails only this test, not test_phase6_findall_
+		sub_split too. '''
+		self.assert_programs_run([
+			( 'finditer', _RE_FINDITER ),
 		])
 
 
