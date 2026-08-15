@@ -1081,6 +1081,18 @@ def _emit_operand( op: ir.Operand ) -> str:
 # existing exact-string test assertions on ordinary i32 field literals)
 _WIDE_INT_STEMS: frozenset[str] = frozenset([ 'i64', 'u64', 'i128', 'u128', 'isize', 'usize' ])
 
+# i128/u128's own top-bit shift amount, as a C sizeof expression rather than
+# a hardcoded 127 - __metalpy_wideint is only 64 bits wide under MSVC's
+# fallback (see its own typedef comment), where a literal `<< 127` is UB
+# (shift amount exceeds the operand's real width). sizeof is evaluated by
+# whichever compiler actually processes the emitted C, so this always
+# matches __metalpy_wideint's REAL width (64 under MSVC, 128 under
+# gcc/clang) - the same technique isize/usize already use for their own
+# compiler-dependent width (sizeof(intptr_t)*8 - 1). Confirmed the hardcoded
+# 127 broke EVERY i128/u128 float-cast range check under MSVC, even for
+# trivially in-range values (see test_checked_cast_i128_u128_in_range).
+_WIDEINT_TOP_BIT_SHIFT = 'sizeof(__metalpy_wideint)*8 - 1'
+
 def _emit_wide_int_const( value: int, stem: str ) -> str:
 	''' a _WIDE_INT_STEMS constant, cast to its own C type. A bare C integer
 	literal token can represent at most 64 bits of magnitude (stdint.h
@@ -1305,7 +1317,12 @@ def _float_int_range_bounds( stem: str, fctype: str ) -> tuple[str,str]:
 	never `> max_expr`, the imprecise comparison this replaces. '''
 	if stem not in _FIXED_INT_BITS and stem not in ( 'isize', 'usize' ):
 		raise NotImplementedError( f'float<->int range check: unsupported target stem {stem!r}' )
-	shift = 'sizeof(intptr_t)*8 - 1' if stem in ( 'isize', 'usize' ) else str( _FIXED_INT_BITS[stem] - 1 )
+	if stem in ( 'isize', 'usize' ):
+		shift = 'sizeof(intptr_t)*8 - 1'
+	elif stem in ( 'i128', 'u128' ):
+		shift = _WIDEINT_TOP_BIT_SHIFT  # see its own comment - not a hardcoded 127
+	else:
+		shift = str( _FIXED_INT_BITS[stem] - 1 )
 	half = f'(({fctype})((__metalpy_wideuint)1 << ({shift})))' # exact 2**(n-1)
 	if _is_unsigned_stem( stem ):
 		return f'({fctype})0', f'(({fctype})2.0 * {half})' # exact 2**n
@@ -1322,8 +1339,8 @@ def _int_min_max_bit_pattern( stem: str ) -> tuple[str,str]:
 	if stem in _SATURATE_LIMITS:
 		return _SATURATE_LIMITS[stem]
 	if stem == 'i128':
-		return ( '(__metalpy_wideint)((__metalpy_wideuint)1 << 127)',
-			'(__metalpy_wideint)(((__metalpy_wideuint)1 << 127) - 1)' )
+		return ( f'(__metalpy_wideint)((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT}))',
+			f'(__metalpy_wideint)(((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT})) - 1)' )
 	if stem == 'u128':
 		return ( '(__metalpy_wideuint)0', '(~(__metalpy_wideuint)0)' )
 	raise NotImplementedError( f'no MIN/MAX for stem {stem!r}' )
@@ -1458,8 +1475,8 @@ def _signed_min_max( stem: str ) -> tuple[str,str]:
 	if stem in _SATURATE_LIMITS:
 		return _SATURATE_LIMITS[stem]
 	if stem == 'i128':
-		return ( '(__metalpy_wideint)((__metalpy_wideuint)1 << 127)',
-			'(__metalpy_wideint)(((__metalpy_wideuint)1 << 127) - 1)' )
+		return ( f'(__metalpy_wideint)((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT}))',
+			f'(__metalpy_wideint)(((__metalpy_wideuint)1 << ({_WIDEINT_TOP_BIT_SHIFT})) - 1)' )
 	raise NotImplementedError( f'no MIN/MAX for signed stem {stem!r}' )
 
 def _emit_int_division( instr ) -> list[str]:
