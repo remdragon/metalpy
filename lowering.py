@@ -279,7 +279,7 @@ class Lowering:
 				return module
 		self.discovery.fail_loc( f'no module found owning {unit.qualname} (file={unit.file})', unit.file, unit.line )
 
-	def _is_aliasing_expr( self, node: ast.expr, operand_type: Type|None = None ) -> bool:
+	def _is_aliasing_expr( self, node: ast.expr, operand: 'ir.Operand|None' = None ) -> bool:
 		# does lowering `node` hand back a reference to a value that
 		# already exists independently (needing its own Incref if it's
 		# stored into a new binding), vs a genuinely fresh value (Allocate,
@@ -326,6 +326,42 @@ class Lowering:
 		# is an ordinary aliasing read like any other RC-typed Name, and
 		# must still incref (confirmed by a real regression: `d = c` then
 		# calling both silently underreferenced the shared closure)
+		# a value that needed coercing INTO a declared union type (_coerce_
+		# into_union, called from _coerce_or_check_operand right after
+		# whichever _expr_X method above actually dispatched on `node`) is
+		# ALSO genuinely ambiguous the same way: `node` might be a plain
+		# Name/Attribute read that looks aliasing on its own, but by the
+		# time the caller sees `operand` here it's no longer that read at
+		# all - it's the FRESH return value of a synthesized union-member
+		# constructor Call (mirrors _coerce_into_union's own emission: `dest
+		# = self._new_temp(union); self._emit(ir.Call(dest=dest, ...))`),
+		# exactly the "Call is always fresh from the caller's perspective...
+		# since a well-behaved callee already accounts for that on its own
+		# side" rule this function's own docstring already states for every
+		# OTHER Call. That constructor's own body already Increfs the leaf
+		# it wraps (the same way any other constructor increfs a BORROWED
+		# RC argument it stores into a field - see cfg.py's attr_assign()) -
+		# a caller here treating the wrapped result as STILL aliasing the
+		# original `node` double-counts that Incref (confirmed by direct
+		# compile-and-run: `return b` from a Box|None-returning function,
+		# b an ordinary BORROWED parameter, left compiler.refcount(b) two
+		# higher than the caller's own new binding plus b's own local
+		# should ever account for) - and, wherever the caller's own is_alias
+		# branch also skips untrack_temp() (assign()'s is_alias=True path
+		# never untracks `src`, only the is_alias=False path does),
+		# _flush_pending_temps' later cleanup of the still-tracked union
+		# temp decrefs it a SECOND time on top of that, which can net back
+		# out to looking "correct" by sheer coincidence (two wrongs) or, in
+		# a context where only one of those two extra ops fires, silently
+		# under- or over-count for real (confirmed via generated-C
+		# inspection, not just reasoning). Checking the OPERAND actually
+		# produced (not `node`, which has no idea a coercion happened
+		# underneath it) is the only way to tell - same reasoning as the
+		# ClosureType check just above, generalized from "a bound-method
+		# ast.Attribute" to "any node a coercion silently replaced".
+		if getattr( operand, 'is_union_coerce_result', False ):
+			return False
+		operand_type = operand.type if operand is not None else None
 		if isinstance( node, ast.Attribute ) and isinstance( operand_type, ClosureType ):
 			return False
 		if isinstance( node, ast.Subscript ):
@@ -1580,7 +1616,7 @@ class FunctionLowering:
 			with self.lowering.discovery.module_context( module ):
 				with self.lowering.discovery.scope_context( cls ):
 					default_value = self._lower_expr( attr.init, attr.type )
-			for instr in self._cfg.attr_assign( attr, default_value, is_alias = self.lowering._is_aliasing_expr( attr.init, default_value.type )):
+			for instr in self._cfg.attr_assign( attr, default_value, is_alias = self.lowering._is_aliasing_expr( attr.init, default_value )):
 				self._emit( instr )
 			self._emit( ir.SetAttr( obj = self_param, attr = attr.stem, value = default_value ))
 
@@ -1863,7 +1899,7 @@ class FunctionLowering:
 		# holder of the returned value, double-counted as the SAME
 		# reference) where 3 are live once the caller's copy exists,
 		# leading to a premature free the moment either one dropped.
-		if value is not None and self.lowering._is_aliasing_expr( node.value, value.type ) and not self._cfg.has_live_entry( value ):
+		if value is not None and self.lowering._is_aliasing_expr( node.value, value ) and not self._cfg.has_live_entry( value ):
 			for instr in self._cfg.incref( value.type, value ):
 				self._emit( instr )
 		# what actually gets returned/assigned into the return-value slot
@@ -2239,7 +2275,7 @@ class FunctionLowering:
 			# own _ensure_resolved call), same as it always has.
 			if self.lowering._monomorphizer._is_concrete( var_type ):
 				var.type = self.lowering._ensure_resolved( var_type )
-			for instr in self._cfg_assign( var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type ), node = node ):
+			for instr in self._cfg_assign( var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
 				self._emit( instr )
 			self._emit( ir.Assign( dest = var, src = operand ))
 
@@ -2335,7 +2371,7 @@ class FunctionLowering:
 					self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 				self._cfg.unnarrow( target.id ) # a real reassignment invalidates whatever this name was previously narrowed to - see cfg.py's own comment
 				operand = self._lower_expr( node.value, existing.type )
-				for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type ), node = node ):
+				for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = existing, src = operand ))
 			else:
@@ -2365,7 +2401,7 @@ class FunctionLowering:
 				# the source (see cfg.py's "Independent tracking"), but a
 				# match statement genuinely IS the inspection of its subject
 				is_match_subject = getattr( node, 'is_match_subject', False )
-				is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )
+				is_alias = self.lowering._is_aliasing_expr( node.value, operand )
 				# when the subject is a bare Name (is_alias=True), the
 				# ORIGINAL name already owns a live reference for the whole
 				# (function-scoped) rest of its lifetime, so __match_subj_N
@@ -2390,7 +2426,7 @@ class FunctionLowering:
 				# self.<attr> = value, inside __init__ construction itself -
 				# tracked for definite-assignment/self-escape purposes (see
 				# RCCLASS ATTRIBUTE LIFETIME.md and cfg.attr_assign())
-				for instr in self._cfg.attr_assign( attr_var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )):
+				for instr in self._cfg.attr_assign( attr_var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand )):
 					self._emit( instr )
 			elif cfg.rc_leaves( attr_var.type ):
 				# ordinary SetAttr on an already-constructed instance -
@@ -2402,7 +2438,7 @@ class FunctionLowering:
 				# fresh here rather than consulted from any tracked state
 				old = self._new_temp( attr_var.type )
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = target.attr ))
-				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )):
+				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand )):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = target.attr, value = operand ))
 			if writeback is not None:
@@ -3938,6 +3974,12 @@ class FunctionLowering:
 			self.lowering.schedule( p.type )
 		dest = self._new_temp( union )
 		self._emit( ir.Call( dest = dest, target = ctor_fn, receiver = None, args = [ operand ], kwargs = {} ))
+		# see _is_aliasing_expr's own comment on this flag: `dest` is a
+		# fresh, already-Increfed Call result (the ctor's own body increfs
+		# the leaf it wraps), never still-aliasing whatever `node` (the
+		# original, pre-coercion expression) looked like to a caller that
+		# only has the ast around, not this operand
+		dest.is_union_coerce_result = True
 		return dest
 
 	def _expr_Name( self, node: ast.Name, expected_type: Type|None ) -> ir.Operand:
@@ -4009,7 +4051,7 @@ class FunctionLowering:
 				self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 			self._cfg.unnarrow( target.id )
 			operand = self._lower_expr( node.value, existing.type )
-			for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type ), node = node ):
+			for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
 				self._emit( instr )
 			self._emit( ir.Assign( dest = existing, src = operand ))
 			return existing
@@ -4024,7 +4066,7 @@ class FunctionLowering:
 		)
 		fn.add_name( var.stem, var )
 		self.lowering.schedule( var.type )
-		is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )
+		is_alias = self.lowering._is_aliasing_expr( node.value, operand )
 		for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = var, src = operand ))
@@ -5064,7 +5106,7 @@ class FunctionLowering:
 			# binding (Name/Attribute) does, since the tuple now
 			# independently owns a reference alongside whatever binding the
 			# element came from
-			for instr in self._cfg.field_value( value.type, value, is_alias = self.lowering._is_aliasing_expr( elt, value.type )):
+			for instr in self._cfg.field_value( value.type, value, is_alias = self.lowering._is_aliasing_expr( elt, value )):
 				self._emit( instr )
 			operands.append( value )
 		tt = self.lowering.discovery._get_or_create_tuple_type( [ op.type for op in operands ] )
@@ -5718,7 +5760,7 @@ class FunctionLowering:
 		true_val = self._lower_expr( node.body, expected_type )
 		if dest is None:
 			dest = self._new_temp( true_val.type )
-		if self.lowering._is_aliasing_expr( node.body, true_val.type ):
+		if self.lowering._is_aliasing_expr( node.body, true_val ):
 			for instr in self._cfg.incref( dest.type, true_val ):
 				self._emit( instr )
 		else:
@@ -5728,7 +5770,7 @@ class FunctionLowering:
 		# false branch
 		self._emit( ir.Label( name = else_label ))
 		false_val = self._lower_expr( node.orelse, dest.type )
-		if self.lowering._is_aliasing_expr( node.orelse, false_val.type ):
+		if self.lowering._is_aliasing_expr( node.orelse, false_val ):
 			for instr in self._cfg.incref( dest.type, false_val ):
 				self._emit( instr )
 		else:
@@ -6103,7 +6145,7 @@ class FunctionLowering:
 			# _enqueue) - value.type is always the operand's real, concrete
 			# type regardless, since only concrete values ever actually get
 			# lowered
-			for instr in self._cfg.field_value( value.type, value, is_alias = self.lowering._is_aliasing_expr( expr, value.type )):
+			for instr in self._cfg.field_value( value.type, value, is_alias = self.lowering._is_aliasing_expr( expr, value )):
 				self._emit( instr )
 			fields[name] = value
 
