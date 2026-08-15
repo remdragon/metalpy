@@ -810,6 +810,23 @@ successful full drain (`errdefer_fires_on_error_exit_only`); `defer` AND
 if-unit's own branch both rejected with a clear message, not silently
 wrong.
 
+**Follow-up fix, found in a later session while auditing gaps**: a
+`return` inside a generator's own `defer`/`errdefer` body was
+unvalidated - ordinary (non-generator) functions already reject this
+(lowering.py's `_stmt_Return`, gated on `_in_deferred_body`, set only by
+`_register_defer_block`), but a generator's own defer body never routes
+through that mechanism at all (both Mechanism 1 and Mechanism 2 lower it
+via their own separate AST-If-wrap + `_lower_stmt` technique), so
+nothing caught it. Fixed via `_reject_return_inside_generator_defer_body`
+(type_resolver.py), called right where each site's body is captured
+(`_desugar_generator_defer_sites`) - walks the WHOLE captured body
+(`_walk_generator_body`, not just the top-level statement) so a return
+nested inside an if/while inside the defer body is caught too, reusing
+the exact same error message text as the ordinary check for consistency.
+Verified via two rejection tests (`test_return_inside_generator_defer_
+body_is_rejected`, and a second confirming the nested-inside-an-if case
+specifically).
+
 Original planning notes follow, kept for historical context and for the
 phases not yet attempted (the fallible-generator sketch below predates,
 and is superseded in detail by, the Phase 4 roadmap entry just above).

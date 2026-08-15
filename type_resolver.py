@@ -350,6 +350,30 @@ class TypeResolver:
 		ast.copy_location( single_stmt, node )
 		return [ single_stmt ]
 
+	def _reject_return_inside_generator_defer_body( self, fn: Function, body_stmts: list[ast.stmt] ) -> None:
+		''' mirrors lowering.py's own _stmt_Return check for ordinary (non-
+		generator) defer/errdefer bodies ("return is not allowed inside a
+		defer/errdefer body") - that check is gated on self._in_deferred_
+		body, which never gets set here: a generator's own defer/errdefer
+		body never routes through _register_defer_block at all (Mechanism
+		1's _build_defer_replay_guards and Mechanism 2's lowering.py hook
+		both lower it via their own, separate AST-If-wrap + _lower_stmt
+		technique), so nothing catches this today without an explicit
+		check. Same reasoning applies: a generator defer body's own
+		statements run later, replayed inline at an exit point (or_
+		return() error, tail exhaustion, abandonment) - a `return` inside
+		one would jump out of $$__next__ early, skipping any later-armed
+		site's own replay and the flag-unset every replay guard relies on
+		to avoid firing twice (see _build_defer_replay_guards' own
+		docstring). Walks the WHOLE body (_walk_generator_body, not just
+		top-level statements), so a return nested inside an if/while
+		inside the defer body is caught too - same "stays set for the
+		whole capture, not just the top-level statement" posture the
+		ordinary check already documents. '''
+		for node in self._walk_generator_body( body_stmts ):
+			if isinstance( node, ast.Return ):
+				self.discovery.fail( f'{fn.qualname}: return is not allowed inside a defer/errdefer body: {ast.unparse(node)}', node )
+
 	def _desugar_generator_defer_sites( self, fn: Function ) -> list[tuple[str,bool,list[ast.stmt]]]:
 		''' Mechanism 1 (PLAN_GENERATORS.md's defer/errdefer phase) - every
 		top-level defer/errdefer site (already validated by _validate_
@@ -383,7 +407,9 @@ class TypeResolver:
 				new_body.append( stmt )
 				continue
 			flag_stem = f'__defer_armed_{len( sites )}'
-			sites.append( ( flag_stem, kind == 'errdefer', self._capture_defer_site_body( stmt )))
+			body_stmts = self._capture_defer_site_body( stmt )
+			self._reject_return_inside_generator_defer_body( fn, body_stmts )
+			sites.append( ( flag_stem, kind == 'errdefer', body_stmts ))
 			arm = ast.Assign( targets = [ self._self_attr( flag_stem, stmt ) ], value = ast.Constant( value = True ))
 			ast.copy_location( arm, stmt )
 			new_body.append( arm )

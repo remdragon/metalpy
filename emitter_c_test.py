@@ -11214,6 +11214,48 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'direct top-level statement', str( self.discovery.errors.errors[0] ))
 
+	def test_return_inside_generator_defer_body_is_rejected( self ) -> None:
+		# a return inside a generator's defer/errdefer body would jump out
+		# of $$__next__ early, skipping any later-armed site's own replay
+		# and the flag-unset every replay guard relies on to avoid firing
+		# twice - mirrors the identical, pre-existing rejection ordinary
+		# (non-generator) defer/errdefer bodies already get
+		# (lowering.py's _stmt_Return, gated on _in_deferred_body), which
+		# never fires here since a generator's own defer body never routes
+		# through _register_defer_block at all
+		self._run( '''
+def gen( count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	with defer:
+		return
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> None:
+	g = gen( 3 )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'return is not allowed inside a defer/errdefer body', str( self.discovery.errors.errors[0] ))
+
+	def test_return_inside_generator_errdefer_body_nested_in_if_is_rejected( self ) -> None:
+		# same check, errdefer instead of defer, and the return nested one
+		# level deeper (inside an if) - confirms the whole-body walk
+		# catches a nested return too, not just a direct top-level one
+		self._run( '''
+def gen( flag: bool ) -> Generator[i32,str]:
+	with errdefer:
+		if flag:
+			return
+	yield 1
+
+def main() -> None:
+	g = gen( True )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'return is not allowed inside a defer/errdefer body', str( self.discovery.errors.errors[0] ))
+
 	def test_generic_generator_referencing_own_type_param_in_body_is_rejected( self ) -> None:
 		# Phase 3's recommended interim scope (PLAN_GENERATORS.md) - a
 		# generic generator body that references its own type param
