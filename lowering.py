@@ -6181,15 +6181,18 @@ class FunctionLowering:
 		return dest
 
 	def _expr_Compare( self, node: ast.Compare, expected_type: Type|None ) -> ir.Operand:
-		# ast.In/NotIn are deliberately not handled here - `in`/`not in`
-		# need a real container protocol that doesn't exist yet, guessing
-		# would bake in the wrong semantics. ast.Is/IsNot ARE handled (see
-		# _lower_is_comparison) - identity happens to coincide with value
-		# equality for every value kind this language has today
+		# ast.Is/IsNot ARE handled (see _lower_is_comparison) - identity
+		# happens to coincide with value equality for every value kind this
+		# language has today. ast.In/NotIn ARE ALSO handled (see
+		# _lower_in_comparison) but needed their own dispatch method rather
+		# than falling through _COMP_DUNDER below - see that method's own
+		# comment for why
 		if len( node.ops ) != 1 or len( node.comparators ) != 1:
 			self.lowering.discovery.fail( f'chained comparisons are not yet supported: {ast.unparse(node)}', node )
 		if isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
 			return self._lower_is_comparison( node, negate = isinstance( node.ops[0], ast.IsNot ))
+		if isinstance( node.ops[0], ( ast.In, ast.NotIn )):
+			return self._lower_in_comparison( node, negate = isinstance( node.ops[0], ast.NotIn ))
 
 		# non-scalar left operand — try the dunder method (str.__eq__, ...)
 		left = self._lower_expr( node.left, None )
@@ -6258,6 +6261,46 @@ class FunctionLowering:
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
 		return dest
+
+	def _lower_in_comparison( self, node: ast.Compare, negate: bool ) -> ir.Operand:
+		# `x in y` / `x not in y` mean `y.__contains__(x)` (negated for
+		# NotIn) - the REVERSE of every other _COMP_DUNDER-driven comparison
+		# (==, <, ...), where the LEFT operand is always the receiver. That
+		# reversal is exactly why In/NotIn can't just be added as two more
+		# _COMP_DUNDER entries and fall through the generic left-operand
+		# dispatch above: this lowers the RIGHT operand first and dispatches
+		# on ITS type instead.
+		right = self._lower_expr( node.comparators[0], None )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if not isinstance( right.type, Scalar ):
+			method = self.lowering._find_method( right.type, '__contains__' )
+			if method is not None:
+				self.lowering._ensure_resolved( method )
+				self.lowering.schedule( method.return_type )
+				for p in ( method.parameters or [] ):
+					self.lowering.schedule( p.type )
+				param_type = method.parameters[0].type if method.parameters else None
+				left = self._lower_expr( node.left, param_type )
+				call_dest = self._new_temp( method.return_type )
+				self._emit( ir.Call( dest = call_dest, target = method, receiver = right, args = [ left ], kwargs = {} ))
+				if not negate:
+					return call_dest
+				# NotIn: negate __contains__'s plain bool result - ir.Not
+				# (same as _expr_UnaryOp's `not x`), NOT
+				# _lower_is_comparison's tagged-union-aware EQ/NE flip,
+				# which solves an unrelated problem (`is None` narrowing)
+				dest = self._new_temp( bool_cls )
+				self._emit( ir.Not( dest = dest, operand = call_dest ))
+				return dest
+		# no __contains__ on a non-scalar right operand, or a scalar right
+		# operand entirely (e.g. `x in 5`) - unlike ==, there's no sane
+		# degraded fallback (a raw pointer/value compare is never what `in`
+		# means), so this is a hard error rather than a silent Cmp fallback
+		self.lowering.discovery.fail(
+			f'{"not " if negate else ""}in requires a __contains__ method on '
+			f'{right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+			node,
+		)
 
 	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization|_ReceiverDispatch,ir.Operand|None]:
 		target = self.lowering._type_resolver._resolve_callee_target( func_node )

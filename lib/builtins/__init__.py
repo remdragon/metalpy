@@ -1392,6 +1392,11 @@ class str:
 	def __ne__( self, other: str ) -> bool:
 		return self.__cmp__( other ) != 0
 
+	# supports `sub in some_str` (see lowering.py's _lower_in_comparison) -
+	# reuses find()'s own byte-level scan rather than duplicating it
+	def __contains__( self, sub: str ) -> bool:
+		return self.find( sub ).is_ok()
+
 	def __hash__( self ) -> u64:
 		# content-based (never the pointer's own address) - two equal
 		# strings must hash equally regardless of where each one lives, or

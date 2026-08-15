@@ -1384,6 +1384,66 @@ class Tests( unittest.TestCase ):
 		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
 		self.assertTrue( any( c.op == ir.CmpOp.NE for c in cmp_instrs ))
 
+	# --- in / not in (dispatch to __contains__, receiver/arg order reversed) --
+
+	def test_in_dispatches_to_contains_with_reversed_receiver( self ) -> None:
+		# `x in y` means y.__contains__(x) - y (the RIGHT operand) is the
+		# receiver, x (the LEFT operand) is the sole argument, the reverse
+		# of every _COMP_DUNDER-driven comparison (==, <, ...)
+		code = '\n'.join([
+			'class Bag:',
+			'	def __contains__( self, value: i32 ) -> bool:',
+			'		return value == 1',
+			'',
+			'def main() -> None:',
+			'	b = Bag()',
+			'	found: bool = 1 in b',
+			'	return',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].target.stem, '__contains__' )
+		b_var = mod.get_local( 'main' ).names['b']
+		self.assertIs( calls[0].receiver, b_var )
+		self.assertEqual( len( calls[0].args ), 1 )
+		self.assertEqual( calls[0].args[0].value, 1 )
+		self.assertFalse( any( isinstance( i, ir.Not ) for i in lowered.instructions ))
+
+	def test_not_in_negates_contains_result( self ) -> None:
+		code = '\n'.join([
+			'class Bag:',
+			'	def __contains__( self, value: i32 ) -> bool:',
+			'		return value == 1',
+			'',
+			'def main() -> None:',
+			'	b = Bag()',
+			'	missing: bool = 1 not in b',
+			'	return',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].target.stem, '__contains__' )
+		not_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Not ) ]
+		self.assertEqual( len( not_instrs ), 1 )
+		self.assertIs( not_instrs[0].operand, calls[0].dest )
+
+	def test_in_without_contains_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class Bar: pass',
+			'',
+			'def main() -> None:',
+			'	b = Bar()',
+			'	found: bool = 1 in b',
+			'	return',
+		])
+		mod = self._import( code )
+		self.compiler._lower( mod.get_local( 'main' ))
+		self.assertTrue( any( '__contains__' in e for e in self.discovery.errors.errors ))
+
 	# --- boolean operators (and/or) -------------------------------------------
 
 	def test_boolop_and_shape( self ) -> None:
@@ -6644,6 +6704,35 @@ class Tests( unittest.TestCase ):
 		# the call's own dest is the union itself, not the leaf type
 		# (canonicalized asciibetically by qualname - 'bool' < 'i32')
 		self.assertEqual( call.dest.type.stem, 'intrinsics.bool|intrinsics.i32' )
+
+# --- in / not in against real builtin types --------------------------------
+
+class InOperatorRealBuiltinsTests( unittest.TestCase ):
+	''' the reversed-receiver __contains__ dispatch tests above (in the main
+	Tests class) use cheap user-defined classes under import_builtins=False.
+	str.__contains__ is a real lib/builtins/__init__.py method, so exercising
+	`x in some_str` needs the real builtins loaded - same reason
+	JoinedStrLoweringTests/WalrusOperatorTests keep their own
+	import_builtins=True setUp instead of sharing the main Tests class's. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_in_on_str_dispatches_to_str_contains( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			"	s: str = 'hello world'",
+			"	found: bool = 'world' in s",
+			'	return',
+		])
+		mod = self._import( code )
+		lowered = self.compiler._lower( mod.get_local( 'main' ))
+		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
+		self.assertTrue( any( c.target.stem == '__contains__' for c in calls ))
 
 # --- @inline (PLAN_INLINE.md) -------------------------------------------
 
