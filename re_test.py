@@ -39,7 +39,16 @@
 # real caller necessarily imports `re` from elsewhere, there's no way to
 # exercise it via a real compiled program today. findall/sub/subn/split
 # were deliberately written to not depend on it internally for exactly
-# this reason. See PLAN_RE.md for all six phases.
+# this reason.
+#
+# Phase 7: IGNORECASE (ASCII-only case-flip, both literal CHAR ops and
+# character classes), lazy quantifiers `*? +? ?? {m,n}?` (same SPLIT-
+# based compilation as their greedy counterparts, just with the two
+# targets swapped so the VM prefers fewer repeats), and named groups
+# `(?P<name>...)` - real numbered capturing groups underneath, plus a
+# name->group-number map threaded from Parser through Pattern to Match
+# for Match.group(name)/groupdict(). See PLAN_RE.md for all seven
+# phases - this is the last one on the original roadmap.
 #
 # Follows time_test.py's own template: RealCompileMixin + assert_programs_run,
 # print()-free, exit code 0 = every check passed, distinct nonzero i32 per
@@ -540,6 +549,104 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_IGNORECASE_LAZY_NAMED = '''
+import re
+
+def main() -> i32:
+	ci: re.Pattern = re.compile( 'HELLO', re.IGNORECASE ).unwrap( 'bad' )
+	if ci.fullmatch( 'hello' ).is_err():
+		return 1
+	if ci.fullmatch( 'HeLLo' ).is_err():
+		return 2
+	no_ci: re.Pattern = re.compile( 'HELLO' ).unwrap( 'bad' )
+	if no_ci.fullmatch( 'hello' ).is_ok():
+		return 3
+
+	ci_cls: re.Pattern = re.compile( '[a-f]+', re.IGNORECASE ).unwrap( 'bad' )
+	if ci_cls.fullmatch( 'ABCdef' ).is_err():
+		return 4
+	no_ci_cls: re.Pattern = re.compile( '[a-f]+' ).unwrap( 'bad' )
+	if no_ci_cls.fullmatch( 'ABCdef' ).is_ok():
+		return 5
+
+	lazy_star: re.Pattern = re.compile( '<.*?>' ).unwrap( 'bad' )
+	m: Result[re.Match, re.MatchError] = lazy_star.search( '<a><b>' )
+	if m.is_err():
+		return 6
+	g: str|None = m.unwrap( 'ok' ).group()
+	if g is None:
+		return 7
+	if g != '<a>':  # lazy: shortest match, not '<a><b>'
+		return 7
+
+	greedy_star: re.Pattern = re.compile( '<.*>' ).unwrap( 'bad' )
+	gm: Result[re.Match, re.MatchError] = greedy_star.search( '<a><b>' )
+	if gm.is_err():
+		return 8
+	gg: str|None = gm.unwrap( 'ok' ).group()
+	if gg is None:
+		return 9
+	if gg != '<a><b>':  # greedy: longest match
+		return 9
+
+	lazy_plus: re.Pattern = re.compile( 'a+?' ).unwrap( 'bad' )
+	lp: Result[re.Match, re.MatchError] = lazy_plus.search( 'aaaa' )
+	if lp.is_err():
+		return 10
+	lpg: str|None = lp.unwrap( 'ok' ).group()
+	if lpg is None:
+		return 11
+	if lpg != 'a':  # lazy +: minimal one repeat
+		return 11
+
+	lazy_opt: re.Pattern = re.compile( 'colou??r' ).unwrap( 'bad' )
+	if lazy_opt.fullmatch( 'color' ).is_err():
+		return 12
+	if lazy_opt.fullmatch( 'colour' ).is_err():
+		return 13
+
+	lazy_range: re.Pattern = re.compile( 'a{2,4}?' ).unwrap( 'bad' )
+	lr: Result[re.Match, re.MatchError] = lazy_range.search( 'aaaa' )
+	if lr.is_err():
+		return 14
+	lrg: str|None = lr.unwrap( 'ok' ).group()
+	if lrg is None:
+		return 15
+	if lrg != 'aa':  # lazy {2,4}: minimal 2 repeats
+		return 15
+
+	named: re.Pattern = re.compile( r'(?P<year>\\d{4})-(?P<month>\\d{2})' ).unwrap( 'bad' )
+	nm: Result[re.Match, re.MatchError] = named.search( '2026-08' )
+	if nm.is_err():
+		return 16
+	nmm: re.Match = nm.unwrap( 'ok' )
+	year: str|None = nmm.group( 'year' )
+	if year is None:
+		return 17
+	if year != '2026':
+		return 17
+	month: str|None = nmm.group( 'month' )
+	if month is None:
+		return 18
+	if month != '08':
+		return 18
+
+	gd: dict[str, re.GroupResult] = nmm.groupdict()
+	if len( gd ) != 2:
+		return 19
+	yr: re.GroupResult = gd.__getitem__( 'year' ).unwrap( 'ok' )
+	if yr.text != '2026':
+		return 20
+	if not yr.matched:
+		return 21
+
+	# duplicate named group is a compile error
+	dup_name: Result[re.Pattern, re.PatternError] = re.compile( r'(?P<x>a)(?P<x>b)' )
+	if dup_name.is_ok():
+		return 22
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -589,6 +696,14 @@ class RePhase6BehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_phase6_findall_sub_split( self ) -> None:
 		self.assert_programs_run([
 			( 'findall_sub_split', _RE_FINDALL_SUB_SPLIT ),
+		])
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase7BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def test_phase7_ignorecase_lazy_named( self ) -> None:
+		self.assert_programs_run([
+			( 'ignorecase_lazy_named', _RE_IGNORECASE_LAZY_NAMED ),
 		])
 
 

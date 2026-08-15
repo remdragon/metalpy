@@ -242,6 +242,18 @@ class CharClass:
 			return not found
 		return found
 
+	def contains_ci( self, cp: u32 ) -> bool:
+		''' IGNORECASE membership: cp itself, or its ASCII case-flip, either
+		matching - handles [a-z]/[A-Z]/[a-zA-Z] alike without needing to
+		fold the stored ranges themselves. ASCII-only, consistent with
+		this engine's existing \\w/\\d/\\s ASCII-only stance. '''
+		if self.contains( cp ):
+			return True
+		flipped: u32 = _case_flip_ascii( cp )
+		if flipped != cp:
+			return self.contains( flipped )
+		return False
+
 
 # ---------------------------------------------------------------------------
 # Fragment helpers — every grammar rule below builds and returns its OWN
@@ -350,6 +362,61 @@ def _quantify_range( atom: list[Op], m: usize, n: usize, unbounded: bool ) -> li
 	return out
 
 
+def _quantify_star_lazy( atom: list[Op] ) -> list[Op]:
+	# lazy e*?: same shape as greedy e* but with the SPLIT's two targets
+	# swapped - target_a (tried first) skips the loop, target_b (tried
+	# only on backtrack) enters it, so the VM prefers "as few repeats as
+	# possible" instead of "as many as possible".
+	out: list[Op] = list[Op]()
+	_append_fragment( out, _single_op_fragment( _op_split( 0, 0 )))
+	_append_fragment( out, atom )
+	_append_fragment( out, _single_op_fragment( _op_jump( 0 )))
+	with compiler.wrap_arithmetic:
+		jump_idx: usize = 1 + len( atom )
+	split_op: Op = out.__getitem__( 0 ).unwrap( 're: quantify_star_lazy patch split' )
+	split_op.target_a = len( out )
+	split_op.target_b = 1
+	jump_op: Op = out.__getitem__( jump_idx ).unwrap( 're: quantify_star_lazy patch jump' )
+	jump_op.target_a = 0
+	return out
+
+def _quantify_plus_lazy( atom: list[Op] ) -> list[Op]:
+	# lazy e+? == e (still mandatory) followed by e*?
+	out: list[Op] = list[Op]()
+	_append_fragment( out, atom )
+	_append_fragment( out, _quantify_star_lazy( atom ))
+	return out
+
+def _quantify_optional_lazy( atom: list[Op] ) -> list[Op]:
+	# lazy e??: SPLIT targets swapped vs greedy e? - skip tried first.
+	out: list[Op] = list[Op]()
+	_append_fragment( out, _single_op_fragment( _op_split( 0, 0 )))
+	_append_fragment( out, atom )
+	split_op: Op = out.__getitem__( 0 ).unwrap( 're: quantify_optional_lazy patch' )
+	split_op.target_a = len( out )
+	split_op.target_b = 1
+	return out
+
+def _quantify_range_lazy( atom: list[Op], m: usize, n: usize, unbounded: bool ) -> list[Op]:
+	# {m,n}?: m mandatory copies (no choice involved, same as greedy),
+	# then the lazy variant of the remaining repetition.
+	out: list[Op] = list[Op]()
+	i: usize = 0
+	while i < m:
+		_append_fragment( out, atom )
+		with compiler.wrap_arithmetic:
+			i += 1
+	if unbounded:
+		_append_fragment( out, _quantify_star_lazy( atom ))
+	else:
+		i = m
+		while i < n:
+			_append_fragment( out, _quantify_optional_lazy( atom ))
+			with compiler.wrap_arithmetic:
+				i += 1
+	return out
+
+
 # ---------------------------------------------------------------------------
 # Parser — a one-pass recursive-descent compiler straight to Op fragments
 # (no separate AST layer). Each parse_* method returns Result[list[Op],
@@ -384,6 +451,7 @@ class Parser:
 	pos: usize
 	next_slot: usize
 	classes: list[CharClass]
+	group_names: dict[str, usize]  # (?P<name>...) -> group number
 
 	def __init__( self, text: str ) -> None:
 		self.text = text
@@ -391,6 +459,7 @@ class Parser:
 		self.pos = 0
 		self.next_slot = 2  # 0/1 are reserved for the whole match's own span
 		self.classes = list[CharClass]()
+		self.group_names = dict[str, usize]()
 
 	def _at_end( self ) -> bool:
 		return self.pos >= self.text_len
@@ -472,16 +541,38 @@ class Parser:
 		b: u8 = self._peek_byte()
 		if b == _BYTE_STAR:
 			self._advance_byte()
+			if self._consume_lazy_marker():
+				return Result.Ok( _quantify_star_lazy( atom ))
 			return Result.Ok( _quantify_star( atom ))
 		if b == _BYTE_PLUS:
 			self._advance_byte()
+			if self._consume_lazy_marker():
+				return Result.Ok( _quantify_plus_lazy( atom ))
 			return Result.Ok( _quantify_plus( atom ))
 		if b == _BYTE_QUESTION:
 			self._advance_byte()
+			if self._consume_lazy_marker():
+				return Result.Ok( _quantify_optional_lazy( atom ))
 			return Result.Ok( _quantify_optional( atom ))
 		if b == _BYTE_LBRACE:
 			return self._parse_brace_quantifier( atom )
 		return Result.Ok( atom )
+
+	def _consume_lazy_marker( self ) -> bool:
+		''' the trailing `?` that makes a quantifier lazy (`*?` `+?` `??`
+		`{m,n}?`) rather than greedy - a plain, unconsumed `?` right after
+		one of those is otherwise meaningless (Python rejects it as
+		"multiple repeat" too), so treating it as this marker whenever it
+		appears is unambiguous. '''
+		if not self._at_end() and self._peek_byte() == _BYTE_QUESTION:
+			self._advance_byte()
+			return True
+		return False
+
+	def _finish_quantify_range( self, atom: list[Op], m: usize, n: usize, unbounded: bool ) -> list[Op]:
+		if self._consume_lazy_marker():
+			return _quantify_range_lazy( atom, m, n, unbounded )
+		return _quantify_range( atom, m, n, unbounded )
 
 	def _parse_brace_quantifier( self, atom: list[Op] ) -> Result[list[Op], PatternError]:
 		save_pos: usize = self.pos
@@ -500,13 +591,13 @@ class Parser:
 			return Result.Ok( atom )
 		if not self._at_end() and self._peek_byte() == _BYTE_RBRACE:
 			self._advance_byte()
-			return Result.Ok( _quantify_range( atom, m, m, False ))
+			return Result.Ok( self._finish_quantify_range( atom, m, m, False ))
 		if self._at_end() or self._peek_byte() != _BYTE_COMMA:
 			return Result.Err( PatternError( 're: malformed {m,n} quantifier' ))
 		self._advance_byte()  # consume ','
 		if not self._at_end() and self._peek_byte() == _BYTE_RBRACE:
 			self._advance_byte()
-			return Result.Ok( _quantify_range( atom, m, 0, True ))
+			return Result.Ok( self._finish_quantify_range( atom, m, 0, True ))
 		n: usize = 0
 		have_n: bool = False
 		while not self._at_end() and self._is_digit_byte( self._peek_byte()):
@@ -519,7 +610,7 @@ class Parser:
 		self._advance_byte()
 		if n < m:
 			return Result.Err( PatternError( 're: {m,n} quantifier with n < m' ))
-		return Result.Ok( _quantify_range( atom, m, n, False ))
+		return Result.Ok( self._finish_quantify_range( atom, m, n, False ))
 
 	def _is_digit_byte( self, b: u8 ) -> bool:
 		return b >= 48 and b <= 57
@@ -558,6 +649,7 @@ class Parser:
 		is_lookahead: bool = False
 		is_lookbehind: bool = False
 		negate_lookaround: bool = False
+		group_name: str = ''  # '' means unnamed - empty names are rejected below, so this doubles as "no name"
 		if not self._at_end() and self._peek_byte() == _BYTE_QUESTION_MARK:
 			self._advance_byte()  # consume '?'
 			if self._at_end():
@@ -575,6 +667,22 @@ class Parser:
 				capturing = False
 				is_lookahead = True
 				negate_lookaround = True
+			elif qb == 80:  # 'P' -> (?P<name>...) named capturing group
+				self._advance_byte()  # consume 'P'
+				if self._at_end() or self._peek_byte() != 60:  # '<'
+					return Result.Err( PatternError( 're: unsupported group syntax (only (?P<name>...) is recognized after (?P)' ))
+				self._advance_byte()  # consume '<'
+				name_start: usize = self.pos
+				while not self._at_end() and self._peek_byte() != 62:  # '>'
+					self._advance_byte()
+				if self._at_end():
+					return Result.Err( PatternError( 're: unterminated (?P<name>...) group name' ))
+				group_name = _substr( self.text, name_start, self.pos )
+				if group_name == '':
+					return Result.Err( PatternError( 're: empty group name in (?P<...>...)' ))
+				self._advance_byte()  # consume '>'
+				# capturing stays True - falls through to ordinary slot
+				# allocation below, same as a bare (...)
 			elif qb == 60:  # '<' -> (?<=...)/(?<!...) lookbehind (Python has no bare (?<name>...))
 				self._advance_byte()
 				if self._at_end():
@@ -592,7 +700,7 @@ class Parser:
 				else:
 					return Result.Err( PatternError( 're: unsupported group syntax (only (?<=...)/(?<!...) lookbehind recognized after (?<)' ))
 			else:
-				return Result.Err( PatternError( 're: unsupported group syntax (recognized: (?:...) (?=...) (?!...) (?<=...) (?<!...))' ))
+				return Result.Err( PatternError( 're: unsupported group syntax (recognized: (?:...) (?=...) (?!...) (?<=...) (?<!...) (?P<name>...))' ))
 		start_slot: usize = 0
 		end_slot: usize = 0
 		if capturing:
@@ -607,6 +715,12 @@ class Parser:
 			with compiler.wrap_arithmetic:
 				end_slot = start_slot + 1
 				self.next_slot = start_slot + 2
+			if group_name != '':
+				if self.group_names.__getitem__( group_name ).is_ok():
+					return Result.Err( PatternError( 're: redefinition of group name ' + group_name ))
+				with compiler.panic_arithmetic( 're: _parse_group: unreachable (start_slot always even, >= 2)' ):
+					group_index: usize = start_slot // 2
+				self.group_names.__setitem__( group_name, group_index )
 		inner: list[Op] = self.parse_alt().or_return()
 		if self._at_end() or self._peek_byte() != _BYTE_RPAREN:
 			return Result.Err( PatternError( 're: unbalanced parenthesis' ))
@@ -845,6 +959,21 @@ def _is_word_byte_cp( cp: u32 ) -> bool:
 		return True
 	return False
 
+def _case_flip_ascii( cp: u32 ) -> u32:
+	''' the opposite-case ASCII letter, or cp unchanged if cp isn't an
+	ASCII letter at all - used for IGNORECASE (Matcher's CHAR comparison
+	and CharClass.contains_ci). ASCII-only, consistent with this engine's
+	existing \\w/\\d/\\s ASCII-only stance - not the full-Unicode case
+	folding lib/case_folding.py/builtins.case_map_one can do, which would
+	be inconsistent with that stance rather than more correct. '''
+	if cp >= 97 and cp <= 122:   # 'a'-'z'
+		with compiler.wrap_arithmetic:
+			return cp - 32
+	if cp >= 65 and cp <= 90:    # 'A'-'Z'
+		with compiler.wrap_arithmetic:
+			return cp + 32
+	return cp
+
 
 def _class_fixed_byte_width( cls: CharClass ) -> usize|None:
 	''' the single UTF-8 byte width every codepoint this class can match
@@ -1060,7 +1189,15 @@ class Matcher:
 			matched: bool = True
 
 			if op.kind == OpKind.CHAR:
-				if sp < self.text_len and self._codepoint_at( sp ) == op.ch:
+				ignorecase: bool = ( self.flags & IGNORECASE ) != 0
+				char_ok: bool = False
+				if sp < self.text_len:
+					cp_here: u32 = self._codepoint_at( sp )
+					if cp_here == op.ch:
+						char_ok = True
+					elif ignorecase and _case_flip_ascii( cp_here ) == op.ch:
+						char_ok = True
+				if char_ok:
 					with compiler.wrap_arithmetic:
 						sp += self._codepoint_width_at( sp )
 				else:
@@ -1075,7 +1212,11 @@ class Matcher:
 			elif op.kind == OpKind.IN:
 				if sp < self.text_len:
 					cc: CharClass = self.classes.__getitem__( op.class_idx ).unwrap( 're: run_at class_idx' )
-					if cc.contains( self._codepoint_at( sp )):
+					cp_in: u32 = self._codepoint_at( sp )
+					in_ok: bool = cc.contains( cp_in )
+					if not in_ok and ( self.flags & IGNORECASE ) != 0:
+						in_ok = cc.contains_ci( cp_in )
+					if in_ok:
 						with compiler.wrap_arithmetic:
 							sp += self._codepoint_width_at( sp )
 					else:
@@ -1222,11 +1363,13 @@ class Match:
 	__source: str
 	__slot_values: list[usize]
 	__slot_set: list[bool]
+	__group_names: dict[str, usize]
 
-	def __init__( self, source: str, slot_values: list[usize], slot_set: list[bool] ) -> None:
+	def __init__( self, source: str, slot_values: list[usize], slot_set: list[bool], group_names: dict[str, usize] ) -> None:
 		self.__source = source
 		self.__slot_values = slot_values
 		self.__slot_set = slot_set
+		self.__group_names = group_names
 
 	def group( self, n: usize = 0 ) -> str|None:
 		with compiler.panic_arithmetic( 're: Match.group: group index overflow' ):
@@ -1237,6 +1380,33 @@ class Match:
 		lo: usize = self.__slot_values.__getitem__( lo_slot ).unwrap( 're: Match.group slot' )
 		hi: usize = self.__slot_values.__getitem__( hi_slot ).unwrap( 're: Match.group slot' )
 		return _substr( self.__source, lo, hi )
+
+	def group( self, name: str ) -> str|None:
+		''' overload resolved by argument type - group() with no args
+		still picks the usize overload above (it's the only one with a
+		default), group('name') picks this one. Panics on an unknown
+		group name - a hardcoded name that doesn't exist in the compiled
+		pattern is a programmer error, same posture as an out-of-range
+		numeric group index above. '''
+		idx_result: Result[usize, KeyError] = self.__group_names.__getitem__( name )
+		idx: usize = idx_result.unwrap( 're: Match.group: unknown group name' )
+		return self.group( idx )
+
+	def groupdict( self ) -> dict[str, GroupResult]:
+		out: dict[str, GroupResult] = dict[str, GroupResult]()
+		count: usize = len( self.__group_names )
+		i: usize = 0
+		while i < count:
+			name: str = self.__group_names.key_at( i ).unwrap( 're: Match.groupdict key' )
+			idx: usize = self.__group_names.value_at( i ).unwrap( 're: Match.groupdict value' )
+			g: str|None = self.group( idx )
+			if g is None:
+				out.__setitem__( name, GroupResult( '', False ))
+			else:
+				out.__setitem__( name, GroupResult( g, True ))
+			with compiler.wrap_arithmetic:
+				i += 1
+		return out
 
 	def groups( self ) -> list[GroupResult]:
 		out: list[GroupResult] = list[GroupResult]()
@@ -1286,12 +1456,14 @@ class Pattern:
 	__classes: list[CharClass]
 	__n_slots: usize
 	__flags: u32
+	__group_names: dict[str, usize]
 
-	def __init__( self, ops: list[Op], classes: list[CharClass], n_slots: usize, flags: u32 ) -> None:
+	def __init__( self, ops: list[Op], classes: list[CharClass], n_slots: usize, flags: u32, group_names: dict[str, usize] ) -> None:
 		self.__ops = ops
 		self.__classes = classes
 		self.__n_slots = n_slots
 		self.__flags = flags
+		self.__group_names = group_names
 
 	@staticmethod
 	def compile( pattern: str, flags: u32 = 0 ) -> Result[Pattern, PatternError]:
@@ -1306,7 +1478,7 @@ class Pattern:
 		tail.append( _op_save( 1 )).unwrap( 're: compile tail' )
 		tail.append( _op_match()).unwrap( 're: compile tail' )
 		_append_fragment( prog, tail )
-		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags ))
+		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags, parser.group_names ))
 
 	def search( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Result[Match, MatchError]:
 		return self._search_from( s, 0, max_steps )
@@ -1325,7 +1497,7 @@ class Pattern:
 			outcome: Result[Frame, MatchError] = matcher.run_at( pos, self.__n_slots )
 			match outcome:
 				case Result.Ok( frame ):
-					return Result.Ok( Match( s, frame.slot_values, frame.slot_set ))
+					return Result.Ok( Match( s, frame.slot_values, frame.slot_set, self.__group_names ))
 				case Result.Err( e ):
 					if e == MatchError.StepLimitExceeded:
 						return Result.Err( e )
@@ -1339,7 +1511,7 @@ class Pattern:
 		outcome: Result[Frame, MatchError] = matcher.run_at( 0, self.__n_slots )
 		match outcome:
 			case Result.Ok( frame ):
-				return Result.Ok( Match( s, frame.slot_values, frame.slot_set ))
+				return Result.Ok( Match( s, frame.slot_values, frame.slot_set, self.__group_names ))
 			case Result.Err( e ):
 				return Result.Err( e )
 
