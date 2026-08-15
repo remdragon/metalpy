@@ -521,11 +521,14 @@ Verification (early-return/defer/or_return addition):
   statement early-exits via `.or_return()` on an `Err` receiver, called
   from `main()` with real code after the call site that must still run
   and correctly observe the propagated `Err`.
-- Full python tests.py green (1029 passing) under clang (the default);
-  spot-checked under MSVC too (`METALPY_CC=msvc`) - both new real-compile
-  tests pass there as well, after the two MSVC-only bugs above were found
-  and fixed this way. gcc unavailable in this environment to check
-  directly. (A handful of unrelated MSVC-only failures were also observed
+- Full python tests.py green (1035 passing, post-merge) under clang (the
+  default), MSVC (`METALPY_CC=msvc`), and gcc 14.2.0 (via WSL -
+  `wsl bash -lc "cd /mnt/c/cvs/metalpy && METALPY_CC=gcc python3 tests.py"`,
+  see `linker_c_validate_all_compilers.md` memory - gcc isn't on native
+  PATH here, but is reachable through WSL, don't infer "unavailable" from
+  a native-shell check alone). Both new real-compile tests pass on all
+  three, after the two MSVC-only bugs above were found and fixed this
+  way. (A handful of unrelated MSVC-only failures were also observed
   in this worktree under `METALPY_CC=msvc python tests.py` - confirmed
   pre-existing and already fixed on master by other, concurrent work that
   landed after this worktree branched, not a regression from this pass -
