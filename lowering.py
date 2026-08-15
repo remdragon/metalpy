@@ -1204,6 +1204,20 @@ class FunctionLowering:
 		# by object identity - see _lower_inline_call's own comment).
 		self._inlining_stack: list[int] = []
 		self._inline_binding_id = 0
+		# set (briefly, restored in a finally) only around lowering a
+		# multi-statement @inline body's own PRE-RETURN statements (see
+		# _splice_multi_statement_inline_body) - an .or_return()/checked-
+		# arithmetic early exit reached from one of those statements would
+		# otherwise jump to the CALLER's own real epilogue mid-splice
+		# (self._current_fn is briefly the caller during that window too),
+		# silently skipping the rest of the splice AND the rest of the
+		# caller's own subsequent statements - _consume_checked_result
+		# checks this and fails clearly instead. The trailing return-
+		# expression itself is lowered with this already restored to
+		# False, unaffected - nothing of the splice remains after it to
+		# skip past, so jumping to the caller's own epilogue is correct
+		# there, exactly as it always has been.
+		self._in_inline_splice_prelude = False
 
 	def run( self ) -> list[ir.Instruction]:
 		fn = self._current_fn
@@ -5073,6 +5087,30 @@ class FunctionLowering:
 		# check_dest is sometimes a real, named Variable (or_return()'s own
 		# receiver) and sometimes a bare Temp (checked arithmetic, __len__/
 		# __getitem__'s auto-unwrap) - isinstance covers both uniformly
+		if self._in_inline_splice_prelude:
+			# PLAN_INLINE.md multi-statement generalization: a pre-return
+			# statement of a spliced @inline body reached an early-exit-
+			# shaped construct (.or_return(), checked arithmetic under the
+			# default Check mode, or the __len__/__getitem__ auto-consume
+			# path) - left unguarded, the OrReturn/OrJump path below would
+			# jump to the CALLER's own real epilogue (self._current_fn is
+			# briefly the caller during this window too - see
+			# _splice_multi_statement_inline_body's own comment), silently
+			# skipping the rest of THIS splice AND the rest of the
+			# caller's own subsequent statements whenever the caller
+			# happens to also satisfy the Result-return shape - a real
+			# correctness bug, not just an unsupported case, if left
+			# unchecked. The trailing return-EXPRESSION itself never sets
+			# this flag (restored to False before it's lowered), so it's
+			# unaffected - nothing of the splice remains after it to skip
+			# past there, so jumping to the caller's own epilogue is
+			# already correct, exactly as the single-statement case
+			# already relies on
+			self.lowering.discovery.fail(
+				f'@inline: .or_return()/checked arithmetic that could propagate an error is not yet supported before the '
+				f'final return of a multi-statement body: {ast.unparse(node)}',
+				node,
+			)
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
 			if isinstance( check_dest, Variable ):
@@ -6238,16 +6276,16 @@ class FunctionLowering:
 		return args, kwargs
 
 	def _lower_inline_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
-		# PLAN_INLINE.md - target.is_inline: splice target's own single
-		# `return <expr>` body directly here instead of ever emitting a
-		# real ir.Call. `args`/`kwargs` are already-lowered operands (the
-		# caller already ran _lower_call_args, or the interleaved generic
-		# lower_and_unify - same move-hook/argument-lowering either way,
-		# only the tail differs). target may be a plain Function, OR an
-		# already-monomorphized one (target.node was deep-copied per
-		# Specialization by monomorphize.py - see its own docstring), so
-		# target.node.body is always safe to read directly here regardless
-		# of which caller reached this
+		# PLAN_INLINE.md, generalized for multi-statement bodies - target.
+		# is_inline: splice target's own body directly here instead of
+		# ever emitting a real ir.Call. `args`/`kwargs` are already-lowered
+		# operands (the caller already ran _lower_call_args, or the
+		# interleaved generic lower_and_unify - same move-hook/argument-
+		# lowering either way, only the tail differs). target may be a
+		# plain Function, OR an already-monomorphized one (target.node was
+		# deep-copied per Specialization by monomorphize.py - see its own
+		# docstring), so target.node.body is always safe to read directly
+		# here regardless of which caller reached this
 		if id( target ) in self._inlining_stack:
 			self.lowering.discovery.fail(
 				f'@inline {target.qualname}: recursive inlining (directly or through another @inline function) is not supported: {ast.unparse(node)}',
@@ -6256,61 +6294,201 @@ class FunctionLowering:
 		if not want_result and cfg.is_result_type( target.return_type ):
 			# same discard check the ordinary call tails already apply -
 			# discovery.py's _is_inline_eligible_body already guarantees
-			# target.node.body is exactly one `return <expr>`, so this can't
-			# be sidestepped by inlining instead of calling for real
+			# target.node.body ends in exactly one `return <expr>`, so this
+			# can't be sidestepped by inlining instead of calling for real
 			self.lowering.discovery.fail(
 				f'{target.qualname}(...) returns a Result that is discarded here - '
 				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
 				node,
 			)
+		stmts = target.node.body
+		if stmts and isinstance( stmts[0], ast.Expr ) and isinstance( stmts[0].value, ast.Constant ) and isinstance( stmts[0].value.value, str ):
+			stmts = stmts[1:] # strip a leading docstring, same shape discovery.py's _is_inline_eligible_body already validated
+		# the reentrancy guard wraps the WHOLE call - both branches below,
+		# not just the single-expression case's own return-expression -
+		# so a recursive @inline call reached from a pre-return statement
+		# in the multi-statement path is caught identically
+		self._inlining_stack.append( id( target ))
+		try:
+			if len( stmts ) > 1:
+				return self._splice_multi_statement_inline_body( node, target, receiver, args, kwargs, expected_type, want_result, stmts )
+
+			bindings: dict[str,ir.Operand] = {} if receiver is None else { 'self': receiver }
+			for i, param in enumerate( target.parameters or [] ):
+				bindings[param.stem] = args[i] if i < len( args ) else kwargs[param.stem]
+
+			# each binding becomes a REAL local Variable, registered under its
+			# ordinary name ('self', a parameter's own stem) directly into
+			# target.names - not just an _expr_Name-level shortcut - because
+			# discovery.find_name is reached from more than one place while
+			# lowering a Call (e.g. _try_resolve_namespace, used by the
+			# construction-call recognizers to probe whether `self.foo(...)`
+			# might be construction sugar, BEFORE ordinary attribute/method
+			# resolution ever runs) - anything less than a real registry entry
+			# left those other paths seeing an unresolved 'self'/param name
+			# (confirmed by a real repro, not just reasoning: self.__len__()
+			# inside an inlined body failed exactly this way, from inside a
+			# construction-sugar probe, not from _expr_Name at all).
+			#
+			# the Variable's own .stem (what emitter_c.py actually declares as
+			# a C local, keyed by NAME not by object identity - see its own
+			# "declared" set) is deliberately NOT 'self'/the parameter's own
+			# stem - reusing those would silently collide with and overwrite
+			# the ENCLOSING function's own real `self`/parameter of the same
+			# name the moment one method's @inline body gets spliced into
+			# another method's own body. _inline_binding_id makes every
+			# splice's own bindings unique instead.
+			#
+			# no _cfg_assign/incref here, deliberately - this must behave
+			# exactly like an ordinary (non-@move) function parameter already
+			# does at a REAL call boundary: borrowed, no incref at the
+			# boundary, no independent decref responsibility (the caller's own
+			# argument operand keeps whatever cleanup it already had, e.g. an
+			# argument Temp's own DeleteTemp - untouched by any of this). A
+			# bare ir.Assign against a fresh Variable is exactly that: a named
+			# alias for the call's own duration, nothing more.
+			#
+			# when the operand is ALREADY a Variable (by far the common case -
+			# a bare-name receiver/argument, e.g. b.get_len()/some_result.
+			# is_ok()), it's registered directly, no fresh copy and no Assign
+			# at all - true zero overhead, and what makes the "compiles
+			# identically to writing the callee's body directly at the call
+			# site" guarantee exact, not just "close". Only a genuinely
+			# computed operand (a Temp from a sub-expression like make_box().
+			# get_len(), or a Const) needs the synthesized-local fallback -
+			# both to give it a referenceable name at all (Temp/Const aren't
+			# Name subtypes, discovery.find_name's registry requires one - see
+			# above) and to guarantee it's evaluated exactly once even if the
+			# spliced body references self/that parameter more than once
+			saved: dict[str,object] = {}
+			for stem, operand in bindings.items():
+				if isinstance( operand, Variable ):
+					fresh = operand
+				else:
+					fresh = Variable(
+						stem = f'$inline{self._inline_binding_id}${stem}',
+						qualname = f'{target.qualname}$$inline{self._inline_binding_id}${stem}',
+						file = target.file, line = target.line,
+						type = operand.type,
+					)
+					self._inline_binding_id += 1
+					self._emit( ir.Assign( dest = fresh, src = operand ))
+				saved[stem] = target.names.get( stem )
+				target.names[stem] = fresh
+
+			return_expr = stmts[-1].value
+			module = self.lowering._find_module_for( target )
+			try:
+				with self.lowering.discovery.module_context( module ):
+					with self.lowering.discovery.scope_context( target ):
+						result = self._lower_expr( return_expr, expected_type or target.return_type )
+			finally:
+				for stem, old in saved.items():
+					if old is None:
+						target.names.pop( stem, None )
+					else:
+						target.names[stem] = old
+			return result if want_result else None
+		finally:
+			self._inlining_stack.pop()
+
+	def _splice_multi_statement_inline_body( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, stmts: list[ast.stmt] ) -> ir.Operand|None:
+		# PLAN_INLINE.md multi-statement generalization - target's own
+		# body (already docstring-stripped by _lower_inline_call, the only
+		# caller) has more than the single `return <expr>` statement the
+		# original @inline design handled. discovery.py's _is_inline_
+		# eligible_body already guarantees `stmts` ends in exactly one,
+		# un-nested `return <expr>`, no other Return anywhere else in it,
+		# no defer/errdefer, and no reassignment of self/a parameter
+		# anywhere among the pre-return statements - this method doesn't
+		# re-check any of that. The reentrancy guard was already pushed by
+		# _lower_inline_call, covering this whole splice.
 		bindings: dict[str,ir.Operand] = {} if receiver is None else { 'self': receiver }
 		for i, param in enumerate( target.parameters or [] ):
 			bindings[param.stem] = args[i] if i < len( args ) else kwargs[param.stem]
 
-		# each binding becomes a REAL local Variable, registered under its
-		# ordinary name ('self', a parameter's own stem) directly into
-		# target.names - not just an _expr_Name-level shortcut - because
-		# discovery.find_name is reached from more than one place while
-		# lowering a Call (e.g. _try_resolve_namespace, used by the
-		# construction-call recognizers to probe whether `self.foo(...)`
-		# might be construction sugar, BEFORE ordinary attribute/method
-		# resolution ever runs) - anything less than a real registry entry
-		# left those other paths seeing an unresolved 'self'/param name
-		# (confirmed by a real repro, not just reasoning: self.__len__()
-		# inside an inlined body failed exactly this way, from inside a
-		# construction-sugar probe, not from _expr_Name at all).
-		#
-		# the Variable's own .stem (what emitter_c.py actually declares as
-		# a C local, keyed by NAME not by object identity - see its own
-		# "declared" set) is deliberately NOT 'self'/the parameter's own
-		# stem - reusing those would silently collide with and overwrite
-		# the ENCLOSING function's own real `self`/parameter of the same
-		# name the moment one method's @inline body gets spliced into
-		# another method's own body. _inline_binding_id makes every
-		# splice's own bindings unique instead.
-		#
-		# no _cfg_assign/incref here, deliberately - this must behave
-		# exactly like an ordinary (non-@move) function parameter already
-		# does at a REAL call boundary: borrowed, no incref at the
-		# boundary, no independent decref responsibility (the caller's own
-		# argument operand keeps whatever cleanup it already had, e.g. an
-		# argument Temp's own DeleteTemp - untouched by any of this). A
-		# bare ir.Assign against a fresh Variable is exactly that: a named
-		# alias for the call's own duration, nothing more.
-		#
-		# when the operand is ALREADY a Variable (by far the common case -
-		# a bare-name receiver/argument, e.g. b.get_len()/some_result.
-		# is_ok()), it's registered directly, no fresh copy and no Assign
-		# at all - true zero overhead, and what makes the "compiles
-		# identically to writing the callee's body directly at the call
-		# site" guarantee exact, not just "close". Only a genuinely
-		# computed operand (a Temp from a sub-expression like make_box().
-		# get_len(), or a Const) needs the synthesized-local fallback -
-		# both to give it a referenceable name at all (Temp/Const aren't
-		# Name subtypes, discovery.find_name's registry requires one - see
-		# above) and to guarantee it's evaluated exactly once even if the
-		# spliced body references self/that parameter more than once
-		saved: dict[str,object] = {}
+		# a fresh, per-call-site provisional Function - independent deep-
+		# copied .node, independent .names dict, never touching `target`
+		# itself (unlike the single-statement path's target.names
+		# monkeypatch above - no save/restore needed anywhere in this
+		# path, provisional is single-use, discarded once this call
+		# returns). type_params=[]/args=[] is a no-op substitution: target
+		# is already type-parameter-free by the time it reaches here
+		# regardless of whether it was originally generic (monomorphize.py
+		# already did that substitution before _lower_inline_call was ever
+		# reached - see PLAN_RETURN_INFERENCE.md/monomorphize_function)
+		provisional = self.lowering._monomorphizer._build_monomorphized_function( target, [], [], target.qualname )
+
+		# run BEFORE alpha-renaming: match-statement desugaring (rewrite 2
+		# - there is no _stmt_Match anywhere in this file, so a match
+		# statement in a spliced body can only ever lower after this runs)
+		# needs to see the ORIGINAL names (the alpha-renamer below only
+		# understands plain ast.Name, never match-pattern capture shapes);
+		# generic-call tagging (rewrite 3) is genuinely per-copy already -
+		# needed for a nested generic call inside the pre-return
+		# statements to resolve against THIS call site's own bindings, not
+		# some other call site's
+		self.lowering._type_resolver.resolve_function_body( provisional )
+
+		provisional_stmts = provisional.node.body
+		if provisional_stmts and isinstance( provisional_stmts[0], ast.Expr ) and isinstance( provisional_stmts[0].value, ast.Constant ) and isinstance( provisional_stmts[0].value.value, str ):
+			provisional_stmts = provisional_stmts[1:]
+		pre_return_stmts = provisional_stmts[:-1]
+		return_stmt = provisional_stmts[-1]
+
+		# alpha-rename every local the pre-return statements themselves
+		# declare (a Store-context Name that isn't already self/a
+		# parameter - those are bound via the names-dict substitution
+		# below instead, never renamed here, since that mechanism still
+		# keys off the literal original name) to a fresh, globally-unique
+		# name, reusing the same $inline{id}$stem convention self/param
+		# bindings already use (so the two can never collide). No
+		# shadowing subtlety needed: this language has no block scoping
+		# (cfg.py's own docstring: "structural, not a reference scan"),
+		# and a nested def/lambda's own free variables are already
+		# rejected elsewhere (PLAN_LAMBDA.md) - a flat, uniform rename
+		# across every occurrence, Store and Load alike, is exactly
+		# correct here, not an approximation. In-place mutation of ast.
+		# Name.id suffices (no NodeTransformer needed) since provisional.
+		# node is already a private, freshly-deep-copied-per-call-site
+		# object - this only ever changes a string field, never
+		# restructures the tree
+		fl = self
+		rename_map: dict[str,str] = {}
+		class _LocalCollector( ast.NodeVisitor ):
+			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+				pass
+			def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+				pass
+			def visit_Lambda( self, lam: ast.Lambda ) -> None:
+				pass
+			def visit_Name( self, n: ast.Name ) -> None:
+				if isinstance( n.ctx, ast.Store ) and n.id not in bindings and n.id not in rename_map:
+					rename_map[n.id] = f'$inline{fl._inline_binding_id}${n.id}'
+					fl._inline_binding_id += 1
+		collector = _LocalCollector()
+		for stmt in pre_return_stmts:
+			collector.visit( stmt )
+
+		if rename_map:
+			class _LocalRenamer( ast.NodeVisitor ):
+				def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+					pass
+				def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+					pass
+				def visit_Lambda( self, lam: ast.Lambda ) -> None:
+					pass
+				def visit_Name( self, n: ast.Name ) -> None:
+					if n.id in rename_map:
+						n.id = rename_map[n.id]
+			renamer = _LocalRenamer()
+			for stmt in pre_return_stmts:
+				renamer.visit( stmt )
+			renamer.visit( return_stmt ) # a later pre-return statement, or the return-expression itself, may reference an earlier pre-return-declared local
+
+		# bind self/params into the PROVISIONAL's own names dict - same
+		# logic the single-statement path above uses for target.names,
+		# just no save/restore needed (provisional is single-use)
 		for stem, operand in bindings.items():
 			if isinstance( operand, Variable ):
 				fresh = operand
@@ -6323,27 +6501,62 @@ class FunctionLowering:
 				)
 				self._inline_binding_id += 1
 				self._emit( ir.Assign( dest = fresh, src = operand ))
-			saved[stem] = target.names.get( stem )
-			target.names[stem] = fresh
+			provisional.names[stem] = fresh
 
-		# discovery.py's _is_inline_eligible_body already guaranteed
-		# target.node.body is exactly one `return <expr>`, optionally
-		# preceded by a docstring - the Return is always the LAST statement
-		# either way, so no need to re-strip the docstring here
-		return_expr = target.node.body[-1].value
 		module = self.lowering._find_module_for( target )
-		self._inlining_stack.append( id( target ))
-		try:
-			with self.lowering.discovery.module_context( module ):
-				with self.lowering.discovery.scope_context( target ):
-					result = self._lower_expr( return_expr, expected_type or target.return_type )
-		finally:
-			self._inlining_stack.pop()
-			for stem, old in saved.items():
-				if old is None:
-					target.names.pop( stem, None )
-				else:
-					target.names[stem] = old
+		with self.lowering.discovery.module_context( module ):
+			with self.lowering.discovery.scope_context( provisional ):
+				# the ONE place self._current_fn is ever reassigned in this
+				# file - narrowly scoped to this window, restored in a
+				# finally. Needed because _stmt_AnnAssign/_stmt_Assign's
+				# fresh-declaration branch registers a new local into
+				# self._current_fn (see their own code) while their
+				# "already exists?" check instead goes through discovery.
+				# find_name_or_none (walking discovery.scope_stack, which
+				# module_context/scope_context above already point at
+				# `provisional`) - without this reassignment those two
+				# would disagree: a pre-return local would silently
+				# register into the CALLER's own namespace (self._current_
+				# fn, unless reassigned, stays whatever the caller's own
+				# top-level function is - confirmed by grep, it's assigned
+				# exactly once, in __init__, and never touched anywhere
+				# else in this file), corrupting any later caller-side
+				# reference to a same-named local; and reassigning that
+				# same pre-return local a second time within the SAME
+				# spliced body would fail to find its own first
+				# registration, creating a second, independent binding
+				# instead of a replace (a silent decref/leak, not just a
+				# cosmetic issue - cfg.py's own fresh-vs-replace machinery
+				# depends on finding the SAME Variable object both times).
+				# Making self._current_fn and the active scope_context
+				# point at the same `provisional` object for this whole
+				# window fixes both at once.
+				outer_fn = self._current_fn
+				outer_prelude = self._in_inline_splice_prelude
+				self._current_fn = provisional
+				self._in_inline_splice_prelude = True
+				try:
+					for stmt in pre_return_stmts:
+						# mirrors FunctionLowering.run()'s own identical
+						# per-statement recovery boundary - one bad
+						# statement doesn't stop the rest of this splice
+						# from being lowered (and error-collected)
+						try:
+							self._lower_stmt( stmt )
+						except CompileError:
+							continue
+				finally:
+					self._current_fn = outer_fn
+					self._in_inline_splice_prelude = outer_prelude
+				# self._current_fn/._in_inline_splice_prelude are both
+				# restored to the REAL caller before lowering the trailing
+				# return-expression - its own .or_return()/checked-
+				# arithmetic behavior is therefore unchanged from the
+				# single-statement case (validates and jumps against the
+				# CALLER's own epilogue/return type, exactly as already
+				# tested), while scope_context(provisional) stays active
+				# so it can still resolve pre-return-declared locals
+				result = self._lower_expr( return_stmt.value, expected_type or target.return_type )
 		return result if want_result else None
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:

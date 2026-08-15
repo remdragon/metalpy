@@ -1001,6 +1001,153 @@ class Foo:
 		self.assertIn( 'cannot also be @abstractmethod', self.discovery.errors.errors[0] )
 		self.assertNotIn( 'cannot also be @virtual', self.discovery.errors.errors[0] )
 
+	def test_inline_multistatement_body_accepted( self ) -> None:
+		# the multi-statement generalization: locals/branches before a
+		# single, final, un-nested return
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		y: i32 = x
+		if y == 0:
+			y = 1
+		return y
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_return_nested_in_if_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			return 0
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'no other `return` anywhere else', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_return_not_last_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		return x
+		y: i32 = 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'no other `return` anywhere else', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_bare_return_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self ) -> i32:
+		y: i32 = 1
+		return
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_defer_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		with defer:
+			pass
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'defer/errdefer cannot appear', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_errdefer_call_form_rejected( self ) -> None:
+		# the OTHER recognized spelling, `errdefer(...)` as a bare call
+		# statement, not just `with defer:`
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		errdefer( x )
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'defer/errdefer cannot appear', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_defer_nested_in_if_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			with defer:
+				pass
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'defer/errdefer cannot appear', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_self_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self ) -> i32:
+		self = self
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_parameter_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		x = x + 1
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_parameter_nested_in_if_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			x = 1
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_own_local_accepted( self ) -> None:
+		# unlike self/a parameter, reassigning a local the BODY ITSELF
+		# declared is fine - only self/params are restricted (they might
+		# alias the caller's own argument; a fresh local never does)
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		y: i32 = x
+		y = y + 1
+		return y
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_virtual_with_second_plain_signature_is_a_compile_error( self ) -> None:
 		# NOT just the already-rejected @virtual+@overload-on-the-SAME-def
 		# combo - metalpy also allows multiple PLAIN (non-@overload) defs
