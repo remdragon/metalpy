@@ -110,6 +110,8 @@ class OpKind:
 	JUMP = 6    # unconditional jump to target_a
 	SAVE = 7    # record the current string position into capture slot `slot`
 	MATCH = 8   # whole pattern matched
+	WORDB = 9   # `\b` - zero-width word boundary
+	NWORDB = 10 # `\B` - zero-width NOT-a-word-boundary
 
 
 class Op:
@@ -147,6 +149,12 @@ def _op_bol() -> Op:
 
 def _op_eol() -> Op:
 	return Op( OpKind.EOL )
+
+def _op_wordb() -> Op:
+	return Op( OpKind.WORDB )
+
+def _op_nwordb() -> Op:
+	return Op( OpKind.NWORDB )
 
 def _op_split( a: usize, b: usize ) -> Op:
 	op = Op( OpKind.SPLIT )
@@ -548,6 +556,16 @@ class Parser:
 			idx: usize = len( self.classes )
 			self.classes.append( cc ).unwrap( 're: register shorthand class' )
 			return Result.Ok( _single_op_fragment( _op_in( idx )))
+		if b == 98:  # 'b' - zero-width word boundary (outside a class; \b
+			self._advance_byte()  # inside a class means backspace instead - see _class_member_cp)
+			return Result.Ok( _single_op_fragment( _op_wordb()))
+		if b == 66:  # 'B' - zero-width NOT-a-word-boundary
+			self._advance_byte()
+			return Result.Ok( _single_op_fragment( _op_nwordb()))
+		common: u32|None = _common_escape_cp( b )
+		if common is not None:
+			self._advance_byte()
+			return Result.Ok( _single_op_fragment( _op_char( common )))
 		# anything else escaped is a literal codepoint (covers `\. \\ \* \+`
 		# and friends the same way real regex engines treat "no special
 		# meaning for this escape" - as the literal character itself).
@@ -610,7 +628,49 @@ class Parser:
 			self._advance_byte()
 			if self._at_end():
 				return Result.Err( PatternError( 're: dangling backslash in character class' ))
+			b: u8 = self._peek_byte()
+			if b == 98:  # 'b' inside a class means backspace (0x08), unlike
+				self._advance_byte()  # outside a class where it's a word boundary
+				return Result.Ok( u32( 8 ))
+			common: u32|None = _common_escape_cp( b )
+			if common is not None:
+				self._advance_byte()
+				return Result.Ok( common )
 		return Result.Ok( self._decode_cp())
+
+
+def _common_escape_cp( b: u8 ) -> u32|None:
+	''' the handful of backslash escapes whose meaning is the same inside
+	and outside a character class (unlike \\b, which is a word-boundary
+	assertion outside a class but a literal backspace inside one - see
+	Parser._parse_escape_atom/_class_member_cp's own separate \\b handling). '''
+	# each return goes through a locally-typed variable, not a bare integer
+	# literal - a bare literal return into a T|None union position fails
+	# to compile here the same way a bare @enum member did in Result.Err
+	# (see the compiler-bug investigation task); an annotated local sidesteps
+	# it the same way.
+	if b == 110:  # 'n'
+		cp_n: u32 = 10
+		return cp_n
+	if b == 116:  # 't'
+		cp_t: u32 = 9
+		return cp_t
+	if b == 114:  # 'r'
+		cp_r: u32 = 13
+		return cp_r
+	if b == 102:  # 'f'
+		cp_f: u32 = 12
+		return cp_f
+	if b == 118:  # 'v'
+		cp_v: u32 = 11
+		return cp_v
+	if b == 97:   # 'a' (bell)
+		cp_a: u32 = 7
+		return cp_a
+	if b == 48:   # '0' (NUL)
+		cp_nul: u32 = 0
+		return cp_nul
+	return None
 
 
 def _digit_class( negate: bool ) -> CharClass:
@@ -631,6 +691,20 @@ def _space_class( negate: bool ) -> CharClass:
 	cc.add_range( 32, 32 )  # ' '
 	cc.add_range( 9, 13 )   # '\t'..'\r' (tab, newline, vtab, formfeed, cr)
 	return cc
+
+def _is_word_byte_cp( cp: u32 ) -> bool:
+	# same ASCII-only membership as _word_class(False), as a plain
+	# predicate - used by \b/\B, which run once per VM step and shouldn't
+	# allocate a fresh CharClass every time.
+	if cp >= 48 and cp <= 57:    # '0'-'9'
+		return True
+	if cp >= 65 and cp <= 90:    # 'A'-'Z'
+		return True
+	if cp >= 97 and cp <= 122:   # 'a'-'z'
+		return True
+	if cp == 95:                 # '_'
+		return True
+	return False
 
 
 # ---------------------------------------------------------------------------
@@ -682,14 +756,16 @@ class Matcher:
 	text_len: usize
 	max_steps: usize
 	steps: usize
+	flags: u32
 
-	def __init__( self, ops: list[Op], classes: list[CharClass], text: str, max_steps: usize ) -> None:
+	def __init__( self, ops: list[Op], classes: list[CharClass], text: str, max_steps: usize, flags: u32 ) -> None:
 		self.ops = ops
 		self.classes = classes
 		self.text = text
 		self.text_len = text.byte_len()
 		self.max_steps = max_steps
 		self.steps = 0
+		self.flags = flags
 
 	def _codepoint_at( self, pos: usize ) -> u32:
 		width: usize = 0
@@ -699,6 +775,25 @@ class Matcher:
 		width: usize = 0
 		builtins.decode_utf8_at( self.text.get_cstr(), pos, compiler.addrof( width ))
 		return width
+
+	def _is_word_boundary( self, sp: usize ) -> bool:
+		before: bool = False
+		after: bool = False
+		if sp > 0:
+			# the raw byte immediately before sp is a word BYTE iff the
+			# preceding codepoint was itself that single ASCII word char -
+			# \w is ASCII-only in this engine (see _word_class), and any
+			# multi-byte UTF-8 codepoint's own last byte is always >= 0x80,
+			# which never collides with an ASCII word-char byte value, so
+			# no separate "decode the previous codepoint" step is needed.
+			with compiler.panic_arithmetic( 're: _is_word_boundary: sp > 0 checked above' ):
+				prev_pos: usize = sp - 1
+			prev_byte: u8 = self.text.get_cstr()[ prev_pos ]
+			with compiler.wrap_arithmetic:
+				before = _is_word_byte_cp( u32( prev_byte ))
+		if sp < self.text_len:
+			after = _is_word_byte_cp( self._codepoint_at( sp ))
+		return before != after
 
 	def run_at( self, start_pos: usize, n_slots: usize ) -> Result[Frame, MatchError]:
 		''' attempts an anchored match beginning exactly at start_pos.
@@ -733,7 +828,8 @@ class Matcher:
 				else:
 					matched = False
 			elif op.kind == OpKind.ANY:
-				if sp < self.text_len and self._codepoint_at( sp ) != 10:  # '\n'
+				dotall: bool = ( self.flags & DOTALL ) != 0
+				if sp < self.text_len and ( dotall or self._codepoint_at( sp ) != 10 ):  # '\n'
 					with compiler.wrap_arithmetic:
 						sp += self._codepoint_width_at( sp )
 				else:
@@ -750,8 +846,18 @@ class Matcher:
 					matched = False
 			elif op.kind == OpKind.BOL:
 				matched = sp == 0
+				if not matched and ( self.flags & MULTILINE ) != 0 and sp > 0:
+					with compiler.panic_arithmetic( 're: run_at BOL: sp > 0 checked above' ):
+						prev_pos: usize = sp - 1
+					matched = self.text.get_cstr()[ prev_pos ] == 10  # '\n'
 			elif op.kind == OpKind.EOL:
 				matched = sp == self.text_len
+				if not matched and ( self.flags & MULTILINE ) != 0 and sp < self.text_len:
+					matched = self.text.get_cstr()[ sp ] == 10  # '\n'
+			elif op.kind == OpKind.WORDB:
+				matched = self._is_word_boundary( sp )
+			elif op.kind == OpKind.NWORDB:
+				matched = not self._is_word_boundary( sp )
 			elif op.kind == OpKind.SPLIT:
 				frame = Frame( op.target_b, sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ))
 				stack.append( frame ).unwrap( 're: run_at push split frame' )
@@ -883,11 +989,13 @@ class Pattern:
 	__ops: list[Op]
 	__classes: list[CharClass]
 	__n_slots: usize
+	__flags: u32
 
-	def __init__( self, ops: list[Op], classes: list[CharClass], n_slots: usize ) -> None:
+	def __init__( self, ops: list[Op], classes: list[CharClass], n_slots: usize, flags: u32 ) -> None:
 		self.__ops = ops
 		self.__classes = classes
 		self.__n_slots = n_slots
+		self.__flags = flags
 
 	@staticmethod
 	def compile( pattern: str, flags: u32 = 0 ) -> Result[Pattern, PatternError]:
@@ -902,10 +1010,10 @@ class Pattern:
 		tail.append( _op_save( 1 )).unwrap( 're: compile tail' )
 		tail.append( _op_match()).unwrap( 're: compile tail' )
 		_append_fragment( prog, tail )
-		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot ))
+		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags ))
 
 	def search( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Result[Match, MatchError]:
-		matcher = Matcher( self.__ops, self.__classes, s, max_steps )
+		matcher = Matcher( self.__ops, self.__classes, s, max_steps, self.__flags )
 		slen: usize = s.byte_len()
 		pos: usize = 0
 		while True:
@@ -923,7 +1031,7 @@ class Pattern:
 				pos += matcher._codepoint_width_at( pos )
 
 	def match( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Result[Match, MatchError]:
-		matcher = Matcher( self.__ops, self.__classes, s, max_steps )
+		matcher = Matcher( self.__ops, self.__classes, s, max_steps, self.__flags )
 		outcome: Result[Frame, MatchError] = matcher.run_at( 0, self.__n_slots )
 		match outcome:
 			case Result.Ok( frame ):

@@ -7,7 +7,13 @@
 #
 # Phase 2: numbered capturing groups - bare `(...)` now allocates a real
 # slot pair (see Parser._parse_group), Match.group(n)/groups()/start(n)/
-# end(n) beyond the whole match (group 0). See PLAN_RE.md for both.
+# end(n) beyond the whole match (group 0).
+#
+# Phase 3: `\b`/`\B` word-boundary assertions, a common backslash-escape
+# table (\n \t \r \f \v \a \0, shared between atom and character-class
+# parsing except `\b`, which is a word boundary outside a class but a
+# literal backspace inside one), and the MULTILINE/DOTALL flags. See
+# PLAN_RE.md for all three phases.
 #
 # Follows time_test.py's own template: RealCompileMixin + assert_programs_run,
 # print()-free, exit code 0 = every check passed, distinct nonzero i32 per
@@ -293,6 +299,60 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_WORD_BOUNDARIES_ESCAPES_AND_FLAGS = '''
+import re
+
+def main() -> i32:
+	wb: re.Pattern = re.compile( r'\\bcat\\b' ).unwrap( 'bad' )
+	if wb.search( 'the cat sat' ).is_err():
+		return 1
+	if wb.search( 'concatenate' ).is_ok():
+		return 2
+
+	nwb: re.Pattern = re.compile( r'\\Bcat\\B' ).unwrap( 'bad' )
+	if nwb.search( 'concatenate' ).is_err():
+		return 3
+	if nwb.search( 'the cat sat' ).is_ok():
+		return 4
+
+	ml: re.Pattern = re.compile( '^b', re.MULTILINE ).unwrap( 'bad' )
+	m: Result[re.Match, re.MatchError] = ml.search( 'a\\nb\\nc' )
+	if m.is_err():
+		return 5
+	mstart: usize|None = m.unwrap( 'ok' ).start()
+	if mstart is None:
+		return 6
+	if mstart != 2:
+		return 6
+
+	no_ml: re.Pattern = re.compile( '^b' ).unwrap( 'bad' )
+	if no_ml.search( 'a\\nb\\nc' ).is_ok():
+		return 7
+
+	dotall: re.Pattern = re.compile( 'a.c', re.DOTALL ).unwrap( 'bad' )
+	if dotall.fullmatch( 'a\\nc' ).is_err():
+		return 8
+
+	no_dotall: re.Pattern = re.compile( 'a.c' ).unwrap( 'bad' )
+	if no_dotall.fullmatch( 'a\\nc' ).is_ok():
+		return 9
+
+	esc: re.Pattern = re.compile( 'a\\\\tb\\\\nc' ).unwrap( 'bad' )
+	if esc.fullmatch( 'a\\tb\\nc' ).is_err():
+		return 10
+
+	# multiline + dotall combined via bitwise OR
+	both: re.Pattern = re.compile( '^a.c$', re.MULTILINE | re.DOTALL ).unwrap( 'bad' )
+	if both.search( 'x\\na\\nc\\ny' ).is_err():
+		return 11
+
+	# common escapes inside a character class
+	cls_esc: re.Pattern = re.compile( '[\\\\t\\\\n]+' ).unwrap( 'bad' )
+	if cls_esc.fullmatch( '\\t\\n\\t' ).is_err():
+		return 12
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -310,6 +370,14 @@ class RePhase2BehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_phase2_capturing_groups( self ) -> None:
 		self.assert_programs_run([
 			( 'capturing_groups', _RE_CAPTURING_GROUPS ),
+		])
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase3BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def test_phase3_boundaries_escapes_and_flags( self ) -> None:
+		self.assert_programs_run([
+			( 'word_boundaries_escapes_and_flags', _RE_WORD_BOUNDARIES_ESCAPES_AND_FLAGS ),
 		])
 
 
