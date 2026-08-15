@@ -1,4 +1,5 @@
 # stdlib imports
+import hashlib
 import logging
 from pathlib import Path
 import tempfile
@@ -2369,6 +2370,63 @@ def get_error() -> i32:
 		fn = mod.get_local( 'get_error' )
 		self.assertIsInstance( fn, Function )
 		self.assertNotIsInstance( fn, Overload )
+		self.assertEqual( fn.node.body[0].value.value, 1 )
+
+	def test_torn_cache_file_is_re_probed_not_read_as_a_negative( self ) -> None:
+		''' a half-written has_symbol cache entry must be treated as a MISS,
+		not as "symbol unavailable".
+
+		Deterministic stand-in for a real, rare suite failure: the two
+		mutually-exclusive definitions below BOTH survived discovery, producing
+		an Overload where exactly one Function was expected. They are separate
+		has_symbol() calls with no in-process memo between them, so when a
+		concurrent shard rewrote the shared disk cache between the two probes,
+		one read True and the other read '' -> False, and `available != negate`
+		then admitted BOTH. tests.py runs 16 shards as concurrent subprocesses
+		over one cache dir, which is why the suite is where it showed up.
+
+		Reproduced here by emptying the cache file between the two probes
+		rather than by racing for it - same observable state, no timing luck.
+		Writes are atomic now (linker_c.atomic_write_cache), so this state can
+		only come from an older build, but the reader has to tolerate it. '''
+		import linker_c
+		cc = linker_c.detect_cc()
+		if cc is None:
+			self.skipTest( 'no C compiler to probe with' )
+		lib, symbol = test_support.KNOWN_LIB, test_support.KNOWN_SYMBOL
+		key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
+		cache_file = Path( tempfile.gettempdir() ) / 'metalpy' / 'has_symbol' / key
+
+		real_has_symbol = linker_c.has_symbol
+		calls = [ 0 ]
+		def torn_between_probes( *args, **kwargs ):
+			result = real_has_symbol( *args, **kwargs )
+			# leave the cache in the exact mid-write state (exists, empty) that
+			# the next probe would observe
+			calls[0] += 1
+			if calls[0] == 1 and cache_file.is_file():
+				cache_file.write_text( '' )
+			return result
+
+		linker_c.has_symbol = torn_between_probes
+		try:
+			disco, mod = self._import( f'''
+@compiler.target( has_library = ( '{lib}', '{symbol}' ))
+def get_error() -> i32:
+	return 1
+
+@compiler.target( has_library = not ( '{lib}', '{symbol}' ))
+def get_error() -> i32:
+	return 2
+''' )
+		finally:
+			linker_c.has_symbol = real_has_symbol
+			cache_file.unlink( missing_ok = True ) # never leave the torn file for other tests
+
+		self.assertGreaterEqual( calls[0], 2, 'both decorators should have probed' )
+		fn = mod.get_local( 'get_error' )
+		self.assertNotIsInstance( fn, Overload ) # the observed failure
+		self.assertIsInstance( fn, Function )
 		self.assertEqual( fn.node.body[0].value.value, 1 )
 
 	def test_malformed_value_is_a_compile_error( self ) -> None:
