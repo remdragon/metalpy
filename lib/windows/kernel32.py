@@ -15,10 +15,8 @@ class SYSTEMTIME:
 	# wYear == 0 in a *Date field below means "yearly recurring rule" (wDay
 	# is then 1-5, the Nth occurrence of wDayOfWeek in wMonth, 5 = last) -
 	# see windows/zoneinfo_rules.py's own rule-interpretation comment. Used
-	# standalone (GetSystemTime-style callers would construct one directly);
-	# DynamicTimeZoneInformation/TIME_ZONE_INFORMATION below do NOT nest this
-	# type by value - see their own comment for why (a real emitter bug,
-	# reported separately - task_421ed8be).
+	# standalone (GetSystemTime-style callers construct one directly) AND
+	# nested by value as StandardDate/DaylightDate below.
 	wYear: u16 = 0
 	wMonth: u16 = 0
 	wDayOfWeek: u16 = 0
@@ -49,16 +47,13 @@ class SYSTEMTIME:
 # args - a real @cstruct requires every field to be given explicitly
 # otherwise.
 #
-# StandardDate/DaylightDate are SYSTEMTIME's own 8 fields, INLINED
-# (StandardDate_wYear, ...) rather than nested as a SYSTEMTIME-typed field -
-# nesting a small cstruct by value inside a struct this large, in an
-# imported module, hits a real emitter bug (confirmed directly this
-# session: a real clang "incomplete type" compile error - the topological
-# sort in emitter_c.py's _emit_value_type_bodies() doesn't always detect
-# the by-value dependency correctly at this size/module-boundary
-# combination - reported separately, task_421ed8be). Inlining sidesteps it
-# entirely; SYSTEMTIME itself is kept as a real standalone type above for
-# other callers.
+# StandardDate/DaylightDate nest SYSTEMTIME by value directly - a small
+# cstruct nested by value inside a large cross-module cstruct used to hit a
+# real emitter bug here (a by-value-embedded field type reachable only
+# through the containing struct never got scheduled for compilation at all -
+# confirmed directly via a real clang "incomplete type" error, worked around
+# at the time by inlining SYSTEMTIME's 8 fields by hand; fixed upstream
+# since - task_421ed8be).
 #
 # StandardName/DaylightName's own content is never read anywhere in this
 # codebase (only TimeZoneKeyName is) - they still need real, individually-
@@ -111,14 +106,7 @@ class DynamicTimeZoneInformation:
 	StandardName_29: u16 = 0
 	StandardName_30: u16 = 0
 	StandardName_31: u16 = 0
-	StandardDate_wYear: u16 = 0
-	StandardDate_wMonth: u16 = 0
-	StandardDate_wDayOfWeek: u16 = 0
-	StandardDate_wDay: u16 = 0
-	StandardDate_wHour: u16 = 0
-	StandardDate_wMinute: u16 = 0
-	StandardDate_wSecond: u16 = 0
-	StandardDate_wMilliseconds: u16 = 0
+	StandardDate: SYSTEMTIME = SYSTEMTIME()
 	StandardBias: i32 = 0
 	DaylightName_0: u16 = 0
 	DaylightName_1: u16 = 0
@@ -152,14 +140,7 @@ class DynamicTimeZoneInformation:
 	DaylightName_29: u16 = 0
 	DaylightName_30: u16 = 0
 	DaylightName_31: u16 = 0
-	DaylightDate_wYear: u16 = 0
-	DaylightDate_wMonth: u16 = 0
-	DaylightDate_wDayOfWeek: u16 = 0
-	DaylightDate_wDay: u16 = 0
-	DaylightDate_wHour: u16 = 0
-	DaylightDate_wMinute: u16 = 0
-	DaylightDate_wSecond: u16 = 0
-	DaylightDate_wMilliseconds: u16 = 0
+	DaylightDate: SYSTEMTIME = SYSTEMTIME()
 	DaylightBias: i32 = 0
 	TimeZoneKeyName_0: u16 = 0
 	TimeZoneKeyName_1: u16 = 0
@@ -301,9 +282,8 @@ _TZKEYNAME_OFFSET: usize = 172  # see DynamicTimeZoneInformation's own comment
 # TIME_ZONE_INFORMATION (timezoneapi.h) - same leading layout as
 # DynamicTimeZoneInformation above, just without TimeZoneKeyName/
 # DynamicDaylightTimeDisabled. This is GetTimeZoneInformationForYear's own
-# [out] parameter type - StandardDate/DaylightDate are SYSTEMTIME's fields
-# inlined (same reasoning as DynamicTimeZoneInformation above) and read
-# directly as ordinary field access (tzi.StandardDate_wMonth, etc.) - no
+# [out] parameter type - StandardDate/DaylightDate are read directly as
+# ordinary nested-struct field access (tzi.StandardDate.wMonth, etc.) - no
 # addrof/offset trick needed there, unlike TimeZoneKeyName above, since
 # these are real scalar reads, not "get a contiguous buffer" reads. See
 # windows/zoneinfo_rules.py for how the recurring-rule encoding in these two
@@ -343,14 +323,7 @@ class TIME_ZONE_INFORMATION:
 	StandardName_29: u16 = 0
 	StandardName_30: u16 = 0
 	StandardName_31: u16 = 0
-	StandardDate_wYear: u16 = 0
-	StandardDate_wMonth: u16 = 0
-	StandardDate_wDayOfWeek: u16 = 0
-	StandardDate_wDay: u16 = 0
-	StandardDate_wHour: u16 = 0
-	StandardDate_wMinute: u16 = 0
-	StandardDate_wSecond: u16 = 0
-	StandardDate_wMilliseconds: u16 = 0
+	StandardDate: SYSTEMTIME = SYSTEMTIME()
 	StandardBias: i32 = 0
 	DaylightName_0: u16 = 0
 	DaylightName_1: u16 = 0
@@ -384,14 +357,7 @@ class TIME_ZONE_INFORMATION:
 	DaylightName_29: u16 = 0
 	DaylightName_30: u16 = 0
 	DaylightName_31: u16 = 0
-	DaylightDate_wYear: u16 = 0
-	DaylightDate_wMonth: u16 = 0
-	DaylightDate_wDayOfWeek: u16 = 0
-	DaylightDate_wDay: u16 = 0
-	DaylightDate_wHour: u16 = 0
-	DaylightDate_wMinute: u16 = 0
-	DaylightDate_wSecond: u16 = 0
-	DaylightDate_wMilliseconds: u16 = 0
+	DaylightDate: SYSTEMTIME = SYSTEMTIME()
 	DaylightBias: i32 = 0
 
 

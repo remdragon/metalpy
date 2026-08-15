@@ -270,17 +270,17 @@ def _rules_for_year( tzi_raw: Ptr[u8], year: i32 ) -> _YearRules:
 	std_rule: TTInfo = TTInfo( utcoffset = std_offset, is_dst = False, abbr = 'STD' )
 	dst_rule: TTInfo = TTInfo( utcoffset = dst_offset, is_dst = True, abbr = 'DST' )
 
-	std_month: u16 = tzi_ptr.StandardDate_wMonth
+	std_month: u16 = tzi_ptr.StandardDate.wMonth
 	if std_month == 0:
 		return _YearRules( has_dst = False, std_rule = std_rule, dst_rule = dst_rule, to_dst_epoch = 0, to_std_epoch = 0 )
 
 	with compiler.wrap_arithmetic:
-		dst_month: i32 = i32( tzi_ptr.DaylightDate_wMonth )
-		dst_dow: i32 = i32( tzi_ptr.DaylightDate_wDayOfWeek )
-		dst_nth: i32 = i32( tzi_ptr.DaylightDate_wDay )
-		dst_hour: i32 = i32( tzi_ptr.DaylightDate_wHour )
-		dst_minute: i32 = i32( tzi_ptr.DaylightDate_wMinute )
-		dst_second: i32 = i32( tzi_ptr.DaylightDate_wSecond )
+		dst_month: i32 = i32( tzi_ptr.DaylightDate.wMonth )
+		dst_dow: i32 = i32( tzi_ptr.DaylightDate.wDayOfWeek )
+		dst_nth: i32 = i32( tzi_ptr.DaylightDate.wDay )
+		dst_hour: i32 = i32( tzi_ptr.DaylightDate.wHour )
+		dst_minute: i32 = i32( tzi_ptr.DaylightDate.wMinute )
+		dst_second: i32 = i32( tzi_ptr.DaylightDate.wSecond )
 	# DaylightDate (std->dst transition): the local wall-clock reading just
 	# before this instant is still in STANDARD time, so subtract the
 	# STANDARD utcoffset to recover true UTC.
@@ -289,12 +289,12 @@ def _rules_for_year( tzi_raw: Ptr[u8], year: i32 ) -> _YearRules:
 		to_dst_epoch: i64 = dst_local - i64( std_offset )
 
 	with compiler.wrap_arithmetic:
-		std_month_i32: i32 = i32( tzi_ptr.StandardDate_wMonth )
-		std_dow: i32 = i32( tzi_ptr.StandardDate_wDayOfWeek )
-		std_nth: i32 = i32( tzi_ptr.StandardDate_wDay )
-		std_hour: i32 = i32( tzi_ptr.StandardDate_wHour )
-		std_minute: i32 = i32( tzi_ptr.StandardDate_wMinute )
-		std_second: i32 = i32( tzi_ptr.StandardDate_wSecond )
+		std_month_i32: i32 = i32( tzi_ptr.StandardDate.wMonth )
+		std_dow: i32 = i32( tzi_ptr.StandardDate.wDayOfWeek )
+		std_nth: i32 = i32( tzi_ptr.StandardDate.wDay )
+		std_hour: i32 = i32( tzi_ptr.StandardDate.wHour )
+		std_minute: i32 = i32( tzi_ptr.StandardDate.wMinute )
+		std_second: i32 = i32( tzi_ptr.StandardDate.wSecond )
 	# StandardDate (dst->std transition): local wall-clock just before this
 	# one is still in DAYLIGHT time, so subtract the DAYLIGHT utcoffset.
 	std_local: i64 = _nth_weekday_epoch_seconds( year, std_month_i32, std_dow, std_nth, std_hour, std_minute, std_second )
