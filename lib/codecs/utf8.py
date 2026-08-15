@@ -1,7 +1,7 @@
 import sys
 from . import Codec, CodecError
 
-class utf8( Codec ):
+class Utf8( Codec ):
 	@virtual
 	def names( self ) -> list[str]:
 		return [ 'utf8', 'utf-8', 'UTF8', 'UTF-8' ]
@@ -33,3 +33,14 @@ class utf8( Codec ):
 		sys.memcpy( new_buf, b.get_const_ptr(), length )
 		new_buf[length] = 0
 		return str._from_owned_cstr( new_buf, buf_size )
+
+# Utf8 is stateless (no __init__, no fields) - one shared instance is safe
+# and avoids constructing a fresh one at every default-parameter-value site
+# (lib/posix/fs.py's readlink, bytes.decode/bytearray.decode/str.encode's
+# own codec: Codec = utf8 defaults, lib/codecs/__init__.py's _build_registry).
+# Deliberately named the SAME as the old class identifier: every existing
+# bare `utf8` reference (imports, defaults, utf8.decode(self)-shaped calls)
+# keeps working completely unchanged now that it resolves to a real
+# instance instead of the class - only call sites that explicitly try to
+# CONSTRUCT it (utf8()) need to change, since it's no longer callable.
+utf8: Utf8 = Utf8()

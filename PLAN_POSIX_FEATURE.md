@@ -204,11 +204,13 @@ Verification
 
 STATUS: DONE - walrus and slice syntax both landed, and the investigation
 kept going several layers deeper than originally scoped, fixing a real
-double-free along the way. Full history below; `python tests.py` green
-throughout (final count: 1007/1007), confirmed via 12 consecutive full-suite
-runs after the deepest fix (a real double-free is exactly the kind of bug
-that only shows up intermittently under load - a single clean run doesn't
-prove it's gone).
+double-free along the way. Every item this doc originally deferred was
+later closed out too (round 5, below), plus one new safety rule and a
+second real, previously-unknown crash bug. Full history below; `python
+tests.py` green throughout (final count: 1070/1070), confirmed via 12
+consecutive full-suite runs after round 3's own double-free fix (a real
+double-free is exactly the kind of bug that only shows up intermittently
+under load - a single clean run doesn't prove it's gone).
 
 **Round 1 - the two features themselves.** `lowering.py`'s `_expr_NamedExpr`
 (walrus) and `_lower_slice_subscript`/`bytearray._byte_slice` (slice syntax,
@@ -304,13 +306,59 @@ doesn't exist on Windows; the identical snippet compiles cleanly under the
 default (Windows) `active_target`. Out of scope - would need a real Linux
 sysroot/cross-toolchain, not a code fix.
 
-**Still deferred, out of scope, unchanged by any of this**: the original 3
-items (`errors.py:1`'s stray import, `fs.py:12`'s `utf8`-class-not-instance,
-the `_lower_call_args` module-context misattribution bug), plus 3 more found
-along the way (`str.from_cstr(move(b))`'s own separate overload-resolution
-gap - `move(...)` sugar isn't recognized during *overload* matching,
-already flagged in `TODO.txt`; `ascii`/`cp437`/`latin1`'s own dormant
-`get_ptr()`-on-`bytes` bug in their `decode()` bodies; the plain-`if`
-narrowing gap from round 1). `lib/posix/time.py` compiling fully clean on
-this host needs all of these plus a real POSIX cross-toolchain - a
-substantially bigger undertaking than this doc's own original scope.
+**Round 5 - every item this doc had deferred, now closed out**, plus one new
+safety rule (per a separate, later plan - `~/.claude/plans/scope-out-the-fix-
+splendid-tome.md`), and a real, previously-unknown crash found along the way:
+
+- **A real, general RC-correctness bug, found while implementing the
+  `fs.py:12` fix below**: any module-level global constructed from an
+  RCClass with NO fields of its own (a stateless singleton, or a fieldless
+  subclass) never got its real `__metalpy_init_<name>()` call emitted -
+  `emitter_c.py`'s `_global_init_is_all_zero_value_type` vacuously matched
+  "every field is zero" on an *empty* fields dict, misclassifying a real
+  heap `sys.alloc(...)` construction as a skippable value-type zero-init.
+  The global's own C declaration (`= {0}`, i.e. NULL) was then never
+  overwritten - reading through it crashed (a real access violation,
+  confirmed reliably on any fieldless-subclass-with-a-virtual-method
+  global, not a hypothetical). Fixed: that function's `ir.Allocate` branch
+  now declines outright whenever `instr.cls` is an `RCClass`, regardless
+  of field count.
+- `errors.py:1`'s stray `TypeAlias` import - deleted.
+- `fs.py:12`'s `utf8`-class-not-instance bug - `utf8` renamed to `Utf8`,
+  with a shared `utf8: Utf8 = Utf8()` module-level singleton (stateless,
+  confirmed no fields anywhere) taking over the OLD class name, so every
+  existing bare reference keeps working unchanged.
+- `ascii`/`cp437`/`latin1`'s own dormant `get_ptr()`-on-`bytes` bug in
+  their `decode()` bodies - fixed (`get_const_ptr()`).
+- `crt.py:83`'s `strerror` param type typo (`errnum: 32` -> `i32`) and
+  `crt.py`'s `readlink` return-type signedness (`usize` -> `isize`,
+  coordinated with `fs.py`'s own now-real `nbytes < 0` check).
+- The `_lower_call_args` module-context misattribution bug - default
+  values are now lowered under the CALLEE's own module/scope, not the
+  caller's (previously could fail outright for a default referencing a
+  name private to the callee's own module, not just mis-locate the error).
+- `str.from_cstr(move(b))`'s own overload-resolution gap - `move(...)`
+  sugar is now recognized during overload candidate matching too, not just
+  against an already-resolved single target.
+- The plain-`if` narrowing gap - `if x is not None:`/`if x is None: ...
+  else:` now narrows, for the `T|None` (exactly one non-None member) shape.
+- New safety rule: calling an `@move`-decorated method through a union-
+  typed receiver or an overload group is now a compile error (both were
+  silent gaps - ownership neither tracked nor rejected).
+
+Re-ran this doc's own full repro (`get_local_timezone_name()`, synthetic
+`linux` `active_target`) after all of the above: every error above this
+round is gone. Two NEW, unrelated, separately-tracked issues surfaced in
+their place (both pre-existing, only reachable now that everything else
+compiles far enough to reach them) - a `Result.unwrap_or()` generic
+return-type bug (zero-argument call site resolves to the wrong return
+type) and `crt.py:162`'s already-known `locale.h` cross-compilation
+limitation (unchanged, still needs a real Linux toolchain). Also found,
+separately, while implementing the `move(...)`-in-overload fix: a general
+C-symbol-collision bug (two overload candidates that both need real C
+bodies mangle to the identical C function name). None of these three are
+fixed by this round - each spawned as its own separate, self-contained
+follow-up task.
+
+Full `python tests.py` green throughout this round too (final count:
+1070/1070).

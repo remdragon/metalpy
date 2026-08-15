@@ -6622,7 +6622,14 @@ class FunctionLowering:
 		given.update( kwargs.keys() )
 		for param in target.parameters or []:
 			if param.stem not in given and param.default is not None:
-				default_operand = self._lower_expr( param.default, param.type )
+				# lowered in the CALLEE's own module/scope, not the
+				# caller's (matching the identical field-default pattern
+				# above in _lower_allocate_fields) - a default expression
+				# can reference names visible where the function/class was
+				# DEFINED, and errors inside it should be located there too
+				with self.lowering.discovery.module_context( self.lowering._find_module_for( target )):
+					with self.lowering.discovery.scope_context( target ):
+						default_operand = self._lower_expr( param.default, param.type )
 				kwargs[param.stem] = default_operand
 		return args, kwargs
 
@@ -7654,10 +7661,42 @@ class FunctionLowering:
 			candidates = [ *target.stubs, *target.implementations ]
 			for fn in candidates:
 				assert fn.resolve is None, f'internal compiler error - {fn.qualname} was not resolved before overload dispatch'
-			args = [ self._lower_overload_arg( a, i, None, candidates, node ) for i, a in enumerate( node.args ) ]
+			if any( fn.is_move for fn in candidates ):
+				# the receiver-move-hook (below, gated on isinstance(target,
+				# Function)) never fires for an Overload target at all -
+				# calling an @move-decorated overload alternative would
+				# neither track receiver ownership correctly nor error, so
+				# it's rejected outright, matching this same plan's
+				# identical policy for a union-typed receiver
+				self.lowering.discovery.fail(
+					f'calling an @move-decorated overload of {target.qualname} is not supported: {ast.unparse(node)}',
+					node,
+				)
+
+			def _peel_move( expr: ast.expr ) -> tuple[ast.expr,bool]:
+				# move(...) sugar isn't a real name anywhere - _check_move_
+				# argument (only reachable once a single concrete Function
+				# target is already chosen, never for an Overload group)
+				# already recognizes this exact shape; mirrored here so it
+				# at least PARSES against an overload group too, before a
+				# winning candidate is even known. Which positions/kwargs
+				# were wrapped is remembered (moved_pos/moved_kw below) so
+				# it can be validated/applied once resolve_call picks a
+				# single concrete winner, below.
+				if isinstance( expr, ast.Call ) and isinstance( expr.func, ast.Name ) and expr.func.id == 'move':
+					if len( expr.args ) != 1 or expr.keywords:
+						self.lowering.discovery.fail( f'move(...) takes exactly one argument: {ast.unparse(expr)}', node )
+					return expr.args[0], True
+				return expr, False
+
+			peeled_args = [ _peel_move( a ) for a in node.args ]
+			args = [ self._lower_overload_arg( e, i, None, candidates, node ) for i, ( e, _ ) in enumerate( peeled_args ) ]
+			moved_pos = [ was_moved for _, was_moved in peeled_args ]
 			if any( kw.arg is None for kw in node.keywords ):
 				self.lowering.discovery.fail( f'**kwargs not supported yet: {ast.unparse(node)}', node )
-			kwargs = { kw.arg: self._lower_overload_arg( kw.value, None, kw.arg, candidates, node ) for kw in node.keywords }
+			peeled_kwargs = { kw.arg: _peel_move( kw.value ) for kw in node.keywords }
+			kwargs = { name: self._lower_overload_arg( e, None, name, candidates, node ) for name, ( e, _ ) in peeled_kwargs.items() }
+			moved_kw = { name: was_moved for name, ( _, was_moved ) in peeled_kwargs.items() }
 			arg_types = [ op.type for op in args ]
 			kwarg_types = { name: op.type for name, op in kwargs.items() }
 
@@ -7702,11 +7741,63 @@ class FunctionLowering:
 				# lands in the collector
 				self.lowering.discovery.fail( str( e ), node )
 			if branches:
+				if any( moved_pos ) or any( moved_kw.values() ):
+					# which branch actually runs is a RUNTIME decision
+					# (ConditionalDispatch) - move(...)'s ownership transfer
+					# needs a single, statically-known target (matching this
+					# plan's own policy on @move through a union receiver/
+					# overload group elsewhere) - not attempted here
+					self.lowering.discovery.fail(
+						f'move(...) through a runtime-dispatched overload group is not supported: {ast.unparse(node)}',
+						node,
+					)
 				branches = [ ConditionalDispatch( conditions = b.conditions, function = _resolve_original( b.function )) for b in branches ]
 				resolved = _resolve_original( resolved )
 				return self._lower_conditional_dispatch( node, branches, resolved, args, kwargs, expected_type, want_result )
 			target = _resolve_original( resolved )
 			self.lowering._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
+
+			# now that a single concrete winner is known, validate move(...)
+			# usage against ITS OWN parameters (mirroring _check_move_
+			# argument's identical checks) and actually transition
+			# ownership (mirroring _apply_move_hook) - both were previously
+			# unreachable for an Overload target, see this plan's own item 3
+			for i, param in enumerate( target.parameters or [] ):
+				if i >= len( args ):
+					break
+				was_moved = moved_pos[i] if i < len( moved_pos ) else False
+				if param.is_move and not was_moved:
+					self.lowering.discovery.fail(
+						f"{target.qualname}: parameter {param.stem!r} is move[{param.type.qualname}] - "
+						f"call site must pass move(...): {ast.unparse(node)}",
+						node,
+					)
+				elif was_moved and not param.is_move:
+					self.lowering.discovery.fail(
+						f"{target.qualname}: parameter {param.stem!r} is not move[T] - "
+						f"call site must not wrap it in move(...): {ast.unparse(node)}",
+						node,
+					)
+				if param.is_move:
+					self._apply_move_hook( param, args[i], target.qualname )
+			for param in target.parameters or []:
+				if param.stem not in moved_kw:
+					continue
+				was_moved = moved_kw[param.stem]
+				if param.is_move and not was_moved:
+					self.lowering.discovery.fail(
+						f"{target.qualname}: parameter {param.stem!r} is move[{param.type.qualname}] - "
+						f"call site must pass move(...): {ast.unparse(node)}",
+						node,
+					)
+				elif was_moved and not param.is_move:
+					self.lowering.discovery.fail(
+						f"{target.qualname}: parameter {param.stem!r} is not move[T] - "
+						f"call site must not wrap it in move(...): {ast.unparse(node)}",
+						node,
+					)
+				if param.is_move:
+					self._apply_move_hook( param, kwargs[param.stem], target.qualname )
 		else:
 			self.lowering._resolve_call_target( target )
 			args, kwargs = self._lower_call_args( target, node )

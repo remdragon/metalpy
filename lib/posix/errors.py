@@ -1,5 +1,3 @@
-from typing import TypeAlias
-
 ENOENT: i32 = 2
 EACCESS: i32 = 13
 EINVAL: i32 = 22

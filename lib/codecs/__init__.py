@@ -51,7 +51,7 @@ def _build_registry() -> None:
 	from .latin1 import latin1
 	latin1().register()
 	from .utf8 import utf8
-	utf8().register()
+	utf8.register()
 
 def encode( s: str, encoding: str ) -> Result[bytes,CodecError]:
 	codec = Codec.get( encoding ).or_return()

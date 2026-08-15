@@ -2488,6 +2488,40 @@ class EmitGlobalRCClassRealCompileTests( test_support.RealCompileMixin, RCClassT
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
+	def test_fieldless_subclass_global_calling_inherited_virtual_actually_constructed( self ) -> None:
+		# a global whose static type is a SUBCLASS (participates in a
+		# vtable via an inherited/overridden @virtual method) but has no
+		# fields of its own - g's own ir.Allocate has fields={} - used to
+		# be misclassified by _global_init_is_all_zero_value_type as an
+		# all-zero VALUE type (which vacuously matches "every field is
+		# zero" on an EMPTY fields dict) and its real sys.alloc(...)
+		# construction call got skipped entirely, leaving g permanently
+		# NULL - reading g.get() then dereferenced a null $header.vtable
+		# and crashed (real access violation, not a plain wrong-value
+		# failure). Confirmed the bug needs BOTH a subclass (a plain,
+		# non-inherited RCClass global already worked) and zero fields
+		# (a global with any real field already worked, since a non-zero
+		# field value fails the all-zero check) - this fixture is the
+		# minimal shape hitting both.
+		self._run( '\n'.join([
+			'class Base:',
+			'	@abstractmethod',
+			'	def get( self ) -> i32:',
+			'		...',
+			'',
+			'class Derived( Base ):',
+			'	@virtual',
+			'	def get( self ) -> i32:',
+			'		return 42',
+			'',
+			'g: Derived = Derived()',
+			'',
+			'def main() -> i32:',
+			'	return g.get()',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
+
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
 	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:
@@ -6291,13 +6325,21 @@ class MoveParameterRealCompileTests( test_support.RealCompileMixin, CompilerTest
 	resolved to a real bytearray anywhere that pattern was matched).
 
 	str.from_cstr's identical move[bytearray] overload is NOT exercised
-	here - confirmed via a standalone repro that str.from_cstr(move(b))
-	fails with "name 'move' is not defined": move(...)'s own sugar isn't
-	recognized during OVERLOAD resolution (str.from_cstr has 2 signatures)
-	the way it is for an ordinary, already-resolved call - a real, separate
-	gap already flagged in TODO.txt's own "incref/decref" section
-	("Move.leaves() falls back to Type.leaves()'s default [self], never
-	exposing bytearray itself"), not something this fix touches. '''
+	here - move(...)'s own sugar not being recognized during OVERLOAD
+	resolution ("name 'move' is not defined") is now fixed (peeled before
+	candidate type-matching in _lower_overload_arg's own caller, then
+	validated+applied via the real ownership-transfer hook once
+	resolve_call picks a single concrete winner - see lowering.py's
+	_lower_call, the Overload branch; lowering_test.py's own
+	OverloadMoveResolutionTests verifies this directly via IR inspection).
+	A REAL compile-and-run test against str.from_cstr specifically is
+	blocked by a separate, general, pre-existing bug this investigation
+	also found: emitter_c.py mangles every candidate in an @overload group
+	to the SAME C symbol name, so a program needing real C bodies for more
+	than one candidate (str.from_cstr's own move[bytearray] overload
+	unconditionally falls back to calling its 2-arg sibling in one branch,
+	so both always need real bodies together) fails to compile at the C
+	level - tracked separately, not this fix's own scope. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -6338,13 +6380,14 @@ def main() -> i32:
 
 
 class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
-	''' Codec.decode widened to bytes|bytearray, against the REAL utf8
-	class (not a synthetic stand-in) - constructing any real utf8()
-	instance forces its whole vtable (names/encode/decode) to compile, so
-	this also depends on: utf8.names()'s list literal (_expr_List),
-	utf8.encode()'s get_ptr()/get_const_ptr() fix, and the move[T] fix
-	above (utf8.encode() -> bytes.from_bytearray() -> len(src)/
-	src.release()). '''
+	''' Codec.decode widened to bytes|bytearray, against the REAL Utf8
+	class (not a synthetic stand-in) - constructing a real Utf8() instance
+	forces its whole vtable (names/encode/decode) to compile, so this also
+	depends on: Utf8.names()'s list literal (_expr_List), Utf8.encode()'s
+	get_ptr()/get_const_ptr() fix, and the move[T] fix above (Utf8.encode()
+	-> bytes.from_bytearray() -> len(src)/src.release()). Also covers the
+	module-level `utf8 = Utf8()` singleton every real decode()/encode()
+	default value actually uses. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -6353,8 +6396,10 @@ class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_programs_compile_and_run( self ) -> None:
 		self.assert_programs_run([
+			# explicit construction via the real class (not the singleton) -
+			# keeps the vtable-forcing/construction path covered too
 			( 'decode_bytes', '''
-from codecs.utf8 import utf8
+from codecs.utf8 import Utf8
 
 def main() -> i32:
 	b: bytearray = bytearray( 5 )
@@ -6365,12 +6410,13 @@ def main() -> i32:
 	p[3] = 108
 	p[4] = 111
 	bs: bytes = bytes( b )
-	codec = utf8()
+	codec = Utf8()
 	s: str = codec.decode( bs ).unwrap( 'decode failed' )
 	if s != "hello":
 		return 1
 	return 0
 ''' ),
+			# the rest use the shared `utf8` singleton directly
 			( 'decode_bytearray', '''
 from codecs.utf8 import utf8
 
@@ -6383,23 +6429,21 @@ def main() -> i32:
 	p[3] = 33
 	p[4] = 33
 	c: bytearray = b[:3]
-	codec = utf8()
-	s: str = codec.decode( c ).unwrap( 'decode failed' )
+	s: str = utf8.decode( c ).unwrap( 'decode failed' )
 	if s != "hi!":
 		return 1
 	return 0
 ''' ),
-			# multi-byte UTF-8 round trip via the real utf8().encode() ->
-			# utf8().decode() path - guards the alloc/memcpy/terminate
+			# multi-byte UTF-8 round trip via the real utf8.encode() ->
+			# utf8.decode() path - guards the alloc/memcpy/terminate
 			# arithmetic in both directions
 			( 'decode_multibyte_utf8_round_trip', '''
 from codecs.utf8 import utf8
 
 def main() -> i32:
 	src: str = "héllo"
-	codec = utf8()
-	eb: bytes = codec.encode( src ).unwrap( 'encode failed' )
-	s: str = codec.decode( eb ).unwrap( 'decode failed' )
+	eb: bytes = utf8.encode( src ).unwrap( 'encode failed' )
+	s: str = utf8.decode( eb ).unwrap( 'decode failed' )
 	if s != src:
 		return 1
 	if s.byte_len() != src.byte_len():
@@ -6412,8 +6456,7 @@ def main() -> i32:
 from codecs.utf8 import utf8
 
 def decode_it( x: bytes|bytearray ) -> str:
-	codec = utf8()
-	return codec.decode( x ).unwrap( 'decode failed' )
+	return utf8.decode( x ).unwrap( 'decode failed' )
 
 def main() -> i32:
 	b: bytearray = bytearray( 3 )
@@ -6429,18 +6472,19 @@ def main() -> i32:
 	return 0
 ''' ),
 			# mirrors the real forcing case: fs.py:24's
-			# codec.decode(buf[:nbytes]) shape
-			( 'decode_bytearray_slice_result', '''
-from codecs.utf8 import utf8
-
+			# codec.decode(buf[:nbytes]) shape - and, unlike the other
+			# cases here, relies entirely on decode()'s own now-fixed
+			# `codec: Codec = utf8` DEFAULT (no codec argument passed at
+			# all), proving the default itself works, not just the
+			# singleton used explicitly
+			( 'decode_bytearray_slice_result_via_default_codec', '''
 def main() -> i32:
 	buf: bytearray = bytearray( 128 )
 	p: Ptr[u8] = buf.get_ptr()
 	p[0] = 104
 	p[1] = 105
 	nbytes: usize = 2
-	codec = utf8()
-	s: str = codec.decode( buf[:nbytes] ).unwrap( 'decode failed' )
+	s: str = buf[:nbytes].decode().unwrap( 'decode failed' )
 	if s != "hi":
 		return 1
 	return 0
@@ -6449,14 +6493,225 @@ def main() -> i32:
 from codecs.utf8 import utf8
 
 def main() -> i32:
-	codec = utf8()
-	n = codec.names()
+	n = utf8.names()
 	if len( n ) != 4:
 		return 1
 	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
 		return 2
 	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
 		return 3
+	return 0
+''' ),
+		] )
+
+
+class AsciiCp437Latin1CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Real compile-and-run coverage for lib/codecs/ascii.py, cp437.py and
+	latin1.py - previously constructed only via _build_registry()'s own
+	.register() (itself only calling .names()), so their encode()/decode()
+	bodies were never actually reached by any compiled program, real test,
+	or the 1057-test suite passing. Getting these three to real-compile,
+	link, and run surfaced (and this fix resolves):
+
+	  - s.get_ptr() on str (only bytes|bytearray has get_ptr; str only
+	    exposes get_const_ptr) in all three encode()s.
+	  - missing checked-arithmetic wrappers around every +/- op in bodies
+	    whose own Result[...] error type doesn't cover OverflowError.
+	  - cp437.py's own `with compiler.panic_arithmetic:` (no call/message -
+	    unsupported with statement; panic_arithmetic always takes one).
+	  - bytes.from_bytearray( bytes, move( out )) in cp437.py/latin1.py
+	    (bytes passed as a stray extra positional argument - too many
+	    positional arguments; should just be from_bytearray( move( out ))).
+	  - str.from_cstr( ptr, len ) in cp437.py/latin1.py/ascii.py's decode()
+	    - that overload's second argument means size INCLUDING the zero
+	    terminator (checked: from_cstr errors if buf[size-1] isn't 0), not
+	    a plain byte count, and none of these buffers were ever actually
+	    null-terminated - fixed by allocating an exact len+1 buffer,
+	    memcpy'ing, explicitly terminating, and going through
+	    str._from_owned_cstr directly (matching utf8.py's own decode()
+	    shape) instead.
+	  - DECODE_TABLE[i]/[usize(byte-0x80)] (plain __getitem__ sugar) in
+	    cp437.py requiring encode()/decode() to return Result[_,IndexError]
+	    (they return Result[_,CodecError]) - fixed via the real
+	    .__getitem__(...).unwrap(...) call other list-indexing lib code
+	    already uses.
+
+	Also found and fixed two bugs invisible to discovery/emit_c alone (only
+	surfaced by an actual C compile+link+run):
+
+	  - A real, general, pre-existing compiler bug: a `return` reachable
+	    while an RC-tracked local (e.g. a bytearray) is still live, in a
+	    function that later consumes that SAME local via move() on its
+	    fall-through success path, leaves the early return's own epilogue-
+	    cleanup label un-emitted ("use of undeclared label" at the C
+	    level) - current_epilogue_label() hands the return a label whose
+	    backing _epilogue_stack entry the later move() consumption then
+	    silently drops, instead of leaving a decref-less "cancelled" entry
+	    the way every other consumption path does. Confirmed via minimal,
+	    codec-independent repros. Not fixed here (out of this scope - a
+	    cfg.py/lowering.py issue, not a lib/codecs one); ascii.py/cp437.py/
+	    latin1.py's own encode()s just avoid the trigger shape (bytes(out)
+	    copy instead of bytes.from_bytearray(move(out)) directly on a
+	    local live across an earlier return).
+	  - cp437.py/latin1.py's own encode() allocated their output bytearray
+	    to the worst-case size (one output byte per INPUT byte) but multi-
+	    byte UTF-8 input sequences collapse to a single output byte, so the
+	    actually-written length (out_idx) can be less than that allocation
+	    - wrapping the oversized, unfilled-tail buffer directly into the
+	    returned bytes silently included trailing garbage. Fixed by
+	    copying down to a final buffer sized to out_idx before returning. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'ascii_round_trip', '''
+from codecs.ascii import ascii
+
+def main() -> i32:
+	a = ascii()
+	eb: bytes = a.encode( "Hello, World!" ).unwrap( 'encode failed' )
+	s: str = a.decode( eb ).unwrap( 'decode failed' )
+	if s != "Hello, World!":
+		return 1
+	return 0
+''' ),
+			( 'ascii_encode_out_of_range_errors', '''
+from codecs.ascii import ascii
+
+def main() -> i32:
+	a = ascii()
+	match a.encode( "héllo" ):
+		case Result.Ok( b ):
+			return 1
+		case Result.Err( e ):
+			pass
+	return 0
+''' ),
+			( 'ascii_decode_out_of_range_errors', '''
+from codecs.ascii import ascii
+
+def main() -> i32:
+	a = ascii()
+	b = bytearray( 1 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 0xFF
+	match a.decode( bytes( b )):
+		case Result.Ok( s ):
+			return 1
+		case Result.Err( e ):
+			pass
+	return 0
+''' ),
+			( 'cp437_ascii_passthrough_round_trip', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	eb: bytes = c.encode( "Hello, World!" ).unwrap( 'encode failed' )
+	s: str = c.decode( eb ).unwrap( 'decode failed' )
+	if s != "Hello, World!":
+		return 1
+	return 0
+''' ),
+			( 'cp437_extended_char_round_trip', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	# accented/box-drawing chars only, no ASCII passthrough at all - also
+	# exercises the output-buffer-trim fix (3 codepoints, 6 UTF-8 input
+	# bytes, but only 3 CP437 output bytes)
+	eb: bytes = c.encode( "éàü" ).unwrap( 'encode failed' )
+	if len( eb ) != 3:
+		return 1
+	s: str = c.decode( eb ).unwrap( 'decode failed' )
+	if s != "éàü":
+		return 2
+	return 0
+''' ),
+			( 'cp437_decode_raw_byte', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	b = bytearray( 1 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 0x82 # cp437 0x82 -> DECODE_TABLE[2] -> U+00E9 (e-acute)
+	s: str = c.decode( bytes( b )).unwrap( 'decode failed' )
+	if s != "é":
+		return 1
+	return 0
+''' ),
+			( 'cp437_encode_unmappable_char_errors', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	# U+1F600 (grinning face) is a 4-byte UTF-8 sequence - outside every
+	# branch cp437's encode() handles (2-byte/3-byte only)
+	match c.encode( "\U0001F600" ):
+		case Result.Ok( b ):
+			return 1
+		case Result.Err( e ):
+			pass
+	return 0
+''' ),
+			( 'latin1_ascii_passthrough_round_trip', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	eb: bytes = l.encode( "Hello, World!" ).unwrap( 'encode failed' )
+	s: str = l.decode( eb ).unwrap( 'decode failed' )
+	if s != "Hello, World!":
+		return 1
+	return 0
+''' ),
+			( 'latin1_extended_char_round_trip', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	# U+00E9/U+00E0/U+00FC are all within Latin-1 range (<=0xFF) - also
+	# exercises the output-buffer-trim fix (3 codepoints, 6 UTF-8 input
+	# bytes, but only 3 Latin-1 output bytes)
+	eb: bytes = l.encode( "éàü" ).unwrap( 'encode failed' )
+	if len( eb ) != 3:
+		return 1
+	s: str = l.decode( eb ).unwrap( 'decode failed' )
+	if s != "éàü":
+		return 2
+	return 0
+''' ),
+			( 'latin1_decode_raw_byte', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	b = bytearray( 1 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 0xE9 # Latin-1 0xE9 IS U+00E9 (e-acute) directly
+	s: str = l.decode( bytes( b )).unwrap( 'decode failed' )
+	if s != "é":
+		return 1
+	return 0
+''' ),
+			( 'latin1_encode_out_of_range_errors', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	# U+3042 (hiragana A) is a 3-byte UTF-8 sequence, codepoint > 0xFF -
+	# outside Latin-1 range
+	match l.encode( "あ" ):
+		case Result.Ok( b ):
+			return 1
+		case Result.Err( e ):
+			pass
 	return 0
 ''' ),
 		] )
@@ -7469,9 +7724,7 @@ def main() -> i32:
 			# real RC-lifetime stress check under repetition, same rigor as
 			# every other RC test this session established - narrowing
 			# surviving past the if (via type(x) is str, not a plain `is
-			# None` check - Phase 5/6's own narrowing-survival mechanism
-			# doesn't extend to the ordinary is-None rewrite, only type(x) is
-			# T/instanceof and match), then reading the narrowed str repeatedly
+			# None` check), then reading the narrowed str repeatedly
 			( 'rc_lifetime_repeated_calls_no_leak', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -7483,6 +7736,28 @@ def main() -> i32:
 				pass
 			else:
 				return 1
+			if x.byte_len() != 5:
+				return 2
+			i += 1
+		return 0
+''' ),
+			# the plain `is not None`/`is None` rewrite ALSO narrows now
+			# (this plan's own item 4 - previously ONLY type(x) is T/
+			# instanceof/match narrowed; a bare is-not-None check on a
+			# real T|None union did not, at all). Both the in-body
+			# narrowing AND post-if survival (the None branch returns) are
+			# exercised together, under the same repeated-call RC-lifetime
+			# rigor as the case just above
+			( 'is_not_none_narrows_body_and_survives_past_the_if', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			if x is None:
+				return 1
+			# narrowing survived the whole if - x is str here, not str|None
 			if x.byte_len() != 5:
 				return 2
 			i += 1

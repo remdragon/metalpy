@@ -28,7 +28,7 @@ class cp437( Codec ):
 	@virtual
 	def encode( self, s: str ) -> Result[bytes,CodecError]:
 		s_len: usize = s.byte_len()
-		s_ptr: ConstPtr[u8] = s.get_ptr()
+		s_ptr: ConstPtr[u8] = s.get_const_ptr()
 		
 		out = bytearray( s_len )
 		out_ptr: Ptr[u8] = out.get_ptr()
@@ -36,7 +36,7 @@ class cp437( Codec ):
 		out_idx: usize = 0
 		in_idx: usize = 0
 		
-		with compiler.panic_arithmetic: # an overflow should be impossible based on the if checks
+		with compiler.panic_arithmetic( 'overflow should be impossible based on the if checks' ):
 			while in_idx < s_len:
 				b0: u8 = s_ptr[in_idx]
 				
@@ -76,7 +76,7 @@ class cp437( Codec ):
 				found: bool = False
 				i: usize = 0
 				while i < 128:
-					if DECODE_TABLE[i] == cp:
+					if DECODE_TABLE.__getitem__( i ).unwrap( 'i in bounds by loop condition' ) == cp:
 						out_ptr[out_idx] = u8( i + 0x80 )
 						out_idx += 1
 						found = True
@@ -90,41 +90,63 @@ class cp437( Codec ):
 				
 				in_idx += bytes_read
 		
-		return Result.Ok( bytes.from_bytearray( bytes, move( out )))
+		# out was allocated to the worst-case size (s_len, one CP437 byte
+		# per INPUT byte) but multi-byte UTF-8 sequences collapse to a
+		# single output byte each, so out_idx can be < s_len - copy down
+		# to a final buffer sized to what was actually written. Safe to
+		# move() this exactly-sized buffer (unlike out itself) since it's
+		# allocated after every early-return above has already resolved -
+		# see ascii.py's own encode() for the move()-past-a-still-
+		# reachable-return compiler bug this sidesteps.
+		final = bytearray( out_idx )
+		sys.memcpy( final.get_ptr(), out_ptr, out_idx )
+		return Result.Ok( bytes.from_bytearray( move( final )))
 	
 	@virtual
 	def decode( self, b: bytes|bytearray ) -> Result[str,CodecError]:
 		b_len: usize = len( b )
-		b_ptr: ConstPtr[u8] = b.get_ptr()
+		b_ptr: ConstPtr[u8] = b.get_const_ptr()
 		
 		# Worst-case allocation: 3 UTF-8 output bytes per 1 CP437 input byte
-		out = bytearray( b_len * 3 )
+		with compiler.panic_arithmetic( 'irrational byte length' ):
+			out = bytearray( b_len * 3 )
 		out_ptr: Ptr[u8] = out.get_ptr()
-		
+
 		out_idx: usize = 0
 		in_idx: usize = 0
-		
-		while in_idx < b_len:
-			byte: u8 = b_ptr[in_idx]
-			
-			if byte <= 0x7F: # Standard ASCII passthrough
-				out_ptr[out_idx] = byte
-				out_idx += 1
-			else:
-				# Map extended byte to UTF-8 codepoint via table lookup
-				cp = DECODE_TABLE[usize(byte - 0x80)]
-				
-				if cp <= 0x07FF:
-					out_ptr[out_idx]     = 0xC0 | u8( cp >> 6 )
-					out_ptr[out_idx+1] = 0x80 | u8( cp & 0x3F )
-					out_idx += 2
+
+		with compiler.panic_arithmetic( 'bounded by b_len, cannot overflow' ):
+			while in_idx < b_len:
+				byte: u8 = b_ptr[in_idx]
+
+				if byte <= 0x7F: # Standard ASCII passthrough
+					out_ptr[out_idx] = byte
+					out_idx += 1
 				else:
-					out_ptr[out_idx]     = 0xE0 | u8( cp >> 12 )
-					out_ptr[out_idx+1] = 0x80 | u8( (cp >> 6) & 0x3F )
-					out_ptr[out_idx+2] = 0x80 | u8( cp & 0x3F )
-					out_idx += 3
-			
-			in_idx += 1
-		
-		# Yield final string directly using internal raw length
-		return Result.Ok(str.from_cstr(out_ptr, out_idx))
+					# Map extended byte to UTF-8 codepoint via table lookup
+					cp: u16 = DECODE_TABLE.__getitem__( usize( byte - 0x80 )).unwrap( 'byte-0x80 in bounds by construction' )
+
+					if cp <= 0x07FF:
+						out_ptr[out_idx]     = 0xC0 | u8( cp >> 6 )
+						out_ptr[out_idx+1] = 0x80 | u8( cp & 0x3F )
+						out_idx += 2
+					else:
+						out_ptr[out_idx]     = 0xE0 | u8( cp >> 12 )
+						out_ptr[out_idx+1] = 0x80 | u8( (cp >> 6) & 0x3F )
+						out_ptr[out_idx+2] = 0x80 | u8( cp & 0x3F )
+						out_idx += 3
+
+				in_idx += 1
+
+		# Yield final string via a freshly-sized, explicitly null-terminated
+		# buffer - str.from_cstr(ptr, size)'s size means size INCLUDING the
+		# zero terminator, and out's own worst-case-sized buffer isn't
+		# actually filled (or terminated) up to out_idx, so the raw
+		# out_ptr/out_idx pair can't be handed to it directly (matches
+		# utf8.py's own decode() shape).
+		with compiler.panic_arithmetic( 'irrational byte length' ):
+			buf_size: usize = out_idx + 1
+		new_buf: Ptr[u8] = sys.alloc[u8]( buf_size )
+		sys.memcpy( new_buf, out_ptr, out_idx )
+		new_buf[out_idx] = 0
+		return str._from_owned_cstr( new_buf, buf_size )

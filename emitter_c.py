@@ -2970,6 +2970,18 @@ def _global_init_is_all_zero_value_type( instructions: list[ir.Instruction] ) ->
 		return False
 	for instr in rest:
 		if isinstance( instr, ir.Allocate ):
+			# an RCClass Allocate performs a REAL sys.alloc(...) heap
+			# allocation at C-emission time (see _emit_instruction's own
+			# ir.Allocate/RCClass branch) - never skippable, regardless of
+			# how many fields it has (a zero-field or default-constructed
+			# RCClass, e.g. a stateless singleton or a fieldless subclass,
+			# vacuously satisfies the all-zero-fields check below otherwise,
+			# which would wrongly skip the real allocation entirely,
+			# leaving the global's own pointer permanently NULL - confirmed
+			# via a real access-violation crash, a subclass singleton with
+			# no fields of its own calling a virtual method through it)
+			if isinstance( instr.cls, RCClass ):
+				return False
 			if not all( _is_zero_const( v ) for v in instr.fields.values() ):
 				return False
 		elif isinstance( instr, ir.Assign ) and isinstance( instr.src, ( ir.Const, ir.Temp ) ):

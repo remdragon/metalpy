@@ -1,7 +1,6 @@
 # src/unix/time.py
 
 import compiler
-from codecs.utf8 import utf8
 
 # ---------------------------------------------------------------------------
 # High-resolution timing backend — lib/time.py's monotonic() and time().
@@ -58,23 +57,14 @@ def get_local_timezone_name() -> str:
 def _read_etc_timezone_file() -> str:
 	# `open(path, mode)` was never a real name anywhere in this codebase -
 	# the real primitives are File.binary_reader()/BinaryReader.read()
-	# (lib/builtins/__File.py). match-based Result narrowing throughout
-	# (not `.unwrap_or()` + `is not None`): `if x is not None: use(x)`
-	# doesn't narrow for a plain if-statement in this compiler (confirmed
-	# separately, unrelated to this function) - match is the one mechanism
-	# already proven to work, same shape as str.partition's own
+	# (lib/builtins/__File.py). match-based Result narrowing throughout,
+	# same shape as str.partition's own
 	# `match found: case Result.Ok(idx): ... case Result.Err(_): ...`.
-	# codec=utf8() passed explicitly (not relying on decode()'s own
-	# `codec: Codec = utf8` default) - that default is a real, separate,
-	# already-known bug (the `utf8` CLASS used as a default value where an
-	# INSTANCE belongs, same pattern as fs.py:12's own readlink() default -
-	# PLAN_POSIX_FEATURE.md's own deferred item 2). No explicit reader.
-	# close() either - not a correctness requirement (its own destructor
-	# already closes the fd), and BinaryReader.close()'s own body has a
-	# separate, real, pre-existing bug (an unchecked Result from
-	# fs.close_raw(), lib/builtins/__File.py:40) - both sidestepped here
+	# No explicit reader.close() - not a correctness requirement (its own
+	# destructor already closes the fd), and BinaryReader.close()'s own
+	# body has a separate, real, pre-existing bug (an unchecked Result
+	# from fs.close_raw(), lib/builtins/__File.py:40) - sidestepped here
 	# rather than fixed, out of scope for this function's own rewrite.
-	codec = utf8()
 	match File.binary_reader( '/etc/timezone' ):
 		case Result.Ok( reader ):
 			buf: bytearray = bytearray( 128 )
@@ -82,7 +72,7 @@ def _read_etc_timezone_file() -> str:
 				case Result.Ok( n ):
 					if n == 0:
 						return 'UTC'
-					match codec.decode( buf[:n] ):
+					match buf[:n].decode():
 						case Result.Ok( s ):
 							return s.strip()
 						case Result.Err( _ ):

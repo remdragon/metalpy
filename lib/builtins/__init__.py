@@ -340,8 +340,10 @@ class str:
 		errdefer( sys.free( new_buf ))
 		
 		sys.memcpy( new_buf, buf, size_including_zero_terminator )
-		
-		if new_buf[size_including_zero_terminator-1]:
+
+		with compiler.panic_arithmetic( 'invalid str length' ):
+			last_index: usize = size_including_zero_terminator - 1
+		if new_buf[last_index]:
 			return Result.Err( CodecError( 'utf-8', 'missing null terminator' ))
 		
 		return str._from_owned_cstr( new_buf, size_including_zero_terminator )

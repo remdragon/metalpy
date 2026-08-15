@@ -724,6 +724,21 @@ class TypeResolver:
 			self.ensure_resolved( found )
 			per_leaf.append(( member, found ))
 
+		for member, fn in per_leaf:
+			if fn.is_move:
+				# the receiver-move-hook (lowering.py's _lower_call, gated
+				# on isinstance(target, Function)) never fires for a
+				# ReceiverDispatch target at all - calling an @move method
+				# through a union receiver would neither track ownership
+				# correctly nor error, so it's rejected outright here
+				# instead (matching this same union-receiver resolution's
+				# own existing return-type/param-count checks below)
+				self.discovery.fail(
+					f'{union.qualname}.{attr}(...): calling an @move method through a union-typed receiver is not '
+					f'supported - leaf {member.type.qualname if member.type else "?"}.{attr} is @move-decorated',
+					ctx,
+				)
+
 		reference = per_leaf[0][1]
 		for member, fn in per_leaf[1:]:
 			if fn.return_type is not reference.return_type:
@@ -1617,6 +1632,52 @@ class _ReferenceResolver( ast.NodeTransformer ):
 	# class's own _try_resolve_namespace recognize the type(x) call shape
 	# and substitute _type_of_expr(x)/_static_type_of_value_expr(x).
 
+	def _is_none_narrowing_shape( self, test: ast.expr ) -> tuple[ast.expr,TaggedUnion,list[Variable],Variable,bool]|None:
+		''' recognizes `x is None` / `x is not None` against a union-typed
+		x, resolving all the way through to the real (union, members,
+		none_member) - shared shape-detection half of visit_Compare's own
+		rewrite-1 below (this method IS that detection, factored out
+		unchanged) and visit_If's own is-not-None narrowing. Returns
+		(subject_expr, base, members, none_member, is_not), or None on ANY
+		doubt - same "caller declines silently" philosophy _type_is_shape
+		documents. Deliberately does NOT restrict how many non-None
+		members the union has - visit_Compare's own boolean rewrite below
+		needs no single narrowing target to build `x.tag != TAG_NONE`, only
+		narrowing itself does (that restriction, matching
+		_rewrite_tagged_union_truthiness's identical one, is applied by
+		visit_If itself, same as visit_While applies its own extra
+		restriction on top of the equally general _type_is_shape). '''
+		if not ( isinstance( test, ast.Compare ) and len( test.ops ) == 1 and isinstance( test.ops[0], ( ast.Is, ast.IsNot ))):
+			return None
+		left_is_none = isinstance( test.left, ast.Constant ) and test.left.value is None
+		right_is_none = isinstance( test.comparators[0], ast.Constant ) and test.comparators[0].value is None
+		if left_is_none == right_is_none:
+			return None # both-None/neither-None - not this rewrite's shape, leave for lowering's ordinary is/is-not handling
+		subject_expr = test.comparators[0] if left_is_none else test.left
+		subject_type = self._type_of_expr( subject_expr )
+		if subject_type is None:
+			return None # can't determine - leave as ordinary `is`/`is not`, lowering's own _lower_is_comparison handles the non-union fallback
+		# unwrap a Specialization to its ABSTRACT base, same as
+		# Lowering._tagged_union_shape - "does this have a None member" is
+		# substitution-independent (None doesn't vary by specialization), so
+		# no monomorphize_class call is needed here. Critically, must NOT
+		# call ensure_resolved(subject_type) first: that would swap a
+		# Specialization for its MONOMORPHIZED copy, whose own tag/data
+		# (already built by monomorphize_class) would collide with
+		# UnionStorage.get() trying to synthesize them again as if for a
+		# fresh union (same mistake, and fix, as lowering.py's
+		# _lower_allocate_fields TaggedUnion branch had)
+		base = subject_type.base if isinstance( subject_type, Specialization ) else subject_type
+		if not isinstance( base, TaggedUnion ):
+			return None
+		members = self._resolved_union_members( subject_type, base )
+		none_type = self.discovery.get_none_type()
+		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
+		if none_member is None:
+			return None
+		is_not = isinstance( test.ops[0], ast.IsNot )
+		return subject_expr, base, members, none_member, is_not
+
 	def visit_Compare( self, node: ast.Compare ) -> ast.expr:
 		self.generic_visit( node )
 		if len( node.ops ) != 1 or not isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
@@ -1635,36 +1696,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			subject_expr = left_subject if left_subject is not None else right_subject
 			type_expr = node.comparators[0] if left_subject is not None else node.left
 			return self._rewrite_type_is_comparison( node, subject_expr, type_expr )
-		left_is_none = isinstance( node.left, ast.Constant ) and node.left.value is None
-		right_is_none = isinstance( node.comparators[0], ast.Constant ) and node.comparators[0].value is None
-		if left_is_none == right_is_none:
-			return node # both-None/neither-None - not this rewrite's shape, leave for lowering's ordinary is/is-not handling
-		other = node.comparators[0] if left_is_none else node.left
-		other_type = self._type_of_expr( other )
-		if other_type is None:
-			return node # can't determine - leave as ordinary `is`/`is not`, lowering's own _lower_is_comparison handles the non-union fallback
-		# unwrap a Specialization to its ABSTRACT base, same as
-		# Lowering._tagged_union_shape - "does this have a None member" is
-		# substitution-independent (None doesn't vary by specialization), so
-		# no monomorphize_class call is needed here. Critically, must NOT
-		# call ensure_resolved(other_type) first: that would swap a
-		# Specialization for its MONOMORPHIZED copy, whose own tag/data
-		# (already built by monomorphize_class) would collide with
-		# UnionStorage.get() trying to synthesize them again as if for a
-		# fresh union (same mistake, and fix, as lowering.py's
-		# _lower_allocate_fields TaggedUnion branch had)
-		base = other_type.base if isinstance( other_type, Specialization ) else other_type
-		if not isinstance( base, TaggedUnion ):
+		# rewrite 1: x is None / x is not None
+		shape = self._is_none_narrowing_shape( node )
+		if shape is None:
 			return node
-		members = self._resolved_union_members( other_type, base )
-		none_type = self.discovery.get_none_type()
-		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
-		if none_member is None:
-			return node
+		subject_expr, base, _members, none_member, is_not = shape
 		tag_attr, _data_attr, _payload_cls, tags = self.resolver.union_storage.get( base )
-		tag_expr = ast.Attribute( value = other, attr = tag_attr.stem, ctx = ast.Load() )
+		tag_expr = ast.Attribute( value = subject_expr, attr = tag_attr.stem, ctx = ast.Load() )
 		ast.copy_location( tag_expr, node )
-		op = ast.NotEq() if isinstance( node.ops[0], ast.IsNot ) else ast.Eq()
+		op = ast.NotEq() if is_not else ast.Eq()
 		result = ast.Compare( left = tag_expr, ops = [ op ], comparators = [ ast.Constant( value = tags[none_member.stem] ) ] )
 		ast.copy_location( result, node )
 		return result
@@ -1939,18 +1979,84 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		return result
 
 	def visit_If( self, node: ast.If ) -> ast.If|list[ast.stmt]:
+		''' `if x is not None:`/`if x is None: ... else:` against a
+		union-typed, bare-Name x - narrows x for whichever branch is
+		actually "live" given the comparison (body for `is not`, orelse
+		for `is`), for that branch's own duration. Restricted to the same
+		exactly-one-non-None-member shape _rewrite_tagged_union_truthiness
+		already restricts itself to (a 3+-member union's own "is not None"
+		doesn't uniquely determine a single narrowed type) - no multi-
+		member narrowing-marker support exists yet, matching visit_While's
+		identical restriction on top of the equally general _type_is_shape.
+		Post-if survival (narrowing surviving past the WHOLE if-statement
+		when the un-narrowed branch terminates) needs no changes here at
+		all - merge_if/_merge_narrowed_soft (cfg.py) are already fully
+		generic over any branch's own end-of-branch _narrowed snapshot,
+		already exercised today via the type(x) is T -> match desugar path.
+
+		Manually walks node.body/node.orelse itself (not left to
+		generic_visit's own field-list traversal) once a narrowing target
+		is found - same reasoning visit_While/visit_Match's own manual
+		per-statement loops document: a synthesized narrow-marker Assign
+		must never be re-visited through the ordinary visit_Assign path. '''
 		folded = self._try_fold_is_rc_if( node )
 		if folded is not None:
 			return folded
 		desugared = self._try_desugar_type_is_if( node )
 		if desugared is not None:
 			return desugared
-		# rewrite test BEFORE generic_visit recurses into it, so the new BoolOp
-		# children (Name references, Compare, Call) are visited normally
+		# computed from the ORIGINAL, not-yet-rewritten test - visit_Compare's
+		# own is-not-None tag rewrite (triggered below, via self.visit on the
+		# test) would otherwise already have destroyed this shape by the time
+		# it's looked for
+		none_shape = self._is_none_narrowing_shape( node.test )
+		subject_name: str|None = None
+		narrow_member: Variable|None = None
+		is_not = False
+		if none_shape is not None and isinstance( none_shape[0], ast.Name ):
+			subject_expr, _base, members, none_member, shape_is_not = none_shape
+			non_none = [ m for m in members if m is not none_member ]
+			if len( non_none ) == 1:
+				subject_name = subject_expr.id
+				narrow_member = non_none[0]
+				is_not = shape_is_not
+		# rewrite test BEFORE recursing into it, so the new BoolOp children
+		# (Name references, Compare, Call) are visited normally (unchanged
+		# from before this method's own narrowing support)
 		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
 		if rewritten is not None:
 			node.test = rewritten
-		self.generic_visit( node )
+		node.test = self.visit( node.test )
+
+		def _visit_stmts( stmts: list[ast.stmt] ) -> list[ast.stmt]:
+			result: list[ast.stmt] = []
+			for stmt in stmts:
+				visited = self.visit( stmt )
+				if isinstance( visited, list ):
+					result.extend( visited )
+				elif visited is not None:
+					result.append( visited )
+			return result
+
+		if narrow_member is None or subject_name is None:
+			node.body = _visit_stmts( node.body )
+			node.orelse = _visit_stmts( node.orelse )
+			return node
+
+		narrowed_body = node.body if is_not else node.orelse
+		other_body = node.orelse if is_not else node.body
+		case_entry_narrowed = dict( self._narrowed )
+		self._narrowed[subject_name] = [ narrow_member.type ]
+		try:
+			narrowed_visited = _visit_stmts( narrowed_body )
+		finally:
+			self._narrowed = case_entry_narrowed
+		narrowed_visited = [ self._build_narrow_marker( subject_name, narrow_member, node ), *narrowed_visited ]
+		other_visited = _visit_stmts( other_body )
+		if is_not:
+			node.body, node.orelse = narrowed_visited, other_visited
+		else:
+			node.orelse, node.body = narrowed_visited, other_visited
 		return node
 
 	def visit_While( self, node: ast.While ) -> ast.While:

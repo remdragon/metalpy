@@ -8439,6 +8439,369 @@ class MoveParameterTests( unittest.TestCase ):
 		self.assertEqual( decrefs_on_b, [] )
 
 
+class DefaultValueModuleContextTests( unittest.TestCase ):
+	''' _lower_call_args' own default-value-lowering loop (the branch that
+	fills in a parameter the CALLER omitted) used to lower param.default
+	with whatever module/scope context happened to be active - the
+	CALLER's own, since that's what's active while lowering the caller's
+	body - instead of pushing the callee's own module/scope first, unlike
+	every other default-lowering site in this file (field defaults,
+	@inline splicing). A default value that references a name private to
+	the callee's own module (module-scoped, never imported by the caller)
+	would then fail to resolve AT ALL under the caller's own context - not
+	just a misattributed error location, a genuine false compile failure
+	(confirmed via a real repro: lib/posix/time.py's own default-driven
+	'utf8' is not a value, the real bug turned out to be lib/posix/fs.py's
+	own default value). '''
+
+	def test_default_value_referencing_a_callee_module_private_name( self ) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( '\n'.join([
+				'SPECIAL: i32 = 5', # never imported by __main__.py below -
+				# only resolvable if the default is lowered in a.py's own
+				# module context, not __main__.py's
+				'def f( x: i32 = SPECIAL ) -> i32:',
+				'	return x',
+			]), encoding = 'utf-8' )
+			( root / '__main__.py' ).write_text( '\n'.join([
+				'from a import f',
+				'def main() -> i32:',
+				'	return f()', # x omitted - forces the default to be lowered
+			]), encoding = 'utf-8' )
+			discovery = Discovery( paths = [ root ], import_builtins = False )
+			compiler = Compiler( discovery )
+			compiler.import_file( root / '__main__.py' )
+			compiler.run()
+			self.assertEqual( discovery.errors.errors, [] )
+
+	def test_default_value_error_is_located_in_the_callee_module_not_the_caller( self ) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( '\n'.join([
+				'def f( x: i32 = undefined_name ) -> i32:',
+				'	return x',
+			]), encoding = 'utf-8' )
+			( root / '__main__.py' ).write_text( '\n'.join([
+				'from a import f',
+				'def main() -> i32:',
+				'	return f()',
+			]), encoding = 'utf-8' )
+			discovery = Discovery( paths = [ root ], import_builtins = False )
+			compiler = Compiler( discovery )
+			compiler.import_file( root / '__main__.py' )
+			compiler.run()
+			self.assertEqual( len( discovery.errors.errors ), 1 )
+			# located in a.py (where `undefined_name` was actually written),
+			# not __main__.py (which merely calls f() with x omitted)
+			self.assertIn( 'a.py', discovery.errors.errors[0] )
+			self.assertNotIn( '__main__.py', discovery.errors.errors[0] )
+
+
+class OverloadMoveResolutionTests( unittest.TestCase ):
+	''' move(...) sugar used to only be recognized once a single concrete
+	Function target was already chosen (_check_move_argument, reachable
+	from _match_call_args) - never for an Overload group, since
+	_lower_overload_arg fell through to ordinary name resolution instead,
+	where `move` isn't a real registered name anywhere ("name 'move' is
+	not defined": confirmed via str.from_cstr(move(b)), which has both a
+	(ConstPtr[u8], usize) and a move[bytearray] overload). Fixed in
+	_lower_call's own Overload branch: move(...) is peeled before
+	candidate type-matching (so the peeled argument's plain type, e.g.
+	bytearray, can match the move[bytearray] candidate), then - once
+	resolve_call settles on a single concrete winner - validated against
+	that winner's own is_move-ness and the real ownership-transfer hook
+	(_apply_move_hook, i.e. cfg.move()) is applied, mirroring what
+	_lower_call_args already does for a plain, non-overloaded target.
+	IR-level (not real-compile) coverage: a real compile-and-run test
+	against str.from_cstr specifically is blocked by a separate, general,
+	pre-existing bug this investigation also found - two overload
+	candidates that both need real C bodies in the same program collide on
+	an identical mangled C symbol name (emitter_c.py never disambiguates
+	between candidates sharing one qualname) - tracked separately, not
+	this fix's own scope. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_move_call_dispatches_to_the_move_parameter_overload_and_transfers_ownership( self ) -> None:
+		code = '\n'.join([
+			'@overload',
+			'def make( n: i32 ) -> usize:',
+			'	...',
+			'',
+			'def make( n: i32 = 0 ) -> usize:',
+			'	return usize( n )',
+			'',
+			'def make( src: move[bytearray] ) -> usize:',
+			'	return len( src )',
+			'',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return make( move( b ))',
+		])
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and i.target.stem == 'make' ]
+		self.assertEqual( len( calls ), 1 )
+		# dispatched to the move[bytearray] overload, not the i32 default one
+		winner = calls[0].target
+		self.assertEqual( len( winner.parameters ), 1 )
+		self.assertTrue( winner.parameters[0].is_move )
+		self.assertEqual( winner.parameters[0].type.qualname, 'builtins.bytearray' )
+
+		# b's own ownership actually transferred (_apply_move_hook ran) -
+		# no spurious Decref of b left over at its own scope exit on top
+		# of whatever the callee itself does with it (the exact double-
+		# free shape this same investigation already found and fixed once
+		# for the plain, non-overloaded call path)
+		decrefs_on_b = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Decref ) and getattr( i.value, 'stem', None ) == 'b'
+		]
+		self.assertEqual( decrefs_on_b, [] )
+
+	def test_move_call_against_a_non_move_overload_candidate_is_a_compile_error( self ) -> None:
+		# the mirror-image validation _check_move_argument already does for
+		# a plain (non-overloaded) target - move(...) wrapping an argument
+		# whose resolved candidate ISN'T move[T] must still be rejected,
+		# not silently accepted
+		code = '\n'.join([
+			'@overload',
+			'def make( n: i32 ) -> usize:',
+			'	...',
+			'',
+			'def make( n: i32 = 0 ) -> usize:',
+			'	return usize( n )',
+			'',
+			'def make( src: move[bytearray] ) -> usize:',
+			'	return len( src )',
+			'',
+			'def main() -> usize:',
+			'	return make( move( 3 ))',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any( 'is not move[T]' in e for e in self.discovery.errors.errors ) )
+
+
+class IfIsNotNoneNarrowingTests( unittest.TestCase ):
+	''' `if x is not None:`/`if x is None: ... else:` against a union-
+	typed, bare-Name x now narrows x for whichever branch is actually
+	"live" - type_resolver.py's visit_If, previously with no body-
+	narrowing setup at all (unlike visit_While/visit_Match). Verified the
+	same way test_compiler_sizeof_of_narrowed_name_uses_narrowed_type
+	above verifies match-arm narrowing: compiler.sizeof(x) folds to a
+	compile-time constant that only matches the NARROWED leaf's own size
+	if x's tracked type was actually narrowed down from the whole union's
+	own (larger) size. Post-if survival itself needs no new machinery -
+	merge_if/_merge_narrowed_soft (cfg.py) are already fully generic. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _sizeof_x_is_narrowed_to_u8( self, code: str ) -> bool:
+		# True only when compiler.sizeof(u) folded to the compile-time
+		# constant 1 (u8's own size) - proof u was narrowed down from U's
+		# own (larger) union size. An un-narrowed compiler.sizeof(u) isn't
+		# necessarily a Const at all (a TaggedUnion's own size isn't always
+		# foldable the same way a scalar leaf's is) - either shape here
+		# just means "not narrowed", which is all the negative tests need
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		src = assigns['x']
+		return isinstance( src, ir.Const ) and src.value == 1
+
+	def test_narrows_inside_if_is_not_none_body( self ) -> None:
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertTrue( is_narrowed ) # u8's own size, not U's (tag + payload)
+
+	def test_narrows_inside_if_is_none_else_body( self ) -> None:
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is None:',
+			'		pass',
+			'	else:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertTrue( is_narrowed )
+
+	def test_narrowing_does_not_leak_into_the_non_narrowed_branch( self ) -> None:
+		# the ELSE of `if x is not None:` (x could still be None there) must
+		# NOT be narrowed - compiler.sizeof(u) there uses U's own full size
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		pass',
+			'	else:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertFalse( is_narrowed )
+
+	def test_narrowing_survives_past_the_whole_if_when_the_other_branch_returns( self ) -> None:
+		# `if x is None: return` - the ONLY way past this statement is
+		# already having x is not None, so x is narrowed for the REST of
+		# the function too, same survival merge_if already gives match/
+		# while (steady-dancing-haven.md's own reasoning)
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is None:',
+			'		return',
+			'	x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertTrue( is_narrowed )
+
+	def test_no_narrowing_survival_when_neither_branch_terminates( self ) -> None:
+		# neither branch of the if unconditionally exits - nothing proves
+		# u is non-None by the time execution reaches past the whole
+		# statement, so code after it must NOT be narrowed
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		pass',
+			'	x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertFalse( is_narrowed )
+
+	def test_three_member_union_is_not_none_does_not_narrow( self ) -> None:
+		# more than one non-None member - which of them x actually IS
+		# can't be determined from `is not None` alone, matching
+		# _rewrite_tagged_union_truthiness's own identical restriction; no
+		# multi-member narrowing-marker support exists (compiler.sizeof(u)
+		# still compiles - just against U's own full, un-narrowed size)
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	B: i64',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertFalse( is_narrowed )
+
+
+class RejectMoveThroughUnionOrOverloadTests( unittest.TestCase ):
+	''' calling an @move-decorated method through a union-typed receiver
+	or an overload group is now a compile error, not a silent gap. Both
+	were confirmed silent before this fix: the receiver-move-hook
+	(lowering.py's _lower_call, gated on isinstance(target, Function))
+	never fires for a ReceiverDispatch OR an Overload target at all - so
+	calling an @move method through either shape neither tracked
+	ownership correctly nor errored. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_move_method_through_union_receiver_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class A:',
+			'	@move',
+			'	def consume( self ) -> i32:',
+			'		return 1',
+			'',
+			'class B:',
+			'	@move',
+			'	def consume( self ) -> i32:',
+			'		return 2',
+			'',
+			'def main() -> None:',
+			'	x: A|B',
+			'	x.consume()',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any( '@move' in e and 'union-typed receiver' in e for e in self.discovery.errors.errors ) )
+
+	def test_move_overload_candidate_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class Box:',
+			'	value: i32',
+			'',
+			'	def __init__( self, v: i32 ) -> None:',
+			'		self.value = v',
+			'',
+			'	@overload',
+			'	@move',
+			'	def unwrap( self, default: i32 ) -> i32:',
+			'		...',
+			'',
+			'	@move',
+			'	def unwrap( self, default: i32 = 0 ) -> i32:',
+			'		return self.value',
+			'',
+			'def main() -> None:',
+			'	b: Box = Box( 1 )',
+			'	b.unwrap()',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any( '@move-decorated overload' in e for e in self.discovery.errors.errors ) )
+
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()
