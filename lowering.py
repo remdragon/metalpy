@@ -379,6 +379,18 @@ class Lowering:
 			return False
 		if isinstance( node, ast.Subscript ):
 			return getattr( node, 'is_tuple_element_read', False )
+		if isinstance( node, ast.Yield ):
+			# PLAN_GENERATORS.md Phase C - a CAPTURED yield expression
+			# (_expr_Yield's own return - a discarded/statement-position
+			# yield never reaches here at all, see _emit_generator_yield_
+			# suspend's own _is_aliasing_expr call, which is checked
+			# against the YIELDED expression, never the Yield node itself)
+			# reads self.__send_slot, a field that independently keeps its
+			# own reference - exactly the same "reads an existing value
+			# someone else still owns" shape ast.Attribute already is,
+			# just reached through the generator's own send() mechanism
+			# instead of a textual `self.<attr>` in the user's own source
+			return True
 		return isinstance( node, ( ast.Name, ast.Attribute ))
 
 	def _is_compiler_attr( self, node: ast.expr ) -> str|None:
@@ -1820,9 +1832,6 @@ class FunctionLowering:
 		slot_field = self.lowering._attr_lookup( self_var.type, '__send_slot', node )
 		dest = self._new_temp( slot_field.type )
 		self._emit( ir.GetAttr( dest = dest, obj = self_var, attr = '__send_slot' ))
-		if cfg.is_rc( send_type ):
-			for instr in self._cfg.incref( send_type, dest ):
-				self._emit( instr )
 		return dest
 
 	def run_global( self, var: Variable ) -> list[ir.Instruction]:
@@ -2753,6 +2762,20 @@ class FunctionLowering:
 				# the source (see cfg.py's "Independent tracking"), but a
 				# match statement genuinely IS the inspection of its subject
 				is_match_subject = getattr( node, 'is_match_subject', False )
+				# PLAN_GENERATORS.md Phase C - _build_liveness_guard's own
+				# capture-temp restructuring (`__yield_capture_N = yield v`,
+				# needed whenever a captured yield's result is assigned
+				# into an RC-typed promoted local - see that method's own
+				# docstring for why the yield can't just be deep-copied
+				# like an ordinary value expression) tags its own synthesized
+				# capture assignment with this - same "purely a relay,
+				# never an independent owner" shape is_match_subject already
+				# is: the captured yield reads self.__send_slot, a FIELD
+				# that keeps its own reference for as long as it's live, so
+				# the capture temp needs exactly the same BORROW treatment
+				# __match_subj_N gets, for the identical reason (see that
+				# case's own comment just below)
+				is_generator_send_capture = getattr( node, 'is_generator_send_capture', False )
 				is_alias = self.lowering._is_aliasing_expr( node.value, operand )
 				# when the subject is a bare Name (is_alias=True), the
 				# ORIGINAL name already owns a live reference for the whole
@@ -2763,8 +2786,19 @@ class FunctionLowering:
 				# Incref that inflated every compiler.refcount() read taken
 				# inside a match arm). A non-Name subject (e.g. `match
 				# make():`) has no such original owner, so it keeps full
-				# ownership tracking unchanged (borrow=False there).
-				for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node, track_result = not is_match_subject, borrow = is_match_subject and is_alias ):
+				# ownership tracking unchanged (borrow=False there). A
+				# generator-send-capture temp is NEVER itself a Result
+				# needing inspection (track_result unconditional on the
+				# flag alone, mirroring is_match_subject's own identical
+				# unconditional skip) - borrow, unlike track_result, still
+				# only applies when the source is genuinely aliasing
+				# (always true for is_generator_send_capture in practice -
+				# _is_aliasing_expr treats every captured yield as aliasing
+				# unconditionally - but kept as its own check for symmetry
+				# with is_match_subject's identical shape)
+				never_a_result = is_match_subject or is_generator_send_capture
+				borrow = ( is_match_subject or is_generator_send_capture ) and is_alias
+				for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node, track_result = not never_a_result, borrow = borrow ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
 				match_clears_name = getattr( node, 'match_clears_name', None )

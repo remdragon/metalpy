@@ -212,6 +212,12 @@ class TypeResolver:
 		# simplest way to guarantee uniqueness without threading a fresh
 		# counter through every desugaring call site
 		self._for_desugar_counter = 0
+		# PLAN_GENERATORS.md Phase C - unique per-captured-yield-value temp
+		# name (__yield_capture_N - see _build_liveness_guard's own
+		# docstring for why this exists), same "global across every
+		# generator, never reset" uniqueness posture as _for_desugar_counter
+		# just above, same reasoning
+		self._yield_capture_counter = 0
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -1359,17 +1365,74 @@ class TypeResolver:
 			renamed = renamer.visit( s )
 			stem = self._assigned_self_attr_stem( renamed )
 			if stem is not None and stem in rc_local_stems:
-				result.append( self._build_liveness_guard( renamed, stem ))
+				result.extend( self._build_liveness_guard( renamed, stem ))
 			else:
 				self._recurse_liveness_wrap( renamed, rc_local_stems )
 				result.append( renamed )
 		return result
 
-	def _build_liveness_guard( self, renamed: ast.stmt, stem: str ) -> ast.If:
+	def _build_liveness_guard( self, renamed: ast.stmt, stem: str ) -> list[ast.stmt]:
 		''' shared by _rename_and_track_liveness's own top-level loop and
 		_recurse_liveness_wrap's identical nested case - see
 		_rename_and_track_liveness's own docstring for the exact if/else
-		shape this builds and why. '''
+		shape this builds and why (and when this needs to run at all -
+		only for an assignment INTO an RC-typed promoted local).
+
+		PLAN_GENERATORS.md Phase C - deep-copying the WHOLE statement into
+		two independent branches (the ordinary path, below) is only safe
+		when the value expression is side-effect-duplication-safe: an
+		ordinary constructor/function call appearing TWICE in the compiled
+		C is still evaluated EXACTLY ONCE at runtime (only one of the two
+		branches ever actually executes for a given dynamic instance - see
+		this method's own caller's docstring), so which COPY runs doesn't
+		matter. A `yield` breaks that assumption: it isn't an ordinary
+		value computation, it's a real suspend point with its own unique
+		dispatch (state, resume_label) pair - deep-copying a statement
+		whose value expression contains one would allocate TWO separate
+        suspend points for what must be ONE textual yield site (confirmed
+		via a real repro: `held = yield i` where held: Box - the resulting
+		double-counted state broke self.__state's own dispatch entirely,
+		reported as a confusing unrelated type error several statements
+		later). Detected here and handled differently: capture the yield's
+		own result ONCE into an ordinary (never-promoted, purely $$__
+		resume__-call-scoped - same "real local, not a field" posture
+		_build_while_unit_guard's own long-removed resume_var used) temp,
+		THEN branch only on the simple re-store from that temp - the yield
+		itself now appears exactly once in the compiled body, textually
+		and state-wise alike. '''
+		assert isinstance( renamed, ast.Assign ) and len( renamed.targets ) == 1
+		if any( isinstance( n, ast.Yield ) for n in ast.walk( renamed.value ) ):
+			target = renamed.targets[0]
+			temp_name = f'__yield_capture_{self._yield_capture_counter}'
+			self._yield_capture_counter += 1
+			capture = ast.Assign(
+				targets = [ ast.Name( id = temp_name, ctx = ast.Store() ) ],
+				value = renamed.value,
+			)
+			# PLAN_GENERATORS.md Phase C - see lowering.py's own _stmt_Assign
+			# comment on this flag: the captured yield reads self.__send_
+			# slot, a field that keeps its own reference independently, so
+			# this temp is purely a relay (a BORROW), never an independent
+			# owner needing its own incref/eventual decref
+			capture.is_generator_send_capture = True
+			ast.copy_location( capture, renamed )
+			already_live = ast.Assign( targets = [ target ], value = ast.Name( id = temp_name, ctx = ast.Load() ) )
+			ast.copy_location( already_live, renamed )
+			first_time = ast.Assign( targets = [ copy.deepcopy( target ) ], value = ast.Name( id = temp_name, ctx = ast.Load() ) )
+			first_time.generator_first_rc_assign = True
+			ast.copy_location( first_time, renamed )
+			flag_assign = ast.Assign(
+				targets = [ self._self_attr( self._live_flag_stem( stem ), renamed ) ],
+				value = ast.Constant( value = True ),
+			)
+			ast.copy_location( flag_assign, renamed )
+			guard = ast.If(
+				test = self._self_attr( self._live_flag_stem( stem ), renamed ),
+				body = [ already_live ],
+				orelse = [ first_time, flag_assign ],
+			)
+			ast.copy_location( guard, renamed )
+			return [ capture, guard ]
 		already_live = renamed
 		first_time = copy.deepcopy( renamed )
 		first_time.generator_first_rc_assign = True
@@ -1384,7 +1447,7 @@ class TypeResolver:
 			orelse = [ first_time, flag_assign ],
 		)
 		ast.copy_location( guard, renamed )
-		return guard
+		return [ guard ]
 
 	def _recurse_liveness_wrap( self, stmt: ast.stmt, rc_local_stems: set ) -> None:
 		''' PLAN_GENERATORS.md Phase F - in place: descends into every
@@ -1413,7 +1476,7 @@ class TypeResolver:
 			for s in nested:
 				stem = self._assigned_self_attr_stem( s )
 				if stem is not None and stem in rc_local_stems:
-					new_nested.append( self._build_liveness_guard( s, stem ))
+					new_nested.extend( self._build_liveness_guard( s, stem ))
 				else:
 					self._recurse_liveness_wrap( s, rc_local_stems )
 					new_nested.append( s )
@@ -1683,7 +1746,12 @@ class TypeResolver:
 			value = ast.Name( id = 'v', ctx = ast.Load() ),
 		)
 		ast.copy_location( send_slot_assign, fn.node )
-		send_slot_stmt = self._build_liveness_guard( send_slot_assign, '__send_slot' ) if is_rc( send_type ) else send_slot_assign
+		# _build_liveness_guard now returns a list[ast.stmt] (PLAN_GENERATORS.md
+		# Phase C's yield-in-value-expression capture-temp case, which never
+		# applies here - send_slot_assign's own value is just `v`, a plain
+		# Name, never a yield) - a single-element list in this case, but
+		# still a list, so extend rather than assume one statement
+		send_slot_stmts = self._build_liveness_guard( send_slot_assign, '__send_slot' ) if is_rc( send_type ) else [ send_slot_assign ]
 		send_ready_assign = ast.Assign(
 			targets = [ self._self_attr( '__send_ready', fn.node ) ], value = ast.Constant( value = True ),
 		)
@@ -1692,7 +1760,7 @@ class TypeResolver:
 			args = ast.arguments( posonlyargs = [], args = [ ast.arg( arg = 'v' ) ], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
 			body = [
 				not_started_guard,
-				send_slot_stmt,
+				*send_slot_stmts,
 				send_ready_assign,
 				ast.Return( value = ast.Call(
 					func = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__resume__', ctx = ast.Load() ),
