@@ -10,7 +10,6 @@
 # nonzero/negative code too.
 
 # stdlib imports:
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -52,7 +51,7 @@ class WideIntBehaviorTests( unittest.TestCase ):
 			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
 			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
-			libs = set( compiler.extern_libs ) | linker_c.implicit_ldflags( no_crt, 'windows' if os.name == 'nt' else os.name )
+			libs = set( compiler.extern_libs )
 			ldflags = ''
 			for lib in sorted( libs ):
 				if lib == 'c':
