@@ -2327,6 +2327,50 @@ class FunctionLowering:
 				# RCCLASS ATTRIBUTE LIFETIME.md and cfg.attr_assign())
 				for instr in self._cfg.attr_assign( attr_var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )):
 					self._emit( instr )
+			elif getattr( node, 'generator_first_rc_assign', False ):
+				# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a generator's
+				# own $$__next__ reassigning an RC-typed promoted local for
+				# the FIRST time ever (type_resolver.py's _rename_and_track_
+				# liveness splits every such reassignment into `if self.__
+				# <stem>_live: <ordinary decref-old assign via attr_replace,
+				# below> else: <THIS tagged assign>; self.__<stem>_live =
+				# True`). The field's CURRENT value is still the construction-
+				# time placeholder (a bare `0`, see _expr_Constant's own
+				# generator_zero_rc_field exemption elsewhere in this file) -
+				# reading it back and decref-ing it the ordinary way below
+				# would compute &(NULL)->$header, a real, confirmed UBSan trap
+				# (member access through a null pointer is UB even when the
+				# member is at offset 0, and release_object's own runtime
+				# null-check would otherwise make it harmless anyway) - so
+				# there is no old value read/decref here at all, unlike both
+				# branches above/below. Deliberately NOT routed through
+				# attr_assign (unlike the construction-time branch just above)
+				# even though the underlying need - "a fresh value, no prior
+				# one to decref" - is the same: attr_assign also pushes a
+				# 'self.<attr>'-keyed entry onto self.bindings/the epilogue
+				# stack, a mechanism scoped to (and only ever reconciled
+				# correctly by merge_if/cfg.py for) an actual __init__ under
+				# construction - reusing it here, inside the ordinary if/else
+				# type_resolver.py synthesizes around this branch, made
+				# merge_if() see a 'self.<attr>' binding fresh on only one
+				# branch and try to `del self._current_fn.names['self.<attr>']`
+				# - a real KeyError, confirmed via a real repro, since no local
+				# named 'self.<attr>' is ever registered in fn.names (that key
+				# format is attr_assign's own bindings-dict convention, not a
+				# real name lookup key). Only the two ordinary halves of what
+				# a fresh RC value assignment needs are reproduced directly
+				# instead, via the same public helpers _stmt_Return already
+				# uses for an analogous "move ownership in, no bindings
+				# tracking" need: incref the new value if it's an alias of an
+				# existing tracked binding (mirrors attr_replace/attr_assign's
+				# own is_alias branch), else untrack_temp() so the fresh temp's
+				# own end-of-statement cleanup doesn't ALSO decref it now that
+				# the field owns it.
+				if self.lowering._is_aliasing_expr( node.value, operand.type ):
+					for instr in self._cfg.incref( attr_var.type, operand ):
+						self._emit( instr )
+				else:
+					self._cfg.untrack_temp( operand )
 			elif cfg.rc_leaves( attr_var.type ):
 				# ordinary SetAttr on an already-constructed instance -
 				# "an RCClass is always complete, so setting an attribute
@@ -4232,6 +4276,22 @@ class FunctionLowering:
 			expected_type is not None and not isinstance( expected_base, TaggedUnion )
 			and not isinstance( expected_type, ( TypeVar, CEnum ))
 			and not self.lowering._type_resolver._is_ptr_specialization( expected_type )
+			# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a compiler-
+			# synthesized `0` standing in for "this RC-typed generator
+			# field isn't assigned yet" (type_resolver.py's
+			# _build_generator_backing_class/_rewrite_generator_
+			# constructor - a live-flag-gated field, never read before
+			# its own first real assignment, so the actual zero bit
+			# pattern here is never observed by anything but the
+			# generator's own state/flag-gated destructor deciding NOT
+			# to decref it). Deliberately NOT a general "int literal into
+			# any RCClass" language relaxation (unlike the pre-existing
+			# Ptr[T]/ConstPtr[T] exemption just above, which IS meant for
+			# ordinary user code) - gated on this compiler-internal tag
+			# only, exactly like resolved_type/resolved_callee elsewhere
+			# in this codebase, so ordinary user code still can't write
+			# `b: Box = 0` as a novel "null RCClass" idiom
+			and not getattr( node, 'generator_zero_rc_field', False )
 		):
 			compatible_stems = self.lowering._LITERAL_COMPATIBLE_STEMS.get( type( node.value ) )
 			expected_stem = getattr( expected_type, 'stem', None )

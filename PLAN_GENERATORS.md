@@ -9,13 +9,15 @@ an arithmetic-mode `with` block) + Phase 7 (generic generator functions,
 inferred `gen(...)` instantiation, interim-scoped to reject a body that
 references its own type param outside a parameter/return annotation) +
 Phase 8 (fallible generators, `Generator[T,E]`, `or_return()` inside a
-generator body) landed and real-compile-and-run tested
+generator body) + Phase 9 (RC-typed locals crossing a yield - the LAST
+item on the original roadmap) landed and real-compile-and-run tested
 (emitter_c_test.py's GeneratorFunctionTests). Phase 5 matches the
 "remaining phases roadmap" section's own Phase 1, Phase 6 matches that
-roadmap's own Phase 2, Phase 7 matches that roadmap's own Phase 3, and
-Phase 8 matches that roadmap's own Phase 4 (below) - kept the SEQUENTIAL
-landed-phase numbering here (v1, Phase 2, 3, 4, 5, 6, 7, 8) rather than
-renaming it, since that roadmap's own 1-5 numbering is a separate, later
+roadmap's own Phase 2, Phase 7 matches that roadmap's own Phase 3, Phase
+8 matches that roadmap's own Phase 4, and Phase 9 matches that roadmap's
+own Phase 5 (below) - kept the SEQUENTIAL landed-phase numbering here
+(v1, Phase 2, 3, 4, 5, 6, 7, 8, 9) rather than renaming it, since that
+roadmap's own 1-5 numbering is a separate, later
 scoping pass over what was still left, not a renumbering of what had
 already landed; the two schemes overlap in NAME but not in MEANING -
 watch for this when
@@ -472,6 +474,129 @@ _emit_check_arith, entirely outside anything this phase touched) - this
 is a pre-existing gap in the CORE checked-arithmetic-error machinery,
 flagged as a separate task, not fixed here.
 
+Phase 9 design (type_resolver.py's `_live_flag_stem`,
+`_build_generator_backing_class`'s live-flag fields, `_rename_and_track_
+liveness`, `_maybe_route_yield_through_temp`, `_build_generator_
+destructor`; lowering.py's `_stmt_Assign`'s new `generator_first_rc_
+assign` branch and `_expr_Constant`'s `generator_zero_rc_field`
+exemption): landed RC-typed locals crossing a yield - the last item on
+the whole roadmap. Lifted `_collect_generator_locals`'s scalar-only
+check entirely (any type now allowed for a promoted local); this alone
+also lifts Phase 1/5's own for-loop element-type restriction, since the
+loop target is just another promoted local by the time it reaches that
+check - confirmed via a real for-loop-over-`list[RCClass]`-inside-a-
+generator repro, no separate code change needed for that part.
+
+**Design pivot from the original sketch**: the ORIGINAL plan (see below)
+sketched a per-STATE validity table (a `switch` on `self.__state`,
+decref-ing exactly the fields "valid from state N onward", computed from
+CFG liveness). Working through the real cases - specifically, a local
+assigned only in a while-unit's POST-yield code (`post_iter_stmts`),
+which does NOT run on the very first pass through the loop - surfaced a
+real correctness gap the per-state model can't express: `self.__state`
+alone can't distinguish "paused right after the first yield, post-yield
+code never run yet" from "paused after a later iteration where it HAS
+run", since both leave `self.__state` at the exact same value. A
+per-FIELD boolean live-flag (`__<stem>_live: bool`, false until the
+field's own first real assignment, never reset false again since
+ordinary reassignment already correctly decrefs the old value) sidesteps
+this entirely - correctness no longer depends on WHICH unit/branch/pre-
+or-post-yield-position a local's assignment happens to live in, just
+"has this specific field literally been written yet." Simpler to build
+and provably correct against every shape tried, at the cost of one extra
+bool field per RC-typed promoted local (this codebase's own
+`_collect_generator_locals` already deliberately over-promotes rather
+than tracking precise liveness, so this fits its own established
+philosophy).
+
+**Zero-value placeholder**: a promoted RC-typed field needs SOME value
+at construction time (every field is required by the no-`__init__`
+construction sugar this generator's own constructor already used, with
+no existing way to omit one). A bare `0` fails ordinary type-checking
+for an RCClass field (confirmed: "an int literal cannot be used where
+X is expected") - `_expr_Constant` gained a narrow, compiler-internal-
+only exemption (`generator_zero_rc_field`, checked alongside the
+pre-existing `Ptr[T]`/`ConstPtr[T]` literal exemption, but NOT merged
+into it - deliberately kept as its own separate tag so ordinary user
+code still can't write `b: SomeClass = 0` as a novel "null RCClass"
+idiom; RCClass values are never null anywhere else in this language).
+This placeholder is NEVER read as a real value (the live-flag guarantees
+that), only ever passed to `release_object` - which is itself already
+null-safe at runtime (`if (obj && ...)`) - so this part alone would have
+been harmless. It wasn't: a SEPARATE bug surfaced downstream (below).
+
+**The real bug found, and its fix**: ordinary in-body reassignment of
+the SAME promoted local (its own declaring statement, textually once in
+source but re-executed every loop iteration at runtime) unconditionally
+reads the field's CURRENT value and decrefs it before storing the new
+one - correct once a real prior value exists, but on the field's
+DYNAMICALLY first-ever execution (which the live-flag, not source
+position, is what actually identifies - confirmed via a real repro that
+a naive "textually-first-occurrence" rule breaks starting the second
+loop iteration), the field is still the placeholder, and computing
+`&(NULL)->$header` to decref it is undefined behavior per the C
+standard even though `release_object`'s own runtime check makes it
+harmless in practice - confirmed as a real UBSan trap
+(`-fsanitize=undefined -fsanitize-trap=undefined`, this project's own
+default test build flags) even though a plain non-sanitized build ran
+the same path without visibly crashing. Fixed by splitting every
+reassignment of an RC-typed promoted local into `if self.__<stem>_live:
+<ordinary reassignment> else: <a differently-tagged assign, generator_
+first_rc_assign> ; self.__<stem>_live = True` - the tagged branch skips
+the old-value read/decref entirely, reproducing only the "adopt a fresh
+value" half via the same public `cfg.py` helpers (`incref`/
+`untrack_temp`) `_stmt_Return` already uses for an analogous "move
+ownership in, no bindings tracking" situation - deliberately NOT routed
+through `cfg.attr_assign` (the mechanism `__init__` construction uses
+for the identical-looking need), since that pushes a `'self.<attr>'`-
+keyed entry onto the epilogue/bindings stack scoped to real constructor
+lowering - reusing it inside an ordinary synthesized `if/else` (not
+`__init__`) made `merge_if()` see that binding as fresh on only one
+branch and raise a real `KeyError` trying to reconcile it, confirmed via
+a direct repro.
+
+**Yielding an RC value needs an explicit incref** (the user's own
+framing, confirmed exactly right): the caller receives a new, counted
+reference while the generator's own field keeps its own - both alive
+independently. This surfaced the session's THIRD and FOURTH pre-existing,
+generator-unrelated RC bugs (flagged separately, not fixed here): plain
+`return self.<field>` doesn't incref at all; and coercing a value into a
+declared union return type (`__next__`'s own `elem_type|None` shape)
+loses the incref even for an ordinary tracked parameter/local, AND
+separately, coercing a value into a union assignment target only
+correctly increfs when the source is itself already a tracked binding
+(a Name), not an untracked expression like a field read. All three are
+sidestepped by chaining two ALREADY-correct steps rather than fixing any
+of them: `__yield_raw_N: elem_type = <yielded>` (a bare-typed local from
+whatever expression, confirmed to always incref correctly regardless of
+source), then `__yield_val_N: elem_type|None = __yield_raw_N` (coercing
+a TRACKED LOCAL, not a field read, into the union - confirmed this
+specific shape increfs correctly), then `return __yield_val_N` (a plain
+move of an already-union-typed tracked local - the one return shape
+this compiler already gets right, per every existing test in
+or_return_rc_test.py). Verifying this took real trial and error against
+precise `compiler.refcount()` deltas - repeated false alarms came from
+two easy-to-miss, already-established compiler behaviors: `case T(name):`
+match extraction always takes its OWN additional incref on top of
+whatever the subject already holds, and an earlier match statement's own
+hidden subject temp stays alive until the ENCLOSING FUNCTION's scope
+ends, not just past its own match statement - both inflate a naive
+before/after count by +1 in ways that look like bugs but aren't. The
+project's own established RC-test style (a before/after delta around an
+isolated helper call, not precise intermediate counts - see
+`dropped_mid_iteration_decrefs_captured_parameter`) sidesteps both
+pitfalls and is what this phase's own tests use.
+
+Verified via real compile-and-run: an RC-typed promoted local reassigned
+fresh every loop iteration, values read back correctly (not corrupted)
+across multiple reassignment cycles; a generator dropped mid-iteration
+with its own promoted-local field still holding a live RC value,
+confirmed released via the live-flag-gated destructor without touching
+an unrelated object's refcount; a captured parameter repeatedly yielded
+and still correctly released on drop; a for-loop over `list[RCClass]`
+inside a generator, both fully drained (values correct) and refcount-
+verified.
+
 Remaining phases roadmap (scoped 2026-08-15)
 
 Phase 1: LANDED (same session it was scoped in) - see "Phase 5 design"
@@ -513,15 +638,17 @@ open question) - the one piece of this whole roadmap flagged as having
 the IR-level one sketched here originally: a pure AST-level reordering
 (see "Phase 8 design"), not a new OrReturn/OrJump/IR primitive at all.
 
-Phase 5 (not explicitly requested, proposed as the most load-bearing
-remaining gap): RC-typed locals crossing a yield. v1 restricted promoted
-LOCALS to scalar types specifically because a not-yet-initialized RC
-field would make the ordinary unconditional $$__destructor__ cascade
-decref garbage - the original plan's own state-gated-destructor sketch
-(below) is the real fix, computed from the same per-field "valid from
-state N onward" data the liveness/promotion step already has. Landing
-this lifts the scalar-only restriction everywhere it currently applies,
-including Phase 1's own iterator-consumption element type.
+Phase 5: LANDED (same session it was scoped in) - see "Phase 9 design"
+below (kept the sequential landed-phase numbering there; see the STATUS
+section's own note on why the two schemes overlap in name but not
+meaning). RC-typed locals crossing a yield - not explicitly requested,
+proposed as the most load-bearing remaining gap, and the LAST item on
+this whole roadmap. Landed via a live-FLAG-gated destructor instead of
+the state-gated one originally sketched here (see "Phase 9 design" for
+why - a per-field boolean turned out simpler and more robust than a
+per-state validity table, once the actual edge cases were worked
+through). Lifts the scalar-only restriction everywhere it applied,
+including Phase 1's own for-loop element type.
 
 Explicitly not planned, no forcing use case: `yield from`; `.send()`/
 `.throw()`/`.close()`; defer/errdefer inside a generator body (a real,

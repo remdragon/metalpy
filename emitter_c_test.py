@@ -8814,6 +8814,116 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+		# --- Phase 5 (roadmap Phase 5, the last roadmap item): RC-typed
+		# locals crossing a yield. Lifts v1's own scalar-only restriction
+		# on promoted locals (a not-yet-initialized RC field would make
+		# the ordinary unconditional $$__destructor__ cascade decref
+		# garbage) via a state/flag-gated destructor - each RC-typed
+		# promoted local gets its own `__<stem>_live` companion field,
+		# set once actually assigned, checked by the generator's own
+		# custom-built destructor before decref-ing it. A yielded RC
+		# value is routed through two chained, ALREADY-correctly-RC'd
+		# intermediate locals (see _maybe_route_yield_through_temp's own
+		# docstring for exactly which two, and why - two separate real,
+		# pre-existing, generator-unrelated RC bugs were found and
+		# routed around building this, both flagged separately). Values
+		# are read back correctly across MULTIPLE reassignment cycles of
+		# the SAME promoted local (not just constructed once) - the
+		# generator's own field is reassigned fresh each loop iteration,
+		# each old value correctly released before the new one lands.
+		( 'rc_typed_promoted_local_reassigned_each_iteration', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def make_boxes( count: usize ) -> Iterator[Box]:
+	i: usize = 0
+	while i < count:
+		b: Box = Box( v = 100 )
+		yield b
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def consume_fully( count: usize ) -> None:
+	with compiler.wrap_arithmetic:
+		n: usize = 0
+		while True:
+			match make_boxes( count ).__next__():
+				case Box( x ):
+					if x.v != 100:
+						return
+					n += 1
+				case None:
+					break
+
+def gen_from_box( b: Box, count: usize ) -> Iterator[Box]:
+	i: usize = 0
+	while i < count:
+		yield b
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def make_and_partially_consume( b: Box ) -> None:
+	g = gen_from_box( b, 5 )
+	match g.__next__():
+		case Box( first ):
+			pass
+		case None:
+			pass
+	# g goes out of scope here, still mid-iteration (only 1 of 5 yields
+	# consumed) - dropping it must decref the captured parameter b,
+	# exactly like the existing (scalar-yielding) drop tests already
+	# verify, now with an RC value flowing through the yield itself too
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b0 = Box( v = 1 )
+		if compiler.refcount( b0 ) != 1:
+			return 1
+		b1 = Box( v = 2 )
+		if compiler.refcount( b1 ) != 1:
+			return 2
+		make_and_partially_consume( b1 )
+		if compiler.refcount( b0 ) != 1: # unaffected by an unrelated generator
+			return 3
+		if compiler.refcount( b1 ) != 1: # g's own captured parameter released
+			return 4
+		return 0
+''' ),
+		( 'generator_for_loop_over_rc_typed_list_element', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def double_all( xs: list[Box] ) -> Iterator[Box]:
+	for x in xs:
+		yield x
+
+def consume_fully( xs: list[Box] ) -> None:
+	with compiler.wrap_arithmetic:
+		total: i32 = 0
+		n: usize = 0
+		for y in double_all( xs ):
+			total += y.v
+			n += 1
+		if n != 3:
+			return
+		if total != 60: # 10+20+30
+			return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		xs: list[Box] = list[Box]()
+		xs.append( Box( v = 10 ) ).unwrap( 'append failed' )
+		xs.append( Box( v = 20 ) ).unwrap( 'append failed' )
+		xs.append( Box( v = 30 ) ).unwrap( 'append failed' )
+		consume_fully( xs )
+		if compiler.refcount( xs ) != 1:
+			return 1
+		return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:

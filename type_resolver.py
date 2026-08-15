@@ -1,10 +1,12 @@
 # stdlib imports:
 import ast
+import copy
 from contextlib import nullcontext
 import queue
 import threading
 
 # local imports:
+from cfg import is_rc
 from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
@@ -279,12 +281,6 @@ class TypeResolver:
 
 	def _function_contains_yield( self, fn: Function ) -> bool:
 		return any( isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( fn.node.body ))
-
-	# v1 restriction: a promoted local must be one of these scalar stems
-	# (mpy_types.Scalar.stem) - see this section's own docstring above for why
-	_GENERATOR_LOCAL_STEMS = {
-		'bool', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'isize', 'usize', 'i128', 'u128',
-	}
 
 	def _self_attr( self, name: str, node: ast.AST ) -> ast.Attribute:
 		inner = ast.Name( id = 'self', ctx = ast.Load() )
@@ -689,11 +685,9 @@ class TypeResolver:
 		only option available to a generator's own $$__next__. x's own
 		element type is __getitem__'s UNWRAPPED return type, spelled as a
 		bare ast.Name(id=elem_type.stem) for its own AnnAssign annotation
-		(works whether elem_type turns out scalar - the only kind v1's
-		_collect_generator_locals actually allows for a per-iteration
-		local yet, Phase 5's own concern to lift - or not, which then
-		surfaces as THAT existing, clear "only scalar locals" error
-		instead of a confusing one from here). '''
+		- an ordinary promoted local like any other since PLAN_GENERATORS.
+		md Phase 5 (roadmap Phase 5) lifted _collect_generator_locals'
+		former scalar-only restriction, RC-typed elem_type included. '''
 		self.ensure_resolved( getitem_fn )
 		len_fn = self._probe_method( obj_type, '__len__' )
 		assert len_fn is not None # caller (_desugar_general_for) already confirmed this
@@ -770,10 +764,14 @@ class TypeResolver:
 		concern once written). BODY itself (containing the yield) stays a
 		SIBLING of the match statement, not nested inside it - keeping
 		yield at the exact nesting depth _validate_while_yield_unit
-		already requires, with zero changes to that validator. x is
-		restricted to a scalar element type for this pass (same
-		restriction _desugar_indexable_for's own docstring notes, and for
-		the identical reason - Phase 5's concern to lift). '''
+		already requires, with zero changes to that validator. x's own
+		element type was restricted to scalar when this was written -
+		PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) lifted that (x is an
+		ordinary promoted local like any other now - _collect_generator_
+		locals no longer scalar-gates it, and an RC-typed one gets the
+		same live-flag-gated destructor treatment as any other RC-typed
+		promoted local), verified via a real for-loop-over-list[RCClass]-
+		inside-a-generator repro. '''
 		self.ensure_resolved( next_fn )
 		elem_type = next_fn.return_type
 		none_type = self.discovery.get_none_type()
@@ -926,21 +924,40 @@ class TypeResolver:
 		this section's own docstring above. A local's TYPE comes from its
 		own first `x: T = ...` annotated assignment (required - a generator
 		local can't rely on plain-assignment type inference); a later plain
-		`x = ...` reassignment is fine once `x` is already declared. '''
+		`x = ...` reassignment is fine once `x` is already declared.
+
+		PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) lifted the v1 scalar-
+		only restriction here (previously: only bool/integer types were
+		accepted) - any type is now allowed, including RC-typed ones. An
+		RC-typed promoted local gets its own "live" companion field (see
+		_build_generator_backing_class) so the generator's own state/flag-
+		gated destructor (_build_generator_destructor) only ever decrefs
+		it once it's actually been assigned - the exact problem that made
+		v1 restrict this in the first place (an unconditional decref of a
+		not-yet-initialized field would touch garbage). '''
 		param_stems = { p.stem for p in fn.parameters or [] }
 		locals_decl: dict[str,Type] = {}
 		for node in self._walk_generator_body( fn.node.body ):
+			if getattr( node, 'compiler_synthesized_for_loop_temp', False ):
+				# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a synthesized
+				# yield-return temp (_maybe_route_yield_through_temp) is the
+				# FIRST synthesized temp in this file to need an AnnAssign
+				# shape (an explicit `: T|None` annotation, to route the
+				# union-coercion through the ALREADY-correctly-RC'd
+				# assignment path rather than the KNOWN-broken bare-value-
+				# into-declared-return-type coercion `return <bare value>`
+				# hits - see that method's own docstring) - every earlier
+				# synthesized temp (__gen_resuming_N/__for_next_N) used a
+				# bare Assign instead, specifically to duck this same
+				# exemption check via the Assign-only branch below. An
+				# ordinary $$__next__-scoped local, never a field - same
+				# posture as those, just needing the check up here too now
+				continue
 			if isinstance( node, ast.AnnAssign ) and isinstance( node.target, ast.Name ):
 				stem = node.target.id
 				if stem in param_stems:
 					self.discovery.fail( f'{fn.qualname}: generator local {stem!r} has the same name as a parameter', node )
 				local_type = self.discovery.visit( node.annotation )
-				if not ( isinstance( local_type, Scalar ) and local_type.stem in self._GENERATOR_LOCAL_STEMS ):
-					self.discovery.fail(
-						f'{fn.qualname}: generator local {stem!r} has type {local_type.qualname} - only scalar '
-						f'locals (bool/integer types) are supported inside a generator body yet - see PLAN_GENERATORS.md',
-						node,
-					)
 				if stem in locals_decl and locals_decl[stem] is not local_type:
 					self.discovery.fail( f'{fn.qualname}: generator local {stem!r} redeclared with a different type', node )
 				locals_decl[stem] = local_type
@@ -954,6 +971,14 @@ class TypeResolver:
 						)
 		return locals_decl
 
+	def _live_flag_stem( self, local_stem: str ) -> str:
+		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - the companion
+		boolean field name for an RC-typed promoted local, tracking
+		whether it's actually been assigned yet (see _build_generator_
+		backing_class/_build_generator_destructor's own docstrings). Never
+		used for a scalar/non-RC local (nothing to gate - see is_rc). '''
+		return f'__{local_stem}_live'
+
 	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> RCClass:
 		''' the per-function backing RCClass a generator's constructor
 		allocates and its own $$__next__ method operates on - fields:
@@ -963,15 +988,21 @@ class TypeResolver:
 		evaluated iterated expression a non-range() for-loop needs; see
 		_new_for_obj_field's own docstring for why these are safe to
 		decref unconditionally, same as a captured parameter, with no new
-		destructor machinery). resolve=None/every attribute's own
-		resolve=None (mirrors tuple_storage.TupleStorage.get()'s identical
-		"already fully known, nothing to defer" shape) - once scheduled
-		(see ensure_generator_synthesized), compiler.py's own ordinary
-		RCClass handling (Compiler._lower) synthesizes its
-		$$__destructor__ completely unmodified, same as any other class -
-		see this section's own top docstring for why that's correct here
-		with zero changes. '''
+		destructor machinery) + one `__<stem>_live: bool` companion field
+		per RC-typed promoted LOCAL (PLAN_GENERATORS.md Phase 5/roadmap
+		Phase 5 - NOT for parameters/extra_fields, which stay always-valid
+		from construction onward, unchanged). resolve=None/every
+		attribute's own resolve=None (mirrors tuple_storage.TupleStorage.
+		get()'s identical "already fully known, nothing to defer" shape).
+		Unlike every other RCClass, this one's own $$__destructor__ is
+		NOT built by compiler.py's ordinary, unconditional RCClass
+		handling - ensure_generator_synthesized pre-marks it as already
+		synthesized and builds a state/flag-gated one itself
+		(_build_generator_destructor) instead, since an RC-typed
+		promoted local is only conditionally valid (see that method's own
+		docstring for why the unconditional cascade would be wrong here). '''
 		usize_cls = self.discovery.get_intrinsics()['usize']
+		bool_cls = self.discovery.get_intrinsics()['bool']
 		qualname = f'{fn.qualname}$$generator'
 		state_attr = Variable( stem = '__state', qualname = f'{qualname}.__state', file = fn.file, line = fn.line, type = usize_cls )
 		param_attrs = [
@@ -982,17 +1013,197 @@ class TypeResolver:
 			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
 			for stem, t in locals_decl.items()
 		]
+		live_flag_attrs = [
+			Variable( stem = self._live_flag_stem( stem ), qualname = f'{qualname}.{self._live_flag_stem( stem )}', file = fn.file, line = fn.line, type = bool_cls )
+			for stem, t in locals_decl.items() if is_rc( t )
+		]
 		extra_attrs = [
 			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
 			for stem, ( t, _expr ) in extra_fields.items()
 		]
-		attributes = [ state_attr ] + param_attrs + local_attrs + extra_attrs
+		attributes = [ state_attr ] + param_attrs + local_attrs + live_flag_attrs + extra_attrs
 		return RCClass(
 			stem = qualname, qualname = qualname, file = fn.file, line = fn.line,
 			base = None, type_params = None,
 			attributes = attributes, methods = [], names = { a.stem: a for a in attributes },
 			resolve = None,
 		)
+
+	def _assigned_self_attr_stem( self, stmt: ast.stmt ) -> 'str|None':
+		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - after
+		_GeneratorNameRenamer has already run, an assignment TO a
+		promoted field looks like `self.<stem> = ...` (Assign) or
+		`self.<stem>: T = ...` (AnnAssign, a promoted local's own FIRST/
+		declaring occurrence - already valid, working AST shape today for
+		every scalar local this whole plan has synthesized so far, see
+		_rename_and_track_liveness's own docstring). Returns the stem, or
+		None if `stmt` isn't (post-rename) an assignment into a self
+		attribute at all. '''
+		if isinstance( stmt, ast.Assign ) and len( stmt.targets ) == 1:
+			target = stmt.targets[0]
+		elif isinstance( stmt, ast.AnnAssign ):
+			target = stmt.target
+		else:
+			return None
+		if isinstance( target, ast.Attribute ) and isinstance( target.value, ast.Name ) and target.value.id == 'self':
+			return target.attr
+		return None
+
+	def _rename_and_track_liveness( self, stmts: list[ast.stmt], renamer: '_GeneratorNameRenamer', rc_local_stems: set ) -> list[ast.stmt]:
+		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - renames each
+		statement (same as the old bare `[renamer.visit(s) for s in
+		stmts]` every guard builder used before this phase), and splits
+		any assignment INTO an RC-typed promoted local into:
+
+			if self.__<stem>_live:
+				self.<stem> = <value>      # unchanged - ordinary field
+				                            # reassignment lowering reads
+				                            # the CURRENT value and decrefs
+				                            # it before storing, correct
+				                            # here since it's a real prior
+				                            # object
+			else:
+				self.<stem> = <value>      # tagged generator_first_rc_
+				                            # assign (see lowering.py's
+				                            # _stmt_Assign) - the field's
+				                            # current value is still the
+				                            # construction-time placeholder
+				                            # (a bare `0`), so this skips
+				                            # the read-old-value-and-decref
+				                            # step entirely instead of
+				                            # computing &(NULL)->$header,
+				                            # a real, confirmed UBSan trap
+				self.__<stem>_live = True
+
+		A single occurrence in the SOURCE (this method only ever sees one
+		AST node per assignment - _GeneratorNameRenamer already turned the
+		promoted local's own declaring `x: T = expr` into a plain `self.x
+		= expr`, indistinguishable from a later plain reassignment - see
+		_GeneratorNameRenamer.visit_AnnAssign's own docstring) can run at
+		RUNTIME any number of times if it's inside a loop - the live flag,
+		not source position, is what actually determines whether a given
+		DYNAMIC execution of this statement is the first one ever
+		(confirmed via a real repro: `b: Box = Box(v=100)` inside a while
+		loop, yielded each iteration - the textually-first-and-only
+		occurrence in the source runs once per iteration at runtime, so a
+		static "first occurrence = no decref" AST-position rule would be
+		wrong starting with the second iteration). The value expression is
+		deep-copied (not shared) between the two branches so each has its
+		own independent AST node - safe at this pre-lowering stage (no
+		resolved_*/generator_first_rc_assign-adjacent attributes attached
+		to either copy yet), and correct at runtime since only one branch
+		ever actually executes per statement instance, so the expression
+		is still evaluated exactly once.
+
+		rc_local_stems is empty for a generator with no RC-typed promoted
+		locals at all - a no-op then, identical to the old bare rename. '''
+		if not rc_local_stems:
+			return [ renamer.visit( s ) for s in stmts ]
+		result: list[ast.stmt] = []
+		for s in stmts:
+			renamed = renamer.visit( s )
+			stem = self._assigned_self_attr_stem( renamed )
+			if stem is not None and stem in rc_local_stems:
+				already_live = renamed
+				first_time = copy.deepcopy( renamed )
+				first_time.generator_first_rc_assign = True
+				flag_assign = ast.Assign(
+					targets = [ self._self_attr( self._live_flag_stem( stem ), renamed ) ],
+					value = ast.Constant( value = True ),
+				)
+				ast.copy_location( flag_assign, renamed )
+				guard = ast.If(
+					test = self._self_attr( self._live_flag_stem( stem ), renamed ),
+					body = [ already_live ],
+					orelse = [ first_time, flag_assign ],
+				)
+				ast.copy_location( guard, renamed )
+				result.append( guard )
+			else:
+				result.append( renamed )
+		return result
+
+	def _maybe_route_yield_through_temp( self, yielded: ast.expr, node: ast.AST, temp_key: str, elem_type: Type, elem_is_rc: bool ) -> 'tuple[list[ast.stmt],ast.expr]':
+		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a yielded RC-
+		typed value needs an INCREF: the caller receives a real, counted
+		reference, but the generator's OWN field the value came from
+		(self.<local>, or a captured parameter) keeps its own reference
+		too - both now genuinely alive.
+
+		THREE real, pre-existing, generator-unrelated RC bugs were found
+		and worked around while building this (all flagged separately,
+		out of scope to fix here - see PLAN_GENERATORS.md's own note):
+		(1) `return self.<field>` does not incref at all; (2) `return
+		<bare value>` where the function's OWN declared return type is a
+		union (elem_type|None, exactly __next__'s own shape) ALSO does
+		not incref, even for an ordinary tracked parameter/local; (3) an
+		annotated local assignment that coerces a value INTO a union
+		(`x: T|None = value`) only correctly increfs when `value` is
+		itself already a tracked binding (a parameter/local Name) - when
+		`value` is instead a FIELD READ (`self.foo`) or other untracked
+		expression, the intermediate union-wrap temp ends up DECREF'd
+		once (as if it were a fresh owned temp needing cleanup) with NO
+		matching incref ever having fired for it - confirmed via a real
+		repro that crashed with STATUS_ACCESS_VIOLATION (the field's own
+		reference count silently dropped below the number of live
+		holders). All three sidestepped by chaining TWO ordinary,
+		already-correct steps: (a) `__yield_raw_<temp_key>: elem_type =
+		<yielded>` - an annotated local assignment with a BARE (non-
+		union) type, which correctly increfs regardless of whether
+		`yielded` is a field read or a tracked binding (confirmed via a
+		real repro); (b) `__yield_val_<temp_key>: elem_type|None =
+		__yield_raw_<temp_key>` - coercing THAT tracked local (never a
+		field read) into the union, which is exactly the shape bug (3)
+		above confirmed DOES correctly incref. Returning the ALREADY-
+		union-typed __yield_val_<temp_key> is then a plain "move" of a
+		tracked local - the one return shape this compiler already gets
+		right, per every existing RC test in or_return_rc_test.py. Both
+		intermediate locals are ordinary, non-promoted $$__next__-locals
+		(compiler_synthesized_for_loop_temp-exempted - see
+		_collect_generator_locals' own AnnAssign-branch check, added for
+		this - every EARLIER synthesized temp in this file used a bare
+		Assign specifically to avoid needing that check at all; these are
+		the first that need a real `: T` annotation for the right
+		coercion behavior) - never fields, never cross a resume boundary,
+		recomputed fresh every yield.
+
+		temp_key is the unit's own start_state for a bare yield/while-
+		unit, but an if-unit's two branches SHARE one start_state
+		(build_branch runs once per branch, same start_state both times)
+		- its own callers suffix with '_if'/'_else' so the two branches'
+		own temps never collide (harmless either way, since only one
+		branch ever actually runs per call, but avoiding the same-named
+		local in two sibling if/else arms sidesteps relying on that being
+		fine at the C level).
+
+		A no-op (returns `yielded` unchanged, no extra statements) when
+		elem_is_rc is False - scalars need no incref, matching every
+		generator built before this phase. '''
+		if not elem_is_rc:
+			return [], yielded
+		elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() )
+		ast.copy_location( elem_type_name, node )
+		raw_name = f'__yield_raw_{temp_key}'
+		raw_assign = ast.AnnAssign(
+			target = ast.Name( id = raw_name, ctx = ast.Store() ),
+			annotation = elem_type_name, value = yielded, simple = 1,
+		)
+		ast.copy_location( raw_assign, node )
+		raw_assign.compiler_synthesized_for_loop_temp = True
+
+		val_name = f'__yield_val_{temp_key}'
+		elem_type_name2 = ast.Name( id = elem_type.stem, ctx = ast.Load() )
+		ast.copy_location( elem_type_name2, node )
+		union_annotation = ast.BinOp( left = elem_type_name2, op = ast.BitOr(), right = ast.Constant( value = None ) )
+		ast.copy_location( union_annotation, node )
+		val_assign = ast.AnnAssign(
+			target = ast.Name( id = val_name, ctx = ast.Store() ),
+			annotation = union_annotation, value = ast.Name( id = raw_name, ctx = ast.Load() ), simple = 1,
+		)
+		ast.copy_location( val_assign, node )
+		val_assign.compiler_synthesized_for_loop_temp = True
+
+		return [ raw_assign, val_assign ], ast.Name( id = val_name, ctx = ast.Load() )
 
 	def _pessimistic_done_prefix( self, stmts: list[ast.stmt], node: ast.AST, pending_done_assigns: 'list[ast.Assign]|None' ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
@@ -1029,7 +1240,7 @@ class TypeResolver:
 		pending_done_assigns.append( assign )
 		return [ assign ] + stmts
 
-	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None ) -> tuple[ast.If,int]:
+	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, elem_is_rc: bool = False, elem_type: 'Type|None' = None ) -> tuple[ast.If,int]:
 		''' a bare top-level `yield expr` (v1), or the SAME shape wrapped
 		in `with compiler.wrap_arithmetic/saturate_arithmetic/
 		panic_arithmetic(...):` (Phase 2 - see _yield_with_wrapper's own
@@ -1041,7 +1252,8 @@ class TypeResolver:
 		unguarded: this guard only ever fires when __state == start_state
 		exactly (every smaller state was already caught and returned by an
 		earlier guard). pending_done_assigns: see _pessimistic_done_prefix -
-		non-None only for a fallible (Generator[T,E]) generator. '''
+		non-None only for a fallible (Generator[T,E]) generator.
+		elem_is_rc: see _maybe_route_yield_through_temp. '''
 		if isinstance( stmt, ast.With ):
 			yield_stmt = stmt.body[0]
 			assert isinstance( yield_stmt, ast.Expr )
@@ -1049,9 +1261,10 @@ class TypeResolver:
 		else:
 			yield_node = stmt.value
 		assert isinstance( yield_node, ast.Yield )
-		seg_stmts = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in pre ], stmt, pending_done_assigns )
+		seg_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems or set() ), stmt, pending_done_assigns )
 		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-		yield_stmts: list[ast.stmt] = [
+		temp_stmts, yielded = self._maybe_route_yield_through_temp( yielded, stmt, str( start_state ), elem_type, elem_is_rc )
+		yield_stmts: list[ast.stmt] = temp_stmts + [
 			ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = start_state + 1 ) ),
 			ast.Return( value = yielded ),
 		]
@@ -1073,7 +1286,7 @@ class TypeResolver:
 		)
 		return guard, start_state + 1
 
-	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None ) -> tuple[ast.If,int]:
+	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, elem_is_rc: bool = False, elem_type: 'Type|None' = None ) -> tuple[ast.If,int]:
 		''' a `while cond: PRE_ITER; yield V; POST_ITER` loop occupies TWO
 		states: start_state ("not yet entered") and start_state+1
 		("paused mid-loop, resuming"). Restructured as the standard
@@ -1106,17 +1319,18 @@ class TypeResolver:
 		place in this restructuring when it can appear before OR after the
 		yield, so it's left rejected rather than guessed at. '''
 		yield_index = next( i for i, s in enumerate( node.body ) if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) )
-		pre_iter_stmts = [ renamer.visit( s ) for s in node.body[:yield_index] ]
+		rc_local_stems = rc_local_stems or set()
+		pre_iter_stmts = self._rename_and_track_liveness( node.body[:yield_index], renamer, rc_local_stems )
 		yield_node = node.body[ yield_index ].value
 		assert isinstance( yield_node, ast.Yield )
 		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-		post_iter_stmts = [ renamer.visit( s ) for s in node.body[ yield_index + 1: ] ]
+		post_iter_stmts = self._rename_and_track_liveness( node.body[ yield_index + 1: ], renamer, rc_local_stems )
 		cond = renamer.visit( node.test )
 
 		resume_var = f'__gen_resuming_{start_state}' # unique per while-unit (keyed by its own start_state) - an ordinary $$__next__-scoped local, never a field: only needs to survive within ONE call
 		first_entry_guard = ast.If(
 			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in pre ], node, pending_done_assigns ) or [ ast.Pass() ],
+			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns ) or [ ast.Pass() ],
 			orelse = [],
 		)
 		resuming_init = ast.Assign(
@@ -1128,7 +1342,8 @@ class TypeResolver:
 		]
 		inner_if = ast.If( test = ast.Name( id = resume_var, ctx = ast.Load() ), body = resume_body, orelse = [] )
 		break_if = ast.If( test = ast.UnaryOp( op = ast.Not(), operand = cond ), body = [ ast.Break() ], orelse = [] )
-		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns ) + [
+		temp_stmts, yielded = self._maybe_route_yield_through_temp( yielded, node, str( start_state ), elem_type, elem_is_rc )
+		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns ) + temp_stmts + [
 			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
 			ast.Return( value = yielded ),
 		]
@@ -1147,7 +1362,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None ) -> tuple[ast.If,int]:
+	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, elem_is_rc: bool = False, elem_type: 'Type|None' = None ) -> tuple[ast.If,int]:
 		''' `if cond: [...yield...] else: [...yield...]` (at most one
 		yield per branch, at least one branch having one - see
 		_validate_if_yield_unit) occupies TWO states, same as a while-unit
@@ -1174,8 +1389,9 @@ class TypeResolver:
 		own statements just run unconditionally and fall through. '''
 		cond = renamer.visit( node.test )
 		resume_var = f'__gen_if_resuming_{start_state}'
+		rc_local_stems = rc_local_stems or set()
 
-		def build_branch( branch_stmts: list[ast.stmt] ) -> list[ast.stmt]:
+		def build_branch( branch_stmts: list[ast.stmt], branch_label: str ) -> list[ast.stmt]:
 			yield_index = next(
 				( i for i, s in enumerate( branch_stmts ) if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield )),
 				None,
@@ -1186,14 +1402,15 @@ class TypeResolver:
 				# but its own code can still fail partway through, so it
 				# needs the same pessimistic-done guarding as any other
 				# fallible block, same reasoning as first_entry_guard below
-				return self._pessimistic_done_prefix( [ renamer.visit( s ) for s in branch_stmts ], node, pending_done_assigns )
-			pre_stmts = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in branch_stmts[:yield_index] ], node, pending_done_assigns )
+				return self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts, renamer, rc_local_stems ), node, pending_done_assigns )
+			pre_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[:yield_index], renamer, rc_local_stems ), node, pending_done_assigns )
 			yield_node = branch_stmts[ yield_index ].value
 			assert isinstance( yield_node, ast.Yield )
 			yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-			post_stmts = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in branch_stmts[ yield_index + 1: ] ], node, pending_done_assigns )
+			post_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[ yield_index + 1: ], renamer, rc_local_stems ), node, pending_done_assigns )
 			resuming_branch = post_stmts or [ ast.Pass() ]
-			fresh_branch = pre_stmts + [
+			temp_stmts, yielded = self._maybe_route_yield_through_temp( yielded, node, f'{start_state}_{branch_label}', elem_type, elem_is_rc )
+			fresh_branch = pre_stmts + temp_stmts + [
 				ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
 				ast.Return( value = yielded ),
 			]
@@ -1201,15 +1418,15 @@ class TypeResolver:
 
 		first_entry_guard = ast.If(
 			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = self._pessimistic_done_prefix( [ renamer.visit( s ) for s in pre ], node, pending_done_assigns ) or [ ast.Pass() ],
+			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns ) or [ ast.Pass() ],
 			orelse = [],
 		)
 		resuming_init = ast.Assign(
 			targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ],
 			value = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
 		)
-		if_body = build_branch( node.body )
-		else_body = build_branch( node.orelse ) if node.orelse else []
+		if_body = build_branch( node.body, 'if' )
+		else_body = build_branch( node.orelse, 'else' ) if node.orelse else []
 		outer_if = ast.If( test = cond, body = if_body, orelse = else_body )
 
 		end_state = start_state + 2
@@ -1225,7 +1442,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None' ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', elem_type: Type ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
@@ -1262,16 +1479,27 @@ class TypeResolver:
 		segments, tail = self._split_generator_segments( fn, units )
 		is_fallible = error_type is not None
 		pending_done_assigns: 'list[ast.Assign]|None' = [] if is_fallible else None
+		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - which promoted
+		# locals need the live-flag treatment at all (see
+		# _rename_and_track_liveness/_build_generator_destructor) -
+		# scalar/non-RC locals need nothing, same posture as before this
+		# phase
+		rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
+		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - every yield in ONE
+		# generator shares the SAME declared elem_type, so this is computed
+		# once here rather than per-yield-site (see _maybe_route_yield_
+		# through_temp for what it gates)
+		elem_is_rc = is_rc( elem_type )
 
 		guards: list[ast.If] = []
 		state = 0
 		for preamble, ( kind, stmt ) in segments:
 			if kind == 'yield':
-				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns )
+				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, elem_is_rc, elem_type )
 			elif kind == 'if':
-				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns )
+				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, elem_is_rc, elem_type )
 			else:
-				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns )
+				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, elem_is_rc, elem_type )
 			guards.append( guard )
 		done_state = state + 1
 		if pending_done_assigns is not None:
@@ -1288,7 +1516,7 @@ class TypeResolver:
 		next_body.extend( guards )
 
 		anchor = tail[0] if tail else fn.node
-		tail_stmts = [ renamer.visit( s ) for s in tail ]
+		tail_stmts = self._rename_and_track_liveness( tail, renamer, rc_local_stems )
 		if is_fallible:
 			# the real done_state is already known here (unlike each unit's
 			# own placeholder above) - tail_stmts is ordinary user code
@@ -1360,6 +1588,137 @@ class TypeResolver:
 					ast.copy_location( ok_call.func.value, n )
 					n.value = ok_call
 
+	def _build_generator_destructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> None:
+		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a generator's
+		backing class does NOT get the ordinary, unconditional
+		$$__destructor__ cascade _synthesize_rcclass_destructor builds
+		for every other RCClass: a promoted LOCAL is only known-
+		initialized once it's actually been assigned (an RC-typed one
+		crossing a yield might never have been reached if the generator
+		is dropped before its first assignment - e.g. mid-way through an
+		EARLIER unit, or before an if-unit's non-taken branch ever runs),
+		so an unconditional decref would touch garbage - the exact
+		problem v1 sidestepped by restricting promoted locals to scalar
+		types in the first place (see this section's own top docstring).
+
+		Structurally this mirrors _synthesize_rcclass_destructor closely
+		(same 3-part shape: no self.__del__() here though - a generator's
+		backing class is entirely compiler-synthesized, never user-
+		declared, so there's no user __del__ to call; field cascade;
+		sys.free(self)) but gates each RC-typed promoted local's own
+		teardown behind `if self.__<stem>_live:` (see _build_generator_
+		backing_class/_rename_and_track_liveness for how that field gets
+		declared and set). Parameters and extra_fields (Phase 1's
+		__for_obj_N) stay UNCONDITIONAL, unchanged from every earlier
+		phase - both are valid from construction onward, same reasoning
+		as always. backing_cls has no base (never subclassed - PLAN_
+		GENERATORS.md's synthesized classes are always leaves), so unlike
+		_synthesize_rcclass_destructor this never needs to walk an
+		inheritance chain.
+
+		Called directly from ensure_generator_synthesized, which also
+		pre-marks id(backing_cls) in self._destructors_synthesized so
+		compiler.py's own ordinary, unconditional RCClass handling (which
+		would otherwise also try to build one) becomes a no-op for it -
+		see that call site's own comment. '''
+		self._destructors_synthesized.add( id( backing_cls ))
+		sys_module = self.discovery.modules.get( 'sys' )
+		if sys_module is None:
+			return  # sys.free must be available
+		none_type = self.discovery.get_none_type()
+		qualname = f'{backing_cls.qualname}$$__destructor__'
+
+		body: list[ast.stmt] = []
+
+		# 1. captured parameters - unconditional, always valid from
+		# construction onward (unchanged from every earlier phase)
+		for p in fn.parameters or []:
+			attr = backing_cls.names.get( p.stem )
+			assert isinstance( attr, Variable )
+			body.extend( self._build_field_teardown_ast(
+				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = p.stem, ctx = ast.Load() ),
+				attr.type,
+			))
+
+		# 2. RC-typed promoted locals - gated behind their own live-flag;
+		# non-RC (scalar/CEnum/...) locals need no teardown at all, same
+		# as every earlier phase
+		for stem, t in locals_decl.items():
+			if not is_rc( t ):
+				continue
+			teardown = self._build_field_teardown_ast(
+				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = stem, ctx = ast.Load() ),
+				t,
+			)
+			if not teardown:
+				continue
+			guard = ast.If(
+				test = self._self_attr( self._live_flag_stem( stem ), fn.node ),
+				body = teardown, orelse = [],
+			)
+			body.append( guard )
+
+		# 3. extra_fields (Phase 1's __for_obj_N - the once-evaluated
+		# iterated expression a non-range() for-loop needs) - unconditional,
+		# same reasoning/precedent as a captured parameter (see
+		# _new_for_obj_field's own docstring)
+		for stem, ( t, _expr ) in extra_fields.items():
+			body.extend( self._build_field_teardown_ast(
+				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = stem, ctx = ast.Load() ),
+				t,
+			))
+
+		# 4. sys.free(self) - identical to _synthesize_rcclass_destructor's
+		# own ending, see its own comments for why the explicit cast is needed
+		free_overload = sys_module.get_local( 'free' )
+		from mpy_types import Overload
+		if isinstance( free_overload, Overload ):
+			free_fn = free_overload.implementations[0]
+		else:
+			free_fn = free_overload
+		if free_fn.resolve is not None:
+			free_fn.resolve()
+		free_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'sys', ctx = ast.Load() ), attr = 'free', ctx = ast.Load() ),
+			args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+		)
+		free_call.resolved_callee = free_fn
+		free_call.end_lineno = None; free_call.end_col_offset = None
+		free_param_type = free_fn.parameters[0].type
+		cast_type_ref = ast.Name( id = '<sys.free.ptr>', ctx = ast.Load() )
+		cast_type_ref.resolved_type = free_param_type
+		free_call.args = [ ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'cast', ctx = ast.Load() ),
+			args = [ cast_type_ref, ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+		)]
+		body.append( ast.Expr( free_call ))
+
+		self_param = Parameter(
+			stem = 'self', qualname = f'{qualname}.self',
+			file = backing_cls.file, line = backing_cls.line, type = backing_cls,
+		)
+		node = ast.FunctionDef(
+			name = '$$__destructor__',
+			args = ast.arguments(
+				posonlyargs = [], args = [], vararg = None,
+				kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [],
+			),
+			body = body, decorator_list = [], returns = None, type_params = [],
+			lineno = backing_cls.line or 1, col_offset = 0,
+			end_lineno = backing_cls.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+
+		dtor_fn = Function(
+			stem = '$$__destructor__', qualname = qualname,
+			file = backing_cls.file, line = backing_cls.line,
+			cls = None, node = node,
+			parameters = [ self_param ], return_type = none_type,
+			is_static = True, is_destructor = True, resolve = None,
+		)
+		dtor_fn.add_name( 'self', self_param )
+		self.schedule( dtor_fn )
+
 	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> None:
 		''' replaces the original generator def's own body with a single
 		`return <allocate the backing class, state=0, fields=args/zeros>` -
@@ -1391,8 +1750,19 @@ class TypeResolver:
 			ast.copy_location( name_node, fn.node )
 			keywords.append( ast.keyword( arg = p.stem, value = name_node ) )
 		for stem, t in locals_decl.items():
-			zero = ast.Constant( value = False if ( isinstance( t, Scalar ) and t.stem == 'bool' ) else 0 )
+			if is_rc( t ):
+				# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - never read
+				# before its own first real assignment (gated by the
+				# companion live-flag field below, checked by the
+				# generator's own state/flag-gated destructor) - see
+				# _expr_Constant's own generator_zero_rc_field exemption
+				zero = ast.Constant( value = 0 )
+				zero.generator_zero_rc_field = True
+			else:
+				zero = ast.Constant( value = False if ( isinstance( t, Scalar ) and t.stem == 'bool' ) else 0 )
 			keywords.append( ast.keyword( arg = stem, value = zero ) )
+			if is_rc( t ):
+				keywords.append( ast.keyword( arg = self._live_flag_stem( stem ), value = ast.Constant( value = False ) ) )
 		for stem, ( _t, expr ) in extra_fields.items():
 			keywords.append( ast.keyword( arg = stem, value = expr ) )
 		call = ast.Call( func = ast.Name( id = backing_cls.stem, ctx = ast.Load() ), args = [], keywords = keywords )
@@ -1510,7 +1880,15 @@ class TypeResolver:
 			next_return_type = result_union
 
 		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type )
+		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, elem_type )
+		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
+		# backing_cls is ever scheduled below, so its own pre-mark of
+		# id(backing_cls) in self._destructors_synthesized (see its own
+		# docstring) beats compiler.py's ordinary, unconditional RCClass
+		# handling to the punch - that path checks the SAME memo set
+		# before ever building its own (wrong, unconditional-decref)
+		# destructor for this class
+		self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields )
 
 		self.schedule( backing_cls )
 		self.schedule( backing_cls.names['__next__'] )
