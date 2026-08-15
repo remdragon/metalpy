@@ -982,7 +982,21 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 	already use for i128 MIN/MAX. '''
 	ctype = _SCALAR_C_TYPES[stem]
 	if -1 * ( 2**64 - 1 ) <= value <= 2**64 - 1:
-		return f'(({ctype}){value})'
+		# an explicit ULL suffix on the literal's own MAGNITUDE, not a bare
+		# unsuffixed decimal token - confirmed directly that MSVC's cl.exe,
+		# even under /std:c11, mistypes an unsuffixed decimal literal outside
+		# plain `int`'s own range as `unsigned int` (not the C99+-mandated
+		# long/long long promotion): sizeof(-2147483648) is 4 there, and
+		# `(int64_t)-2147483648` silently corrupts to a huge positive value
+		# instead of the real negative one (caught chasing int_test.py's
+		# test_i32_conversions - the exact literal that broke it). Negation
+		# is applied to the whole CAST expression afterward, never baked into
+		# the literal token itself - this also sidesteps INT64_MIN's own
+		# classic "positive magnitude doesn't fit a signed 64-bit literal"
+		# problem, since the magnitude is always spelled as unsigned
+		magnitude = abs( value )
+		cast_expr = f'(({ctype}){magnitude}ULL)'
+		return f'(-{cast_expr})' if value < 0 else cast_expr
 	magnitude = abs( value )
 	hi, lo = magnitude >> 64, magnitude & 0xFFFFFFFFFFFFFFFF
 	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << 64 ) | (__metalpy_wideuint){lo}ULL )'
