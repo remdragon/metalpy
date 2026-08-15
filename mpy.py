@@ -52,19 +52,27 @@ def _parse_args() -> argparse.Namespace:
 		help = 'extra flags passed through to the C compiler' )
 	p.add_argument( '--ldflags', type = str, default = '',
 		help = 'extra flags passed through to the linker' )
+	p.add_argument( '--strip', action = 'store_true',
+		help = 'strip symbols / fold identical code for a smaller binary' )
+	p.add_argument( '--asan', action = 'store_true',
+		help = 'build with AddressSanitizer (requires the C runtime - not compatible with a freestanding/no-CRT program)' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
 	print( f'mpy: error: {msg}', file = sys.stderr )
 	sys.exit( 1 )
 
-def _build_active_target( args: argparse.Namespace ) -> dict[str,object]:
+def _build_active_target( args: argparse.Namespace, cc: linker_c.CcTool|None ) -> dict[str,object]:
 	'''
 	Build the active_target dict. Starts from _detect_active_target() just
-	like Discovery does, then overrides debug based on --release.
+	like Discovery does, then overrides debug based on --release and has_i128
+	based on the detected C compiler backend (`cc` must already be detected -
+	compile_time_transformer folds compiler.target.* eagerly, so this needs a
+	concrete answer before Discovery ever starts, not a lazily-resolved one).
 	'''
 	target = _detect_active_target()
 	target['debug'] = not args.release
+	target['has_i128'] = linker_c.has_i128( cc )
 	return target
 
 def _print_dep_report( compiler: Compiler ) -> None:
@@ -119,12 +127,17 @@ def main() -> None:
 	if not args.source.is_file():
 		_die( f'source file not found: {args.source}' )
 
-	# --- build active target ---
-	active_target = _build_active_target( args )
-
-	# --- compiler override ---
+	# --- compiler override (must happen before detect_cc() below) ---
 	if args.cc:
 		os.environ['METALPY_CC'] = args.cc
+
+	# --- detect compiler early: active_target['has_i128'] needs a concrete
+	# answer before Discovery even starts (see _build_active_target) - reused
+	# again at stage 6 below, so this only ever detects once per run ---
+	cc = linker_c.detect_cc()
+
+	# --- build active target ---
+	active_target = _build_active_target( args, cc )
 
 	# --- stage 1: discovery ---
 	disco = Discovery( import_builtins = True, active_target = active_target )
@@ -167,17 +180,21 @@ def main() -> None:
 		print( f'mpy: wrote {c_path}' )
 		return
 
-	# --- stage 6: detect compiler ---
-	cc = linker_c.detect_cc()
+	# --- stage 6: compiler was already detected above (needed early for has_i128) ---
 	if cc is None:
 		_die( 'no C compiler found (try --cc or METALPY_CC)' )
+
+	if args.asan and no_crt:
+		_die( "--asan requires a program that imports the C runtime (e.g. `import c`) - "
+			"it has nothing to instrument against metalpy's own freestanding allocator, "
+			"and the no-CRT path excludes the ASan runtime's own CRT dependencies too" )
 
 	with tempfile.TemporaryDirectory() as tmp:
 		src_path = Path( tmp ) / 'generated.c'
 		obj_path = Path( tmp ) / 'generated.o'
 		src_path.write_text( c_source, encoding = 'utf-8' )
 
-		compile_result = cc.compile( src_path, obj_path, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ) )
+		compile_result = cc.compile( src_path, obj_path, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, cflags = args.cflags )
 		if compile_result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
 			print( compile_result.stdout, file = sys.stderr )
@@ -192,7 +209,8 @@ def main() -> None:
 		if active_target['os'] == 'windows' and exe_path.suffix != '.exe':
 			exe_path = exe_path.with_suffix( exe_path.suffix + '.exe' )
 		ldflags = args.ldflags
-		for lib in sorted( compiler.extern_libs ):
+		libs = set( compiler.extern_libs ) | linker_c.implicit_ldflags( no_crt, str( active_target['os'] ) )
+		for lib in sorted( libs ):
 			if lib == 'c':
 				continue
 			if lib not in ldflags:
@@ -201,7 +219,7 @@ def main() -> None:
 				else:
 					flag = f'-l{lib}'
 				ldflags = ldflags + f' {flag}' if ldflags else flag
-		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ) )
+		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip )
 		if link_result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
 			print( link_result.stdout, file = sys.stderr )

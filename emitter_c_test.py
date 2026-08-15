@@ -1663,7 +1663,7 @@ class RCClassConstructTests( RCClassTestCase ):
 		# destructor argument, no _rcclass_destructor_name reference here
 		main2_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		main_src = emitter_c.emit_function( main2_lf )
-		self.assertIn( 'release_object( &(foo)->$header )', main_src )
+		self.assertIn( 'release_object( (ObjectHeader*)(foo) )', main_src )
 		self.assertNotIn( '__main__$Foo$$__destructor__', main_src )
 
 	def test_release_object_reads_destructor_from_header( self ) -> None:
@@ -2003,7 +2003,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime (see ObjectHeader's own comment) rather
 		# than this call site naming it as a literal argument
-		self.assertIn( 'release_object( &($t0)->$header )', destructor_src )
+		self.assertIn( 'release_object( (ObjectHeader*)($t0) )', destructor_src )
 		# see test_del_method_is_called_from_synthesized_destructor's own
 		# comment on why this is a real temp ($t1, following the field
 		# decref's own $t0) rather than `self` passed bare
@@ -2066,7 +2066,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime rather than this call site naming it
-		self.assertIn( 'release_object( &($t1)->$header )', destructor_src )
+		self.assertIn( 'release_object( (ObjectHeader*)($t1) )', destructor_src )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
