@@ -784,6 +784,17 @@ class Function( Type, ScopeMixin ):
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
 	is_destructor: bool = False # synthesized $$__destructor__ body — emitter uses void(void*) signature + cast prologue
 
+	# implementations only (never set on a stub - stubs are never scheduled
+	# as real compile units, so they never need a C symbol of their own) -
+	# the Overload group this Function was appended to group.implementations
+	# of, set alongside that same append (see discovery.py's
+	# _parse_function_def). Every member of one group shares the group's own
+	# .qualname (it's literally "the same named function", just a different
+	# signature) - emitter_c.py's mangle_function_qualname uses this back-
+	# reference to disambiguate the C symbol when more than one member of
+	# the same group actually needs a real body.
+	overload_group: 'Overload|None' = None
+
 	# @inline (PLAN_INLINE.md) - body is arbitrary statements followed by
 	# exactly one final, top-level `return <expr>` (no other `return`
 	# anywhere else, no defer/errdefer, no reassignment of self/a

@@ -1856,6 +1856,7 @@ class Discovery( ast.NodeVisitor ):
 					# runs _check_overload_ambiguity against its new siblings,
 					# the same as every other plain implementation does.
 					group.implementations.append( existing )
+					existing.overload_group = group
 					if class_obj is not None:
 						class_obj.methods.remove( existing )
 					existing.resolve = self._make_function_resolver( existing, module, class_obj, group )
@@ -1863,6 +1864,7 @@ class Discovery( ast.NodeVisitor ):
 				group.stubs.append( fn )
 			else:
 				group.implementations.append( fn )
+				fn.overload_group = group
 
 		fn.resolve = self._make_function_resolver( fn, module, class_obj, group )
 
