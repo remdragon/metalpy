@@ -6537,16 +6537,98 @@ class FunctionLowering:
 
 		candidate_types: list[Type] = []
 		for fn in candidates:
-			if fn.parameters is None:
+			# a stub (fn.bound_to is not None) is "signature-only, never
+			# actually called" (see mpy_types.Overload's own docstring) - the
+			# real, emitted call always targets its bound_to implementation,
+			# whose OWN parameter type is what the literal argument actually
+			# needs to satisfy at the C level, not the stub's own (often
+			# narrower) declared one. Without this redirect, a stub bound to
+			# a WIDER implementation (e.g. Result[T,E].unwrap_or's own
+			# `default: T` stub, bound to the plain `default: T|None = None`
+			# impl) contributed its own narrower scalar type as a SEPARATE
+			# candidate alongside the impl's own wider union type - two
+			# genuinely different Type objects for what is, at the real call
+			# site, the exact same parameter slot - which the magnitude-based
+			# disambiguation just below (correctly designed for choosing
+			# between truly independent overload arms, e.g. i8 vs i32) then
+			# resolved by picking the narrower SCALAR one, since only a
+			# Scalar passes its own isinstance(t, Scalar) filter. The literal
+			# was then lowered against that narrower type while the actual,
+			# real call still targets the wider union-typed implementation -
+			# a genuine "passing 'int' to parameter of incompatible type
+			# 'struct $__u$$...'" C mismatch, confirmed via a real compile of
+			# Result[i32,str]'s own .unwrap_or(5). Redirecting first makes a
+			# bound stub and its own implementation contribute the SAME
+			# (impl's) type, deduping to one real candidate - matching what
+			# actually gets called
+			real_fn = fn.bound_to if fn.bound_to is not None else fn
+			if real_fn.parameters is None:
 				continue
 			param = (
-				fn.parameters[position] if position is not None and position < len( fn.parameters ) else
-				next( ( p for p in fn.parameters if p.stem == kw_name ), None )
+				real_fn.parameters[position] if position is not None and position < len( real_fn.parameters ) else
+				next( ( p for p in real_fn.parameters if p.stem == kw_name ), None )
 			)
-			if param is None or param.type is None or getattr( param.type, 'stem', None ) not in compatible_stems:
+			if param is None or param.type is None:
 				continue
-			if not any( t is param.type for t in candidate_types ):
-				candidate_types.append( param.type )
+			if getattr( param.type, 'stem', None ) in compatible_stems:
+				matched_type = param.type
+			else:
+				# not DIRECTLY a compatible scalar - but a union-typed param
+				# (e.g. Result[T,E].unwrap_or's own `default: T|None`, once T
+				# itself substitutes to a scalar) can still unambiguously
+				# accept this literal, through exactly one of its own leaves.
+				# Without this, a union-typed candidate was always silently
+				# skipped here regardless of whether it fit, so a literal
+				# argument to an overloaded call never got the union-
+				# coercion _lower_expr's own expected_type machinery
+				# (_coerce_into_union) already does correctly for an ORDINARY
+				# (non-overloaded) call - the literal fell through to the
+				# "no candidate's parameter type is even plausible" path
+				# below, lowered with expected_type=None, and reached
+				# emitter_c as a bare scalar handed to a C parameter whose
+				# real type is the whole union struct: a genuine, confirmed
+				# "passing 'int' to parameter of incompatible type 'struct
+				# $__u$$...'" C compile error (Result[i32|None,str].
+				# unwrap_or(42), a fallible generator's own g.__next__().
+				# unwrap_or(default) - any T|None-shaped default param at
+				# all). len(...)==1 (not >=1) mirrors this method's own
+				# existing ambiguity discipline just below: a literal that
+				# plausibly fits more than one leaf of the SAME union is
+				# exactly as ambiguous as fitting more than one candidate
+				# scalar directly would be, and is left for the ordinary
+				# ambiguous-candidate error path rather than silently
+				# guessing one.
+				#
+				# the matched LEAF itself (not the whole union) is what gets
+				# added as this candidate's type below - lowering the literal
+				# with the union as its expected_type would make the
+				# resulting operand's own STATIC type the whole union (both
+				# members "possible" as far as any TYPE-based reasoning can
+				# tell), even though a fresh literal's value is obviously,
+				# unambiguously never the None variant. overload_resolution.
+				# resolve_call is a pure function of TYPES with no way to see
+				# that extra fact - an operand whose type is the whole union
+				# made it build a genuine, unnecessary RUNTIME conditional
+				# dispatch (checking the literal's own freshly-constructed
+				# tag at runtime, only ever one way) instead of a single
+				# unconditional target, and that dispatch path (_emit_
+				# dispatch_call) has no notion of a bound method RECEIVER at
+				# all - confirmed via a real compile of Result[i32,str]'s own
+				# .unwrap_or(5): a bound method call's own `self` argument
+				# went missing from the emitted C call entirely. Using the
+				# narrow leaf here instead keeps the operand's own static
+				# type exactly as unambiguous as the literal itself is, and
+				# the mismatch against the real (union-typed) parameter this
+				# eventually needs to satisfy is resolved afterward, once the
+				# winning target is actually known - see the Overload
+				# dispatch's own post-resolution coercion step, below
+				leaves = param.type.leaves()
+				compatible_leaves = [ leaf for leaf in leaves if getattr( leaf, 'stem', None ) in compatible_stems ]
+				if len( compatible_leaves ) != 1:
+					continue
+				matched_type = compatible_leaves[0]
+			if not any( t is matched_type for t in candidate_types ):
+				candidate_types.append( matched_type )
 
 		if len( candidate_types ) > 1 and type( expr.value ) is int:
 			# kind alone left more than one candidate (e.g. i8 AND i32 both
@@ -8476,6 +8558,22 @@ class FunctionLowering:
 		if isinstance( target, Function ) and not target.type_params and target.cls is not None and getattr( target.cls, 'type_params', None ):
 			return self._lower_class_generic_method_call( node, target, receiver, expected_type, want_result )
 
+		# set only by the Overload branch below, when a winning stub's own
+		# more specific return type applies to THIS call's real arguments
+		# (see the Overload branch's own comment on stub_covers_call) - a
+		# genuinely narrower Type than target.return_type's own real,
+		# emittable return type. Applied AFTER the call is emitted (see the
+		# shared tail below, "narrowed_return_type is not None"): the call
+		# itself always still targets the ORIGINAL, shared Function (never a
+		# replace()'d copy with a mismatched declared return type), and the
+		# narrowing is realized by statically extracting the matching leaf
+		# out of the call's real, wide-typed result - sound specifically
+		# because stub_covers_call already proved this call's own arguments
+		# can never actually produce the OTHER (narrowed-away) member at
+		# runtime, so no tag check is needed, mirroring
+		# _maybe_unwrap_union_arg's identical no-runtime-check extraction
+		# for a union-typed CALL ARGUMENT already known to match one leaf
+		narrowed_return_type: Type|None = None
 		if isinstance( target, Overload ):
 			# a bare literal argument has no type of its own before a
 			# specific implementation is chosen - _lower_overload_arg tries
@@ -8594,8 +8692,36 @@ class FunctionLowering:
 				branches = [ ConditionalDispatch( conditions = b.conditions, function = _resolve_original( b.function )) for b in branches ]
 				resolved = _resolve_original( resolved )
 				return self._lower_conditional_dispatch( node, branches, resolved, args, kwargs, expected_type, want_result )
-			target = _resolve_original( resolved )
+			winning_stub = next( ( s for s in target.stubs if s.bound_to is resolved ), None )
+			if (
+				winning_stub is not None and winning_stub.return_type is not resolved.return_type
+				and overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves )
+			):
+				narrowed_return_type = winning_stub.return_type
+			target = resolved
 			self.lowering._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
+
+			# args/kwargs were lowered by _lower_overload_arg BEFORE target was
+			# known, each literal deliberately typed as narrowly as possible
+			# (see _lower_overload_arg's own comment on why: so resolve_call's
+			# own dispatch decision, above, sees the literal's true, single-
+			# leaf type rather than a whole union "either member is possible"
+			# type). Now that target is fixed, coerce any operand that's still
+			# narrower than target's own real declared parameter type UP into
+			# it - mirrors the identical coercion an ORDINARY, non-overloaded
+			# call gets for free by lowering its arguments directly against
+			# the (already statically known) target's parameter types; an
+			# Overload target never goes through that path (see _lower_call_
+			# args, only used by the plain-target `else` branch below), so it
+			# needs this equivalent applied explicitly, once, here
+			for i, param in enumerate( target.parameters or [] ):
+				if i >= len( args ):
+					break
+				if args[i].type is not param.type and isinstance( param.type, TaggedUnion ):
+					args[i] = self._coerce_into_union( args[i], param.type, node )
+			for param in target.parameters or []:
+				if param.stem in kwargs and kwargs[param.stem].type is not param.type and isinstance( param.type, TaggedUnion ):
+					kwargs[param.stem] = self._coerce_into_union( kwargs[param.stem], param.type, node )
 
 			# now that a single concrete winner is known, validate move(...)
 			# usage against ITS OWN parameters (mirroring _check_move_
@@ -8709,6 +8835,23 @@ class FunctionLowering:
 			# self.lowering.schedule() below only enqueues it for later
 			# compilation)
 			target_return_type_base = target_return_type.base if isinstance( target_return_type, Specialization ) else target_return_type
+			if narrowed_return_type is not None:
+				# the raw call always targets `target`'s own REAL, wide return
+				# type (see narrowed_return_type's own comment, above where
+				# it's declared) - sizing dest directly to expected_type/
+				# narrowed_return_type here, the way the ordinary branches
+				# below do, would declare dest with a C type the actual
+				# callee never produces (its real, emitted C prototype still
+				# returns the whole union struct). The narrowing is instead
+				# realized AFTER the call: extract the matching leaf out of
+				# the wide result via the SAME no-runtime-check extraction
+				# _maybe_unwrap_union_arg already uses for a union-typed call
+				# ARGUMENT known to match one leaf - sound here for the
+				# identical reason (stub_covers_call already proved this
+				# call's arguments can never produce the other member)
+				dest = self._new_temp( target_return_type )
+				self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
+				return self._maybe_unwrap_union_arg( dest, narrowed_return_type )
 			if isinstance( expected_type, TaggedUnion ) and target_return_type is not None and not isinstance( target_return_type_base, ( TaggedUnion, TypeVar )):
 				# a call whose own return type is a plain leaf (e.g. str)
 				# flowing into a T|None-typed slot - dest must be typed as
