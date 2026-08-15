@@ -441,116 +441,152 @@ class TupleType( Type ):
 # creation time, because external code subscripting this class as a generic
 # (Result[i32,usize]) needs to see it before this class's own .resolve ever runs.
 
-# --- shared single-inheritance-chain/vtable helpers, RCClass and CStruct ---
-#
-# RCClass and CStruct both have an identically-shaped .base/.methods/.names/
-# .resolve (single inheritance, own-members-only .names, lazy .resolve) - no
-# real shared base class exists to hang one implementation off of (ClassLike,
-# below, is a plain Union type alias, not a class), so these live as free
-# functions instead, parameterized over 'RCClass|CStruct', and each class's
-# own same-named method just delegates to the matching one here. Originally
-# CStruct-only (RCClass subclassing/vtables was deferred - see
-# PLAN_SUBCLASSING_VTABLES_COM.md); generalized once RCClass subclassing
-# work resumed (see PLAN's own RCClass-subclassing follow-up).
+class InheritanceChainMixin:
+	'''
+	shared single-inheritance-chain / vtable behaviour for the two class kinds
+	that have one: RCClass and CStruct. Both grew an identically-shaped
+	.base/.methods/.attributes/.names/.resolve (single inheritance,
+	own-members-only .names, lazy .resolve) independently, and neither is a
+	base of the other - ClassLike, below, is a plain Union type ALIAS, not a
+	class - so these five algorithms used to live as module-level free
+	functions parameterized over the union type 'RCClass|CStruct', with each
+	class carrying a same-named method that did nothing but forward to the
+	matching one. That is what a mixin is for; the union annotation was the
+	type system being asked to assert a shared shape that no type expressed.
 
-def chain_lookup( cls: 'RCClass|CStruct', name: str ) -> Name|None:
-	''' walk this class's own single-inheritance chain (self, then base,
-	then base.base, ... until None) looking for `name` - .names only ever
-	holds a class's OWN declared members (discovery.py never merges a
-	base's own names into a subclass), so a subclass needs this to see an
-	inherited method/attribute at all. Only ever non-trivial for a class
-	that actually has a base (a plain, non-@interface CStruct can't have
-	one at all - see discovery.py's _parse_ClassDef_CStruct, which rejects
-	bases outright for that case). '''
-	node: 'RCClass|CStruct|None' = cls
-	while node is not None:
-		if node.resolve is not None: # each level's .names is populated lazily, same "None means already resolved" convention as everywhere else - a base's own body may not have run yet just because the derived class's own resolve() (already done by the caller) ran
-			node.resolve()
-		found = node.names.get( name )
-		if found is not None:
-			return found
-		node = node.base
-	return None
+	Not a dataclass, and it declares no fields of its own - exactly the
+	discipline ScopeMixin follows above, and for the same reason: RCClass and
+	CStruct are @dataclass( kw_only = True ), and a mixin contributing real
+	fields would interfere with their own field collection/ordering. The
+	attribute lines below are bare ANNOTATIONS (no assignment), purely so the
+	methods here can be read without chasing what .base/.methods/.attributes
+	are; each real class declares them as actual dataclass fields.
 
-def own_new_virtual_slots( cls: 'RCClass|CStruct' ) -> list['Function']:
-	''' this class's OWN @virtual methods that AREN'T already a slot
-	somewhere in its ancestor chain - i.e. genuinely NEW vtable slots
-	introduced here, not overrides of an inherited one. Any level in the
-	chain can introduce new slots (not just the root - see vtbl_owner's
-	own docstring for why: real interface hierarchies routinely add
-	methods at every level, e.g. IUnknown -> ICustom (adds methods) ->
-	ConcreteImpl, which a root-only-introduces-slots rule can never
-	express). '''
-	if cls.resolve is not None:
-		cls.resolve()
-	inherited_names: set[str] = set()
-	node = cls.base
-	while node is not None:
-		if node.resolve is not None:
-			node.resolve()
-		inherited_names.update( m.stem for m in node.methods if isinstance( m, Function ) and m.is_virtual )
-		node = node.base
-	return [ m for m in cls.methods if isinstance( m, Function ) and m.is_virtual and m.stem not in inherited_names ]
+	Mixed in AFTER Type (class RCClass( Type, ScopeMixin, InheritanceChainMixin ))
+	to match the existing base order. Nothing here shadows a Type method, so
+	that ordering is safe - note it would NOT be if this defined, say,
+	has_vtable(): Type comes first in the MRO and would win. has_vtable()
+	therefore stays declared on Type and overridden on each class directly,
+	which is also the honest place for it - RCClass is always True, a CStruct
+	only when @interface, so the two genuinely differ and there is no shared
+	answer to hoist.
+	'''
+	base: 'InheritanceChainMixin|None'
+	names: dict[str,Name]
+	methods: list['Function|Overload']
+	attributes: list['Variable']
+	resolve: Callable[[],None]|None
 
-def vtbl_owner( cls: 'RCClass|CStruct' ) -> 'RCClass|CStruct':
-	''' the nearest class at or above `cls` (cls itself, or walking up
-	.base) whose own Vtbl C struct type is the one cls's own $vtable field
-	actually points at - the nearest one (starting from cls) that
-	introduces at least one genuinely new slot (see own_new_virtual_slots).
-	A class that adds nothing of its own (pure overrides, or no @virtual
-	methods at all) simply reuses whatever ancestor's Vtbl type is already
-	in effect - matches real COM: FooImpl (an ordinary implementation, no
-	new capabilities) still has an $vtable field literally typed as
-	whichever interface it implements' own IFooVtbl*, not a FooImplVtbl of
-	its own. '''
-	node = cls
-	while node.base is not None and not own_new_virtual_slots( node ):
-		node = node.base
-	return node
+	def chain_lookup( self, name: str ) -> Name|None:
+		''' walk this class's own single-inheritance chain (self, then base,
+		then base.base, ... until None) looking for `name` - .names only ever
+		holds a class's OWN declared members (discovery.py never merges a
+		base's own names into a subclass), so a subclass needs this to see an
+		inherited method/attribute at all. Only ever non-trivial for a class
+		that actually has a base (a plain, non-@interface CStruct can't have
+		one at all - see discovery.py's _parse_ClassDef_CStruct, which rejects
+		bases outright for that case). '''
+		node: 'InheritanceChainMixin|None' = self
+		while node is not None:
+			if node.resolve is not None: # each level's .names is populated lazily, same "None means already resolved" convention as everywhere else - a base's own body may not have run yet just because the derived class's own resolve() (already done by the caller) ran
+				node.resolve()
+			found = node.names.get( name )
+			if found is not None:
+				return found
+			node = node.base
+		return None
 
-def virtual_slots( cls: 'RCClass|CStruct' ) -> list['Function']:
-	''' the full, ordered slot list for THIS class's own EFFECTIVE vtable
-	type (vtbl_owner()'s own type) - every new-slot-introducing ancestor's
-	own slots, root-first, up to and including vtbl_owner() itself
-	(.methods is append-only in source order - see discovery.py's
-	_parse_function, so each level's own contribution is already
-	declaration-ordered). This is a superset walk, not "only the root" -
-	see vtbl_owner's own docstring on why every level can contribute. '''
-	owner = vtbl_owner( cls )
-	chain: list['RCClass|CStruct'] = []
-	node: 'RCClass|CStruct|None' = owner
-	while node is not None:
-		chain.append( node )
-		node = node.base
-	slots: list[Function] = []
-	for node in reversed( chain ):
-		slots.extend( own_new_virtual_slots( node ))
-	return slots
+	def own_new_virtual_slots( self ) -> list['Function']:
+		''' this class's OWN @virtual methods that AREN'T already a slot
+		somewhere in its ancestor chain - i.e. genuinely NEW vtable slots
+		introduced here, not overrides of an inherited one. Any level in the
+		chain can introduce new slots (not just the root - see vtbl_owner's
+		own docstring for why: real interface hierarchies routinely add
+		methods at every level, e.g. IUnknown -> ICustom (adds methods) ->
+		ConcreteImpl, which a root-only-introduces-slots rule can never
+		express). '''
+		if self.resolve is not None:
+			self.resolve()
+		inherited_names: set[str] = set()
+		node = self.base
+		while node is not None:
+			if node.resolve is not None:
+				node.resolve()
+			inherited_names.update( m.stem for m in node.methods if isinstance( m, Function ) and m.is_virtual )
+			node = node.base
+		return [ m for m in self.methods if isinstance( m, Function ) and m.is_virtual and m.stem not in inherited_names ]
 
-def flattened_attributes( cls: 'RCClass|CStruct' ) -> list['Variable']:
-	''' every attribute declared anywhere in cls's own single-inheritance
-	chain (cls itself, then cls.base, then cls.base.base, ... until None),
-	base-first/most-derived-last order - the same order emitter_c.py's own
-	emit_rcclass/emit_cstruct field-flattening walk and type_resolver.py's
-	_synthesize_rcclass_destructor use for real struct layout. .attributes
-	alone only ever holds a class's OWN declared fields (discovery.py never
-	merges a base's own fields into a subclass) - this is what a
-	subclass's field=value construction sugar (no __init__ at all
-	anywhere in the chain) and super().__init__() chaining (the base's
-	own portion specifically - see lowering.py's own caller) both need
-	instead. '''
-	chain: list['RCClass|CStruct'] = []
-	node: 'RCClass|CStruct|None' = cls
-	while node is not None:
-		chain.append( node )
-		node = node.base
-	attrs: list[Variable] = []
-	for node in reversed( chain ):
-		attrs.extend( node.attributes )
-	return attrs
+	def vtbl_owner( self ) -> 'InheritanceChainMixin':
+		''' the nearest class at or above self (self itself, or walking up
+		.base) whose own Vtbl C struct type is the one self's own $vtable field
+		actually points at - the nearest one (starting from self) that
+		introduces at least one genuinely new slot (see own_new_virtual_slots).
+		A class that adds nothing of its own (pure overrides, or no @virtual
+		methods at all) simply reuses whatever ancestor's Vtbl type is already
+		in effect - matches real COM: FooImpl (an ordinary implementation, no
+		new capabilities) still has an $vtable field literally typed as
+		whichever interface it implements' own IFooVtbl*, not a FooImplVtbl of
+		its own.
+
+		RCClass and CStruct each override this to narrow the RETURN type to
+		themselves - the one thing a shared method genuinely can't express.
+		typing.Self would be wrong here rather than merely awkward: ClosureType
+		is an RCClass subclass, and walking up .base from one can legitimately
+		land on a plain RCClass ancestor, so the result is "the same class
+		KIND", not "the same class". Those two narrowing overrides are all that
+		remains of what used to be ten forwarding stubs. '''
+		node = self
+		while node.base is not None and not node.own_new_virtual_slots():
+			node = node.base
+		return node
+
+	def virtual_slots( self ) -> list['Function']:
+		''' the full, ordered slot list for THIS class's own EFFECTIVE vtable
+		type (vtbl_owner()'s own type) - every new-slot-introducing ancestor's
+		own slots, root-first, up to and including vtbl_owner() itself
+		(.methods is append-only in source order - see discovery.py's
+		_parse_function, so each level's own contribution is already
+		declaration-ordered). This is a superset walk, not "only the root" -
+		see vtbl_owner's own docstring on why every level can contribute. '''
+		chain: list['InheritanceChainMixin'] = []
+		node: 'InheritanceChainMixin|None' = self.vtbl_owner()
+		while node is not None:
+			chain.append( node )
+			node = node.base
+		slots: list[Function] = []
+		for node in reversed( chain ):
+			slots.extend( node.own_new_virtual_slots() )
+		return slots
+
+	def flattened_attributes( self ) -> list['Variable']:
+		''' every attribute declared anywhere in self's own single-inheritance
+		chain (self itself, then .base, then .base.base, ... until None),
+		base-first/most-derived-last order - the same order emitter_c.py's own
+		emit_rcclass/emit_cstruct field-flattening walk and type_resolver.py's
+		_synthesize_rcclass_destructor use for real struct layout. .attributes
+		alone only ever holds a class's OWN declared fields (discovery.py never
+		merges a base's own fields into a subclass) - this is what a
+		subclass's field=value construction sugar (no __init__ at all
+		anywhere in the chain) and super().__init__() chaining (the base's
+		own portion specifically - see lowering.py's own caller) both need
+		instead.
+
+		NOTE: unlike own_new_virtual_slots above, this resolves NOTHING it
+		returns - a caller that goes on to ask an attribute about its own
+		.type has to resolve it first (see cfg.py's complete_base_construction,
+		which does exactly that, and says why). '''
+		chain: list['InheritanceChainMixin'] = []
+		node: 'InheritanceChainMixin|None' = self
+		while node is not None:
+			chain.append( node )
+			node = node.base
+		attrs: list[Variable] = []
+		for node in reversed( chain ):
+			attrs.extend( node.attributes )
+		return attrs
 
 @dataclass( kw_only = True )
-class RCClass( Type, ScopeMixin ): # normal ref-counted class
+class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted class
 	# base is resolved eagerly at class-creation time, same as type_params -
 	# Python itself requires a base class to already exist when the `class
 	# Foo(Base):` statement runs, so there's no forward-reference case to
@@ -563,20 +599,16 @@ class RCClass( Type, ScopeMixin ): # normal ref-counted class
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 
-	def chain_lookup( self, name: str ) -> Name|None:
-		return chain_lookup( self, name )
-
-	def own_new_virtual_slots( self ) -> list['Function']:
-		return own_new_virtual_slots( self )
-
+	# chain_lookup/own_new_virtual_slots/virtual_slots/flattened_attributes all
+	# come from InheritanceChainMixin unchanged. Only vtbl_owner needs anything
+	# here, and only to narrow the RETURN type - callers immediately treat the
+	# result as an RCClass (emitter_c's _rcclass_vtbl_type_name takes one), and
+	# typing.Self would be a lie, since ClosureType is an RCClass subclass whose
+	# vtbl_owner can legitimately be a plain RCClass ancestor.
 	def vtbl_owner( self ) -> 'RCClass':
-		return vtbl_owner( self )
-
-	def virtual_slots( self ) -> list['Function']:
-		return virtual_slots( self )
-
-	def flattened_attributes( self ) -> list[Variable]:
-		return flattened_attributes( self )
+		owner = super().vtbl_owner()
+		assert isinstance( owner, RCClass ) # the chain is homogeneous - .base is typed RCClass|None
+		return owner
 
 	# the whole point of the class - and ClosureType (the only RCClass
 	# subclass) inherits every one of these for free, which is exactly why
@@ -613,7 +645,7 @@ class ClosureType( RCClass ):
 	return_type: Type|None = None
 
 @dataclass( kw_only = True )
-class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
+class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 	# base is only meaningful for @interface CStructs (single inheritance,
 	# same "resolved eagerly at class-creation time" reasoning as
 	# RCClass.base above) - a plain (non-@interface) CStruct subclassing
@@ -627,20 +659,13 @@ class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 
-	def chain_lookup( self, name: str ) -> Name|None:
-		return chain_lookup( self, name )
-
-	def own_new_virtual_slots( self ) -> list['Function']:
-		return own_new_virtual_slots( self )
-
+	# everything except vtbl_owner comes from InheritanceChainMixin unchanged;
+	# this narrows the return type only - see RCClass's own copy for why a
+	# shared implementation can't do it
 	def vtbl_owner( self ) -> 'CStruct':
-		return vtbl_owner( self )
-
-	def virtual_slots( self ) -> list['Function']:
-		return virtual_slots( self )
-
-	def flattened_attributes( self ) -> list[Variable]:
-		return flattened_attributes( self )
+		owner = super().vtbl_owner()
+		assert isinstance( owner, CStruct ) # the chain is homogeneous - .base is typed CStruct|None
+		return owner
 
 	def has_vtable( self ) -> bool:
 		# only an @interface CStruct dispatches virtually (the COM model) -
