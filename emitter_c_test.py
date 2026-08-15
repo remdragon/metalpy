@@ -585,6 +585,59 @@ def main() -> i32:
 ''' ),
 		] )
 
+class CStructNestedByValueOnlyReachedViaSizeofTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression coverage for task_421ed8be: a small @cstruct (Inner)
+	nested BY VALUE inside another @cstruct (Outer), where Outer is only
+	ever reached through compiler.sizeof(Outer)/Ptr[Outer] - never actually
+	CONSTRUCTED (Outer(...)) anywhere reachable, and Inner is never
+	independently constructed/sized/pointed-to either. Used to fail real C
+	compilation outright - "field has incomplete type 'struct ...Inner'",
+	"forward declaration of ..." - because Inner never got scheduled as a
+	real compile unit at all: resolving Outer's own `nested: Inner` field
+	(compiler.py's `for attr in unit.attributes: self.lowering.
+	_ensure_resolved(attr)` loop) only resolves the ATTRIBUTE Variable
+	itself, never attr.type - schedule()'s own guard silently ignores a
+	class-attribute Variable (is_global=False), so Inner was never added to
+	compiler.cstructs, and _emit_value_type_bodies had nothing to emit a
+	definition for, even though Outer's own struct body still references
+	it by name. The exact same root cause union_storage.py's UnionStorage.
+	get() was already fixed for once (see UnionAsUnconstructedResultErrorTypeTests
+	above, "union_member_never_constructed_still_gets_full_struct") - this
+	is the general case, fixed in compiler.py's CStruct/CUnion/TaggedUnion
+	branches and monomorphize.py's monomorphize_class (mpy_types.py's new
+	by_value_dependency helper). Confirmed this exact minimal shape crashes
+	on a clean checkout (reverting the fix reproduces the real clang error
+	directly - a 3-field Outer, no ~70-field struct needed; the original
+	report's large real-world struct just happened to be the shape that
+	first surfaced it). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'nested_by_value_cstruct_only_reached_via_sizeof_compiles', '''
+@cstruct
+class Inner:
+	a: u16 = 0
+	b: u16 = 0
+
+@cstruct
+class Outer:
+	x: i32 = 0
+	nested: Inner = Inner( a = 0, b = 0 )
+	y: i32 = 0
+
+def main() -> i32:
+	struct_size: usize = compiler.sizeof( Outer )
+	raw: Ptr[u8] = sys.alloc[u8]( struct_size )
+	sys.memzero( raw, struct_size )
+	sys.free( raw )
+	return 0
+''' ),
+		] )
+
 class RCClassSubclassingPhase1Tests( CompilerTestCase ):
 	''' Phase 1 of the RCClass-subclassing plan (base-chain lookup +
 	attribute-shadowing rejection, no constructor chaining/@virtual/

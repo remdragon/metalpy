@@ -5,7 +5,7 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType, GeneratorType
+from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType, GeneratorType, by_value_dependency
 from tuple_storage import TupleStorage
 from union_storage import UnionStorage, build_member_constructor
 
@@ -494,6 +494,22 @@ class Monomorphizer:
 				replace( attr, type = self.substitute_type_params( attr.type, type_params, spec.args ))
 				for attr in base.attributes
 			]
+			# a concrete generic field embedded BY VALUE (e.g. `x: SomeStruct`
+			# inside Result[T,E]-shaped class, or any ordinary generic cstruct
+			# nesting another cstruct) needs its OWN type independently
+			# scheduled here, against the SUBSTITUTED (concrete) type, not
+			# base.attributes' own still-possibly-TypeVar one above - same gap,
+			# same reasoning as compiler.py's identical fix in its plain
+			# (non-generic) CStruct/CUnion/TaggedUnion branches: merely
+			# resolving a field's own .type never schedules that type itself,
+			# so a by-value dependency reachable ONLY through this field would
+			# otherwise never land in compiler.cstructs/cunions/tagged_unions -
+			# not a wrong topological order, a missing definition entirely
+			# (task_421ed8be)
+			for attr in substituted_attrs:
+				dep = by_value_dependency( attr.type )
+				if dep is not None:
+					self._ensure_resolved( attr.type )
 			substituted_names = dict( base.names )
 			for attr in substituted_attrs:
 				substituted_names[attr.stem] = attr
