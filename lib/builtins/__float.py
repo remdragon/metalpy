@@ -48,6 +48,7 @@ _MAX_INTEGER_DIGITS: usize = 320
 # one of these, chosen at compile time by lowering.py's _lower_float_
 # format_spec based on the f-string's own literal spec.type.
 _TYPE_CHAR_F: i32 = 102 # ord('f')
+_TYPE_CHAR_G: i32 = 103 # ord('g') - the "no type char at all" default's own underlying conversion, see _f64_none_type_digits_raw
 
 
 @private
@@ -170,7 +171,24 @@ def _f64_fixed_digits_raw( value: f64, precision: usize, type_char: i32, alt: bo
 	digits together with these (lowering.py's _lower_float_format_spec,
 	via str._pad_and_group_before_dot), which only works starting from
 	ungrouped text - see str._pad_and_group_after_prefix's own comment for
-	the real, confirmed bug pre-grouping first would cause here too. '''
+	the real, confirmed bug pre-grouping first would cause here too.
+
+	NaN/infinity are special-cased FIRST, before ever calling compiler.
+	format_f64 at all - real Python always shows plain "nan"/"inf" text
+	for these, ignoring precision/type_char/alt entirely (f"{nan:.1e}" ==
+	f"{nan:.1g}" == f"{nan:.1f}" == 'nan'), which real snprintf does NOT
+	reliably give: legacy msvcrt.dll's own _snprintf was confirmed (by a
+	real test against this system's own msvcrt.dll) to produce outright
+	garbage for infinity ("1.$" for "%.1f" of +inf, not "inf") - a
+	correctness bug this special-casing also fixes, not just a
+	convenience. compiler.is_nan/is_inf (lowering.py's own new
+	intrinsics, mirroring compiler.format_f64's shape) reuse the C-level
+	__metalpy_isnan/__metalpy_isinf macros already used for checked
+	arithmetic (emitter_c.py's PROLOGUE). '''
+	if compiler.is_nan( value ):
+		return str( 'nan' )
+	if compiler.is_inf( value ):
+		return str( 'inf' )
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		with compiler.panic_arithmetic( 'an integer-digit bound plus a decimal point plus precision fractional digits plus a zero terminator cannot overflow usize for any real f-string format spec' ):
@@ -223,11 +241,57 @@ def _f64_percent_digits( value: f64, precision: usize, alt: bool, sep: str ) -> 
 	return _group_integer_part( _f64_percent_digits_raw( value, precision, alt ), sep ) + str( '%' )
 
 
+@private
+def _f64_none_type_digits_raw( value: f64, precision: usize, alt: bool ) -> str:
+	''' the "no type char at all" default's own UNGROUPED digit text -
+	f"{x:.2}" (a literal format spec with no 'f'/'e'/'g'/etc after the
+	precision). Real Python's own "None" presentation type is closer to
+	'g' than 'f' (PLAN_STR_FORMAT.md item 4's own note) - built on 'g'
+	here, via _f64_fixed_digits_raw, with ONE extra tweak 'g' itself
+	doesn't have: fixed-point results always keep at least one digit past
+	the decimal point (f"{5.0:.2}" == '5.0', not '5.0:.2g}' == '5' - 'g'
+	strips a bare integer's own trailing '.0' entirely, "None" doesn't).
+	NaN/infinity ("nan"/"inf", handled inside _f64_fixed_digits_raw
+	already) are passed through completely unchanged - appending ".0" to
+	them would be wrong (there's no Python behavior distinction between
+	"None" and 'g' for these; both just show "nan"/"inf"). Exponential-
+	form results ('g' switching to scientific notation, e.g. "1.2e+03")
+	are also passed through unchanged - the "always show a fractional
+	digit" tweak only applies to FIXED-point results. '''
+	raw: str = _f64_fixed_digits_raw( value, precision, _TYPE_CHAR_G, alt )
+	if raw == str( 'nan' ) or raw == str( 'inf' ):
+		return raw
+	has_dot: bool = False
+	match raw.find( str( '.' )):
+		case Result.Ok( _ ):
+			has_dot = True
+		case Result.Err( _ ):
+			pass
+	if has_dot:
+		return raw
+	has_exp: bool = False
+	match raw.find( str( 'e' )):
+		case Result.Ok( _ ):
+			has_exp = True
+		case Result.Err( _ ):
+			pass
+	if has_exp:
+		return raw
+	return raw + str( '.0' )
+
+
+@private
+def _f64_none_type_digits( value: f64, precision: usize, alt: bool, sep: str ) -> str:
+	return _group_integer_part( _f64_none_type_digits_raw( value, precision, alt ), sep )
+
+
 f64._sign_prefix = _f64_sign_prefix
 f64._fixed_digits = _f64_fixed_digits
 f64._fixed_digits_raw = _f64_fixed_digits_raw
 f64._percent_digits = _f64_percent_digits
 f64._percent_digits_raw = _f64_percent_digits_raw
+f64._none_type_digits = _f64_none_type_digits
+f64._none_type_digits_raw = _f64_none_type_digits_raw
 
 
 @private
@@ -260,8 +324,20 @@ def _f32_percent_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
 	return f64( value )._percent_digits_raw( precision, alt )
 
 
+@private
+def _f32_none_type_digits( value: f32, precision: usize, alt: bool, sep: str ) -> str:
+	return f64( value )._none_type_digits( precision, alt, sep )
+
+
+@private
+def _f32_none_type_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
+	return f64( value )._none_type_digits_raw( precision, alt )
+
+
 f32._sign_prefix = _f32_sign_prefix
 f32._fixed_digits = _f32_fixed_digits
 f32._fixed_digits_raw = _f32_fixed_digits_raw
 f32._percent_digits = _f32_percent_digits
 f32._percent_digits_raw = _f32_percent_digits_raw
+f32._none_type_digits = _f32_none_type_digits
+f32._none_type_digits_raw = _f32_none_type_digits_raw

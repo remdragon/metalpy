@@ -995,6 +995,29 @@ class str:
 			effective_width: usize = width - rest_len
 		return int_part._pad_and_group_after_prefix( prefix, effective_width, fill, sep ) + rest
 
+	@private
+	def _pad_maybe_special( self, prefix: str, width: usize, fill: str, sep: str ) -> str:
+		''' the '0' zero-pad shorthand's own dispatch for float digit text
+		that might be "nan"/"inf" (lib/builtins/__float.py's own _f64_
+		fixed_digits_raw/_f64_percent_digits_raw/_f64_none_type_digits_raw,
+		special-cased there for non-finite values) instead of real digits.
+		Real Python still zero-pads "nan"/"inf" (right-justified with
+		fill, sign-aware - f"{inf:015,.1f}" == '000000000000inf'), but
+		grouping and any '.'-based dot-splitting never apply to them EVEN
+		when requested (no comma ever appears in that padded "inf" - not
+		'000,000,000,inf') - _pad_and_group_before_dot's own grouping-
+		aware machinery would incorrectly try to treat "nan"/"inf" as
+		digits needing exactly that treatment (it has no way to know they
+		aren't), so this checks first and routes to the plain (non-
+		grouping, non-dot-aware) _pad_after_prefix instead when self isn't
+		real digits. Lives here, not in __float.py, despite being float-
+		motivated - self is the receiver float's code needs to dispatch
+		on, and only a real str method (not a Scalar.names-registered free
+		function) can be reached that way. '''
+		if self == str( 'nan' ) or self == str( 'inf' ):
+			return self._pad_after_prefix( prefix, width, fill )
+		return self._pad_and_group_before_dot( prefix, width, fill, sep )
+
 	def zfill( self, width: usize ) -> str:
 		''' like rjust(width, '0'), except a leading '+'/'-' byte stays
 		first, with the zero padding inserted right after it - matches

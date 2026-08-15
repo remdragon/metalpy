@@ -228,6 +228,47 @@ Deferred items
    (non-zero-pad width, or no width at all) calling the original,
    unchanged, already-tested grouped-digit methods exactly as before.
 
+   TWO of the three residual float-specific gaps flagged after the above
+   landed (inf/nan display, and the "no type char" default) are now also
+   fixed - a dedicated follow-up review of this whole area surfaced them:
+
+   - inf/nan display was a genuine, already-shipped BUG on Windows, not
+     merely untested: legacy msvcrt.dll's own _snprintf produces outright
+     garbage for infinity ("1.$" for "%.1f" of +inf, confirmed against
+     this system's own msvcrt.dll - not "wrong precision", actually
+     nonsense text). Fixed by special-casing NaN/infinity entirely in
+     metalpy source (lib/builtins/__float.py's _f64_fixed_digits_raw),
+     before compiler.format_f64 is ever called for them - two new
+     compiler intrinsics, compiler.is_nan/is_inf (lowering.py's
+     _lower_compiler_is_nan_or_inf, ir.IsNan/ir.IsInf, same shape as
+     compiler.format_f64), expose the C-level __metalpy_isnan/
+     __metalpy_isinf macros already used internally for checked float
+     arithmetic (emitter_c.py's PROLOGUE) directly to metalpy source.
+     Matches real Python exactly: precision/type_char/alt are all
+     ignored ("inf" regardless of 'f'/'e'/'g'), but sign/width/zero-pad
+     still apply (f"{inf:08.1f}" == '00000inf'), and grouping is a
+     correct no-op even when explicitly requested (no comma ever
+     appears - '000000000000inf', not '000,000,000,inf'). That last part
+     needed its own new str method, _pad_maybe_special (lib/builtins/
+     __init__.py, alongside _pad_and_group_before_dot) - the grouping-
+     aware zero-pad path would otherwise treat "inf"/"nan" text as if it
+     were real digits needing exactly that treatment, which it has no
+     way to know they aren't.
+   - the "no type char at all" default (f"{x:.2}") now matches real
+     Python's actual "None" presentation type when a precision IS given -
+     closer to 'g' than to the 'f' this pass originally, deliberately
+     simplified to (this item's own earlier note) - via a new
+     _f64_none_type_digits/_raw pair (lib/builtins/__float.py) built on
+     'g' (a new _TYPE_CHAR_G constant) plus ONE extra tweak 'g' itself
+     doesn't have: fixed-point results always keep at least one
+     fractional digit (f"{5.0:.2}" == '5.0', where plain 'g' would give
+     '5' - confirmed against real Python). Still falls back to plain 'f'
+     for the ONE remaining combination this doesn't cover - no type char
+     AND no precision either (f"{x:10}", or the completely bare f"{x}"
+     interpolation) - both of those need Python's real shortest-round-
+     trip repr algorithm, which is a separate, materially larger
+     undertaking (see item 6's own note) still not started.
+
 5. `=` general sign-aware alignment
 
    Only the `0` zero-pad shorthand's own implicit `=` is supported
@@ -245,8 +286,11 @@ Deferred items
    '0'), so generalizing to an explicit `=` align character with a custom
    fill is a small, mostly-mechanical follow-up entirely within the
    existing design, not a new one. (str._pad_after_prefix, the older,
-   non-grouping-aware helper these superseded for this exact call site,
-   is unused by any format-spec path now, though still defined.)
+   non-grouping-aware helper these superseded for this exact call site, is
+   no longer reachable from any GROUPING-aware format-spec path, but
+   picked up a second, unrelated real caller since: str._pad_maybe_special
+   uses it directly for "nan"/"inf" text, which must never be treated as
+   groupable digits - see item 4's own inf/nan writeup.)
 
 6. Implicit scalar-to-str boxing - f"{i}" for i: i32
 

@@ -2085,6 +2085,11 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			f'{_emit_operand(instr.type_char)}, {_emit_operand(instr.alt)}, {_emit_operand(instr.value)});'
 		]
 
+	if isinstance( instr, ir.IsNan ):
+		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_isnan( {_emit_operand(instr.value)} );' ]
+	if isinstance( instr, ir.IsInf ):
+		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_isinf( {_emit_operand(instr.value)} );' ]
+
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
 			# routed through sys.alloc[cls] - the SAME allocation path

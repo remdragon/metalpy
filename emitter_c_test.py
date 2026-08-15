@@ -8335,9 +8335,12 @@ def main() -> i32:
 		# legacy msvcrt), a real, already-shipped bug this test would have
 		# caught immediately - emitter_c.py's PROLOGUE now substitutes
 		# lowercase 'f' internally on Windows for this one conversion
-		# character, correct for every finite value (the only real
-		# difference between 'f'/'F' is inf/nan capitalization, which this
-		# compiler doesn't special-case either way yet)
+		# character, correct for every finite value. inf/nan display
+		# (see test_float_format_spec_inf_nan below) is handled entirely
+		# separately, in metalpy source, before compiler.format_f64 (and
+		# so this 'f'-vs-'F' substitution) is ever reached - Python shows
+		# "inf"/"nan" identically regardless of 'f' vs 'F', so there's no
+		# capitalization difference left to worry about here either
 		self._run( f'''
 def main() -> i32:
 	if f"{{1.0:.1F}}" != {f"{1.0:.1F}"!r}:
@@ -8346,6 +8349,94 @@ def main() -> i32:
 		return 2
 	if f"{{5.0:#.0F}}" != {f"{5.0:#.0F}"!r}:
 		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_inf_nan( self ) -> None:
+		# a real, confirmed bug (PLAN_STR_FORMAT.md item 4): legacy
+		# msvcrt.dll's own _snprintf produces outright GARBAGE for
+		# infinity ("1.$" for "%.1f" of +inf, confirmed against this
+		# system's own msvcrt.dll - not merely untested, actually wrong).
+		# lib/builtins/__float.py now special-cases NaN/infinity (via the
+		# new compiler.is_nan/is_inf intrinsics) before ever calling
+		# compiler.format_f64 at all, matching real Python: precision/
+		# type_char/alt are all ignored ("inf" regardless of 'f'/'e'/'g'),
+		# but sign/width/zero-pad still apply, and grouping is a no-op
+		# even when requested (no comma ever appears inside "inf")
+		self._run( f'''
+def get_pos_inf() -> f64:
+	with compiler.saturate_arithmetic:
+		big: f64 = 1.0e300
+		return big * big
+
+def get_neg_inf() -> f64:
+	return -get_pos_inf()
+
+def get_nan() -> f64:
+	with compiler.wrap_arithmetic:
+		return get_pos_inf() + get_neg_inf()
+
+def main() -> i32:
+	if f"{{get_pos_inf():.1f}}" != {f"{float('inf'):.1f}"!r}:
+		return 1
+	if f"{{get_neg_inf():.1f}}" != {f"{float('-inf'):.1f}"!r}:
+		return 2
+	if f"{{get_nan():.1f}}" != {f"{float('nan'):.1f}"!r}:
+		return 3
+	if f"{{get_pos_inf():.1e}}" != {f"{float('inf'):.1e}"!r}:
+		return 4
+	if f"{{get_nan():.1g}}" != {f"{float('nan'):.1g}"!r}:
+		return 5
+	if f"{{get_pos_inf():+.1f}}" != {f"{float('inf'):+.1f}"!r}:
+		return 6
+	if f"{{get_pos_inf():08.1f}}" != {f"{float('inf'):08.1f}"!r}:
+		return 7
+	if f"{{get_pos_inf():.1%}}" != {f"{float('inf'):.1%}"!r}:
+		return 8
+	if f"{{get_pos_inf():015,.1f}}" != {f"{float('inf'):015,.1f}"!r}:
+		return 9
+	if f"{{get_neg_inf():015,.1f}}" != {f"{float('-inf'):015,.1f}"!r}:
+		return 10
+	if f"{{get_neg_inf():08.1%}}" != {f"{float('-inf'):08.1%}"!r}:
+		return 11
+	if f"{{get_nan():+.1f}}" != {f"{float('nan'):+.1f}"!r}:
+		return 12
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_none_type_with_precision( self ) -> None:
+		# f"{x:.2}" (a literal spec with a precision but no type char) -
+		# real Python's own "None" presentation type, closer to 'g' than
+		# to plain 'f' (PLAN_STR_FORMAT.md item 4's own note), except
+		# fixed-point results always keep at least one fractional digit
+		# (f"{5.0:.2}" == '5.0', not 'g''s own '5') - confirmed against
+		# real Python. No-precision-no-type (f"{x:10}"/bare f"{x}") still
+		# falls back to plain 'f' - that needs Python's real shortest-
+		# round-trip repr algorithm instead, not implemented yet
+		self._run( f'''
+def main() -> i32:
+	if f"{{5.0:.2}}" != {f"{5.0:.2}"!r}:
+		return 1
+	if f"{{1234.5:.2}}" != {f"{1234.5:.2}"!r}:
+		return 2
+	if f"{{0.0001234:.2}}" != {f"{0.0001234:.2}"!r}:
+		return 3
+	if f"{{1234.5:10.2}}" != {f"{1234.5:10.2}"!r}:
+		return 4
+	if f"{{1234.5:.6}}" != {f"{1234.5:.6}"!r}:
+		return 5
+	if f"{{1234.5:#.2}}" != {f"{1234.5:#.2}"!r}:
+		return 6
+	if f"{{-5.0:.2}}" != {f"{-5.0:.2}"!r}:
+		return 7
+	if f"{{5.0:015,.2}}" != {f"{5.0:015,.2}"!r}:
+		return 8
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

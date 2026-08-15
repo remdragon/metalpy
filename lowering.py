@@ -2750,6 +2750,28 @@ class FunctionLowering:
 		self._emit( ir.FormatFloat( dest = dest, buf = buf, size = size, precision = precision, type_char = type_char, alt = alt, value = value ))
 		return dest
 
+	def _lower_compiler_is_nan_or_inf( self, node: ast.Call, expected_type: Type|None, name: str ) -> ir.Operand:
+		# compiler.is_nan(x)/compiler.is_inf(x) - x: f32|f64 -> bool. Reuses
+		# __metalpy_isnan/__metalpy_isinf (emitter_c.py's PROLOGUE, already
+		# there for checked/panic-mode float arithmetic) - exposed directly
+		# so f-string format specs can special-case inf/nan display
+		# (lib/builtins/__float.py), since real snprintf/msvcrt don't
+		# reliably produce "inf"/"nan" text for these themselves (confirmed:
+		# legacy msvcrt's own _snprintf gives outright garbage like "1.$"
+		# for +infinity, not "inf" - unlike the exponent-padding/missing-'F'
+		# quirks found earlier, this one isn't even close to right).
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{name}(...) takes exactly one argument: {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		value = self._lower_expr( node.args[0], None )
+		if value.type is not intrinsics.get( 'f32' ) and value.type is not intrinsics.get( 'f64' ):
+			type_name = value.type.qualname if value.type is not None else '?'
+			self.lowering.discovery.fail( f'compiler.{name}(...) argument must be f32 or f64, not {type_name}: {ast.unparse(node)}', node )
+		dest = self._new_temp( expected_type or intrinsics['bool'] )
+		ir_cls = ir.IsNan if name == 'is_nan' else ir.IsInf
+		self._emit( ir_cls( dest = dest, value = value ))
+		return dest
+
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
 		# statement-only (see _stmt_Expr's own dispatch) - mirrors
 		# compiler.incref/decref: no return value, nothing to hand back to
@@ -4435,50 +4457,58 @@ class FunctionLowering:
 		alt = self._const_bool( spec.alt )
 		sep = ir.Const( type = str_type, value = spec.grouping or '' ) # '' still groups correctly - see str._insert_thousands_sep's own comment
 		is_percent = spec.type == '%'
-		# None (no type char at all) defers to 'f' - a simplification, not
-		# Python's real "no type char" presentation (closer to 'g' with its
-		# own tweaks) - see validate_float_spec's own comment
-		type_char = self._const_i32( ord( spec.type or 'f' ) ) if not is_percent else None
+		# None type char WITH an explicit precision behaves like 'g' (plus
+		# its own "always show a fractional digit in fixed form" tweak) -
+		# real Python's own "None" presentation, not plain 'f' (see
+		# validate_float_spec's own comment and lib/builtins/__float.py's
+		# _none_type_digits_raw). None type char with NO precision would
+		# need Python's real shortest-round-trip repr algorithm instead -
+		# not implemented (PLAN_STR_FORMAT.md item 4's own note), so that
+		# specific combination still falls back to plain 'f' below,
+		# unchanged from before.
+		is_none_type_with_precision = spec.type is None and spec.precision is not None and not is_percent
+		type_char = self._const_i32( ord( spec.type or 'f' ) ) if not is_percent and not is_none_type_with_precision else None
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
+
+		if is_percent:
+			digits_method, digits_args = '_percent_digits', [ self._const_usize( precision ), alt ]
+		elif is_none_type_with_precision:
+			digits_method, digits_args = '_none_type_digits', [ self._const_usize( precision ), alt ]
+		else:
+			digits_method, digits_args = '_fixed_digits', [ self._const_usize( precision ), type_char, alt ]
 
 		if spec.width is not None and spec.align == '=':
 			# the '0' shorthand - zero-padding goes BETWEEN sign and
-			# digits, grouping-aware (str._pad_and_group_before_dot - a
-			# plain "group first, then _pad_after_prefix" two-step gives
-			# the wrong answer once grouping is combined with zero-pad, see
-			# str._pad_and_group_after_prefix's own comment) - needs the
-			# RAW, ungrouped digits (_fixed_digits_raw/_percent_digits_raw),
-			# not the already-grouped _fixed_digits/_percent_digits the
-			# other two branches below want
+			# digits, grouping-aware AND special-value-aware (str._pad_
+			# maybe_special - a plain "group first, then _pad_after_prefix"
+			# two-step gives the wrong answer once grouping is combined
+			# with zero-pad, and "nan"/"inf" text needs to skip grouping
+			# entirely even when requested - see str._pad_and_group_after_
+			# prefix's own comment and _pad_maybe_special's own comment) -
+			# needs the RAW, ungrouped digits (the '_raw' variant of
+			# whichever digits_method was picked above), not the already-
+			# grouped ones the other branch below wants
+			raw = self._lower_method_call( operand, digits_method + '_raw', digits_args, str_type, node )
 			if is_percent:
-				raw = self._lower_method_call( operand, '_percent_digits_raw', [ self._const_usize( precision ), alt ], str_type, node )
-				# _pad_and_group_before_dot has no notion of '%' - reserve
-				# 1 char of the nominal width for it here, then append it
+				# str._pad_maybe_special has no notion of '%' - reserve 1
+				# char of the nominal width for it here, then append it
 				# after, the same "caller reserves room for what this
-				# method doesn't know about" convention its own comment
-				# documents
+				# method doesn't know about" convention _pad_and_group_
+				# before_dot's own comment documents
 				inner_width = max( spec.width - 1, 0 )
 				padded = self._lower_method_call(
-					raw, '_pad_and_group_before_dot',
+					raw, '_pad_maybe_special',
 					[ sign_char, self._const_usize( inner_width ), ir.Const( type = str_type, value = spec.fill ), sep ],
 					str_type, node,
 				)
 				return self._lower_str_add( padded, ir.Const( type = str_type, value = '%' ), str_type, node )
-			raw = self._lower_method_call( operand, '_fixed_digits_raw', [ self._const_usize( precision ), type_char, alt ], str_type, node )
 			return self._lower_method_call(
-				raw, '_pad_and_group_before_dot',
+				raw, '_pad_maybe_special',
 				[ sign_char, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ), sep ],
 				str_type, node,
 			)
 
-		if is_percent:
-			# has no printf equivalent of its own - _percent_digits handles
-			# the *100-then-'f' scaling itself (lib/builtins/__float.py)
-			digits = self._lower_method_call( operand, '_percent_digits', [ self._const_usize( precision ), alt, sep ], str_type, node )
-		else:
-			digits = self._lower_method_call(
-				operand, '_fixed_digits', [ self._const_usize( precision ), type_char, alt, sep ], str_type, node,
-			)
+		digits = self._lower_method_call( operand, digits_method, digits_args + [ sep ], str_type, node )
 		if spec.width is None:
 			return self._lower_str_add( sign_char, digits, str_type, node )
 		body = self._lower_str_add( sign_char, digits, str_type, node )
@@ -7052,6 +7082,14 @@ class FunctionLowering:
 
 			case 'format_f64':
 				result = self._lower_compiler_format_f64( node, expected_type )
+				return result if want_result else None
+
+			case 'is_nan':
+				result = self._lower_compiler_is_nan_or_inf( node, expected_type, 'is_nan' )
+				return result if want_result else None
+
+			case 'is_inf':
+				result = self._lower_compiler_is_nan_or_inf( node, expected_type, 'is_inf' )
 				return result if want_result else None
 
 		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_return':

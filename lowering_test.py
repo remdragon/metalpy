@@ -7679,6 +7679,23 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
 		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
 
+	def test_float_format_spec_none_type_with_precision_dispatches_to_none_type_digits( self ) -> None:
+		# f"{x:.2}" - a literal spec with a precision but no type char at
+		# all goes through its own dedicated _none_type_digits (lib/
+		# builtins/__float.py, real Python's own "None" presentation type -
+		# closer to 'g' than 'f', see its own comment), not the plain
+		# _fixed_digits('f') fallback f"{x:.2f}" itself would dispatch to
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_none_type_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_percent_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
 	def test_invalid_float_type_char_is_a_compile_error( self ) -> None:
 		# f"{x:x}" - 'x' is a valid int type char but not a float one
 		self._import( '\n'.join([
