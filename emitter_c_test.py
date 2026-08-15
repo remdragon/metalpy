@@ -961,6 +961,33 @@ def main() -> i32:
 			i += 1
 		return 0
 ''' ),
+			# a @virtual method on a GENERIC RCClass. Monomorphization sets the
+			# method's own .cls to a Specialization wrapping the class (see
+			# monomorphize.py's substituted_cls), never to a bare RCClass - so
+			# the emitter's old isinstance( instr.target.cls, RCClass ) dispatch
+			# check answered False here and fell through to CStruct's COM form,
+			# emitting `(b)->$vtable->get( b )`. An RCClass has no $vtable member
+			# at all (its vtable pointer lives inside $header - see the PROLOGUE),
+			# so that was a reference to a field that doesn't exist. Now asked as
+			# has_object_header(), which a Specialization answers by delegating.
+			( 'virtual_dispatch_on_a_generic_rcclass', '''
+class Holder[T]:
+	v: T
+	def __init__( self, v: T ) -> None:
+		self.v = v
+	@virtual
+	def tag( self ) -> i32:
+		return 7
+
+def main() -> i32:
+	h: Holder[i32] = Holder[i32]( v = 5 )
+	if h.tag() != 7: # goes through the vtable, not a direct call
+		return 1
+	s: Holder[str] = Holder[str]( v = 'x' )
+	if s.tag() != 7:
+		return 2
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )

@@ -2141,7 +2141,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			assert instr.receiver is not None # is_virtual only ever set on real instance methods - see discovery.py's _parse_function
 			slot_name = _field_name( instr.target.stem )
 			vtable_op = _member_access_operator( instr.receiver.type )
-			if isinstance( instr.target.cls, RCClass ):
+			# WHERE the vtable pointer lives, not whether there is one - both
+			# arms have a vtable. An RCClass reads it out of its ObjectHeader
+			# ($header.vtable, reusing the field destructor dispatch already
+			# needed); an @interface CStruct has a plain top-level $vtable
+			# member instead. has_object_header() is exactly that distinction.
+			if instr.target.cls is not None and instr.target.cls.has_object_header():
 				receiver_pointee = instr.receiver.type.base if isinstance( instr.receiver.type, Specialization ) else instr.receiver.type
 				assert isinstance( receiver_pointee, RCClass )
 				vtbl_type = _rcclass_vtbl_type_name( receiver_pointee )
@@ -2268,7 +2273,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_parse_f64( (const char*){_emit_operand(instr.buf)} );' ]
 
 	if isinstance( instr, ir.Allocate ):
-		if isinstance( instr.cls, RCClass ):
+		# has_object_header, not is_rc_pointer: this branch writes
+		# $header.ref_count and wires $header.vtable, which only exists on a
+		# type that actually LEADS with an ObjectHeader. A TupleType is an RC
+		# pointer but is never allocated under its own annotation - its
+		# synthesized backing RCClass is what reaches here, and that answers
+		# True on its own behalf.
+		if instr.cls is not None and instr.cls.has_object_header():
 			# routed through sys.alloc[cls] - the SAME allocation path
 			# every other real allocation in the language goes through, not
 			# an emitter-invented allocator (explicit user decision - see
