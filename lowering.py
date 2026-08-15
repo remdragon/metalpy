@@ -2249,7 +2249,14 @@ class FunctionLowering:
 		# resolve-on-use
 		parts: list[str] = []
 		if node.level:
-			parts.extend( self.lowering.discovery.module_stack[-1].qualname.split( '.' )[:-node.level] )
+			# same package-relative counting as discovery.py's own
+			# visit_ImportFrom - see the comment there. This site previously
+			# sliced the qualname without discovery's compensation for a
+			# folded module, so a relative import written inside a function
+			# body in a package's __init__.py climbed one level too far
+			package = self.lowering.discovery.module_stack[-1].package
+			strip = node.level - 1
+			parts.extend(( package.split( '.' )[:-strip] if strip else package.split( '.' )) if package else [] )
 			if not parts:
 				self.lowering.discovery.fail( f'unable to relative import from here: {ast.unparse(node)}', node )
 		if node.module:

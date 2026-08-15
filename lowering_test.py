@@ -2,10 +2,12 @@
 import logging
 from pathlib import Path
 import queue as queue_module
+import tempfile
 import unittest
 
 # local imports:
 from compiler import Compiler, LoweredFunction
+import discovery
 from discovery import Discovery, _detect_active_target
 from errors import CompileError
 import ir
@@ -8939,6 +8941,77 @@ class RejectMoveThroughUnionOrOverloadTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler._lower( self.discovery.main )
 		self.assertTrue( any( '@move-decorated overload' in e for e in self.discovery.errors.errors ) )
+
+
+class InFunctionRelativeImportTests( unittest.TestCase ):
+	'''
+	function bodies are never walked by discovery.py's visitor, so an import
+	written inside a function body reaches only Lowering._stmt_ImportFrom.
+	That site used to slice the importing module's qualname directly, without
+	discovery.py's own compensation for a module whose qualname is already its
+	package - so a relative import inside a function body in a package's
+	__init__.py climbed one level too far. Both sites now count from
+	Module.package instead.
+	'''
+
+	def _build( self, root: Path, files: dict[str,str] ) -> Compiler:
+		( root / 'pkg' ).mkdir()
+		for name, text in files.items():
+			( root / 'pkg' / name ).write_text( text )
+		# the fixture package plus the real lib/ - these tests lower actual
+		# code, so builtins has to be importable
+		disco = Discovery(
+			paths = [ root, Path( discovery.__file__ ).parent / 'lib' ],
+			import_builtins = True,
+		)
+		return Compiler( disco )
+
+	def test_relative_import_inside_a_function_body_in_package_init( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			compiler = self._build( root, {
+				'__init__.py': '\n'.join([
+					'def get() -> i32:',
+					'	from .impl import VALUE',
+					'	return VALUE',
+					'',
+				]),
+				'impl.py': 'VALUE: i32 = 7\n',
+			})
+			compiler.import_code( '\n'.join([
+				'import pkg',
+				'',
+				'def main() -> i32:',
+				'	return pkg.get()',
+				'',
+			]), Path( '__main__.py' ), scope = None )
+			compiler.run()
+
+			self.assertEqual( compiler.disco.errors.errors, [] )
+
+	def test_relative_import_inside_a_function_body_in_private_module( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			compiler = self._build( root, {
+				'__init__.py': 'from .__impl import get\n',
+				'__impl.py': '\n'.join([
+					'def get() -> i32:',
+					'	from .impl import VALUE',
+					'	return VALUE',
+					'',
+				]),
+				'impl.py': 'VALUE: i32 = 7\n',
+			})
+			compiler.import_code( '\n'.join([
+				'import pkg',
+				'',
+				'def main() -> i32:',
+				'	return pkg.get()',
+				'',
+			]), Path( '__main__.py' ), scope = None )
+			compiler.run()
+
+			self.assertEqual( compiler.disco.errors.errors, [] )
 
 
 if __name__ == '__main__':
