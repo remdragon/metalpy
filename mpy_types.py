@@ -23,6 +23,85 @@ class Type( Name ):
 		# primitives below) to treat "a union" and "a plain type" uniformly.
 		return [ self ]
 
+	# --- RC classification -------------------------------------------------
+	#
+	# These live HERE, on each type kind, rather than as isinstance ladders in
+	# whichever pass happens to need them, because the ladder version shipped
+	# the same bug three separate times: a new Type kind appeared, the ladder
+	# in cfg.py wasn't updated, and the new kind silently defaulted to "not RC"
+	# (a nested TaggedUnion leaf -> reference leak; a generic union's
+	# unsubstituted TypeVar leaves -> UAF; an unresolved TaggedUnion reporting
+	# no leaves depending purely on compile ORDER -> UAF). The default is still
+	# "no" below, but it's now a default a new subclass's author is looking
+	# straight at, instead of one decided in a file they'd never open.
+	#
+	# Three DISTINCT questions, deliberately not collapsed into one - tuple[T...]
+	# is the row that proves they can't be: it's RC and it's pointer-shaped, but
+	# it has no ObjectHeader of its own (its synthesized BACKING class owns
+	# that - see TupleType.backing / tuple_storage.py).
+
+	def is_rc( self ) -> bool:
+		''' this type's runtime representation carries reference-counted
+		references SOMEWHERE inside it - i.e. something has to incref/decref
+		when a value of this type is copied or dropped. True for a bare RC
+		pointer, but ALSO for an aggregate that merely CONTAINS one (a
+		TaggedUnion with any RC member), which is why this is not the same
+		question as is_rc_pointer() below. '''
+		return False
+
+	def is_rc_pointer( self ) -> bool:
+		''' this type's OWN runtime representation IS a single, bare RC
+		pointer - so a Retain/Release can be applied to a value of this type
+		DIRECTLY, and it can be spelled `struct <mangled>*` in C.
+
+		Strictly narrower than is_rc(): a TaggedUnion's runtime shape is a
+		tag+data VALUE STRUCT, not a pointer at all, so reading one through a
+		bare-pointer accessor produces garbage even when it plainly does carry
+		RC references. cfg.py's tag-gated refcount path exists precisely for
+		the is_rc()-but-not-is_rc_pointer() case. '''
+		return False
+
+	def rc_leaves( self ) -> list['Type']:
+		''' the distinct runtime slots of this type that need RC treatment.
+		At most one (this type itself) for everything except a TaggedUnion,
+		which has one per RC member. An empty list means "no RC work at all"
+		and is what every automatic incref/decref site in cfg.py gates on. '''
+		return [ self ] if self.is_rc() else []
+
+	# --- memory layout (NOT RC - see the note above) ------------------------
+
+	def has_object_header( self ) -> bool:
+		''' a value of this type is a heap object that LEADS with
+		`ObjectHeader $header` - the refcount field, plus the vtable pointer
+		that RCClass's virtual dispatch and its destructor dispatch both read
+		through (emitter_c.py's PROLOGUE). This is what separates the two
+		vtable-pointer LOCATIONS: an RCClass reads `$header.vtable`, while an
+		@interface CStruct has a plain top-level `$vtable` member instead.
+
+		Deliberately False for TupleType even though it IS an RC pointer: the
+		header belongs to the backing class tuple_storage.py synthesizes, not
+		to the TupleType annotation itself. '''
+		return False
+
+	def has_vtable( self ) -> bool:
+		''' this type dispatches @virtual methods through SOME vtable -
+		true for every RCClass, and for an @interface CStruct (COM model).
+		Says nothing about WHERE that vtable pointer lives (see
+		has_object_header) nor whether this class needs its own synthesized
+		Vtbl STRUCT TYPE (that's own_new_virtual_slots()'s question - see
+		emitter_c.py's _rcclass_vtbl_type_name). '''
+		return False
+
+	# --- ownership annotations ---------------------------------------------
+
+	def unwrap_ownership( self ) -> 'Type':
+		''' the real runtime type this annotation describes - self for an
+		ordinary type, and .inner for the move[T]/copy[T] wrappers, which are
+		an ownership STATUS on a binding rather than a distinct type at all
+		(see Move's own docstring). Call this before asking any of the
+		questions above about a PARAMETER's declared type. '''
+		return self
+
 class ScopeMixin:
 	'''
 	shared shape for anything that owns a local namespace (Module, the various
@@ -129,6 +208,50 @@ class Specialization( Type ):
 	def names( self ) -> dict[str,Name]|None:
 		return getattr( self.base, 'names', None )
 
+	# every RC/layout question about Box[i32] is really a question about Box.
+	# This delegation is what retires the `base = t.base if isinstance( t,
+	# Specialization ) else t` idiom that used to be copy-pasted verbatim in 14
+	# places across cfg/lowering/emitter_c/type_resolver, each site
+	# independently deciding whether to ALSO handle Move/Copy/TupleType.
+	# Without it, every generic-class/generic-union instance method's own
+	# `self` (already typed as a Specialization) wrongly looks untracked.
+	def is_rc( self ) -> bool: return self.base.is_rc()
+	def is_rc_pointer( self ) -> bool: return self.base.is_rc_pointer()
+	def has_object_header( self ) -> bool: return self.base.has_object_header()
+	def has_vtable( self ) -> bool: return self.base.has_vtable()
+
+	def rc_leaves( self ) -> list['Type']:
+		''' the one place ORDER matters: substitution has to happen BEFORE the
+		is_rc() filter.
+
+		A Specialization of a still-GENERIC TaggedUnion (Result[str,MyError])
+		has an abstract base whose leaves() returns Result's OWN declared field
+		types verbatim - bare TypeVars T/E - and a bare TypeVar is never RC.
+		Filtering first therefore returns [] for EVERY generic-union
+		instantiation regardless of what T/E were actually bound to, which is
+		how a Result[str,E]'s own payload went entirely untracked. Confirmed by
+		a real UAF: a temp Result[str,E] receiver of .unwrap()/.unwrap_or() was
+		never registered by fresh_temp at all, which is what made the old
+		receiver-move workaround in lowering.py's _lower_call look load-bearing
+		(it was popping a Temp that had never been inserted - already a no-op)
+		while this, the real gap, went unnoticed. '''
+		# a NON-union Specialization's leaf is SELF, not self.base: everything
+		# downstream (Incref/Decref operands, temp registration) needs the
+		# concrete instantiation, never the abstract template
+		if not isinstance( self.base, TaggedUnion ):
+			return [ self ] if self.is_rc() else []
+		leaves = self.base._resolved_leaves()
+		if self.base.type_params:
+			# Shallow (one level) on purpose: a leaf that's instead e.g.
+			# `list[T]` needs no T resolved at all to know list itself is RC
+			# (is_rc only reads a Specialization's own .base), and a leaf
+			# that's already a fixed concrete type is correct as-is.
+			# Identity-keyed deliberately, not by value - Type dataclasses have
+			# structural equality (see _leaf_is_accepted's own comment).
+			substitution = { id( param ): arg for param, arg in zip( self.base.type_params, self.args ) }
+			leaves = [ substitution.get( id( leaf ), leaf ) for leaf in leaves ]
+		return [ leaf for leaf in leaves if leaf.is_rc() ]
+
 @dataclass( kw_only = True )
 class Variable( Name ):
 	type: Type|None = None
@@ -191,6 +314,9 @@ class Move( Type ):
 	CFG/incref-decref ownership-tracking work, not a standalone tweak here. '''
 	inner: Type
 
+	def unwrap_ownership( self ) -> Type:
+		return self.inner
+
 @dataclass( kw_only = True )
 class Copy( Type ):
 	''' `copy[T]` in annotation position - the callee wants its own
@@ -201,6 +327,9 @@ class Copy( Type ):
 	binding is completely unaffected. See TODO.txt/RC MANAGEMENT.md for
 	the CFG work this exists for. '''
 	inner: Type
+
+	def unwrap_ownership( self ) -> Type:
+		return self.inner
 
 @dataclass( kw_only = True )
 class CallableType( Type ):
@@ -242,6 +371,30 @@ class TupleType( Type ):
 	occurrence). '''
 	elem_types: list[Type]
 	backing: 'RCClass|None' = None
+
+	def is_rc( self ) -> bool:
+		# PLAN_TUPLE.md: unlike an ordinary generic (list[T]/Result[T,E]/...),
+		# where the ABSTRACT template class itself (Specialization.base)
+		# already answers "is this RC" without ever needing to monomorphize a
+		# specific instantiation, a TupleType has no such template - the only
+		# place "is a tuple RC" lives is its own synthesized backing RCClass
+		# (tuple_storage.py), which may not have been synthesized yet for this
+		# particular TupleType (a local variable's own declared annotation type
+		# is never independently re-resolved after discovery.py first builds it
+		# - see emitter_c.py's c_type() for the identical "found by a real
+		# hang, not anticipated up front" gap this mirrors). No lazy check
+		# needed though: EVERY TupleType's backing is unconditionally an
+		# RCClass by construction (tuple_storage.TupleStorage.get() never
+		# produces anything else), so this is a structural guarantee, not
+		# something that depends on whether .backing happens to be populated.
+		return True
+
+	def is_rc_pointer( self ) -> bool:
+		return True
+
+	# NOT has_object_header: the header belongs to the backing class, not to
+	# this annotation. The emitter never allocates a TupleType directly - it
+	# allocates the backing RCClass, which answers True on its own behalf.
 
 # a class's own body scan (revealing its attribute/method *names*) is
 # deferred behind .resolve, exactly like a Function's parameters or a
@@ -387,6 +540,14 @@ class RCClass( Type, ScopeMixin ): # normal ref-counted class
 	def flattened_attributes( self ) -> list[Variable]:
 		return flattened_attributes( self )
 
+	# the whole point of the class - and ClosureType (the only RCClass
+	# subclass) inherits every one of these for free, which is exactly why
+	# it was made a real subclass rather than a wrapper (see its docstring)
+	def is_rc( self ) -> bool: return True
+	def is_rc_pointer( self ) -> bool: return True
+	def has_object_header( self ) -> bool: return True
+	def has_vtable( self ) -> bool: return True
+
 @dataclass( kw_only = True )
 class ClosureType( RCClass ):
 	''' `Closure[[Arg1,Arg2,...], Ret]` - a bound-method VALUE (`worker.run`
@@ -443,6 +604,14 @@ class CStruct( Type, ScopeMixin ): # @cstruct class Foo:
 	def flattened_attributes( self ) -> list[Variable]:
 		return flattened_attributes( self )
 
+	def has_vtable( self ) -> bool:
+		# only an @interface CStruct dispatches virtually (the COM model) -
+		# and through its OWN top-level `$vtable` member, never an
+		# ObjectHeader, which is why has_object_header() stays False here.
+		# discovery.py's "is a @virtual method even legal on this class"
+		# check is exactly this question.
+		return self.is_interface
+
 @dataclass( kw_only = True )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:
 	type_params: list[TypeVar]|None = None
@@ -469,6 +638,54 @@ class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backin
 				attr.resolve()
 			result.append( attr.type )
 		return result
+
+	def _resolved_leaves( self ) -> list['Type']:
+		''' leaves(), but forcing this union's own CLASS BODY to resolve first.
+
+		Load-bearing, not caution. leaves() reads self.attributes directly,
+		which is populated by the CLASS's own .resolve() (parsing its body) - a
+		separate step from leaves()'s own per-ATTRIBUTE attr.resolve() (which
+		only resolves each attribute's already-existing .type). Called too
+		early - e.g. the very first time any code anywhere references a
+		Result[...]-shaped type, before anything else has forced Result's own
+		class body to resolve - self.attributes is still empty and leaves()
+		silently returns [], which reads as "this union has no RC leaves"
+		rather than "this union hasn't been read yet". Confirmed by a real
+		UAF: it made a temp Result[str,CodecError] receiver of .unwrap() look
+		RC-free depending on ONLY where in the compile that particular call
+		site happened to land relative to Result's own first real use
+		elsewhere. '''
+		if self.resolve is not None:
+			self.resolve()
+		return self.leaves()
+
+	def is_rc( self ) -> bool:
+		# a union is RC whenever ANY of its members are. The recursion matters
+		# for a union appearing as a LEAF of an outer type (e.g. Result[T, A|B]):
+		# before this existed, a nested union leaf was always reported non-RC
+		# (a TaggedUnion is never an RCClass), so rc_leaves() on the OUTER type
+		# silently dropped it entirely even when its own members carried real
+		# RC payloads - no incref/decref ever fired for that leaf's contents, a
+		# genuine reference leak. (A nested union's own TOP-LEVEL rc_leaves()
+		# always worked; the gap was specifically one level up, treating A|B as
+		# an opaque, always-non-RC leaf of something else.)
+		#
+		# No type-param substitution needed here, unlike Specialization.rc_leaves:
+		# every leaf reaching this point is either a fully concrete anonymous
+		# union (never generic/Specialization-wrapped by construction) or has
+		# already had its params substituted by whichever caller is asking.
+		return any( leaf.is_rc() for leaf in self._resolved_leaves() )
+
+	def is_rc_pointer( self ) -> bool:
+		# a union's runtime shape is a tag+data VALUE STRUCT, never a bare
+		# pointer - see Type.is_rc_pointer's docstring
+		return False
+
+	def rc_leaves( self ) -> list['Type']:
+		# str|i32 needs a TAG-GATED incref (only the str arm); str|int (both
+		# RC) needs none of that, unconditional instead - see cfg.py's
+		# _refcount_instructions, which forks on exactly this
+		return [ leaf for leaf in self._resolved_leaves() if leaf.is_rc() ]
 
 @dataclass( kw_only = True )
 class CEnum( Type, ScopeMixin ): # @enum class Foo:
