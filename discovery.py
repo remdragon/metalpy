@@ -386,14 +386,23 @@ class Discovery( ast.NodeVisitor ):
 			
 			# TODO FIXME: make active_target.bits a requirement...
 			sizeof_bits = self.active_target.get( 'bits', 64 ) // 8
-			
+			# __metalpy_wideint/__metalpy_wideuint (i128/u128's own real C
+			# type) fall back to plain 64-bit under MSVC, which has no native
+			# 128-bit integer type - has_i128 tracks whether the active
+			# target's real C compiler actually supports the full 128 bits,
+			# same target-width-dependent pattern as sizeof_bits above for
+			# isize/usize. Defaults True so callers that build Discovery
+			# without going through mpy.py's CLI (most tests) keep today's
+			# behavior unless they opt in.
+			sizeof_i128 = 16 if self.active_target.get( 'has_i128', True ) else 8
+
 			for name, sizeof in [
 				( 'isize', sizeof_bits ), ( 'usize', sizeof_bits ),
 				( 'i8', 1 ), ( 'u8', 1 ),
 				( 'i16', 2 ), ( 'u16', 2 ),
 				( 'i32', 4 ), ( 'u32', 4 ),
 				( 'i64', 8 ), ( 'u64', 8 ),
-				( 'i128', 16 ), ( 'u128', 16 ),
+				( 'i128', sizeof_i128 ), ( 'u128', sizeof_i128 ),
 			]:
 				intrinsics[name] = Scalar(
 					stem = name,
@@ -1122,7 +1131,7 @@ class Discovery( ast.NodeVisitor ):
 		if not isinstance( target, ast.Name ):
 			self.fail( f'enum member target must be a Name, not {target=} in {cls.qualname}', node )
 		key = target.id
-		value_expr = node.value
+		value_expr = compile_time_transformer.transform_expr( node.value, self.active_target, self._detect_cc )
 		if isinstance( value_expr, ast.Name ) and value_expr.id == '_':
 			value: int|None = None
 		else:
@@ -1701,7 +1710,7 @@ class Discovery( ast.NodeVisitor ):
 				# shape @overload stubs already use
 				self.fail( f'@abstractmethod {qualname} must have a stub body (...) - it declares a required override, not a real implementation', node )
 
-		if is_virtual and not ( isinstance( class_obj, CStruct ) and class_obj.is_interface ) and not isinstance( class_obj, RCClass ):
+		if is_virtual and not ( class_obj is not None and class_obj.has_vtable() ):
 			# @interface CStructs and ordinary RCClasses both build a real
 			# vtable now (RCClass-subclassing plan Phase 4 generalized this
 			# from CStruct-only) - CUnion/TaggedUnion/CEnum/a plain, non-

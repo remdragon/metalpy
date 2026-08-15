@@ -209,7 +209,7 @@ def main() -> None:
 		if active_target['os'] == 'windows' and exe_path.suffix != '.exe':
 			exe_path = exe_path.with_suffix( exe_path.suffix + '.exe' )
 		ldflags = args.ldflags
-		libs = set( compiler.extern_libs ) | linker_c.implicit_ldflags( no_crt, str( active_target['os'] ) )
+		libs = set( compiler.extern_libs )
 		for lib in sorted( libs ):
 			if lib == 'c':
 				continue

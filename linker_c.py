@@ -17,6 +17,49 @@ import subprocess
 import sys
 
 
+def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
+	''' publish a disk-cache entry so a concurrent reader sees either the
+	complete previous state or the complete new one, never a half-written file.
+
+	Path.write_text/write_bytes open with 'w', which TRUNCATES first - so
+	between the open and the write completing there is a window where the file
+	exists but is empty (or short). Every cache reader in this codebase gates
+	on `cache_file.is_file()` and then parses the contents, so a reader landing
+	in that window doesn't see a cache MISS, it sees a cache HIT with garbage:
+
+	  - linker_c.has_symbol:    ''.strip() == '1' -> False, i.e. "that symbol
+	                            isn't available" for a symbol that is
+	  - lowering._eval_cexpr:   int('') -> ValueError, a hard crash
+	  - lowering's UnicodeData: a truncated table, silently
+
+	Confirmed by a real, if rare, test failure: two mutually-exclusive
+	@compiler.target(has_library=X) / (has_library=not X) definitions BOTH
+	survived discovery (producing an Overload where exactly one Function was
+	expected) because the two probes - separate has_symbol calls, no in-process
+	memo between them - read INCONSISTENT values, one before and one during
+	another shard's rewrite of the same cache file. tests.py runs 16 shards as
+	concurrent subprocesses sharing one cache dir, which is why the suite is
+	where this showed up; any two concurrent mpy invocations can hit it.
+
+	The temp file is created in the SAME directory as the target so os.replace
+	is a same-filesystem rename, which is atomic on both POSIX and Windows.
+	Readers should ALSO treat empty/unparseable content as a miss - this fixes
+	new writes, but cannot repair a corrupt file some earlier run left behind. '''
+	cache_file.parent.mkdir( parents = True, exist_ok = True )
+	tmp = cache_file.with_name( f'{cache_file.name}.{os.getpid()}.tmp' )
+	try:
+		if isinstance( data, bytes ):
+			tmp.write_bytes( data )
+		else:
+			tmp.write_text( data, encoding = 'utf-8' )
+		os.replace( tmp, cache_file )
+	except BaseException:
+		# never leave a stray .tmp behind on failure - it would accumulate in
+		# %TEMP% forever, and (unlike the real cache file) nothing reaps it
+		tmp.unlink( missing_ok = True )
+		raise
+
+
 class CcTool:
 	'''
 	A detected C compiler.
@@ -167,25 +210,6 @@ class CcTool:
 		)
 
 
-def implicit_ldflags( no_crt: bool, target_os: str ) -> set[str]:
-	'''
-	Libs the generated mainCRTStartup boilerplate itself needs regardless of
-	what the user's program imports - a no_crt (freestanding) Windows build's
-	synthesized entry point unconditionally calls ExitProcess (see
-	emitter_c.py's emit_c), which lives in kernel32, but nothing in the
-	user's own program necessarily references kernel32 to pull it into
-	compiler.extern_libs on its own. (SetConsoleOutputCP used to need the
-	same treatment, back when it was hardcoded the same way - it's now an
-	ordinary @extern call reached through windows/_console.py's
-	compiler-forced global, so compiler.extern_libs already has 'kernel32'
-	from that alone by the time this runs; this function's return value
-	would be identical either way, since ExitProcess still needs it.)
-	'''
-	if no_crt and target_os == 'windows':
-		return { 'kernel32' }
-	return set()
-
-
 def has_i128( cc: CcTool|None ) -> bool:
 	'''
 	True 128-bit i128/u128 range/semantics, vs MSVC's documented 64-bit
@@ -227,7 +251,13 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 	cache_dir.mkdir( parents = True, exist_ok = True )
 	cache_file = cache_dir / key
 	if cache_file.is_file():
-		return cache_file.read_text().strip() == '1'
+		# an empty/unrecognized body is a TORN or half-written entry, not a
+		# real answer - fall through and re-probe rather than reporting "not
+		# available" for something that is (see atomic_write_cache). Cheap:
+		# the re-probe overwrites it with a good value.
+		cached = cache_file.read_text().strip()
+		if cached in ( '0', '1' ):
+			return cached == '1'
 
 	c_src = f'char {symbol}();\nint main(void) {{ return {symbol}(); }}\n'
 	with tempfile.TemporaryDirectory() as tmp:
@@ -243,7 +273,7 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 			link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflag )
 			available = link_result.returncode == 0
 
-	cache_file.write_text( '1' if available else '0', encoding = 'utf-8' )
+	atomic_write_cache( cache_file, '1' if available else '0' )
 	return available
 
 

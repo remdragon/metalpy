@@ -15,7 +15,6 @@
 # anything - they just assert Discovery collected the expected error.
 
 # stdlib imports:
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -55,11 +54,11 @@ class FloatBehaviorTests( unittest.TestCase ):
 			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
 			# every extern library the program pulled in needs an explicit link
-			# flag ('c' is the CRT, handled by no_crt), plus whatever the
-			# generated boilerplate itself always needs (kernel32 on a no-CRT
-			# Windows build - these float-only programs use no builtins, so
-			# nothing would otherwise pull it in - see linker_c.implicit_ldflags)
-			libs = set( compiler.extern_libs ) | linker_c.implicit_ldflags( no_crt, 'windows' if os.name == 'nt' else os.name )
+			# flag ('c' is the CRT, handled by no_crt) - compiler.extern_libs
+			# already has whatever the generated boilerplate itself needs too
+			# (kernel32 on a no-CRT Windows build - windows._console/sys.exit
+			# are compiler-forced reachable, see Compiler.force_reachable)
+			libs = set( compiler.extern_libs )
 			ldflags = ''
 			for lib in sorted( libs ):
 				if lib == 'c':

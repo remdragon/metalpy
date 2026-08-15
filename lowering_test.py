@@ -5950,6 +5950,30 @@ class Tests( unittest.TestCase ):
 		compiler64._lower( discovery64.main )
 		self.assertEqual( discovery64.errors.errors, [] )
 
+	def test_i128_range_uses_active_target_has_i128_not_hardcoded_true( self ) -> None:
+		# a value needing >64-bit magnitude is a valid i128/u128 literal under
+		# a real 128-bit __metalpy_wideint/__metalpy_wideuint (has_i128=True,
+		# clang/gcc), but out of range under MSVC's 64-bit wideint/wideuint
+		# fallback (has_i128=False) - confirms get_intrinsics() derives i128/
+		# u128's own .sizeof from active_target['has_i128'], not a fixed 16
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: u128 = 18446744073709551616', # 2**64, needs 65 bits
+		])
+		target_no_i128 = dict( _detect_active_target(), has_i128 = False )
+		discovery_no_i128 = Discovery( import_builtins = False, active_target = target_no_i128 )
+		compiler_no_i128 = Compiler( discovery_no_i128 )
+		compiler_no_i128.import_code( code, filename = Path( '__test__.py' ))
+		compiler_no_i128._lower( discovery_no_i128.main )
+		self.assertIn( 'is out of range for intrinsics.u128', discovery_no_i128.errors.errors[0] )
+
+		target_i128 = dict( _detect_active_target(), has_i128 = True )
+		discovery_i128 = Discovery( import_builtins = False, active_target = target_i128 )
+		compiler_i128 = Compiler( discovery_i128 )
+		compiler_i128.import_code( code, filename = Path( '__test__.py' ))
+		compiler_i128._lower( discovery_i128.main )
+		self.assertEqual( discovery_i128.errors.errors, [] )
+
 	def test_cenum_construction_out_of_range_fails( self ) -> None:
 		code = '\n'.join([
 			'@enum( u8 )',
@@ -5982,19 +6006,16 @@ class Tests( unittest.TestCase ):
 		self.assertIn( '300 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
 
 	def test_cenum_member_declaration_boundary_values( self ) -> None:
-		# a negative literal (i8's own MIN) isn't reachable here at all -
-		# class/enum bodies never go through compile_time_transformer's
-		# constant-folding pass (only module/function bodies do), so
-		# `Lo = -128` is rejected pre-existingly by _register_enum_member's
-		# own "must be '_' or an integer constant" check (UnaryOp(USub,...)
-		# never folds to a plain Constant here) - unrelated to this fix,
-		# confirmed during development. u8's own 0..255 range needs no
-		# negative literal to test both boundaries
+		# i8's own MIN needs a negative literal (-128) - _register_enum_member
+		# now folds node.value through compile_time_transformer.transform_expr
+		# before checking for ast.Constant, so UnaryOp(USub, Constant(128))
+		# collapses to Constant(-128) same as it already would in a function
+		# body
 		code = '\n'.join([
-			'@enum( u8 )',
+			'@enum( i8 )',
 			'class MyError:',
-			'	Lo = 0',
-			'	Hi = 255',
+			'	Lo = -128',
+			'	Hi = 127',
 			'',
 			'def main() -> None:',
 			'	x: MyError = MyError( 0 )',
@@ -6015,6 +6036,19 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		self._lower_main()
 		self.assertIn( '128 is out of range for __test__.MyError (-128..127)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_declaration_negative_out_of_range_fails( self ) -> None:
+		code = '\n'.join([
+			'@enum( i8 )',
+			'class MyError:',
+			'	Bad = -129',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '-129 is out of range for __test__.MyError (-128..127)', self.discovery.errors.errors[0] )
 
 	def test_cenum_member_auto_increment_overflow_fails( self ) -> None:
 		# the '_' auto-increment sentinel can ALSO overflow the underlying
@@ -6548,10 +6582,15 @@ class InlineTests( unittest.TestCase ):
 		return [ op.test_repr() for op in fn.instructions ]
 
 	# compiler.run() force-enqueues windows/_console.py's own console-codepage
-	# global on every Windows target (see compiler.py's own comment) - real
-	# but incidental to what these tests check, and absent entirely on
-	# non-Windows targets, so exact-set assertions filter it back out first
-	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+	# global on every Windows target, and sys.exit() whenever no_crt (see
+	# Compiler.force_reachable's own comment) - real but incidental to what
+	# these tests check, and absent entirely on non-Windows targets (or on
+	# CRT-linked Windows targets, for sys.exit specifically), so exact-set
+	# assertions filter them back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({
+		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
+		'sys.exit', 'windows.kernel32.ExitProcess',
+	})
 
 	def _function_qualnames( self ) -> set[str]:
 		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
@@ -6815,10 +6854,15 @@ class InlineMultiStatementTests( unittest.TestCase ):
 		return fn
 
 	# compiler.run() force-enqueues windows/_console.py's own console-codepage
-	# global on every Windows target (see compiler.py's own comment) - real
-	# but incidental to what these tests check, and absent entirely on
-	# non-Windows targets, so exact-set assertions filter it back out first
-	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+	# global on every Windows target, and sys.exit() whenever no_crt (see
+	# Compiler.force_reachable's own comment) - real but incidental to what
+	# these tests check, and absent entirely on non-Windows targets (or on
+	# CRT-linked Windows targets, for sys.exit specifically), so exact-set
+	# assertions filter them back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({
+		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
+		'sys.exit', 'windows.kernel32.ExitProcess',
+	})
 
 	def _function_qualnames( self ) -> set[str]:
 		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
@@ -7804,6 +7848,45 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( len( self._calls_to( fn, '_none_type_digits' )), 1 )
 		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
 		self.assertEqual( self._calls_to( fn, '_percent_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_bare_float_interpolation_dispatches_to_str_dunder( self ) -> None:
+		# f"{x}" with NO format spec at all (not even an empty ":") never
+		# reaches _lower_float_format_spec - parsed_spec is None, so this
+		# takes the plain __str__/__repr__ dispatch path (same as str/int),
+		# which f64/f32 now have real implementations of (the shortest-
+		# round-trip repr algorithm, PLAN_STR_FORMAT.md item 4's own later
+		# writeup) instead of failing to compile. The dispatched Call's own
+		# target.qualname is the underlying def's real name (_f64_str, from
+		# `f64.__str__ = _f64_str`'s registration, lib/builtins/__float.py)
+		# - NOT the literal string '__str__', which is only ever a KEY in
+		# f64.names, never the Function's own identity.
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_f64_str' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_none_type_digits' ), [] )
+
+	def test_float_format_spec_no_type_no_precision_dispatches_to_repr_digits( self ) -> None:
+		# f"{x:10}" - an explicit spec (width only, no type char, no
+		# precision) DOES reach _lower_float_format_spec, which routes this
+		# exact combination to _repr_digits (same underlying shortest-
+		# round-trip algorithm bare f"{x}" uses, just padded afterward) -
+		# distinct from both _fixed_digits (needs a type char or precision)
+		# and _none_type_digits (needs a precision)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:10}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_repr_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_none_type_digits' ), [] )
 		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
 
 	def test_invalid_float_type_char_is_a_compile_error( self ) -> None:

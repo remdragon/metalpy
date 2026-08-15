@@ -961,6 +961,33 @@ def main() -> i32:
 			i += 1
 		return 0
 ''' ),
+			# a @virtual method on a GENERIC RCClass. Monomorphization sets the
+			# method's own .cls to a Specialization wrapping the class (see
+			# monomorphize.py's substituted_cls), never to a bare RCClass - so
+			# the emitter's old isinstance( instr.target.cls, RCClass ) dispatch
+			# check answered False here and fell through to CStruct's COM form,
+			# emitting `(b)->$vtable->get( b )`. An RCClass has no $vtable member
+			# at all (its vtable pointer lives inside $header - see the PROLOGUE),
+			# so that was a reference to a field that doesn't exist. Now asked as
+			# has_object_header(), which a Specialization answers by delegating.
+			( 'virtual_dispatch_on_a_generic_rcclass', '''
+class Holder[T]:
+	v: T
+	def __init__( self, v: T ) -> None:
+		self.v = v
+	@virtual
+	def tag( self ) -> i32:
+		return 7
+
+def main() -> i32:
+	h: Holder[i32] = Holder[i32]( v = 5 )
+	if h.tag() != 7: # goes through the vtable, not a direct call
+		return 1
+	s: Holder[str] = Holder[str]( v = 'x' )
+	if s.tag() != 7:
+		return 2
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -1147,6 +1174,70 @@ def main() -> i32:
 		self.assertNotIn( '__main__$Base$$vtable', src )
 		self.assertIn( '__main__$Derived$$vtable', src )
 		self._assert_compiles_and_runs( src )
+
+class TupleFieldTeardownTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' an RCClass holding a tuple-typed FIELD must release it in its own
+	destructor.
+
+	type_resolver.py's _build_field_teardown_ast is a separate re-derivation
+	of "which parts of this type are RC" from cfg.py's, and it used to be an
+	isinstance ladder that had no TupleType branch at all - a tuple field
+	matched nothing and fell through to `return []`, so the owner simply never
+	decref'd it. Every instance leaked its tuple, silently: the emitted
+	destructor freed the object itself and never touched the field.
+
+	Verified by refcount rather than by exit code alone - a leak does not
+	crash, so nothing short of observing the refcount can fail on it. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the shared str must come back to refcount 1 after the Holder is
+			# gone. 'x'.upper() (not a literal) forces a real heap allocation -
+			# a literal binds to immortal static storage and can't distinguish
+			# a leak from doing nothing.
+			( 'rcclass_with_a_tuple_field_releases_it', '''
+class Holder:
+	t: tuple[str, i32]
+	def __init__( self, t: tuple[str, i32] ) -> None:
+		self.t = t
+
+def main() -> i32:
+	s: str = 'x'.upper()
+	if compiler.refcount( s ) != 1:
+		return 1
+	h: Holder = Holder( t = ( s, 3 ) )
+	if compiler.refcount( s ) != 2: # the tuple now holds a reference too
+		return 2
+	compiler.decref( h )
+	if compiler.refcount( s ) != 1: # ...released again with the Holder
+		return 3
+	return 0
+''' ),
+			# and under repetition, which is what turns a missed release into
+			# unbounded growth rather than one stray allocation
+			( 'rc_lifetime_repeated_tuple_field_no_leak', '''
+class Holder:
+	t: tuple[str, i32]
+	def __init__( self, t: tuple[str, i32] ) -> None:
+		self.t = t
+	def byte_len( self ) -> usize:
+		return self.t[0].byte_len()
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			h: Holder = Holder( t = ( 'hello'.upper(), 1 ) )
+			if h.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
 
 class AugAssignRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for _stmt_AugAssign's Attribute/Subscript-
@@ -2523,6 +2614,54 @@ class EmitGlobalRCClassRealCompileTests( test_support.RealCompileMixin, RCClassT
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class NoCrtExitCodeRealCompileTests( unittest.TestCase ):
+	# test_support.RealCompileMixin's _build_and_run doesn't thread no_crt
+	# through compile()/link() at all (it always compiles/links as if the
+	# CRT were linked) - float_test.py/wide_int_test.py/return_inference_
+	# test.py all hit the same gap for their own no-CRT real-compile needs
+	# and duplicate this same compile+link+run shape locally rather than
+	# use the mixin; mirrored here rather than inventing a third variant
+	def test_no_crt_windows_exit_code_round_trips_through_sys_exit( self ) -> None:
+		# proves the __result plumbing survived the ExitProcess -> sys.exit()
+		# rewrite: a distinctive, non-{0,1} exit code, so this can't pass by
+		# accident the way a bare 0/1 check might (0 = success fallback, 1 =
+		# an uncaught panic/error - 42 is neither)
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+def main() -> i32:
+	return 42
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, 42, f'exe exited {result.returncode}, expected 42 (stderr: {result.stderr})' )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
 	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:
 		# PLAN_GLOBAL_INIT.md flags TRUE cross-global dependency ordering
@@ -2700,6 +2839,21 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		end = src.index( '\n}', start )
 		return src[ start : end ]
 
+	def _compiled_source_no_crt( self, active_target: dict[str,object] ) -> str:
+		# separate from _compiled_source above (which always passes emit_c()'s
+		# own no_crt=False default) - mainCRTStartup is only emitted when
+		# no_crt=True is passed to emit_c(), so this threads the compiler's
+		# own real no_crt determination through, mirroring mpy.py's own
+		# 'c' not in compiler.extern_libs computation
+		discovery = Discovery( import_builtins = True, active_target = active_target )
+		compiler = Compiler( discovery )
+		compiler.import_code( self._FIXTURE, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		return emitter_c.emit_c( compiler, no_crt = True )
+
 	def test_exactly_one_metalpy_init_definition( self ) -> None:
 		# the two competing #ifdef'd definitions this plan replaced
 		# (emitter_c.py's old PROLOGUE) are gone - never more than one
@@ -2720,6 +2874,19 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		self.assertIn( '__metalpy_init_windows$_console$_console_init();', body )
 		self.assertIn( 'SetConsoleOutputCP(', src )
 		self.assertNotIn( '#ifdef _WIN32', body )
+
+	def test_windows_no_crt_exit_is_an_ordinary_sys_exit_call( self ) -> None:
+		# ExitProcess is no longer hand-declared/hardcoded raw C text inside
+		# mainCRTStartup itself - it's sys.py's own public exit() (forced
+		# reachable whenever no_crt by Compiler.force_reachable), called here
+		# by its own mangled C symbol name, same shape as any other call
+		src = self._compiled_source_no_crt( self._WINDOWS_TARGET )
+		start = src.index( 'void mainCRTStartup( void ) {' )
+		end = src.index( '\n}', start )
+		body = src[ start : end ]
+		self.assertIn( 'sys$exit( (uint32_t)__result );', body )
+		self.assertIn( 'ExitProcess(', src ) # real @extern prototype/call, somewhere
+		self.assertNotIn( 'void __stdcall ExitProcess( unsigned int );', src )
 
 	def test_main_prepends_metalpy_init_call_on_every_target( self ) -> None:
 		# not just Windows - global initializers must run everywhere now,
@@ -8179,6 +8346,114 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class IfExpTempLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression tests for a real UAF/double-free in lowering.py's
+	_expr_IfExp: a ternary `A if cond else B` whose branches produce a
+	fresh RC value (e.g. `str('-') if cond else str('+')`) merges both
+	branches into one dest temp via a plain ir.Assign, but never untracked
+	the branch's own temp - so _flush_pending_temps' later decref of the
+	branch temp ran AGAINST THE SAME OBJECT dest (and whatever dest is
+	later assigned into) still holds, freeing it out from under the merged
+	result. Confirmed as a real, reproducible bug (found while building
+	float64's shortest-round-trip repr - PLAN_STR_FORMAT.md item 4 -
+	whose scientific-notation exponent-sign construction is exactly this
+	shape): every scientific-notation float repr crashed or printed
+	garbage before this fix. Worse, the UNTAKEN branch's own temp
+	(declared but never assigned, since only one branch runs at runtime)
+	was ALSO unconditionally decref'd at flush time - freeing
+	uninitialized memory. Fixed by untrack_temp()-ing a fresh branch value
+	before the merge Assign (mirroring _stmt_Return's own identical
+	pattern), Incref-ing an ALIASING branch value instead (mirroring
+	cfg.assign()'s own is_alias split - an existing binding read via the
+	ternary becomes an independent, longer-lived reference), and
+	registering the merge temp itself as the fresh owner afterward. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fresh_branch_values_no_double_free( self ) -> None:
+		# both branches are fresh str(...) constructions (never assigned to
+		# a name first) - the exact shape that crashed/corrupted before the
+		# fix. Checked over 1000 iterations against FRESH heap allocations
+		# each time, matching ReturnStatementTempLifetimeTests' own
+		# reasoning for why a bare single-shot check isn't enough to catch
+		# a leak (as opposed to the double-free, which a single shot alone
+		# already reliably reproduced).
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		cond: bool = True
+		while i < 1000:
+			x: str = str( '-' ) if cond else str( '+' )
+			expected: str = str( '-' ) if cond else str( '+' )
+			if x != expected:
+				return 1
+			if compiler.refcount( x ) != 1:
+				return 2
+			cond = not cond
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_aliasing_branch_value_gets_its_own_incref( self ) -> None:
+		# both branches read EXISTING bindings (a, b) rather than
+		# constructing fresh values - the merged result must be an
+		# independently-owned reference (refcount bumped), not a bare
+		# pointer copy: mutating/dropping a or b afterward must not affect
+		# the merged result, and vice versa
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		a: str = str( 'A' )
+		b: str = str( 'B' )
+		cond: bool = True
+		z: str = a if cond else b
+		if z != str( 'A' ):
+			return 1
+		if compiler.refcount( a ) != 2:
+			return 2
+		if compiler.refcount( z ) != 2:
+			return 3
+		if a != str( 'A' ) or b != str( 'B' ):
+			return 4
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_mixed_fresh_and_aliasing_branches( self ) -> None:
+		# one branch fresh (str.upper()'s own new allocation), the other
+		# aliasing (a plain Name read) - each branch needs its OWN correct
+		# treatment independently of what the other branch does
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		existing: str = str( 'lower' )
+		cond: bool = False
+		result: str = existing.upper() if cond else existing
+		if result != str( 'lower' ):
+			return 1
+		if compiler.refcount( existing ) != 2:
+			return 2
+		cond2: bool = True
+		result2: str = existing.upper() if cond2 else existing
+		if result2 != str( 'LOWER' ):
+			return 3
+		if compiler.refcount( result2 ) != 1:
+			return 4
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never
@@ -9205,6 +9480,90 @@ def main() -> i32:
 		return 7
 	if f"{{5.0:015,.2}}" != {f"{5.0:015,.2}"!r}:
 		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_repr_shortest_roundtrip( self ) -> None:
+		# bare f"{x}" (no format spec at all) and the no-type/no-precision
+		# spec both fall through to f64._repr_digits/_repr_digits_raw - the
+		# shortest decimal text that round-trips back to the exact same
+		# double (via the new compiler.parse_f64 intrinsic, an iterative
+		# search over compiler.format_f64's 'e'-conversion precision), then
+		# re-rendered into Python's own fixed-vs-scientific presentation
+		# (fixed for -4 <= exponent < 16, scientific otherwise - see
+		# _f64_repr_from_scientific's own comment for how that threshold was
+		# confirmed against real Python). Covers both sides of that exact
+		# threshold (1e15 fixed / 1e16 scientific, 1e-4 fixed / 1e-5
+		# scientific) plus the smallest/largest finite doubles, since those
+		# scientific-notation cases are exactly where a real bug lived
+		# before this test existed: an IfExp (ternary) lowering bug -
+		# `str('-') if exponent < 0 else str('+')`, used to build the
+		# exponent's sign character - double-freed/UAF'd the branch value
+		# (see IfExpTempLifetimeTests for the general fix), so every
+		# scientific-notation repr crashed or produced garbage.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x}}"
+
+def main() -> i32:
+	if build( 1.0 ) != {str(1.0)!r}:
+		return 1
+	if f"{{0.1}}" != {str(0.1)!r}:
+		return 2
+	if f"{{100.0}}" != {str(100.0)!r}:
+		return 3
+	if f"{{1000000.0}}" != {str(1000000.0)!r}:
+		return 4
+	if f"{{1e15}}" != {str(1e15)!r}:
+		return 5
+	if f"{{1e16}}" != {str(1e16)!r}:
+		return 6
+	if f"{{1e17}}" != {str(1e17)!r}:
+		return 7
+	if f"{{0.0001}}" != {str(0.0001)!r}:
+		return 8
+	if f"{{1e-05}}" != {str(1e-05)!r}:
+		return 9
+	if f"{{123456789012345.0}}" != {str(123456789012345.0)!r}:
+		return 10
+	if f"{{3.14159265358979}}" != {str(3.14159265358979)!r}:
+		return 11
+	if f"{{-5.0}}" != {str(-5.0)!r}:
+		return 12
+	if f"{{-0.1}}" != {str(-0.1)!r}:
+		return 13
+	if f"{{5e-324}}" != {str(5e-324)!r}:
+		return 14
+	if f"{{1.7976931348623157e+308}}" != {str(1.7976931348623157e+308)!r}:
+		return 15
+	if f"{{1234567.0}}" != {str(1234567.0)!r}:
+		return 16
+	if f"{{1234567890123.0}}" != {str(1234567890123.0)!r}:
+		return 17
+	if f"{{10.0}}" != {str(10.0)!r}:
+		return 18
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_repr_width_no_type_no_precision( self ) -> None:
+		# f"{x:10}" - a width/align/fill spec with no type char and no
+		# precision - takes the SAME _repr_digits path as bare f"{x}"
+		# (is_none_type_no_precision in _lower_float_format_spec), just
+		# padded afterward
+		self._run( f'''
+def main() -> i32:
+	if f"{{1e16:>12}}" != {f"{1e16:>12}"!r}:
+		return 1
+	if f"{{1e-05:<12}}" != {f"{1e-05:<12}"!r}:
+		return 2
+	if f"{{1.5:010}}" != {f"{1.5:010}"!r}:
+		return 3
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

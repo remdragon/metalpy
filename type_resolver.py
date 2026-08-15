@@ -17,81 +17,6 @@ from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
 
-
-def _union_member_ast_path( union: TaggedUnion, member_stem: str ) -> ast.Attribute:
-	''' build an ast.Attribute path for a union's member reference in a
-	match-case pattern, e.g. builtins.MaybeFoo.Some — the union's own
-	qualname dotted then the member name. '''
-	parts = union.qualname.rsplit( '.', 1 )
-	if len( parts ) == 2:
-		return ast.Attribute(
-			value = ast.Attribute(
-				value = ast.Name( id = parts[0], ctx = ast.Load() ),
-				attr = parts[1], ctx = ast.Load(),
-			),
-			attr = member_stem, ctx = ast.Load(),
-		)
-	return ast.Attribute(
-		value = ast.Name( id = parts[0], ctx = ast.Load() ),
-		attr = member_stem, ctx = ast.Load(),
-	)
-
-
-def _id( name: str ) -> ast.Name:
-	return ast.Name( id = name, ctx = ast.Load() )
-
-
-def _expr_stmt( value: ast.expr ) -> ast.Expr:
-	return ast.Expr( value = value )
-
-
-def _build_field_teardown_ast( field_expr: ast.Attribute, field_type: Type ) -> list[ast.stmt]:
-	''' recursively build AST statements to decref every RC leaf
-	reachable from field_expr, given its declared type. '''
-	base = field_type.base if isinstance( field_type, Specialization ) else field_type
-	if isinstance( base, RCClass ):
-		return [ _expr_stmt( ast.Call(
-			func = ast.Attribute( value = _id('compiler'), attr = 'decref', ctx = ast.Load() ),
-			args = [ field_expr ], keywords = [],
-		)) ]
-	if isinstance( base, CStruct ):
-		stmts: list[ast.stmt] = []
-		for attr in base.attributes:
-			sub_expr = ast.Attribute( value = field_expr, attr = attr.stem, ctx = ast.Load() )
-			stmts.extend( _build_field_teardown_ast( sub_expr, attr.type ))
-		return stmts
-	if isinstance( base, TaggedUnion ):
-		cases: list[ast.match_case] = []
-		for member in base.attributes:
-			member_base = member.type.base if isinstance( member.type, Specialization ) else member.type
-			if isinstance( member_base, RCClass ):
-				bind_name = f'__dtor_{member.stem}'
-				cases.append( ast.match_case(
-					pattern = ast.MatchClass(
-						cls = _union_member_ast_path( base, member.stem ),
-						patterns = [ ast.MatchAs( name = bind_name ) ],
-						kwd_attrs = [], kwd_patterns = [],
-					),
-					guard = None,
-					body = [ _expr_stmt( ast.Call(
-						func = ast.Attribute( value = _id('compiler'), attr = 'decref', ctx = ast.Load() ),
-						args = [ _id( bind_name ) ], keywords = [],
-					)) ],
-				))
-			else:
-				cases.append( ast.match_case(
-					pattern = ast.MatchClass(
-						cls = _union_member_ast_path( base, member.stem ),
-						patterns = [ ast.MatchAs( name = None ) ],
-						kwd_attrs = [], kwd_patterns = [],
-					),
-					guard = None,
-					body = [ ast.Pass() ],
-				))
-		return [ ast.Match( subject = field_expr, cases = cases ) ]
-	return []
-
-
 class TypeResolver:
 	'''
 	stage 1.5: sits between discovery.py (lazy name-binding + skeleton type
@@ -358,10 +283,22 @@ class TypeResolver:
 		base = field_type.base if isinstance( field_type, Specialization ) else field_type
 		line = field_expr.lineno if hasattr( field_expr, 'lineno' ) and field_expr.lineno else 1
 
-		# RCClass — compiler.decref(expr)
-		if isinstance( base, RCClass ):
-			if base.resolve is not None:
-				base.resolve()
+		# any bare RC pointer — compiler.decref(expr).
+		#
+		# is_rc_pointer(), not isinstance( base, RCClass ): a tuple-typed field
+		# is just as much a single RC pointer, but used to match NOTHING in
+		# this ladder and fell all the way through to the `return []` at the
+		# bottom, so an RCClass holding a tuple field never released it. The
+		# synthesized backing class is a real RCClass with a real destructor -
+		# it simply never got decref'd from the owner, because this walk was
+		# the one place that had to say so.
+		if field_type.is_rc_pointer():
+			# getattr: a TupleType has no .resolve at all (nothing to resolve -
+			# its backing class is synthesized on demand by tuple_storage),
+			# unlike an RCClass whose body may still be unparsed
+			resolve = getattr( base, 'resolve', None )
+			if resolve is not None:
+				resolve()
 			return [ ast.Expr( ast.Call(
 				func = ast.Attribute(
 					value = ast.Name( id = 'compiler', ctx = ast.Load(), lineno = line, col_offset = 0 ),
@@ -404,8 +341,14 @@ class TypeResolver:
 			) ]
 
 			for i, member in enumerate( base.attributes ):
-				member_base = member.type.base if isinstance( member.type, Specialization ) else member.type
-				if not isinstance( member_base, RCClass ):
+				# same is_rc_pointer() widening as the top of this method - a
+				# tuple-typed union MEMBER was skipped here for the same reason
+				# a tuple-typed field was skipped there. Still pointer-only, not
+				# is_rc(): the decref below reads the member's payload accessor
+				# as a bare RC pointer, which a NESTED union member is not (that
+				# case needs its own tag ladder and remains unhandled here -
+				# cfg.py's _refcount_instructions is what covers it for values).
+				if not member.type.is_rc_pointer():
 					continue
 				member_expr = ast.Attribute(
 					value = ast.Attribute(
@@ -435,7 +378,16 @@ class TypeResolver:
 				))
 			return stmts
 
-		# CUnion / CEnum / Scalar / Ptr — never RC, nothing to tear down
+		# CUnion / CEnum / Scalar / Ptr — never RC, nothing to tear down.
+		#
+		# Asserted rather than assumed: this fallthrough is exactly how the
+		# tuple gap above went unnoticed - a field kind that IS RC but matched
+		# no branch silently produced "nothing to release" instead of an error.
+		# A future RC-bearing Type kind now trips here instead of leaking.
+		assert not field_type.is_rc(), (
+			f'{field_type.qualname} is RC but reached the teardown fallthrough - '
+			f'it needs its own branch in _build_field_teardown_ast'
+		)
 		return []
 	
 
@@ -458,13 +410,28 @@ class TypeResolver:
 		return inner if isinstance( inner, CallableType ) else None
 
 	def _is_RC( self, t: Type|None ) -> bool:
-		''' true if `t` is an RCClass, possibly wrapped in a Specialization. '''
-		base = t.base if isinstance( t, Specialization ) else t
-		return isinstance( base, RCClass )
+		''' true if `t`'s own runtime representation IS a single bare RC
+		pointer - a None-tolerant shim for mpy_types.Type.is_rc_pointer
+		(call sites here and in lowering.py hold Type|None).
+
+		Deliberately is_rc_POINTER, not the deeper is_rc(): every caller
+		(compiler.incref/decref/addrof/cast, and the compiler.is_rc(T)
+		intrinsic's own compile-time fold) goes on to emit a DIRECT pointer
+		operation, which is only valid for a genuine pointer. A TaggedUnion
+		carrying RC members answers False here and must keep doing so - its
+		runtime shape is a tag+data value struct, and it needs cfg.py's
+		tag-gated ladder instead.
+
+		This used to be an RCClass-only isinstance check, which left tuples
+		out: compiler.is_rc(tuple[str,str]) answered False even though a
+		tuple is every bit as much a bare RC pointer as an RCClass, so
+		lib/builtins' RawDict/list skipped their key/value increfs entirely
+		for tuple element types. '''
+		return t is not None and t.is_rc_pointer()
 
 	def _is_pointer_representable( self, t: Type|None ) -> bool:
 		''' true if `t`'s own runtime representation IS a single machine
-		pointer - a real Ptr[T]/ConstPtr[T], OR an RCClass value (always a
+		pointer - a real Ptr[T]/ConstPtr[T], OR an RC pointer (always a
 		pointer to its heap object everywhere in this compiler - see
 		_is_RC). Used by compiler.cast(...) to allow a plain reinterpret
 		cast between ANY two of these (Ptr[None] <-> Ptr[T], Ptr[None] <->

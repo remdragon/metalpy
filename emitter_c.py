@@ -9,7 +9,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Copy, Function, Move,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
@@ -386,8 +386,8 @@ static inline bool __metalpy_isinf_f64( double x ) {
 // "%.3f" of 3.14159 -> "3.142". GetModuleHandleA/GetProcAddress are
 // kernel32 exports (emit_c()'s own extern_libs bookkeeping tags this
 // 'kernel32', which is either already linked for any real program, or
-// added the same way float_test.py already adds 'kernel32' for the
-// no-crt entry point's own ExitProcess call). NOTE: legacy _snprintf
+// already tracked for real via windows._console's/sys.exit's own @extern
+// bindings - see compiler.py's Compiler.force_reachable). NOTE: legacy _snprintf
 // (unlike C99 snprintf) returns -1 on truncation instead of the would-
 // have-been-written length - callers must size buf generously enough
 // that truncation never actually happens (a fixed-precision f64 can need
@@ -459,8 +459,31 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 	if ( n > 0 ) __metalpy_fixup_msvcrt_exponent( buf, &n );
 	return n;
 }
+// backs compiler.parse_f64(buf) - the inverse of compiler.format_f64, needed
+// for the shortest-round-trip repr search (lib/builtins/__float.py's
+// _f64_repr_digits_raw). msvcrt.dll's own strtod was verified correct
+// against this system's own msvcrt.dll (unlike some of its other legacy
+// quirks found earlier - _snprintf's own missing 'F'/garbage inf-nan/3-
+// digit-exponent issues): 0.1 -> the standard closest-double approximation,
+// 5e-324 -> the smallest denormal, the max finite double, all round-tripped
+// exactly. strtod is an ordinary (non-variadic) function - no ABI hazard
+// like _snprintf has - but resolved the same dynamic way regardless, since
+// a plain @extern('c', ...) binding would still wrongly flip the no-crt
+// Windows build (same reasoning __metalpy_format_f64 above documents).
+typedef double ( __cdecl *__metalpy_strtod_fn )( const char*, char** );
+static inline double __metalpy_parse_f64( const char* text ) {
+	static __metalpy_strtod_fn fn = 0;
+	if ( !fn ) {
+		void* msvcrt = GetModuleHandleA( "msvcrt.dll" );
+		if ( !msvcrt ) msvcrt = LoadLibraryA( "msvcrt.dll" );
+		fn = msvcrt ? (__metalpy_strtod_fn)GetProcAddress( msvcrt, "strtod" ) : 0;
+		if ( !fn ) return 0.0;
+	}
+	return fn( text, 0 );
+}
 #else
 #include <stdio.h>
+#include <stdlib.h>
 static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
 	char fmt[6];
 	int fi = 0;
@@ -471,6 +494,9 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 	fmt[fi++] = (char)type_char;
 	fmt[fi] = 0;
 	return snprintf( buf, size, fmt, precision, value );
+}
+static inline double __metalpy_parse_f64( const char* text ) {
+	return strtod( text, 0 );
 }
 #endif
 '''
@@ -673,8 +699,7 @@ def c_type( t: Type|None ) -> str:
 	first (ownership is a compile-time/CFG-only concept, invisible in C). '''
 	if t is None:
 		return 'void'
-	if isinstance( t, ( Move, Copy )):
-		return c_type( t.inner )
+	t = t.unwrap_ownership() # move[T]/copy[T] are compile-time only, invisible in C
 	if isinstance( t, Specialization ):
 		base = t.base
 		if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
@@ -686,7 +711,7 @@ def c_type( t: Type|None ) -> str:
 			else:
 				inner = _value_spelling( inner_type )
 			return f'{inner}*' if base.stem == 'Ptr' else f'const {inner}*'
-		if isinstance( base, RCClass ):
+		if t.is_rc_pointer():
 			return f'struct {mangle_type(t)}*'
 		if isinstance( base, ( CStruct, CUnion, TaggedUnion )):
 			return f'{_class_keyword(base)} {mangle_type(t)}'
@@ -704,9 +729,10 @@ def c_type( t: Type|None ) -> str:
 		if mapped is None:
 			raise NotImplementedError( f'c_type: unsupported scalar {t.qualname!r}' )
 		return mapped
-	if isinstance( t, RCClass ):
-		return f'struct {mangle_type(t)}*'
-	if isinstance( t, TupleType ):
+	if t.is_rc_pointer():
+		# RCClass and TupleType both, in one branch - a bare RC pointer is a
+		# bare RC pointer regardless of which kind produced it.
+		#
 		# PLAN_TUPLE.md, found by a real hang (not anticipated up front): a
 		# bare, unresolved TupleType can still reach here even after
 		# monomorphize.py's own substitute_type_params fix - a plain LOCAL/
@@ -722,8 +748,8 @@ def c_type( t: Type|None ) -> str:
 		# concrete backing RCClass eventually gets emitted under the SAME
 		# mangled name, since TupleType.qualname == backing.qualname by
 		# construction (tuple_storage.py's own TupleStorage.get()). Always
-		# a pointer, same as RCClass directly above - a tuple's backing is
-		# never anything else.
+		# a pointer, same as an RCClass - a tuple's backing is never
+		# anything else, which is what lets both share this branch.
 		return f'struct {mangle_type(t)}*'
 	if isinstance( t, ( CStruct, CUnion, TaggedUnion )):
 		return f'{_class_keyword(t)} {mangle_type(t)}'
@@ -799,8 +825,7 @@ def _value_spelling( t: Type ) -> str:
 	is an RCClass - sys.alloc[Foo]'s own real return type), and sizeof(T)
 	(sizeof(struct Foo), never sizeof(struct Foo*) - see ir.SizeOf's
 	handling in _emit_instruction). '''
-	if isinstance( t, ( Move, Copy )):
-		return _value_spelling( t.inner )
+	t = t.unwrap_ownership()
 	base = t.base if isinstance( t, Specialization ) else t
 	if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion, TupleType )):
 		return f'{_class_keyword(base)} {mangle_type(t)}'
@@ -1111,7 +1136,17 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 		return f'(-{cast_expr})' if value < 0 else cast_expr
 	magnitude = abs( value )
 	hi, lo = magnitude >> 64, magnitude & 0xFFFFFFFFFFFFFFFF
-	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << 64 ) | (__metalpy_wideuint){lo}ULL )'
+	# the shift amount is derived from __metalpy_wideuint's own real C width
+	# rather than hardcoded, the same sizeof()-based technique
+	# _WIDEINT_TOP_BIT_SHIFT already uses for i128 MIN/MAX - under MSVC's
+	# 64-bit wideint/wideuint fallback this reduces to a safe, well-defined
+	# no-op shift (0) instead of a shift-by-width (UB in C). The reconstructed
+	# value is still numerically wrong in that case (a >64-bit magnitude
+	# can't be represented in a genuinely 64-bit type by any expression -
+	# this can only be reached via an explicit bit-reinterpretation cast or a
+	# float->int128 literal cast, both of which deliberately bypass this
+	# stem's own int_stem_range validation) but at least well-defined, not UB
+	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << ( sizeof(__metalpy_wideuint)*8 - 64 ) ) | (__metalpy_wideuint){lo}ULL )'
 	if _is_unsigned_stem( stem ):
 		return unsigned_expr
 	signed_expr = f'(__metalpy_wideint){unsigned_expr}'
@@ -1803,7 +1838,7 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 	# type, as the pointer - this is where that pointer-ness actually
 	# becomes `->` in the emitted C).
 	base = obj_type.base if isinstance( obj_type, Specialization ) else obj_type
-	if isinstance( base, ( RCClass, TupleType )): # PLAN_TUPLE.md: a tuple's backing is always an RCClass, always pointer-accessed
+	if obj_type is not None and obj_type.is_rc_pointer(): # PLAN_TUPLE.md: a tuple's backing is always an RCClass, always pointer-accessed
 		return '->'
 	if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
 		return '->'
@@ -2104,7 +2139,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			assert instr.receiver is not None # is_virtual only ever set on real instance methods - see discovery.py's _parse_function
 			slot_name = _field_name( instr.target.stem )
 			vtable_op = _member_access_operator( instr.receiver.type )
-			if isinstance( instr.target.cls, RCClass ):
+			# WHERE the vtable pointer lives, not whether there is one - both
+			# arms have a vtable. An RCClass reads it out of its ObjectHeader
+			# ($header.vtable, reusing the field destructor dispatch already
+			# needed); an @interface CStruct has a plain top-level $vtable
+			# member instead. has_object_header() is exactly that distinction.
+			if instr.target.cls is not None and instr.target.cls.has_object_header():
 				receiver_pointee = instr.receiver.type.base if isinstance( instr.receiver.type, Specialization ) else instr.receiver.type
 				assert isinstance( receiver_pointee, RCClass )
 				vtbl_type = _rcclass_vtbl_type_name( receiver_pointee )
@@ -2227,8 +2267,17 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.IsInf ):
 		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_isinf( {_emit_operand(instr.value)} );' ]
 
+	if isinstance( instr, ir.ParseFloat ):
+		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_parse_f64( (const char*){_emit_operand(instr.buf)} );' ]
+
 	if isinstance( instr, ir.Allocate ):
-		if isinstance( instr.cls, RCClass ):
+		# has_object_header, not is_rc_pointer: this branch writes
+		# $header.ref_count and wires $header.vtable, which only exists on a
+		# type that actually LEADS with an ObjectHeader. A TupleType is an RC
+		# pointer but is never allocated under its own annotation - its
+		# synthesized backing RCClass is what reaches here, and that answers
+		# True on its own behalf.
+		if instr.cls is not None and instr.cls.has_object_header():
 			# routed through sys.alloc[cls] - the SAME allocation path
 			# every other real allocation in the language goes through, not
 			# an emitter-invented allocator (explicit user decision - see
@@ -3245,7 +3294,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# Windows, adding it would incorrectly flip no_crt for any caller that
 	# reads compiler.extern_libs before emit_c().
 	if compiler.disco.active_target['os'] == 'windows' and any(
-		isinstance( instr, ir.FormatFloat ) for lf in compiler.functions for instr in lf.instructions
+		isinstance( instr, ( ir.FormatFloat, ir.ParseFloat ) ) for lf in compiler.functions for instr in lf.instructions
 	):
 		compiler.extern_libs.setdefault( 'kernel32', set() ).add( 'GetProcAddress' )
 
@@ -3459,15 +3508,20 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 
 	# custom entry point when CRT is not linked - the linker expects
 	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls
-	# __metalpy_init() then main() and exits cleanly via the process itself
+	# __metalpy_init() then main() and exits cleanly via the process itself.
+	# Terminates via sys.exit()'s own mangled C symbol (mangle_qualname
+	# doesn't need a Function object - 'sys.exit' is a known, fixed qualname,
+	# same as _global_init_fn_name's approach) rather than a hardcoded raw
+	# ExitProcess call - compiler.py's Compiler.run() force-enqueues sys.exit
+	# whenever no_crt, so this always resolves to a real, lowered function
+	# with its own pass-1 prototype already emitted above.
 	if no_crt:
 		parts.append(
 			'#ifdef _WIN32\n'
-			'void __stdcall ExitProcess( unsigned int );\n'
 			'void mainCRTStartup( void ) {\n'
 			'\t__metalpy_init();\n'
 			'\tint __result = main();\n'
-			'\tExitProcess( (unsigned int)__result );\n'
+			f'\t{mangle_qualname( "sys.exit" )}( (uint32_t)__result );\n'
 			'}\n'
 			'#endif'
 		)

@@ -389,7 +389,13 @@ class Lowering:
 		cache_dir.mkdir( parents = True, exist_ok = True )
 		cache_file = cache_dir / key
 		if cache_file.is_file():
-			return int( cache_file.read_text().strip() )
+			# a torn/half-written entry parses as ValueError, not as a wrong
+			# answer - treat it as a miss and re-probe rather than crashing
+			# the whole compile (see linker_c.atomic_write_cache)
+			try:
+				return int( cache_file.read_text().strip() )
+			except ValueError:
+				pass
 
 		# no cached value — compile and run a tiny C program
 		import linker_c
@@ -436,7 +442,8 @@ class Lowering:
 					node,
 				)
 			value = int( run_result.stdout.strip() )
-		cache_file.write_text( str( value ), encoding = 'utf-8' )
+		import linker_c as _linker_c
+		_linker_c.atomic_write_cache( cache_file, str( value ))
 		return value
 
 	_UNICODE_DATA_URL = 'https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt'
@@ -469,7 +476,18 @@ class Lowering:
 		cache_dir.mkdir( parents = True, exist_ok = True )
 		cache_file = cache_dir / 'UnicodeData.txt'
 		if cache_file.is_file():
-			return cache_file.read_bytes()
+			# an empty file is a torn write, never a real (multi-MB) table -
+			# re-download instead of building casing tables from nothing.
+			# Deliberately NOT trying to detect a PARTIAL-but-non-empty file:
+			# there's no length/checksum to check against, and a content
+			# heuristic (say, "must end in a newline") would risk permanently
+			# re-downloading a valid table if upstream ever changed format.
+			# Writes are atomic now (see linker_c.atomic_write_cache), so a
+			# partial file can only be a leftover from an older build; delete
+			# %TEMP%/metalpy/case_folding to clear one.
+			cached = cache_file.read_bytes()
+			if cached:
+				return cached
 
 		import urllib.error
 		import urllib.request
@@ -483,7 +501,8 @@ class Lowering:
 				f'set METALPY_UNICODE_DATA_DIR to a local directory containing UnicodeData.txt to avoid the network entirely',
 				node,
 			)
-		cache_file.write_bytes( data )
+		import linker_c as _linker_c
+		_linker_c.atomic_write_cache( cache_file, data )
 		return data
 
 	def _build_unicode_simple_table( self, data: bytes, which: str, node: ast.AST ) -> bytes:
@@ -1815,6 +1834,30 @@ class FunctionLowering:
 		# own comment below already expects still apply regardless (not
 		# gated on strict - see _lower_expr's own comment)
 		value = self._lower_expr( node.value, self._current_fn.return_type, strict = False ) if node.value is not None else None
+		# an ALIASING return expression (self._is_aliasing_expr - a plain
+		# Name/Attribute read, or a tuple-element Subscript) that does NOT
+		# correspond to a live, skippable epilogue entry (self._cfg.
+		# has_live_entry) needs its own Incref right here, before it's
+		# handed off below: `return self.x` (an attribute read) and
+		# `return self`/`return some_borrowed_param` (a BORROWED Name,
+		# never pushed onto the epilogue stack - see cfg.py's
+		# _enter_parameter()) both alias a reference that SOMEONE ELSE
+		# still independently owns and will decref on their own schedule,
+		# so the caller needs a genuinely separate +1, not a bare pointer
+		# copy. An OWNED/COPY local (or a copy[T]/move[T] parameter) DOES
+		# have a live entry - that's a real move (its own decref is what
+		# current_epilogue_label()/return_() skip below, by this same
+		# identity), and must NOT also get an Incref here, or the moved-
+		# out reference would be permanently over-counted by one.
+		# Confirmed by direct compile-and-run testing with compiler.
+		# refcount(): `Holder.get(self) -> Box: return self.x` previously
+		# hung onto only 2 references (the field + the caller's own new
+		# holder of the returned value, double-counted as the SAME
+		# reference) where 3 are live once the caller's copy exists,
+		# leading to a premature free the moment either one dropped.
+		if value is not None and self.lowering._is_aliasing_expr( node.value, value.type ) and not self._cfg.has_live_entry( value ):
+			for instr in self._cfg.incref( value.type, value ):
+				self._emit( instr )
 		# what actually gets returned/assigned into the return-value slot
 		# below - defaults to `value` itself, reassigned to a widened temp
 		# further down when the covered-Result-error-widening case applies.
@@ -2818,6 +2861,33 @@ class FunctionLowering:
 		self._emit( ir_cls( dest = dest, value = value ))
 		return dest
 
+	def _lower_compiler_parse_f64( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.parse_f64(buf) - buf: ConstPtr[u8] (null-terminated C
+		# text) -> f64. The inverse of compiler.format_f64 - needed for the
+		# shortest-round-trip repr search (lib/builtins/__float.py's
+		# _f64_repr_digits_raw: try increasing precision, re-parse each
+		# candidate, stop at the first exact round-trip). Backed by a
+		# hand-written C helper in emitter_c.py's PROLOGUE (real strtod on
+		# POSIX; msvcrt.dll's own strtod, resolved dynamically via
+		# GetModuleHandleA/LoadLibraryA/GetProcAddress, on Windows -
+		# verified correct against this system's own msvcrt.dll, unlike
+		# some of its other legacy quirks found earlier) - deliberately
+		# NOT an ordinary @extern binding even though strtod's own
+		# signature is perfectly ordinary (non-variadic, no ABI hazard
+		# like compiler.format_f64 has): tagging it under the 'c' extern
+		# lib would still wrongly flip compiler.extern_libs and break the
+		# no-crt Windows build, the same reason compiler.format_f64 itself
+		# isn't a plain @extern binding either.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.parse_f64(...) takes exactly one argument: {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		ptr_cls = intrinsics['ConstPtr']
+		buf_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ intrinsics['u8'] ] )
+		buf = self._lower_expr( node.args[0], buf_type )
+		dest = self._new_temp( expected_type or intrinsics['f64'] )
+		self._emit( ir.ParseFloat( dest = dest, buf = buf ))
+		return dest
+
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
 		# statement-only (see _stmt_Expr's own dispatch) - mirrors
 		# compiler.incref/decref: no return value, nothing to hand back to
@@ -3706,7 +3776,16 @@ class FunctionLowering:
 
 	def _is_rcclass_upcast( self, sub: Type|None, sup: Type|None ) -> bool:
 		''' True if `sub` is a strict subclass (transitively) of `sup`, both being
-		RCClasses (or specializations of one) - i.e. a derived->base upcast. '''
+		RCClasses (or specializations of one) - i.e. a derived->base upcast.
+
+		Deliberately NOT expressed with Type.is_rc()/is_rc_pointer(): this asks
+		about INHERITANCE, not reference counting, and it needs the real RCClass
+		OBJECT to walk .base with. A tuple[T...] is every bit as much an RC
+		pointer as an RCClass but has no inheritance chain at all, so widening
+		this guard to is_rc_pointer() would let one into an upcast test it can
+		never meaningfully participate in. The isinstance is the right check
+		here - see mpy_types.Type's own note on the RC vs layout vs class-kind
+		distinction. '''
 		def rc_of( t: Type|None ) -> Type|None:
 			base = t.base if isinstance( t, Specialization ) else t
 			return base if isinstance( base, RCClass ) else None
@@ -4578,19 +4657,27 @@ class FunctionLowering:
 		# its own "always show a fractional digit in fixed form" tweak) -
 		# real Python's own "None" presentation, not plain 'f' (see
 		# validate_float_spec's own comment and lib/builtins/__float.py's
-		# _none_type_digits_raw). None type char with NO precision would
-		# need Python's real shortest-round-trip repr algorithm instead -
-		# not implemented (PLAN_STR_FORMAT.md item 4's own note), so that
-		# specific combination still falls back to plain 'f' below,
-		# unchanged from before.
+		# _none_type_digits_raw). None type char with NO precision either
+		# (f"{x:10}") needs Python's real shortest-round-trip repr
+		# algorithm instead - _repr_digits/_repr_digits_raw (lib/builtins/
+		# __float.py), the same machinery bare f"{x}" uses via __str__/
+		# __repr__ (_lower_fstring_part's own dispatch, unrelated to this
+		# function - reached before a format spec is even considered).
 		is_none_type_with_precision = spec.type is None and spec.precision is not None and not is_percent
-		type_char = self._const_i32( ord( spec.type or 'f' ) ) if not is_percent and not is_none_type_with_precision else None
+		is_none_type_no_precision = spec.type is None and spec.precision is None and not is_percent
+		type_char = (
+			self._const_i32( ord( spec.type or 'f' ) )
+			if not is_percent and not is_none_type_with_precision and not is_none_type_no_precision
+			else None
+		)
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
 
 		if is_percent:
 			digits_method, digits_args = '_percent_digits', [ self._const_usize( precision ), alt ]
 		elif is_none_type_with_precision:
 			digits_method, digits_args = '_none_type_digits', [ self._const_usize( precision ), alt ]
+		elif is_none_type_no_precision:
+			digits_method, digits_args = '_repr_digits', []
 		else:
 			digits_method, digits_args = '_fixed_digits', [ self._const_usize( precision ), type_char, alt ]
 
@@ -5596,6 +5683,23 @@ class FunctionLowering:
 		# ternary `x if cond else y` — both branches assign to the same
 		# dest temp, then merge at end_label. Use JumpIfTrue so the true
 		# branch (body) comes first, avoiding an extra negate.
+		#
+		# RC bookkeeping mirrors cfg.assign()'s own is_alias split, done
+		# per-branch since node.body/node.orelse can differ in aliasing-ness
+		# (e.g. `x if cond else str('literal')`): an ALIASING branch value
+		# (a plain Name/GetAttr read of an already-live binding) needs its
+		# own Incref before being merged into dest, since dest becomes an
+		# independent, longer-lived holder of the same reference; a FRESH
+		# branch value (a Call/Allocate result, already registered via
+		# fresh_temp() by whatever lowered it) has its ownership MOVED into
+		# dest via the plain ir.Assign below, so it must be untrack_temp()'d
+		# - otherwise _flush_pending_temps' later decref of the branch's own
+		# temp double-frees the exact same object dest (and whatever dest
+		# gets assigned into) still holds. dest itself only becomes tracked
+		# once, after both branches (fresh_temp() is idempotent per id) -
+		# confirmed as a real, reproducible UAF/double-free via direct
+		# testing (`str('-') if cond else str('+')` corrupted/crashed
+		# before this fix), not just reasoning from the code shape.
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		cond = self._lower_expr( node.test, bool_cls )
 		else_label = self._new_label( 'ifexp_else' )
@@ -5606,13 +5710,24 @@ class FunctionLowering:
 		true_val = self._lower_expr( node.body, expected_type )
 		if dest is None:
 			dest = self._new_temp( true_val.type )
+		if self.lowering._is_aliasing_expr( node.body, true_val.type ):
+			for instr in self._cfg.incref( dest.type, true_val ):
+				self._emit( instr )
+		else:
+			self._cfg.untrack_temp( true_val )
 		self._emit( ir.Assign( dest = dest, src = true_val ))
 		self._emit( ir.Jump( target = end_label ))
 		# false branch
 		self._emit( ir.Label( name = else_label ))
 		false_val = self._lower_expr( node.orelse, dest.type )
+		if self.lowering._is_aliasing_expr( node.orelse, false_val.type ):
+			for instr in self._cfg.incref( dest.type, false_val ):
+				self._emit( instr )
+		else:
+			self._cfg.untrack_temp( false_val )
 		self._emit( ir.Assign( dest = dest, src = false_val ))
 		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, dest.type )
 		return dest
 
 	def _expr_Compare( self, node: ast.Compare, expected_type: Type|None ) -> ir.Operand:
@@ -7506,6 +7621,10 @@ class FunctionLowering:
 
 			case 'is_inf':
 				result = self._lower_compiler_is_nan_or_inf( node, expected_type, 'is_inf' )
+				return result if want_result else None
+
+			case 'parse_f64':
+				result = self._lower_compiler_parse_f64( node, expected_type )
 				return result if want_result else None
 
 		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_return':
