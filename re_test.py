@@ -20,7 +20,15 @@
 # populates the outer Match) without consuming input. Lookbehind requires
 # a fixed-width body (Parser._parse_group computes it via
 # _fragment_fixed_byte_width) since the VM needs to know exactly how far
-# back to anchor the nested match. See PLAN_RE.md for all four phases.
+# back to anchor the nested match.
+#
+# Phase 5: backreferences - `\1`..`\9` and the explicit `\g<N>` form
+# (numeric only; `\g<name>` needs named groups, a later phase). A
+# backreference can only refer to a group already OPENED earlier in the
+# pattern (this parser has no separate lookahead pass), so a forward
+# reference is a compile error rather than an op that could never
+# succeed. An unmatched/non-participating group's backreference never
+# matches, same as Python re. See PLAN_RE.md for all five phases.
 #
 # Follows time_test.py's own template: RealCompileMixin + assert_programs_run,
 # print()-free, exit code 0 = every check passed, distinct nonzero i32 per
@@ -416,6 +424,55 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_BACKREFERENCES = '''
+import re
+
+def main() -> i32:
+	dup: re.Pattern = re.compile( r'(\\w+) \\1' ).unwrap( 'bad' )
+	if dup.search( 'hey hey' ).is_err():
+		return 1
+	if dup.search( 'hey bye' ).is_ok():
+		return 2
+
+	# lazy quantifiers aren't implemented yet (later phase) - no ".*?" here
+	tag2: re.Pattern = re.compile( r'<(\\w+)></\\1>' ).unwrap( 'bad' )
+	if tag2.fullmatch( '<div></div>' ).is_err():
+		return 3
+	if tag2.fullmatch( '<div></span>' ).is_ok():
+		return 4
+
+	# \\g<N> explicit numbered backreference
+	gform: re.Pattern = re.compile( r'(\\w+)-\\g<1>' ).unwrap( 'bad' )
+	if gform.fullmatch( 'abc-abc' ).is_err():
+		return 5
+	if gform.fullmatch( 'abc-xyz' ).is_ok():
+		return 6
+
+	# backreference to an optional group that didn't participate never matches
+	opt: re.Pattern = re.compile( r'(a)?b\\1' ).unwrap( 'bad' )
+	if opt.fullmatch( 'aba' ).is_err():
+		return 7
+	if opt.fullmatch( 'b' ).is_ok():  # group 1 unset -> \\1 never matches
+		return 8
+
+	# forward reference (referring to a group not yet opened) is a compile error
+	fwd: Result[re.Pattern, re.PatternError] = re.compile( r'\\1(a)' )
+	if fwd.is_ok():
+		return 9
+
+	# \\0 is not a valid backreference (group numbering starts at 1) -
+	# should still be a valid NUL escape via the common-escape table
+	nul: re.Pattern = re.compile( 'a\\\\0b' ).unwrap( 'bad' )
+	if nul.fullmatch( 'a\\0b' ).is_err():
+		return 10
+
+	# 'g' with no following '<' is just a literal 'g'
+	lit_g: re.Pattern = re.compile( 'a\\\\gb' ).unwrap( 'bad' )
+	if lit_g.fullmatch( 'agb' ).is_err():
+		return 11
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -449,6 +506,14 @@ class RePhase4BehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_phase4_lookaround( self ) -> None:
 		self.assert_programs_run([
 			( 'lookaround', _RE_LOOKAROUND ),
+		])
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase5BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def test_phase5_backreferences( self ) -> None:
+		self.assert_programs_run([
+			( 'backreferences', _RE_BACKREFERENCES ),
 		])
 
 

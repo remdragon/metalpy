@@ -116,6 +116,7 @@ class OpKind:
 	LOOKAHEAD_NEG = 12  # `(?!...)` - zero-width, op.sub must NOT match at sp
 	LOOKBEHIND_POS = 13 # `(?<=...)` - zero-width, op.sub must match ending exactly at sp, anchored at sp-op.width
 	LOOKBEHIND_NEG = 14 # `(?<!...)` - zero-width negation of the above
+	BACKREF = 15        # `\N` / `\g<N>` - op.slot holds the referenced GROUP number (not a slot index - see _op_backref)
 
 
 class Op:
@@ -192,6 +193,11 @@ def _op_lookbehind( sub: list[Op], width: usize, negate: bool ) -> Op:
 	op = Op( OpKind.LOOKBEHIND_NEG if negate else OpKind.LOOKBEHIND_POS )
 	op.sub = sub
 	op.width = width
+	return op
+
+def _op_backref( group_idx: usize ) -> Op:
+	op = Op( OpKind.BACKREF )
+	op.slot = group_idx
 	return op
 
 
@@ -633,6 +639,10 @@ class Parser:
 		if b == 66:  # 'B' - zero-width NOT-a-word-boundary
 			self._advance_byte()
 			return Result.Ok( _single_op_fragment( _op_nwordb()))
+		if b >= 49 and b <= 57:  # '1'-'9' - numbered backreference (\0 is NUL, handled below)
+			return self._parse_numbered_backref()
+		if b == 103:  # 'g' - possible \g<N> explicit numbered backreference
+			return self._parse_g_backref()
 		common: u32|None = _common_escape_cp( b )
 		if common is not None:
 			self._advance_byte()
@@ -642,6 +652,54 @@ class Parser:
 		# meaning for this escape" - as the literal character itself).
 		cp: u32 = self._decode_cp()
 		return Result.Ok( _single_op_fragment( _op_char( cp )))
+
+	def _parse_numbered_backref( self ) -> Result[list[Op], PatternError]:
+		n: usize = 0
+		while not self._at_end() and self._is_digit_byte( self._peek_byte()):
+			with compiler.wrap_arithmetic:
+				n = n * 10 + usize( self._peek_byte() - 48 )
+			self._advance_byte()
+		return self._backref_fragment( n )
+
+	def _parse_g_backref( self ) -> Result[list[Op], PatternError]:
+		# only \g<N> (numeric) is supported for now - \g<name> needs named
+		# groups (a later phase). If it doesn't look like \g<digits>, 'g'
+		# falls back to an ordinary literal codepoint, matching this
+		# parser's "unrecognized escape is a literal" convention.
+		save_pos: usize = self.pos
+		self._advance_byte()  # consume 'g'
+		if self._at_end() or self._peek_byte() != 60:  # '<'
+			self.pos = save_pos
+			cp: u32 = self._decode_cp()
+			return Result.Ok( _single_op_fragment( _op_char( cp )))
+		self._advance_byte()  # consume '<'
+		n: usize = 0
+		have_digit: bool = False
+		while not self._at_end() and self._is_digit_byte( self._peek_byte()):
+			have_digit = True
+			with compiler.wrap_arithmetic:
+				n = n * 10 + usize( self._peek_byte() - 48 )
+			self._advance_byte()
+		if not have_digit:
+			return Result.Err( PatternError( 're: \\g<...> requires a numeric group reference (named groups not yet supported)' ))
+		if self._at_end() or self._peek_byte() != 62:  # '>'
+			return Result.Err( PatternError( 're: unterminated \\g<...>' ))
+		self._advance_byte()  # consume '>'
+		return self._backref_fragment( n )
+
+	def _backref_fragment( self, n: usize ) -> Result[list[Op], PatternError]:
+		if n == 0:
+			return Result.Err( PatternError( 're: \\0 is not a valid backreference (group numbering starts at 1)' ))
+		# a backreference can only be validated against groups OPENED so
+		# far (this parser has no separate lookahead pass over the whole
+		# pattern) - a forward reference to a not-yet-parsed group is
+		# rejected here rather than silently compiled into an op that can
+		# never succeed at match time.
+		with compiler.panic_arithmetic( 're: _backref_fragment: next_slot underflow (unreachable, starts at 2)' ):
+			groups_so_far: usize = ( self.next_slot - 2 ) // 2
+		if n > groups_so_far:
+			return Result.Err( PatternError( 're: invalid backreference to a group that is not yet defined' ))
+		return Result.Ok( _single_op_fragment( _op_backref( n )))
 
 	def _shorthand_class_for_byte( self, b: u8 ) -> CharClass:
 		# only ever called after _parse_escape_atom's own d/D/w/W/s/S guard
@@ -929,6 +987,30 @@ class Matcher:
 			after = _is_word_byte_cp( self._codepoint_at( sp ))
 		return before != after
 
+	def _backref_matches_at( self, sp: usize, g_start: usize, g_len: usize ) -> bool:
+		''' does the g_len bytes of self.text starting at g_start
+		(an already-closed capture group's own span) reappear literally
+		at sp? compares raw bytes, not codepoints - a byte-exact
+		reappearance of valid UTF-8 is itself valid UTF-8, so this needs
+		no separate decode step (same reasoning str._byte_slice's own
+		docstring gives for byte-exact needle matches always landing on
+		codepoint boundaries). '''
+		with compiler.wrap_arithmetic:
+			end_pos: usize = sp + g_len
+		if end_pos > self.text_len:
+			return False
+		data: ConstPtr[u8] = self.text.get_cstr()
+		i: usize = 0
+		while i < g_len:
+			with compiler.wrap_arithmetic:
+				a: usize = g_start + i
+				b: usize = sp + i
+			if data[a] != data[b]:
+				return False
+			with compiler.wrap_arithmetic:
+				i += 1
+		return True
+
 	def run_at( self, start_pos: usize, n_slots: usize ) -> Result[Frame, MatchError]:
 		''' attempts an anchored match beginning exactly at start_pos, with
 		every capture slot starting unset. Returns the final Frame (whose
@@ -1004,6 +1086,27 @@ class Matcher:
 				matched = self._is_word_boundary( sp )
 			elif op.kind == OpKind.NWORDB:
 				matched = not self._is_word_boundary( sp )
+			elif op.kind == OpKind.BACKREF:
+				group_idx: usize = op.slot
+				with compiler.wrap_arithmetic:
+					lo_slot: usize = group_idx * 2
+					hi_slot: usize = group_idx * 2 + 1
+				if not slot_set.__getitem__( lo_slot ).unwrap( 're: run_at backref slot_set' ):
+					# the referenced group never participated in this
+					# particular match attempt (e.g. an alternated-away or
+					# unmatched optional group) - matches Python re's own
+					# "an unmatched group's backreference never matches".
+					matched = False
+				else:
+					g_start: usize = slot_values.__getitem__( lo_slot ).unwrap( 're: run_at backref slot' )
+					g_end: usize = slot_values.__getitem__( hi_slot ).unwrap( 're: run_at backref slot' )
+					with compiler.panic_arithmetic( 're: run_at backref: end < start (invariant)' ):
+						g_len: usize = g_end - g_start
+					if self._backref_matches_at( sp, g_start, g_len ):
+						with compiler.wrap_arithmetic:
+							sp += g_len
+					else:
+						matched = False
 			elif op.kind == OpKind.LOOKAHEAD_POS or op.kind == OpKind.LOOKAHEAD_NEG:
 				saved_ops: list[Op] = self.ops
 				self.ops = op.sub
