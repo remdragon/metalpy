@@ -613,6 +613,34 @@ class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no fi
 @dataclass( kw_only = True )
 class Return( Instruction ):
 	value: Operand|None
-	
+
 	def test_repr( self ) -> str:
 		return f'Return( value={self.value!r} )'
+
+@dataclass( kw_only = True )
+class Yield( Instruction ):
+	''' PLAN_GENERATORS.md Phase F - a real `yield` suspend point inside a
+	generator's $$__next__/$$__resume__ body (Function.is_generator_next).
+	Codegen (emitter_c.py) stores `state` into self.__state, then returns
+	`value` - exactly the "state store + return" shape the OLD AST-
+	synthesis mechanism used to hand-build per yield unit
+	(type_resolver.py's _build_yield_unit_guard/_build_while_unit_guard/
+	_build_if_unit_guard, all removed by Phase F), now emitted once,
+	directly, by real lowering instead. Immediately after this instruction
+	in the lowered stream is an ordinary ir.Label(name=resume_label) -
+	existing, unmodified machinery - which is exactly where a LATER call,
+	dispatched via the function's own state-check prologue jumping
+	straight to that label, resumes execution. state is this yield's own
+	dispatch discriminant (unique per textual yield site, assigned in
+	source order starting at 1 - state 0 means "not yet started", matching
+	the old mechanism's own convention) and by convention doubles as
+	resume_label's numeric suffix, but both are carried explicitly here
+	(mirroring Jump/JumpIfFalse's own explicit `target` field) rather than
+	derived, so codegen never needs to know the label-naming convention
+	itself. '''
+	value: Operand # already coerced/wrapped to match the function's own declared return type (elem_type|None, or Result[elem_type|None,error_type] when fallible) - same convention ir.Return's own `value` field expects
+	state: int
+	resume_label: str
+
+	def test_repr( self ) -> str:
+		return f'Yield( value={self.value!r}, state={self.state}, resume_label={self.resume_label!r} )'
