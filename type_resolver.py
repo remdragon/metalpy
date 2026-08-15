@@ -3732,6 +3732,55 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		self.resolver.ensure_generator_synthesized( node.resolved_callee, origin_stems )
 		return node
 
+	# --- local imports ---
+
+	def visit_ImportFrom( self, node: ast.ImportFrom ) -> ast.ImportFrom:
+		''' registers a function-body-local `from X import Y` into fn.names,
+		mirroring lowering.py's own _stmt_ImportFrom (see its docstring: function
+		bodies are deliberately never walked by discovery.py's own visitor, so
+		an in-function import only ever gets registered for real at lowering
+		time). Without this, a local import followed immediately by an
+		annotation using the imported name (`from windows.kernel32 import
+		HANDLE` then `h: HANDLE = ...`, both inside the same function) failed
+		to compile with a spurious "name not defined" - visit_AnnAssign below
+		resolves its annotation via self.discovery.visit(), which walks
+		self.discovery.scope_stack (fn is pushed onto it for the whole of
+		resolve_function_body's walk), but nothing had put the import's name
+		into fn.names yet at that point; a plain (non-annotated) use of the
+		same name was unaffected, since this pass never resolves ordinary
+		value expressions by name the way it resolves annotations. Registering
+		it here (rather than only at lowering time) closes that gap for this
+		pass's own annotation resolution while leaving the ImportFrom node
+		itself untouched in the body - lowering.py's _stmt_ImportFrom still
+		runs against it normally afterward and re-registers the same cached
+		Name object, which is harmless (add_name is a plain dict assignment). '''
+		if self.fn is None:
+			return node
+		parts: list[str] = []
+		if node.level:
+			# same package-relative counting as discovery.py's own
+			# visit_ImportFrom/lowering.py's own _stmt_ImportFrom
+			package = self.discovery.module_stack[-1].package
+			strip = node.level - 1
+			parts.extend(( package.split( '.' )[:-strip] if strip else package.split( '.' )) if package else [] )
+			if not parts:
+				self.discovery.fail( f'unable to relative import from here: {ast.unparse(node)}', node )
+		if node.module:
+			parts.append( node.module )
+		package = '.'.join( parts )
+		try:
+			mod = self.discovery.import_name( package )
+		except FileNotFoundError as e:
+			self.discovery.fail( str( e ), node )
+		if not mod:
+			self.discovery.fail( f'module {package!r} not found', node )
+		for alias in node.names:
+			item = mod.names.get( alias.name )
+			if item is None:
+				self.discovery.fail( f'module {package} does not export {alias.name!r}', node )
+			self.fn.add_name( alias.asname or alias.name, item )
+		return node
+
 	# --- local type tracking ---
 
 	def visit_AnnAssign( self, node: ast.AnnAssign ) -> ast.AnnAssign:

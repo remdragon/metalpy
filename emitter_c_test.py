@@ -9923,6 +9923,78 @@ def main() -> i32:
 		] )
 
 
+class LocalImportAnnotationResolutionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' A function-body-local `from X import Y` immediately followed by a
+	same-function annotation using Y (`h: Y = ...`) previously failed to
+	compile with a spurious "name 'Y' is not defined", even though the
+	identical import resolves fine written at module level, and even though
+	an UNANNOTATED use of the same locally-imported name (`x = Y`) was
+	unaffected. Root cause: type_resolver.py's _ReferenceResolver (the AST-
+	rewrite pass resolve_function_body runs over a function body) never
+	registered a local ImportFrom's own names into fn.names - only lowering.
+	py's own _stmt_ImportFrom did that, which runs in a separate, LATER pass
+	(real codegen), too late for THIS pass's own visit_AnnAssign, which
+	resolves its annotation via self.discovery.visit() - walking self.
+	discovery.scope_stack, which fn IS already pushed onto for the whole of
+	resolve_function_body's walk (see its own scope_context(fn)) - just
+	nothing had populated fn.names from the import yet by the time the very
+	next statement's annotation was resolved. Hit for real in lib/fs.py's
+	own open_raw (Windows branch): `from windows.kernel32 import ...,
+	HANDLE, ...` immediately followed by `handle: HANDLE = CreateFileA(...)`
+	- worked around there by dropping the redundant `: HANDLE` annotation
+	(CreateFileA's own declared return type already IS HANDLE), which is
+	fine to leave as-is, but left this general resolver gap itself
+	unfixed until now. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'local_import_immediately_used_in_annotation', '''
+def main() -> i32:
+	from windows.kernel32 import HANDLE, INVALID_HANDLE_VALUE
+	h: HANDLE = INVALID_HANDLE_VALUE
+	if h != INVALID_HANDLE_VALUE:
+		return 1
+	return 0
+''' ),
+			# an aliased import (`as`), with unrelated statements between the
+			# import and the annotation that uses it - guards against a fix
+			# that only special-cases "the very next statement" or the
+			# original (non-aliased) name.
+			( 'aliased_local_import_used_in_annotation_after_a_gap', '''
+def main() -> i32:
+	from windows.kernel32 import HANDLE as H, INVALID_HANDLE_VALUE
+	x: i32 = 1
+	y: i32 = 2
+	h: H = INVALID_HANDLE_VALUE
+	if x != 1 or y != 2:
+		return 1
+	if h != INVALID_HANDLE_VALUE:
+		return 2
+	return 0
+''' ),
+			# the identical name, used as a plain VALUE rather than a type
+			# annotation, must keep compiling too (this path never broke -
+			# see this class's own docstring - but a fix that regresses it
+			# would be just as real a bug).
+			( 'local_import_used_as_a_value_not_just_a_type', '''
+def main() -> i32:
+	from windows.kernel32 import INVALID_HANDLE_VALUE
+	x = INVALID_HANDLE_VALUE
+	if x != INVALID_HANDLE_VALUE:
+		return 1
+	return 0
+''' ),
+		] )
+
+
 class FStringTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' f-string (PEP 498) real end-to-end compile-and-run tests
 	(PLAN_FSTRINGS.md). Mirrors StrUpperLowerTests/ListGenericTests' own
