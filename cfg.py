@@ -1178,6 +1178,16 @@ class CFGState:
 		call unconditionally regardless of whether t actually turns out RC. '''
 		return self._incref_instructions( t, operand )
 
+	def decref( self, t: Type, operand: ir.Operand ) -> list[ir.Instruction]:
+		''' public entry point mirroring incref() above, for a caller that's
+		fully done with a value and needs to release it explicitly (e.g.
+		compiler.decref(x) - lowering.py's _lower_compiler_decref). Union-
+		aware exactly like incref(): a TaggedUnion operand gets the real
+		tag-gated release sequence (_tag_gated_refcount_instructions), not a
+		bare pointer release - calling ir.Decref directly here would be
+		correct only for a plain RC pointer, not a tag+data value struct. '''
+		return self._decref_instructions( t, operand )
+
 	def _incref_instructions( self, t: Type, operand: ir.Operand ) -> list[ir.Instruction]:
 		return self._refcount_instructions( t, operand, ir.Incref )
 

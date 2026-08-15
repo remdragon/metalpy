@@ -3277,7 +3277,12 @@ class FunctionLowering:
 		return isinstance( cls, Specialization )
 
 	def _lower_compiler_decref( self, node: ast.Call ) -> None:
-		# compiler.decref(x) — emit an ir.Decref for x. Used inside
+		# compiler.decref(x) — emit the real Decref sequence for x, via
+		# cfg.py's own union-aware decref() (NOT a bare ir.Decref emitted
+		# directly here - that's only correct for a plain RC pointer; a
+		# TaggedUnion operand with RC leaves needs the tag-gated release
+		# ladder instead, exactly like every other decref site in this
+		# compiler - see cfg.py's _refcount_instructions). Used inside
 		# synthesized destructor bodies to tear down each RC field, and by
 		# generic containers (list[T]) that need to conditionally RC-manage
 		# elements whose T may or may not turn out to be an RC type once
@@ -3287,12 +3292,29 @@ class FunctionLowering:
 		# body stays correct for both list[SomeRCClass] and list[i32]
 		# without the class itself branching on whether T is RC - an
 		# ordinary, non-generic call site with a genuinely wrong (always
-		# non-RC) argument is still rejected, same as before
+		# non-RC) argument is still rejected, same as before.
+		#
+		# Gated on cfg.rc_leaves(operand.type), not the narrower
+		# type_resolver._is_RC (is_rc_pointer) - _is_RC is False for a
+		# TaggedUnion with RC members (its runtime shape is a tag+data value
+		# struct, never a bare pointer), which used to make this whole
+		# branch treat "T monomorphized to a union with RC leaves" exactly
+		# like "T monomorphized to a genuinely non-RC scalar" - a silent
+		# no-op inside _in_generic_class_method(), the SAME no-op posture
+		# that's actually correct for list[i32]. Confirmed via a real repro
+		# (list[T].append/__getitem__ with T a @union whose RC-carrying leaf
+		# is a plain RCClass like the builtin int): the missing incref/decref
+		# left every such element under-retained by exactly one reference,
+		# a real heap-corruption-on-free bug - masked whenever the leaf
+		# happened to be an IMMORTAL-refcount value (a string literal),
+		# which is why this surfaced as "str leaves work, int leaves crash"
+		# rather than an unconditional failure.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.decref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is not None and self.lowering._type_resolver._is_RC( operand.type ):
-			self._emit( ir.Decref( value = operand ))
+		if operand.type is not None and cfg.rc_leaves( operand.type ):
+			for instr in self._cfg.decref( operand.type, operand ):
+				self._emit( instr )
 			# stop the scope-exit epilogue from decref'ing operand a SECOND
 			# time - see cfg.py's manually_decreffed's own comment for why
 			# this is required, not optional (a real, always-on double
@@ -3314,13 +3336,16 @@ class FunctionLowering:
 		)
 
 	def _lower_compiler_incref( self, node: ast.Call ) -> None:
-		# compiler.incref(x) — emit an ir.Incref for x. Same conditional
-		# no-op-for-non-RC-T posture as _lower_compiler_decref above.
+		# compiler.incref(x) — emit the real Incref sequence for x, via
+		# cfg.py's own union-aware incref(). Same conditional no-op-for-
+		# non-RC-T posture, and the same rc_leaves(...)-vs-_is_RC fix, as
+		# _lower_compiler_decref above.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.incref(...) takes exactly one argument: {ast.unparse(node)}', node )
 		operand = self._lower_expr( node.args[0], None )
-		if operand.type is not None and self.lowering._type_resolver._is_RC( operand.type ):
-			self._emit( ir.Incref( value = operand ))
+		if operand.type is not None and cfg.rc_leaves( operand.type ):
+			for instr in self._cfg.incref( operand.type, operand ):
+				self._emit( instr )
 			return
 		if operand.type is not None and self._in_generic_class_method():
 			return
