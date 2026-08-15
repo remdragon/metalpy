@@ -2151,56 +2151,66 @@ class TypeResolver:
 			self.discovery.fail( f'{fn.qualname}: a generator method is not supported yet - only a plain function may contain yield - see PLAN_GENERATORS.md', fn.node )
 		if not isinstance( fn.return_type, GeneratorType ):
 			self.discovery.fail( f'{fn.qualname} contains yield but is not declared -> Iterator[T]', fn.node )
-		elem_type = fn.return_type.elem_type
-		error_type = fn.return_type.error_type
-		self.schedule( elem_type )
 
-		extra_fields = self._desugar_generator_for_loops( fn )
-		units = self._collect_generator_units( fn )
-		self._validate_generator_defer_sites( fn )
-		defer_sites = self._desugar_generator_defer_sites( fn )
-		self._reject_generator_value_return( fn )
-		pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
-		locals_decl = self._collect_generator_locals( fn )
+		# this runs eagerly from a CALL SITE (see this function's own
+		# top docstring), which may live in a different module than fn
+		# itself - every name lookup below (locals' own type
+		# annotations, in particular) must resolve against fn's OWN
+		# defining module, not whichever module happens to be active on
+		# discovery.module_stack at the call site. Mirrors
+		# resolve_function_body's identical push, just triggered earlier.
+		module = self._find_module_for( fn )
+		with self.discovery.module_context( module ):
+			elem_type = fn.return_type.elem_type
+			error_type = fn.return_type.error_type
+			self.schedule( elem_type )
 
-		none_type = self.discovery.get_none_type()
-		result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
+			extra_fields = self._desugar_generator_for_loops( fn )
+			units = self._collect_generator_units( fn )
+			self._validate_generator_defer_sites( fn )
+			defer_sites = self._desugar_generator_defer_sites( fn )
+			self._reject_generator_value_return( fn )
+			pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
+			locals_decl = self._collect_generator_locals( fn )
 
-		# PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - Generator[T,E]
-		# (error_type set) makes __next__ fallible: it returns
-		# Result[elem_type|None, error_type] instead of the bare union, so
-		# or_return()/checked-arithmetic inside the body engage the
-		# existing _require_result_return machinery for free (no special
-		# generator-side flag needed - it's purely a consequence of
-		# __next__'s own declared return type, exactly like any other
-		# fallible function). Iterator[T] (error_type None) is unaffected -
-		# next_return_type stays the bare union, same as before this phase.
-		if error_type is not None:
-			self.schedule( error_type )
-			result_cls = self.discovery.find_name_or_none( 'Result' )
-			assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for Generator[T,E] but was not found'
-			next_return_type = self.discovery._get_or_create_specialization( result_cls, [ result_union, error_type ] )
-			self.schedule( next_return_type )
-		else:
-			next_return_type = result_union
+			none_type = self.discovery.get_none_type()
+			result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
 
-		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
-		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
-		# backing_cls is ever scheduled below, so its own pre-mark of
-		# id(backing_cls) in self._destructors_synthesized (see its own
-		# docstring) beats compiler.py's ordinary, unconditional RCClass
-		# handling to the punch - that path checks the SAME memo set
-		# before ever building its own (wrong, unconditional-decref)
-		# destructor for this class
-		self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
+			# PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - Generator[T,E]
+			# (error_type set) makes __next__ fallible: it returns
+			# Result[elem_type|None, error_type] instead of the bare union, so
+			# or_return()/checked-arithmetic inside the body engage the
+			# existing _require_result_return machinery for free (no special
+			# generator-side flag needed - it's purely a consequence of
+			# __next__'s own declared return type, exactly like any other
+			# fallible function). Iterator[T] (error_type None) is unaffected -
+			# next_return_type stays the bare union, same as before this phase.
+			if error_type is not None:
+				self.schedule( error_type )
+				result_cls = self.discovery.find_name_or_none( 'Result' )
+				assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for Generator[T,E] but was not found'
+				next_return_type = self.discovery._get_or_create_specialization( result_cls, [ result_union, error_type ] )
+				self.schedule( next_return_type )
+			else:
+				next_return_type = result_union
 
-		self.schedule( backing_cls )
-		self.schedule( backing_cls.names['__next__'] )
-		self.schedule( result_union )
+			backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
+			self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
+			# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
+			# backing_cls is ever scheduled below, so its own pre-mark of
+			# id(backing_cls) in self._destructors_synthesized (see its own
+			# docstring) beats compiler.py's ordinary, unconditional RCClass
+			# handling to the punch - that path checks the SAME memo set
+			# before ever building its own (wrong, unconditional-decref)
+			# destructor for this class
+			self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
 
-		self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
-		fn.return_type = backing_cls
+			self.schedule( backing_cls )
+			self.schedule( backing_cls.names['__next__'] )
+			self.schedule( result_union )
+
+			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
+			fn.return_type = backing_cls
 
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:
 		''' the emitter always synthesizes a destructor for every
