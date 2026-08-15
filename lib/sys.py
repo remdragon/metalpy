@@ -20,9 +20,9 @@ def alloc[T]( count: usize ) -> Ptr[T]:
 	return ptr
 
 # ---------------------------------------------------------------------------
-# stdout: minimal stream object (see TODO.txt - full IO interfaces, including
-# a real stderr, buffering, and reading, are still future work; this is just
-# enough for print()).
+# stdout/stderr: minimal stream objects (see TODO.txt - full IO interfaces,
+# including buffering and reading, are still future work; this is just
+# enough for print() and lib/logging.py's StreamHandler).
 # ---------------------------------------------------------------------------
 
 class _Stdout:
@@ -38,6 +38,20 @@ class _Stdout:
 		return write_all( 1, s.get_cstr(), s.byte_len() ) # STDOUT_FILENO is 1
 
 stdout: _Stdout = _Stdout()
+
+class _Stderr:
+	@compiler.target( os = 'windows' )
+	def write( self, s: str ) -> Result[None,OSError]:
+		from fs import write_all
+		from windows.kernel32 import GetStdHandle, STD_ERROR_HANDLE
+		return write_all( GetStdHandle( STD_ERROR_HANDLE ), s.get_cstr(), s.byte_len() )
+
+	@compiler.target( os = not 'windows' )
+	def write( self, s: str ) -> Result[None,OSError]:
+		from fs import write_all
+		return write_all( 2, s.get_cstr(), s.byte_len() ) # STDERR_FILENO is 2
+
+stderr: _Stderr = _Stderr()
 
 @compiler.target( os = 'windows' )
 def cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
