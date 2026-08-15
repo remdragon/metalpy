@@ -1,5 +1,6 @@
 # src/posix/fs.py
 
+import compiler
 import crt
 from codecs import Codec
 from codecs.utf8 import utf8
@@ -20,5 +21,7 @@ def readlink(
 	)
 	if nbytes < 0:
 		return Result.Err( PosixError( crt.get_errno() ))
-	
-	return codec.decode( buf[:nbytes] )
+
+	with compiler.panic_arithmetic( 'nbytes already proven non-negative above' ):
+		n: usize = usize( nbytes )
+	return codec.decode( buf[:n] )

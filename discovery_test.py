@@ -1,5 +1,8 @@
 # stdlib imports
+import contextlib
+import hashlib
 import logging
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,7 +14,8 @@ import linker_c
 import test_support
 from mpy_types import (
 	Module, RCClass, CStruct, CUnion, CEnum, TaggedUnion, Overload,
-	Function, Variable, Specialization, Move, Copy, ConditionalDispatch, Scalar,
+	Function, Variable, Specialization, ConditionalDispatch, Scalar,
+	Move, Copy,
 )
 
 logger = logging.getLogger( __name__ )
@@ -1001,6 +1005,183 @@ class Foo:
 		self.assertIn( 'cannot also be @abstractmethod', self.discovery.errors.errors[0] )
 		self.assertNotIn( 'cannot also be @virtual', self.discovery.errors.errors[0] )
 
+	def test_inline_multistatement_body_accepted( self ) -> None:
+		# the multi-statement generalization: locals/branches before a
+		# single, final, un-nested return
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		y: i32 = x
+		if y == 0:
+			y = 1
+		return y
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_return_nested_in_if_accepted( self ) -> None:
+		# early/nested return generalization - the spliced body now has its
+		# own local epilogue to jump into (see lowering.py's _splice_multi_
+		# statement_inline_body/cfg.py's push_inline_scope), so a `return`
+		# nested inside an if is no longer rejected outright
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			return 0
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_return_not_last_rejected( self ) -> None:
+		# unchanged: the body must still structurally END in a `return
+		# <expr>` - a return followed by dead-but-still-textually-present
+		# code stays rejected, only the ERROR MESSAGE changed to reflect
+		# that earlier returns are now otherwise allowed
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		return x
+		y: i32 = 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_bare_return_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self ) -> i32:
+		y: i32 = 1
+		return
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_bare_early_return_rejected( self ) -> None:
+		# every reachable return needs a value, not just the trailing one -
+		# an early bare `return` has no well-defined meaning for an inline
+		# function's own overall value
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			return
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_defer_accepted( self ) -> None:
+		# defer/errdefer generalization - the spliced body now has a
+		# well-defined local boundary of its own to run against (see
+		# lowering.py's _splice_multi_statement_inline_body), so it's no
+		# longer rejected at parse time. resolve() alone doesn't reach
+		# lowering/splicing (that only happens at an actual call site), so
+		# this only confirms the DISCOVERY-time rejection is gone
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		with defer:
+			pass
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_errdefer_call_form_accepted( self ) -> None:
+		# the OTHER recognized spelling, `errdefer(...)` as a bare call
+		# statement, not just `with defer:`
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		errdefer( x )
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_with_defer_nested_in_if_accepted( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			with defer:
+				pass
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_inline_body_reassigning_self_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self ) -> i32:
+		self = self
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_parameter_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		x = x + 1
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_parameter_nested_in_if_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			x = 1
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'reassigning self/a parameter', self.discovery.errors.errors[0] )
+
+	def test_inline_body_reassigning_own_local_accepted( self ) -> None:
+		# unlike self/a parameter, reassigning a local the BODY ITSELF
+		# declared is fine - only self/params are restricted (they might
+		# alias the caller's own argument; a fresh local never does)
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		y: i32 = x
+		y = y + 1
+		return y
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_virtual_with_second_plain_signature_is_a_compile_error( self ) -> None:
 		# NOT just the already-rejected @virtual+@overload-on-the-SAME-def
 		# combo - metalpy also allows multiple PLAIN (non-@overload) defs
@@ -1408,6 +1589,40 @@ class Foo:
 		self.assertEqual( [ p.stem for p in make.parameters ], [ 'args' ])
 
 
+class OwnershipAnnotationTypeQueryTests( unittest.TestCase ):
+	''' move[T]/copy[T] are an ownership STATUS on a binding, not types - so
+	asking one an RC or memory-layout question is a category error, and
+	mpy_types raises rather than politely delegating to .inner.
+
+	Pinned by a test because the tempting "fix" when one of these raises is to
+	make it delegate, which would silently restore the very thing this is
+	meant to expose: a path in the compiler treating an ownership annotation
+	as a real runtime type. Callers that legitimately hold one call
+	.unwrap_ownership() first. '''
+
+	def _wrappers( self ) -> list:
+		i32 = Scalar( stem = 'i32', qualname = 'intrinsics.i32', file = None, line = None, sizeof = 4 )
+		return [
+			Move( stem = 'move', qualname = 'move', file = None, line = None, inner = i32 ),
+			Copy( stem = 'copy', qualname = 'copy', file = None, line = None, inner = i32 ),
+		]
+
+	def test_rc_and_layout_queries_raise( self ) -> None:
+		for w in self._wrappers():
+			for question in ( 'is_rc', 'is_rc_pointer', 'rc_leaves', 'has_object_header', 'has_vtable' ):
+				with self.subTest( wrapper = type( w ).__name__, question = question ):
+					with self.assertRaises( AssertionError ) as ctx:
+						getattr( w, question )()
+					self.assertIn( 'unwrap_ownership', str( ctx.exception ))
+
+	def test_unwrap_ownership_yields_the_real_type_which_answers_normally( self ) -> None:
+		for w in self._wrappers():
+			with self.subTest( wrapper = type( w ).__name__ ):
+				inner = w.unwrap_ownership()
+				self.assertIs( inner, w.inner )
+				self.assertFalse( inner.is_rc() ) # i32
+				self.assertEqual( inner.rc_leaves(), [] )
+
 class MoveTypeTests( unittest.TestCase ):
 	''' move[T] in annotation position - recognized textually (like @move) rather than resolved through find_name, so it works even though `move` is never a real bound name anywhere '''
 
@@ -1417,7 +1632,13 @@ class MoveTypeTests( unittest.TestCase ):
 	def _import( self, code: str ) -> Module:
 		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
 
-	def test_move_wraps_inner_type( self ) -> None:
+	def test_move_unwraps_to_inner_type( self ) -> None:
+		# move[T] is an ownership status on the binding, not a distinct
+		# type from T (see Move's own docstring, TODO.txt's "incref/
+		# decref" section) - discovery.py's own parameter-construction
+		# site unwraps it, recording the fact on Parameter.is_move instead,
+		# so p.type here is the SAME real Foo class every other consumer
+		# (attribute lookup, generic inference, assignability) sees
 		mod = self._import( '''
 class Foo:
 	pass
@@ -1428,8 +1649,9 @@ def consume( x: move[Foo] ) -> None:
 		fn = mod.get_local( 'consume' )
 		fn.resolve()
 		p = fn.parameters[0]
-		self.assertIsInstance( p.type, Move )
-		self.assertIs( p.type.inner, mod.get_local( 'Foo' ))
+		self.assertIs( p.type, mod.get_local( 'Foo' ))
+		self.assertTrue( p.is_move )
+		self.assertFalse( p.is_copy )
 
 	def test_move_dedups_to_identical_object( self ) -> None:
 		mod = self._import( '''
@@ -1447,6 +1669,8 @@ def consume2( y: move[Foo] ) -> None:
 		consume.resolve()
 		consume2.resolve()
 		self.assertIs( consume.parameters[0].type, consume2.parameters[0].type )
+		self.assertTrue( consume.parameters[0].is_move )
+		self.assertTrue( consume2.parameters[0].is_move )
 
 	def test_move_multiple_args_errors( self ) -> None:
 		mod = self._import( '''
@@ -1472,7 +1696,7 @@ class CopyTypeTests( unittest.TestCase ):
 	def _import( self, code: str ) -> Module:
 		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
 
-	def test_copy_wraps_inner_type( self ) -> None:
+	def test_copy_unwraps_to_inner_type( self ) -> None:
 		mod = self._import( '''
 class Foo:
 	pass
@@ -1483,8 +1707,9 @@ def consume( x: copy[Foo] ) -> None:
 		fn = mod.get_local( 'consume' )
 		fn.resolve()
 		p = fn.parameters[0]
-		self.assertIsInstance( p.type, Copy )
-		self.assertIs( p.type.inner, mod.get_local( 'Foo' ))
+		self.assertIs( p.type, mod.get_local( 'Foo' ))
+		self.assertTrue( p.is_copy )
+		self.assertFalse( p.is_move )
 
 	def test_copy_dedups_to_identical_object( self ) -> None:
 		mod = self._import( '''
@@ -1502,6 +1727,8 @@ def consume2( y: copy[Foo] ) -> None:
 		consume.resolve()
 		consume2.resolve()
 		self.assertIs( consume.parameters[0].type, consume2.parameters[0].type )
+		self.assertTrue( consume.parameters[0].is_copy )
+		self.assertTrue( consume2.parameters[0].is_copy )
 
 	def test_copy_multiple_args_errors( self ) -> None:
 		mod = self._import( '''
@@ -1533,8 +1760,13 @@ def consume_move( x: move[Foo] ) -> None:
 		consume_move = mod.get_local( 'consume_move' )
 		consume_copy.resolve()
 		consume_move.resolve()
-		self.assertIsInstance( consume_copy.parameters[0].type, Copy )
-		self.assertIsInstance( consume_move.parameters[0].type, Move )
+		# both parameters' .type is the SAME plain Foo - ownership is now
+		# tracked via is_move/is_copy, not via distinct wrapper types
+		self.assertIs( consume_copy.parameters[0].type, consume_move.parameters[0].type )
+		self.assertTrue( consume_copy.parameters[0].is_copy )
+		self.assertFalse( consume_copy.parameters[0].is_move )
+		self.assertTrue( consume_move.parameters[0].is_move )
+		self.assertFalse( consume_move.parameters[0].is_copy )
 
 	def test_move_decorator_flag_on_function( self ) -> None:
 		mod = self._import( '''
@@ -1573,6 +1805,39 @@ class Foo:
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
 		self.assertIn( 'unsupported function decorator', self.discovery.errors.errors[0] )
+
+
+class OrReturnReservedNameTests( unittest.TestCase ):
+	''' 'or_return' is reserved for the compiler's own Result[T,E].or_return()
+	- <result_expr>.or_return() is recognized purely by AST shape (lowering.
+	py's _lower_call, before ordinary call resolution ever runs), never by
+	looking up a real declared method the way is_ok()/is_err()/unwrap()/
+	unwrap_or() genuinely are - a user-written `def or_return(...)` could
+	never actually run, at any receiver type, so it's rejected outright here
+	rather than silently accepted as dead code '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_plain_function_named_or_return_is_rejected( self ) -> None:
+		self._import( '''
+def or_return() -> i32:
+	return 1
+''' )
+		self.assertIn( "'or_return' is reserved", self.discovery.errors.errors[0] )
+
+	def test_method_named_or_return_is_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	def or_return( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( "'or_return' is reserved", self.discovery.errors.errors[0] )
 
 
 class CircularImportTests( unittest.TestCase ):
@@ -2109,6 +2374,138 @@ def get_error() -> i32:
 		self.assertNotIsInstance( fn, Overload )
 		self.assertEqual( fn.node.body[0].value.value, 1 )
 
+	@contextlib.contextmanager
+	def _private_cache_dir( self ):
+		''' redirect linker_c's has_symbol cache to a throwaway directory for
+		the duration of a test.
+
+		Load-bearing for the tests below, which write to and delete cache
+		entries: the real cache lives in one shared %TEMP%/metalpy dir that all
+		16 test shards hammer CONCURRENTLY, so a test mutating it there is both
+		flaky (its own unlink loses to another shard's open handle - observed,
+		WinError 32) and a source of flakiness for everyone else. has_symbol
+		derives its cache dir from tempfile.gettempdir() at call time, so
+		patching that is enough. '''
+		real = tempfile.gettempdir
+		private = tempfile.mkdtemp() # call BEFORE patching - mkdtemp uses gettempdir itself
+		tempfile.gettempdir = lambda: private
+		try:
+			yield Path( private ) / 'metalpy' / 'has_symbol'
+		finally:
+			tempfile.gettempdir = real
+
+	def test_cache_publish_failure_does_not_break_the_probe( self ) -> None:
+		''' failing to PUBLISH a cache entry must never fail the compile.
+
+		On Windows os.replace raises PermissionError (WinError 5) when the
+		destination is open - which a concurrent shard doing read_text() briefly
+		makes it. The first version of atomic_write_cache let that propagate,
+		turning a rare wrong answer into a rare hard crash; this is the
+		deterministic stand-in for that race. Losing the publish is harmless
+		because the cache is idempotent - every writer for a key computes the
+		same value - and the caller already holds its own correct result. '''
+		import linker_c
+		cc = linker_c.detect_cc()
+		if cc is None:
+			self.skipTest( 'no C compiler to probe with' )
+		lib, symbol = test_support.KNOWN_LIB, test_support.KNOWN_SYMBOL
+		key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
+		with self._private_cache_dir() as cache_dir:
+			real_replace = os.replace
+			def always_denied( src, dst, *a, **kw ):
+				raise PermissionError( 5, 'Access is denied' )
+			os.replace = always_denied
+			try:
+				self.assertTrue( linker_c.has_symbol( cc, lib, symbol )) # still the right answer
+			finally:
+				os.replace = real_replace
+
+			# and no .tmp litter left behind in the cache dir
+			leftovers = [ p.name for p in cache_dir.glob( f'{key}.*.tmp' ) ]
+			self.assertEqual( leftovers, [], f'stray temp files: {leftovers}' )
+
+	def test_cache_read_failure_does_not_break_the_probe( self ) -> None:
+		''' the same tolerance from the READER's side. On Windows, opening a
+		cache file fails with PermissionError while another process's
+		os.replace of it is in flight - so contention is racy in BOTH
+		directions, and an unreadable cache entry has to degrade to a re-probe
+		rather than aborting the compile. (Found the hard way: fixing only the
+		writer moved the identical failure onto this line.) '''
+		import linker_c
+		cc = linker_c.detect_cc()
+		if cc is None:
+			self.skipTest( 'no C compiler to probe with' )
+		lib, symbol = test_support.KNOWN_LIB, test_support.KNOWN_SYMBOL
+		with self._private_cache_dir():
+			linker_c.has_symbol( cc, lib, symbol ) # populate, so the read is really attempted
+
+			real_read_text = Path.read_text
+			def denied( self, *a, **kw ):
+				if 'has_symbol' in str( self ):
+					raise PermissionError( 13, 'Permission denied' )
+				return real_read_text( self, *a, **kw )
+			Path.read_text = denied
+			try:
+				self.assertTrue( linker_c.has_symbol( cc, lib, symbol )) # re-probed, still correct
+			finally:
+				Path.read_text = real_read_text
+
+	def test_torn_cache_file_is_re_probed_not_read_as_a_negative( self ) -> None:
+		''' a half-written has_symbol cache entry must be treated as a MISS,
+		not as "symbol unavailable".
+
+		Deterministic stand-in for a real, rare suite failure: the two
+		mutually-exclusive definitions below BOTH survived discovery, producing
+		an Overload where exactly one Function was expected. They are separate
+		has_symbol() calls with no in-process memo between them, so when a
+		concurrent shard rewrote the shared disk cache between the two probes,
+		one read True and the other read '' -> False, and `available != negate`
+		then admitted BOTH. tests.py runs 16 shards as concurrent subprocesses
+		over one cache dir, which is why the suite is where it showed up.
+
+		Reproduced here by emptying the cache file between the two probes
+		rather than by racing for it - same observable state, no timing luck.
+		Writes are atomic now (linker_c.atomic_write_cache), so this state can
+		only come from an older build, but the reader has to tolerate it. '''
+		import linker_c
+		cc = linker_c.detect_cc()
+		if cc is None:
+			self.skipTest( 'no C compiler to probe with' )
+		lib, symbol = test_support.KNOWN_LIB, test_support.KNOWN_SYMBOL
+		key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
+		calls = [ 0 ]
+		with self._private_cache_dir() as cache_dir:
+			cache_file = cache_dir / key
+			real_has_symbol = linker_c.has_symbol
+			def torn_between_probes( *args, **kwargs ):
+				result = real_has_symbol( *args, **kwargs )
+				# leave the cache in the exact mid-write state (exists, empty)
+				# that the next probe would observe
+				calls[0] += 1
+				if calls[0] == 1 and cache_file.is_file():
+					cache_file.write_text( '' )
+				return result
+
+			linker_c.has_symbol = torn_between_probes
+			try:
+				disco, mod = self._import( f'''
+@compiler.target( has_library = ( '{lib}', '{symbol}' ))
+def get_error() -> i32:
+	return 1
+
+@compiler.target( has_library = not ( '{lib}', '{symbol}' ))
+def get_error() -> i32:
+	return 2
+''' )
+			finally:
+				linker_c.has_symbol = real_has_symbol
+
+		self.assertGreaterEqual( calls[0], 2, 'both decorators should have probed' )
+		fn = mod.get_local( 'get_error' )
+		self.assertNotIsInstance( fn, Overload ) # the observed failure
+		self.assertIsInstance( fn, Function )
+		self.assertEqual( fn.node.body[0].value.value, 1 )
+
 	def test_malformed_value_is_a_compile_error( self ) -> None:
 		disco, mod = self._import( '''
 @compiler.target( has_library = 'kernel32' )
@@ -2395,8 +2792,8 @@ class RealLibSmokeTest( unittest.TestCase ):
 			group.implementations[1].resolve()
 		self.assertIsNone( group.implementations[1].resolve )
 		src = group.implementations[1].parameters[0]
-		self.assertIsInstance( src.type, Move )
-		self.assertIs( src.type.inner, self.builtins_mod.get_local( 'bytearray' ))
+		self.assertIs( src.type, self.builtins_mod.get_local( 'bytearray' ))
+		self.assertTrue( src.is_move )
 
 	def test_bytearray_resolves( self ) -> None:
 		ba_cls = self.builtins_mod.get_local( 'bytearray' )

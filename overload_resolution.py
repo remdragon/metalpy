@@ -103,6 +103,33 @@ def _translate_indices( member: Function, call_slots: list[int|str] ) -> tuple[i
 		return None
 	return tuple( indices )
 
+def stub_covers_call( stub: Function, call_slots: list[int|str], arg_leaves: dict[int|str,tuple[Type,...]] ) -> bool:
+	'''
+	True iff `stub`'s own declared parameter types, at every one of the
+	call's actual slots, fully accept every leaf the call supplies there -
+	i.e. this exact call could have been dispatched to `stub` on its own.
+	Used by lowering.py to decide whether a stub's more specific declared
+	return type may be used to narrow a resolved call's result type: sound
+	only when the call's own arguments are entirely within the stub's
+	declared domain, NOT merely whenever the stub happens to be bound_to
+	the resolved plain implementation (a stub is bound to exactly one
+	implementation regardless of whether any given call actually matched
+	the stub's own narrower signature or fell through to the
+	implementation's own wider one - e.g. Result[T,E].unwrap_or's
+	`default: T` stub is bound_to the plain `default: T|None = None`
+	impl, but a zero-argument call only ever matches the impl's own
+	broader signature, never the stub's).
+	'''
+	indices = _translate_indices( stub, call_slots )
+	if indices is None:
+		return False
+	params = stub.parameters or []
+	for slot, idx in zip( call_slots, indices ):
+		required = tuple( params[idx].type.leaves() )
+		if not all( _contains( required, leaf ) for leaf in arg_leaves[slot] ):
+			return False
+	return True
+
 def _build_candidates( members: list[Function], call_slots: list[int|str], targets: dict[int,Function] ) -> list[_Candidate]:
 	# targets maps id(member) -> the Function actually called for that
 	# member (bound_to for a stub, else the member itself) - a plain dict

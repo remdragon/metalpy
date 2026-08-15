@@ -12,8 +12,60 @@ from errors import CompileError, ErrorCollector
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, GeneratorType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
-	Module, _is_covered_by, _overlaps, chain_lookup,
+	Module, _is_covered_by, _overlaps, int_stem_range,
 )
+
+def _collect_reachable_returns( stmts: list[ast.stmt] ) -> list[ast.Return]:
+	''' every ast.Return reachable anywhere within `stmts` (if/for/while/
+	with/try/match bodies included), NOT descending into a nested def/
+	lambda - a nested def/lambda's own `return` belongs to IT, not to the
+	enclosing body (mirrors lowering.py's _reject_free_variables,
+	PLAN_LAMBDA.md). Shared by Discovery._is_inline_eligible_body
+	(PLAN_INLINE.md) and Discovery._is_eager_return_inferable_body
+	(PLAN_RETURN_INFERENCE.md) - both need exactly this walk, just apply a
+	different condition to the result. '''
+	returns: list[ast.Return] = []
+	class _ReturnCollector( ast.NodeVisitor ):
+		def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+			pass
+		def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+			pass
+		def visit_Lambda( self, lam: ast.Lambda ) -> None:
+			pass
+		def visit_Return( self, ret: ast.Return ) -> None:
+			returns.append( ret )
+	collector = _ReturnCollector()
+	for stmt in stmts:
+		collector.visit( stmt )
+	return returns
+
+def _find_inline_body_reserved_name_reassignment( stmts: list[ast.stmt], reserved_names: set[str] ) -> ast.Name|None:
+	''' PLAN_INLINE.md multi-statement generalization: a Store-context
+	reference to `self` or a declared parameter name anywhere within
+	`stmts`, not descending into a nested def/lambda. When such a binding
+	was passed into the splice via _lower_inline_call's own zero-overhead
+	fast path (reuse the caller's own bare Variable directly, no copy - the
+	common case for a bare-name receiver/argument), reassigning it inside
+	the spliced body would silently mutate the CALLER's own variable, not
+	a private copy - a real aliasing bug, not just an unsupported shape,
+	if left unguarded. Returns the first offending Name node, or None. '''
+	if not reserved_names:
+		return None
+	found: list[ast.Name] = []
+	class _ReassignmentFinder( ast.NodeVisitor ):
+		def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+			pass
+		def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+			pass
+		def visit_Lambda( self, lam: ast.Lambda ) -> None:
+			pass
+		def visit_Name( self, node: ast.Name ) -> None:
+			if isinstance( node.ctx, ast.Store ) and node.id in reserved_names:
+				found.append( node )
+	finder = _ReassignmentFinder()
+	for stmt in stmts:
+		finder.visit( stmt )
+	return found[0] if found else None
 
 def is_stub_body( body: list[ast.stmt] ) -> bool:
 	''' a bodyless `...`-only declaration - @overload's own stub convention,
@@ -334,14 +386,23 @@ class Discovery( ast.NodeVisitor ):
 			
 			# TODO FIXME: make active_target.bits a requirement...
 			sizeof_bits = self.active_target.get( 'bits', 64 ) // 8
-			
+			# __metalpy_wideint/__metalpy_wideuint (i128/u128's own real C
+			# type) fall back to plain 64-bit under MSVC, which has no native
+			# 128-bit integer type - has_i128 tracks whether the active
+			# target's real C compiler actually supports the full 128 bits,
+			# same target-width-dependent pattern as sizeof_bits above for
+			# isize/usize. Defaults True so callers that build Discovery
+			# without going through mpy.py's CLI (most tests) keep today's
+			# behavior unless they opt in.
+			sizeof_i128 = 16 if self.active_target.get( 'has_i128', True ) else 8
+
 			for name, sizeof in [
 				( 'isize', sizeof_bits ), ( 'usize', sizeof_bits ),
 				( 'i8', 1 ), ( 'u8', 1 ),
 				( 'i16', 2 ), ( 'u16', 2 ),
 				( 'i32', 4 ), ( 'u32', 4 ),
 				( 'i64', 8 ), ( 'u64', 8 ),
-				( 'i128', 16 ), ( 'u128', 16 ),
+				( 'i128', sizeof_i128 ), ( 'u128', sizeof_i128 ),
 			]:
 				intrinsics[name] = Scalar(
 					stem = name,
@@ -1106,7 +1167,7 @@ class Discovery( ast.NodeVisitor ):
 		if not isinstance( target, ast.Name ):
 			self.fail( f'enum member target must be a Name, not {target=} in {cls.qualname}', node )
 		key = target.id
-		value_expr = node.value
+		value_expr = compile_time_transformer.transform_expr( node.value, self.active_target, self._detect_cc )
 		if isinstance( value_expr, ast.Name ) and value_expr.id == '_':
 			value: int|None = None
 		else:
@@ -1117,6 +1178,20 @@ class Discovery( ast.NodeVisitor ):
 				self.fail( f'enum key {cls.qualname}.{key} value must be an integer, not {value_expr.value=}', node )
 		if value is None:
 			value = cls.next_auto
+		# a member's value must actually fit the enum's own underlying type's
+		# real range - catches both an explicit out-of-range value AND an
+		# auto-incremented ('_') one that overflows after enough members.
+		# Unlike lowering.py's plain-literal/CEnum-construction range checks,
+		# there's no bit-reinterpretation exemption to consider here: an enum
+		# member's value is ALWAYS a bare literal (a Call/cast expression is
+		# already rejected above, "must be '_' or an integer constant")
+		if isinstance( cls.value_type, Scalar ):
+			lo, hi = int_stem_range( cls.value_type )
+			if not ( lo <= value <= hi ):
+				self.fail(
+					f'{value} is out of range for {cls.qualname} ({lo}..{hi}): {ast.unparse(node)}',
+					node,
+				)
 		if value in cls.values:
 			self.fail(
 				f'enum {cls.qualname} has duplicated value {value!r} from both {cls.qualname}.{key} and {cls.qualname}.{cls.values[value]}',
@@ -1254,7 +1329,7 @@ class Discovery( ast.NodeVisitor ):
 		for own_name, own in class_obj.names.items():
 			if own_name == '__init__':
 				continue
-			ancestor = chain_lookup( base, own_name )
+			ancestor = base.chain_lookup( own_name )
 			if ancestor is None:
 				continue
 			if isinstance( own, Function ) and own.is_virtual and isinstance( ancestor, Function ) and ancestor.is_virtual:
@@ -1587,6 +1662,28 @@ class Discovery( ast.NodeVisitor ):
 		# NOTE: the name 'main' is special, there can be only one...
 		qualname = 'main' if node.name == 'main' else self._get_qualname( node.name )
 
+		if node.name == 'or_return':
+			# 'or_return' is reserved, compiler-implemented-only - Result[T,E]
+			# .or_return() is recognized purely by AST shape + the receiver's
+			# own type (lowering.py's _lower_call, before ordinary call
+			# resolution ever runs), never by looking up a real declared
+			# method the way is_ok()/is_err()/unwrap()/unwrap_or() genuinely
+			# are (those DO have real, callable bodies - only or_return's own
+			# "body" was ever just a spec of the intended behavior, expanded
+			# directly to OrReturn/OrJump IR instead - see _lower_or_return's
+			# own comment). A user-written `def or_return(...)` - on Result
+			# itself or on any other class - can never actually run: nothing
+			# ever resolves a real call to it, at ANY receiver type, so
+			# accepting one silently would just be dead, misleading code.
+			# Checked here unconditionally (independent of any decorator,
+			# class, or overload grouping) since the name alone is what's
+			# reserved, not any particular shape of definition.
+			self.fail(
+				f"'or_return' is reserved for the compiler's own Result[T,E].or_return() - it can't be defined as a real "
+				f'function or method: {qualname}',
+				node,
+			)
+
 		is_overload = False
 		is_static = False
 		is_classmethod = False
@@ -1649,7 +1746,7 @@ class Discovery( ast.NodeVisitor ):
 				# shape @overload stubs already use
 				self.fail( f'@abstractmethod {qualname} must have a stub body (...) - it declares a required override, not a real implementation', node )
 
-		if is_virtual and not ( isinstance( class_obj, CStruct ) and class_obj.is_interface ) and not isinstance( class_obj, RCClass ):
+		if is_virtual and not ( class_obj is not None and class_obj.has_vtable() ):
 			# @interface CStructs and ordinary RCClasses both build a real
 			# vtable now (RCClass-subclassing plan Phase 4 generalized this
 			# from CStruct-only) - CUnion/TaggedUnion/CEnum/a plain, non-
@@ -1702,9 +1799,35 @@ class Discovery( ast.NodeVisitor ):
 				self.fail( f'@inline {qualname} cannot also be @move - not supported', node )
 			if not self._is_inline_eligible_body( node.body ):
 				self.fail(
-					f'@inline {qualname} must have a body of exactly `return <expr>` '
-					f'(optionally preceded by a docstring) - not yet supported for anything else',
+					f'@inline {qualname} must have a body ending in exactly one `return <expr>` '
+					f'(optionally preceded by a docstring), with every other reachable `return` (anywhere earlier, including '
+					f'nested in if/for/while) also carrying a value - not yet supported for anything else',
 					node,
+				)
+			# multi-statement generalization: everything but the final
+			# `return <expr>` (already validated above) gets spliced as
+			# real statements at each call site - self/parameter
+			# reassignment is rejected here because leaving it unguarded
+			# would be silently WRONG (aliasing the caller's own argument),
+			# not just unsupported - see the helper's own docstring.
+			# defer/errdefer WAS rejected here too (its "runs when this
+			# function returns" contract had no real boundary to mean
+			# anything against before this pass) - no longer needed: the
+			# splice now has a well-defined local epilogue of its own (see
+			# lowering.py's _splice_multi_statement_inline_body/cfg.py's
+			# push_inline_scope), so defer/errdefer is spliced and replayed
+			# there exactly like an ordinary function's own
+			pre_return_stmts = node.body[:-1]
+			reserved_names = { a.arg for a in ( node.args.posonlyargs + node.args.args + node.args.kwonlyargs ) }
+			if class_obj is not None and not is_static and not is_classmethod:
+				reserved_names.add( 'self' )
+			reassigned = _find_inline_body_reserved_name_reassignment( pre_return_stmts, reserved_names )
+			if reassigned is not None:
+				self.fail(
+					f'@inline {qualname}: reassigning self/a parameter ({reassigned.id!r}) before the final return of a '
+					f'multi-statement body is not yet supported - it may alias the caller\'s own argument, not a private '
+					f'copy; assign it to a new local first: {ast.unparse(reassigned)}',
+					reassigned,
 				)
 
 		module = self.module_stack[-1]
@@ -1769,6 +1892,7 @@ class Discovery( ast.NodeVisitor ):
 					# runs _check_overload_ambiguity against its new siblings,
 					# the same as every other plain implementation does.
 					group.implementations.append( existing )
+					existing.overload_group = group
 					if class_obj is not None:
 						class_obj.methods.remove( existing )
 					existing.resolve = self._make_function_resolver( existing, module, class_obj, group )
@@ -1776,6 +1900,7 @@ class Discovery( ast.NodeVisitor ):
 				group.stubs.append( fn )
 			else:
 				group.implementations.append( fn )
+				fn.overload_group = group
 
 		fn.resolve = self._make_function_resolver( fn, module, class_obj, group )
 
@@ -1791,17 +1916,32 @@ class Discovery( ast.NodeVisitor ):
 		return is_stub_body( body )
 
 	def _is_inline_eligible_body( self, body: list[ast.stmt] ) -> bool:
-		''' PLAN_INLINE.md - @inline is only supported on a body that is
-		exactly one `return <expr>` statement, optionally preceded by a
-		docstring (an ast.Expr wrapping a string ast.Constant - the same
-		shape ast.get_docstring recognizes). Anything else (multiple
-		statements, a bare `return` with no value, control flow, ...) isn't
-		splice-able yet - lowering.py's _lower_inline_call relies on this
-		having already rejected everything else, it doesn't re-check '''
+		''' PLAN_INLINE.md, generalized for early/nested return: @inline
+		accepts a body (after stripping an optional leading docstring - an
+		ast.Expr wrapping a string ast.Constant, the same shape ast.
+		get_docstring recognizes) of arbitrary statements followed by
+		exactly one final, TOP-LEVEL `return <expr>` - but now, unlike the
+		original multi-statement generalization, OTHER `return <expr>`
+		statements are also allowed anywhere earlier, including nested
+		inside if/for/while (lowering.py's _splice_multi_statement_inline_
+		body/cfg.py's push_inline_scope give each splice its own local
+		early-exit target, so an early return no longer needs to be
+		rejected outright the way it once did). Every reachable return -
+		the trailing one and any earlier ones alike - must still carry a
+		value: a bare `return` has no well-defined meaning for an inline
+		function's own overall value, so it's rejected the same way the
+		trailing one always has been. The original single-`return <expr>`-
+		statement shape is the trivial special case of this (stmts ==
+		[Return]) and stays accepted unchanged - every currently-accepted
+		body stays accepted. lowering.py's _lower_inline_call relies on
+		this having already rejected everything else, it doesn't re-check. '''
 		stmts = body
 		if stmts and isinstance( stmts[0], ast.Expr ) and isinstance( stmts[0].value, ast.Constant ) and isinstance( stmts[0].value.value, str ):
 			stmts = stmts[1:]
-		return len( stmts ) == 1 and isinstance( stmts[0], ast.Return ) and stmts[0].value is not None
+		if not stmts or not isinstance( stmts[-1], ast.Return ) or stmts[-1].value is None:
+			return False
+		returns = _collect_reachable_returns( stmts )
+		return all( r.value is not None for r in returns )
 
 	def _is_eager_return_inferable_body( self, body: list[ast.stmt] ) -> bool:
 		''' return-only generic type-parameter inference (a generic
@@ -1810,28 +1950,12 @@ class Discovery( ast.NodeVisitor ):
 		OTHER type param is bound - see lowering.py's
 		_infer_return_only_type_params) is only attempted on a body with
 		EXACTLY ONE reachable `return <expr>` ANYWHERE in it (unlike
-		@inline's _is_inline_eligible_body just above, this walks the WHOLE
-		statement tree - if/for/while/with/try/match bodies included, not
-		just the top level) - this sidesteps "do all return points agree on
-		the same concrete type" entirely, since there's only ever one to
-		agree with. Multi-statement bodies with locals/branches/loops are
-		fine; multiple RETURN POINTS are not. Doesn't descend into a nested
-		def/lambda - mirrors _reject_free_variables's identical discipline
-		(PLAN_LAMBDA.md): a nested def/lambda's own `return` belongs to IT,
-		not to the enclosing generic function's own return type. '''
-		returns: list[ast.Return] = []
-		class _ReturnCollector( ast.NodeVisitor ):
-			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
-				pass
-			def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
-				pass
-			def visit_Lambda( self, lam: ast.Lambda ) -> None:
-				pass
-			def visit_Return( self, ret: ast.Return ) -> None:
-				returns.append( ret )
-		collector = _ReturnCollector()
-		for stmt in body:
-			collector.visit( stmt )
+		@inline's _is_inline_eligible_body just above, this doesn't
+		additionally require it be positionally last) - this sidesteps "do
+		all return points agree on the same concrete type" entirely, since
+		there's only ever one to agree with. Multi-statement bodies with
+		locals/branches/loops are fine; multiple RETURN POINTS are not. '''
+		returns = _collect_reachable_returns( body )
 		return len( returns ) == 1 and returns[0].value is not None
 
 	def _bind_overload_stub( self, stub: Function, group: Overload ) -> None:
@@ -1910,6 +2034,22 @@ class Discovery( ast.NodeVisitor ):
 							if arg.annotation is None:
 								self.fail( f'{fn.qualname} parameter {arg.arg!r} has no type annotation', arg )
 							param_type = self.visit( arg.annotation )
+							# move[T]/copy[T] is an ownership status on this
+							# binding, not a distinct type from T (see Move/
+							# Copy's own docstrings, TODO.txt's own "incref/
+							# decref" section) - unwrap here, at the one place
+							# a Parameter's real .type gets set, so every
+							# ordinary consumer downstream (attribute/method
+							# lookup, generic inference, assignability) sees
+							# plain T like any other binding; the ownership
+							# fact itself is recorded on is_move/is_copy
+							# instead, consulted only by the two things that
+							# actually care about it (the move(x) call-site
+							# syntax check, and the CFG's own decref bookkeeping)
+							is_move = isinstance( param_type, Move )
+							is_copy = isinstance( param_type, Copy )
+							if is_move or is_copy:
+								param_type = param_type.inner
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
 								stem = arg.arg,
@@ -1918,6 +2058,8 @@ class Discovery( ast.NodeVisitor ):
 								line = fn.line,
 								type = param_type,
 								default = default,
+								is_move = is_move,
+								is_copy = is_copy,
 								**kind,
 							)
 							parameters.append( param )

@@ -9,7 +9,7 @@ from compiler import Compiler, LoweredFunction
 from discovery import Discovery, _detect_active_target
 from errors import CompileError
 import ir
-from mpy_types import Variable, Specialization, Function, ClosureType
+from mpy_types import Variable, Specialization, Function, ClosureType, TaggedUnion
 
 logger = logging.getLogger( __name__ )
 
@@ -544,20 +544,18 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_or_return_call_expands_to_or_return_ir_at_call_site( self ) -> None:
-		# <result_expr>.or_return() is recognized at the call site and
-		# expanded directly to OrReturn - Result.or_return's own declared
-		# body (`return self.x` here) is never itself scheduled/lowered as
-		# a Call target, since it would need to return from ITS CALLER, not
-		# itself (see _lower_or_return's own comment)
+		# <result_expr>.or_return() is recognized at the call site purely by
+		# AST shape and expanded directly to OrReturn - it has no declared
+		# body at all (a user-written `def or_return(...)` is a discovery-
+		# time compile error, see discovery.py's _parse_function), since a
+		# real one would need to return from ITS CALLER, not itself (see
+		# _lower_or_return's own comment)
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
 			'@cstruct',
 			'class Result[T,E]:',
 			'	x: T',
-			'',
-			'	def or_return( self ) -> T:',
-			'		return self.x',
 			'',
 			'def get_result() -> Result[i32,MyError]:',
 			'	pass',
@@ -576,7 +574,7 @@ class Tests( unittest.TestCase ):
 			result_cls.resolve()
 		result_i32_myerror = self.discovery._get_or_create_specialization( result_cls, [ i32, myerror_cls ] )
 
-		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 14, type = i32 )
+		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 11, type = i32 )
 		t0 = ir.Temp( type = result_i32_myerror, id = 0 ) # get_result()'s Result
 		t1 = ir.Temp( type = i32, id = 1 )                # unwrapped via OrReturn
 
@@ -595,6 +593,38 @@ class Tests( unittest.TestCase ):
 		])
 		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
 
+	def test_or_return_on_bare_union_result_with_no_declared_method_still_lowers( self ) -> None:
+		# regression: a bare @union Result[T,E] with only Ok/Err members and
+		# NO explicit or_return method (matching lib/builtins's own real
+		# Result post-fix - see its own comment) used to fail to resolve
+		# .or_return() at all ("'or_return' is not callable on ..."), since
+		# the old dispatch required first finding a real declared method via
+		# ordinary attribute lookup. or_return() never needed one - it's
+		# recognized purely by AST shape plus the receiver's own type
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'def risky() -> Result[i32,MyError]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def bad() -> Result[i32,MyError]:',
+			'	tmp: i32 = risky().or_return()',
+			'	return Result.Ok( tmp )',
+		])
+		mod = self._import( code )
+		bad_fn = mod.get_local( 'bad' )
+		if bad_fn.resolve is not None:
+			bad_fn.resolve()
+		fn = self.compiler._lower( bad_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertTrue( any( isinstance( i, ir.OrReturn ) for i in fn.instructions ))
+		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
+
 	def test_or_return_outside_result_returning_function_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'class MyError: pass',
@@ -602,9 +632,6 @@ class Tests( unittest.TestCase ):
 			'@cstruct',
 			'class Result[T,E]:',
 			'	x: T',
-			'',
-			'	def or_return( self ) -> T:',
-			'		return self.x',
 			'',
 			'def get_result() -> Result[i32,MyError]:',
 			'	pass',
@@ -1976,6 +2003,49 @@ class Tests( unittest.TestCase ):
 			'',
 			'def main() -> None:',
 			'	foo( 5 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'ambiguous literal argument', self.discovery.errors.errors[0] )
+
+	def test_overload_literal_arg_magnitude_disambiguates_candidates( self ) -> None:
+		# f(300) between f(x: i8)/f(x: i32) used to be rejected as "ambiguous"
+		# purely because both are int-KIND-compatible - 300 obviously can't
+		# fit i8, so there's really only one answer
+		code = '\n'.join([
+			'def foo( x: i8 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( 300 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		i32 = self.discovery.get_intrinsics()['i32']
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.args, [ ir.Const( type = i32, value = 300 ) ] )
+
+	def test_overload_literal_arg_out_of_range_for_every_candidate_still_reports_ambiguous( self ) -> None:
+		# f(300) where NEITHER candidate can hold it (i8 max 127, u8 max 255)
+		# - magnitude narrowing eliminates every candidate, so candidate_types
+		# is left as the original, unnarrowed kind-only list and the existing
+		# "ambiguous" error is unchanged (not attempting a better message for
+		# this case - out of scope)
+		code = '\n'.join([
+			'def foo( x: i8 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: u8 ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( 300 )',
 			'	return',
 		])
 		self._import( code )
@@ -4671,6 +4741,62 @@ class Tests( unittest.TestCase ):
 		self.assertIs( target.parameters[0].type, i32 ) # substituted, not the abstract TypeVar T
 		self.assertIs( target.return_type, i32 )
 
+	def test_overload_call_with_no_argument_uses_the_impls_own_wider_return_type( self ) -> None:
+		# regression test: a real, confirmed bug in builtins.Result[T,E].
+		# unwrap_or() - calling it with NO argument (its own `default: T|
+		# None = None` fallback) resolved to the STUB's `-> T` return type
+		# instead of the plain implementation's own wider `-> T|None`,
+		# because _lower_call's _resolve_original narrowed the return type
+		# to whatever stub happened to be bound_to the winning
+		# implementation, unconditionally - regardless of whether THIS
+		# call's own arguments actually matched the stub's narrower
+		# signature. A stub is bound_to its implementation as a static,
+		# always-true fact (`default: T` binds to `default: T|None = None`
+		# here), but a zero-argument call can only ever satisfy the
+		# IMPLEMENTATION's own broader signature - the stub itself requires
+		# `default`, so a call passing none of it can never match the
+		# stub's own domain at all (see overload_resolution.py's own
+		# _translate_indices). Fixed via overload_resolution.
+		# stub_covers_call, which re-checks the call's real argument types
+		# against the stub before narrowing - a one-argument call (which
+		# DOES match the stub) still correctly narrows to T, covered by
+		# this same file's test_overload_call_on_generic_class_
+		# specialization_substitutes_class_type_params just above.
+		code = '\n'.join([
+			'@union',
+			'class Box[T]:',
+			'	Some: T',
+			'',
+			'	@overload',
+			'	def get_or( self, default: T ) -> T:',
+			'		...',
+			'	def get_or( self, default: T|None = None ) -> T|None:',
+			'		return default',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box.Some( 5 )',
+			'	w = b.get_or()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'get_or' ]
+		self.assertEqual( len( calls ), 1 )
+		target = calls[0].target
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		self.assertIsInstance( target.return_type, TaggedUnion ) # T|None, NOT narrowed down to bare T
+		leaf_types = [ attr.type for attr in target.return_type.attributes ]
+		self.assertEqual( len( leaf_types ), 2 )
+		self.assertTrue( any( t is i32 for t in leaf_types ))
+		self.assertTrue( any( t is none_type for t in leaf_types ))
+		# the call site's own omitted `default` argument must still be
+		# filled in with the impl's own None default - a separate gap this
+		# same fix closes (the Overload dispatch path never filled in
+		# defaults for parameters the call site didn't supply at all,
+		# unlike the plain, non-Overload call path's _lower_call_args)
+		self.assertIn( 'default', calls[0].kwargs )
+
 	# --- defer/errdefer --------------------------------------------------------
 
 	def test_defer_rejected_inside_a_for_loop( self ) -> None:
@@ -5880,6 +6006,30 @@ class Tests( unittest.TestCase ):
 		compiler64._lower( discovery64.main )
 		self.assertEqual( discovery64.errors.errors, [] )
 
+	def test_i128_range_uses_active_target_has_i128_not_hardcoded_true( self ) -> None:
+		# a value needing >64-bit magnitude is a valid i128/u128 literal under
+		# a real 128-bit __metalpy_wideint/__metalpy_wideuint (has_i128=True,
+		# clang/gcc), but out of range under MSVC's 64-bit wideint/wideuint
+		# fallback (has_i128=False) - confirms get_intrinsics() derives i128/
+		# u128's own .sizeof from active_target['has_i128'], not a fixed 16
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: u128 = 18446744073709551616', # 2**64, needs 65 bits
+		])
+		target_no_i128 = dict( _detect_active_target(), has_i128 = False )
+		discovery_no_i128 = Discovery( import_builtins = False, active_target = target_no_i128 )
+		compiler_no_i128 = Compiler( discovery_no_i128 )
+		compiler_no_i128.import_code( code, filename = Path( '__test__.py' ))
+		compiler_no_i128._lower( discovery_no_i128.main )
+		self.assertIn( 'is out of range for intrinsics.u128', discovery_no_i128.errors.errors[0] )
+
+		target_i128 = dict( _detect_active_target(), has_i128 = True )
+		discovery_i128 = Discovery( import_builtins = False, active_target = target_i128 )
+		compiler_i128 = Compiler( discovery_i128 )
+		compiler_i128.import_code( code, filename = Path( '__test__.py' ))
+		compiler_i128._lower( discovery_i128.main )
+		self.assertEqual( discovery_i128.errors.errors, [] )
+
 	def test_cenum_construction_out_of_range_fails( self ) -> None:
 		code = '\n'.join([
 			'@enum( u8 )',
@@ -5892,6 +6042,87 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		self._lower_main()
 		self.assertIn( '300 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_declaration_out_of_range_fails( self ) -> None:
+		# distinct from test_cenum_construction_out_of_range_fails above - this
+		# is the ENUM'S OWN member declaration (discovery.py's
+		# _register_enum_member), a completely separate mechanism from a
+		# construction call (lowering.py's _try_lower_construct_call)
+		code = '\n'.join([
+			'@enum( u8 )',
+			'class MyError:',
+			'	Bad = 300',
+			'	Ok = 0',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '300 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_declaration_boundary_values( self ) -> None:
+		# i8's own MIN needs a negative literal (-128) - _register_enum_member
+		# now folds node.value through compile_time_transformer.transform_expr
+		# before checking for ast.Constant, so UnaryOp(USub, Constant(128))
+		# collapses to Constant(-128) same as it already would in a function
+		# body
+		code = '\n'.join([
+			'@enum( i8 )',
+			'class MyError:',
+			'	Lo = -128',
+			'	Hi = 127',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_cenum_member_declaration_out_of_range_by_one_fails( self ) -> None:
+		code = '\n'.join([
+			'@enum( i8 )',
+			'class MyError:',
+			'	Bad = 128',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '128 is out of range for __test__.MyError (-128..127)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_declaration_negative_out_of_range_fails( self ) -> None:
+		code = '\n'.join([
+			'@enum( i8 )',
+			'class MyError:',
+			'	Bad = -129',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '-129 is out of range for __test__.MyError (-128..127)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_auto_increment_overflow_fails( self ) -> None:
+		# the '_' auto-increment sentinel can ALSO overflow the underlying
+		# type's range after enough members - A=254, B='_' auto-fills 255
+		# (still in range), C='_' auto-fills 256 (out of range for u8)
+		code = '\n'.join([
+			'@enum( u8 )',
+			'class MyError:',
+			'	A = 254',
+			'	B = _',
+			'	C = _',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '256 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
 
 	def test_non_literal_cast_default_check_mode( self ) -> None:
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
@@ -6406,6 +6637,20 @@ class InlineTests( unittest.TestCase ):
 	def _ir_repr( self, fn: LoweredFunction ) -> list[str]:
 		return [ op.test_repr() for op in fn.instructions ]
 
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target, and sys.exit() whenever no_crt (see
+	# Compiler.force_reachable's own comment) - real but incidental to what
+	# these tests check, and absent entirely on non-Windows targets (or on
+	# CRT-linked Windows targets, for sys.exit specifically), so exact-set
+	# assertions filter them back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({
+		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
+		'sys.exit', 'windows.kernel32.ExitProcess',
+	})
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
+
 	def test_inline_method_call_compiles_identically_to_calling_the_body_directly( self ) -> None:
 		# @inline def get_len(self): return self.__len__() called as
 		# b.get_len() must produce the SAME instruction shape as writing
@@ -6492,7 +6737,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 		main_fn = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
@@ -6519,7 +6764,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 
 	def test_inline_receiver_with_side_effect_evaluated_once( self ) -> None:
@@ -6643,6 +6888,367 @@ class InlineTests( unittest.TestCase ):
 		self.assertIn( 'Cmp', kinds )
 		qualnames = { lf.function.qualname for lf in self.compiler.functions }
 		self.assertNotIn( '__test__.Result.is_ok[intrinsics.i32,__test__.MyError]', qualnames )
+
+# --- multi-statement @inline bodies (generalization of PLAN_INLINE.md) -------
+
+class InlineMultiStatementTests( unittest.TestCase ):
+	''' @inline generalized to accept locals/if/for/while before a single,
+	final, un-nested `return <expr>` - see _splice_multi_statement_inline_
+	body. import_builtins=False, same as InlineTests. '''
+	maxDiff = None
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ) -> LoweredFunction:
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		return fn
+
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target, and sys.exit() whenever no_crt (see
+	# Compiler.force_reachable's own comment) - real but incidental to what
+	# these tests check, and absent entirely on non-Windows targets (or on
+	# CRT-linked Windows targets, for sys.exit specifically), so exact-set
+	# assertions filter them back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({
+		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
+		'sys.exit', 'windows.kernel32.ExitProcess',
+	})
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
+
+	def test_multistatement_body_emits_no_call_funcstart_funcend_for_target( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return w.doubled()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'Call', kinds ) # doubled() itself never becomes a real call
+		self.assertIn( 'GetAttr', kinds ) # ...just self.y spliced directly
+		# the alpha-renamed local must be a real, uniquely-named Variable,
+		# not the callee's own literal 'tmp'
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) ]
+		self.assertTrue( any( a.dest.stem.startswith( '$inline' ) and 'tmp' in a.dest.stem for a in assigns ) )
+
+	def test_caller_local_with_same_name_as_inline_local_not_corrupted( self ) -> None:
+		# Hazard 1 regression: without alpha-renaming + the provisional-
+		# Function fix, the inlined body's own `tmp` would silently
+		# overwrite main's OWN `tmp` in the shared names dict
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	tmp: usize = 100',
+			'	result: usize = w.doubled()',
+			'	with compiler.wrap_arithmetic:',
+			'		return tmp + result',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = { i.dest.qualname for i in fn.instructions if hasattr( i, 'dest' ) and isinstance( getattr( i, 'dest', None ), Variable ) }
+		self.assertIn( 'main.tmp', qualnames )
+		# main's own `tmp` must still be the operand referenced by the
+		# final AddWrap - not silently replaced by the inlined one
+		add = next( i for i in fn.instructions if type( i ).__name__ == 'AddWrap' )
+		self.assertEqual( add.left.qualname, 'main.tmp' )
+
+	def test_reassigning_own_local_reuses_the_same_variable( self ) -> None:
+		# Hazard 2 regression: a SECOND assignment to an already-alpha-
+		# renamed local must find and replace the FIRST binding (one
+		# decref-then-replace), not silently create a second, independent
+		# Variable under the same stem (a leak - cfg.py's own fresh-vs-
+		# replace machinery depends on finding the SAME Variable object
+		# both times)
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def other( self ) -> usize:',
+			'		return self.y',
+			'	@inline',
+			'	def pick( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		tmp = self.other()',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return w.pick()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'tmp' in i.dest.stem ]
+		self.assertEqual( len( assigns ), 2 )
+		self.assertIs( assigns[0].dest, assigns[1].dest ) # SAME Variable object, not two independent bindings
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Widget.other' ] )
+
+	def test_spliced_if_nests_inside_callers_own_if( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		if tmp == 0:',
+			'			tmp = 1',
+			'		return tmp',
+			'',
+			'def main( w: Widget, flag: bool ) -> usize:',
+			'	if flag:',
+			'		return w.doubled()',
+			'	return 0',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_match_statement_in_pre_return_statement( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Choice:',
+			'	A: i32',
+			'	B: usize',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	c: Choice',
+			'	@inline',
+			'	def resolve_choice( self ) -> i32:',
+			'		result: i32 = 0',
+			'		match self.c:',
+			'			case Choice.A( x ):',
+			'				result = x',
+			'			case Choice.B( y ):',
+			'				result = 1',
+			'		return result',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	return w.resolve_choice()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'Call', kinds ) # resolve_choice() itself never becomes a real call
+
+	def test_or_return_in_pre_return_statement_now_works( self ) -> None:
+		# early/nested-return + defer/errdefer/.or_return() generalization -
+		# a pre-return statement's own .or_return() early exit now jumps to
+		# the SPLICE's own local epilogue (cfg.py's push_inline_scope/
+		# current_epilogue_label), never the caller's real one. This is the
+		# exact regression the user specifically flagged as "notably
+		# important": .or_return() from inside an @inline must NOT trigger
+		# a return from the calling function - only jump to the end of the
+		# spliced/embedded scope, letting the caller's OWN subsequent code
+		# still run. Result is a bare @union with no declared or_return
+		# method (matching lib/builtins's own real shape - or_return() is
+		# recognized structurally, never a real method - see discovery.py's
+		# reserved-name rejection)
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'	def is_err( self ) -> bool:',
+			'		return self.tag == 1',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	def risky( self ) -> Result[usize,MyError]:',
+			'		return Result.Ok( 1 )',
+			'	@inline',
+			'	def bad( self ) -> Result[usize,MyError]:',
+			'		tmp: usize = self.risky().or_return()',
+			'		return Result.Ok( tmp )',
+			'',
+			'def main( w: Widget ) -> Result[usize,MyError]:',
+			'	if w.bad().is_err():',
+			'		pass',
+			'	return Result.Ok( 5 )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one OrJump (bad()'s own risky().or_return()), and its
+		# target is a real, declared label local to the splice
+		or_jumps = [ i for i in fn.instructions if isinstance( i, ir.OrJump ) ]
+		self.assertEqual( len( or_jumps ), 1 )
+		labels = { i.name for i in fn.instructions if isinstance( i, ir.Label ) }
+		self.assertIn( or_jumps[0].target, labels ) # a real, declared label - not a dangling reference
+		# the decisive check: main() must still have exactly ONE real
+		# ir.Return and ONE ir.FuncEnd - bad()'s own internal early exit
+		# must never produce a SEPARATE return/funcend for the CALLER, and
+		# main's own trailing `return Result.Ok( 5 )` must be the only one
+		returns = [ i for i in fn.instructions if isinstance( i, ir.Return ) ]
+		func_ends = [ i for i in fn.instructions if isinstance( i, ir.FuncEnd ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( len( func_ends ), 1 )
+		self.assertIs( fn.instructions[-1], func_ends[0] ) # main's own real end, not cut short mid-body
+
+	def test_early_return_nested_in_if_jumps_to_local_scope_not_caller( self ) -> None:
+		# early/nested-return generalization - a `return` nested inside a
+		# spliced if must land at a label local to the splice, not the
+		# caller's own shared epilogue label, and must never produce a real
+		# ir.Return/ir.FuncEnd mid-body (those belong to the caller alone)
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	@inline',
+			'	def clamped( self ) -> i32:',
+			'		if self.y < 0:',
+			'			return 0',
+			'		return self.y',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	x: i32 = w.clamped()',
+			'	y: i32 = x',
+			'	return y',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one real ir.Return (main's own trailing `return y`) -
+		# clamped()'s own internal early `return 0` must never produce a
+		# SECOND one - and it's the second-to-last instruction, immediately
+		# before ir.FuncEnd, not buried mid-body ahead of dead code
+		returns = [ i for i in fn.instructions if isinstance( i, ir.Return ) ]
+		func_ends = [ i for i in fn.instructions if isinstance( i, ir.FuncEnd ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( len( func_ends ), 1 )
+		self.assertIs( fn.instructions[-1], func_ends[0] )
+		self.assertIs( fn.instructions[-2], returns[0] )
+		# main's own trailing statement (x + 1) must actually be reachable/
+		# present - not skipped by clamped()'s own internal early return
+		self.assertTrue( any(
+			isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'x' in i.dest.stem
+			for i in fn.instructions
+		))
+
+	def test_defer_in_spliced_body_replayed_once_at_splice_ladder( self ) -> None:
+		# defer/errdefer generalization - a defer registered inside a
+		# spliced body's own pre-return statements is now allowed, and must
+		# be replayed exactly once, at the splice's own local ladder - not
+		# at the caller's real epilogue, and not duplicated between an
+		# early exit and the normal fallthrough path
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	@inline',
+			'	def traced( self ) -> i32:',
+			'		result: i32 = self.y',
+			'		with defer:',
+			'			result = result',
+			'		return result',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	return w.traced()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one defer flag armed (Const True Assign into a
+		# $defer_flag-named Variable), matching exactly one defer statement
+		flag_arms = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'defer_flag' in i.dest.stem
+			and isinstance( i.src, ir.Const ) and i.src.value is True
+		]
+		self.assertEqual( len( flag_arms ), 1 )
+
+	def test_direct_recursion_in_pre_return_statement_rejected( self ) -> None:
+		code = '\n'.join([
+			'@inline',
+			'def foo( x: i32 ) -> i32:',
+			'	tmp: i32 = foo( x )',
+			'	return tmp',
+			'',
+			'def main() -> i32:',
+			'	return foo( 1 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'recursive inlining' in e for e in self.discovery.errors.errors ))
+
+	def test_generic_multistatement_inline_splices_bare_call( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def get( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def wrap[T]( t: T ) -> usize:',
+			'	tmp: usize = t.get()',
+			'	return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return wrap( w )',
+		])
+		self._import( code )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = self._function_qualnames()
+		self.assertEqual( qualnames, { 'main', '__test__.Widget.get' } ) # never a real wrap[Widget] function
+
+	def test_multistatement_inline_with_return_only_type_param( self ) -> None:
+		# composes with PLAN_RETURN_INFERENCE.md - R is inferred from the
+		# body's own final return, even though R never appears in any
+		# parameter, and the body is multi-statement
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def get( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def wrap[T,R]( t: T ) -> R:',
+			'	tmp = t.get()',
+			'	return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return wrap( w )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# t.get() is a real (non-@inline) method - a real Call to it is
+		# expected; wrap() ITSELF must never become one
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Widget.get' ] )
+		self.assertEqual( fn.function.return_type.stem, 'usize' )
 
 # --- return-only generic type-parameter inference (PLAN_RETURN_INFERENCE.md) -
 
@@ -7240,6 +7846,117 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 			self.discovery.errors.errors,
 		)
 
+	def test_float_format_spec_dispatches_to_fixed_digits_and_sign_prefix( self ) -> None:
+		# f"{x:.1f}" (f64) - dispatches to lib/builtins/__float.py's own
+		# _fixed_digits/_sign_prefix (Scalar-registered methods, not
+		# __str__/__repr__ - a format spec formats the operand's own type
+		# directly, matching Python's format(x, spec) == type(x).
+		# __format__(x, spec) semantics, same as int's own dispatch)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.1f}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_fixed_digits' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+		self.assertEqual( self._calls_to( fn, '__str__' ), [] )
+
+	def test_float_format_spec_exponential_dispatches_to_fixed_digits( self ) -> None:
+		# f"{x:.2e}" - dispatches through the same _fixed_digits as 'f'/'F',
+		# just with a different type_char argument (PLAN_STR_FORMAT.md item 4)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2e}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_fixed_digits' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_float_format_spec_percent_dispatches_to_percent_digits( self ) -> None:
+		# f"{x:.2%}" - '%' has no printf equivalent, so it goes through its
+		# own dedicated _percent_digits (lib/builtins/__float.py) instead of
+		# _fixed_digits - the *100 scaling + 'f' + '%' suffix all happen
+		# there, not here
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2%}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_percent_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_float_format_spec_none_type_with_precision_dispatches_to_none_type_digits( self ) -> None:
+		# f"{x:.2}" - a literal spec with a precision but no type char at
+		# all goes through its own dedicated _none_type_digits (lib/
+		# builtins/__float.py, real Python's own "None" presentation type -
+		# closer to 'g' than 'f', see its own comment), not the plain
+		# _fixed_digits('f') fallback f"{x:.2f}" itself would dispatch to
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_none_type_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_percent_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_bare_float_interpolation_dispatches_to_str_dunder( self ) -> None:
+		# f"{x}" with NO format spec at all (not even an empty ":") never
+		# reaches _lower_float_format_spec - parsed_spec is None, so this
+		# takes the plain __str__/__repr__ dispatch path (same as str/int),
+		# which f64/f32 now have real implementations of (the shortest-
+		# round-trip repr algorithm, PLAN_STR_FORMAT.md item 4's own later
+		# writeup) instead of failing to compile. The dispatched Call's own
+		# target.qualname is the underlying def's real name (_f64_str, from
+		# `f64.__str__ = _f64_str`'s registration, lib/builtins/__float.py)
+		# - NOT the literal string '__str__', which is only ever a KEY in
+		# f64.names, never the Function's own identity.
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_f64_str' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_none_type_digits' ), [] )
+
+	def test_float_format_spec_no_type_no_precision_dispatches_to_repr_digits( self ) -> None:
+		# f"{x:10}" - an explicit spec (width only, no type char, no
+		# precision) DOES reach _lower_float_format_spec, which routes this
+		# exact combination to _repr_digits (same underlying shortest-
+		# round-trip algorithm bare f"{x}" uses, just padded afterward) -
+		# distinct from both _fixed_digits (needs a type char or precision)
+		# and _none_type_digits (needs a precision)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:10}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_repr_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_none_type_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_invalid_float_type_char_is_a_compile_error( self ) -> None:
+		# f"{x:x}" - 'x' is a valid int type char but not a float one
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:x}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( "'x' is not valid for float" in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
 	def test_int_type_char_on_str_is_a_compile_error( self ) -> None:
 		# f"{s:x}" - 'x' parses fine but validate_str_spec rejects any
 		# type char other than 's'/None for a str operand
@@ -7312,19 +8029,25 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
 
 	def test_literal_int_format_spec_decimal_dispatches_to_sign_and_digits( self ) -> None:
-		# f"{n:05d}" - decimal path: _decimal_digits_with_grouping (empty
-		# separator) + _sign_prefix, then zero-pad via _pad_after_prefix
-		# (the '=' align implied by the '0' shorthand) rather than a
-		# generic ljust/rjust/center call
+		# f"{n:05d}" - decimal path: _decimal_digits (raw, ungrouped) +
+		# _sign_prefix, then grouping-aware zero-pad via
+		# _pad_and_group_after_prefix (the '=' align implied by the '0'
+		# shorthand) rather than a generic ljust/rjust/center call or the
+		# plain (non-grouping-aware) _pad_after_prefix - see str._pad_and_
+		# group_after_prefix's own comment on why the zero-pad path needs
+		# raw digits and grouping-aware padding, not pre-grouped digits
+		# plus a naive rjust (PLAN_STR_FORMAT.md item 4's own bugfix note)
 		self._import( '\n'.join([
 			'def main( n: int ) -> str:',
 			'	return f"{n:05d}"',
 		]))
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		self.assertEqual( len( self._calls_to( fn, '_decimal_digits_with_grouping' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_decimal_digits' )), 1 )
 		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
-		self.assertEqual( len( self._calls_to( fn, '_pad_after_prefix' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_pad_and_group_after_prefix' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
+		self.assertEqual( self._calls_to( fn, '_pad_after_prefix' ), [] )
 		self.assertEqual( self._calls_to( fn, '_to_radix_digits' ), [] )
 
 	def test_literal_int_format_spec_hex_dispatches_to_radix_digits( self ) -> None:
@@ -7600,6 +8323,622 @@ class AssignabilityCheckTests( unittest.TestCase ):
 			'	p: ConstPtr[u8] = compiler.addrof( x )',
 		]))
 		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
+
+
+class WalrusOperatorTests( unittest.TestCase ):
+	''' _expr_NamedExpr (ast.NamedExpr, `x := expr`) - PLAN_POSIX_FEATURE.md's
+	scope. Mirrors _stmt_Assign's own two ast.Name-target branches, but
+	returns the operand as this expression's own value. All locals here are
+	function-scoped unconditionally (not block-scoped), so a walrus binding
+	made inside an if/while condition is expected to stay visible in code
+	textually after it, same as an ordinary preceding assignment would be -
+	these tests confirm that isn't just true by inspection, but actually
+	holds once real CFG/binding machinery runs. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def test_binding_visible_after_the_if_statement( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	if ( x := f() ) != 5:',
+			'		return 1',
+			'	if x != 5:',
+			'		return 2',
+			'	return 0',
+		]))
+		# two real reads of the SAME walrus-bound Variable - one inside the
+		# if's own condition, one textually after the if - not two
+		# different bindings that happen to share a name
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem == 'x' ]
+		self.assertEqual( len( assigns ), 1 )
+
+	def test_binding_reused_later_in_the_same_function( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	x: i32 = 0',
+			'	if ( x := f() ) != 5:',
+			'		return 1',
+			'	y: i32 = 0',
+			'	with compiler.wrap_arithmetic:',
+			'		y = x + 1',
+			'	if y != 6:',
+			'		return 2',
+			'	return 0',
+		]))
+		self.assertTrue( any( isinstance( i, ir.Assign ) and i.dest.stem == 'x' for i in fn.instructions ) )
+
+	def test_nested_walrus_inside_boolean_expression( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	if ( a := f() ) != 5 and ( b := f() ) != 6:',
+			'		return 1',
+			'	if a != 5 or b != 6:',
+			'		return 2',
+			'	return 0',
+		]))
+		names = { i.dest.stem for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) }
+		self.assertIn( 'a', names )
+		self.assertIn( 'b', names )
+
+	def test_walrus_rebinding_an_existing_name( self ) -> None:
+		# the reassignment branch (existing = discovery.find_name_or_none(...)
+		# is not None) - unlike a fresh declaration, must reuse the SAME
+		# Variable object, not create a second one under the same stem
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 1',
+			'	if ( x := 2 ) != 2:',
+			'		return 1',
+			'	if x != 2:',
+			'		return 2',
+			'	return 0',
+		]))
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem == 'x' ]
+		self.assertEqual( len( assigns ), 2 ) # the initial x: i32 = 1, then the walrus rebind
+		self.assertIs( assigns[0].dest, assigns[1].dest )
+
+
+class ListLiteralTests( unittest.TestCase ):
+	''' _expr_List (ast.List, `[a, b, c]`) - PLAN_POSIX_FEATURE.md's follow-up
+	scope (found while unblocking utf8.names()'s own list-literal return).
+	Requires expected_type to already be a concrete list[T] Specialization -
+	no element-driven inference. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def _assert_rejected( self, code: str, needle: str ) -> None:
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( needle in e for e in self.discovery.errors.errors ),
+			f'expected an error containing {needle!r}, got: {self.discovery.errors.errors}',
+		)
+
+	def test_construction_and_append_shape( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			"	x: list[str] = [ 'a', 'b' ]",
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		append_calls = [ c for c in calls if c.target.stem == 'append' ]
+		self.assertEqual( len( append_calls ), 2 )
+		# both append calls target the SAME constructed list instance
+		self.assertIs( append_calls[0].receiver, append_calls[1].receiver )
+		unwrap_calls = [ c for c in calls if c.target.stem == 'unwrap' ]
+		self.assertEqual( len( unwrap_calls ), 2 )
+		# unwrap()'s own return value (None) is never assigned to a dest -
+		# only its side effect (panic on Err) matters
+		self.assertTrue( all( c.dest is None for c in unwrap_calls ) )
+
+	def test_empty_list_literal_is_construction_only( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	x: list[i32] = []',
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertFalse( any( c.target.stem == 'append' for c in calls ) )
+
+	def test_wrong_element_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x: list[str] = [ 'a', 5 ]",
+			'	return',
+		]), needle = 'expected' )
+
+	def test_no_expected_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x = [ 'a', 'b' ]",
+			'	return',
+		]), needle = 'list literal needs a known list[T] target type' )
+
+
+class MoveParameterTests( unittest.TestCase ):
+	''' move[T] is an ownership status on a binding, not a distinct type
+	from T (Parameter.is_move/is_copy, not a Move/Copy-wrapped .type -
+	discovery.py's own parameter-construction site unwraps it). Before this
+	fix, NO property of a move[T]-typed parameter could be read at all
+	inside the function that owns it - confirmed via lib/builtins/
+	__init__.py's own real bytes.from_bytearray/str.from_cstr, both of
+	which read len(src) before consuming src via .release(). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def test_generic_len_call_on_move_parameter( self ) -> None:
+		# the exact reported shape: len[T](t: T) is an ORDINARY (non-move)
+		# generic free function - a move[bytearray]-typed argument flowing
+		# into its plain T parameter must infer T as the unwrapped
+		# bytearray, not the wrapped ownership annotation
+		self._assert_accepted( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	n: usize = len( src )',
+			'	return n',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+
+	def test_direct_method_call_on_move_parameter( self ) -> None:
+		# bypasses the generic len() entirely - an ordinary, direct method
+		# call on a move[T]-typed parameter must resolve through the same
+		# attribute lookup any other binding's method call would
+		self._assert_accepted( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	return src.__len__()',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+
+	def test_move_parameter_type_is_unwrapped( self ) -> None:
+		mod = self._import( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	return src.__len__()',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+		consume = mod.get_local( 'consume' )
+		consume.resolve()
+		src_param = consume.parameters[0]
+		self.assertTrue( src_param.is_move )
+		self.assertFalse( src_param.is_copy )
+		self.assertEqual( src_param.type.qualname, 'builtins.bytearray' )
+
+	def test_receiver_not_double_decreffed_after_move_method_call( self ) -> None:
+		# @move on a METHOD (bytearray.release()'s own real shape) means
+		# calling it consumes/invalidates self - before this fix, nothing
+		# transitioned the CALLER's own ownership state for the RECEIVER,
+		# so a real Decref still got emitted for b at scope exit on top of
+		# release()'s own internal cleanup (a genuine double-free,
+		# confirmed via a real intermittent ~10-15% test-suite flake).
+		# cfg.py's own move() (already used by _apply_move_hook for move[T]
+		# ARGUMENTS) cancels the receiver's own pending epilogue Decref -
+		# note this does NOT reject reading b again afterward (confirmed:
+		# neither does the pre-existing move[T]-argument mechanism this
+		# mirrors) - it only stops the double teardown, which is exactly
+		# the bug being fixed here.
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			'	b: bytearray = bytearray( 5 )',
+			'	match b.release():',
+			'		case Result.Ok( ptr ):',
+			'			return 0',
+			'		case Result.Err( _ ):',
+			'			return 1',
+		]))
+		decrefs_on_b = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Decref ) and getattr( i.value, 'stem', None ) == 'b'
+		]
+		self.assertEqual( decrefs_on_b, [] )
+
+
+class DefaultValueModuleContextTests( unittest.TestCase ):
+	''' _lower_call_args' own default-value-lowering loop (the branch that
+	fills in a parameter the CALLER omitted) used to lower param.default
+	with whatever module/scope context happened to be active - the
+	CALLER's own, since that's what's active while lowering the caller's
+	body - instead of pushing the callee's own module/scope first, unlike
+	every other default-lowering site in this file (field defaults,
+	@inline splicing). A default value that references a name private to
+	the callee's own module (module-scoped, never imported by the caller)
+	would then fail to resolve AT ALL under the caller's own context - not
+	just a misattributed error location, a genuine false compile failure
+	(confirmed via a real repro: lib/posix/time.py's own default-driven
+	'utf8' is not a value, the real bug turned out to be lib/posix/fs.py's
+	own default value). '''
+
+	def test_default_value_referencing_a_callee_module_private_name( self ) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( '\n'.join([
+				'SPECIAL: i32 = 5', # never imported by __main__.py below -
+				# only resolvable if the default is lowered in a.py's own
+				# module context, not __main__.py's
+				'def f( x: i32 = SPECIAL ) -> i32:',
+				'	return x',
+			]), encoding = 'utf-8' )
+			( root / '__main__.py' ).write_text( '\n'.join([
+				'from a import f',
+				'def main() -> i32:',
+				'	return f()', # x omitted - forces the default to be lowered
+			]), encoding = 'utf-8' )
+			discovery = Discovery( paths = [ root ], import_builtins = False )
+			compiler = Compiler( discovery )
+			compiler.import_file( root / '__main__.py' )
+			compiler.run()
+			self.assertEqual( discovery.errors.errors, [] )
+
+	def test_default_value_error_is_located_in_the_callee_module_not_the_caller( self ) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( '\n'.join([
+				'def f( x: i32 = undefined_name ) -> i32:',
+				'	return x',
+			]), encoding = 'utf-8' )
+			( root / '__main__.py' ).write_text( '\n'.join([
+				'from a import f',
+				'def main() -> i32:',
+				'	return f()',
+			]), encoding = 'utf-8' )
+			discovery = Discovery( paths = [ root ], import_builtins = False )
+			compiler = Compiler( discovery )
+			compiler.import_file( root / '__main__.py' )
+			compiler.run()
+			self.assertEqual( len( discovery.errors.errors ), 1 )
+			# located in a.py (where `undefined_name` was actually written),
+			# not __main__.py (which merely calls f() with x omitted)
+			self.assertIn( 'a.py', discovery.errors.errors[0] )
+			self.assertNotIn( '__main__.py', discovery.errors.errors[0] )
+
+
+class OverloadMoveResolutionTests( unittest.TestCase ):
+	''' move(...) sugar used to only be recognized once a single concrete
+	Function target was already chosen (_check_move_argument, reachable
+	from _match_call_args) - never for an Overload group, since
+	_lower_overload_arg fell through to ordinary name resolution instead,
+	where `move` isn't a real registered name anywhere ("name 'move' is
+	not defined": confirmed via str.from_cstr(move(b)), which has both a
+	(ConstPtr[u8], usize) and a move[bytearray] overload). Fixed in
+	_lower_call's own Overload branch: move(...) is peeled before
+	candidate type-matching (so the peeled argument's plain type, e.g.
+	bytearray, can match the move[bytearray] candidate), then - once
+	resolve_call settles on a single concrete winner - validated against
+	that winner's own is_move-ness and the real ownership-transfer hook
+	(_apply_move_hook, i.e. cfg.move()) is applied, mirroring what
+	_lower_call_args already does for a plain, non-overloaded target.
+	IR-level (not real-compile) coverage: a real compile-and-run test
+	against str.from_cstr specifically is blocked by a separate, general,
+	pre-existing bug this investigation also found - two overload
+	candidates that both need real C bodies in the same program collide on
+	an identical mangled C symbol name (emitter_c.py never disambiguates
+	between candidates sharing one qualname) - tracked separately, not
+	this fix's own scope. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_move_call_dispatches_to_the_move_parameter_overload_and_transfers_ownership( self ) -> None:
+		code = '\n'.join([
+			'@overload',
+			'def make( n: i32 ) -> usize:',
+			'	...',
+			'',
+			'def make( n: i32 = 0 ) -> usize:',
+			'	return usize( n )',
+			'',
+			'def make( src: move[bytearray] ) -> usize:',
+			'	return len( src )',
+			'',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return make( move( b ))',
+		])
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and i.target.stem == 'make' ]
+		self.assertEqual( len( calls ), 1 )
+		# dispatched to the move[bytearray] overload, not the i32 default one
+		winner = calls[0].target
+		self.assertEqual( len( winner.parameters ), 1 )
+		self.assertTrue( winner.parameters[0].is_move )
+		self.assertEqual( winner.parameters[0].type.qualname, 'builtins.bytearray' )
+
+		# b's own ownership actually transferred (_apply_move_hook ran) -
+		# no spurious Decref of b left over at its own scope exit on top
+		# of whatever the callee itself does with it (the exact double-
+		# free shape this same investigation already found and fixed once
+		# for the plain, non-overloaded call path)
+		decrefs_on_b = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Decref ) and getattr( i.value, 'stem', None ) == 'b'
+		]
+		self.assertEqual( decrefs_on_b, [] )
+
+	def test_move_call_against_a_non_move_overload_candidate_is_a_compile_error( self ) -> None:
+		# the mirror-image validation _check_move_argument already does for
+		# a plain (non-overloaded) target - move(...) wrapping an argument
+		# whose resolved candidate ISN'T move[T] must still be rejected,
+		# not silently accepted
+		code = '\n'.join([
+			'@overload',
+			'def make( n: i32 ) -> usize:',
+			'	...',
+			'',
+			'def make( n: i32 = 0 ) -> usize:',
+			'	return usize( n )',
+			'',
+			'def make( src: move[bytearray] ) -> usize:',
+			'	return len( src )',
+			'',
+			'def main() -> usize:',
+			'	return make( move( 3 ))',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any( 'is not move[T]' in e for e in self.discovery.errors.errors ) )
+
+
+class IfIsNotNoneNarrowingTests( unittest.TestCase ):
+	''' `if x is not None:`/`if x is None: ... else:` against a union-
+	typed, bare-Name x now narrows x for whichever branch is actually
+	"live" - type_resolver.py's visit_If, previously with no body-
+	narrowing setup at all (unlike visit_While/visit_Match). Verified the
+	same way test_compiler_sizeof_of_narrowed_name_uses_narrowed_type
+	above verifies match-arm narrowing: compiler.sizeof(x) folds to a
+	compile-time constant that only matches the NARROWED leaf's own size
+	if x's tracked type was actually narrowed down from the whole union's
+	own (larger) size. Post-if survival itself needs no new machinery -
+	merge_if/_merge_narrowed_soft (cfg.py) are already fully generic. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _sizeof_x_is_narrowed_to_u8( self, code: str ) -> bool:
+		# True only when compiler.sizeof(u) folded to the compile-time
+		# constant 1 (u8's own size) - proof u was narrowed down from U's
+		# own (larger) union size. An un-narrowed compiler.sizeof(u) isn't
+		# necessarily a Const at all (a TaggedUnion's own size isn't always
+		# foldable the same way a scalar leaf's is) - either shape here
+		# just means "not narrowed", which is all the negative tests need
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		src = assigns['x']
+		return isinstance( src, ir.Const ) and src.value == 1
+
+	def test_narrows_inside_if_is_not_none_body( self ) -> None:
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertTrue( is_narrowed ) # u8's own size, not U's (tag + payload)
+
+	def test_narrows_inside_if_is_none_else_body( self ) -> None:
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is None:',
+			'		pass',
+			'	else:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertTrue( is_narrowed )
+
+	def test_narrowing_does_not_leak_into_the_non_narrowed_branch( self ) -> None:
+		# the ELSE of `if x is not None:` (x could still be None there) must
+		# NOT be narrowed - compiler.sizeof(u) there uses U's own full size
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		pass',
+			'	else:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertFalse( is_narrowed )
+
+	def test_narrowing_survives_past_the_whole_if_when_the_other_branch_returns( self ) -> None:
+		# `if x is None: return` - the ONLY way past this statement is
+		# already having x is not None, so x is narrowed for the REST of
+		# the function too, same survival merge_if already gives match/
+		# while (steady-dancing-haven.md's own reasoning)
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is None:',
+			'		return',
+			'	x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertTrue( is_narrowed )
+
+	def test_no_narrowing_survival_when_neither_branch_terminates( self ) -> None:
+		# neither branch of the if unconditionally exits - nothing proves
+		# u is non-None by the time execution reaches past the whole
+		# statement, so code after it must NOT be narrowed
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		pass',
+			'	x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertFalse( is_narrowed )
+
+	def test_three_member_union_is_not_none_does_not_narrow( self ) -> None:
+		# more than one non-None member - which of them x actually IS
+		# can't be determined from `is not None` alone, matching
+		# _rewrite_tagged_union_truthiness's own identical restriction; no
+		# multi-member narrowing-marker support exists (compiler.sizeof(u)
+		# still compiles - just against U's own full, un-narrowed size)
+		is_narrowed = self._sizeof_x_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	B: i64',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	u: U = U.A( 1 )',
+			'	if u is not None:',
+			'		x: usize = compiler.sizeof( u )',
+			'	return',
+		]))
+		self.assertFalse( is_narrowed )
+
+
+class RejectMoveThroughUnionOrOverloadTests( unittest.TestCase ):
+	''' calling an @move-decorated method through a union-typed receiver
+	or an overload group is now a compile error, not a silent gap. Both
+	were confirmed silent before this fix: the receiver-move-hook
+	(lowering.py's _lower_call, gated on isinstance(target, Function))
+	never fires for a ReceiverDispatch OR an Overload target at all - so
+	calling an @move method through either shape neither tracked
+	ownership correctly nor errored. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_move_method_through_union_receiver_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class A:',
+			'	@move',
+			'	def consume( self ) -> i32:',
+			'		return 1',
+			'',
+			'class B:',
+			'	@move',
+			'	def consume( self ) -> i32:',
+			'		return 2',
+			'',
+			'def main() -> None:',
+			'	x: A|B',
+			'	x.consume()',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any( '@move' in e and 'union-typed receiver' in e for e in self.discovery.errors.errors ) )
+
+	def test_move_overload_candidate_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class Box:',
+			'	value: i32',
+			'',
+			'	def __init__( self, v: i32 ) -> None:',
+			'		self.value = v',
+			'',
+			'	@overload',
+			'	@move',
+			'	def unwrap( self, default: i32 ) -> i32:',
+			'		...',
+			'',
+			'	@move',
+			'	def unwrap( self, default: i32 = 0 ) -> i32:',
+			'		return self.value',
+			'',
+			'def main() -> None:',
+			'	b: Box = Box( 1 )',
+			'	b.unwrap()',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any( '@move-decorated overload' in e for e in self.discovery.errors.errors ) )
 
 
 if __name__ == '__main__':

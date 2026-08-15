@@ -212,27 +212,6 @@ _RESULT_FIXTURE = '\n'.join([
 	'\t\treturn self.tag == 1',
 ])
 
-_RESULT_FIXTURE_WITH_OR_RETURN = '\n'.join([
-	'@cstruct',
-	'class OverflowError: pass',
-	'',
-	'@union',
-	'class Result[T,E]:',
-	'\tOk: T',
-	'\tErr: E',
-	'',
-	'\tdef is_ok( self ) -> bool:',
-	'\t\treturn self.tag == 0',
-	'',
-	'\tdef is_err( self ) -> bool:',
-	'\t\treturn self.tag == 1',
-	'',
-	'\tdef or_return( self ) -> T:',
-	'\t\tif self.is_err():',
-	'\t\t\tcompiler.early_return( self.data.v_Err )',
-	'\t\treturn self.data.v_Ok',
-])
-
 class SpecializationSynthesisTests( CompilerTestCase ):
 	def test_result_specialization_is_a_real_compiler_tagged_unions_entry( self ) -> None:
 		# a concrete generic class specialization (Result[i32,
@@ -288,13 +267,15 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 
 	def test_or_return_on_concrete_result_receiver_still_lowers_textually( self ) -> None:
 		# or_return() must never become a real compiled function or a real
-		# Call to one - Result.or_return's own declared body is a spec of
-		# the intended behavior, not literally compilable (see Lowering.
-		# _lower_or_return's own comment) - this is the exact regression
-		# the eager-substitution work risked: target.cls became a
-		# Specialization for a concrete receiver, breaking the `target.cls
-		# is Result` identity check _lower_call used to route here
-		self._run( _RESULT_FIXTURE_WITH_OR_RETURN + '\n' + '\n'.join([
+		# Call to one - it has no declared body at all (a user-written
+		# `def or_return(...)` is a discovery-time compile error, see
+		# discovery.py's _parse_function) and is recognized purely by AST
+		# shape in Lowering._lower_call, before ordinary call resolution
+		# ever runs (see that check's own comment) - this is the exact
+		# regression the eager-substitution work risked: target.cls became
+		# a Specialization for a concrete receiver, breaking the old
+		# `target.cls is Result` identity check that used to route here
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def get() -> Result[i32,OverflowError]:',
 			'\treturn Result.Ok( 1 )',
 			'',
@@ -329,31 +310,21 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'get' ]
 		self.assertEqual( len( calls ), 1 )
 
-	def test_known_gap_union_receiver_dispatch_does_not_check_per_leaf_parameter_types( self ) -> None:
-		# documents a pre-existing gap, NOT fixed as part of this plan: a
-		# union mixing two DIFFERENT concrete instantiations of the same
+	def test_union_receiver_dispatch_rejects_incompatible_leaf_parameter_types( self ) -> None:
+		# a union mixing two DIFFERENT concrete instantiations of the same
 		# generic class (Box[i32]|Box[u32]) with a same-named method taking
-		# a generic-typed argument - the per-leaf consistency check only
-		# compares return-type identity and parameter COUNT, never
-		# per-position parameter TYPE, so this compiles with no error, and
-		# the SAME lowered argument operand (typed i32 here) is silently
-		# reused for BOTH leaves' Call, including the Box[u32] one that
-		# actually expects a u32. Before Stage 1/2 this couldn't happen at
-		# all - every leaf's method stayed abstract/bare-T, so there was
-		# nothing to disagree about
-		#
-		# Re-verified, explicitly, when lowering.py gained a general
-		# assignability check (_lower_expr's _check_assignable): confirmed
-		# STILL unaffected, not just untouched by oversight -
-		# _lower_union_receiver_call lowers this call's argument exactly
-		# ONCE, against the FIRST leaf's (Box[i32].set) own parameter type,
-		# then reuses that single already-lowered operand across every
-		# leaf's own ir.Call with no second _lower_expr invocation - the
-		# general check has no opportunity to see the SECOND leaf's own
-		# mismatch at all, structurally, regardless of how strict it is.
-		# Still a real, separate, larger gap to fix another day (per-leaf
-		# argument re-lowering/re-checking in union-receiver dispatch), not
-		# something this plan's own narrower fix could reach.
+		# a generic-typed argument - the per-leaf consistency check
+		# (type_resolver.py's _resolve_union_receiver_members) only compares
+		# return-type identity and parameter COUNT, never per-position
+		# parameter TYPE, so lowering itself has to catch a genuinely
+		# non-coercible leaf. _lower_union_receiver_call now runs
+		# _coerce_or_check_operand once per leaf (not just once overall,
+		# against the first leaf) - the Box[u32] leaf's own mismatch is
+		# caught and located, naming both types, the leaf, and the
+		# parameter. No re-lowering of the argument expression happens
+		# (side-effect safety): the SAME originally-lowered operand is still
+		# reused, unchanged, across leaves whenever no coercion applies -
+		# only now it's also validated per leaf.
 		self._run( '\n'.join([
 			'class Box[T]:',
 			'\tv: T',
@@ -366,13 +337,51 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tb.set( x )',
 			'\treturn',
 		]))
-		self.assertEqual( self.discovery.errors.errors, [] ) # no error today - this is the gap
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		error = errors[0]
+		self.assertIn( '__main__.Box.set[intrinsics.u32]', error )
+		self.assertIn( "parameter 'x'", error )
+		self.assertIn( 'expected intrinsics.u32', error )
+		self.assertIn( 'got intrinsics.i32', error )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'set' ]
+		# only the i32 leaf's own Call (checked first, and legal) got
+		# emitted - the u32 leaf's own failing _check_assignable raises,
+		# aborting the rest of this statement via the ordinary per-
+		# statement recovery boundary, same as any other lowering error
+		self.assertEqual( len( calls ), 1 )
+
+	def test_union_receiver_dispatch_applies_per_leaf_scalar_widening( self ) -> None:
+		# the real fix, on the happy path: Box[i32]|Box[i64], x: i32 - the
+		# i32 leaf keeps the original operand unchanged (exact type match,
+		# _coerce_or_check_operand's own same-type fast path), the i64 leaf
+		# gets its OWN distinct operand, fed by a real ir.CastWrap widening
+		# that SAME original x - never re-lowering/re-evaluating the
+		# argument expression itself
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'\tv: T',
+			'\tdef set( self, x: T ) -> None:',
+			'\t\tself.v = x',
+			'',
+			'def main() -> None:',
+			'\tb: Box[i32]|Box[i64]',
+			'\tx: i32 = 5',
+			'\tb.set( x )',
+			'\treturn',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'set' ]
 		self.assertEqual( len( calls ), 2 )
-		# same operand passed to both, including the Box[u32] leaf that
-		# actually declares x: u32 - the mismatch nothing catches
-		self.assertIs( calls[0].args[0], calls[1].args[0] )
+		i32_call = next( c for c in calls if c.target.qualname.endswith( '[intrinsics.i32]' ) )
+		i64_call = next( c for c in calls if c.target.qualname.endswith( '[intrinsics.i64]' ) )
+		self.assertEqual( i32_call.args[0].type.qualname, 'intrinsics.i32' )
+		self.assertIsNot( i64_call.args[0], i32_call.args[0] )
+		casts = [ i for i in main_lf.instructions if isinstance( i, ir.CastWrap ) and i.dest is i64_call.args[0] ]
+		self.assertEqual( len( casts ), 1 )
+		self.assertIs( casts[0].operand, i32_call.args[0] )
 
 class EmitArithmeticTests( CompilerTestCase ):
 	def test_wrap_arithmetic_smoke_test( self ) -> None:
@@ -952,6 +961,33 @@ def main() -> i32:
 			i += 1
 		return 0
 ''' ),
+			# a @virtual method on a GENERIC RCClass. Monomorphization sets the
+			# method's own .cls to a Specialization wrapping the class (see
+			# monomorphize.py's substituted_cls), never to a bare RCClass - so
+			# the emitter's old isinstance( instr.target.cls, RCClass ) dispatch
+			# check answered False here and fell through to CStruct's COM form,
+			# emitting `(b)->$vtable->get( b )`. An RCClass has no $vtable member
+			# at all (its vtable pointer lives inside $header - see the PROLOGUE),
+			# so that was a reference to a field that doesn't exist. Now asked as
+			# has_object_header(), which a Specialization answers by delegating.
+			( 'virtual_dispatch_on_a_generic_rcclass', '''
+class Holder[T]:
+	v: T
+	def __init__( self, v: T ) -> None:
+		self.v = v
+	@virtual
+	def tag( self ) -> i32:
+		return 7
+
+def main() -> i32:
+	h: Holder[i32] = Holder[i32]( v = 5 )
+	if h.tag() != 7: # goes through the vtable, not a direct call
+		return 1
+	s: Holder[str] = Holder[str]( v = 'x' )
+	if s.tag() != 7:
+		return 2
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -1138,6 +1174,70 @@ def main() -> i32:
 		self.assertNotIn( '__main__$Base$$vtable', src )
 		self.assertIn( '__main__$Derived$$vtable', src )
 		self._assert_compiles_and_runs( src )
+
+class TupleFieldTeardownTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' an RCClass holding a tuple-typed FIELD must release it in its own
+	destructor.
+
+	type_resolver.py's _build_field_teardown_ast is a separate re-derivation
+	of "which parts of this type are RC" from cfg.py's, and it used to be an
+	isinstance ladder that had no TupleType branch at all - a tuple field
+	matched nothing and fell through to `return []`, so the owner simply never
+	decref'd it. Every instance leaked its tuple, silently: the emitted
+	destructor freed the object itself and never touched the field.
+
+	Verified by refcount rather than by exit code alone - a leak does not
+	crash, so nothing short of observing the refcount can fail on it. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the shared str must come back to refcount 1 after the Holder is
+			# gone. 'x'.upper() (not a literal) forces a real heap allocation -
+			# a literal binds to immortal static storage and can't distinguish
+			# a leak from doing nothing.
+			( 'rcclass_with_a_tuple_field_releases_it', '''
+class Holder:
+	t: tuple[str, i32]
+	def __init__( self, t: tuple[str, i32] ) -> None:
+		self.t = t
+
+def main() -> i32:
+	s: str = 'x'.upper()
+	if compiler.refcount( s ) != 1:
+		return 1
+	h: Holder = Holder( t = ( s, 3 ) )
+	if compiler.refcount( s ) != 2: # the tuple now holds a reference too
+		return 2
+	compiler.decref( h )
+	if compiler.refcount( s ) != 1: # ...released again with the Holder
+		return 3
+	return 0
+''' ),
+			# and under repetition, which is what turns a missed release into
+			# unbounded growth rather than one stray allocation
+			( 'rc_lifetime_repeated_tuple_field_no_leak', '''
+class Holder:
+	t: tuple[str, i32]
+	def __init__( self, t: tuple[str, i32] ) -> None:
+		self.t = t
+	def byte_len( self ) -> usize:
+		return self.t[0].byte_len()
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			h: Holder = Holder( t = ( 'hello'.upper(), 1 ) )
+			if h.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
 
 class AugAssignRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for _stmt_AugAssign's Attribute/Subscript-
@@ -1663,7 +1763,7 @@ class RCClassConstructTests( RCClassTestCase ):
 		# destructor argument, no _rcclass_destructor_name reference here
 		main2_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		main_src = emitter_c.emit_function( main2_lf )
-		self.assertIn( 'release_object( &(foo)->$header )', main_src )
+		self.assertIn( 'release_object( (ObjectHeader*)(foo) )', main_src )
 		self.assertNotIn( '__main__$Foo$$__destructor__', main_src )
 
 	def test_release_object_reads_destructor_from_header( self ) -> None:
@@ -2003,7 +2103,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime (see ObjectHeader's own comment) rather
 		# than this call site naming it as a literal argument
-		self.assertIn( 'release_object( &($t0)->$header )', destructor_src )
+		self.assertIn( 'release_object( (ObjectHeader*)($t0) )', destructor_src )
 		# see test_del_method_is_called_from_synthesized_destructor's own
 		# comment on why this is a real temp ($t1, following the field
 		# decref's own $t0) rather than `self` passed bare
@@ -2066,7 +2166,7 @@ class RCClassDestructorTests( RCClassTestCase ):
 		destructor_src = self._emit_and_find_destructor( '__main__.Box' )
 		# release_object now reads the field's own destructor back off its
 		# own header at runtime rather than this call site naming it
-		self.assertIn( 'release_object( &($t1)->$header )', destructor_src )
+		self.assertIn( 'release_object( (ObjectHeader*)($t1) )', destructor_src )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class RCClassDestructorRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
@@ -2479,6 +2579,88 @@ class EmitGlobalRCClassRealCompileTests( test_support.RealCompileMixin, RCClassT
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
+	def test_fieldless_subclass_global_calling_inherited_virtual_actually_constructed( self ) -> None:
+		# a global whose static type is a SUBCLASS (participates in a
+		# vtable via an inherited/overridden @virtual method) but has no
+		# fields of its own - g's own ir.Allocate has fields={} - used to
+		# be misclassified by _global_init_is_all_zero_value_type as an
+		# all-zero VALUE type (which vacuously matches "every field is
+		# zero" on an EMPTY fields dict) and its real sys.alloc(...)
+		# construction call got skipped entirely, leaving g permanently
+		# NULL - reading g.get() then dereferenced a null $header.vtable
+		# and crashed (real access violation, not a plain wrong-value
+		# failure). Confirmed the bug needs BOTH a subclass (a plain,
+		# non-inherited RCClass global already worked) and zero fields
+		# (a global with any real field already worked, since a non-zero
+		# field value fails the all-zero check) - this fixture is the
+		# minimal shape hitting both.
+		self._run( '\n'.join([
+			'class Base:',
+			'	@abstractmethod',
+			'	def get( self ) -> i32:',
+			'		...',
+			'',
+			'class Derived( Base ):',
+			'	@virtual',
+			'	def get( self ) -> i32:',
+			'		return 42',
+			'',
+			'g: Derived = Derived()',
+			'',
+			'def main() -> i32:',
+			'	return g.get()',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class NoCrtExitCodeRealCompileTests( unittest.TestCase ):
+	# test_support.RealCompileMixin's _build_and_run doesn't thread no_crt
+	# through compile()/link() at all (it always compiles/links as if the
+	# CRT were linked) - float_test.py/wide_int_test.py/return_inference_
+	# test.py all hit the same gap for their own no-CRT real-compile needs
+	# and duplicate this same compile+link+run shape locally rather than
+	# use the mixin; mirrored here rather than inventing a third variant
+	def test_no_crt_windows_exit_code_round_trips_through_sys_exit( self ) -> None:
+		# proves the __result plumbing survived the ExitProcess -> sys.exit()
+		# rewrite: a distinctive, non-{0,1} exit code, so this can't pass by
+		# accident the way a bare 0/1 check might (0 = success fallback, 1 =
+		# an uncaught panic/error - 42 is neither)
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+def main() -> i32:
+	return 42
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, 42, f'exe exited {result.returncode}, expected 42 (stderr: {result.stderr})' )
+
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
 	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:
@@ -2657,6 +2839,21 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		end = src.index( '\n}', start )
 		return src[ start : end ]
 
+	def _compiled_source_no_crt( self, active_target: dict[str,object] ) -> str:
+		# separate from _compiled_source above (which always passes emit_c()'s
+		# own no_crt=False default) - mainCRTStartup is only emitted when
+		# no_crt=True is passed to emit_c(), so this threads the compiler's
+		# own real no_crt determination through, mirroring mpy.py's own
+		# 'c' not in compiler.extern_libs computation
+		discovery = Discovery( import_builtins = True, active_target = active_target )
+		compiler = Compiler( discovery )
+		compiler.import_code( self._FIXTURE, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		return emitter_c.emit_c( compiler, no_crt = True )
+
 	def test_exactly_one_metalpy_init_definition( self ) -> None:
 		# the two competing #ifdef'd definitions this plan replaced
 		# (emitter_c.py's old PROLOGUE) are gone - never more than one
@@ -2667,12 +2864,29 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 				src = self._compiled_source( target )
 				self.assertEqual( src.count( 'static void __metalpy_init( void ) {' ), 1 )
 
-	def test_windows_console_codepage_call_is_gated_inside_the_one_function( self ) -> None:
+	def test_windows_console_codepage_call_is_an_ordinary_global_init_call( self ) -> None:
+		# SetConsoleOutputCP is no longer hardcoded/gated inside __metalpy_init
+		# itself - it's windows/_console.py's _console_init global (forced
+		# reachable on every Windows target by Compiler.run()), called from
+		# here exactly like any other global's own init function
 		src = self._compiled_source( self._WINDOWS_TARGET )
 		body = self._metalpy_init_body( src )
-		self.assertIn( '#ifdef _WIN32', body )
-		self.assertIn( 'SetConsoleOutputCP( CP_UTF8 );', body )
-		self.assertIn( '#endif', body )
+		self.assertIn( '__metalpy_init_windows$_console$_console_init();', body )
+		self.assertIn( 'SetConsoleOutputCP(', src )
+		self.assertNotIn( '#ifdef _WIN32', body )
+
+	def test_windows_no_crt_exit_is_an_ordinary_sys_exit_call( self ) -> None:
+		# ExitProcess is no longer hand-declared/hardcoded raw C text inside
+		# mainCRTStartup itself - it's sys.py's own public exit() (forced
+		# reachable whenever no_crt by Compiler.force_reachable), called here
+		# by its own mangled C symbol name, same shape as any other call
+		src = self._compiled_source_no_crt( self._WINDOWS_TARGET )
+		start = src.index( 'void mainCRTStartup( void ) {' )
+		end = src.index( '\n}', start )
+		body = src[ start : end ]
+		self.assertIn( 'sys$exit( (uint32_t)__result );', body )
+		self.assertIn( 'ExitProcess(', src ) # real @extern prototype/call, somewhere
+		self.assertNotIn( 'void __stdcall ExitProcess( unsigned int );', src )
 
 	def test_main_prepends_metalpy_init_call_on_every_target( self ) -> None:
 		# not just Windows - global initializers must run everywhere now,
@@ -3198,7 +3412,7 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
-		self.assertIn( '(p)[((uintptr_t)1)] = $t1;', src ) # real write-back, not a copy-mutate-discard
+		self.assertIn( '(p)[((uintptr_t)1ULL)] = $t1;', src ) # real write-back, not a copy-mutate-discard
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -5988,6 +6202,753 @@ def main() -> i32:
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 
 
+class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile-and-run companion to GenericMethodDispatchTests'
+	test_union_receiver_dispatch_applies_per_leaf_scalar_widening - proves
+	the per-leaf ir.CastWrap actually widens the runtime VALUE correctly
+	through both leaves of a union receiver, not just that the IR has the
+	right shape.
+
+	Uses two plain, unrelated classes (not two Specializations of one
+	generic class, unlike the lowering-level test) deliberately: assigning
+	a freshly-constructed generic RCClass value into a union of that same
+	generic class's own instantiations hits a real, separate, pre-existing
+	bug (_coerce_into_union's leaf lookup is identity-based - `attr.type is
+	operand.type` - and a Specialization built by a constructor call is
+	apparently never reconciled with the one the union's own member list
+	holds), confirmed via a standalone repro and confirmed unrelated to
+	this fix (plain, non-generic union members hit no such issue). Flagged
+	here, not fixed - out of scope for this plan. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		# matches() returns bool (identical across leaves) rather than each
+		# leaf's own field type deliberately: union-receiver dispatch
+		# requires every leaf's own method to share one return type, so
+		# reading the per-leaf-widened value back has to go through a
+		# same-return-type-everywhere method instead
+		self.assert_programs_run([
+			( 'per_leaf_scalar_widening_produces_correct_runtime_value', '''
+class BoxI32:
+	v: i32
+	def set( self, x: i32 ) -> None:
+		self.v = x
+	def matches( self, expected: i64 ) -> bool:
+		with compiler.wrap_arithmetic:
+			return i64( self.v ) == expected
+
+class BoxI64:
+	v: i64
+	def set( self, x: i64 ) -> None:
+		self.v = x
+	def matches( self, expected: i64 ) -> bool:
+		return self.v == expected
+
+def main() -> i32:
+	x: i32 = 5
+
+	u64: BoxI32|BoxI64 = BoxI64( v = 0 )
+	u64.set( x )
+	if not u64.matches( 5 ):
+		return 1
+
+	u32: BoxI32|BoxI64 = BoxI32( v = 0 )
+	u32.set( x )
+	if not u32.matches( 5 ):
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class WalrusOperatorRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_NamedExpr (ast.NamedExpr, `x := expr`) - real compile-and-run
+	companion to lowering_test.py's WalrusOperatorTests. Deliberately
+	avoids `if (x := opt()) is not None: use(x)`-shaped fixtures: `is not
+	None` narrowing for a plain if-statement is a real, separate,
+	pre-existing gap in this compiler (confirmed independent of walrus -
+	the identical failure reproduces with an ordinary, non-walrus `x: T|
+	None; if x is not None: use(x)`; only while/match/`type(x) is T`
+	narrow today) - out of scope here, not something walrus needs to
+	solve. These fixtures instead use plain scalar/bool conditions, which
+	already work end to end. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the walrus target starts undeclared (first-declaration branch
+			# of _expr_NamedExpr), then the SAME while condition re-evaluates
+			# it every subsequent iteration (the reassignment branch) -
+			# exercises both branches in one natural fixture, and confirms
+			# the binding survives (and is reused) past the loop
+			( 'walrus_in_while_condition_first_decl_then_rebind', '''
+def main() -> i32:
+	i: i32 = 0
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		while ( x := i ) < 5:
+			total += x
+			i += 1
+	if total != 10:
+		return 1
+	if i != 5:
+		return 2
+	return 0
+''' ),
+			# the walrus expression's own return value used directly as an
+			# if-condition, then the same binding read again afterward
+			( 'walrus_return_value_used_directly_as_condition', '''
+def f( n: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return n + 1
+
+def main() -> i32:
+	if ( y := f( 4 ) ) != 5:
+		return 1
+	if y != 5:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class SliceSyntaxTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' x[a:b] / x[:b] / x[a:] (ast.Slice) - PLAN_POSIX_FEATURE.md's scope,
+	str/bytearray only (list[T] slicing deferred - no real caller). Byte-
+	offset semantics, not Python's real Unicode-codepoint offsets - see
+	_lower_slice_subscript's own docstring on why. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_slice_shapes', '''
+def main() -> i32:
+	s: str = "hello world"
+	if s[:5] != "hello":
+		return 1
+	if s[6:] != "world":
+		return 2
+	if s[2:5] != "llo":
+		return 3
+	return 0
+''' ),
+			( 'bytearray_slice_shapes', '''
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 1
+	p[1] = 2
+	p[2] = 3
+	p[3] = 4
+	p[4] = 5
+	c: bytearray = b[1:4]
+	if len( c ) != 3:
+		return 1
+	cp: ConstPtr[u8] = c.get_const_ptr()
+	if cp[0] != 2 or cp[1] != 3 or cp[2] != 4:
+		return 2
+	if len( b[:2] ) != 2:
+		return 3
+	if len( b[3:] ) != 2:
+		return 4
+	return 0
+''' ),
+			# mirrors lib/posix/fs.py:24's buf[:nbytes] shape - slicing a
+			# bytearray to a runtime-computed length, not a constant
+			( 'bytearray_slice_to_computed_length', '''
+def fill( buf: bytearray ) -> usize:
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 65
+	p[1] = 66
+	p[2] = 67
+	return 3
+
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	nbytes: usize = fill( buf )
+	result: bytearray = buf[:nbytes]
+	if len( result ) != 3:
+		return 1
+	return 0
+''' ),
+			# mirrors lib/posix/time.py:52's target_path[idx+9:] shape -
+			# slicing a str from a runtime-computed (str.find()'s own byte
+			# offset) start, no upper bound
+			( 'str_slice_from_computed_find_offset', '''
+def main() -> i32:
+	target_path: str = "/usr/share/zoneinfo/America/New_York"
+	idx: usize = target_path.find( "zoneinfo/" ).unwrap( "expected match" )
+	with compiler.wrap_arithmetic:
+		tz: str = target_path[idx+9:]
+	if tz != "America/New_York":
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_slice_step_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	s: str = "hello"',
+			'	a: str = s[::2]',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slice step is not supported', errors[0] )
+
+	def test_unsupported_receiver_type_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 5',
+			'	y: i32 = x[0:2]',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slicing is not supported for intrinsics.i32', errors[0] )
+
+
+class ListLiteralRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_List (ast.List, `[a, b, c]`) - real compile-and-run companion
+	to lowering_test.py's ListLiteralTests. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_list_literal', '''
+def main() -> i32:
+	x: list[str] = [ 'a', 'b', 'c' ]
+	if len( x ) != 3:
+		return 1
+	if x.__getitem__( 0 ).unwrap( 'idx failed' ) != 'a':
+		return 2
+	if x.__getitem__( 2 ).unwrap( 'idx failed' ) != 'c':
+		return 3
+	return 0
+''' ),
+			( 'i32_list_literal', '''
+def main() -> i32:
+	x: list[i32] = [ 10, 20, 30 ]
+	if len( x ) != 3:
+		return 1
+	if x.__getitem__( 1 ).unwrap( 'idx failed' ) != 20:
+		return 2
+	return 0
+''' ),
+			( 'empty_list_literal', '''
+def main() -> i32:
+	x: list[i32] = []
+	if len( x ) != 0:
+		return 1
+	return 0
+''' ),
+			# mirrors the real forcing case: lib/codecs/*.py's own
+			# names(self) -> list[str]: return [...] shape
+			( 'list_literal_returned_from_function', '''
+def names() -> list[str]:
+	return [ 'utf8', 'utf-8', 'UTF8', 'UTF-8' ]
+
+def main() -> i32:
+	n = names()
+	if len( n ) != 4:
+		return 1
+	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
+		return 2
+	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
+		return 3
+	return 0
+''' ),
+		] )
+
+
+class MoveParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' move[T] is an ownership status on a binding, not a distinct type
+	from T (Parameter.is_move, not a Move-wrapped .type) - real compile-
+	and-run companion to lowering_test.py's MoveParameterTests. Exercises
+	lib/builtins/__init__.py's own real bytes.from_bytearray, previously-
+	untested dead code (nothing in lib/ ever called it before this fix)
+	that reads len(src) before consuming src via .release() - also depends
+	on bytearray.release()'s own return-type fix (bare sys.OwnershipError
+	-> sys.OwnershipError[bytearray], a separate, real, pre-existing
+	authoring bug this same investigation found: the unspecialized
+	annotation left T unbound, so Err(SharedReference(x))'s own x never
+	resolved to a real bytearray anywhere that pattern was matched).
+
+	str.from_cstr's identical move[bytearray] overload is exercised by the
+	'move_through_overload_resolution' case below - move(...)'s own sugar
+	not being recognized during OVERLOAD resolution ("name 'move' is not
+	defined") is fixed (peeled before candidate type-matching in
+	_lower_overload_arg's own caller, then validated+applied via the real
+	ownership-transfer hook once resolve_call picks a single concrete
+	winner - see lowering.py's _lower_call, the Overload branch;
+	lowering_test.py's own OverloadMoveResolutionTests verifies this
+	directly via IR inspection). Getting a REAL compile-and-run test
+	against str.from_cstr specifically also required fixing a separate,
+	general, pre-existing bug this investigation found: emitter_c.py used
+	to mangle every candidate in an @overload group to the SAME C symbol
+	name, so a program needing real C bodies for more than one candidate
+	(str.from_cstr's own move[bytearray] overload unconditionally falls
+	back to calling its 2-arg sibling in one branch, so both always need
+	real bodies together) failed to compile at the C level - see
+	OverloadRealCompileTests below for a minimal, move-unrelated repro of
+	that bug; fixed via mangle_function_qualname consulting each
+	Function's own overload_group/position within it. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'move_parameter_read_before_consume', '''
+def consume( src: move[bytearray] ) -> usize:
+	n: usize = len( src )
+	return n
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	if consume( move( b )) != 5:
+		return 1
+	return 0
+''' ),
+			( 'bytes_from_bytearray_real_usage', '''
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	bs: bytes = bytes.from_bytearray( move( b ))
+	if len( bs ) != 5:
+		return 1
+	cp: ConstPtr[u8] = bs.get_const_ptr()
+	if cp[0] != 104:
+		return 2
+	return 0
+''' ),
+			( 'move_through_overload_resolution', '''
+def main() -> i32:
+	b: bytearray = bytearray( 6 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	p[5] = 0
+	s: str = str.from_cstr( move( b )).unwrap( 'from_cstr failed' )
+	if s != "hello":
+		return 1
+	if s.byte_len() != 5:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class OverloadRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression test for the general emitter_c.py bug found alongside the
+	move(...)-through-overload-resolution fix above (see
+	MoveParameterRealCompileTests' own docstring): every candidate in an
+	@overload group used to mangle to the SAME C symbol name (mpy_types.
+	Overload's members all share one .qualname - "the same named function",
+	just different signatures), so a program that actually needs real C
+	bodies for more than one candidate in the same group failed to compile
+	at the C level ("conflicting types"/"too many arguments", depending on
+	whether the two happened to share an arity). This is a minimal,
+	move-unrelated repro: two @overload-decorated candidates distinguished
+	purely by arity, both with real bodies, both actually called. Fixed via
+	emitter_c.py's mangle_function_qualname consulting each Function's own
+	overload_group/position within it (mpy_types.Function.overload_group) -
+	a group with only one real implementation (the common case: signature-
+	only stubs routed to one real body) still mangles unsuffixed. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'two_overloads_both_called', '''
+@overload
+def combine( a: i32, b: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return a + b
+
+@overload
+def combine( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x * 10
+
+def main() -> i32:
+	if combine( 2, 3 ) != 5:
+		return 1
+	if combine( 7 ) != 70:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Codec.decode widened to bytes|bytearray, against the REAL Utf8
+	class (not a synthetic stand-in) - constructing a real Utf8() instance
+	forces its whole vtable (names/encode/decode) to compile, so this also
+	depends on: Utf8.names()'s list literal (_expr_List), Utf8.encode()'s
+	get_ptr()/get_const_ptr() fix, and the move[T] fix above (Utf8.encode()
+	-> bytes.from_bytearray() -> len(src)/src.release()). Also covers the
+	module-level `utf8 = Utf8()` singleton every real decode()/encode()
+	default value actually uses. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# explicit construction via the real class (not the singleton) -
+			# keeps the vtable-forcing/construction path covered too
+			( 'decode_bytes', '''
+from codecs.utf8 import Utf8
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	bs: bytes = bytes( b )
+	codec = Utf8()
+	s: str = codec.decode( bs ).unwrap( 'decode failed' )
+	if s != "hello":
+		return 1
+	return 0
+''' ),
+			# the rest use the shared `utf8` singleton directly
+			( 'decode_bytearray', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 105
+	p[2] = 33
+	p[3] = 33
+	p[4] = 33
+	c: bytearray = b[:3]
+	s: str = utf8.decode( c ).unwrap( 'decode failed' )
+	if s != "hi!":
+		return 1
+	return 0
+''' ),
+			# multi-byte UTF-8 round trip via the real utf8.encode() ->
+			# utf8.decode() path - guards the alloc/memcpy/terminate
+			# arithmetic in both directions
+			( 'decode_multibyte_utf8_round_trip', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	src: str = "héllo"
+	eb: bytes = utf8.encode( src ).unwrap( 'encode failed' )
+	s: str = utf8.decode( eb ).unwrap( 'decode failed' )
+	if s != src:
+		return 1
+	if s.byte_len() != src.byte_len():
+		return 2
+	return 0
+''' ),
+			# a genuinely bytes|bytearray-typed local (not two separately-
+			# typed locals) - exercises union-receiver dispatch for real
+			( 'decode_through_union_typed_local', '''
+from codecs.utf8 import utf8
+
+def decode_it( x: bytes|bytearray ) -> str:
+	return utf8.decode( x ).unwrap( 'decode failed' )
+
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 97
+	p[1] = 98
+	p[2] = 99
+	if decode_it( b ) != "abc":
+		return 1
+	bs: bytes = bytes( b )
+	if decode_it( bs ) != "abc":
+		return 2
+	return 0
+''' ),
+			# mirrors the real forcing case: fs.py:24's
+			# codec.decode(buf[:nbytes]) shape - and, unlike the other
+			# cases here, relies entirely on decode()'s own now-fixed
+			# `codec: Codec = utf8` DEFAULT (no codec argument passed at
+			# all), proving the default itself works, not just the
+			# singleton used explicitly
+			( 'decode_bytearray_slice_result_via_default_codec', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 104
+	p[1] = 105
+	nbytes: usize = 2
+	s: str = buf[:nbytes].decode().unwrap( 'decode failed' )
+	if s != "hi":
+		return 1
+	return 0
+''' ),
+			( 'names_list_literal', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	n = utf8.names()
+	if len( n ) != 4:
+		return 1
+	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
+		return 2
+	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
+		return 3
+	return 0
+''' ),
+		] )
+
+
+class AsciiCp437Latin1CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Real compile-and-run coverage for lib/codecs/ascii.py, cp437.py and
+	latin1.py - previously constructed only via _build_registry()'s own
+	.register() (itself only calling .names()), so their encode()/decode()
+	bodies were never actually reached by any compiled program, real test,
+	or the 1057-test suite passing. Getting these three to real-compile,
+	link, and run surfaced (and this fix resolves):
+
+	  - s.get_ptr() on str (only bytes|bytearray has get_ptr; str only
+	    exposes get_const_ptr) in all three encode()s.
+	  - missing checked-arithmetic wrappers around every +/- op in bodies
+	    whose own Result[...] error type doesn't cover OverflowError.
+	  - cp437.py's own `with compiler.panic_arithmetic:` (no call/message -
+	    unsupported with statement; panic_arithmetic always takes one).
+	  - bytes.from_bytearray( bytes, move( out )) in cp437.py/latin1.py
+	    (bytes passed as a stray extra positional argument - too many
+	    positional arguments; should just be from_bytearray( move( out ))).
+	  - str.from_cstr( ptr, len ) in cp437.py/latin1.py/ascii.py's decode()
+	    - that overload's second argument means size INCLUDING the zero
+	    terminator (checked: from_cstr errors if buf[size-1] isn't 0), not
+	    a plain byte count, and none of these buffers were ever actually
+	    null-terminated - fixed by allocating an exact len+1 buffer,
+	    memcpy'ing, explicitly terminating, and going through
+	    str._from_owned_cstr directly (matching utf8.py's own decode()
+	    shape) instead.
+	  - DECODE_TABLE[i]/[usize(byte-0x80)] (plain __getitem__ sugar) in
+	    cp437.py requiring encode()/decode() to return Result[_,IndexError]
+	    (they return Result[_,CodecError]) - fixed via the real
+	    .__getitem__(...).unwrap(...) call other list-indexing lib code
+	    already uses.
+
+	Also found and fixed two bugs invisible to discovery/emit_c alone (only
+	surfaced by an actual C compile+link+run):
+
+	  - A real, general, pre-existing compiler bug: a `return` reachable
+	    while an RC-tracked local (e.g. a bytearray) is still live, in a
+	    function that later consumes that SAME local via move() on its
+	    fall-through success path, leaves the early return's own epilogue-
+	    cleanup label un-emitted ("use of undeclared label" at the C
+	    level) - current_epilogue_label() hands the return a label whose
+	    backing _epilogue_stack entry the later move() consumption then
+	    silently drops, instead of leaving a decref-less "cancelled" entry
+	    the way every other consumption path does. Confirmed via minimal,
+	    codec-independent repros. Not fixed here (out of this scope - a
+	    cfg.py/lowering.py issue, not a lib/codecs one); ascii.py/cp437.py/
+	    latin1.py's own encode()s just avoid the trigger shape (bytes(out)
+	    copy instead of bytes.from_bytearray(move(out)) directly on a
+	    local live across an earlier return).
+	  - cp437.py/latin1.py's own encode() allocated their output bytearray
+	    to the worst-case size (one output byte per INPUT byte) but multi-
+	    byte UTF-8 input sequences collapse to a single output byte, so the
+	    actually-written length (out_idx) can be less than that allocation
+	    - wrapping the oversized, unfilled-tail buffer directly into the
+	    returned bytes silently included trailing garbage. Fixed by
+	    copying down to a final buffer sized to out_idx before returning. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'ascii_round_trip', '''
+from codecs.ascii import ascii
+
+def main() -> i32:
+	a = ascii()
+	eb: bytes = a.encode( "Hello, World!" ).unwrap( 'encode failed' )
+	s: str = a.decode( eb ).unwrap( 'decode failed' )
+	if s != "Hello, World!":
+		return 1
+	return 0
+''' ),
+			( 'ascii_encode_out_of_range_errors', '''
+from codecs.ascii import ascii
+
+def main() -> i32:
+	a = ascii()
+	match a.encode( "héllo" ):
+		case Result.Ok( b ):
+			return 1
+		case Result.Err( e ):
+			pass
+	return 0
+''' ),
+			( 'ascii_decode_out_of_range_errors', '''
+from codecs.ascii import ascii
+
+def main() -> i32:
+	a = ascii()
+	b = bytearray( 1 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 0xFF
+	match a.decode( bytes( b )):
+		case Result.Ok( s ):
+			return 1
+		case Result.Err( e ):
+			pass
+	return 0
+''' ),
+			( 'cp437_ascii_passthrough_round_trip', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	eb: bytes = c.encode( "Hello, World!" ).unwrap( 'encode failed' )
+	s: str = c.decode( eb ).unwrap( 'decode failed' )
+	if s != "Hello, World!":
+		return 1
+	return 0
+''' ),
+			( 'cp437_extended_char_round_trip', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	# accented/box-drawing chars only, no ASCII passthrough at all - also
+	# exercises the output-buffer-trim fix (3 codepoints, 6 UTF-8 input
+	# bytes, but only 3 CP437 output bytes)
+	eb: bytes = c.encode( "éàü" ).unwrap( 'encode failed' )
+	if len( eb ) != 3:
+		return 1
+	s: str = c.decode( eb ).unwrap( 'decode failed' )
+	if s != "éàü":
+		return 2
+	return 0
+''' ),
+			( 'cp437_decode_raw_byte', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	b = bytearray( 1 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 0x82 # cp437 0x82 -> DECODE_TABLE[2] -> U+00E9 (e-acute)
+	s: str = c.decode( bytes( b )).unwrap( 'decode failed' )
+	if s != "é":
+		return 1
+	return 0
+''' ),
+			( 'cp437_encode_unmappable_char_errors', '''
+from codecs.cp437 import cp437
+
+def main() -> i32:
+	c = cp437()
+	# U+1F600 (grinning face) is a 4-byte UTF-8 sequence - outside every
+	# branch cp437's encode() handles (2-byte/3-byte only)
+	match c.encode( "\U0001F600" ):
+		case Result.Ok( b ):
+			return 1
+		case Result.Err( e ):
+			pass
+	return 0
+''' ),
+			( 'latin1_ascii_passthrough_round_trip', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	eb: bytes = l.encode( "Hello, World!" ).unwrap( 'encode failed' )
+	s: str = l.decode( eb ).unwrap( 'decode failed' )
+	if s != "Hello, World!":
+		return 1
+	return 0
+''' ),
+			( 'latin1_extended_char_round_trip', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	# U+00E9/U+00E0/U+00FC are all within Latin-1 range (<=0xFF) - also
+	# exercises the output-buffer-trim fix (3 codepoints, 6 UTF-8 input
+	# bytes, but only 3 Latin-1 output bytes)
+	eb: bytes = l.encode( "éàü" ).unwrap( 'encode failed' )
+	if len( eb ) != 3:
+		return 1
+	s: str = l.decode( eb ).unwrap( 'decode failed' )
+	if s != "éàü":
+		return 2
+	return 0
+''' ),
+			( 'latin1_decode_raw_byte', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	b = bytearray( 1 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 0xE9 # Latin-1 0xE9 IS U+00E9 (e-acute) directly
+	s: str = l.decode( bytes( b )).unwrap( 'decode failed' )
+	if s != "é":
+		return 1
+	return 0
+''' ),
+			( 'latin1_encode_out_of_range_errors', '''
+from codecs.latin1 import latin1
+
+def main() -> i32:
+	l = latin1()
+	# U+3042 (hiragana A) is a 3-byte UTF-8 sequence, codepoint > 0xFF -
+	# outside Latin-1 range
+	match l.encode( "あ" ):
+		case Result.Ok( b ):
+			return 1
+		case Result.Err( e ):
+			pass
+	return 0
+''' ),
+		] )
+
+
 class MatchArmSameNameNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' `match x: case T(x): ...` - the arm rebinds the SAME name as its
 	own subject - used to crash outright (monomorphize.py silently
@@ -6995,9 +7956,7 @@ def main() -> i32:
 			# real RC-lifetime stress check under repetition, same rigor as
 			# every other RC test this session established - narrowing
 			# surviving past the if (via type(x) is str, not a plain `is
-			# None` check - Phase 5/6's own narrowing-survival mechanism
-			# doesn't extend to the ordinary is-None rewrite, only type(x) is
-			# T/instanceof and match), then reading the narrowed str repeatedly
+			# None` check), then reading the narrowed str repeatedly
 			( 'rc_lifetime_repeated_calls_no_leak', '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -7009,6 +7968,28 @@ def main() -> i32:
 				pass
 			else:
 				return 1
+			if x.byte_len() != 5:
+				return 2
+			i += 1
+		return 0
+''' ),
+			# the plain `is not None`/`is None` rewrite ALSO narrows now
+			# (this plan's own item 4 - previously ONLY type(x) is T/
+			# instanceof/match narrowed; a bare is-not-None check on a
+			# real T|None union did not, at all). Both the in-body
+			# narrowing AND post-if survival (the None branch returns) are
+			# exercised together, under the same repeated-call RC-lifetime
+			# rigor as the case just above
+			( 'is_not_none_narrows_body_and_survives_past_the_if', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			x: str|None = s
+			if x is None:
+				return 1
+			# narrowing survived the whole if - x is str here, not str|None
 			if x.byte_len() != 5:
 				return 2
 			i += 1
@@ -7424,6 +8405,114 @@ def main() -> i32:
 				case Result.Err( e ):
 					return 2
 			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
+class IfExpTempLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression tests for a real UAF/double-free in lowering.py's
+	_expr_IfExp: a ternary `A if cond else B` whose branches produce a
+	fresh RC value (e.g. `str('-') if cond else str('+')`) merges both
+	branches into one dest temp via a plain ir.Assign, but never untracked
+	the branch's own temp - so _flush_pending_temps' later decref of the
+	branch temp ran AGAINST THE SAME OBJECT dest (and whatever dest is
+	later assigned into) still holds, freeing it out from under the merged
+	result. Confirmed as a real, reproducible bug (found while building
+	float64's shortest-round-trip repr - PLAN_STR_FORMAT.md item 4 -
+	whose scientific-notation exponent-sign construction is exactly this
+	shape): every scientific-notation float repr crashed or printed
+	garbage before this fix. Worse, the UNTAKEN branch's own temp
+	(declared but never assigned, since only one branch runs at runtime)
+	was ALSO unconditionally decref'd at flush time - freeing
+	uninitialized memory. Fixed by untrack_temp()-ing a fresh branch value
+	before the merge Assign (mirroring _stmt_Return's own identical
+	pattern), Incref-ing an ALIASING branch value instead (mirroring
+	cfg.assign()'s own is_alias split - an existing binding read via the
+	ternary becomes an independent, longer-lived reference), and
+	registering the merge temp itself as the fresh owner afterward. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fresh_branch_values_no_double_free( self ) -> None:
+		# both branches are fresh str(...) constructions (never assigned to
+		# a name first) - the exact shape that crashed/corrupted before the
+		# fix. Checked over 1000 iterations against FRESH heap allocations
+		# each time, matching ReturnStatementTempLifetimeTests' own
+		# reasoning for why a bare single-shot check isn't enough to catch
+		# a leak (as opposed to the double-free, which a single shot alone
+		# already reliably reproduced).
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		cond: bool = True
+		while i < 1000:
+			x: str = str( '-' ) if cond else str( '+' )
+			expected: str = str( '-' ) if cond else str( '+' )
+			if x != expected:
+				return 1
+			if compiler.refcount( x ) != 1:
+				return 2
+			cond = not cond
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_aliasing_branch_value_gets_its_own_incref( self ) -> None:
+		# both branches read EXISTING bindings (a, b) rather than
+		# constructing fresh values - the merged result must be an
+		# independently-owned reference (refcount bumped), not a bare
+		# pointer copy: mutating/dropping a or b afterward must not affect
+		# the merged result, and vice versa
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		a: str = str( 'A' )
+		b: str = str( 'B' )
+		cond: bool = True
+		z: str = a if cond else b
+		if z != str( 'A' ):
+			return 1
+		if compiler.refcount( a ) != 2:
+			return 2
+		if compiler.refcount( z ) != 2:
+			return 3
+		if a != str( 'A' ) or b != str( 'B' ):
+			return 4
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_mixed_fresh_and_aliasing_branches( self ) -> None:
+		# one branch fresh (str.upper()'s own new allocation), the other
+		# aliasing (a plain Name read) - each branch needs its OWN correct
+		# treatment independently of what the other branch does
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		existing: str = str( 'lower' )
+		cond: bool = False
+		result: str = existing.upper() if cond else existing
+		if result != str( 'lower' ):
+			return 1
+		if compiler.refcount( existing ) != 2:
+			return 2
+		cond2: bool = True
+		result2: str = existing.upper() if cond2 else existing
+		if result2 != str( 'LOWER' ):
+			return 3
+		if compiler.refcount( result2 ) != 1:
+			return 4
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -8048,6 +9137,497 @@ def main() -> i32:
 	if f"{{int(255):#010x}}" != {f"{255:#010x}"!r}:
 		return 2
 	if f"{{int(-5):05d}}" != {f"{-5:05d}"!r}:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_int_format_spec_zero_pad_is_grouping_aware( self ) -> None:
+		# the '0' shorthand COMBINED with grouping (,/_) - a real, confirmed
+		# bug (PLAN_STR_FORMAT.md item 4's own writeup): the padding zeros
+		# themselves need their own separators too, matching real Python's
+		# f"{1234567:015,d}" == '000,001,234,567', NOT '0000001,234,567'
+		# (raw zeros in front of an already-grouped string, what a naive
+		# "group first, then rjust-pad" two-step gives instead)
+		self._run( f'''
+def main() -> i32:
+	if f"{{int(1234567):015,d}}" != {f"{1234567:015,d}"!r}:
+		return 1
+	if f"{{int(1234567):013,d}}" != {f"{1234567:013,d}"!r}:
+		return 2
+	if f"{{int(-1234567):016,d}}" != {f"{-1234567:016,d}"!r}:
+		return 3
+	if f"{{int(0):06,d}}" != {f"{0:06,d}"!r}:
+		return 4
+	if f"{{int(1234567):015_d}}" != {f"{1234567:015_d}"!r}:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_precision( self ) -> None:
+		# 'f'/'F' fixed-point only (PLAN_STR_FORMAT.md item 4) - real
+		# Python's own f-string output is the oracle, same convention as
+		# every str/int format-spec test above. f"{1.0:.1f}" is the exact
+		# motivating case this pass exists for.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x:.1f}}"
+
+def main() -> i32:
+	if build( 1.0 ) != {f"{1.0:.1f}"!r}:
+		return 1
+	if f"{{3.14159:.3f}}" != {f"{3.14159:.3f}"!r}:
+		return 2
+	if f"{{7.0:.0f}}" != {f"{7.0:.0f}"!r}:
+		return 3
+	if f"{{0.0:.2f}}" != {f"{0.0:.2f}"!r}:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_sign_and_width( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{-2.5:.1f}}" != {f"{-2.5:.1f}"!r}:
+		return 1
+	if f"{{2.5:+.1f}}" != {f"{2.5:+.1f}"!r}:
+		return 2
+	if f"{{2.5: .1f}}" != {f"{2.5: .1f}"!r}:
+		return 3
+	if f"{{1.5:>10.1f}}" != {f"{1.5:>10.1f}"!r}:
+		return 4
+	if f"{{1.5:<10.1f}}" != {f"{1.5:<10.1f}"!r}:
+		return 5
+	if f"{{1.5:*^10.1f}}" != {f"{1.5:*^10.1f}"!r}:
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_zero_pad_is_sign_aware( self ) -> None:
+		# the '0' shorthand's own sign-aware zero-fill, same shape int's own
+		# equivalent test already covers - the '-' stays in front, zeros
+		# fill AFTER it, not before ('-00001.5', not '0000-1.5')
+		self._run( f'''
+def main() -> i32:
+	if f"{{1.5:08.1f}}" != {f"{1.5:08.1f}"!r}:
+		return 1
+	if f"{{-1.5:08.1f}}" != {f"{-1.5:08.1f}"!r}:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_str_type_char_on_float_is_a_compile_error( self ) -> None:
+		# 'x' is a valid type char for int/radix, but not for float - a
+		# clear, named error, not a crash or silently wrong output
+		self._run( '''
+def main() -> i32:
+	return len( f"{1.0:x}" )
+''' )
+		self.assertTrue( any( "'x' is not valid for float" in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_exponential( self ) -> None:
+		# 'e'/'E' (PLAN_STR_FORMAT.md item 4) - real Python's own f-string
+		# output is the oracle, same convention as every other format-spec
+		# test in this class. Backed by real snprintf/msvcrt _snprintf -
+		# msvcrt's own exponent is always 3 digits ("e+003"), unlike Python/
+		# C99's 2-digit floor ("e+03") - emitter_c.py's PROLOGUE fixes this
+		# up on Windows (__metalpy_fixup_msvcrt_exponent); this test is the
+		# real end-to-end proof that fixup actually produces Python-matching
+		# output, not just that it compiles.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x:.2e}}"
+
+def main() -> i32:
+	if build( 1234.5 ) != {f"{1234.5:.2e}"!r}:
+		return 1
+	if f"{{1234.5:.2E}}" != {f"{1234.5:.2E}"!r}:
+		return 2
+	if f"{{1234.5:e}}" != {f"{1234.5:e}"!r}:
+		return 3
+	if f"{{0.0001234:e}}" != {f"{0.0001234:e}"!r}:
+		return 4
+	if f"{{-1234.5:.2e}}" != {f"{-1234.5:.2e}"!r}:
+		return 5
+	if f"{{5.0:.0e}}" != {f"{5.0:.0e}"!r}:
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_exponential_sign_and_width( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234.5:+.2e}}" != {f"{1234.5:+.2e}"!r}:
+		return 1
+	if f"{{1234.5:012.2e}}" != {f"{1234.5:012.2e}"!r}:
+		return 2
+	if f"{{-1234.5:012.2e}}" != {f"{-1234.5:012.2e}"!r}:
+		return 3
+	if f"{{1234.5:>15.2e}}" != {f"{1234.5:>15.2e}"!r}:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_general( self ) -> None:
+		# 'g'/'G' - precision means SIGNIFICANT digits here, not fractional
+		# digits like 'f'/'e' (real snprintf handles this distinction
+		# itself), and switches between fixed/exponential notation based on
+		# magnitude, stripping trailing zeros - all exercised against real
+		# Python's own output
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234.5:.3g}}" != {f"{1234.5:.3g}"!r}:
+		return 1
+	if f"{{0.0001234:.3g}}" != {f"{0.0001234:.3g}"!r}:
+		return 2
+	if f"{{1234.5:g}}" != {f"{1234.5:g}"!r}:
+		return 3
+	if f"{{100000.0:g}}" != {f"{100000.0:g}"!r}:
+		return 4
+	if f"{{1000000.0:g}}" != {f"{1000000.0:g}"!r}:
+		return 5
+	if f"{{0.0:.3g}}" != {f"{0.0:.3g}"!r}:
+		return 6
+	if f"{{123.456:.3G}}" != {f"{123.456:.3G}"!r}:
+		return 7
+	if f"{{5.0:.0g}}" != {f"{5.0:.0g}"!r}:
+		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_percent( self ) -> None:
+		# '%' has no printf equivalent - lib/builtins/__float.py's own
+		# _percent_digits scales by 100 and formats as 'f' in metalpy
+		# source, then appends the literal '%' - this is the real end-to-
+		# end proof that scaling + suffix + sign/width assembly all compose
+		# correctly, matching real Python's own f"{x:%}" output
+		self._run( f'''
+def main() -> i32:
+	if f"{{0.1234:.2%}}" != {f"{0.1234:.2%}"!r}:
+		return 1
+	if f"{{0.1234:%}}" != {f"{0.1234:%}"!r}:
+		return 2
+	if f"{{-0.1234:8.2%}}" != {f"{-0.1234:8.2%}"!r}:
+		return 3
+	if f"{{0.1234:8.2%}}" != {f"{0.1234:8.2%}"!r}:
+		return 4
+	if f"{{1.0:%}}" != {f"{1.0:%}"!r}:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_alt_flag( self ) -> None:
+		# '#' (always show the decimal point for 'f'/'F'/'e'/'E', keep
+		# trailing zeros for 'g'/'G') - passed straight through to real
+		# snprintf/msvcrt _snprintf, which already matches Python's own
+		# semantics exactly for every type char, confirmed against real
+		# Python's own output
+		self._run( f'''
+def main() -> i32:
+	if f"{{5.0:#.0f}}" != {f"{5.0:#.0f}"!r}:
+		return 1
+	if f"{{5.0:#f}}" != {f"{5.0:#f}"!r}:
+		return 2
+	if f"{{5.0:#.0e}}" != {f"{5.0:#.0e}"!r}:
+		return 3
+	if f"{{5.0:#g}}" != {f"{5.0:#g}"!r}:
+		return 4
+	if f"{{100000.0:#g}}" != {f"{100000.0:#g}"!r}:
+		return 5
+	if f"{{5.0:#.0%}}" != {f"{5.0:#.0%}"!r}:
+		return 6
+	if f"{{5.0:#.0F}}" != {f"{5.0:#.0F}"!r}:
+		return 7
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_grouping( self ) -> None:
+		# ','/'_' grouping - has no printf equivalent at all (unlike '#'),
+		# so it's a separate post-processing pass (lib/builtins/__float.py's
+		# _group_integer_part) applied to whatever snprintf already
+		# returned, touching only the digits before the first '.' - a
+		# correct no-op for 'e'/'E' and for 'g'/'G' in exponential form
+		# (only ever one digit there), confirmed against real Python
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234567.891:,.2f}}" != {f"{1234567.891:,.2f}"!r}:
+		return 1
+	if f"{{1234567.891:_.2f}}" != {f"{1234567.891:_.2f}"!r}:
+		return 2
+	if f"{{-1234567.891:,.2f}}" != {f"{-1234567.891:,.2f}"!r}:
+		return 3
+	if f"{{1234567.891:,.0f}}" != {f"{1234567.891:,.0f}"!r}:
+		return 4
+	if f"{{1234.5:,e}}" != {f"{1234.5:,e}"!r}:
+		return 5
+	if f"{{1234567.891:,g}}" != {f"{1234567.891:,g}"!r}:
+		return 6
+	if f"{{1234.56:,g}}" != {f"{1234.56:,g}"!r}:
+		return 7
+	if f"{{1234567.891:,.2%}}" != {f"{1234567.891:,.2%}"!r}:
+		return 8
+	if f"{{1234567.891:20,.2f}}" != {f"{1234567.891:20,.2f}"!r}:
+		return 9
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_zero_pad_is_grouping_aware( self ) -> None:
+		# the '0' shorthand COMBINED with grouping (,/_) - same real,
+		# confirmed bug int's own equivalent test documents
+		# (PLAN_STR_FORMAT.md item 4), just for float: only the digits
+		# BEFORE the first '.' (or, for '%', before the trailing '%') are
+		# the groupable "integer part" that gets padded+grouped together -
+		# the fractional digits/exponent/'%' suffix are left untouched and
+		# reappended, confirmed against real Python's own output, which
+		# groups the zero-fill itself just like the plain digits
+		# (f"{1234567.89:018,.2f}" == '000,001,234,567.89')
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234567.89:018,.2f}}" != {f"{1234567.89:018,.2f}"!r}:
+		return 1
+	if f"{{1234567.89:017,.2f}}" != {f"{1234567.89:017,.2f}"!r}:
+		return 2
+	if f"{{-1234567.89:018,.2f}}" != {f"{-1234567.89:018,.2f}"!r}:
+		return 3
+	if f"{{1234567.891:020,e}}" != {f"{1234567.891:020,e}"!r}:
+		return 4
+	if f"{{1234567.891:020,g}}" != {f"{1234567.891:020,g}"!r}:
+		return 5
+	if f"{{1234567.891:015,.2%}}" != {f"{1234567.891:015,.2%}"!r}:
+		return 6
+	if f"{{-1234.5:020,.2%}}" != {f"{-1234.5:020,.2%}"!r}:
+		return 7
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_uppercase_F( self ) -> None:
+		# uppercase 'F' specifically - legacy msvcrt.dll's own _snprintf
+		# silently produces empty output for "%F" (confirmed by a real
+		# test against this system's own msvcrt.dll: unlike 'E'/'G', which
+		# it supports fine, 'F' was only added to printf in C99, after
+		# legacy msvcrt), a real, already-shipped bug this test would have
+		# caught immediately - emitter_c.py's PROLOGUE now substitutes
+		# lowercase 'f' internally on Windows for this one conversion
+		# character, correct for every finite value. inf/nan display
+		# (see test_float_format_spec_inf_nan below) is handled entirely
+		# separately, in metalpy source, before compiler.format_f64 (and
+		# so this 'f'-vs-'F' substitution) is ever reached - Python shows
+		# "inf"/"nan" identically regardless of 'f' vs 'F', so there's no
+		# capitalization difference left to worry about here either
+		self._run( f'''
+def main() -> i32:
+	if f"{{1.0:.1F}}" != {f"{1.0:.1F}"!r}:
+		return 1
+	if f"{{-2.5:8.1F}}" != {f"{-2.5:8.1F}"!r}:
+		return 2
+	if f"{{5.0:#.0F}}" != {f"{5.0:#.0F}"!r}:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_inf_nan( self ) -> None:
+		# a real, confirmed bug (PLAN_STR_FORMAT.md item 4): legacy
+		# msvcrt.dll's own _snprintf produces outright GARBAGE for
+		# infinity ("1.$" for "%.1f" of +inf, confirmed against this
+		# system's own msvcrt.dll - not merely untested, actually wrong).
+		# lib/builtins/__float.py now special-cases NaN/infinity (via the
+		# new compiler.is_nan/is_inf intrinsics) before ever calling
+		# compiler.format_f64 at all, matching real Python: precision/
+		# type_char/alt are all ignored ("inf" regardless of 'f'/'e'/'g'),
+		# but sign/width/zero-pad still apply, and grouping is a no-op
+		# even when requested (no comma ever appears inside "inf")
+		self._run( f'''
+def get_pos_inf() -> f64:
+	with compiler.saturate_arithmetic:
+		big: f64 = 1.0e300
+		return big * big
+
+def get_neg_inf() -> f64:
+	return -get_pos_inf()
+
+def get_nan() -> f64:
+	with compiler.wrap_arithmetic:
+		return get_pos_inf() + get_neg_inf()
+
+def main() -> i32:
+	if f"{{get_pos_inf():.1f}}" != {f"{float('inf'):.1f}"!r}:
+		return 1
+	if f"{{get_neg_inf():.1f}}" != {f"{float('-inf'):.1f}"!r}:
+		return 2
+	if f"{{get_nan():.1f}}" != {f"{float('nan'):.1f}"!r}:
+		return 3
+	if f"{{get_pos_inf():.1e}}" != {f"{float('inf'):.1e}"!r}:
+		return 4
+	if f"{{get_nan():.1g}}" != {f"{float('nan'):.1g}"!r}:
+		return 5
+	if f"{{get_pos_inf():+.1f}}" != {f"{float('inf'):+.1f}"!r}:
+		return 6
+	if f"{{get_pos_inf():08.1f}}" != {f"{float('inf'):08.1f}"!r}:
+		return 7
+	if f"{{get_pos_inf():.1%}}" != {f"{float('inf'):.1%}"!r}:
+		return 8
+	if f"{{get_pos_inf():015,.1f}}" != {f"{float('inf'):015,.1f}"!r}:
+		return 9
+	if f"{{get_neg_inf():015,.1f}}" != {f"{float('-inf'):015,.1f}"!r}:
+		return 10
+	if f"{{get_neg_inf():08.1%}}" != {f"{float('-inf'):08.1%}"!r}:
+		return 11
+	if f"{{get_nan():+.1f}}" != {f"{float('nan'):+.1f}"!r}:
+		return 12
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_none_type_with_precision( self ) -> None:
+		# f"{x:.2}" (a literal spec with a precision but no type char) -
+		# real Python's own "None" presentation type, closer to 'g' than
+		# to plain 'f' (PLAN_STR_FORMAT.md item 4's own note), except
+		# fixed-point results always keep at least one fractional digit
+		# (f"{5.0:.2}" == '5.0', not 'g''s own '5') - confirmed against
+		# real Python. No-precision-no-type (f"{x:10}"/bare f"{x}") still
+		# falls back to plain 'f' - that needs Python's real shortest-
+		# round-trip repr algorithm instead, not implemented yet
+		self._run( f'''
+def main() -> i32:
+	if f"{{5.0:.2}}" != {f"{5.0:.2}"!r}:
+		return 1
+	if f"{{1234.5:.2}}" != {f"{1234.5:.2}"!r}:
+		return 2
+	if f"{{0.0001234:.2}}" != {f"{0.0001234:.2}"!r}:
+		return 3
+	if f"{{1234.5:10.2}}" != {f"{1234.5:10.2}"!r}:
+		return 4
+	if f"{{1234.5:.6}}" != {f"{1234.5:.6}"!r}:
+		return 5
+	if f"{{1234.5:#.2}}" != {f"{1234.5:#.2}"!r}:
+		return 6
+	if f"{{-5.0:.2}}" != {f"{-5.0:.2}"!r}:
+		return 7
+	if f"{{5.0:015,.2}}" != {f"{5.0:015,.2}"!r}:
+		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_repr_shortest_roundtrip( self ) -> None:
+		# bare f"{x}" (no format spec at all) and the no-type/no-precision
+		# spec both fall through to f64._repr_digits/_repr_digits_raw - the
+		# shortest decimal text that round-trips back to the exact same
+		# double (via the new compiler.parse_f64 intrinsic, an iterative
+		# search over compiler.format_f64's 'e'-conversion precision), then
+		# re-rendered into Python's own fixed-vs-scientific presentation
+		# (fixed for -4 <= exponent < 16, scientific otherwise - see
+		# _f64_repr_from_scientific's own comment for how that threshold was
+		# confirmed against real Python). Covers both sides of that exact
+		# threshold (1e15 fixed / 1e16 scientific, 1e-4 fixed / 1e-5
+		# scientific) plus the smallest/largest finite doubles, since those
+		# scientific-notation cases are exactly where a real bug lived
+		# before this test existed: an IfExp (ternary) lowering bug -
+		# `str('-') if exponent < 0 else str('+')`, used to build the
+		# exponent's sign character - double-freed/UAF'd the branch value
+		# (see IfExpTempLifetimeTests for the general fix), so every
+		# scientific-notation repr crashed or produced garbage.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x}}"
+
+def main() -> i32:
+	if build( 1.0 ) != {str(1.0)!r}:
+		return 1
+	if f"{{0.1}}" != {str(0.1)!r}:
+		return 2
+	if f"{{100.0}}" != {str(100.0)!r}:
+		return 3
+	if f"{{1000000.0}}" != {str(1000000.0)!r}:
+		return 4
+	if f"{{1e15}}" != {str(1e15)!r}:
+		return 5
+	if f"{{1e16}}" != {str(1e16)!r}:
+		return 6
+	if f"{{1e17}}" != {str(1e17)!r}:
+		return 7
+	if f"{{0.0001}}" != {str(0.0001)!r}:
+		return 8
+	if f"{{1e-05}}" != {str(1e-05)!r}:
+		return 9
+	if f"{{123456789012345.0}}" != {str(123456789012345.0)!r}:
+		return 10
+	if f"{{3.14159265358979}}" != {str(3.14159265358979)!r}:
+		return 11
+	if f"{{-5.0}}" != {str(-5.0)!r}:
+		return 12
+	if f"{{-0.1}}" != {str(-0.1)!r}:
+		return 13
+	if f"{{5e-324}}" != {str(5e-324)!r}:
+		return 14
+	if f"{{1.7976931348623157e+308}}" != {str(1.7976931348623157e+308)!r}:
+		return 15
+	if f"{{1234567.0}}" != {str(1234567.0)!r}:
+		return 16
+	if f"{{1234567890123.0}}" != {str(1234567890123.0)!r}:
+		return 17
+	if f"{{10.0}}" != {str(10.0)!r}:
+		return 18
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_repr_width_no_type_no_precision( self ) -> None:
+		# f"{x:10}" - a width/align/fill spec with no type char and no
+		# precision - takes the SAME _repr_digits path as bare f"{x}"
+		# (is_none_type_no_precision in _lower_float_format_spec), just
+		# padded afterward
+		self._run( f'''
+def main() -> i32:
+	if f"{{1e16:>12}}" != {f"{1e16:>12}"!r}:
+		return 1
+	if f"{{1e-05:<12}}" != {f"{1e-05:<12}"!r}:
+		return 2
+	if f"{{1.5:010}}" != {f"{1.5:010}"!r}:
 		return 3
 	return 0
 ''' )
@@ -9093,6 +10673,74 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
 
+
+class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression test for a real, confirmed bug: Result[T,E].unwrap_or()
+	called with NO argument (relying on its own `default: T|None = None`
+	fallback) resolved to the WRONG return type - the enclosing (generic,
+	monomorphized) unwrap_or() body itself failed to compile with
+	"function returns builtins.str, not builtins.str|intrinsics.NoneType"
+	(seen for real via lib/posix/time.py's `readlink(...).unwrap_or()` on
+	a branch with posix syscalls; reproduced here without any OS
+	dependency). Root cause: lowering.py's _lower_call unconditionally
+	narrowed an Overload group's resolved return type to whatever STUB
+	happened to be bound_to the winning plain implementation, regardless
+	of whether THIS call's own arguments actually matched the stub's
+	narrower signature - unwrap_or()'s `default: T` stub is bound_to the
+	plain `default: T|None = None` impl, but a zero-argument call only
+	ever matches the impl's own broader signature, never the stub's.
+	Fixed via overload_resolution.stub_covers_call, which re-checks the
+	call's real argument types against the stub before narrowing.
+
+	Two further gaps surfaced once the return type itself was fixed, both
+	fixed alongside it: (1) type_resolver.py's _type_of_expr didn't handle
+	a Call resolving to an Overload group at all (only a plain Function),
+	so a local assigned from such a call never got its type tracked,
+	silently disabling _rewrite_tagged_union_truthiness's `if x:` rewrite
+	for it further down the same function body; (2) the Overload branch of
+	_lower_call never filled in defaults for parameters the call site
+	omitted (unlike the plain-Function call path), so a zero-argument
+	unwrap_or() reached real C emission with no 'default' entry in its own
+	Call instruction's kwargs at all - a bare KeyError in emitter_c.py's
+	_emit_call_args.
+
+	T=str (not e.g. i32) deliberately: matches the real-world repro
+	exactly, and forces the non-bool leaf of _rewrite_tagged_union_
+	truthiness's rewrite (str.__bool__(), newly added alongside this fix -
+	str had no truthiness dunder at all before, so this path was never
+	reachable for any RC leaf type, only the bool-leaf shortcut). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'result_unwrap_or_no_argument_return_type_and_truthiness', '''
+def make( ok: bool, s: str ) -> Result[str,OverflowError]:
+	if ok:
+		return Result.Ok( s )
+	return Result.Err( OverflowError() )
+
+def main() -> i32:
+	# Ok("hello") -> unwrap_or() with no fallback -> "hello", truthy
+	a: str|None = make( True, "hello" ).unwrap_or()
+	if a:
+		pass
+	else:
+		return 1
+	# Ok("") -> unwrap_or() -> "" (not None, but empty) -> falsy
+	b: str|None = make( True, "" ).unwrap_or()
+	if b:
+		return 2
+	# Err(...) -> unwrap_or() -> None (the impl's own default) -> falsy
+	c: str|None = make( False, "hello" ).unwrap_or()
+	if c:
+		return 3
+	return 0
+''' ),
+		] )
 
 if __name__ == '__main__':
 	unittest.main()

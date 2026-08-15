@@ -45,6 +45,12 @@ def GetDynamicTimeZoneInformation(
 ) -> u32:
 	...
 
+@extern( 'kernel32', 'ExitProcess' )
+def ExitProcess(
+	uExitCode: u32,
+) -> None:
+	...
+
 @extern( 'kernel32', 'GetLastError' )
 def GetLastError() -> u32:
 	...
@@ -206,6 +212,12 @@ def ReleaseSRWLockExclusive(
 # ---------------------------------------------------------------------------
 
 CP_UTF8: u32 = 65001
+
+@extern('kernel32', 'SetConsoleOutputCP')
+def SetConsoleOutputCP(
+	wCodePageID: u32,
+) -> bool:
+	...
 
 LCMAP_LOWERCASE:         u32 = 0x00000100
 LCMAP_UPPERCASE:         u32 = 0x00000200

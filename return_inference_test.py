@@ -33,21 +33,13 @@ class ReturnOnlyInferenceBehaviorTests( unittest.TestCase ):
 		compiler.import_code( code, Path( '__main__.py' ), scope = None )
 		compiler.run()
 		self.assertEqual( discovery.errors.errors, [], f'compile errors:\n' + '\n'.join( str(e) for e in discovery.errors.errors ))
-		# always the real C runtime (no_crt=False), not the 'c' not in
-		# compiler.extern_libs heuristic int_test.py/inline_test.py use -
-		# their own real-builtins-heavy programs (list/str construction)
-		# always end up needing sys.alloc, which naturally pulls in a real
-		# extern_libs entry; this file's own minimal @cstruct-only programs
-		# (no allocation at all) don't, so that heuristic would pick the
-		# no_crt/raw-syscall startup path here, which needs kernel32 linked
-		# explicitly for ExitProcess/SetConsoleOutputCP - unrelated to what
-		# this file is actually testing, so sidestepped entirely
-		c_source = emitter_c.emit_c( compiler, no_crt = False )
+		no_crt = 'c' not in compiler.extern_libs
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
 		return compiler, c_source
 
 	def _run_program( self, code: str ) -> tuple[subprocess.CompletedProcess, Compiler, str]:
 		compiler, c_source = self._compile( code )
-		no_crt = False
+		no_crt = 'c' not in compiler.extern_libs
 		with tempfile.TemporaryDirectory() as tmp:
 			src_path = Path( tmp ) / 'generated.c'
 			obj_path = Path( tmp ) / 'generated.o'
@@ -57,8 +49,14 @@ class ReturnOnlyInferenceBehaviorTests( unittest.TestCase ):
 			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
 			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
+			# every extern library the program pulled in needs an explicit link
+			# flag - compiler.extern_libs already has whatever the generated
+			# boilerplate itself needs too (kernel32 on a no-CRT Windows build
+			# - windows._console/sys.exit are compiler-forced reachable, see
+			# Compiler.force_reachable)
+			libs = set( compiler.extern_libs )
 			ldflags = ''
-			for lib in sorted( compiler.extern_libs ):
+			for lib in sorted( libs ):
 				if lib == 'c':
 					continue
 				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'

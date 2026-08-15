@@ -76,11 +76,11 @@ def readlink(
 	path: ConstPtr[u8],
 	buf: Ptr[u8],
 	bufsize: usize,
-) -> usize:
+) -> isize:
 	...
 
 @extern( 'c', 'strerror' )
-def strerror( errnum: 32 ) -> ConstPtr[u8]|None:
+def strerror( errnum: i32 ) -> ConstPtr[u8]|None:
 	...
 
 @extern( 'c', 'strnlen' )

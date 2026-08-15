@@ -49,54 +49,18 @@ class OwnState( Enum ):
 	COPY = 'copy'
 	MOVED = 'moved'
 
+# is_rc/rc_leaves/_is_direct_pointer_rc all used to be open-coded isinstance
+# ladders right here, which is how the same bug shipped three separate times:
+# a new Type kind appeared, this ladder wasn't updated, and the new kind
+# silently defaulted to "not RC" (nested-union leaf -> leak; generic union's
+# unsubstituted TypeVar leaves -> UAF; unresolved union -> order-dependent
+# UAF). Each type kind now answers for itself - see mpy_types.Type's own
+# is_rc/is_rc_pointer/rc_leaves, which carry the full history of those bugs.
+# These stay as module-level names purely because ~20 call sites in this file
+# and lowering.py already spell them that way.
+
 def is_rc( t: Type ) -> bool:
-	# a concrete generic RCClass instantiation (Box[i32]) is a Specialization,
-	# not an RCClass instance itself - unwrap first, or every generic-class/
-	# generic-union instance method's own `self` (already typed as a
-	# Specialization) would wrongly look untracked here
-	base = t.base if isinstance( t, Specialization ) else t
-	if isinstance( base, TupleType ):
-		# PLAN_TUPLE.md: unlike an ordinary generic (list[T]/Result[T,E]/...),
-		# where the ABSTRACT template class itself (Specialization.base)
-		# already answers "is this RC" without ever needing to monomorphize
-		# a specific instantiation, a TupleType has no such template - the
-		# only place "is a tuple RC" lives is its own synthesized backing
-		# RCClass (tuple_storage.py), which may not have been synthesized
-		# yet for this particular TupleType (a local variable's own
-		# declared annotation type is never independently re-resolved after
-		# discovery.py first builds it - see emitter_c.py's c_type() for
-		# the identical "found by a real hang, not anticipated up front"
-		# gap this mirrors). No lazy check needed here though: EVERY
-		# TupleType's backing is unconditionally an RCClass by construction
-		# (tuple_storage.TupleStorage.get() never produces anything else),
-		# so this is a structural guarantee, not something that depends on
-		# whether .backing happens to be populated yet.
-		return True
-	if isinstance( base, TaggedUnion ):
-		# a union appearing as a LEAF of an outer type (e.g. Result[T, A|B] -
-		# the error union this session's own division/widening work
-		# introduced) is "RC" whenever ANY of its own members are - is_rc()
-		# is only ever called from rc_leaves()'s own per-leaf filter below
-		# (confirmed: no other call site in this module calls it directly),
-		# so this recursion only ever changes what rc_leaves() reports for
-		# an outer type's leaves, nothing else. Before this branch, a nested
-		# union leaf was ALWAYS reported as non-RC here (TaggedUnion is
-		# never RCClass/TupleType), so rc_leaves() on an OUTER type silently
-		# dropped it entirely even when its own members carried real RC
-		# payloads - no incref/decref ever fired for that leaf's own
-		# contents, a genuine reference leak (this union's own TOP-LEVEL
-		# rc_leaves(A|B) call already worked correctly - isinstance(base,
-		# TaggedUnion) is checked there directly; the gap was specifically
-		# one level up, treating A|B as an opaque, always-non-RC leaf of
-		# something else). No type-param substitution needed here (unlike
-		# rc_leaves()'s own top-level substitution step) - every leaf that
-		# reaches this branch is either a fully concrete anonymous union
-		# (never generic/Specialization-wrapped by construction) or already
-		# had its own params substituted by whichever caller is asking.
-		if base.resolve is not None:
-			base.resolve()
-		return any( is_rc( leaf ) for leaf in base.leaves() )
-	return isinstance( base, RCClass )
+	return t.is_rc()
 
 def is_result_type( t: Type|None ) -> bool:
 	''' True when `t` is a concrete Result[T,E] specialization. '''
@@ -106,72 +70,17 @@ def is_result_type( t: Type|None ) -> bool:
 	return isinstance( base, TaggedUnion ) and base.stem == 'Result'
 
 def rc_leaves( t: Type ) -> list[Type]:
-	# a TaggedUnion's RC-relevant leaves specifically - str|i32 needs a
-	# tag-gated incref (only str); str|int (both RC) needs none of that,
-	# unconditional instead
-	base = t.base if isinstance( t, Specialization ) else t
-	if isinstance( base, TaggedUnion ):
-		# base.leaves() reads base.attributes directly - populated by the
-		# CLASS's own .resolve() (parsing its body), a separate step from
-		# leaves()'s own per-ATTRIBUTE attr.resolve() call (which only
-		# resolves each attribute's already-existing .type). Called too
-		# early (e.g. the very first time any code anywhere references a
-		# Result[...]-shaped type, before anything else has forced Result's
-		# own class body to resolve), base.attributes is still empty and
-		# leaves() silently returns [] - not "this union has no RC leaves",
-		# just "this union hasn't been read yet". Confirmed by a real UAF:
-		# this made a temp Result[str,CodecError] receiver of .unwrap() look
-		# RC-free depending on ONLY where in the compile that particular
-		# call site happened to land relative to Result's own first real use
-		# elsewhere - a real, load-bearing ordering bug, not just caution.
-		if base.resolve is not None:
-			base.resolve()
-		leaves = base.leaves()
-		if isinstance( t, Specialization ) and base.type_params:
-			# t is a Specialization of a still-GENERIC TaggedUnion (e.g.
-			# Result[str,MyError] - base is the abstract builtins.Result class
-			# itself, never independently monomorphized into its own concrete
-			# TaggedUnion instance). base.leaves() therefore returns Result's
-			# OWN declared field types verbatim - bare TypeVars T/E - and
-			# is_rc() always says no to a bare TypeVar (it's never an RCClass
-			# itself). That silently reported EVERY generic-union
-			# Specialization as having no RC leaves at all, regardless of what
-			# T/E were actually bound to - str is obviously RC, so
-			# Result[str,MyError] plainly has RC leaves, but nothing here ever
-			# saw that: cfg.py's callers (fresh_temp/assign/attr_assign/...)
-			# all gate their Incref/Decref emission on this return value being
-			# non-empty, so a generic-union value's OWN payload (structural
-			# lifetime aside - a nested RC value living IN it) never got
-			# tracked/released at all. Confirmed by a real UAF: a temp
-			# Result[str,E] receiver of .unwrap()/.unwrap_or() was never
-			# registered by fresh_temp in the first place (this same
-			# rc_leaves() gap), which is what made the old receiver-move
-			# workaround in lowering.py's _lower_call look load-bearing (it
-			# was popping a Temp that fresh_temp had never actually inserted -
-			# already a no-op) while the REAL gap (this function) went
-			# unnoticed. Substitute each leaf that IS one of base's own type
-			# params against t's own concrete args - shallow (one level) is
-			# enough: a leaf that's instead e.g. `list[T]` doesn't need T
-			# resolved at all to know list itself is RC (is_rc() only reads
-			# a Specialization's own .base), and a leaf that's already a fixed
-			# concrete type (not one of base's type params) is correct as-is.
-			substitution = { id( param ): arg for param, arg in zip( base.type_params, t.args ) }
-			leaves = [ substitution.get( id( leaf ), leaf ) for leaf in leaves ]
-		return [ leaf for leaf in leaves if is_rc( leaf ) ]
-	return [ t ] if is_rc( t ) else []
+	return t.rc_leaves()
 
 def _is_direct_pointer_rc( t: Type ) -> bool:
 	''' True for an RC leaf whose OWN runtime representation is a single, bare
-	pointer (RCClass, or a TupleType's synthesized backing RCClass) - as
-	opposed to a NESTED union leaf (is_rc() now also reports these as "RC",
-	but a union's own runtime shape is a tag+data VALUE STRUCT, not a bare
-	pointer at all). _refcount_instructions' own "every member shares the
-	same underlying pointer layout, read any ONE member's accessor" shortcut
-	is only safe when EVERY leaf satisfies this - it silently produces
-	garbage for a nested-union leaf otherwise (reading that leaf's own
-	payload accessor as if it were a bare RC pointer). '''
-	base = t.base if isinstance( t, Specialization ) else t
-	return isinstance( base, ( RCClass, TupleType ))
+	pointer - as opposed to a NESTED union leaf (also "RC", but a union's
+	runtime shape is a tag+data VALUE STRUCT, not a pointer at all).
+	_refcount_instructions' "every member shares the same underlying pointer
+	layout, read any ONE member's accessor" shortcut is only safe when EVERY
+	leaf satisfies this - it silently produces garbage for a nested-union leaf
+	otherwise (reading that leaf's payload accessor as a bare RC pointer). '''
+	return t.is_rc_pointer()
 
 UnionStorage = Callable[[TaggedUnion], tuple[Variable,Variable,CUnion,dict[str,int]]]
 
@@ -206,6 +115,19 @@ class _Binding:
 	entry: Epilogue | None # None only for BORROWED (never needs cleanup)
 
 Bindings = dict[str,_Binding]
+
+@dataclass
+class InlineScope:
+	''' one active multi-statement @inline splice's own local "epilogue" -
+	pushed by push_inline_scope() when lowering.py's _splice_multi_statement_
+	inline_body begins lowering a target's pre-return statements, popped once
+	it's done. current_epilogue_label()/return_() both stop at boundary_depth
+	instead of continuing into the CALLER's own older entries - see their own
+	comments. A stack (not a single field) because a spliced body can itself
+	call another @inline function - the innermost entry is always the one
+	that matters. '''
+	boundary_depth: int # len(self._epilogue_stack) at push time - entries below this belong to an outer scope (the caller, or an outer splice) and must never be inspected/replayed from inside this one
+	label: str # this scope's own shared-ladder fallback target - see current_epilogue_label()'s own comment
 
 @dataclass
 class _Snapshot:
@@ -251,7 +173,9 @@ class CFGState:
 		self._new_label = new_label
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
+		self._any_shared_label_used: bool = False # see used_shared_epilogue_label()'s own docstring
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
+		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
 		self.bindings: Bindings = {}
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
@@ -266,19 +190,24 @@ class CFGState:
 	# --- prologue --------------------------------------------------------------
 
 	def _enter_parameter( self, param: Parameter ) -> None:
-		if isinstance( param.type, Move ):
+		# param.type is always the real, unwrapped T here (discovery.py's
+		# own parameter-construction site already strips move[T]/copy[T]
+		# down to T, recording the ownership fact on is_move/is_copy
+		# instead - see Parameter's own docstring) - only the OWNERSHIP
+		# STATE this prologue sets up differs by which flag is set
+		if param.is_move:
 			# the callee now fully owns the incoming reference - MOVED is
 			# the CALLER's state at the call site, not the callee's own
 			# parameter (see prerequisite #2's move() call-site check,
 			# which is what guarantees this parameter really was moved in)
-			if rc_leaves( param.type.inner ):
-				self._push( param, param.type.inner, OwnState.OWNED )
-		elif isinstance( param.type, Copy ):
+			if rc_leaves( param.type ):
+				self._push( param, param.type, OwnState.OWNED )
+		elif param.is_copy:
 			# the callee wants its own independent reference - an explicit
 			# Incref right here in the prologue, matching Decref at exit
-			if rc_leaves( param.type.inner ):
-				self.prologue_instructions += self._incref_instructions( param.type.inner, param )
-				self._push( param, param.type.inner, OwnState.COPY )
+			if rc_leaves( param.type ):
+				self.prologue_instructions += self._incref_instructions( param.type, param )
+				self._push( param, param.type, OwnState.COPY )
 		elif rc_leaves( param.type ):
 			self.bindings[param.stem] = _Binding( operand = param, type = param.type, state = OwnState.BORROWED, entry = None )
 
@@ -335,6 +264,33 @@ class CFGState:
 		self._epilogue_stack.append( Epilogue(
 			instructions = instructions, name = self._new_label( 'epilogue' ), flag = flag, is_err_only = is_err_only,
 		))
+
+	def push_inline_scope( self ) -> str:
+		''' called once by lowering.py's own _splice_multi_statement_inline_
+		body, right before it starts lowering a target's pre-return
+		statements - marks the CURRENT stack depth as this splice's own
+		boundary. current_epilogue_label()/return_() both stop here instead
+		of continuing into the CALLER's own older entries (see their own
+		comments) - this is the entire fix that lets an early `return`/
+		`.or_return()`/checked-arithmetic inside a spliced body jump to a
+		label that's genuinely local to the splice, never the caller's real
+		epilogue. Returns the fresh label current_epilogue_label() falls back
+		to once nothing shallower (within this scope) qualifies - the caller
+		(lowering.py) emits this as a real ir.Label at the end of the splice,
+		right where its own local ladder begins. '''
+		scope = InlineScope( boundary_depth = len( self._epilogue_stack ), label = self._new_label( 'inline_epilogue' ))
+		self._inline_scope_stack.append( scope )
+		return scope.label
+
+	def pop_inline_scope( self ) -> None:
+		''' called once the splice's own local ladder has been fully emitted
+		(lowering.py's own responsibility - this just stops
+		current_epilogue_label()/return_() from consulting this scope's
+		boundary any further, restoring the immediately-enclosing scope, if
+		any, to visibility - the caller/outer splice's own entries were never
+		touched while this scope was active, so there's nothing left to
+		reconcile here beyond popping the stack entry itself. '''
+		self._inline_scope_stack.pop()
 
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
 
@@ -935,16 +891,46 @@ class CFGState:
 		otherwise the DeleteTemp _lower_stmt's own wrapper emits for it
 		right after this statement would decref the very value we just
 		handed to the caller. get_is_err_check is only ever actually called
-		if an errdefer entry is genuinely live here - see _replay(). '''
+		if an errdefer entry is genuinely live here - see _replay().
+
+		Bounded to the innermost active multi-statement @inline splice's own
+		boundary_depth when one is active (self._inline_scope_stack - see
+		push_inline_scope()) - "the ENTIRE current stack" above means the
+		entire stack of the CURRENT scope (the splice, if inside one), never
+		reaching down into the caller's (or an outer splice's) own older,
+		still-pending entries: those aren't this call's to unwind, they'll
+		get their own replay whenever THEIR OWN scope eventually exits. '''
 		self.untrack_temp( returned_operand )
 		instructions: list[ir.Instruction] = []
-		for entry in reversed( self._epilogue_stack ):
+		floor = self._inline_scope_stack[-1].boundary_depth if self._inline_scope_stack else 0
+		for entry in reversed( self._epilogue_stack[floor:] ):
 			if entry.cancelled:
 				continue
 			if returned_operand is not None and entry.operand is returned_operand:
 				continue
 			instructions += self._replay( entry, get_is_err_check )
 		return instructions
+
+	def has_live_entry( self, operand: ir.Operand | None ) -> bool:
+		''' whether `operand`'s identity matches a still-live (non-cancelled)
+		epilogue entry - the exact identity test current_epilogue_label()/
+		return_() already use to recognize "this really is an ownership move,
+		its own eventual decref is already accounted for by matching/skipping
+		this entry" rather than a borrow. Used by lowering.py's _stmt_Return
+		to decide whether an ALIASING return expression (self.lowering.
+		_is_aliasing_expr) needs its own Incref before being handed to the
+		caller: an OWNED/COPY local or a copy[T]/move[T] parameter has a live
+		entry here (a genuine move, no Incref needed - the source's own
+		decref is what's being skipped), but a BORROWED parameter/self (never
+		pushed - see _enter_parameter()'s own BORROWED branch) and an
+		attribute/tuple-element read (a fresh GetAttr temp, never pushed
+		either - fields are never separately tracked, see field_value()'s own
+		comment) both have NO entry at all here even though _is_aliasing_expr
+		says they alias existing state - those need a real Incref, since
+		nothing downstream is skipping a decref on their behalf. '''
+		return operand is not None and any(
+			not entry.cancelled and entry.operand is operand for entry in self._epilogue_stack
+		)
 
 	def current_epilogue_label( self, returned_operand: ir.Operand | None = None ) -> str | None:
 		''' the label a `return` (or the function's own fall-off-the-end)
@@ -989,7 +975,20 @@ class CFGState:
 		INNER branch/loop was even entered, is still doomed by the OUTER
 		scope's own eventual restore() even though it predates the inner
 		one - using only the top of the stack would miss exactly that
-		entry and hand out a label for it anyway. '''
+		entry and hand out a label for it anyway.
+
+		While a multi-statement @inline splice is active (self.
+		_inline_scope_stack non-empty - see push_inline_scope()), this never
+		returns None purely for "nothing's left pending": the innermost
+		scope's own boundary_depth acts as a hard floor the walk below never
+		crosses, falling back to that scope's own label instead of either
+		returning None or continuing into the caller's own older entries.
+		The confinement-floor and returned-operand-identity None-cases above
+		still apply exactly as before, scoped to the splice's own portion of
+		the stack the same way they'd apply to a real function's - see
+		return_()'s own matching comment for why THOSE cases still need a
+		self-contained inline unwind rather than the shared label even
+		inside a splice. '''
 		if returned_operand is not None and any(
 			not entry.cancelled and entry.operand is returned_operand
 			for entry in self._epilogue_stack
@@ -1001,13 +1000,83 @@ class CFGState:
 		# wrongly treat EVERY entry as confined, since every valid index
 		# is >= 0)
 		confinement_floor = min( self._confinement_depths ) if self._confinement_depths else None
+		# the innermost active multi-statement @inline splice, if any (see
+		# push_inline_scope()'s own comment) - entries BELOW its own
+		# boundary_depth belong to the CALLER (or an outer splice), and must
+		# never be inspected here, let alone handed back as this return's own
+		# jump target: that's exactly the bug that used to make .or_return()/
+		# checked arithmetic unsupported inside a spliced body (it would
+		# otherwise silently jump into the caller's own real epilogue,
+		# short-circuiting the caller's own remaining code). Once the walk
+		# below reaches the scope's own boundary with nothing shallower
+		# eligible, its own label is always a valid fallback target - unlike
+		# the plain "nothing pending" case (a bare ir.Return is fine there),
+		# a splice never gets to just fall through to a caller-level ir.
+		# Return; it always needs a real, local landing point
+		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
 		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
+			if inline_scope is not None and i < inline_scope.boundary_depth:
+				return inline_scope.label
 			if entry.cancelled:
 				continue
 			if confinement_floor is not None and not entry.is_flag_guarded and i >= confinement_floor:
 				return None
+			# used_shared_epilogue_label()'s flag is scoped to THIS function's
+			# own real closing-brace ladder specifically - only set when
+			# inline_scope is None (this entry belongs to the function
+			# itself, not to some still-open splice's own segment of the
+			# stack: had it been the latter, the `i < boundary_depth` branch
+			# above would already have returned first). A splice-local
+			# entry's own label is consumed by build_inline_scope_ladder()
+			# instead, fully popped off the stack by the time this function's
+			# own closing brace is ever reached - marking the flag for it
+			# here would wrongly make used_shared_epilogue_label() report
+			# true for the OUTER function even though nothing of ITS OWN is
+			# actually pending, forcing a spurious extra Return/FuncEnd
+			# (confirmed via a real regression: an @inline splice's own
+			# internal early return/.or_return() must never manufacture a
+			# second real ir.Return in the CALLER).
+			if inline_scope is None:
+				self._any_shared_label_used = True
 			return entry.name
+		if inline_scope is not None:
+			return inline_scope.label
 		return None
+
+	def used_shared_epilogue_label( self ) -> bool:
+		''' whether some ALREADY-LOWERED return/OrJump actually committed a
+		jump into one of this function's own shared epilogue labels (i.e.
+		current_epilogue_label() returned non-None at least once so far) -
+		DELIBERATELY not the same question current_epilogue_label() answers
+		for a hypothetical NEW return right here (which correctly skips a
+		cancelled entry, since a fresh return needs no unwind through
+		something already consumed).
+
+		Needed because an entry a return jumped into WHILE STILL LIVE can
+		since have been cancelled (move()/compiler.decref(x)/del - see
+		move()'s own comment) by the time lowering reaches the function's
+		own closing brace: current_epilogue_label() then correctly reports
+		"nothing NEW needs to unwind here" (None), but that EARLIER goto
+		still needs its label actually built by build_epilogue_ladder()
+		(which emits one per entry regardless of cancelled, per its own
+		docstring), or it's left dangling. Tracking "was a real label ever
+		handed out" (rather than just "is the stack non-empty") avoids
+		over-triggering for a case that looks superficially similar but
+		isn't: a nonfallible __init__ whose only entries are attributes
+		complete_construction() cancels on its own single, implicit,
+		success-only return path - current_epilogue_label() never once
+		returns non-None there (complete_construction() always cancels
+		before that return's own current_epilogue_label() call, per its own
+		docstring), so no dead, never-jumped-to Label is emitted for it.
+
+		Confirmed via a real repro: `out = bytearray(n); if cond: return
+		Result.Err(...); return Result.Ok(bytes.from_bytearray(move(out)))` -
+		the earlier `return` DOES call current_epilogue_label() while out's
+		entry is still live (setting this flag), then move() cancels that
+		same entry - without this check, the goto that earlier return
+		already committed to would go undeclared - "use of undeclared
+		label" at the C level, a real, general, silent miscompile. '''
+		return self._any_shared_label_used
 
 	def build_epilogue_ladder(
 		self, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' = None,
@@ -1027,6 +1096,35 @@ class CFGState:
 			instructions.append( ir.Label( name = entry.name ))
 			if not entry.cancelled:
 				instructions += self._replay( entry, get_is_err_check )
+		return instructions
+
+	def build_inline_scope_ladder(
+		self, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' = None,
+	) -> list[ir.Instruction]:
+		''' the multi-statement @inline splice analogue of build_epilogue_
+		ladder() - same shape (one Label + still-live replay per pending
+		entry, deepest first), bounded to just the innermost active
+		InlineScope's own segment of the stack (self._epilogue_stack[scope.
+		boundary_depth:]) instead of the whole thing - entries belonging to
+		the caller (or an outer splice) are never touched, exactly like
+		current_epilogue_label()/return_() are now scoped (see their own
+		comments). Called once, right after lowering.py finishes lowering a
+		splice's own pre-return statements - the caller (lowering.py) is
+		responsible for emitting the scope's own leading Label (push_inline_
+		scope()'s own return value) itself first; this only emits what
+		follows it. Truncates _epilogue_stack back to boundary_depth once
+		built - this scope's own entries are now fully consumed, whether by
+		this ladder or by an earlier inline-unwind return_() call reached
+		during the splice itself (those already removed nothing from the
+		stack themselves - see return_()'s own docstring - so this is the
+		one place a splice's own entries actually get popped). '''
+		scope = self._inline_scope_stack[-1]
+		instructions: list[ir.Instruction] = []
+		for entry in reversed( self._epilogue_stack[scope.boundary_depth:] ):
+			instructions.append( ir.Label( name = entry.name ))
+			if not entry.cancelled:
+				instructions += self._replay( entry, get_is_err_check )
+		del self._epilogue_stack[scope.boundary_depth:]
 		return instructions
 
 	def _replay( self, entry: Epilogue, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' ) -> list[ir.Instruction]:
@@ -1513,6 +1611,36 @@ class CFGState:
 		self.<base_attr> before this runs), so unlike attr_assign this
 		never needs an "already exists" branch. '''
 		for attr in base_required:
+			# flattened_attributes() (unlike own_new_virtual_slots() right beside
+			# it in mpy_types.py) doesn't resolve anything it returns, so base
+			# attributes DO routinely arrive here unresolved - that alone is
+			# normal and can't be asserted away (i32 fields do it constantly).
+			#
+			# What IS load-bearing is that an unresolved one is never RC. Asking
+			# the RC question of an unresolved attribute answers "not RC" and
+			# takes the else-branch below, pushing NO epilogue entry - so an
+			# early exit from the subclass __init__ after super().__init__()
+			# would never decref that base field, the leak this method's own
+			# docstring says it exists to prevent. Same "unresolved and 'has no
+			# RC leaves' are indistinguishable" hazard as
+			# TaggedUnion._resolved_leaves (see its docstring).
+			#
+			# Instrumenting the whole test corpus: only i32 attributes ever
+			# arrive unresolved; the one RC base attribute (str) is always
+			# already resolved here - plausibly because an RC-typed annotation
+			# has to be looked up to be scheduled at all, where an intrinsic
+			# scalar doesn't. That's an accident of resolution order rather than
+			# anything guaranteed, so it's a tripwire, not an assumption: if an
+			# RC attribute ever does arrive unresolved, the correct fix is to
+			# resolve it at the source, not to rely on being rescued here.
+			arrived_unresolved = attr.resolve is not None
+			if arrived_unresolved:
+				attr.resolve()
+			assert not ( arrived_unresolved and attr.type is not None and attr.type.is_rc() ), (
+				f'base attribute self.{attr.stem} ({attr.type.qualname if attr.type else "?"}) '
+				f'is RC but arrived unresolved - the RC answer here now depends on compile '
+				f'order; resolve it at the source'
+			)
 			key = f'self.{attr.stem}'
 			if rc_leaves( attr.type ):
 				self._push( attr, attr.type, OwnState.OWNED, key = key )

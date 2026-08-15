@@ -19,12 +19,6 @@ def RtlCompareMemory(
 ) -> usize:
 	...
 
-@extern('ntdll', 'RtlExitUserProcess')
-def RtlExitUserProcess(
-	ExitCode: u32,
-) -> None:
-	...
-
 @extern( 'ntdll', 'RtlMoveMemory' )
 def RtlMoveMemory(
 	Destination: Ptr[u8],

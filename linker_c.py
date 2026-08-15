@@ -17,6 +17,75 @@ import subprocess
 import sys
 
 
+def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
+	''' publish a disk-cache entry so a concurrent reader sees either the
+	complete previous state or the complete new one, never a half-written file.
+
+	Path.write_text/write_bytes open with 'w', which TRUNCATES first - so
+	between the open and the write completing there is a window where the file
+	exists but is empty (or short). Every cache reader in this codebase gates
+	on `cache_file.is_file()` and then parses the contents, so a reader landing
+	in that window doesn't see a cache MISS, it sees a cache HIT with garbage:
+
+	  - linker_c.has_symbol:    ''.strip() == '1' -> False, i.e. "that symbol
+	                            isn't available" for a symbol that is
+	  - lowering._eval_cexpr:   int('') -> ValueError, a hard crash
+	  - lowering's UnicodeData: a truncated table, silently
+
+	Confirmed by a real, if rare, test failure: two mutually-exclusive
+	@compiler.target(has_library=X) / (has_library=not X) definitions BOTH
+	survived discovery (producing an Overload where exactly one Function was
+	expected) because the two probes - separate has_symbol calls, no in-process
+	memo between them - read INCONSISTENT values, one before and one during
+	another shard's rewrite of the same cache file. tests.py runs 16 shards as
+	concurrent subprocesses sharing one cache dir, which is why the suite is
+	where this showed up; any two concurrent mpy invocations can hit it.
+
+	The temp file is created in the SAME directory as the target so os.replace
+	is a same-filesystem rename, which is atomic on both POSIX and Windows.
+	Readers should ALSO treat empty/unparseable content as a miss - this fixes
+	new writes, but cannot repair a corrupt file some earlier run left behind.
+
+	PUBLISHING IS BEST-EFFORT, deliberately. On Windows os.replace fails with
+	PermissionError (WinError 5) when the destination is currently OPEN - which
+	a concurrent reader doing cache_file.read_text() briefly makes it. The first
+	version of this raised, which turned the original rare silent-wrong-answer
+	into a rare hard crash that aborted the compile - strictly worse, and caught
+	by the same test that motivated the fix in the first place.
+
+	Losing that race is harmless: this cache is IDEMPOTENT, every writer for a
+	given key computes the same value from the same (lib, symbol, compiler) or
+	(expr, header) inputs, so whoever wins publishes the identical bytes. The
+	caller already has its own correct value in hand and returns it either way;
+	all that's lost is the chance to save the NEXT process a re-probe. A few
+	tight retries first, since a reader's handle is only open for microseconds
+	and retrying usually wins immediately - but never at the cost of failing. '''
+	cache_file.parent.mkdir( parents = True, exist_ok = True )
+	tmp = cache_file.with_name( f'{cache_file.name}.{os.getpid()}.tmp' )
+	try:
+		if isinstance( data, bytes ):
+			tmp.write_bytes( data )
+		else:
+			tmp.write_text( data, encoding = 'utf-8' )
+		for attempt in range( 3 ):
+			try:
+				os.replace( tmp, cache_file )
+				return
+			except OSError:
+				if attempt == 2:
+					# give up publishing - see "best-effort" above. NOT an error
+					# to report: a failed publish costs a future re-probe, never
+					# correctness, and the cache lives in %TEMP% where a full
+					# disk / locked file is the user's environment, not a bug in
+					# the compile they asked for.
+					break
+	finally:
+		# never leave a stray .tmp behind - on the give-up path above, and on
+		# any exception from the writes themselves. Nothing reaps %TEMP%/metalpy
+		# the way it eventually reaps the real cache files.
+		tmp.unlink( missing_ok = True )
+
+
 class CcTool:
 	'''
 	A detected C compiler.
@@ -29,26 +98,50 @@ class CcTool:
 		self.name = name
 		self.path = path
 
-	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False, debug: bool = True ) -> subprocess.CompletedProcess[bytes]:
+	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, cflags: str = '' ) -> subprocess.CompletedProcess[bytes]:
 		''' compile a single .c file to a .o object file '''
+		# asan forces debug INFO on regardless of debug/release, so a crash
+		# report is symbolized - optimization level still follows debug/release
+		# normally (asan works fine instrumented+optimized, a common combo for
+		# fuzzing performance)
+		want_debug_info = debug or asan
 		if self.name == 'cl':
 			cmd = [ self.path, '/nologo', '/std:c11',
 				'/experimental:c11atomics',
 				'/W4', '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
+			if want_debug_info:
+				# /Fd points the PDB at obj's own directory instead of cl's
+				# default (a shared vc140.pdb in the CURRENT directory) - since
+				# every caller already compiles into its own unique temp dir
+				# (mpy.py, test_support.py, etc.), this makes concurrent cl.exe
+				# processes (parallel test shards) never share a PDB path in the
+				# first place, rather than relying on /FS to merely serialize
+				# writes through mspdbsrv.exe (which alone still produced
+				# C1041 "cannot open program database" under this project's
+				# full parallel test suite - /FS is kept too, since it's still
+				# correct/harmless for the rarer case of two compiles that DO
+				# legitimately share one obj directory)
+				cmd += [ '/Zi', '/FS', f'/Fd:{obj.with_name( "vc140.pdb" )}' ]
 			if debug:
-				cmd += [ '/Zi', '/Od' ]
+				cmd += [ '/Od' ]
 				# /RTC1 (stack-frame + uninitialized-variable checks) needs the
 				# _RTC_* support routines that live in the CRT - the no_crt
 				# freestanding path already passes /NODEFAULTLIB at link time,
-				# which would leave those symbols unresolved
-				if not no_crt:
+				# which would leave those symbols unresolved. Also mutually
+				# exclusive with /fsanitize=address (MSVC hard-errors if both
+				# are given), so asan wins when both would otherwise apply.
+				if not no_crt and not asan:
 					cmd += [ '/RTC1' ]
 			else:
 				cmd += [ '/O2', '/DNDEBUG' ]
+			if asan:
+				cmd += [ '/fsanitize=address' ]
 		else:
 			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
+			if want_debug_info:
+				cmd += [ '-g' ]
 			if debug:
 				# -fsanitize-trap=undefined compiles each UBSan check straight to
 				# a trap instruction instead of calling a runtime-library
@@ -63,10 +156,26 @@ class CcTool:
 				# UB-clean alternative short of a trampoline per override.
 				# (the analogous ShlCheck/ShlSaturate false positive on
 				# shift-base was fixed at the source instead - see _shl_expr
-				# in emitter_c.py - so no exclusion is needed for that one)
-				cmd += [ '-g', '-O0', '-fsanitize=undefined', '-fsanitize-trap=undefined', '-fno-sanitize=function' ]
+				# in emitter_c.py - so no exclusion is needed for that one).
+				# -fno-sanitize=function is clang-only: GCC never implemented
+				# -fsanitize=function (no function-pointer-type check in its
+				# own -fsanitize=undefined group at all), so it has nothing to
+				# exclude and rejects the flag outright - gcc's vtable dispatch
+				# was never going to trip this check in the first place.
+				cmd += [ '-O0', '-fsanitize=undefined', '-fsanitize-trap=undefined' ]
+				if self.name == 'clang':
+					cmd += [ '-fno-sanitize=function' ]
 			else:
 				cmd += [ '-O2', '-DNDEBUG' ]
+			if asan:
+				# clang/gcc accumulate multiple -fsanitize= flags (this adds to,
+				# not replaces, the debug-mode -fsanitize=undefined above) -
+				# -fsanitize-trap=undefined still scopes its trap behavior to
+				# only the undefined group, so asan keeps its normal runtime-
+				# reporting behavior (it has no trap-mode equivalent)
+				cmd += [ '-fsanitize=address', '-fno-omit-frame-pointer' ]
+		if cflags:
+			cmd += cflags.split()
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,
@@ -75,7 +184,7 @@ class CcTool:
 			text = True,
 		)
 
-	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True ) -> subprocess.CompletedProcess[bytes]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False ) -> subprocess.CompletedProcess[bytes]:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
@@ -83,8 +192,20 @@ class CcTool:
 			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
 			if no_crt:
 				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
-			if debug:
+			if debug or asan:
 				cmd += [ '/DEBUG' ]
+			if strip:
+				# PE has no ELF-style embedded symbol table to strip in the
+				# first place (a binary built without /DEBUG already carries
+				# none) - /OPT:REF /OPT:ICF (dead-code elimination + identical-
+				# COMDAT folding) is the closest MSVC analog to what people
+				# actually mean by a "stripped" release build
+				cmd += [ '/OPT:REF', '/OPT:ICF' ]
+			# no /fsanitize=address here: that's a cl.exe compiler-frontend
+			# flag, not understood by link.exe directly - cl.exe embeds the
+			# necessary /DEFAULTLIB directive for the ASan runtime straight
+			# into the .obj itself, so the separate link step needs nothing
+			# extra (verified empirically - see plan's verification section)
 		else:
 			# a program using an f32/f64<->i128/u128 cast needs GCC/Clang's own
 			# runtime helpers (__fixdfti/__fixunsdfti/__floattidf/... - see
@@ -98,6 +219,14 @@ class CcTool:
 			# actually references
 			wide_int_lib = _find_wide_int_runtime_lib( self )
 			cmd = [ self.path ] + extra + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + [ '-o', str( exe ) ]
+			if asan:
+				# clang/gcc's own driver acts as the linker frontend even for
+				# an objects-only link, and only links the ASan runtime when
+				# -fsanitize=address is present at THIS invocation too, not
+				# just at compile time
+				cmd += [ '-fsanitize=address' ]
+			if strip:
+				cmd += [ '-s' ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,
@@ -105,6 +234,19 @@ class CcTool:
 			stderr = subprocess.STDOUT,
 			text = True,
 		)
+
+
+def has_i128( cc: CcTool|None ) -> bool:
+	'''
+	True 128-bit i128/u128 range/semantics, vs MSVC's documented 64-bit
+	fallback (see emitter_c.py's __metalpy_wideint/__metalpy_wideuint
+	typedefs, `#if defined(_MSC_VER) && !defined(__clang__)`) - this is the
+	direct Python-side mirror of that same C-preprocessor condition. `cc is
+	None` (no compiler found at all) defaults to True: permissive, and moot
+	anyway since an actual build with no compiler dies with a clear error
+	regardless of what this said.
+	'''
+	return cc is None or cc.name != 'cl'
 
 
 def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
@@ -135,7 +277,23 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 	cache_dir.mkdir( parents = True, exist_ok = True )
 	cache_file = cache_dir / key
 	if cache_file.is_file():
-		return cache_file.read_text().strip() == '1'
+		# an empty/unrecognized body is a TORN or half-written entry, not a
+		# real answer - fall through and re-probe rather than reporting "not
+		# available" for something that is (see atomic_write_cache). Cheap:
+		# the re-probe overwrites it with a good value.
+		#
+		# OSError is the same story from the other side: on Windows, opening
+		# this file fails with PermissionError while another process's
+		# os.replace of it is in flight. READING is best-effort for exactly the
+		# reason PUBLISHING is - a lost read costs one re-probe, never
+		# correctness - so cache contention must never surface as an error on
+		# either side.
+		try:
+			cached = cache_file.read_text().strip()
+		except OSError:
+			cached = ''
+		if cached in ( '0', '1' ):
+			return cached == '1'
 
 	c_src = f'char {symbol}();\nint main(void) {{ return {symbol}(); }}\n'
 	with tempfile.TemporaryDirectory() as tmp:
@@ -151,7 +309,7 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 			link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflag )
 			available = link_result.returncode == 0
 
-	cache_file.write_text( '1' if available else '0', encoding = 'utf-8' )
+	atomic_write_cache( cache_file, '1' if available else '0' )
 	return available
 
 

@@ -143,13 +143,37 @@ lowering:
 		len(src) where src: move[bytearray] (Move has no .names at all - see
 		incref/decref/move[T] below) - confirmed still reproduces:
 		"Move(...) has no members, cannot look up '__len__'".
-	@inline decorator: a function marked @inline should compile down to its
-		body spliced directly at each call site (no real Call/FuncStart/
-		FuncEnd for it) - lib/builtins/__init__.py's len() is meant to become
-		@inline once this exists, so len(x) costs exactly what x.__len__()
-		would and no more. See PLAN_INLINE.md for the full design (scoped to
-		single `return <expr>` bodies - covers len() plus ~50 other
-		one-liner forwarders found across lib/).
+	@inline decorator: landed (see PLAN_INLINE.md for the full design/status) -
+		a function marked @inline compiles down to its body spliced directly
+		at each call site (no real Call/FuncStart/FuncEnd for it).
+		lib/builtins/__init__.py's len() uses it, so len(x) costs exactly
+		what x.__len__() would and no more. Covers single `return <expr>`
+		bodies, multi-statement bodies (locals, if/for/while), early/nested
+		return, defer/errdefer, and .or_return()/checked-arithmetic in a
+		pre-return statement - each gets its own local splice-scoped "early
+		exit" target (cfg.py's InlineScope) rather than ever touching the
+		caller's own real epilogue.
+
+		Still explicitly unsupported, for later review:
+		- self/parameter reassignment inside a spliced body's pre-return
+			statements - rejected at parse time (aliasing hazard: a bare-name
+			receiver/argument is passed in as the CALLER's own Variable
+			directly, zero-copy - reassigning it inside the splice would
+			silently mutate the caller's own binding). Relaxing this needs a
+			defensive-copy fallback whenever reassignment is detected,
+			replacing today's zero-copy reuse optimization.
+		- .or_return()/checked-arithmetic in a pre-return statement, when
+			combined with PLAN_RETURN_INFERENCE.md's return-only type-
+			parameter inference - stays rejected. Return-only inference
+			already requires exactly one reachable return (a separate
+			eligibility gate), and during inference the return type is a
+			"not yet known" sentinel with no real type to build a splice-
+			local scope's own result variable from.
+		- @classmethod/@move/@overload/@virtual combined with @inline -
+			unchanged/untouched since the original single-statement design.
+		- tuple-unpacking assignment and `with X as y:` inside an inline
+			body - already globally unsupported by this compiler, not
+			@inline-specific new scope.
 	incref/decref
 		part of this: remodel move[T]/Move properly. It's currently a Type
 		wrapper (mpy_types.Move, holding .inner), which is wrong - move[T]

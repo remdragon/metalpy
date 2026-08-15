@@ -125,6 +125,69 @@ class Compiler:
 			self.disco.errors.error( 'no main() found', file = None, line = None )
 			return
 		self._enqueue( self.disco.main )
+		self._drain()
+		if self.disco.active_target['os'] == 'windows':
+			# 'c' not in self.extern_libs mirrors mpy.py's own no_crt
+			# computation ('c' not in compiler.extern_libs) - captured HERE,
+			# right after the user's own program has fully drained (above),
+			# before any of the forcing below runs, so it reflects exactly
+			# what the user's own program needs. Neither force_reachable
+			# call below ever touches the 'c' extern either way (Windows
+			# console-codepage/exit both live in kernel32), so this doesn't
+			# need to be recomputed between them.
+			no_crt = 'c' not in self.extern_libs
+			# force windows._console's _console_init global to be reachable on
+			# EVERY Windows build - nothing in the user's own program
+			# necessarily references it, but its own initializer
+			# (SetConsoleOutputCP) must still run before main() does. See
+			# windows/_console.py's own comment. Enqueued AFTER main's own
+			# graph fully drains (not alongside it above) so this always
+			# lands at the END of compiler.globals - tests (and any other
+			# compiler.globals[0]-style code) that assume the user's own
+			# first-declared global is index 0 stay correct; the real CALL
+			# order inside __metalpy_init() is dependency order
+			# (_topologically_sort_globals in emitter_c.py), not this
+			# scheduling order anyway, so appending here has no effect on
+			# correctness - only on this list's own enumeration order.
+			self.force_reachable( 'windows._console', '_console_init' )
+			if no_crt:
+				# emitter_c.py's synthesized mainCRTStartup (no-CRT Windows
+				# entry point only) calls sys.exit() directly by its own
+				# mangled C symbol name to terminate the process - force it
+				# reachable so that call always resolves. Unlike
+				# _console_init above, this is only needed when no_crt (a
+				# CRT-linked Windows build never emits mainCRTStartup at
+				# all), so it's gated separately rather than being forced
+				# unconditionally on every Windows target.
+				self.force_reachable( 'sys', 'exit' )
+
+	def force_reachable( self, module_qualname: str, attr_name: str ) -> None:
+		''' resolves module_qualname.attr_name (a Function or global
+		Variable) and forces it onto the work queue + drains, even though
+		nothing in the user's own program necessarily references it. Used
+		for compiler-synthesized C text (raw, hand-written, outside the
+		normal IR pipeline - see emitter_c.py's __metalpy_init/
+		mainCRTStartup synthesis) that needs to call/reference a real
+		metalpy-level symbol by its own mangled C name. Silently no-ops if
+		module_qualname can't be resolved, or doesn't define attr_name -
+		some Discovery instances (tests) use a deliberately minimal,
+		fixture-only `paths=` that doesn't include the real lib/ tree, or
+		swaps in a minimal stand-in module missing this particular symbol
+		(e.g. emitter_c_test.py's BuiltinsStrTestCase, whose own sys.py
+		fixture has no exit()) - there's nothing useful to force-init in
+		either case, so skip it rather than hard-failing every compile
+		through that harness. '''
+		try:
+			mod = self.disco.import_name( module_qualname )
+		except FileNotFoundError:
+			return
+		unit = mod.names.get( attr_name )
+		if unit is None:
+			return
+		self._enqueue( unit )
+		self._drain()
+
+	def _drain( self ) -> None:
 		while True:
 			unit = self.type_resolver.next_unit()
 			if unit is None:

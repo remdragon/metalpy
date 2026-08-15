@@ -55,10 +55,29 @@ def get_local_timezone_name() -> str:
 
 
 def _read_etc_timezone_file() -> str:
-	if f := open( '/etc/timezone', 'r' ).unwrap_or():
-		with defer:
-			f.close()
-		if s := f.read( 128 ):
-			return s.strip()
-	
-	return 'UTC'
+	# `open(path, mode)` was never a real name anywhere in this codebase -
+	# the real primitives are File.binary_reader()/BinaryReader.read()
+	# (lib/builtins/__File.py). match-based Result narrowing throughout,
+	# same shape as str.partition's own
+	# `match found: case Result.Ok(idx): ... case Result.Err(_): ...`.
+	# No explicit reader.close() - not a correctness requirement (its own
+	# destructor already closes the fd), and BinaryReader.close()'s own
+	# body has a separate, real, pre-existing bug (an unchecked Result
+	# from fs.close_raw(), lib/builtins/__File.py:40) - sidestepped here
+	# rather than fixed, out of scope for this function's own rewrite.
+	match File.binary_reader( '/etc/timezone' ):
+		case Result.Ok( reader ):
+			buf: bytearray = bytearray( 128 )
+			match reader.read( buf.get_ptr(), 128 ):
+				case Result.Ok( n ):
+					if n == 0:
+						return 'UTC'
+					match buf[:n].decode():
+						case Result.Ok( s ):
+							return s.strip()
+						case Result.Err( _ ):
+							return 'UTC'
+				case Result.Err( _ ):
+					return 'UTC'
+		case Result.Err( _ ):
+			return 'UTC'
