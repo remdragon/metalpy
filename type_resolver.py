@@ -1105,6 +1105,37 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if isinstance( node, ast.Call ):
 			target: object|None
 			if isinstance( node.func, ast.Attribute ):
+				if node.func.attr == 'or_return':
+					# <result_expr>.or_return() - recognized by AST shape
+					# alone, mirroring lowering.py's own _lower_call fix
+					# (see that check's comment for the full story). Never
+					# look for a real declared 'or_return' method here -
+					# discovery.py now rejects defining one outright, on
+					# ANY class, so names.get('or_return') below would
+					# never find one anyway post-fix; and even when the
+					# real library still had a hand-written one, scheduling
+					# it via ensure_resolved() below was itself the bug
+					# (confirmed directly: a self-referential/same-file T,
+					# e.g. a method of Foo returning Result[Foo,E] and
+					# or_return()-ing it from elsewhere in Foo, crashed with
+					# "compiler.early_return(...) requires the enclosing
+					# function to return Result[_,_]"). Result[T,E].
+					# or_return() always returns T - read it straight off
+					# the receiver's own Specialization args instead, no
+					# scheduling, no real method lookup, needed at all.
+					receiver_type = self._type_of_expr( node.func.value )
+					if receiver_type is None:
+						return None
+					receiver_type = self.resolver.ensure_resolved( receiver_type )
+					receiver_cls_base = (
+						receiver_type.base if isinstance( receiver_type, Specialization ) else receiver_type
+					)
+					if (
+						receiver_cls_base is self.discovery.find_name_or_none( 'Result' )
+						and isinstance( receiver_type, Specialization ) and receiver_type.args
+					):
+						return receiver_type.args[0]
+					return None
 				receiver_type = self._type_of_expr( node.func.value )
 				target = None
 				if receiver_type is not None:
@@ -1117,36 +1148,6 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			else:
 				target = self._try_resolve_callable_namespace( node.func )
 			if isinstance( target, Function ):
-				if target.stem == 'or_return':
-					# or_return() is never a real, scheduled/compiled function
-					# (its declared body is a spec for lowering.py's own
-					# _lower_or_return to special-case at the call site, not
-					# something literally compilable - see that method's own
-					# comment) - but ensure_resolved() below unconditionally
-					# schedules whatever it's handed, with no exemption for
-					# this one method. Reached here specifically for a bare
-					# `x = <result_expr>.or_return()` (no type annotation) -
-					# this pass's own speculative bookkeeping for x's type
-					# then resolves the RECEIVER (a Result[T,E] Specialization)
-					# down to its monomorphized concrete class two lines up,
-					# whose own already-monomorphized 'or_return' entry (found
-					# via names.get above) is what target is here - scheduling
-					# THAT literally compiles or_return[T,E]'s spec-only body,
-					# which fails the moment it does (confirmed directly: a
-					# self-referential/same-file T, e.g. a method of Foo
-					# returning Result[Foo,E] and or_return()-ing it from
-					# elsewhere in Foo, reaches exactly this path and crashes
-					# with "compiler.early_return(...) requires the enclosing
-					# function to return Result[_,_]"). Result[T,E].or_return()
-					# always returns T - read it straight off the receiver's
-					# own Specialization args instead, no scheduling needed.
-					target_cls_base = target.cls.base if isinstance( target.cls, Specialization ) else target.cls
-					if (
-						target_cls_base is self.discovery.find_name_or_none( 'Result' )
-						and isinstance( target.cls, Specialization ) and target.cls.args
-					):
-						return target.cls.args[0]
-					return None
 				target = self.resolver.ensure_resolved( target )
 				return target.return_type if isinstance( target, Function ) else None
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):

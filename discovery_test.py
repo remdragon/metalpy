@@ -1575,6 +1575,39 @@ class Foo:
 		self.assertIn( 'unsupported function decorator', self.discovery.errors.errors[0] )
 
 
+class OrReturnReservedNameTests( unittest.TestCase ):
+	''' 'or_return' is reserved for the compiler's own Result[T,E].or_return()
+	- <result_expr>.or_return() is recognized purely by AST shape (lowering.
+	py's _lower_call, before ordinary call resolution ever runs), never by
+	looking up a real declared method the way is_ok()/is_err()/unwrap()/
+	unwrap_or() genuinely are - a user-written `def or_return(...)` could
+	never actually run, at any receiver type, so it's rejected outright here
+	rather than silently accepted as dead code '''
+
+	def setUp( self ) -> None:
+		self.discovery = discovery.Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def test_plain_function_named_or_return_is_rejected( self ) -> None:
+		self._import( '''
+def or_return() -> i32:
+	return 1
+''' )
+		self.assertIn( "'or_return' is reserved", self.discovery.errors.errors[0] )
+
+	def test_method_named_or_return_is_rejected( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	def or_return( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( "'or_return' is reserved", self.discovery.errors.errors[0] )
+
+
 class CircularImportTests( unittest.TestCase ):
 	'''
 	regression: import_name() used to register a module in self.modules only

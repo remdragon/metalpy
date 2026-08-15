@@ -64,18 +64,24 @@ class Result[T,E]:
 	# expression, a named receiver's is at scope exit) - see cfg.py's
 	# rc_leaves()/_refcount_instructions for the matching fix that makes a
 	# Result value's own payload actually get tracked/decref'd at all (a
-	# separate, previously-missing half of this same balance). NOTE: this
-	# declared body is what actually runs for unwrap()/unwrap_or() (real
-	# function calls) - but NOT for or_return(), which is recognized
-	# textually and compiled to raw OrReturn/OrJump IR instead (see
-	# lowering.py's _lower_or_return); or_return's own matching incref lives
-	# in lowering.py's _consume_checked_result, which every or_return() call
+	# separate, previously-missing half of this same balance). This declared
+	# body is what actually runs for unwrap()/unwrap_or() below (real
+	# function calls).
+
+	# or_return() is compiler magic, not a real method - deliberately NOT
+	# declared here (or anywhere: 'or_return' is a reserved name, rejected
+	# outright by discovery.py's _parse_function on ANY class, since a
+	# user-written one could never actually run). `<result_expr>.or_return()`
+	# is recognized purely by its AST shape (lowering.py's _lower_call,
+	# before ordinary call resolution ever runs) and compiled directly to
+	# raw OrReturn/OrJump IR (see _lower_or_return) - equivalent to:
+	#     if self.is_err():
+	#         compiler.early_return( self.data.v_Err )
+	#     ok: T = self.data.v_Ok
+	#     return ok
+	# or_return's own matching incref (see the accessor NOTE above) lives in
+	# lowering.py's _consume_checked_result, which every or_return() call
 	# actually goes through.
-	def or_return( self ) -> T:
-		if self.is_err():
-			compiler.early_return( self.data.v_Err )
-		ok: T = self.data.v_Ok
-		return ok
 
 	def unwrap( self, errmsg: str ) -> T:
 		if self.is_ok():
