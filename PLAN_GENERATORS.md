@@ -1,16 +1,35 @@
 Generator functions (`yield`, state-machine transform)
 
-STATUS: v1 landed and real-compile-and-run tested (emitter_c_test.py's
-GeneratorFunctionTests) - Phases 0-1 below, restricted further than
-originally scoped: every `yield` must be a direct top-level statement of
-the function body (not nested inside if/while/for/with/try - loops are
-Phase 2, not yet attempted). Within that restriction, straight-line bodies
-with multiple sequential yields work end to end, including the RC-
-correctness payoff this whole plan is about (a generator dropped mid-
+STATUS: v1 + Phase 2 (while loops) landed and real-compile-and-run tested
+(emitter_c_test.py's GeneratorFunctionTests) - PLAN_GENERATORS.md's own
+motivating example (a real `range()`-shaped generator: `while i < count:
+yield i; i += 1`) now compiles and runs, not just textual `range()` sugar.
+
+`yield` may be either a direct top-level statement of the function body
+(Phase 1), or the single yield inside a direct top-level `while` loop
+(Phase 2) - a yield nested inside an if/for/with/try, or inside a loop
+that has more than one yield or any break/continue, is a clear compile
+error, not a silently wrong state machine (see GeneratorFunctionTests'
+own three rejection tests). Both unit shapes verified for the RC-
+correctness payoff this whole plan is about: a generator dropped mid-
 iteration correctly decrefs a captured RC-typed PARAMETER via the
 ordinary, completely unmodified $$__destructor__ synthesis - see "The
 $$__del__ problem" below for why parameters specifically, not yet
-arbitrary locals).
+arbitrary locals.
+
+Phase 2 design: a `while` unit occupies TWO states (not-yet-entered /
+resuming) rather than one state per iteration - cfg.py's own structured
+loop machinery is untouched, no goto/switch needed. Restructured (in
+type_resolver.py's `_build_while_unit_guard`) into the standard resumable-
+loop idiom: `while True: [on resume only: run the code after the yield,
+once]; if not cond: break; [code before the yield]; state = N+1; return
+value`. When the loop naturally exhausts, state advances and execution
+FALLS THROUGH (no return) into whatever follows - correct, since Python's
+own generator semantics don't pause between a loop ending and the code
+after it. Confirmed working when mixed with ordinary bare-yield units in
+the same generator (bare yield, then a while-unit, then another bare
+yield - see the `bare_yield_and_while_unit_mixed_in_one_generator` test
+case).
 
 Landed design deviates from the plan's original sketch in three ways,
 each because the simpler thing turned out to already be sufficient:
@@ -27,19 +46,18 @@ each because the simpler thing turned out to already be sufficient:
    unchanged. An RC-typed local surviving a yield (needing the state-
    gated cascade this doc originally sketched) is deferred, no forcing
    use case yet.
-3. Dispatch is a flat sequence of `if self.__state <= i:` guards (each
-   ending in an unconditional `return`), not a goto/switch - discovered
-   while implementing that emitter_c.py already lowers Jump/Label/
-   JumpIfFalse as flat C goto/label pairs (not reconstructed structured
-   control flow), so a real dispatch mechanism was available for free,
-   but the recursive-AST-If approach turned out simpler to generate
-   correctly and needed zero emitter work either way. Confirmed this
-   still works correctly THROUGH ordinary nested if/while inside a
-   segment (cfg.py's structured lowering doesn't care that the whole
-   thing is wrapped in one more `if self.__state <= i:`), so Phase 2
-   (loops) is likely much less work than originally estimated - the
-   segment-splitting-at-top-level-yields restriction is the only thing
-   standing in the way now, not the dispatch mechanism itself.
+3. Dispatch is a flat sequence of `if self.__state <= i:` guards, not a
+   goto/switch - discovered while implementing that emitter_c.py already
+   lowers Jump/Label/JumpIfFalse as flat C goto/label pairs (not
+   reconstructed structured control flow), so a real dispatch mechanism
+   was available for free, but the recursive-AST-If approach turned out
+   simpler to generate correctly and needed zero emitter work either way.
+   A YIELD unit's own guard still ends in an unconditional `return`; a
+   WHILE unit's guard does NOT (see the Phase 2 design note above) - this
+   turned out to still fit the same flat-guard-chain shape with no
+   goto/switch needed, confirming the Phase 1 prediction that loops
+   wouldn't need the dispatch mechanism to change, only the unit-
+   recognition/guard-building logic.
 
 A genuine, pre-existing, unrelated gap found while testing this (not
 fixed, not in scope): reading a `T|None` value back out in NARROWED form
@@ -56,7 +74,10 @@ know `T|None` specifically is affected, not just named multi-member
 unions.
 
 Original planning notes follow, kept for the phases not yet attempted
-(loops, fallible generators, `for`-loop consumption, generic generators).
+(fallible generators, `for`-loop consumption, generic generators, `for`
+LOOPS containing yield - as opposed to `while`, still rejected: a `for`
+loop's own hidden index/length bookkeeping was never analyzed for this,
+out of scope for Phase 2).
 
 Why
 

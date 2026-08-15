@@ -8075,13 +8075,15 @@ def main() -> i32:
 
 
 class GeneratorFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
-	''' PLAN_GENERATORS.md, v1 scope: a plain function containing `yield`,
-	every yield a direct top-level statement (no yield nested inside if/
-	while/for/with/try yet). Real compile-and-run - not just "does it
-	lower", the whole point is the generated C state machine actually
-	behaves like Python's own generator semantics, including RC correctness
-	on early abandonment (the "function epilogue moves into __del__" idea
-	this plan doc is built around). '''
+	''' PLAN_GENERATORS.md - a plain function containing `yield`, where
+	every yield is either a direct top-level statement (Phase 1) or the
+	single yield inside a direct top-level while loop (Phase 2 -
+	PLAN_GENERATORS.md's own motivating range()-style example). Real
+	compile-and-run - not just "does it lower", the whole point is the
+	generated C state machine actually behaves like Python's own generator
+	semantics, including RC correctness on early abandonment (the
+	"function epilogue moves into __del__" idea this plan doc is built
+	around) for both unit shapes. '''
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
@@ -8154,7 +8156,141 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+			# --- Phase 2: a while loop containing exactly one yield, as a
+			# direct statement of the loop's own body - PLAN_GENERATORS.md's
+			# own motivating example (a real range()) finally compiles and
+			# runs, not just textual `range()` sugar (lowering.py's
+			# _is_range_call). See _build_while_unit_guard's own docstring
+			# for the resumable-loop restructuring this compiles down to.
+			( 'while_loop_resumable_across_next_calls', '''
+def counter( count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = counter( 3 )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__()
+		if c is None:
+			return 3
+		d = g.__next__()
+		if d is not None:
+			return 4
+		return 0
+''' ),
+			( 'while_loop_dropped_mid_iteration_decrefs_captured_parameter', '''
+class Box:
+	v: usize
+	def __init__( self, v: usize ) -> None:
+		self.v = v
+
+def gen( b: Box ) -> Iterator[usize]:
+	i: usize = 0
+	while i < b.v:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def make_and_partially_consume( b: Box ) -> None:
+	g = gen( b )
+	first = g.__next__()
+	second = g.__next__() # b.v is 10 - only 2 of 10 iterations consumed
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 10 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		make_and_partially_consume( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
+			( 'bare_yield_and_while_unit_mixed_in_one_generator', '''
+def mixed( count: usize ) -> Iterator[usize]:
+	hundred: usize = 100
+	yield hundred
+	i: usize = 0
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+	two_hundred: usize = 200
+	yield two_hundred
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = mixed( 2 )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__()
+		if c is None:
+			return 3
+		d = g.__next__()
+		if d is None:
+			return 4
+		e = g.__next__()
+		if e is not None:
+			return 5
+		return 0
+''' ),
 		])
+
+	def test_yield_nested_in_if_is_rejected( self ) -> None:
+		# Phase 2 only recognizes a bare top-level yield or a single-yield
+		# top-level while loop as valid units - a yield nested one level
+		# deeper (inside an if inside the loop) must be a clear compile
+		# error, not a silently wrong state machine
+		self._run( '''
+def gen( flag: bool ) -> Iterator[i32]:
+	while True:
+		if flag:
+			yield 1
+
+def main() -> None:
+	g = gen( True )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
+
+	def test_while_loop_with_two_yields_is_rejected( self ) -> None:
+		self._run( '''
+def gen() -> Iterator[i32]:
+	while True:
+		yield 1
+		yield 2
+
+def main() -> None:
+	g = gen()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'exactly one yield', str( self.discovery.errors.errors[0] ))
+
+	def test_break_inside_yielding_while_loop_is_rejected( self ) -> None:
+		self._run( '''
+def gen() -> Iterator[i32]:
+	while True:
+		yield 1
+		break
+
+def main() -> None:
+	g = gen()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'break/continue', str( self.discovery.errors.errors[0] ))
 
 
 if __name__ == '__main__':
