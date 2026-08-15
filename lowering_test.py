@@ -8606,6 +8606,68 @@ class ListLiteralTests( unittest.TestCase ):
 		]), needle = 'list literal needs a known list[T] target type' )
 
 
+class SetLiteralTests( unittest.TestCase ):
+	''' _expr_Set (ast.Set, `{a, b, c}`) - mirrors ListLiteralTests above.
+	Requires expected_type to already be a concrete set[T] Specialization -
+	no element-driven inference, same precedent as list literals. No
+	empty-literal test here (unlike ListLiteralTests' own
+	test_empty_list_literal_is_construction_only): `{}` is unconditionally
+	an empty ast.Dict in Python's own grammar, never an empty ast.Set - the
+	defensive `if not node.elts` guard in _expr_Set exists only for a
+	synthetically-built AST node, not reachable from real source text. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def _assert_rejected( self, code: str, needle: str ) -> None:
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( needle in e for e in self.discovery.errors.errors ),
+			f'expected an error containing {needle!r}, got: {self.discovery.errors.errors}',
+		)
+
+	def test_construction_and_add_shape( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			"	x: set[str] = { 'a', 'b' }",
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		add_calls = [ c for c in calls if c.target.stem == 'add' ]
+		self.assertEqual( len( add_calls ), 2 )
+		# both add calls target the SAME constructed set instance
+		self.assertIs( add_calls[0].receiver, add_calls[1].receiver )
+		# unlike list[T].append, set[T].add returns plain None - no
+		# unwrap()/Result dance needed for a set literal
+		self.assertFalse( any( c.target.stem == 'unwrap' for c in calls ) )
+
+	def test_wrong_element_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x: set[str] = { 'a', 5 }",
+			'	return',
+		]), needle = 'expected' )
+
+	def test_no_expected_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x = { 'a', 'b' }",
+			'	return',
+		]), needle = 'set literal needs a known set[T] target type' )
+
+
 class MoveParameterTests( unittest.TestCase ):
 	''' move[T] is an ownership status on a binding, not a distinct type
 	from T (Parameter.is_move/is_copy, not a Move/Copy-wrapped .type -
