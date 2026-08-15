@@ -5040,6 +5040,25 @@ def main() -> i32:
 		return 8
 	return 0
 ''' ),
+			# str.__contains__ (find().is_ok()) plus the `in`/`not in`
+			# operator dispatch to it (lowering.py's _lower_in_comparison)
+			( 'contains_and_in_operator', '''
+def main() -> i32:
+	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
+	if not s.__contains__( 'beef' ):
+		return 1
+	if s.__contains__( 'zzz' ):
+		return 2
+	if not ( 'beef' in s ):
+		return 3
+	if 'zzz' in s:
+		return 4
+	if not ( 'zzz' not in s ):
+		return 5
+	if 'beef' not in s:
+		return 6
+	return 0
+''' ),
 		] )
 
 
@@ -6066,6 +6085,22 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
+			# `in`/`not in` dispatch to __contains__ (lowering.py's
+			# _lower_in_comparison) - the reversed receiver/arg order
+			( 'in_and_not_in_operator', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if not ( 'a' in d ):
+		return 1
+	if 'nope' in d:
+		return 2
+	if not ( 'nope' not in d ):
+		return 3
+	if 'a' not in d:
+		return 4
+	return 0
+''' ),
 		] )
 
 
@@ -6238,6 +6273,22 @@ def main() -> i32:
 		return 2
 	if r.unwrap( 'x' ) != 15:  # 1 ^ 2 ^ 4 ^ 8 == 15
 		return 3
+	return 0
+''' ),
+			# `in`/`not in` dispatch to __contains__ (lowering.py's
+			# _lower_in_comparison) - the reversed receiver/arg order
+			( 'in_and_not_in_operator', '''
+def main() -> i32:
+	s: set[i32] = set[i32]()
+	s.add( 7 )
+	if not ( 7 in s ):
+		return 1
+	if 8 in s:
+		return 2
+	if not ( 8 not in s ):
+		return 3
+	if 7 not in s:
+		return 4
 	return 0
 ''' ),
 		] )
