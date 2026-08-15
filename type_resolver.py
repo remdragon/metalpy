@@ -303,6 +303,88 @@ class TypeResolver:
 			if isinstance( node, ast.Return ) and node.value is not None and not ( isinstance( node.value, ast.Constant ) and node.value.value is None ):
 				self.discovery.fail( f'{fn.qualname}: a generator function cannot `return` a value (a bare `return` ends iteration) - see PLAN_GENERATORS.md', node )
 
+	def _rewrite_generator_bare_returns( self, fn: Function ) -> list[ast.Assign]:
+		''' a bare `return` inside a generator body (already confirmed, by
+		_reject_generator_value_return running just before this, to carry no
+		value) compiles today but doesn't end iteration the way real Python
+		generator semantics require - it's just an ordinary early `return
+		None` out of $$__next__, which leaves self.__state exactly where it
+		was BEFORE this call. A later manual .__next__() call would then
+		wrongly resume and re-run whatever this return was meant to skip,
+		instead of staying permanently exhausted (see PLAN_GENERATORS.md's
+		defer/errdefer phase writeup for how this gap was found).
+
+		Fixed the same way Phase 4 (roadmap Phase 4) already fixed the
+		analogous or_return()-early-exit gap for fallible generators (see
+		_pessimistic_done_prefix's own docstring): rewrite every bare
+		`return` - wherever it's reachable, including nested inside an
+		ordinary if/while/with/match, a while-unit's own loop body, or an
+		if-unit's own branch (today only break/continue get checked inside
+		those - see _validate_while_yield_unit) - into `self.__state =
+		<placeholder>; return None`, mutating fn.node.body itself, IN PLACE,
+		BEFORE _collect_generator_units/_split_generator_segments/the guard
+		builders ever consume it. Each guard builder already renames/wraps
+		whatever it's handed (_rename_and_track_liveness, _pessimistic_done_
+		prefix) without caring how many statements are in a given segment,
+		so no changes are needed there - this only has to run early enough
+		that the extra statements are already sitting in the body by the
+		time those methods slice/copy it.
+
+		The real done_state value isn't known until AFTER every unit is
+		built (same reason _pessimistic_done_prefix's own pending_done_
+		assigns list is patched late, not while building this) - unlike
+		that mechanism, THIS one has to run regardless of fallible-ness (an
+		Iterator[T] generator needs to stay permanently exhausted after a
+		bare return exactly as much as a Generator[T,E] one does), so it
+		gets its OWN always-populated pending list, patched to done_state by
+		_build_generator_next_function alongside pending_done_assigns. '''
+		pending: list[ast.Assign] = []
+		fn.node.body = self._rewrite_bare_return_stmts( fn.node.body, pending )
+		return pending
+
+	def _rewrite_bare_return_stmts( self, stmts: list[ast.stmt], pending: list[ast.Assign] ) -> list[ast.stmt]:
+		''' helper for _rewrite_generator_bare_returns - see its own
+		docstring. Recurses into every nested statement-list-bearing field
+		this language's statements can have (If/While/With's own `body`/
+		`orelse`, plus match_case's own `body` - there's no try/except here
+		to worry about, confirmed elsewhere in this file), but NOT into a
+		nested def/lambda (a separate, unrelated scope - same boundary
+		_walk_generator_body's own docstring explains). '''
+		result: list[ast.stmt] = []
+		for stmt in stmts:
+			if isinstance( stmt, ast.Return ) and ( stmt.value is None or ( isinstance( stmt.value, ast.Constant ) and stmt.value.value is None )):
+				assign = ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = 0 ) )
+				ast.copy_location( assign, stmt )
+				pending.append( assign )
+				if stmt.value is None:
+					# a truly bare `return` (no expression at all) lowers to
+					# a void C `return;` - wrong, $$__next__'s own declared
+					# return type is never void (always elem_type|None, or
+					# Result[...] when fallible) - every OTHER synthesized
+					# return in this file already uses an explicit
+					# `ast.Constant(value=None)` (see the DONE short-
+					# circuit/tail's own returns just above), so normalize
+					# this one the same way, confirmed via a real repro that
+					# failed to even COMPILE otherwise ("non-void function
+					# ... should return a value")
+					stmt.value = ast.Constant( value = None )
+					ast.copy_location( stmt.value, stmt )
+				result.append( assign )
+				result.append( stmt )
+				continue
+			if isinstance( stmt, ( ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda )):
+				result.append( stmt )
+				continue
+			if isinstance( stmt, ast.Match ):
+				for case in stmt.cases:
+					case.body = self._rewrite_bare_return_stmts( case.body, pending )
+			elif hasattr( stmt, 'body' ):
+				stmt.body = self._rewrite_bare_return_stmts( stmt.body, pending )
+			if hasattr( stmt, 'orelse' ):
+				stmt.orelse = self._rewrite_bare_return_stmts( stmt.orelse, pending )
+			result.append( stmt )
+		return result
+
 	def _while_yield_nodes( self, node: ast.While ) -> list[ast.expr]:
 		return [ n for n in self._walk_generator_body( node.body ) if isinstance( n, ( ast.Yield, ast.YieldFrom )) ]
 
@@ -1442,7 +1524,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', elem_type: Type ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', elem_type: Type, pending_bare_return_assigns: 'list[ast.Assign]' ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
@@ -1505,6 +1587,8 @@ class TypeResolver:
 		if pending_done_assigns is not None:
 			for pending in pending_done_assigns:
 				pending.value = ast.Constant( value = done_state )
+		for pending in pending_bare_return_assigns:
+			pending.value = ast.Constant( value = done_state )
 
 		next_body: list[ast.stmt] = [
 			ast.If(
@@ -1856,6 +1940,7 @@ class TypeResolver:
 		units = self._collect_generator_units( fn )
 		self._reject_generator_defer( fn )
 		self._reject_generator_value_return( fn )
+		pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn )
 		locals_decl = self._collect_generator_locals( fn )
 
 		none_type = self.discovery.get_none_type()
@@ -1880,7 +1965,7 @@ class TypeResolver:
 			next_return_type = result_union
 
 		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, elem_type )
+		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, elem_type, pending_bare_return_assigns )
 		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 		# backing_cls is ever scheduled below, so its own pre-mark of
 		# id(backing_cls) in self._destructors_synthesized (see its own

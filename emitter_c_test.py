@@ -8924,6 +8924,63 @@ def main() -> i32:
 			return 1
 		return 0
 ''' ),
+			# --- prerequisite for defer/errdefer support (PLAN_GENERATORS.md) -
+			# a bare `return` inside a generator body must permanently end
+			# iteration (self.__state pinned at the DONE sentinel), not just
+			# return None once and leave __state wherever it was - a real,
+			# previously-untested gap (_reject_generator_value_return only ever
+			# rejected a VALUE return, nothing rewrote a bare one)
+			( 'bare_return_nested_in_while_unit_loop_body_ends_iteration_permanently', '''
+def gen( limit: i32 ) -> Iterator[i32]:
+	x: i32 = 0
+	while x < limit:
+		if x == 2:
+			return
+		yield x
+		with compiler.wrap_arithmetic:
+			x += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen( 5 )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__() # x becomes 2 here, hits the bare `return` before yielding again
+		if c is not None:
+			return 3
+		d = g.__next__() # must stay permanently None, not resume mid-loop
+		if d is not None:
+			return 4
+		e = g.__next__()
+		if e is not None:
+			return 5
+		return 0
+''' ),
+			( 'bare_return_in_tail_after_yield_ends_iteration_permanently', '''
+def gen( flag: bool ) -> Iterator[i32]:
+	yield 1
+	if flag:
+		return
+	yield 2
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen( True )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__() # the tail's `if flag: return` fires here
+		if b is not None:
+			return 2
+		c = g.__next__() # must stay None - not fall through to the second yield
+		if c is not None:
+			return 3
+		return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
