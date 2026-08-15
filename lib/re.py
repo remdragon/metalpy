@@ -962,8 +962,7 @@ class Matcher:
 			with compiler.wrap_arithmetic:
 				self.steps += 1
 			if self.steps > self.max_steps:
-				step_limit_err: MatchError = MatchError.StepLimitExceeded
-				return Result.Err( step_limit_err )
+				return Result.Err( MatchError.StepLimitExceeded )
 
 			op: Op = self.ops.__getitem__( pc ).unwrap( 're: run_at pc out of range' )
 			matched: bool = True
@@ -1073,8 +1072,7 @@ class Matcher:
 				continue
 
 			if len( stack ) == 0:
-				no_match_err: MatchError = MatchError.NoMatch
-				return Result.Err( no_match_err )
+				return Result.Err( MatchError.NoMatch )
 			back: Frame = stack.pop().unwrap( 're: run_at pop backtrack frame' )
 			pc = back.pc
 			sp = back.sp
@@ -1160,18 +1158,13 @@ class Match:
 		# group 0 (the whole match) is unconditionally SAVE'd by compile()'s
 		# own tail, so it is always set on any Match that exists at all -
 		# these None branches are an unreachable defensive backstop, not a
-		# real code path. Returning a dummy (0,0) rather than sys.panic()-
-		# ing here: an early `return` is what actually narrows `s`/`e` from
-		# usize|None to usize on the fallthrough path in this compiler,
-		# unlike a sys.panic() call, which isn't recognized as diverging -
-		# comparing/returning the un-narrowed union afterward is a compile
-		# error (confirmed directly; flagged for the compiler bug report).
+		# real code path.
 		s: usize|None = self.start()
 		if s is None:
-			return ( 0, 0 )
+			sys.panic( 're: Match.span: whole match start unexpectedly unset' )
 		e: usize|None = self.end()
 		if e is None:
-			return ( 0, 0 )
+			sys.panic( 're: Match.span: whole match end unexpectedly unset' )
 		return ( s, e )
 
 
@@ -1215,8 +1208,7 @@ class Pattern:
 					if e == MatchError.StepLimitExceeded:
 						return Result.Err( e )
 			if pos >= slen:
-				no_match_err: MatchError = MatchError.NoMatch
-				return Result.Err( no_match_err )
+				return Result.Err( MatchError.NoMatch )
 			with compiler.wrap_arithmetic:
 				pos += matcher._codepoint_width_at( pos )
 
@@ -1234,16 +1226,12 @@ class Pattern:
 		match result:
 			case Result.Ok( m ):
 				end_pos: usize|None = m.end()
-				# group 0 is always set on a successful match - see
-				# Match.span()'s own comment on why this is an early
-				# `return`, not a sys.panic(), even though unreachable.
+				# group 0 is always set on a successful match - unreachable.
 				if end_pos is None:
-					no_match_err0: MatchError = MatchError.NoMatch
-					return Result.Err( no_match_err0 )
+					sys.panic( 're: fullmatch: whole match end unexpectedly unset' )
 				if end_pos == s.byte_len():
 					return Result.Ok( m )
-				no_match_err: MatchError = MatchError.NoMatch
-				return Result.Err( no_match_err )
+				return Result.Err( MatchError.NoMatch )
 			case Result.Err( e ):
 				return Result.Err( e )
 
