@@ -4439,6 +4439,60 @@ class _ReferenceResolver( ast.NodeTransformer ):
 
 	# --- rewrite 2: match statements ---
 
+	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
+		''' true if `stmt` never falls through - either structurally (return/
+		break/continue) or because it's a bare call to a function declared
+		-> NoReturn (sys.panic, most commonly). The type_resolver.py-level
+		analogue of lowering.py's own _stmt_diverges (used by _stmt_If's
+		true_terminates/false_terminates) - this one backs visit_Match's own
+		per-case `terminates` computation (_merge_case_narrowing), for the
+		identical reason: a `case ...: sys.panic(...)` arm should be treated
+		as never reaching the match's own join point, the same as an
+		explicit return/break/continue arm, or narrowing established inside
+		it is wrongly dropped from self._narrowed instead of surviving past
+		the match. Resolved via _resolve_callee_target - a pure lookup, no
+		scheduling side effects beyond _resolve_callable's ordinary
+		signature resolution - since this only needs the callee's declared
+		return type, not a real lowered call. A receiver call (x.method())
+		or anything _resolve_callee_target can't resolve without a receiver
+		just isn't recognized here, same scope cut as lowering.py's own
+		version - EXCEPT unlike lowering.py's call site (at LOWERING time),
+		this one runs during type_resolver.py's OWN pass, where a receiver
+		rooted in a local (self, or any other parameter/local) genuinely
+		isn't resolvable via discovery's scope-stack-based find_name at all
+		(that lookup is module/class-level names only - locals live in
+		this resolver's own separate self.locals dict, never registered
+		into discovery's scope stack) - _try_resolve_namespace's own
+		ast.Name branch calls the RAISING find_name, not find_name_or_none,
+		so a receiver like self.foo() THROWS instead of returning None
+		here. Catching the CompileError is NOT enough to make this safe:
+		discovery.fail() (errors.py's ErrorCollector.fail) permanently
+		records the message in discovery.errors.errors BEFORE raising, by
+		design ("the failure is already recorded... callers that catch it
+		need no data from it") - so even a caught-and-ignored exception
+		here would still poison the overall compile into reporting failure,
+		confirmed via a real repro (case Result.Ok(v): self.touch() left
+		'name \'self\' is not defined' in the error list even after
+		wrapping the call in try/except CompileError). So this pre-checks
+		the call's own ultimate base name against self.locals - a name
+		tracked there is DEFINITELY a local/parameter, never a resolvable
+		namespace path - and skips calling _resolve_callee_target at all
+		when it is, rather than calling it and hoping nothing raises. '''
+		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
+			return True
+		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
+			return False
+		root = stmt.value.func
+		while isinstance( root, ( ast.Attribute, ast.Subscript )):
+			root = root.value
+		if not isinstance( root, ast.Name ) or root.id in self.locals:
+			return False
+		target = self.resolver._resolve_callee_target( stmt.value.func )
+		fn = target.base if isinstance( target, Specialization ) else target
+		if not isinstance( fn, Function ):
+			return False
+		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
+
 	def visit_Match( self, node: ast.Match ) -> list[ast.stmt]:
 		unique = self._label_id
 		self._label_id += 1
@@ -4590,7 +4644,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 						body.extend( visited )
 					elif visited is not None:
 						body.append( visited )
-				terminates = bool( case.body ) and isinstance( case.body[-1], ( ast.Return, ast.Break, ast.Continue ))
+				terminates = bool( case.body ) and self._stmt_diverges( case.body[-1] )
 				case_infos.append( ( terminates, dict( self._narrowed )))
 			finally:
 				self._narrowed = case_entry_narrowed

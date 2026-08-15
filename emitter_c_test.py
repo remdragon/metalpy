@@ -8754,6 +8754,82 @@ def main() -> i32:
 			i += 1
 		return 0
 ''' ),
+			# a match's own case arm, not just an if-branch, ending in a call
+			# to a -> NoReturn function (sys.panic) must ALSO count as
+			# "never reaches the match's own join point" - type_resolver.py's
+			# visit_Match had the identical syntactic-only terminates check
+			# _stmt_If had before its own NoReturn fix (see PLAN_COMPILER_
+			# BUG_SWEEP.md). Ordinary expressions (arithmetic, attribute
+			# access, ...) after the match are NOT a useful test here - those
+			# are type-checked by lowering.py's OWN, separate, already-correct
+			# cfg-based narrowing over the if-chain visit_Match desugars into,
+			# regardless of whether THIS bug is fixed. The observable effect is
+			# narrower: type_resolver.py's own _narrowed dict backs its
+			# _rewrite_type_is_comparison fold-to-constant optimization for a
+			# LATER type(x) is T check - without the fix, that rewrite assumes
+			# s is STILL union-typed at this point (since its own bookkeeping
+			# never recorded the narrowing) and emits a tag-comparison against
+			# it, while lowering.py's OWN independent narrowing has ALREADY
+			# narrowed s's real, lowered type to plain usize by here - the
+			# mismatch produces invalid C ('usize' has no '.tag' member),
+			# confirmed via a real repro before this fix existed
+			( 'match_arm_sys_panic_narrows_past_the_match', '''
+def classify( s: usize|None ) -> bool:
+	match s:
+		case None:
+			sys.panic( 'unreachable' )
+		case _:
+			pass
+	return type( s ) is usize
+
+def main() -> i32:
+	if not classify( usize( 5 ) ):
+		return 1
+	return 0
+''' ),
+			# a case arm ending in an ORDINARY receiver method call
+			# (self.touch(), not sys.panic) must NOT be mistaken for a
+			# diverging arm, and - the actual regression caught while
+			# building the above fix - must not crash the compiler either.
+			# _stmt_diverges resolves a bare call's callee via
+			# _resolve_callee_target, which walks discovery's scope-stack-
+			# based find_name - that raises (not returns None) for a
+			# receiver rooted in a local like self, since locals live in
+			# this resolver's own self.locals dict, never in discovery's
+			# scope stack. The raise ALSO permanently records a bogus "name
+			# 'self' is not defined" error (discovery.fail's own contract),
+			# so even catching the exception wasn't enough to fix the first
+			# attempt at this - it takes a pre-check against self.locals to
+			# avoid calling into the raising path at all for a receiver call
+			( 'match_arm_receiver_call_does_not_crash_the_compiler', '''
+class Widget:
+	touched: i32
+
+	def __init__( self ) -> None:
+		self.touched = 0
+
+	def touch( self ) -> None:
+		self.touched = 1
+
+	# the last statement of a case arm being a BARE receiver call
+	# (self.touch(), no return/assignment wrapping it) is the exact shape
+	# that crashed - _stmt_diverges only even LOOKS at a stmt shaped like
+	# ast.Expr(ast.Call(...)); a return/assign short-circuits before ever
+	# reaching the receiver-call resolution this test guards
+	def maybe_touch( self, r: Result[i32,i32] ) -> None:
+		match r:
+			case Result.Ok( v ):
+				self.touch()
+			case Result.Err( e ):
+				pass
+
+def main() -> i32:
+	w: Widget = Widget()
+	w.maybe_touch( Result.Ok( 5 ) )
+	if w.touched != 1:
+		return 1
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
