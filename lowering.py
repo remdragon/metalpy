@@ -2959,8 +2959,16 @@ class FunctionLowering:
 				node,
 			)
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
-		if size := getattr( target_type, 'sizeof', None ):
-			return ir.Const( type = expected_type or usize_cls, value = size )
+		# `is not None`, NOT a truthy `:=` check - NoneType's own sizeof is
+		# a legitimate 0 (see discovery.py's get_none_type()), and 0 is
+		# falsy, so a truthy check here wrongly fell through to the
+		# RCClass/CStruct/CUnion/TaggedUnion-only branch below and failed
+		# with "compiler.sizeof(NoneType) is not supported yet" - see that
+		# type's own sizeof field for why 0 there is real, not a "missing"
+		# sentinel
+		sizeof_attr = getattr( target_type, 'sizeof', None )
+		if sizeof_attr is not None:
+			return ir.Const( type = expected_type or usize_cls, value = sizeof_attr )
 		# Ptr[T]/ConstPtr[T] is always exactly one machine pointer wide, whatever
 		# T is - fold to the Ptr/ConstPtr intrinsic's own sizeof. A Specialization
 		# carries no sizeof of its own, so the plain getattr above misses it;
