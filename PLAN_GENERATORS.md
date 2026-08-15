@@ -1,20 +1,29 @@
 Generator functions (`yield`, state-machine transform)
 
-STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption)
-landed and real-compile-and-run tested (emitter_c_test.py's
-GeneratorFunctionTests) - PLAN_GENERATORS.md's own motivating example (a
-real `range()`-shaped generator: `while i < count: yield i; i += 1`,
-consumed the natural way: `for x in counter(5):`) now compiles and runs,
-not just textual `range()` sugar. `range()` ITSELF has deliberately NOT
-been rewritten into a real generator yet (see Phase 3 note below) - the
-sugar path (`_is_range_call`/`_lower_for_range`) is untouched.
+STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
+Phase 4 (`for x in range(...):` containing yield) landed and real-
+compile-and-run tested (emitter_c_test.py's GeneratorFunctionTests).
+PLAN_GENERATORS.md's own motivating example now compiles and runs in its
+most natural, idiomatic spelling: `for i in range(count): yield i`,
+consumed the equally natural way: `for x in counter(5):`. `range()`
+ITSELF has deliberately NOT been rewritten into a real generator, and
+never will be - this is a permanent design decision, not a gap (see
+ARCHITECTURE.md's own "design decision: range() stays a compiler
+intrinsic" section, confirmed with the user 2026-08-15) - the sugar path
+(`_is_range_call`/`_lower_for_range`) is untouched; Phase 4 only teaches
+the generator machinery to RECOGNIZE and desugar a for-loop that happens
+to iterate over a range() call, same as a user would write by hand today
+outside a generator.
 
-`yield` may be either a direct top-level statement of the function body
-(Phase 1), or the single yield inside a direct top-level `while` loop
-(Phase 2) - a yield nested inside an if/for/with/try, or inside a loop
-that has more than one yield or any break/continue, is a clear compile
+`yield` may be a direct top-level statement of the function body (Phase
+1), the single yield inside a direct top-level `while` loop (Phase 2), or
+the single yield inside a direct top-level `for x in range(...):` loop
+(Phase 4, desugared to the Phase 2 shape before anything else runs) - a
+yield nested inside an if/with/try, inside a for-loop over anything other
+than range(), or inside a loop that has more than one yield or any
+break/continue, is a clear compile
 error, not a silently wrong state machine (see GeneratorFunctionTests'
-own three rejection tests). Both unit shapes verified for the RC-
+own five rejection tests). Every unit shape verified for the RC-
 correctness payoff this whole plan is about: a generator dropped mid-
 iteration correctly decrefs a captured RC-typed PARAMETER via the
 ordinary, completely unmodified $$__destructor__ synthesis - see "The
@@ -102,23 +111,44 @@ something built mid-lowering): `_lower_for_over_iterator` builds the
 equivalent `.tag == N` comparison directly, by hand, rather than relying
 on `is None` syntax.
 
-Not attempted this pass, deliberately: rewriting `range()` itself from
+PERMANENT, confirmed-with-the-user design decision (2026-08-15), not a
+deferred follow-up: `range()` itself will NEVER be rewritten from
 `_is_range_call` textual sugar into a real generator. The sugar has a
 real, deliberate performance property (documented in its own comment: no
 allocation, unchecked arithmetic proven safe by construction) that a
-real generator's heap-allocated backing object would give up, and
-`range()` is used pervasively throughout lib/ and the existing test
-suite - swapping its implementation is a real risk for a cosmetic-only
-win (per this doc's own original framing, "lets range() stop being
-special-cased syntax") now that the FUNCTIONAL goal (a real, user-
-authored range()-shaped generator working end to end) is already met by
-`counter()` in the tests above. Left as an explicit follow-up, not
-folded into this pass.
+real generator's heap-allocated, refcounted backing object would give up
+at every single call site - `range()` is the single most common loop-
+counting construct in any real program, so this isn't a one-off cost.
+This doc's own original framing ("lets range() stop being special-cased
+syntax") was wrong to treat that as a win worth pursuing - it's cosmetic
+at best, and actively costly given how pervasively range() is used. The
+FUNCTIONAL goal this framing was actually chasing (a real, user-authored
+range()-shaped generator working end to end, in its natural spelling)
+is fully met by Phase 4 below - only the literal builtin `range()` stays
+exempt. See ARCHITECTURE.md's own "design decision: range() stays a
+compiler intrinsic" section and TODO.txt's "generators:" entry for the
+same note in context.
+
+Phase 4 design (type_resolver.py's `_desugar_generator_for_loops`/
+`_desugar_range_for`): a top-level `for x in range(...): BODY` containing
+exactly one yield is rewritten, IN PLACE, into the exact while-loop
+equivalent (`x: usize = start; while x < stop: BODY; with compiler.
+wrap_arithmetic: x += 1`) before unit collection ever runs - a pure AST-
+to-AST desugaring, zero new state-machine logic, zero changes to any
+Phase 2 code. Confirmed the emitted C is structurally IDENTICAL to the
+hand-written while-loop version (same instruction numbering, same
+`__gen_resuming_N` local) by inspecting it directly. A for-loop over
+anything other than `range()` (an indexable, or another `__next__`-based
+iterator) still needs real type resolution to know which shape applies -
+that information doesn't exist yet at this AST-only collection stage
+(lowering.py's `_lower_for_over_indexable`/`_lower_for_over_iterator`
+both need an active FunctionLowering/CFG to resolve it) - rejected with a
+clear message, not attempted here.
 
 Original planning notes follow, kept for the phases not yet attempted
-(fallible generators, generic generators, `for` LOOPS containing yield -
-as opposed to `while`, still rejected: a `for` loop's own hidden index/
-length bookkeeping was never analyzed for this).
+(fallible generators, generic generators, a `for` loop over an
+indexable/`__next__`-based iterable - as opposed to `range()` - still
+rejected inside a generator body, see the Phase 4 design note above).
 
 Why
 

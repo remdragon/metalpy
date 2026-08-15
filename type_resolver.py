@@ -325,21 +325,134 @@ class TypeResolver:
 			if isinstance( n, ( ast.Break, ast.Continue )):
 				self.discovery.fail( f'{fn.qualname}: break/continue are not supported inside a yield-containing while loop yet - see PLAN_GENERATORS.md', n )
 
+	def _is_generator_range_call( self, node: ast.expr ) -> bool:
+		# textual recognition, same shape as lowering.py's own
+		# _is_range_call (deliberately duplicated rather than reached
+		# across the Lowering/TypeResolver boundary - TypeResolver is
+		# constructed before Lowering and holds no back-reference to it;
+		# this check is cheap, self-contained, and already purely textual,
+		# so duplicating it is simpler and safer than threading a new
+		# dependency through). range() itself stays a compiler intrinsic
+		# always - see ARCHITECTURE.md's own "design decision" section -
+		# this is only about RECOGNIZING a for-loop over it inside a
+		# generator body, not about implementing range() as a generator
+		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range':
+			return True
+		return False
+
+	def _desugar_range_for( self, fn: Function, node: ast.For ) -> list[ast.stmt]:
+		''' PLAN_GENERATORS.md Phase 4 - `for x in range(...): BODY`
+		(containing yield) becomes the EXACT equivalent while-loop shape
+		(`x: usize = start; while x < stop: BODY; with compiler.
+		wrap_arithmetic: x += 1`), mirroring lowering.py's own
+		_lower_for_range exactly: usize target, 1 or 2 positional args, no
+		keywords/step, the increment structurally guaranteed safe (x < stop
+		strictly before every increment) so it bypasses ordinary checked-
+		arithmetic policy the same way _lower_for_range's own raw AddWrap
+		does - here, from synthesized AST rather than raw IR, the only way
+		to get the same bypass is an explicit `with compiler.
+		wrap_arithmetic:` wrapper. Returns a real ast.While, so every
+		existing while-unit mechanism (Phase 2 - _validate_while_yield_
+		unit/_build_while_unit_guard) picks it up with zero changes - this
+		IS the entire mechanism Phase 4 needed (see
+		_desugar_generator_for_loops, this method's only caller). '''
+		if not isinstance( node.target, ast.Name ):
+			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node)}', node )
+		if node.orelse:
+			self.discovery.fail( f'{fn.qualname}: for/else is not supported', node )
+		call = node.iter
+		if not self._is_generator_range_call( call ):
+			self.discovery.fail(
+				f'{fn.qualname}: a for loop containing yield is only supported over range(...) yet - see PLAN_GENERATORS.md',
+				node,
+			)
+		if call.keywords:
+			self.discovery.fail( f'{fn.qualname}: range(...) does not support keyword arguments: {ast.unparse(call)}', call )
+		if len( call.args ) == 1:
+			start_expr = ast.Constant( value = 0 )
+			ast.copy_location( start_expr, call )
+			stop_expr = call.args[0]
+		elif len( call.args ) == 2:
+			start_expr, stop_expr = call.args
+		else:
+			self.discovery.fail( f'{fn.qualname}: range(...) supports 1 or 2 arguments only (no step yet): {ast.unparse(call)}', call )
+
+		target_id = node.target.id
+		usize_name = ast.Name( id = 'usize', ctx = ast.Load() )
+		ast.copy_location( usize_name, node )
+		init = ast.AnnAssign(
+			target = ast.Name( id = target_id, ctx = ast.Store() ),
+			annotation = usize_name, value = start_expr, simple = 1,
+		)
+		ast.copy_location( init, node )
+
+		increment = ast.AugAssign( target = ast.Name( id = target_id, ctx = ast.Store() ), op = ast.Add(), value = ast.Constant( value = 1 ) )
+		wrapped_increment = ast.With(
+			items = [ ast.withitem(
+				context_expr = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'wrap_arithmetic', ctx = ast.Load() ),
+				optional_vars = None,
+			) ],
+			body = [ increment ],
+		)
+		ast.copy_location( wrapped_increment, node )
+
+		while_node = ast.While(
+			test = ast.Compare( left = ast.Name( id = target_id, ctx = ast.Load() ), ops = [ ast.Lt() ], comparators = [ stop_expr ] ),
+			body = list( node.body ) + [ wrapped_increment ],
+			orelse = [],
+		)
+		ast.copy_location( while_node, node )
+		ast.fix_missing_locations( while_node )
+		ast.fix_missing_locations( init )
+		return [ init, while_node ]
+
+	def _desugar_generator_for_loops( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md Phase 4 - a top-level `for x in range(...):
+		BODY` containing a yield is rewritten, in place, into its own
+		exactly-equivalent while form (_desugar_range_for) BEFORE unit
+		collection ever runs - the ONLY new mechanism `for`-loop generator
+		support needed: every downstream step (locals collection, unit
+		recognition/guard-building) already handles a while unit correctly
+		(Phase 2), so a range()-shaped for-loop gets that support for
+		free, with zero changes to any of it. Only range()-shaped for-
+		loops are desugared - a for-loop over an indexable/iterator
+		expression still needs real type resolution to know which shape
+		applies (does the iterated expression's type have __len__/
+		__getitem__, or __next__?), which doesn't exist yet at this AST-
+		only collection stage (lowering.py's _lower_for_over_indexable/
+		_lower_for_over_iterator both need an active FunctionLowering/CFG
+		to resolve that) - left as an explicit follow-up, not attempted
+		here. A for-loop with no yield in it at all is left completely
+		alone (ordinary preamble/body content, not this pass's concern -
+		it may still be a range()-over-something-else or any other shape,
+		irrelevant since nothing inside it needs state-machine treatment). '''
+		new_body: list[ast.stmt] = []
+		for stmt in fn.node.body:
+			if isinstance( stmt, ast.For ) and any(
+				isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( stmt.body )
+			):
+				new_body.extend( self._desugar_range_for( fn, stmt ))
+			else:
+				new_body.append( stmt )
+		fn.node.body = new_body
+
 	def _collect_generator_units( self, fn: Function ) -> list[tuple]:
 		''' walks fn.node.body's own top-level statements, recognizing two
 		yield-bearing shapes: a bare `yield expr` statement (Phase 1), and a
 		`while` loop whose own body contains exactly one yield as a direct
-		statement (Phase 2 - PLAN_GENERATORS.md's own motivating range()
-		example: `while i < count: yield i; i += 1`). Anything else
-		containing a yield (nested in if/for/with/try, multiple yields in
-		one loop, yield nested two levels deep, `yield from`) is rejected -
-		enforced by cross-checking against the TOTAL yield count found
-		anywhere in the body, so nothing containing a yield can silently
-		slip through unrecognized. Returns an ordered list of
-		('yield', stmt) / ('while', while_stmt) tuples - ordinary non-yield-
-		bearing statements (including an ordinary while/for/if with no
-		yield in it at all) aren't units, they're picked up as segment
-		preamble by _split_generator_segments below. '''
+		statement (Phase 2/4 - PLAN_GENERATORS.md's own motivating range()
+		example: `while i < count: yield i; i += 1`, or the equivalent `for
+		i in range(count): yield i`, already desugared to this same shape
+		by _desugar_generator_for_loops before this ever runs). Anything
+		else containing a yield (nested in if/for-non-range/with/try,
+		multiple yields in one loop, yield nested two levels deep, `yield
+		from`) is rejected - enforced by cross-checking against the TOTAL
+		yield count found anywhere in the body, so nothing containing a
+		yield can silently slip through unrecognized. Returns an ordered
+		list of ('yield', stmt) / ('while', while_stmt) tuples - ordinary
+		non-yield-bearing statements (including an ordinary while/for/if
+		with no yield in it at all) aren't units, they're picked up as
+		segment preamble by _split_generator_segments below. '''
 		all_yields = self._find_all_yield_nodes( fn )
 		if any( isinstance( y, ast.YieldFrom ) for y in all_yields ):
 			self.discovery.fail( f'{fn.qualname}: yield from is not supported yet - see PLAN_GENERATORS.md', fn.node )
@@ -358,9 +471,10 @@ class TypeResolver:
 		if accounted != len( all_yields ):
 			self.discovery.fail(
 				f'{fn.qualname}: yield must be a direct top-level statement of the generator function body, '
-				f'or the single yield inside a direct top-level while loop (Phase 2 - see '
-				f'PLAN_GENERATORS.md); yield inside if/for/with/try, multiple yields in one loop, or yield '
-				f'nested more than one level deep is not supported yet',
+				f'or the single yield inside a direct top-level while loop or a `for x in range(...):` loop '
+				f'(Phases 2/4 - see PLAN_GENERATORS.md); yield inside if/with/try, a for loop over anything '
+				f'other than range(...), multiple yields in one loop, or yield nested more than one level '
+				f'deep is not supported yet',
 				fn.node,
 			)
 		return units
@@ -659,6 +773,7 @@ class TypeResolver:
 		elem_type = fn.return_type.elem_type
 		self.schedule( elem_type )
 
+		self._desugar_generator_for_loops( fn )
 		units = self._collect_generator_units( fn )
 		self._reject_generator_defer( fn )
 		self._reject_generator_value_return( fn )

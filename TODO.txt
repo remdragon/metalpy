@@ -455,35 +455,31 @@ lowering:
 						case _:
 							sys.panic( 'system invariant, invalid union tag' )
 
-	generators:
-		def range( count: int ) -> Iterator[int]:
-			i: int = 0
-			while i < count:
-				yield i
-				i += 1
+	generators: implemented - see PLAN_GENERATORS.md for the full design and
+		STATUS. A `yield`-containing function becomes a synthesized backing
+		RCClass + __next__ state machine + trivial constructor; the function
+		epilogue genuinely did move into the backing class's own
+		$$__destructor__, exactly as originally guessed above - confirmed via
+		real compile-and-run tests that drop a generator mid-iteration and
+		check its captured parameter's refcount. Landed so far: bodies where
+		every yield is a direct top-level statement or the single yield
+		inside a top-level while/for loop (for desugars to the while shape
+		first). Still open: fallible generators (Generator[T,E], the
+		error-handling question originally asked here - deferred, no forcing
+		use case yet), generic generators, yield nested inside if/with/try.
 
-		# alternate implementation for performance reasons:
-		def range( count: usize ) -> Iterator[usize]:
-			with compiler.wrap_arithmetic: # wrap is most performant and this algo is guaranteed safe
-				i: usize = 0
-				while i < count:
-					yield i
-					i += 1
-
-		implementing generators is going to be interesting.
-		we have to translate the code into a state machine
-		the function epilogue will have to be put into the state machine's __del__() function
-
-		do we need to handle errors? For example, what about the following?
-
-		def foo() -> Result[None,OverflowError]:
-			total: u16 = 0
-			for i in range( u16( 10_000 )):
-				total += i # this will eventually overflow
-
-		the question is... the generator needs to be told to exit, but we don't support exceptions
-		maybe a yield statement gets an implicit or_return and a generator must return a result?
-		but if it returns a Result, how does that interact with its Iterator or Generator return type?
+		NOTE: the example above originally used `range()` itself as the
+		motivating generator - real range() deliberately stays a compiler
+		intrinsic (lowering.py's _is_range_call/_lower_for_range), not a
+		real generator, confirmed with the user: it's the most common loop-
+		counting construct in any real program, and reimplementing it as a
+		heap-allocated, refcounted generator would cost real allocation +
+		atomic-refcount overhead at every one of those call sites for no
+		functional benefit - see ARCHITECTURE.md's own "design decision:
+		range() stays a compiler intrinsic" section. A user-authored
+		generator using `while`/`for ... in range(...)` internally (like the
+		example above) works fully; only the real builtin range() itself is
+		exempted.
 
 emitter:
 	C support (target C11)

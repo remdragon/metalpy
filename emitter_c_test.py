@@ -8338,7 +8338,88 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+			# --- Phase 4: `for x in range(...):` containing yield, as a
+			# direct top-level statement of the generator body -
+			# type_resolver.py's _desugar_generator_for_loops rewrites this,
+			# in place, into the exact while-loop shape Phase 2 already
+			# handles, BEFORE unit collection ever runs - zero changes to
+			# the while-unit machinery itself. Confirmed the desugared C is
+			# structurally IDENTICAL to the hand-written while-loop version
+			# (same $t-numbered instructions, same __gen_resuming_0 local)
+			# by inspecting the emitted C directly during development.
+			( 'for_loop_over_range_containing_yield', '''
+def counter( count: usize ) -> Iterator[usize]:
+	for i in range( count ):
+		yield i
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = counter( 5 )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__()
+		if c is None:
+			return 3
+		d = g.__next__()
+		if d is None:
+			return 4
+		e = g.__next__()
+		if e is None:
+			return 5
+		f = g.__next__()
+		if f is not None:
+			return 6
+		return 0
+''' ),
+			( 'for_loop_over_range_composes_with_for_loop_consumption', '''
+class Box:
+	v: usize
+	def __init__( self, v: usize ) -> None:
+		self.v = v
+
+def gen( b: Box ) -> Iterator[usize]:
+	for i in range( b.v ):
+		yield i
+
+def consume_via_for( b: Box ) -> None:
+	with compiler.wrap_arithmetic:
+		total: usize = 0
+		for x in gen( b ):
+			total += x
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 5 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		consume_via_for( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
 		])
+
+	def test_for_loop_over_non_range_with_yield_is_rejected( self ) -> None:
+		# Phase 4 only desugars a for-loop over range() - a for-loop over
+		# anything else containing yield still needs real type resolution
+		# during AST-only unit collection to know whether it's an
+		# indexable or a __next__-based iterator, which doesn't exist yet
+		# (see PLAN_GENERATORS.md's own STATUS section) - must be a clear
+		# compile error, not a silently wrong state machine
+		self._run( '''
+def gen( xs: list[i32] ) -> Iterator[i32]:
+	for x in xs:
+		yield x
+
+def main() -> None:
+	g = gen( list[i32]() )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'range(...)', str( self.discovery.errors.errors[0] ))
 
 	def test_for_loop_over_bad_next_shape_is_rejected( self ) -> None:
 		# a __next__() that returns something other than T|None - real, not

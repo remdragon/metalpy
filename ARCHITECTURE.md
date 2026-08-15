@@ -175,6 +175,30 @@ IR:
 		against registers/temporaries. This is so the emitter doesn't have to
 		try to figure that out later.
 
+design decision: range() stays a compiler intrinsic, not a real generator
+
+	PLAN_GENERATORS.md's own generator-function work (real `yield`,
+	state-machine transform, real user-authored iterators) does NOT extend to
+	range() itself. `for i in range(n):` is recognized textually
+	(lowering.py's _is_range_call) and lowered directly to a plain counting
+	loop (_lower_for_range) - no heap allocation, no backing RCClass, no
+	refcounting, arithmetic proven safe by construction (target < stop
+	strictly before every increment) so the increment bypasses the ordinary
+	checked-arithmetic policy entirely.
+
+	This is deliberate, not a gap waiting to be closed. range() is the single
+	most common loop-counting construct in any real program - every one of
+	those call sites would pay a real allocation + refcount-churn cost for
+	zero functional benefit if range() were reimplemented as an ordinary
+	generator function (PLAN_GENERATORS.md's own machinery: a synthesized
+	RCClass, sys.alloc, an ObjectHeader, atomic refcount ops on every
+	__next__() call). A user-authored generator that NEEDS real yield/resume
+	semantics still works fully (including `for x in range(n): yield x*2`
+	inside one - PLAN_GENERATORS.md's Phase 4, a for-loop over range()
+	containing yield is desugared into the equivalent while-loop shape before
+	lowering) - only range() ITSELF stays intrinsic. Confirmed with the user
+	(2026-08-15): do not convert range() into a real generator.
+
 stage 4 - IR optimization (map/reduce):
 	NOTE: all concept of @union is gone here, IR operates on values and pointers
 	

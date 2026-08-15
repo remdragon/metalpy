@@ -661,12 +661,24 @@ class Lowering:
 	def _is_range_call( self, node: ast.expr ) -> str|None:
 		# range(...) is textually recognized as compiler sugar, same as
 		# compiler.wrap_arithmetic/defer/etc. - there's no real range()
-		# function (TODO.txt: a real range()/Iterator needs the generator
-		# state-machine transform, which doesn't exist yet). This covers
-		# exactly the 1-2 arg counting-loop shape real lib/ code already
-		# uses (str.concat's `for i in range(count):`). Returns the
-		# discriminant ('range') rather than a bare bool, matching every
-		# other textual recognizer in this file
+		# function, and this is DELIBERATE, not a gap: real generator
+		# functions exist now (PLAN_GENERATORS.md - a `yield`-containing
+		# function becomes a synthesized RCClass + __next__ state machine),
+		# but range() specifically stays intrinsic on purpose - it's the
+		# single most common loop-counting construct in any real program,
+		# and every call site would pay a real heap allocation + atomic-
+		# refcount-churn cost for zero functional benefit if it were
+		# reimplemented as an ordinary generator (see ARCHITECTURE.md's own
+		# "design decision: range() stays a compiler intrinsic" section).
+		# Confirmed with the user (2026-08-15): do not convert this. This
+		# covers exactly the 1-2 arg counting-loop shape real lib/ code
+		# already uses (str.concat's `for i in range(count):`), and a
+		# range() call INSIDE a generator body still works (desugared into
+		# the equivalent while-loop shape before lowering - see type_
+		# resolver.py's _desugar_generator_for_loops, PLAN_GENERATORS.md
+		# Phase 4) - this recognizer itself is untouched by that. Returns
+		# the discriminant ('range') rather than a bare bool, matching
+		# every other textual recognizer in this file
 		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range':
 			return 'range'
 		return None
