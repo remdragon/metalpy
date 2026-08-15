@@ -14,7 +14,7 @@ from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
-	CallableType, ClosureType, TupleType,
+	CallableType, ClosureType, TupleType, int_stem_range,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -97,19 +97,6 @@ _SIGNED_INT_STEMS: frozenset[str] = frozenset([ 'i8', 'i16', 'i32', 'i64', 'i128
 def _is_signed_scalar( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem in _SIGNED_INT_STEMS
 
-def _int_stem_range( t: Scalar ) -> tuple[int,int]:
-	''' (MIN, MAX), the real inclusive range of integer stem t.stem, as
-	Python ints - used to validate a literal's magnitude against its
-	declared type (see _expr_Constant's own range check). Derived from
-	t.sizeof (already resolved to the ACTIVE TARGET's real width by the
-	time lowering.py runs - see discovery.py's active_target-driven sizeof
-	computation - isize/usize are NOT hardcoded to 64 here), not a fixed
-	per-stem table, so this is correct for every integer stem uniformly,
-	whatever target width the compiler was configured for. '''
-	bits = t.sizeof * 8
-	if t.stem in _SIGNED_INT_STEMS:
-		return -(2**(bits-1)), 2**(bits-1) - 1
-	return 0, 2**bits - 1
 
 # ast binary operators that have no floating-point meaning - bitwise/shift and
 # floor-div/mod (Python's float // and % exist but aren't in this first pass).
@@ -4132,7 +4119,7 @@ class FunctionLowering:
 				not self._allow_literal_bit_reinterpret and type( node.value ) is int
 				and isinstance( expected_type, Scalar ) and expected_stem in self.lowering._LITERAL_COMPATIBLE_STEMS[int]
 			):
-				lo, hi = _int_stem_range( expected_type )
+				lo, hi = int_stem_range( expected_type )
 				if not ( lo <= node.value <= hi ):
 					self.lowering.discovery.fail(
 						f'{node.value} is out of range for {expected_type.qualname} ({lo}..{hi}): {ast.unparse(node)}',
@@ -5271,6 +5258,20 @@ class FunctionLowering:
 			if not any( t is param.type for t in candidate_types ):
 				candidate_types.append( param.type )
 
+		if len( candidate_types ) > 1 and type( expr.value ) is int:
+			# kind alone left more than one candidate (e.g. i8 AND i32 both
+			# accept an int literal) - narrow further by whether the
+			# literal's own MAGNITUDE actually fits each candidate's real
+			# range (f(300) between f(x: i8)/f(x: i32) has only one answer,
+			# not an ambiguity). Only ever NARROWS candidate_types when this
+			# lands on exactly one match - if it eliminates every candidate,
+			# or still leaves more than one (genuinely ambiguous even by
+			# magnitude, e.g. two same-range types), candidate_types is left
+			# untouched and the existing ambiguous/fallback paths below are
+			# completely unaffected
+			in_range = [ t for t in candidate_types if isinstance( t, Scalar ) and int_stem_range( t )[0] <= expr.value <= int_stem_range( t )[1] ]
+			if len( in_range ) == 1:
+				candidate_types = in_range
 		if len( candidate_types ) == 1:
 			return self._lower_expr( expr, candidate_types[0] )
 		if len( candidate_types ) > 1:
@@ -5654,7 +5655,7 @@ class FunctionLowering:
 			arg_node = node.args[0]
 			value_type = target_cls.value_type
 			if isinstance( arg_node, ast.Constant ) and type( arg_node.value ) is int and isinstance( value_type, Scalar ):
-				lo, hi = _int_stem_range( value_type )
+				lo, hi = int_stem_range( value_type )
 				if not ( lo <= arg_node.value <= hi ):
 					self.lowering.discovery.fail(
 						f'{arg_node.value} is out of range for {target_cls.qualname} ({lo}..{hi}): {ast.unparse(node)}',

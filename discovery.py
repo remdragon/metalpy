@@ -12,7 +12,7 @@ from errors import CompileError, ErrorCollector
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
-	Module, _is_covered_by, _overlaps, chain_lookup,
+	Module, _is_covered_by, _overlaps, chain_lookup, int_stem_range,
 )
 
 def is_stub_body( body: list[ast.stmt] ) -> bool:
@@ -1081,6 +1081,20 @@ class Discovery( ast.NodeVisitor ):
 				self.fail( f'enum key {cls.qualname}.{key} value must be an integer, not {value_expr.value=}', node )
 		if value is None:
 			value = cls.next_auto
+		# a member's value must actually fit the enum's own underlying type's
+		# real range - catches both an explicit out-of-range value AND an
+		# auto-incremented ('_') one that overflows after enough members.
+		# Unlike lowering.py's plain-literal/CEnum-construction range checks,
+		# there's no bit-reinterpretation exemption to consider here: an enum
+		# member's value is ALWAYS a bare literal (a Call/cast expression is
+		# already rejected above, "must be '_' or an integer constant")
+		if isinstance( cls.value_type, Scalar ):
+			lo, hi = int_stem_range( cls.value_type )
+			if not ( lo <= value <= hi ):
+				self.fail(
+					f'{value} is out of range for {cls.qualname} ({lo}..{hi}): {ast.unparse(node)}',
+					node,
+				)
 		if value in cls.values:
 			self.fail(
 				f'enum {cls.qualname} has duplicated value {value!r} from both {cls.qualname}.{key} and {cls.qualname}.{cls.values[value]}',

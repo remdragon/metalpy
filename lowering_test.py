@@ -1982,6 +1982,49 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'ambiguous literal argument', self.discovery.errors.errors[0] )
 
+	def test_overload_literal_arg_magnitude_disambiguates_candidates( self ) -> None:
+		# f(300) between f(x: i8)/f(x: i32) used to be rejected as "ambiguous"
+		# purely because both are int-KIND-compatible - 300 obviously can't
+		# fit i8, so there's really only one answer
+		code = '\n'.join([
+			'def foo( x: i8 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( 300 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		i32 = self.discovery.get_intrinsics()['i32']
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		self.assertEqual( call.args, [ ir.Const( type = i32, value = 300 ) ] )
+
+	def test_overload_literal_arg_out_of_range_for_every_candidate_still_reports_ambiguous( self ) -> None:
+		# f(300) where NEITHER candidate can hold it (i8 max 127, u8 max 255)
+		# - magnitude narrowing eliminates every candidate, so candidate_types
+		# is left as the original, unnarrowed kind-only list and the existing
+		# "ambiguous" error is unchanged (not attempting a better message for
+		# this case - out of scope)
+		code = '\n'.join([
+			'def foo( x: i8 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: u8 ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( 300 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'ambiguous literal argument', self.discovery.errors.errors[0] )
+
 	def test_overload_literal_kwarg_resolves_by_name( self ) -> None:
 		code = '\n'.join([
 			'class str: pass',
@@ -5892,6 +5935,77 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		self._lower_main()
 		self.assertIn( '300 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_declaration_out_of_range_fails( self ) -> None:
+		# distinct from test_cenum_construction_out_of_range_fails above - this
+		# is the ENUM'S OWN member declaration (discovery.py's
+		# _register_enum_member), a completely separate mechanism from a
+		# construction call (lowering.py's _try_lower_construct_call)
+		code = '\n'.join([
+			'@enum( u8 )',
+			'class MyError:',
+			'	Bad = 300',
+			'	Ok = 0',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '300 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_declaration_boundary_values( self ) -> None:
+		# a negative literal (i8's own MIN) isn't reachable here at all -
+		# class/enum bodies never go through compile_time_transformer's
+		# constant-folding pass (only module/function bodies do), so
+		# `Lo = -128` is rejected pre-existingly by _register_enum_member's
+		# own "must be '_' or an integer constant" check (UnaryOp(USub,...)
+		# never folds to a plain Constant here) - unrelated to this fix,
+		# confirmed during development. u8's own 0..255 range needs no
+		# negative literal to test both boundaries
+		code = '\n'.join([
+			'@enum( u8 )',
+			'class MyError:',
+			'	Lo = 0',
+			'	Hi = 255',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_cenum_member_declaration_out_of_range_by_one_fails( self ) -> None:
+		code = '\n'.join([
+			'@enum( i8 )',
+			'class MyError:',
+			'	Bad = 128',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '128 is out of range for __test__.MyError (-128..127)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_auto_increment_overflow_fails( self ) -> None:
+		# the '_' auto-increment sentinel can ALSO overflow the underlying
+		# type's range after enough members - A=254, B='_' auto-fills 255
+		# (still in range), C='_' auto-fills 256 (out of range for u8)
+		code = '\n'.join([
+			'@enum( u8 )',
+			'class MyError:',
+			'	A = 254',
+			'	B = _',
+			'	C = _',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '256 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
 
 	def test_non_literal_cast_default_check_mode( self ) -> None:
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
