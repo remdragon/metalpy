@@ -1,8 +1,17 @@
 Generator functions (`yield`, state-machine transform)
 
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
-Phase 4 (`for x in range(...):` containing yield) landed and real-
-compile-and-run tested (emitter_c_test.py's GeneratorFunctionTests).
+Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
+<expr>:` containing yield, over a non-range() indexable OR another
+generator) landed and real-compile-and-run tested (emitter_c_test.py's
+GeneratorFunctionTests). This last one matches the "remaining phases
+roadmap" section's own Phase 1 (below) - kept the SEQUENTIAL landed-phase
+numbering here (v1, Phase 2, 3, 4, 5) rather than renaming it, since that
+roadmap's own 1-5 numbering is a separate, later scoping pass over what
+was still left, not a renumbering of what had already landed; the two
+schemes overlap in NAME but not in MEANING - watch for this when reading
+older commit messages/comments that say "Phase 1" meaning v1 instead.
+
 PLAN_GENERATORS.md's own motivating example now compiles and runs in its
 most natural, idiomatic spelling: `for i in range(count): yield i`,
 consumed the equally natural way: `for x in counter(5):`. `range()`
@@ -13,14 +22,20 @@ intrinsic" section, confirmed with the user 2026-08-15) - the sugar path
 (`_is_range_call`/`_lower_for_range`) is untouched; Phase 4 only teaches
 the generator machinery to RECOGNIZE and desugar a for-loop that happens
 to iterate over a range() call, same as a user would write by hand today
-outside a generator.
+outside a generator. Phase 5 does the same for a for-loop over anything
+ELSE with a real for-loop shape (list-like, or another generator) - this
+is what actually makes generators testable with realistic code (a
+generator consuming a real collection, or composing another generator),
+which is why the roadmap prioritized it first.
 
-`yield` may be a direct top-level statement of the function body (Phase
-1), the single yield inside a direct top-level `while` loop (Phase 2), or
-the single yield inside a direct top-level `for x in range(...):` loop
-(Phase 4, desugared to the Phase 2 shape before anything else runs) - a
-yield nested inside an if/with/try, inside a for-loop over anything other
-than range(), or inside a loop that has more than one yield or any
+`yield` may be a direct top-level statement of the function body (v1),
+the single yield inside a direct top-level `while` loop (Phase 2), or the
+single yield inside a direct top-level `for` loop - over range() (Phase
+4), a list-like indexable, or another generator's own `__next__()` (both
+Phase 5) - the last two desugared to the Phase 2 while shape before
+anything else runs, same as range() already was. A yield nested inside
+an if/with/try, inside a for-loop over something with neither shape, or
+inside a loop that has more than one yield or any USER-written
 break/continue, is a clear compile
 error, not a silently wrong state machine (see GeneratorFunctionTests'
 own five rejection tests). Every unit shape verified for the RC-
@@ -137,18 +152,171 @@ wrap_arithmetic: x += 1`) before unit collection ever runs - a pure AST-
 to-AST desugaring, zero new state-machine logic, zero changes to any
 Phase 2 code. Confirmed the emitted C is structurally IDENTICAL to the
 hand-written while-loop version (same instruction numbering, same
-`__gen_resuming_N` local) by inspecting it directly. A for-loop over
-anything other than `range()` (an indexable, or another `__next__`-based
-iterator) still needs real type resolution to know which shape applies -
-that information doesn't exist yet at this AST-only collection stage
-(lowering.py's `_lower_for_over_indexable`/`_lower_for_over_iterator`
-both need an active FunctionLowering/CFG to resolve it) - rejected with a
-clear message, not attempted here.
+`__gen_resuming_N` local) by inspecting it directly.
 
-Original planning notes follow, kept for the phases not yet attempted
-(fallible generators, generic generators, a `for` loop over an
-indexable/`__next__`-based iterable - as opposed to `range()` - still
-rejected inside a generator body, see the Phase 4 design note above).
+Phase 5 design (type_resolver.py's `_desugar_general_for`/
+`_desugar_indexable_for`/`_desugar_iterator_for`) - the roadmap's own
+Phase 1, landed the same session it was scoped in. `node.iter`'s type is
+resolved via a NEW `_resolve_expr_type_for_desugar` (a standalone,
+`.visit()`-never-called `_ReferenceResolver`, seeded with parameters plus
+a permissive AnnAssign scan) reusing `_type_of_expr` - confirmed via
+research that this already resolves arbitrary expressions, including
+`obj.method()` calls recursing into the receiver, entirely from AST, no
+lowering needed (it's what `visit_Match` already uses for a match
+subject). `__len__`+`__getitem__` wins the SAME priority tie lowering.py's
+own ordinary `_stmt_For` gives it against `__next__`... no wait, the
+other way - `__next__` is checked FIRST, matching `_lower_for_over_
+iterator`'s own priority over indexable for an ordinary for-loop.
+
+Both desugared shapes hit a REAL fallibility snag the design didn't
+originally anticipate: `list[T]`'s own `__getitem__` (and, unusually,
+NOT its `__len__`, confirmed by inspecting the emitted C - only
+`__getitem__` needed the fix) is genuinely fallible, `Result[T,
+IndexError]`, and this is true for an ORDINARY (non-generator) for-loop
+too, confirmed via a standalone repro (an ordinary for-loop over `list
+[i32]` fails to compile inside a plain, non-Result-returning function
+with the exact same error) - not something generators broke. `[]`
+subscript syntax hard-codes PROPAGATION (needs the enclosing function to
+be Result-shaped), which `$$__next__` never is in v1 - so the desugaring
+calls `__getitem__`/`__len__` EXPLICITLY (not via `[]`) and passes each
+through a new `_maybe_unwrap_call` helper, which panics via `.unwrap(msg)`
+when the return type actually is `Result[T,E]`-shaped (structurally safe:
+every call site here has an index strictly less than a just-read length,
+same reasoning `_lower_for_range`'s own raw-AddWrap bypass already
+relies on) and passes a non-fallible call through unchanged otherwise.
+
+The iterated object itself (`__for_obj_N`) is typically RC-typed (a
+list, or another generator) - a real complication the roadmap's own
+Phase 1 write-up under-scoped (it flagged the per-ITERATION element as
+possibly RC-typed and deferred that to Phase 5's OWN later item, but
+missed that the ITERABLE'S OWN storage has the identical problem one
+level up). Building the general state-gated destructor that item is
+scoped for felt like too much for this pass, so `__for_obj_N` is instead
+evaluated EAGERLY, in the generator's own CONSTRUCTOR (alongside its real
+parameters - see `_rewrite_generator_constructor`'s own extra_fields
+handling), rather than lazily on the first `__next__()` call the way
+real Python would defer it. This makes `__for_obj_N` valid unconditionally
+from construction onward, exactly like a captured parameter, so the
+EXISTING unconditional `$$__destructor__` cascade handles it correctly
+with ZERO new destructor machinery - the same "simpler thing turned out
+sufficient" pattern as v1's own scalar-only-locals simplification.
+The real, accepted semantic gap this leaves: if the iterated expression
+has an observable side effect, it now happens at `gen(...)` call time
+rather than at the first `.__next__()` call - noted in code (`_new_for_
+obj_field`'s own docstring), not silently swallowed. Verified correct
+for nested composition specifically (a generator consuming another
+generator, itself capturing an RC parameter) - both levels release
+correctly when abandoned mid-iteration, confirmed by a real refcount
+check (`for_loop_over_nested_generator_releases_both_levels`).
+
+The iterator shape's own payload extraction reuses the SAME `match
+subject: case T(subject):` technique Phase 3 discovered, but as REAL
+match-statement SOURCE syntax this time (not hand-built IR) - which
+surfaced two more real snags: (1) the synthesized `case None: break`
+tripped `_validate_while_yield_unit`'s existing break/continue rejection
+(meant for genuine USER-written break/continue, which stays rejected) -
+fixed via a `compiler_synthesized_break` tag on the ast.Break node
+itself, checked before rejecting; (2) the intermediate `__for_next_N =
+obj.__next__()` plain assignment tripped `_collect_generator_locals`'s
+own "must be explicitly annotated" rule (it's not meant to be a promoted
+local at all - it's an ordinary `$$__next__`-scoped temp, like
+`_build_while_unit_guard`'s own `__gen_resuming_N`, just built one stage
+earlier) - fixed via a matching `compiler_synthesized_for_loop_temp` tag.
+Both are the SAME established "tag the AST node, check the tag" escape-
+hatch convention this file already uses throughout (`resolved_callee`,
+`generator_backing_cls`, etc.), not new mechanisms. The DEEPER lesson
+both bugs share: raising early (via `discovery.fail`) from partway
+through `ensure_generator_synthesized` leaves `fn.node.body` in a
+half-desugared, half-renamed state that then gets INCORRECTLY processed
+as an ordinary (non-generator) function body once dequeued later -
+producing a confusing CASCADE of unrelated-looking downstream errors,
+exactly like the very first walk-order bug found while landing v1. Worth
+remembering next time a new failure mode here produces a weird error
+list: check whether it's actually just ONE early failure cascading.
+
+Remaining phases roadmap (scoped 2026-08-15)
+
+Phase 1: LANDED (same session it was scoped in) - see "Phase 5 design"
+above (kept the sequential landed-phase numbering there; this roadmap's
+own 1-5 numbering is a separate scoping pass, not a renumbering - see
+the STATUS section's own note on why the two schemes overlap in name but
+not meaning). `for x in <expr>:` over a non-range() iterable inside a
+generator body, both the indexable shape (`__len__`+`__getitem__`) and
+the iterator shape (`__next__() -> T|None`, i.e. one generator consuming
+another), real-compile-and-run tested including nested RC correctness.
+
+Phase 2 (next up): yield inside `if`/`with`. ("try" doesn't exist in this language -
+no exception handling anywhere in lowering.py's statement dispatch; the
+closer analog, `with defer/errdefer:`, stays out of scope, see below.)
+`with compiler.wrap_arithmetic/saturate_arithmetic/panic_arithmetic(...):`
+wrapping a yield is low-risk (pure lowering-time bookkeeping, no runtime
+branching - just unwrap it during unit collection). `if`/`if-else`
+generalizes the while-unit's own "resuming" pattern per-branch: since a
+condition's underlying values are fields, untouched between `__next__()`
+calls, re-evaluating it on resume safely lands back in the same branch
+that yielded - `if resuming: <post-yield stmts> else: <pre-yield stmts>;
+state = N+1; return value`, once per branch. Recommended first cut: a
+single if/else, at most one yield per branch - not elif chains or nested
+loops-inside-branches yet.
+
+Phase 3: generic generator functions (`def gen[T](x: T) -> Iterator[T]:`).
+Confirmed groundwork: monomorphize.py's substitute_type_params (107-226)
+has no GeneratorType case yet (a bare T inside Iterator[T] is never
+substituted today) - needs a small addition mirroring the CallableType/
+ClosureType branches, no interning needed (GeneratorType is deliberately
+never interned). ensure_resolved's Specialization branch (type_resolver.
+py:1490-1492) needs ensure_generator_synthesized applied to the
+*monomorphized* Function it returns, not just plain Functions (today's
+`isinstance(obj, Function)` gate at line 1479 misses a Specialization-
+wrapped generic entirely) - same eager-resolution fix v1 already needed
+for the non-generic case. Open, unverified risk: compiler.py's own
+Specialization+Function branch runs resolve_function_body TWICE (rewrites
+1/2 on the abstract body, rewrite 3 - substitution-dependent nested-
+generic-call resolution - on the monomorphized copy) - whether generator
+synthesis firing between those two calls is actually safe needs a real
+minimal repro early in this phase, not more pre-analysis. Recommended
+interim scope: reject a generic generator body that itself calls another
+generic function referencing the same type param, sidestepping the
+ordering question for a first landing.
+
+Phase 4: fallible generators (`Generator[T, E]`, TODO.txt's original open
+question). Confirmed groundwork: "returns Result[T,E]" is purely
+structural (_result_shape, type_resolver.py:1158-1164) - no Function flag
+to set, so making __next__ return Result[T|None,E] engages the existing
+checked-arithmetic/_require_result_return machinery for free. Open,
+unresolved risk (the one piece of this whole roadmap with no existing
+analog to reuse): or_return() firing inside a generator body needs to
+BOTH return Err(e) from __next__ AND permanently set self.__state = DONE
+- but OrReturn's shape has no room for "also run this statement first",
+and a blanket always-set-DONE epilogue entry is wrong (it would fire on
+the normal yield-return path too). Needs either a way to distinguish the
+error exit specifically (errdefer's own `.is_err()` check on the stowed
+return value, ir.py's OrJump docstring ~304-306, is the closest existing
+precedent for "tell error exits apart from success exits", but errdefer
+needs OrJump, which today's generator bodies never naturally reach) or a
+small generator-specific IR/lowering addition. Resolve with a minimal
+repro before committing to a direction.
+
+Phase 5 (not explicitly requested, proposed as the most load-bearing
+remaining gap): RC-typed locals crossing a yield. v1 restricted promoted
+LOCALS to scalar types specifically because a not-yet-initialized RC
+field would make the ordinary unconditional $$__destructor__ cascade
+decref garbage - the original plan's own state-gated-destructor sketch
+(below) is the real fix, computed from the same per-field "valid from
+state N onward" data the liveness/promotion step already has. Landing
+this lifts the scalar-only restriction everywhere it currently applies,
+including Phase 1's own iterator-consumption element type.
+
+Explicitly not planned, no forcing use case: `yield from`; `.send()`/
+`.throw()`/`.close()`; defer/errdefer inside a generator body (a real,
+already-flagged combinatorial hazard, see "Body restrictions for v1"
+below); generator methods (a generator must stay a plain function for
+now, same posture as PLAN_CALLABLE.md/PLAN_LAMBDA.md's own deferred
+closures); async/await (unrelated mechanism entirely).
+
+Original planning notes follow, kept for historical context and for the
+phases not yet attempted (the fallible-generator sketch below predates,
+and is superseded in detail by, the Phase 4 roadmap entry just above).
 
 Why
 

@@ -8076,14 +8076,19 @@ def main() -> i32:
 
 class GeneratorFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' PLAN_GENERATORS.md - a plain function containing `yield`, where
-	every yield is either a direct top-level statement (Phase 1) or the
-	single yield inside a direct top-level while loop (Phase 2 -
-	PLAN_GENERATORS.md's own motivating range()-style example). Real
+	every yield is a direct top-level statement (v1), the single yield
+	inside a direct top-level while loop (Phase 2 - PLAN_GENERATORS.md's
+	own motivating range()-style example), or the single yield inside a
+	direct top-level for loop - over range() (Phase 4), a list-like
+	__len__/__getitem__ indexable, or another generator's own __next__()
+	(both Phase 5, matching the user-facing "remaining phases roadmap"'s
+	own Phase 1 - one generator consuming another this way is the
+	realistic way generators actually get exercised/tested). Real
 	compile-and-run - not just "does it lower", the whole point is the
 	generated C state machine actually behaves like Python's own generator
 	semantics, including RC correctness on early abandonment (the
 	"function epilogue moves into __del__" idea this plan doc is built
-	around) for both unit shapes. '''
+	around) for every unit shape. '''
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
@@ -8401,25 +8406,158 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+			# --- Phase 1: `for x in <expr>:` inside a generator body, over
+			# a non-range() iterable - both the indexable shape (__len__/
+			# __getitem__, e.g. list[T]) and the iterator shape (__next__()
+			# -> T|None, i.e. one generator consuming another). Unblocked by
+			# type_resolver.py's _resolve_expr_type_for_desugar, reusing
+			# _ReferenceResolver._type_of_expr (already proven for match-
+			# statement subjects) to resolve the iterated expression's type
+			# entirely from AST, before any real lowering exists.
+			( 'for_loop_over_list_inside_generator', '''
+def double_all( xs: list[i32] ) -> Iterator[i32]:
+	for x in xs:
+		doubled: i32 = 0
+		with compiler.wrap_arithmetic:
+			doubled = x * 2
+		yield doubled
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		xs: list[i32] = list[i32]()
+		xs.append( 1 ).unwrap( 'append failed' )
+		xs.append( 2 ).unwrap( 'append failed' )
+		xs.append( 3 ).unwrap( 'append failed' )
+		g = double_all( xs )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__()
+		if c is None:
+			return 3
+		d = g.__next__()
+		if d is not None:
+			return 4
+		return 0
+''' ),
+			( 'for_loop_over_list_releases_it_and_its_captured_parameter', '''
+def double_all( xs: list[i32] ) -> Iterator[i32]:
+	for x in xs:
+		doubled: i32 = 0
+		with compiler.wrap_arithmetic:
+			doubled = x * 2
+		yield doubled
+
+def make_and_partially_consume( xs: list[i32] ) -> None:
+	g = double_all( xs )
+	first = g.__next__()
+	# g goes out of scope here, mid-iteration - g's own __for_obj_N field
+	# holds a SEPARATE reference to xs, must also be released
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		xs: list[i32] = list[i32]()
+		xs.append( 1 ).unwrap( 'append failed' )
+		xs.append( 2 ).unwrap( 'append failed' )
+		xs.append( 3 ).unwrap( 'append failed' )
+		if compiler.refcount( xs ) != 1:
+			return 1
+		make_and_partially_consume( xs )
+		if compiler.refcount( xs ) != 1:
+			return 2
+		return 0
+''' ),
+			( 'for_loop_consumes_another_generator_inside_a_generator', '''
+def counter( count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def doubled( count: usize ) -> Iterator[usize]:
+	for x in counter( count ):
+		y: usize = 0
+		with compiler.wrap_arithmetic:
+			y = x * 2
+		yield y
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = doubled( 3 )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__()
+		if c is None:
+			return 3
+		d = g.__next__()
+		if d is not None:
+			return 4
+		return 0
+''' ),
+			( 'for_loop_over_nested_generator_releases_both_levels', '''
+class Box:
+	v: usize
+	def __init__( self, v: usize ) -> None:
+		self.v = v
+
+def counter( b: Box ) -> Iterator[usize]:
+	i: usize = 0
+	while i < b.v:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def doubled( b: Box ) -> Iterator[usize]:
+	for x in counter( b ):
+		y: usize = 0
+		with compiler.wrap_arithmetic:
+			y = x * 2
+		yield y
+
+def make_and_partially_consume( b: Box ) -> None:
+	g = doubled( b )
+	first = g.__next__()
+	# g's own __for_obj_N field holds the inner counter(b) generator,
+	# which ITSELF holds b as its own captured parameter - both levels
+	# must release correctly when g is dropped mid-iteration
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 5 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		make_and_partially_consume( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
 		])
 
-	def test_for_loop_over_non_range_with_yield_is_rejected( self ) -> None:
-		# Phase 4 only desugars a for-loop over range() - a for-loop over
-		# anything else containing yield still needs real type resolution
-		# during AST-only unit collection to know whether it's an
-		# indexable or a __next__-based iterator, which doesn't exist yet
-		# (see PLAN_GENERATORS.md's own STATUS section) - must be a clear
+	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
+		# PLAN_GENERATORS.md Phase 1 - a for loop over something with
+		# neither __len__/__getitem__ NOR __next__ must be a clear
 		# compile error, not a silently wrong state machine
 		self._run( '''
-def gen( xs: list[i32] ) -> Iterator[i32]:
-	for x in xs:
-		yield x
+class NotIterable:
+	pass
+
+def gen( x: NotIterable ) -> Iterator[i32]:
+	for y in x:
+		yield 1
 
 def main() -> None:
-	g = gen( list[i32]() )
+	g = gen( NotIterable() )
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'range(...)', str( self.discovery.errors.errors[0] ))
+		self.assertIn( '__len__', str( self.discovery.errors.errors[0] ))
 
 	def test_for_loop_over_bad_next_shape_is_rejected( self ) -> None:
 		# a __next__() that returns something other than T|None - real, not

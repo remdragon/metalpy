@@ -201,6 +201,14 @@ class TypeResolver:
 		# still mirrors _destructors_synthesized's own "idempotent, once
 		# per real object" spirit)
 		self._generators_synthesized: set[int] = set()
+		# PLAN_GENERATORS.md Phase 1 - unique per-desugared-for-loop suffix
+		# for __for_obj_N/__for_len_N/__for_index_N field names, global
+		# across every generator function this TypeResolver ever processes
+		# (never reset per-function) so two different generators never
+		# collide even though each gets its own backing RCClass anyway -
+		# simplest way to guarantee uniqueness without threading a fresh
+		# counter through every desugaring call site
+		self._for_desugar_counter = 0
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -322,8 +330,15 @@ class TypeResolver:
 				node,
 			)
 		for n in self._walk_generator_body( node.body ):
-			if isinstance( n, ( ast.Break, ast.Continue )):
-				self.discovery.fail( f'{fn.qualname}: break/continue are not supported inside a yield-containing while loop yet - see PLAN_GENERATORS.md', n )
+			if isinstance( n, ( ast.Break, ast.Continue )) and not getattr( n, 'compiler_synthesized_break', False ):
+				# the exemption is for THIS pass's own synthesized `case
+				# None: break` (PLAN_GENERATORS.md Phase 1's
+				# _desugar_iterator_for, the "was __next__() exhausted"
+				# check) - a genuinely USER-written break/continue inside
+				# the for-loop's own body (which becomes part of node.body
+				# here too) still hits the real, unsolved ambiguity this
+				# check exists for, and stays rejected
+				self.discovery.fail( f'{fn.qualname}: break/continue are not supported inside a yield-containing while/for loop yet - see PLAN_GENERATORS.md', n )
 
 	def _is_generator_range_call( self, node: ast.expr ) -> bool:
 		# textual recognition, same shape as lowering.py's own
@@ -339,6 +354,50 @@ class TypeResolver:
 		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range':
 			return True
 		return False
+
+	def _probe_method( self, owner_type: Type|None, name: str ) -> Function|None:
+		''' PLAN_GENERATORS.md Phase 1 - non-failing probe (unlike
+		_attr_lookup_callable, which raises on a miss - a real error for an
+		ordinary method call, but "this type has no such method" is a
+		perfectly normal outcome here, deciding which for-loop desugaring
+		shape applies). Mirrors lowering.py's own _find_method exactly,
+		deliberately duplicated rather than reached across the
+		TypeResolver/Lowering boundary - same reasoning
+		_is_generator_range_call's own comment already gives. '''
+		if owner_type is None:
+			return None
+		owner_type = self.ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass )):
+			found = owner_type.chain_lookup( name )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( name ) if isinstance( names, dict ) else None
+		return found if isinstance( found, Function ) else None
+
+	def _resolve_expr_type_for_desugar( self, fn: Function, expr: ast.expr ) -> Type|None:
+		''' PLAN_GENERATORS.md Phase 1 - best-effort "what type does this
+		expression have", used to decide which for-loop desugaring shape
+		applies (indexable vs. __next__-based) BEFORE any real lowering
+		exists to ask lowering.py's own _lower_expr. Reuses
+		_ReferenceResolver._type_of_expr - already proven for exactly this
+		"type an arbitrary expression from AST alone" need (it's what
+		visit_Match uses to type a match subject, which already accepts
+		arbitrary expressions, not just bare names - real precedent, not
+		a new capability). Constructed standalone, NEVER calling its own
+		.visit() (which would rewrite is-None/match/generic-call shapes
+		this desugaring pass has no business touching) - .locals is seeded
+		from parameters (by _ReferenceResolver's own __init__) plus a
+		permissive walk collecting every already-declared generator
+		local's annotated type (mirrors _collect_generator_locals's own
+		AnnAssign scan, but without its strict validation - a real
+		validation error, if any, still surfaces correctly once
+		_collect_generator_locals runs for real, after desugaring
+		completes). '''
+		ref_resolver = _ReferenceResolver( self, fn )
+		for node in self._walk_generator_body( fn.node.body ):
+			if isinstance( node, ast.AnnAssign ) and isinstance( node.target, ast.Name ):
+				ref_resolver.locals[ node.target.id ] = self.discovery.visit( node.annotation )
+		return ref_resolver._type_of_expr( expr )
 
 	def _desugar_range_for( self, fn: Function, node: ast.For ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 4 - `for x in range(...): BODY`
@@ -406,35 +465,309 @@ class TypeResolver:
 		ast.fix_missing_locations( init )
 		return [ init, while_node ]
 
-	def _desugar_generator_for_loops( self, fn: Function ) -> None:
-		''' PLAN_GENERATORS.md Phase 4 - a top-level `for x in range(...):
-		BODY` containing a yield is rewritten, in place, into its own
-		exactly-equivalent while form (_desugar_range_for) BEFORE unit
-		collection ever runs - the ONLY new mechanism `for`-loop generator
-		support needed: every downstream step (locals collection, unit
-		recognition/guard-building) already handles a while unit correctly
-		(Phase 2), so a range()-shaped for-loop gets that support for
-		free, with zero changes to any of it. Only range()-shaped for-
-		loops are desugared - a for-loop over an indexable/iterator
-		expression still needs real type resolution to know which shape
-		applies (does the iterated expression's type have __len__/
-		__getitem__, or __next__?), which doesn't exist yet at this AST-
-		only collection stage (lowering.py's _lower_for_over_indexable/
-		_lower_for_over_iterator both need an active FunctionLowering/CFG
-		to resolve that) - left as an explicit follow-up, not attempted
-		here. A for-loop with no yield in it at all is left completely
-		alone (ordinary preamble/body content, not this pass's concern -
-		it may still be a range()-over-something-else or any other shape,
-		irrelevant since nothing inside it needs state-machine treatment). '''
+	def _desugar_generator_for_loops( self, fn: Function ) -> dict[str,tuple[Type,ast.expr]]:
+		''' PLAN_GENERATORS.md Phase 4 (range()) + Phase 1 (indexable/
+		iterator) - a top-level `for x in <expr>: BODY` containing a yield
+		is rewritten, in place, into its own exactly-equivalent while form
+		BEFORE unit collection ever runs - the ONLY new mechanism `for`-
+		loop generator support needed: every downstream step (locals
+		collection, unit recognition/guard-building) already handles a
+		while unit correctly (Phase 2), so ANY for-loop shape this desugars
+		gets that support for free, with zero changes to any of it.
+		range() is recognized textually (_is_generator_range_call, zero
+		type resolution needed, unchanged from Phase 4); anything else
+		goes through _desugar_general_for, which resolves <expr>'s type
+		(_resolve_expr_type_for_desugar) to decide indexable vs. iterator
+		shape.
+
+		Returns extra_fields: name -> (type, original constructor-time
+		expr) for every FRESH RC-typed field this desugaring needed
+		beyond what _collect_generator_locals already tracks (currently:
+		just __for_obj_N, the once-evaluated iterated expression itself,
+		for the indexable/iterator shapes - range()'s own desugaring needs
+		none, its only new local is the scalar loop counter, already
+		covered by the ordinary locals mechanism). See _desugar_general_
+		for's own docstring for why this field is evaluated EAGERLY, in
+		the constructor, rather than lazily on first __next__() call.
+
+		A for-loop with no yield in it at all is left completely alone
+		(ordinary preamble/body content, not this pass's concern). '''
+		extra_fields: dict[str,tuple[Type,ast.expr]] = {}
 		new_body: list[ast.stmt] = []
 		for stmt in fn.node.body:
 			if isinstance( stmt, ast.For ) and any(
 				isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( stmt.body )
 			):
-				new_body.extend( self._desugar_range_for( fn, stmt ))
+				if self._is_generator_range_call( stmt.iter ):
+					new_body.extend( self._desugar_range_for( fn, stmt ))
+				else:
+					new_body.extend( self._desugar_general_for( fn, stmt, extra_fields ))
 			else:
 				new_body.append( stmt )
 		fn.node.body = new_body
+		return extra_fields
+
+	def _desugar_general_for( self, fn: Function, node: ast.For, extra_fields: dict[str,tuple[Type,ast.expr]] ) -> list[ast.stmt]:
+		''' PLAN_GENERATORS.md Phase 1 - `for x in <expr>: BODY` where
+		<expr> isn't range() - resolves <expr>'s type (best-effort, AST-
+		only - see _resolve_expr_type_for_desugar) and dispatches to
+		whichever shape it has: __next__() -> T|None (another generator,
+		or any hand-written iterator - checked FIRST, matching lowering.
+		py's own _stmt_For priority for an ordinary for-loop) or
+		__len__()+__getitem__() (an indexable like list[T]). Neither
+		found, or the type can't be determined at all, is a clear compile
+		error - not a silent fallback to some other behavior. '''
+		if not isinstance( node.target, ast.Name ):
+			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node)}', node )
+		if node.orelse:
+			self.discovery.fail( f'{fn.qualname}: for/else is not supported', node )
+		obj_type = self._resolve_expr_type_for_desugar( fn, node.iter )
+		if obj_type is None:
+			self.discovery.fail(
+				f'{fn.qualname}: cannot determine the type of {ast.unparse(node.iter)} to desugar this for '
+				f'loop - a for loop containing yield needs its iterated expression\'s type to be resolvable '
+				f'without lowering (a parameter, an already-declared local, or a simple attribute/call chain) '
+				f'- see PLAN_GENERATORS.md',
+				node,
+			)
+		next_fn = self._probe_method( obj_type, '__next__' )
+		if next_fn is not None:
+			return self._desugar_iterator_for( fn, node, obj_type, next_fn, extra_fields )
+		len_fn = self._probe_method( obj_type, '__len__' )
+		getitem_fn = self._probe_method( obj_type, '__getitem__' )
+		if len_fn is not None and getitem_fn is not None:
+			return self._desugar_indexable_for( fn, node, obj_type, getitem_fn, extra_fields )
+		self.discovery.fail(
+			f'{fn.qualname}: a for loop containing yield needs __len__ and __getitem__ (or __next__ '
+			f'returning T|None) on {obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
+			node,
+		)
+
+	def _new_for_obj_field( self, node: ast.For, obj_type: Type, extra_fields: dict[str,tuple[Type,ast.expr]] ) -> str:
+		''' registers a fresh __for_obj_N field (type obj_type, initial
+		value node.iter) in extra_fields and returns its name - shared by
+		_desugar_indexable_for/_desugar_iterator_for. Deliberately
+		EAGER (evaluated once, in the generator's own CONSTRUCTOR,
+		alongside its real parameters - see _rewrite_generator_
+		constructor) rather than lazily on the first __next__() call a
+		real Python generator would defer it to: __for_obj is typically
+		RC-typed (a list, another generator, ...), and v1's RC-safety
+		model (_synthesize_rcclass_destructor's ordinary, unconditional
+		decref cascade) only works for fields that are unconditionally
+		valid from construction onward, same as a captured parameter -
+		exactly what eager evaluation gives it for free, with zero new
+		destructor machinery. The real, deliberate semantic gap this
+		leaves: if <expr> has an observable side effect (a print, another
+		generator's own construction-time work), it now happens at
+		`gen(...)` call time rather than at the first `.__next__()` call
+		the way real Python would defer it - noted in PLAN_GENERATORS.md
+		as an accepted tradeoff for this pass, not a silent bug. Lifting
+		it (true lazy evaluation) needs the state-gated destructor Phase 5
+		is scoped to build. '''
+		unique = self._for_desugar_counter
+		self._for_desugar_counter += 1
+		obj_name = f'__for_obj_{unique}'
+		extra_fields[ obj_name ] = ( obj_type, node.iter )
+		return obj_name
+
+	def _maybe_unwrap_call( self, call_expr: ast.expr, return_type: Type|None, node: ast.AST, msg: str ) -> tuple[ast.expr,Type|None]:
+		''' PLAN_GENERATORS.md Phase 1 - if return_type is Result[T,E]-
+		shaped, wraps call_expr in an explicit `.unwrap(msg)` (confirmed
+		via a real repro: list[T].__getitem__/__len__ are BOTH fallible,
+		Result[T,IndexError] - and unlike lowering.py's own _lower_for_
+		over_indexable, which auto-propagates via _maybe_consume_result
+		because IT'S lowering an ordinary for-loop where the enclosing
+		function might legitimately be Result-shaped, a generator's own
+		$$__next__ never is in v1 - propagation isn't an option here,
+		only a panic. Safe: every call site this is used for has a
+		structurally-guaranteed-safe precondition (an index strictly less
+		than a just-read length), matching the exact reasoning _lower_
+		for_range's own raw-AddWrap bypass already relies on for its
+		increment - this is that same guarantee, just for a fallible
+		METHOD instead of arithmetic) and returns (wrapped_expr, T);
+		otherwise returns (call_expr, return_type) unchanged - not every
+		indexable's own __len__/__getitem__ need be fallible, only
+		list[T]'s confirmed to be. '''
+		shape = self._result_shape( return_type )
+		if shape is None:
+			return call_expr, return_type
+		unwrap_call = ast.Call(
+			func = ast.Attribute( value = call_expr, attr = 'unwrap', ctx = ast.Load() ),
+			args = [ ast.Constant( value = msg ) ], keywords = [],
+		)
+		ast.copy_location( unwrap_call, node )
+		return unwrap_call, shape[0]
+
+	def _desugar_indexable_for( self, fn: Function, node: ast.For, obj_type: Type, getitem_fn: Function, extra_fields: dict[str,tuple[Type,ast.expr]] ) -> list[ast.stmt]:
+		''' `for x in <expr>: BODY` (has __len__/__getitem__) desugars into
+		the exact while-loop equivalent lowering.py's own _lower_for_over_
+		indexable already builds at IR level - here as source AST feeding
+		the existing Phase 2 while-unit machinery unchanged. __for_obj
+		itself is the ONLY new field (_new_for_obj_field); __for_len/
+		__for_index are ordinary scalar generator locals, already covered
+		by _collect_generator_locals with zero changes. Both __len__() and
+		__getitem__() are called explicitly (not via `[]` subscript syntax,
+		which hard-codes propagation) and passed through _maybe_unwrap_call
+		- see its own docstring for why panic, not propagation, is the
+		only option available to a generator's own $$__next__. x's own
+		element type is __getitem__'s UNWRAPPED return type, spelled as a
+		bare ast.Name(id=elem_type.stem) for its own AnnAssign annotation
+		(works whether elem_type turns out scalar - the only kind v1's
+		_collect_generator_locals actually allows for a per-iteration
+		local yet, Phase 5's own concern to lift - or not, which then
+		surfaces as THAT existing, clear "only scalar locals" error
+		instead of a confusing one from here). '''
+		self.ensure_resolved( getitem_fn )
+		len_fn = self._probe_method( obj_type, '__len__' )
+		assert len_fn is not None # caller (_desugar_general_for) already confirmed this
+		self.ensure_resolved( len_fn )
+		obj_name = self._new_for_obj_field( node, obj_type, extra_fields )
+		unique = self._for_desugar_counter
+		self._for_desugar_counter += 1
+		len_name = f'__for_len_{unique}'
+		index_name = f'__for_index_{unique}'
+
+		usize_name = ast.Name( id = 'usize', ctx = ast.Load() )
+		ast.copy_location( usize_name, node )
+		len_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__len__', ctx = ast.Load() ),
+			args = [], keywords = [],
+		)
+		ast.copy_location( len_call, node )
+		len_expr, _len_type = self._maybe_unwrap_call( len_call, len_fn.return_type, node, 'generator for-loop __len__() failed (unreachable)' )
+		len_init = ast.AnnAssign(
+			target = ast.Name( id = len_name, ctx = ast.Store() ), annotation = usize_name,
+			value = len_expr, simple = 1,
+		)
+		index_init = ast.AnnAssign(
+			target = ast.Name( id = index_name, ctx = ast.Store() ), annotation = usize_name,
+			value = ast.Constant( value = 0 ), simple = 1,
+		)
+		ast.copy_location( len_init, node ); ast.copy_location( index_init, node )
+
+		getitem_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__getitem__', ctx = ast.Load() ),
+			args = [ ast.Name( id = index_name, ctx = ast.Load() ) ], keywords = [],
+		)
+		ast.copy_location( getitem_call, node )
+		getitem_expr, elem_type = self._maybe_unwrap_call( getitem_call, getitem_fn.return_type, node, 'generator for-loop index is structurally guaranteed in bounds (unreachable)' )
+
+		elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() ) if elem_type is not None else ast.Name( id = '?', ctx = ast.Load() )
+		ast.copy_location( elem_type_name, node )
+		target_bind = ast.AnnAssign(
+			target = ast.Name( id = node.target.id, ctx = ast.Store() ), annotation = elem_type_name,
+			value = getitem_expr, simple = 1,
+		)
+		ast.copy_location( target_bind, node )
+
+		increment = ast.AugAssign( target = ast.Name( id = index_name, ctx = ast.Store() ), op = ast.Add(), value = ast.Constant( value = 1 ) )
+		wrapped_increment = ast.With(
+			items = [ ast.withitem(
+				context_expr = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'wrap_arithmetic', ctx = ast.Load() ),
+				optional_vars = None,
+			) ],
+			body = [ increment ],
+		)
+		ast.copy_location( wrapped_increment, node )
+
+		while_node = ast.While(
+			test = ast.Compare( left = ast.Name( id = index_name, ctx = ast.Load() ), ops = [ ast.Lt() ], comparators = [ ast.Name( id = len_name, ctx = ast.Load() ) ] ),
+			body = [ target_bind ] + list( node.body ) + [ wrapped_increment ],
+			orelse = [],
+		)
+		ast.copy_location( while_node, node )
+		ast.fix_missing_locations( while_node )
+		ast.fix_missing_locations( len_init ); ast.fix_missing_locations( index_init )
+		return [ len_init, index_init, while_node ]
+
+	def _desugar_iterator_for( self, fn: Function, node: ast.For, obj_type: Type, next_fn: Function, extra_fields: dict[str,tuple[Type,ast.expr]] ) -> list[ast.stmt]:
+		''' `for x in <expr>: BODY` where <expr> has __next__() -> T|None
+		(most commonly: another generator). Extracting the non-None
+		payload needs real narrowing, and the only working mechanism is
+		`match subject: case T(subject): ...` reusing the subject's own
+		name (cfg.py's narrow()/narrowed_member(), same as lowering.py's
+		own _lower_for_over_iterator uses at the IR level) - and that
+		narrowing does NOT survive past the branch that established it,
+		so the extraction has to happen INSIDE the match's own case arm,
+		writing directly into x (an ordinary field by then, no narrowing
+		concern once written). BODY itself (containing the yield) stays a
+		SIBLING of the match statement, not nested inside it - keeping
+		yield at the exact nesting depth _validate_while_yield_unit
+		already requires, with zero changes to that validator. x is
+		restricted to a scalar element type for this pass (same
+		restriction _desugar_indexable_for's own docstring notes, and for
+		the identical reason - Phase 5's concern to lift). '''
+		self.ensure_resolved( next_fn )
+		elem_type = next_fn.return_type
+		none_type = self.discovery.get_none_type()
+		if not (
+			isinstance( elem_type, TaggedUnion ) and len( elem_type.attributes ) == 2
+			and any( a.type is none_type for a in elem_type.attributes )
+		):
+			self.discovery.fail(
+				f'{fn.qualname}: for loop needs __next__() to return exactly T|None on '
+				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		result_type = elem_type
+		elem_type = next( a.type for a in result_type.attributes if a.type is not none_type )
+
+		obj_name = self._new_for_obj_field( node, obj_type, extra_fields )
+		unique = self._for_desugar_counter
+		self._for_desugar_counter += 1
+		next_name = f'__for_next_{unique}'
+
+		elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() ) if elem_type is not None else ast.Name( id = '?', ctx = ast.Load() )
+		ast.copy_location( elem_type_name, node )
+		target_zero = ast.Constant( value = False ) if ( isinstance( elem_type, Scalar ) and elem_type.stem == 'bool' ) else ast.Constant( value = 0 )
+		target_init = ast.AnnAssign(
+			target = ast.Name( id = node.target.id, ctx = ast.Store() ), annotation = elem_type_name,
+			value = target_zero, simple = 1,
+		)
+		ast.copy_location( target_init, node )
+
+		next_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__next__', ctx = ast.Load() ),
+			args = [], keywords = [],
+		)
+		next_assign = ast.Assign( targets = [ ast.Name( id = next_name, ctx = ast.Store() ) ], value = next_call )
+		ast.copy_location( next_assign, node )
+		# exempted from _collect_generator_locals's own "must be declared
+		# with an explicit annotation" check - __for_next_N is deliberately
+		# an ordinary $$__next__-scoped local (recomputed fresh every
+		# resume, never crosses one - see this method's own docstring),
+		# same posture as _build_while_unit_guard's own __gen_resuming_N,
+		# just built one stage earlier (during desugaring, before locals
+		# collection ever runs) so it needs an explicit opt-out here
+		# instead of simply never being visible to that scan at all
+		next_assign.compiler_synthesized_for_loop_temp = True
+
+		exhausted_break = ast.Break()
+		exhausted_break.compiler_synthesized_break = True # exempted from _validate_while_yield_unit's own break/continue rejection - see its own comment
+		none_case = ast.match_case(
+			pattern = ast.MatchSingleton( value = None ), guard = None,
+			body = [ exhausted_break ],
+		)
+		elem_case = ast.match_case(
+			pattern = ast.MatchClass(
+				cls = elem_type_name, patterns = [ ast.MatchAs( name = next_name ) ],
+				kwd_attrs = [], kwd_patterns = [],
+			),
+			guard = None,
+			body = [ ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = ast.Name( id = next_name, ctx = ast.Load() ) ) ],
+		)
+		match_stmt = ast.Match( subject = ast.Name( id = next_name, ctx = ast.Load() ), cases = [ none_case, elem_case ] )
+		ast.copy_location( match_stmt, node )
+
+		while_node = ast.While(
+			test = ast.Constant( value = True ),
+			body = [ next_assign, match_stmt ] + list( node.body ),
+			orelse = [],
+		)
+		ast.copy_location( while_node, node )
+		ast.fix_missing_locations( while_node )
+		ast.fix_missing_locations( target_init )
+		return [ target_init, while_node ]
 
 	def _collect_generator_units( self, fn: Function ) -> list[tuple]:
 		''' walks fn.node.body's own top-level statements, recognizing two
@@ -471,10 +804,10 @@ class TypeResolver:
 		if accounted != len( all_yields ):
 			self.discovery.fail(
 				f'{fn.qualname}: yield must be a direct top-level statement of the generator function body, '
-				f'or the single yield inside a direct top-level while loop or a `for x in range(...):` loop '
-				f'(Phases 2/4 - see PLAN_GENERATORS.md); yield inside if/with/try, a for loop over anything '
-				f'other than range(...), multiple yields in one loop, or yield nested more than one level '
-				f'deep is not supported yet',
+				f'or the single yield inside a direct top-level while loop or for loop (Phases 2/4/1 - see '
+				f'PLAN_GENERATORS.md); yield inside if/with/try, a for loop nested inside something else '
+				f'(rather than a direct top-level statement), multiple yields in one loop, or yield nested '
+				f'more than one level deep is not supported yet',
 				fn.node,
 			)
 		return units
@@ -522,7 +855,7 @@ class TypeResolver:
 				if stem in locals_decl and locals_decl[stem] is not local_type:
 					self.discovery.fail( f'{fn.qualname}: generator local {stem!r} redeclared with a different type', node )
 				locals_decl[stem] = local_type
-			elif isinstance( node, ast.Assign ):
+			elif isinstance( node, ast.Assign ) and not getattr( node, 'compiler_synthesized_for_loop_temp', False ):
 				for target in node.targets:
 					if isinstance( target, ast.Name ) and target.id not in param_stems and target.id not in locals_decl:
 						self.discovery.fail(
@@ -532,15 +865,20 @@ class TypeResolver:
 						)
 		return locals_decl
 
-	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type] ) -> RCClass:
+	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> RCClass:
 		''' the per-function backing RCClass a generator's constructor
 		allocates and its own $$__next__ method operates on - fields:
 		`__state` (resume discriminant) + one per parameter + one per
-		promoted local (_collect_generator_locals). resolve=None/every
-		attribute's own resolve=None (mirrors tuple_storage.TupleStorage.
-		get()'s identical "already fully known, nothing to defer" shape) -
-		once scheduled (see ensure_generator_synthesized), compiler.py's own
-		ordinary RCClass handling (Compiler._lower) synthesizes its
+		promoted local (_collect_generator_locals) + one per Phase-1 for-
+		loop-desugaring field (extra_fields - e.g. __for_obj_N, the once-
+		evaluated iterated expression a non-range() for-loop needs; see
+		_new_for_obj_field's own docstring for why these are safe to
+		decref unconditionally, same as a captured parameter, with no new
+		destructor machinery). resolve=None/every attribute's own
+		resolve=None (mirrors tuple_storage.TupleStorage.get()'s identical
+		"already fully known, nothing to defer" shape) - once scheduled
+		(see ensure_generator_synthesized), compiler.py's own ordinary
+		RCClass handling (Compiler._lower) synthesizes its
 		$$__destructor__ completely unmodified, same as any other class -
 		see this section's own top docstring for why that's correct here
 		with zero changes. '''
@@ -555,7 +893,11 @@ class TypeResolver:
 			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
 			for stem, t in locals_decl.items()
 		]
-		attributes = [ state_attr ] + param_attrs + local_attrs
+		extra_attrs = [
+			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
+			for stem, ( t, _expr ) in extra_fields.items()
+		]
+		attributes = [ state_attr ] + param_attrs + local_attrs + extra_attrs
 		return RCClass(
 			stem = qualname, qualname = qualname, file = fn.file, line = fn.line,
 			base = None, type_params = None,
@@ -659,7 +1001,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], result_union: TaggedUnion ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], result_union: TaggedUnion ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard - a bare yield occupies one state, a
@@ -671,7 +1013,7 @@ class TypeResolver:
 		whatever guard covers the state it just advanced to - no elif/
 		goto/switch needed anywhere (see this section's own top
 		docstring). '''
-		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() )
+		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
 		renamer = _GeneratorNameRenamer( rename_targets )
 
 		segments, tail = self._split_generator_segments( fn, units )
@@ -725,7 +1067,7 @@ class TypeResolver:
 		backing_cls.names[ next_fn.stem ] = next_fn
 		return next_fn
 
-	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type] ) -> None:
+	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> None:
 		''' replaces the original generator def's own body with a single
 		`return <allocate the backing class, state=0, fields=args/zeros>` -
 		matches Python's own "calling a generator function doesn't run any
@@ -739,7 +1081,17 @@ class TypeResolver:
 		synthesized class to be resolvable by name through any real scope,
 		mirroring the established resolved_callee/resolved_construction
 		convention that file already uses for other compiler-synthesized
-		call sites. '''
+		call sites.
+
+		extra_fields (PLAN_GENERATORS.md Phase 1 - _new_for_obj_field) get
+		their ORIGINAL expression embedded here, UNRENAMED - this method
+		runs against the constructor's own real, un-substituted parameter
+		scope (not $$__next__'s renamed-to-self.X body), so a captured
+		expression like `inner_gen(count)` just reads `count` as an
+		ordinary parameter reference, exactly like any other keyword value
+		here already does. This is the ONE place that expression is ever
+		evaluated - see _new_for_obj_field's own docstring for why eager,
+		construction-time evaluation was chosen over lazy. '''
 		keywords = [ ast.keyword( arg = '__state', value = ast.Constant( value = 0 ) ) ]
 		for p in fn.parameters or []:
 			name_node = ast.Name( id = p.stem, ctx = ast.Load() )
@@ -748,6 +1100,8 @@ class TypeResolver:
 		for stem, t in locals_decl.items():
 			zero = ast.Constant( value = False if ( isinstance( t, Scalar ) and t.stem == 'bool' ) else 0 )
 			keywords.append( ast.keyword( arg = stem, value = zero ) )
+		for stem, ( _t, expr ) in extra_fields.items():
+			keywords.append( ast.keyword( arg = stem, value = expr ) )
 		call = ast.Call( func = ast.Name( id = backing_cls.stem, ctx = ast.Load() ), args = [], keywords = keywords )
 		call.generator_backing_cls = backing_cls
 		fn.node.body = [ ast.Return( value = call ) ]
@@ -773,7 +1127,7 @@ class TypeResolver:
 		elem_type = fn.return_type.elem_type
 		self.schedule( elem_type )
 
-		self._desugar_generator_for_loops( fn )
+		extra_fields = self._desugar_generator_for_loops( fn )
 		units = self._collect_generator_units( fn )
 		self._reject_generator_defer( fn )
 		self._reject_generator_value_return( fn )
@@ -782,14 +1136,14 @@ class TypeResolver:
 		none_type = self.discovery.get_none_type()
 		result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
 
-		backing_cls = self._build_generator_backing_class( fn, locals_decl )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, result_union )
+		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields )
+		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, result_union )
 
 		self.schedule( backing_cls )
 		self.schedule( backing_cls.names['__next__'] )
 		self.schedule( result_union )
 
-		self._rewrite_generator_constructor( fn, backing_cls, locals_decl )
+		self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields )
 		fn.return_type = backing_cls
 
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:
