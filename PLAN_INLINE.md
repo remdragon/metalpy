@@ -444,3 +444,89 @@ Verification (multi-statement addition):
   body's own local name is unaffected, and no separate C function is ever
   emitted for the inlined target.
 - Full python tests.py green throughout (1001 passing).
+
+STATUS: early/nested return + defer/errdefer/.or_return() (2026-08-15)
+
+The three restrictions the multi-statement pass above deliberately left in
+place - early/nested `return`, `defer`/`errdefer`, and `.or_return()`/
+checked-arithmetic in a pre-return statement - are now supported. All three
+turned out to be one piece of work: each is "produce a value, then exit the
+inlined function early," and `defer`/`errdefer`'s own "runs when THIS
+function returns" contract only has a meaning once that early exit is a
+real, addressable point again.
+
+The core primitive: `cfg.py` gained `InlineScope`/`push_inline_scope`/
+`pop_inline_scope`/`build_inline_scope_ladder` - a splice-local analogue of
+the function-wide `current_epilogue_label`/`build_epilogue_ladder` an
+ordinary early return already uses. `current_epilogue_label`/`return_` both
+now stop at the innermost active scope's own `boundary_depth` instead of
+continuing into the caller's (or an outer splice's) older entries - the
+exact bug that made jumping into the caller's real epilogue possible before.
+`_stmt_Return`/`_consume_checked_result` redirect into the scope's own
+`result_var`/`exited_flag` (armed the same way a defer flag already is)
+instead of `self._return_value_var`/a real return whenever a scope is
+active; `ir.OrJump`/`ir.OrReturn` gained matching optional fields
+(`exited_flag`/`inline_exit`) so `.or_return()`/checked-arithmetic redirect
+too, with zero new opcodes. `_splice_multi_statement_inline_body`'s own tail
+now emits the scope's ladder, then a flag-gated merge (mirroring
+`_expr_IfExp`'s own "shared dest temp, two Assign sites, converge at one
+label" ternary shape) between the early-exit value and the trailing
+return-expression - only one of which actually runs.
+
+Two real bugs found only by testing beyond clang/gcc (see
+`vcvars64_available.md`/`linker_c_validate_all_compilers.md` memory - MSVC's
+`/RTC1` catches what clang/gcc silently tolerate):
+1. A synthesized local (`result_var`) whose first write could land inside
+   `emitter_c.py`'s own hand-emitted `if (...) { }` blocks (`_emit_or_return`/
+   `_emit_or_jump`) got block-scoped by C, undeclared everywhere else - fixed
+   with a new `ir.DeclareLocal` instruction (the `DeclareTemp` of named
+   Variables), emitted flat and unconditional before the splice's own
+   pre-return statements even start lowering.
+2. The trailing return-expression's own temp never got `untrack_temp`'d
+   after its ownership moved into the merge's `result` via a bare
+   `ir.Assign` - `_flush_pending_temps` then emitted an RC-cleanup check for
+   it unconditionally, outside the "normal path" branch that's the only
+   place it was ever actually assigned - a genuine uninitialized-read on the
+   early-exit path, not just a redundant decref.
+
+PLAN_RETURN_INFERENCE.md's own `@inline` variant needed one more carve-out:
+it reaches `_splice_multi_statement_inline_body` with `target.return_type`
+set to Python `None` as a deliberate "not yet known" sentinel (not
+`none_type`) - none of the new machinery can run against an unresolved
+type, but `_is_eager_return_inferable_body`'s own "exactly one reachable
+return" eligibility gate already guarantees no early return can co-occur
+with it, so this case simply falls back to the original, pre-this-pass
+code path unchanged. `.or_return()`/checked-arithmetic in a pre-return
+statement stays rejected in that one narrow combination (no scope exists
+to redirect into, same as before this pass for every splice).
+
+Verification (early-return/defer/or_return addition):
+
+- discovery_test.py: early `return` nested in if/for/while now accepted; a
+  bare early `return` still rejected (every reachable return needs a
+  value); `defer`/`errdefer` (both spellings, including nested in an if)
+  no longer rejected; self/parameter reassignment still rejected
+  (unrelated hazard, untouched).
+- lowering_test.py `InlineMultiStatementTests`: an early return nested in
+  a spliced `if` produces exactly one real `ir.Return`/`ir.FuncEnd` for
+  the caller (not a second one from the inlined target); `.or_return()`
+  in a pre-return statement now works, with a direct regression test for
+  the "notably important" requirement - the `OrJump` lands on a real,
+  declared label local to the splice, and the caller keeps exactly one
+  `ir.Return`/`ir.FuncEnd`, proving no caller-level early return happened;
+  a defer registered inside a spliced `if` is replayed exactly once, at
+  the splice's own ladder.
+- inline_multistatement_test.py: real compile+link+run proof of the same
+  "notably important" requirement - an `@inline` method whose pre-return
+  statement early-exits via `.or_return()` on an `Err` receiver, called
+  from `main()` with real code after the call site that must still run
+  and correctly observe the propagated `Err`.
+- Full python tests.py green (1029 passing) under clang (the default);
+  spot-checked under MSVC too (`METALPY_CC=msvc`) - both new real-compile
+  tests pass there as well, after the two MSVC-only bugs above were found
+  and fixed this way. gcc unavailable in this environment to check
+  directly. (A handful of unrelated MSVC-only failures were also observed
+  in this worktree under `METALPY_CC=msvc python tests.py` - confirmed
+  pre-existing and already fixed on master by other, concurrent work that
+  landed after this worktree branched, not a regression from this pass -
+  see master's `4f94935` and neighboring commits.)

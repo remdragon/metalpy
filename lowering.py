@@ -1218,6 +1218,20 @@ class FunctionLowering:
 		# skip past, so jumping to the caller's own epilogue is correct
 		# there, exactly as it always has been.
 		self._in_inline_splice_prelude = False
+		# parallel to self._cfg's own _inline_scope_stack (cfg.py), pushed/
+		# popped in lockstep by _splice_multi_statement_inline_body - cfg.py's
+		# InlineScope only carries the CFG-level boundary_depth/label; these
+		# are the LOWERING-level artifacts _stmt_Return/_consume_checked_
+		# result need once current_epilogue_label() hands back a splice-local
+		# label: (result_var, exited_flag). result_var is where an early exit
+		# (return/or_return/checked-arithmetic) inside the splice's pre-
+		# return statements stows its value - the splice-local analogue of
+		# self._return_value_var. exited_flag is armed (Assign, Const(True))
+		# right before jumping there, so the ladder's own tail can tell
+		# "early exit vs normal fallthrough" apart and decide whether to
+		# still lower the trailing return-expression - see
+		# _splice_multi_statement_inline_body's own comment
+		self._inline_scope_vars: list[tuple[Variable,Variable]] = []
 
 	def run( self ) -> list[ir.Instruction]:
 		fn = self._current_fn
@@ -1904,14 +1918,33 @@ class FunctionLowering:
 			if is_success:
 				self._complete_construction_or_fail( self._current_fn )
 		label = self._cfg.current_epilogue_label( value )
+		# the innermost active multi-statement @inline splice, if this
+		# return is reached from one of its own pre-return statements (see
+		# _splice_multi_statement_inline_body/self._inline_scope_vars' own
+		# comment) - value-computation/widening above is already correct
+		# unchanged (self._current_fn.return_type is provisional's, i.e.
+		# the INLINED function's own declared type), only the TERMINAL
+		# emission below needs to redirect: into the scope's own result_var
+		# instead of self._return_value_var, arming its exited_flag, and
+		# (inline-unwind branch only) jumping to the scope's own merge_label
+		# instead of emitting a real ir.Return - this early return must
+		# never become the CALLER's own return
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
 		if label is not None:
 			# whatever's still pending (RC decrefs, defer/errdefer replays)
 			# gets unwound once, later, by the shared ladder every other
 			# return reaching this same label also jumps into
 			# (build_epilogue_ladder(), emitted at the function's own
-			# closing brace - see _emit_epilogue) - value has to survive
-			# the jump some other way than a direct ir.Return
-			if self._return_value_var is not None and value is not None:
+			# closing brace - see _emit_epilogue; or, inside a splice, the
+			# scope's own local ladder - see _splice_multi_statement_
+			# inline_body) - value has to survive the jump some other way
+			# than a direct ir.Return
+			if inline_scope is not None:
+				result_var, exited_flag, _merge_label = inline_scope
+				if result_var is not None and value is not None:
+					self._emit( ir.Assign( dest = result_var, src = return_value ))
+				self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = exited_flag.type, value = True )))
+			elif self._return_value_var is not None and value is not None:
 				self._emit( ir.Assign( dest = self._return_value_var, src = return_value ))
 			# value's own ownership (if it's a bare temp - `return
 			# SomeConstructor(...)`, never assigned to a name) just
@@ -1936,18 +1969,31 @@ class FunctionLowering:
 			# either nothing is pending, or `value` IS itself one of the
 			# still-live entries current_epilogue_label() can't route
 			# through a shared label (see its own comment) - unwind inline,
-			# right here, same as always. Still has to replay any pending
+			# right here, same as always (bounded to the splice's own
+			# portion of the stack when inline_scope is set - see cfg.py's
+			# return_() own comment). Still has to replay any pending
 			# defer/errdefer entries itself (return_() does this now too -
 			# they're just as "pending" as an RC decref from here)
 			for instr in self._cfg.return_( value, lambda: self._build_is_err_check( node )):
 				self._emit( instr )
 			# same reasoning as the label-is-not-None branch above - flush
-			# BEFORE this branch's own unconditional ir.Return, not after
+			# BEFORE this branch's own unconditional terminator, not after
 			# (return_() already untracked `value` itself, so this only
 			# ever cleans up OTHER still-pending temps - e.g. an
 			# intermediate argument consumed into constructing `value`)
 			self._flush_pending_temps()
-			self._emit( ir.Return( value = return_value ))
+			if inline_scope is not None:
+				result_var, exited_flag, merge_label = inline_scope
+				if result_var is not None and value is not None:
+					self._emit( ir.Assign( dest = result_var, src = return_value ))
+				self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = exited_flag.type, value = True )))
+				# jumps PAST the scope's own ladder (already replayed
+				# inline, right above - re-entering it via its own label
+				# would replay the same entries a second time) straight to
+				# where the early-exit-vs-normal-fallthrough merge begins
+				self._emit( ir.Jump( target = merge_label ))
+			else:
+				self._emit( ir.Return( value = return_value ))
 
 	def _maybe_widen_return_result( self, node: ast.Return, value: ir.Operand, fn_type: Type ) -> ir.Temp|None:
 		''' `return x` where x is Result[T,NarrowE] and this function is
@@ -5087,30 +5133,38 @@ class FunctionLowering:
 		# check_dest is sometimes a real, named Variable (or_return()'s own
 		# receiver) and sometimes a bare Temp (checked arithmetic, __len__/
 		# __getitem__'s auto-unwrap) - isinstance covers both uniformly
-		if self._in_inline_splice_prelude:
-			# PLAN_INLINE.md multi-statement generalization: a pre-return
-			# statement of a spliced @inline body reached an early-exit-
-			# shaped construct (.or_return(), checked arithmetic under the
-			# default Check mode, or the __len__/__getitem__ auto-consume
-			# path) - left unguarded, the OrReturn/OrJump path below would
-			# jump to the CALLER's own real epilogue (self._current_fn is
-			# briefly the caller during this window too - see
-			# _splice_multi_statement_inline_body's own comment), silently
-			# skipping the rest of THIS splice AND the rest of the
-			# caller's own subsequent statements whenever the caller
-			# happens to also satisfy the Result-return shape - a real
-			# correctness bug, not just an unsupported case, if left
-			# unchecked. The trailing return-EXPRESSION itself never sets
-			# this flag (restored to False before it's lowered), so it's
-			# unaffected - nothing of the splice remains after it to skip
-			# past there, so jumping to the caller's own epilogue is
-			# already correct, exactly as the single-statement case
-			# already relies on
+		# the innermost active multi-statement @inline splice, if this
+		# early-exit-shaped construct (.or_return(), checked arithmetic
+		# under the default Check mode, or the __len__/__getitem__ auto-
+		# consume path) is reached from one of a spliced body's own pre-
+		# return statements (self._current_fn is briefly the caller during
+		# this window too - see _splice_multi_statement_inline_body's own
+		# comment). Left unredirected, the OrReturn/OrJump path below would
+		# jump to/return from the CALLER's own real epilogue - a real
+		# correctness bug (silently skipping the rest of THIS splice AND
+		# the caller's own subsequent statements), not just an unsupported
+		# case - so both branches below stow into the SPLICE's own result
+		# var/exited flag instead of self._return_value_var/a real return
+		# whenever this is set. The trailing return-EXPRESSION itself is
+		# lowered with this restored to None first, so it's unaffected -
+		# nothing of the splice remains after it to skip past there, so
+		# jumping to the caller's own epilogue is already correct, exactly
+		# as the single-statement case already relies on
+		if self._in_inline_splice_prelude and not self._inline_scope_vars:
+			# PLAN_RETURN_INFERENCE.md's own @inline variant reached here
+			# with target.return_type still the "infer it" sentinel (see
+			# _splice_multi_statement_inline_body's own top-of-function
+			# comment) - no inline scope exists to redirect into (result_
+			# var's type isn't known yet, by construction), so this narrow
+			# combination stays rejected, exactly as the single, blanket
+			# guard this method used to have always rejected every
+			# multi-statement splice's own pre-return statements
 			self.lowering.discovery.fail(
 				f'@inline: .or_return()/checked arithmetic that could propagate an error is not yet supported before the '
-				f'final return of a multi-statement body: {ast.unparse(node)}',
+				f'final return of a multi-statement body whose own return type is still being inferred: {ast.unparse(node)}',
 				node,
 			)
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
 			if isinstance( check_dest, Variable ):
@@ -5141,7 +5195,11 @@ class FunctionLowering:
 			tracked_operand = check_dest if isinstance( check_dest, Variable ) else None
 			label = self._cfg.current_epilogue_label( tracked_operand )
 			if label is not None:
-				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
+				if inline_scope is not None:
+					result_var, exited_flag, _merge_label = inline_scope
+					self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = result_var, exited_flag = exited_flag ))
+				else:
+					self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
 			else:
 				# either check_dest's own entry needed excluding (the bug above),
 				# or (matching _stmt_Return's own inline path for the identical
@@ -5156,7 +5214,10 @@ class FunctionLowering:
 				# actual conditional replay logic) is embedded below, to run
 				# strictly inside the Err branch
 				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
-				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
+				if inline_scope is not None:
+					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay, inline_exit = inline_scope ))
+				else:
+					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
 		else:
 			panic_fn = self.lowering._type_resolver._resolve_sys_function( 'panic' )
 			self.lowering.schedule( panic_fn )
@@ -6503,6 +6564,60 @@ class FunctionLowering:
 				self._emit( ir.Assign( dest = fresh, src = operand ))
 			provisional.names[stem] = fresh
 
+		# early/nested-return + defer/errdefer/.or_return() generalization -
+		# a splice-local "epilogue" scope for the pre-return statements: an
+		# early return, or a .or_return()/checked-arithmetic early exit,
+		# reached from one of them must never jump into/return from the
+		# CALLER's own real epilogue - it needs its OWN local landing point.
+		# result_var carries whichever value flowed through an early exit
+		# (the splice-local analogue of self._return_value_var); exited_flag
+		# (armed alongside it, same mechanism defer/errdefer's own flags
+		# use) lets the tail below tell "early exit vs normal fallthrough"
+		# apart once everything converges - see cfg.py's push_inline_scope()
+		# and current_epilogue_label()/return_()'s own comments for the CFG
+		# half of this, and ir.OrReturn.inline_exit/ir.OrJump.exited_flag
+		# for how or_return()/checked-arithmetic feed into it
+		# PLAN_RETURN_INFERENCE.md's own @inline variant (_infer_return_
+		# only_type_params_inline) reaches here with target.return_type set
+		# to Python None as a DELIBERATE SENTINEL (not none_type - the real
+		# NoneType class), specifically so the trailing return-expression's
+		# own _lower_expr(..., None) call can take its own natural type,
+		# later read back via result.type to discover R. None of the new
+		# early-exit machinery below can run in that state - result_var/
+		# result would need a REAL type up front, which is exactly the one
+		# thing not known yet. This is safe to skip entirely rather than
+		# work around: _is_eager_return_inferable_body (the ONLY gate that
+		# lets return-only inference even be attempted) already requires
+		# EXACTLY ONE reachable return, so a body reaching here with this
+		# sentinel can never have an early return to support in the first
+		# place - only .or_return()/checked-arithmetic in a pre-return
+		# statement remains a real (if narrow) hazard, still explicitly
+		# rejected below, exactly as the single, blanket guard this
+		# replaces always did for every multi-statement splice
+		none_type = self.lowering.discovery.get_none_type()
+		noreturn_type = self.lowering.discovery.get_intrinsics()['NoReturn']
+		supports_early_exit = target.return_type is not None
+		result_var: Variable|None = None
+		exited_flag: Variable|None = None
+		merge_label: str|None = None
+		bool_cls: Type|None = None
+		if supports_early_exit:
+			result_var = (
+				Variable(
+					stem = f'$inline{self._inline_binding_id}$result', qualname = f'{target.qualname}$$inline{self._inline_binding_id}$result',
+					file = target.file, line = target.line, type = target.return_type,
+				)
+				if target.return_type not in ( none_type, noreturn_type )
+				else None
+			)
+			bool_cls = self.lowering.discovery.find_name( 'bool', node )
+			exited_flag = Variable(
+				stem = f'$inline{self._inline_binding_id}$exited', qualname = f'{target.qualname}$$inline{self._inline_binding_id}$exited',
+				file = target.file, line = target.line, type = bool_cls,
+			)
+			self._inline_binding_id += 1
+			merge_label = self._new_label( 'inline_merge' )
+
 		module = self.lowering._find_module_for( target )
 		with self.lowering.discovery.module_context( module ):
 			with self.lowering.discovery.scope_context( provisional ):
@@ -6531,6 +6646,25 @@ class FunctionLowering:
 				# Making self._current_fn and the active scope_context
 				# point at the same `provisional` object for this whole
 				# window fixes both at once.
+				#
+				# result_var/exited_flag are both given a real, flat,
+				# unconditional declaration/init RIGHT HERE - before the
+				# pre-return statements (and therefore before any .or_
+				# return()/checked-arithmetic early exit nested inside
+				# emitter_c.py's own hand-emitted C `{ }` blocks - see ir.
+				# DeclareLocal's own docstring) could otherwise become
+				# result_var's first, block-scoped-and-therefore-unsafe
+				# write. exited_flag has a trivial default (False) an
+				# ordinary ir.Assign already declares safely; result_var's
+				# type has no generic default, hence DeclareLocal
+				scope_label: str|None = None
+				if supports_early_exit:
+					assert exited_flag is not None and bool_cls is not None and merge_label is not None
+					if result_var is not None:
+						self._emit( ir.DeclareLocal( variable = result_var ))
+					self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = bool_cls, value = False )))
+					scope_label = self._cfg.push_inline_scope()
+					self._inline_scope_vars.append(( result_var, exited_flag, merge_label ))
 				outer_fn = self._current_fn
 				outer_prelude = self._in_inline_splice_prelude
 				self._current_fn = provisional
@@ -6548,15 +6682,71 @@ class FunctionLowering:
 				finally:
 					self._current_fn = outer_fn
 					self._in_inline_splice_prelude = outer_prelude
-				# self._current_fn/._in_inline_splice_prelude are both
-				# restored to the REAL caller before lowering the trailing
-				# return-expression - its own .or_return()/checked-
-				# arithmetic behavior is therefore unchanged from the
-				# single-statement case (validates and jumps against the
-				# CALLER's own epilogue/return type, exactly as already
-				# tested), while scope_context(provisional) stays active
-				# so it can still resolve pre-return-declared locals
-				result = self._lower_expr( return_stmt.value, expected_type or target.return_type )
+
+				if not supports_early_exit:
+					# PLAN_RETURN_INFERENCE.md's own @inline variant - see
+					# this method's own top-of-function comment. No scope
+					# was pushed, nothing to merge - the trailing return-
+					# expression's own natural type IS the answer being
+					# discovered here, exactly as the pre-existing
+					# single-statement/original multi-statement code always
+					# computed it
+					result = self._lower_expr( return_stmt.value, expected_type )
+					return result if want_result else None
+
+				assert scope_label is not None and exited_flag is not None and merge_label is not None
+				# current_epilogue_label()'s own fallback target once
+				# nothing shallower within THIS splice qualified (push_
+				# inline_scope()'s own label) - an inline-unwind return_()
+				# call reached during the splice already replayed
+				# everything itself and jumps straight past this, to
+				# merge_label below (see _stmt_Return/_consume_checked_
+				# result's own splice branches)
+				self._emit( ir.Label( name = scope_label ))
+				for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
+					self._emit( instr )
+				self._cfg.pop_inline_scope()
+				self._inline_scope_vars.pop()
+
+				# early exit vs normal fallthrough - both converge into ONE
+				# result operand from here, same "shared dest temp, two
+				# Assign sites, converge at one label" shape _expr_IfExp
+				# already uses for Python's own ternary. self._current_fn/
+				# _in_inline_splice_prelude are already restored to the
+				# REAL caller above, before this point - the trailing
+				# return-expression's own .or_return()/checked-arithmetic
+				# behavior is therefore unchanged from the single-statement
+				# case (validates and jumps against the CALLER's own
+				# epilogue/return type, exactly as already tested), while
+				# scope_context(provisional) stays active so it can still
+				# resolve pre-return-declared locals it references
+				self._emit( ir.Label( name = merge_label ))
+				result = self._new_temp( target.return_type )
+				normal_label = self._new_label( 'inline_normal' )
+				converge_label = self._new_label( 'inline_converge' )
+				self._emit( ir.JumpIfFalse( cond = exited_flag, target = normal_label ))
+				if result_var is not None:
+					self._emit( ir.Assign( dest = result, src = result_var ))
+				self._emit( ir.Jump( target = converge_label ))
+				self._emit( ir.Label( name = normal_label ))
+				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+				self._emit( ir.Assign( dest = result, src = trailing_value ))
+				# trailing_value's own ownership (if it's a bare temp - e.g.
+				# the Result.Ok(x) construction temp a trailing `return
+				# Result.Ok(x)` produces) just transferred into `result`
+				# above via the plain ir.Assign - untrack it, or whatever
+				# later cleans up STILL-pending temps (_flush_pending_temps,
+				# called by _lower_stmt's own post-statement wrapper once
+				# this whole splice call returns) would emit a SECOND,
+				# unconditional RC-check for it outside the "normal" arm's
+				# own guard - reading trailing_value's memory even on the
+				# early-exit path, where it was never assigned at all (a
+				# real uninitialized-read bug, not just a redundant decref -
+				# confirmed by a real repro under MSVC's /RTC1). Exactly the
+				# same concern _stmt_Return's own identical transfer already
+				# guards against via this same call
+				self._cfg.untrack_temp( trailing_value )
+				self._emit( ir.Label( name = converge_label ))
 		return result if want_result else None
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:

@@ -76,6 +76,30 @@ class DeleteTemp( Instruction ): # temp is no longer valid after this instructio
 		return f'DeleteTemp( temp={self.temp!r} )'
 
 @dataclass( kw_only = True )
+class DeclareLocal( Instruction ):
+	''' PLAN_INLINE.md early-return generalization - a bare "TYPE name;"
+	declaration (no initializer) for a synthesized, splice-local NAMED
+	Variable, emitted flat/unconditionally wherever this instruction itself
+	is placed - the DeclareTemp of Variables (which are keyed by .stem, not
+	an id, so DeclareTemp itself doesn't fit). Specifically for _splice_
+	multi_statement_inline_body's own result_var: relying on ir.Assign's own
+	lazy "declare on first use" (Lowering._emit_instruction) risks the
+	declaration landing INSIDE one of emitter_c.py's own hand-emitted C `{
+	}` blocks (_emit_or_return's Err branch, _emit_or_jump's tag check) if
+	an early exit via .or_return()/checked-arithmetic happens to be result_
+	var's first write - C then scopes the declaration to just that block,
+	making it an undeclared identifier anywhere used afterward (confirmed by
+	a real repro, not just reasoning). No such hazard for a type that
+	already has a trivial default value (exited_flag: bool, initialized via
+	a plain, always-flat ir.Assign(..., Const(False)) instead) - this is
+	only needed for result_var, whose type has no generic zero/default
+	representation to assign. '''
+	variable: Variable
+
+	def test_repr( self ) -> str:
+		return f'DeclareLocal( variable={self.variable!r} )'
+
+@dataclass( kw_only = True )
 class Assign( Instruction ):
 	dest: Variable|Temp
 	src: Operand
@@ -269,6 +293,21 @@ class OrReturn( Instruction ): # Result.or_return(): Err -> return Err from the 
 	# Emitted inside emitter_c.py's own `if (value.tag==1) {...}` block, after
 	# the error-widening lines and before the actual `return`.
 	epilogue: list['Instruction'] = field( default_factory = list )
+	# PLAN_INLINE.md early-return generalization: (result_var, exited_flag,
+	# merge_label), or None (default - preserves today's exact behavior:
+	# widen and emit a real C `return`). When set, this OrReturn is
+	# .or_return()/checked-arithmetic's own "no shared label" inline-unwind
+	# path (lowering.py's _consume_checked_result), reached from inside a
+	# multi-statement @inline splice's pre-return statements - a literal C
+	# `return` there would incorrectly return from the CALLER, not just
+	# exit the splice (self._current_fn is briefly the caller during that
+	# window too). The Err branch instead widens into result_var (typed
+	# from the INLINED target's own return type, not the enclosing C
+	# function's - see emitter_c.py's own comment on why function.
+	# return_type can't be used here), arms exited_flag, and `goto`s
+	# merge_label - see _splice_multi_statement_inline_body's own comment
+	# for what happens there.
+	inline_exit: 'tuple[Variable,Variable,str]|None' = None
 
 	def test_repr( self ) -> str:
 		return f'OrReturn( dest={self.dest!r}, value={self.value!r} )'
@@ -308,6 +347,14 @@ class OrJump( Instruction ):
 	value: Operand # a Result[T,E]
 	target: str # epilogue label
 	return_slot: Variable|None # where the wrapped error gets stowed before jumping; None if the function returns None
+	# PLAN_INLINE.md early-return generalization: set only when `target` is a
+	# multi-statement @inline splice's own local epilogue label (rather than
+	# the enclosing real function's) - armed (set true) right before the
+	# `goto`, alongside return_slot, so the splice's own ladder tail (see
+	# _splice_multi_statement_inline_body) can tell "early exit vs normal
+	# fallthrough" apart. None (the default) for every ordinary, non-spliced
+	# OrJump - unchanged behavior.
+	exited_flag: Variable|None = None
 
 	def test_repr( self ) -> str:
 		return f'OrJump( dest={self.dest!r}, value={self.value!r}, target={self.target!r}, return_slot={self.return_slot!r} )'
