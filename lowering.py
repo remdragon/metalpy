@@ -4869,15 +4869,27 @@ class FunctionLowering:
 		# still-generic Box[T]) is exempted too: there's no real type here
 		# yet to validate against at all, this literal's own natural type
 		# is what will eventually get UNIFIED to solve T, not compared
-		# against it. A CEnum expected_type (EnumName(42)'s own construction
-		# call, see _try_lower_construct_call's CEnum branch) is exempted
-		# too - "a CEnum has exactly the same runtime representation as its
-		# underlying type", so a raw int literal is exactly what a CEnum
-		# construction call is for, not a type mismatch
+		# against it. A CEnum expected_type validates against its OWN
+		# underlying scalar's stem instead of being exempted outright
+		# (cenum_value_type below) - "a CEnum has exactly the same
+		# runtime representation as its underlying type" (EnumName(42)'s
+		# own construction call, see _try_lower_construct_call's CEnum
+		# branch, is exactly what this is for), but that's only true
+		# when the literal is actually compatible with the underlying
+		# SCALAR - a raw int literal for an i32-backed CEnum, not
+		# literally anything. Unconditionally exempting every CEnum
+		# expected_type from validation here (the original code) let a
+		# kind-mismatched literal (e.g. a string) sail through
+		# unchecked, tagging the resulting Const with the CEnum type
+		# while its own .value stayed the mismatched Python value -
+		# confirmed to crash emitter_c.py's _emit_const with an
+		# uncaught Python NotImplementedError instead of a clean
+		# CompileError (PLAN_COMPILER_BUG_SWEEP.md)
+		cenum_value_type = expected_type.value_type if isinstance( expected_type, CEnum ) else None
 		expected_base = expected_type.base if isinstance( expected_type, Specialization ) else expected_type
 		if (
 			expected_type is not None and not isinstance( expected_base, TaggedUnion )
-			and not isinstance( expected_type, ( TypeVar, CEnum ))
+			and not isinstance( expected_type, TypeVar )
 			and not self.lowering._type_resolver._is_ptr_specialization( expected_type )
 			# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a compiler-
 			# synthesized `0` standing in for "this RC-typed generator
@@ -4897,7 +4909,7 @@ class FunctionLowering:
 			and not getattr( node, 'generator_zero_rc_field', False )
 		):
 			compatible_stems = self.lowering._LITERAL_COMPATIBLE_STEMS.get( type( node.value ) )
-			expected_stem = getattr( expected_type, 'stem', None )
+			expected_stem = cenum_value_type.stem if cenum_value_type is not None else getattr( expected_type, 'stem', None )
 			# an int literal implicitly widening into a float scalar (`x: f64
 			# = 1`, `f64(1)`) is a pre-existing, legitimate pattern - NOT
 			# folded into _LITERAL_COMPATIBLE_STEMS[int] itself, since that
@@ -4939,9 +4951,10 @@ class FunctionLowering:
 			# literal's KIND (int vs float/str/...), never its magnitude
 			if (
 				not self._allow_literal_bit_reinterpret and type( node.value ) is int
-				and isinstance( expected_type, Scalar ) and expected_stem in self.lowering._LITERAL_COMPATIBLE_STEMS[int]
+				and ( isinstance( expected_type, Scalar ) or cenum_value_type is not None )
+				and expected_stem in self.lowering._LITERAL_COMPATIBLE_STEMS[int]
 			):
-				lo, hi = int_stem_range( expected_type )
+				lo, hi = int_stem_range( cenum_value_type if cenum_value_type is not None else expected_type )
 				if not ( lo <= node.value <= hi ):
 					self.lowering.discovery.fail(
 						f'{node.value} is out of range for {expected_type.qualname} ({lo}..{hi}): {ast.unparse(node)}',
