@@ -6344,6 +6344,104 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			# union/intersection/difference/symmetric_difference, via both
+			# the named methods and the operators (|/&/-/^, wired through
+			# _BINOP_DUNDER) - a: {1,2,3}, b: {2,3,4}
+			( 'set_algebra_named_methods_and_operators', '''
+def main() -> i32:
+	a: set[i32] = { 1, 2, 3 }
+	b: set[i32] = { 2, 3, 4 }
+
+	u: set[i32] = a.union( b )
+	if u.__len__() != 4:
+		return 1
+	if not ( u.__contains__( 1 ) and u.__contains__( 2 ) and u.__contains__( 3 ) and u.__contains__( 4 )):
+		return 2
+
+	x: set[i32] = a.intersection( b )
+	if x.__len__() != 2:
+		return 3
+	if not ( x.__contains__( 2 ) and x.__contains__( 3 )):
+		return 4
+
+	d: set[i32] = a.difference( b )
+	if d.__len__() != 1 or not d.__contains__( 1 ):
+		return 5
+
+	sd: set[i32] = a.symmetric_difference( b )
+	if sd.__len__() != 2:
+		return 6
+	if not ( sd.__contains__( 1 ) and sd.__contains__( 4 )):
+		return 7
+
+	# same results via the operator forms
+	u2: set[i32] = a | b
+	if u2.__len__() != 4:
+		return 8
+	x2: set[i32] = a & b
+	if x2.__len__() != 2:
+		return 9
+	d2: set[i32] = a - b
+	if d2.__len__() != 1 or not d2.__contains__( 1 ):
+		return 10
+	sd2: set[i32] = a ^ b
+	if sd2.__len__() != 2:
+		return 11
+
+	# neither a nor b was mutated by any of the above
+	if a.__len__() != 3 or b.__len__() != 3:
+		return 12
+	return 0
+''' ),
+			# __eq__/__ne__ - unordered-set equality (same length + one-
+			# directional containment), and _COMP_DUNDER's need for an
+			# EXPLICIT __ne__ (never auto-derived from __eq__)
+			( 'set_equality_and_inequality', '''
+def main() -> i32:
+	a: set[i32] = { 1, 2, 3 }
+	b: set[i32] = { 3, 2, 1 }  # same members, different insertion order
+	c: set[i32] = { 1, 2, 4 }
+
+	if not ( a == b ):
+		return 1
+	if a != b:
+		return 2
+	if a == c:
+		return 3
+	if not ( a != c ):
+		return 4
+
+	empty1: set[i32] = set[i32]()
+	empty2: set[i32] = set[i32]()
+	if not ( empty1 == empty2 ):
+		return 5
+
+	# different length alone must be enough to reject equality, even
+	# with no element mismatch scanned yet
+	small: set[i32] = { 1, 2 }
+	if small == a:
+		return 6
+	return 0
+''' ),
+			# RC element type (str) through the algebra methods - a
+			# double-free/leak proxy, same posture as the earlier RC
+			# add/discard repeated-cycle test
+			( 'set_algebra_rc_element_does_not_crash', '''
+def main() -> i32:
+	a: set[str] = { 'a', 'b', 'c' }
+	b: set[str] = { 'b', 'c', 'd' }
+	u: set[str] = a | b
+	x: set[str] = a & b
+	d: set[str] = a - b
+	sd: set[str] = a ^ b
+	if u.__len__() != 4 or x.__len__() != 2 or d.__len__() != 1 or sd.__len__() != 2:
+		return 1
+	# a itself must be untouched by any of the algebra calls above
+	original: set[str] = { 'a', 'b', 'c' }
+	if not ( a == original ):
+		return 2
+	return 0
+''' ),
 		] )
 
 

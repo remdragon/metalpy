@@ -52,13 +52,19 @@ _ALTERNATIVES_BY_ERROR: dict[str,str] = {
 
 # ast.BinOp operator -> the dunder method name to dispatch to for a
 # non-scalar left operand (str.__add__, etc.). Scalar operands always
-# go through arithmetic mode instead.
+# go through arithmetic mode instead. The three bitwise entries exist
+# purely for set[T]'s own algebra (__or__/__and__/__xor__ - union/
+# intersection/symmetric_difference); ast.Sub (__sub__, difference) was
+# already here for str/int's own use.
 _BINOP_DUNDER: dict[type,str] = {
 	ast.Add: '__add__',
 	ast.Sub: '__sub__',
 	ast.Mult: '__mul__',
 	ast.FloorDiv: '__floordiv__',
 	ast.Mod: '__mod__',
+	ast.BitOr: '__or__',
+	ast.BitAnd: '__and__',
+	ast.BitXor: '__xor__',
 }
 
 # ast comparison operator -> the dunder method name to dispatch to for a
