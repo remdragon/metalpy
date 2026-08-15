@@ -44,7 +44,22 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 	The temp file is created in the SAME directory as the target so os.replace
 	is a same-filesystem rename, which is atomic on both POSIX and Windows.
 	Readers should ALSO treat empty/unparseable content as a miss - this fixes
-	new writes, but cannot repair a corrupt file some earlier run left behind. '''
+	new writes, but cannot repair a corrupt file some earlier run left behind.
+
+	PUBLISHING IS BEST-EFFORT, deliberately. On Windows os.replace fails with
+	PermissionError (WinError 5) when the destination is currently OPEN - which
+	a concurrent reader doing cache_file.read_text() briefly makes it. The first
+	version of this raised, which turned the original rare silent-wrong-answer
+	into a rare hard crash that aborted the compile - strictly worse, and caught
+	by the same test that motivated the fix in the first place.
+
+	Losing that race is harmless: this cache is IDEMPOTENT, every writer for a
+	given key computes the same value from the same (lib, symbol, compiler) or
+	(expr, header) inputs, so whoever wins publishes the identical bytes. The
+	caller already has its own correct value in hand and returns it either way;
+	all that's lost is the chance to save the NEXT process a re-probe. A few
+	tight retries first, since a reader's handle is only open for microseconds
+	and retrying usually wins immediately - but never at the cost of failing. '''
 	cache_file.parent.mkdir( parents = True, exist_ok = True )
 	tmp = cache_file.with_name( f'{cache_file.name}.{os.getpid()}.tmp' )
 	try:
@@ -52,12 +67,23 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 			tmp.write_bytes( data )
 		else:
 			tmp.write_text( data, encoding = 'utf-8' )
-		os.replace( tmp, cache_file )
-	except BaseException:
-		# never leave a stray .tmp behind on failure - it would accumulate in
-		# %TEMP% forever, and (unlike the real cache file) nothing reaps it
+		for attempt in range( 3 ):
+			try:
+				os.replace( tmp, cache_file )
+				return
+			except OSError:
+				if attempt == 2:
+					# give up publishing - see "best-effort" above. NOT an error
+					# to report: a failed publish costs a future re-probe, never
+					# correctness, and the cache lives in %TEMP% where a full
+					# disk / locked file is the user's environment, not a bug in
+					# the compile they asked for.
+					break
+	finally:
+		# never leave a stray .tmp behind - on the give-up path above, and on
+		# any exception from the writes themselves. Nothing reaps %TEMP%/metalpy
+		# the way it eventually reaps the real cache files.
 		tmp.unlink( missing_ok = True )
-		raise
 
 
 class CcTool:
@@ -255,7 +281,17 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 		# real answer - fall through and re-probe rather than reporting "not
 		# available" for something that is (see atomic_write_cache). Cheap:
 		# the re-probe overwrites it with a good value.
-		cached = cache_file.read_text().strip()
+		#
+		# OSError is the same story from the other side: on Windows, opening
+		# this file fails with PermissionError while another process's
+		# os.replace of it is in flight. READING is best-effort for exactly the
+		# reason PUBLISHING is - a lost read costs one re-probe, never
+		# correctness - so cache contention must never surface as an error on
+		# either side.
+		try:
+			cached = cache_file.read_text().strip()
+		except OSError:
+			cached = ''
 		if cached in ( '0', '1' ):
 			return cached == '1'
 

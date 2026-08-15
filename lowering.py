@@ -391,10 +391,13 @@ class Lowering:
 		if cache_file.is_file():
 			# a torn/half-written entry parses as ValueError, not as a wrong
 			# answer - treat it as a miss and re-probe rather than crashing
-			# the whole compile (see linker_c.atomic_write_cache)
+			# the whole compile (see linker_c.atomic_write_cache). OSError
+			# likewise: on Windows this open fails while another process's
+			# os.replace of the same path is in flight. Cache contention must
+			# never be an error on either side - a lost read costs a re-probe.
 			try:
 				return int( cache_file.read_text().strip() )
-			except ValueError:
+			except ( ValueError, OSError ):
 				pass
 
 		# no cached value — compile and run a tiny C program
@@ -485,7 +488,12 @@ class Lowering:
 			# Writes are atomic now (see linker_c.atomic_write_cache), so a
 			# partial file can only be a leftover from an older build; delete
 			# %TEMP%/metalpy/case_folding to clear one.
-			cached = cache_file.read_bytes()
+			# OSError: on Windows this open fails while another process's
+			# os.replace of the same path is in flight - a miss, not an error
+			try:
+				cached = cache_file.read_bytes()
+			except OSError:
+				cached = b''
 			if cached:
 				return cached
 
