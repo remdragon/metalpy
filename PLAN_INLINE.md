@@ -308,3 +308,139 @@ Verification
   emitted, no call instruction at the use site - direct inlining of
   `x.__len__()`'s own body.
 - Full python tests.py green before/after.
+
+Follow-up done: multi-statement bodies (locals, if/for/while before a
+single, final, un-nested `return <expr>` - NOT early/nested return, that's
+its own further follow-up, explicitly deferred by the user). The original
+`@inline` scope above ("EXACTLY one `return <expr>` statement") is now
+just the trivial single-statement special case of a more general shape
+check; every previously-accepted body still compiles identically.
+
+The two hazards that make this more than "just splice more statements",
+both found by design research BEFORE any code was written (a background
+CFG deep-dive, then a Plan agent asked to specifically stress-test the
+"no new CFG scope primitive needed" hypothesis) - confirmed real via a
+repro once implemented, not just reasoning:
+
+- **Hazard 1**: `_stmt_Assign`/`_stmt_AnnAssign`'s fresh-declaration branch
+  registers a new local into `self._current_fn` (a `FunctionLowering`-
+  level field, assigned exactly once, in `__init__`, never reassigned
+  anywhere else in the file before this) - which, unmodified, is the
+  CALLER's own top-level function during a splice, not the callee's.
+  `Function.add_name` is an unconditional dict overwrite with no collision
+  guard - a pre-return-statement local sharing a name with an existing
+  caller-side local would silently overwrite the caller's own entry,
+  corrupting every later reference to that name in the caller's own
+  hand-written code, from that point in the (unordered) dict onward.
+- **Hazard 2**: `_stmt_Assign`'s "is this name already bound" check goes
+  through `discovery.find_name_or_none` (walking `discovery.scope_stack`,
+  which `module_context`/`scope_context` control) - a SEPARATE mechanism
+  from `self._current_fn`. Reassigning an already-alpha-renamed local a
+  SECOND time within the same spliced body needs both to agree on where
+  the first assignment landed, or the second assignment can't find it and
+  creates an independent second binding under the same name instead of a
+  replace - `cfg.py`'s own fresh-vs-replace RC bookkeeping depends on
+  finding the SAME Variable object both times, so this would silently
+  skip a decref (a real leak, not just a bookkeeping oddity).
+
+Both fixed by ONE mechanism: a fresh, per-call-site **provisional
+Function** (built via `monomorphize.py`'s `_build_monomorphized_function`
+- already precedented for exactly this shape by PLAN_RETURN_INFERENCE.md's
+own `_infer_return_only_type_params_inline`), with `self._current_fn`
+TEMPORARILY reassigned to it (the first and only place this ever happens
+in the file, narrowly scoped, restored in a `finally`) for exactly the
+window `discovery.scope_context(provisional)` is also active - unifying
+where new locals get registered and where "is this already bound" gets
+looked up onto the same object resolves both hazards at once.
+
+A third hazard, not part of the original ask, found during the SAME design
+pass: reassigning `self`/a parameter inside a multi-statement body, when
+that binding was passed in via the existing "reuse the caller's own bare
+Variable directly, no copy" fast path (the common case - a bare-name
+receiver/argument), would silently mutate the CALLER's own variable, not a
+private copy. Rejected outright at parse time for this pass (a new
+discovery.py scanner, `_find_inline_body_reserved_name_reassignment`) -
+relaxing it later needs "force a defensive copy binding whenever
+reassignment is detected" instead of today's zero-copy reuse optimization.
+
+`defer`/`errdefer` anywhere before the final return are ALSO rejected
+outright (`_find_inline_body_early_exit_construct`) - not merely "no
+boundary exists" but a genuine timing bug waiting to happen: `defer`'s own
+contract is "runs when THIS function returns" (i.e. right after the
+return-expression is computed), not whenever the CALLER's own, much later,
+real exit eventually fires.
+
+`.or_return()`/checked-arithmetic auto-propagation in a pre-return
+statement is rejected at LOWERING time (a new `self._in_inline_splice_
+prelude` flag, checked at the top of `_consume_checked_result` - the one
+shared choke point for `.or_return()`, checked arithmetic's own opcode
+dispatch, AND the `__getitem__`/`__len__` auto-consume path, confirmed by
+grep before relying on it) rather than at parse time, since whether a given
+op is actually checked depends on operand types not known until lowering.
+Left unguarded, this would jump to the CALLER's own real epilogue mid-
+splice - silently wrong whenever the caller happens to also satisfy the
+Result-return shape, not just an error case. The trailing return-
+EXPRESSION itself is unaffected (the flag is restored to False before it's
+lowered) - nothing of the splice remains after it to skip past, so jumping
+to the caller's own epilogue there is already correct, exactly as before
+this pass.
+
+Alpha-renaming itself (every local the pre-return statements declare, via
+`Store`-context `ast.Name` collection, excluding self/params) turned out
+to need only in-place `ast.Name.id` mutation, no `ast.NodeTransformer` -
+the provisional's own `.node` is already a private, per-call-site deep
+copy, so mutating it directly is safe, and renaming never restructures the
+tree, only a string field.
+
+`resolve_function_body` (type_resolver.py) runs against the provisional
+BEFORE alpha-renaming, not after - match-statement desugaring (there is no
+`_stmt_Match` anywhere in lowering.py, so a `match` in a spliced body can
+only ever lower after this rewrite has run) needs to see the ORIGINAL
+names; the alpha-renamer only ever needs to understand plain `ast.Name`,
+never a match pattern's own capture-binding shapes.
+
+Found, out of scope, flagged separately (spawn_task, not fixed here):
+`.or_return()` fails to compile at all - even for a completely ordinary,
+non-inline, non-generic free function - when the `Result[T,E]` class is a
+bare `@union` with just `Ok`/`Err` members and no explicit, hand-written
+`or_return` method of its own (the shape the real lib/builtins/__init__.py
+Result actually has, and the same shape `is_ok`/`is_err`/`match` already
+work fine with) - only reproduced once this pass's own tests needed a
+synthetic Result class exercising `.or_return()` for the first time in
+this codebase's session history; a real, pre-existing gap, unrelated to
+`@inline` itself.
+
+Verification (multi-statement addition):
+
+- discovery_test.py (12 new tests in `RCClassVirtualTests`): the
+  generalized body-shape check accepts locals/if before a final return;
+  rejects a return nested in an if even alongside a different final
+  return (two reachable returns); rejects a non-last return; rejects a
+  bare `return`; rejects `defer`/`errdefer` (both spellings, including
+  nested in an if); rejects self/parameter reassignment (including
+  nested); accepts reassignment of a body-declared local.
+- lowering_test.py `InlineMultiStatementTests` (9 tests): no real Call/
+  FuncStart/FuncEnd for a multi-statement target; a caller-side local
+  sharing a name with an inline-body local is NOT corrupted (Hazard 1
+  regression, checked by identity/qualname, not just "no error"); a
+  second assignment to a body-declared local reuses the SAME Variable
+  object, not two independent bindings (Hazard 2 regression); a spliced
+  `if` nests correctly inside the caller's own `if`; a `match` statement
+  in a pre-return statement lowers correctly; `.or_return()` in a pre-
+  return statement rejected via the new lowering-time guard (using an
+  inline target that itself declares a Result-shaped return type, so the
+  PRE-EXISTING "enclosing function must return Result" check passes and
+  the NEW guard is what actually catches it); direct recursion reached
+  from a pre-return statement rejected; a bare-call generic multi-
+  statement `@inline` function splices with no Specialization ever
+  compiled; combined with PLAN_RETURN_INFERENCE.md, a multi-statement
+  generic `@inline` function with a return-only type parameter still
+  infers correctly.
+- inline_multistatement_test.py (new file, `test_support.RealCompileMixin`):
+  real compile+link+run - a multi-statement `@inline` method (a local,
+  checked arithmetic under `with compiler.wrap_arithmetic:`, a nested
+  `if`/reassignment) produces the correct runtime value across two call
+  sites with different inputs, a caller-side local sharing the inlined
+  body's own local name is unaffected, and no separate C function is ever
+  emitted for the inlined target.
+- Full python tests.py green throughout (1001 passing).

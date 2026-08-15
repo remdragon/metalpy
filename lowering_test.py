@@ -6644,6 +6644,261 @@ class InlineTests( unittest.TestCase ):
 		qualnames = { lf.function.qualname for lf in self.compiler.functions }
 		self.assertNotIn( '__test__.Result.is_ok[intrinsics.i32,__test__.MyError]', qualnames )
 
+# --- multi-statement @inline bodies (generalization of PLAN_INLINE.md) -------
+
+class InlineMultiStatementTests( unittest.TestCase ):
+	''' @inline generalized to accept locals/if/for/while before a single,
+	final, un-nested `return <expr>` - see _splice_multi_statement_inline_
+	body. import_builtins=False, same as InlineTests. '''
+	maxDiff = None
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ) -> LoweredFunction:
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		return fn
+
+	def test_multistatement_body_emits_no_call_funcstart_funcend_for_target( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return w.doubled()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'Call', kinds ) # doubled() itself never becomes a real call
+		self.assertIn( 'GetAttr', kinds ) # ...just self.y spliced directly
+		# the alpha-renamed local must be a real, uniquely-named Variable,
+		# not the callee's own literal 'tmp'
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) ]
+		self.assertTrue( any( a.dest.stem.startswith( '$inline' ) and 'tmp' in a.dest.stem for a in assigns ) )
+
+	def test_caller_local_with_same_name_as_inline_local_not_corrupted( self ) -> None:
+		# Hazard 1 regression: without alpha-renaming + the provisional-
+		# Function fix, the inlined body's own `tmp` would silently
+		# overwrite main's OWN `tmp` in the shared names dict
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	tmp: usize = 100',
+			'	result: usize = w.doubled()',
+			'	with compiler.wrap_arithmetic:',
+			'		return tmp + result',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = { i.dest.qualname for i in fn.instructions if hasattr( i, 'dest' ) and isinstance( getattr( i, 'dest', None ), Variable ) }
+		self.assertIn( 'main.tmp', qualnames )
+		# main's own `tmp` must still be the operand referenced by the
+		# final AddWrap - not silently replaced by the inlined one
+		add = next( i for i in fn.instructions if type( i ).__name__ == 'AddWrap' )
+		self.assertEqual( add.left.qualname, 'main.tmp' )
+
+	def test_reassigning_own_local_reuses_the_same_variable( self ) -> None:
+		# Hazard 2 regression: a SECOND assignment to an already-alpha-
+		# renamed local must find and replace the FIRST binding (one
+		# decref-then-replace), not silently create a second, independent
+		# Variable under the same stem (a leak - cfg.py's own fresh-vs-
+		# replace machinery depends on finding the SAME Variable object
+		# both times)
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def other( self ) -> usize:',
+			'		return self.y',
+			'	@inline',
+			'	def pick( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		tmp = self.other()',
+			'		return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return w.pick()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'tmp' in i.dest.stem ]
+		self.assertEqual( len( assigns ), 2 )
+		self.assertIs( assigns[0].dest, assigns[1].dest ) # SAME Variable object, not two independent bindings
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Widget.other' ] )
+
+	def test_spliced_if_nests_inside_callers_own_if( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	@inline',
+			'	def doubled( self ) -> usize:',
+			'		tmp: usize = self.y',
+			'		if tmp == 0:',
+			'			tmp = 1',
+			'		return tmp',
+			'',
+			'def main( w: Widget, flag: bool ) -> usize:',
+			'	if flag:',
+			'		return w.doubled()',
+			'	return 0',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_match_statement_in_pre_return_statement( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class Choice:',
+			'	A: i32',
+			'	B: usize',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	c: Choice',
+			'	@inline',
+			'	def resolve_choice( self ) -> i32:',
+			'		result: i32 = 0',
+			'		match self.c:',
+			'			case Choice.A( x ):',
+			'				result = x',
+			'			case Choice.B( y ):',
+			'				result = 1',
+			'		return result',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	return w.resolve_choice()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'Call', kinds ) # resolve_choice() itself never becomes a real call
+
+	def test_or_return_in_pre_return_statement_rejected( self ) -> None:
+		# lowering-time guard (_consume_checked_result's own new check) -
+		# the inline function ITSELF declares a Result-shaped return type,
+		# so _require_result_return's own pre-existing check passes and
+		# this new guard is what actually catches it
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'	def is_err( self ) -> bool:',
+			'		return self.tag == 1',
+			'',
+			'	def or_return( self ) -> T:',
+			'		if self.is_err():',
+			'			compiler.early_return( self.data.v_Err )',
+			'		return self.data.v_Ok',
+			'',
+			'@cstruct',
+			'class Widget:',
+			'	def risky( self ) -> Result[usize,MyError]:',
+			'		return Result.Ok( 1 )',
+			'	@inline',
+			'	def bad( self ) -> Result[usize,MyError]:',
+			'		tmp: usize = self.risky().or_return()',
+			'		return Result.Ok( tmp )',
+			'',
+			'def main( w: Widget ) -> Result[usize,MyError]:',
+			'	return w.bad()',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'not yet supported before the final return' in e for e in self.discovery.errors.errors ))
+
+	def test_direct_recursion_in_pre_return_statement_rejected( self ) -> None:
+		code = '\n'.join([
+			'@inline',
+			'def foo( x: i32 ) -> i32:',
+			'	tmp: i32 = foo( x )',
+			'	return tmp',
+			'',
+			'def main() -> i32:',
+			'	return foo( 1 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'recursive inlining' in e for e in self.discovery.errors.errors ))
+
+	def test_generic_multistatement_inline_splices_bare_call( self ) -> None:
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def get( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def wrap[T]( t: T ) -> usize:',
+			'	tmp: usize = t.get()',
+			'	return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return wrap( w )',
+		])
+		self._import( code )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		self.assertEqual( qualnames, { 'main', '__test__.Widget.get' } ) # never a real wrap[Widget] function
+
+	def test_multistatement_inline_with_return_only_type_param( self ) -> None:
+		# composes with PLAN_RETURN_INFERENCE.md - R is inferred from the
+		# body's own final return, even though R never appears in any
+		# parameter, and the body is multi-statement
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: usize',
+			'	def get( self ) -> usize:',
+			'		return self.y',
+			'',
+			'@inline',
+			'def wrap[T,R]( t: T ) -> R:',
+			'	tmp = t.get()',
+			'	return tmp',
+			'',
+			'def main( w: Widget ) -> usize:',
+			'	return wrap( w )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# t.get() is a real (non-@inline) method - a real Call to it is
+		# expected; wrap() ITSELF must never become one
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Widget.get' ] )
+		self.assertEqual( fn.function.return_type.stem, 'usize' )
+
 # --- return-only generic type-parameter inference (PLAN_RETURN_INFERENCE.md) -
 
 class ReturnOnlyTypeParamInferenceTests( unittest.TestCase ):

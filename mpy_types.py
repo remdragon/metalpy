@@ -497,10 +497,13 @@ class Function( Type, ScopeMixin ):
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
 	is_destructor: bool = False # synthesized $$__destructor__ body — emitter uses void(void*) signature + cast prologue
 
-	# @inline (PLAN_INLINE.md) - body is exactly one `return <expr>`
-	# statement (discovery.py's _is_inline_eligible_body enforces this at
-	# parse time); lowering.py splices that expression directly at each
-	# call site instead of ever emitting a real Call/FuncStart/FuncEnd for it
+	# @inline (PLAN_INLINE.md) - body is arbitrary statements followed by
+	# exactly one final, top-level `return <expr>` (no other `return`
+	# anywhere else, no defer/errdefer, no reassignment of self/a
+	# parameter - discovery.py's _is_inline_eligible_body and its sibling
+	# scanners enforce this at parse time); lowering.py splices the whole
+	# body directly at each call site instead of ever emitting a real
+	# Call/FuncStart/FuncEnd for it
 	is_inline: bool = False
 
 def _leaf_is_accepted( leaf: Type, declared: Type ) -> bool:
