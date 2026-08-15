@@ -1433,7 +1433,7 @@ class FunctionLowering:
 					except CompileError as e:
 						self.lowering.discovery.fail( str( e ), fn.node )
 
-					if self._cfg.current_epilogue_label() is not None:
+					if self._cfg.current_epilogue_label() is not None or self._cfg.used_shared_epilogue_label():
 						# some return (or OrJump) already jumped into the
 						# shared epilogue ladder (_stmt_Return/_consume_checked_
 						# result, via current_epilogue_label()), or nothing did
@@ -1441,7 +1441,17 @@ class FunctionLowering:
 						# closing brace (an implicit `return None`/fall-off
 						# reaching them the same way) - either way,
 						# build_epilogue_ladder() covers whatever's still
-						# pending, RC decrefs and defer/errdefer replays alike
+						# pending, RC decrefs and defer/errdefer replays alike.
+						# used_shared_epilogue_label() (not just current_
+						# epilogue_label()) is required here: an entry a return
+						# ALREADY jumped into, while still live, may since have
+						# been cancelled (move()/compiler.decref(x)/del) by the
+						# time we reach this closing brace - current_epilogue_
+						# label() then correctly reports "nothing NEW needs to
+						# unwind here" (None), but that earlier goto still needs
+						# its label built, or it's left dangling - see used_
+						# shared_epilogue_label()'s own docstring for the real
+						# repro this was found from
 						self._emit_epilogue( fn, none_type, body_start )
 					elif fn.return_type is none_type and self.lowering._body_may_fall_off_the_end( fn.node.body ):
 						# nothing pending to unwind - but falling off the end
