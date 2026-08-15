@@ -11185,6 +11185,161 @@ def main() -> i32:
 		return 0
 		# g goes out of scope here - THIS is where the real teardown happens
 ''' ),
+			# PLAN_GENERATORS.md Phase F - the five shapes the old AST-
+			# synthesis mechanism used to reject outright (see this test's
+			# own git history for the removed rejection tests) are real,
+			# ordinary compile-and-run cases now: yield reachable at any
+			# nesting depth is just an ordinary lowering-level event
+			# (FunctionLowering._lower_generator_yield), not a template the
+			# old unit-collector had to specifically recognize.
+			( 'yield_nested_inside_if_inside_while', '''
+def gen( flag: bool, count: usize ) -> Iterator[i32]:
+	i: usize = 0
+	while i < count:
+		if flag:
+			yield 100
+		else:
+			yield 1
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	total: i32 = 0
+	n: i32 = 0
+	for x in gen( True, 3 ):
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	if n != 3 or total != 300:
+		return 1
+	total = 0
+	n = 0
+	for x in gen( False, 4 ):
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	if n != 4 or total != 4:
+		return 2
+	return 0
+''' ),
+			( 'multiple_yields_in_one_while_loop', '''
+def gen() -> Iterator[i32]:
+	while True:
+		yield 1
+		yield 2
+		yield 3
+
+def main() -> i32:
+	g = gen()
+	a = g.__next__()
+	b = g.__next__()
+	c = g.__next__()
+	d = g.__next__() # loops back around to the first yield again
+	if a is None:
+		return 1
+	if a != 1:
+		return 2
+	if b is None:
+		return 3
+	if b != 2:
+		return 4
+	if c is None:
+		return 5
+	if c != 3:
+		return 6
+	if d is None:
+		return 7
+	if d != 1:
+		return 8
+	return 0
+''' ),
+			( 'break_inside_yielding_while_loop', '''
+def gen() -> Iterator[i32]:
+	i: i32 = 0
+	while True:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+		if i == 3:
+			break
+
+def main() -> i32:
+	total: i32 = 0
+	n: i32 = 0
+	for x in gen():
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	# yields 0, 1, 2 then breaks - exactly 3 values, sum 3
+	if n != 3 or total != 3:
+		return 1
+	return 0
+''' ),
+			( 'elif_chain_containing_yield', '''
+def gen( flag: i32 ) -> Iterator[i32]:
+	if flag == 0:
+		yield 1
+	elif flag == 1:
+		yield 2
+	elif flag == 2:
+		yield 3
+	else:
+		yield 4
+
+def main() -> i32:
+	a = gen( 0 ).__next__()
+	b = gen( 1 ).__next__()
+	c = gen( 2 ).__next__()
+	d = gen( 3 ).__next__()
+	if a is None:
+		return 1
+	if a != 1:
+		return 2
+	if b is None:
+		return 3
+	if b != 2:
+		return 4
+	if c is None:
+		return 5
+	if c != 3:
+		return 6
+	if d is None:
+		return 7
+	if d != 4:
+		return 8
+	return 0
+''' ),
+			( 'two_yields_in_one_if_branch', '''
+def gen( flag: bool ) -> Iterator[i32]:
+	if flag:
+		yield 1
+		yield 2
+	else:
+		yield 3
+
+def main() -> i32:
+	g = gen( True )
+	a = g.__next__()
+	b = g.__next__()
+	c = g.__next__() # exhausted
+	if a is None:
+		return 1
+	if a != 1:
+		return 2
+	if b is None:
+		return 3
+	if b != 2:
+		return 4
+	if c is not None:
+		return 5
+	h = gen( False )
+	d = h.__next__()
+	if d is None:
+		return 6
+	if d != 3:
+		return 7
+	return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -11224,23 +11379,6 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'T|None', str( self.discovery.errors.errors[0] ))
 
-	def test_yield_nested_in_if_is_rejected( self ) -> None:
-		# Phase 2 only recognizes a bare top-level yield or a single-yield
-		# top-level while loop as valid units - a yield nested one level
-		# deeper (inside an if inside the loop) must be a clear compile
-		# error, not a silently wrong state machine
-		self._run( '''
-def gen( flag: bool ) -> Iterator[i32]:
-	while True:
-		if flag:
-			yield 1
-
-def main() -> None:
-	g = gen( True )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
-
 	def test_nested_yield_from_is_rejected( self ) -> None:
 		# A.4a only desugars a DIRECT top-level `yield from` (mirroring
 		# _desugar_generator_for_loops' own top-level-only restriction) -
@@ -11260,66 +11398,6 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'yield from is not supported yet', str( self.discovery.errors.errors[0] ))
-
-	def test_while_loop_with_two_yields_is_rejected( self ) -> None:
-		self._run( '''
-def gen() -> Iterator[i32]:
-	while True:
-		yield 1
-		yield 2
-
-def main() -> None:
-	g = gen()
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'exactly one yield', str( self.discovery.errors.errors[0] ))
-
-	def test_break_inside_yielding_while_loop_is_rejected( self ) -> None:
-		self._run( '''
-def gen() -> Iterator[i32]:
-	while True:
-		yield 1
-		break
-
-def main() -> None:
-	g = gen()
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'break/continue', str( self.discovery.errors.errors[0] ))
-
-	def test_if_elif_chain_with_yield_is_rejected( self ) -> None:
-		# Phase 2a only recognizes a single if/else - an elif chain
-		# generalizes the same branch-stable-resume idea but multiplies the
-		# state/testing surface, deliberately deferred (PLAN_GENERATORS.md)
-		self._run( '''
-def gen( flag: i32 ) -> Iterator[i32]:
-	if flag == 0:
-		yield 1
-	elif flag == 1:
-		yield 2
-	else:
-		yield 3
-
-def main() -> None:
-	g = gen( 0 )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'elif', str( self.discovery.errors.errors[0] ))
-
-	def test_if_else_with_two_yields_in_one_branch_is_rejected( self ) -> None:
-		self._run( '''
-def gen( flag: bool ) -> Iterator[i32]:
-	if flag:
-		yield 1
-		yield 2
-	else:
-		yield 3
-
-def main() -> None:
-	g = gen( True )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'at most one yield per branch', str( self.discovery.errors.errors[0] ))
 
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
