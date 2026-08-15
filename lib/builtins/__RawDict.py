@@ -13,10 +13,15 @@
 # boundary to cross there at all.
 #
 # __entries/__indices are a sorted-by-hash binary-searchable index
-# (__indices, RawIndex{hash, entry_idx}) over an append-only entry log
+# (__indices, RawIndex{hash, entry_idx}) over a compacted entry log
 # (__entries, RawEntry{hash, key_ptr, value_ptr}) - the same split the
 # original port of this file used, just without the fictional K.__eq_fn__/
-# reinterpret_cast it reached for before Callable[...] existed.
+# reinterpret_cast it reached for before Callable[...] existed. __entries
+# is no longer append-only (see remove_entry) - removal keeps it fully
+# compacted (memmove-based shift, never a swap-and-pop hole), so every
+# index in [0, len) still names a live entry; only the entry_idx values
+# stored in __indices need fixing up after a removal (see
+# _fixup_indices_after_removal).
 
 import compiler
 
@@ -85,6 +90,64 @@ class RawDict:
 					return Result.Ok( idx_node.entry_idx )
 				pos += 1
 		return Result.Err( KeyError() )
+
+	# same scan shape as _find_entry_idx (binary-search to the lower bound,
+	# then linear-scan same-hash collisions), but returns the match's own
+	# POSITION WITHIN __indices instead of its entry_idx - remove_entry
+	# (below) needs that position too, to erase_at() the right __indices
+	# slot. _find_entry_idx itself is left untouched (its own callers,
+	# __getitem__/__setitem__, never need this) rather than widening its
+	# signature for a caller that didn't exist when it was written.
+	def _find_indices_pos( self, target_hash: u64, key_ptr: Ptr[None], key_eq_fn: KeyEqFn ) -> Result[usize, KeyError]:
+		pos: usize = self._lower_bound( target_hash )
+		n: usize = len( self.__indices )
+		with compiler.panic_arithmetic( 'RawDict _find_indices_pos: overflow' ):
+			while pos < n:
+				idx_node: RawIndex = self.__indices.__getitem__( pos ).unwrap( 'RawDict: index out of bounds' )
+				if idx_node.hash != target_hash:
+					break
+				entry: RawEntry = self.__entries.__getitem__( idx_node.entry_idx ).unwrap( 'RawDict: entry out of bounds' )
+				if key_eq_fn( entry.key_ptr, key_ptr ):
+					return Result.Ok( pos )
+				pos += 1
+		return Result.Err( KeyError() )
+
+	# decrements entry_idx on every __indices node that pointed PAST the
+	# just-removed __entries slot - erasing that slot (a memmove-based
+	# shift-left) moved every LATER entry down by one, so every OTHER
+	# RawIndex whose entry_idx was greater than the removed one is now
+	# stale by exactly one. O(n): removal position within the sorted-by-
+	# hash __indices array has nothing to do with entry_idx order, so the
+	# stale nodes are scattered arbitrarily through it - a full walk is
+	# the only way to find them all. Same complexity class insert_new
+	# already pays (its own O(n) shift inside UnsafeList.insert).
+	def _fixup_indices_after_removal( self, removed_entry_idx: usize ) -> None:
+		i: usize = 0
+		n: usize = len( self.__indices )
+		with compiler.panic_arithmetic( 'RawDict _fixup_indices_after_removal: overflow' ):
+			while i < n:
+				node: RawIndex = self.__indices.__getitem__( i ).unwrap( 'RawDict: index out of bounds' )
+				if node.entry_idx > removed_entry_idx:
+					fixed: RawIndex = RawIndex( hash = node.hash, entry_idx = node.entry_idx - 1 )
+					self.__indices.__setitem__( i, fixed ).unwrap( 'RawDict: index out of bounds' )
+				i += 1
+
+	# removes the entry matching (hash, key_ptr) via key_eq_fn and returns a
+	# COPY of the removed RawEntry - Err(KeyError()) if none match. RawDict
+	# owns nothing K/V-shaped (see this file's own module docstring), so the
+	# returned entry's key_ptr/value_ptr are handed back OWNED to the
+	# caller (dict[K,V], which knows whether K/V are RC) to release; nobody
+	# else can, since erase_at on a non-RC RawEntry element just drops the
+	# slot without decreffing/freeing anything - there is no other path to
+	# these two pointers once this call returns.
+	def remove_entry( self, target_hash: u64, key_ptr: Ptr[None], key_eq_fn: KeyEqFn ) -> Result[RawEntry, KeyError]:
+		indices_pos: usize = self._find_indices_pos( target_hash, key_ptr, key_eq_fn ).or_return()
+		removed_index: RawIndex = self.__indices.__getitem__( indices_pos ).unwrap( 'RawDict: index out of bounds' )
+		removed_entry: RawEntry = self.__entries.__getitem__( removed_index.entry_idx ).unwrap( 'RawDict: entry out of bounds' )
+		self.__indices.erase_at( indices_pos ).unwrap( 'RawDict remove_entry: indices erase index out of bounds' )
+		self.__entries.erase_at( removed_index.entry_idx ).unwrap( 'RawDict remove_entry: entries erase index out of bounds' )
+		self._fixup_indices_after_removal( removed_index.entry_idx )
+		return Result.Ok( removed_entry )
 
 	def key_ptr_at( self, entry_idx: usize ) -> Ptr[None]:
 		return self.__entries.__getitem__( entry_idx ).unwrap( 'RawDict: entry out of bounds' ).key_ptr

@@ -8,7 +8,8 @@ from .__fastlist import FastList
 from .__float import _f64_sign_prefix, _f64_fixed_digits
 from .__int import int, IntError
 from .__list import list, UnsafeList
-from .__RawDict import RawDict
+from .__RawDict import RawDict, RawEntry
+from .__set import set
 from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
@@ -2014,11 +2015,56 @@ class UnsafeDict[K, V]:
 		entry_idx: usize = self.__raw._find_entry_idx( h, key_ptr, _key_eq ).or_return()
 		return Result.Ok( self._owned_value( self.__raw.value_ptr_at( entry_idx )))
 
+	# deliberately does its OWN hash + _find_entry_idx call rather than
+	# calling __getitem__ and discarding the Result - that path would
+	# incref a found V via _owned_value for no reason, relying on
+	# Result[T,E]'s own discarded-payload-decref to balance it back out.
+	# A pure membership check never needs to touch _owned_value/_owned_key
+	# at all, so there's nothing to balance and nothing to get wrong.
+	def __contains__( self, key: K ) -> bool:
+		h: u64 = self._hash_key( key )
+		key_ptr: Ptr[None] = 0
+		if compiler.is_rc( K ):
+			key_ptr = compiler.cast( Ptr[None], key )
+		else:
+			key_ptr = compiler.cast( Ptr[None], compiler.addrof( key ))
+		return self.__raw._find_entry_idx( h, key_ptr, _key_eq ).is_ok()
+
+	# d[key] syntax (subscript del) isn't wired up - lowering.py's
+	# _stmt_Delete only accepts a bare local name - so this must be called
+	# directly (d.__delitem__(key)) for now, same situation as
+	# __contains__/`x in y`. The name is still right: Python convention,
+	# forward-compatible if subscript-del sugar is ever added.
+	def __delitem__( self, key: K ) -> Result[None, KeyError]:
+		h: u64 = self._hash_key( key )
+		key_ptr: Ptr[None] = 0
+		if compiler.is_rc( K ):
+			key_ptr = compiler.cast( Ptr[None], key )
+		else:
+			key_ptr = compiler.cast( Ptr[None], compiler.addrof( key ))
+		removed: RawEntry = self.__raw.remove_entry( h, key_ptr, _key_eq ).or_return()
+		# removed.key_ptr/value_ptr are raw Ptr[None]s straight off RawEntry,
+		# handed bare into _release_key/_release_value - same discipline
+		# __del__ already follows (see _release_key's own comment: casting
+		# a Ptr[None] back to K/V and binding it to a named local would
+		# double-decref via the compiler's own scope-exit RC tracking).
+		# Binding `removed` itself to a name IS safe - RawEntry is a plain
+		# non-RC @cstruct of two Ptr[None] fields, not a K/V-typed value,
+		# so that pitfall doesn't apply to it.
+		self._release_key( removed.key_ptr )
+		self._release_value( removed.value_ptr )
+		return Result.Ok( None )
+
 	def key_at( self, index: usize ) -> Result[K, IndexError]:
-		# positional access into insertion order - valid because __entries
-		# (RawDict) is append-only with no removal path yet, so every index
-		# in [0, len) names a live entry, the same "no gaps" invariant
-		# list[T]/slice[T]'s own __getitem__ rely on
+		# positional access into CURRENT LIVE-ENTRY order - not a fixed
+		# mapping for the dict's whole lifetime any more. Still valid for
+		# every index in [0, len): RawDict.remove_entry always keeps
+		# __entries fully compacted (erase_at shifts left, never leaves a
+		# hole), so there's no gap. But a removal renumbers every entry
+		# AFTER the removed one down by one slot - key_at(i) can return a
+		# different key after a removal than before, even for an i whose
+		# own entry was never touched. Relative order among SURVIVING
+		# entries is preserved (shift, not reorder).
 		if index >= len( self.__raw ):
 			return Result.Err( IndexError() )
 		return Result.Ok( self._owned_key( self.__raw.key_ptr_at( index )))
@@ -2070,6 +2116,16 @@ class dict[K, V]:
 		self.__lock.acquire().unwrap( 'dict.__getitem__: lock failed' )
 		defer( self.__lock.release() )
 		return self.__inner.__getitem__( key )
+
+	def __contains__( self, key: K ) -> bool:
+		self.__lock.acquire().unwrap( 'dict.__contains__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__contains__( key )
+
+	def __delitem__( self, key: K ) -> Result[None, KeyError]:
+		self.__lock.acquire().unwrap( 'dict.__delitem__: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.__delitem__( key )
 
 	def key_at( self, index: usize ) -> Result[K, IndexError]:
 		self.__lock.acquire().unwrap( 'dict.key_at: lock failed' )
