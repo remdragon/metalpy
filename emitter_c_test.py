@@ -12172,539 +12172,6 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
-			# --- generic generator body referencing its own type param
-			# outside a parameter/return annotation (A.3) - the synthesized
-			# $$__next__'s own scope now inherits the SAME T -> concrete-arg
-			# substitution monomorphized_function already records on the
-			# generator function itself, so a nested generic call using T
-			# (or a plain local declared as T) resolves correctly instead
-			# of failing with "name 'T' is not defined"
-			( 'generic_generator_body_calling_generic_function_via_own_type_param', '''
-def identity[T]( v: T ) -> T:
-	return v
-
-def gen[T]( x: T ) -> Iterator[T]:
-	y: T = identity( x )
-	yield y
-
-def main() -> i32:
-	g = gen[i32]( 5 )
-	a = g.__next__()
-	match a:
-		case i32( v ):
-			if v != 5:
-				return 1
-		case None:
-			return 2
-	return 0
-''' ),
-			# --- yield from (A.4a) - pure element-forwarding sugar,
-			# desugared into an exactly-equivalent for loop before unit-
-			# collection ever runs, so it rides on the already-proven
-			# for-loop-over-generator machinery entirely
-			( 'yield_from_top_level_forwards_all_values', '''
-def inner() -> Iterator[i32]:
-	yield 1
-	yield 2
-	yield 3
-
-def outer() -> Iterator[i32]:
-	yield from inner()
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		total: i32 = 0
-		n: usize = 0
-		for x in outer():
-			total += x
-			n += 1
-	if n != 3:
-		return 1
-	if total != 6: # 1+2+3
-		return 2
-	return 0
-''' ),
-			# --- .close() (A.4b) - rides entirely on the existing bare-
-			# return/defer-replay machinery, no new RC design
-			( 'close_on_partially_consumed_generator_runs_armed_defer_not_errdefer', '''
-class Box:
-	v: i32
-	def __init__( self, v: i32 ) -> None:
-		self.v = v
-
-def gen( b: Box, count: usize ) -> Iterator[usize]:
-	i: usize = 0
-	with defer:
-		compiler.incref( b )
-	while i < count:
-		yield i
-		with compiler.wrap_arithmetic:
-			i += 1
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		b = Box( v = 1 )
-		g = gen( b, 5 )
-		if compiler.refcount( b ) != 2: # caller + captured param
-			return 1
-		a = g.__next__() # consume one of five
-		if a is None:
-			return 2
-		if compiler.refcount( b ) != 2: # defer not fired yet
-			return 3
-		g.close() # early end - armed defer replays exactly once
-		if compiler.refcount( b ) != 3:
-			return 4
-		d = g.__next__() # generator is done - None forever, no re-fire
-		if d is not None:
-			return 5
-		if compiler.refcount( b ) != 3:
-			return 6
-		g.close() # idempotent - must not fire again
-		if compiler.refcount( b ) != 3:
-			return 7
-		return 0
-''' ),
-			( 'close_does_not_free_object_still_referenced', '''
-class Box:
-	v: i32
-	def __init__( self, v: i32 ) -> None:
-		self.v = v
-
-def gen( b: Box, count: usize ) -> Iterator[usize]:
-	i: usize = 0
-	while i < count:
-		yield i
-		with compiler.wrap_arithmetic:
-			i += 1
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		b = Box( v = 1 )
-		if compiler.refcount( b ) != 1:
-			return 1
-		g = gen( b, 5 )
-		if compiler.refcount( b ) != 2: # captured param
-			return 2
-		a = g.__next__()
-		if a is None:
-			return 3
-		g.close()
-		if compiler.refcount( b ) != 2: # close() itself doesn't free the captured param
-			return 4
-		return 0
-		# g goes out of scope here - THIS is where the real teardown happens
-''' ),
-			# PLAN_GENERATORS.md Phase F - the five shapes the old AST-
-			# synthesis mechanism used to reject outright (see this test's
-			# own git history for the removed rejection tests) are real,
-			# ordinary compile-and-run cases now: yield reachable at any
-			# nesting depth is just an ordinary lowering-level event
-			# (FunctionLowering._lower_generator_yield), not a template the
-			# old unit-collector had to specifically recognize.
-			( 'yield_nested_inside_if_inside_while', '''
-def gen( flag: bool, count: usize ) -> Iterator[i32]:
-	i: usize = 0
-	while i < count:
-		if flag:
-			yield 100
-		else:
-			yield 1
-		with compiler.wrap_arithmetic:
-			i += 1
-
-def main() -> i32:
-	total: i32 = 0
-	n: i32 = 0
-	for x in gen( True, 3 ):
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	if n != 3 or total != 300:
-		return 1
-	total = 0
-	n = 0
-	for x in gen( False, 4 ):
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	if n != 4 or total != 4:
-		return 2
-	return 0
-''' ),
-			( 'multiple_yields_in_one_while_loop', '''
-def gen() -> Iterator[i32]:
-	while True:
-		yield 1
-		yield 2
-		yield 3
-
-def main() -> i32:
-	g = gen()
-	a = g.__next__()
-	b = g.__next__()
-	c = g.__next__()
-	d = g.__next__() # loops back around to the first yield again
-	if a is None:
-		return 1
-	if a != 1:
-		return 2
-	if b is None:
-		return 3
-	if b != 2:
-		return 4
-	if c is None:
-		return 5
-	if c != 3:
-		return 6
-	if d is None:
-		return 7
-	if d != 1:
-		return 8
-	return 0
-''' ),
-			( 'break_inside_yielding_while_loop', '''
-def gen() -> Iterator[i32]:
-	i: i32 = 0
-	while True:
-		yield i
-		with compiler.wrap_arithmetic:
-			i += 1
-		if i == 3:
-			break
-
-def main() -> i32:
-	total: i32 = 0
-	n: i32 = 0
-	for x in gen():
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	# yields 0, 1, 2 then breaks - exactly 3 values, sum 3
-	if n != 3 or total != 3:
-		return 1
-	return 0
-''' ),
-			( 'elif_chain_containing_yield', '''
-def gen( flag: i32 ) -> Iterator[i32]:
-	if flag == 0:
-		yield 1
-	elif flag == 1:
-		yield 2
-	elif flag == 2:
-		yield 3
-	else:
-		yield 4
-
-def main() -> i32:
-	a = gen( 0 ).__next__()
-	b = gen( 1 ).__next__()
-	c = gen( 2 ).__next__()
-	d = gen( 3 ).__next__()
-	if a is None:
-		return 1
-	if a != 1:
-		return 2
-	if b is None:
-		return 3
-	if b != 2:
-		return 4
-	if c is None:
-		return 5
-	if c != 3:
-		return 6
-	if d is None:
-		return 7
-	if d != 4:
-		return 8
-	return 0
-''' ),
-			( 'two_yields_in_one_if_branch', '''
-def gen( flag: bool ) -> Iterator[i32]:
-	if flag:
-		yield 1
-		yield 2
-	else:
-		yield 3
-
-def main() -> i32:
-	g = gen( True )
-	a = g.__next__()
-	b = g.__next__()
-	c = g.__next__() # exhausted
-	if a is None:
-		return 1
-	if a != 1:
-		return 2
-	if b is None:
-		return 3
-	if b != 2:
-		return 4
-	if c is not None:
-		return 5
-	h = gen( False )
-	d = h.__next__()
-	if d is None:
-		return 6
-	if d != 3:
-		return 7
-	return 0
-''' ),
-			# PLAN_GENERATORS.md Phase C - .send(): a captured yield
-			# expression (`x = yield v`) receives whatever value the NEXT
-			# .send(value) call delivers - proven with an accumulator that
-			# echoes its own running total back on each resume.
-			( 'send_delivers_value_into_captured_yield_expression', '''
-def echo() -> Generator[i32, i32, OverflowError]:
-	total: i32 = 0
-	while True:
-		received: i32 = yield total
-		with compiler.wrap_arithmetic:
-			total = total + received
-
-def main() -> i32:
-	g = echo()
-	result_a: i32 = -1
-	match g.__next__(): # primes it - total starts at 0
-		case Result.Ok( v ):
-			xa: i32|None = v
-			if xa is not None:
-				result_a = xa
-		case Result.Err( e ):
-			return 1
-	if result_a != 0:
-		return 2
-	result_b: i32 = -1
-	match g.send( 5 ): # received=5, total becomes 5, yields 5
-		case Result.Ok( v ):
-			xb: i32|None = v
-			if xb is not None:
-				result_b = xb
-		case Result.Err( e ):
-			return 3
-	if result_b != 5:
-		return 4
-	result_c: i32 = -1
-	match g.send( 10 ): # received=10, total becomes 15, yields 15
-		case Result.Ok( v ):
-			xc: i32|None = v
-			if xc is not None:
-				result_c = xc
-		case Result.Err( e ):
-			return 5
-	if result_c != 15:
-		return 6
-	return 0
-''' ),
-			( 'send_rc_typed_value_captured_into_promoted_local', '''
-class Box:
-	v: i32
-	def __init__( self, v: i32 ) -> None:
-		self.v = v
-
-def gen( count: i32 ) -> Generator[i32, Box, OverflowError]:
-	i: i32 = 0
-	held: Box = Box( v = -1 )
-	while i < count:
-		held = yield i
-		with compiler.wrap_arithmetic:
-			i += 1
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		b1 = Box( v = 1 )
-		if compiler.refcount( b1 ) != 1:
-			return 1
-		g = gen( 3 )
-		match g.__next__(): # primes it - i=0 yielded
-			case Result.Ok( v ):
-				pass
-			case Result.Err( e ):
-				return 2
-		match g.send( b1 ): # held = b1 - captured, live-flag-first-assign path
-			case Result.Ok( v ):
-				pass
-			case Result.Err( e ):
-				return 3
-		# three independent owners now: b1's own binding, __send_slot (the
-		# field, keeps the sent value alive until the NEXT send() overwrites
-		# it), and held (gen's own promoted local, a SEPARATE copy the body
-		# itself assigned into via `held = yield i`)
-		if compiler.refcount( b1 ) != 3:
-			return 4
-		b2 = Box( v = 2 )
-		match g.send( b2 ): # held = b2, __send_slot = b2 - both reassignments must decref b1's own two references
-			case Result.Ok( v ):
-				pass
-			case Result.Err( e ):
-				return 5
-		if compiler.refcount( b1 ) != 1:
-			return 6
-		if compiler.refcount( b2 ) != 3:
-			return 7
-	return 0
-''' ),
-			# PLAN_GENERATORS.md Phase B - the remaining nesting/multiplicity
-			# shapes the plan's own verification list calls for: the OPPOSITE
-			# nesting direction (a while inside a yield-containing if branch,
-			# not just if-inside-while), yield nested 2+ levels deep, and
-			# continue skipping a yield mid-loop.
-			( 'while_nested_inside_if_branch', '''
-def gen( mode: bool, count: i32 ) -> Iterator[i32]:
-	if mode:
-		i: i32 = 0
-		while i < count:
-			yield i
-			with compiler.wrap_arithmetic:
-				i += 1
-	else:
-		yield -1
-
-def main() -> i32:
-	total: i32 = 0
-	n: i32 = 0
-	for x in gen( True, 3 ):
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	if n != 3 or total != 3:
-		return 1
-	total = 0
-	n = 0
-	for x in gen( False, 3 ):
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	if n != 1 or total != -1:
-		return 2
-	return 0
-''' ),
-			( 'yield_nested_three_levels_deep', '''
-def gen( a: bool, b: bool, count: i32 ) -> Iterator[i32]:
-	i: i32 = 0
-	while i < count:
-		if a:
-			if b:
-				yield 100
-			else:
-				yield 10
-		else:
-			yield 1
-		with compiler.wrap_arithmetic:
-			i += 1
-
-def main() -> i32:
-	total: i32 = 0
-	for x in gen( True, True, 2 ):
-		with compiler.wrap_arithmetic:
-			total += x
-	if total != 200:
-		return 1
-	total = 0
-	for x in gen( True, False, 2 ):
-		with compiler.wrap_arithmetic:
-			total += x
-	if total != 20:
-		return 2
-	total = 0
-	for x in gen( False, False, 2 ):
-		with compiler.wrap_arithmetic:
-			total += x
-	if total != 2:
-		return 3
-	return 0
-''' ),
-			( 'continue_skips_yield_in_while', '''
-def gen( count: i32 ) -> Iterator[i32]:
-	i: i32 = 0
-	while i < count:
-		with compiler.wrap_arithmetic:
-			i += 1
-		if i == 2:
-			continue
-		yield i
-
-def main() -> i32:
-	total: i32 = 0
-	n: i32 = 0
-	for x in gen( 3 ):
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	# i goes 1,2,3 - i==2 skips its own yield - yields 1, 3
-	if n != 2 or total != 4:
-		return 1
-	return 0
-''' ),
-			( 'rc_drop_mid_iteration_at_nested_depth', '''
-class Box:
-	v: i32
-	def __init__( self, v: i32 ) -> None:
-		self.v = v
-
-def gen_from_box_nested( b: Box, count: i32 ) -> Iterator[i32]:
-	i: i32 = 0
-	toggle: bool = True
-	while i < count:
-		if toggle:
-			yield i
-		else:
-			yield i
-		toggle = not toggle
-		with compiler.wrap_arithmetic:
-			i += 1
-
-def drop_after_one_nested( b: Box ) -> None:
-	g = gen_from_box_nested( b, 5 )
-	a = g.__next__()
-	# g drops here, mid-iteration, current state nested inside if/while
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		b1 = Box( v = 1 )
-		if compiler.refcount( b1 ) != 1:
-			return 1
-		drop_after_one_nested( b1 )
-		if compiler.refcount( b1 ) != 1:
-			return 2
-	return 0
-''' ),
-			# PLAN_GENERATORS.md A.4a follow-up - yield from nested inside an
-			# if (reached at most once per generator lifetime, unlike a
-			# while/for loop that could re-enter it - see
-			# test_yield_from_nested_inside_loop_is_rejected for why THAT stays
-			# rejected) forwards correctly now, not just at the top level.
-			( 'nested_yield_from_inside_if', '''
-def inner() -> Iterator[i32]:
-	yield 1
-	yield 2
-	yield 3
-
-def gen( flag: bool ) -> Iterator[i32]:
-	if flag:
-		yield from inner()
-	else:
-		yield 99
-
-def main() -> i32:
-	total: i32 = 0
-	n: i32 = 0
-	for x in gen( True ):
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	if n != 3 or total != 6:
-		return 1
-	total = 0
-	n = 0
-	for x in gen( False ):
-		with compiler.wrap_arithmetic:
-			total += x
-			n += 1
-	if n != 1 or total != 99:
-		return 2
-	return 0
-''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -12744,33 +12211,82 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'T|None', str( self.discovery.errors.errors[0] ))
 
-	def test_yield_from_nested_inside_loop_is_rejected( self ) -> None:
-		# A.4a follow-up - yield from nested inside an if/with (reached at
-		# most once per generator lifetime) is real, supported forwarding
-		# now (see test_programs_compile_and_run's own nested_yield_from_
-		# inside_if case) - but nested inside a while/for loop stays
-		# rejected: _new_for_obj_field's own "eager, once, at
-		# construction" design would silently reuse the SAME already-
-		# exhausted forwarded generator on every re-entry instead of
-		# reconstructing it, confirmed via a real repro before this
-		# rejection existed (only the outer loop's first pass ever
-		# forwarded anything)
+	def test_yield_nested_in_if_is_rejected( self ) -> None:
+		# Phase 2 only recognizes a bare top-level yield or a single-yield
+		# top-level while loop as valid units - a yield nested one level
+		# deeper (inside an if inside the loop) must be a clear compile
+		# error, not a silently wrong state machine
 		self._run( '''
-def inner() -> Iterator[i32]:
-	yield 1
-
-def gen( count: i32 ) -> Iterator[i32]:
-	j: i32 = 0
-	while j < count:
-		yield from inner()
-		with compiler.wrap_arithmetic:
-			j += 1
+def gen( flag: bool ) -> Iterator[i32]:
+	while True:
+		if flag:
+			yield 1
 
 def main() -> None:
-	g = gen( 3 )
+	g = gen( True )
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'yield from nested inside a while/for loop', str( self.discovery.errors.errors[0] ))
+		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
+
+	def test_while_loop_with_two_yields_is_rejected( self ) -> None:
+		self._run( '''
+def gen() -> Iterator[i32]:
+	while True:
+		yield 1
+		yield 2
+
+def main() -> None:
+	g = gen()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'exactly one yield', str( self.discovery.errors.errors[0] ))
+
+	def test_break_inside_yielding_while_loop_is_rejected( self ) -> None:
+		self._run( '''
+def gen() -> Iterator[i32]:
+	while True:
+		yield 1
+		break
+
+def main() -> None:
+	g = gen()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'break/continue', str( self.discovery.errors.errors[0] ))
+
+	def test_if_elif_chain_with_yield_is_rejected( self ) -> None:
+		# Phase 2a only recognizes a single if/else - an elif chain
+		# generalizes the same branch-stable-resume idea but multiplies the
+		# state/testing surface, deliberately deferred (PLAN_GENERATORS.md)
+		self._run( '''
+def gen( flag: i32 ) -> Iterator[i32]:
+	if flag == 0:
+		yield 1
+	elif flag == 1:
+		yield 2
+	else:
+		yield 3
+
+def main() -> None:
+	g = gen( 0 )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'elif', str( self.discovery.errors.errors[0] ))
+
+	def test_if_else_with_two_yields_in_one_branch_is_rejected( self ) -> None:
+		self._run( '''
+def gen( flag: bool ) -> Iterator[i32]:
+	if flag:
+		yield 1
+		yield 2
+	else:
+		yield 3
+
+def main() -> None:
+	g = gen( True )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'at most one yield per branch', str( self.discovery.errors.errors[0] ))
 
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
@@ -12850,6 +12366,30 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'return is not allowed inside a defer/errdefer body', str( self.discovery.errors.errors[0] ))
 
+	def test_generic_generator_referencing_own_type_param_in_body_is_rejected( self ) -> None:
+		# Phase 3's recommended interim scope (PLAN_GENERATORS.md) - a
+		# generic generator body that references its own type param
+		# outside a parameter/return annotation (here, a nested generic
+		# call using it) is rejected for now - _build_generator_next_
+		# function's synthesized __next__ doesn't inherit the type-param
+		# substitution monomorphized_function recorded only on the
+		# generator function itself, confirmed by a real repro that
+		# otherwise fails downstream with a confusing "name 'T' is not
+		# defined" instead of this clear, upfront rejection
+		self._run( '''
+def identity[T]( v: T ) -> T:
+	return v
+
+def gen[T]( x: T ) -> Iterator[T]:
+	y: T = identity( x )
+	yield y
+
+def main() -> None:
+	g = gen[i32]( 5 )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
+
 	def test_or_return_inside_infallible_iterator_is_rejected( self ) -> None:
 		# Phase 4 (roadmap Phase 4) - or_return() stays rejected inside a
 		# plain Iterator[T] (infallible) generator, exactly as before this
@@ -12879,64 +12419,6 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
 
-
-	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_send_before_first_yield_panics( self ) -> None:
-		# PLAN_GENERATORS.md Phase C - .send() on a generator that has never
-		# yielded (self.__state == 0) panics, mirroring Python's own
-		# TypeError ("can't send non-None value to a just-started generator")
-		self._run( '''
-def gen( n: i32 ) -> Generator[i32, str, OverflowError]:
-	i: i32 = 0
-	while i < n:
-		yield i
-		with compiler.wrap_arithmetic:
-			i += 1
-
-def main() -> i32:
-	g = gen( 3 )
-	b = g.send( "too early" )
-	match b:
-		case Result.Ok( v ):
-			pass
-		case Result.Err( e ):
-			pass
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
-
-	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_next_on_captured_yield_instead_of_send_panics( self ) -> None:
-		# PLAN_GENERATORS.md Phase C - resuming a CAPTURED yield expression
-		# via a bare .__next__() (instead of .send()) panics too - the
-		# generator body has nothing to bind `received` to, since __send_
-		# ready is only ever set True by send() itself
-		self._run( '''
-def echo() -> Generator[i32, i32, OverflowError]:
-	total: i32 = 0
-	while True:
-		received: i32 = yield total
-		with compiler.wrap_arithmetic:
-			total = total + received
-
-def main() -> i32:
-	g = echo()
-	match g.__next__():
-		case Result.Ok( v ):
-			pass
-		case Result.Err( e ):
-			return 1
-	# calling __next__() again (not send()) on a captured yield must panic
-	match g.__next__():
-		case Result.Ok( v ):
-			pass
-		case Result.Err( e ):
-			pass
-	return 0
-''' )
-		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
 
 class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' regression test for a real, confirmed bug: Result[T,E].unwrap_or()

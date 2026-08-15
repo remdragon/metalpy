@@ -450,7 +450,6 @@ class GeneratorType( Type ):
 	to that one Function, not to this type). '''
 	elem_type: Type
 	error_type: 'Type|None' = None # None: Iterator[T] (infallible); set: Generator[T,error_type] - __next__ returns Result[elem_type|None, error_type] instead of plain elem_type|None
-	send_type: 'Type|None' = None # PLAN_GENERATORS.md Phase C - None for Iterator[T] and the 2-arg Generator[T,E] (no .send() support, __next__-only); set for the 3-arg Generator[T,SendType,E] - a captured `x = yield v` expression evaluates to plain SendType (no automatic Result-wrapping - the generator's own author declares SendType as Result[V,Err] themselves if they want .send()-injected-error semantics, reusing the existing .or_return()/.unwrap_or() machinery generically). Independent of error_type: SendType has nothing to do with E/or_return() propagation
 	backing: 'RCClass|None' = None
 
 # a class's own body scan (revealing its attribute/method *names*) is
@@ -842,9 +841,6 @@ class Function( Type, ScopeMixin ):
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
 	is_destructor: bool = False # synthesized $$__destructor__ body — emitter uses void(void*) signature + cast prologue
-	is_generator_next: bool = False # PLAN_GENERATORS.md Phase F - synthesized $$__next__/$$__resume__ body of a generator's backing class: lowering.py's own generator-body entry point handles ast.Yield (emits ir.Yield + a resume ir.Label) and builds the self.__state dispatch prologue in front of the ordinary lowered body, mirroring is_destructor's own precedent of a Function-level flag gating a special-cased prologue
-	generator_done_state: int|None = None # is_generator_next only - the concrete "permanently exhausted" self.__state value, computed once at synthesis time (type_resolver.py's _build_generator_next_function: 1 + total yield count) and reused as-is at lowering time (dispatch prologue's own done-check, and _consume_checked_result's pessimistic-done OrReturn.epilogue injection) rather than trusting a second independent count to agree
-	generator_send_type: 'Type|None' = None # is_generator_next only - PLAN_GENERATORS.md Phase C: None unless this is a $$__resume__ body built for a Generator[T,SendType,E] (send_type set) - lets lowering.py's own _expr_Yield tell "yield used in expression position, read back __send_ready/__send_slot after resuming" apart from "no .send() support, reject" without re-deriving it from fn.cls's own field list
 
 	# implementations only (never set on a stub - stubs are never scheduled
 	# as real compile units, so they never need a C symbol of their own) -

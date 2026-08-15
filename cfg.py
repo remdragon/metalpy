@@ -245,7 +245,17 @@ class CFGState:
 		local, no separate "uninitialized" state needed. '''
 		self.enter_self( self_param, is_move = False )
 		self._construction_self = self_param
-		self._construction_required = required
+		# a COPY, not the caller's own list by reference - the caller passes
+		# self_cls.attributes directly (lowering.py), the class's own
+		# permanent declared-fields list; complete_base_construction() below
+		# appends base attributes onto self._construction_required so
+		# complete_construction()'s success-path cancellation loop also
+		# covers them (see its own comment) - without this copy, that append
+		# would mutate self_cls.attributes itself, permanently duplicating
+		# the base attribute into the subclass's own field list (confirmed
+		# by a real "duplicate member" C struct compile error while fixing
+		# the bug complete_base_construction's own comment describes).
+		self._construction_required = list( required )
 
 	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None ) -> Epilogue:
 		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref )
@@ -1751,3 +1761,19 @@ class CFGState:
 				self._push( attr, attr.type, OwnState.OWNED, key = key )
 			else:
 				self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
+			# complete_construction()'s own success-path cancellation loop
+			# only walks self._construction_required (the SUBCLASS's own
+			# declared attributes - enter_construction()'s own docstring
+			# flags this as "not yet base-class-aware"). Without also
+			# appending base attrs here, a base-owned RC attribute's
+			# epilogue entry (just pushed above) is never cancelled on the
+			# subclass __init__'s success path, so an ordinary fall-off-the-
+			# end/plain `return` wrongly decrefs a field self now legitimately
+			# owns - confirmed by a real compile: any subclass whose base
+			# __init__ sets an RC field emits `release_object((ObjectHeader*)
+			# (<bare_field_name>))` unconditionally at the end of ITS OWN
+			# __init__, referencing a name that was never even declared as a
+			# local in the generated C (it's self's own field, not a local).
+			# already present in self.bindings (just pushed above), so this
+			# can't trip complete_construction()'s "missing" check.
+			self._construction_required.append( attr )
