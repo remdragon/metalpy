@@ -842,6 +842,52 @@ def main() -> i32:
 	return 0
 ''', [ 'unsigned 200//4 == 50', 'unsigned div Err (unexpected)' ] )
 
+	def test_f64_str_and_repr_direct_call( self ) -> None:
+		# f64.__str__/f64.__repr__ are attached via post-hoc assignment
+		# (f64.__str__ = _f64_str in lib/builtins/__float.py), not declared
+		# inside a class body - discovery.py never strips a "self" off
+		# _f64_str's own single `value: f64` parameter the way it would for
+		# an ordinary method, so a Call built with BOTH a receiver AND the
+		# untouched parameter list double-counted the receiver, crashing
+		# emitter_c.py's _emit_call_args with a bare KeyError('value') the
+		# moment user code called f.__str__()/f.__repr__() directly (as
+		# opposed to via f-string interpolation, which reaches the same
+		# formatter through a different, already-correct call path -
+		# lowering.py's own _lower_method_call). Confirmed to crash before
+		# the fix (lowering.py's _lower_call, the general call-lowering
+		# path every ordinary `receiver.method()` call site goes through,
+		# now carries the same "receiver is really just a leading
+		# positional argument for a Scalar-attached free function"
+		# adjustment _lower_method_call already had for its own narrower
+		# set of f-string-only callers).
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	f: f64 = 3.5
+	s: str = f.__str__()
+	if s != '3.5':
+		return 1
+	r: str = f.__repr__()
+	if r != '3.5':
+		return 2
+	return 0
+''', [ 'f64.__str__() == "3.5"', 'f64.__repr__() == "3.5"' ] )
+
+	def test_f64_str_via_local_receiver_variable( self ) -> None:
+		# same call shape, but through a receiver bound to an ordinary named
+		# local first (rather than a fresh literal) - the exact shape
+		# lib/json.py's dumps() originally hit this bug through
+		self._assert_program_succeeds( '''
+def format_value( value: f64 ) -> str:
+	return value.__str__()
+
+def main() -> i32:
+	f: f64 = 2.0
+	got: str = format_value( f )
+	if got != '2.0':
+		return 1
+	return 0
+''', [ 'format_value(f64) via .__str__() == "2.0"' ] )
+
 
 if __name__ == '__main__':
 	unittest.main()
