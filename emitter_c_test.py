@@ -11434,6 +11434,131 @@ def main() -> i32:
 			return 7
 	return 0
 ''' ),
+			# PLAN_GENERATORS.md Phase B - the remaining nesting/multiplicity
+			# shapes the plan's own verification list calls for: the OPPOSITE
+			# nesting direction (a while inside a yield-containing if branch,
+			# not just if-inside-while), yield nested 2+ levels deep, and
+			# continue skipping a yield mid-loop.
+			( 'while_nested_inside_if_branch', '''
+def gen( mode: bool, count: i32 ) -> Iterator[i32]:
+	if mode:
+		i: i32 = 0
+		while i < count:
+			yield i
+			with compiler.wrap_arithmetic:
+				i += 1
+	else:
+		yield -1
+
+def main() -> i32:
+	total: i32 = 0
+	n: i32 = 0
+	for x in gen( True, 3 ):
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	if n != 3 or total != 3:
+		return 1
+	total = 0
+	n = 0
+	for x in gen( False, 3 ):
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	if n != 1 or total != -1:
+		return 2
+	return 0
+''' ),
+			( 'yield_nested_three_levels_deep', '''
+def gen( a: bool, b: bool, count: i32 ) -> Iterator[i32]:
+	i: i32 = 0
+	while i < count:
+		if a:
+			if b:
+				yield 100
+			else:
+				yield 10
+		else:
+			yield 1
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	total: i32 = 0
+	for x in gen( True, True, 2 ):
+		with compiler.wrap_arithmetic:
+			total += x
+	if total != 200:
+		return 1
+	total = 0
+	for x in gen( True, False, 2 ):
+		with compiler.wrap_arithmetic:
+			total += x
+	if total != 20:
+		return 2
+	total = 0
+	for x in gen( False, False, 2 ):
+		with compiler.wrap_arithmetic:
+			total += x
+	if total != 2:
+		return 3
+	return 0
+''' ),
+			( 'continue_skips_yield_in_while', '''
+def gen( count: i32 ) -> Iterator[i32]:
+	i: i32 = 0
+	while i < count:
+		with compiler.wrap_arithmetic:
+			i += 1
+		if i == 2:
+			continue
+		yield i
+
+def main() -> i32:
+	total: i32 = 0
+	n: i32 = 0
+	for x in gen( 3 ):
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	# i goes 1,2,3 - i==2 skips its own yield - yields 1, 3
+	if n != 2 or total != 4:
+		return 1
+	return 0
+''' ),
+			( 'rc_drop_mid_iteration_at_nested_depth', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen_from_box_nested( b: Box, count: i32 ) -> Iterator[i32]:
+	i: i32 = 0
+	toggle: bool = True
+	while i < count:
+		if toggle:
+			yield i
+		else:
+			yield i
+		toggle = not toggle
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def drop_after_one_nested( b: Box ) -> None:
+	g = gen_from_box_nested( b, 5 )
+	a = g.__next__()
+	# g drops here, mid-iteration, current state nested inside if/while
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b1 = Box( v = 1 )
+		if compiler.refcount( b1 ) != 1:
+			return 1
+		drop_after_one_nested( b1 )
+		if compiler.refcount( b1 ) != 1:
+			return 2
+	return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
