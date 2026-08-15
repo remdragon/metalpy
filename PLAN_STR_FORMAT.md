@@ -199,6 +199,35 @@ Deferred items
      yet (a separate, likely upcoming item once float inf/nan display
      itself is addressed).
 
+   A THIRD bug - real, not float-specific, and not caught until a
+   dedicated review of this whole area afterward - was found and fixed
+   separately: grouping (,/_) COMBINED with the '0' zero-pad shorthand
+   produced silently wrong output for BOTH int and float. Real Python
+   groups the padding characters together with the original digits
+   (f"{1234567:015,d}" == '000,001,234,567' - the padding zeros pick up
+   their own comma separators too); the old code grouped the digits
+   FIRST, then rjust-padded that already-grouped string with raw fill
+   characters on top, giving '0000001,234,567' instead - the right VALUE,
+   wrong grouping. No test anywhere (int or float) had ever combined the
+   '0' shorthand with grouping. Fixed with three new shared str methods
+   (lib/builtins/__init__.py, alongside _pad_after_prefix): _insert_
+   thousands_sep (the grouping loop int._decimal_digits_with_grouping and
+   float._group_integer_part each already had their own earlier, narrower
+   inline copy of - not retrofitted onto either, to avoid touching
+   already-shipped code for a pure refactor), _pad_and_group_after_prefix
+   (pads RAW ungrouped digits, then groups the WHOLE padded field - int's
+   own shape), and _pad_and_group_before_dot (float's wrapper - splits at
+   the first '.', delegates the integer part to the previous method,
+   reappends the untouched fractional/exponent suffix). Both int
+   (_decimal_digits, lib/builtins/__int.py) and float (_fixed_digits_raw/
+   _percent_digits_raw, lib/builtins/__float.py) gained raw (ungrouped)
+   digit-producing variants alongside their existing grouped ones,
+   specifically for this zero-pad path - lowering.py's _lower_int_format_
+   spec/_lower_float_format_spec now route the '0'-shorthand branch
+   through the raw+pad-and-group path, leaving every OTHER branch
+   (non-zero-pad width, or no width at all) calling the original,
+   unchanged, already-tested grouped-digit methods exactly as before.
+
 5. `=` general sign-aware alignment
 
    Only the `0` zero-pad shorthand's own implicit `=` is supported
@@ -208,12 +237,16 @@ Deferred items
    (fstring_format_spec.py:87, "explicit '=' alignment is not supported
    yet"): f"{-5:=8d}" (sign-aware padding with a non-zero width but no '0'
    shorthand) or f"{-5:*=8d}" (sign-aware padding with a custom fill
-   character) both fail today, even though `_lower_int_format_spec`
-   already has to build sign-aware padding for the `0` shorthand case
-   (via str._pad_after_prefix) - generalizing it to accept an arbitrary
-   fill character instead of the hardcoded '0' is a small, mostly-
-   mechanical follow-up entirely within the existing design, not a new
-   one.
+   character) both fail today, even though `_lower_int_format_spec`/
+   `_lower_float_format_spec` already build sign-and-grouping-aware
+   padding for the `0` shorthand case (str._pad_and_group_after_prefix/
+   _pad_and_group_before_dot, item 4's own grouping+zero-pad bugfix) -
+   both already take an arbitrary `fill` parameter (not hardcoded to
+   '0'), so generalizing to an explicit `=` align character with a custom
+   fill is a small, mostly-mechanical follow-up entirely within the
+   existing design, not a new one. (str._pad_after_prefix, the older,
+   non-grouping-aware helper these superseded for this exact call site,
+   is unused by any format-spec path now, though still defined.)
 
 6. Implicit scalar-to-str boxing - f"{i}" for i: i32
 

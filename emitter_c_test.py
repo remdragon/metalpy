@@ -8036,6 +8036,31 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_int_format_spec_zero_pad_is_grouping_aware( self ) -> None:
+		# the '0' shorthand COMBINED with grouping (,/_) - a real, confirmed
+		# bug (PLAN_STR_FORMAT.md item 4's own writeup): the padding zeros
+		# themselves need their own separators too, matching real Python's
+		# f"{1234567:015,d}" == '000,001,234,567', NOT '0000001,234,567'
+		# (raw zeros in front of an already-grouped string, what a naive
+		# "group first, then rjust-pad" two-step gives instead)
+		self._run( f'''
+def main() -> i32:
+	if f"{{int(1234567):015,d}}" != {f"{1234567:015,d}"!r}:
+		return 1
+	if f"{{int(1234567):013,d}}" != {f"{1234567:013,d}"!r}:
+		return 2
+	if f"{{int(-1234567):016,d}}" != {f"{-1234567:016,d}"!r}:
+		return 3
+	if f"{{int(0):06,d}}" != {f"{0:06,d}"!r}:
+		return 4
+	if f"{{int(1234567):015_d}}" != {f"{1234567:015_d}"!r}:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_float_format_spec_precision( self ) -> None:
 		# 'f'/'F' fixed-point only (PLAN_STR_FORMAT.md item 4) - real
 		# Python's own f-string output is the oracle, same convention as
@@ -8264,6 +8289,38 @@ def main() -> i32:
 		return 8
 	if f"{{1234567.891:20,.2f}}" != {f"{1234567.891:20,.2f}"!r}:
 		return 9
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_zero_pad_is_grouping_aware( self ) -> None:
+		# the '0' shorthand COMBINED with grouping (,/_) - same real,
+		# confirmed bug int's own equivalent test documents
+		# (PLAN_STR_FORMAT.md item 4), just for float: only the digits
+		# BEFORE the first '.' (or, for '%', before the trailing '%') are
+		# the groupable "integer part" that gets padded+grouped together -
+		# the fractional digits/exponent/'%' suffix are left untouched and
+		# reappended, confirmed against real Python's own output, which
+		# groups the zero-fill itself just like the plain digits
+		# (f"{1234567.89:018,.2f}" == '000,001,234,567.89')
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234567.89:018,.2f}}" != {f"{1234567.89:018,.2f}"!r}:
+		return 1
+	if f"{{1234567.89:017,.2f}}" != {f"{1234567.89:017,.2f}"!r}:
+		return 2
+	if f"{{-1234567.89:018,.2f}}" != {f"{-1234567.89:018,.2f}"!r}:
+		return 3
+	if f"{{1234567.891:020,e}}" != {f"{1234567.891:020,e}"!r}:
+		return 4
+	if f"{{1234567.891:020,g}}" != {f"{1234567.891:020,g}"!r}:
+		return 5
+	if f"{{1234567.891:015,.2%}}" != {f"{1234567.891:015,.2%}"!r}:
+		return 6
+	if f"{{-1234.5:020,.2%}}" != {f"{-1234.5:020,.2%}"!r}:
+		return 7
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

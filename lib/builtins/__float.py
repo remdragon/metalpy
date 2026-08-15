@@ -139,35 +139,38 @@ def _f64_sign_prefix( value: f64, mode: str ) -> str:
 
 
 @private
-def _f64_fixed_digits( value: f64, precision: usize, type_char: i32, alt: bool, sep: str ) -> str:
+def _f64_fixed_digits_raw( value: f64, precision: usize, type_char: i32, alt: bool ) -> str:
 	''' value's own MAGNITUDE (sign ignored - callers prepend it themselves
 	via _f64_sign_prefix, the same split int's _to_radix_digits/
-	_decimal_digits_with_grouping already keep) as decimal text per a
+	_decimal_digits already keep) as UNGROUPED decimal text per a
 	printf-style type_char ('f'/'F'/'e'/'E'/'g'/'G' - see fstring_format_
 	spec.FORMAT_SPEC_TYPE_CHARS; '%' is NOT passed here, see
-	_f64_percent_digits below), with `precision` meaning fractional digits
-	for 'f'/'F'/'e'/'E' or significant digits for 'g'/'G' (matching both
-	Python's own format-spec precision semantics and C's %g precision
-	semantics exactly - no special-casing needed here for that split),
+	_f64_percent_digits_raw below), with `precision` meaning fractional
+	digits for 'f'/'F'/'e'/'E' or significant digits for 'g'/'G' (matching
+	both Python's own format-spec precision semantics and C's %g precision
+	semantics exactly - no special-casing needed here for that split), and
 	`alt` the '#' flag (always show the decimal point for 'f'/'F'/'e'/'E',
 	keep trailing zeros for 'g'/'G' - passed straight through to
 	compiler.format_f64, real snprintf's own '#' already matches Python's
-	semantics exactly), and `sep` an f-string format spec's own grouping
-	option (',', '_', or '' for none) - the f-string format-spec dispatch's
-	actual digit-conversion work (lowering.py's _lower_float_format_spec).
-	Built on compiler.format_f64 (a hand-written C helper - see its own
-	comment in emitter_c.py's PROLOGUE) rather than a hand-rolled metalpy-
-	source conversion: getting float-to-decimal rounding exactly right by
-	hand is genuinely hard (naive fractional-digit extraction accumulates
+	semantics exactly) - the f-string format-spec dispatch's actual
+	digit-conversion work (lowering.py's _lower_float_format_spec). Built
+	on compiler.format_f64 (a hand-written C helper - see its own comment
+	in emitter_c.py's PROLOGUE) rather than a hand-rolled metalpy-source
+	conversion: getting float-to-decimal rounding exactly right by hand is
+	genuinely hard (naive fractional-digit extraction accumulates
 	floating-point error), so this reuses the platform's own proven
 	conversion instead - matching int's own design choice to push real
 	control flow into plain metalpy source methods rather than hand-built
 	IR in lowering.py (see the RC use-after-free commit 52333fd
 	int._to_radix_digits' own comment documents), just with the numeric
 	conversion itself delegated to compiler.format_f64 instead of being
-	hand-rolled here too. Grouping (unlike '#') has no printf equivalent at
-	all - it's applied as a separate post-processing pass, _group_integer_
-	part, since real snprintf simply doesn't support it for any type char. '''
+	hand-rolled here too. Deliberately UNGROUPED (unlike _f64_fixed_digits
+	below, which is this function plus grouping) - the '0' zero-pad
+	shorthand combined with grouping (,/_) needs to group the PADDING
+	digits together with these (lowering.py's _lower_float_format_spec,
+	via str._pad_and_group_before_dot), which only works starting from
+	ungrouped text - see str._pad_and_group_after_prefix's own comment for
+	the real, confirmed bug pre-grouping first would cause here too. '''
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		with compiler.panic_arithmetic( 'an integer-digit bound plus a decimal point plus precision fractional digits plus a zero terminator cannot overflow usize for any real f-string format spec' ):
@@ -177,10 +180,33 @@ def _f64_fixed_digits( value: f64, precision: usize, type_char: i32, alt: bool, 
 		if n < 0:
 			sys.free( buf )
 			sys.panic( 'f-string float formatting failed' )
-		digits: str = str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
+		return str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
 			'compiler.format_f64 produced invalid utf-8 (unreachable - only ASCII digits, \'.\', and \'e\'/\'E\'/\'+\'/\'-\' are ever written)'
 		)
-	return _group_integer_part( digits, sep )
+
+
+@private
+def _f64_fixed_digits( value: f64, precision: usize, type_char: i32, alt: bool, sep: str ) -> str:
+	''' _f64_fixed_digits_raw's own output, grouped (_group_integer_part) -
+	used by every format-spec path EXCEPT the '0' zero-pad shorthand,
+	which needs the raw, ungrouped text instead (see _f64_fixed_digits_raw
+	and str._pad_and_group_before_dot's own comments for why). Grouping
+	(unlike '#', which compiler.format_f64/real snprintf already handles)
+	has no printf equivalent at all - it's applied as a separate post-
+	processing pass, since real snprintf simply doesn't support it for any
+	type char. '''
+	return _group_integer_part( _f64_fixed_digits_raw( value, precision, type_char, alt ), sep )
+
+
+@private
+def _f64_percent_digits_raw( value: f64, precision: usize, alt: bool ) -> str:
+	''' like _f64_percent_digits below, minus grouping AND the trailing
+	'%' - just value scaled by 100 and formatted as ungrouped fixed-point
+	text (see _f64_fixed_digits_raw's own comment on why the '0' zero-pad
+	shorthand combined with grouping needs this split). '''
+	with compiler.wrap_arithmetic:
+		scaled: f64 = value * 100.0
+	return _f64_fixed_digits_raw( scaled, precision, _TYPE_CHAR_F, alt )
 
 
 @private
@@ -190,20 +216,18 @@ def _f64_percent_digits( value: f64, precision: usize, alt: bool, sep: str ) -> 
 	given precision (and '#'/grouping, same as any other type char), append
 	a literal '%'. Done here in metalpy source (not passed down to
 	compiler.format_f64 as some 8th type_char) since it needs a real
-	arithmetic step first, not just a different format string - reuses
-	_f64_fixed_digits for the actual digit conversion (and its own '#'/
-	grouping handling) once scaled, same as every other type char. Sign is
+	arithmetic step first, not just a different format string. Sign is
 	unaffected by scaling by the positive constant 100, so lowering.py
 	still calls _f64_sign_prefix on the ORIGINAL, un-scaled value for this
 	case - no separate percent-specific sign handling needed. '''
-	with compiler.wrap_arithmetic:
-		scaled: f64 = value * 100.0
-	return _f64_fixed_digits( scaled, precision, _TYPE_CHAR_F, alt, sep ) + str( '%' )
+	return _group_integer_part( _f64_percent_digits_raw( value, precision, alt ), sep ) + str( '%' )
 
 
 f64._sign_prefix = _f64_sign_prefix
 f64._fixed_digits = _f64_fixed_digits
+f64._fixed_digits_raw = _f64_fixed_digits_raw
 f64._percent_digits = _f64_percent_digits
+f64._percent_digits_raw = _f64_percent_digits_raw
 
 
 @private
@@ -222,10 +246,22 @@ def _f32_fixed_digits( value: f32, precision: usize, type_char: i32, alt: bool, 
 
 
 @private
+def _f32_fixed_digits_raw( value: f32, precision: usize, type_char: i32, alt: bool ) -> str:
+	return f64( value )._fixed_digits_raw( precision, type_char, alt )
+
+
+@private
 def _f32_percent_digits( value: f32, precision: usize, alt: bool, sep: str ) -> str:
 	return f64( value )._percent_digits( precision, alt, sep )
 
 
+@private
+def _f32_percent_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
+	return f64( value )._percent_digits_raw( precision, alt )
+
+
 f32._sign_prefix = _f32_sign_prefix
 f32._fixed_digits = _f32_fixed_digits
+f32._fixed_digits_raw = _f32_fixed_digits_raw
 f32._percent_digits = _f32_percent_digits
+f32._percent_digits_raw = _f32_percent_digits_raw

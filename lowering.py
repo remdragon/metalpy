@@ -4385,12 +4385,14 @@ class FunctionLowering:
 		if type_char in ( 'b', 'o', 'x', 'X' ):
 			base = self._RADIX_BY_TYPE_CHAR[type_char]
 			uppercase = type_char == 'X'
-			digits = self._lower_method_call( operand, '_to_radix_digits', [ self._const_i32( base ), self._const_bool( uppercase ) ], str_type, node )
+			raw_digits = self._lower_method_call( operand, '_to_radix_digits', [ self._const_i32( base ), self._const_bool( uppercase ) ], str_type, node )
 			prefix_text = self._RADIX_PREFIX_BY_TYPE_CHAR[type_char] if spec.alt else ''
+			sep_text = '' # grouping is never valid for a radix type char (validate_int_spec)
 		else:
-			sep = spec.grouping or '' # '' still goes through _decimal_digits_with_grouping correctly - splitting into groups of 3 and joining with nothing reconstructs the plain digit text unchanged
-			digits = self._lower_method_call( operand, '_decimal_digits_with_grouping', [ ir.Const( type = str_type, value = sep ) ], str_type, node )
+			raw_digits = self._lower_method_call( operand, '_decimal_digits', [], str_type, node )
 			prefix_text = ''
+			sep_text = spec.grouping or ''
+		sep = ir.Const( type = str_type, value = sep_text ) # '' still groups correctly - see str._insert_thousands_sep's own comment
 
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
 		if prefix_text:
@@ -4398,10 +4400,21 @@ class FunctionLowering:
 		else:
 			sign_and_prefix = sign_char
 
+		if spec.width is not None and spec.align == '=':
+			# the '0' shorthand - zero-padding goes BETWEEN sign/prefix and
+			# digits, grouping-aware (str._pad_and_group_after_prefix - a
+			# plain "group first, then _pad_after_prefix" two-step gives
+			# the wrong answer once grouping is combined with zero-pad, see
+			# its own comment) - needs the RAW, ungrouped digits, not the
+			# _insert_thousands_sep'd ones the other two branches below want
+			return self._lower_method_call(
+				raw_digits, '_pad_and_group_after_prefix',
+				[ sign_and_prefix, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ), sep ],
+				str_type, node,
+			)
+		digits = self._lower_method_call( raw_digits, '_insert_thousands_sep', [ sep ], str_type, node )
 		if spec.width is None:
 			return self._lower_str_add( sign_and_prefix, digits, str_type, node )
-		if spec.align == '=': # the '0' shorthand - zero-padding goes BETWEEN sign/prefix and digits
-			return self._lower_method_call( digits, '_pad_after_prefix', [ sign_and_prefix, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ) ], str_type, node )
 		body = self._lower_str_add( sign_and_prefix, digits, str_type, node )
 		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
 
@@ -4420,26 +4433,54 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
 		precision = spec.precision if spec.precision is not None else 6 # Python's own f"{x:f}"/f"{x:e}"/f"{x:g}"/f"{x:%}" all share this default
 		alt = self._const_bool( spec.alt )
-		sep = ir.Const( type = str_type, value = spec.grouping or '' ) # '' still groups correctly - see _group_integer_part's own comment
-		if spec.type == '%':
-			# has no printf equivalent of its own - _percent_digits handles
-			# the *100-then-'f' scaling itself (lib/builtins/__float.py),
-			# so no type_char argument here
-			digits = self._lower_method_call( operand, '_percent_digits', [ self._const_usize( precision ), alt, sep ], str_type, node )
-		else:
-			# None (no type char at all) defers to 'f' - a simplification,
-			# not Python's real "no type char" presentation (closer to 'g'
-			# with its own tweaks) - see validate_float_spec's own comment
-			type_char = ord( spec.type or 'f' )
-			digits = self._lower_method_call(
-				operand, '_fixed_digits', [ self._const_usize( precision ), self._const_i32( type_char ), alt, sep ], str_type, node,
-			)
+		sep = ir.Const( type = str_type, value = spec.grouping or '' ) # '' still groups correctly - see str._insert_thousands_sep's own comment
+		is_percent = spec.type == '%'
+		# None (no type char at all) defers to 'f' - a simplification, not
+		# Python's real "no type char" presentation (closer to 'g' with its
+		# own tweaks) - see validate_float_spec's own comment
+		type_char = self._const_i32( ord( spec.type or 'f' ) ) if not is_percent else None
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
 
+		if spec.width is not None and spec.align == '=':
+			# the '0' shorthand - zero-padding goes BETWEEN sign and
+			# digits, grouping-aware (str._pad_and_group_before_dot - a
+			# plain "group first, then _pad_after_prefix" two-step gives
+			# the wrong answer once grouping is combined with zero-pad, see
+			# str._pad_and_group_after_prefix's own comment) - needs the
+			# RAW, ungrouped digits (_fixed_digits_raw/_percent_digits_raw),
+			# not the already-grouped _fixed_digits/_percent_digits the
+			# other two branches below want
+			if is_percent:
+				raw = self._lower_method_call( operand, '_percent_digits_raw', [ self._const_usize( precision ), alt ], str_type, node )
+				# _pad_and_group_before_dot has no notion of '%' - reserve
+				# 1 char of the nominal width for it here, then append it
+				# after, the same "caller reserves room for what this
+				# method doesn't know about" convention its own comment
+				# documents
+				inner_width = max( spec.width - 1, 0 )
+				padded = self._lower_method_call(
+					raw, '_pad_and_group_before_dot',
+					[ sign_char, self._const_usize( inner_width ), ir.Const( type = str_type, value = spec.fill ), sep ],
+					str_type, node,
+				)
+				return self._lower_str_add( padded, ir.Const( type = str_type, value = '%' ), str_type, node )
+			raw = self._lower_method_call( operand, '_fixed_digits_raw', [ self._const_usize( precision ), type_char, alt ], str_type, node )
+			return self._lower_method_call(
+				raw, '_pad_and_group_before_dot',
+				[ sign_char, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ), sep ],
+				str_type, node,
+			)
+
+		if is_percent:
+			# has no printf equivalent of its own - _percent_digits handles
+			# the *100-then-'f' scaling itself (lib/builtins/__float.py)
+			digits = self._lower_method_call( operand, '_percent_digits', [ self._const_usize( precision ), alt, sep ], str_type, node )
+		else:
+			digits = self._lower_method_call(
+				operand, '_fixed_digits', [ self._const_usize( precision ), type_char, alt, sep ], str_type, node,
+			)
 		if spec.width is None:
 			return self._lower_str_add( sign_char, digits, str_type, node )
-		if spec.align == '=': # the '0' shorthand - zero-padding goes BETWEEN sign and digits
-			return self._lower_method_call( digits, '_pad_after_prefix', [ sign_char, self._const_usize( spec.width ), ir.Const( type = str_type, value = spec.fill ) ], str_type, node )
 		body = self._lower_str_add( sign_char, digits, str_type, node )
 		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
 

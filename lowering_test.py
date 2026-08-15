@@ -7763,19 +7763,25 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
 
 	def test_literal_int_format_spec_decimal_dispatches_to_sign_and_digits( self ) -> None:
-		# f"{n:05d}" - decimal path: _decimal_digits_with_grouping (empty
-		# separator) + _sign_prefix, then zero-pad via _pad_after_prefix
-		# (the '=' align implied by the '0' shorthand) rather than a
-		# generic ljust/rjust/center call
+		# f"{n:05d}" - decimal path: _decimal_digits (raw, ungrouped) +
+		# _sign_prefix, then grouping-aware zero-pad via
+		# _pad_and_group_after_prefix (the '=' align implied by the '0'
+		# shorthand) rather than a generic ljust/rjust/center call or the
+		# plain (non-grouping-aware) _pad_after_prefix - see str._pad_and_
+		# group_after_prefix's own comment on why the zero-pad path needs
+		# raw digits and grouping-aware padding, not pre-grouped digits
+		# plus a naive rjust (PLAN_STR_FORMAT.md item 4's own bugfix note)
 		self._import( '\n'.join([
 			'def main( n: int ) -> str:',
 			'	return f"{n:05d}"',
 		]))
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		self.assertEqual( len( self._calls_to( fn, '_decimal_digits_with_grouping' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_decimal_digits' )), 1 )
 		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
-		self.assertEqual( len( self._calls_to( fn, '_pad_after_prefix' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_pad_and_group_after_prefix' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_decimal_digits_with_grouping' ), [] )
+		self.assertEqual( self._calls_to( fn, '_pad_after_prefix' ), [] )
 		self.assertEqual( self._calls_to( fn, '_to_radix_digits' ), [] )
 
 	def test_literal_int_format_spec_hex_dispatches_to_radix_digits( self ) -> None:

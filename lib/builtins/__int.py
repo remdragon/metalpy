@@ -709,6 +709,22 @@ class int:
 		return str( '' ).join( ordered )
 
 	@private
+	def _decimal_digits( self ) -> str:
+		''' self's own decimal MAGNITUDE text, no sign, no grouping - the
+		raw building block the '0' zero-pad shorthand combined with
+		grouping (,/_) needs (lowering.py's _lower_int_format_spec, via
+		str._pad_and_group_after_prefix): that combination has to group
+		the PADDING digits together with these, which only works starting
+		from UNGROUPED text - pre-grouping first (what _decimal_digits_
+		with_grouping below does) gives the wrong answer once zero-padding
+		is layered on top (see str._pad_and_group_after_prefix's own
+		comment for the real, confirmed bug this was fixing). '''
+		digits: str = self.__str__()
+		if self.__is_negative:
+			digits = digits._byte_slice( 1, digits.byte_len() ) # drop the leading '-' - see _to_radix_digits' own "caller prepends sign" split
+		return digits
+
+	@private
 	def _decimal_digits_with_grouping( self, sep: str ) -> str:
 		''' self's own decimal MAGNITUDE text (no sign - same split
 		_to_radix_digits above keeps) with `sep` (a single ASCII
