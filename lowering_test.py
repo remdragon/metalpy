@@ -4639,6 +4639,36 @@ class Tests( unittest.TestCase ):
 		self.assertIsNot( allocs[0].cls, allocs[1].cls )
 		self.assertNotEqual( allocs[0].cls.qualname, allocs[1].cls.qualname )
 
+	def test_tuple_as_nested_explicit_type_argument_to_generic_construction_call( self ) -> None:
+		# regression test: tuple[...] (and every other textually-special
+		# subscript form - move/copy/Callable/Closure/Iterator/Generator)
+		# used to fail with "name 'tuple' is not defined" when it appeared as
+		# a NESTED, EXPLICIT type argument to another generic class's own
+		# constructor CALL - Box[tuple[i32,i32]](...) - even though the exact
+		# same tuple[tuple[i32,i32]] shape resolves fine as a plain
+		# ANNOTATION. Root cause: type_resolver.py's own _try_resolve_
+		# namespace (the generic-construction-call counterpart to discovery.
+		# py's visit_Subscript, used by Lowering._try_lower_construct_call)
+		# only special-cased Callable/Closure textually, so a nested tuple[...]
+		# argument fell through to the "ordinary generic base" branch and
+		# tried (and failed) to find_name('tuple') as if it were a real,
+		# registered class - see type_resolver.py's _try_resolve_namespace
+		# for the fix, which now delegates every textually-special subscript
+		# form to discovery.py's own visit_Subscript directly
+		code = '\n'.join([
+			'class Box[T]:',
+			'	value: T',
+			'	def __init__( self, value: T ) -> None:',
+			'		self.value = value',
+			'',
+			'def main() -> None:',
+			'	b = Box[tuple[i32,i32]]( ( 1, 2 ) )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	# --- globals -------------------------------------------------------------
 
 	def test_reads_module_global( self ) -> None:

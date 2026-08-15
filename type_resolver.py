@@ -2701,37 +2701,24 @@ class TypeResolver:
 			return result
 		if (
 			isinstance( node, ast.Subscript ) and isinstance( node.value, ast.Name )
-			and node.value.id in ( 'Callable', 'Closure' )
+			and node.value.id in ( 'move', 'copy', 'Callable', 'Closure', 'tuple', 'Iterator', 'Generator' )
 		):
-			# Callable[[Arg1,...],Ret]/Closure[[Arg1,...],Ret] as a TYPE-
-			# REFERENCE-context expression (compiler.cast(Closure[[],None],
-			# x), compiler.sizeof(Callable[...]), ...) - discovery.py's own
-			# visit_Subscript already recognizes this shape for ANNOTATIONS,
-			# but that path is never reached from here (Callable/Closure
-			# are recognized textually, not through find_name - a bare
-			# ast.Name(id='Callable') node.value would otherwise fail
-			# resolution outright, same as any other undefined name).
-			# Mirrors visit_Subscript's own shape validation exactly
-			shape_ok = (
-				isinstance( node.slice, ast.Tuple )
-				and len( node.slice.elts ) == 2
-				and isinstance( node.slice.elts[0], ast.List )
-			)
-			if not shape_ok:
-				self.discovery.fail( f"{node.value.id}[...] must look like {node.value.id}[[ArgType, ...], RetType]: {ast.unparse(node)}", node )
-			arg_nodes, ret_node = node.slice.elts
-			arg_types: list[Type] = []
-			for a in arg_nodes.elts:
-				resolved = self._try_resolve_namespace( a )
-				if not isinstance( resolved, Type ):
-					self.discovery.fail( f'{node.value.id}[...] argument is not a type: {ast.unparse(a)}', node )
-				arg_types.append( resolved )
-			return_type = self._try_resolve_namespace( ret_node )
-			if not isinstance( return_type, Type ):
-				self.discovery.fail( f'{node.value.id}[...] return type is not a type: {ast.unparse(ret_node)}', node )
-			if node.value.id == 'Callable':
-				return self.discovery._get_or_create_callable_type( arg_types, return_type )
-			return self.discovery._get_or_create_closure_type( arg_types, return_type )
+			# move[T]/copy[T]/Callable[[Arg1,...],Ret]/Closure[[Arg1,...],Ret]/
+			# tuple[T0,T1,...]/Iterator[T]/Generator[T,E] as a TYPE-REFERENCE-
+			# context expression (compiler.cast(Closure[[],None], x),
+			# compiler.sizeof(Callable[...]), an explicit generic construction
+			# call's own type argument like list[tuple[str,str]](), ...) - all
+			# of these are recognized TEXTUALLY in discovery.py's own
+			# visit_Subscript, not through find_name (a bare
+			# ast.Name(id='tuple') node.value would otherwise fail resolution
+			# outright, same as any other undefined name - this was exactly
+			# the "name 'tuple' is not defined" bug on list[tuple[str,str]]()).
+			# Reuse that same implementation directly rather than duplicating
+			# it here (this used to hand-roll just the Callable/Closure case)
+			# so every textually-special subscript form resolves identically
+			# whether it appears in an ANNOTATION or as an explicit type
+			# argument to a generic constructor CALL
+			return self.discovery.visit_Subscript( node )
 		if isinstance( node, ast.Subscript ):
 			base = self._try_resolve_namespace( node.value )
 			# Name[T] - a generic FUNCTION (mylen[i32]), a generic CLASS
