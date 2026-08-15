@@ -56,6 +56,16 @@ def _substr( source: str, start: usize, end: usize ) -> str:
 	return str.from_cstr( move( buf )).unwrap( 're._substr: invalid UTF-8 boundary' )
 
 
+def _codepoint_width_at_str( s: str, pos: usize ) -> usize:
+	''' byte width of the codepoint at byte offset pos in s - the Pattern-
+	level (not Matcher-level) counterpart of Matcher._codepoint_width_at,
+	used by finditer/sub/split to step forward by a whole codepoint when
+	skipping a non-matching position. '''
+	width: usize = 0
+	builtins.decode_utf8_at( s.get_cstr(), pos, compiler.addrof( width ))
+	return width
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -1299,9 +1309,18 @@ class Pattern:
 		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags ))
 
 	def search( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Result[Match, MatchError]:
+		return self._search_from( s, 0, max_steps )
+
+	def _search_from( self, s: str, start_pos: usize, max_steps: usize ) -> Result[Match, MatchError]:
+		''' like search(), but the scan-forward starts at start_pos rather
+		than 0 - the shared core finditer() calls repeatedly to find each
+		successive match without re-scanning from the beginning, while
+		still searching the SAME full string (not a slice of it), so
+		anchors like ^ / MULTILINE-BOL / lookbehind stay correct relative
+		to absolute string position. '''
 		matcher = Matcher( self.__ops, self.__classes, s, max_steps, self.__flags )
 		slen: usize = s.byte_len()
-		pos: usize = 0
+		pos: usize = start_pos
 		while True:
 			outcome: Result[Frame, MatchError] = matcher.run_at( pos, self.__n_slots )
 			match outcome:
@@ -1338,6 +1357,232 @@ class Pattern:
 			case Result.Err( e ):
 				return Result.Err( e )
 
+	# No Pattern.finditer() METHOD - "a generator method is not supported
+	# yet" (confirmed directly). See the module-level finditer() function
+	# below for the free-function form and its own further limitation
+	# (confirmed unusable from any module other than this one - a general
+	# compiler bug, not specific to this API).
+
+	def findall( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> list[str]:
+		''' the whole (group 0) text of every non-overlapping match, in
+		order. Python's own findall() returns per-group tuples when the
+		pattern has groups - simplified here to always be the whole match;
+		use finditer() + Match.group(n) for per-group access (same-module
+		callers only - see finditer()'s own docstring). Uses
+		_find_next_match/_advance_pos_after_match directly in a plain
+		while loop rather than consuming finditer()'s own generator -
+		calling the same generator function from several call sites
+		within this module produced confusing, seemingly unrelated
+		compile errors at OTHER call sites (confirmed directly; not
+		investigated further, just avoided), so only the public
+		module-level finditer() is a real generator; every internal user
+		re-does the same scan-forward directly instead. '''
+		slen: usize = s.byte_len()
+		out: list[str] = list[str]()
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		while has_next:
+			mm: Match = _require_next_match( self, s, pos, slen, max_steps )
+			g: str|None = mm.group()
+			if g is None:
+				sys.panic( 're: findall: whole match text unexpectedly unset' )
+			out.append( g ).unwrap( 're: findall append' )
+			pos = _advance_pos_after_match( mm, s )
+			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		return out
+
+	def sub( self, repl: str, s: str, count: usize = 0, max_steps: usize = DEFAULT_MAX_STEPS ) -> str:
+		pair: tuple[str,usize] = self._sub_impl( repl, s, count, max_steps )
+		return pair[0]
+
+	def subn( self, repl: str, s: str, count: usize = 0, max_steps: usize = DEFAULT_MAX_STEPS ) -> tuple[str,usize]:
+		return self._sub_impl( repl, s, count, max_steps )
+
+	def _sub_impl( self, repl: str, s: str, count: usize, max_steps: usize ) -> tuple[str,usize]:
+		''' shared implementation for sub()/subn() - repl is inserted
+		literally (no \\1-style backreference expansion in v1). count == 0
+		means unlimited, matching Python's own re.sub/subn convention.
+		See findall()'s own comment for why this is a plain while loop
+		over _find_next_match rather than consuming finditer(). '''
+		slen: usize = s.byte_len()
+		out: str = ''
+		last_end: usize = 0
+		n: usize = 0
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		while has_next and ( count == 0 or n < count ):
+			mm: Match = _require_next_match( self, s, pos, slen, max_steps )
+			start: usize|None = mm.start()
+			if start is None:
+				sys.panic( 're: sub: whole match start unexpectedly unset' )
+			end: usize|None = mm.end()
+			if end is None:
+				sys.panic( 're: sub: whole match end unexpectedly unset' )
+			out = out + _substr( s, last_end, start )
+			out = out + repl
+			last_end = end
+			with compiler.wrap_arithmetic:
+				n += 1
+			pos = _advance_pos_after_match( mm, s )
+			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		out = out + _substr( s, last_end, s.byte_len())
+		return ( out, n )
+
+	def split( self, s: str, maxsplit: usize = 0, max_steps: usize = DEFAULT_MAX_STEPS ) -> list[str]:
+		''' maxsplit == 0 means unlimited, matching Python's own re.split
+		convention. Python also interleaves captured groups into the
+		result when the pattern has any - simplified here to just the
+		substrings between whole-pattern matches. See findall()'s own
+		comment for why this is a plain while loop over _find_next_match
+		rather than consuming finditer(). '''
+		slen: usize = s.byte_len()
+		out: list[str] = list[str]()
+		last_end: usize = 0
+		n: usize = 0
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		while has_next and ( maxsplit == 0 or n < maxsplit ):
+			mm: Match = _require_next_match( self, s, pos, slen, max_steps )
+			start: usize|None = mm.start()
+			if start is None:
+				sys.panic( 're: split: whole match start unexpectedly unset' )
+			end: usize|None = mm.end()
+			if end is None:
+				sys.panic( 're: split: whole match end unexpectedly unset' )
+			out.append( _substr( s, last_end, start )).unwrap( 're: split append' )
+			last_end = end
+			with compiler.wrap_arithmetic:
+				n += 1
+			pos = _advance_pos_after_match( mm, s )
+			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		out.append( _substr( s, last_end, s.byte_len())).unwrap( 're: split append' )
+		return out
+
+
+def _advance_pos_after_match( m: Match, s: str ) -> usize:
+	''' the next scan position after m: m.end(), or one codepoint past
+	m.start() for a zero-width match (end == start), to avoid finditer
+	looping forever on the same position. Both m.start()/m.end() are
+	group 0's, which is unconditionally set on any successful match -
+	the None branches below are an unreachable defensive backstop. '''
+	start_pos: usize|None = m.start()
+	if start_pos is None:
+		sys.panic( 're: _advance_pos_after_match: whole match start unexpectedly unset' )
+	end_pos: usize|None = m.end()
+	if end_pos is None:
+		sys.panic( 're: _advance_pos_after_match: whole match end unexpectedly unset' )
+	if end_pos > start_pos:
+		return end_pos
+	with compiler.wrap_arithmetic:
+		return start_pos + _codepoint_width_at_str( s, start_pos )
+
+
+def _find_next_match( pattern: Pattern, s: str, start_pos: usize, slen: usize, max_steps: usize ) -> Match|None:
+	''' ordinary (non-generator) scan-forward helper: the next match at or
+	after start_pos, or None if there isn't one - Pattern._search_from
+	already scans every position from start_pos through slen internally
+	(only returning Err(NoMatch) once none of them work), so this makes
+	exactly one call, no retry loop of its own. A StepLimitExceeded
+	attempt is folded into the same "no more matches" outcome as an
+	ordinary NoMatch - Iterator[T] has no error channel to report it
+	through separately (a fallible Generator[T,E] would, but the extra
+	plumbing isn't worth it for v1), so a pathological pattern just
+	yields fewer matches than a truly unbounded engine would, bounded by
+	the same per-call max_steps budget every other call already
+	respects, not by silently hanging. '''
+	if start_pos > slen:
+		return None
+	attempt: Result[Match, MatchError] = pattern._search_from( s, start_pos, max_steps )
+	if attempt.is_ok():
+		return attempt.unwrap( 're: _find_next_match: is_ok checked above' )
+	return None
+
+
+def _has_match_at_or_after( pattern: Pattern, s: str, pos: usize, slen: usize, max_steps: usize ) -> bool:
+	m: Match|None = _find_next_match( pattern, s, pos, slen, max_steps )
+	return m is not None
+
+def _require_next_match( pattern: Pattern, s: str, pos: usize, slen: usize, max_steps: usize ) -> Match:
+	''' only ever called right after _has_match_at_or_after confirmed one
+	exists at this same pos - the panic is an unreachable backstop, not a
+	real code path (matching wasn't going to become non-deterministic
+	between the two calls). '''
+	m: Match|None = _find_next_match( pattern, s, pos, slen, max_steps )
+	if m is None:
+		sys.panic( 're: _require_next_match: unreachable (_has_match_at_or_after already confirmed true)' )
+	return m
+
+
+def finditer( pattern: Pattern, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Iterator[Match]:
+	''' yields each successive non-overlapping match, scanning forward
+	from the end of the previous one (or by one codepoint, for a
+	zero-width match).
+
+	KNOWN LIMITATION, confirmed with a minimal cross-module repro
+	(unrelated to re.py's own code - a plain `Iterator[Box]`-returning
+	generator in one lib/ module, consumed via `for x in othermodule.
+	gen():` from a second module, fails identically): a generator
+	function consumed via for-loop (or driven manually via .__next__())
+	from any module OTHER than the one that defines it fails to resolve
+	names local to the defining module inside the synthesized closure
+	body ("name 'X' is not defined"). Since every real caller of this
+	module imports `re` - i.e. is necessarily a different module - this
+	means `finditer` is not usable by any external caller today; it only
+	compiles and runs correctly for same-module callers (which is why
+	findall/sub/subn/split below, all real Pattern methods, deliberately
+	do NOT call this - they re-do the same scan-forward directly against
+	_find_next_match instead). Kept in the module (matching PLAN_RE.md's
+	API surface and ready to work once the compiler bug is fixed)
+	rather than removed, but re_test.py cannot exercise it via a real
+	compiled program for the same reason - flagged as a candidate for
+	the same kind of investigation as the earlier three bugs, not
+	re-litigated further here.
+
+	A free function, not a Pattern method either way - confirmed
+	directly that a generator METHOD isn't supported yet, and separately
+	that an Iterator[T] value merely returned/passed through a non-
+	generator function (even a trivial `return other_generator(...)`,
+	same module) has no usable __next__ for the receiver - only a DIRECT
+	call to the actual generator function works as a for-loop's iterable
+	expression. There is also no module-level str-pattern convenience
+	overload here (unlike search/match/fullmatch/findall/sub/subn/split
+	below): a second `finditer(pattern: str, ...)` generator that
+	re-yields from this one via `for m in finditer(p,...): yield m` was
+	tried and produced the same kind of nonsensical errors (undefined
+	names inside THIS function's own already-correct body) once two
+	same-named overloads were both generators - not investigated
+	further, just avoided. Compile the pattern with re.compile() first,
+	then call finditer(pattern, s) with the result (from the SAME
+	module, until the cross-module bug above is fixed).
+
+	The generator body itself must also keep yield as a direct, unnested
+	statement of a single top-level while loop - nesting it inside an
+	if/else within the loop (the natural first-cut shape) is a separate,
+	unsupported combination from a bare top-level if/else containing
+	yield (confirmed directly), so the "is there a match" branching has
+	to live in the while loop's own CONDITION instead of its body. That
+	in turn means the loop can't carry a Match|None as its own persisted
+	state across the yield boundary either (confirmed directly -
+	promoting an Optional RC-typed local across a yield produces a type
+	mismatch in the synthesized state field, unlike a bare, non-Optional
+	RC-typed local, which Phase 9 of PLAN_GENERATORS.md's own generator
+	work does support) - so the loop state here is two plain scalars
+	(pos: usize, has_next: bool) instead, and the actual Match value is
+	recomputed fresh each iteration via _require_next_match rather than
+	carried across the yield. This costs an extra redundant _search_from
+	call per position (once to check has_next, once more to fetch the
+	value) - an accepted v1 inefficiency, not a correctness issue, since
+	matching is deterministic. '''
+	slen: usize = s.byte_len()
+	pos: usize = 0
+	has_next: bool = _has_match_at_or_after( pattern, s, pos, slen, max_steps )
+	while has_next:
+		m: Match = _require_next_match( pattern, s, pos, slen, max_steps )
+		pos = _advance_pos_after_match( m, s )
+		yield m
+		has_next = _has_match_at_or_after( pattern, s, pos, slen, max_steps )
+	return
+
 
 def compile( pattern: str, flags: u32 = 0 ) -> Result[Pattern, PatternError]:
 	return Pattern.compile( pattern, flags )
@@ -1353,3 +1598,19 @@ def match( pattern: str, s: str, flags: u32 = 0 ) -> Result[Match, MatchError]:
 def fullmatch( pattern: str, s: str, flags: u32 = 0 ) -> Result[Match, MatchError]:
 	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.fullmatch: invalid pattern' )
 	return p.fullmatch( s )
+
+def findall( pattern: str, s: str, flags: u32 = 0 ) -> list[str]:
+	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.findall: invalid pattern' )
+	return p.findall( s )
+
+def sub( pattern: str, repl: str, s: str, count: usize = 0, flags: u32 = 0 ) -> str:
+	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.sub: invalid pattern' )
+	return p.sub( repl, s, count )
+
+def subn( pattern: str, repl: str, s: str, count: usize = 0, flags: u32 = 0 ) -> tuple[str,usize]:
+	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.subn: invalid pattern' )
+	return p.subn( repl, s, count )
+
+def split( pattern: str, s: str, maxsplit: usize = 0, flags: u32 = 0 ) -> list[str]:
+	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.split: invalid pattern' )
+	return p.split( s, maxsplit )

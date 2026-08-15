@@ -28,7 +28,18 @@
 # pattern (this parser has no separate lookahead pass), so a forward
 # reference is a compile error rather than an op that could never
 # succeed. An unmatched/non-participating group's backreference never
-# matches, same as Python re. See PLAN_RE.md for all five phases.
+# matches, same as Python re.
+#
+# Phase 6: Pattern.findall/sub/subn/split, plus module-level convenience
+# wrappers taking a pattern string directly. Module-level `finditer` is
+# NOT covered here: it's real and correct, but confirmed unusable from
+# any module other than the one that defines it (a general compiler bug
+# in cross-module generator consumption, unrelated to this module's own
+# code - see finditer()'s own docstring in lib/re.py) - since every
+# real caller necessarily imports `re` from elsewhere, there's no way to
+# exercise it via a real compiled program today. findall/sub/subn/split
+# were deliberately written to not depend on it internally for exactly
+# this reason. See PLAN_RE.md for all six phases.
 #
 # Follows time_test.py's own template: RealCompileMixin + assert_programs_run,
 # print()-free, exit code 0 = every check passed, distinct nonzero i32 per
@@ -473,6 +484,62 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_FINDALL_SUB_SPLIT = '''
+import re
+
+def main() -> i32:
+	p: re.Pattern = re.compile( r'\\d+' ).unwrap( 'bad' )
+
+	fa: list[str] = p.findall( 'a1 b22 c333' )
+	if len( fa ) != 3:
+		return 1
+	fa0: str = fa.__getitem__( 0 ).unwrap( 'ok' )
+	if fa0 != '1':
+		return 2
+	fa1: str = fa.__getitem__( 1 ).unwrap( 'ok' )
+	if fa1 != '22':
+		return 3
+	fa2: str = fa.__getitem__( 2 ).unwrap( 'ok' )
+	if fa2 != '333':
+		return 4
+
+	subbed: str = p.sub( '#', 'a1b22c333' )
+	if subbed != 'a#b#c#':
+		return 5
+	pair: tuple[str,usize] = p.subn( '#', 'a1b22c333' )
+	if pair[0] != 'a#b#c#':
+		return 6
+	if pair[1] != 3:
+		return 7
+
+	limited: str = p.sub( '#', 'a1b22c333', 2 )
+	if limited != 'a#b#c333':
+		return 8
+
+	sp: re.Pattern = re.compile( r'\\s*,\\s*' ).unwrap( 'bad' )
+	parts: list[str] = sp.split( 'a, b,c ,  d' )
+	if len( parts ) != 4:
+		return 9
+	p0: str = parts.__getitem__( 0 ).unwrap( 'ok' )
+	if p0 != 'a':
+		return 10
+	p3: str = parts.__getitem__( 3 ).unwrap( 'ok' )
+	if p3 != 'd':
+		return 11
+
+	# module-level convenience wrappers (compile-then-delegate)
+	if len( re.findall( r'\\w+', 'foo bar' )) != 2:
+		return 12
+	if re.sub( r'\\d', 'X', 'a1b2' ) != 'aXbX':
+		return 13
+	sn: tuple[str,usize] = re.subn( r'\\d', 'X', 'a1b2' )
+	if sn[1] != 2:
+		return 14
+	if len( re.split( r',', 'a,b,c' )) != 3:
+		return 15
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -514,6 +581,14 @@ class RePhase5BehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_phase5_backreferences( self ) -> None:
 		self.assert_programs_run([
 			( 'backreferences', _RE_BACKREFERENCES ),
+		])
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase6BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def test_phase6_findall_sub_split( self ) -> None:
+		self.assert_programs_run([
+			( 'findall_sub_split', _RE_FINDALL_SUB_SPLIT ),
 		])
 
 
