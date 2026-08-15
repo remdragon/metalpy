@@ -458,13 +458,28 @@ class TypeResolver:
 		return inner if isinstance( inner, CallableType ) else None
 
 	def _is_RC( self, t: Type|None ) -> bool:
-		''' true if `t` is an RCClass, possibly wrapped in a Specialization. '''
-		base = t.base if isinstance( t, Specialization ) else t
-		return isinstance( base, RCClass )
+		''' true if `t`'s own runtime representation IS a single bare RC
+		pointer - a None-tolerant shim for mpy_types.Type.is_rc_pointer
+		(call sites here and in lowering.py hold Type|None).
+
+		Deliberately is_rc_POINTER, not the deeper is_rc(): every caller
+		(compiler.incref/decref/addrof/cast, and the compiler.is_rc(T)
+		intrinsic's own compile-time fold) goes on to emit a DIRECT pointer
+		operation, which is only valid for a genuine pointer. A TaggedUnion
+		carrying RC members answers False here and must keep doing so - its
+		runtime shape is a tag+data value struct, and it needs cfg.py's
+		tag-gated ladder instead.
+
+		This used to be an RCClass-only isinstance check, which left tuples
+		out: compiler.is_rc(tuple[str,str]) answered False even though a
+		tuple is every bit as much a bare RC pointer as an RCClass, so
+		lib/builtins' RawDict/list skipped their key/value increfs entirely
+		for tuple element types. '''
+		return t is not None and t.is_rc_pointer()
 
 	def _is_pointer_representable( self, t: Type|None ) -> bool:
 		''' true if `t`'s own runtime representation IS a single machine
-		pointer - a real Ptr[T]/ConstPtr[T], OR an RCClass value (always a
+		pointer - a real Ptr[T]/ConstPtr[T], OR an RC pointer (always a
 		pointer to its heap object everywhere in this compiler - see
 		_is_RC). Used by compiler.cast(...) to allow a plain reinterpret
 		cast between ANY two of these (Ptr[None] <-> Ptr[T], Ptr[None] <->
