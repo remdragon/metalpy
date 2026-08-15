@@ -8659,6 +8659,29 @@ class FunctionLowering:
 			self.lowering._resolve_call_target( target )
 			args, kwargs = self._lower_call_args( target, node )
 
+		if receiver is not None and isinstance( target, Function ) and target.cls is None:
+			# a Scalar-registered method (`SomeScalar.method = some_free_
+			# function` - discovery.py's visit_Assign, e.g. lib/builtins/
+			# __float.py's `f64.__str__ = _f64_str`) is a genuine free
+			# Function, unlike a real CStruct/RCClass method - discovery
+			# never strips a "self" off its .parameters the way
+			# _make_function_resolver does for an actual class body (there
+			# IS no class body here), so ir.Call's own receiver field
+			# (meant for real bound-method calls only) would make
+			# emitter_c.py's own _emit_call_args (which walks
+			# target.parameters assuming it already excludes the receiver)
+			# double-count the receiver against the first declared
+			# parameter - confirmed by a real KeyError crash on ordinary
+			# `f.__str__()` call syntax. _lower_method_call above (used by
+			# f-string dunder-dispatch/format-spec call sites) already
+			# carries this exact fix for its own narrower set of callers;
+			# this is the same fix for the general call-lowering path every
+			# other Scalar-attached-method call site (including ordinary
+			# user-written `receiver.method()` syntax) actually goes
+			# through.
+			args = [ receiver ] + args
+			receiver = None
+
 		if isinstance( target, Function ) and target.is_inline:
 			# PLAN_INLINE.md - reaches this shared tail from either the
 			# plain (non-generic, non-Overload) `else` branch above, the
