@@ -6262,6 +6262,31 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# regression test: tuple[...] as a NESTED, EXPLICIT type argument
+			# to another generic class's own constructor CALL -
+			# list[tuple[str,str]]() - used to fail with "name 'tuple' is not
+			# defined" even though the exact same list[tuple[str,str]]
+			# ANNOTATION resolved fine one line above it (see type_resolver.
+			# py's _try_resolve_namespace - the constructor-call counterpart
+			# to discovery.py's own visit_Subscript, which already recognized
+			# tuple[...] textually for annotations). Mirrors the real
+			# lib/http/client.py HTTPHeaders shape this bug was found in:
+			# construct a list of pairs, append, read each field back
+			( 'list_of_tuple_as_explicit_constructor_type_argument', '''
+def main() -> i32:
+	entries: list[tuple[str,str]] = list[tuple[str,str]]()
+	entries.append( ( "Content-Type", "text/plain" ) ).unwrap( 'append' )
+	entries.append( ( "X-Test", "1" ) ).unwrap( 'append' )
+	if len( entries ) != 2:
+		return 1
+	first: tuple[str,str] = entries.__getitem__( 0 ).unwrap( 'idx' )
+	if first[0] != "Content-Type" or first[1] != "text/plain":
+		return 2
+	second: tuple[str,str] = entries.__getitem__( 1 ).unwrap( 'idx' )
+	if second[0] != "X-Test" or second[1] != "1":
+		return 3
+	return 0
+''' ),
 		] )
 
 
