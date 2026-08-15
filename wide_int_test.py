@@ -148,6 +148,48 @@ def main() -> i32:
 	return 0
 ''', checks )
 
+	# _emit_wide_int_const's hi/lo-split reconstruction used to hardcode
+	# `<< 64` when combining a >64-bit-magnitude i128/u128 constant's two
+	# halves - under MSVC, where __metalpy_wideuint is only 64 bits wide (no
+	# native 128-bit type), that's a shift-by-width: undefined behavior in C.
+	# Fixing the range validation gap (get_intrinsics' has_i128-aware
+	# Scalar.sizeof) closes the COMMON path into this (a plain literal
+	# assignment now gets rejected before reaching emission), but an explicit
+	# bit-reinterpretation cast (`u128(<huge literal>)`) deliberately bypasses
+	# that validation on purpose (same mechanism as `u32(-11)`) and can still
+	# reach it - confirmed via direct A/B testing under real MSVC: the OLD
+	# code made cl.exe itself emit `warning C4293: '<<': shift count negative
+	# or too big, undefined behavior` for this exact program; the fix (basing
+	# the shift amount on sizeof(__metalpy_wideuint) instead of a hardcoded
+	# 64, mirroring _WIDEINT_TOP_BIT_SHIFT's own technique) eliminates that
+	# warning entirely. Only meaningful under real MSVC - __metalpy_wideuint
+	# genuinely is 128-bit under clang/gcc, so there's nothing to reproduce
+	# there.
+	@unittest.skipUnless( _CC is not None and _CC.name == 'cl', "only meaningful under real MSVC, where __metalpy_wideuint's 64-bit fallback makes the old hardcoded <<64 a genuine shift-by-width" )
+	def test_wide_int_const_hi_lo_split_has_no_shift_ub_under_msvc( self ) -> None:
+		code = '''
+def main() -> i32:
+	x: u128 = u128(340282366920938463463374607431768211455)
+	return 0
+'''
+		active_target = _detect_active_target()
+		active_target['has_i128'] = False
+		discovery = Discovery( import_builtins = True, active_target = active_target )
+		compiler = Compiler( discovery )
+		compiler.import_code( code, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+			self.assertNotIn( 'C4293', cc_result.stdout, f'shift-count UB warning still present:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
 	# --- Stage 2: saturating arithmetic on i128/u128 (previously NotImplementedError) --
 
 	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )

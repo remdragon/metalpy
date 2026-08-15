@@ -1137,7 +1137,17 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 		return f'(-{cast_expr})' if value < 0 else cast_expr
 	magnitude = abs( value )
 	hi, lo = magnitude >> 64, magnitude & 0xFFFFFFFFFFFFFFFF
-	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << 64 ) | (__metalpy_wideuint){lo}ULL )'
+	# the shift amount is derived from __metalpy_wideuint's own real C width
+	# rather than hardcoded, the same sizeof()-based technique
+	# _WIDEINT_TOP_BIT_SHIFT already uses for i128 MIN/MAX - under MSVC's
+	# 64-bit wideint/wideuint fallback this reduces to a safe, well-defined
+	# no-op shift (0) instead of a shift-by-width (UB in C). The reconstructed
+	# value is still numerically wrong in that case (a >64-bit magnitude
+	# can't be represented in a genuinely 64-bit type by any expression -
+	# this can only be reached via an explicit bit-reinterpretation cast or a
+	# float->int128 literal cast, both of which deliberately bypass this
+	# stem's own int_stem_range validation) but at least well-defined, not UB
+	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << ( sizeof(__metalpy_wideuint)*8 - 64 ) ) | (__metalpy_wideuint){lo}ULL )'
 	if _is_unsigned_stem( stem ):
 		return unsigned_expr
 	signed_expr = f'(__metalpy_wideint){unsigned_expr}'

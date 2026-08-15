@@ -5950,6 +5950,30 @@ class Tests( unittest.TestCase ):
 		compiler64._lower( discovery64.main )
 		self.assertEqual( discovery64.errors.errors, [] )
 
+	def test_i128_range_uses_active_target_has_i128_not_hardcoded_true( self ) -> None:
+		# a value needing >64-bit magnitude is a valid i128/u128 literal under
+		# a real 128-bit __metalpy_wideint/__metalpy_wideuint (has_i128=True,
+		# clang/gcc), but out of range under MSVC's 64-bit wideint/wideuint
+		# fallback (has_i128=False) - confirms get_intrinsics() derives i128/
+		# u128's own .sizeof from active_target['has_i128'], not a fixed 16
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: u128 = 18446744073709551616', # 2**64, needs 65 bits
+		])
+		target_no_i128 = dict( _detect_active_target(), has_i128 = False )
+		discovery_no_i128 = Discovery( import_builtins = False, active_target = target_no_i128 )
+		compiler_no_i128 = Compiler( discovery_no_i128 )
+		compiler_no_i128.import_code( code, filename = Path( '__test__.py' ))
+		compiler_no_i128._lower( discovery_no_i128.main )
+		self.assertIn( 'is out of range for intrinsics.u128', discovery_no_i128.errors.errors[0] )
+
+		target_i128 = dict( _detect_active_target(), has_i128 = True )
+		discovery_i128 = Discovery( import_builtins = False, active_target = target_i128 )
+		compiler_i128 = Compiler( discovery_i128 )
+		compiler_i128.import_code( code, filename = Path( '__test__.py' ))
+		compiler_i128._lower( discovery_i128.main )
+		self.assertEqual( discovery_i128.errors.errors, [] )
+
 	def test_cenum_construction_out_of_range_fails( self ) -> None:
 		code = '\n'.join([
 			'@enum( u8 )',
@@ -5982,19 +6006,16 @@ class Tests( unittest.TestCase ):
 		self.assertIn( '300 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
 
 	def test_cenum_member_declaration_boundary_values( self ) -> None:
-		# a negative literal (i8's own MIN) isn't reachable here at all -
-		# class/enum bodies never go through compile_time_transformer's
-		# constant-folding pass (only module/function bodies do), so
-		# `Lo = -128` is rejected pre-existingly by _register_enum_member's
-		# own "must be '_' or an integer constant" check (UnaryOp(USub,...)
-		# never folds to a plain Constant here) - unrelated to this fix,
-		# confirmed during development. u8's own 0..255 range needs no
-		# negative literal to test both boundaries
+		# i8's own MIN needs a negative literal (-128) - _register_enum_member
+		# now folds node.value through compile_time_transformer.transform_expr
+		# before checking for ast.Constant, so UnaryOp(USub, Constant(128))
+		# collapses to Constant(-128) same as it already would in a function
+		# body
 		code = '\n'.join([
-			'@enum( u8 )',
+			'@enum( i8 )',
 			'class MyError:',
-			'	Lo = 0',
-			'	Hi = 255',
+			'	Lo = -128',
+			'	Hi = 127',
 			'',
 			'def main() -> None:',
 			'	x: MyError = MyError( 0 )',
@@ -6015,6 +6036,19 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		self._lower_main()
 		self.assertIn( '128 is out of range for __test__.MyError (-128..127)', self.discovery.errors.errors[0] )
+
+	def test_cenum_member_declaration_negative_out_of_range_fails( self ) -> None:
+		code = '\n'.join([
+			'@enum( i8 )',
+			'class MyError:',
+			'	Bad = -129',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 0 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '-129 is out of range for __test__.MyError (-128..127)', self.discovery.errors.errors[0] )
 
 	def test_cenum_member_auto_increment_overflow_fails( self ) -> None:
 		# the '_' auto-increment sentinel can ALSO overflow the underlying
