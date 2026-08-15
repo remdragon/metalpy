@@ -1207,6 +1207,19 @@ def _emit_saturate_arith( dest: str, left: ir.Operand, right: ir.Operand, kind: 
 		'\t}',
 	]
 
+def _shl_expr( ctype: str, stem: str|None, l: str, r: str ) -> str:
+	''' `l << r` computed via an unsigned-cast round-trip when the dest stem is
+	signed - a plain signed `l << r` is undefined behavior in C whenever the
+	shifted-in bits would overflow the representable range (exactly the case
+	ShlCheck/ShlSaturate below need to detect), so the shift itself must happen
+	in the unsigned domain (well-defined: modulo wraparound) and get cast back
+	to the signed ctype only afterward. Mirrors ShlWrap's own approach just
+	below - the same trick, for the same reason. '''
+	if stem in _SIGNED_TO_UNSIGNED:
+		uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
+		return f'({ctype})(({uctype})({l}) << ({r}))'
+	return f'({l}) << ({r})'
+
 def _emit_shl( instr ) -> list[str]:
 	# no __builtin_shl_overflow exists - detect overflow by shifting the
 	# result back down and comparing to the original value
@@ -1216,17 +1229,15 @@ def _emit_shl( instr ) -> list[str]:
 		ctype = c_type( instr.dest.type )
 		stem = instr.dest.type.stem if isinstance( instr.dest.type, Scalar ) else None
 		dest = _emit_operand( instr.dest )
-		if stem in _SIGNED_TO_UNSIGNED:
-			uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
-			return [ f'\t{dest} = ({ctype})(({uctype})({l}) << ({r}));' ]
-		return [ f'\t{dest} = ({l}) << ({r});' ]
+		return [ f'\t{dest} = {_shl_expr( ctype, stem, l, r )};' ]
 	if isinstance( instr, ir.ShlCheck ):
 		ctype = c_type( dest_type )
+		stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
 		dest = _temp_name( instr.dest.id )
 		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
 		return [
 			'\t{',
-			f'\t\t{ctype} __tmp = ({l}) << ({r});',
+			f'\t\t{ctype} __tmp = {_shl_expr( ctype, stem, l, r )};',
 			f'\t\tbool __overflow = ( __tmp >> ({r}) ) != ({l});',
 			'\t\tif ( __overflow ) {',
 			f'\t\t\t{dest}.{tag_f} = 1;',
@@ -1243,7 +1254,7 @@ def _emit_shl( instr ) -> list[str]:
 	dest = _emit_operand( instr.dest )
 	return [
 		'\t{',
-		f'\t\t{ctype} __tmp = ({l}) << ({r});',
+		f'\t\t{ctype} __tmp = {_shl_expr( ctype, stem, l, r )};',
 		f'\t\tbool __overflow = ( __tmp >> ({r}) ) != ({l});',
 		f'\t\t{dest} = __overflow ? {max_c} : __tmp;',
 		'\t}',

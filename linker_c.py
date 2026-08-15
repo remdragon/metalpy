@@ -29,7 +29,7 @@ class CcTool:
 		self.name = name
 		self.path = path
 
-	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False ) -> subprocess.CompletedProcess[bytes]:
+	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False, debug: bool = True ) -> subprocess.CompletedProcess[bytes]:
 		''' compile a single .c file to a .o object file '''
 		if self.name == 'cl':
 			cmd = [ self.path, '/nologo', '/std:c11',
@@ -37,8 +37,36 @@ class CcTool:
 				'/W4', '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
+			if debug:
+				cmd += [ '/Zi', '/Od' ]
+				# /RTC1 (stack-frame + uninitialized-variable checks) needs the
+				# _RTC_* support routines that live in the CRT - the no_crt
+				# freestanding path already passes /NODEFAULTLIB at link time,
+				# which would leave those symbols unresolved
+				if not no_crt:
+					cmd += [ '/RTC1' ]
+			else:
+				cmd += [ '/O2', '/DNDEBUG' ]
 		else:
 			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
+			if debug:
+				# -fsanitize-trap=undefined compiles each UBSan check straight to
+				# a trap instruction instead of calling a runtime-library
+				# handler, so unlike ASan it has no CRT/allocator dependency and
+				# is safe even in the no_crt freestanding path.
+				# -fno-sanitize=function: emit_interface_vtable_instance()
+				# stores each vtable slot as a function pointer cast from the
+				# concrete override's own signature to the interface's base
+				# pointer type - the standard C vtable idiom, technically UB by
+				# the letter of the standard but load-bearing for every
+				# @interface/@virtual call in the language; there's no
+				# UB-clean alternative short of a trampoline per override.
+				# (the analogous ShlCheck/ShlSaturate false positive on
+				# shift-base was fixed at the source instead - see _shl_expr
+				# in emitter_c.py - so no exclusion is needed for that one)
+				cmd += [ '-g', '-O0', '-fsanitize=undefined', '-fsanitize-trap=undefined', '-fno-sanitize=function' ]
+			else:
+				cmd += [ '-O2', '-DNDEBUG' ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,
@@ -47,7 +75,7 @@ class CcTool:
 			text = True,
 		)
 
-	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False ) -> subprocess.CompletedProcess[bytes]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True ) -> subprocess.CompletedProcess[bytes]:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
@@ -55,6 +83,8 @@ class CcTool:
 			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
 			if no_crt:
 				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
+			if debug:
+				cmd += [ '/DEBUG' ]
 		else:
 			# a program using an f32/f64<->i128/u128 cast needs GCC/Clang's own
 			# runtime helpers (__fixdfti/__fixunsdfti/__floattidf/... - see

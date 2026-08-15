@@ -177,7 +177,7 @@ def main() -> None:
 		obj_path = Path( tmp ) / 'generated.o'
 		src_path.write_text( c_source, encoding = 'utf-8' )
 
-		compile_result = cc.compile( src_path, obj_path, verbose = args.v, no_crt = no_crt )
+		compile_result = cc.compile( src_path, obj_path, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ) )
 		if compile_result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
 			print( compile_result.stdout, file = sys.stderr )
@@ -201,7 +201,7 @@ def main() -> None:
 				else:
 					flag = f'-l{lib}'
 				ldflags = ldflags + f' {flag}' if ldflags else flag
-		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt )
+		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ) )
 		if link_result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
 			print( link_result.stdout, file = sys.stderr )
