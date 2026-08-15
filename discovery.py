@@ -726,7 +726,44 @@ class Discovery( ast.NodeVisitor ):
 		# actually needed (Lowering._find_module_for, once something
 		# schedules one of this union's synthesized member constructors,
 		# not just reads its tag/data fields directly).
-		ordered = sorted( operands, key = lambda t: t.qualname )
+		#
+		# operands are flattened here (any operand that is ITSELF an
+		# anonymous union - t.file is None, never a real user `@union class`
+		# - contributes its own leaves instead of itself) and deduped by
+		# qualname before sorting. Needed for e.g. Result[T,E].unwrap_or's
+		# own `T|None` return annotation: ordinary AST-level parsing already
+		# flattens a literal `T|None` into the two operands [T, NoneType]
+		# before either is resolved (this class's own visit_BinOp/
+		# _flatten_union above), but that flattening can't see through a
+		# TypeVar - monomorphize.py's substitute_type_params substitutes T
+		# with a concrete type AFTER that AST-level flattening already ran,
+		# so when T is itself bound to an Optional (e.g. i32|None), the
+		# substituted operand list becomes [i32|None, NoneType] - one
+		# already-a-union operand plus a second, redundant NoneType. Without
+		# flattening here, that nested union was kept as a single opaque
+		# member whose OWN qualname already contains '|', producing a
+		# doubled "NoneType" in the outer key (e.g.
+		# "intrinsics.NoneType|intrinsics.NoneType|intrinsics.i32") instead
+		# of collapsing to the correct, flat "intrinsics.NoneType|
+		# intrinsics.i32" - confirmed via a real compile of
+		# Result[i32|None,str].unwrap_or(), which failed with exactly that
+		# doubled-NoneType mismatch against the (correctly flat) Ok-payload
+		# type before this fix. This half of the fix landed independently
+		# on worktree-fix-optional-result-bugs (uncommitted there as of this
+		# writing) - ported here as a prerequisite: Result[i32|None,str]
+		# can't compile AT ALL without it, which this session's own actual
+		# target bug (an @overload/impl mangled-name collision, only
+		# reachable once the type compiles) sits behind.
+		flattened: list[Type] = []
+		for operand in operands:
+			if isinstance( operand, TaggedUnion ) and operand.file is None:
+				flattened.extend( attr.type for attr in operand.attributes )
+			else:
+				flattened.append( operand )
+		deduped: dict[str,Type] = {}
+		for operand in flattened:
+			deduped.setdefault( operand.qualname, operand )
+		ordered = sorted( deduped.values(), key = lambda t: t.qualname )
 		key = '|'.join( t.qualname for t in ordered )
 		if union := self._unions.get( key ):
 			return union

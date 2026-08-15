@@ -6543,8 +6543,38 @@ class FunctionLowering:
 				fn.parameters[position] if position is not None and position < len( fn.parameters ) else
 				next( ( p for p in fn.parameters if p.stem == kw_name ), None )
 			)
-			if param is None or param.type is None or getattr( param.type, 'stem', None ) not in compatible_stems:
+			if param is None or param.type is None:
 				continue
+			if getattr( param.type, 'stem', None ) not in compatible_stems:
+				# not DIRECTLY a compatible scalar - but a union-typed param
+				# (e.g. Result[T,E].unwrap_or's own `default: T|None`, once T
+				# itself substitutes to a scalar) can still unambiguously
+				# accept this literal, through exactly one of its own leaves.
+				# Without this, a union-typed candidate was always silently
+				# skipped here regardless of whether it fit, so a literal
+				# argument to an overloaded call never got the union-
+				# coercion _lower_expr's own expected_type machinery
+				# (_coerce_into_union) already does correctly for an ORDINARY
+				# (non-overloaded) call - the literal fell through to the
+				# "no candidate's parameter type is even plausible" path
+				# below, lowered with expected_type=None, and reached
+				# emitter_c as a bare scalar handed to a C parameter whose
+				# real type is the whole union struct: a genuine, confirmed
+				# "passing 'int' to parameter of incompatible type 'struct
+				# $__u$$...'" C compile error (Result[i32|None,str].
+				# unwrap_or(42), a fallible generator's own g.__next__().
+				# unwrap_or(default) - any T|None-shaped default param at
+				# all). len(...)==1 (not >=1) mirrors this method's own
+				# existing ambiguity discipline just below: a literal that
+				# plausibly fits more than one leaf of the SAME union is
+				# exactly as ambiguous as fitting more than one candidate
+				# scalar directly would be, and is left for the ordinary
+				# ambiguous-candidate error path rather than silently
+				# guessing one
+				leaves = param.type.leaves()
+				compatible_leaves = [ leaf for leaf in leaves if getattr( leaf, 'stem', None ) in compatible_stems ]
+				if len( compatible_leaves ) != 1:
+					continue
 			if not any( t is param.type for t in candidate_types ):
 				candidate_types.append( param.type )
 
@@ -8568,7 +8598,41 @@ class FunctionLowering:
 				# T` stub bound to it) - stub_covers_call re-checks that
 				# against this call's real argument types before narrowing
 				winning_stub = next( ( s for s in target.stubs if s.bound_to is fn ), None )
-				if winning_stub is not None and overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves ):
+				if (
+					winning_stub is not None and winning_stub.return_type is not fn.return_type
+					and overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves )
+				):
+					# only actually narrow (build a distinct replace()'d copy)
+					# when the stub's own return type is genuinely a DIFFERENT
+					# object from fn's own - when T is already itself Optional
+					# (e.g. Result[i32|None,E].unwrap_or), the stub's `T` and
+					# the impl's `T|None` substitute to the exact SAME interned
+					# union object (discovery.py's _get_or_create_union
+					# memoizes by flattened/deduped leaf set - see its own
+					# flattening fix), so there's nothing to narrow. Skipping
+					# the copy in that case matters for more than avoiding
+					# useless work: the copy returned here is handed straight
+					# to self.lowering._ensure_resolved()/schedule() below as
+					# if it were its own real, independent compile unit - fully
+					# separately LOWERED (type_resolver.py's
+					# resolve_function_body + Lowering.lower_function) under
+					# the narrowed return_type - but mangle_function_qualname
+					# (emitter_c.py) mangles purely off fn.qualname +
+					# fn.overload_group, with no notion of "this Function
+					# object is a distinct return-type view of another one" -
+					# so a call site combining a zero-argument call (schedules
+					# the original, wide-return-type fn) with an explicit-
+					# argument call to the same group previously always built
+					# and scheduled a SEPARATE replace()'d copy, even on the
+					# many calls where there was nothing left to actually
+					# narrow, producing two independently-lowered Functions
+					# sharing one mangled C symbol - a genuine duplicate-
+					# definition/argument-type-mismatch at the real C compile
+					# stage. Confirmed via a real compile of
+					# Result[i32|None,str]'s own .unwrap_or(42): before this
+					# fix, a fresh identical-looking copy was always built and
+					# independently scheduled regardless, producing exactly
+					# that redefinition.
 					return replace( fn, return_type = winning_stub.return_type )
 				return fn
 
