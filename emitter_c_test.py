@@ -6491,22 +6491,25 @@ class MoveParameterRealCompileTests( test_support.RealCompileMixin, CompilerTest
 	annotation left T unbound, so Err(SharedReference(x))'s own x never
 	resolved to a real bytearray anywhere that pattern was matched).
 
-	str.from_cstr's identical move[bytearray] overload is NOT exercised
-	here - move(...)'s own sugar not being recognized during OVERLOAD
-	resolution ("name 'move' is not defined") is now fixed (peeled before
-	candidate type-matching in _lower_overload_arg's own caller, then
-	validated+applied via the real ownership-transfer hook once
-	resolve_call picks a single concrete winner - see lowering.py's
-	_lower_call, the Overload branch; lowering_test.py's own
-	OverloadMoveResolutionTests verifies this directly via IR inspection).
-	A REAL compile-and-run test against str.from_cstr specifically is
-	blocked by a separate, general, pre-existing bug this investigation
-	also found: emitter_c.py mangles every candidate in an @overload group
-	to the SAME C symbol name, so a program needing real C bodies for more
-	than one candidate (str.from_cstr's own move[bytearray] overload
-	unconditionally falls back to calling its 2-arg sibling in one branch,
-	so both always need real bodies together) fails to compile at the C
-	level - tracked separately, not this fix's own scope. '''
+	str.from_cstr's identical move[bytearray] overload is exercised by the
+	'move_through_overload_resolution' case below - move(...)'s own sugar
+	not being recognized during OVERLOAD resolution ("name 'move' is not
+	defined") is fixed (peeled before candidate type-matching in
+	_lower_overload_arg's own caller, then validated+applied via the real
+	ownership-transfer hook once resolve_call picks a single concrete
+	winner - see lowering.py's _lower_call, the Overload branch;
+	lowering_test.py's own OverloadMoveResolutionTests verifies this
+	directly via IR inspection). Getting a REAL compile-and-run test
+	against str.from_cstr specifically also required fixing a separate,
+	general, pre-existing bug this investigation found: emitter_c.py used
+	to mangle every candidate in an @overload group to the SAME C symbol
+	name, so a program needing real C bodies for more than one candidate
+	(str.from_cstr's own move[bytearray] overload unconditionally falls
+	back to calling its 2-arg sibling in one branch, so both always need
+	real bodies together) failed to compile at the C level - see
+	OverloadRealCompileTests below for a minimal, move-unrelated repro of
+	that bug; fixed via mangle_function_qualname consulting each
+	Function's own overload_group/position within it. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -6540,6 +6543,68 @@ def main() -> i32:
 		return 1
 	cp: ConstPtr[u8] = bs.get_const_ptr()
 	if cp[0] != 104:
+		return 2
+	return 0
+''' ),
+			( 'move_through_overload_resolution', '''
+def main() -> i32:
+	b: bytearray = bytearray( 6 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	p[5] = 0
+	s: str = str.from_cstr( move( b )).unwrap( 'from_cstr failed' )
+	if s != "hello":
+		return 1
+	if s.byte_len() != 5:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class OverloadRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression test for the general emitter_c.py bug found alongside the
+	move(...)-through-overload-resolution fix above (see
+	MoveParameterRealCompileTests' own docstring): every candidate in an
+	@overload group used to mangle to the SAME C symbol name (mpy_types.
+	Overload's members all share one .qualname - "the same named function",
+	just different signatures), so a program that actually needs real C
+	bodies for more than one candidate in the same group failed to compile
+	at the C level ("conflicting types"/"too many arguments", depending on
+	whether the two happened to share an arity). This is a minimal,
+	move-unrelated repro: two @overload-decorated candidates distinguished
+	purely by arity, both with real bodies, both actually called. Fixed via
+	emitter_c.py's mangle_function_qualname consulting each Function's own
+	overload_group/position within it (mpy_types.Function.overload_group) -
+	a group with only one real implementation (the common case: signature-
+	only stubs routed to one real body) still mangles unsuffixed. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'two_overloads_both_called', '''
+@overload
+def combine( a: i32, b: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return a + b
+
+@overload
+def combine( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x * 10
+
+def main() -> i32:
+	if combine( 2, 3 ) != 5:
+		return 1
+	if combine( 7 ) != 70:
 		return 2
 	return 0
 ''' ),
