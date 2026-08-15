@@ -19,6 +19,7 @@ PLAN_HTTP_CLIENT.md) are not part of this file yet.
 
 import sys
 import compiler
+import base64
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -243,52 +244,13 @@ def percent_encode( s: str ) -> str:
 # base64 (encode only - v1 only needs it for auth= -> Basic auth header)
 # ---------------------------------------------------------------------------
 
-_B64_ALPHABET: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-_B64_PAD: u8 = 0x3D # '='
-
 def base64_encode( data: bytes ) -> str:
-	n: usize = data.__len__()
-	in_ptr: ConstPtr[u8] = data.get_const_ptr()
-	alphabet: ConstPtr[u8] = _B64_ALPHABET.get_const_ptr()
-
-	with compiler.panic_arithmetic( 'irrational byte length' ):
-		out_len: usize = ( ( n + 2 ) // 3 ) * 4
-		buf_size: usize = out_len + 1
-
-	out: bytearray = bytearray( buf_size )
-	out_ptr: Ptr[u8] = out.get_ptr()
-	i: usize = 0
-	o: usize = 0
-	b0: u8 = 0
-	b1: u8 = 0
-	b2: u8 = 0
-	with compiler.wrap_arithmetic:
-		while i + 3 <= n:
-			b0 = in_ptr[i]
-			b1 = in_ptr[i+1]
-			b2 = in_ptr[i+2]
-			out_ptr[o]   = alphabet[ usize( b0 >> 2 ) ]
-			out_ptr[o+1] = alphabet[ usize( (( b0 & 0x03 ) << 4 ) | ( b1 >> 4 )) ]
-			out_ptr[o+2] = alphabet[ usize( (( b1 & 0x0F ) << 2 ) | ( b2 >> 6 )) ]
-			out_ptr[o+3] = alphabet[ usize( b2 & 0x3F ) ]
-			i += 3
-			o += 4
-		remaining: usize = n - i
-		if remaining == 1:
-			b0 = in_ptr[i]
-			out_ptr[o]   = alphabet[ usize( b0 >> 2 ) ]
-			out_ptr[o+1] = alphabet[ usize(( b0 & 0x03 ) << 4 ) ]
-			out_ptr[o+2] = _B64_PAD
-			out_ptr[o+3] = _B64_PAD
-		elif remaining == 2:
-			b0 = in_ptr[i]
-			b1 = in_ptr[i+1]
-			out_ptr[o]   = alphabet[ usize( b0 >> 2 ) ]
-			out_ptr[o+1] = alphabet[ usize( (( b0 & 0x03 ) << 4 ) | ( b1 >> 4 )) ]
-			out_ptr[o+2] = alphabet[ usize(( b1 & 0x0F ) << 2 ) ]
-			out_ptr[o+3] = _B64_PAD
-
-	return str.from_cstr( move( out )).unwrap( 'base64_encode: invalid UTF-8 (unreachable - output is pure ASCII)' )
+	''' str-returning wrapper around lib/base64.py's own b64encode() (RFC
+	4648 base64/urlsafe/base16 encode+decode, added after this file's own
+	hand-rolled version - see PLAN_HTTP_CLIENT.md) - base64.b64encode()
+	itself returns bytes, matching Python's own base64 module, while an
+	HTTP header value needs a str. '''
+	return base64.b64encode( data ).decode().unwrap( 'base64_encode: invalid UTF-8 (unreachable - output is pure ASCII)' )
 
 # ---------------------------------------------------------------------------
 # chunked transfer-encoding decode
