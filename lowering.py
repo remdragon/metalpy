@@ -389,7 +389,13 @@ class Lowering:
 		cache_dir.mkdir( parents = True, exist_ok = True )
 		cache_file = cache_dir / key
 		if cache_file.is_file():
-			return int( cache_file.read_text().strip() )
+			# a torn/half-written entry parses as ValueError, not as a wrong
+			# answer - treat it as a miss and re-probe rather than crashing
+			# the whole compile (see linker_c.atomic_write_cache)
+			try:
+				return int( cache_file.read_text().strip() )
+			except ValueError:
+				pass
 
 		# no cached value — compile and run a tiny C program
 		import linker_c
@@ -436,7 +442,8 @@ class Lowering:
 					node,
 				)
 			value = int( run_result.stdout.strip() )
-		cache_file.write_text( str( value ), encoding = 'utf-8' )
+		import linker_c as _linker_c
+		_linker_c.atomic_write_cache( cache_file, str( value ))
 		return value
 
 	_UNICODE_DATA_URL = 'https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt'
@@ -469,7 +476,18 @@ class Lowering:
 		cache_dir.mkdir( parents = True, exist_ok = True )
 		cache_file = cache_dir / 'UnicodeData.txt'
 		if cache_file.is_file():
-			return cache_file.read_bytes()
+			# an empty file is a torn write, never a real (multi-MB) table -
+			# re-download instead of building casing tables from nothing.
+			# Deliberately NOT trying to detect a PARTIAL-but-non-empty file:
+			# there's no length/checksum to check against, and a content
+			# heuristic (say, "must end in a newline") would risk permanently
+			# re-downloading a valid table if upstream ever changed format.
+			# Writes are atomic now (see linker_c.atomic_write_cache), so a
+			# partial file can only be a leftover from an older build; delete
+			# %TEMP%/metalpy/case_folding to clear one.
+			cached = cache_file.read_bytes()
+			if cached:
+				return cached
 
 		import urllib.error
 		import urllib.request
@@ -483,7 +501,8 @@ class Lowering:
 				f'set METALPY_UNICODE_DATA_DIR to a local directory containing UnicodeData.txt to avoid the network entirely',
 				node,
 			)
-		cache_file.write_bytes( data )
+		import linker_c as _linker_c
+		_linker_c.atomic_write_cache( cache_file, data )
 		return data
 
 	def _build_unicode_simple_table( self, data: bytes, which: str, node: ast.AST ) -> bytes:
