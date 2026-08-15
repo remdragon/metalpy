@@ -11559,6 +11559,42 @@ def main() -> i32:
 			return 2
 	return 0
 ''' ),
+			# PLAN_GENERATORS.md A.4a follow-up - yield from nested inside an
+			# if (reached at most once per generator lifetime, unlike a
+			# while/for loop that could re-enter it - see
+			# test_yield_from_nested_inside_loop_is_rejected for why THAT stays
+			# rejected) forwards correctly now, not just at the top level.
+			( 'nested_yield_from_inside_if', '''
+def inner() -> Iterator[i32]:
+	yield 1
+	yield 2
+	yield 3
+
+def gen( flag: bool ) -> Iterator[i32]:
+	if flag:
+		yield from inner()
+	else:
+		yield 99
+
+def main() -> i32:
+	total: i32 = 0
+	n: i32 = 0
+	for x in gen( True ):
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	if n != 3 or total != 6:
+		return 1
+	total = 0
+	n = 0
+	for x in gen( False ):
+		with compiler.wrap_arithmetic:
+			total += x
+			n += 1
+	if n != 1 or total != 99:
+		return 2
+	return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -11598,25 +11634,33 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'T|None', str( self.discovery.errors.errors[0] ))
 
-	def test_nested_yield_from_is_rejected( self ) -> None:
-		# A.4a only desugars a DIRECT top-level `yield from` (mirroring
-		# _desugar_generator_for_loops' own top-level-only restriction) -
-		# one nested inside an if/while never gets turned into a for loop,
-		# so it's still reachable by _collect_generator_units' own
-		# existing (pre-A.4a) YieldFrom rejection, unchanged
+	def test_yield_from_nested_inside_loop_is_rejected( self ) -> None:
+		# A.4a follow-up - yield from nested inside an if/with (reached at
+		# most once per generator lifetime) is real, supported forwarding
+		# now (see test_programs_compile_and_run's own nested_yield_from_
+		# inside_if case) - but nested inside a while/for loop stays
+		# rejected: _new_for_obj_field's own "eager, once, at
+		# construction" design would silently reuse the SAME already-
+		# exhausted forwarded generator on every re-entry instead of
+		# reconstructing it, confirmed via a real repro before this
+		# rejection existed (only the outer loop's first pass ever
+		# forwarded anything)
 		self._run( '''
 def inner() -> Iterator[i32]:
 	yield 1
 
-def gen( flag: bool ) -> Iterator[i32]:
-	if flag:
+def gen( count: i32 ) -> Iterator[i32]:
+	j: i32 = 0
+	while j < count:
 		yield from inner()
+		with compiler.wrap_arithmetic:
+			j += 1
 
 def main() -> None:
-	g = gen( True )
+	g = gen( 3 )
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'yield from is not supported yet', str( self.discovery.errors.errors[0] ))
+		self.assertIn( 'yield from nested inside a while/for loop', str( self.discovery.errors.errors[0] ))
 
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-

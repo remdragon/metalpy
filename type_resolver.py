@@ -809,39 +809,101 @@ class TypeResolver:
 		ast.fix_missing_locations( init )
 		return [ init, while_node ]
 
-	def _desugar_generator_yield_from( self, fn: Function ) -> None:
-		''' PLAN_GENERATORS.md - `yield from inner()`, as a DIRECT top-level
-		statement of the generator body, desugars in place into the
-		exactly-equivalent `for __yield_from_N in inner(): yield
-		__yield_from_N` BEFORE _desugar_generator_for_loops (and
-		therefore _collect_generator_units) ever run - pure element-
-		forwarding sugar, needing no new unit machinery of its own: the
-		synthesized `for` loop is EXACTLY the shape _desugar_general_for/
-		_desugar_iterator_for already handle (an iterated expression with
-		its own `__next__() -> T|None`, which any generator or hand-
-		written iterator already has), so it gets that support, and every
-		correctness property it already has (nested RC release, etc. -
-		see for_loop_over_nested_generator_releases_both_levels), for
-		free. Deliberately forwarding-only: no `.send()`/`.throw()`
-		delegation to the sub-generator (`.throw()` doesn't exist in this
-		plan at all; `.send()` delegation through `yield from` is out of
-		scope here, real Python `yield from` semantics beyond plain
-		forwarding are not attempted).
+	def _reject_generator_for_or_yield_from_nested_inside_loop( self, fn: Function ) -> None:
+		''' A.4a follow-up's own scope cut, discovered via a real repro
+		(not just reasoning) before this validator was added: _new_for_
+		obj_field's own "eager, once, at construction" design (Phase 1)
+		evaluates a for-loop's (or yield-from's own desugared for-loop's)
+		iterated expression EXACTLY ONCE, for the whole lifetime of the
+		generator object - correct when the for-loop only ever runs once
+		overall (true at the top level, or nested inside a non-looping
+		construct like if/with, reached at most once per generator
+		lifetime), but WRONG once the for-loop is reachable through a
+		while/for loop that can re-enter it multiple times: the SAME
+		already-exhausted iterated object gets reused on every re-entry
+		instead of being freshly reconstructed, silently forwarding
+		nothing on the second and later outer iterations (confirmed via a
+		real repro: `while j < count: yield from inner(); j += 1` only
+		ever forwarded inner()'s own values during the outer loop's FIRST
+		pass). Rejected outright, with a clear message, rather than left
+		to either desugar pass (which would otherwise happily produce this
+		exact silently-wrong shape) - lifting this needs re-deriving
+		__for_obj_N's own eager-construction design to re-initialize per
+		LOOP ENTRY, not just once ever; out of scope here. Runs BEFORE
+		either desugar pass, against the ORIGINAL (undesugared) body, so
+		it catches both a direct `for ... : yield ...` and a `yield from`
+		uniformly, in one pass. '''
+		self._walk_for_yield_loop_nesting( fn, fn.node.body, in_loop = False )
 
-		Only a DIRECT top-level `yield from` is recognized here, mirroring
-		_desugar_generator_for_loops' own top-level-only restriction - a
-		`yield from` nested inside an if/while stays rejected exactly as
-		before (_collect_generator_units' own existing YieldFrom check,
-		which walks the WHOLE body, still catches any occurrence this
-		pass didn't turn into a `for` loop, i.e. every non-top-level one -
-		see PLAN_GENERATORS.md's own "A.4a follow-up" note for lifting
-		this later once nested yield is generally supported). '''
+	def _walk_for_yield_loop_nesting( self, fn: Function, stmts: list[ast.stmt], in_loop: bool ) -> None:
+		for stmt in stmts:
+			if in_loop:
+				if isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.YieldFrom ):
+					self.discovery.fail(
+						f'{fn.qualname}: yield from nested inside a while/for loop is not supported yet '
+						f'(the forwarded generator would need re-constructing on every re-entry, not just once) '
+						f'- see PLAN_GENERATORS.md: {ast.unparse(stmt)}',
+						stmt,
+					)
+				if isinstance( stmt, ast.For ) and any(
+					isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( stmt.body )
+				):
+					self.discovery.fail(
+						f'{fn.qualname}: a for loop containing yield, nested inside a while/for loop, is not '
+						f'supported yet (its own iterated expression would need re-evaluating on every '
+						f're-entry, not just once) - see PLAN_GENERATORS.md: {ast.unparse(stmt)}',
+						stmt,
+					)
+			if isinstance( stmt, ( ast.While, ast.For )):
+				self._walk_for_yield_loop_nesting( fn, stmt.body, in_loop = True )
+				self._walk_for_yield_loop_nesting( fn, stmt.orelse, in_loop = True )
+			elif isinstance( stmt, ast.If ):
+				self._walk_for_yield_loop_nesting( fn, stmt.body, in_loop = in_loop )
+				self._walk_for_yield_loop_nesting( fn, stmt.orelse, in_loop = in_loop )
+			elif isinstance( stmt, ast.With ):
+				self._walk_for_yield_loop_nesting( fn, stmt.body, in_loop = in_loop )
+
+	def _desugar_generator_yield_from( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md / A.4a follow-up - `yield from inner()`, at
+		ANY nesting depth in the generator body (any bare `ast.Expr(
+		ast.YieldFrom(...))` statement, top-level or nested inside if/
+		while/for/with), desugars in place into the exactly-equivalent
+		`for __yield_from_N in inner(): yield __yield_from_N` BEFORE
+		_desugar_generator_for_loops (and therefore real lowering) ever
+		runs - pure element-forwarding sugar, needing no new unit machinery
+		of its own: the synthesized `for` loop is EXACTLY the shape
+		_desugar_general_for/_desugar_iterator_for already handle (an
+		iterated expression with its own `__next__() -> T|None`, which any
+		generator or hand-written iterator already has), so it gets that
+		support, and every correctness property it already has (nested RC
+		release, etc. - see for_loop_over_nested_generator_releases_both_
+		levels), for free. Deliberately forwarding-only: no `.send()`/
+		`.throw()` delegation to the sub-generator (`.throw()` doesn't
+		exist in this plan at all; `.send()` delegation through `yield
+		from` is out of scope here, real Python `yield from` semantics
+		beyond plain forwarding are not attempted).
+
+		Originally top-level-only (Phase F's own dispatch mechanism didn't
+		exist yet to make a NESTED synthesized for-loop's own yield
+		resumable) - now recurses into nested if/while/for/with bodies the
+		same way _recurse_liveness_wrap already does for the live-flag
+		pass, since _desugar_generator_for_loops (this method's own
+        immediate successor, run right after it) got the identical
+		generalization for the same reason - see that method's own
+		docstring. A leftover ast.YieldFrom after this runs (nested inside
+		something this walk doesn't descend into - a lambda/comprehension,
+		neither ever legal inside a generator body anyway) is still caught
+		by _validate_generator_yield_positions's own unconditional
+		YieldFrom rejection, unchanged. '''
+		counter = [ 0 ]
+		fn.node.body = self._desugar_yield_from_in_stmts( fn.node.body, counter )
+
+	def _desugar_yield_from_in_stmts( self, stmts: list[ast.stmt], counter: list[int] ) -> list[ast.stmt]:
 		new_body: list[ast.stmt] = []
-		counter = 0
-		for stmt in fn.node.body:
+		for stmt in stmts:
 			if isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.YieldFrom ):
-				temp_name = f'__yield_from_{counter}'
-				counter += 1
+				temp_name = f'__yield_from_{counter[0]}'
+				counter[0] += 1
 				target = ast.Name( id = temp_name, ctx = ast.Store() )
 				ast.copy_location( target, stmt )
 				yielded = ast.Name( id = temp_name, ctx = ast.Load() )
@@ -854,8 +916,26 @@ class TypeResolver:
 				ast.fix_missing_locations( for_node )
 				new_body.append( for_node )
 			else:
+				self._recurse_desugar_yield_from( stmt, counter )
 				new_body.append( stmt )
-		fn.node.body = new_body
+		return new_body
+
+	def _recurse_desugar_yield_from( self, stmt: ast.stmt, counter: list[int] ) -> None:
+		''' in place: descends into every nested statement-list inside
+		`stmt` (If.body/.orelse, While.body/.orelse, For.body/.orelse,
+		With.body), applying _desugar_yield_from_in_stmts to each - same
+		shape as _recurse_liveness_wrap, different transform. '''
+		if isinstance( stmt, ( ast.If, ast.While, ast.For )):
+			attrs = ( 'body', 'orelse' )
+		elif isinstance( stmt, ast.With ):
+			attrs = ( 'body', )
+		else:
+			return
+		for attr in attrs:
+			nested = getattr( stmt, attr, None )
+			if not nested:
+				continue
+			setattr( stmt, attr, self._desugar_yield_from_in_stmts( nested, counter ))
 
 	def _desugar_generator_for_loops( self, fn: Function ) -> dict[str,tuple[Type,ast.expr]]:
 		''' PLAN_GENERATORS.md Phase 4 (range()) + Phase 1 (indexable/
@@ -883,10 +963,22 @@ class TypeResolver:
 		the constructor, rather than lazily on first __next__() call.
 
 		A for-loop with no yield in it at all is left completely alone
-		(ordinary preamble/body content, not this pass's concern). '''
+		(ordinary preamble/body content, not this pass's concern).
+
+		A.4a follow-up - originally top-level-only; now recurses into
+		nested if/while/for/with bodies (same shape as _recurse_liveness_
+		wrap/_recurse_desugar_yield_from) so a `yield from` nested inside
+		an if/while - already turned into a nested for-loop by
+		_desugar_generator_yield_from, which runs right before this - gets
+		picked up and desugared into a while loop at whatever depth it now
+		sits, not just at the top level. '''
 		extra_fields: dict[str,tuple[Type,ast.expr]] = {}
+		fn.node.body = self._desugar_for_loops_in_stmts( fn, fn.node.body, extra_fields )
+		return extra_fields
+
+	def _desugar_for_loops_in_stmts( self, fn: Function, stmts: list[ast.stmt], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> list[ast.stmt]:
 		new_body: list[ast.stmt] = []
-		for stmt in fn.node.body:
+		for stmt in stmts:
 			if isinstance( stmt, ast.For ) and any(
 				isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( stmt.body )
 			):
@@ -895,9 +987,31 @@ class TypeResolver:
 				else:
 					new_body.extend( self._desugar_general_for( fn, stmt, extra_fields ))
 			else:
+				self._recurse_desugar_for_loops( fn, stmt, extra_fields )
 				new_body.append( stmt )
-		fn.node.body = new_body
-		return extra_fields
+		return new_body
+
+	def _recurse_desugar_for_loops( self, fn: Function, stmt: ast.stmt, extra_fields: dict[str,tuple[Type,ast.expr]] ) -> None:
+		''' in place: descends into every nested statement-list inside
+		`stmt` (If.body/.orelse, While.body/.orelse, For.body/.orelse,
+		With.body), applying _desugar_for_loops_in_stmts to each - same
+		shape as _recurse_liveness_wrap/_recurse_desugar_yield_from,
+		different transform. Only reached for a stmt that ISN'T itself a
+		directly-matched yield-containing for-loop (see this method's own
+		caller) - a for-loop with no yield ANYWHERE inside it (including
+		via a deeper nested for-loop) still needs this to reach whatever
+		yield-bearing construct might be nested inside ITS OWN body. '''
+		if isinstance( stmt, ( ast.If, ast.While, ast.For )):
+			attrs = ( 'body', 'orelse' )
+		elif isinstance( stmt, ast.With ):
+			attrs = ( 'body', )
+		else:
+			return
+		for attr in attrs:
+			nested = getattr( stmt, attr, None )
+			if not nested:
+				continue
+			setattr( stmt, attr, self._desugar_for_loops_in_stmts( fn, nested, extra_fields ))
 
 	def _desugar_general_for( self, fn: Function, node: ast.For, extra_fields: dict[str,tuple[Type,ast.expr]] ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 1 - `for x in <expr>: BODY` where
@@ -2175,6 +2289,7 @@ class TypeResolver:
 		# add there, same as an ordinary function's own body resolution
 		# already tolerates this identical wrapping unconditionally).
 		with self.discovery.scope_context( fn ):
+			self._reject_generator_for_or_yield_from_nested_inside_loop( fn )
 			self._desugar_generator_yield_from( fn )
 			extra_fields = self._desugar_generator_for_loops( fn )
 			self._validate_generator_yield_positions( fn )
