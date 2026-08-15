@@ -110,6 +110,20 @@ def memcmp( a: ConstPtr[u8], b: ConstPtr[u8], count: usize ) -> i32:
 	from crt import memcmp as _crt_memcmp
 	return _crt_memcmp( a, b, count )
 
+@compiler.target( os = 'windows' )
+def exit( code: u32 ) -> NoReturn:
+	from windows.kernel32 import ExitProcess
+	ExitProcess( code )
+
+@compiler.target( os = not 'windows' )
+def exit( code: u32 ) -> NoReturn:
+	from crt import _exit
+	# POSIX _exit(int status) takes a signed int - code is u32 (matches
+	# Windows' own u32 exit-code convention, see the sibling branch above),
+	# an explicit narrowing/sign-changing cast either way
+	with compiler.wrap_arithmetic:
+		_exit( i32( code ) )
+
 def panic( message: str ) -> NoReturn:
 	# TODO: route through a real `stderr` stream once IO interfaces exist (see
 	# TODO.txt); for now always use the OS low-level unbuffered write (no
@@ -123,7 +137,7 @@ def panic( message: str ) -> NoReturn:
 	# (-Wincompatible-pointer-types, promoted to an error by default on
 	# recent GCC).
 	_write_stderr_cstr( message.get_cstr(), message.byte_len() )
-	_exit_process( 1 )
+	exit( 1 )
 
 def _assert( cond: bool, msg: str ) -> None:
 	# TODO FIXME: change type_discovery.py to emit this logic directly
@@ -143,20 +157,6 @@ def _alloc( size: usize ) -> Ptr[u8]:
 	from crt import malloc
 	ptr = malloc( size )
 	return ptr
-
-@compiler.target( os = 'windows' )
-def _exit_process( code: u32 ) -> None:
-	from windows.ntdll import RtlExitUserProcess
-	RtlExitUserProcess( code )
-
-@compiler.target( os = not 'windows' )
-def _exit_process( code: u32 ) -> None:
-	from crt import _exit
-	# POSIX _exit(int status) takes a signed int - code is u32 (matches
-	# Windows' own u32 exit-code convention, see the sibling branch above),
-	# an explicit narrowing/sign-changing cast either way
-	with compiler.wrap_arithmetic:
-		_exit( i32( code ) )
 
 @compiler.target( os = 'windows' )
 def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:

@@ -2489,6 +2489,54 @@ class EmitGlobalRCClassRealCompileTests( test_support.RealCompileMixin, RCClassT
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class NoCrtExitCodeRealCompileTests( unittest.TestCase ):
+	# test_support.RealCompileMixin's _build_and_run doesn't thread no_crt
+	# through compile()/link() at all (it always compiles/links as if the
+	# CRT were linked) - float_test.py/wide_int_test.py/return_inference_
+	# test.py all hit the same gap for their own no-CRT real-compile needs
+	# and duplicate this same compile+link+run shape locally rather than
+	# use the mixin; mirrored here rather than inventing a third variant
+	def test_no_crt_windows_exit_code_round_trips_through_sys_exit( self ) -> None:
+		# proves the __result plumbing survived the ExitProcess -> sys.exit()
+		# rewrite: a distinctive, non-{0,1} exit code, so this can't pass by
+		# accident the way a bare 0/1 check might (0 = success fallback, 1 =
+		# an uncaught panic/error - 42 is neither)
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+def main() -> i32:
+	return 42
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, 42, f'exe exited {result.returncode}, expected 42 (stderr: {result.stderr})' )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
 	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:
 		# PLAN_GLOBAL_INIT.md flags TRUE cross-global dependency ordering
@@ -2666,6 +2714,21 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		end = src.index( '\n}', start )
 		return src[ start : end ]
 
+	def _compiled_source_no_crt( self, active_target: dict[str,object] ) -> str:
+		# separate from _compiled_source above (which always passes emit_c()'s
+		# own no_crt=False default) - mainCRTStartup is only emitted when
+		# no_crt=True is passed to emit_c(), so this threads the compiler's
+		# own real no_crt determination through, mirroring mpy.py's own
+		# 'c' not in compiler.extern_libs computation
+		discovery = Discovery( import_builtins = True, active_target = active_target )
+		compiler = Compiler( discovery )
+		compiler.import_code( self._FIXTURE, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		return emitter_c.emit_c( compiler, no_crt = True )
+
 	def test_exactly_one_metalpy_init_definition( self ) -> None:
 		# the two competing #ifdef'd definitions this plan replaced
 		# (emitter_c.py's old PROLOGUE) are gone - never more than one
@@ -2686,6 +2749,19 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		self.assertIn( '__metalpy_init_windows$_console$_console_init();', body )
 		self.assertIn( 'SetConsoleOutputCP(', src )
 		self.assertNotIn( '#ifdef _WIN32', body )
+
+	def test_windows_no_crt_exit_is_an_ordinary_sys_exit_call( self ) -> None:
+		# ExitProcess is no longer hand-declared/hardcoded raw C text inside
+		# mainCRTStartup itself - it's sys.py's own public exit() (forced
+		# reachable whenever no_crt by Compiler.force_reachable), called here
+		# by its own mangled C symbol name, same shape as any other call
+		src = self._compiled_source_no_crt( self._WINDOWS_TARGET )
+		start = src.index( 'void mainCRTStartup( void ) {' )
+		end = src.index( '\n}', start )
+		body = src[ start : end ]
+		self.assertIn( 'sys$exit( (uint32_t)__result );', body )
+		self.assertIn( 'ExitProcess(', src ) # real @extern prototype/call, somewhere
+		self.assertNotIn( 'void __stdcall ExitProcess( unsigned int );', src )
 
 	def test_main_prepends_metalpy_init_call_on_every_target( self ) -> None:
 		# not just Windows - global initializers must run everywhere now,

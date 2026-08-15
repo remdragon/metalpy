@@ -45,6 +45,12 @@ def GetDynamicTimeZoneInformation(
 ) -> u32:
 	...
 
+@extern( 'kernel32', 'ExitProcess' )
+def ExitProcess(
+	uExitCode: u32,
+) -> None:
+	...
+
 @extern( 'kernel32', 'GetLastError' )
 def GetLastError() -> u32:
 	...

@@ -10,12 +10,17 @@ from mpy_types import Module, Variable, RCClass, Specialization
 
 class CompilerTestCase( unittest.TestCase ):
 	# compiler.run() force-enqueues windows/_console.py's own console-codepage
-	# global on every Windows target (see compiler.py's own comment) - real
-	# but incidental to what these tests are actually checking, and absent
-	# entirely on non-Windows targets, so every helper below that turns
-	# compiler.functions/.extern_libs into a comparable value filters it back
-	# out first, keeping assertions host-OS-independent
-	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+	# global on every Windows target, and sys.exit() whenever no_crt (see
+	# Compiler.force_reachable's own comment) - real but incidental to what
+	# these tests are actually checking, and absent entirely on non-Windows
+	# targets (or on CRT-linked Windows targets, for sys.exit specifically),
+	# so every helper below that turns compiler.functions/.extern_libs into a
+	# comparable value filters them back out first, keeping assertions
+	# host-OS-independent
+	_CONSOLE_INIT_QUALNAMES = frozenset({
+		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
+		'sys.exit', 'windows.kernel32.ExitProcess',
+	})
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = False )
@@ -32,6 +37,7 @@ class CompilerTestCase( unittest.TestCase ):
 		libs = { lib: set( syms ) for lib, syms in self.compiler.extern_libs.items() }
 		if 'kernel32' in libs:
 			libs['kernel32'].discard( 'SetConsoleOutputCP' )
+			libs['kernel32'].discard( 'ExitProcess' )
 			if not libs['kernel32']:
 				del libs['kernel32']
 		return libs

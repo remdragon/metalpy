@@ -386,8 +386,8 @@ static inline bool __metalpy_isinf_f64( double x ) {
 // "%.3f" of 3.14159 -> "3.142". GetModuleHandleA/GetProcAddress are
 // kernel32 exports (emit_c()'s own extern_libs bookkeeping tags this
 // 'kernel32', which is either already linked for any real program, or
-// added the same way float_test.py already adds 'kernel32' for the
-// no-crt entry point's own ExitProcess call). NOTE: legacy _snprintf
+// already tracked for real via windows._console's/sys.exit's own @extern
+// bindings - see compiler.py's Compiler.force_reachable). NOTE: legacy _snprintf
 // (unlike C99 snprintf) returns -1 on truncation instead of the would-
 // have-been-written length - callers must size buf generously enough
 // that truncation never actually happens (a fixed-precision f64 can need
@@ -3486,15 +3486,20 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 
 	# custom entry point when CRT is not linked - the linker expects
 	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls
-	# __metalpy_init() then main() and exits cleanly via the process itself
+	# __metalpy_init() then main() and exits cleanly via the process itself.
+	# Terminates via sys.exit()'s own mangled C symbol (mangle_qualname
+	# doesn't need a Function object - 'sys.exit' is a known, fixed qualname,
+	# same as _global_init_fn_name's approach) rather than a hardcoded raw
+	# ExitProcess call - compiler.py's Compiler.run() force-enqueues sys.exit
+	# whenever no_crt, so this always resolves to a real, lowered function
+	# with its own pass-1 prototype already emitted above.
 	if no_crt:
 		parts.append(
 			'#ifdef _WIN32\n'
-			'void __stdcall ExitProcess( unsigned int );\n'
 			'void mainCRTStartup( void ) {\n'
 			'\t__metalpy_init();\n'
 			'\tint __result = main();\n'
-			'\tExitProcess( (unsigned int)__result );\n'
+			f'\t{mangle_qualname( "sys.exit" )}( (uint32_t)__result );\n'
 			'}\n'
 			'#endif'
 		)
