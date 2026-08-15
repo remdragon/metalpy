@@ -237,16 +237,17 @@ trailing call to a `-> NoReturn` function (`sys.panic(...)`). Fixed via a new
   `match_bound_name_receiver_call_does_not_crash_the_compiler`
   (emitter_c_test.py) - each independently confirmed to fail without its
   fix and pass with it.
-- [lowering.py:683](lowering.py:683) (`_body_may_fall_off_the_end`) - `return
-  not body or not isinstance(body[-1], ast.Return)`, used to decide whether to
-  synthesize an implicit `return None` at a function's close. Lower priority:
-  per its own comment (672-682), a false positive here is explicitly argued to
-  be harmless (produces dead-but-unreachable code after a real diverging call,
-  not a compile break). Its comment ("same 'future work' scope cut as
-  `_stmt_If`'s own true_terminates/false_terminates detection") is now
-  slightly stale, since `_stmt_If` no longer has that exact scope cut - worth a
-  comment update even if the behavior itself is judged low-risk enough to leave
-  alone.
+- **Fixed (comment only):** `lowering.py`'s `_body_may_fall_off_the_end` -
+  `return not body or not isinstance(body[-1], ast.Return)`, used to decide
+  whether to synthesize an implicit `return None` at a function's close. Its
+  behavior is unchanged - a false positive here (a trailing `sys.panic()`,
+  an exhaustive-if, a `while True:` with no break, ...) stays explicitly
+  harmless (produces dead-but-unreachable code, never a compile break, per
+  its own comment), so intentionally NOT wired into `_stmt_diverges` the way
+  `_stmt_If`/`visit_Match` were. Its comment claiming "same 'future work'
+  scope cut as `_stmt_If`'s own true_terminates/false_terminates detection"
+  was stale (that method no longer shares this scope cut) - updated to
+  explain the current, deliberate divergence instead.
 
 **Checked, ruled out - no comparable gap:** `cfg.py`'s `merge_loop_exits`,
 `type_resolver.py`'s `visit_While`/`visit_For`, and `lowering.py`'s
@@ -295,16 +296,14 @@ which needs no hint).
    duplicated logic); a new, unrelated, pre-existing crash bug
    (`_expr_Constant`/`_emit_const`, kind-mismatched CEnum-return literals)
    was found incidentally and flagged, not fixed.
-4. **`lowering.py:683` (Shape 3, `_body_may_fall_off_the_end`)** - low risk, low
-   priority; at minimum update its stale comment. Next up.
-5. **New, incidentally-found candidate:** `lowering.py`'s `_expr_Constant`
-   (feeding `emitter_c.py`'s `_emit_const`) crashes with an uncaught Python
-   `NotImplementedError` instead of a clean `CompileError` for a
-   kind-mismatched literal (e.g. a string) returned/assigned where a CEnum
-   is expected - confirmed via a real repro, pre-existing on `master`,
-   unrelated to any fix in this document. Not investigated further (found
-   while verifying the `_stmt_Return` fix, out of scope for that task) -
-   worth its own root-cause pass.
+4. ~~`lowering.py:683` (Shape 3, `_body_may_fall_off_the_end`)~~ - **fixed
+   (comment only)**, see above. Behavior deliberately unchanged.
+5. **`lowering.py`'s `_expr_Constant`/`_emit_const` crash** - incidentally
+   found while verifying the `_stmt_Return` fix, not yet investigated.
+   Crashes with an uncaught Python `NotImplementedError` instead of a clean
+   `CompileError` for a kind-mismatched literal (e.g. a string) returned/
+   assigned where a CEnum is expected - confirmed via a real repro,
+   pre-existing on `master`. Next up - worth its own root-cause pass.
 6. Everything under "awareness only" - do not fix without first confirming with
    the user that the documented deliberate-design reasoning no longer holds.
    Note: `overload_resolution.py`'s `_leaf_is_accepted`/`_contains` (its own
