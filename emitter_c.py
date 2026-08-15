@@ -9,7 +9,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function, Overload,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
@@ -610,6 +610,24 @@ def mangle_type( t: Type ) -> str:
 		return '$' + '$$'.join( parts ) + '$data'
 	return mangle_qualname( t.qualname )
 
+def _overload_symbol_index( fn: Function, group: Overload ) -> int:
+	''' fn's position among the OTHER group.implementations that also need a
+	real C body (used to build a disambiguating symbol suffix - see
+	mangle_function_qualname). Keyed by (file, line), not object identity or
+	`list.index()`: lowering.py's own _resolve_original (the generic-
+	specialization/winning-stub path) can hand back a dataclasses.replace()-
+	derived COPY of the winning implementation (same file/line/qualname,
+	different return_type/object identity) as the actual Call target, so a
+	plain identity scan would miss it - and list.index() would fall back to
+	Function's auto-generated structural __eq__, which is exactly what
+	mpy_types.py's _leaf_is_accepted docstring already warns is wrong/
+	expensive for these dataclasses. (file, line) uniquely picks out the
+	specific `def` among siblings sharing one qualname. '''
+	for i, candidate in enumerate( group.implementations ):
+		if candidate.file == fn.file and candidate.line == fn.line:
+			return i
+	raise AssertionError( f'{fn.qualname}: not found in its own overload_group.implementations by (file, line)' )
+
 def mangle_function_qualname( fn: Function ) -> str:
 	''' union-aware entry point for a Function's own symbol name - call
 	this (not mangle_qualname directly) for any real function/method
@@ -624,10 +642,24 @@ def mangle_function_qualname( fn: Function ) -> str:
 	for the payload struct. A REAL @union class's own methods (fn.cls.file
 	is never None there) mangle exactly as before - this only branches for
 	the specific shape nothing scheduled before Lowering._coerce_into_union
-	started actually calling these constructors. '''
+	started actually calling these constructors.
+
+	Every member of an @overload group shares its group's own .qualname
+	(mpy_types.Overload's docstring: "stands in for a Function when
+	multiple defs share a name") - a group with only one real implementation
+	(the overwhelmingly common case: signature-only stubs routed to one
+	real body) still mangles exactly as before, unsuffixed. Only when more
+	than one member of the SAME group actually needs its own real C body
+	(distinct implementations for distinct signatures, not just distinct
+	stubs) does this append a $$overload<N> suffix, keyed by fn's own
+	position among those bodies - see _overload_symbol_index. '''
 	if isinstance( fn.cls, TaggedUnion ) and fn.cls.file is None:
 		return f'{mangle_type( fn.cls )}${mangle_qualname( fn.stem )}'
-	return mangle_qualname( fn.qualname )
+	base = mangle_qualname( fn.qualname )
+	group = fn.overload_group
+	if group is not None and len( group.implementations ) > 1:
+		return f'{base}$$overload{_overload_symbol_index( fn, group )}'
+	return base
 
 def _c_label( name: str ) -> str:
 	# label names (lowering.py's own generated 'else'/'end'/epilogue labels)

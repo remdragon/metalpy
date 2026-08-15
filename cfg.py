@@ -173,6 +173,7 @@ class CFGState:
 		self._new_label = new_label
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
+		self._any_shared_label_used: bool = False # see used_shared_epilogue_label()'s own docstring
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
@@ -1020,10 +1021,62 @@ class CFGState:
 				continue
 			if confinement_floor is not None and not entry.is_flag_guarded and i >= confinement_floor:
 				return None
+			# used_shared_epilogue_label()'s flag is scoped to THIS function's
+			# own real closing-brace ladder specifically - only set when
+			# inline_scope is None (this entry belongs to the function
+			# itself, not to some still-open splice's own segment of the
+			# stack: had it been the latter, the `i < boundary_depth` branch
+			# above would already have returned first). A splice-local
+			# entry's own label is consumed by build_inline_scope_ladder()
+			# instead, fully popped off the stack by the time this function's
+			# own closing brace is ever reached - marking the flag for it
+			# here would wrongly make used_shared_epilogue_label() report
+			# true for the OUTER function even though nothing of ITS OWN is
+			# actually pending, forcing a spurious extra Return/FuncEnd
+			# (confirmed via a real regression: an @inline splice's own
+			# internal early return/.or_return() must never manufacture a
+			# second real ir.Return in the CALLER).
+			if inline_scope is None:
+				self._any_shared_label_used = True
 			return entry.name
 		if inline_scope is not None:
 			return inline_scope.label
 		return None
+
+	def used_shared_epilogue_label( self ) -> bool:
+		''' whether some ALREADY-LOWERED return/OrJump actually committed a
+		jump into one of this function's own shared epilogue labels (i.e.
+		current_epilogue_label() returned non-None at least once so far) -
+		DELIBERATELY not the same question current_epilogue_label() answers
+		for a hypothetical NEW return right here (which correctly skips a
+		cancelled entry, since a fresh return needs no unwind through
+		something already consumed).
+
+		Needed because an entry a return jumped into WHILE STILL LIVE can
+		since have been cancelled (move()/compiler.decref(x)/del - see
+		move()'s own comment) by the time lowering reaches the function's
+		own closing brace: current_epilogue_label() then correctly reports
+		"nothing NEW needs to unwind here" (None), but that EARLIER goto
+		still needs its label actually built by build_epilogue_ladder()
+		(which emits one per entry regardless of cancelled, per its own
+		docstring), or it's left dangling. Tracking "was a real label ever
+		handed out" (rather than just "is the stack non-empty") avoids
+		over-triggering for a case that looks superficially similar but
+		isn't: a nonfallible __init__ whose only entries are attributes
+		complete_construction() cancels on its own single, implicit,
+		success-only return path - current_epilogue_label() never once
+		returns non-None there (complete_construction() always cancels
+		before that return's own current_epilogue_label() call, per its own
+		docstring), so no dead, never-jumped-to Label is emitted for it.
+
+		Confirmed via a real repro: `out = bytearray(n); if cond: return
+		Result.Err(...); return Result.Ok(bytes.from_bytearray(move(out)))` -
+		the earlier `return` DOES call current_epilogue_label() while out's
+		entry is still live (setting this flag), then move() cancels that
+		same entry - without this check, the goto that earlier return
+		already committed to would go undeclared - "use of undeclared
+		label" at the C level, a real, general, silent miscompile. '''
+		return self._any_shared_label_used
 
 	def build_epilogue_ladder(
 		self, get_is_err_check: 'Callable[[],tuple[list[ir.Instruction],ir.Operand]] | None' = None,
