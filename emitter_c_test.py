@@ -11088,6 +11088,103 @@ def main() -> i32:
 			return 2
 	return 0
 ''' ),
+			# --- yield from (A.4a) - pure element-forwarding sugar,
+			# desugared into an exactly-equivalent for loop before unit-
+			# collection ever runs, so it rides on the already-proven
+			# for-loop-over-generator machinery entirely
+			( 'yield_from_top_level_forwards_all_values', '''
+def inner() -> Iterator[i32]:
+	yield 1
+	yield 2
+	yield 3
+
+def outer() -> Iterator[i32]:
+	yield from inner()
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		total: i32 = 0
+		n: usize = 0
+		for x in outer():
+			total += x
+			n += 1
+	if n != 3:
+		return 1
+	if total != 6: # 1+2+3
+		return 2
+	return 0
+''' ),
+			# --- .close() (A.4b) - rides entirely on the existing bare-
+			# return/defer-replay machinery, no new RC design
+			( 'close_on_partially_consumed_generator_runs_armed_defer_not_errdefer', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	with defer:
+		compiler.incref( b )
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		g = gen( b, 5 )
+		if compiler.refcount( b ) != 2: # caller + captured param
+			return 1
+		a = g.__next__() # consume one of five
+		if a is None:
+			return 2
+		if compiler.refcount( b ) != 2: # defer not fired yet
+			return 3
+		g.close() # early end - armed defer replays exactly once
+		if compiler.refcount( b ) != 3:
+			return 4
+		d = g.__next__() # generator is done - None forever, no re-fire
+		if d is not None:
+			return 5
+		if compiler.refcount( b ) != 3:
+			return 6
+		g.close() # idempotent - must not fire again
+		if compiler.refcount( b ) != 3:
+			return 7
+		return 0
+''' ),
+			( 'close_does_not_free_object_still_referenced', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, count: usize ) -> Iterator[usize]:
+	i: usize = 0
+	while i < count:
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		g = gen( b, 5 )
+		if compiler.refcount( b ) != 2: # captured param
+			return 2
+		a = g.__next__()
+		if a is None:
+			return 3
+		g.close()
+		if compiler.refcount( b ) != 2: # close() itself doesn't free the captured param
+			return 4
+		return 0
+		# g goes out of scope here - THIS is where the real teardown happens
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -11143,6 +11240,26 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
+
+	def test_nested_yield_from_is_rejected( self ) -> None:
+		# A.4a only desugars a DIRECT top-level `yield from` (mirroring
+		# _desugar_generator_for_loops' own top-level-only restriction) -
+		# one nested inside an if/while never gets turned into a for loop,
+		# so it's still reachable by _collect_generator_units' own
+		# existing (pre-A.4a) YieldFrom rejection, unchanged
+		self._run( '''
+def inner() -> Iterator[i32]:
+	yield 1
+
+def gen( flag: bool ) -> Iterator[i32]:
+	if flag:
+		yield from inner()
+
+def main() -> None:
+	g = gen( True )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'yield from is not supported yet', str( self.discovery.errors.errors[0] ))
 
 	def test_while_loop_with_two_yields_is_rejected( self ) -> None:
 		self._run( '''

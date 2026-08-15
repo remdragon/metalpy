@@ -848,6 +848,54 @@ class TypeResolver:
 		ast.fix_missing_locations( init )
 		return [ init, while_node ]
 
+	def _desugar_generator_yield_from( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md - `yield from inner()`, as a DIRECT top-level
+		statement of the generator body, desugars in place into the
+		exactly-equivalent `for __yield_from_N in inner(): yield
+		__yield_from_N` BEFORE _desugar_generator_for_loops (and
+		therefore _collect_generator_units) ever run - pure element-
+		forwarding sugar, needing no new unit machinery of its own: the
+		synthesized `for` loop is EXACTLY the shape _desugar_general_for/
+		_desugar_iterator_for already handle (an iterated expression with
+		its own `__next__() -> T|None`, which any generator or hand-
+		written iterator already has), so it gets that support, and every
+		correctness property it already has (nested RC release, etc. -
+		see for_loop_over_nested_generator_releases_both_levels), for
+		free. Deliberately forwarding-only: no `.send()`/`.throw()`
+		delegation to the sub-generator (`.throw()` doesn't exist in this
+		plan at all; `.send()` delegation through `yield from` is out of
+		scope here, real Python `yield from` semantics beyond plain
+		forwarding are not attempted).
+
+		Only a DIRECT top-level `yield from` is recognized here, mirroring
+		_desugar_generator_for_loops' own top-level-only restriction - a
+		`yield from` nested inside an if/while stays rejected exactly as
+		before (_collect_generator_units' own existing YieldFrom check,
+		which walks the WHOLE body, still catches any occurrence this
+		pass didn't turn into a `for` loop, i.e. every non-top-level one -
+		see PLAN_GENERATORS.md's own "A.4a follow-up" note for lifting
+		this later once nested yield is generally supported). '''
+		new_body: list[ast.stmt] = []
+		counter = 0
+		for stmt in fn.node.body:
+			if isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.YieldFrom ):
+				temp_name = f'__yield_from_{counter}'
+				counter += 1
+				target = ast.Name( id = temp_name, ctx = ast.Store() )
+				ast.copy_location( target, stmt )
+				yielded = ast.Name( id = temp_name, ctx = ast.Load() )
+				ast.copy_location( yielded, stmt )
+				yield_stmt = ast.Expr( value = ast.Yield( value = yielded ) )
+				ast.copy_location( yield_stmt, stmt )
+				ast.copy_location( yield_stmt.value, stmt )
+				for_node = ast.For( target = target, iter = stmt.value.value, body = [ yield_stmt ], orelse = [] )
+				ast.copy_location( for_node, stmt )
+				ast.fix_missing_locations( for_node )
+				new_body.append( for_node )
+			else:
+				new_body.append( stmt )
+		fn.node.body = new_body
+
 	def _desugar_generator_for_loops( self, fn: Function ) -> dict[str,tuple[Type,ast.expr]]:
 		''' PLAN_GENERATORS.md Phase 4 (range()) + Phase 1 (indexable/
 		iterator) - a top-level `for x in <expr>: BODY` containing a yield
@@ -1689,7 +1737,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]], origin_type_substitution: 'list[tuple[str,Type]]|None' = None ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]], origin_type_substitution: 'list[tuple[str,Type]]|None' = None ) -> tuple[Function,int]:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
@@ -1847,7 +1895,7 @@ class TypeResolver:
 				next_fn.names[ stem ] = concrete_type
 		backing_cls.methods.append( next_fn )
 		backing_cls.names[ next_fn.stem ] = next_fn
-		return next_fn
+		return next_fn, done_state
 
 	def _wrap_generator_next_returns_in_ok( self, next_body: list[ast.stmt] ) -> None:
 		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
@@ -2034,6 +2082,57 @@ class TypeResolver:
 		dtor_fn.add_name( 'self', self_param )
 		self.schedule( dtor_fn )
 
+	def _build_generator_close_function( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]], done_state: int ) -> Function:
+		''' PLAN_GENERATORS.md - A.4b: `.close()` rides entirely on the SAME
+		machinery a bare `return`/natural exhaustion already uses to end a
+		generator early - `if self.__state != done_state: <replay
+		whatever plain defer is currently armed, LIFO, via
+		_build_defer_replay_guards - never errdefer, closing isn't an
+		error exit>; self.__state = done_state`. Idempotent by
+		construction: a second `.close()` call sees state already ==
+		done_state and is a complete no-op, matching Python's own
+		`.close()` semantics.
+
+		Deliberately does NOT touch any live RC-typed promoted field
+		itself - the existing, UNMODIFIED state/flag-gated destructor
+		(_build_generator_destructor) already tears those down correctly
+		whenever the object is actually freed later, exactly the same
+		"ended early, still referenced, real teardown happens later" case
+		a bare `return` already leaves for the destructor to handle. '''
+		none_type = self.discovery.get_none_type()
+		qualname = f'{backing_cls.qualname}.close'
+		anchor = fn.node
+		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
+		renamer = _GeneratorNameRenamer( rename_targets )
+		rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
+		defer_replay = self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, anchor ), renamer, rc_local_stems )
+		body: list[ast.stmt] = [
+			ast.If(
+				test = ast.Compare( left = self._self_attr( '__state', anchor ), ops = [ ast.NotEq() ], comparators = [ ast.Constant( value = done_state ) ] ),
+				body = defer_replay + [
+					ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) ),
+				],
+				orelse = [],
+			),
+			ast.Return( value = ast.Constant( value = None ) ),
+		]
+		node = ast.FunctionDef(
+			name = '$$close',
+			args = ast.arguments( posonlyargs = [], args = [], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
+			body = body, decorator_list = [], returns = None, type_params = [],
+			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+		close_fn = Function(
+			stem = 'close', qualname = qualname, file = fn.file, line = fn.line,
+			cls = backing_cls, node = node,
+			parameters = [], return_type = none_type,
+			is_static = False, resolve = None,
+		)
+		backing_cls.methods.append( close_fn )
+		backing_cls.names[ close_fn.stem ] = close_fn
+		return close_fn
+
 	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> None:
 		''' replaces the original generator def's own body with a single
 		`return <allocate the backing class, state=0, fields=args/zeros>` -
@@ -2159,6 +2258,7 @@ class TypeResolver:
 		# add there, same as an ordinary function's own body resolution
 		# already tolerates this identical wrapping unconditionally).
 		with self.discovery.scope_context( fn ):
+			self._desugar_generator_yield_from( fn )
 			extra_fields = self._desugar_generator_for_loops( fn )
 			units = self._collect_generator_units( fn )
 			self._validate_generator_defer_sites( fn )
@@ -2189,7 +2289,7 @@ class TypeResolver:
 			next_return_type = result_union
 
 		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites, origin_type_substitution )
+		_next_fn, done_state = self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites, origin_type_substitution )
 		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 		# backing_cls is ever scheduled below, so its own pre-mark of
 		# id(backing_cls) in self._destructors_synthesized (see its own
@@ -2198,9 +2298,17 @@ class TypeResolver:
 		# before ever building its own (wrong, unconditional-decref)
 		# destructor for this class
 		self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
+		# PLAN_GENERATORS.md - A.4b: `.close()` rides entirely on machinery
+		# that already exists for a bare `return`/natural exhaustion -
+		# replay whatever plain `defer` is currently armed (never
+		# `errdefer` - closing isn't an error exit), then pin __state to
+		# done. Needs done_state (only known once _build_generator_next_
+		# function finishes) - see that method's own build for why
+		self._build_generator_close_function( fn, backing_cls, locals_decl, extra_fields, defer_sites, done_state )
 
 		self.schedule( backing_cls )
 		self.schedule( backing_cls.names['__next__'] )
+		self.schedule( backing_cls.names['close'] )
 		self.schedule( result_union )
 
 		self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
