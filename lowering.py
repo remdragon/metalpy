@@ -798,16 +798,20 @@ class Lowering:
 		return None
 
 	def _body_may_fall_off_the_end( self, body: list[ast.stmt] ) -> bool:
-		# a simple, deliberately narrow check (not full terminator analysis -
-		# same "future work" scope cut as _stmt_If's own true_terminates/
-		# false_terminates detection): true whenever the LAST top-level
-		# statement isn't itself a `return` (an empty body, or one ending in
-		# a plain statement/if/loop/etc, could all still fall through to the
-		# function's own closing brace). A body that's actually unreachable
-		# past this point (both branches of a trailing if already return,
-		# a trailing `while True:` with no break, ...) is a false positive -
-		# harmless, since the resulting fall-off unwind+Return is then
-		# genuinely dead code, never executed
+		# a simple, deliberately narrow check (not full terminator analysis):
+		# true whenever the LAST top-level statement isn't itself a `return`
+		# (an empty body, or one ending in a plain statement/if/loop/etc,
+		# could all still fall through to the function's own closing brace).
+		# A body that's actually unreachable past this point (both branches
+		# of a trailing if already return, a trailing `while True:` with no
+		# break, a trailing call to a -> NoReturn function like sys.panic(),
+		# ...) is a false positive - harmless, since the resulting fall-off
+		# unwind+Return is then genuinely dead code, never executed. _stmt_If
+		# and visit_Match's own true_terminates/false_terminates/terminates
+		# detection used to share this exact same scope cut but no longer do
+		# (see _stmt_diverges, wired into both, and PLAN_COMPILER_BUG_SWEEP.md) -
+		# not mirrored here since a false positive at THIS level stays harmless
+		# dead code rather than a real narrowing-survival bug, unlike those two
 		return not body or not isinstance( body[-1], ast.Return )
 
 	def _synth_name( self, stem: str, node: ast.AST ) -> ast.Name:
