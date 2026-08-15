@@ -2510,7 +2510,7 @@ class FunctionLowering:
 				# own is_alias branch), else untrack_temp() so the fresh temp's
 				# own end-of-statement cleanup doesn't ALSO decref it now that
 				# the field owns it.
-				if self.lowering._is_aliasing_expr( node.value, operand.type ):
+				if self.lowering._is_aliasing_expr( node.value, operand ):
 					for instr in self._cfg.incref( attr_var.type, operand ):
 						self._emit( instr )
 				else:
