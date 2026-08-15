@@ -11062,6 +11062,32 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+			# --- generic generator body referencing its own type param
+			# outside a parameter/return annotation (A.3) - the synthesized
+			# $$__next__'s own scope now inherits the SAME T -> concrete-arg
+			# substitution monomorphized_function already records on the
+			# generator function itself, so a nested generic call using T
+			# (or a plain local declared as T) resolves correctly instead
+			# of failing with "name 'T' is not defined"
+			( 'generic_generator_body_calling_generic_function_via_own_type_param', '''
+def identity[T]( v: T ) -> T:
+	return v
+
+def gen[T]( x: T ) -> Iterator[T]:
+	y: T = identity( x )
+	yield y
+
+def main() -> i32:
+	g = gen[i32]( 5 )
+	a = g.__next__()
+	match a:
+		case i32( v ):
+			if v != 5:
+				return 1
+		case None:
+			return 2
+	return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -11255,30 +11281,6 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'return is not allowed inside a defer/errdefer body', str( self.discovery.errors.errors[0] ))
-
-	def test_generic_generator_referencing_own_type_param_in_body_is_rejected( self ) -> None:
-		# Phase 3's recommended interim scope (PLAN_GENERATORS.md) - a
-		# generic generator body that references its own type param
-		# outside a parameter/return annotation (here, a nested generic
-		# call using it) is rejected for now - _build_generator_next_
-		# function's synthesized __next__ doesn't inherit the type-param
-		# substitution monomorphized_function recorded only on the
-		# generator function itself, confirmed by a real repro that
-		# otherwise fails downstream with a confusing "name 'T' is not
-		# defined" instead of this clear, upfront rejection
-		self._run( '''
-def identity[T]( v: T ) -> T:
-	return v
-
-def gen[T]( x: T ) -> Iterator[T]:
-	y: T = identity( x )
-	yield y
-
-def main() -> None:
-	g = gen[i32]( 5 )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
 
 	def test_or_return_inside_infallible_iterator_is_rejected( self ) -> None:
 		# Phase 4 (roadmap Phase 4) - or_return() stays rejected inside a

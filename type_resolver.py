@@ -1689,7 +1689,7 @@ class TypeResolver:
 		)
 		return guard, end_state
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]], origin_type_substitution: 'list[tuple[str,Type]]|None' = None ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
 		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
@@ -1831,6 +1831,20 @@ class TypeResolver:
 			parameters = [], return_type = next_return_type,
 			is_static = False, resolve = None,
 		)
+		# PLAN_GENERATORS.md - a generic generator's own body statements get
+		# copied into THIS fresh Function/scope, which starts with an empty
+		# .names dict - a bare body-level reference to the outer generic's
+		# own type param (e.g. `y: T = identity(x)`, or even a plain `y: T
+		# = <value>`) would otherwise fail to resolve ("name 'T' is not
+		# defined"), since it no longer has access to `fn`'s own already-
+		# correct substitution (`fn.names['T'] = <concrete arg>`, set by
+		# Monomorphizer._build_monomorphized_function the same way for
+		# every other generic function). Seeding next_fn.names the exact
+		# same way - `next_fn.names[stem] = concrete_type` - mirrors that
+		# precedent directly rather than inventing a new mechanism.
+		if origin_type_substitution:
+			for stem, concrete_type in origin_type_substitution:
+				next_fn.names[ stem ] = concrete_type
 		backing_cls.methods.append( next_fn )
 		backing_cls.names[ next_fn.stem ] = next_fn
 		return next_fn
@@ -2073,60 +2087,32 @@ class TypeResolver:
 		fn.node.body = [ ast.Return( value = call ) ]
 		ast.fix_missing_locations( fn.node )
 
-	def ensure_generator_synthesized( self, fn: Function, origin_type_param_stems: 'list[str]|None' = None ) -> None:
+	def ensure_generator_synthesized( self, fn: Function, origin_type_substitution: 'list[tuple[str,Type]]|None' = None ) -> None:
 		''' idempotent (id(fn)-memoized) - a no-op unless fn's own body
 		actually contains a `yield` (checked first, cheaply). See this
 		section's own top docstring for the full design and why this runs
 		from ensure_resolved rather than lowering.py.
 
-		origin_type_param_stems: PLAN_GENERATORS.md Phase 3 (roadmap Phase
-		3) - non-None only when `fn` is a monomorphized copy of a GENERIC
-		generator template (passed by both call sites that build one -
-		ensure_resolved's Specialization branch and visit_Call's own
-		nested-generic-call resolution - each already has the abstract
-		base Function's own .type_params in hand at the point it calls
-		this). See the interim-scope rejection below for why this is
-		needed at all. '''
+		origin_type_substitution: PLAN_GENERATORS.md Phase 3 (roadmap
+		Phase 3) - non-None only when `fn` is a monomorphized copy of a
+		GENERIC generator template: the (stem, concrete_type) pairs for
+		the abstract base Function's own .type_params, in the SAME shape
+		Monomorphizer._build_monomorphized_function already builds for
+		`fn.names` itself (both call sites - ensure_resolved's
+		Specialization branch, and visit_Call's own nested-generic-call
+		resolution - already have the abstract base's .type_params AND
+		the concrete args in hand at the point they call this, so this is
+		just zip(), not new inference). Threaded down into _build_
+		generator_next_function, which seeds the SAME substitution into
+		the synthesized `$$__next__` method's own (freshly empty) .names
+		dict - see that method's own comment for why this is needed at
+		all (a body statement copied into $$__next__'s fresh scope loses
+		access to `fn`'s own already-correct substitution otherwise). '''
 		if id( fn ) in self._generators_synthesized:
 			return
 		if not self._function_contains_yield( fn ):
 			return
 		self._generators_synthesized.add( id( fn ))
-
-		if origin_type_param_stems:
-			# Recommended interim scope (PLAN_GENERATORS.md's own roadmap
-			# Phase 3 write-up): a generic generator body that itself
-			# calls another generic function referencing the enclosing
-			# generator's own type param is rejected for now, sidestepping
-			# a real ordering hazard confirmed by a minimal repro, not
-			# just a hypothetical one - _build_generator_next_function
-			# copies this function's OWN raw body statements into a FRESH
-			# `__next__` method/backing-class scope that does NOT inherit
-			# the T -> concrete-arg substitution monomorphized_function
-			# recorded on `fn.names` (that substitution lives only on
-			# THIS Function object, never propagated to the new one built
-			# for it) - so a body statement that still needs it (e.g. `y:
-			# T = identity(x)`, whether or not identity's own call
-			# actually depends on T) fails with "name 'T' is not defined"
-			# once __next__'s body is itself resolved later. A bare `x: T`
-			# PARAMETER (the v1 baseline case) is unaffected - parameter
-			# types flow through fn.parameters, already correctly
-			# substituted independent of this - only a body-level
-			# reference to the type param's own bare name is at risk,
-			# which is exactly what this scans for. Lifting this needs
-			# __next__/the backing class to inherit the substitution
-			# (thread origin_type_param_stems's underlying (stem,
-			# concrete-type) pairs through _build_generator_next_function/
-			# _build_generator_backing_class's own names dicts) - not
-			# attempted here, see PLAN_GENERATORS.md's own Phase 3 write-up
-			for stmt in fn.node.body:
-				for n in ast.walk( stmt ):
-					if isinstance( n, ast.Name ) and n.id in origin_type_param_stems:
-						self.discovery.fail(
-							f'{fn.qualname}: a generic generator body that references its own type parameter '
-							f'({n.id}) outside a parameter/return annotation is not supported yet - see PLAN_GENERATORS.md',
-							fn.node,
-						)
 
 		if fn.type_params:
 			# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - the ABSTRACT,
@@ -2155,13 +2141,31 @@ class TypeResolver:
 		error_type = fn.return_type.error_type
 		self.schedule( elem_type )
 
-		extra_fields = self._desugar_generator_for_loops( fn )
-		units = self._collect_generator_units( fn )
-		self._validate_generator_defer_sites( fn )
-		defer_sites = self._desugar_generator_defer_sites( fn )
-		self._reject_generator_value_return( fn )
-		pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
-		locals_decl = self._collect_generator_locals( fn )
+		# PLAN_GENERATORS.md - pushes `fn` itself onto discovery's own
+		# scope_stack for the whole body-processing pass below, mirroring
+		# resolve_function_body's own identical `with self.discovery.
+		# scope_context(fn):` wrapping - WITHOUT this, a generic
+		# generator's own body-level reference to its type param (e.g.
+		# `y: T = identity(x)`, resolved by _collect_generator_locals's
+		# own `self.discovery.visit(node.annotation)` call below) fails
+		# to resolve: `fn.names['T']` already holds the correct concrete
+		# substitution (Monomorphizer._build_monomorphized_function sets
+		# it, same as for any other generic function), but nothing
+		# consults it unless `fn` is actually the active scope - confirmed
+		# via a real repro/traceback that this exact call site is where
+		# resolution was failing, not (as originally assumed) inside the
+		# later-built $$__next__ method itself. Harmless/a no-op for a
+		# non-generic generator (fn.names has nothing extra relevant to
+		# add there, same as an ordinary function's own body resolution
+		# already tolerates this identical wrapping unconditionally).
+		with self.discovery.scope_context( fn ):
+			extra_fields = self._desugar_generator_for_loops( fn )
+			units = self._collect_generator_units( fn )
+			self._validate_generator_defer_sites( fn )
+			defer_sites = self._desugar_generator_defer_sites( fn )
+			self._reject_generator_value_return( fn )
+			pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
+			locals_decl = self._collect_generator_locals( fn )
 
 		none_type = self.discovery.get_none_type()
 		result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
@@ -2185,7 +2189,7 @@ class TypeResolver:
 			next_return_type = result_union
 
 		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
+		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites, origin_type_substitution )
 		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 		# backing_cls is ever scheduled below, so its own pre-mark of
 		# id(backing_cls) in self._destructors_synthesized (see its own
@@ -2967,8 +2971,8 @@ class TypeResolver:
 				# RCClass), same eager-resolution requirement v1 already
 				# needed for the non-generic case, just one level further
 				# in through the Specialization indirection
-				origin_stems = [ tv.stem for tv in obj.base.type_params ] if obj.base.type_params else None
-				self.ensure_generator_synthesized( monomorphized, origin_stems )
+				origin_substitution = list( zip( ( tv.stem for tv in obj.base.type_params ), obj.args )) if obj.base.type_params else None
+				self.ensure_generator_synthesized( monomorphized, origin_substitution )
 				return monomorphized
 			if isinstance( obj.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				return self.monomorphizer.monomorphize_class( obj )
@@ -3710,8 +3714,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# ALSO reaches the exact same memoized monomorphized_function
 		# object via a different route (e.g. a caller assigning the call
 		# result to a local, resolved through _type_of_expr instead)
-		origin_stems = [ tv.stem for tv in target.type_params ] if target.type_params else None
-		self.resolver.ensure_generator_synthesized( node.resolved_callee, origin_stems )
+		origin_substitution = list( zip( ( tv.stem for tv in target.type_params ), args )) if target.type_params else None
+		self.resolver.ensure_generator_synthesized( node.resolved_callee, origin_substitution )
 		return node
 
 	# --- local type tracking ---
