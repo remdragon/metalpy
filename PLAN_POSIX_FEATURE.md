@@ -202,4 +202,33 @@ Verification
   `lib/posix/time.py`'s `get_local_timezone_name` once all pieces land, as
   the actual forcing case this plan started from.
 
-STATUS: not started - this file is the plan only, no implementation yet.
+STATUS: DONE. Both features landed (`lowering.py`'s `_expr_NamedExpr` for
+walrus; `_lower_slice_subscript` + `bytearray._byte_slice` for slice syntax,
+scoped to `str`/`bytearray` - see the follow-up plan for full design/
+verification detail). `python tests.py` green (996/996). Re-ran this doc's
+own repro (`from posix.time import get_local_timezone_name` under a
+synthetic linux `active_target`): the walrus/slice "unsupported expression"
+errors (items 3 and 4 above) are gone, replaced by clean, correctly-located
+errors for two newly-exposed, separate, still-deferred authoring bugs those
+gaps had been masking:
+- `lib/posix/fs.py:24`: `codec.decode( buf[:nbytes] )` - the slice now
+  compiles and produces a real `bytearray`, but `decode()` wants `bytes` (a
+  different type) - a real type mismatch in fs.py itself, not a slice-syntax
+  bug.
+- `lib/posix/time.py:58`: `open('/etc/timezone', 'r')` - `open` isn't a real
+  defined name anywhere in this codebase (no free `open(path,mode)` matching
+  this call shape exists; only `crt.open(path,flags,mode)`, a different
+  signature) - a real, separate authoring bug in time.py itself, not a
+  walrus bug.
+- Also newly found while chasing the above: `if x is not None: use(x)`
+  narrowing is unimplemented for a PLAIN `if` statement (confirmed via a
+  standalone, walrus-free repro) - only `while`/`match`/`type(x) is T`
+  narrow today. `_read_etc_timezone_file`'s own `if f := ...: ... if s :=
+  f.read(...): return s.strip()` would need this to fully compile even once
+  `open()` itself is fixed. A real, separate, larger gap - not attempted.
+
+The 3 originally-deferred items (`errors.py:1`'s stray import, `fs.py:12`'s
+`utf8`-class-not-instance, and the `_lower_call_args` module-context
+misattribution bug) are all still present and still out of scope - `lib/
+posix/time.py` compiling fully clean needs those PLUS the 2 newly-found
+items above, none of which this plan touched.

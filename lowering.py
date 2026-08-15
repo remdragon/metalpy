@@ -3778,6 +3778,50 @@ class FunctionLowering:
 		# expression kind gets identical treatment, not just a bare Name
 		return name
 
+	def _expr_NamedExpr( self, node: ast.NamedExpr, expected_type: Type|None ) -> ir.Operand:
+		''' walrus (`x := expr`): the same two ast.Name-target branches
+		_stmt_Assign uses (reassignment vs first declaration - `target` is
+		always a bare ast.Name per Python's own grammar), except this is an
+		EXPRESSION, so it hands back the assigned operand as its own value
+		instead of emitting a void statement. Doesn't thread expected_type
+		into the RHS lowering below - _lower_expr's own wrapper already
+		re-applies _coerce_or_check_operand to whatever this returns, so
+		outer-context coercion (e.g. `x: i64 = (y := 5)`) happens for free,
+		same as every other _expr_* method. All locals here are function-
+		scoped unconditionally (not block-scoped), so a walrus-bound name
+		stays visible after its enclosing if/while exactly like an ordinary
+		preceding assignment would - no special escape-the-block handling
+		needed, unlike real Python's own comprehension-scoping nuance
+		(moot anyway - this language has no comprehensions). '''
+		target = node.target
+		assert isinstance( target, ast.Name )
+		existing = self.lowering.discovery.find_name_or_none( target.id )
+		if existing is not None:
+			if not isinstance( existing, Variable ):
+				self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
+			self._cfg.unnarrow( target.id )
+			operand = self._lower_expr( node.value, existing.type )
+			for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type ), node = node ):
+				self._emit( instr )
+			self._emit( ir.Assign( dest = existing, src = operand ))
+			return existing
+		operand = self._lower_expr( node.value, None )
+		fn = self._current_fn
+		var = Variable(
+			stem = target.id,
+			qualname = f'{fn.qualname}.{target.id}',
+			file = fn.file,
+			line = node.lineno,
+			type = operand.type,
+		)
+		fn.add_name( var.stem, var )
+		self.lowering.schedule( var.type )
+		is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )
+		for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node ):
+			self._emit( instr )
+		self._emit( ir.Assign( dest = var, src = operand ))
+		return var
+
 	def _reject_free_variables( self, roots: list[ast.AST], param_names: set[str], node: ast.AST ) -> None:
 		# a nested def/lambda may only reference its own parameters/locally
 		# -assigned names, module-level names, and builtins - referencing
@@ -4719,8 +4763,68 @@ class FunctionLowering:
 		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
 		return dest
 
+	# obj.type.stem -> its own length-accessor method name, for slice
+	# syntax's own default-stop resolution (_lower_slice_subscript below).
+	# str and bytearray genuinely expose differently-named length
+	# accessors (str.__len__() is a Unicode codepoint count - see its own
+	# docstring - not the byte length _byte_slice's own byte-offset
+	# contract needs; bytearray has no such split, __len__() IS its real
+	# byte length) - not a uniform dunder lookup, so a small fixed table
+	# for the two currently-supported types is the honest shape here,
+	# same posture as the tuple-index/pointer-fallback cases elsewhere in
+	# _expr_Subscript already hardcoding per concrete type family rather
+	# than inventing a protocol for two callers
+	_SLICE_LENGTH_METHOD = { 'str': 'byte_len', 'bytearray': '__len__' }
+
+	def _lower_slice_subscript( self, node: ast.Subscript, obj: ir.Operand ) -> ir.Operand:
+		''' x[a:b] / x[:b] / x[a:] - str/bytearray only (PLAN_POSIX_FEATURE.md's
+		scope; list[T] slicing deferred - no real caller, and would need new
+		RC-aware bulk-copy machinery list[T] doesn't have yet). Byte-offset
+		semantics, not Python's real Unicode-codepoint offsets - deliberate:
+		the one real caller (lib/posix/time.py's target_path[idx+9:]) slices
+		from str.find()'s own byte offset, and str already has exactly the
+		right byte-offset primitive (_byte_slice, also used by split()) -
+		distinct from str.__len__()'s codepoint count. No special RC/
+		aliasing tagging needed (unlike the tuple-index case's node.
+		is_tuple_element_read) - this goes through an ordinary ir.Call,
+		which the general Call-result convention already treats as a fresh,
+		owned value by default. '''
+		node_slice = node.slice
+		assert isinstance( node_slice, ast.Slice )
+		if node_slice.step is not None:
+			self.lowering.discovery.fail( f'slice step is not supported: {ast.unparse(node)}', node )
+		slice_fn = self.lowering._find_method( obj.type, '_byte_slice' )
+		length_method_name = self._SLICE_LENGTH_METHOD.get( getattr( obj.type, 'stem', None ) )
+		if slice_fn is None or length_method_name is None:
+			self.lowering.discovery.fail(
+				f'slicing is not supported for {obj.type.qualname} (only str and bytearray support slice syntax): {ast.unparse(node)}',
+				node,
+			)
+		self.lowering._ensure_resolved( slice_fn )
+		self.lowering.schedule( slice_fn.return_type )
+		start_type = slice_fn.parameters[0].type
+		stop_type = slice_fn.parameters[1].type
+		if node_slice.lower is not None:
+			start = self._lower_expr( node_slice.lower, start_type )
+		else:
+			start = ir.Const( type = start_type, value = 0 )
+		if node_slice.upper is not None:
+			stop = self._lower_expr( node_slice.upper, stop_type )
+		else:
+			length_fn = self.lowering._find_method( obj.type, length_method_name )
+			self.lowering._ensure_resolved( length_fn )
+			self.lowering.schedule( length_fn.return_type )
+			len_dest = self._new_temp( length_fn.return_type )
+			self._emit( ir.Call( dest = len_dest, target = length_fn, receiver = obj, args = [], kwargs = {} ))
+			stop = len_dest
+		dest = self._new_temp( slice_fn.return_type )
+		self._emit( ir.Call( dest = dest, target = slice_fn, receiver = obj, args = [ start, stop ], kwargs = {} ))
+		return self._maybe_consume_result( node, dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
 		obj = self._lower_expr( node.value, None )
+		if isinstance( node.slice, ast.Slice ):
+			return self._lower_slice_subscript( node, obj )
 		getitem_fn = self.lowering._find_method( obj.type, '__getitem__' )
 		if getitem_fn is None:
 			# tuple[...]'s own constant-index-only element access

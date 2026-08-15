@@ -6079,6 +6079,162 @@ def main() -> i32:
 		] )
 
 
+class WalrusOperatorRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_NamedExpr (ast.NamedExpr, `x := expr`) - real compile-and-run
+	companion to lowering_test.py's WalrusOperatorTests. Deliberately
+	avoids `if (x := opt()) is not None: use(x)`-shaped fixtures: `is not
+	None` narrowing for a plain if-statement is a real, separate,
+	pre-existing gap in this compiler (confirmed independent of walrus -
+	the identical failure reproduces with an ordinary, non-walrus `x: T|
+	None; if x is not None: use(x)`; only while/match/`type(x) is T`
+	narrow today) - out of scope here, not something walrus needs to
+	solve. These fixtures instead use plain scalar/bool conditions, which
+	already work end to end. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the walrus target starts undeclared (first-declaration branch
+			# of _expr_NamedExpr), then the SAME while condition re-evaluates
+			# it every subsequent iteration (the reassignment branch) -
+			# exercises both branches in one natural fixture, and confirms
+			# the binding survives (and is reused) past the loop
+			( 'walrus_in_while_condition_first_decl_then_rebind', '''
+def main() -> i32:
+	i: i32 = 0
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		while ( x := i ) < 5:
+			total += x
+			i += 1
+	if total != 10:
+		return 1
+	if i != 5:
+		return 2
+	return 0
+''' ),
+			# the walrus expression's own return value used directly as an
+			# if-condition, then the same binding read again afterward
+			( 'walrus_return_value_used_directly_as_condition', '''
+def f( n: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return n + 1
+
+def main() -> i32:
+	if ( y := f( 4 ) ) != 5:
+		return 1
+	if y != 5:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class SliceSyntaxTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' x[a:b] / x[:b] / x[a:] (ast.Slice) - PLAN_POSIX_FEATURE.md's scope,
+	str/bytearray only (list[T] slicing deferred - no real caller). Byte-
+	offset semantics, not Python's real Unicode-codepoint offsets - see
+	_lower_slice_subscript's own docstring on why. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_slice_shapes', '''
+def main() -> i32:
+	s: str = "hello world"
+	if s[:5] != "hello":
+		return 1
+	if s[6:] != "world":
+		return 2
+	if s[2:5] != "llo":
+		return 3
+	return 0
+''' ),
+			( 'bytearray_slice_shapes', '''
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 1
+	p[1] = 2
+	p[2] = 3
+	p[3] = 4
+	p[4] = 5
+	c: bytearray = b[1:4]
+	if len( c ) != 3:
+		return 1
+	cp: ConstPtr[u8] = c.get_const_ptr()
+	if cp[0] != 2 or cp[1] != 3 or cp[2] != 4:
+		return 2
+	if len( b[:2] ) != 2:
+		return 3
+	if len( b[3:] ) != 2:
+		return 4
+	return 0
+''' ),
+			# mirrors lib/posix/fs.py:24's buf[:nbytes] shape - slicing a
+			# bytearray to a runtime-computed length, not a constant
+			( 'bytearray_slice_to_computed_length', '''
+def fill( buf: bytearray ) -> usize:
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 65
+	p[1] = 66
+	p[2] = 67
+	return 3
+
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	nbytes: usize = fill( buf )
+	result: bytearray = buf[:nbytes]
+	if len( result ) != 3:
+		return 1
+	return 0
+''' ),
+			# mirrors lib/posix/time.py:52's target_path[idx+9:] shape -
+			# slicing a str from a runtime-computed (str.find()'s own byte
+			# offset) start, no upper bound
+			( 'str_slice_from_computed_find_offset', '''
+def main() -> i32:
+	target_path: str = "/usr/share/zoneinfo/America/New_York"
+	idx: usize = target_path.find( "zoneinfo/" ).unwrap( "expected match" )
+	with compiler.wrap_arithmetic:
+		tz: str = target_path[idx+9:]
+	if tz != "America/New_York":
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_slice_step_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	s: str = "hello"',
+			'	a: str = s[::2]',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slice step is not supported', errors[0] )
+
+	def test_unsupported_receiver_type_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 5',
+			'	y: i32 = x[0:2]',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slicing is not supported for intrinsics.i32', errors[0] )
+
+
 class MatchArmSameNameNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' `match x: case T(x): ...` - the arm rebinds the SAME name as its
 	own subject - used to crash outright (monomorphize.py silently

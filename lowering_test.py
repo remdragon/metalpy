@@ -7716,6 +7716,97 @@ class AssignabilityCheckTests( unittest.TestCase ):
 		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
 
 
+class WalrusOperatorTests( unittest.TestCase ):
+	''' _expr_NamedExpr (ast.NamedExpr, `x := expr`) - PLAN_POSIX_FEATURE.md's
+	scope. Mirrors _stmt_Assign's own two ast.Name-target branches, but
+	returns the operand as this expression's own value. All locals here are
+	function-scoped unconditionally (not block-scoped), so a walrus binding
+	made inside an if/while condition is expected to stay visible in code
+	textually after it, same as an ordinary preceding assignment would be -
+	these tests confirm that isn't just true by inspection, but actually
+	holds once real CFG/binding machinery runs. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def test_binding_visible_after_the_if_statement( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	if ( x := f() ) != 5:',
+			'		return 1',
+			'	if x != 5:',
+			'		return 2',
+			'	return 0',
+		]))
+		# two real reads of the SAME walrus-bound Variable - one inside the
+		# if's own condition, one textually after the if - not two
+		# different bindings that happen to share a name
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem == 'x' ]
+		self.assertEqual( len( assigns ), 1 )
+
+	def test_binding_reused_later_in_the_same_function( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	x: i32 = 0',
+			'	if ( x := f() ) != 5:',
+			'		return 1',
+			'	y: i32 = 0',
+			'	with compiler.wrap_arithmetic:',
+			'		y = x + 1',
+			'	if y != 6:',
+			'		return 2',
+			'	return 0',
+		]))
+		self.assertTrue( any( isinstance( i, ir.Assign ) and i.dest.stem == 'x' for i in fn.instructions ) )
+
+	def test_nested_walrus_inside_boolean_expression( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	if ( a := f() ) != 5 and ( b := f() ) != 6:',
+			'		return 1',
+			'	if a != 5 or b != 6:',
+			'		return 2',
+			'	return 0',
+		]))
+		names = { i.dest.stem for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) }
+		self.assertIn( 'a', names )
+		self.assertIn( 'b', names )
+
+	def test_walrus_rebinding_an_existing_name( self ) -> None:
+		# the reassignment branch (existing = discovery.find_name_or_none(...)
+		# is not None) - unlike a fresh declaration, must reuse the SAME
+		# Variable object, not create a second one under the same stem
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 1',
+			'	if ( x := 2 ) != 2:',
+			'		return 1',
+			'	if x != 2:',
+			'		return 2',
+			'	return 0',
+		]))
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem == 'x' ]
+		self.assertEqual( len( assigns ), 2 ) # the initial x: i32 = 1, then the walrus rebind
+		self.assertIs( assigns[0].dest, assigns[1].dest )
+
+
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
 	unittest.main()

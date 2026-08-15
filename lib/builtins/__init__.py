@@ -230,6 +230,23 @@ class bytearray:
 		if self.__data != BYTEARRAY_INVALID: # this can happen if release() is called and successful
 			sys.free( self.__data )
 
+	@private
+	def _byte_slice( self, start: usize, end: usize ) -> bytearray:
+		''' bytes [start, end) of self, as a new, independently-owned
+		bytearray - the bytearray-side counterpart to str._byte_slice
+		below (same method name deliberately, so slice-syntax lowering
+		only needs one method name to look up across both types). No
+		zero-terminator/UTF-8 revalidation concern here (unlike str's own
+		hand-rolled version), so this just reuses the ordinary public
+		constructor. '''
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			piece_len: usize = end - start
+		result = bytearray( piece_len )
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			src: ConstPtr[u8] = self.__data + start
+		sys.memcpy( result.__data, src, piece_len )
+		return result
+
 class str:
 	__data: ConstPtr[u8]
 	
