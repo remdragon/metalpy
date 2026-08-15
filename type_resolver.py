@@ -2151,56 +2151,66 @@ class TypeResolver:
 			self.discovery.fail( f'{fn.qualname}: a generator method is not supported yet - only a plain function may contain yield - see PLAN_GENERATORS.md', fn.node )
 		if not isinstance( fn.return_type, GeneratorType ):
 			self.discovery.fail( f'{fn.qualname} contains yield but is not declared -> Iterator[T]', fn.node )
-		elem_type = fn.return_type.elem_type
-		error_type = fn.return_type.error_type
-		self.schedule( elem_type )
 
-		extra_fields = self._desugar_generator_for_loops( fn )
-		units = self._collect_generator_units( fn )
-		self._validate_generator_defer_sites( fn )
-		defer_sites = self._desugar_generator_defer_sites( fn )
-		self._reject_generator_value_return( fn )
-		pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
-		locals_decl = self._collect_generator_locals( fn )
+		# this runs eagerly from a CALL SITE (see this function's own
+		# top docstring), which may live in a different module than fn
+		# itself - every name lookup below (locals' own type
+		# annotations, in particular) must resolve against fn's OWN
+		# defining module, not whichever module happens to be active on
+		# discovery.module_stack at the call site. Mirrors
+		# resolve_function_body's identical push, just triggered earlier.
+		module = self._find_module_for( fn )
+		with self.discovery.module_context( module ):
+			elem_type = fn.return_type.elem_type
+			error_type = fn.return_type.error_type
+			self.schedule( elem_type )
 
-		none_type = self.discovery.get_none_type()
-		result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
+			extra_fields = self._desugar_generator_for_loops( fn )
+			units = self._collect_generator_units( fn )
+			self._validate_generator_defer_sites( fn )
+			defer_sites = self._desugar_generator_defer_sites( fn )
+			self._reject_generator_value_return( fn )
+			pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
+			locals_decl = self._collect_generator_locals( fn )
 
-		# PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - Generator[T,E]
-		# (error_type set) makes __next__ fallible: it returns
-		# Result[elem_type|None, error_type] instead of the bare union, so
-		# or_return()/checked-arithmetic inside the body engage the
-		# existing _require_result_return machinery for free (no special
-		# generator-side flag needed - it's purely a consequence of
-		# __next__'s own declared return type, exactly like any other
-		# fallible function). Iterator[T] (error_type None) is unaffected -
-		# next_return_type stays the bare union, same as before this phase.
-		if error_type is not None:
-			self.schedule( error_type )
-			result_cls = self.discovery.find_name_or_none( 'Result' )
-			assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for Generator[T,E] but was not found'
-			next_return_type = self.discovery._get_or_create_specialization( result_cls, [ result_union, error_type ] )
-			self.schedule( next_return_type )
-		else:
-			next_return_type = result_union
+			none_type = self.discovery.get_none_type()
+			result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
 
-		backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
-		self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
-		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
-		# backing_cls is ever scheduled below, so its own pre-mark of
-		# id(backing_cls) in self._destructors_synthesized (see its own
-		# docstring) beats compiler.py's ordinary, unconditional RCClass
-		# handling to the punch - that path checks the SAME memo set
-		# before ever building its own (wrong, unconditional-decref)
-		# destructor for this class
-		self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
+			# PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - Generator[T,E]
+			# (error_type set) makes __next__ fallible: it returns
+			# Result[elem_type|None, error_type] instead of the bare union, so
+			# or_return()/checked-arithmetic inside the body engage the
+			# existing _require_result_return machinery for free (no special
+			# generator-side flag needed - it's purely a consequence of
+			# __next__'s own declared return type, exactly like any other
+			# fallible function). Iterator[T] (error_type None) is unaffected -
+			# next_return_type stays the bare union, same as before this phase.
+			if error_type is not None:
+				self.schedule( error_type )
+				result_cls = self.discovery.find_name_or_none( 'Result' )
+				assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for Generator[T,E] but was not found'
+				next_return_type = self.discovery._get_or_create_specialization( result_cls, [ result_union, error_type ] )
+				self.schedule( next_return_type )
+			else:
+				next_return_type = result_union
 
-		self.schedule( backing_cls )
-		self.schedule( backing_cls.names['__next__'] )
-		self.schedule( result_union )
+			backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
+			self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
+			# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
+			# backing_cls is ever scheduled below, so its own pre-mark of
+			# id(backing_cls) in self._destructors_synthesized (see its own
+			# docstring) beats compiler.py's ordinary, unconditional RCClass
+			# handling to the punch - that path checks the SAME memo set
+			# before ever building its own (wrong, unconditional-decref)
+			# destructor for this class
+			self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
 
-		self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
-		fn.return_type = backing_cls
+			self.schedule( backing_cls )
+			self.schedule( backing_cls.names['__next__'] )
+			self.schedule( result_union )
+
+			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
+			fn.return_type = backing_cls
 
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:
 		''' the emitter always synthesizes a destructor for every
@@ -2722,37 +2732,24 @@ class TypeResolver:
 			return self.discovery._get_or_create_union( operands )
 		if (
 			isinstance( node, ast.Subscript ) and isinstance( node.value, ast.Name )
-			and node.value.id in ( 'Callable', 'Closure' )
+			and node.value.id in ( 'move', 'copy', 'Callable', 'Closure', 'tuple', 'Iterator', 'Generator' )
 		):
-			# Callable[[Arg1,...],Ret]/Closure[[Arg1,...],Ret] as a TYPE-
-			# REFERENCE-context expression (compiler.cast(Closure[[],None],
-			# x), compiler.sizeof(Callable[...]), ...) - discovery.py's own
-			# visit_Subscript already recognizes this shape for ANNOTATIONS,
-			# but that path is never reached from here (Callable/Closure
-			# are recognized textually, not through find_name - a bare
-			# ast.Name(id='Callable') node.value would otherwise fail
-			# resolution outright, same as any other undefined name).
-			# Mirrors visit_Subscript's own shape validation exactly
-			shape_ok = (
-				isinstance( node.slice, ast.Tuple )
-				and len( node.slice.elts ) == 2
-				and isinstance( node.slice.elts[0], ast.List )
-			)
-			if not shape_ok:
-				self.discovery.fail( f"{node.value.id}[...] must look like {node.value.id}[[ArgType, ...], RetType]: {ast.unparse(node)}", node )
-			arg_nodes, ret_node = node.slice.elts
-			arg_types: list[Type] = []
-			for a in arg_nodes.elts:
-				resolved = self._try_resolve_namespace( a )
-				if not isinstance( resolved, Type ):
-					self.discovery.fail( f'{node.value.id}[...] argument is not a type: {ast.unparse(a)}', node )
-				arg_types.append( resolved )
-			return_type = self._try_resolve_namespace( ret_node )
-			if not isinstance( return_type, Type ):
-				self.discovery.fail( f'{node.value.id}[...] return type is not a type: {ast.unparse(ret_node)}', node )
-			if node.value.id == 'Callable':
-				return self.discovery._get_or_create_callable_type( arg_types, return_type )
-			return self.discovery._get_or_create_closure_type( arg_types, return_type )
+			# move[T]/copy[T]/Callable[[Arg1,...],Ret]/Closure[[Arg1,...],Ret]/
+			# tuple[T0,T1,...]/Iterator[T]/Generator[T,E] as a TYPE-REFERENCE-
+			# context expression (compiler.cast(Closure[[],None], x),
+			# compiler.sizeof(Callable[...]), an explicit generic construction
+			# call's own type argument like list[tuple[str,str]](), ...) - all
+			# of these are recognized TEXTUALLY in discovery.py's own
+			# visit_Subscript, not through find_name (a bare
+			# ast.Name(id='tuple') node.value would otherwise fail resolution
+			# outright, same as any other undefined name - this was exactly
+			# the "name 'tuple' is not defined" bug on list[tuple[str,str]]()).
+			# Reuse that same implementation directly rather than duplicating
+			# it here (this used to hand-roll just the Callable/Closure case)
+			# so every textually-special subscript form resolves identically
+			# whether it appears in an ANNOTATION or as an explicit type
+			# argument to a generic constructor CALL
+			return self.discovery.visit_Subscript( node )
 		if isinstance( node, ast.Subscript ):
 			base = self._try_resolve_namespace( node.value )
 			# Name[T] - a generic FUNCTION (mylen[i32]), a generic CLASS
@@ -3735,6 +3732,55 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		self.resolver.ensure_generator_synthesized( node.resolved_callee, origin_stems )
 		return node
 
+	# --- local imports ---
+
+	def visit_ImportFrom( self, node: ast.ImportFrom ) -> ast.ImportFrom:
+		''' registers a function-body-local `from X import Y` into fn.names,
+		mirroring lowering.py's own _stmt_ImportFrom (see its docstring: function
+		bodies are deliberately never walked by discovery.py's own visitor, so
+		an in-function import only ever gets registered for real at lowering
+		time). Without this, a local import followed immediately by an
+		annotation using the imported name (`from windows.kernel32 import
+		HANDLE` then `h: HANDLE = ...`, both inside the same function) failed
+		to compile with a spurious "name not defined" - visit_AnnAssign below
+		resolves its annotation via self.discovery.visit(), which walks
+		self.discovery.scope_stack (fn is pushed onto it for the whole of
+		resolve_function_body's walk), but nothing had put the import's name
+		into fn.names yet at that point; a plain (non-annotated) use of the
+		same name was unaffected, since this pass never resolves ordinary
+		value expressions by name the way it resolves annotations. Registering
+		it here (rather than only at lowering time) closes that gap for this
+		pass's own annotation resolution while leaving the ImportFrom node
+		itself untouched in the body - lowering.py's _stmt_ImportFrom still
+		runs against it normally afterward and re-registers the same cached
+		Name object, which is harmless (add_name is a plain dict assignment). '''
+		if self.fn is None:
+			return node
+		parts: list[str] = []
+		if node.level:
+			# same package-relative counting as discovery.py's own
+			# visit_ImportFrom/lowering.py's own _stmt_ImportFrom
+			package = self.discovery.module_stack[-1].package
+			strip = node.level - 1
+			parts.extend(( package.split( '.' )[:-strip] if strip else package.split( '.' )) if package else [] )
+			if not parts:
+				self.discovery.fail( f'unable to relative import from here: {ast.unparse(node)}', node )
+		if node.module:
+			parts.append( node.module )
+		package = '.'.join( parts )
+		try:
+			mod = self.discovery.import_name( package )
+		except FileNotFoundError as e:
+			self.discovery.fail( str( e ), node )
+		if not mod:
+			self.discovery.fail( f'module {package!r} not found', node )
+		for alias in node.names:
+			item = mod.names.get( alias.name )
+			if item is None:
+				self.discovery.fail( f'module {package} does not export {alias.name!r}', node )
+			self.fn.add_name( alias.asname or alias.name, item )
+		return node
+
 	# --- local type tracking ---
 
 	def visit_AnnAssign( self, node: ast.AnnAssign ) -> ast.AnnAssign:
@@ -4452,6 +4498,60 @@ class _ReferenceResolver( ast.NodeTransformer ):
 
 	# --- rewrite 2: match statements ---
 
+	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
+		''' true if `stmt` never falls through - either structurally (return/
+		break/continue) or because it's a bare call to a function declared
+		-> NoReturn (sys.panic, most commonly). The type_resolver.py-level
+		analogue of lowering.py's own _stmt_diverges (used by _stmt_If's
+		true_terminates/false_terminates) - this one backs visit_Match's own
+		per-case `terminates` computation (_merge_case_narrowing), for the
+		identical reason: a `case ...: sys.panic(...)` arm should be treated
+		as never reaching the match's own join point, the same as an
+		explicit return/break/continue arm, or narrowing established inside
+		it is wrongly dropped from self._narrowed instead of surviving past
+		the match. Resolved via _resolve_callee_target - a pure lookup, no
+		scheduling side effects beyond _resolve_callable's ordinary
+		signature resolution - since this only needs the callee's declared
+		return type, not a real lowered call. A receiver call (x.method())
+		or anything _resolve_callee_target can't resolve without a receiver
+		just isn't recognized here, same scope cut as lowering.py's own
+		version - EXCEPT unlike lowering.py's call site (at LOWERING time),
+		this one runs during type_resolver.py's OWN pass, where a receiver
+		rooted in a local (self, or any other parameter/local) genuinely
+		isn't resolvable via discovery's scope-stack-based find_name at all
+		(that lookup is module/class-level names only - locals live in
+		this resolver's own separate self.locals dict, never registered
+		into discovery's scope stack) - _try_resolve_namespace's own
+		ast.Name branch calls the RAISING find_name, not find_name_or_none,
+		so a receiver like self.foo() THROWS instead of returning None
+		here. Catching the CompileError is NOT enough to make this safe:
+		discovery.fail() (errors.py's ErrorCollector.fail) permanently
+		records the message in discovery.errors.errors BEFORE raising, by
+		design ("the failure is already recorded... callers that catch it
+		need no data from it") - so even a caught-and-ignored exception
+		here would still poison the overall compile into reporting failure,
+		confirmed via a real repro (case Result.Ok(v): self.touch() left
+		'name \'self\' is not defined' in the error list even after
+		wrapping the call in try/except CompileError). So this pre-checks
+		the call's own ultimate base name against self.locals - a name
+		tracked there is DEFINITELY a local/parameter, never a resolvable
+		namespace path - and skips calling _resolve_callee_target at all
+		when it is, rather than calling it and hoping nothing raises. '''
+		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
+			return True
+		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
+			return False
+		root = stmt.value.func
+		while isinstance( root, ( ast.Attribute, ast.Subscript )):
+			root = root.value
+		if not isinstance( root, ast.Name ) or root.id in self.locals:
+			return False
+		target = self.resolver._resolve_callee_target( stmt.value.func )
+		fn = target.base if isinstance( target, Specialization ) else target
+		if not isinstance( fn, Function ):
+			return False
+		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
+
 	def visit_Match( self, node: ast.Match ) -> list[ast.stmt]:
 		unique = self._label_id
 		self._label_id += 1
@@ -4603,7 +4703,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 						body.extend( visited )
 					elif visited is not None:
 						body.append( visited )
-				terminates = bool( case.body ) and isinstance( case.body[-1], ( ast.Return, ast.Break, ast.Continue ))
+				terminates = bool( case.body ) and self._stmt_diverges( case.body[-1] )
 				case_infos.append( ( terminates, dict( self._narrowed )))
 			finally:
 				self._narrowed = case_entry_narrowed

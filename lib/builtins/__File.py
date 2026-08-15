@@ -65,14 +65,14 @@ class BinaryWriter:
 
 	def __del__( self ) -> None:
 		if self.__fd != INVALID_FD:
-			close_raw( self.__fd )
+			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 
 	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		return write_raw( self.__fd, buf, count )
 
 	def close( self ) -> None:
 		if self.__fd != INVALID_FD:
-			close_raw( self.__fd )
+			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 			self.__fd = INVALID_FD
 
 	def fd( self ) -> FD:
@@ -93,7 +93,7 @@ class BinaryReadWriter:
 
 	def __del__( self ) -> None:
 		if self.__fd != INVALID_FD:
-			close_raw( self.__fd )
+			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 
 	def read( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		return read_raw( self.__fd, buf, count )
@@ -103,7 +103,7 @@ class BinaryReadWriter:
 
 	def close( self ) -> None:
 		if self.__fd != INVALID_FD:
-			close_raw( self.__fd )
+			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 			self.__fd = INVALID_FD
 
 	def fd( self ) -> FD:
