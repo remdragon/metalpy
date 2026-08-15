@@ -1017,7 +1017,11 @@ class Foo:
 		foo.resolve()
 		self.assertEqual( self.discovery.errors.errors, [] )
 
-	def test_inline_body_with_return_nested_in_if_rejected( self ) -> None:
+	def test_inline_body_with_return_nested_in_if_accepted( self ) -> None:
+		# early/nested return generalization - the spliced body now has its
+		# own local epilogue to jump into (see lowering.py's _splice_multi_
+		# statement_inline_body/cfg.py's push_inline_scope), so a `return`
+		# nested inside an if is no longer rejected outright
 		mod = self._import( '''
 class Foo:
 	@inline
@@ -1028,9 +1032,13 @@ class Foo:
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
-		self.assertIn( 'no other `return` anywhere else', self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
 
 	def test_inline_body_with_return_not_last_rejected( self ) -> None:
+		# unchanged: the body must still structurally END in a `return
+		# <expr>` - a return followed by dead-but-still-textually-present
+		# code stays rejected, only the ERROR MESSAGE changed to reflect
+		# that earlier returns are now otherwise allowed
 		mod = self._import( '''
 class Foo:
 	@inline
@@ -1040,7 +1048,7 @@ class Foo:
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
-		self.assertIn( 'no other `return` anywhere else', self.discovery.errors.errors[0] )
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
 
 	def test_inline_body_with_bare_return_rejected( self ) -> None:
 		mod = self._import( '''
@@ -1054,7 +1062,29 @@ class Foo:
 		foo.resolve()
 		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
 
-	def test_inline_body_with_defer_rejected( self ) -> None:
+	def test_inline_body_with_bare_early_return_rejected( self ) -> None:
+		# every reachable return needs a value, not just the trailing one -
+		# an early bare `return` has no well-defined meaning for an inline
+		# function's own overall value
+		mod = self._import( '''
+class Foo:
+	@inline
+	def hello( self, x: i32 ) -> i32:
+		if x == 0:
+			return
+		return x
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must have a body ending in exactly one `return <expr>`', self.discovery.errors.errors[0] )
+
+	def test_inline_body_with_defer_accepted( self ) -> None:
+		# defer/errdefer generalization - the spliced body now has a
+		# well-defined local boundary of its own to run against (see
+		# lowering.py's _splice_multi_statement_inline_body), so it's no
+		# longer rejected at parse time. resolve() alone doesn't reach
+		# lowering/splicing (that only happens at an actual call site), so
+		# this only confirms the DISCOVERY-time rejection is gone
 		mod = self._import( '''
 class Foo:
 	@inline
@@ -1065,9 +1095,9 @@ class Foo:
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
-		self.assertIn( 'defer/errdefer cannot appear', self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
 
-	def test_inline_body_with_errdefer_call_form_rejected( self ) -> None:
+	def test_inline_body_with_errdefer_call_form_accepted( self ) -> None:
 		# the OTHER recognized spelling, `errdefer(...)` as a bare call
 		# statement, not just `with defer:`
 		mod = self._import( '''
@@ -1079,9 +1109,9 @@ class Foo:
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
-		self.assertIn( 'defer/errdefer cannot appear', self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
 
-	def test_inline_body_with_defer_nested_in_if_rejected( self ) -> None:
+	def test_inline_body_with_defer_nested_in_if_accepted( self ) -> None:
 		mod = self._import( '''
 class Foo:
 	@inline
@@ -1093,7 +1123,7 @@ class Foo:
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
-		self.assertIn( 'defer/errdefer cannot appear', self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
 
 	def test_inline_body_reassigning_self_rejected( self ) -> None:
 		mod = self._import( '''

@@ -1978,6 +1978,15 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{_declarator( instr.temp.type, _temp_name( instr.temp.id ) )};' ]
 	if isinstance( instr, ir.DeleteTemp ):
 		return [] # C block scoping already handles temp lifetime - nothing to emit
+	if isinstance( instr, ir.DeclareLocal ):
+		# see ir.DeclareLocal's own docstring - a bare declaration, no
+		# initializer, emitted flat wherever this instruction itself sits
+		# (guaranteed by lowering.py to be a genuinely flat/unconditional
+		# point - never nested inside one of THIS module's own hand-emitted
+		# C `{ }` blocks)
+		name = _c_local_name( instr.variable.stem )
+		declared.add( name )
+		return [ f'\t{_declarator( instr.variable.type, name )};' ]
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
@@ -2361,6 +2370,35 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 	epilogue_lines: list[str] = []
 	for sub in instr.epilogue:
 		epilogue_lines.extend( _emit_instruction( sub, function = function, declared = declared ))
+	if instr.inline_exit is not None:
+		# PLAN_INLINE.md early-return generalization - this OrReturn is
+		# .or_return()/checked-arithmetic's own inline-unwind path reached
+		# from inside a multi-statement @inline splice: `function` here is
+		# the CALLER's real, enclosing C function (splicing puts everything
+		# in ONE emitted function) - NOT the inlined target - so ret_ctype/
+		# e_fn must come from result_var's own type (the target's real
+		# return type) instead of function.return_type, or the widened
+		# __err would be built with the wrong struct shape/error union
+		# entirely. No real `return` here - stow into result_var, arm
+		# exited_flag, `goto` merge_label instead (see ir.OrReturn's own
+		# inline_exit docstring)
+		result_var, exited_flag, merge_label = instr.inline_exit
+		inline_ret_ctype = c_type( result_var.type )
+		inline_e_fn = _result_error_type( result_var.type )
+		result_c = _emit_operand( result_var )
+		flag_c = _emit_operand( exited_flag )
+		return [
+			f'\tif ( ({value}).{tag_f} == 1 ) {{',
+			f'\t\t{inline_ret_ctype} __err;',
+			f'\t\t__err.{tag_f} = 1;',
+			*_emit_widen_error( f'__err.{data_f}.{err_f}', inline_e_fn, f'({value}).{data_f}.{err_f}', e_op ),
+			*epilogue_lines,
+			f'\t\t{result_c} = __err;',
+			f'\t\t{flag_c} = true;',
+			f'\t\tgoto {_c_label(merge_label)};',
+			'\t}',
+			f'\t{dest} = ({value}).{data_f}.{ok_f};',
+		]
 	return [
 		f'\tif ( ({value}).{tag_f} == 1 ) {{',
 		f'\t\t{ret_ctype} __err;',
@@ -2409,6 +2447,13 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 		e_fn = _result_error_type( instr.return_slot.type )
 		lines.append( f'\t\t{slot}.{tag_f} = 1;' )
 		lines.extend( _emit_widen_error( f'{slot}.{data_f}.{err_f}', e_fn, f'({value}).{data_f}.{err_f}', e_op ))
+	if instr.exited_flag is not None:
+		# PLAN_INLINE.md early-return generalization - see ir.OrJump's own
+		# exited_flag docstring: armed alongside return_slot whenever
+		# `target` is a multi-statement @inline splice's own local label,
+		# so the splice's own ladder tail can tell early exit apart from
+		# normal fallthrough
+		lines.append( f'\t\t{_emit_operand(instr.exited_flag)} = true;' )
 	lines.append( f'\t\tgoto {_c_label(instr.target)};' )
 	lines.append( '\t}' )
 	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
