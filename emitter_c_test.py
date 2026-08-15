@@ -8539,6 +8539,84 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+		# --- Phase 2a: `if`/`else` containing yield, at most one yield
+		# per branch, as a direct statement of its own branch. Uses the
+		# branch-stable-condition resume pattern (see
+		# _build_if_unit_guard's own docstring): re-evaluating `cond`
+		# on resume is safe because nothing but the generator's own
+		# code touches its fields between __next__() calls, so it
+		# always lands back in the branch that yielded. Exercises both
+		# branches (separate generator instances) and post-yield code
+		# in the yielding branch (the `resuming` flag's own body),
+		# falling through to a shared tail unit after the if/else.
+		( 'if_else_yield_resumes_correct_branch_and_falls_through', '''
+def alternator( flag: bool ) -> Iterator[i32]:
+	if flag:
+		one: i32 = 1
+		yield one
+		side: i32 = 0
+		with compiler.wrap_arithmetic:
+			side = 100
+	else:
+		two: i32 = 2
+		yield two
+	three: i32 = 3
+	yield three
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = alternator( True )
+		a = g.__next__() # if-branch
+		if a is None:
+			return 1
+		b = g.__next__() # resumes if-branch post-yield code, falls through to tail
+		if b is None:
+			return 2
+		c = g.__next__() # exhausted
+		if c is not None:
+			return 3
+
+		g2 = alternator( False )
+		d = g2.__next__() # else-branch
+		if d is None:
+			return 4
+		e = g2.__next__() # falls through to tail
+		if e is None:
+			return 5
+		f = g2.__next__() # exhausted
+		if f is not None:
+			return 6
+		return 0
+''' ),
+		# --- Phase 2b: `with compiler.wrap_arithmetic/saturate_arithmetic/
+		# panic_arithmetic(...):` wrapping a bare yield as its entire
+		# body - transparent unwrap/rewrap during unit collection
+		# (_yield_with_wrapper), no new unit kind. Confirms the mode
+		# is still correctly scoped when the segment is lowered.
+		( 'with_wrapped_yield_units', '''
+def counter( start: i32 ) -> Iterator[i32]:
+	x: i32 = start
+	with compiler.wrap_arithmetic:
+		yield x
+	with compiler.wrap_arithmetic:
+		x = x + 1
+	with compiler.wrap_arithmetic:
+		yield x
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = counter( 10 )
+		a = g.__next__()
+		if a is None:
+			return 1
+		b = g.__next__()
+		if b is None:
+			return 2
+		c = g.__next__()
+		if c is not None:
+			return 3
+		return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -8620,6 +8698,40 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'break/continue', str( self.discovery.errors.errors[0] ))
+
+	def test_if_elif_chain_with_yield_is_rejected( self ) -> None:
+		# Phase 2a only recognizes a single if/else - an elif chain
+		# generalizes the same branch-stable-resume idea but multiplies the
+		# state/testing surface, deliberately deferred (PLAN_GENERATORS.md)
+		self._run( '''
+def gen( flag: i32 ) -> Iterator[i32]:
+	if flag == 0:
+		yield 1
+	elif flag == 1:
+		yield 2
+	else:
+		yield 3
+
+def main() -> None:
+	g = gen( 0 )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'elif', str( self.discovery.errors.errors[0] ))
+
+	def test_if_else_with_two_yields_in_one_branch_is_rejected( self ) -> None:
+		self._run( '''
+def gen( flag: bool ) -> Iterator[i32]:
+	if flag:
+		yield 1
+		yield 2
+	else:
+		yield 3
+
+def main() -> None:
+	g = gen( True )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'at most one yield per branch', str( self.discovery.errors.errors[0] ))
 
 
 if __name__ == '__main__':

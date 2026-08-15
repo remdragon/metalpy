@@ -340,6 +340,38 @@ class TypeResolver:
 				# check exists for, and stays rejected
 				self.discovery.fail( f'{fn.qualname}: break/continue are not supported inside a yield-containing while/for loop yet - see PLAN_GENERATORS.md', n )
 
+	def _if_yield_nodes( self, node: ast.If ) -> list[ast.expr]:
+		return [ n for n in self._walk_generator_body( node.body + node.orelse ) if isinstance( n, ( ast.Yield, ast.YieldFrom )) ]
+
+	def _validate_if_yield_unit( self, fn: Function, node: ast.If ) -> None:
+		''' PLAN_GENERATORS.md Phase 2 - a top-level `if`/`if-else`
+		containing yield: at most one yield PER BRANCH, each a direct
+		statement of its OWN branch (not nested one level further in if/
+		for/while/with/try inside it), at least one branch actually
+		having one (an if/else with a yield in NEITHER branch would never
+		have been recognized as a unit in the first place - see
+		_collect_generator_units's own caller). elif chains (`orelse`
+		being a single nested `ast.If` - how Python itself represents
+		`elif`) are rejected outright for now: the branch-stable-condition
+		resume trick this unit's own guard-building relies on (see
+		_build_if_unit_guard's own docstring) generalizes to a chain in
+		principle, but hasn't been worked through/tested here - a
+		deliberate, narrower first cut, not an oversight. '''
+		if len( node.orelse ) == 1 and isinstance( node.orelse[0], ast.If ):
+			self.discovery.fail( f'{fn.qualname}: elif chains inside a generator body are not supported yet - see PLAN_GENERATORS.md', node )
+		body_yields = [ s for s in node.body if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) ]
+		orelse_yields = [ s for s in node.orelse if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) ]
+		all_yields = self._if_yield_nodes( node )
+		if len( body_yields ) > 1 or len( orelse_yields ) > 1 or ( len( body_yields ) + len( orelse_yields )) != len( all_yields ):
+			self.discovery.fail(
+				f'{fn.qualname}: an if/else containing yield must have at most one yield per branch, each a '
+				f'direct statement of its own branch (not nested in if/for/while/with/try) - see PLAN_GENERATORS.md',
+				node,
+			)
+		for n in self._walk_generator_body( node.body + node.orelse ):
+			if isinstance( n, ( ast.Break, ast.Continue )):
+				self.discovery.fail( f'{fn.qualname}: break/continue are not supported inside a yield-containing if/else yet - see PLAN_GENERATORS.md', n )
+
 	def _is_generator_range_call( self, node: ast.expr ) -> bool:
 		# textual recognition, same shape as lowering.py's own
 		# _is_range_call (deliberately duplicated rather than reached
@@ -354,6 +386,51 @@ class TypeResolver:
 		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range':
 			return True
 		return False
+
+	def _arithmetic_mode_with_kind( self, node: ast.expr ) -> str|None:
+		# textual recognition, mirrors lowering.py's own _stmt_With
+		# (compiler.wrap_arithmetic / compiler.saturate_arithmetic /
+		# compiler.panic_arithmetic(...)) - duplicated rather than reached
+		# across the TypeResolver/Lowering boundary, same reasoning as
+		# this file's other textual recognizers (_is_generator_range_call
+		# etc.). defer/errdefer with-blocks are deliberately NOT
+		# recognized here - PLAN_GENERATORS.md rejects those inside a
+		# generator body outright (_reject_generator_defer), unrelated to
+		# this Phase 2 arithmetic-mode-only allowance
+		if isinstance( node, ast.Attribute ) and isinstance( node.value, ast.Name ) and node.value.id == 'compiler':
+			if node.attr in ( 'wrap_arithmetic', 'saturate_arithmetic' ):
+				return node.attr
+			return None
+		if (
+			isinstance( node, ast.Call ) and isinstance( node.func, ast.Attribute )
+			and isinstance( node.func.value, ast.Name ) and node.func.value.id == 'compiler'
+			and node.func.attr == 'panic_arithmetic'
+		):
+			return 'panic_arithmetic'
+		return None
+
+	def _yield_with_wrapper( self, node: ast.stmt ) -> ast.With|None:
+		''' PLAN_GENERATORS.md Phase 2 - is `node` a `with compiler.
+		wrap_arithmetic/saturate_arithmetic/panic_arithmetic(...): yield
+		expr` statement (a bare yield, alone, as the with-block's ENTIRE
+		body)? These with-blocks are pure lowering-time bookkeeping (push/
+		pop an arithmetic mode - lowering.py's own _stmt_With), no real
+		runtime branching at all, so a yield directly inside one is safe
+		to treat as an ordinary bare-yield unit (_build_yield_unit_guard),
+		just with the same with-wrapper preserved around the synthesized
+		state-assign+return so the arithmetic mode is still correctly
+		active while the yielded value's own expression gets lowered.
+		Returns `node` itself (not just a bool) so callers can use it
+		directly as the unit's own stmt. '''
+		if not isinstance( node, ast.With ):
+			return None
+		if len( node.items ) != 1 or node.items[0].optional_vars is not None:
+			return None
+		if self._arithmetic_mode_with_kind( node.items[0].context_expr ) is None:
+			return None
+		if len( node.body ) != 1 or not ( isinstance( node.body[0], ast.Expr ) and isinstance( node.body[0].value, ast.Yield )):
+			return None
+		return node
 
 	def _probe_method( self, owner_type: Type|None, name: str ) -> Function|None:
 		''' PLAN_GENERATORS.md Phase 1 - non-failing probe (unlike
@@ -770,22 +847,26 @@ class TypeResolver:
 		return [ target_init, while_node ]
 
 	def _collect_generator_units( self, fn: Function ) -> list[tuple]:
-		''' walks fn.node.body's own top-level statements, recognizing two
-		yield-bearing shapes: a bare `yield expr` statement (Phase 1), and a
-		`while` loop whose own body contains exactly one yield as a direct
-		statement (Phase 2/4 - PLAN_GENERATORS.md's own motivating range()
-		example: `while i < count: yield i; i += 1`, or the equivalent `for
-		i in range(count): yield i`, already desugared to this same shape
-		by _desugar_generator_for_loops before this ever runs). Anything
-		else containing a yield (nested in if/for-non-range/with/try,
-		multiple yields in one loop, yield nested two levels deep, `yield
-		from`) is rejected - enforced by cross-checking against the TOTAL
-		yield count found anywhere in the body, so nothing containing a
-		yield can silently slip through unrecognized. Returns an ordered
-		list of ('yield', stmt) / ('while', while_stmt) tuples - ordinary
-		non-yield-bearing statements (including an ordinary while/for/if
-		with no yield in it at all) aren't units, they're picked up as
-		segment preamble by _split_generator_segments below. '''
+		''' walks fn.node.body's own top-level statements, recognizing four
+		yield-bearing shapes: a bare `yield expr` statement (v1), the same
+		wrapped in an arithmetic-mode `with` block (Phase 2 -
+		_yield_with_wrapper), a `while` loop whose own body contains
+		exactly one yield as a direct statement (Phase 2/4 - PLAN_
+		GENERATORS.md's own motivating range() example: `while i < count:
+		yield i; i += 1`, or the equivalent `for i in range(count): yield
+		i`, already desugared to this same shape by _desugar_generator_
+		for_loops before this ever runs), and an `if`/`if-else` with at
+		most one yield per branch (Phase 2 - _validate_if_yield_unit).
+		Anything else containing a yield (nested in for-non-range/try,
+		elif chains, multiple yields in one loop/branch, yield nested two
+		levels deep, `yield from`) is rejected - enforced by cross-
+		checking against the TOTAL yield count found anywhere in the
+		body, so nothing containing a yield can silently slip through
+		unrecognized. Returns an ordered list of ('yield', stmt) /
+		('while', while_stmt) / ('if', if_stmt) tuples - ordinary non-
+		yield-bearing statements (including an ordinary while/for/if with
+		no yield in it at all) aren't units, they're picked up as segment
+		preamble by _split_generator_segments below. '''
 		all_yields = self._find_all_yield_nodes( fn )
 		if any( isinstance( y, ast.YieldFrom ) for y in all_yields ):
 			self.discovery.fail( f'{fn.qualname}: yield from is not supported yet - see PLAN_GENERATORS.md', fn.node )
@@ -796,18 +877,26 @@ class TypeResolver:
 			if isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Yield ):
 				units.append( ( 'yield', stmt ) )
 				accounted += 1
+			elif self._yield_with_wrapper( stmt ) is not None:
+				units.append( ( 'yield', stmt ) )
+				accounted += 1
 			elif isinstance( stmt, ast.While ) and self._while_yield_nodes( stmt ):
 				self._validate_while_yield_unit( fn, stmt )
 				units.append( ( 'while', stmt ) )
 				accounted += 1
+			elif isinstance( stmt, ast.If ) and self._if_yield_nodes( stmt ):
+				self._validate_if_yield_unit( fn, stmt )
+				units.append( ( 'if', stmt ) )
+				accounted += len( self._if_yield_nodes( stmt ))
 
 		if accounted != len( all_yields ):
 			self.discovery.fail(
-				f'{fn.qualname}: yield must be a direct top-level statement of the generator function body, '
-				f'or the single yield inside a direct top-level while loop or for loop (Phases 2/4/1 - see '
-				f'PLAN_GENERATORS.md); yield inside if/with/try, a for loop nested inside something else '
-				f'(rather than a direct top-level statement), multiple yields in one loop, or yield nested '
-				f'more than one level deep is not supported yet',
+				f'{fn.qualname}: yield must be a direct top-level statement of the generator function body '
+				f'(optionally wrapped in an arithmetic-mode with-block), or the single yield inside a direct '
+				f'top-level while/for loop, or at most one yield per branch of a direct top-level if/else '
+				f'(Phases 1/2/4/5 - see PLAN_GENERATORS.md); yield inside try, a for loop nested inside '
+				f'something else, an elif chain, multiple yields in one loop/branch, or yield nested more '
+				f'than one level deep is not supported yet',
 				fn.node,
 			)
 		return units
@@ -905,22 +994,43 @@ class TypeResolver:
 			resolve = None,
 		)
 
-	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: ast.Expr, start_state: int, renamer: '_GeneratorNameRenamer' ) -> tuple[ast.If,int]:
-		''' a bare top-level `yield expr` occupies exactly ONE state
-		(start_state) - there's no separate "resuming" state to distinguish
-		the way a while-unit needs (see _build_while_unit_guard), so `pre`
-		(the ordinary statements immediately before this yield) can run
+	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer' ) -> tuple[ast.If,int]:
+		''' a bare top-level `yield expr` (v1), or the SAME shape wrapped
+		in `with compiler.wrap_arithmetic/saturate_arithmetic/
+		panic_arithmetic(...):` (Phase 2 - see _yield_with_wrapper's own
+		docstring for why this is safe to treat as the same unit kind),
+		occupies exactly ONE state (start_state) - there's no separate
+		"resuming" state to distinguish the way a while/if-unit needs (see
+		_build_while_unit_guard/_build_if_unit_guard), so `pre` (the
+		ordinary statements immediately before this yield) can run
 		unguarded: this guard only ever fires when __state == start_state
 		exactly (every smaller state was already caught and returned by an
 		earlier guard). '''
-		yield_node = stmt.value
+		if isinstance( stmt, ast.With ):
+			yield_stmt = stmt.body[0]
+			assert isinstance( yield_stmt, ast.Expr )
+			yield_node = yield_stmt.value
+		else:
+			yield_node = stmt.value
 		assert isinstance( yield_node, ast.Yield )
 		seg_stmts = [ renamer.visit( s ) for s in pre ]
 		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-		body = seg_stmts + [
+		yield_stmts: list[ast.stmt] = [
 			ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = start_state + 1 ) ),
 			ast.Return( value = yielded ),
 		]
+		if isinstance( stmt, ast.With ):
+			# keep the arithmetic-mode wrapper around the state-assign+
+			# return, not just the yielded expression itself - lowering.py's
+			# own _stmt_With pushes/pops the arithmetic mode around
+			# whatever's textually inside the with-block, so this is what
+			# keeps the yielded value's own expression lowering under the
+			# right mode once it's embedded here
+			context_expr = renamer.visit( stmt.items[0].context_expr )
+			wrapped = ast.With( items = [ ast.withitem( context_expr = context_expr, optional_vars = None ) ], body = yield_stmts )
+			ast.copy_location( wrapped, stmt )
+			yield_stmts = [ wrapped ]
+		body = seg_stmts + yield_stmts
 		guard = ast.If(
 			test = ast.Compare( left = self._self_attr( '__state', stmt ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = start_state ) ] ),
 			body = body, orelse = [],
@@ -1001,18 +1111,91 @@ class TypeResolver:
 		)
 		return guard, end_state
 
+	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer' ) -> tuple[ast.If,int]:
+		''' `if cond: [...yield...] else: [...yield...]` (at most one
+		yield per branch, at least one branch having one - see
+		_validate_if_yield_unit) occupies TWO states, same as a while-unit
+		(not-yet-entered / resuming), for the identical reason: it's
+		possible to suspend mid-branch and need to finish that branch's
+		own post-yield code on the next call. Unlike a while-unit, there's
+		no LOOPING - the if/else runs exactly once per __next__() call,
+		so resuming never re-runs a branch's own pre-yield code, only
+		whatever comes after the yield, then falls straight through to
+		whatever follows the if/else entirely (state = end_state, no
+		return - same "no pause between this construct ending and the
+		code after it" reasoning _build_while_unit_guard's own docstring
+		already gives for a loop's natural exit).
+
+		Resuming safely lands back in the SAME branch that yielded by
+		simply RE-EVALUATING `cond` on every call, first-entry or resume:
+		cond's own underlying values are fields, untouched between
+		__next__() calls (nothing else runs during a suspension), so it's
+		guaranteed stable - no separate per-branch resume state needed,
+		one shared `resuming` flag covers whichever branch actually used
+		it. A branch with NO yield at all needs no resume handling of its
+		own - it can only ever be reached on the first entry (a branch
+		that never yields can't be the one execution suspended in), so its
+		own statements just run unconditionally and fall through. '''
+		cond = renamer.visit( node.test )
+		resume_var = f'__gen_if_resuming_{start_state}'
+
+		def build_branch( branch_stmts: list[ast.stmt] ) -> list[ast.stmt]:
+			yield_index = next(
+				( i for i, s in enumerate( branch_stmts ) if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield )),
+				None,
+			)
+			if yield_index is None:
+				return [ renamer.visit( s ) for s in branch_stmts ]
+			pre_stmts = [ renamer.visit( s ) for s in branch_stmts[:yield_index] ]
+			yield_node = branch_stmts[ yield_index ].value
+			assert isinstance( yield_node, ast.Yield )
+			yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
+			post_stmts = [ renamer.visit( s ) for s in branch_stmts[ yield_index + 1: ] ]
+			resuming_branch = post_stmts or [ ast.Pass() ]
+			fresh_branch = pre_stmts + [
+				ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
+				ast.Return( value = yielded ),
+			]
+			return [ ast.If( test = ast.Name( id = resume_var, ctx = ast.Load() ), body = resuming_branch, orelse = fresh_branch ) ]
+
+		first_entry_guard = ast.If(
+			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
+			body = [ renamer.visit( s ) for s in pre ] or [ ast.Pass() ],
+			orelse = [],
+		)
+		resuming_init = ast.Assign(
+			targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ],
+			value = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
+		)
+		if_body = build_branch( node.body )
+		else_body = build_branch( node.orelse ) if node.orelse else []
+		outer_if = ast.If( test = cond, body = if_body, orelse = else_body )
+
+		end_state = start_state + 2
+		body = [
+			first_entry_guard,
+			resuming_init,
+			outer_if,
+			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = end_state ) ),
+		]
+		guard = ast.If(
+			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
+			body = body, orelse = [],
+		)
+		return guard, end_state
+
 	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], result_union: TaggedUnion ) -> Function:
 		''' builds $$__next__: self.__state == DONE short-circuits to `return
 		None`, then a flat sequence of per-unit guards (_build_yield_unit_
-		guard/_build_while_unit_guard - a bare yield occupies one state, a
-		while-unit occupies two), plus a final tail guard (the statements
-		after the last unit, ending `self.__state = DONE; return None`).
-		Every YIELD unit's own branch unconditionally returns; a WHILE
-		unit's branch falls through once its loop naturally exhausts
-		(correct - see _build_while_unit_guard's own docstring) into
-		whatever guard covers the state it just advanced to - no elif/
-		goto/switch needed anywhere (see this section's own top
-		docstring). '''
+		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
+		occupies one state, a while/if-unit occupies two), plus a final
+		tail guard (the statements after the last unit, ending `self.
+		__state = DONE; return None`). Every YIELD unit's own branch
+		unconditionally returns; a WHILE/IF unit's branch falls through
+		once its own construct naturally finishes (correct - see each
+		builder's own docstring) into whatever guard covers the state it
+		just advanced to - no elif/goto/switch needed anywhere (see this
+		section's own top docstring). '''
 		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
 		renamer = _GeneratorNameRenamer( rename_targets )
 
@@ -1023,6 +1206,8 @@ class TypeResolver:
 		for preamble, ( kind, stmt ) in segments:
 			if kind == 'yield':
 				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer )
+			elif kind == 'if':
+				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer )
 			else:
 				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer )
 			guards.append( guard )

@@ -3,14 +3,17 @@ Generator functions (`yield`, state-machine transform)
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
 <expr>:` containing yield, over a non-range() indexable OR another
-generator) landed and real-compile-and-run tested (emitter_c_test.py's
-GeneratorFunctionTests). This last one matches the "remaining phases
-roadmap" section's own Phase 1 (below) - kept the SEQUENTIAL landed-phase
-numbering here (v1, Phase 2, 3, 4, 5) rather than renaming it, since that
-roadmap's own 1-5 numbering is a separate, later scoping pass over what
-was still left, not a renumbering of what had already landed; the two
-schemes overlap in NAME but not in MEANING - watch for this when reading
-older commit messages/comments that say "Phase 1" meaning v1 instead.
+generator) + Phase 6 (yield inside `if`/`if-else`, and yield wrapped in
+an arithmetic-mode `with` block) landed and real-compile-and-run tested
+(emitter_c_test.py's GeneratorFunctionTests). Phase 5 matches the
+"remaining phases roadmap" section's own Phase 1, and Phase 6 matches
+that roadmap's own Phase 2 (below) - kept the SEQUENTIAL landed-phase
+numbering here (v1, Phase 2, 3, 4, 5, 6) rather than renaming it, since
+that roadmap's own 1-5 numbering is a separate, later scoping pass over
+what was still left, not a renumbering of what had already landed; the
+two schemes overlap in NAME but not in MEANING - watch for this when
+reading older commit messages/comments that say "Phase 1" or "Phase 2"
+meaning something other than the roadmap's own numbering.
 
 PLAN_GENERATORS.md's own motivating example now compiles and runs in its
 most natural, idiomatic spelling: `for i in range(count): yield i`,
@@ -234,6 +237,43 @@ exactly like the very first walk-order bug found while landing v1. Worth
 remembering next time a new failure mode here produces a weird error
 list: check whether it's actually just ONE early failure cascading.
 
+Phase 6 design (type_resolver.py's `_build_if_unit_guard`, `_validate_
+if_yield_unit`, `_if_yield_nodes`, `_yield_with_wrapper`,
+`_arithmetic_mode_with_kind`): landed exactly the "recommended first
+cut" scoped in the roadmap below - a single top-level `if`/`if-else`,
+at most one yield per branch, no elif chains and no nested loops-inside-
+branches (both explicit compile errors, see GeneratorFunctionTests'
+`test_if_elif_chain_with_yield_is_rejected` and `test_if_else_with_two_
+yields_in_one_branch_is_rejected`). An if-unit occupies TWO states, same
+as a while-unit, but does NOT loop - `if state <= start+1: [state ==
+start: preamble]; resuming = (state == start+1); if cond: <branch-A>
+else: <branch-B>; state = end`, where each branch is itself `if
+resuming: <post-yield stmts> else: <pre-yield stmts>; state = start+1;
+return value`. Safe to re-evaluate `cond` on resume because nothing but
+the generator's OWN code touches its fields between `__next__()` calls -
+whichever branch a call's `cond` selected is still the branch that will
+be selected on the resuming call, so `resuming` doesn't need to be
+per-branch, just one shared flag. A non-yielding branch needs no resume
+handling at all - it's structurally unreachable when `state == start+1`
+(you can only be resuming a branch that itself yielded to get there).
+Verified: yield in both branches with different post-yield code
+(`side = 100`, unobservable directly but proves no crash/corruption on
+resume), falling through correctly to a shared tail unit after the
+if/else, exhaustively calling `.__next__()` through both branches on
+separate generator instances (`if_else_yield_resumes_correct_branch_and_
+falls_through`).
+
+`with`-wrapped yield (`_yield_with_wrapper`/`_arithmetic_mode_with_kind`,
+mirroring lowering.py's own textual arithmetic-mode recognition) turned
+out to be exactly as low-risk as scoped: no new unit kind at all - it's
+still a `('yield', stmt)` unit, just with `_build_yield_unit_guard`
+taught to accept `ast.With` as well as `ast.Expr` and re-wrap the
+generated `state = N+1; return value` pair back inside the same `with`
+block so the arithmetic mode stays correctly scoped once the segment is
+actually lowered (`with_wrapped_yield_units` test - two separate
+with-wrapped yields in one generator, each with real i32 arithmetic in
+between, confirming the mode wrapping round-trips correctly both times).
+
 Remaining phases roadmap (scoped 2026-08-15)
 
 Phase 1: LANDED (same session it was scoped in) - see "Phase 5 design"
@@ -245,19 +285,15 @@ generator body, both the indexable shape (`__len__`+`__getitem__`) and
 the iterator shape (`__next__() -> T|None`, i.e. one generator consuming
 another), real-compile-and-run tested including nested RC correctness.
 
-Phase 2 (next up): yield inside `if`/`with`. ("try" doesn't exist in this language -
-no exception handling anywhere in lowering.py's statement dispatch; the
-closer analog, `with defer/errdefer:`, stays out of scope, see below.)
-`with compiler.wrap_arithmetic/saturate_arithmetic/panic_arithmetic(...):`
-wrapping a yield is low-risk (pure lowering-time bookkeeping, no runtime
-branching - just unwrap it during unit collection). `if`/`if-else`
-generalizes the while-unit's own "resuming" pattern per-branch: since a
-condition's underlying values are fields, untouched between `__next__()`
-calls, re-evaluating it on resume safely lands back in the same branch
-that yielded - `if resuming: <post-yield stmts> else: <pre-yield stmts>;
-state = N+1; return value`, once per branch. Recommended first cut: a
-single if/else, at most one yield per branch - not elif chains or nested
-loops-inside-branches yet.
+Phase 2: LANDED (same session it was scoped in) - see "Phase 6 design"
+above (kept the sequential landed-phase numbering there; see the STATUS
+section's own note on why the two schemes overlap in name but not
+meaning). yield inside `if`/`with`. ("try" doesn't exist in this
+language - no exception handling anywhere in lowering.py's statement
+dispatch; the closer analog, `with defer/errdefer:`, stays out of scope,
+see below.) Landed exactly the recommended first cut: a single if/else,
+at most one yield per branch - elif chains and nested loops-inside-
+branches are explicit compile errors, not yet supported.
 
 Phase 3: generic generator functions (`def gen[T](x: T) -> Iterator[T]:`).
 Confirmed groundwork: monomorphize.py's substitute_type_params (107-226)
