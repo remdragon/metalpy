@@ -6,7 +6,7 @@ import unittest
 
 # local imports:
 from compiler import Compiler, LoweredFunction
-from discovery import Discovery
+from discovery import Discovery, _detect_active_target
 from errors import CompileError
 import ir
 from mpy_types import Variable, Specialization, Function, ClosureType
@@ -5778,6 +5778,120 @@ class Tests( unittest.TestCase ):
 		self.assertNotIn( 'CastCheck', kinds )
 		assign = next( i for i in lowered.instructions if isinstance( i, ir.Assign ))
 		self.assertEqual( assign.src, ir.Const( type = self.discovery.get_intrinsics()['u32'], value = -11 ))
+
+	# --- integer literal range validation ----------------------------------
+
+	def test_out_of_range_unsigned_literal_assignment_fails( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: u8 = 300',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '300 is out of range for intrinsics.u8 (0..255)', self.discovery.errors.errors[0] )
+
+	def test_out_of_range_negative_signed_literal_assignment_fails( self ) -> None:
+		# folds via compile_time_transformer before lowering.py sees it, same
+		# mechanism as test_negative_literal_cast_is_a_bare_const's -11 - the
+		# difference here is the PLAIN assignment (no explicit i8(...) cast),
+		# which must NOT get the cast's bit-reinterpretation exemption
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: i8 = -200',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '-200 is out of range for intrinsics.i8 (-128..127)', self.discovery.errors.errors[0] )
+
+	def test_out_of_range_negative_literal_into_unsigned_128_fails( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: u128 = -1',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '-1 is out of range for intrinsics.u128', self.discovery.errors.errors[0] )
+
+	def test_explicit_cast_still_exempt_from_range_check( self ) -> None:
+		# the exact shape the fix must NOT break - u8(300) is exactly as
+		# deliberate a bit-reinterpretation as u32(-11) (test_negative_
+		# literal_cast_is_a_bare_const above), just overflowing the OTHER
+		# direction (positive, above MAX, instead of negative, below MIN)
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: u8 = u8( 300 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_boundary_values_signed_and_unsigned( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i8 = -128',
+			'	b: i8 = 127',
+			'	c: u8 = 0',
+			'	d: u8 = 255',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_boundary_values_i128_u128( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i128 = -170141183460469231731687303715884105728',
+			'	b: i128 = 170141183460469231731687303715884105727',
+			'	c: u128 = 0',
+			'	d: u128 = 340282366920938463463374607431768211455',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_out_of_range_i128_by_one_fails( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	a: i128 = 170141183460469231731687303715884105728',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'is out of range for intrinsics.i128', self.discovery.errors.errors[0] )
+
+	def test_isize_usize_range_uses_active_target_bits_not_hardcoded_64( self ) -> None:
+		# 2**31 is a valid isize value at 64 bits but out of range at 32 -
+		# confirms _int_stem_range derives width from the Scalar's own
+		# .sizeof (itself resolved from active_target['bits']), not a fixed
+		# assumption
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: isize = 2147483648',
+		])
+		target32 = dict( _detect_active_target(), bits = 32 )
+		discovery32 = Discovery( import_builtins = False, active_target = target32 )
+		compiler32 = Compiler( discovery32 )
+		compiler32.import_code( code, filename = Path( '__test__.py' ))
+		compiler32._lower( discovery32.main )
+		self.assertIn( 'is out of range for intrinsics.isize', discovery32.errors.errors[0] )
+
+		discovery64 = Discovery( import_builtins = False )
+		compiler64 = Compiler( discovery64 )
+		compiler64.import_code( code, filename = Path( '__test__.py' ))
+		compiler64._lower( discovery64.main )
+		self.assertEqual( discovery64.errors.errors, [] )
+
+	def test_cenum_construction_out_of_range_fails( self ) -> None:
+		code = '\n'.join([
+			'@enum( u8 )',
+			'class MyError:',
+			'	Ok = 0',
+			'',
+			'def main() -> None:',
+			'	x: MyError = MyError( 300 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( '300 is out of range for __test__.MyError (0..255)', self.discovery.errors.errors[0] )
 
 	def test_non_literal_cast_default_check_mode( self ) -> None:
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([

@@ -97,6 +97,20 @@ _SIGNED_INT_STEMS: frozenset[str] = frozenset([ 'i8', 'i16', 'i32', 'i64', 'i128
 def _is_signed_scalar( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem in _SIGNED_INT_STEMS
 
+def _int_stem_range( t: Scalar ) -> tuple[int,int]:
+	''' (MIN, MAX), the real inclusive range of integer stem t.stem, as
+	Python ints - used to validate a literal's magnitude against its
+	declared type (see _expr_Constant's own range check). Derived from
+	t.sizeof (already resolved to the ACTIVE TARGET's real width by the
+	time lowering.py runs - see discovery.py's active_target-driven sizeof
+	computation - isize/usize are NOT hardcoded to 64 here), not a fixed
+	per-stem table, so this is correct for every integer stem uniformly,
+	whatever target width the compiler was configured for. '''
+	bits = t.sizeof * 8
+	if t.stem in _SIGNED_INT_STEMS:
+		return -(2**(bits-1)), 2**(bits-1) - 1
+	return 0, 2**bits - 1
+
 # ast binary operators that have no floating-point meaning - bitwise/shift and
 # floor-div/mod (Python's float // and % exist but aren't in this first pass).
 # Rejected with a clear message before float arithmetic routing.
@@ -1183,6 +1197,13 @@ class FunctionLowering:
 		self._loop_depth = 0
 		self._loop_labels: list[tuple[str,str]] = []
 		self._in_deferred_body = False
+		# set (briefly, restored in a finally) only around _lower_scalar_cast's
+		# own literal-argument branch - an EXPLICIT cast on a literal
+		# (u32(-11), compiler.cast(u8, -1)) is deliberate bit-reinterpretation,
+		# exempt from _expr_Constant's own range check below; every other
+		# route into _expr_Constant (plain assignment, argument binding,
+		# return, CEnum construction) leaves this False and gets validated
+		self._allow_literal_bit_reinterpret = False
 		self._defer_flags: list[Variable] = []
 		self._return_value_var = None
 		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
@@ -2760,7 +2781,16 @@ class FunctionLowering:
 			# (float value preserved, or int bit-reinterpretation via _lower_expr)
 			if isinstance( source, ast.Constant ) and isinstance( source.value, float ) and not _is_float_scalar( target_type ):
 				return ir.Const( type = target_type, value = int( source.value ) )
-			return self._lower_expr( source, target_type )
+			# a literal argument to an EXPLICIT cast is intentional bit-
+			# reinterpretation (see this method's own docstring above) -
+			# exempt from _expr_Constant's own range check, unlike a plain
+			# literal flowing into a type via assignment/argument/return
+			prev_allow_bit_reinterpret = self._allow_literal_bit_reinterpret
+			self._allow_literal_bit_reinterpret = True
+			try:
+				return self._lower_expr( source, target_type )
+			finally:
+				self._allow_literal_bit_reinterpret = prev_allow_bit_reinterpret
 		operand = source
 		# a cast that touches a float on either side (int<->float, float<->float)
 		# takes the GetFloatCast path: floats have no integer-overflow concept,
@@ -4091,6 +4121,23 @@ class FunctionLowering:
 					f'{expected_type.qualname} is expected',
 					node,
 				)
+			# a PLAIN literal (not the argument of an explicit T(...)/
+			# compiler.cast(T,...) - see _lower_scalar_cast's own
+			# _allow_literal_bit_reinterpret handling, which exempts THAT
+			# case as deliberate bit-reinterpretation) flowing into a
+			# concrete integer scalar type must actually FIT that type's
+			# real range - compatible_stems above only checked the
+			# literal's KIND (int vs float/str/...), never its magnitude
+			if (
+				not self._allow_literal_bit_reinterpret and type( node.value ) is int
+				and isinstance( expected_type, Scalar ) and expected_stem in self.lowering._LITERAL_COMPATIBLE_STEMS[int]
+			):
+				lo, hi = _int_stem_range( expected_type )
+				if not ( lo <= node.value <= hi ):
+					self.lowering.discovery.fail(
+						f'{node.value} is out of range for {expected_type.qualname} ({lo}..{hi}): {ast.unparse(node)}',
+						node,
+					)
 		# expected_type being a TaggedUnion (e.g. str|None) is treated the
 		# same as no expected_type at all: a literal's OWN Python type
 		# always determines its natural type (bool/i32/str/NoneType) -
@@ -5598,6 +5645,21 @@ class FunctionLowering:
 			if len( node.args ) != 1 or node.keywords:
 				self.lowering.discovery.fail( f'{target_cls.qualname}(...) takes exactly one positional argument: {ast.unparse(node)}', node )
 			self.lowering._ensure_resolved( target_cls )
+			# a literal argument's magnitude must fit the enum's own
+			# underlying type's real range - this is CONSTRUCTION, not a
+			# cast, so _lower_scalar_cast's bit-reinterpretation exemption
+			# (_allow_literal_bit_reinterpret) doesn't apply here; an out-
+			# of-range value is a genuine mistake, unlike u32(-11)'s
+			# deliberate WinAPI-style reinterpretation
+			arg_node = node.args[0]
+			value_type = target_cls.value_type
+			if isinstance( arg_node, ast.Constant ) and type( arg_node.value ) is int and isinstance( value_type, Scalar ):
+				lo, hi = _int_stem_range( value_type )
+				if not ( lo <= arg_node.value <= hi ):
+					self.lowering.discovery.fail(
+						f'{arg_node.value} is out of range for {target_cls.qualname} ({lo}..{hi}): {ast.unparse(node)}',
+						node,
+					)
 			# lower the argument directly — no arithmetic-mode semantics
 			# needed here; a CEnum has exactly the same runtime
 			# representation as its underlying type, so OSError(42) is
