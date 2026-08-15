@@ -12,8 +12,15 @@
 # Phase 3: `\b`/`\B` word-boundary assertions, a common backslash-escape
 # table (\n \t \r \f \v \a \0, shared between atom and character-class
 # parsing except `\b`, which is a word boundary outside a class but a
-# literal backspace inside one), and the MULTILINE/DOTALL flags. See
-# PLAN_RE.md for all three phases.
+# literal backspace inside one), and the MULTILINE/DOTALL flags.
+#
+# Phase 4: lookahead `(?=...)`/`(?!...)` and lookbehind `(?<=...)`/`(?<!...)`
+# - zero-width assertions that run a nested sub-match (sharing the outer
+# match's own capture slots, so a group nested inside an assertion still
+# populates the outer Match) without consuming input. Lookbehind requires
+# a fixed-width body (Parser._parse_group computes it via
+# _fragment_fixed_byte_width) since the VM needs to know exactly how far
+# back to anchor the nested match. See PLAN_RE.md for all four phases.
 #
 # Follows time_test.py's own template: RealCompileMixin + assert_programs_run,
 # print()-free, exit code 0 = every check passed, distinct nonzero i32 per
@@ -353,6 +360,62 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_LOOKAROUND = '''
+import re
+
+def main() -> i32:
+	la: re.Pattern = re.compile( 'foo(?=bar)' ).unwrap( 'bad' )
+	if la.search( 'foobar' ).is_err():
+		return 1
+	if la.search( 'foobaz' ).is_ok():
+		return 2
+
+	nla: re.Pattern = re.compile( 'foo(?!bar)' ).unwrap( 'bad' )
+	if nla.search( 'foobaz' ).is_err():
+		return 3
+	if nla.search( 'foobar' ).is_ok():
+		return 4
+
+	lb: re.Pattern = re.compile( r'(?<=\\$)\\d+' ).unwrap( 'bad' )
+	m: Result[re.Match, re.MatchError] = lb.search( 'price: $42' )
+	if m.is_err():
+		return 5
+	mg: str|None = m.unwrap( 'ok' ).group()
+	if mg is None:
+		return 6
+	if mg != '42':
+		return 6
+	if lb.search( 'price: 42' ).is_ok():  # no '$' before the digits
+		return 7
+
+	nlb: re.Pattern = re.compile( r'(?<!\\$)\\d+' ).unwrap( 'bad' )
+	if nlb.search( 'x42' ).is_err():
+		return 8
+
+	# lookbehind must reject a variable-width body
+	bad_lb: Result[re.Pattern, re.PatternError] = re.compile( r'(?<=a+)b' )
+	if bad_lb.is_ok():
+		return 9
+
+	# lookahead containing a capturing group still populates the outer match
+	grp_la: re.Pattern = re.compile( r'\\w+(?=@(\\w+))' ).unwrap( 'bad' )
+	gm: Result[re.Match, re.MatchError] = grp_la.search( 'user@host' )
+	if gm.is_err():
+		return 10
+	gmm: re.Match = gm.unwrap( 'ok' )
+	whole: str|None = gmm.group()
+	if whole is None:
+		return 11
+	if whole != 'user':  # lookahead itself is zero-width, doesn't extend the match
+		return 11
+	g1: str|None = gmm.group( 1 )
+	if g1 is None:
+		return 12
+	if g1 != 'host':
+		return 12
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -378,6 +441,14 @@ class RePhase3BehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_phase3_boundaries_escapes_and_flags( self ) -> None:
 		self.assert_programs_run([
 			( 'word_boundaries_escapes_and_flags', _RE_WORD_BOUNDARIES_ESCAPES_AND_FLAGS ),
+		])
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase4BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def test_phase4_lookaround( self ) -> None:
+		self.assert_programs_run([
+			( 'lookaround', _RE_LOOKAROUND ),
 		])
 
 

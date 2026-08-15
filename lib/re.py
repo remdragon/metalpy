@@ -112,6 +112,10 @@ class OpKind:
 	MATCH = 8   # whole pattern matched
 	WORDB = 9   # `\b` - zero-width word boundary
 	NWORDB = 10 # `\B` - zero-width NOT-a-word-boundary
+	LOOKAHEAD_POS = 11  # `(?=...)` - zero-width, op.sub must match at sp
+	LOOKAHEAD_NEG = 12  # `(?!...)` - zero-width, op.sub must NOT match at sp
+	LOOKBEHIND_POS = 13 # `(?<=...)` - zero-width, op.sub must match ending exactly at sp, anchored at sp-op.width
+	LOOKBEHIND_NEG = 14 # `(?<!...)` - zero-width negation of the above
 
 
 class Op:
@@ -121,6 +125,8 @@ class Op:
 	target_a: usize
 	target_b: usize
 	slot: usize
+	width: usize       # LOOKBEHIND_*: fixed byte width to step back from sp
+	sub: list[Op]      # LOOKAHEAD_*/LOOKBEHIND_*: the assertion's own self-contained compiled body (ends in MATCH)
 
 	def __init__( self, kind: OpKind ) -> None:
 		self.kind = kind
@@ -129,6 +135,8 @@ class Op:
 		self.target_a = 0
 		self.target_b = 0
 		self.slot = 0
+		self.width = 0
+		self.sub = list[Op]()
 
 
 def _op_char( ch: u32 ) -> Op:
@@ -174,6 +182,17 @@ def _op_save( slot: usize ) -> Op:
 
 def _op_match() -> Op:
 	return Op( OpKind.MATCH )
+
+def _op_lookahead( sub: list[Op], negate: bool ) -> Op:
+	op = Op( OpKind.LOOKAHEAD_NEG if negate else OpKind.LOOKAHEAD_POS )
+	op.sub = sub
+	return op
+
+def _op_lookbehind( sub: list[Op], width: usize, negate: bool ) -> Op:
+	op = Op( OpKind.LOOKBEHIND_NEG if negate else OpKind.LOOKBEHIND_POS )
+	op.sub = sub
+	op.width = width
+	return op
 
 
 class CharClass:
@@ -224,6 +243,13 @@ def _clone_op_at_offset( op: Op, offset: usize ) -> Op:
 	out.ch = op.ch
 	out.class_idx = op.class_idx
 	out.slot = op.slot
+	out.width = op.width
+	# op.sub (LOOKAHEAD_*/LOOKBEHIND_*) is its own self-contained, already-
+	# finished fragment with local-to-itself indices - never mutated after
+	# construction (only the OUTER op's target_a/target_b, unused by these
+	# kinds, ever get offset-shifted), so sharing the reference across
+	# clones is safe, not just an optimization.
+	out.sub = op.sub
 	if op.kind == OpKind.SPLIT:
 		with compiler.wrap_arithmetic:
 			out.target_a = op.target_a + offset
@@ -513,12 +539,44 @@ class Parser:
 	def _parse_group( self ) -> Result[list[Op], PatternError]:
 		self._advance_byte()  # consume '('
 		capturing: bool = True
+		is_lookahead: bool = False
+		is_lookbehind: bool = False
+		negate_lookaround: bool = False
 		if not self._at_end() and self._peek_byte() == _BYTE_QUESTION_MARK:
 			self._advance_byte()  # consume '?'
-			if self._at_end() or self._peek_byte() != _BYTE_COLON:
-				return Result.Err( PatternError( 're: unsupported group syntax (only (?:...) is recognized so far)' ))
-			self._advance_byte()  # consume ':'
-			capturing = False
+			if self._at_end():
+				return Result.Err( PatternError( 're: unexpected end of pattern after (?' ))
+			qb: u8 = self._peek_byte()
+			if qb == _BYTE_COLON:
+				self._advance_byte()
+				capturing = False
+			elif qb == 61:  # '=' -> (?=...) positive lookahead
+				self._advance_byte()
+				capturing = False
+				is_lookahead = True
+			elif qb == 33:  # '!' -> (?!...) negative lookahead
+				self._advance_byte()
+				capturing = False
+				is_lookahead = True
+				negate_lookaround = True
+			elif qb == 60:  # '<' -> (?<=...)/(?<!...) lookbehind (Python has no bare (?<name>...))
+				self._advance_byte()
+				if self._at_end():
+					return Result.Err( PatternError( 're: unexpected end of pattern after (?<' ))
+				lb: u8 = self._peek_byte()
+				if lb == 61:  # '='
+					self._advance_byte()
+					capturing = False
+					is_lookbehind = True
+				elif lb == 33:  # '!'
+					self._advance_byte()
+					capturing = False
+					is_lookbehind = True
+					negate_lookaround = True
+				else:
+					return Result.Err( PatternError( 're: unsupported group syntax (only (?<=...)/(?<!...) lookbehind recognized after (?<)' ))
+			else:
+				return Result.Err( PatternError( 're: unsupported group syntax (recognized: (?:...) (?=...) (?!...) (?<=...) (?<!...))' ))
 		start_slot: usize = 0
 		end_slot: usize = 0
 		if capturing:
@@ -537,6 +595,19 @@ class Parser:
 		if self._at_end() or self._peek_byte() != _BYTE_RPAREN:
 			return Result.Err( PatternError( 're: unbalanced parenthesis' ))
 		self._advance_byte()  # consume ')'
+		if is_lookahead:
+			sub_prog: list[Op] = list[Op]()
+			_append_fragment( sub_prog, inner )
+			_append_fragment( sub_prog, _single_op_fragment( _op_match()))
+			return Result.Ok( _single_op_fragment( _op_lookahead( sub_prog, negate_lookaround )))
+		if is_lookbehind:
+			width: usize|None = _fragment_fixed_byte_width( inner, self.classes )
+			if width is None:
+				return Result.Err( PatternError( 're: look-behind requires a fixed-width pattern' ))
+			sub_prog2: list[Op] = list[Op]()
+			_append_fragment( sub_prog2, inner )
+			_append_fragment( sub_prog2, _single_op_fragment( _op_match()))
+			return Result.Ok( _single_op_fragment( _op_lookbehind( sub_prog2, width, negate_lookaround )))
 		if not capturing:
 			return Result.Ok( inner )
 		wrapped: list[Op] = list[Op]()
@@ -707,6 +778,69 @@ def _is_word_byte_cp( cp: u32 ) -> bool:
 	return False
 
 
+def _class_fixed_byte_width( cls: CharClass ) -> usize|None:
+	''' the single UTF-8 byte width every codepoint this class can match
+	is guaranteed to have, or None if that varies (a negated class, or
+	one whose member ranges span more than one UTF-8 width band) - used
+	by _fragment_fixed_byte_width for lookbehind validation. '''
+	if cls.negate:
+		return None
+	n: usize = len( cls.lo )
+	if n == 0:
+		return None
+	common_width: usize = 0
+	first: bool = True
+	i: usize = 0
+	while i < n:
+		lo: u32 = cls.lo.__getitem__( i ).unwrap( 're: class width lo' )
+		hi: u32 = cls.hi.__getitem__( i ).unwrap( 're: class width hi' )
+		w_lo: usize = builtins.utf8_encoded_len( lo )
+		w_hi: usize = builtins.utf8_encoded_len( hi )
+		if w_lo != w_hi:
+			return None
+		if first:
+			common_width = w_lo
+			first = False
+		elif w_lo != common_width:
+			return None
+		with compiler.wrap_arithmetic:
+			i += 1
+	return common_width
+
+
+def _fragment_fixed_byte_width( frag: list[Op], classes: list[CharClass] ) -> usize|None:
+	''' the fixed byte count every possible execution path through frag
+	consumes, or None if it isn't fixed (a SPLIT/JUMP - alternation or a
+	variable-count quantifier - or ANY, or a variable-width character
+	class, appears anywhere in it). Mirrors Python re's own "look-behind
+	requires fixed-width pattern" restriction; an exact-count quantifier
+	like {3} is fine (it unrolls to 3 plain copies with no SPLIT/JUMP -
+	see _quantify_range), only a variable count (*, +, ?, {m,n} with
+	n != m, or {m,}) is rejected. '''
+	total: usize = 0
+	i: usize = 0
+	n: usize = len( frag )
+	while i < n:
+		op: Op = frag.__getitem__( i ).unwrap( 're: fixed width scan' )
+		if op.kind == OpKind.CHAR:
+			with compiler.wrap_arithmetic:
+				total += builtins.utf8_encoded_len( op.ch )
+		elif op.kind == OpKind.IN:
+			cls: CharClass = classes.__getitem__( op.class_idx ).unwrap( 're: fixed width scan class' )
+			w: usize|None = _class_fixed_byte_width( cls )
+			if w is None:
+				return None
+			with compiler.wrap_arithmetic:
+				total += w
+		elif op.kind == OpKind.SAVE or op.kind == OpKind.BOL or op.kind == OpKind.EOL or op.kind == OpKind.WORDB or op.kind == OpKind.NWORDB:
+			pass  # zero-width
+		else:
+			return None  # ANY, SPLIT, JUMP, MATCH, LOOKAHEAD_*, LOOKBEHIND_* - variable or not applicable
+		with compiler.wrap_arithmetic:
+			i += 1
+	return total
+
+
 # ---------------------------------------------------------------------------
 # Matcher — a backtracking VM over the compiled Op list, using an explicit
 # `list[Frame]` stack for choice points instead of real recursion (see
@@ -796,11 +930,9 @@ class Matcher:
 		return before != after
 
 	def run_at( self, start_pos: usize, n_slots: usize ) -> Result[Frame, MatchError]:
-		''' attempts an anchored match beginning exactly at start_pos.
-		Returns the final Frame (whose slot_values/slot_set carry the
-		capture results) on success. '''
-		pc: usize = 0
-		sp: usize = start_pos
+		''' attempts an anchored match beginning exactly at start_pos, with
+		every capture slot starting unset. Returns the final Frame (whose
+		slot_values/slot_set carry the capture results) on success. '''
 		slot_values: list[usize] = list[usize]()
 		slot_set: list[bool] = list[bool]()
 		i: usize = 0
@@ -809,6 +941,21 @@ class Matcher:
 			slot_set.append( False ).unwrap( 're: run_at init slots' )
 			with compiler.wrap_arithmetic:
 				i += 1
+		return self._run_from( start_pos, slot_values, slot_set )
+
+	def _run_from( self, start_pos: usize, slot_values_in: list[usize], slot_set_in: list[bool] ) -> Result[Frame, MatchError]:
+		''' like run_at, but the caller supplies the starting capture-slot
+		state instead of it being reset to unset - used by LOOKAHEAD_*/
+		LOOKBEHIND_* to run a nested sub-match that shares (a snapshot of)
+		the outer match's own slots, so a capturing group nested inside a
+		lookaround still populates the outer Match's groups on success.
+		self.ops is swapped to the assertion's own op.sub for the duration
+		of the nested run (self.steps/self.max_steps stay shared, so the
+		step budget bounds the combined effort of outer + nested matching). '''
+		pc: usize = 0
+		sp: usize = start_pos
+		slot_values: list[usize] = slot_values_in
+		slot_set: list[bool] = slot_set_in
 		stack: list[Frame] = list[Frame]()
 
 		while True:
@@ -858,6 +1005,49 @@ class Matcher:
 				matched = self._is_word_boundary( sp )
 			elif op.kind == OpKind.NWORDB:
 				matched = not self._is_word_boundary( sp )
+			elif op.kind == OpKind.LOOKAHEAD_POS or op.kind == OpKind.LOOKAHEAD_NEG:
+				saved_ops: list[Op] = self.ops
+				self.ops = op.sub
+				sub_outcome: Result[Frame, MatchError] = self._run_from(
+					sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ))
+				self.ops = saved_ops
+				positive: bool = op.kind == OpKind.LOOKAHEAD_POS
+				match sub_outcome:
+					case Result.Ok( sub_frame ):
+						if positive:
+							slot_values = sub_frame.slot_values
+							slot_set = sub_frame.slot_set
+							matched = True
+						else:
+							matched = False
+					case Result.Err( sub_err ):
+						if sub_err == MatchError.StepLimitExceeded:
+							return Result.Err( sub_err )
+						matched = not positive
+			elif op.kind == OpKind.LOOKBEHIND_POS or op.kind == OpKind.LOOKBEHIND_NEG:
+				positive2: bool = op.kind == OpKind.LOOKBEHIND_POS
+				if sp < op.width:
+					matched = not positive2  # can't look behind far enough - POS fails, NEG succeeds
+				else:
+					with compiler.wrap_arithmetic:
+						behind_start: usize = sp - op.width
+					saved_ops2: list[Op] = self.ops
+					self.ops = op.sub
+					sub_outcome2: Result[Frame, MatchError] = self._run_from(
+						behind_start, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ))
+					self.ops = saved_ops2
+					match sub_outcome2:
+						case Result.Ok( sub_frame2 ):
+							if positive2:
+								slot_values = sub_frame2.slot_values
+								slot_set = sub_frame2.slot_set
+								matched = True
+							else:
+								matched = False
+						case Result.Err( sub_err2 ):
+							if sub_err2 == MatchError.StepLimitExceeded:
+								return Result.Err( sub_err2 )
+							matched = not positive2
 			elif op.kind == OpKind.SPLIT:
 				frame = Frame( op.target_b, sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ))
 				stack.append( frame ).unwrap( 're: run_at push split frame' )
