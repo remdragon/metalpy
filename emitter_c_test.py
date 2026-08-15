@@ -4903,6 +4903,85 @@ def main() -> i32:
 		] )
 
 
+class PropertyRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for @property (lowering.py's _expr_
+	Attribute is_property branch) - unlike the IR-shape assertions in
+	lowering_test.py, these confirm the generated code actually calls the
+	getter and produces the right value, and (for an RC-typed property)
+	doesn't leak or double-free the returned value across repeated reads. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# obj.attr (no call parens) actually calls the getter - a plain
+			# GetAttr would find no real field named 'doubled' and fail to
+			# compile at all, so a successful compile+correct value together
+			# confirm the Call-based dispatch is really happening
+			( 'scalar_property_computed_from_field', '''
+class Box:
+	x: i32
+
+	@property
+	def doubled( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x * 2
+
+def main() -> i32:
+	b: Box = Box( x = 21 )
+	if b.doubled != 42:
+		return 1
+	return 0
+''' ),
+			# the property's result participates in an ordinary expression
+			# exactly like a real field would - not just a bare read
+			( 'property_used_in_expression', '''
+class Box:
+	x: i32
+
+	@property
+	def doubled( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x * 2
+
+def main() -> i32:
+	b: Box = Box( x = 5 )
+	with compiler.wrap_arithmetic:
+		y: i32 = b.doubled + 1
+	if y != 11:
+		return 1
+	return 0
+''' ),
+			# an RC-typed property (returns a fresh str each read) read
+			# repeatedly in a loop - a missing/wrong incref or decref on the
+			# Call's own result would leak or double-free, and 200
+			# iterations is enough for that to reliably surface
+			( 'rc_typed_property_read_in_a_loop', '''
+class Greeter:
+	name: str
+
+	@property
+	def greeting( self ) -> str:
+		return "hello " + self.name
+
+def main() -> i32:
+	g: Greeter = Greeter( name = "world" )
+	i: i32 = 0
+	while i < 200:
+		if len( g.greeting ) != 11:
+			return 1
+		with compiler.wrap_arithmetic:
+			i += 1
+	return 0
+''' ),
+		] )
+
+
 class ThreadRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for threading.Thread (lib/threading.py),
 	built on Phase 1 (compiler.atomic_*/lib/atomic.py) and Phase 2b

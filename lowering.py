@@ -5548,6 +5548,18 @@ class FunctionLowering:
 			and not method.is_static and not method.is_classmethod
 			and not method.type_params and not method.is_overload
 		):
+			if method.is_property:
+				# @property - `obj.attr` (no call parens) means "call this
+				# zero-arg getter and use its result", not "bind a callable
+				# closure to it" (the ordinary method-as-value meaning just
+				# below, which a property never uses - there is no coherent
+				# "callable referring to this property" the way there is for
+				# an ordinary method). _ensure_resolved first - method.
+				# return_type is still None until then (same reason the
+				# dunder-dispatch BinOp/Compare paths above resolve their own
+				# method before ever reading .return_type)
+				self.lowering._ensure_resolved( method )
+				return self._lower_method_call( obj, node.attr, [], expected_type or method.return_type, node )
 			return self._lower_bound_method_closure( node, obj, method, expected_type )
 		attr_var = self.lowering._attr_lookup( obj.type, node.attr, node )
 		dest = self._new_temp( attr_var.type )

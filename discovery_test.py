@@ -1781,21 +1781,14 @@ class Foo:
 		self.assertTrue( release.is_move )
 
 
-class UnsupportedDecoratorTests( unittest.TestCase ):
+class PropertyDecoratorTests( unittest.TestCase ):
 	def setUp( self ) -> None:
 		self.discovery = discovery.Discovery( import_builtins = False )
 
 	def _import( self, code: str ) -> Module:
 		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
 
-	def test_property_is_not_yet_supported( self ) -> None:
-		# intentionally unimplemented for now, deferred until other problems
-		# are solved (see Discovery/ARCHITECTURE.md discussion) - this test
-		# just locks in that it fails loudly rather than silently doing the
-		# wrong thing, so implementing it later is a deliberate decision.
-		# @property lives inside the class body, which is itself deferred
-		# behind .resolve() (see ShallowScanTests), so the error only
-		# surfaces once something actually asks for it
+	def test_property_decorator_flag_on_function( self ) -> None:
 		mod = self._import( '''
 class Foo:
 	@property
@@ -1804,7 +1797,66 @@ class Foo:
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
-		self.assertIn( 'unsupported function decorator', self.discovery.errors.errors[0] )
+		bar = foo.get_local( 'bar' )
+		self.assertTrue( bar.is_property )
+
+	def test_property_on_free_function_errors( self ) -> None:
+		# a free function is parsed eagerly at import time (unlike a class
+		# method, deferred behind the class's own .resolve() - see the other
+		# tests here), so the error already fired during _import itself
+		self._import( '''
+@property
+def bar() -> i32:
+	return 1
+''' )
+		self.assertIn( 'only valid on a method', self.discovery.errors.errors[0] )
+
+	def test_property_with_extra_parameter_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	def bar( self, extra: i32 ) -> i32:
+		return extra
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must take exactly `self`', self.discovery.errors.errors[0] )
+
+	def test_property_combined_with_staticmethod_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	@staticmethod
+	def bar() -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @staticmethod/@classmethod', self.discovery.errors.errors[0] )
+
+	def test_property_combined_with_classmethod_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	@classmethod
+	def bar( cls ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @staticmethod/@classmethod', self.discovery.errors.errors[0] )
+
+	def test_property_combined_with_overload_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	@overload
+	def bar( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @overload', self.discovery.errors.errors[0] )
 
 
 class OrReturnReservedNameTests( unittest.TestCase ):
