@@ -339,19 +339,6 @@ static inline bool __metalpy_isinf_f64( double x ) {
 #define __metalpy_nanf() __builtin_nanf("")
 #define __metalpy_nan()  __builtin_nan("")
 #endif
-// Windows: call SetConsoleOutputCP(CP_UTF8) so Unicode print() works.
-// Called from __metalpy_init() (synthesized below, in emit_c()) on every
-// Windows build, and from the custom entry point (mainCRTStartup below)
-// when the CRT is not linked.
-#ifdef _WIN32
-#define CP_UTF8 65001
-#ifdef _MSC_VER
-int __stdcall SetConsoleOutputCP(unsigned int);
-#pragma comment(linker, "/alternatename:__imp__SetConsoleOutputCP=__imp_SetConsoleOutputCP")
-#else
-int __stdcall SetConsoleOutputCP(unsigned int);
-#endif
-#endif
 // backs compiler.format_f64(buf, size, precision, type_char, alt, value)
 // (lowering.py's _lower_compiler_format_f64 / ir.FormatFloat) - writes
 // value's fixed-precision decimal digits into buf via a dynamically-built
@@ -3361,36 +3348,36 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		init_fn = _emit_global_init_fn( g )
 		if init_fn is not None:
 			parts.append( init_fn )
-	# the single, real __metalpy_init() (PLAN_GLOBAL_INIT.md) - runs the
-	# Windows console-codepage setup (previously two competing #ifdef'd
-	# function bodies in PROLOGUE, now one function with the platform bit
-	# gated internally) plus every non-trivial global's own init function,
-	# in DEPENDENCY order (_topologically_sort_globals - NOT compiler.
-	# globals' own scheduling order, which has no relationship to which
-	# global's own initializer reads which other global's value; confirmed
-	# as a real, reachable bug via a real test - `b: Foo = Foo.make(a.x)`
-	# with main() only ever referencing b schedules b before a). Always
-	# defined and always called (see main()'s own prepend below) - not just
-	# on Windows - since global initializers must run on every target now,
-	# not only the Windows-specific statement. A global whose non-trivial
-	# init is nonetheless an all-zero value-type construction (_global_
-	# init_is_all_zero_value_type) is skipped here - its own {0} static
-	# initializer (_emit_global_declaration, above) already IS that value,
-	# so calling it would be a pure no-op at best (and, confirmed by a real
-	# link failure, a real problem at worst on a no-CRT target if the C
-	# compiler lowers the struct-copy into a memset/memcpy call) -
-	# _topologically_sort_globals already excludes it from its own graph
-	# for the identical reason (it never gets a call, so it can never be a
-	# real dependency edge either).
+	# the single, real __metalpy_init() (PLAN_GLOBAL_INIT.md) - calls every
+	# non-trivial global's own init function, in DEPENDENCY order
+	# (_topologically_sort_globals - NOT compiler.globals' own scheduling
+	# order, which has no relationship to which global's own initializer
+	# reads which other global's value; confirmed as a real, reachable bug
+	# via a real test - `b: Foo = Foo.make(a.x)` with main() only ever
+	# referencing b schedules b before a). Always defined and always called
+	# (see main()'s own prepend below) - not just on Windows - since global
+	# initializers must run on every target now. The Windows console-
+	# codepage setup used to be hardcoded directly in here (two competing
+	# #ifdef'd function bodies in PROLOGUE, later folded into one); it's now
+	# just an ordinary global - windows/_console.py's _console_init, forced
+	# reachable on every Windows target by Compiler.run() - so its own
+	# SetConsoleOutputCP call flows through this same init_calls list like
+	# any other global, with no special-casing needed here at all. A global
+	# whose non-trivial init is nonetheless an all-zero value-type
+	# construction (_global_init_is_all_zero_value_type) is skipped here -
+	# its own {0} static initializer (_emit_global_declaration, above)
+	# already IS that value, so calling it would be a pure no-op at best
+	# (and, confirmed by a real link failure, a real problem at worst on a
+	# no-CRT target if the C compiler lowers the struct-copy into a memset/
+	# memcpy call) - _topologically_sort_globals already excludes it from
+	# its own graph for the identical reason (it never gets a call, so it
+	# can never be a real dependency edge either).
 	init_calls = [
 		f'\t{_global_init_fn_name( g )}();'
 		for g in _topologically_sort_globals( compiler )
 	]
 	parts.append(
 		'static void __metalpy_init( void ) {\n'
-		'#ifdef _WIN32\n'
-		'\tSetConsoleOutputCP( CP_UTF8 );\n'
-		'#endif\n'
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
 	)
