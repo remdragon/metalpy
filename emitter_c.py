@@ -1056,7 +1056,13 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 	builtin = _ARITH_BUILTIN[kind]
 	dest = _temp_name( dest_temp_id )
 	l, r = _emit_operand( left ), _emit_operand( right )
-	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( result_spec )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( result_spec )
+	# the Err branches below zero the (unused, zero-payload-marker) err_f
+	# payload slot alongside the tag, via a compound-literal cast to its own
+	# real ctype (not a bare `= 0` - see _emit_set_result_err's own comment:
+	# an uninitialized payload here is genuine, confirmed UB, but E isn't
+	# always an RC pointer either, so the zero-literal needs E's own ctype)
+	err_ctype = c_type( _result_error_type( result_spec ))
 	if _is_pointer_type( ok_type ):
 		if kind not in ( 'add', 'sub' ):
 			raise NotImplementedError( f'checked pointer {kind} is not supported' )
@@ -1066,6 +1072,7 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 			f'\t\tbool __overflow = {builtin}( (uintptr_t)({l}), (uintptr_t)({r}), &__tmp );',
 			'\t\tif ( __overflow ) {',
 			f'\t\t\t{dest}.{tag_f} = 1;',
+			f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};',
 			'\t\t} else {',
 			f'\t\t\t{dest}.{tag_f} = 0;',
 			f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})__tmp;',
@@ -1078,6 +1085,7 @@ def _emit_check_arith( dest_temp_id: int, left: ir.Operand, right: ir.Operand, k
 		f'\t\tbool __overflow = {builtin}( {l}, {r}, &__tmp );',
 		'\t\tif ( __overflow ) {',
 		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};',
 		'\t\t} else {',
 		f'\t\t\t{dest}.{tag_f} = 0;',
 		f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
@@ -1099,12 +1107,14 @@ def _emit_float_check_arith( instr ) -> list[str]:
 	ctype = c_type( ok_type )
 	dest = _temp_name( instr.dest.id )
 	l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
-	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+	err_ctype = c_type( _result_error_type( instr.dest.type ))
 	return [
 		'\t{',
 		f'\t\t{ctype} __tmp = ({l}) {symbol} ({r});',
 		'\t\tif ( __metalpy_isinf( __tmp ) || __metalpy_isnan( __tmp ) ) {',
 		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
 		'\t\t} else {',
 		f'\t\t\t{dest}.{tag_f} = 0;',
 		f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
@@ -1176,13 +1186,22 @@ def _emit_float_cast_check( instr ) -> list[str]:
 	ctype = c_type( ok_type )
 	operand = _emit_operand( instr.operand )
 	dest = _temp_name( instr.dest.id )
-	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+	# the Err branch below only ever sets .tag = 1 - the .data.{err_f} slot
+	# is otherwise left uninitialized, harmless in isolation but genuine,
+	# confirmed UB once this Result gets copied/widened elsewhere (e.g.
+	# _emit_widen_error's identical-layout fast path is a plain whole-struct
+	# assignment) - see _emit_set_result_err's own comment. Zero-initialized
+	# via a compound literal cast to E's own ctype, not a bare `= 0` - E
+	# isn't always an RC pointer (could be a non-RC @cstruct value type)
+	err_ctype = c_type( _result_error_type( instr.dest.type ))
 	if _is_float_type( ok_type ):
 		return [
 			'\t{',
 			f'\t\t{ctype} __tmp = ({ctype})({operand});',
 			'\t\tif ( __metalpy_isinf( __tmp ) || __metalpy_isnan( __tmp ) ) {',
 			f'\t\t\t{dest}.{tag_f} = 1;',
+			f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};',
 			'\t\t} else {',
 			f'\t\t\t{dest}.{tag_f} = 0;',
 			f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
@@ -1197,6 +1216,7 @@ def _emit_float_cast_check( instr ) -> list[str]:
 		'\t{',
 		f'\t\tif ( __metalpy_isnan( {operand} ) || ({operand}) < {min_c} || ({operand}) >= {max_c} ) {{',
 		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};',
 		'\t\t} else {',
 		f'\t\t\t{dest}.{tag_f} = 0;',
 		f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
@@ -1241,13 +1261,38 @@ def _emit_set_result_err( dest: str, result_spec: Type, error_stem: str, indent:
 	# set the Err tag; when the error type is a UNION (e.g. ZeroDivisionError|
 	# OverflowError), also set the inner union's variant tag for `error_stem`.
 	# A single-marker error type has no inner variant to pick.
+	#
+	# error_stem is always one of the zero-payload arithmetic marker errors
+	# (ZeroDivisionError/OverflowError/FloatingPointError - this helper's only
+	# 3 call sites, in _emit_int_division/_emit_float_div_check). They carry
+	# no real data, but the payload field the union/struct storage still
+	# declares for them (a bare RC-pointer slot, like any other error class -
+	# see _emit_widen_error's own docstring) was otherwise left uninitialized
+	# here. Harmless in isolation (a marker error's payload is never
+	# dereferenced), but _emit_widen_error's union-remap switch unconditionally
+	# copies EVERY variant's payload alongside its tag (necessarily so, since
+	# it's a general mechanism that also serves real user error payloads) -
+	# copying that uninitialized pointer value is a genuine, confirmed UB
+	# (caught by gcc's UBSan under -O0 as an actual SIGILL, not a false
+	# positive - see test_widening_propagates_error). Zero-initializing the
+	# payload here, at the one place these markers are ever actually
+	# constructed, fixes it at the source: cheap, always well-defined, and
+	# makes every later copy of this payload well-defined too.
 	tag_f, data_f, _ok_f, err_f = _result_tag_data_names( result_spec )
 	lines = [ f'{indent}{dest}.{tag_f} = 1;' ]
 	err_type = _result_error_type( result_spec )
 	if isinstance( err_type, TaggedUnion ):
-		inner_tag, _inner_data = _union_tag_data_fields( err_type )
-		ordinal = next( i for i, attr in enumerate( err_type.attributes ) if attr.type is not None and attr.type.stem == error_stem )
+		inner_tag, inner_data = _union_tag_data_fields( err_type )
+		ordinal, attr = next( ( i, a ) for i, a in enumerate( err_type.attributes ) if a.type is not None and a.type.stem == error_stem )
 		lines.append( f'{indent}{dest}.{data_f}.{err_f}.{inner_tag} = {ordinal};' )
+		lines.append( f'{indent}{dest}.{data_f}.{err_f}.{inner_data}.{_field_name( f"v_{attr.stem}" )} = 0;' )
+	else:
+		# a compound-literal zero-init, not a bare `= 0` - err_type is USUALLY
+		# one of the built-in RC-pointer markers (NULL-able with a bare 0),
+		# but a Result[T,E] can also declare a non-RC (@cstruct-shaped, plain
+		# VALUE struct) E, where `= 0` is a real type-mismatch compile error,
+		# not just a style nit - (ctype){0} zero-initializes correctly either way
+		lines.append( f'{indent}{dest}.{data_f}.{err_f} = ({c_type( err_type )}){{0}};' )
 	return lines
 
 def _signed_min_max( stem: str ) -> tuple[str,str]:
@@ -1359,13 +1404,15 @@ def _emit_shl( instr ) -> list[str]:
 		ctype = c_type( dest_type )
 		stem = dest_type.stem if isinstance( dest_type, Scalar ) else None
 		dest = _temp_name( instr.dest.id )
-		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+		tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+		err_ctype = c_type( _result_error_type( instr.dest.type ))
 		return [
 			'\t{',
 			f'\t\t{ctype} __tmp = {_shl_expr( ctype, stem, l, r )};',
 			f'\t\tbool __overflow = ( __tmp >> ({r}) ) != ({l});',
 			'\t\tif ( __overflow ) {',
 			f'\t\t\t{dest}.{tag_f} = 1;',
+			f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
 			'\t\t} else {',
 			f'\t\t\t{dest}.{tag_f} = 0;',
 			f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
@@ -1415,13 +1462,15 @@ def _emit_neg( instr ) -> list[str]:
 		]
 	# check
 	dest = _temp_name( instr.dest.id )
-	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+	err_ctype = c_type( _result_error_type( instr.dest.type ))
 	return [
 		'\t{',
 		f'\t\t{ctype} __tmp;',
 		f'\t\tbool __overflow = __metalpy_sub_overflow( ({ctype})0, ({operand}), &__tmp );',
 		'\t\tif ( __overflow ) {',
 		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
 		'\t\t} else {',
 		f'\t\t\t{dest}.{tag_f} = 0;',
 		f'\t\t\t{dest}.{data_f}.{ok_f} = __tmp;',
@@ -1480,14 +1529,16 @@ def _emit_cast( instr ) -> list[str]:
 			clamp = f'{out_of_range} ? {min_c} : ({ctype})({operand})' if out_of_range else f'({ctype})({operand})'
 			return [ f'\t{dest} = {clamp};' ]
 		dest = _temp_name( instr.dest.id )
-		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+		tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
 		if out_of_range is None:
 			return [ f'\t{dest}.{tag_f} = 0;', f'\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});' ]
+		err_ctype = c_type( _result_error_type( instr.dest.type ))
 		return [
 			'\t{',
 			f'\t\tbool __overflow = {out_of_range};',
 			'\t\tif ( __overflow ) {',
 			f'\t\t\t{dest}.{tag_f} = 1;',
+			f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
 			'\t\t} else {',
 			f'\t\t\t{dest}.{tag_f} = 0;',
 			f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
@@ -1502,12 +1553,35 @@ def _emit_cast( instr ) -> list[str]:
 	# non-negative source can never actually be "below" any real MIN anyway)
 	wide_ctype = '__metalpy_wideuint' if source_stem == 'u128' else '__metalpy_wideint'
 	wide_decl = f'{wide_ctype} __wide = ({wide_ctype})({operand});'
+	# u64/usize's own MAX (UINT64_MAX/UINTPTR_MAX) doesn't fit as a positive
+	# value in a SIGNED __metalpy_wideint once its own width matches the
+	# target's - true under MSVC's 64-bit fallback specifically (see the
+	# __metalpy_wideint comment near its typedefs), where
+	# (__metalpy_wideint)(UINTPTR_MAX) wraps to -1, making a plain
+	# "__wide > (wideint)max_c" spuriously true for every non-negative
+	# value (confirmed - see lib/builtins/__str.py's case_map, whose own
+	# `usize(wide_len)` cast panicked on any string at all this way).
+	# Reinterpreting BOTH sides as the unsigned wide type for just the
+	# upper-bound comparison sidesteps this: __wide's own bit pattern is
+	# unaffected by the reinterpretation, and max_c fits its own unsigned
+	# type by definition regardless of width. Scoped to u64/usize only -
+	# u128 already has its own, more direct special case above (skips
+	# wideint machinery entirely, safe since it's the widest type, nothing
+	# else's range can exceed it); u64/usize can't take that same shortcut
+	# since a wider i128/u128 SOURCE can legitimately exceed u64/usize's
+	# own range and still needs a real overflow check, not just a sign check.
+	upper_needs_unsigned_domain = wide_ctype == '__metalpy_wideint' and stem in ( 'u64', 'usize' )
+	upper_bound = (
+		f'( (__metalpy_wideuint)(__wide) > (__metalpy_wideuint)({max_c}) )'
+		if upper_needs_unsigned_domain else
+		f'( __wide > ({wide_ctype})({max_c}) )'
+	)
 	if mode == 'saturate':
 		dest = _emit_operand( instr.dest )
 		clamp = (
-			f'( __wide > ({wide_ctype})({max_c}) ) ? {max_c} : ({ctype})({operand})'
+			f'{upper_bound} ? {max_c} : ({ctype})({operand})'
 			if wide_ctype == '__metalpy_wideuint' else
-			f'( __wide < ({wide_ctype})({min_c}) ) ? {min_c} : ( __wide > ({wide_ctype})({max_c}) ) ? {max_c} : ({ctype})({operand})'
+			f'( __wide < ({wide_ctype})({min_c}) ) ? {min_c} : {upper_bound} ? {max_c} : ({ctype})({operand})'
 		)
 		return [
 			'\t{',
@@ -1517,11 +1591,12 @@ def _emit_cast( instr ) -> list[str]:
 		]
 	# check
 	dest = _temp_name( instr.dest.id )
-	tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.dest.type )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+	err_ctype = c_type( _result_error_type( instr.dest.type ))
 	overflow = (
-		f'( __wide > ({wide_ctype})({max_c}) )'
+		upper_bound
 		if wide_ctype == '__metalpy_wideuint' else
-		f'( __wide < ({wide_ctype})({min_c}) ) || ( __wide > ({wide_ctype})({max_c}) )'
+		f'( __wide < ({wide_ctype})({min_c}) ) || {upper_bound}'
 	)
 	return [
 		'\t{',
@@ -1529,6 +1604,7 @@ def _emit_cast( instr ) -> list[str]:
 		f'\t\tbool __overflow = {overflow};',
 		'\t\tif ( __overflow ) {',
 		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
 		'\t\t} else {',
 		f'\t\t\t{dest}.{tag_f} = 0;',
 		f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
@@ -1901,11 +1977,25 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{_emit_operand(instr.dest)} = sizeof({_value_spelling(instr.type)});' ]
 
 	if isinstance( instr, ir.Incref ):
-		return [ f'\tretain_object( &({_emit_operand(instr.value)})->$header );' ]
+		# a plain cast, not &(value)->$header - $header is always the FIRST
+		# member of every RCClass struct (emit_rcclass's own field-flattening,
+		# same fact ir.DecrefDynamic below already relies on), so the two are
+		# equivalent addresses for a non-null value, but &ptr->field is UB in C
+		# when ptr is null (forming an lvalue through a null pointer via `->`,
+		# independent of whether it's ever dereferenced afterward) - a real,
+		# reachable case here: a "zero-payload marker" RC-typed union leaf
+		# (e.g. the built-in ZeroDivisionError/OverflowError/FloatingPointError
+		# - see _emit_widen_error's own docstring) is never actually allocated,
+		# so its payload pointer is always NULL, and the union-aware tag-gated
+		# Incref/Decref emission in cfg.py legitimately reaches this case.
+		# retain_object/release_object already null-guard internally, but that
+		# guard never gets a chance to matter if computing the argument itself
+		# is already UB - confirmed by gcc's UBSan catching a genuine SIGILL
+		# here (see test_widening_propagates_error)
+		return [ f'\tretain_object( (ObjectHeader*)({_emit_operand(instr.value)}) );' ]
 	if isinstance( instr, ir.Decref ):
-		# release_object reads the destructor off the object's own header
-		# now (see ObjectHeader's own comment) - nothing to compute here
-		return [ f'\trelease_object( &({_emit_operand(instr.value)})->$header );' ]
+		# see ir.Incref's own comment just above for why this is a plain cast
+		return [ f'\trelease_object( (ObjectHeader*)({_emit_operand(instr.value)}) );' ]
 	if isinstance( instr, ir.DecrefDynamic ):
 		# instr.value is Ptr[None] (type-erased) - $header is always the
 		# FIRST member of every RCClass struct (emit_rcclass's own field-
