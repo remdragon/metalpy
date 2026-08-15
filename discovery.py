@@ -1565,6 +1565,28 @@ class Discovery( ast.NodeVisitor ):
 		# NOTE: the name 'main' is special, there can be only one...
 		qualname = 'main' if node.name == 'main' else self._get_qualname( node.name )
 
+		if node.name == 'or_return':
+			# 'or_return' is reserved, compiler-implemented-only - Result[T,E]
+			# .or_return() is recognized purely by AST shape + the receiver's
+			# own type (lowering.py's _lower_call, before ordinary call
+			# resolution ever runs), never by looking up a real declared
+			# method the way is_ok()/is_err()/unwrap()/unwrap_or() genuinely
+			# are (those DO have real, callable bodies - only or_return's own
+			# "body" was ever just a spec of the intended behavior, expanded
+			# directly to OrReturn/OrJump IR instead - see _lower_or_return's
+			# own comment). A user-written `def or_return(...)` - on Result
+			# itself or on any other class - can never actually run: nothing
+			# ever resolves a real call to it, at ANY receiver type, so
+			# accepting one silently would just be dead, misleading code.
+			# Checked here unconditionally (independent of any decorator,
+			# class, or overload grouping) since the name alone is what's
+			# reserved, not any particular shape of definition.
+			self.fail(
+				f"'or_return' is reserved for the compiler's own Result[T,E].or_return() - it can't be defined as a real "
+				f'function or method: {qualname}',
+				node,
+			)
+
 		is_overload = False
 		is_static = False
 		is_classmethod = False

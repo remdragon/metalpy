@@ -6774,6 +6774,26 @@ class FunctionLowering:
 				result = self._lower_compiler_format_f64( node, expected_type )
 				return result if want_result else None
 
+		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_return':
+			# <result_expr>.or_return() - recognized by AST shape alone,
+			# BEFORE _resolve_callee/_attr_lookup_callable ever look for a
+			# real declared 'or_return' method on the receiver's class -
+			# there is none to find (discovery.py's _parse_function now
+			# rejects any user-written `def or_return(...)` outright, on
+			# ANY class, since one could never actually be called - see its
+			# own comment). Without this, a receiver whose class has no
+			# such method (the ordinary, correct case - nobody is expected
+			# to write one) failed to resolve at all ("'or_return' is not
+			# callable on ..."), confirmed by a real repro: this bug
+			# predates and is unrelated to that new rejection, which just
+			# makes the fix here airtight instead of merely "the common
+			# case works". _lower_or_return itself already validates the
+			# receiver is actually Result[_,_]-shaped (and that no
+			# arguments were given) - a non-Result receiver correctly still
+			# fails there, with the same message as before.
+			receiver = self._lower_expr( node.func.value, None )
+			return self._lower_or_return( node, receiver, want_result )
+
 		# each recognizer returns None (not an error) when this call doesn't
 		# match its own construction-sugar shape at all, falling through to
 		# the next; a real error inside a matched shape (e.g. a malformed
@@ -6857,19 +6877,9 @@ class FunctionLowering:
 		if isinstance( target, _ReceiverDispatch ):
 			return self._lower_union_receiver_call( node, target, receiver, expected_type, want_result )
 
-		if isinstance( target, Function ) and target.stem == 'or_return':
-			# target.cls is a Specialization, not bare Result, whenever the
-			# receiver already pinned concrete args (the common case, e.g.
-			# some_result.or_return() where some_result: Result[i32,E]) -
-			# unwrap before the identity check, or a concrete receiver's own
-			# or_return() would stop being recognized at all and fall
-			# through to actually CALLING Result.or_return's literal
-			# declared body, which is a spec of the intended behavior, not
-			# something literally compilable (see _lower_or_return's own
-			# comment)
-			target_cls_base = target.cls.base if isinstance( target.cls, Specialization ) else target.cls
-			if target_cls_base is self.lowering.discovery.find_name( 'Result', node ):
-				return self._lower_or_return( node, receiver, want_result )
+		# `.or_return()` no longer reaches here at all - it's recognized and
+		# fully handled at the top of this method, before target/receiver
+		# were even resolved (see that check's own comment for why)
 
 		if isinstance( target, Specialization ) and isinstance( target.base, Function ):
 			return self._lower_generic_function_call( node, target, receiver, expected_type, want_result )

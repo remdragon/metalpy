@@ -544,20 +544,18 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_or_return_call_expands_to_or_return_ir_at_call_site( self ) -> None:
-		# <result_expr>.or_return() is recognized at the call site and
-		# expanded directly to OrReturn - Result.or_return's own declared
-		# body (`return self.x` here) is never itself scheduled/lowered as
-		# a Call target, since it would need to return from ITS CALLER, not
-		# itself (see _lower_or_return's own comment)
+		# <result_expr>.or_return() is recognized at the call site purely by
+		# AST shape and expanded directly to OrReturn - it has no declared
+		# body at all (a user-written `def or_return(...)` is a discovery-
+		# time compile error, see discovery.py's _parse_function), since a
+		# real one would need to return from ITS CALLER, not itself (see
+		# _lower_or_return's own comment)
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
 			'@cstruct',
 			'class Result[T,E]:',
 			'	x: T',
-			'',
-			'	def or_return( self ) -> T:',
-			'		return self.x',
 			'',
 			'def get_result() -> Result[i32,MyError]:',
 			'	pass',
@@ -576,7 +574,7 @@ class Tests( unittest.TestCase ):
 			result_cls.resolve()
 		result_i32_myerror = self.discovery._get_or_create_specialization( result_cls, [ i32, myerror_cls ] )
 
-		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 14, type = i32 )
+		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 11, type = i32 )
 		t0 = ir.Temp( type = result_i32_myerror, id = 0 ) # get_result()'s Result
 		t1 = ir.Temp( type = i32, id = 1 )                # unwrapped via OrReturn
 
@@ -595,6 +593,38 @@ class Tests( unittest.TestCase ):
 		])
 		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
 
+	def test_or_return_on_bare_union_result_with_no_declared_method_still_lowers( self ) -> None:
+		# regression: a bare @union Result[T,E] with only Ok/Err members and
+		# NO explicit or_return method (matching lib/builtins's own real
+		# Result post-fix - see its own comment) used to fail to resolve
+		# .or_return() at all ("'or_return' is not callable on ..."), since
+		# the old dispatch required first finding a real declared method via
+		# ordinary attribute lookup. or_return() never needed one - it's
+		# recognized purely by AST shape plus the receiver's own type
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'def risky() -> Result[i32,MyError]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def bad() -> Result[i32,MyError]:',
+			'	tmp: i32 = risky().or_return()',
+			'	return Result.Ok( tmp )',
+		])
+		mod = self._import( code )
+		bad_fn = mod.get_local( 'bad' )
+		if bad_fn.resolve is not None:
+			bad_fn.resolve()
+		fn = self.compiler._lower( bad_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertTrue( any( isinstance( i, ir.OrReturn ) for i in fn.instructions ))
+		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
+
 	def test_or_return_outside_result_returning_function_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'class MyError: pass',
@@ -602,9 +632,6 @@ class Tests( unittest.TestCase ):
 			'@cstruct',
 			'class Result[T,E]:',
 			'	x: T',
-			'',
-			'	def or_return( self ) -> T:',
-			'		return self.x',
 			'',
 			'def get_result() -> Result[i32,MyError]:',
 			'	pass',

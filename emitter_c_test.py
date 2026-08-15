@@ -212,27 +212,6 @@ _RESULT_FIXTURE = '\n'.join([
 	'\t\treturn self.tag == 1',
 ])
 
-_RESULT_FIXTURE_WITH_OR_RETURN = '\n'.join([
-	'@cstruct',
-	'class OverflowError: pass',
-	'',
-	'@union',
-	'class Result[T,E]:',
-	'\tOk: T',
-	'\tErr: E',
-	'',
-	'\tdef is_ok( self ) -> bool:',
-	'\t\treturn self.tag == 0',
-	'',
-	'\tdef is_err( self ) -> bool:',
-	'\t\treturn self.tag == 1',
-	'',
-	'\tdef or_return( self ) -> T:',
-	'\t\tif self.is_err():',
-	'\t\t\tcompiler.early_return( self.data.v_Err )',
-	'\t\treturn self.data.v_Ok',
-])
-
 class SpecializationSynthesisTests( CompilerTestCase ):
 	def test_result_specialization_is_a_real_compiler_tagged_unions_entry( self ) -> None:
 		# a concrete generic class specialization (Result[i32,
@@ -288,13 +267,15 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 
 	def test_or_return_on_concrete_result_receiver_still_lowers_textually( self ) -> None:
 		# or_return() must never become a real compiled function or a real
-		# Call to one - Result.or_return's own declared body is a spec of
-		# the intended behavior, not literally compilable (see Lowering.
-		# _lower_or_return's own comment) - this is the exact regression
-		# the eager-substitution work risked: target.cls became a
-		# Specialization for a concrete receiver, breaking the `target.cls
-		# is Result` identity check _lower_call used to route here
-		self._run( _RESULT_FIXTURE_WITH_OR_RETURN + '\n' + '\n'.join([
+		# Call to one - it has no declared body at all (a user-written
+		# `def or_return(...)` is a discovery-time compile error, see
+		# discovery.py's _parse_function) and is recognized purely by AST
+		# shape in Lowering._lower_call, before ordinary call resolution
+		# ever runs (see that check's own comment) - this is the exact
+		# regression the eager-substitution work risked: target.cls became
+		# a Specialization for a concrete receiver, breaking the old
+		# `target.cls is Result` identity check that used to route here
+		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def get() -> Result[i32,OverflowError]:',
 			'\treturn Result.Ok( 1 )',
 			'',
