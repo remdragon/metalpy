@@ -9314,5 +9314,74 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression test for a real, confirmed bug: Result[T,E].unwrap_or()
+	called with NO argument (relying on its own `default: T|None = None`
+	fallback) resolved to the WRONG return type - the enclosing (generic,
+	monomorphized) unwrap_or() body itself failed to compile with
+	"function returns builtins.str, not builtins.str|intrinsics.NoneType"
+	(seen for real via lib/posix/time.py's `readlink(...).unwrap_or()` on
+	a branch with posix syscalls; reproduced here without any OS
+	dependency). Root cause: lowering.py's _lower_call unconditionally
+	narrowed an Overload group's resolved return type to whatever STUB
+	happened to be bound_to the winning plain implementation, regardless
+	of whether THIS call's own arguments actually matched the stub's
+	narrower signature - unwrap_or()'s `default: T` stub is bound_to the
+	plain `default: T|None = None` impl, but a zero-argument call only
+	ever matches the impl's own broader signature, never the stub's.
+	Fixed via overload_resolution.stub_covers_call, which re-checks the
+	call's real argument types against the stub before narrowing.
+
+	Two further gaps surfaced once the return type itself was fixed, both
+	fixed alongside it: (1) type_resolver.py's _type_of_expr didn't handle
+	a Call resolving to an Overload group at all (only a plain Function),
+	so a local assigned from such a call never got its type tracked,
+	silently disabling _rewrite_tagged_union_truthiness's `if x:` rewrite
+	for it further down the same function body; (2) the Overload branch of
+	_lower_call never filled in defaults for parameters the call site
+	omitted (unlike the plain-Function call path), so a zero-argument
+	unwrap_or() reached real C emission with no 'default' entry in its own
+	Call instruction's kwargs at all - a bare KeyError in emitter_c.py's
+	_emit_call_args.
+
+	T=str (not e.g. i32) deliberately: matches the real-world repro
+	exactly, and forces the non-bool leaf of _rewrite_tagged_union_
+	truthiness's rewrite (str.__bool__(), newly added alongside this fix -
+	str had no truthiness dunder at all before, so this path was never
+	reachable for any RC leaf type, only the bool-leaf shortcut). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'result_unwrap_or_no_argument_return_type_and_truthiness', '''
+def make( ok: bool, s: str ) -> Result[str,OverflowError]:
+	if ok:
+		return Result.Ok( s )
+	return Result.Err( OverflowError() )
+
+def main() -> i32:
+	# Ok("hello") -> unwrap_or() with no fallback -> "hello", truthy
+	a: str|None = make( True, "hello" ).unwrap_or()
+	if a:
+		pass
+	else:
+		return 1
+	# Ok("") -> unwrap_or() -> "" (not None, but empty) -> falsy
+	b: str|None = make( True, "" ).unwrap_or()
+	if b:
+		return 2
+	# Err(...) -> unwrap_or() -> None (the impl's own default) -> falsy
+	c: str|None = make( False, "hello" ).unwrap_or()
+	if c:
+		return 3
+	return 0
+''' ),
+		] )
+
+
 if __name__ == '__main__':
 	unittest.main()

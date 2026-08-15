@@ -9,7 +9,7 @@ from compiler import Compiler, LoweredFunction
 from discovery import Discovery, _detect_active_target
 from errors import CompileError
 import ir
-from mpy_types import Variable, Specialization, Function, ClosureType
+from mpy_types import Variable, Specialization, Function, ClosureType, TaggedUnion
 
 logger = logging.getLogger( __name__ )
 
@@ -4740,6 +4740,62 @@ class Tests( unittest.TestCase ):
 		i32 = self.discovery.get_intrinsics()['i32']
 		self.assertIs( target.parameters[0].type, i32 ) # substituted, not the abstract TypeVar T
 		self.assertIs( target.return_type, i32 )
+
+	def test_overload_call_with_no_argument_uses_the_impls_own_wider_return_type( self ) -> None:
+		# regression test: a real, confirmed bug in builtins.Result[T,E].
+		# unwrap_or() - calling it with NO argument (its own `default: T|
+		# None = None` fallback) resolved to the STUB's `-> T` return type
+		# instead of the plain implementation's own wider `-> T|None`,
+		# because _lower_call's _resolve_original narrowed the return type
+		# to whatever stub happened to be bound_to the winning
+		# implementation, unconditionally - regardless of whether THIS
+		# call's own arguments actually matched the stub's narrower
+		# signature. A stub is bound_to its implementation as a static,
+		# always-true fact (`default: T` binds to `default: T|None = None`
+		# here), but a zero-argument call can only ever satisfy the
+		# IMPLEMENTATION's own broader signature - the stub itself requires
+		# `default`, so a call passing none of it can never match the
+		# stub's own domain at all (see overload_resolution.py's own
+		# _translate_indices). Fixed via overload_resolution.
+		# stub_covers_call, which re-checks the call's real argument types
+		# against the stub before narrowing - a one-argument call (which
+		# DOES match the stub) still correctly narrows to T, covered by
+		# this same file's test_overload_call_on_generic_class_
+		# specialization_substitutes_class_type_params just above.
+		code = '\n'.join([
+			'@union',
+			'class Box[T]:',
+			'	Some: T',
+			'',
+			'	@overload',
+			'	def get_or( self, default: T ) -> T:',
+			'		...',
+			'	def get_or( self, default: T|None = None ) -> T|None:',
+			'		return default',
+			'',
+			'def main() -> None:',
+			'	b: Box[i32] = Box.Some( 5 )',
+			'	w = b.get_or()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'get_or' ]
+		self.assertEqual( len( calls ), 1 )
+		target = calls[0].target
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		self.assertIsInstance( target.return_type, TaggedUnion ) # T|None, NOT narrowed down to bare T
+		leaf_types = [ attr.type for attr in target.return_type.attributes ]
+		self.assertEqual( len( leaf_types ), 2 )
+		self.assertTrue( any( t is i32 for t in leaf_types ))
+		self.assertTrue( any( t is none_type for t in leaf_types ))
+		# the call site's own omitted `default` argument must still be
+		# filled in with the impl's own None default - a separate gap this
+		# same fix closes (the Overload dispatch path never filled in
+		# defaults for parameters the call site didn't supply at all,
+		# unlike the plain, non-Overload call path's _lower_call_args)
+		self.assertIn( 'default', calls[0].kwargs )
 
 	# --- defer/errdefer --------------------------------------------------------
 
