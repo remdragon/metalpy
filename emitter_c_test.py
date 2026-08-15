@@ -8617,6 +8617,85 @@ def main() -> i32:
 			return 3
 		return 0
 ''' ),
+		# --- Phase 3: generic generator functions (`def gen[T](x: T) ->
+		# Iterator[T]:`) - both an explicit instantiation (`gen[i32](...)`)
+		# and an inferred one (`gen(seven)`, T inferred from the
+		# argument's own static type - a bare int LITERAL argument hits a
+		# pre-existing, generator-unrelated inference gap in this
+		# compiler, confirmed via a standalone repro against an ordinary
+		# non-generator generic function too, so this uses a typed local
+		# instead, same as any other generic-inference call site would
+		# need to). monomorphize.py's substitute_type_params gained a
+		# GeneratorType case (substitutes elem_type, never interned - see
+		# GeneratorType's own docstring); type_resolver.py's ensure_
+		# resolved and _ReferenceResolver.visit_Call/_type_of_expr all
+		# needed their own fix to actually reach a generic call's
+		# monomorphized copy with ensure_generator_synthesized (the plain-
+		# Function fast path only ever sees a Specialization-wrapped
+		# generic function's ABSTRACT base, never the concrete copy - see
+		# each fix's own comment for the specific gap it closes).
+		( 'generic_generator_explicit_and_inferred_instantiation', '''
+def gen[T]( x: T ) -> Iterator[T]:
+	yield x
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g1 = gen[i32]( 5 ) # explicit instantiation
+		a = g1.__next__()
+		if a is None:
+			return 1
+		b = g1.__next__()
+		if b is not None:
+			return 2
+
+		seven: i32 = 7
+		g2 = gen( seven ) # inferred instantiation
+		c = g2.__next__()
+		if c is None:
+			return 3
+		d = g2.__next__()
+		if d is not None:
+			return 4
+		return 0
+''' ),
+		( 'generic_generator_two_instantiations_coexist_independently', '''
+def gen[T]( x: T ) -> Iterator[T]:
+	yield x
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g1 = gen[i32]( 5 )
+		a = g1.__next__()
+		if a is None:
+			return 1
+
+		g2 = gen[usize]( 9 ) # a DIFFERENT instantiation - independent backing class
+		b = g2.__next__()
+		if b is None:
+			return 2
+		return 0
+''' ),
+		( 'generic_generator_consumed_via_for_loop', '''
+def gen[T]( x: T, count: usize ) -> Iterator[T]:
+	i: usize = 0
+	while i < count:
+		yield x
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		total: i32 = 0
+		n: usize = 0
+		for v in gen[i32]( 3, 4 ):
+			total += v
+			n += 1
+		if n != 4:
+			return 1
+		if total != 12: # 3+3+3+3
+			return 2
+		return 0
+''' ),
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
@@ -8732,6 +8811,30 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'at most one yield per branch', str( self.discovery.errors.errors[0] ))
+
+	def test_generic_generator_referencing_own_type_param_in_body_is_rejected( self ) -> None:
+		# Phase 3's recommended interim scope (PLAN_GENERATORS.md) - a
+		# generic generator body that references its own type param
+		# outside a parameter/return annotation (here, a nested generic
+		# call using it) is rejected for now - _build_generator_next_
+		# function's synthesized __next__ doesn't inherit the type-param
+		# substitution monomorphized_function recorded only on the
+		# generator function itself, confirmed by a real repro that
+		# otherwise fails downstream with a confusing "name 'T' is not
+		# defined" instead of this clear, upfront rejection
+		self._run( '''
+def identity[T]( v: T ) -> T:
+	return v
+
+def gen[T]( x: T ) -> Iterator[T]:
+	y: T = identity( x )
+	yield y
+
+def main() -> None:
+	g = gen[i32]( 5 )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
 
 
 if __name__ == '__main__':

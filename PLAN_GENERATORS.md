@@ -4,14 +4,19 @@ STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
 <expr>:` containing yield, over a non-range() indexable OR another
 generator) + Phase 6 (yield inside `if`/`if-else`, and yield wrapped in
-an arithmetic-mode `with` block) landed and real-compile-and-run tested
-(emitter_c_test.py's GeneratorFunctionTests). Phase 5 matches the
-"remaining phases roadmap" section's own Phase 1, and Phase 6 matches
-that roadmap's own Phase 2 (below) - kept the SEQUENTIAL landed-phase
-numbering here (v1, Phase 2, 3, 4, 5, 6) rather than renaming it, since
-that roadmap's own 1-5 numbering is a separate, later scoping pass over
-what was still left, not a renumbering of what had already landed; the
-two schemes overlap in NAME but not in MEANING - watch for this when
+an arithmetic-mode `with` block) + Phase 7 (generic generator functions,
+`def gen[T](x: T) -> Iterator[T]:`, both explicit `gen[i32](...)` and
+inferred `gen(...)` instantiation, interim-scoped to reject a body that
+references its own type param outside a parameter/return annotation)
+landed and real-compile-and-run tested (emitter_c_test.py's
+GeneratorFunctionTests). Phase 5 matches the "remaining phases roadmap"
+section's own Phase 1, Phase 6 matches that roadmap's own Phase 2, and
+Phase 7 matches that roadmap's own Phase 3 (below) - kept the SEQUENTIAL
+landed-phase numbering here (v1, Phase 2, 3, 4, 5, 6, 7) rather than
+renaming it, since that roadmap's own 1-5 numbering is a separate, later
+scoping pass over what was still left, not a renumbering of what had
+already landed; the two schemes overlap in NAME but not in MEANING -
+watch for this when
 reading older commit messages/comments that say "Phase 1" or "Phase 2"
 meaning something other than the roadmap's own numbering.
 
@@ -274,6 +279,89 @@ actually lowered (`with_wrapped_yield_units` test - two separate
 with-wrapped yields in one generator, each with real i32 arithmetic in
 between, confirming the mode wrapping round-trips correctly both times).
 
+Phase 7 design (monomorphize.py's `substitute_type_params` GeneratorType
+branch; type_resolver.py's `ensure_resolved` Specialization branch,
+`_ReferenceResolver.visit_Call`/`_type_of_expr`, `ensure_generator_
+synthesized`'s new `origin_type_param_stems` parameter): landed generic
+generator functions - `def gen[T](x: T) -> Iterator[T]:`, both explicit
+(`gen[i32](...)`) and inferred (`gen(local_var)`) instantiation, real-
+compile-and-run tested including two independent instantiations
+coexisting and for-loop consumption of one. The groundwork sketched in
+the roadmap below turned out to need MORE fixing than anticipated, all
+found via real repros rather than more up-front analysis, per the
+roadmap's own recommendation:
+
+1. `substitute_type_params`'s new GeneratorType branch (needed the same
+   shape as CallableType/ClosureType - substitute elem_type, rebuild a
+   fresh instance since GeneratorType is deliberately never interned)
+   required all four of GeneratorType's own `Name`-inherited kw-only
+   fields (stem/qualname/file/line), not just elem_type - confirmed by a
+   real TypeError, fixed by mirroring discovery.py's own `Iterator[T]`
+   construction exactly.
+
+2. `ensure_resolved`'s Specialization branch DOES need `ensure_generator_
+   synthesized` applied to the monomorphized Function it returns (as
+   scoped) - but this branch turned out to never actually fire for an
+   ordinary nested call site (`main`'s own body calling `gen[i32](...)`)
+   at all: `_ReferenceResolver.visit_Call`'s own generic-call resolution
+   deliberately builds the monomorphized copy directly, bypassing ensure_
+   resolved entirely (see its own comment - avoiding double-scheduling).
+   Needed the identical `ensure_generator_synthesized` call added there
+   too, independently - both call sites are safe to call unconditionally
+   since the underlying monomorphized Function is memoized (`spec.
+   monomorphized`) and `ensure_generator_synthesized` is itself id(fn)-
+   memoized, so whichever path reaches a given instantiation first does
+   the real work and the other is a no-op.
+
+3. `ensure_generator_synthesized`'s own `fn.type_params` check had to
+   change from a hard rejection to a silent skip (mirroring _schedule_
+   rcclass_destructor_deps's identical posture for a generic class's own
+   abstract template) - it turned out to be reached constantly and
+   harmlessly on the ABSTRACT, still-generic Function itself (not just
+   on genuinely-unsupported shapes), e.g. from `_type_of_expr`'s Call
+   handling on a path that hadn't yet been taught about generics either
+   (next point) - a hard failure there rejected the very first `gen(...)`
+   call in the program.
+
+4. `_type_of_expr`'s own Call handling had NO `ast.Subscript` case at all
+   (`gen[i32](...)`'s own `node.func`), and its bare-Name fallback
+   resolved a call like `gen(...)` to the STILL-ABSTRACT generic Function
+   rather than doing generic-call resolution - meaning `g1 = gen[i32](5)`
+   never got g1's real (post-synthesis) type tracked for narrowing
+   purposes at all, silently breaking every subsequent `g1.__next__() is
+   None` check downstream (confirmed by a real miscompile - clang
+   rejecting a raw union-struct compared against a bare `0`). Fixed by
+   reusing `node.resolved_callee` (already tagged by visit_Call, which
+   always runs first - `_type_of_expr` is only ever called after
+   `generic_visit` has already visited the same Call node) rather than
+   re-deriving anything.
+
+5. The roadmap's own flagged "open, unverified risk" (rewrite-3 ordering)
+   turned out to be a REAL bug, not just a theoretical one, confirmed by
+   the recommended minimal repro: a generic generator body calling
+   another generic function via its own type param (`y: T = identity(x)`
+   inside `gen[T]`) fails with a confusing "name 'T' is not defined',
+   because `_build_generator_next_function` copies the body's raw
+   statements into a FRESH `__next__` method/backing-class scope that
+   never inherits the `T -> concrete-arg` substitution recorded only on
+   the outer generator Function's own `.names`. Landed the roadmap's own
+   recommended interim scope exactly: reject such a body up front with a
+   clear message (a raw AST scan of the function's own body statements
+   for the origin type param's bare name, threaded down from each of the
+   two call sites in point 2 above, which each already have the abstract
+   base's own `.type_params` in hand) rather than let it cascade into
+   the same confusing downstream errors - see `ensure_generator_
+   synthesized`'s own docstring/comment for what lifting this properly
+   would need (threading the substitution through the synthesized `__next__`/
+   backing class's own names, not attempted here).
+
+Separately confirmed, NOT a generator-specific bug: a bare int LITERAL
+argument to an INFERRED (no explicit `[T]`) generic call already fails
+type inference in this compiler, even for an ordinary non-generator
+generic function (`ident(7)` fails the same way `ident[T](x: T) -> T:`
+does) - a typed local works fine. Out of scope here; noted for whoever
+next touches generic-call inference.
+
 Remaining phases roadmap (scoped 2026-08-15)
 
 Phase 1: LANDED (same session it was scoped in) - see "Phase 5 design"
@@ -295,25 +383,16 @@ see below.) Landed exactly the recommended first cut: a single if/else,
 at most one yield per branch - elif chains and nested loops-inside-
 branches are explicit compile errors, not yet supported.
 
-Phase 3: generic generator functions (`def gen[T](x: T) -> Iterator[T]:`).
-Confirmed groundwork: monomorphize.py's substitute_type_params (107-226)
-has no GeneratorType case yet (a bare T inside Iterator[T] is never
-substituted today) - needs a small addition mirroring the CallableType/
-ClosureType branches, no interning needed (GeneratorType is deliberately
-never interned). ensure_resolved's Specialization branch (type_resolver.
-py:1490-1492) needs ensure_generator_synthesized applied to the
-*monomorphized* Function it returns, not just plain Functions (today's
-`isinstance(obj, Function)` gate at line 1479 misses a Specialization-
-wrapped generic entirely) - same eager-resolution fix v1 already needed
-for the non-generic case. Open, unverified risk: compiler.py's own
-Specialization+Function branch runs resolve_function_body TWICE (rewrites
-1/2 on the abstract body, rewrite 3 - substitution-dependent nested-
-generic-call resolution - on the monomorphized copy) - whether generator
-synthesis firing between those two calls is actually safe needs a real
-minimal repro early in this phase, not more pre-analysis. Recommended
-interim scope: reject a generic generator body that itself calls another
-generic function referencing the same type param, sidestepping the
-ordering question for a first landing.
+Phase 3: LANDED (same session it was scoped in) - see "Phase 7 design"
+above (kept the sequential landed-phase numbering there; see the STATUS
+section's own note on why the two schemes overlap in name but not
+meaning). generic generator functions (`def gen[T](x: T) -> Iterator[T]:`),
+both explicit and inferred instantiation. Landed exactly the recommended
+interim scope: a generic generator body that references its own type
+param outside a parameter/return annotation (e.g. calling another
+generic function through it) is a clear compile error, not yet
+supported - the roadmap's own flagged ordering risk turned out to be a
+real bug, confirmed by exactly the minimal repro recommended below.
 
 Phase 4: fallible generators (`Generator[T, E]`, TODO.txt's original open
 question). Confirmed groundwork: "returns Result[T,E]" is purely

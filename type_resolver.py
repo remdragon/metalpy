@@ -1292,19 +1292,80 @@ class TypeResolver:
 		fn.node.body = [ ast.Return( value = call ) ]
 		ast.fix_missing_locations( fn.node )
 
-	def ensure_generator_synthesized( self, fn: Function ) -> None:
+	def ensure_generator_synthesized( self, fn: Function, origin_type_param_stems: 'list[str]|None' = None ) -> None:
 		''' idempotent (id(fn)-memoized) - a no-op unless fn's own body
 		actually contains a `yield` (checked first, cheaply). See this
 		section's own top docstring for the full design and why this runs
-		from ensure_resolved rather than lowering.py. '''
+		from ensure_resolved rather than lowering.py.
+
+		origin_type_param_stems: PLAN_GENERATORS.md Phase 3 (roadmap Phase
+		3) - non-None only when `fn` is a monomorphized copy of a GENERIC
+		generator template (passed by both call sites that build one -
+		ensure_resolved's Specialization branch and visit_Call's own
+		nested-generic-call resolution - each already has the abstract
+		base Function's own .type_params in hand at the point it calls
+		this). See the interim-scope rejection below for why this is
+		needed at all. '''
 		if id( fn ) in self._generators_synthesized:
 			return
 		if not self._function_contains_yield( fn ):
 			return
 		self._generators_synthesized.add( id( fn ))
 
+		if origin_type_param_stems:
+			# Recommended interim scope (PLAN_GENERATORS.md's own roadmap
+			# Phase 3 write-up): a generic generator body that itself
+			# calls another generic function referencing the enclosing
+			# generator's own type param is rejected for now, sidestepping
+			# a real ordering hazard confirmed by a minimal repro, not
+			# just a hypothetical one - _build_generator_next_function
+			# copies this function's OWN raw body statements into a FRESH
+			# `__next__` method/backing-class scope that does NOT inherit
+			# the T -> concrete-arg substitution monomorphized_function
+			# recorded on `fn.names` (that substitution lives only on
+			# THIS Function object, never propagated to the new one built
+			# for it) - so a body statement that still needs it (e.g. `y:
+			# T = identity(x)`, whether or not identity's own call
+			# actually depends on T) fails with "name 'T' is not defined"
+			# once __next__'s body is itself resolved later. A bare `x: T`
+			# PARAMETER (the v1 baseline case) is unaffected - parameter
+			# types flow through fn.parameters, already correctly
+			# substituted independent of this - only a body-level
+			# reference to the type param's own bare name is at risk,
+			# which is exactly what this scans for. Lifting this needs
+			# __next__/the backing class to inherit the substitution
+			# (thread origin_type_param_stems's underlying (stem,
+			# concrete-type) pairs through _build_generator_next_function/
+			# _build_generator_backing_class's own names dicts) - not
+			# attempted here, see PLAN_GENERATORS.md's own Phase 3 write-up
+			for stmt in fn.node.body:
+				for n in ast.walk( stmt ):
+					if isinstance( n, ast.Name ) and n.id in origin_type_param_stems:
+						self.discovery.fail(
+							f'{fn.qualname}: a generic generator body that references its own type parameter '
+							f'({n.id}) outside a parameter/return annotation is not supported yet - see PLAN_GENERATORS.md',
+							fn.node,
+						)
+
 		if fn.type_params:
-			self.discovery.fail( f'{fn.qualname}: generic generator functions are not supported yet - see PLAN_GENERATORS.md', fn.node )
+			# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - the ABSTRACT,
+			# still-generic template (`def gen[T](x: T) -> Iterator[T]:`
+			# itself, T unbound) must never get a backing class of its own
+			# - same "skip the unbound template, only the concrete
+			# instantiation gets synthesized" posture as _schedule_rcclass_
+			# destructor_deps's identical cls.type_params guard. Reached
+			# harmlessly and often: ensure_resolved's own Specialization
+			# branch resolves EACH concrete gen[i32]/gen[str]/... copy
+			# separately (each with type_params cleared - see monomorphize.
+			# py's _build_monomorphized_function - so THOSE go on to
+			# synthesize normally, below), but plenty of other paths
+			# (_type_of_expr's Call handling, resolving a narrowed local's
+			# type) legitimately still reach the bare abstract Function
+			# first, well before any concrete instantiation exists - a
+			# hard failure here would reject the very first `gen(...)` or
+			# `gen[i32](...)` call site in the program, not just a
+			# genuinely unsupported shape
+			return
 		if fn.cls is not None:
 			self.discovery.fail( f'{fn.qualname}: a generator method is not supported yet - only a plain function may contain yield - see PLAN_GENERATORS.md', fn.node )
 		if not isinstance( fn.return_type, GeneratorType ):
@@ -2028,7 +2089,20 @@ class TypeResolver:
 		self.schedule( obj )
 		if isinstance( obj, Specialization ):
 			if isinstance( obj.base, Function ):
-				return self.monomorphizer.monomorphized_function( obj )
+				monomorphized = self.monomorphizer.monomorphized_function( obj )
+				# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - a generic
+				# generator function (`def gen[T](x: T) -> Iterator[T]:`)
+				# only ever appears here as obj.base, never as `obj` itself
+				# (obj is the Specialization wrapper) - the plain-Function
+				# check above this branch never sees it. A caller resolving
+				# gen[i32](...)'s return type needs THIS monomorphized
+				# copy's real return type (the synthesized backing
+				# RCClass), same eager-resolution requirement v1 already
+				# needed for the non-generic case, just one level further
+				# in through the Specialization indirection
+				origin_stems = [ tv.stem for tv in obj.base.type_params ] if obj.base.type_params else None
+				self.ensure_generator_synthesized( monomorphized, origin_stems )
+				return monomorphized
 			if isinstance( obj.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				return self.monomorphizer.monomorphize_class( obj )
 			# Scalar (Ptr[T]/ConstPtr[T], the intrinsic generic-pointer
@@ -2282,6 +2356,25 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			found = names.get( node.attr )
 			return found.type if isinstance( found, Variable ) else None
 		if isinstance( node, ast.Call ):
+			# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - a call to a
+			# GENERIC function (explicit gen[i32](...) or inferred
+			# gen(...)) was already resolved by visit_Call, which tags
+			# node.resolved_callee with the real, substituted,
+			# already-generator-synthesized-if-applicable Function -
+			# reuse it directly rather than re-deriving anything. Needed
+			# specifically because the fallback below (_try_resolve_
+			# callable_namespace) has no ast.Subscript case at all (gen
+			# [i32](...)'s own node.func), and for a BARE inferred call
+			# would resolve to the still-abstract, unbound generic
+			# Function instead of this call's own concrete instantiation
+			# - either way giving back the wrong (or no) type. _type_of_
+			# expr always runs AFTER generic_visit has already visited
+			# this same Call node (see e.g. visit_Assign's own ordering),
+			# so this tag is always populated by the time we get here,
+			# for every generic call - never just for generator ones
+			resolved_callee = getattr( node, 'resolved_callee', None )
+			if isinstance( resolved_callee, Function ):
+				return resolved_callee.return_type
 			target: object|None
 			if isinstance( node.func, ast.Attribute ):
 				receiver_type = self._type_of_expr( node.func.value )
@@ -2681,6 +2774,18 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# (the Specialization, AND the bare monomorphized Function it
 		# caches) - compiler.py would then lower and emit it twice
 		node.resolved_callee = self.resolver.monomorphizer.monomorphized_function( spec )
+		# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - this is the ONLY
+		# path that resolves a NESTED generic call (foo's own body calling
+		# bar[T](...)) - it deliberately never goes through ensure_
+		# resolved (see the comment just above), so it's also the only
+		# place that can catch a generic call whose target turns out to
+		# be a generator here. Idempotent/id(fn)-memoized, so this is safe
+		# to call even when ensure_resolved's own Specialization branch
+		# ALSO reaches the exact same memoized monomorphized_function
+		# object via a different route (e.g. a caller assigning the call
+		# result to a local, resolved through _type_of_expr instead)
+		origin_stems = [ tv.stem for tv in target.type_params ] if target.type_params else None
+		self.resolver.ensure_generator_synthesized( node.resolved_callee, origin_stems )
 		return node
 
 	# --- local type tracking ---

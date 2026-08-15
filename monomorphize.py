@@ -5,7 +5,7 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType
+from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType, GeneratorType
 from tuple_storage import TupleStorage
 from union_storage import UnionStorage, build_member_constructor
 
@@ -208,6 +208,29 @@ class Monomorphizer:
 			if all( sa is a for sa, a in zip( substituted_arg_types, t.arg_types )) and substituted_return_type is t.return_type:
 				return t
 			return self.discovery._get_or_create_closure_type( substituted_arg_types, substituted_return_type )
+		if isinstance( t, GeneratorType ):
+			# Iterator[T] in a generic generator function's own return
+			# annotation (PLAN_GENERATORS.md Phase 3, roadmap Phase 3) - T
+			# needs substituting the same way a bare TypeVar return type
+			# would, e.g. `def gen[T](x: T) -> Iterator[T]:` instantiated
+			# as gen[i32] must produce a concrete Iterator[i32]. Unlike
+			# every other branch here, GeneratorType is deliberately NEVER
+			# interned (see its own docstring - two unrelated generator
+			# functions with the same elem_type still need independent
+			# backing classes), so there's no _get_or_create_* to intern
+			# through - just build a fresh instance when the substitution
+			# actually changed something. .backing stays None; the
+			# monomorphized copy's own ensure_generator_synthesized call
+			# populates it fresh, same as any other generator function
+			substituted_elem = self.substitute_type_params( t.elem_type, type_params, args )
+			if substituted_elem is t.elem_type:
+				return t
+			return GeneratorType(
+				stem = f'Iterator[{substituted_elem.qualname}]',
+				qualname = f'Iterator[{substituted_elem.qualname}]',
+				file = substituted_elem.file, line = substituted_elem.line,
+				elem_type = substituted_elem,
+			)
 		if isinstance( t, TaggedUnion ) and t.file is None:
 			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
 			# _get_or_create_union - file is None only for these, never for
