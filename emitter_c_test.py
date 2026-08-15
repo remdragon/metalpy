@@ -2648,12 +2648,16 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 				src = self._compiled_source( target )
 				self.assertEqual( src.count( 'static void __metalpy_init( void ) {' ), 1 )
 
-	def test_windows_console_codepage_call_is_gated_inside_the_one_function( self ) -> None:
+	def test_windows_console_codepage_call_is_an_ordinary_global_init_call( self ) -> None:
+		# SetConsoleOutputCP is no longer hardcoded/gated inside __metalpy_init
+		# itself - it's windows/_console.py's _console_init global (forced
+		# reachable on every Windows target by Compiler.run()), called from
+		# here exactly like any other global's own init function
 		src = self._compiled_source( self._WINDOWS_TARGET )
 		body = self._metalpy_init_body( src )
-		self.assertIn( '#ifdef _WIN32', body )
-		self.assertIn( 'SetConsoleOutputCP( CP_UTF8 );', body )
-		self.assertIn( '#endif', body )
+		self.assertIn( '__metalpy_init_windows$_console$_console_init();', body )
+		self.assertIn( 'SetConsoleOutputCP(', src )
+		self.assertNotIn( '#ifdef _WIN32', body )
 
 	def test_main_prepends_metalpy_init_call_on_every_target( self ) -> None:
 		# not just Windows - global initializers must run everywhere now,

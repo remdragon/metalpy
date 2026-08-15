@@ -6547,6 +6547,15 @@ class InlineTests( unittest.TestCase ):
 	def _ir_repr( self, fn: LoweredFunction ) -> list[str]:
 		return [ op.test_repr() for op in fn.instructions ]
 
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target (see compiler.py's own comment) - real
+	# but incidental to what these tests check, and absent entirely on
+	# non-Windows targets, so exact-set assertions filter it back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
+
 	def test_inline_method_call_compiles_identically_to_calling_the_body_directly( self ) -> None:
 		# @inline def get_len(self): return self.__len__() called as
 		# b.get_len() must produce the SAME instruction shape as writing
@@ -6633,7 +6642,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 		main_fn = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
@@ -6660,7 +6669,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 
 	def test_inline_receiver_with_side_effect_evaluated_once( self ) -> None:
@@ -6804,6 +6813,15 @@ class InlineMultiStatementTests( unittest.TestCase ):
 		fn = self.compiler._lower( self.discovery.main )
 		self.assertEqual( type( fn ), LoweredFunction )
 		return fn
+
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target (see compiler.py's own comment) - real
+	# but incidental to what these tests check, and absent entirely on
+	# non-Windows targets, so exact-set assertions filter it back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
 
 	def test_multistatement_body_emits_no_call_funcstart_funcend_for_target( self ) -> None:
 		code = '\n'.join([
@@ -7009,7 +7027,7 @@ class InlineMultiStatementTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Widget.get' } ) # never a real wrap[Widget] function
 
 	def test_multistatement_inline_with_return_only_type_param( self ) -> None:
