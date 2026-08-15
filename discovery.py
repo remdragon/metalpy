@@ -837,17 +837,30 @@ class Discovery( ast.NodeVisitor ):
 		# just two type args instead of one, carried as GeneratorType's own
 		# error_type (None for Iterator[T] means infallible). __next__'s
 		# return type becomes Result[elem_type|None, error_type] instead of
-		# plain elem_type|None once ensure_generator_synthesized sees this
+		# plain elem_type|None once ensure_generator_synthesized sees this.
+		#
+		# Generator[T,SendType,E] - PLAN_GENERATORS.md Phase C, the .send()-
+		# capable sibling: three type args (element, send, error) instead of
+		# two, dispatched on arity alone - a bare 2-tuple stays today's
+		# existing (element, error) shape (send_type=None, no .send()
+		# support), a 3-tuple is (element, send, error). Iterator[T] (above)
+		# never gets a third arg at all - only Generator[...] does
 		if isinstance( node.value, ast.Name ) and node.value.id == 'Generator':
-			if not isinstance( node.slice, ast.Tuple ) or len( node.slice.elts ) != 2:
-				self.fail( f'Generator[...] takes exactly two type arguments (element, error): {ast.unparse(node)}', node )
+			if not isinstance( node.slice, ast.Tuple ) or len( node.slice.elts ) not in ( 2, 3 ):
+				self.fail( f'Generator[...] takes two type arguments (element, error) or three (element, send, error): {ast.unparse(node)}', node )
 			elem_type = self.visit( node.slice.elts[0] )
-			error_type = self.visit( node.slice.elts[1] )
+			if len( node.slice.elts ) == 3:
+				send_type = self.visit( node.slice.elts[1] )
+				error_type = self.visit( node.slice.elts[2] )
+				stem = f'Generator[{elem_type.qualname},{send_type.qualname},{error_type.qualname}]'
+			else:
+				send_type = None
+				error_type = self.visit( node.slice.elts[1] )
+				stem = f'Generator[{elem_type.qualname},{error_type.qualname}]'
 			return GeneratorType(
-				stem = f'Generator[{elem_type.qualname},{error_type.qualname}]',
-				qualname = f'Generator[{elem_type.qualname},{error_type.qualname}]',
+				stem = stem, qualname = stem,
 				file = elem_type.file, line = elem_type.line,
-				elem_type = elem_type, error_type = error_type,
+				elem_type = elem_type, error_type = error_type, send_type = send_type,
 			)
 
 		base = self.visit( node.value )

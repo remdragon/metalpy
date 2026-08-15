@@ -450,6 +450,7 @@ class GeneratorType( Type ):
 	to that one Function, not to this type). '''
 	elem_type: Type
 	error_type: 'Type|None' = None # None: Iterator[T] (infallible); set: Generator[T,error_type] - __next__ returns Result[elem_type|None, error_type] instead of plain elem_type|None
+	send_type: 'Type|None' = None # PLAN_GENERATORS.md Phase C - None for Iterator[T] and the 2-arg Generator[T,E] (no .send() support, __next__-only); set for the 3-arg Generator[T,SendType,E] - a captured `x = yield v` expression evaluates to plain SendType (no automatic Result-wrapping - the generator's own author declares SendType as Result[V,Err] themselves if they want .send()-injected-error semantics, reusing the existing .or_return()/.unwrap_or() machinery generically). Independent of error_type: SendType has nothing to do with E/or_return() propagation
 	backing: 'RCClass|None' = None
 
 # a class's own body scan (revealing its attribute/method *names*) is

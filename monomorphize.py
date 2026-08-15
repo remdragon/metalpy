@@ -227,16 +227,22 @@ class Monomorphizer:
 			# roadmap Phase 4) needs the identical substitution - None stays
 			# None (Iterator[T]'s own infallible shape, nothing to substitute)
 			substituted_error = self.substitute_type_params( t.error_type, type_params, args ) if t.error_type is not None else None
-			if substituted_elem is t.elem_type and substituted_error is t.error_type:
+			# Generator[T,SendType,E]'s own send_type (PLAN_GENERATORS.md
+			# Phase C) needs the identical substitution too - None stays None
+			# (Iterator[T]/the 2-arg Generator[T,E] shape, no .send() support)
+			substituted_send = self.substitute_type_params( t.send_type, type_params, args ) if t.send_type is not None else None
+			if substituted_elem is t.elem_type and substituted_error is t.error_type and substituted_send is t.send_type:
 				return t
-			if substituted_error is not None:
+			if substituted_send is not None:
+				stem = f'Generator[{substituted_elem.qualname},{substituted_send.qualname},{substituted_error.qualname}]'
+			elif substituted_error is not None:
 				stem = f'Generator[{substituted_elem.qualname},{substituted_error.qualname}]'
 			else:
 				stem = f'Iterator[{substituted_elem.qualname}]'
 			return GeneratorType(
 				stem = stem, qualname = stem,
 				file = substituted_elem.file, line = substituted_elem.line,
-				elem_type = substituted_elem, error_type = substituted_error,
+				elem_type = substituted_elem, error_type = substituted_error, send_type = substituted_send,
 			)
 		if isinstance( t, TaggedUnion ) and t.file is None:
 			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
