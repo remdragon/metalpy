@@ -7370,18 +7370,42 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
 		self.assertEqual( self._calls_to( fn, '__str__' ), [] )
 
-	def test_unimplemented_float_type_char_is_a_compile_error( self ) -> None:
-		# f"{x:.2e}" - 'e' parses fine (a real float type now exists to
-		# reach validate_float_spec at all) but validate_float_spec rejects
-		# 'e'/'E'/'g'/'G'/'%' with a dedicated "not implemented yet" message
-		# (PLAN_STR_FORMAT.md item 4) - only 'f'/'F' are dispatchable so far
+	def test_float_format_spec_exponential_dispatches_to_fixed_digits( self ) -> None:
+		# f"{x:.2e}" - dispatches through the same _fixed_digits as 'f'/'F',
+		# just with a different type_char argument (PLAN_STR_FORMAT.md item 4)
 		self._import( '\n'.join([
 			'def main( x: f64 ) -> str:',
 			'	return f"{x:.2e}"',
 		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_fixed_digits' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_float_format_spec_percent_dispatches_to_percent_digits( self ) -> None:
+		# f"{x:.2%}" - '%' has no printf equivalent, so it goes through its
+		# own dedicated _percent_digits (lib/builtins/__float.py) instead of
+		# _fixed_digits - the *100 scaling + 'f' + '%' suffix all happen
+		# there, not here
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:.2%}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_percent_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
+	def test_invalid_float_type_char_is_a_compile_error( self ) -> None:
+		# f"{x:x}" - 'x' is a valid int type char but not a float one
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:x}"',
+		]))
 		self.compiler._lower( self.discovery.main )
 		self.assertTrue(
-			any( "'e' is not implemented for float yet" in e for e in self.discovery.errors.errors ),
+			any( "'x' is not valid for float" in e for e in self.discovery.errors.errors ),
 			self.discovery.errors.errors,
 		)
 

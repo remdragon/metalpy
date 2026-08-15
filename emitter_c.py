@@ -218,14 +218,17 @@ int __stdcall SetConsoleOutputCP(unsigned int);
 int __stdcall SetConsoleOutputCP(unsigned int);
 #endif
 #endif
-// backs compiler.format_f64(buf, size, precision, value) (lowering.py's
-// _lower_compiler_format_f64 / ir.FormatFloat) - writes value's fixed-
-// precision decimal digits into buf (a plain "%.*f", so magnitude only;
-// callers split the sign out themselves - see lib/builtins/__float.py),
-// returns the byte count written, or a negative value on failure. Always
-// present (like retain_object/__metalpy_isnan above) whether or not a
-// given program actually formats a float - dead code if unused, same as
-// every other PROLOGUE helper.
+// backs compiler.format_f64(buf, size, precision, type_char, value)
+// (lowering.py's _lower_compiler_format_f64 / ir.FormatFloat) - writes
+// value's fixed-precision decimal digits into buf via a dynamically-built
+// "%.*X" format string (X = type_char, one of 'f'/'F'/'e'/'E'/'g'/'G' - see
+// fstring_format_spec.FORMAT_SPEC_TYPE_CHARS; '%' has no printf equivalent
+// and is handled entirely in metalpy source instead - see lib/builtins/
+// __float.py's _percent_digits), so magnitude only; callers split the sign
+// out themselves. Returns the byte count written, or a negative value on
+// failure. Always present (like retain_object/__metalpy_isnan above)
+// whether or not a given program actually formats a float - dead code if
+// unused, same as every other PROLOGUE helper.
 //
 // Deliberately NOT declared via metalpy's own @extern mechanism: that
 // only ever emits a FIXED-arity C prototype (see _function_prototype),
@@ -265,12 +268,41 @@ int __stdcall SetConsoleOutputCP(unsigned int);
 // that truncation never actually happens (a fixed-precision f64 can need
 // at most ~309 integer digits + '.' + precision fractional digits + sign
 // + NUL).
+//
+// A SECOND, Windows-only quirk was found while adding 'e'/'E'/'g'/'G':
+// legacy msvcrt.dll's exponent is always padded to exactly 3 digits
+// ("1.23e+003"), unlike Python/C99 (glibc's real snprintf included - the
+// POSIX branch below needs no equivalent fixup), which use the minimum
+// digit count with a floor of 2 ("1.23e+03") - confirmed by a real test
+// against this system's own msvcrt.dll. __metalpy_fixup_msvcrt_exponent
+// strips extra leading zeros from the exponent (down to that 2-digit
+// floor) in place, shifting the rest of the buffer left - real f64
+// exponents are always <= 3 digits, so there is at most one leading zero
+// to strip in practice, but the loop handles more on general principle.
 #ifdef _WIN32
+static inline void __metalpy_fixup_msvcrt_exponent( char* buf, int* n ) {
+	for ( int i = 0; i < *n; i++ ) {
+		if ( buf[i] != 'e' && buf[i] != 'E' ) continue;
+		int sign_pos = i + 1;
+		if ( sign_pos >= *n || ( buf[sign_pos] != '+' && buf[sign_pos] != '-' )) continue;
+		int digits_start = sign_pos + 1;
+		int digits_end = digits_start;
+		while ( digits_end < *n && buf[digits_end] >= '0' && buf[digits_end] <= '9' ) digits_end++;
+		int strip = 0;
+		while ( ( digits_end - digits_start ) - strip > 2 && buf[digits_start + strip] == '0' ) strip++;
+		if ( strip > 0 ) {
+			for ( int j = digits_start; j + strip < *n; j++ ) buf[j] = buf[j + strip];
+			*n -= strip;
+			buf[*n] = 0;
+		}
+		break; // at most one exponent in a real float conversion
+	}
+}
 void* __stdcall GetModuleHandleA( const char* lpModuleName );
 void* __stdcall LoadLibraryA( const char* lpLibFileName );
 void* __stdcall GetProcAddress( void* hModule, const char* lpProcName );
 typedef int ( __cdecl *__metalpy_snprintf_fn )( char*, size_t, const char*, ... );
-static inline int __metalpy_format_f64( char* buf, size_t size, int precision, double value ) {
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, double value ) {
 	static __metalpy_snprintf_fn fn = 0;
 	if ( !fn ) {
 		void* msvcrt = GetModuleHandleA( "msvcrt.dll" );
@@ -278,12 +310,16 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, d
 		fn = msvcrt ? (__metalpy_snprintf_fn)GetProcAddress( msvcrt, "_snprintf" ) : 0;
 		if ( !fn ) return -1;
 	}
-	return fn( buf, size, "%.*f", precision, value );
+	char fmt[5] = { '%', '.', '*', (char)type_char, 0 };
+	int n = fn( buf, size, fmt, precision, value );
+	if ( n > 0 ) __metalpy_fixup_msvcrt_exponent( buf, &n );
+	return n;
 }
 #else
 #include <stdio.h>
-static inline int __metalpy_format_f64( char* buf, size_t size, int precision, double value ) {
-	return snprintf( buf, size, "%.*f", precision, value );
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, double value ) {
+	char fmt[5] = { '%', '.', '*', (char)type_char, 0 };
+	return snprintf( buf, size, fmt, precision, value );
 }
 #endif
 '''
@@ -1890,7 +1926,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# @extern('c', ...) tag would wrongly flip the no-crt Windows build)
 		return [
 			f'\t{_emit_operand(instr.dest)} = __metalpy_format_f64('
-			f'(char*){_emit_operand(instr.buf)}, {_emit_operand(instr.size)}, {_emit_operand(instr.precision)}, {_emit_operand(instr.value)});'
+			f'(char*){_emit_operand(instr.buf)}, {_emit_operand(instr.size)}, {_emit_operand(instr.precision)}, '
+			f'{_emit_operand(instr.type_char)}, {_emit_operand(instr.value)});'
 		]
 
 	if isinstance( instr, ir.Allocate ):

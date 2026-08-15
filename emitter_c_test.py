@@ -8115,15 +8115,117 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
-	def test_float_type_char_not_implemented_is_a_compile_error( self ) -> None:
-		# 'e'/'E'/'g'/'G'/'%' stay deliberately unimplemented for now
-		# (PLAN_STR_FORMAT.md item 4) - a clear, named error, not a crash or
-		# silently wrong output
+	def test_str_type_char_on_float_is_a_compile_error( self ) -> None:
+		# 'x' is a valid type char for int/radix, but not for float - a
+		# clear, named error, not a crash or silently wrong output
 		self._run( '''
 def main() -> i32:
-	return len( f"{1.0:.2e}" )
+	return len( f"{1.0:x}" )
 ''' )
-		self.assertTrue( any( "'e' is not implemented for float yet" in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+		self.assertTrue( any( "'x' is not valid for float" in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_exponential( self ) -> None:
+		# 'e'/'E' (PLAN_STR_FORMAT.md item 4) - real Python's own f-string
+		# output is the oracle, same convention as every other format-spec
+		# test in this class. Backed by real snprintf/msvcrt _snprintf -
+		# msvcrt's own exponent is always 3 digits ("e+003"), unlike Python/
+		# C99's 2-digit floor ("e+03") - emitter_c.py's PROLOGUE fixes this
+		# up on Windows (__metalpy_fixup_msvcrt_exponent); this test is the
+		# real end-to-end proof that fixup actually produces Python-matching
+		# output, not just that it compiles.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x:.2e}}"
+
+def main() -> i32:
+	if build( 1234.5 ) != {f"{1234.5:.2e}"!r}:
+		return 1
+	if f"{{1234.5:.2E}}" != {f"{1234.5:.2E}"!r}:
+		return 2
+	if f"{{1234.5:e}}" != {f"{1234.5:e}"!r}:
+		return 3
+	if f"{{0.0001234:e}}" != {f"{0.0001234:e}"!r}:
+		return 4
+	if f"{{-1234.5:.2e}}" != {f"{-1234.5:.2e}"!r}:
+		return 5
+	if f"{{5.0:.0e}}" != {f"{5.0:.0e}"!r}:
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_exponential_sign_and_width( self ) -> None:
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234.5:+.2e}}" != {f"{1234.5:+.2e}"!r}:
+		return 1
+	if f"{{1234.5:012.2e}}" != {f"{1234.5:012.2e}"!r}:
+		return 2
+	if f"{{-1234.5:012.2e}}" != {f"{-1234.5:012.2e}"!r}:
+		return 3
+	if f"{{1234.5:>15.2e}}" != {f"{1234.5:>15.2e}"!r}:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_general( self ) -> None:
+		# 'g'/'G' - precision means SIGNIFICANT digits here, not fractional
+		# digits like 'f'/'e' (real snprintf handles this distinction
+		# itself), and switches between fixed/exponential notation based on
+		# magnitude, stripping trailing zeros - all exercised against real
+		# Python's own output
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234.5:.3g}}" != {f"{1234.5:.3g}"!r}:
+		return 1
+	if f"{{0.0001234:.3g}}" != {f"{0.0001234:.3g}"!r}:
+		return 2
+	if f"{{1234.5:g}}" != {f"{1234.5:g}"!r}:
+		return 3
+	if f"{{100000.0:g}}" != {f"{100000.0:g}"!r}:
+		return 4
+	if f"{{1000000.0:g}}" != {f"{1000000.0:g}"!r}:
+		return 5
+	if f"{{0.0:.3g}}" != {f"{0.0:.3g}"!r}:
+		return 6
+	if f"{{123.456:.3G}}" != {f"{123.456:.3G}"!r}:
+		return 7
+	if f"{{5.0:.0g}}" != {f"{5.0:.0g}"!r}:
+		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_percent( self ) -> None:
+		# '%' has no printf equivalent - lib/builtins/__float.py's own
+		# _percent_digits scales by 100 and formats as 'f' in metalpy
+		# source, then appends the literal '%' - this is the real end-to-
+		# end proof that scaling + suffix + sign/width assembly all compose
+		# correctly, matching real Python's own f"{x:%}" output
+		self._run( f'''
+def main() -> i32:
+	if f"{{0.1234:.2%}}" != {f"{0.1234:.2%}"!r}:
+		return 1
+	if f"{{0.1234:%}}" != {f"{0.1234:%}"!r}:
+		return 2
+	if f"{{-0.1234:8.2%}}" != {f"{-0.1234:8.2%}"!r}:
+		return 3
+	if f"{{0.1234:8.2%}}" != {f"{0.1234:8.2%}"!r}:
+		return 4
+	if f"{{1.0:%}}" != {f"{1.0:%}"!r}:
+		return 5
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_explicit_conversion_plus_format_spec_runtime( self ) -> None:

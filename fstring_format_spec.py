@@ -184,20 +184,18 @@ def validate_int_spec( spec: FStringFormatSpec ) -> None:
 
 def validate_float_spec( spec: FStringFormatSpec ) -> None:
 	''' raises FormatSpecError if `spec` isn't valid for a float operand.
-	Scoped to 'f'/'F' (fixed-point, explicit precision) only for now -
-	PLAN_STR_FORMAT.md item 4's 'e'/'E'/'g'/'G'/'%' (exponential/general/
-	percent) stay unimplemented, same "not there yet" shape validate_int_spec
-	already gives a float type char reaching int, just the other direction:
-	the float type itself now exists (unlike when validate_int_spec's own
-	message was written), only most of its format-spec type chars don't yet.
-	Precision here means DIGIT COUNT (fractional digits after the point),
-	not truncation like str's own precision - sign/'#'/width/fill/align all
-	reuse the existing FStringFormatSpec fields unchanged, validated the
-	same way str/int's own specs already are. '''
+	Covers every float type char FORMAT_SPEC_TYPE_CHARS recognizes -
+	'f'/'F' (fixed-point), 'e'/'E' (exponential), 'g'/'G' (general), '%'
+	(percent) - plus no type char at all (treated as 'f', a simplification:
+	Python's real "no type char" presentation for float is closer to 'g'
+	with a few of its own tweaks, not plain 'f' - PLAN_STR_FORMAT.md item 4
+	notes this as a known, separate gap). Precision means DIGIT COUNT
+	(fractional digits for 'f'/'F'/'e'/'E', significant digits for
+	'g'/'G'/'%') - sign/width/fill/align all reuse the existing
+	FStringFormatSpec fields unchanged, validated the same way str/int's
+	own specs already are. '''
 	type_char = spec.type
-	if type_char not in ( None, 'f', 'F' ):
-		if type_char in ( 'e', 'E', 'g', 'G', '%' ):
-			raise FormatSpecError( f"f-string format spec: {type_char!r} is not implemented for float yet (only 'f'/'F' fixed-point are)" )
+	if type_char not in ( None, 'f', 'F', 'e', 'E', 'g', 'G', '%' ):
 		raise FormatSpecError( f"f-string format spec: {type_char!r} is not valid for float" )
 	if spec.grouping is not None:
 		raise FormatSpecError( f"f-string format spec: cannot specify {spec.grouping!r} grouping with float yet" )

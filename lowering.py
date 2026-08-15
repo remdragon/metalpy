@@ -2698,30 +2698,36 @@ class FunctionLowering:
 		return dest
 
 	def _lower_compiler_format_f64( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
-		# compiler.format_f64(buf, size, precision, value) -> i32 - writes
-		# value's fixed-precision decimal digits (magnitude only, no sign -
-		# lib/builtins/__float.py's own callers split the sign out first, the
-		# same split int's __str__/_to_radix_digits/_decimal_digits_with_
-		# grouping already keep) into buf[0:size), returns the byte count
-		# written. Backed by a hand-written C helper in emitter_c.py's
-		# PROLOGUE (real snprintf/ntdll _snprintf, called there with its true
-		# variadic prototype) - deliberately NOT an ordinary @extern binding:
-		# emitter_c.py's extern codegen only ever emits fixed-arity C
-		# prototypes, which is an ABI hazard for a genuinely variadic callee,
-		# and tagging this under the 'c' extern lib would flip
-		# compiler.extern_libs and break the no-crt Windows build
-		# (float_test.py's own no_crt = 'c' not in compiler.extern_libs).
-		if len( node.args ) != 4 or node.keywords:
-			self.lowering.discovery.fail( f'compiler.format_f64(...) takes exactly 4 arguments (buf, size, precision, value): {ast.unparse(node)}', node )
+		# compiler.format_f64(buf, size, precision, type_char, value) -> i32 -
+		# writes value's fixed-precision decimal digits (magnitude only, no
+		# sign - lib/builtins/__float.py's own callers split the sign out
+		# first, the same split int's __str__/_to_radix_digits/_decimal_
+		# digits_with_grouping already keep) into buf[0:size), returns the
+		# byte count written. type_char is a printf-style conversion
+		# character's ASCII code ('f'/'F'/'e'/'E'/'g'/'G' - see
+		# fstring_format_spec.FORMAT_SPEC_TYPE_CHARS; '%' is handled entirely
+		# in metalpy source instead, by scaling the value and formatting as
+		# 'f' - see lib/builtins/__float.py's _percent_digits). Backed by a
+		# hand-written C helper in emitter_c.py's PROLOGUE (real snprintf/
+		# msvcrt _snprintf, called there with its true variadic prototype) -
+		# deliberately NOT an ordinary @extern binding: emitter_c.py's extern
+		# codegen only ever emits fixed-arity C prototypes, which is an ABI
+		# hazard for a genuinely variadic callee, and tagging this under the
+		# 'c' extern lib would flip compiler.extern_libs and break the
+		# no-crt Windows build (float_test.py's own no_crt = 'c' not in
+		# compiler.extern_libs).
+		if len( node.args ) != 5 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.format_f64(...) takes exactly 5 arguments (buf, size, precision, type_char, value): {ast.unparse(node)}', node )
 		intrinsics = self.lowering.discovery.get_intrinsics()
 		ptr_cls = intrinsics['Ptr']
 		buf_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ intrinsics['u8'] ] )
 		buf = self._lower_expr( node.args[0], buf_type )
 		size = self._lower_expr( node.args[1], intrinsics['usize'] )
 		precision = self._lower_expr( node.args[2], intrinsics['i32'] )
-		value = self._lower_expr( node.args[3], intrinsics['f64'] )
+		type_char = self._lower_expr( node.args[3], intrinsics['i32'] )
+		value = self._lower_expr( node.args[4], intrinsics['f64'] )
 		dest = self._new_temp( expected_type or intrinsics['i32'] )
-		self._emit( ir.FormatFloat( dest = dest, buf = buf, size = size, precision = precision, value = value ))
+		self._emit( ir.FormatFloat( dest = dest, buf = buf, size = size, precision = precision, type_char = type_char, value = value ))
 		return dest
 
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
@@ -4380,20 +4386,32 @@ class FunctionLowering:
 		return self._lower_pad_by_align( body, spec.align or '>', spec.fill, spec.width, str_type, node ) # numeric types' own default align is right, unlike str's left
 
 	def _lower_float_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
-		# 'f'/'F' (fixed-point) only - validate_float_spec rejects
-		# 'e'/'E'/'g'/'G'/'%' with a clear "not implemented yet" error
-		# (PLAN_STR_FORMAT.md item 4). Same sign+digits+pad assembly shape
-		# as _lower_int_format_spec above (no radix/grouping prefix to
-		# worry about here, so it's simpler), calling into
-		# lib/builtins/__float.py's own _sign_prefix/_fixed_digits methods -
-		# real control flow lives there, not hand-built IR here, matching
-		# int's own _sign_prefix/_to_radix_digits split.
+		# 'f'/'F'/'e'/'E'/'g'/'G'/'%' (PLAN_STR_FORMAT.md item 4 - every
+		# float type char fstring_format_spec.FORMAT_SPEC_TYPE_CHARS
+		# recognizes). Same sign+digits+pad assembly shape as
+		# _lower_int_format_spec above (no radix/grouping prefix to worry
+		# about here, so it's simpler), calling into lib/builtins/
+		# __float.py's own _sign_prefix/_fixed_digits/_percent_digits
+		# methods - real control flow lives there, not hand-built IR here,
+		# matching int's own _sign_prefix/_to_radix_digits split.
 		try:
 			validate_float_spec( spec )
 		except FormatSpecError as e:
 			self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
-		precision = spec.precision if spec.precision is not None else 6 # Python's own f"{x:f}" default precision
-		digits = self._lower_method_call( operand, '_fixed_digits', [ self._const_usize( precision ) ], str_type, node )
+		precision = spec.precision if spec.precision is not None else 6 # Python's own f"{x:f}"/f"{x:e}"/f"{x:g}"/f"{x:%}" all share this default
+		if spec.type == '%':
+			# has no printf equivalent of its own - _percent_digits handles
+			# the *100-then-'f' scaling itself (lib/builtins/__float.py),
+			# so no type_char argument here
+			digits = self._lower_method_call( operand, '_percent_digits', [ self._const_usize( precision ) ], str_type, node )
+		else:
+			# None (no type char at all) defers to 'f' - a simplification,
+			# not Python's real "no type char" presentation (closer to 'g'
+			# with its own tweaks) - see validate_float_spec's own comment
+			type_char = ord( spec.type or 'f' )
+			digits = self._lower_method_call(
+				operand, '_fixed_digits', [ self._const_usize( precision ), self._const_i32( type_char ) ], str_type, node,
+			)
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
 
 		if spec.width is None:

@@ -70,14 +70,22 @@ Deferred items
 
 4. Float format specs - f"{x:.2f}", f"{x:.3e}", f"{x:%}"
 
-   STATUS: 'f'/'F' (fixed-point, explicit precision) now work -
-   f"{1.0:.1f}" == '1.0', including sign/width/align/the '0' zero-pad
-   shorthand, same as int/str. 'e'/'E'/'g'/'G'/'%' (exponential/general/
-   percent) are still deferred - validate_float_spec() (fstring_format_
-   spec.py) names them explicitly ("not implemented for float yet"),
-   distinct from the old "doesn't exist yet" message (which is still what
-   an int OPERAND gets for a float type char - validate_int_spec, unrelated
-   to this item).
+   STATUS: DONE - every float type char fstring_format_spec.
+   FORMAT_SPEC_TYPE_CHARS recognizes now works: 'f'/'F' (fixed-point),
+   'e'/'E' (exponential), 'g'/'G' (general), '%' (percent), plus no type
+   char at all (a simplification - defers to 'f', not Python's real "None"
+   presentation, which is closer to 'g' with its own tweaks; a known,
+   separate, narrower gap than this item ever covered). Sign/width/align/
+   the '0' zero-pad shorthand all work uniformly across every type char,
+   same as int/str. validate_int_spec still gives the old "doesn't exist
+   yet" message for a float type char reaching an INT operand - unrelated
+   to this item, that type/operand mismatch is simply invalid.
+
+   The old "doesn't exist yet" message for a float OPERAND is gone -
+   validate_float_spec (fstring_format_spec.py) now only rejects a type
+   char that's genuinely invalid for float (e.g. 'x', int's own radix
+   char) with "is not valid for float". `#`/grouping remain rejected for
+   every float type char - a separate, still-open gap (see below).
 
    float did NOT end up needing a boxed RCClass the way this item
    originally assumed. Scalar (mpy_types.py) already had a `.names` dict
@@ -108,31 +116,57 @@ Deferred items
    flagged) is NOT hand-rolled metalpy-source arithmetic - getting
    float-to-decimal rounding exactly right by hand is genuinely hard
    (naive fractional-digit extraction accumulates floating-point error) -
-   it's a new `compiler.format_f64(buf, size, precision, value)` compiler
-   intrinsic (lowering.py's _lower_compiler_format_f64/ir.FormatFloat,
-   same shape as compiler.addrof/compiler.atomic_load), backed by a
-   hand-written C helper in emitter_c.py's PROLOGUE that resolves and
-   calls the real, always-present platform libc float formatter at
-   runtime: real snprintf on POSIX; on Windows, msvcrt.dll's own
-   _snprintf, resolved dynamically via GetModuleHandleA/LoadLibraryA/
-   GetProcAddress (kernel32) rather than statically linked, keeping
-   no-crt Windows builds CRT-free. This is NOT an ordinary @extern
-   binding on either platform - deliberately, for two independent
-   reasons found while building this: (1) emitter_c.py's extern codegen
-   only emits fixed-arity C prototypes, an ABI hazard for a genuinely
-   variadic callee on some argument shapes/platforms; (2) tagging it
-   under the 'c' extern lib (the obvious alternative) would flip
-   compiler.extern_libs and break float_test.py's own no_crt = 'c' not in
-   compiler.extern_libs on Windows even though the C implementation never
-   touches real msvcrt/ucrt statically. ntdll.dll's own exported
-   _snprintf (same dynamic-resolution technique, and genuinely present
-   per `dumpbin /exports ntdll.dll`) was tried FIRST and rejected once a
-   real functional test showed it silently fails on any float conversion
-   ("%.*f"/"%f" both just emit a stray "f", no digits) - apparently
-   NT's kernel-adjacent runtime never needed float formatting internally.
-   Buffer sizing in lib/builtins/__float.py is a generous fixed upper
-   bound (a max-magnitude f64 needs at most 309 integer digits), not
-   tightly computed.
+   it's a new `compiler.format_f64(buf, size, precision, type_char, value)`
+   compiler intrinsic (lowering.py's _lower_compiler_format_f64/
+   ir.FormatFloat, same shape as compiler.addrof/compiler.atomic_load),
+   backed by a hand-written C helper in emitter_c.py's PROLOGUE that
+   resolves and calls the real, always-present platform libc float
+   formatter at runtime via a dynamically-built "%.*X" format string
+   (X = type_char, one of 'f'/'F'/'e'/'E'/'g'/'G'): real snprintf on
+   POSIX; on Windows, msvcrt.dll's own _snprintf, resolved dynamically via
+   GetModuleHandleA/LoadLibraryA/GetProcAddress (kernel32) rather than
+   statically linked, keeping no-crt Windows builds CRT-free. '%' has no
+   printf equivalent - lib/builtins/__float.py's _f64_percent_digits
+   handles it entirely in metalpy source instead (scale by 100, format as
+   'f', append a literal '%' - Python's own exact definition of '%').
+   This is NOT an ordinary @extern binding on either platform -
+   deliberately, for two independent reasons found while building the
+   'f'/'F' half of this: (1) emitter_c.py's extern codegen only emits
+   fixed-arity C prototypes, an ABI hazard for a genuinely variadic callee
+   on some argument shapes/platforms; (2) tagging it under the 'c' extern
+   lib (the obvious alternative) would flip compiler.extern_libs and break
+   float_test.py's own no_crt = 'c' not in compiler.extern_libs on Windows
+   even though the C implementation never touches real msvcrt/ucrt
+   statically. ntdll.dll's own exported _snprintf (same dynamic-resolution
+   technique, and genuinely present per `dumpbin /exports ntdll.dll`) was
+   tried FIRST and rejected once a real functional test showed it silently
+   fails on any float conversion ("%.*f"/"%f" both just emit a stray "f",
+   no digits) - apparently NT's kernel-adjacent runtime never needed float
+   formatting internally. Buffer sizing in lib/builtins/__float.py is a
+   generous fixed upper bound (a max-magnitude f64 needs at most 309
+   integer digits), not tightly computed.
+
+   A SECOND, Windows-only quirk was found adding 'e'/'E'/'g'/'G': legacy
+   msvcrt.dll's own exponent is always padded to exactly 3 digits
+   ("1.23e+003"), unlike Python/C99 (POSIX's real snprintf included),
+   which use a 2-digit floor ("1.23e+03") - confirmed by a real test
+   against this system's own msvcrt.dll, since dumpbin (symbol presence)
+   can't show behavioral differences like this. emitter_c.py's PROLOGUE
+   now also carries __metalpy_fixup_msvcrt_exponent, a small Windows-only
+   post-processing pass that strips the extra leading zero from the
+   exponent in place before returning - real f64 exponents are always
+   <= 3 digits, so at most one zero is ever stripped in practice.
+
+   Still open, deliberately not addressed by this pass: `#` (always show
+   the decimal point for 'f'/'e'/'E', keep trailing zeros for 'g'/'G')
+   and `,`/`_` grouping both remain rejected for every float type char -
+   validate_float_spec still raises for either. Both would very likely be
+   close to free (C's own `#`/`,`-flag behavior for these conversions
+   already matches Python's semantics almost exactly, the same reason
+   'f'/'e'/'g' delegate straight to snprintf instead of a hand-rolled
+   conversion), just not verified/wired up yet. No boxed float class was
+   needed for any of this, confirming the note below - only Scalar's
+   existing `.names` registration hook.
 
 5. `=` general sign-aware alignment
 

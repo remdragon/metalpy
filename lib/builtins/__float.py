@@ -21,21 +21,33 @@
 # an ordinary name for exactly this reason.
 #
 # Scoped to exactly what f-string format specs need (lowering.py's
-# _lower_float_format_spec) - 'f'/'F' (fixed-point, explicit precision)
-# only. __str__/__repr__ (bare f"{x}", needing Python's own shortest-
-# round-trip default formatting - a materially harder, separate problem)
-# stay deferred, same as every OTHER scalar's bare f"{x}"
-# (PLAN_STR_FORMAT.md item 6) - f'{1.0:.1f}' never reaches __str__/__repr__
-# at all (_lower_fstring_part dispatches an explicit format spec straight
-# against the operand's own type, only falling back to __str__/__repr__
-# for a spec-less interpolation or an explicit !s/!r).
+# _lower_float_format_spec) - 'f'/'F'/'e'/'E'/'g'/'G'/'%' (fixed-point,
+# exponential, general, percent - every float type char fstring_format_
+# spec.FORMAT_SPEC_TYPE_CHARS recognizes). __str__/__repr__ (bare f"{x}",
+# needing Python's own shortest-round-trip default formatting - a
+# materially harder, separate problem) stay deferred, same as every OTHER
+# scalar's bare f"{x}" (PLAN_STR_FORMAT.md item 6) - f'{1.0:.1f}' never
+# reaches __str__/__repr__ at all (_lower_fstring_part dispatches an
+# explicit format spec straight against the operand's own type, only
+# falling back to __str__/__repr__ for a spec-less interpolation or an
+# explicit !s/!r).
 
 import sys
 
 # a max-magnitude f64 (~1.8e308) needs at most 309 integer digits - this is
 # a generous fixed upper bound for the format buffer, not a tightly computed
-# one (matches int's own str conversion's "just alloc enough" style).
+# one (matches int's own str conversion's "just alloc enough" style). Every
+# type char below (f/F/e/E/g/G/%) fits comfortably within it - 'e'/'E'/'g'/
+# 'G' never need anywhere near this many integer digits, but reusing one
+# generous bound for all of them is simpler than computing a tighter one
+# per type char.
 _MAX_INTEGER_DIGITS: usize = 320
+
+# printf conversion character ASCII codes - compiler.format_f64's own
+# type_char argument (an i32, not a str - see its own comment) is always
+# one of these, chosen at compile time by lowering.py's _lower_float_
+# format_spec based on the f-string's own literal spec.type.
+_TYPE_CHAR_F: i32 = 102 # ord('f')
 
 
 @private
@@ -52,7 +64,9 @@ def _f64_sign_prefix( value: f64, mode: str ) -> str:
 	(Python's f"{-0.0:.1f}" == '-0.0') is a known, deliberately out-of-
 	scope edge case for now: no bit-reinterpret/sign-bit-read
 	infrastructure exists in this compiler to distinguish -0.0 from 0.0
-	otherwise (IEEE754 defines -0.0 == 0.0). '''
+	otherwise (IEEE754 defines -0.0 == 0.0). Also used for '%' (lowering.py
+	calls this on the ORIGINAL, un-scaled value - multiplying by the
+	positive constant 100 never changes the sign). '''
 	if value < 0.0:
 		return str( '-' )
 	if mode == '+':
@@ -63,54 +77,84 @@ def _f64_sign_prefix( value: f64, mode: str ) -> str:
 
 
 @private
-def _f64_fixed_digits( value: f64, precision: usize ) -> str:
+def _f64_fixed_digits( value: f64, precision: usize, type_char: i32 ) -> str:
 	''' value's own MAGNITUDE (sign ignored - callers prepend it themselves
 	via _f64_sign_prefix, the same split int's _to_radix_digits/
-	_decimal_digits_with_grouping already keep) as fixed-point decimal text
-	with exactly `precision` fractional digits - the f-string format-spec
-	'f'/'F' dispatch's actual digit-conversion work (lowering.py's
-	_lower_float_format_spec). Built on compiler.format_f64 (a hand-written
-	C helper - see its own comment in emitter_c.py's PROLOGUE) rather than
-	a hand-rolled metalpy-source conversion: getting float-to-decimal
-	rounding exactly right by hand is genuinely hard (naive fractional-
-	digit extraction accumulates floating-point error), so this reuses the
-	platform's own proven conversion instead - matching int's own design
-	choice to push real control flow into plain metalpy source methods
-	rather than hand-built IR in lowering.py (see the RC use-after-free
-	commit 52333fd int._to_radix_digits' own comment documents), just with
-	the numeric conversion itself delegated to compiler.format_f64 instead
-	of being hand-rolled here too. '''
+	_decimal_digits_with_grouping already keep) as decimal text per a
+	printf-style type_char ('f'/'F'/'e'/'E'/'g'/'G' - see fstring_format_
+	spec.FORMAT_SPEC_TYPE_CHARS; '%' is NOT passed here, see
+	_f64_percent_digits below), with `precision` meaning fractional digits
+	for 'f'/'F'/'e'/'E' or significant digits for 'g'/'G' (matching both
+	Python's own format-spec precision semantics and C's %g precision
+	semantics exactly - no special-casing needed here for that split) -
+	the f-string format-spec dispatch's actual digit-conversion work
+	(lowering.py's _lower_float_format_spec). Built on compiler.format_f64
+	(a hand-written C helper - see its own comment in emitter_c.py's
+	PROLOGUE) rather than a hand-rolled metalpy-source conversion: getting
+	float-to-decimal rounding exactly right by hand is genuinely hard
+	(naive fractional-digit extraction accumulates floating-point error),
+	so this reuses the platform's own proven conversion instead - matching
+	int's own design choice to push real control flow into plain metalpy
+	source methods rather than hand-built IR in lowering.py (see the RC
+	use-after-free commit 52333fd int._to_radix_digits' own comment
+	documents), just with the numeric conversion itself delegated to
+	compiler.format_f64 instead of being hand-rolled here too. '''
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		with compiler.panic_arithmetic( 'an integer-digit bound plus a decimal point plus precision fractional digits plus a zero terminator cannot overflow usize for any real f-string format spec' ):
 			buf_size: usize = _MAX_INTEGER_DIGITS + 1 + precision + 1
 		buf: Ptr[u8] = sys.alloc[u8]( buf_size )
-		n: i32 = compiler.format_f64( buf, buf_size, i32( precision ), magnitude )
+		n: i32 = compiler.format_f64( buf, buf_size, i32( precision ), type_char, magnitude )
 		if n < 0:
 			sys.free( buf )
 			sys.panic( 'f-string float formatting failed' )
 		return str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
-			'compiler.format_f64 produced invalid utf-8 (unreachable - only ASCII digits and \'.\' are ever written)'
+			'compiler.format_f64 produced invalid utf-8 (unreachable - only ASCII digits, \'.\', and \'e\'/\'E\'/\'+\'/\'-\' are ever written)'
 		)
+
+
+@private
+def _f64_percent_digits( value: f64, precision: usize ) -> str:
+	''' '%' (PLAN_STR_FORMAT.md item 4) has no printf equivalent - Python
+	defines it as: multiply by 100, format as fixed-point ('f') with the
+	given precision, append a literal '%'. Done here in metalpy source
+	(not passed down to compiler.format_f64 as some 8th type_char) since
+	it needs a real arithmetic step first, not just a different format
+	string - reuses _f64_fixed_digits for the actual digit conversion once
+	scaled, same as every other type char. Sign is unaffected by scaling
+	by the positive constant 100, so lowering.py still calls _f64_sign_
+	prefix on the ORIGINAL, un-scaled value for this case - no separate
+	percent-specific sign handling needed. '''
+	with compiler.wrap_arithmetic:
+		scaled: f64 = value * 100.0
+	return _f64_fixed_digits( scaled, precision, _TYPE_CHAR_F ) + str( '%' )
 
 
 f64._sign_prefix = _f64_sign_prefix
 f64._fixed_digits = _f64_fixed_digits
+f64._percent_digits = _f64_percent_digits
 
 
 @private
 def _f32_sign_prefix( value: f32, mode: str ) -> str:
 	''' f32 has no format-spec digit conversion of its own - widens to f64
-	and delegates, same as _f32_fixed_digits below. Widening f32 -> f64 is
-	always exact (every f32 value is exactly representable in f64), so this
-	loses no precision beyond what value already had. '''
+	and delegates, same as _f32_fixed_digits/_f32_percent_digits below.
+	Widening f32 -> f64 is always exact (every f32 value is exactly
+	representable in f64), so this loses no precision beyond what value
+	already had. '''
 	return f64( value )._sign_prefix( mode )
 
 
 @private
-def _f32_fixed_digits( value: f32, precision: usize ) -> str:
-	return f64( value )._fixed_digits( precision )
+def _f32_fixed_digits( value: f32, precision: usize, type_char: i32 ) -> str:
+	return f64( value )._fixed_digits( precision, type_char )
+
+
+@private
+def _f32_percent_digits( value: f32, precision: usize ) -> str:
+	return f64( value )._percent_digits( precision )
 
 
 f32._sign_prefix = _f32_sign_prefix
 f32._fixed_digits = _f32_fixed_digits
+f32._percent_digits = _f32_percent_digits
