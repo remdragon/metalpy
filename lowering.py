@@ -1639,14 +1639,46 @@ class FunctionLowering:
 			self._emit( ir.Jump( target = n.generator_yield_resume_label ))
 			self._emit( ir.Label( name = skip_label ))
 
-	def _lower_generator_yield( self, node: ast.Yield ) -> None:
-		''' PLAN_GENERATORS.md Phase F - a bare `yield expr` statement
-		(_validate_generator_yield_positions already rejected every other
-		position - yield-as-expression is Phase C's own job) reached by the
-		ordinary per-statement lowering loop, at whatever real nesting
-		depth it textually sits at. state/resume_label were already
-		stamped onto `node` by _emit_generator_dispatch_prologue, which
-		always runs first (see run()'s own call site).
+	def _require_generator_next_fn( self, node: ast.Yield ) -> 'Function|None':
+		''' shared guard for _lower_generator_yield/_expr_Yield: is
+		self._current_fn a successfully-synthesized generator body right
+		now? Reachable, not just a defensive-only case - ensure_generator_
+		synthesized's own pipeline can fail partway through a genuinely
+		invalid generator (e.g. a real `return` inside a defer/errdefer
+		body - _reject_return_inside_generator_defer_body's own discovery.
+		fail(), raised and RECORDED well before this point ever runs) - the
+		idempotency memo (self._generators_synthesized) is set BEFORE that
+		pipeline runs, so it's never retried, and `fn` (the original def,
+		never rewritten by _rewrite_generator_constructor since synthesis
+		didn't reach that far) can end up scheduled and lowered as an
+		ordinary function later, reaching its own still-real, never-
+		stamped yield here. The real, useful error was already recorded -
+		this just reports a clear secondary failure for whatever's left
+		unresolved and returns None, never a raw crash (a bare Python
+		AssertionError here would escape the per-statement/per-unit
+		CompileError recovery boundaries this whole compiler relies on,
+		turning a single bad generator into a hard crash of the entire
+		compile run). '''
+		fn = self._current_fn
+		if fn is not None and fn.is_generator_next:
+			return fn
+		self.lowering.discovery.fail(
+			f'yield reached outside a successfully synthesized generator (see any earlier error for {fn.qualname if fn else "?"}): {ast.unparse(node)}',
+			node,
+		)
+		return None
+
+	def _emit_generator_yield_suspend( self, node: ast.Yield, fn: Function ) -> tuple[int,str]:
+		''' PLAN_GENERATORS.md Phase F/Phase C - the part of lowering a
+		`yield` that's identical regardless of whether its own resumed-with
+		value is discarded (_lower_generator_yield, the plain statement
+		shape - Phase F) or captured (_expr_Yield, Phase C's own .send()
+		support): build the yielded value, store the yield's own state,
+		emit the real suspend (ir.Yield), then the resume point (ir.Label)
+		- a later call's own dispatch prologue jumps straight back in here.
+		Returns (state, resume_label) so a caller in expression position
+		can continue past the resume point to read back __send_ready/
+		__send_slot; the statement-position caller just discards both.
 
 		Builds the yielded value exactly like an ordinary `return <expr>`
 		would (_stmt_Return's own identical coercion + aliasing-incref
@@ -1658,43 +1690,11 @@ class FunctionLowering:
 		coerce a bare leaf value the way an ordinary Optional-style union
 		does - same reason type_resolver.py's now-removed _wrap_generator_
 		next_returns_in_ok needed to build the same Call by hand for every
-		other generator-body return). Then: store the yield's own state
-        into self.__state, flush whatever pending temps the value's own
-		evaluation left behind (same "flush before the terminator"
-		discipline _stmt_Return's own comment explains, and for the exact
-		same reason - an intermediate temp's release must stay reachable),
-		emit the real suspend (ir.Yield), then the resume point
-		(ir.Label) - a later call's own dispatch prologue jumps straight
-		back in here. Unlike a real `return`, nothing here touches the CFG
-		epilogue/defer-replay machinery at all: a yield doesn't exit the
-		function's own scope in the RC-bookkeeping sense (every generator
-		local is a promoted field, still alive across the suspend - Phase
-		5), so there's nothing to unwind. '''
-		fn = self._current_fn
-		if fn is None or not fn.is_generator_next:
-			# PLAN_GENERATORS.md - reachable, not just a defensive-only
-			# case: ensure_generator_synthesized's own pipeline can fail
-			# partway through a genuinely invalid generator (e.g. a real
-			# `return` inside a defer/errdefer body - _reject_return_
-			# inside_generator_defer_body's own discovery.fail(), raised
-			# and RECORDED well before this point ever runs) - the
-			# idempotency memo (self._generators_synthesized) is set
-			# BEFORE that pipeline runs, so it's never retried, and `fn`
-			# (the original def, never rewritten by _rewrite_generator_
-			# constructor since synthesis didn't reach that far) can end
-			# up scheduled and lowered as an ordinary function later,
-			# reaching its own still-real, never-stamped yield here. The
-			# real, useful error was already recorded - this is just a
-			# clear secondary report for whatever's left unresolved,
-			# never a raw crash (a bare Python AssertionError here would
-			# escape the per-statement/per-unit CompileError recovery
-			# boundaries this whole compiler relies on, turning a single
-			# bad generator into a hard crash of the entire compile run).
-			self.lowering.discovery.fail(
-				f'yield reached outside a successfully synthesized generator (see any earlier error for {self._current_fn.qualname if self._current_fn else "?"}): {ast.unparse(node)}',
-				node,
-			)
-			return
+		other generator-body return). Unlike a real `return`, nothing here
+		touches the CFG epilogue/defer-replay machinery at all: a yield
+		doesn't exit the function's own scope in the RC-bookkeeping sense
+		(every generator local is a promoted field, still alive across the
+		suspend - Phase 5), so there's nothing to unwind. '''
 		state = getattr( node, 'generator_yield_state', None )
 		resume_label = getattr( node, 'generator_yield_resume_label', None )
 		assert state is not None and resume_label is not None, (
@@ -1745,6 +1745,85 @@ class FunctionLowering:
 		self._flush_pending_temps()
 		self._emit( ir.Yield( value = value, state = state, resume_label = resume_label ))
 		self._emit( ir.Label( name = resume_label ))
+		return state, resume_label
+
+	def _lower_generator_yield( self, node: ast.Yield ) -> None:
+		''' PLAN_GENERATORS.md Phase F - a bare `yield expr` statement
+		reached by the ordinary per-statement lowering loop, at whatever
+		real nesting depth it textually sits at - its own resumed-with
+		value (whatever a LATER .send() might deliver, if this generator
+		even supports it) is simply discarded, exactly like Python's own
+		`yield expr` used as a bare statement. See _expr_Yield for the
+		captured/Phase C counterpart. '''
+		fn = self._require_generator_next_fn( node )
+		if fn is None:
+			return
+		self._emit_generator_yield_suspend( node, fn )
+
+	def _expr_Yield( self, node: ast.Yield, expected_type: Type|None ) -> ir.Operand:
+		''' PLAN_GENERATORS.md Phase C - a captured yield expression (`x =
+		yield v`, `x = (yield v).or_return()`, ...) - _validate_generator_
+		yield_positions already confirmed this generator declared a
+		SendType before ever allowing yield to reach expression position at
+		all, so fn.generator_send_type is never None here. Ordinary
+		recursive expression lowering is what makes arbitrary nesting
+		(`.or_return()`, `.unwrap_or()`, assignment into a union-typed
+		local, ...) just work - this method only has to produce the right
+		OPERAND; every caller-side coercion/consumption already exists.
+
+		After resuming (_emit_generator_yield_suspend takes care of the
+		suspend itself, identical to the discarded/statement-position
+		case), reads back self.__send_ready: True means send(v) actually
+		ran since this suspend and __send_slot holds the real value - clear
+        the flag (own semantics: each captured yield consumes exactly the
+		ONE send() that resumed it, not a stale earlier one) and return an
+		incref'd read of __send_slot (the field itself keeps its own
+		reference - this is a genuine aliasing read, same reasoning
+		_lower_generator_yield's own aliasing-incref comment gives, just
+		unconditional here since there's no user-source AST node to
+		inspect the shape of - __send_slot is always a field). False means
+		this suspend was resumed via a bare __next__()/for-loop consumption
+		instead - Python's own generators raise TypeError for exactly this
+		("can't send non-None value to a just-started generator" is the
+		specific message for state==0; a captured yield resumed via
+		__next__() past the first one is the general case) - panics with a
+		clear message pointing at .send() instead. '''
+		fn = self._require_generator_next_fn( node )
+		if fn is None:
+			return ir.Const( type = expected_type, value = None )
+		send_type = fn.generator_send_type
+		assert send_type is not None, (
+			f'{fn.qualname}: yield reached expression position with no send_type - _validate_generator_yield_positions should have rejected this: {ast.unparse(node)}'
+		)
+		self._emit_generator_yield_suspend( node, fn )
+		self_var = fn.names['self']
+		ready_field = self.lowering._attr_lookup( self_var.type, '__send_ready', node )
+		ready_temp = self._new_temp( ready_field.type )
+		self._emit( ir.GetAttr( dest = ready_temp, obj = self_var, attr = '__send_ready' ))
+		ready_label = self._new_label( 'gen_send_ready' )
+		self._emit( ir.JumpIfTrue( cond = ready_temp, target = ready_label ))
+		panic_fn = self.lowering._type_resolver._resolve_sys_function( 'panic' )
+		self.lowering.schedule( panic_fn )
+		panic_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'sys', ctx = ast.Load() ), attr = 'panic', ctx = ast.Load() ),
+			args = [ ast.Constant( value = f'{fn.qualname}: a captured yield was resumed via __next__() instead of send() - use .send(value) to provide the sent value' ) ],
+			keywords = [],
+		)
+		panic_call.resolved_callee = panic_fn
+		panic_call.end_lineno = None; panic_call.end_col_offset = None
+		panic_stmt = ast.Expr( value = panic_call )
+		ast.copy_location( panic_stmt, node )
+		ast.fix_missing_locations( panic_stmt )
+		self._lower_stmt( panic_stmt )
+		self._emit( ir.Label( name = ready_label ))
+		self._emit( ir.SetAttr( obj = self_var, attr = '__send_ready', value = ir.Const( type = ready_field.type, value = False )))
+		slot_field = self.lowering._attr_lookup( self_var.type, '__send_slot', node )
+		dest = self._new_temp( slot_field.type )
+		self._emit( ir.GetAttr( dest = dest, obj = self_var, attr = '__send_slot' ))
+		if cfg.is_rc( send_type ):
+			for instr in self._cfg.incref( send_type, dest ):
+				self._emit( instr )
+		return dest
 
 	def run_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self.lowering._find_module_for( var )

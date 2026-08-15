@@ -620,17 +620,27 @@ class TypeResolver:
 		longer generator-specific problems once yield is a real lowering-
 		level event reachable from anywhere cfg.py already handles
 		correctly for every other function, see lowering.py's own
-		_lower_generator_yield). The one restriction that still genuinely
-		doesn't exist yet is yield used as an EXPRESSION (`x = yield v`,
-		`.send()` - PLAN_GENERATORS.md Phase C) - every yield must still be
+		_lower_generator_yield). yield used as an EXPRESSION (`x = yield
+		v`, `x = (yield v).or_return()`, ... - PLAN_GENERATORS.md Phase C)
+		is allowed exactly when this generator declared a SendType (the
+		3-arg Generator[T,SendType,E] form) - lowering.py's own _expr_Yield
+		is what makes an arbitrarily-nested yield expression actually work
+		(ordinary recursive expression lowering composes with it for free,
+		same as any other sub-expression), so no further shape restriction
+		is needed here once send_type is confirmed set. Without a SendType
+		(Iterator[T], the 2-arg Generator[T,E]), every yield must still be
 		the entire value of a bare `ast.Expr` statement, at any nesting
-		depth. A leftover `ast.YieldFrom` here (top-level occurrences were
-		already desugared away by _desugar_generator_yield_from, which runs
-		before this) is a nested one - still unsupported (A.4a follow-up,
-		not this phase). '''
+		depth - there's no .send() to ever deliver an expression-position
+		yield's own "resumed with" value. A leftover `ast.YieldFrom` here
+		(top-level occurrences were already desugared away by
+		_desugar_generator_yield_from, which runs before this) is a nested
+		one - still unsupported (A.4a follow-up, not this phase). '''
 		all_yields = self._find_all_yield_nodes( fn )
 		if any( isinstance( y, ast.YieldFrom ) for y in all_yields ):
 			self.discovery.fail( f'{fn.qualname}: yield from is not supported yet - see PLAN_GENERATORS.md', fn.node )
+		send_type = fn.return_type.send_type if isinstance( fn.return_type, GeneratorType ) else None
+		if send_type is not None:
+			return
 		bare_statement_yields = {
 			id( node.value )
 			for node in self._walk_generator_body( fn.node.body )
@@ -641,7 +651,8 @@ class TypeResolver:
 				self.discovery.fail(
 					f'{fn.qualname}: yield must be a direct top-level statement (`yield expr` alone on its own '
 					f'line, optionally nested inside if/while/for/with of any depth) - using it inside another '
-					f'expression (.send()-style) is not supported yet: {ast.unparse(n)}',
+					f'expression is only supported for a generator declaring a SendType (Generator[T,SendType,E], '
+					f'to receive the value from .send()): {ast.unparse(n)}',
 					n,
 				)
 
@@ -1569,7 +1580,7 @@ class TypeResolver:
 			cls = backing_cls, node = node,
 			parameters = [], return_type = next_return_type,
 			is_static = False, resolve = None,
-			is_generator_next = True, generator_done_state = done_state,
+			is_generator_next = True, generator_done_state = done_state, generator_send_type = send_type,
 		)
 		# PLAN_GENERATORS.md - a generic generator's own body statements get
 		# copied into THIS fresh Function/scope, which starts with an empty
