@@ -4702,6 +4702,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return test, []
 			bind = ast.Assign( targets = [ ast.Name( id = pattern.name, ctx = ast.Store() ) ], value = subj_expr )
 			ast.copy_location( bind, node )
+			# unlike an ordinary Assign (visited through visit_Assign, which
+			# populates self.locals for free), this bind is synthesized
+			# directly here and returned to the caller (visit_Match) to be
+			# PREPENDED to the case body rather than run through self.visit()
+			# - so nothing else records the bound name's type. Without this,
+			# a match-pattern-bound name (`case Result.Ok(v):`) never gets a
+			# self.locals entry at all, so a later `if v is not None:` inside
+			# the same case body can't recognize v as a narrowable
+			# union-typed name (_is_none_narrowing_shape's own _type_of_expr
+			# call returns None for it) and the narrowing that an ordinary
+			# local would get is silently skipped - confirmed via a real
+			# compile: `match r: case Result.Ok(v): if v is not None: x = v`
+			# (v: i32|None) failed to narrow, rejecting `x = v` as
+			# i32|None-into-i32, even though the identical pattern against a
+			# plain `v: i32|None = ...` local already narrowed correctly.
+			self.locals[pattern.name] = self._type_of_expr( subj_expr )
 			return test, [ bind ]
 
 		if isinstance( pattern, ast.MatchValue ):
