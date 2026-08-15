@@ -288,6 +288,55 @@ def main() -> i32:
 	return 0
 ''' )
 
+	# regression test for the u64/usize-SOURCE promotion bug: the u128-source
+	# fix below promoted ONLY a literal u128 source to __metalpy_wideuint -
+	# but under MSVC's 64-bit __metalpy_wideint fallback, u64/usize sources
+	# have the IDENTICAL problem (their own MAX also doesn't fit a SIGNED
+	# 64-bit wideint). Confirmed via a real repro: a near-MAX u64 cast down
+	# to i32 silently reported "in range" under MSVC instead of overflowing.
+	# Deliberately NOT _HAS_I128-gated - u64/usize's own MAX needs no true
+	# 128-bit range to construct (unlike the u128 tests below), so this
+	# exercises the bug on every backend, MSVC included.
+	def test_cast_from_u64_usize_max_saturates_and_panics_correctly( self ) -> None:
+		checks = [
+			'saturating u64 MAX -> i32 clamps to i32 MAX (not silently in-range)',
+			'saturating usize MAX -> i32 clamps to i32 MAX (not silently in-range)',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		one: u64 = 1
+		u64_max: u64 = one - 2
+		one_sz: usize = 1
+		usize_max: usize = one_sz - 2
+	with compiler.saturate_arithmetic:
+		clamped: i32 = i32(u64_max)
+		if clamped != 2147483647:
+			return 1
+		clamped_sz: i32 = i32(usize_max)
+		if clamped_sz != 2147483647:
+			return 2
+	return 0
+''', checks )
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		one: u64 = 1
+		u64_max: u64 = one - 2
+	with compiler.panic_arithmetic("ov"):
+		bad: i32 = i32(u64_max)
+	return 0
+''' )
+		self._assert_program_panics( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		one: usize = 1
+		usize_max: usize = one - 2
+	with compiler.panic_arithmetic("ov"):
+		bad: i32 = i32(usize_max)
+	return 0
+''' )
+
 	# regression test for the u128-SOURCE promotion bug: the old code always
 	# promoted the source operand to __metalpy_wideint (signed 128-bit) for
 	# the range comparison - reinterpreting u128's own MAX (all 128 bits set)

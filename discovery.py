@@ -39,38 +39,6 @@ def _collect_reachable_returns( stmts: list[ast.stmt] ) -> list[ast.Return]:
 		collector.visit( stmt )
 	return returns
 
-def _find_inline_body_early_exit_construct( stmts: list[ast.stmt] ) -> ast.AST|None:
-	''' PLAN_INLINE.md multi-statement generalization: a `defer`/`errdefer`
-	construct (either spelling lowering.py's own _defer_kind_of_with/
-	_defer_kind_of_call recognize - `with defer:`/`with errdefer:`, or
-	`defer(...)`/`errdefer(...)` as a call) anywhere within `stmts`, not
-	descending into a nested def/lambda. defer/errdefer's whole contract
-	is "runs when THIS function returns" - once spliced, there is no such
-	boundary left for it to mean anything against, so this is a real
-	timing bug waiting to happen, not just an unsupported shape, if left
-	unguarded. Returns the first offending node, or None. '''
-	found: list[ast.AST] = []
-	class _EarlyExitFinder( ast.NodeVisitor ):
-		def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
-			pass
-		def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
-			pass
-		def visit_Lambda( self, lam: ast.Lambda ) -> None:
-			pass
-		def visit_With( self, node: ast.With ) -> None:
-			for item in node.items:
-				if isinstance( item.context_expr, ast.Name ) and item.context_expr.id in ( 'defer', 'errdefer' ):
-					found.append( node )
-			self.generic_visit( node )
-		def visit_Call( self, node: ast.Call ) -> None:
-			if isinstance( node.func, ast.Name ) and node.func.id in ( 'defer', 'errdefer' ):
-				found.append( node )
-			self.generic_visit( node )
-	finder = _EarlyExitFinder()
-	for stmt in stmts:
-		finder.visit( stmt )
-	return found[0] if found else None
-
 def _find_inline_body_reserved_name_reassignment( stmts: list[ast.stmt], reserved_names: set[str] ) -> ast.Name|None:
 	''' PLAN_INLINE.md multi-statement generalization: a Store-context
 	reference to `self` or a declared parameter name anywhere within
@@ -1787,22 +1755,24 @@ class Discovery( ast.NodeVisitor ):
 			if not self._is_inline_eligible_body( node.body ):
 				self.fail(
 					f'@inline {qualname} must have a body ending in exactly one `return <expr>` '
-					f'(optionally preceded by a docstring), with no other `return` anywhere else in it - not yet supported for anything else',
+					f'(optionally preceded by a docstring), with every other reachable `return` (anywhere earlier, including '
+					f'nested in if/for/while) also carrying a value - not yet supported for anything else',
 					node,
 				)
 			# multi-statement generalization: everything but the final
 			# `return <expr>` (already validated above) gets spliced as
-			# real statements at each call site - two shapes are rejected
-			# here because leaving them unguarded would be silently WRONG,
-			# not just unsupported (see each helper's own docstring)
+			# real statements at each call site - self/parameter
+			# reassignment is rejected here because leaving it unguarded
+			# would be silently WRONG (aliasing the caller's own argument),
+			# not just unsupported - see the helper's own docstring.
+			# defer/errdefer WAS rejected here too (its "runs when this
+			# function returns" contract had no real boundary to mean
+			# anything against before this pass) - no longer needed: the
+			# splice now has a well-defined local epilogue of its own (see
+			# lowering.py's _splice_multi_statement_inline_body/cfg.py's
+			# push_inline_scope), so defer/errdefer is spliced and replayed
+			# there exactly like an ordinary function's own
 			pre_return_stmts = node.body[:-1]
-			early_exit = _find_inline_body_early_exit_construct( pre_return_stmts )
-			if early_exit is not None:
-				self.fail(
-					f'@inline {qualname}: defer/errdefer cannot appear before the final return of a multi-statement body - '
-					f'its own function-exit boundary no longer exists once the body is spliced at each call site: {ast.unparse(early_exit)}',
-					early_exit,
-				)
 			reserved_names = { a.arg for a in ( node.args.posonlyargs + node.args.args + node.args.kwonlyargs ) }
 			if class_obj is not None and not is_static and not is_classmethod:
 				reserved_names.add( 'self' )
@@ -1899,27 +1869,32 @@ class Discovery( ast.NodeVisitor ):
 		return is_stub_body( body )
 
 	def _is_inline_eligible_body( self, body: list[ast.stmt] ) -> bool:
-		''' PLAN_INLINE.md, generalized for multi-statement bodies: @inline
+		''' PLAN_INLINE.md, generalized for early/nested return: @inline
 		accepts a body (after stripping an optional leading docstring - an
 		ast.Expr wrapping a string ast.Constant, the same shape ast.
 		get_docstring recognizes) of arbitrary statements followed by
-		exactly one final, TOP-LEVEL `return <expr>` - no other ast.Return
-		may appear anywhere else in the body, including nested inside
-		if/for/while (reuses _collect_reachable_returns' own "exactly one
-		reachable Return" walk, additionally requiring POSITIONALLY that
-		the one Return found is the body's own last statement). The
-		original single-`return <expr>`-statement shape is the trivial
-		special case of this (stmts == [Return]) and stays accepted
-		unchanged - every currently-accepted body stays accepted.
-		lowering.py's _lower_inline_call relies on this having already
-		rejected everything else, it doesn't re-check. '''
+		exactly one final, TOP-LEVEL `return <expr>` - but now, unlike the
+		original multi-statement generalization, OTHER `return <expr>`
+		statements are also allowed anywhere earlier, including nested
+		inside if/for/while (lowering.py's _splice_multi_statement_inline_
+		body/cfg.py's push_inline_scope give each splice its own local
+		early-exit target, so an early return no longer needs to be
+		rejected outright the way it once did). Every reachable return -
+		the trailing one and any earlier ones alike - must still carry a
+		value: a bare `return` has no well-defined meaning for an inline
+		function's own overall value, so it's rejected the same way the
+		trailing one always has been. The original single-`return <expr>`-
+		statement shape is the trivial special case of this (stmts ==
+		[Return]) and stays accepted unchanged - every currently-accepted
+		body stays accepted. lowering.py's _lower_inline_call relies on
+		this having already rejected everything else, it doesn't re-check. '''
 		stmts = body
 		if stmts and isinstance( stmts[0], ast.Expr ) and isinstance( stmts[0].value, ast.Constant ) and isinstance( stmts[0].value.value, str ):
 			stmts = stmts[1:]
 		if not stmts or not isinstance( stmts[-1], ast.Return ) or stmts[-1].value is None:
 			return False
 		returns = _collect_reachable_returns( stmts )
-		return len( returns ) == 1 and returns[0] is stmts[-1]
+		return all( r.value is not None for r in returns )
 
 	def _is_eager_return_inferable_body( self, body: list[ast.stmt] ) -> bool:
 		''' return-only generic type-parameter inference (a generic
@@ -2012,6 +1987,22 @@ class Discovery( ast.NodeVisitor ):
 							if arg.annotation is None:
 								self.fail( f'{fn.qualname} parameter {arg.arg!r} has no type annotation', arg )
 							param_type = self.visit( arg.annotation )
+							# move[T]/copy[T] is an ownership status on this
+							# binding, not a distinct type from T (see Move/
+							# Copy's own docstrings, TODO.txt's own "incref/
+							# decref" section) - unwrap here, at the one place
+							# a Parameter's real .type gets set, so every
+							# ordinary consumer downstream (attribute/method
+							# lookup, generic inference, assignability) sees
+							# plain T like any other binding; the ownership
+							# fact itself is recorded on is_move/is_copy
+							# instead, consulted only by the two things that
+							# actually care about it (the move(x) call-site
+							# syntax check, and the CFG's own decref bookkeeping)
+							is_move = isinstance( param_type, Move )
+							is_copy = isinstance( param_type, Copy )
+							if is_move or is_copy:
+								param_type = param_type.inner
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
 								stem = arg.arg,
@@ -2020,6 +2011,8 @@ class Discovery( ast.NodeVisitor ):
 								line = fn.line,
 								type = param_type,
 								default = default,
+								is_move = is_move,
+								is_copy = is_copy,
 								**kind,
 							)
 							parameters.append( param )

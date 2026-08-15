@@ -207,6 +207,12 @@ def ReleaseSRWLockExclusive(
 
 CP_UTF8: u32 = 65001
 
+@extern('kernel32', 'SetConsoleOutputCP')
+def SetConsoleOutputCP(
+	wCodePageID: u32,
+) -> bool:
+	...
+
 LCMAP_LOWERCASE:         u32 = 0x00000100
 LCMAP_UPPERCASE:         u32 = 0x00000200
 LCMAP_LINGUISTIC_CASING: u32 = 0x01000000

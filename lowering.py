@@ -977,10 +977,10 @@ class Lowering:
 		# Unwraps a valid move(expr) down to expr - callers only ever see
 		# the real argument expression from here on
 		is_move_call = isinstance( expr, ast.Call ) and isinstance( expr.func, ast.Name ) and expr.func.id == 'move'
-		if isinstance( param.type, Move ):
+		if param.is_move:
 			if not is_move_call:
 				self.discovery.fail(
-					f"{target.qualname}: parameter {param.stem!r} is move[{param.type.inner.qualname}] - "
+					f"{target.qualname}: parameter {param.stem!r} is move[{param.type.qualname}] - "
 					f"call site must pass move({ast.unparse(expr)}): {ast.unparse(call)}",
 					call,
 				)
@@ -1218,6 +1218,20 @@ class FunctionLowering:
 		# skip past, so jumping to the caller's own epilogue is correct
 		# there, exactly as it always has been.
 		self._in_inline_splice_prelude = False
+		# parallel to self._cfg's own _inline_scope_stack (cfg.py), pushed/
+		# popped in lockstep by _splice_multi_statement_inline_body - cfg.py's
+		# InlineScope only carries the CFG-level boundary_depth/label; these
+		# are the LOWERING-level artifacts _stmt_Return/_consume_checked_
+		# result need once current_epilogue_label() hands back a splice-local
+		# label: (result_var, exited_flag). result_var is where an early exit
+		# (return/or_return/checked-arithmetic) inside the splice's pre-
+		# return statements stows its value - the splice-local analogue of
+		# self._return_value_var. exited_flag is armed (Assign, Const(True))
+		# right before jumping there, so the ladder's own tail can tell
+		# "early exit vs normal fallthrough" apart and decide whether to
+		# still lower the trailing return-expression - see
+		# _splice_multi_statement_inline_body's own comment
+		self._inline_scope_vars: list[tuple[Variable,Variable]] = []
 
 	def run( self ) -> list[ir.Instruction]:
 		fn = self._current_fn
@@ -1904,14 +1918,33 @@ class FunctionLowering:
 			if is_success:
 				self._complete_construction_or_fail( self._current_fn )
 		label = self._cfg.current_epilogue_label( value )
+		# the innermost active multi-statement @inline splice, if this
+		# return is reached from one of its own pre-return statements (see
+		# _splice_multi_statement_inline_body/self._inline_scope_vars' own
+		# comment) - value-computation/widening above is already correct
+		# unchanged (self._current_fn.return_type is provisional's, i.e.
+		# the INLINED function's own declared type), only the TERMINAL
+		# emission below needs to redirect: into the scope's own result_var
+		# instead of self._return_value_var, arming its exited_flag, and
+		# (inline-unwind branch only) jumping to the scope's own merge_label
+		# instead of emitting a real ir.Return - this early return must
+		# never become the CALLER's own return
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
 		if label is not None:
 			# whatever's still pending (RC decrefs, defer/errdefer replays)
 			# gets unwound once, later, by the shared ladder every other
 			# return reaching this same label also jumps into
 			# (build_epilogue_ladder(), emitted at the function's own
-			# closing brace - see _emit_epilogue) - value has to survive
-			# the jump some other way than a direct ir.Return
-			if self._return_value_var is not None and value is not None:
+			# closing brace - see _emit_epilogue; or, inside a splice, the
+			# scope's own local ladder - see _splice_multi_statement_
+			# inline_body) - value has to survive the jump some other way
+			# than a direct ir.Return
+			if inline_scope is not None:
+				result_var, exited_flag, _merge_label = inline_scope
+				if result_var is not None and value is not None:
+					self._emit( ir.Assign( dest = result_var, src = return_value ))
+				self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = exited_flag.type, value = True )))
+			elif self._return_value_var is not None and value is not None:
 				self._emit( ir.Assign( dest = self._return_value_var, src = return_value ))
 			# value's own ownership (if it's a bare temp - `return
 			# SomeConstructor(...)`, never assigned to a name) just
@@ -1936,18 +1969,31 @@ class FunctionLowering:
 			# either nothing is pending, or `value` IS itself one of the
 			# still-live entries current_epilogue_label() can't route
 			# through a shared label (see its own comment) - unwind inline,
-			# right here, same as always. Still has to replay any pending
+			# right here, same as always (bounded to the splice's own
+			# portion of the stack when inline_scope is set - see cfg.py's
+			# return_() own comment). Still has to replay any pending
 			# defer/errdefer entries itself (return_() does this now too -
 			# they're just as "pending" as an RC decref from here)
 			for instr in self._cfg.return_( value, lambda: self._build_is_err_check( node )):
 				self._emit( instr )
 			# same reasoning as the label-is-not-None branch above - flush
-			# BEFORE this branch's own unconditional ir.Return, not after
+			# BEFORE this branch's own unconditional terminator, not after
 			# (return_() already untracked `value` itself, so this only
 			# ever cleans up OTHER still-pending temps - e.g. an
 			# intermediate argument consumed into constructing `value`)
 			self._flush_pending_temps()
-			self._emit( ir.Return( value = return_value ))
+			if inline_scope is not None:
+				result_var, exited_flag, merge_label = inline_scope
+				if result_var is not None and value is not None:
+					self._emit( ir.Assign( dest = result_var, src = return_value ))
+				self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = exited_flag.type, value = True )))
+				# jumps PAST the scope's own ladder (already replayed
+				# inline, right above - re-entering it via its own label
+				# would replay the same entries a second time) straight to
+				# where the early-exit-vs-normal-fallthrough merge begins
+				self._emit( ir.Jump( target = merge_label ))
+			else:
+				self._emit( ir.Return( value = return_value ))
 
 	def _maybe_widen_return_result( self, node: ast.Return, value: ir.Operand, fn_type: Type ) -> ir.Temp|None:
 		''' `return x` where x is Result[T,NarrowE] and this function is
@@ -3566,6 +3612,25 @@ class FunctionLowering:
 		if method is None:
 			self.lowering.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
 		operand = method( node, expected_type )
+		return self._coerce_or_check_operand( operand, expected_type, node, strict = strict )
+
+	def _coerce_or_check_operand( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST, *, strict: bool = True, context: str|None = None ) -> ir.Operand:
+		''' the shared post-dispatch tail: given an operand (freshly produced
+		by one of the _expr_X dispatch methods above, OR - unlike every
+		other caller - already-lowered and handed in directly, with no AST
+		node of its own left to re-dispatch) and an expected_type, applies
+		every legitimate coercion in turn and, if none apply and `strict`,
+		rejects a genuine mismatch. Factored out of _lower_expr (which calls
+		this immediately after dispatch, `node` there being the same node
+		method() was just given) specifically so _lower_union_receiver_call
+		can call this a SECOND time, once per union leaf, against an
+		operand it already has - never re-lowering/re-evaluating the
+		original argument expression (which would double its side effects
+		once per leaf) while still getting the exact same coercion-or-
+		rejection treatment an ordinary call argument gets. `context`, if
+		given, only affects _check_assignable's own failure message (see
+		its own docstring) - it plays no role in which coercion, if any,
+		applies. '''
 		# post-hoc, not a pre-emptive override of expected_type before
 		# dispatch: a node kind that already produces the right union type
 		# on its own (an explicit Result.Ok(x) call, a match-narrowed
@@ -3628,12 +3693,13 @@ class FunctionLowering:
 		# this one is a REAL value conversion (C's own sign-/zero-extension,
 		# not a pointer reinterpret) - see _is_safe_scalar_widening's own
 		# docstring for exactly which pairs qualify and why isize/usize are
-		# deliberately excluded. Gated on `strict` (see its own parameter
-		# comment) - _lower_binary_operands' own cross-operand HINTING must
-		# never trigger this: `c: f64 = a + b` (a: f64, b: f32) needs to keep
-		# hitting _lower_binop_values' own deliberately-stricter "floating-
-		# point operation requires both operands to be the SAME type, cast
-		# explicitly" rule, not have b silently widened to f64 here first.
+		# deliberately excluded. Gated on `strict` (see _lower_expr's own
+		# parameter comment) - _lower_binary_operands' own cross-operand
+		# HINTING must never trigger this: `c: f64 = a + b` (a: f64, b: f32)
+		# needs to keep hitting _lower_binop_values' own deliberately-
+		# stricter "floating-point operation requires both operands to be
+		# the SAME type, cast explicitly" rule, not have b silently widened
+		# to f64 here first.
 		elif ( strict and expected_type is not None and operand.type is not expected_type
 				and self._is_safe_scalar_widening( operand.type, expected_type ) ):
 			dest = self._new_temp( expected_type )
@@ -3662,7 +3728,7 @@ class FunctionLowering:
 		# _lower_binop_values' own float-same-type check) is responsible for
 		# validating the ACTUAL requirement itself in that case.
 		if strict:
-			self._check_assignable( operand, expected_type, node )
+			self._check_assignable( operand, expected_type, node, context = context )
 		return operand
 
 	def _is_rcclass_upcast( self, sub: Type|None, sup: Type|None ) -> bool:
@@ -3708,14 +3774,20 @@ class FunctionLowering:
 				return order.index( expected_type.stem ) > order.index( operand_type.stem )
 		return False
 
-	def _check_assignable( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST ) -> None:
+	def _check_assignable( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST, *, context: str|None = None ) -> None:
 		''' the single choke point for lowering.py's own longstanding,
 		self-documented gap ("a genuine argument-type mismatch isn't
 		checked anywhere yet (no general type-checking pass exists)") -
-		called last from _lower_expr, after every legitimate coercion
-		(TaggedUnion wrap, RCClass upcast, safe scalar widening,
-		interchangeable pointer cast) already had its chance to rewrite
-		`operand` into something matching expected_type. Uses _same_type,
+		called last from _coerce_or_check_operand (in turn called from both
+		_lower_expr and, a second time per leaf, _lower_union_receiver_call),
+		after every legitimate coercion (TaggedUnion wrap, RCClass upcast,
+		safe scalar widening, interchangeable pointer cast) already had its
+		chance to rewrite `operand` into something matching expected_type.
+		`context`, if given, is prefixed onto the failure message - used by
+		union-receiver dispatch to name which leaf/parameter disagreed,
+		since a bare "expected X, got Y" doesn't otherwise say WHICH of
+		several call targets is the one that actually declared X. Uses
+		_same_type,
 		not raw `is`, for the equality check: a bare Specialization and its
 		own already-monomorphized form (or a bare TupleType and its own
 		resolved backing RCClass) are the SAME type reached through two
@@ -3751,10 +3823,11 @@ class FunctionLowering:
 		if isinstance( operand.type, CEnum ) and expected_type is operand.type.value_type:
 			return
 		if isinstance( expected_type, ( Move, Copy )):
-			self._check_assignable( operand, expected_type.inner, node )
+			self._check_assignable( operand, expected_type.inner, node, context = context )
 			return
+		prefix = f'{context}: ' if context is not None else ''
 		self.lowering.discovery.fail(
-			f'{ast.unparse(node)}: expected {expected_type.qualname}, got {operand.type.qualname} - '
+			f'{prefix}{ast.unparse(node)}: expected {expected_type.qualname}, got {operand.type.qualname} - '
 			f'these are different types; convert explicitly if this is intentional '
 			f'(e.g. {expected_type.stem}(...) for a scalar target)',
 			node,
@@ -3852,6 +3925,50 @@ class FunctionLowering:
 		# pointers, unlike this now-removed inline copy did), so every
 		# expression kind gets identical treatment, not just a bare Name
 		return name
+
+	def _expr_NamedExpr( self, node: ast.NamedExpr, expected_type: Type|None ) -> ir.Operand:
+		''' walrus (`x := expr`): the same two ast.Name-target branches
+		_stmt_Assign uses (reassignment vs first declaration - `target` is
+		always a bare ast.Name per Python's own grammar), except this is an
+		EXPRESSION, so it hands back the assigned operand as its own value
+		instead of emitting a void statement. Doesn't thread expected_type
+		into the RHS lowering below - _lower_expr's own wrapper already
+		re-applies _coerce_or_check_operand to whatever this returns, so
+		outer-context coercion (e.g. `x: i64 = (y := 5)`) happens for free,
+		same as every other _expr_* method. All locals here are function-
+		scoped unconditionally (not block-scoped), so a walrus-bound name
+		stays visible after its enclosing if/while exactly like an ordinary
+		preceding assignment would - no special escape-the-block handling
+		needed, unlike real Python's own comprehension-scoping nuance
+		(moot anyway - this language has no comprehensions). '''
+		target = node.target
+		assert isinstance( target, ast.Name )
+		existing = self.lowering.discovery.find_name_or_none( target.id )
+		if existing is not None:
+			if not isinstance( existing, Variable ):
+				self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
+			self._cfg.unnarrow( target.id )
+			operand = self._lower_expr( node.value, existing.type )
+			for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand.type ), node = node ):
+				self._emit( instr )
+			self._emit( ir.Assign( dest = existing, src = operand ))
+			return existing
+		operand = self._lower_expr( node.value, None )
+		fn = self._current_fn
+		var = Variable(
+			stem = target.id,
+			qualname = f'{fn.qualname}.{target.id}',
+			file = fn.file,
+			line = node.lineno,
+			type = operand.type,
+		)
+		fn.add_name( var.stem, var )
+		self.lowering.schedule( var.type )
+		is_alias = self.lowering._is_aliasing_expr( node.value, operand.type )
+		for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node ):
+			self._emit( instr )
+		self._emit( ir.Assign( dest = var, src = operand ))
+		return var
 
 	def _reject_free_variables( self, roots: list[ast.AST], param_names: set[str], node: ast.AST ) -> None:
 		# a nested def/lambda may only reference its own parameters/locally
@@ -4909,8 +5026,156 @@ class FunctionLowering:
 		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
 		return dest
 
+	def _construct_generic_instance( self, target_cls: Type, node: ast.AST ) -> ir.Operand:
+		''' construct a zero-argument instance of an already-fully-resolved
+		class/generic Specialization (target_cls's own type args, if any,
+		are already concrete) - used by _expr_List to build the backing
+		list[T] instance a list-literal populates via append(). Deliberately
+		narrower than _try_lower_construct_call (this file, the general
+		ClassName(...) sugar): no fresh AST Call node naming the class is
+		synthesized here (that would never have passed through type_
+		resolver.py's own pre-pass the way a real call site does, and would
+		need its own textual type-argument spelling for an arbitrary
+		target_cls) - target_cls is already the concrete type we want, so
+		this goes straight to ordinary (non-generic-inference) construction,
+		using a synthetic zero-arg Call node purely as the argument-list
+		shape _lower_call_args/_match_call_args need (never inspected for
+		its own .func) - real default-value expressions (e.g. list[T]'s own
+		initial_capacity: usize = 8) are already real AST nodes on the
+		Function's own Parameter objects, nothing to fabricate there. Only
+		supports a target whose __init__ is present, non-overloaded, and
+		non-fallible - list[T]'s own shape; a different caller needing more
+		would extend this, not work around it. '''
+		resolved_cls = self.lowering._ensure_resolved( target_cls )
+		assert isinstance( resolved_cls, ClassLike ), f'internal compiler error: {resolved_cls} is not constructible'
+		init = resolved_cls.names.get( '__init__' )
+		assert isinstance( init, Function ), f'internal compiler error: {resolved_cls.qualname} has no usable __init__'
+		self.lowering.schedule( resolved_cls )
+		self.lowering._ensure_resolved( init )
+		synth_call = ast.Call( func = node, args = [], keywords = [] )
+		ast.copy_location( synth_call, node )
+		args, kwargs = self._lower_call_args( init, synth_call )
+		self_temp = self._new_temp( resolved_cls )
+		self.lowering._schedule_rcclass_construction( resolved_cls, self_temp.type )
+		self._emit( ir.Allocate( dest = self_temp, cls = resolved_cls, fields = {} ))
+		self.lowering.schedule( init.return_type )
+		for param in init.parameters or []:
+			self.lowering.schedule( param.type )
+		assert not self.lowering._init_fallibility( init ), f'internal compiler error: {resolved_cls.qualname}.__init__ is fallible'
+		self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
+		return self_temp
+
+	def _expr_List( self, node: ast.List, expected_type: Type|None ) -> ir.Operand:
+		''' [a, b, c] - requires expected_type to already be a concrete
+		list[T] Specialization (inferring T from the elements themselves
+		when no annotation/return-type is available is deferred - every
+		real site in lib/ already has one, matching _expr_Tuple's own
+		precedent of deferring an unforced generalization (arity 0/1)
+		rather than guessing). Builds one list[T] instance via
+		_construct_generic_instance, then a real append(elt).unwrap(...)
+		method-call chain per element - list[T] has a real __init__/append,
+		unlike tuple, so this can't reuse _expr_Tuple's single-ir.Allocate
+		shape. A wrong-typed element is rejected the ordinary way by the
+		_lower_expr(elt, elem_type) call below - the general assignability
+		check already covers it, nothing extra needed here. '''
+		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
+		if not ( isinstance( expected_type, Specialization ) and isinstance( resolved, RCClass )
+				and expected_type.base.stem == 'list' and len( expected_type.args ) == 1 ):
+			self.lowering.discovery.fail(
+				f'list literal needs a known list[T] target type from context (e.g. an annotation or return type): {ast.unparse(node)}',
+				node,
+			)
+		elem_type = expected_type.args[0]
+		dest = self._construct_generic_instance( expected_type, node )
+		if not node.elts:
+			return dest
+		append_fn = self.lowering._find_method( dest.type, 'append' )
+		assert append_fn is not None, 'internal compiler error: list[T] has no append method'
+		self.lowering._ensure_resolved( append_fn )
+		self.lowering.schedule( append_fn.return_type )
+		unwrap_fn = self.lowering._find_method( append_fn.return_type, 'unwrap' )
+		assert unwrap_fn is not None, 'internal compiler error: list[T].append does not return a Result with unwrap()'
+		self.lowering._ensure_resolved( unwrap_fn )
+		self.lowering.schedule( unwrap_fn.return_type )
+		errmsg_node = ast.Constant( value = 'list literal: append failed' )
+		ast.copy_location( errmsg_node, node )
+		for elt in node.elts:
+			operand = self._lower_expr( elt, elem_type )
+			append_dest = self._new_temp( append_fn.return_type )
+			self._emit( ir.Call( dest = append_dest, target = append_fn, receiver = dest, args = [ operand ], kwargs = {} ))
+			errmsg = self._lower_expr( errmsg_node, unwrap_fn.parameters[0].type )
+			# unwrap()'s own return value (T=None here, list[T].append's own
+			# Result[None,OverflowError]) is never read - only its side
+			# effect (panic on Err) matters, so no destination temp: T=None
+			# compiles to a real C `void` return, and a real ir.Call dest
+			# expects an actual value to assign, not void - same "dest=None
+			# for a call whose result isn't used" convention _stmt_Expr's
+			# own bare-call-statement handling already relies on
+			self._emit( ir.Call( dest = None, target = unwrap_fn, receiver = append_dest, args = [ errmsg ], kwargs = {} ))
+		return dest
+
+	# obj.type.stem -> its own length-accessor method name, for slice
+	# syntax's own default-stop resolution (_lower_slice_subscript below).
+	# str and bytearray genuinely expose differently-named length
+	# accessors (str.__len__() is a Unicode codepoint count - see its own
+	# docstring - not the byte length _byte_slice's own byte-offset
+	# contract needs; bytearray has no such split, __len__() IS its real
+	# byte length) - not a uniform dunder lookup, so a small fixed table
+	# for the two currently-supported types is the honest shape here,
+	# same posture as the tuple-index/pointer-fallback cases elsewhere in
+	# _expr_Subscript already hardcoding per concrete type family rather
+	# than inventing a protocol for two callers
+	_SLICE_LENGTH_METHOD = { 'str': 'byte_len', 'bytearray': '__len__' }
+
+	def _lower_slice_subscript( self, node: ast.Subscript, obj: ir.Operand ) -> ir.Operand:
+		''' x[a:b] / x[:b] / x[a:] - str/bytearray only (PLAN_POSIX_FEATURE.md's
+		scope; list[T] slicing deferred - no real caller, and would need new
+		RC-aware bulk-copy machinery list[T] doesn't have yet). Byte-offset
+		semantics, not Python's real Unicode-codepoint offsets - deliberate:
+		the one real caller (lib/posix/time.py's target_path[idx+9:]) slices
+		from str.find()'s own byte offset, and str already has exactly the
+		right byte-offset primitive (_byte_slice, also used by split()) -
+		distinct from str.__len__()'s codepoint count. No special RC/
+		aliasing tagging needed (unlike the tuple-index case's node.
+		is_tuple_element_read) - this goes through an ordinary ir.Call,
+		which the general Call-result convention already treats as a fresh,
+		owned value by default. '''
+		node_slice = node.slice
+		assert isinstance( node_slice, ast.Slice )
+		if node_slice.step is not None:
+			self.lowering.discovery.fail( f'slice step is not supported: {ast.unparse(node)}', node )
+		slice_fn = self.lowering._find_method( obj.type, '_byte_slice' )
+		length_method_name = self._SLICE_LENGTH_METHOD.get( getattr( obj.type, 'stem', None ) )
+		if slice_fn is None or length_method_name is None:
+			self.lowering.discovery.fail(
+				f'slicing is not supported for {obj.type.qualname} (only str and bytearray support slice syntax): {ast.unparse(node)}',
+				node,
+			)
+		self.lowering._ensure_resolved( slice_fn )
+		self.lowering.schedule( slice_fn.return_type )
+		start_type = slice_fn.parameters[0].type
+		stop_type = slice_fn.parameters[1].type
+		if node_slice.lower is not None:
+			start = self._lower_expr( node_slice.lower, start_type )
+		else:
+			start = ir.Const( type = start_type, value = 0 )
+		if node_slice.upper is not None:
+			stop = self._lower_expr( node_slice.upper, stop_type )
+		else:
+			length_fn = self.lowering._find_method( obj.type, length_method_name )
+			self.lowering._ensure_resolved( length_fn )
+			self.lowering.schedule( length_fn.return_type )
+			len_dest = self._new_temp( length_fn.return_type )
+			self._emit( ir.Call( dest = len_dest, target = length_fn, receiver = obj, args = [], kwargs = {} ))
+			stop = len_dest
+		dest = self._new_temp( slice_fn.return_type )
+		self._emit( ir.Call( dest = dest, target = slice_fn, receiver = obj, args = [ start, stop ], kwargs = {} ))
+		return self._maybe_consume_result( node, dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
 		obj = self._lower_expr( node.value, None )
+		if isinstance( node.slice, ast.Slice ):
+			return self._lower_slice_subscript( node, obj )
 		getitem_fn = self.lowering._find_method( obj.type, '__getitem__' )
 		if getitem_fn is None:
 			# tuple[...]'s own constant-index-only element access
@@ -5193,30 +5458,38 @@ class FunctionLowering:
 		# check_dest is sometimes a real, named Variable (or_return()'s own
 		# receiver) and sometimes a bare Temp (checked arithmetic, __len__/
 		# __getitem__'s auto-unwrap) - isinstance covers both uniformly
-		if self._in_inline_splice_prelude:
-			# PLAN_INLINE.md multi-statement generalization: a pre-return
-			# statement of a spliced @inline body reached an early-exit-
-			# shaped construct (.or_return(), checked arithmetic under the
-			# default Check mode, or the __len__/__getitem__ auto-consume
-			# path) - left unguarded, the OrReturn/OrJump path below would
-			# jump to the CALLER's own real epilogue (self._current_fn is
-			# briefly the caller during this window too - see
-			# _splice_multi_statement_inline_body's own comment), silently
-			# skipping the rest of THIS splice AND the rest of the
-			# caller's own subsequent statements whenever the caller
-			# happens to also satisfy the Result-return shape - a real
-			# correctness bug, not just an unsupported case, if left
-			# unchecked. The trailing return-EXPRESSION itself never sets
-			# this flag (restored to False before it's lowered), so it's
-			# unaffected - nothing of the splice remains after it to skip
-			# past there, so jumping to the caller's own epilogue is
-			# already correct, exactly as the single-statement case
-			# already relies on
+		# the innermost active multi-statement @inline splice, if this
+		# early-exit-shaped construct (.or_return(), checked arithmetic
+		# under the default Check mode, or the __len__/__getitem__ auto-
+		# consume path) is reached from one of a spliced body's own pre-
+		# return statements (self._current_fn is briefly the caller during
+		# this window too - see _splice_multi_statement_inline_body's own
+		# comment). Left unredirected, the OrReturn/OrJump path below would
+		# jump to/return from the CALLER's own real epilogue - a real
+		# correctness bug (silently skipping the rest of THIS splice AND
+		# the caller's own subsequent statements), not just an unsupported
+		# case - so both branches below stow into the SPLICE's own result
+		# var/exited flag instead of self._return_value_var/a real return
+		# whenever this is set. The trailing return-EXPRESSION itself is
+		# lowered with this restored to None first, so it's unaffected -
+		# nothing of the splice remains after it to skip past there, so
+		# jumping to the caller's own epilogue is already correct, exactly
+		# as the single-statement case already relies on
+		if self._in_inline_splice_prelude and not self._inline_scope_vars:
+			# PLAN_RETURN_INFERENCE.md's own @inline variant reached here
+			# with target.return_type still the "infer it" sentinel (see
+			# _splice_multi_statement_inline_body's own top-of-function
+			# comment) - no inline scope exists to redirect into (result_
+			# var's type isn't known yet, by construction), so this narrow
+			# combination stays rejected, exactly as the single, blanket
+			# guard this method used to have always rejected every
+			# multi-statement splice's own pre-return statements
 			self.lowering.discovery.fail(
 				f'@inline: .or_return()/checked arithmetic that could propagate an error is not yet supported before the '
-				f'final return of a multi-statement body: {ast.unparse(node)}',
+				f'final return of a multi-statement body whose own return type is still being inferred: {ast.unparse(node)}',
 				node,
 			)
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
 			if isinstance( check_dest, Variable ):
@@ -5247,7 +5520,11 @@ class FunctionLowering:
 			tracked_operand = check_dest if isinstance( check_dest, Variable ) else None
 			label = self._cfg.current_epilogue_label( tracked_operand )
 			if label is not None:
-				self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
+				if inline_scope is not None:
+					result_var, exited_flag, _merge_label = inline_scope
+					self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = result_var, exited_flag = exited_flag ))
+				else:
+					self._emit( ir.OrJump( dest = unwrapped, value = check_dest, target = label, return_slot = self._return_value_var ))
 			else:
 				# either check_dest's own entry needed excluding (the bug above),
 				# or (matching _stmt_Return's own inline path for the identical
@@ -5262,7 +5539,10 @@ class FunctionLowering:
 				# actual conditional replay logic) is embedded below, to run
 				# strictly inside the Err branch
 				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
-				self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
+				if inline_scope is not None:
+					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay, inline_exit = inline_scope ))
+				else:
+					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
 		else:
 			panic_fn = self.lowering._type_resolver._resolve_sys_function( 'panic' )
 			self.lowering.schedule( panic_fn )
@@ -5503,7 +5783,7 @@ class FunctionLowering:
 		# value, not just the AST expr) - shared by every _match_call_args
 		# caller (plain calls, both generic call flavors, union-receiver
 		# dispatch), called right after each argument is lowered
-		if isinstance( param.type, Move ):
+		if param.is_move:
 			for instr in self._cfg.move( operand, target_qualname = target_qualname, param_stem = param.stem ):
 				self._emit( instr )
 
@@ -6637,6 +6917,60 @@ class FunctionLowering:
 				self._emit( ir.Assign( dest = fresh, src = operand ))
 			provisional.names[stem] = fresh
 
+		# early/nested-return + defer/errdefer/.or_return() generalization -
+		# a splice-local "epilogue" scope for the pre-return statements: an
+		# early return, or a .or_return()/checked-arithmetic early exit,
+		# reached from one of them must never jump into/return from the
+		# CALLER's own real epilogue - it needs its OWN local landing point.
+		# result_var carries whichever value flowed through an early exit
+		# (the splice-local analogue of self._return_value_var); exited_flag
+		# (armed alongside it, same mechanism defer/errdefer's own flags
+		# use) lets the tail below tell "early exit vs normal fallthrough"
+		# apart once everything converges - see cfg.py's push_inline_scope()
+		# and current_epilogue_label()/return_()'s own comments for the CFG
+		# half of this, and ir.OrReturn.inline_exit/ir.OrJump.exited_flag
+		# for how or_return()/checked-arithmetic feed into it
+		# PLAN_RETURN_INFERENCE.md's own @inline variant (_infer_return_
+		# only_type_params_inline) reaches here with target.return_type set
+		# to Python None as a DELIBERATE SENTINEL (not none_type - the real
+		# NoneType class), specifically so the trailing return-expression's
+		# own _lower_expr(..., None) call can take its own natural type,
+		# later read back via result.type to discover R. None of the new
+		# early-exit machinery below can run in that state - result_var/
+		# result would need a REAL type up front, which is exactly the one
+		# thing not known yet. This is safe to skip entirely rather than
+		# work around: _is_eager_return_inferable_body (the ONLY gate that
+		# lets return-only inference even be attempted) already requires
+		# EXACTLY ONE reachable return, so a body reaching here with this
+		# sentinel can never have an early return to support in the first
+		# place - only .or_return()/checked-arithmetic in a pre-return
+		# statement remains a real (if narrow) hazard, still explicitly
+		# rejected below, exactly as the single, blanket guard this
+		# replaces always did for every multi-statement splice
+		none_type = self.lowering.discovery.get_none_type()
+		noreturn_type = self.lowering.discovery.get_intrinsics()['NoReturn']
+		supports_early_exit = target.return_type is not None
+		result_var: Variable|None = None
+		exited_flag: Variable|None = None
+		merge_label: str|None = None
+		bool_cls: Type|None = None
+		if supports_early_exit:
+			result_var = (
+				Variable(
+					stem = f'$inline{self._inline_binding_id}$result', qualname = f'{target.qualname}$$inline{self._inline_binding_id}$result',
+					file = target.file, line = target.line, type = target.return_type,
+				)
+				if target.return_type not in ( none_type, noreturn_type )
+				else None
+			)
+			bool_cls = self.lowering.discovery.find_name( 'bool', node )
+			exited_flag = Variable(
+				stem = f'$inline{self._inline_binding_id}$exited', qualname = f'{target.qualname}$$inline{self._inline_binding_id}$exited',
+				file = target.file, line = target.line, type = bool_cls,
+			)
+			self._inline_binding_id += 1
+			merge_label = self._new_label( 'inline_merge' )
+
 		module = self.lowering._find_module_for( target )
 		with self.lowering.discovery.module_context( module ):
 			with self.lowering.discovery.scope_context( provisional ):
@@ -6665,6 +6999,25 @@ class FunctionLowering:
 				# Making self._current_fn and the active scope_context
 				# point at the same `provisional` object for this whole
 				# window fixes both at once.
+				#
+				# result_var/exited_flag are both given a real, flat,
+				# unconditional declaration/init RIGHT HERE - before the
+				# pre-return statements (and therefore before any .or_
+				# return()/checked-arithmetic early exit nested inside
+				# emitter_c.py's own hand-emitted C `{ }` blocks - see ir.
+				# DeclareLocal's own docstring) could otherwise become
+				# result_var's first, block-scoped-and-therefore-unsafe
+				# write. exited_flag has a trivial default (False) an
+				# ordinary ir.Assign already declares safely; result_var's
+				# type has no generic default, hence DeclareLocal
+				scope_label: str|None = None
+				if supports_early_exit:
+					assert exited_flag is not None and bool_cls is not None and merge_label is not None
+					if result_var is not None:
+						self._emit( ir.DeclareLocal( variable = result_var ))
+					self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = bool_cls, value = False )))
+					scope_label = self._cfg.push_inline_scope()
+					self._inline_scope_vars.append(( result_var, exited_flag, merge_label ))
 				outer_fn = self._current_fn
 				outer_prelude = self._in_inline_splice_prelude
 				self._current_fn = provisional
@@ -6682,15 +7035,71 @@ class FunctionLowering:
 				finally:
 					self._current_fn = outer_fn
 					self._in_inline_splice_prelude = outer_prelude
-				# self._current_fn/._in_inline_splice_prelude are both
-				# restored to the REAL caller before lowering the trailing
-				# return-expression - its own .or_return()/checked-
-				# arithmetic behavior is therefore unchanged from the
-				# single-statement case (validates and jumps against the
-				# CALLER's own epilogue/return type, exactly as already
-				# tested), while scope_context(provisional) stays active
-				# so it can still resolve pre-return-declared locals
-				result = self._lower_expr( return_stmt.value, expected_type or target.return_type )
+
+				if not supports_early_exit:
+					# PLAN_RETURN_INFERENCE.md's own @inline variant - see
+					# this method's own top-of-function comment. No scope
+					# was pushed, nothing to merge - the trailing return-
+					# expression's own natural type IS the answer being
+					# discovered here, exactly as the pre-existing
+					# single-statement/original multi-statement code always
+					# computed it
+					result = self._lower_expr( return_stmt.value, expected_type )
+					return result if want_result else None
+
+				assert scope_label is not None and exited_flag is not None and merge_label is not None
+				# current_epilogue_label()'s own fallback target once
+				# nothing shallower within THIS splice qualified (push_
+				# inline_scope()'s own label) - an inline-unwind return_()
+				# call reached during the splice already replayed
+				# everything itself and jumps straight past this, to
+				# merge_label below (see _stmt_Return/_consume_checked_
+				# result's own splice branches)
+				self._emit( ir.Label( name = scope_label ))
+				for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
+					self._emit( instr )
+				self._cfg.pop_inline_scope()
+				self._inline_scope_vars.pop()
+
+				# early exit vs normal fallthrough - both converge into ONE
+				# result operand from here, same "shared dest temp, two
+				# Assign sites, converge at one label" shape _expr_IfExp
+				# already uses for Python's own ternary. self._current_fn/
+				# _in_inline_splice_prelude are already restored to the
+				# REAL caller above, before this point - the trailing
+				# return-expression's own .or_return()/checked-arithmetic
+				# behavior is therefore unchanged from the single-statement
+				# case (validates and jumps against the CALLER's own
+				# epilogue/return type, exactly as already tested), while
+				# scope_context(provisional) stays active so it can still
+				# resolve pre-return-declared locals it references
+				self._emit( ir.Label( name = merge_label ))
+				result = self._new_temp( target.return_type )
+				normal_label = self._new_label( 'inline_normal' )
+				converge_label = self._new_label( 'inline_converge' )
+				self._emit( ir.JumpIfFalse( cond = exited_flag, target = normal_label ))
+				if result_var is not None:
+					self._emit( ir.Assign( dest = result, src = result_var ))
+				self._emit( ir.Jump( target = converge_label ))
+				self._emit( ir.Label( name = normal_label ))
+				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+				self._emit( ir.Assign( dest = result, src = trailing_value ))
+				# trailing_value's own ownership (if it's a bare temp - e.g.
+				# the Result.Ok(x) construction temp a trailing `return
+				# Result.Ok(x)` produces) just transferred into `result`
+				# above via the plain ir.Assign - untrack it, or whatever
+				# later cleans up STILL-pending temps (_flush_pending_temps,
+				# called by _lower_stmt's own post-statement wrapper once
+				# this whole splice call returns) would emit a SECOND,
+				# unconditional RC-check for it outside the "normal" arm's
+				# own guard - reading trailing_value's memory even on the
+				# early-exit path, where it was never assigned at all (a
+				# real uninitialized-read bug, not just a redundant decref -
+				# confirmed by a real repro under MSVC's /RTC1). Exactly the
+				# same concern _stmt_Return's own identical transfer already
+				# guards against via this same call
+				self._cfg.untrack_temp( trailing_value )
+				self._emit( ir.Label( name = converge_label ))
 		return result if want_result else None
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -7227,6 +7636,24 @@ class FunctionLowering:
 		if receiver is not None:
 			self.lowering.schedule( receiver.type )
 
+		if receiver is not None and isinstance( target, Function ) and target.is_move:
+			# @move on a method means calling it consumes/invalidates self -
+			# cfg.py's own move() (already the exact mechanism _apply_move_hook
+			# uses for move[T] PARAMETER arguments) needs to run here too, for
+			# the RECEIVER: nothing else ever transitions the CALLER's own
+			# ownership-tracking state for a receiver on an @move call -
+			# confirmed via a real double-free (bytearray.release(), called
+			# through str.from_cstr's own move[bytearray] parameter: release()
+			# only invalidates ITS OWN self.__data sentinel, guarding against
+			# a double-free of the byte buffer, but does nothing about the
+			# CALLER's own binding, which still got an ordinary Decref at
+			# scope exit on top of that - two teardown paths for one struct).
+			# Also correctly rejects calling an @move method through a merely
+			# BORROWED receiver (move()'s own OWNED/COPY precondition), which
+			# was never checked before either.
+			for instr in self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' ):
+				self._emit( instr )
+
 		if isinstance( target, ( Function, Overload )) and target.stem in self.lowering._RESULT_CONSUMING_METHODS and isinstance( receiver, Variable ):
 			# .is_ok()/.is_err()/.unwrap(msg)/.unwrap_or(default) - like
 			# or_return() above, these aren't given their own IR shape;
@@ -7569,9 +7996,42 @@ class FunctionLowering:
 			self.lowering.schedule( fn.return_type )
 			for p in fn.parameters or []:
 				self.lowering.schedule( p.type )
-			self._emit( ir.Call( dest = dest, target = fn, receiver = narrowed, args = args, kwargs = kwargs ))
+			# per-leaf argument coercion/validation - `args`/`kwargs` above
+			# were built ONCE, lowered against `reference`'s own declared
+			# parameter types only; a leaf whose own parameter type
+			# genuinely differs (Box[i32]|Box[u32]'s own two `set(x: T)`
+			# instantiations) needs the SAME coercion-or-rejection chain
+			# _lower_expr's own dispatch would already have given it, run
+			# again here against THIS leaf's own type - reusing the already-
+			# lowered operand (never re-lowering/re-evaluating the original
+			# argument expression, which would double its side effects once
+			# per leaf; see _coerce_or_check_operand's own docstring)
+			leaf_args = []
+			for ( ref_param, expr ), operand in zip( positional, args ):
+				leaf_param = self._corresponding_leaf_param( reference, fn, ref_param )
+				context = f'{fn.qualname}(...): parameter {leaf_param.stem!r}'
+				leaf_args.append( self._coerce_or_check_operand( operand, leaf_param.type, expr, context = context ))
+			leaf_kwargs = {}
+			for ref_param, expr in keyword:
+				leaf_param = self._corresponding_leaf_param( reference, fn, ref_param )
+				context = f'{fn.qualname}(...): parameter {leaf_param.stem!r}'
+				leaf_kwargs[leaf_param.stem] = self._coerce_or_check_operand( kwargs[ref_param.stem], leaf_param.type, expr, context = context )
+			self._emit( ir.Call( dest = dest, target = fn, receiver = narrowed, args = leaf_args, kwargs = leaf_kwargs ))
 			if not is_last:
 				self._emit( ir.Jump( target = end_label ))
 				self._emit( ir.Label( name = next_label ))
 		self._emit( ir.Label( name = end_label ))
 		return dest
+
+	def _corresponding_leaf_param( self, reference: Function, fn: Function, ref_param: Parameter ) -> Parameter:
+		''' the Parameter in `fn`'s own parameter list at the SAME POSITION
+		as `ref_param` in `reference`'s - used by _lower_union_receiver_call
+		to find each leaf's own declared type for an argument that was
+		matched (once, against `reference` only) by _match_call_args.
+		Index-based, not name-based: type_resolver.py's own _resolve_union_
+		receiver_members already guarantees every leaf has the SAME
+		parameter COUNT as reference, but not (yet - a real, smaller,
+		separate gap, not attempted here) the same names/kinds at each
+		position, so position is the only correspondence available. '''
+		index = next( i for i, p in enumerate( reference.parameters ) if p is ref_param )
+		return fn.parameters[index]

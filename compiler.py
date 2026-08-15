@@ -125,6 +125,40 @@ class Compiler:
 			self.disco.errors.error( 'no main() found', file = None, line = None )
 			return
 		self._enqueue( self.disco.main )
+		self._drain()
+		if self.disco.active_target['os'] == 'windows':
+			# force windows._console's _console_init global to be reachable on
+			# EVERY Windows build, exactly like main() above - nothing in the
+			# user's own program necessarily references it, but its own
+			# initializer (SetConsoleOutputCP) must still run before main()
+			# does. See windows/_console.py's own comment. Enqueued AFTER
+			# main's own graph fully drains (not alongside it above) so this
+			# always lands at the END of compiler.globals - tests (and any
+			# other compiler.globals[0]-style code) that assume the user's
+			# own first-declared global is index 0 stay correct; the real
+			# CALL order inside __metalpy_init() is dependency order
+			# (_topologically_sort_globals in emitter_c.py), not this
+			# scheduling order anyway, so appending here has no effect on
+			# correctness - only on this list's own enumeration order.
+			#
+			# windows._console lives in the real lib/ tree shipped alongside
+			# this compiler - always resolvable for a genuine compile (mpy.py
+			# always uses Discovery's own default self.paths). Some tests
+			# build a Discovery with a deliberately minimal, fixture-only
+			# `paths=` (e.g. emitter_c_test.py's BuiltinsStrTestCase) to
+			# isolate unrelated compiler internals without needing the whole
+			# lib/ tree - for those, there's nothing useful to force-init,
+			# so skip it rather than hard-failing every Windows-target
+			# compile through that harness.
+			try:
+				console = self.disco.import_name( 'windows._console' )
+			except FileNotFoundError:
+				console = None
+			if console is not None:
+				self._enqueue( console.names['_console_init'] )
+				self._drain()
+
+	def _drain( self ) -> None:
 		while True:
 			unit = self.type_resolver.next_unit()
 			if unit is None:

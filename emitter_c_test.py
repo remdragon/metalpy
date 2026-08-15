@@ -310,31 +310,21 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'get' ]
 		self.assertEqual( len( calls ), 1 )
 
-	def test_known_gap_union_receiver_dispatch_does_not_check_per_leaf_parameter_types( self ) -> None:
-		# documents a pre-existing gap, NOT fixed as part of this plan: a
-		# union mixing two DIFFERENT concrete instantiations of the same
+	def test_union_receiver_dispatch_rejects_incompatible_leaf_parameter_types( self ) -> None:
+		# a union mixing two DIFFERENT concrete instantiations of the same
 		# generic class (Box[i32]|Box[u32]) with a same-named method taking
-		# a generic-typed argument - the per-leaf consistency check only
-		# compares return-type identity and parameter COUNT, never
-		# per-position parameter TYPE, so this compiles with no error, and
-		# the SAME lowered argument operand (typed i32 here) is silently
-		# reused for BOTH leaves' Call, including the Box[u32] one that
-		# actually expects a u32. Before Stage 1/2 this couldn't happen at
-		# all - every leaf's method stayed abstract/bare-T, so there was
-		# nothing to disagree about
-		#
-		# Re-verified, explicitly, when lowering.py gained a general
-		# assignability check (_lower_expr's _check_assignable): confirmed
-		# STILL unaffected, not just untouched by oversight -
-		# _lower_union_receiver_call lowers this call's argument exactly
-		# ONCE, against the FIRST leaf's (Box[i32].set) own parameter type,
-		# then reuses that single already-lowered operand across every
-		# leaf's own ir.Call with no second _lower_expr invocation - the
-		# general check has no opportunity to see the SECOND leaf's own
-		# mismatch at all, structurally, regardless of how strict it is.
-		# Still a real, separate, larger gap to fix another day (per-leaf
-		# argument re-lowering/re-checking in union-receiver dispatch), not
-		# something this plan's own narrower fix could reach.
+		# a generic-typed argument - the per-leaf consistency check
+		# (type_resolver.py's _resolve_union_receiver_members) only compares
+		# return-type identity and parameter COUNT, never per-position
+		# parameter TYPE, so lowering itself has to catch a genuinely
+		# non-coercible leaf. _lower_union_receiver_call now runs
+		# _coerce_or_check_operand once per leaf (not just once overall,
+		# against the first leaf) - the Box[u32] leaf's own mismatch is
+		# caught and located, naming both types, the leaf, and the
+		# parameter. No re-lowering of the argument expression happens
+		# (side-effect safety): the SAME originally-lowered operand is still
+		# reused, unchanged, across leaves whenever no coercion applies -
+		# only now it's also validated per leaf.
 		self._run( '\n'.join([
 			'class Box[T]:',
 			'\tv: T',
@@ -347,13 +337,51 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tb.set( x )',
 			'\treturn',
 		]))
-		self.assertEqual( self.discovery.errors.errors, [] ) # no error today - this is the gap
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		error = errors[0]
+		self.assertIn( '__main__.Box.set[intrinsics.u32]', error )
+		self.assertIn( "parameter 'x'", error )
+		self.assertIn( 'expected intrinsics.u32', error )
+		self.assertIn( 'got intrinsics.i32', error )
+		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
+		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'set' ]
+		# only the i32 leaf's own Call (checked first, and legal) got
+		# emitted - the u32 leaf's own failing _check_assignable raises,
+		# aborting the rest of this statement via the ordinary per-
+		# statement recovery boundary, same as any other lowering error
+		self.assertEqual( len( calls ), 1 )
+
+	def test_union_receiver_dispatch_applies_per_leaf_scalar_widening( self ) -> None:
+		# the real fix, on the happy path: Box[i32]|Box[i64], x: i32 - the
+		# i32 leaf keeps the original operand unchanged (exact type match,
+		# _coerce_or_check_operand's own same-type fast path), the i64 leaf
+		# gets its OWN distinct operand, fed by a real ir.CastWrap widening
+		# that SAME original x - never re-lowering/re-evaluating the
+		# argument expression itself
+		self._run( '\n'.join([
+			'class Box[T]:',
+			'\tv: T',
+			'\tdef set( self, x: T ) -> None:',
+			'\t\tself.v = x',
+			'',
+			'def main() -> None:',
+			'\tb: Box[i32]|Box[i64]',
+			'\tx: i32 = 5',
+			'\tb.set( x )',
+			'\treturn',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		calls = [ i for i in main_lf.instructions if isinstance( i, ir.Call ) and i.target.stem == 'set' ]
 		self.assertEqual( len( calls ), 2 )
-		# same operand passed to both, including the Box[u32] leaf that
-		# actually declares x: u32 - the mismatch nothing catches
-		self.assertIs( calls[0].args[0], calls[1].args[0] )
+		i32_call = next( c for c in calls if c.target.qualname.endswith( '[intrinsics.i32]' ) )
+		i64_call = next( c for c in calls if c.target.qualname.endswith( '[intrinsics.i64]' ) )
+		self.assertEqual( i32_call.args[0].type.qualname, 'intrinsics.i32' )
+		self.assertIsNot( i64_call.args[0], i32_call.args[0] )
+		casts = [ i for i in main_lf.instructions if isinstance( i, ir.CastWrap ) and i.dest is i64_call.args[0] ]
+		self.assertEqual( len( casts ), 1 )
+		self.assertIs( casts[0].operand, i32_call.args[0] )
 
 class EmitArithmeticTests( CompilerTestCase ):
 	def test_wrap_arithmetic_smoke_test( self ) -> None:
@@ -2648,12 +2676,16 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 				src = self._compiled_source( target )
 				self.assertEqual( src.count( 'static void __metalpy_init( void ) {' ), 1 )
 
-	def test_windows_console_codepage_call_is_gated_inside_the_one_function( self ) -> None:
+	def test_windows_console_codepage_call_is_an_ordinary_global_init_call( self ) -> None:
+		# SetConsoleOutputCP is no longer hardcoded/gated inside __metalpy_init
+		# itself - it's windows/_console.py's _console_init global (forced
+		# reachable on every Windows target by Compiler.run()), called from
+		# here exactly like any other global's own init function
 		src = self._compiled_source( self._WINDOWS_TARGET )
 		body = self._metalpy_init_body( src )
-		self.assertIn( '#ifdef _WIN32', body )
-		self.assertIn( 'SetConsoleOutputCP( CP_UTF8 );', body )
-		self.assertIn( '#endif', body )
+		self.assertIn( '__metalpy_init_windows$_console$_console_init();', body )
+		self.assertIn( 'SetConsoleOutputCP(', src )
+		self.assertNotIn( '#ifdef _WIN32', body )
 
 	def test_main_prepends_metalpy_init_call_on_every_target( self ) -> None:
 		# not just Windows - global initializers must run everywhere now,
@@ -5967,6 +5999,467 @@ def main() -> i32:
 	return 0
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+
+class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile-and-run companion to GenericMethodDispatchTests'
+	test_union_receiver_dispatch_applies_per_leaf_scalar_widening - proves
+	the per-leaf ir.CastWrap actually widens the runtime VALUE correctly
+	through both leaves of a union receiver, not just that the IR has the
+	right shape.
+
+	Uses two plain, unrelated classes (not two Specializations of one
+	generic class, unlike the lowering-level test) deliberately: assigning
+	a freshly-constructed generic RCClass value into a union of that same
+	generic class's own instantiations hits a real, separate, pre-existing
+	bug (_coerce_into_union's leaf lookup is identity-based - `attr.type is
+	operand.type` - and a Specialization built by a constructor call is
+	apparently never reconciled with the one the union's own member list
+	holds), confirmed via a standalone repro and confirmed unrelated to
+	this fix (plain, non-generic union members hit no such issue). Flagged
+	here, not fixed - out of scope for this plan. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		# matches() returns bool (identical across leaves) rather than each
+		# leaf's own field type deliberately: union-receiver dispatch
+		# requires every leaf's own method to share one return type, so
+		# reading the per-leaf-widened value back has to go through a
+		# same-return-type-everywhere method instead
+		self.assert_programs_run([
+			( 'per_leaf_scalar_widening_produces_correct_runtime_value', '''
+class BoxI32:
+	v: i32
+	def set( self, x: i32 ) -> None:
+		self.v = x
+	def matches( self, expected: i64 ) -> bool:
+		with compiler.wrap_arithmetic:
+			return i64( self.v ) == expected
+
+class BoxI64:
+	v: i64
+	def set( self, x: i64 ) -> None:
+		self.v = x
+	def matches( self, expected: i64 ) -> bool:
+		return self.v == expected
+
+def main() -> i32:
+	x: i32 = 5
+
+	u64: BoxI32|BoxI64 = BoxI64( v = 0 )
+	u64.set( x )
+	if not u64.matches( 5 ):
+		return 1
+
+	u32: BoxI32|BoxI64 = BoxI32( v = 0 )
+	u32.set( x )
+	if not u32.matches( 5 ):
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class WalrusOperatorRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_NamedExpr (ast.NamedExpr, `x := expr`) - real compile-and-run
+	companion to lowering_test.py's WalrusOperatorTests. Deliberately
+	avoids `if (x := opt()) is not None: use(x)`-shaped fixtures: `is not
+	None` narrowing for a plain if-statement is a real, separate,
+	pre-existing gap in this compiler (confirmed independent of walrus -
+	the identical failure reproduces with an ordinary, non-walrus `x: T|
+	None; if x is not None: use(x)`; only while/match/`type(x) is T`
+	narrow today) - out of scope here, not something walrus needs to
+	solve. These fixtures instead use plain scalar/bool conditions, which
+	already work end to end. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the walrus target starts undeclared (first-declaration branch
+			# of _expr_NamedExpr), then the SAME while condition re-evaluates
+			# it every subsequent iteration (the reassignment branch) -
+			# exercises both branches in one natural fixture, and confirms
+			# the binding survives (and is reused) past the loop
+			( 'walrus_in_while_condition_first_decl_then_rebind', '''
+def main() -> i32:
+	i: i32 = 0
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		while ( x := i ) < 5:
+			total += x
+			i += 1
+	if total != 10:
+		return 1
+	if i != 5:
+		return 2
+	return 0
+''' ),
+			# the walrus expression's own return value used directly as an
+			# if-condition, then the same binding read again afterward
+			( 'walrus_return_value_used_directly_as_condition', '''
+def f( n: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return n + 1
+
+def main() -> i32:
+	if ( y := f( 4 ) ) != 5:
+		return 1
+	if y != 5:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class SliceSyntaxTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' x[a:b] / x[:b] / x[a:] (ast.Slice) - PLAN_POSIX_FEATURE.md's scope,
+	str/bytearray only (list[T] slicing deferred - no real caller). Byte-
+	offset semantics, not Python's real Unicode-codepoint offsets - see
+	_lower_slice_subscript's own docstring on why. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_slice_shapes', '''
+def main() -> i32:
+	s: str = "hello world"
+	if s[:5] != "hello":
+		return 1
+	if s[6:] != "world":
+		return 2
+	if s[2:5] != "llo":
+		return 3
+	return 0
+''' ),
+			( 'bytearray_slice_shapes', '''
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 1
+	p[1] = 2
+	p[2] = 3
+	p[3] = 4
+	p[4] = 5
+	c: bytearray = b[1:4]
+	if len( c ) != 3:
+		return 1
+	cp: ConstPtr[u8] = c.get_const_ptr()
+	if cp[0] != 2 or cp[1] != 3 or cp[2] != 4:
+		return 2
+	if len( b[:2] ) != 2:
+		return 3
+	if len( b[3:] ) != 2:
+		return 4
+	return 0
+''' ),
+			# mirrors lib/posix/fs.py:24's buf[:nbytes] shape - slicing a
+			# bytearray to a runtime-computed length, not a constant
+			( 'bytearray_slice_to_computed_length', '''
+def fill( buf: bytearray ) -> usize:
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 65
+	p[1] = 66
+	p[2] = 67
+	return 3
+
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	nbytes: usize = fill( buf )
+	result: bytearray = buf[:nbytes]
+	if len( result ) != 3:
+		return 1
+	return 0
+''' ),
+			# mirrors lib/posix/time.py:52's target_path[idx+9:] shape -
+			# slicing a str from a runtime-computed (str.find()'s own byte
+			# offset) start, no upper bound
+			( 'str_slice_from_computed_find_offset', '''
+def main() -> i32:
+	target_path: str = "/usr/share/zoneinfo/America/New_York"
+	idx: usize = target_path.find( "zoneinfo/" ).unwrap( "expected match" )
+	with compiler.wrap_arithmetic:
+		tz: str = target_path[idx+9:]
+	if tz != "America/New_York":
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_slice_step_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	s: str = "hello"',
+			'	a: str = s[::2]',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slice step is not supported', errors[0] )
+
+	def test_unsupported_receiver_type_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 5',
+			'	y: i32 = x[0:2]',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slicing is not supported for intrinsics.i32', errors[0] )
+
+
+class ListLiteralRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' _expr_List (ast.List, `[a, b, c]`) - real compile-and-run companion
+	to lowering_test.py's ListLiteralTests. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_list_literal', '''
+def main() -> i32:
+	x: list[str] = [ 'a', 'b', 'c' ]
+	if len( x ) != 3:
+		return 1
+	if x.__getitem__( 0 ).unwrap( 'idx failed' ) != 'a':
+		return 2
+	if x.__getitem__( 2 ).unwrap( 'idx failed' ) != 'c':
+		return 3
+	return 0
+''' ),
+			( 'i32_list_literal', '''
+def main() -> i32:
+	x: list[i32] = [ 10, 20, 30 ]
+	if len( x ) != 3:
+		return 1
+	if x.__getitem__( 1 ).unwrap( 'idx failed' ) != 20:
+		return 2
+	return 0
+''' ),
+			( 'empty_list_literal', '''
+def main() -> i32:
+	x: list[i32] = []
+	if len( x ) != 0:
+		return 1
+	return 0
+''' ),
+			# mirrors the real forcing case: lib/codecs/*.py's own
+			# names(self) -> list[str]: return [...] shape
+			( 'list_literal_returned_from_function', '''
+def names() -> list[str]:
+	return [ 'utf8', 'utf-8', 'UTF8', 'UTF-8' ]
+
+def main() -> i32:
+	n = names()
+	if len( n ) != 4:
+		return 1
+	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
+		return 2
+	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
+		return 3
+	return 0
+''' ),
+		] )
+
+
+class MoveParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' move[T] is an ownership status on a binding, not a distinct type
+	from T (Parameter.is_move, not a Move-wrapped .type) - real compile-
+	and-run companion to lowering_test.py's MoveParameterTests. Exercises
+	lib/builtins/__init__.py's own real bytes.from_bytearray, previously-
+	untested dead code (nothing in lib/ ever called it before this fix)
+	that reads len(src) before consuming src via .release() - also depends
+	on bytearray.release()'s own return-type fix (bare sys.OwnershipError
+	-> sys.OwnershipError[bytearray], a separate, real, pre-existing
+	authoring bug this same investigation found: the unspecialized
+	annotation left T unbound, so Err(SharedReference(x))'s own x never
+	resolved to a real bytearray anywhere that pattern was matched).
+
+	str.from_cstr's identical move[bytearray] overload is NOT exercised
+	here - confirmed via a standalone repro that str.from_cstr(move(b))
+	fails with "name 'move' is not defined": move(...)'s own sugar isn't
+	recognized during OVERLOAD resolution (str.from_cstr has 2 signatures)
+	the way it is for an ordinary, already-resolved call - a real, separate
+	gap already flagged in TODO.txt's own "incref/decref" section
+	("Move.leaves() falls back to Type.leaves()'s default [self], never
+	exposing bytearray itself"), not something this fix touches. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'move_parameter_read_before_consume', '''
+def consume( src: move[bytearray] ) -> usize:
+	n: usize = len( src )
+	return n
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	if consume( move( b )) != 5:
+		return 1
+	return 0
+''' ),
+			( 'bytes_from_bytearray_real_usage', '''
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	bs: bytes = bytes.from_bytearray( move( b ))
+	if len( bs ) != 5:
+		return 1
+	cp: ConstPtr[u8] = bs.get_const_ptr()
+	if cp[0] != 104:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Codec.decode widened to bytes|bytearray, against the REAL utf8
+	class (not a synthetic stand-in) - constructing any real utf8()
+	instance forces its whole vtable (names/encode/decode) to compile, so
+	this also depends on: utf8.names()'s list literal (_expr_List),
+	utf8.encode()'s get_ptr()/get_const_ptr() fix, and the move[T] fix
+	above (utf8.encode() -> bytes.from_bytearray() -> len(src)/
+	src.release()). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'decode_bytes', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	bs: bytes = bytes( b )
+	codec = utf8()
+	s: str = codec.decode( bs ).unwrap( 'decode failed' )
+	if s != "hello":
+		return 1
+	return 0
+''' ),
+			( 'decode_bytearray', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	b: bytearray = bytearray( 5 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 104
+	p[1] = 105
+	p[2] = 33
+	p[3] = 33
+	p[4] = 33
+	c: bytearray = b[:3]
+	codec = utf8()
+	s: str = codec.decode( c ).unwrap( 'decode failed' )
+	if s != "hi!":
+		return 1
+	return 0
+''' ),
+			# multi-byte UTF-8 round trip via the real utf8().encode() ->
+			# utf8().decode() path - guards the alloc/memcpy/terminate
+			# arithmetic in both directions
+			( 'decode_multibyte_utf8_round_trip', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	src: str = "héllo"
+	codec = utf8()
+	eb: bytes = codec.encode( src ).unwrap( 'encode failed' )
+	s: str = codec.decode( eb ).unwrap( 'decode failed' )
+	if s != src:
+		return 1
+	if s.byte_len() != src.byte_len():
+		return 2
+	return 0
+''' ),
+			# a genuinely bytes|bytearray-typed local (not two separately-
+			# typed locals) - exercises union-receiver dispatch for real
+			( 'decode_through_union_typed_local', '''
+from codecs.utf8 import utf8
+
+def decode_it( x: bytes|bytearray ) -> str:
+	codec = utf8()
+	return codec.decode( x ).unwrap( 'decode failed' )
+
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 97
+	p[1] = 98
+	p[2] = 99
+	if decode_it( b ) != "abc":
+		return 1
+	bs: bytes = bytes( b )
+	if decode_it( bs ) != "abc":
+		return 2
+	return 0
+''' ),
+			# mirrors the real forcing case: fs.py:24's
+			# codec.decode(buf[:nbytes]) shape
+			( 'decode_bytearray_slice_result', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 104
+	p[1] = 105
+	nbytes: usize = 2
+	codec = utf8()
+	s: str = codec.decode( buf[:nbytes] ).unwrap( 'decode failed' )
+	if s != "hi":
+		return 1
+	return 0
+''' ),
+			( 'names_list_literal', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	codec = utf8()
+	n = codec.names()
+	if len( n ) != 4:
+		return 1
+	if n.__getitem__( 0 ).unwrap( 'idx failed' ) != 'utf8':
+		return 2
+	if n.__getitem__( 3 ).unwrap( 'idx failed' ) != 'UTF-8':
+		return 3
+	return 0
+''' ),
+		] )
 
 
 class MatchArmSameNameNarrowingTests( test_support.RealCompileMixin, CompilerTestCase ):

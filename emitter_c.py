@@ -339,19 +339,6 @@ static inline bool __metalpy_isinf_f64( double x ) {
 #define __metalpy_nanf() __builtin_nanf("")
 #define __metalpy_nan()  __builtin_nan("")
 #endif
-// Windows: call SetConsoleOutputCP(CP_UTF8) so Unicode print() works.
-// Called from __metalpy_init() (synthesized below, in emit_c()) on every
-// Windows build, and from the custom entry point (mainCRTStartup below)
-// when the CRT is not linked.
-#ifdef _WIN32
-#define CP_UTF8 65001
-#ifdef _MSC_VER
-int __stdcall SetConsoleOutputCP(unsigned int);
-#pragma comment(linker, "/alternatename:__imp__SetConsoleOutputCP=__imp_SetConsoleOutputCP")
-#else
-int __stdcall SetConsoleOutputCP(unsigned int);
-#endif
-#endif
 // backs compiler.format_f64(buf, size, precision, type_char, alt, value)
 // (lowering.py's _lower_compiler_format_f64 / ir.FormatFloat) - writes
 // value's fixed-precision decimal digits into buf via a dynamically-built
@@ -1747,11 +1734,22 @@ def _emit_cast( instr ) -> list[str]:
 		]
 	# every other combination (including target u128 paired with source
 	# u128, unreachable per the same-type-cast note above) fits safely in
-	# __metalpy_wideint, EXCEPT a u128 source, which needs __metalpy_wideuint
-	# instead (non-negative by construction, so its own lower-bound/MIN
-	# comparison would misfire if attempted and is skipped entirely - a
-	# non-negative source can never actually be "below" any real MIN anyway)
-	wide_ctype = '__metalpy_wideuint' if source_stem == 'u128' else '__metalpy_wideint'
+	# __metalpy_wideint, EXCEPT an UNSIGNED source, which needs
+	# __metalpy_wideuint instead (non-negative by construction, so its own
+	# lower-bound/MIN comparison would misfire if attempted and is skipped
+	# entirely - a non-negative source can never actually be "below" any
+	# real MIN anyway). Not just u128: any unsigned source's own MAX can
+	# exceed __metalpy_wideint's real (backend-dependent - 64-bit under
+	# MSVC's fallback, 128-bit under gcc/clang) signed positive capacity,
+	# corrupting __wide to negative before any comparison even runs -
+	# confirmed for u64/usize specifically (a near-MAX u64 cast down to a
+	# narrower signed target silently passed as "in range" under MSVC).
+	# _is_unsigned_stem is safe to use unconditionally here even for
+	# stems that never actually need it on a given backend (u8/u16/u32,
+	# or u64/usize under gcc/clang's true 128-bit wideint) - promoting to
+	# wideuint when wideint would have worked anyway gives the identical,
+	# correct comparison result either way.
+	wide_ctype = '__metalpy_wideuint' if source_stem is not None and _is_unsigned_stem( source_stem ) else '__metalpy_wideint'
 	wide_decl = f'{wide_ctype} __wide = ({wide_ctype})({operand});'
 	# u64/usize's own MAX (UINT64_MAX/UINTPTR_MAX) doesn't fit as a positive
 	# value in a SIGNED __metalpy_wideint once its own width matches the
@@ -2006,6 +2004,15 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{_declarator( instr.temp.type, _temp_name( instr.temp.id ) )};' ]
 	if isinstance( instr, ir.DeleteTemp ):
 		return [] # C block scoping already handles temp lifetime - nothing to emit
+	if isinstance( instr, ir.DeclareLocal ):
+		# see ir.DeclareLocal's own docstring - a bare declaration, no
+		# initializer, emitted flat wherever this instruction itself sits
+		# (guaranteed by lowering.py to be a genuinely flat/unconditional
+		# point - never nested inside one of THIS module's own hand-emitted
+		# C `{ }` blocks)
+		name = _c_local_name( instr.variable.stem )
+		declared.add( name )
+		return [ f'\t{_declarator( instr.variable.type, name )};' ]
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
@@ -2392,6 +2399,35 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 	epilogue_lines: list[str] = []
 	for sub in instr.epilogue:
 		epilogue_lines.extend( _emit_instruction( sub, function = function, declared = declared ))
+	if instr.inline_exit is not None:
+		# PLAN_INLINE.md early-return generalization - this OrReturn is
+		# .or_return()/checked-arithmetic's own inline-unwind path reached
+		# from inside a multi-statement @inline splice: `function` here is
+		# the CALLER's real, enclosing C function (splicing puts everything
+		# in ONE emitted function) - NOT the inlined target - so ret_ctype/
+		# e_fn must come from result_var's own type (the target's real
+		# return type) instead of function.return_type, or the widened
+		# __err would be built with the wrong struct shape/error union
+		# entirely. No real `return` here - stow into result_var, arm
+		# exited_flag, `goto` merge_label instead (see ir.OrReturn's own
+		# inline_exit docstring)
+		result_var, exited_flag, merge_label = instr.inline_exit
+		inline_ret_ctype = c_type( result_var.type )
+		inline_e_fn = _result_error_type( result_var.type )
+		result_c = _emit_operand( result_var )
+		flag_c = _emit_operand( exited_flag )
+		return [
+			f'\tif ( ({value}).{tag_f} == 1 ) {{',
+			f'\t\t{inline_ret_ctype} __err;',
+			f'\t\t__err.{tag_f} = 1;',
+			*_emit_widen_error( f'__err.{data_f}.{err_f}', inline_e_fn, f'({value}).{data_f}.{err_f}', e_op ),
+			*epilogue_lines,
+			f'\t\t{result_c} = __err;',
+			f'\t\t{flag_c} = true;',
+			f'\t\tgoto {_c_label(merge_label)};',
+			'\t}',
+			f'\t{dest} = ({value}).{data_f}.{ok_f};',
+		]
 	return [
 		f'\tif ( ({value}).{tag_f} == 1 ) {{',
 		f'\t\t{ret_ctype} __err;',
@@ -2440,6 +2476,13 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 		e_fn = _result_error_type( instr.return_slot.type )
 		lines.append( f'\t\t{slot}.{tag_f} = 1;' )
 		lines.extend( _emit_widen_error( f'{slot}.{data_f}.{err_f}', e_fn, f'({value}).{data_f}.{err_f}', e_op ))
+	if instr.exited_flag is not None:
+		# PLAN_INLINE.md early-return generalization - see ir.OrJump's own
+		# exited_flag docstring: armed alongside return_slot whenever
+		# `target` is a multi-statement @inline splice's own local label,
+		# so the splice's own ladder tail can tell early exit apart from
+		# normal fallthrough
+		lines.append( f'\t\t{_emit_operand(instr.exited_flag)} = true;' )
 	lines.append( f'\t\tgoto {_c_label(instr.target)};' )
 	lines.append( '\t}' )
 	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
@@ -3379,36 +3422,36 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		init_fn = _emit_global_init_fn( g )
 		if init_fn is not None:
 			parts.append( init_fn )
-	# the single, real __metalpy_init() (PLAN_GLOBAL_INIT.md) - runs the
-	# Windows console-codepage setup (previously two competing #ifdef'd
-	# function bodies in PROLOGUE, now one function with the platform bit
-	# gated internally) plus every non-trivial global's own init function,
-	# in DEPENDENCY order (_topologically_sort_globals - NOT compiler.
-	# globals' own scheduling order, which has no relationship to which
-	# global's own initializer reads which other global's value; confirmed
-	# as a real, reachable bug via a real test - `b: Foo = Foo.make(a.x)`
-	# with main() only ever referencing b schedules b before a). Always
-	# defined and always called (see main()'s own prepend below) - not just
-	# on Windows - since global initializers must run on every target now,
-	# not only the Windows-specific statement. A global whose non-trivial
-	# init is nonetheless an all-zero value-type construction (_global_
-	# init_is_all_zero_value_type) is skipped here - its own {0} static
-	# initializer (_emit_global_declaration, above) already IS that value,
-	# so calling it would be a pure no-op at best (and, confirmed by a real
-	# link failure, a real problem at worst on a no-CRT target if the C
-	# compiler lowers the struct-copy into a memset/memcpy call) -
-	# _topologically_sort_globals already excludes it from its own graph
-	# for the identical reason (it never gets a call, so it can never be a
-	# real dependency edge either).
+	# the single, real __metalpy_init() (PLAN_GLOBAL_INIT.md) - calls every
+	# non-trivial global's own init function, in DEPENDENCY order
+	# (_topologically_sort_globals - NOT compiler.globals' own scheduling
+	# order, which has no relationship to which global's own initializer
+	# reads which other global's value; confirmed as a real, reachable bug
+	# via a real test - `b: Foo = Foo.make(a.x)` with main() only ever
+	# referencing b schedules b before a). Always defined and always called
+	# (see main()'s own prepend below) - not just on Windows - since global
+	# initializers must run on every target now. The Windows console-
+	# codepage setup used to be hardcoded directly in here (two competing
+	# #ifdef'd function bodies in PROLOGUE, later folded into one); it's now
+	# just an ordinary global - windows/_console.py's _console_init, forced
+	# reachable on every Windows target by Compiler.run() - so its own
+	# SetConsoleOutputCP call flows through this same init_calls list like
+	# any other global, with no special-casing needed here at all. A global
+	# whose non-trivial init is nonetheless an all-zero value-type
+	# construction (_global_init_is_all_zero_value_type) is skipped here -
+	# its own {0} static initializer (_emit_global_declaration, above)
+	# already IS that value, so calling it would be a pure no-op at best
+	# (and, confirmed by a real link failure, a real problem at worst on a
+	# no-CRT target if the C compiler lowers the struct-copy into a memset/
+	# memcpy call) - _topologically_sort_globals already excludes it from
+	# its own graph for the identical reason (it never gets a call, so it
+	# can never be a real dependency edge either).
 	init_calls = [
 		f'\t{_global_init_fn_name( g )}();'
 		for g in _topologically_sort_globals( compiler )
 	]
 	parts.append(
 		'static void __metalpy_init( void ) {\n'
-		'#ifdef _WIN32\n'
-		'\tSetConsoleOutputCP( CP_UTF8 );\n'
-		'#endif\n'
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
 	)

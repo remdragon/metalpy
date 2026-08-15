@@ -26,7 +26,7 @@ class ascii( Codec ):
 		return Result.Ok( bytes.from_bytearray( move( out )))
 	
 	@virtual
-	def decode( self, b: bytes ) -> Result[str,CodecError]:
+	def decode( self, b: bytes|bytearray ) -> Result[str,CodecError]:
 		length: usize = len( b )
 		ptr: ConstPtr[u8] = b.get_ptr()
 		

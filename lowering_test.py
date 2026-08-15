@@ -6547,6 +6547,15 @@ class InlineTests( unittest.TestCase ):
 	def _ir_repr( self, fn: LoweredFunction ) -> list[str]:
 		return [ op.test_repr() for op in fn.instructions ]
 
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target (see compiler.py's own comment) - real
+	# but incidental to what these tests check, and absent entirely on
+	# non-Windows targets, so exact-set assertions filter it back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
+
 	def test_inline_method_call_compiles_identically_to_calling_the_body_directly( self ) -> None:
 		# @inline def get_len(self): return self.__len__() called as
 		# b.get_len() must produce the SAME instruction shape as writing
@@ -6633,7 +6642,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 		main_fn = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
@@ -6660,7 +6669,7 @@ class InlineTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Box.__len__' } )
 
 	def test_inline_receiver_with_side_effect_evaluated_once( self ) -> None:
@@ -6805,6 +6814,15 @@ class InlineMultiStatementTests( unittest.TestCase ):
 		self.assertEqual( type( fn ), LoweredFunction )
 		return fn
 
+	# compiler.run() force-enqueues windows/_console.py's own console-codepage
+	# global on every Windows target (see compiler.py's own comment) - real
+	# but incidental to what these tests check, and absent entirely on
+	# non-Windows targets, so exact-set assertions filter it back out first
+	_CONSOLE_INIT_QUALNAMES = frozenset({ 'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP' })
+
+	def _function_qualnames( self ) -> set[str]:
+		return { lf.function.qualname for lf in self.compiler.functions } - self._CONSOLE_INIT_QUALNAMES
+
 	def test_multistatement_body_emits_no_call_funcstart_funcend_for_target( self ) -> None:
 		code = '\n'.join([
 			'@cstruct',
@@ -6939,11 +6957,19 @@ class InlineMultiStatementTests( unittest.TestCase ):
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertNotIn( 'Call', kinds ) # resolve_choice() itself never becomes a real call
 
-	def test_or_return_in_pre_return_statement_rejected( self ) -> None:
-		# lowering-time guard (_consume_checked_result's own new check) -
-		# the inline function ITSELF declares a Result-shaped return type,
-		# so _require_result_return's own pre-existing check passes and
-		# this new guard is what actually catches it
+	def test_or_return_in_pre_return_statement_now_works( self ) -> None:
+		# early/nested-return + defer/errdefer/.or_return() generalization -
+		# a pre-return statement's own .or_return() early exit now jumps to
+		# the SPLICE's own local epilogue (cfg.py's push_inline_scope/
+		# current_epilogue_label), never the caller's real one. This is the
+		# exact regression the user specifically flagged as "notably
+		# important": .or_return() from inside an @inline must NOT trigger
+		# a return from the calling function - only jump to the end of the
+		# spliced/embedded scope, letting the caller's OWN subsequent code
+		# still run. Result is a bare @union with no declared or_return
+		# method (matching lib/builtins's own real shape - or_return() is
+		# recognized structurally, never a real method - see discovery.py's
+		# reserved-name rejection)
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -6955,11 +6981,6 @@ class InlineMultiStatementTests( unittest.TestCase ):
 			'	def is_err( self ) -> bool:',
 			'		return self.tag == 1',
 			'',
-			'	def or_return( self ) -> T:',
-			'		if self.is_err():',
-			'			compiler.early_return( self.data.v_Err )',
-			'		return self.data.v_Ok',
-			'',
 			'@cstruct',
 			'class Widget:',
 			'	def risky( self ) -> Result[usize,MyError]:',
@@ -6970,11 +6991,100 @@ class InlineMultiStatementTests( unittest.TestCase ):
 			'		return Result.Ok( tmp )',
 			'',
 			'def main( w: Widget ) -> Result[usize,MyError]:',
-			'	return w.bad()',
+			'	if w.bad().is_err():',
+			'		pass',
+			'	return Result.Ok( 5 )',
 		])
 		self._import( code )
-		self._lower_main()
-		self.assertTrue( any( 'not yet supported before the final return' in e for e in self.discovery.errors.errors ))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one OrJump (bad()'s own risky().or_return()), and its
+		# target is a real, declared label local to the splice
+		or_jumps = [ i for i in fn.instructions if isinstance( i, ir.OrJump ) ]
+		self.assertEqual( len( or_jumps ), 1 )
+		labels = { i.name for i in fn.instructions if isinstance( i, ir.Label ) }
+		self.assertIn( or_jumps[0].target, labels ) # a real, declared label - not a dangling reference
+		# the decisive check: main() must still have exactly ONE real
+		# ir.Return and ONE ir.FuncEnd - bad()'s own internal early exit
+		# must never produce a SEPARATE return/funcend for the CALLER, and
+		# main's own trailing `return Result.Ok( 5 )` must be the only one
+		returns = [ i for i in fn.instructions if isinstance( i, ir.Return ) ]
+		func_ends = [ i for i in fn.instructions if isinstance( i, ir.FuncEnd ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( len( func_ends ), 1 )
+		self.assertIs( fn.instructions[-1], func_ends[0] ) # main's own real end, not cut short mid-body
+
+	def test_early_return_nested_in_if_jumps_to_local_scope_not_caller( self ) -> None:
+		# early/nested-return generalization - a `return` nested inside a
+		# spliced if must land at a label local to the splice, not the
+		# caller's own shared epilogue label, and must never produce a real
+		# ir.Return/ir.FuncEnd mid-body (those belong to the caller alone)
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	@inline',
+			'	def clamped( self ) -> i32:',
+			'		if self.y < 0:',
+			'			return 0',
+			'		return self.y',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	x: i32 = w.clamped()',
+			'	y: i32 = x',
+			'	return y',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one real ir.Return (main's own trailing `return y`) -
+		# clamped()'s own internal early `return 0` must never produce a
+		# SECOND one - and it's the second-to-last instruction, immediately
+		# before ir.FuncEnd, not buried mid-body ahead of dead code
+		returns = [ i for i in fn.instructions if isinstance( i, ir.Return ) ]
+		func_ends = [ i for i in fn.instructions if isinstance( i, ir.FuncEnd ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( len( func_ends ), 1 )
+		self.assertIs( fn.instructions[-1], func_ends[0] )
+		self.assertIs( fn.instructions[-2], returns[0] )
+		# main's own trailing statement (x + 1) must actually be reachable/
+		# present - not skipped by clamped()'s own internal early return
+		self.assertTrue( any(
+			isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'x' in i.dest.stem
+			for i in fn.instructions
+		))
+
+	def test_defer_in_spliced_body_replayed_once_at_splice_ladder( self ) -> None:
+		# defer/errdefer generalization - a defer registered inside a
+		# spliced body's own pre-return statements is now allowed, and must
+		# be replayed exactly once, at the splice's own local ladder - not
+		# at the caller's real epilogue, and not duplicated between an
+		# early exit and the normal fallthrough path
+		code = '\n'.join([
+			'@cstruct',
+			'class Widget:',
+			'	y: i32',
+			'	@inline',
+			'	def traced( self ) -> i32:',
+			'		result: i32 = self.y',
+			'		with defer:',
+			'			result = result',
+			'		return result',
+			'',
+			'def main( w: Widget ) -> i32:',
+			'	return w.traced()',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# exactly one defer flag armed (Const True Assign into a
+		# $defer_flag-named Variable), matching exactly one defer statement
+		flag_arms = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) and 'defer_flag' in i.dest.stem
+			and isinstance( i.src, ir.Const ) and i.src.value is True
+		]
+		self.assertEqual( len( flag_arms ), 1 )
 
 	def test_direct_recursion_in_pre_return_statement_rejected( self ) -> None:
 		code = '\n'.join([
@@ -7009,7 +7119,7 @@ class InlineMultiStatementTests( unittest.TestCase ):
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		qualnames = { lf.function.qualname for lf in self.compiler.functions }
+		qualnames = self._function_qualnames()
 		self.assertEqual( qualnames, { 'main', '__test__.Widget.get' } ) # never a real wrap[Widget] function
 
 	def test_multistatement_inline_with_return_only_type_param( self ) -> None:
@@ -8113,6 +8223,259 @@ class AssignabilityCheckTests( unittest.TestCase ):
 			'	p: ConstPtr[u8] = compiler.addrof( x )',
 		]))
 		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
+
+
+class WalrusOperatorTests( unittest.TestCase ):
+	''' _expr_NamedExpr (ast.NamedExpr, `x := expr`) - PLAN_POSIX_FEATURE.md's
+	scope. Mirrors _stmt_Assign's own two ast.Name-target branches, but
+	returns the operand as this expression's own value. All locals here are
+	function-scoped unconditionally (not block-scoped), so a walrus binding
+	made inside an if/while condition is expected to stay visible in code
+	textually after it, same as an ordinary preceding assignment would be -
+	these tests confirm that isn't just true by inspection, but actually
+	holds once real CFG/binding machinery runs. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def test_binding_visible_after_the_if_statement( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	if ( x := f() ) != 5:',
+			'		return 1',
+			'	if x != 5:',
+			'		return 2',
+			'	return 0',
+		]))
+		# two real reads of the SAME walrus-bound Variable - one inside the
+		# if's own condition, one textually after the if - not two
+		# different bindings that happen to share a name
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem == 'x' ]
+		self.assertEqual( len( assigns ), 1 )
+
+	def test_binding_reused_later_in_the_same_function( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	x: i32 = 0',
+			'	if ( x := f() ) != 5:',
+			'		return 1',
+			'	y: i32 = 0',
+			'	with compiler.wrap_arithmetic:',
+			'		y = x + 1',
+			'	if y != 6:',
+			'		return 2',
+			'	return 0',
+		]))
+		self.assertTrue( any( isinstance( i, ir.Assign ) and i.dest.stem == 'x' for i in fn.instructions ) )
+
+	def test_nested_walrus_inside_boolean_expression( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def f() -> i32:',
+			'	return 5',
+			'def main() -> i32:',
+			'	if ( a := f() ) != 5 and ( b := f() ) != 6:',
+			'		return 1',
+			'	if a != 5 or b != 6:',
+			'		return 2',
+			'	return 0',
+		]))
+		names = { i.dest.stem for i in fn.instructions if isinstance( i, ir.Assign ) and isinstance( i.dest, Variable ) }
+		self.assertIn( 'a', names )
+		self.assertIn( 'b', names )
+
+	def test_walrus_rebinding_an_existing_name( self ) -> None:
+		# the reassignment branch (existing = discovery.find_name_or_none(...)
+		# is not None) - unlike a fresh declaration, must reuse the SAME
+		# Variable object, not create a second one under the same stem
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 1',
+			'	if ( x := 2 ) != 2:',
+			'		return 1',
+			'	if x != 2:',
+			'		return 2',
+			'	return 0',
+		]))
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem == 'x' ]
+		self.assertEqual( len( assigns ), 2 ) # the initial x: i32 = 1, then the walrus rebind
+		self.assertIs( assigns[0].dest, assigns[1].dest )
+
+
+class ListLiteralTests( unittest.TestCase ):
+	''' _expr_List (ast.List, `[a, b, c]`) - PLAN_POSIX_FEATURE.md's follow-up
+	scope (found while unblocking utf8.names()'s own list-literal return).
+	Requires expected_type to already be a concrete list[T] Specialization -
+	no element-driven inference. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def _assert_rejected( self, code: str, needle: str ) -> None:
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( needle in e for e in self.discovery.errors.errors ),
+			f'expected an error containing {needle!r}, got: {self.discovery.errors.errors}',
+		)
+
+	def test_construction_and_append_shape( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			"	x: list[str] = [ 'a', 'b' ]",
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		append_calls = [ c for c in calls if c.target.stem == 'append' ]
+		self.assertEqual( len( append_calls ), 2 )
+		# both append calls target the SAME constructed list instance
+		self.assertIs( append_calls[0].receiver, append_calls[1].receiver )
+		unwrap_calls = [ c for c in calls if c.target.stem == 'unwrap' ]
+		self.assertEqual( len( unwrap_calls ), 2 )
+		# unwrap()'s own return value (None) is never assigned to a dest -
+		# only its side effect (panic on Err) matters
+		self.assertTrue( all( c.dest is None for c in unwrap_calls ) )
+
+	def test_empty_list_literal_is_construction_only( self ) -> None:
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> None:',
+			'	x: list[i32] = []',
+			'	return',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertFalse( any( c.target.stem == 'append' for c in calls ) )
+
+	def test_wrong_element_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x: list[str] = [ 'a', 5 ]",
+			'	return',
+		]), needle = 'expected' )
+
+	def test_no_expected_type_is_rejected( self ) -> None:
+		self._assert_rejected( '\n'.join([
+			'def main() -> None:',
+			"	x = [ 'a', 'b' ]",
+			'	return',
+		]), needle = 'list literal needs a known list[T] target type' )
+
+
+class MoveParameterTests( unittest.TestCase ):
+	''' move[T] is an ownership status on a binding, not a distinct type
+	from T (Parameter.is_move/is_copy, not a Move/Copy-wrapped .type -
+	discovery.py's own parameter-construction site unwraps it). Before this
+	fix, NO property of a move[T]-typed parameter could be read at all
+	inside the function that owns it - confirmed via lib/builtins/
+	__init__.py's own real bytes.from_bytearray/str.from_cstr, both of
+	which read len(src) before consuming src via .release(). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _assert_accepted( self, code: str ) -> LoweredFunction:
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( type( fn ), LoweredFunction )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		return fn
+
+	def test_generic_len_call_on_move_parameter( self ) -> None:
+		# the exact reported shape: len[T](t: T) is an ORDINARY (non-move)
+		# generic free function - a move[bytearray]-typed argument flowing
+		# into its plain T parameter must infer T as the unwrapped
+		# bytearray, not the wrapped ownership annotation
+		self._assert_accepted( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	n: usize = len( src )',
+			'	return n',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+
+	def test_direct_method_call_on_move_parameter( self ) -> None:
+		# bypasses the generic len() entirely - an ordinary, direct method
+		# call on a move[T]-typed parameter must resolve through the same
+		# attribute lookup any other binding's method call would
+		self._assert_accepted( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	return src.__len__()',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+
+	def test_move_parameter_type_is_unwrapped( self ) -> None:
+		mod = self._import( '\n'.join([
+			'def consume( src: move[bytearray] ) -> usize:',
+			'	return src.__len__()',
+			'def main() -> usize:',
+			'	b: bytearray = bytearray( 5 )',
+			'	return consume( move( b ))',
+		]))
+		consume = mod.get_local( 'consume' )
+		consume.resolve()
+		src_param = consume.parameters[0]
+		self.assertTrue( src_param.is_move )
+		self.assertFalse( src_param.is_copy )
+		self.assertEqual( src_param.type.qualname, 'builtins.bytearray' )
+
+	def test_receiver_not_double_decreffed_after_move_method_call( self ) -> None:
+		# @move on a METHOD (bytearray.release()'s own real shape) means
+		# calling it consumes/invalidates self - before this fix, nothing
+		# transitioned the CALLER's own ownership state for the RECEIVER,
+		# so a real Decref still got emitted for b at scope exit on top of
+		# release()'s own internal cleanup (a genuine double-free,
+		# confirmed via a real intermittent ~10-15% test-suite flake).
+		# cfg.py's own move() (already used by _apply_move_hook for move[T]
+		# ARGUMENTS) cancels the receiver's own pending epilogue Decref -
+		# note this does NOT reject reading b again afterward (confirmed:
+		# neither does the pre-existing move[T]-argument mechanism this
+		# mirrors) - it only stops the double teardown, which is exactly
+		# the bug being fixed here.
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			'	b: bytearray = bytearray( 5 )',
+			'	match b.release():',
+			'		case Result.Ok( ptr ):',
+			'			return 0',
+			'		case Result.Err( _ ):',
+			'			return 1',
+		]))
+		decrefs_on_b = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Decref ) and getattr( i.value, 'stem', None ) == 'b'
+		]
+		self.assertEqual( decrefs_on_b, [] )
 
 
 if __name__ == '__main__':

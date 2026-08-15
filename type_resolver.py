@@ -1528,6 +1528,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._narrowed.pop( node.targets[0].id, None )
 		return node
 
+	def visit_NamedExpr( self, node: ast.NamedExpr ) -> ast.NamedExpr:
+		# walrus (`x := expr`) - same local-type-tracking bookkeeping as
+		# visit_Assign above, for parity: without this, an unhandled
+		# NamedExpr still falls through to generic_visit fine (this class's
+		# own self.locals/_type_of_expr are best-effort, tolerating unknown
+		# shapes by returning None - see this class's own docstring), but a
+		# walrus-bound name wouldn't get its type tracked here, so the
+		# best-effort is/is-not-None truthiness rewrite and implicit-
+		# generic-call-argument inference passes elsewhere in this class
+		# wouldn't see it either. target is always a bare ast.Name per
+		# Python's own grammar (walrus forbids attribute/subscript/tuple
+		# targets at parse time).
+		self.generic_visit( node )
+		if isinstance( node.target, ast.Name ):
+			self.locals[node.target.id] = self._type_of_expr( node.value )
+			self._narrowed.pop( node.target.id, None )
+		return node
+
 	def visit_Attribute( self, node: ast.Attribute ) -> ast.expr:
 		# CEnum member VALUE expressions (OSError.FileNotFoundError
 		# used as a runtime value) - the base is a class, not a

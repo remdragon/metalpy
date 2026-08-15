@@ -169,12 +169,17 @@ class CcTool:
 
 def implicit_ldflags( no_crt: bool, target_os: str ) -> set[str]:
 	'''
-	Libs the generated __metalpy_init/mainCRTStartup boilerplate itself needs
-	regardless of what the user's program imports - a no_crt (freestanding)
-	Windows build unconditionally calls SetConsoleOutputCP/ExitProcess (see
-	emitter_c.py's emit_c), which live in kernel32, but nothing in the user's
-	own program necessarily references kernel32 to pull it into
-	compiler.extern_libs on its own.
+	Libs the generated mainCRTStartup boilerplate itself needs regardless of
+	what the user's program imports - a no_crt (freestanding) Windows build's
+	synthesized entry point unconditionally calls ExitProcess (see
+	emitter_c.py's emit_c), which lives in kernel32, but nothing in the
+	user's own program necessarily references kernel32 to pull it into
+	compiler.extern_libs on its own. (SetConsoleOutputCP used to need the
+	same treatment, back when it was hardcoded the same way - it's now an
+	ordinary @extern call reached through windows/_console.py's
+	compiler-forced global, so compiler.extern_libs already has 'kernel32'
+	from that alone by the time this runs; this function's return value
+	would be identical either way, since ExitProcess still needs it.)
 	'''
 	if no_crt and target_os == 'windows':
 		return { 'kernel32' }
