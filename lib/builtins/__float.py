@@ -51,6 +51,68 @@ _TYPE_CHAR_F: i32 = 102 # ord('f')
 
 
 @private
+def _group_integer_part( digits: str, sep: str ) -> str:
+	''' inserts `sep` (empty, ',', or '_' - an f-string format spec's own
+	grouping option, or '' when none was given) every 3 digits from the
+	right into the INTEGER part of `digits` only - everything up to its
+	first '.' (if any); the fractional part and any 'e'/'E' exponent suffix
+	that follows are left untouched. Matches real Python's own f-string
+	grouping semantics for every float type char (f"{1234567.89:,.2f}" ==
+	'1,234,567.89') - grouping is a correct no-op wherever there's only
+	ever one digit before the decimal point, which this handles for free
+	(count <= 3 below): always true for 'e'/'E', and true for 'g'/'G'
+	whenever they pick their own exponential form. Same grouping algorithm
+	as int's own _decimal_digits_with_grouping (lib/builtins/__int.py) -
+	duplicated here in miniature rather than shared, since int's own
+	version starts from self.__str__() (its own internal digit
+	representation), not an already-in-hand plain string the way
+	compiler.format_f64's output already is here; sep='' still reconstructs
+	the original text unchanged, same convention int's own version
+	documents ("splitting into groups of 3 and joining with nothing
+	reconstructs the plain digit text unchanged"), so callers never need to
+	special-case "no grouping requested". '''
+	dot_index: usize = digits.byte_len()
+	match digits.find( str( '.' )):
+		case Result.Ok( idx ):
+			dot_index = idx
+		case Result.Err( _ ):
+			pass
+	int_part: str = digits._byte_slice( 0, dot_index )
+	rest: str = digits._byte_slice( dot_index, digits.byte_len() )
+	count: usize = int_part.byte_len() # ASCII-only digit text - byte length is codepoint count here
+	if count <= 3:
+		# digits is a BORROWED parameter (ordinary, non-move calling
+		# convention) - returning it directly as this function's own result
+		# needs an explicit incref first, giving the caller a real +1 of its
+		# own, the same "explicit incref after a borrowing return" pattern
+		# str.concat's own comment documents (lib/builtins/__init__.py) -
+		# without it, this function's own local `digits` going out of scope
+		# on return double-releases the very value the caller still holds a
+		# reference to (confirmed by a real crash/garbage-read while writing
+		# this, the exact failure shape that pattern's own comment warns
+		# about).
+		compiler.incref( digits )
+		return digits
+	groups: list[str] = list[str]() # least-significant GROUP first
+	end: usize = count
+	with compiler.wrap_arithmetic:
+		while end > 3:
+			with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+				start: usize = end - 3
+			groups.append( int_part._byte_slice( start, end )).unwrap( '_group_integer_part: append failed' )
+			end = start
+		groups.append( int_part._byte_slice( 0, end )).unwrap( '_group_integer_part: append failed' )
+		group_count: usize = groups.__len__()
+		ordered: list[str] = list[str]() # most-significant GROUP first
+		i: usize = group_count
+		with compiler.panic_arithmetic( 'bounded by group_count, cannot underflow' ):
+			while i > 0:
+				i -= 1
+				ordered.append( groups.__getitem__( i ).unwrap( '_group_integer_part: index in bounds by construction' )).unwrap( '_group_integer_part: append failed' )
+	return sep.join( ordered ) + rest
+
+
+@private
 def _f64_sign_prefix( value: f64, mode: str ) -> str:
 	''' the sign CHARACTER (a 0-or-1-codepoint str) an f-string format
 	spec's own sign mode ('+', '-', or ' ') should show before this float's
@@ -77,7 +139,7 @@ def _f64_sign_prefix( value: f64, mode: str ) -> str:
 
 
 @private
-def _f64_fixed_digits( value: f64, precision: usize, type_char: i32 ) -> str:
+def _f64_fixed_digits( value: f64, precision: usize, type_char: i32, alt: bool, sep: str ) -> str:
 	''' value's own MAGNITUDE (sign ignored - callers prepend it themselves
 	via _f64_sign_prefix, the same split int's _to_radix_digits/
 	_decimal_digits_with_grouping already keep) as decimal text per a
@@ -86,48 +148,57 @@ def _f64_fixed_digits( value: f64, precision: usize, type_char: i32 ) -> str:
 	_f64_percent_digits below), with `precision` meaning fractional digits
 	for 'f'/'F'/'e'/'E' or significant digits for 'g'/'G' (matching both
 	Python's own format-spec precision semantics and C's %g precision
-	semantics exactly - no special-casing needed here for that split) -
-	the f-string format-spec dispatch's actual digit-conversion work
-	(lowering.py's _lower_float_format_spec). Built on compiler.format_f64
-	(a hand-written C helper - see its own comment in emitter_c.py's
-	PROLOGUE) rather than a hand-rolled metalpy-source conversion: getting
-	float-to-decimal rounding exactly right by hand is genuinely hard
-	(naive fractional-digit extraction accumulates floating-point error),
-	so this reuses the platform's own proven conversion instead - matching
-	int's own design choice to push real control flow into plain metalpy
-	source methods rather than hand-built IR in lowering.py (see the RC
-	use-after-free commit 52333fd int._to_radix_digits' own comment
-	documents), just with the numeric conversion itself delegated to
-	compiler.format_f64 instead of being hand-rolled here too. '''
+	semantics exactly - no special-casing needed here for that split),
+	`alt` the '#' flag (always show the decimal point for 'f'/'F'/'e'/'E',
+	keep trailing zeros for 'g'/'G' - passed straight through to
+	compiler.format_f64, real snprintf's own '#' already matches Python's
+	semantics exactly), and `sep` an f-string format spec's own grouping
+	option (',', '_', or '' for none) - the f-string format-spec dispatch's
+	actual digit-conversion work (lowering.py's _lower_float_format_spec).
+	Built on compiler.format_f64 (a hand-written C helper - see its own
+	comment in emitter_c.py's PROLOGUE) rather than a hand-rolled metalpy-
+	source conversion: getting float-to-decimal rounding exactly right by
+	hand is genuinely hard (naive fractional-digit extraction accumulates
+	floating-point error), so this reuses the platform's own proven
+	conversion instead - matching int's own design choice to push real
+	control flow into plain metalpy source methods rather than hand-built
+	IR in lowering.py (see the RC use-after-free commit 52333fd
+	int._to_radix_digits' own comment documents), just with the numeric
+	conversion itself delegated to compiler.format_f64 instead of being
+	hand-rolled here too. Grouping (unlike '#') has no printf equivalent at
+	all - it's applied as a separate post-processing pass, _group_integer_
+	part, since real snprintf simply doesn't support it for any type char. '''
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		with compiler.panic_arithmetic( 'an integer-digit bound plus a decimal point plus precision fractional digits plus a zero terminator cannot overflow usize for any real f-string format spec' ):
 			buf_size: usize = _MAX_INTEGER_DIGITS + 1 + precision + 1
 		buf: Ptr[u8] = sys.alloc[u8]( buf_size )
-		n: i32 = compiler.format_f64( buf, buf_size, i32( precision ), type_char, magnitude )
+		n: i32 = compiler.format_f64( buf, buf_size, i32( precision ), type_char, alt, magnitude )
 		if n < 0:
 			sys.free( buf )
 			sys.panic( 'f-string float formatting failed' )
-		return str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
+		digits: str = str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
 			'compiler.format_f64 produced invalid utf-8 (unreachable - only ASCII digits, \'.\', and \'e\'/\'E\'/\'+\'/\'-\' are ever written)'
 		)
+	return _group_integer_part( digits, sep )
 
 
 @private
-def _f64_percent_digits( value: f64, precision: usize ) -> str:
+def _f64_percent_digits( value: f64, precision: usize, alt: bool, sep: str ) -> str:
 	''' '%' (PLAN_STR_FORMAT.md item 4) has no printf equivalent - Python
 	defines it as: multiply by 100, format as fixed-point ('f') with the
-	given precision, append a literal '%'. Done here in metalpy source
-	(not passed down to compiler.format_f64 as some 8th type_char) since
-	it needs a real arithmetic step first, not just a different format
-	string - reuses _f64_fixed_digits for the actual digit conversion once
-	scaled, same as every other type char. Sign is unaffected by scaling
-	by the positive constant 100, so lowering.py still calls _f64_sign_
-	prefix on the ORIGINAL, un-scaled value for this case - no separate
-	percent-specific sign handling needed. '''
+	given precision (and '#'/grouping, same as any other type char), append
+	a literal '%'. Done here in metalpy source (not passed down to
+	compiler.format_f64 as some 8th type_char) since it needs a real
+	arithmetic step first, not just a different format string - reuses
+	_f64_fixed_digits for the actual digit conversion (and its own '#'/
+	grouping handling) once scaled, same as every other type char. Sign is
+	unaffected by scaling by the positive constant 100, so lowering.py
+	still calls _f64_sign_prefix on the ORIGINAL, un-scaled value for this
+	case - no separate percent-specific sign handling needed. '''
 	with compiler.wrap_arithmetic:
 		scaled: f64 = value * 100.0
-	return _f64_fixed_digits( scaled, precision, _TYPE_CHAR_F ) + str( '%' )
+	return _f64_fixed_digits( scaled, precision, _TYPE_CHAR_F, alt, sep ) + str( '%' )
 
 
 f64._sign_prefix = _f64_sign_prefix
@@ -146,13 +217,13 @@ def _f32_sign_prefix( value: f32, mode: str ) -> str:
 
 
 @private
-def _f32_fixed_digits( value: f32, precision: usize, type_char: i32 ) -> str:
-	return f64( value )._fixed_digits( precision, type_char )
+def _f32_fixed_digits( value: f32, precision: usize, type_char: i32, alt: bool, sep: str ) -> str:
+	return f64( value )._fixed_digits( precision, type_char, alt, sep )
 
 
 @private
-def _f32_percent_digits( value: f32, precision: usize ) -> str:
-	return f64( value )._percent_digits( precision )
+def _f32_percent_digits( value: f32, precision: usize, alt: bool, sep: str ) -> str:
+	return f64( value )._percent_digits( precision, alt, sep )
 
 
 f32._sign_prefix = _f32_sign_prefix

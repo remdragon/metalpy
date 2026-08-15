@@ -193,11 +193,12 @@ def validate_float_spec( spec: FStringFormatSpec ) -> None:
 	(fractional digits for 'f'/'F'/'e'/'E', significant digits for
 	'g'/'G'/'%') - sign/width/fill/align all reuse the existing
 	FStringFormatSpec fields unchanged, validated the same way str/int's
-	own specs already are. '''
+	own specs already are. '#' (always show the decimal point for 'f'/'F'/
+	'e'/'E', keep trailing zeros for 'g'/'G') and ','/'_' grouping (thousands
+	separators in the integer part - a no-op wherever there's only ever one
+	digit before the decimal point, i.e. 'e'/'E' always, 'g'/'G' whenever
+	they pick their own exponential form) are both valid for every one of
+	these type chars - real Python is the oracle that confirmed this. '''
 	type_char = spec.type
 	if type_char not in ( None, 'f', 'F', 'e', 'E', 'g', 'G', '%' ):
 		raise FormatSpecError( f"f-string format spec: {type_char!r} is not valid for float" )
-	if spec.grouping is not None:
-		raise FormatSpecError( f"f-string format spec: cannot specify {spec.grouping!r} grouping with float yet" )
-	if spec.alt:
-		raise FormatSpecError( "f-string format spec: '#' is not implemented for float yet" )

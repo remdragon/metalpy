@@ -8228,6 +8228,92 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_alt_flag( self ) -> None:
+		# '#' (always show the decimal point for 'f'/'F'/'e'/'E', keep
+		# trailing zeros for 'g'/'G') - passed straight through to real
+		# snprintf/msvcrt _snprintf, which already matches Python's own
+		# semantics exactly for every type char, confirmed against real
+		# Python's own output
+		self._run( f'''
+def main() -> i32:
+	if f"{{5.0:#.0f}}" != {f"{5.0:#.0f}"!r}:
+		return 1
+	if f"{{5.0:#f}}" != {f"{5.0:#f}"!r}:
+		return 2
+	if f"{{5.0:#.0e}}" != {f"{5.0:#.0e}"!r}:
+		return 3
+	if f"{{5.0:#g}}" != {f"{5.0:#g}"!r}:
+		return 4
+	if f"{{100000.0:#g}}" != {f"{100000.0:#g}"!r}:
+		return 5
+	if f"{{5.0:#.0%}}" != {f"{5.0:#.0%}"!r}:
+		return 6
+	if f"{{5.0:#.0F}}" != {f"{5.0:#.0F}"!r}:
+		return 7
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_grouping( self ) -> None:
+		# ','/'_' grouping - has no printf equivalent at all (unlike '#'),
+		# so it's a separate post-processing pass (lib/builtins/__float.py's
+		# _group_integer_part) applied to whatever snprintf already
+		# returned, touching only the digits before the first '.' - a
+		# correct no-op for 'e'/'E' and for 'g'/'G' in exponential form
+		# (only ever one digit there), confirmed against real Python
+		self._run( f'''
+def main() -> i32:
+	if f"{{1234567.891:,.2f}}" != {f"{1234567.891:,.2f}"!r}:
+		return 1
+	if f"{{1234567.891:_.2f}}" != {f"{1234567.891:_.2f}"!r}:
+		return 2
+	if f"{{-1234567.891:,.2f}}" != {f"{-1234567.891:,.2f}"!r}:
+		return 3
+	if f"{{1234567.891:,.0f}}" != {f"{1234567.891:,.0f}"!r}:
+		return 4
+	if f"{{1234.5:,e}}" != {f"{1234.5:,e}"!r}:
+		return 5
+	if f"{{1234567.891:,g}}" != {f"{1234567.891:,g}"!r}:
+		return 6
+	if f"{{1234.56:,g}}" != {f"{1234.56:,g}"!r}:
+		return 7
+	if f"{{1234567.891:,.2%}}" != {f"{1234567.891:,.2%}"!r}:
+		return 8
+	if f"{{1234567.891:20,.2f}}" != {f"{1234567.891:20,.2f}"!r}:
+		return 9
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_format_spec_uppercase_F( self ) -> None:
+		# uppercase 'F' specifically - legacy msvcrt.dll's own _snprintf
+		# silently produces empty output for "%F" (confirmed by a real
+		# test against this system's own msvcrt.dll: unlike 'E'/'G', which
+		# it supports fine, 'F' was only added to printf in C99, after
+		# legacy msvcrt), a real, already-shipped bug this test would have
+		# caught immediately - emitter_c.py's PROLOGUE now substitutes
+		# lowercase 'f' internally on Windows for this one conversion
+		# character, correct for every finite value (the only real
+		# difference between 'f'/'F' is inf/nan capitalization, which this
+		# compiler doesn't special-case either way yet)
+		self._run( f'''
+def main() -> i32:
+	if f"{{1.0:.1F}}" != {f"{1.0:.1F}"!r}:
+		return 1
+	if f"{{-2.5:8.1F}}" != {f"{-2.5:8.1F}"!r}:
+		return 2
+	if f"{{5.0:#.0F}}" != {f"{5.0:#.0F}"!r}:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_explicit_conversion_plus_format_spec_runtime( self ) -> None:
 		# f"{n!r:>8}" against a real runtime int - the spec formats the
 		# ALREADY-converted str (padding), not n's own int-typed value, so

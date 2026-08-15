@@ -2698,26 +2698,31 @@ class FunctionLowering:
 		return dest
 
 	def _lower_compiler_format_f64( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
-		# compiler.format_f64(buf, size, precision, type_char, value) -> i32 -
-		# writes value's fixed-precision decimal digits (magnitude only, no
-		# sign - lib/builtins/__float.py's own callers split the sign out
-		# first, the same split int's __str__/_to_radix_digits/_decimal_
-		# digits_with_grouping already keep) into buf[0:size), returns the
-		# byte count written. type_char is a printf-style conversion
-		# character's ASCII code ('f'/'F'/'e'/'E'/'g'/'G' - see
+		# compiler.format_f64(buf, size, precision, type_char, alt, value) ->
+		# i32 - writes value's fixed-precision decimal digits (magnitude
+		# only, no sign - lib/builtins/__float.py's own callers split the
+		# sign out first, the same split int's __str__/_to_radix_digits/
+		# _decimal_digits_with_grouping already keep) into buf[0:size),
+		# returns the byte count written. type_char is a printf-style
+		# conversion character's ASCII code ('f'/'F'/'e'/'E'/'g'/'G' - see
 		# fstring_format_spec.FORMAT_SPEC_TYPE_CHARS; '%' is handled entirely
 		# in metalpy source instead, by scaling the value and formatting as
-		# 'f' - see lib/builtins/__float.py's _percent_digits). Backed by a
-		# hand-written C helper in emitter_c.py's PROLOGUE (real snprintf/
-		# msvcrt _snprintf, called there with its true variadic prototype) -
-		# deliberately NOT an ordinary @extern binding: emitter_c.py's extern
-		# codegen only ever emits fixed-arity C prototypes, which is an ABI
-		# hazard for a genuinely variadic callee, and tagging this under the
-		# 'c' extern lib would flip compiler.extern_libs and break the
-		# no-crt Windows build (float_test.py's own no_crt = 'c' not in
-		# compiler.extern_libs).
-		if len( node.args ) != 5 or node.keywords:
-			self.lowering.discovery.fail( f'compiler.format_f64(...) takes exactly 5 arguments (buf, size, precision, type_char, value): {ast.unparse(node)}', node )
+		# 'f' - see lib/builtins/__float.py's _percent_digits). alt is the
+		# '#' flag (always show the decimal point for 'f'/'F'/'e'/'E', keep
+		# trailing zeros for 'g'/'G' - real snprintf's own '#' flag already
+		# matches Python's semantics for every one of these exactly, so it's
+		# passed straight through rather than needing its own post-
+		# processing the way grouping does). Backed by a hand-written C
+		# helper in emitter_c.py's PROLOGUE (real snprintf/msvcrt _snprintf,
+		# called there with its true variadic prototype) - deliberately NOT
+		# an ordinary @extern binding: emitter_c.py's extern codegen only
+		# ever emits fixed-arity C prototypes, which is an ABI hazard for a
+		# genuinely variadic callee, and tagging this under the 'c' extern
+		# lib would flip compiler.extern_libs and break the no-crt Windows
+		# build (float_test.py's own no_crt = 'c' not in compiler.
+		# extern_libs).
+		if len( node.args ) != 6 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.format_f64(...) takes exactly 6 arguments (buf, size, precision, type_char, alt, value): {ast.unparse(node)}', node )
 		intrinsics = self.lowering.discovery.get_intrinsics()
 		ptr_cls = intrinsics['Ptr']
 		buf_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ intrinsics['u8'] ] )
@@ -2725,9 +2730,10 @@ class FunctionLowering:
 		size = self._lower_expr( node.args[1], intrinsics['usize'] )
 		precision = self._lower_expr( node.args[2], intrinsics['i32'] )
 		type_char = self._lower_expr( node.args[3], intrinsics['i32'] )
-		value = self._lower_expr( node.args[4], intrinsics['f64'] )
+		alt = self._lower_expr( node.args[4], intrinsics['bool'] )
+		value = self._lower_expr( node.args[5], intrinsics['f64'] )
 		dest = self._new_temp( expected_type or intrinsics['i32'] )
-		self._emit( ir.FormatFloat( dest = dest, buf = buf, size = size, precision = precision, type_char = type_char, value = value ))
+		self._emit( ir.FormatFloat( dest = dest, buf = buf, size = size, precision = precision, type_char = type_char, alt = alt, value = value ))
 		return dest
 
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
@@ -4399,18 +4405,20 @@ class FunctionLowering:
 		except FormatSpecError as e:
 			self.lowering.discovery.fail( f'{e} ({ast.unparse(node)})', node )
 		precision = spec.precision if spec.precision is not None else 6 # Python's own f"{x:f}"/f"{x:e}"/f"{x:g}"/f"{x:%}" all share this default
+		alt = self._const_bool( spec.alt )
+		sep = ir.Const( type = str_type, value = spec.grouping or '' ) # '' still groups correctly - see _group_integer_part's own comment
 		if spec.type == '%':
 			# has no printf equivalent of its own - _percent_digits handles
 			# the *100-then-'f' scaling itself (lib/builtins/__float.py),
 			# so no type_char argument here
-			digits = self._lower_method_call( operand, '_percent_digits', [ self._const_usize( precision ) ], str_type, node )
+			digits = self._lower_method_call( operand, '_percent_digits', [ self._const_usize( precision ), alt, sep ], str_type, node )
 		else:
 			# None (no type char at all) defers to 'f' - a simplification,
 			# not Python's real "no type char" presentation (closer to 'g'
 			# with its own tweaks) - see validate_float_spec's own comment
 			type_char = ord( spec.type or 'f' )
 			digits = self._lower_method_call(
-				operand, '_fixed_digits', [ self._const_usize( precision ), self._const_i32( type_char ) ], str_type, node,
+				operand, '_fixed_digits', [ self._const_usize( precision ), self._const_i32( type_char ), alt, sep ], str_type, node,
 			)
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
 

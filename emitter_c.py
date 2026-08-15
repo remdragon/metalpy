@@ -218,17 +218,21 @@ int __stdcall SetConsoleOutputCP(unsigned int);
 int __stdcall SetConsoleOutputCP(unsigned int);
 #endif
 #endif
-// backs compiler.format_f64(buf, size, precision, type_char, value)
+// backs compiler.format_f64(buf, size, precision, type_char, alt, value)
 // (lowering.py's _lower_compiler_format_f64 / ir.FormatFloat) - writes
 // value's fixed-precision decimal digits into buf via a dynamically-built
-// "%.*X" format string (X = type_char, one of 'f'/'F'/'e'/'E'/'g'/'G' - see
-// fstring_format_spec.FORMAT_SPEC_TYPE_CHARS; '%' has no printf equivalent
-// and is handled entirely in metalpy source instead - see lib/builtins/
-// __float.py's _percent_digits), so magnitude only; callers split the sign
-// out themselves. Returns the byte count written, or a negative value on
-// failure. Always present (like retain_object/__metalpy_isnan above)
-// whether or not a given program actually formats a float - dead code if
-// unused, same as every other PROLOGUE helper.
+// "%[#].*X" format string (X = type_char, one of 'f'/'F'/'e'/'E'/'g'/'G' -
+// see fstring_format_spec.FORMAT_SPEC_TYPE_CHARS; '%' has no printf
+// equivalent and is handled entirely in metalpy source instead - see
+// lib/builtins/__float.py's _percent_digits; alt is the '#' flag, included
+// in the format string when set - real snprintf's own '#' behavior already
+// matches Python's semantics for every one of these type chars exactly, so
+// it needs no post-processing the way grouping does - see lib/builtins/
+// __float.py's _group_integer_part for that), so magnitude only; callers
+// split the sign out themselves. Returns the byte count written, or a
+// negative value on failure. Always present (like retain_object/
+// __metalpy_isnan above) whether or not a given program actually formats a
+// float - dead code if unused, same as every other PROLOGUE helper.
 //
 // Deliberately NOT declared via metalpy's own @extern mechanism: that
 // only ever emits a FIXED-arity C prototype (see _function_prototype),
@@ -302,7 +306,7 @@ void* __stdcall GetModuleHandleA( const char* lpModuleName );
 void* __stdcall LoadLibraryA( const char* lpLibFileName );
 void* __stdcall GetProcAddress( void* hModule, const char* lpProcName );
 typedef int ( __cdecl *__metalpy_snprintf_fn )( char*, size_t, const char*, ... );
-static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, double value ) {
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
 	static __metalpy_snprintf_fn fn = 0;
 	if ( !fn ) {
 		void* msvcrt = GetModuleHandleA( "msvcrt.dll" );
@@ -310,15 +314,41 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 		fn = msvcrt ? (__metalpy_snprintf_fn)GetProcAddress( msvcrt, "_snprintf" ) : 0;
 		if ( !fn ) return -1;
 	}
-	char fmt[5] = { '%', '.', '*', (char)type_char, 0 };
+	// legacy msvcrt.dll's _snprintf silently produces NOTHING (n=0, empty
+	// buffer) for the uppercase 'F' conversion specifically - confirmed by
+	// a real test against this system's own msvcrt.dll ("%.1F" of 1.0 ->
+	// empty output), unlike 'E'/'G' (both correctly supported there). This
+	// tracks real printf history: %E/%G existed in C89; %F was only added
+	// in C99, and legacy msvcrt predates that. 'f'/'F' are otherwise
+	// identical for every FINITE value (Python's own docs: 'F' differs
+	// from 'f' only in using "INF"/"NAN" instead of "inf"/"nan" - this
+	// compiler doesn't yet special-case inf/nan display for either one),
+	// so substituting lowercase 'f' here on Windows only costs that one
+	// inf/nan-capitalization edge case, not correctness for real numbers.
+	if ( type_char == 'F' ) type_char = 'f';
+	char fmt[6];
+	int fi = 0;
+	fmt[fi++] = '%';
+	if ( alt ) fmt[fi++] = '#';
+	fmt[fi++] = '.';
+	fmt[fi++] = '*';
+	fmt[fi++] = (char)type_char;
+	fmt[fi] = 0;
 	int n = fn( buf, size, fmt, precision, value );
 	if ( n > 0 ) __metalpy_fixup_msvcrt_exponent( buf, &n );
 	return n;
 }
 #else
 #include <stdio.h>
-static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, double value ) {
-	char fmt[5] = { '%', '.', '*', (char)type_char, 0 };
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
+	char fmt[6];
+	int fi = 0;
+	fmt[fi++] = '%';
+	if ( alt ) fmt[fi++] = '#';
+	fmt[fi++] = '.';
+	fmt[fi++] = '*';
+	fmt[fi++] = (char)type_char;
+	fmt[fi] = 0;
 	return snprintf( buf, size, fmt, precision, value );
 }
 #endif
@@ -1927,7 +1957,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [
 			f'\t{_emit_operand(instr.dest)} = __metalpy_format_f64('
 			f'(char*){_emit_operand(instr.buf)}, {_emit_operand(instr.size)}, {_emit_operand(instr.precision)}, '
-			f'{_emit_operand(instr.type_char)}, {_emit_operand(instr.value)});'
+			f'{_emit_operand(instr.type_char)}, {_emit_operand(instr.alt)}, {_emit_operand(instr.value)});'
 		]
 
 	if isinstance( instr, ir.Allocate ):

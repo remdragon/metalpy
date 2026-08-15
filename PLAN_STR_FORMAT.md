@@ -84,8 +84,8 @@ Deferred items
    The old "doesn't exist yet" message for a float OPERAND is gone -
    validate_float_spec (fstring_format_spec.py) now only rejects a type
    char that's genuinely invalid for float (e.g. 'x', int's own radix
-   char) with "is not valid for float". `#`/grouping remain rejected for
-   every float type char - a separate, still-open gap (see below).
+   char) with "is not valid for float". `#` and `,`/`_` grouping are both
+   supported too now, for every type char (see below).
 
    float did NOT end up needing a boxed RCClass the way this item
    originally assumed. Scalar (mpy_types.py) already had a `.names` dict
@@ -157,16 +157,47 @@ Deferred items
    exponent in place before returning - real f64 exponents are always
    <= 3 digits, so at most one zero is ever stripped in practice.
 
-   Still open, deliberately not addressed by this pass: `#` (always show
-   the decimal point for 'f'/'e'/'E', keep trailing zeros for 'g'/'G')
-   and `,`/`_` grouping both remain rejected for every float type char -
-   validate_float_spec still raises for either. Both would very likely be
-   close to free (C's own `#`/`,`-flag behavior for these conversions
-   already matches Python's semantics almost exactly, the same reason
-   'f'/'e'/'g' delegate straight to snprintf instead of a hand-rolled
-   conversion), just not verified/wired up yet. No boxed float class was
-   needed for any of this, confirming the note below - only Scalar's
-   existing `.names` registration hook.
+   `#` (always show the decimal point for 'f'/'F'/'e'/'E', keep trailing
+   zeros for 'g'/'G') and `,`/`_` grouping (thousands separators in the
+   integer part) are both DONE too now - validate_float_spec no longer
+   rejects either, and both were confirmed to match real Python's own
+   output exactly. compiler.format_f64 grew an `alt` (bool) parameter for
+   '#', passed straight into the dynamically-built format string ("%#.*X")
+   since real snprintf's own '#' flag already matches Python's semantics
+   for every one of these type chars exactly - no post-processing needed,
+   unlike grouping, which has NO printf equivalent at all: lib/builtins/
+   __float.py's _group_integer_part is a real (small, self-contained)
+   post-processing pass, applied to whatever snprintf/msvcrt already
+   returned, inserting the separator every 3 digits into the text before
+   the first '.' only - a correct no-op for 'e'/'E' and for 'g'/'G' in
+   its own exponential form, since there's only ever one digit before the
+   decimal point either way. No boxed float class was needed for any of
+   this, confirming the note above - only Scalar's existing `.names`
+   registration hook. Two more real bugs were found and fixed along the
+   way, both only surfacing once this pass actually exercised paths the
+   earlier ones hadn't:
+
+   - _group_integer_part's own trivial "nothing to group" early return
+     handed the caller back its own BORROWED `digits` parameter directly,
+     without the explicit incref str.concat's own comment already
+     documents as required for exactly this shape ("compiler.incref(part)
+     right after the borrow gives part a real +1 of its own") - a real,
+     reproducible over-release/use-after-free (confirmed by a garbage
+     process exit code, the same "different wrong output on repeated
+     runs" signature real UB produces), not just a style nit.
+   - legacy msvcrt.dll's own _snprintf silently returns nothing at all for
+     the uppercase 'F' conversion character specifically (confirmed by a
+     real test against this system's own msvcrt.dll: 'E'/'G' both work
+     correctly there, only 'F' doesn't - matching real printf history,
+     since %F was only added in C99, after legacy msvcrt) - meaning
+     f"{x:.1F}"-shaped specs had been silently broken since the very
+     first 'f'/'F' pass landed, just never exercised by a real end-to-end
+     test until now. emitter_c.py's PROLOGUE now substitutes lowercase
+     'f' internally on Windows for this one conversion character - correct
+     for every finite value, the only known remaining gap being inf/nan
+     capitalization, which this compiler doesn't special-case either way
+     yet (a separate, likely upcoming item once float inf/nan display
+     itself is addressed).
 
 5. `=` general sign-aware alignment
 

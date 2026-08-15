@@ -514,16 +514,17 @@ class AtomicCompareExchange( Instruction ): # compiler.atomic_compare_exchange(p
 		return f'AtomicCompareExchange( dest={self.dest!r}, ptr={self.ptr!r}, expected={self.expected!r}, desired={self.desired!r} )'
 
 @dataclass( kw_only = True )
-class FormatFloat( Instruction ): # compiler.format_f64(buf, size, precision, type_char, value) - writes value's MAGNITUDE (no sign) into buf per a printf-style type_char ('f'/'F'/'e'/'E'/'g'/'G', as its ASCII code), with `precision` meaning fractional digits for 'f'/'F'/'e'/'E' or significant digits for 'g'/'G' - returns the byte count written (see lowering.py's _lower_compiler_format_f64)
+class FormatFloat( Instruction ): # compiler.format_f64(buf, size, precision, type_char, alt, value) - writes value's MAGNITUDE (no sign) into buf per a printf-style type_char ('f'/'F'/'e'/'E'/'g'/'G', as its ASCII code), with `precision` meaning fractional digits for 'f'/'F'/'e'/'E' or significant digits for 'g'/'G', and `alt` the '#' flag (always show the decimal point / keep trailing zeros) - returns the byte count written (see lowering.py's _lower_compiler_format_f64)
 	dest: Temp
 	buf: Operand
 	size: Operand
 	precision: Operand
 	type_char: Operand
+	alt: Operand
 	value: Operand
 
 	def test_repr( self ) -> str:
-		return f'FormatFloat( dest={self.dest!r}, buf={self.buf!r}, size={self.size!r}, precision={self.precision!r}, type_char={self.type_char!r}, value={self.value!r} )'
+		return f'FormatFloat( dest={self.dest!r}, buf={self.buf!r}, size={self.size!r}, precision={self.precision!r}, type_char={self.type_char!r}, alt={self.alt!r}, value={self.value!r} )'
 
 @dataclass( kw_only = True )
 class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no field-layout
