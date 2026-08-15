@@ -7806,6 +7806,45 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( self._calls_to( fn, '_percent_digits' ), [] )
 		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
 
+	def test_bare_float_interpolation_dispatches_to_str_dunder( self ) -> None:
+		# f"{x}" with NO format spec at all (not even an empty ":") never
+		# reaches _lower_float_format_spec - parsed_spec is None, so this
+		# takes the plain __str__/__repr__ dispatch path (same as str/int),
+		# which f64/f32 now have real implementations of (the shortest-
+		# round-trip repr algorithm, PLAN_STR_FORMAT.md item 4's own later
+		# writeup) instead of failing to compile. The dispatched Call's own
+		# target.qualname is the underlying def's real name (_f64_str, from
+		# `f64.__str__ = _f64_str`'s registration, lib/builtins/__float.py)
+		# - NOT the literal string '__str__', which is only ever a KEY in
+		# f64.names, never the Function's own identity.
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_f64_str' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_none_type_digits' ), [] )
+
+	def test_float_format_spec_no_type_no_precision_dispatches_to_repr_digits( self ) -> None:
+		# f"{x:10}" - an explicit spec (width only, no type char, no
+		# precision) DOES reach _lower_float_format_spec, which routes this
+		# exact combination to _repr_digits (same underlying shortest-
+		# round-trip algorithm bare f"{x}" uses, just padded afterward) -
+		# distinct from both _fixed_digits (needs a type char or precision)
+		# and _none_type_digits (needs a precision)
+		self._import( '\n'.join([
+			'def main( x: f64 ) -> str:',
+			'	return f"{x:10}"',
+		]))
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( len( self._calls_to( fn, '_repr_digits' )), 1 )
+		self.assertEqual( self._calls_to( fn, '_fixed_digits' ), [] )
+		self.assertEqual( self._calls_to( fn, '_none_type_digits' ), [] )
+		self.assertEqual( len( self._calls_to( fn, '_sign_prefix' )), 1 )
+
 	def test_invalid_float_type_char_is_a_compile_error( self ) -> None:
 		# f"{x:x}" - 'x' is a valid int type char but not a float one
 		self._import( '\n'.join([

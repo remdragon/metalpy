@@ -7904,6 +7904,114 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class IfExpTempLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression tests for a real UAF/double-free in lowering.py's
+	_expr_IfExp: a ternary `A if cond else B` whose branches produce a
+	fresh RC value (e.g. `str('-') if cond else str('+')`) merges both
+	branches into one dest temp via a plain ir.Assign, but never untracked
+	the branch's own temp - so _flush_pending_temps' later decref of the
+	branch temp ran AGAINST THE SAME OBJECT dest (and whatever dest is
+	later assigned into) still holds, freeing it out from under the merged
+	result. Confirmed as a real, reproducible bug (found while building
+	float64's shortest-round-trip repr - PLAN_STR_FORMAT.md item 4 -
+	whose scientific-notation exponent-sign construction is exactly this
+	shape): every scientific-notation float repr crashed or printed
+	garbage before this fix. Worse, the UNTAKEN branch's own temp
+	(declared but never assigned, since only one branch runs at runtime)
+	was ALSO unconditionally decref'd at flush time - freeing
+	uninitialized memory. Fixed by untrack_temp()-ing a fresh branch value
+	before the merge Assign (mirroring _stmt_Return's own identical
+	pattern), Incref-ing an ALIASING branch value instead (mirroring
+	cfg.assign()'s own is_alias split - an existing binding read via the
+	ternary becomes an independent, longer-lived reference), and
+	registering the merge temp itself as the fresh owner afterward. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fresh_branch_values_no_double_free( self ) -> None:
+		# both branches are fresh str(...) constructions (never assigned to
+		# a name first) - the exact shape that crashed/corrupted before the
+		# fix. Checked over 1000 iterations against FRESH heap allocations
+		# each time, matching ReturnStatementTempLifetimeTests' own
+		# reasoning for why a bare single-shot check isn't enough to catch
+		# a leak (as opposed to the double-free, which a single shot alone
+		# already reliably reproduced).
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		cond: bool = True
+		while i < 1000:
+			x: str = str( '-' ) if cond else str( '+' )
+			expected: str = str( '-' ) if cond else str( '+' )
+			if x != expected:
+				return 1
+			if compiler.refcount( x ) != 1:
+				return 2
+			cond = not cond
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_aliasing_branch_value_gets_its_own_incref( self ) -> None:
+		# both branches read EXISTING bindings (a, b) rather than
+		# constructing fresh values - the merged result must be an
+		# independently-owned reference (refcount bumped), not a bare
+		# pointer copy: mutating/dropping a or b afterward must not affect
+		# the merged result, and vice versa
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		a: str = str( 'A' )
+		b: str = str( 'B' )
+		cond: bool = True
+		z: str = a if cond else b
+		if z != str( 'A' ):
+			return 1
+		if compiler.refcount( a ) != 2:
+			return 2
+		if compiler.refcount( z ) != 2:
+			return 3
+		if a != str( 'A' ) or b != str( 'B' ):
+			return 4
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_mixed_fresh_and_aliasing_branches( self ) -> None:
+		# one branch fresh (str.upper()'s own new allocation), the other
+		# aliasing (a plain Name read) - each branch needs its OWN correct
+		# treatment independently of what the other branch does
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		existing: str = str( 'lower' )
+		cond: bool = False
+		result: str = existing.upper() if cond else existing
+		if result != str( 'lower' ):
+			return 1
+		if compiler.refcount( existing ) != 2:
+			return 2
+		cond2: bool = True
+		result2: str = existing.upper() if cond2 else existing
+		if result2 != str( 'LOWER' ):
+			return 3
+		if compiler.refcount( result2 ) != 1:
+			return 4
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never
@@ -8930,6 +9038,90 @@ def main() -> i32:
 		return 7
 	if f"{{5.0:015,.2}}" != {f"{5.0:015,.2}"!r}:
 		return 8
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_repr_shortest_roundtrip( self ) -> None:
+		# bare f"{x}" (no format spec at all) and the no-type/no-precision
+		# spec both fall through to f64._repr_digits/_repr_digits_raw - the
+		# shortest decimal text that round-trips back to the exact same
+		# double (via the new compiler.parse_f64 intrinsic, an iterative
+		# search over compiler.format_f64's 'e'-conversion precision), then
+		# re-rendered into Python's own fixed-vs-scientific presentation
+		# (fixed for -4 <= exponent < 16, scientific otherwise - see
+		# _f64_repr_from_scientific's own comment for how that threshold was
+		# confirmed against real Python). Covers both sides of that exact
+		# threshold (1e15 fixed / 1e16 scientific, 1e-4 fixed / 1e-5
+		# scientific) plus the smallest/largest finite doubles, since those
+		# scientific-notation cases are exactly where a real bug lived
+		# before this test existed: an IfExp (ternary) lowering bug -
+		# `str('-') if exponent < 0 else str('+')`, used to build the
+		# exponent's sign character - double-freed/UAF'd the branch value
+		# (see IfExpTempLifetimeTests for the general fix), so every
+		# scientific-notation repr crashed or produced garbage.
+		self._run( f'''
+def build( x: f64 ) -> str:
+	return f"{{x}}"
+
+def main() -> i32:
+	if build( 1.0 ) != {str(1.0)!r}:
+		return 1
+	if f"{{0.1}}" != {str(0.1)!r}:
+		return 2
+	if f"{{100.0}}" != {str(100.0)!r}:
+		return 3
+	if f"{{1000000.0}}" != {str(1000000.0)!r}:
+		return 4
+	if f"{{1e15}}" != {str(1e15)!r}:
+		return 5
+	if f"{{1e16}}" != {str(1e16)!r}:
+		return 6
+	if f"{{1e17}}" != {str(1e17)!r}:
+		return 7
+	if f"{{0.0001}}" != {str(0.0001)!r}:
+		return 8
+	if f"{{1e-05}}" != {str(1e-05)!r}:
+		return 9
+	if f"{{123456789012345.0}}" != {str(123456789012345.0)!r}:
+		return 10
+	if f"{{3.14159265358979}}" != {str(3.14159265358979)!r}:
+		return 11
+	if f"{{-5.0}}" != {str(-5.0)!r}:
+		return 12
+	if f"{{-0.1}}" != {str(-0.1)!r}:
+		return 13
+	if f"{{5e-324}}" != {str(5e-324)!r}:
+		return 14
+	if f"{{1.7976931348623157e+308}}" != {str(1.7976931348623157e+308)!r}:
+		return 15
+	if f"{{1234567.0}}" != {str(1234567.0)!r}:
+		return 16
+	if f"{{1234567890123.0}}" != {str(1234567890123.0)!r}:
+		return 17
+	if f"{{10.0}}" != {str(10.0)!r}:
+		return 18
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_float_repr_width_no_type_no_precision( self ) -> None:
+		# f"{x:10}" - a width/align/fill spec with no type char and no
+		# precision - takes the SAME _repr_digits path as bare f"{x}"
+		# (is_none_type_no_precision in _lower_float_format_spec), just
+		# padded afterward
+		self._run( f'''
+def main() -> i32:
+	if f"{{1e16:>12}}" != {f"{1e16:>12}"!r}:
+		return 1
+	if f"{{1e-05:<12}}" != {f"{1e-05:<12}"!r}:
+		return 2
+	if f"{{1.5:010}}" != {f"{1.5:010}"!r}:
+		return 3
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

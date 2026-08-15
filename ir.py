@@ -590,6 +590,14 @@ class IsInf( Instruction ): # compiler.is_inf(x) - x: f32|f64, dest: bool - true
 		return f'IsInf( dest={self.dest!r}, value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class ParseFloat( Instruction ): # compiler.parse_f64(ptr) - ptr: ConstPtr[u8] (null-terminated), dest: f64 - the inverse of compiler.format_f64: parses C text back into a double. Needed for the shortest-round-trip repr search (lib/builtins/__float.py's _f64_repr_digits_raw tries increasing precision and re-parses each candidate to check for an exact round-trip) - same "hand-written C helper in PROLOGUE, dynamically resolved on Windows, never an ordinary @extern binding" shape as compiler.format_f64 (see its own comment), here because strtod is a genuinely ordinary (non-variadic) function but tagging it 'c' would still wrongly flip the no-crt Windows build
+	dest: Temp
+	buf: Operand
+
+	def test_repr( self ) -> str:
+		return f'ParseFloat( dest={self.dest!r}, buf={self.buf!r} )'
+
+@dataclass( kw_only = True )
 class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no field-layout
 	# algorithm exists in this compiler (nor should one - that's the C
 	# compiler's job), so unlike an intrinsic scalar's sizeof (which folds

@@ -459,8 +459,31 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 	if ( n > 0 ) __metalpy_fixup_msvcrt_exponent( buf, &n );
 	return n;
 }
+// backs compiler.parse_f64(buf) - the inverse of compiler.format_f64, needed
+// for the shortest-round-trip repr search (lib/builtins/__float.py's
+// _f64_repr_digits_raw). msvcrt.dll's own strtod was verified correct
+// against this system's own msvcrt.dll (unlike some of its other legacy
+// quirks found earlier - _snprintf's own missing 'F'/garbage inf-nan/3-
+// digit-exponent issues): 0.1 -> the standard closest-double approximation,
+// 5e-324 -> the smallest denormal, the max finite double, all round-tripped
+// exactly. strtod is an ordinary (non-variadic) function - no ABI hazard
+// like _snprintf has - but resolved the same dynamic way regardless, since
+// a plain @extern('c', ...) binding would still wrongly flip the no-crt
+// Windows build (same reasoning __metalpy_format_f64 above documents).
+typedef double ( __cdecl *__metalpy_strtod_fn )( const char*, char** );
+static inline double __metalpy_parse_f64( const char* text ) {
+	static __metalpy_strtod_fn fn = 0;
+	if ( !fn ) {
+		void* msvcrt = GetModuleHandleA( "msvcrt.dll" );
+		if ( !msvcrt ) msvcrt = LoadLibraryA( "msvcrt.dll" );
+		fn = msvcrt ? (__metalpy_strtod_fn)GetProcAddress( msvcrt, "strtod" ) : 0;
+		if ( !fn ) return 0.0;
+	}
+	return fn( text, 0 );
+}
 #else
 #include <stdio.h>
+#include <stdlib.h>
 static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
 	char fmt[6];
 	int fi = 0;
@@ -471,6 +494,9 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 	fmt[fi++] = (char)type_char;
 	fmt[fi] = 0;
 	return snprintf( buf, size, fmt, precision, value );
+}
+static inline double __metalpy_parse_f64( const char* text ) {
+	return strtod( text, 0 );
 }
 #endif
 '''
@@ -2227,6 +2253,9 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.IsInf ):
 		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_isinf( {_emit_operand(instr.value)} );' ]
 
+	if isinstance( instr, ir.ParseFloat ):
+		return [ f'\t{_emit_operand(instr.dest)} = __metalpy_parse_f64( (const char*){_emit_operand(instr.buf)} );' ]
+
 	if isinstance( instr, ir.Allocate ):
 		if isinstance( instr.cls, RCClass ):
 			# routed through sys.alloc[cls] - the SAME allocation path
@@ -3233,7 +3262,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# Windows, adding it would incorrectly flip no_crt for any caller that
 	# reads compiler.extern_libs before emit_c().
 	if compiler.disco.active_target['os'] == 'windows' and any(
-		isinstance( instr, ir.FormatFloat ) for lf in compiler.functions for instr in lf.instructions
+		isinstance( instr, ( ir.FormatFloat, ir.ParseFloat ) ) for lf in compiler.functions for instr in lf.instructions
 	):
 		compiler.extern_libs.setdefault( 'kernel32', set() ).add( 'GetProcAddress' )
 

@@ -2818,6 +2818,33 @@ class FunctionLowering:
 		self._emit( ir_cls( dest = dest, value = value ))
 		return dest
 
+	def _lower_compiler_parse_f64( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.parse_f64(buf) - buf: ConstPtr[u8] (null-terminated C
+		# text) -> f64. The inverse of compiler.format_f64 - needed for the
+		# shortest-round-trip repr search (lib/builtins/__float.py's
+		# _f64_repr_digits_raw: try increasing precision, re-parse each
+		# candidate, stop at the first exact round-trip). Backed by a
+		# hand-written C helper in emitter_c.py's PROLOGUE (real strtod on
+		# POSIX; msvcrt.dll's own strtod, resolved dynamically via
+		# GetModuleHandleA/LoadLibraryA/GetProcAddress, on Windows -
+		# verified correct against this system's own msvcrt.dll, unlike
+		# some of its other legacy quirks found earlier) - deliberately
+		# NOT an ordinary @extern binding even though strtod's own
+		# signature is perfectly ordinary (non-variadic, no ABI hazard
+		# like compiler.format_f64 has): tagging it under the 'c' extern
+		# lib would still wrongly flip compiler.extern_libs and break the
+		# no-crt Windows build, the same reason compiler.format_f64 itself
+		# isn't a plain @extern binding either.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.parse_f64(...) takes exactly one argument: {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		ptr_cls = intrinsics['ConstPtr']
+		buf_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ intrinsics['u8'] ] )
+		buf = self._lower_expr( node.args[0], buf_type )
+		dest = self._new_temp( expected_type or intrinsics['f64'] )
+		self._emit( ir.ParseFloat( dest = dest, buf = buf ))
+		return dest
+
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
 		# statement-only (see _stmt_Expr's own dispatch) - mirrors
 		# compiler.incref/decref: no return value, nothing to hand back to
@@ -4578,19 +4605,27 @@ class FunctionLowering:
 		# its own "always show a fractional digit in fixed form" tweak) -
 		# real Python's own "None" presentation, not plain 'f' (see
 		# validate_float_spec's own comment and lib/builtins/__float.py's
-		# _none_type_digits_raw). None type char with NO precision would
-		# need Python's real shortest-round-trip repr algorithm instead -
-		# not implemented (PLAN_STR_FORMAT.md item 4's own note), so that
-		# specific combination still falls back to plain 'f' below,
-		# unchanged from before.
+		# _none_type_digits_raw). None type char with NO precision either
+		# (f"{x:10}") needs Python's real shortest-round-trip repr
+		# algorithm instead - _repr_digits/_repr_digits_raw (lib/builtins/
+		# __float.py), the same machinery bare f"{x}" uses via __str__/
+		# __repr__ (_lower_fstring_part's own dispatch, unrelated to this
+		# function - reached before a format spec is even considered).
 		is_none_type_with_precision = spec.type is None and spec.precision is not None and not is_percent
-		type_char = self._const_i32( ord( spec.type or 'f' ) ) if not is_percent and not is_none_type_with_precision else None
+		is_none_type_no_precision = spec.type is None and spec.precision is None and not is_percent
+		type_char = (
+			self._const_i32( ord( spec.type or 'f' ) )
+			if not is_percent and not is_none_type_with_precision and not is_none_type_no_precision
+			else None
+		)
 		sign_char = self._lower_method_call( operand, '_sign_prefix', [ ir.Const( type = str_type, value = spec.sign ) ], str_type, node )
 
 		if is_percent:
 			digits_method, digits_args = '_percent_digits', [ self._const_usize( precision ), alt ]
 		elif is_none_type_with_precision:
 			digits_method, digits_args = '_none_type_digits', [ self._const_usize( precision ), alt ]
+		elif is_none_type_no_precision:
+			digits_method, digits_args = '_repr_digits', []
 		else:
 			digits_method, digits_args = '_fixed_digits', [ self._const_usize( precision ), type_char, alt ]
 
@@ -5596,6 +5631,23 @@ class FunctionLowering:
 		# ternary `x if cond else y` — both branches assign to the same
 		# dest temp, then merge at end_label. Use JumpIfTrue so the true
 		# branch (body) comes first, avoiding an extra negate.
+		#
+		# RC bookkeeping mirrors cfg.assign()'s own is_alias split, done
+		# per-branch since node.body/node.orelse can differ in aliasing-ness
+		# (e.g. `x if cond else str('literal')`): an ALIASING branch value
+		# (a plain Name/GetAttr read of an already-live binding) needs its
+		# own Incref before being merged into dest, since dest becomes an
+		# independent, longer-lived holder of the same reference; a FRESH
+		# branch value (a Call/Allocate result, already registered via
+		# fresh_temp() by whatever lowered it) has its ownership MOVED into
+		# dest via the plain ir.Assign below, so it must be untrack_temp()'d
+		# - otherwise _flush_pending_temps' later decref of the branch's own
+		# temp double-frees the exact same object dest (and whatever dest
+		# gets assigned into) still holds. dest itself only becomes tracked
+		# once, after both branches (fresh_temp() is idempotent per id) -
+		# confirmed as a real, reproducible UAF/double-free via direct
+		# testing (`str('-') if cond else str('+')` corrupted/crashed
+		# before this fix), not just reasoning from the code shape.
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		cond = self._lower_expr( node.test, bool_cls )
 		else_label = self._new_label( 'ifexp_else' )
@@ -5606,13 +5658,24 @@ class FunctionLowering:
 		true_val = self._lower_expr( node.body, expected_type )
 		if dest is None:
 			dest = self._new_temp( true_val.type )
+		if self.lowering._is_aliasing_expr( node.body, true_val.type ):
+			for instr in self._cfg.incref( dest.type, true_val ):
+				self._emit( instr )
+		else:
+			self._cfg.untrack_temp( true_val )
 		self._emit( ir.Assign( dest = dest, src = true_val ))
 		self._emit( ir.Jump( target = end_label ))
 		# false branch
 		self._emit( ir.Label( name = else_label ))
 		false_val = self._lower_expr( node.orelse, dest.type )
+		if self.lowering._is_aliasing_expr( node.orelse, false_val.type ):
+			for instr in self._cfg.incref( dest.type, false_val ):
+				self._emit( instr )
+		else:
+			self._cfg.untrack_temp( false_val )
 		self._emit( ir.Assign( dest = dest, src = false_val ))
 		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, dest.type )
 		return dest
 
 	def _expr_Compare( self, node: ast.Compare, expected_type: Type|None ) -> ir.Operand:
@@ -7499,6 +7562,10 @@ class FunctionLowering:
 
 			case 'is_inf':
 				result = self._lower_compiler_is_nan_or_inf( node, expected_type, 'is_inf' )
+				return result if want_result else None
+
+			case 'parse_f64':
+				result = self._lower_compiler_parse_f64( node, expected_type )
 				return result if want_result else None
 
 		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_return':

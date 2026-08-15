@@ -104,9 +104,12 @@ Deferred items
    now special-cases `method.cls is None` to pass the receiver as an
    ordinary leading positional argument instead of via ir.Call's own
    receiver field, which assumes a receiver-stripped parameter list.
-   __str__/__repr__ (bare f"{x}") remain deferred regardless - see #6;
-   f"{x:.1f}" never reaches them at all (an explicit format spec dispatches
-   straight against the operand's own type).
+   __str__/__repr__ (bare f"{x}") were deferred at the time this paragraph
+   was written - f64/f32 have since gained real ones (shortest-round-trip
+   repr, see item 4's own later writeup); #6 still applies to every OTHER
+   scalar (i32, etc.), which still requires explicit conversion.
+   f"{x:.1f}" never reaches __str__/__repr__ at all regardless (an explicit
+   format spec dispatches straight against the operand's own type).
 
    _lower_float_format_spec() (lowering.py, alongside _lower_str_format_
    spec/_lower_int_format_spec) mirrors _lower_int_format_spec's own
@@ -268,6 +271,82 @@ Deferred items
      interpolation) - both of those need Python's real shortest-round-
      trip repr algorithm, which is a separate, materially larger
      undertaking (see item 6's own note) still not started.
+
+   That last remaining gap - bare f"{x}" and the no-type/no-precision
+   spec - IS now implemented: f64/f32 gained real __str__/__repr__
+   (f64._repr_digits/_repr_digits_raw, lib/builtins/__float.py),
+   producing the SHORTEST decimal text that round-trips back to the
+   exact same double, matching CPython's repr() exactly.
+
+   - A new compiler.parse_f64(ptr) intrinsic (ir.ParseFloat, lowering.py's
+     _lower_compiler_parse_f64, emitter_c.py's __metalpy_parse_f64 - real
+     strtod, dynamically resolved from msvcrt.dll via GetProcAddress on
+     Windows same as compiler.format_f64's own snprintf resolution) is
+     the inverse of compiler.format_f64: parses C text back into a
+     double. strtod itself was verified correct directly (0.1, 1e±300,
+     the smallest denormal 5e-324, and the largest finite double all
+     round-trip exactly) before relying on it as the oracle for the
+     algorithm below.
+   - The algorithm (_f64_repr_digits_raw): format the magnitude via
+     compiler.format_f64's 'e' (scientific) conversion at increasing
+     precision (0, 1, 2, ...), parsing each result back with
+     compiler.parse_f64 and stopping at the first precision whose parsed
+     value exactly equals the original - the fewest significant digits
+     that round-trip. 'e'-conversion specifically (not 'f'/'g') because
+     its precision directly controls significant-digit COUNT regardless
+     of magnitude, which both 'f' (controls fractional digits only) and
+     'g' (ties its own fixed/scientific switchover to precision) do not
+     give independently.
+   - _f64_repr_from_scientific then re-renders that scientific text into
+     Python's own presentation: FIXED notation for -4 <= exponent < 16,
+     SCIENTIFIC otherwise. This threshold was confirmed against real
+     Python directly and is notably a FIXED cutoff, NOT tied to how many
+     significant digits the value actually needed (repr(1e16) == '1e+16'
+     even though it only needs 1 significant digit) - critically
+     different from plain '%g''s own switchover, which is exactly why
+     the digit-search step above has to use 'e' rather than reusing 'g'
+     as item 4's None-type-with-precision path already does.
+   - f32 delegates to f64 (widen, format, done) rather than duplicating
+     the algorithm, same as its other format-spec methods already do.
+
+   A real, general compiler bug (NOT float-specific) was found and fixed
+   while building this: lowering.py's _expr_IfExp (ternary `A if cond
+   else B`) never had any test coverage anywhere in this codebase before
+   now, and the exponent-sign line this algorithm needed
+   (`str('-') if exponent < 0 else str('+')`) was the first code in the
+   whole project to put a fresh RC value (str(...)) on both branches of
+   a ternary. Both branches assign into the same merge temp via a plain
+   ir.Assign, but the branch's own temp was never untracked afterward -
+   so _flush_pending_temps' later decref of the branch temp ran AGAINST
+   THE SAME OBJECT the merge temp (and whatever it's later assigned
+   into) still holds, freeing it out from under the result; the
+   NOT-taken branch's own temp (declared but never assigned, since only
+   one branch runs at runtime) was ALSO unconditionally decref'd at
+   flush time, freeing uninitialized memory. Confirmed directly: every
+   scientific-notation repr (1e+16, 1e-05, ...) crashed or printed
+   garbage before the fix, while every fixed-notation value (which
+   never touches the exponent-sign line) worked fine - the asymmetry
+   that pointed straight at it. Fixed by giving _expr_IfExp the same
+   is_alias-driven Incref/untrack_temp split cfg.assign() already uses
+   for ordinary variable assignment (Incref for a branch value that
+   ALIASES an existing binding - it becomes an independent, longer-lived
+   reference; untrack_temp for a FRESH branch value - its ownership
+   moves into the merge temp, not a second independent owner), applied
+   per-branch since the two branches can differ in aliasing-ness.
+   Regression tests: IfExpTempLifetimeTests (emitter_c_test.py) covers
+   the general case (fresh/fresh, alias/alias, fresh/alias, with
+   compiler.refcount() assertions, not just "doesn't crash");
+   FStringTests.test_float_repr_shortest_roundtrip/
+   test_float_repr_width_no_type_no_precision cover the repr algorithm
+   itself end to end, including both sides of the fixed/scientific
+   threshold and the smallest/largest finite doubles.
+
+   Known remaining gap, deliberately out of scope: -0.0's sign is still
+   lost (f"{-0.0}" gives '0.0', not Python's '-0.0') - value < 0.0 is
+   IEEE754-false for negative zero, and no bit-reinterpret/sign-bit-read
+   infrastructure exists in this compiler to distinguish it from +0.0
+   otherwise (_f64_sign_prefix's own comment, predates this phase,
+   unchanged by it).
 
 5. `=` general sign-aware alignment
 
