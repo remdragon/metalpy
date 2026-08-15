@@ -86,24 +86,58 @@ specifically to treat these as equal, and several call sites use it correctly
   could be constructed - would need the `overload_resolution.py` item fixed
   first to ever exercise them with a legitimately-mismatched-but-equal leaf.
 
-**Medium confidence:**
+**Fixed** (both, this pass):
 
-- [lowering.py:2061-2062](lowering.py:2061) (`_stmt_Return`) - hand-rolled
-  reimplementation of `_check_assignable`'s CEnum/Specialization/TupleType
-  duality logic inline (`is_cenum_to_underlying`, then `value.type is not fn_type
-  and value.type is not expected_concrete and not is_cenum_to_underlying`)
-  instead of delegating to `_check_assignable`/`_same_type` directly. Not
-  confirmed broken - the logic looks carefully reasoned - but hand-duplicated
-  logic is exactly how the `_coerce_into_union` gap happened in the first place.
-  Worth checking whether this can just call the shared helper instead of
-  re-deriving it.
-- [lowering.py:4281](lowering.py:4281) (`_expr_Name`) - `if member is not None and
-  expected_type is not name.type:` - the "caller wants the whole union back, not
-  the narrowed payload" escape hatch. Its own comment (4298-4302) already flags
-  "Same Specialization gap as `_stmt_Assign`'s own narrowing-bind handling
-  above" as a known concern. Could misfire (wrongly unwrap when the whole union
-  was wanted) if `expected_type` and `name.type` are two non-identical objects
-  for the same generic instantiation.
+- `lowering.py`'s `_stmt_Return` - the hand-rolled reimplementation of
+  `_check_assignable`'s CEnum duality logic turned out to be a real,
+  confirmed bug, not just a maintainability smell: it only ever re-derived
+  ONE of `_check_assignable`'s two CEnum<->value_type exemption directions
+  (`is_cenum_to_underlying` - a CEnum value returned where the function
+  declares the underlying scalar). The REVERSE direction (a raw scalar
+  returned where the function declares the CEnum) was missing entirely -
+  confirmed via a real repro (`return x` where `x: i32` inside a function
+  declared `-> Color`, wrongly rejected as "function returns Color, not
+  i32"). Fixed by adding the missing `is_underlying_to_cenum` check;
+  genuine mismatches (a real repro with an unrelated `str` return) still
+  correctly rejected. Regression tests: new
+  `CEnumReturnCoercionTests.test_programs_compile_and_run` /
+  `.test_genuinely_mismatched_return_type_still_rejected`
+  (emitter_c_test.py). Not delegated to `_check_assignable` directly -
+  that method's own `strict=False` is deliberate, to let the
+  covered-Result-error-widening case get a chance before a stricter check
+  would reject it outright (see the method's own comment) - so the fix
+  stays as a hand-derived exemption, matching the existing pattern, rather
+  than folding in the shared helper.
+
+  **Incidentally found, unrelated, NOT fixed (out of scope, flagged for a
+  future pass):** `lowering.py`'s `_expr_Constant`/`emitter_c.py`'s
+  `_emit_const` crash with an uncaught Python `NotImplementedError` (not a
+  clean `CompileError`) for a kind-mismatched literal returned where a
+  CEnum is expected (e.g. `return 'not a color'` from a function declared
+  `-> Color`) - the literal gets mistagged with the CEnum's own type by
+  `_expr_Constant` somewhere upstream of `_stmt_Return`'s own check (which
+  never gets a chance to reject it, since `value.type is fn_type` already
+  holds by the time it runs), then crashes at C-emission with a raw
+  Python traceback instead of a clean compile error. Confirmed pre-existing
+  on `master`, unrelated to this fix (reproduces identically with this
+  fix reverted).
+- `lowering.py`'s `_expr_Name` escape hatch (`expected_type is not
+  name.type`) - fixed via `_same_type` for consistency, but **no repro
+  could be constructed** despite several attempts (generic-substituted vs.
+  fresh-annotation parameter types; local-variable-annotation vs.
+  fresh-annotation parameter types - both patterns that DID trigger other
+  Shape 1 candidates). Current best guess, not fully confirmed: unlike a
+  bare member-level Specialization, the WHOLE union types being compared
+  here (`expected_type`/`name.type`) are both `_get_or_create_union`
+  results, which cache by a qualname-TEXT key (see `ARCHITECTURE.md`) -
+  insensitive to whether the union's own member Specializations are
+  identical objects, so two structurally-identical union annotations seem
+  to always land on the same cached object regardless of which resolution
+  path produced them. This is a DIFFERENT reason for "unconfirmed" than
+  the two `lowering.py` dispatch candidates above (those are gated by a
+  separate, known upstream bug) - this one may simply not be reachable at
+  all. No dedicated regression test added, for the same reason as those
+  two.
 
 **Awareness only - deliberately identity-based by design, per their own
 comments. Do not touch without separately confirming the design intent still
@@ -256,18 +290,28 @@ which needs no hint).
 
 1. ~~`type_resolver.py:4593` (Shape 3, `visit_Match`)~~ - **fixed**, see above.
 2. ~~Shape 1's three high-confidence candidates~~ - **fixed**, see above.
-3. **Shape 1's two medium-confidence candidates** (`lowering.py:2061-2062`,
-   `lowering.py:4281`) - worth a repro attempt each; the `_stmt_Return` one may
-   turn out to be correct-but-duplicated rather than actually broken. Next up.
+3. ~~Shape 1's two medium-confidence candidates~~ - **fixed**, see above. The
+   `_stmt_Return` one turned out to be a real, confirmed bug (not just
+   duplicated logic); a new, unrelated, pre-existing crash bug
+   (`_expr_Constant`/`_emit_const`, kind-mismatched CEnum-return literals)
+   was found incidentally and flagged, not fixed.
 4. **`lowering.py:683` (Shape 3, `_body_may_fall_off_the_end`)** - low risk, low
-   priority; at minimum update its stale comment.
-5. Everything under "awareness only" - do not fix without first confirming with
+   priority; at minimum update its stale comment. Next up.
+5. **New, incidentally-found candidate:** `lowering.py`'s `_expr_Constant`
+   (feeding `emitter_c.py`'s `_emit_const`) crashes with an uncaught Python
+   `NotImplementedError` instead of a clean `CompileError` for a
+   kind-mismatched literal (e.g. a string) returned/assigned where a CEnum
+   is expected - confirmed via a real repro, pre-existing on `master`,
+   unrelated to any fix in this document. Not investigated further (found
+   while verifying the `_stmt_Return` fix, out of scope for that task) -
+   worth its own root-cause pass.
+6. Everything under "awareness only" - do not fix without first confirming with
    the user that the documented deliberate-design reasoning no longer holds.
    Note: `overload_resolution.py`'s `_leaf_is_accepted`/`_contains` (its own
    identity-based design, documented as relying on the dedup caches) is now
    the more load-bearing of the two "awareness only" items - it's the reason
-   the two fixed-but-unverified `lowering.py` candidates above couldn't get a
-   positive repro; worth reconsidering whether it should move up in priority.
+   two of the `lowering.py` Shape 1 candidates couldn't get a positive repro;
+   worth reconsidering whether it should move up in priority.
 
 ## Verification plan for any fix made from this list
 
