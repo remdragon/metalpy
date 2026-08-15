@@ -1884,6 +1884,18 @@ class UnsafeDict[K, V]:
 			return ptr[0]
 
 	@staticmethod
+	def _owned_key( key_ptr: Ptr[None] ) -> K:
+		# mirrors _owned_value above, for K instead of V - returned OUT to
+		# the caller (key_at), so an RC key needs its own incref the same way
+		if compiler.is_rc( K ):
+			k: K = compiler.cast( K, key_ptr )
+			compiler.incref( k )
+			return k
+		else:
+			ptr: Ptr[K] = compiler.cast( Ptr[K], key_ptr )
+			return ptr[0]
+
+	@staticmethod
 	def _store_key( key: K ) -> Ptr[None]:
 		# an OWNED copy for RawEntry to hold onto indefinitely - an RC key
 		# just gets increfed (the object is already heap-owned, storing
@@ -2002,6 +2014,21 @@ class UnsafeDict[K, V]:
 		entry_idx: usize = self.__raw._find_entry_idx( h, key_ptr, _key_eq ).or_return()
 		return Result.Ok( self._owned_value( self.__raw.value_ptr_at( entry_idx )))
 
+	def key_at( self, index: usize ) -> Result[K, IndexError]:
+		# positional access into insertion order - valid because __entries
+		# (RawDict) is append-only with no removal path yet, so every index
+		# in [0, len) names a live entry, the same "no gaps" invariant
+		# list[T]/slice[T]'s own __getitem__ rely on
+		if index >= len( self.__raw ):
+			return Result.Err( IndexError() )
+		return Result.Ok( self._owned_key( self.__raw.key_ptr_at( index )))
+
+	def value_at( self, index: usize ) -> Result[V, IndexError]:
+		# see key_at's own comment - same positional access, for V
+		if index >= len( self.__raw ):
+			return Result.Err( IndexError() )
+		return Result.Ok( self._owned_value( self.__raw.value_ptr_at( index )))
+
 	def __setitem__( self, key: K, value: V ) -> None:
 		h: u64 = self._hash_key( key )
 		key_ptr: Ptr[None] = 0
@@ -2043,6 +2070,16 @@ class dict[K, V]:
 		self.__lock.acquire().unwrap( 'dict.__getitem__: lock failed' )
 		defer( self.__lock.release() )
 		return self.__inner.__getitem__( key )
+
+	def key_at( self, index: usize ) -> Result[K, IndexError]:
+		self.__lock.acquire().unwrap( 'dict.key_at: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.key_at( index )
+
+	def value_at( self, index: usize ) -> Result[V, IndexError]:
+		self.__lock.acquire().unwrap( 'dict.value_at: lock failed' )
+		defer( self.__lock.release() )
+		return self.__inner.value_at( index )
 
 	def __setitem__( self, key: K, value: V ) -> None:
 		self.__lock.acquire().unwrap( 'dict.__setitem__: lock failed' )

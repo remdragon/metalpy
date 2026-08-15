@@ -5902,6 +5902,77 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# key_at/value_at - positional access into insertion order
+			# (__entries is append-only with no removal, so index i always
+			# names the i-th inserted entry)
+			( 'key_at_value_at_positional_access_in_insertion_order', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	d[ 'b' ] = 2
+	d[ 'c' ] = 3
+	k0: Result[str,IndexError] = d.key_at( 0 )
+	v0: Result[i32,IndexError] = d.value_at( 0 )
+	k2: Result[str,IndexError] = d.key_at( 2 )
+	v2: Result[i32,IndexError] = d.value_at( 2 )
+	if k0.is_err() or v0.is_err() or k2.is_err() or v2.is_err():
+		return 8
+	if k0.unwrap( 'x' ) != 'a' or v0.unwrap( 'x' ) != 1:
+		return 1
+	if k2.unwrap( 'x' ) != 'c' or v2.unwrap( 'x' ) != 3:
+		return 2
+	return 0
+''' ),
+			( 'key_at_value_at_out_of_bounds_returns_index_error', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	if d.key_at( 1 ).is_ok():
+		return 1
+	if d.value_at( 1 ).is_ok():
+		return 2
+	if d.key_at( 0 ).is_err():
+		return 3
+	return 0
+''' ),
+			# overwriting an existing key must not shift/duplicate its
+			# position - key_at(0) stays 'a', len stays 1
+			( 'key_at_value_at_after_overwrite_keeps_same_position', '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d[ 'a' ] = 1
+	d[ 'a' ] = 100
+	if d.__len__() != 1:
+		return 1
+	k0: Result[str,IndexError] = d.key_at( 0 )
+	v0: Result[i32,IndexError] = d.value_at( 0 )
+	if k0.is_err() or v0.is_err():
+		return 8
+	if k0.unwrap( 'x' ) != 'a' or v0.unwrap( 'x' ) != 100:
+		return 2
+	return 0
+''' ),
+			# RC key AND RC value, repeatedly borrowed out via key_at/value_at
+			# then dropped - a proxy for correct incref/decref bookkeeping,
+			# same posture as rc_key_and_rc_value_destruction_does_not_crash
+			# above (wrong refcounting here would double-free or leak)
+			( 'key_at_value_at_rc_key_and_value_does_not_crash', '''
+def main() -> i32:
+	d: dict[str, str] = dict[str, str]()
+	d[ 'a' ] = 'apple'
+	d[ 'b' ] = 'banana'
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 2:
+			k: Result[str,IndexError] = d.key_at( i )
+			v: Result[str,IndexError] = d.value_at( i )
+			if k.is_err() or v.is_err():
+				return 8
+			ks: str = k.unwrap( 'x' )
+			vs: str = v.unwrap( 'x' )
+			i += 1
+	return 0
+''' ),
 		] )
 
 
