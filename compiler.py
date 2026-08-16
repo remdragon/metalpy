@@ -6,7 +6,7 @@ import queue
 # local imports:
 import ir
 from discovery import Discovery, is_stub_body
-from errors import CompileError
+from errors import CompileError, RedundantCompilationError
 from lowering import Lowering
 from mpy_types import Module, Function, Overload, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization, by_value_dependency
 from type_resolver import TypeResolver
@@ -320,6 +320,16 @@ class Compiler:
 		elif isinstance( unit, Variable ):
 			if unit.resolve is not None:
 				unit.resolve()
+			if unit.broken:
+				# unit's own type-resolution (discovery.py's _make_value_
+				# resolver) already failed and recorded the error once -
+				# resolve_global_init/lower_global below would independently
+				# re-visit the SAME init expression and report the identical
+				# failure a second time (see resolve_global_init's own
+				# comment, which already silences its OWN half of this exact
+				# duplicate but explicitly documents lower_global producing
+				# the other half)
+				raise RedundantCompilationError()
 			# a global's init expression needs the same construction-call
 			# pre-resolution an ordinary function body gets from resolve_
 			# function_body (below, Function branch) before lowering ever

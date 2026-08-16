@@ -3443,6 +3443,30 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( len( self.discovery.errors.errors ), 1 )
 		self.assertIn( "alloc parameter 'count' has no type annotation", self.discovery.errors.errors[0] )
 
+	def test_broken_unannotated_global_referenced_later_does_not_double_report( self ) -> None:
+		# an unannotated global's init expression gets a full discovery-
+		# stage type-inference visit (discovery.py's _make_value_resolver,
+		# needed to infer G's own .type) IN ADDITION TO its ordinary
+		# lowering-stage visit (lowering.py's lower_global, via
+		# Compiler._lower's Variable branch) - before this fix, both
+		# independently visited the same undefined_fn() call and both
+		# reported "not defined", producing the same message twice for one
+		# real problem. Compiler._lower now checks G.broken (set by the
+		# first, discovery-stage failure) and raises a silent
+		# RedundantCompilationError instead of ever reaching the second,
+		# redundant visit.
+		code = '\n'.join([
+			'G = undefined_fn()',
+			'',
+			'def main() -> i32:',
+			'	g: i32 = G',
+			'	return g',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "name 'undefined_fn' is not defined", self.discovery.errors.errors[0] )
+
 	def test_call_free_function_positional_and_keyword( self ) -> None:
 		code = '\n'.join([
 			'def foo( x: i32, y: i32 = 2 ) -> None:',

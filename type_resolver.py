@@ -3185,7 +3185,18 @@ class TypeResolver:
 			try:
 				var.init = resolver.visit( var.init )
 			except CompileError:
-				pass # already recorded - lowering.py's own _lower_expr re-reaches and re-reports the same failure moments later, same recovery discipline as resolve_function_body's per-statement try/except
+				# already recorded - lowering.py's own lower_global re-reaches
+				# and re-reports the same failure moments later, same
+				# recovery discipline as resolve_function_body's per-
+				# statement try/except. var's own type-resolution failing is
+				# no longer reachable here at all (Compiler._lower's Variable
+				# branch raises RedundantCompilationError - silently - before
+				# ever calling this method, once var.broken is set - see
+				# mpy_types.Name.broken) - what CAN still land here is a
+				# failure specific to THIS method's own construction-call
+				# detection (e.g. constructing an instance of a class whose
+				# OWN resolution is broken), unrelated to var itself
+				pass
 
 
 class _ReferenceResolver( ast.NodeTransformer ):
