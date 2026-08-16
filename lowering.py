@@ -15,7 +15,7 @@ from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
-	CallableType, ClosureType, TupleType, int_stem_range,
+	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -2685,6 +2685,17 @@ class FunctionLowering:
 		elif isinstance( target, ast.Attribute ):
 			obj, writeback = self._lower_attr_target_obj( target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, target.attr, target )
+			if isinstance( attr_var.type, FixedArrayType ):
+				# same restriction as the GetAttr (read) side - a bare C array
+				# member is never assignable via `=` (only a whole containing
+				# struct/union is, via the compound-literal construction path
+				# _lower_allocate_fields already handles) - see
+				# FixedArrayType's own docstring
+				self.lowering.discovery.fail(
+					f'{ast.unparse(target)}: {attr_var.type.qualname} fields cannot be assigned after construction '
+					f'(no element-level array access is implemented)',
+					target,
+				)
 			operand = self._lower_expr( node.value, attr_var.type )
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> = value, inside __init__ construction itself -
@@ -4878,6 +4889,22 @@ class FunctionLowering:
 		return self.lowering._function_ref_operand( synthetic )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
+		# ArrType[N] field's own supported literal (see FixedArrayType's own
+		# docstring): a bare `0` means "zero-fill the whole array" - the one
+		# value this construction path knows how to emit (a C11 `{0}`
+		# designated-initializer payload, valid only inside the class-body
+		# compound-literal construction shape - see emitter_c.py's
+		# _emit_const). Handled first/separately since none of the ordinary
+		# scalar-literal validation below (int range checks, CEnum duality,
+		# ...) applies to this type at all.
+		if isinstance( expected_type, FixedArrayType ):
+			if type( node.value ) is not int or node.value != 0:
+				self.lowering.discovery.fail(
+					f'{ast.unparse(node)}: {expected_type.qualname} only supports a 0 (zero-fill) literal here - '
+					f'per-element array construction is not implemented',
+					node,
+				)
+			return ir.Const( type = expected_type, value = 0 )
 		# a floating-point literal can only be typed as a float. If context
 		# hints it toward a non-float scalar (an integer), that's a silent-
 		# truncation trap - reject it. Catches `i + 1.5` (the literal hinted to
@@ -5659,6 +5686,21 @@ class FunctionLowering:
 				return self._lower_method_call( obj, node.attr, [], expected_type or method.return_type, node )
 			return self._lower_bound_method_closure( node, obj, method, expected_type )
 		attr_var = self.lowering._attr_lookup( obj.type, node.attr, node )
+		if isinstance( attr_var.type, FixedArrayType ):
+			# a bare C array member isn't assignable via `=` at all (only a
+			# whole containing struct/union is, or an explicit memcpy) - see
+			# FixedArrayType's own docstring. Reading it out as an ordinary
+			# value (`x = f.b`) would need ir.GetAttr's emission to do
+			# something other than a plain `dest = (obj).field;` assignment,
+			# which isn't implemented (no element-level access exists yet
+			# either, the same gap this repo's own bytearray has today) -
+			# rejected here with a clear message rather than silently
+			# reaching emitter_c.py and producing invalid C.
+			self.lowering.discovery.fail(
+				f'{ast.unparse(node)}: {attr_var.type.qualname} fields cannot be read as a whole value yet '
+				f'(no element-level array access is implemented)',
+				node,
+			)
 		dest = self._new_temp( attr_var.type )
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
 		# a pointer-typed field passed into a differently-typed pointer parameter

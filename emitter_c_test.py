@@ -10954,6 +10954,152 @@ def main() -> i32:
 		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
 
 
+class FixedSizeArrayFieldTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for SYNTAX.md's documented-but-unimplemented
+	"Fixed-Size Inline Array (inside @struct): u16[32], u8[8]" - a bare
+	`ElemType[N]` field annotation used to fail outright at annotation-
+	resolution time ("intrinsics.u8 is not generic, cannot subscript it" -
+	visit_Subscript's generic-subscript path unconditionally rejected any
+	non-generic base). lib/guid.py's own GUID class already documented
+	hitting this exact gap for its `Data4[8]` field and worked around it by
+	unrolling into 8 separate `data4_0..data4_7: u8` fields instead.
+
+	Fixed via a new mpy_types.FixedArrayType, recognized in discovery.py's
+	visit_Subscript (a non-generic base subscripted by a bare positive int
+	constant, as opposed to a real generic type argument - which always
+	uses a TYPE expression as its slice, never a bare int, so this can
+	never misfire against a genuine generic instantiation) and given a real
+	C array declarator in struct/union body emission (`TYPE NAME[N];`,
+	special-cased in _struct_or_union_body the same way _declarator already
+	special-cases a function-pointer field's own discontinuous C syntax).
+
+	Deliberately scoped, not a general-purpose value type: a bare C array
+	is not assignable via `=` at all (only a whole containing struct/union
+	is), so this fix only supports (1) declaring the field, inside a plain
+	@cstruct/@cunion only - rejected everywhere else (parameters, return
+	types, module/class-level variables, RCClass/@interface fields) - and
+	(2) a `= 0` field default / explicit `ClassName(field=0)` construction
+	argument, meaning "zero-fill the whole array" (the one shape a C
+	designated initializer can express, `.field = {0}`). Reading a
+	FixedArrayType field back out as a whole value, or assigning one after
+	construction, is explicitly rejected with a clean error rather than
+	reaching emission and producing invalid C - element-level indexed
+	access is a separate, real, currently-unimplemented follow-up (the same
+	kind of gap this repo's own bytearray has today), not attempted here. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact SYNTAX.md-documented shape - a real @cstruct with a
+			# fixed-size inline array field, zero-filled by default,
+			# constructed bare, real sizeof() confirms correct C layout (no
+			# silent size-0/opaque-type fallback)
+			( 'fixed_array_field_declares_and_zero_fill_constructs', '''
+import compiler
+
+@cstruct
+class Foo:
+	a: u16 = 0
+	b: u8[8] = 0
+
+def main() -> i32:
+	f = Foo()
+	sz: usize = compiler.sizeof( Foo )
+	if sz != usize( 10 ):
+		return 1
+	return 0
+''' ),
+			# explicit ClassName(field=0) construction argument (not just the
+			# class-body default) - same zero-fill path, different call site
+			( 'fixed_array_field_explicit_zero_construction_argument', '''
+@cstruct
+class Foo:
+	a: u16 = 0
+	b: u8[8] = 0
+
+def main() -> i32:
+	f = Foo( a = 5, b = 0 )
+	if f.a != 5:
+		return 1
+	return 0
+''' ),
+			# multiple array fields of different element types/counts in one
+			# struct, interleaved with scalar fields - mirrors SYNTAX.md's own
+			# DynamicTimeZoneInformation worked example almost verbatim
+			( 'multiple_fixed_array_fields_interleaved_with_scalars', '''
+@cstruct
+class Multi:
+	bias: i32 = 0
+	name: u16[32] = 0
+	date: u16[8] = 0
+	flag: u8 = 0
+	pad: u8[3] = 0
+
+def main() -> i32:
+	m = Multi( bias = 7 )
+	if m.bias != 7:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_out_of_range_field_annotation_type_still_rejects_generic_subscript_errors( self ) -> None:
+		# negative check: an actually-invalid subscript (a real, non-generic,
+		# non-array-shaped misuse) must still be rejected the same way it
+		# always was - this fix only ever WIDENS what's accepted (a non-
+		# generic base + a bare positive int constant slice), never narrows
+		# the existing "not generic, cannot subscript it" rejection for
+		# every other shape
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	x: bool[i32] = None', # bool is non-generic, i32 is a TYPE not an int constant - still invalid
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'not generic', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_field_rejected_as_parameter_type( self ) -> None:
+		self._run( '\n'.join([
+			'def f( x: u8[8] ) -> i32:',
+			'	return 0',
+			'',
+			'def main() -> None:',
+			'	f( 0 )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_field_rejected_as_module_global( self ) -> None:
+		self._run( '\n'.join([
+			'g: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	x = g',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_reading_fixed_array_field_as_a_whole_value_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	x = f.b',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be read as a whole value', self.discovery.errors.errors[0] )
+
+
 class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression test for a real, confirmed silent-data-corruption bug: an
 	`@extern` function declared with a `T|None` return type where T is a

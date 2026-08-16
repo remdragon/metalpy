@@ -386,6 +386,40 @@ class CallableType( Type ):
 	return_type: Type
 
 @dataclass( kw_only = True )
+class FixedArrayType( Type ):
+	''' `ElemType[N]` used as a @cstruct/@cunion FIELD annotation only
+	(SYNTAX.md's "Fixed-Size Inline Array": `u16[32]`, `u8[8]`) - a real,
+	fixed-size C array embedded inline in the struct body (`uint16_t
+	name[32];`), not a heap-allocated/RC sequence the way list[T] is.
+	Recognized textually in visit_Subscript (a non-generic base type
+	subscripted by a bare positive integer constant, as opposed to a real
+	generic type argument - see its own comment), interned by discovery.py's
+	_get_or_create_fixed_array the same way CallableType/TupleType already
+	are, so two annotations spelling the same (element type, count) share
+	one object.
+
+	Deliberately NOT a general-purpose value type: C's own array declarator
+	syntax is discontinuous ("TYPE NAME[N]", not a plain prefix type the
+	way every other field is spelled) and a bare C array is not assignable
+	via `=` at all (only a WHOLE containing struct/union is, or an explicit
+	memcpy) - unlike every other Type kind here, a value of this type is
+	only ever legitimately produced two ways: (1) the class-body compound-
+	literal construction path this fix wires up (a `= 0` field default or
+	an explicit `ClassName(field=0)` argument, both meaning "zero-fill the
+	whole array" - the one shape a C designated initializer `.field = {0}`
+	can express), or (2) reading/writing it back out is NOT implemented
+	(discovery.py/lowering.py explicitly reject a FixedArrayType field
+	anywhere else - parameter/return/local-variable annotations, and
+	reading the field back out via ordinary attribute access) rather than
+	silently emit C that fails to compile (`x = arr;`) or is outright
+	invalid (`dest->field = arr;`). Element-level indexed read/write is a
+	separate, real, currently-unimplemented follow-up (would need its own
+	__getitem__/__setitem__-style lowering, the same gap this repo's own
+	bytearray has today), not attempted here. '''
+	elem_type: Type
+	count: int
+
+@dataclass( kw_only = True )
 class TupleType( Type ):
 	''' `tuple[T0, T1, ..., Tn]` in annotation position (see PLAN_TUPLE.md) -
 	a heterogeneous, fixed-arity value group. Unlike list[T]/dict[K,V]

@@ -9,7 +9,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function, Overload,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, FixedArrayType, Function, Overload,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
@@ -789,6 +789,21 @@ def c_type( t: Type|None ) -> str:
 		return mangle_type( t ) # the typedef name itself, no struct/union prefix
 	if isinstance( t, CType ):
 		return t.c_name
+	if isinstance( t, FixedArrayType ):
+		# never reached on a legitimate path: a struct/union FIELD of this
+		# type is special-cased directly in _struct_or_union_body (C's own
+		# discontinuous array declarator, "TYPE NAME[N]", doesn't fit this
+		# function's plain "return a type string" shape at all) - discovery.py
+		# already rejects every OTHER annotation position (parameter, return
+		# type, local/global variable) before this module ever runs, and
+		# reading a FixedArrayType field back out as an ordinary value isn't
+		# implemented (see FixedArrayType's own docstring) - so reaching this
+		# function with one at all means something upstream failed to guard
+		# a position that needs its own guard, not a legitimate use.
+		raise NotImplementedError(
+			f'c_type: {t.qualname} (a fixed-size inline array) cannot be spelled as an ordinary C type - '
+			f'it only exists as a @cstruct/@cunion FIELD, handled directly by _struct_or_union_body'
+		)
 	raise NotImplementedError( f'c_type: unsupported type {t!r}' )
 
 def _is_noreturn( t: Type|None ) -> bool:
@@ -1052,7 +1067,15 @@ def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]]
 		lines.append( '\tchar dummy;' )
 	else:
 		for field_name, field_type in attrs:
-			lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+			if isinstance( field_type, FixedArrayType ):
+				# C's array declarator is discontinuous ("TYPE NAME[N];", not
+				# a plain prefix type followed by the name - see
+				# FixedArrayType's own docstring and _declarator's identical
+				# function-pointer special case) - _field_type_spelling's
+				# plain "TYPE NAME" concatenation can't express this
+				lines.append( f'\t{c_type(field_type.elem_type)} {_field_name(field_name)}[{field_type.count}];' )
+			else:
+				lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 
@@ -1240,6 +1263,16 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 	return f'(-{signed_expr})' if value < 0 else signed_expr
 
 def _emit_const( c: ir.Const ) -> str:
+	if isinstance( c.type, FixedArrayType ):
+		# the one supported FixedArrayType value (see its own docstring and
+		# lowering.py's _expr_Constant fixed-array branch): a bare `0`
+		# literal means "zero-fill the whole array" - the one shape a
+		# C11 initializer can express for an embedded array field, valid
+		# ONLY inside a designated-initializer compound literal (a plain
+		# @cstruct's own stack-construction shape - see ir.Allocate's
+		# emission), never as an ordinary assignment target
+		assert c.value == 0, f'_emit_const: {c.type.qualname} only supports a 0 (zero-fill) constant, got {c.value!r}'
+		return '{0}'
 	if isinstance( c.value, bool ):
 		return 'true' if c.value else 'false'
 	if isinstance( c.value, float ) or ( isinstance( c.value, int ) and _is_float_type( c.type )):
