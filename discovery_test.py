@@ -34,7 +34,7 @@ class ImportTests( unittest.TestCase ):
 			expect_package: str
 
 			@staticmethod
-			def new_test( expect_package: str ) -> MockDiscovery:
+			def new_test( expect_package: str ) -> 'MockDiscovery':
 				disco = MockDiscovery( import_builtins = False )
 				disco.expect_package = expect_package
 				return disco
