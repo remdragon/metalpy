@@ -67,6 +67,27 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.BitXor: '__xor__',
 }
 
+# forward binop dunder name -> its REFLECTED counterpart, mirroring Python's
+# real protocol: `a + b` tries `a.__add__(b)` first, and - if that isn't
+# applicable (no such dunder on left.type at all, OR left.type is Scalar and
+# so has no dunder mechanism of its own to begin with, e.g. `5 + some_vector`)
+# - falls back to `b.__radd__(a)`. Unlike `==`/`!=` (see _LeafPairEq's own
+# docstring on why equality reflects onto the SAME method name, just with
+# receiver/argument swapped), every one of these is a genuinely asymmetric
+# operator - Python gives each one its own DIFFERENTLY-NAMED reflected
+# method, not a reflected call to the same name, since e.g. `a - b` and
+# `b - a` are never interchangeable the way `a == b`/`b == a` are.
+_REFLECTED_BINOP_DUNDER: dict[str,str] = {
+	'__add__': '__radd__',
+	'__sub__': '__rsub__',
+	'__mul__': '__rmul__',
+	'__floordiv__': '__rfloordiv__',
+	'__mod__': '__rmod__',
+	'__or__': '__ror__',
+	'__and__': '__rand__',
+	'__xor__': '__rxor__',
+}
+
 # ast comparison operator -> the dunder method name to dispatch to for a
 # non-scalar left operand (str.__eq__, etc.). Scalar operands go through
 # flat ir.Cmp instead.
@@ -6281,11 +6302,32 @@ class FunctionLowering:
 		# already be the SAME float type, cast explicitly" rule entirely.
 		if left_is_const and not right_is_const:
 			right = self._lower_expr( right_node, expected_type, strict = False )
-			left_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( right.type ) else right.type
+			# only hint the literal toward right.type when that's actually a
+			# meaningful target for a literal to become (a scalar, or the
+			# existing Ptr-offset special case) - hinting toward an arbitrary
+			# non-scalar CLASS (e.g. `5 + some_vector`, right.type=Vector) hits
+			# _expr_Constant's own literal-compatibility check ("an int literal
+			# cannot be used where Vector is expected") before this expression
+			# ever reaches _lower_binop_values' own dunder/reflected-dunder
+			# dispatch - confirmed via a real repro. None here lets the
+			# literal infer its own natural type instead, same as it would
+			# with no hint at all, so the reflected-dunder lookup below can
+			# still find e.g. Vector.__radd__(other: i32) matching it.
+			if self.lowering._type_resolver._is_ptr_specialization( right.type ):
+				left_hint = usize_cls
+			elif isinstance( right.type, Scalar ):
+				left_hint = right.type
+			else:
+				left_hint = None
 			left = self._lower_expr( left_node, left_hint, strict = False )
 		elif right_is_const and not left_is_const:
 			left = self._lower_expr( left_node, expected_type, strict = False )
-			right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( left.type ) else left.type
+			if self.lowering._type_resolver._is_ptr_specialization( left.type ):
+				right_hint = usize_cls
+			elif isinstance( left.type, Scalar ):
+				right_hint = left.type
+			else:
+				right_hint = None
 			right = self._lower_expr( right_node, right_hint, strict = False )
 		else:
 			left = self._lower_expr( left_node, expected_type, strict = False )
@@ -6310,11 +6352,23 @@ class FunctionLowering:
 		# read for its `.op` (ast.BinOp and ast.AugAssign both have one)
 		# and as an error-reporting location - never for `.left`/`.right`.
 
-		# non-scalar left operand — try the dunder method (str.__add__, ...)
-		if not isinstance( left.type, Scalar ):
-			method_name = _BINOP_DUNDER.get( type( node.op ))
-			if method_name is not None:
-				method = self.lowering._find_method( left.type, method_name )
+		# try the dunder method (str.__add__, ...) first on left.type, then -
+		# mirroring Python's real protocol - the REFLECTED, differently-named
+		# dunder on right.type (str.__radd__, ...) if the forward one isn't
+		# applicable. Unlike the old code, this ISN'T gated on left.type
+		# being non-Scalar: a Scalar left operand has no dunder of its own to
+		# try (skip straight to reflected), but that must NOT also skip
+		# giving right.type's own reflected dunder a chance - e.g. `5 +
+		# some_vector` needs some_vector's own __radd__(other: i32), the
+		# exact same "Scalar operand can't have a forward dunder, but the
+		# OTHER side's own dunder is still a real candidate" gap _lower_eq_
+		# or_ne's own unconditional-Eq/NotEq-dispatch fix already closed for
+		# ==/!=; this is the binop counterpart, with a differently-named
+		# reflected method instead of the same name reflected.
+		method_name = _BINOP_DUNDER.get( type( node.op ))
+		if method_name is not None:
+			if not isinstance( left.type, Scalar ):
+				method = self._find_dunder_for_arg( left.type, method_name, right.type )
 				if method is not None:
 					self.lowering._ensure_resolved( method )
 					self.lowering.schedule( method.return_type )
@@ -6322,6 +6376,17 @@ class FunctionLowering:
 						self.lowering.schedule( p.type )
 					dest = self._new_temp( expected_type or method.return_type )
 					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
+					return dest
+			reflected_name = _REFLECTED_BINOP_DUNDER.get( method_name )
+			if reflected_name is not None and not isinstance( right.type, Scalar ):
+				reflected_method = self._find_dunder_for_arg( right.type, reflected_name, left.type )
+				if reflected_method is not None:
+					self.lowering._ensure_resolved( reflected_method )
+					self.lowering.schedule( reflected_method.return_type )
+					for p in ( reflected_method.parameters or [] ):
+						self.lowering.schedule( p.type )
+					dest = self._new_temp( expected_type or reflected_method.return_type )
+					self._emit( ir.Call( dest = dest, target = reflected_method, receiver = right, args = [ left ], kwargs = {} ))
 					return dest
 
 		# a float on EITHER side takes the GetFloatBinOp path (plain IEEE, or
@@ -6775,7 +6840,7 @@ class FunctionLowering:
 		if not isinstance( left.type, Scalar ):
 			method_name = _COMP_DUNDER.get( type( node.ops[0] ))
 			if method_name is not None:
-				# _find_eq_method_for_arg, not the plain _find_method - see
+				# _find_dunder_for_arg, not the plain _find_method - see
 				# its own docstring: right, lowered with strict=True just
 				# below, is already guaranteed to end up exactly left.type
 				# (coerced or rejected) before this dunder lookup even
@@ -6783,7 +6848,7 @@ class FunctionLowering:
 				# declares its own parameter as exactly left.type - same
 				# "caller already knows the wanted arg type" shape as
 				# _lower_eq_or_ne's own same-type fast path
-				method = self._find_eq_method_for_arg( left.type, method_name, left.type )
+				method = self._find_dunder_for_arg( left.type, method_name, left.type )
 				if method is not None:
 					right = self._lower_expr( node.comparators[0], left.type )
 					self.lowering._ensure_resolved( method )
@@ -6806,7 +6871,7 @@ class FunctionLowering:
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
 		return dest
 
-	def _find_eq_method_for_arg( self, owner_type: Type|None, name: str, arg_type: Type ) -> Function|None:
+	def _find_dunder_for_arg( self, owner_type: Type|None, name: str, arg_type: Type ) -> Function|None:
 		''' like self.lowering._find_method, but Overload-aware: if `name`
 		resolves to a real Overload group on owner_type (multiple defs
 		sharing the name - e.g. int.__eq__(other: int) alongside a second
@@ -6822,19 +6887,24 @@ class FunctionLowering:
 
 		Deliberately narrow, not a general replacement for _find_method
 		everywhere: every caller here already knows the exact concrete
-		argument type it wants to match against (this is comparison
-		dispatch, not a call site needing real runtime dispatch across
-		multiple candidate argument shapes), so a simple single-parameter-
-		type scan over the Overload's own implementations suffices - no
-		need for overload_resolution.py's own general ConditionalDispatch
-		machinery. Also used by _expr_Compare's </>/<=/>= dispatch and
-		_lower_operand_compare - both call sites where `strict=True`
-		lowering already forces the argument operand to exactly the
-		receiver's own type before dispatch is even reached, so the same
-		"caller already knows the wanted arg type" precondition holds
-		there too, not just for ==/!=. _find_method's other ~25 call sites
-		elsewhere in this file (container-protocol dunders, binop/unary
-		dispatch, ...) are unrelated and stay untouched - a separate,
+		argument type it wants to match against (comparison dispatch and
+		binop/reflected-binop dispatch, not a call site needing real
+		runtime dispatch across multiple candidate argument shapes), so a
+		simple single-parameter-type scan over the Overload's own
+		implementations suffices - no need for overload_resolution.py's
+		own general ConditionalDispatch machinery. Used by: _lower_eq_or_ne
+		and _classify_leaf_pair_eq (==/!=, both directions),
+		_expr_Compare's </>/<=/>= dispatch, _lower_operand_compare, and
+		_lower_binop_values' forward/reflected dunder dispatch (+-*//%|&^ and
+		their __r<op>__ counterparts) - every one of these already forces
+		(or already knows) the argument operand's exact type before dispatch
+		is even reached, so the same "caller already knows the wanted arg
+		type" precondition holds throughout. _find_method's other ~20
+		remaining call sites elsewhere in this file (container-protocol
+		dunders like __getitem__/__contains__/__next__, unary dispatch, ...)
+		are unrelated and stay untouched - unary in particular can't
+		meaningfully be Overloaded on argument type at all (no second
+		operand to disambiguate against) - the rest are a separate,
 		wider-scoped Overload-blindness gap, not fixed here. '''
 		owner_type = self.lowering._ensure_resolved( owner_type )
 		if isinstance( owner_type, ( CStruct, RCClass ) ):
@@ -6896,16 +6966,16 @@ class FunctionLowering:
 		     both are reinstated explicitly here since strict=False below
 		     skips them). '''
 		method_name = '__ne__' if negate else '__eq__'
-		# _find_eq_method_for_arg, not the plain _find_method: this is the
+		# _find_dunder_for_arg, not the plain _find_method: this is the
 		# "receiver and argument end up the SAME type" fast path (right,
 		# once lowered below, is hinted toward left.type when left isn't a
 		# union - the common case), so the wanted implementation is
 		# whichever one declares its own parameter as exactly left.type -
-		# see _find_eq_method_for_arg's own docstring for why a plain
+		# see _find_dunder_for_arg's own docstring for why a plain
 		# _find_method silently breaks this once a class ever declares a
 		# SECOND __eq__/__ne__ overload (e.g. int.__eq__(other: i32)
 		# alongside the pre-existing int.__eq__(other: int))
-		method = self._find_eq_method_for_arg( left.type, method_name, left.type ) if not isinstance( left.type, Scalar ) else None
+		method = self._find_dunder_for_arg( left.type, method_name, left.type ) if not isinstance( left.type, Scalar ) else None
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		# the hint handed to the comparator's own lowering below: left.type,
 		# EXCEPT when left.type is ITSELF a union - hinting a plain leaf
@@ -7066,17 +7136,17 @@ class FunctionLowering:
 			return _LeafPairEq( 'none_false' )
 		if self.lowering._type_resolver._same_type( left_type, right_type ):
 			return _LeafPairEq( 'same_type' )
-		# _find_eq_method_for_arg, not the plain _find_method - see its own
+		# _find_dunder_for_arg, not the plain _find_method - see its own
 		# docstring: a class declaring TWO __eq__/__ne__ signatures (the
 		# same-type one plus a genuine cross-type one, e.g. int.__eq__
 		# (other: i32) alongside int.__eq__(other: int)) registers as a
 		# real Overload, which a bare _find_method silently treats as "no
 		# such method" - the exact shape this whole 'cross_dunder' branch
 		# exists to use
-		method = self._find_eq_method_for_arg( left_type, method_name, right_type ) if not isinstance( left_type, Scalar ) else None
+		method = self._find_dunder_for_arg( left_type, method_name, right_type ) if not isinstance( left_type, Scalar ) else None
 		if method is not None:
 			return _LeafPairEq( 'cross_dunder', method = method, reflected = False )
-		reflected_method = self._find_eq_method_for_arg( right_type, method_name, left_type ) if not isinstance( right_type, Scalar ) else None
+		reflected_method = self._find_dunder_for_arg( right_type, method_name, left_type ) if not isinstance( right_type, Scalar ) else None
 		if reflected_method is not None:
 			return _LeafPairEq( 'cross_dunder', method = reflected_method, reflected = True )
 		return _LeafPairEq( 'error' )
@@ -7285,11 +7355,11 @@ class FunctionLowering:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		if not isinstance( left.type, Scalar ):
 			method_name = '__ne__' if negate else '__eq__'
-			# _find_eq_method_for_arg, not the plain _find_method - both
+			# _find_dunder_for_arg, not the plain _find_method - both
 			# operands are already known to share the SAME type (this
 			# method's own docstring), so the wanted implementation is
 			# whichever one declares its own parameter as exactly left.type
-			method = self._find_eq_method_for_arg( left.type, method_name, left.type )
+			method = self._find_dunder_for_arg( left.type, method_name, left.type )
 			if method is not None:
 				self.lowering._ensure_resolved( method )
 				self.lowering.schedule( method.return_type )
