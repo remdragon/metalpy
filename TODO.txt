@@ -721,8 +721,6 @@ io interfaces ( stdin, stdout, stderr )
 	panic() still bypasses sys.stderr and writes directly via its own
 	private _write_stderr_cstr (see lib/sys.py's panic() comment).
 
-socket class
-
 threading
 
 other issues:
