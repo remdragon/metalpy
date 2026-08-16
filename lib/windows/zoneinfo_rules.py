@@ -20,7 +20,8 @@ import compiler
 import sys
 from zoneinfo import ZoneInfo, TTInfo
 from windows.time import _decode_ascii_utf16z, _field_ptr_u16
-from _civil_calendar import days_from_civil, days_in_month, floormod_i64
+from _civil_calendar import days_from_civil, days_in_month
+from math import floormod_i64
 
 _YEAR_WINDOW: i32 = 2  # build transitions for current_year +/- this many years
 

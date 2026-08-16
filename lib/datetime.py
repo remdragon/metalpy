@@ -37,7 +37,8 @@
 
 import compiler
 import sys
-from _civil_calendar import days_from_civil, civil_from_days, weekday_from_days, days_in_month, floordiv_i64, floormod_i64
+from _civil_calendar import days_from_civil, civil_from_days, weekday_from_days, days_in_month
+from math import floordiv_i64, floormod_i64
 from zoneinfo import ZoneInfo
 
 

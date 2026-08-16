@@ -4,12 +4,7 @@
 # _is_leap_year/_days_in_month/_days_from_civil (that file's copy only ever
 # needs a small +/-2-year window around "now", by its own comment - fine
 # there, not for a general date/datetime class needing Python's real
-# MINYEAR=1..MAXYEAR=9999 range). Adds the missing inverse (civil_from_days)
-# and the floor-division/floor-modulo helpers real negative-operand callers
-# need - // and % in this compiler are C-style TRUNCATING, not Python-style
-# floor, despite // being spelled like Python's floor-div operator (verified
-# directly by reading emitter_c.py's _emit_int_division, which emits raw C
-# `/`/`%`).
+# MINYEAR=1..MAXYEAR=9999 range). Adds the missing inverse (civil_from_days).
 #
 # Both days_from_civil/civil_from_days are Howard Hinnant's well-known,
 # widely-used public-domain algorithms (howardhinnant.github.io/date_algorithms.html),
@@ -18,29 +13,7 @@
 # own proleptic-Gregorian ordinal (day 1 = 0001-01-01).
 
 import compiler
-
-def floordiv_i64( a: i64, b: i64 ) -> i64:
-	''' Python-style floor division (rounds toward -infinity), unlike this
-	compiler's own // (rounds toward zero, C-style). Only ever called here
-	with a non-zero, non-(-1) literal-shaped divisor - panic_arithmetic
-	turns the impossible ZeroDivisionError/OverflowError cases this compiler
-	would otherwise force a Result for into what they actually are: an
-	unreachable condition, not a real failure mode any real caller hits. '''
-	with compiler.panic_arithmetic( 'unreachable: floordiv_i64 divisor is never zero in this codebase' ):
-		q: i64 = a // b
-		r: i64 = a % b
-		if r != 0 and ( r < 0 ) != ( b < 0 ):
-			q -= 1
-		return q
-
-def floormod_i64( a: i64, b: i64 ) -> i64:
-	''' Python-style floor modulo (result always has the same sign as b),
-	unlike this compiler's own % (sign follows a, C-style). '''
-	with compiler.panic_arithmetic( 'unreachable: floormod_i64 divisor is never zero in this codebase' ):
-		r: i64 = a % b
-		if r != 0 and ( r < 0 ) != ( b < 0 ):
-			r += b
-		return r
+from math import floordiv_i64, floormod_i64
 
 
 def is_leap_year( year: i32 ) -> bool:
