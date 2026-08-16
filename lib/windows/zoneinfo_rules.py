@@ -20,6 +20,7 @@ import compiler
 import sys
 from zoneinfo import ZoneInfo, TTInfo
 from windows.time import _decode_ascii_utf16z, _field_ptr_u16
+from _civil_calendar import days_from_civil, days_in_month, floormod_i64
 
 _YEAR_WINDOW: i32 = 2  # build transitions for current_year +/- this many years
 
@@ -164,44 +165,6 @@ def _bias_to_utcoffset_seconds( bias_minutes: i32, extra_bias_minutes: i32 ) -> 
 		return -( total_minutes * 60 )
 
 
-def _is_leap_year( year: i32 ) -> bool:
-	with compiler.panic_arithmetic( 'unreachable: divisors are non-zero literals' ):
-		if year % 4 != 0:
-			return False
-		if year % 100 != 0:
-			return True
-		return year % 400 == 0
-
-
-def _days_in_month( year: i32, month: i32 ) -> i32:
-	if month == 1 or month == 3 or month == 5 or month == 7 or month == 8 or month == 10 or month == 12:
-		return 31
-	if month == 4 or month == 6 or month == 9 or month == 11:
-		return 30
-	if _is_leap_year( year ):
-		return 29
-	return 28
-
-
-def _days_from_civil( year: i32, month: i32, day: i32 ) -> i64:
-	''' Howard Hinnant's days_from_civil, days since 1970-01-01 - well-known,
-	widely-used public-domain algorithm (see howardhinnant.github.io/
-	date_algorithms.html). Only ever called here with year in a small
-	current-era window (never negative/BCE-range), so the floor-vs-
-	truncating integer division distinction the general algorithm has to
-	care about never actually matters for any input this file produces. '''
-	with compiler.panic_arithmetic( 'unreachable: divisors are non-zero literals, year is in a small current-era window' ):
-		y: i64 = i64( year )
-		if month <= 2:
-			y -= 1
-		era: i64 = y // 400
-		yoe: i64 = y - era * 400
-		mp: i64 = ( i64( month ) + 9 ) % 12
-		doy: i64 = ( 153 * mp + 2 ) // 5 + i64( day ) - 1
-		doe: i64 = yoe * 365 + yoe // 4 - yoe // 100 + doy
-		return era * 146097 + doe - 719468
-
-
 def _nth_weekday_epoch_seconds(
 	year: i32, month: i32, day_of_week: i32, nth: i32,
 	hour: i32, minute: i32, second: i32,
@@ -212,10 +175,15 @@ def _nth_weekday_epoch_seconds(
 	own callers for how the real UTC instant is derived from it). nth is
 	1-4 for the 1st-4th occurrence in the month, 5 for the LAST occurrence -
 	Windows' own SYSTEMTIME.wDay convention for a recurring *Date field
-	(see kernel32.py's SYSTEMTIME comment). day_of_week is 0=Sunday. '''
-	first_of_month_days: i64 = _days_from_civil( year, month, 1 )
+	(see kernel32.py's SYSTEMTIME comment). day_of_week is 0=Sunday.
+	Calendar math (days_from_civil/days_in_month/floormod_i64) is shared
+	with lib/_civil_calendar.py - this file used to keep its own private,
+	narrow-windowed copies; see that module's own docstring. '''
+	first_of_month_days: i64 = days_from_civil( year, month, 1 )
+	with compiler.wrap_arithmetic:
+		shifted: i64 = first_of_month_days + 4  # 1970-01-01 was a Thursday
+	weekday_of_1st: i64 = floormod_i64( shifted, 7 )
 	with compiler.panic_arithmetic( 'unreachable: divisor is a non-zero literal' ):
-		weekday_of_1st: i64 = ( first_of_month_days + 4 ) % 7  # 1970-01-01 was a Thursday
 		delta: i64 = ( i64( day_of_week ) - weekday_of_1st + 7 ) % 7
 		first_occurrence_day: i32 = i32( 1 + delta )
 
@@ -224,11 +192,11 @@ def _nth_weekday_epoch_seconds(
 		with compiler.wrap_arithmetic:
 			day_of_month = first_occurrence_day + ( nth - 1 ) * 7
 	else:
-		days_in_month: i32 = _days_in_month( year, month )
+		month_len: i32 = days_in_month( year, month )
 		with compiler.panic_arithmetic( 'unreachable: divisor is a non-zero literal' ):
-			day_of_month = first_occurrence_day + 7 * (( days_in_month - first_occurrence_day ) // 7 )
+			day_of_month = first_occurrence_day + 7 * (( month_len - first_occurrence_day ) // 7 )
 
-	days: i64 = _days_from_civil( year, month, day_of_month )
+	days: i64 = days_from_civil( year, month, day_of_month )
 	with compiler.wrap_arithmetic:
 		return days * 86400 + i64( hour ) * 3600 + i64( minute ) * 60 + i64( second )
 
