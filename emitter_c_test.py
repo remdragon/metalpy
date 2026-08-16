@@ -943,12 +943,16 @@ class FallibleInitConstructionRCLifetimeTests( test_support.RealCompileMixin, Co
 	   through cfg.decref()+manually_decreffed(), mirroring
 	   _lower_compiler_decref's own compiler.decref(x) handling exactly.
 
-	Every case below loops hundreds of times with a real heap allocation per
-	iteration (matching this codebase's own rc_lifetime_repeated_*_no_leak
-	convention above) rather than checking just one iteration: a single
-	double-free doesn't reliably corrupt the heap badly enough to crash
-	immediately, but repetition makes both directions (double-free AND any
-	leak from an over-corrected fix) show up reliably. '''
+	Every RC-lifetime case below loops hundreds of times with a real heap
+	allocation per iteration (matching this codebase's own
+	rc_lifetime_repeated_*_no_leak convention above) rather than checking
+	just one iteration: a single double-free doesn't reliably corrupt the
+	heap badly enough to crash immediately, but repetition makes both
+	directions (double-free AND any leak from an over-corrected fix) show up
+	reliably. The final case (fallible_construction_as_direct_match_subject)
+	is unrelated to RC lifetime - it's a compiler-crash (AssertionError)
+	regression in type_resolver.py's visit_Match, deterministic on the first
+	attempt, so it doesn't need the loop convention. '''
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
@@ -1096,6 +1100,41 @@ def main() -> i32:
 	if not r.is_err():
 		return 1
 	return 0
+''' ),
+			# a wholly separate bug from the RC/double-free ones above: a
+			# fallible construction used DIRECTLY as a match statement's own
+			# subject (`match Box(5):`), never bound to a variable first. type_
+			# resolver.py's visit_Match built its synthesized `__match_subj_N =
+			# <subject>` assignment via generic_visit_expr(node.subject), which
+			# only visits the subject expression's own CHILDREN (ast.
+			# NodeTransformer.generic_visit's own semantics when called
+			# directly on an expr, rather than on its parent statement) - so a
+			# Call subject's own visit_Call, which is what actually resolves
+			# __init__ (sets resolved_construction / clears Function.resolve),
+			# never ran. lowering.py's _try_lower_construct_call then hit its
+			# own `assert init.resolve is None` sentinel meant to catch exactly
+			# that unresolved state - a compiler crash (AssertionError), not a
+			# runtime one. Fixed by dispatching through self.visit(node.
+			# subject) instead, matching how every other statement
+			# (visit_Assign, visit_AnnAssign, ...) already visits ITS OWN child
+			# expressions via generic_visit(self) called on the PARENT node
+			( 'fallible_construction_as_direct_match_subject', '''
+class MyError:
+	pass
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		match Box( 5 ):
+			case Result.Ok( b ):
+				return b.v - 5
+			case Result.Err( e ):
+				return 99
 ''' ),
 		] )
 
