@@ -51,12 +51,11 @@ class WideIntBehaviorTests( unittest.TestCase ):
 			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
 			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
-			libs = set( compiler.extern_libs )
 			ldflags = ''
-			for lib in sorted( libs ):
+			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )

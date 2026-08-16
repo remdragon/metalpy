@@ -658,10 +658,7 @@ class RCClassSubclassingPhase1Tests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -2534,10 +2531,7 @@ class SizeofValueArgumentRealCompileTests( RCClassTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -2896,7 +2890,7 @@ def main() -> i32:
 			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
@@ -3185,10 +3179,7 @@ class FastLockCompileRunTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -3243,10 +3234,7 @@ class StrUpperLowerTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -3464,10 +3452,7 @@ class InterfaceCStructLayoutTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -4256,10 +4241,7 @@ class UnsafeListGenericTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -10051,10 +10033,7 @@ class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:

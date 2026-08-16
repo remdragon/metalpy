@@ -58,12 +58,11 @@ class FloatBehaviorTests( unittest.TestCase ):
 			# already has whatever the generated boilerplate itself needs too
 			# (kernel32 on a no-CRT Windows build - windows._console/sys.exit
 			# are compiler-forced reachable, see Compiler.force_reachable)
-			libs = set( compiler.extern_libs )
 			ldflags = ''
-			for lib in sorted( libs ):
+			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )

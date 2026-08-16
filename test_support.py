@@ -195,12 +195,13 @@ class RealCompileMixin:
 
 	def _extern_ldflags( self, compiler: Compiler ) -> str:
 		''' derive linker flags from compiler.extern_libs, matching mpy.py's
-		own link step. 'c' is the CRT, handled by the compiler/link defaults. '''
+		own link step (including linker_c.resolve_lib_ldflag's ntdll special
+		case). 'c' is the CRT, handled by the compiler/link defaults. '''
 		flags: list[str] = []
 		for lib in sorted( compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			flags.append( f'{lib}.lib' if _CC is not None and _CC.name == 'cl' else f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _build_and_run( self, compiler: Compiler, c_source: str, timeout: float | None ) -> subprocess.CompletedProcess:
