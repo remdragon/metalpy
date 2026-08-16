@@ -10885,14 +10885,23 @@ def main() -> i32:
 			# shapes must all produce the SAME bit-exact underlying value for
 			# the identical logical error code, and a plain assignment back
 			# to the enum's own value_type (already-established, unrelated
-			# CEnum<->value_type duality) must read that same value back out
+			# CEnum<->value_type duality) must read that same value back out.
+			# OSError's own value_type is platform-dependent (lib/builtins/
+			# __errors.py: u32 on Windows, i32 on Linux) - a fixed `v_name:
+			# u32` readback only type-checks on the Windows build, so this is
+			# gated the same way OSError's OWN declaration is (two
+			# @compiler.target(os=...)-filtered variants of one function,
+			# only one of which is ever actually compiled for a given
+			# target), rather than hardcoding one platform's width and
+			# silently only ever exercising this consistency check there.
 			( 'enum_constructor_argument_shapes_agree_bit_exactly', '''
 import compiler
 
 def get_rc() -> i32:
 	return -5
 
-def main() -> i32:
+@compiler.target( os = 'windows' )
+def check_argument_shapes() -> i32:
 	rc: i32 = -5
 	e_name: OSError = OSError( rc )
 	e_call: OSError = OSError( get_rc() )
@@ -10914,20 +10923,63 @@ def main() -> i32:
 	if e_member != OSError.FileNotFoundError:
 		return 4
 	return 0
+
+@compiler.target( os = not 'windows' )
+def check_argument_shapes() -> i32:
+	rc: i32 = -5
+	e_name: OSError = OSError( rc )
+	e_call: OSError = OSError( get_rc() )
+	with compiler.wrap_arithmetic:
+		e_binop: OSError = OSError( rc + 0 )
+	e_member: OSError = OSError.FileNotFoundError
+
+	v_name: i32 = e_name
+	v_call: i32 = e_call
+	v_binop: i32 = e_binop
+	expected: i32 = -5
+
+	if v_name != expected:
+		return 1
+	if v_call != expected:
+		return 2
+	if v_binop != expected:
+		return 3
+	if e_member != OSError.FileNotFoundError:
+		return 4
+	return 0
+
+def main() -> i32:
+	return check_argument_shapes()
 ''' ),
 			# a routed-through-a-parameter shape (not just a local) - the
 			# task's own report specifically called out that this ALSO
-			# failed identically (not a locals-vs-parameters distinction)
+			# failed identically (not a locals-vs-parameters distinction).
+			# Same platform-dependent value_type split as the case above -
+			# OSError's value_type is u32 on Windows, i32 on Linux.
 			( 'bare_name_parameter_argument_to_enum_constructor_compiles_and_runs', '''
+import compiler
+
 def mk( code: i32 ) -> OSError:
 	return OSError( code )
 
-def main() -> i32:
+@compiler.target( os = 'windows' )
+def check_parameter_shape() -> i32:
 	e: OSError = mk( -5 )
 	v: u32 = e
 	if v != u32( -5 ):
 		return 1
 	return 0
+
+@compiler.target( os = not 'windows' )
+def check_parameter_shape() -> i32:
+	e: OSError = mk( -5 )
+	v: i32 = e
+	if v != -5:
+		return 1
+	return 0
+
+def main() -> i32:
+	return check_parameter_shape()
 ''' ),
 			# the literal fast path (unaffected by this fix) - still folds to
 			# a plain constant and still range-checks correctly
