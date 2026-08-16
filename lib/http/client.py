@@ -1,8 +1,6 @@
 '''
-HTTP wire-format primitives - the zero-prerequisite "Phase 0" slice of
-PLAN_HTTP_CLIENT.md. Everything here is a pure str/bytes transform with no
-socket or buffered-I/O dependency, so it can be built and tested before the
-socket library (a separate, parallel effort) lands.
+HTTP wire-format primitives, plus a low-level one-connection-at-a-time client
+(HTTPConnection/Response) built on lib/socket.py - see PLAN_HTTP_CLIENT.md.
 
 HTTPError       - error type shared by every function/class below
 HTTPHeaders     - ordered, case-insensitive multimap for request/response headers
@@ -12,14 +10,21 @@ parse_headers      - a raw CRLF-joined header block -> HTTPHeaders
 percent_encode     - RFC 3986 percent-encoding of a str's UTF-8 bytes
 base64_encode      - standard (padded) base64 encoding of bytes, for auth=
 decode_chunked     - decodes an already-fully-buffered chunked-transfer body
+HTTPConnection     - connect/request/getresponse/close over one TCP connection
+Response           - status_code/reason/headers/content of a received response
 
-Session/Response/request() (the socket-dependent pieces - Phase 1-3 of
-PLAN_HTTP_CLIENT.md) are not part of this file yet.
+host is an IP literal only for now (lib/socket.py itself has no DNS/
+getaddrinfo yet - see that file's own header comment and this plan's own
+"Socket surface" section). requests-style Session (cookie jar, redirects,
+params=/data=/json=/auth=, module-level get()/post()/...) is a separate,
+not-yet-started layer on top of HTTPConnection - see PLAN_HTTP_CLIENT.md's
+Phase 3b.
 '''
 
 import sys
 import compiler
 import base64
+from socket import Socket
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -350,3 +355,364 @@ def decode_chunked( data: bytes ) -> Result[bytes, HTTPError]:
 			pos = data_start + size + 2
 
 	return Result.Ok( bytes.from_bytearray( move( out )))
+
+# ---------------------------------------------------------------------------
+# small integer <-> str helpers - int (the boxed arbitrary-precision type)
+# only converts from/to i32 (lib/builtins/__int.py), not usize, and a
+# Content-Length can legitimately need the full usize range - spelled out
+# directly rather than routed through int, matching this codebase's own
+# established "ASCII digits by hand" idiom (see lib/builtins/__int.py's own
+# _ASCII_ZERO-based from_str/digit-count code).
+# ---------------------------------------------------------------------------
+
+_ASCII_ZERO: u8 = 0x30
+_ASCII_NINE: u8 = 0x39
+
+def _usize_to_str( n: usize ) -> str:
+	if n == 0:
+		return '0'
+	digits: bytearray = bytearray( 20 ) # a u64 fits in at most 20 decimal digits
+	d_ptr: Ptr[u8] = digits.get_ptr()
+	count: usize = 0
+	v: usize = n
+	with compiler.panic_arithmetic( 'usize has at most 20 decimal digits, divisor is a nonzero literal' ):
+		while v > 0:
+			d_ptr[count] = u8( v % 10 ) + _ASCII_ZERO
+			v = v // 10
+			count += 1
+	with compiler.panic_arithmetic( 'count is bounded by 20, cannot overflow' ):
+		out: bytearray = bytearray( count + 1 ) # +1 zero terminator
+	out_ptr: Ptr[u8] = out.get_ptr()
+	i: usize = 0
+	with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+		while i < count:
+			out_ptr[i] = d_ptr[ count - 1 - i ] # digits were built least-significant-first
+			i += 1
+	return str.from_cstr( move( out )).unwrap( '_usize_to_str: unreachable - pure ASCII digits' )
+
+def _usize_from_str( s: str ) -> Result[usize, HTTPError]:
+	if s.byte_len() == 0:
+		return Result.Err( HTTPError.MalformedHeader( None ))
+	cstr: ConstPtr[u8] = s.get_cstr()
+	n: usize = s.byte_len()
+	value: usize = 0
+	i: usize = 0
+	with compiler.panic_arithmetic( 'a Content-Length within usize range' ):
+		while i < n:
+			ch: u8 = cstr[i]
+			if ch < _ASCII_ZERO or ch > _ASCII_NINE:
+				return Result.Err( HTTPError.MalformedHeader( None ))
+			value = value * 10 + usize( ch - _ASCII_ZERO )
+			i += 1
+	return Result.Ok( value )
+
+# ---------------------------------------------------------------------------
+# _GrowableBuffer - accumulates bytes read off a Socket across multiple
+# recv() calls. bytearray() itself is fixed-size at construction (see lib/
+# builtins/__init__.py) with no append/extend, so this is a small hand-
+# rolled doubling buffer, the same "count/allocate-exact/fill" discipline
+# used throughout this codebase, just amortized across repeated growth
+# instead of computed once up front - the total size isn't known ahead of
+# time here (it depends on how many recv() calls a response takes).
+# ---------------------------------------------------------------------------
+
+class _GrowableBuffer:
+	__data: Ptr[u8]
+	__len: usize
+	__cap: usize
+
+	def __init__( self ) -> None:
+		self.__cap = 4096
+		self.__data = sys.alloc[u8]( self.__cap )
+		self.__len = 0
+
+	def __del__( self ) -> None:
+		sys.free( self.__data )
+
+	def len( self ) -> usize:
+		return self.__len
+
+	def _grow( self, min_additional: usize ) -> None:
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			needed: usize = self.__len + min_additional
+		if needed <= self.__cap:
+			return
+		new_cap: usize = self.__cap
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			while new_cap < needed:
+				new_cap = new_cap * 2
+		new_data: Ptr[u8] = sys.alloc[u8]( new_cap )
+		sys.memcpy( new_data, self.__data, self.__len )
+		sys.free( self.__data )
+		self.__data = new_data
+		self.__cap = new_cap
+
+	def fill_from( self, sock: Socket ) -> Result[usize, OSError]:
+		''' one recv() call, appended to the buffer. Returns the number of
+		bytes read - 0 means the peer closed the connection. '''
+		self._grow( 4096 )
+		with compiler.wrap_arithmetic:
+			dest: Ptr[u8] = self.__data + self.__len
+			room: usize = self.__cap - self.__len
+		n: usize = sock.recv( dest, room ).or_return()
+		with compiler.wrap_arithmetic:
+			self.__len += n
+		return Result.Ok( n )
+
+	def find_double_crlf( self, start: usize ) -> Result[usize, IndexError]:
+		''' offset of the first "\\r\\n\\r\\n" at or after start, or Err if
+		not (yet) present - the header/body boundary. '''
+		if self.__len < 4:
+			return Result.Err( IndexError() )
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			last_start: usize = self.__len - 4
+		i: usize = start
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			while i <= last_start:
+				if self.__data[i] == _CR and self.__data[i+1] == _LF and self.__data[i+2] == _CR and self.__data[i+3] == _LF:
+					return Result.Ok( i )
+				i += 1
+		return Result.Err( IndexError() )
+
+	def slice_bytes( self, start: usize, end: usize ) -> bytes:
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			n: usize = end - start
+			src: ConstPtr[u8] = self.__data + start
+		out: bytearray = bytearray( n )
+		sys.memcpy( out.get_ptr(), src, n )
+		return bytes.from_bytearray( move( out ))
+
+	def slice_str( self, start: usize, end: usize ) -> Result[str, CodecError]:
+		# NOT str.from_cstr(ptr, size) - that overload requires the SOURCE
+		# buffer to already be null-terminated at size-1 (confirmed directly:
+		# it copies `size` bytes as-is and rejects a nonzero last byte), and
+		# this buffer's raw network bytes have no such terminator anywhere.
+		# bytearray(n+1) is zero-filled by construction (see lib/builtins/
+		# __init__.py's bytearray.__init__) and never written at its own
+		# last index below, so it's null-terminated by construction instead -
+		# same approach percent_encode/base64_encode above already use.
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			n: usize = end - start
+			src: ConstPtr[u8] = self.__data + start
+			buf_size: usize = n + 1
+		out: bytearray = bytearray( buf_size )
+		sys.memcpy( out.get_ptr(), src, n )
+		return str.from_cstr( move( out ))
+
+# ---------------------------------------------------------------------------
+# request building / sending
+# ---------------------------------------------------------------------------
+
+def _build_request_head( method: str, path: str, host: str, headers: HTTPHeaders|None, body: bytes|None ) -> str:
+	head: str = method + ' ' + path + ' HTTP/1.1\r\n' + 'Host: ' + host + '\r\n'
+	if headers is not None:
+		n: usize = headers.__len__()
+		i: usize = 0
+		for i in range( n ):
+			name: str = headers.name_at( i ).unwrap( '_build_request_head: index in bounds by construction' )
+			value: str = headers.value_at( i ).unwrap( '_build_request_head: index in bounds by construction' )
+			head = head + name + ': ' + value + '\r\n'
+	if body is not None:
+		head = head + 'Content-Length: ' + _usize_to_str( body.__len__() ) + '\r\n'
+	return head + '\r\n'
+
+# Every socket-facing call in this file is funneled through one of the
+# _*_or_http_err helpers below rather than propagated as a bare OSError via
+# .or_return()/Result.Err(e). Confirmed by a real compile: widening a bare
+# @union error type (HTTPError) - or a value of it, staged through an
+# explicitly-typed local, or via .or_return() - into a WIDER union return
+# type (OSError|HTTPError) is broken in at least three different ways here
+# (ambiguous generic inference on Result.Err(e); "expected
+# OSError|HTTPError, got HTTPError" on the staging assignment itself). lib/
+# socket.py's own OSError, a plain @enum (not @union), does NOT hit this -
+# only HTTPError does. Rather than chase a compiler fix, every public
+# HTTPConnection method just returns a bare Result[_, HTTPError] throughout,
+# collapsing any OSError from lib/socket.py into HTTPError.Other() at the
+# one place each Socket call happens - simpler than it sounds, and it also
+# means HTTPConnection's own public error type stays a single, simple
+# HTTPError instead of leaking lib/socket.py's OSError as part of its API.
+
+def _connect_or_http_err( host: str, port: u16 ) -> Result[Socket, HTTPError]:
+	match Socket.tcp():
+		case Result.Ok( sock ):
+			match sock.connect( host, port ):
+				case Result.Ok( _ ):
+					return Result.Ok( sock )
+				case Result.Err( _ ):
+					return Result.Err( HTTPError.Other( None ))
+		case Result.Err( _ ):
+			return Result.Err( HTTPError.Other( None ))
+
+def _send_or_http_err( sock: Socket, ptr: ConstPtr[u8], length: usize ) -> Result[usize, HTTPError]:
+	match sock.send( ptr, length ):
+		case Result.Ok( n ):
+			return Result.Ok( n )
+		case Result.Err( _ ):
+			return Result.Err( HTTPError.Other( None ))
+
+def _fill_or_http_err( buf: _GrowableBuffer, sock: Socket ) -> Result[usize, HTTPError]:
+	match buf.fill_from( sock ):
+		case Result.Ok( n ):
+			return Result.Ok( n )
+		case Result.Err( _ ):
+			return Result.Err( HTTPError.Other( None ))
+
+def _send_all( sock: Socket, ptr: ConstPtr[u8], length: usize ) -> Result[None, HTTPError]:
+	sent: usize = 0
+	with compiler.panic_arithmetic( 'bounded by length, cannot overflow' ):
+		while sent < length:
+			n: usize = _send_or_http_err( sock, ptr + sent, length - sent ).or_return()
+			if n == 0:
+				return Result.Err( HTTPError.UnexpectedEOF( None ))
+			sent += n
+	return Result.Ok( None )
+
+# ---------------------------------------------------------------------------
+# Response - the result of HTTPConnection.getresponse()
+# ---------------------------------------------------------------------------
+
+class Response:
+	status_code: u16
+	reason: str
+	headers: HTTPHeaders
+	content: bytes
+
+	def __init__( self, status_code: u16, reason: str, headers: HTTPHeaders, content: bytes ) -> None:
+		self.status_code = status_code
+		self.reason = reason
+		self.headers = headers
+		self.content = content
+
+	def text( self ) -> Result[str, CodecError]:
+		return self.content.decode()
+
+	def ok( self ) -> bool:
+		return self.status_code < 400
+
+# ---------------------------------------------------------------------------
+# response body reading - one function per Content-Length/chunked/until-
+# close strategy. Split out of getresponse() itself (rather than inlined
+# per-branch) so each has a single, straight-line return path - definite-
+# assignment tracking for a shared post-if local reassigned from inside a
+# nested `while True: ... break` didn't hold up under a real compile.
+# ---------------------------------------------------------------------------
+
+def _read_chunked_body( sock: Socket, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
+	with compiler.panic_arithmetic( 'a real chunked body fits well within usize' ):
+		while True:
+			body_bytes: bytes = buf.slice_bytes( body_start, buf.len() )
+			match decode_chunked( body_bytes ):
+				case Result.Ok( d ):
+					return Result.Ok( d )
+				case Result.Err( HTTPError.ChunkSizeInvalid( _ )):
+					return Result.Err( HTTPError.ChunkSizeInvalid( None ))
+				case Result.Err( _ ):
+					pass # UnexpectedEOF - not a full chunked body yet, keep reading
+			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			if n == 0:
+				return Result.Err( HTTPError.UnexpectedEOF( None ))
+
+def _read_content_length_body( sock: Socket, buf: _GrowableBuffer, body_start: usize, content_length: usize ) -> Result[bytes, HTTPError]:
+	with compiler.panic_arithmetic( 'a real Content-Length body fits well within usize' ):
+		while True:
+			with compiler.panic_arithmetic( 'bounded by buf.len(), cannot overflow' ):
+				have: usize = buf.len() - body_start
+			if have >= content_length:
+				break
+			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			if n == 0:
+				return Result.Err( HTTPError.UnexpectedEOF( None ))
+	with compiler.wrap_arithmetic:
+		body_end: usize = body_start + content_length
+	return Result.Ok( buf.slice_bytes( body_start, body_end ))
+
+def _read_until_close_body( sock: Socket, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
+	with compiler.panic_arithmetic( 'a real response body fits well within usize' ):
+		while True:
+			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			if n == 0:
+				break
+	return Result.Ok( buf.slice_bytes( body_start, buf.len() ))
+
+# ---------------------------------------------------------------------------
+# HTTPConnection - one TCP connection, one request/response at a time.
+# Mirrors lib/builtins/__File.py's handle shape: an owned resource field (a
+# Socket, itself already RC-managed with its own auto-closing __del__ - no
+# HTTPConnection.__del__ needed, the field's own teardown cascades), a
+# private constructor, ordinary Result-returning methods.
+# ---------------------------------------------------------------------------
+
+class HTTPConnection:
+	__sock: Socket
+	__host: str
+	__port: u16
+
+	def close( self ) -> None:
+		self.__sock.close()
+
+	@staticmethod
+	def connect( host: str, port: u16 = 80 ) -> Result[HTTPConnection, HTTPError]:
+		''' host must be an IP literal for now - lib/socket.py has no DNS/
+		getaddrinfo yet (see this file's own module docstring). '''
+		sock: Socket = _connect_or_http_err( host, port ).or_return()
+		return Result.Ok( HTTPConnection.__allocate__( __sock = sock, __host = host, __port = port ))
+
+	def request( self, method: str, path: str, headers: HTTPHeaders|None = None, body: bytes|None = None ) -> Result[None, HTTPError]:
+		head: str = _build_request_head( method, path, self.__host, headers, body )
+		head_bytes: bytes = head.encode().unwrap( '_build_request_head: unreachable - pure ASCII output' )
+		_send_all( self.__sock, head_bytes.get_const_ptr(), head_bytes.__len__() ).or_return()
+		if body is not None:
+			content: bytes = body
+			_send_all( self.__sock, content.get_const_ptr(), content.__len__() ).or_return()
+		return Result.Ok( None )
+
+	def getresponse( self ) -> Result[Response, HTTPError]:
+		buf: _GrowableBuffer = _GrowableBuffer()
+
+		# --- read until the status-line+headers block is fully buffered ---
+		header_end: usize = 0
+		with compiler.panic_arithmetic( 'a real HTTP response header block fits well within usize' ):
+			while True:
+				found: Result[usize, IndexError] = buf.find_double_crlf( 0 )
+				match found:
+					case Result.Ok( offset ):
+						header_end = offset
+						break
+					case Result.Err( _ ):
+						pass
+				n: usize = _fill_or_http_err( buf, self.__sock ).or_return()
+				if n == 0:
+					return Result.Err( HTTPError.UnexpectedEOF( None ))
+
+		header_block: str = buf.slice_str( 0, header_end ).unwrap( 'getresponse: invalid UTF-8 in status line/headers' )
+		with compiler.wrap_arithmetic:
+			body_start: usize = header_end + 4
+
+		first: tuple[str,str,str] = header_block.partition( '\r\n' )
+		status_line: str = first[0]
+		rest_headers: str = first[2]
+
+		parsed_status: tuple[str,u16,str] = parse_status_line( status_line ).or_return()
+		headers: HTTPHeaders = parse_headers( rest_headers ).or_return()
+
+		# --- read the body, per whichever length strategy the headers say ---
+		transfer_encoding: str|None = headers.get( 'Transfer-Encoding' )
+		is_chunked: bool = False
+		if transfer_encoding is not None:
+			te: str = transfer_encoding
+			is_chunked = te.lower() == 'chunked'
+
+		content: bytes = bytes.from_bytearray( move( bytearray( 0 )))
+		if is_chunked:
+			content = _read_chunked_body( self.__sock, buf, body_start ).or_return()
+		else:
+			content_length_str: str|None = headers.get( 'Content-Length' )
+			if content_length_str is not None:
+				cl: str = content_length_str
+				content_length: usize = _usize_from_str( cl ).or_return()
+				content = _read_content_length_body( self.__sock, buf, body_start, content_length ).or_return()
+			else:
+				# no Content-Length, not chunked - read until the peer closes
+				content = _read_until_close_body( self.__sock, buf, body_start ).or_return()
+
+		return Result.Ok( Response( parsed_status[1], parsed_status[2], headers, content ))

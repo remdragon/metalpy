@@ -182,5 +182,155 @@ def main() -> i32:
 		])
 
 
+class HTTPConnectionLoopbackTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' real-compile-and-run tests for HTTPConnection/Response (see
+	PLAN_HTTP_CLIENT.md's Phase 3a) over an actual loopback TCP connection -
+	a background thread (lib/threading.py) plays a minimal HTTP server
+	(bind/listen/accept/recv/send via lib/socket.py directly), the main
+	thread is the HTTPConnection client. Kept in a separate assert_programs_
+	run cluster from HTTPClientPhase0Tests above (real sockets/threads, not
+	pure in-memory string/bytes transforms). '''
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile http.client tests' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'get_request_content_length_body_and_headers', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import HTTPConnection, Response, HTTPError
+
+class EchoServer:
+	port: u16
+	ready: Atomic[bool]
+	ok: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.ok = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				conn.recv( buf.get_ptr(), 4096 ).unwrap( 'server: recv' )
+				response: str = 'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 5\\r\\n\\r\\nhello'
+				rb: bytes = response.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+				self.ok.store( True )
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: EchoServer = EchoServer( u16( 18765 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	conn: HTTPConnection = HTTPConnection.connect( '127.0.0.1', u16( 18765 )).unwrap( 'client connect' )
+	conn.request( 'GET', '/', None, None ).unwrap( 'client request' )
+	resp: Response = conn.getresponse().unwrap( 'client getresponse' )
+	conn.close()
+	t.join()
+
+	if not server.ok.load():
+		return 1
+	if resp.status_code != 200:
+		return 2
+	body: str = resp.text().unwrap( 'text' )
+	if body != 'hello':
+		return 3
+	ct: str|None = resp.headers.get( 'Content-Type' )
+	match ct:
+		case None:
+			return 4
+		case _:
+			if ct != 'text/plain':
+				return 5
+	return 0
+''' ),
+			( 'get_request_chunked_body', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import HTTPConnection, Response, HTTPError
+
+class ChunkedServer:
+	port: u16
+	ready: Atomic[bool]
+	ok: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.ok = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				conn.recv( buf.get_ptr(), 4096 ).unwrap( 'server: recv' )
+				response: str = 'HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n4\\r\\nWiki\\r\\n5\\r\\npedia\\r\\n0\\r\\n\\r\\n'
+				rb: bytes = response.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+				self.ok.store( True )
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: ChunkedServer = ChunkedServer( u16( 18766 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	conn: HTTPConnection = HTTPConnection.connect( '127.0.0.1', u16( 18766 )).unwrap( 'client connect' )
+	conn.request( 'GET', '/', None, None ).unwrap( 'client request' )
+	resp: Response = conn.getresponse().unwrap( 'client getresponse' )
+	conn.close()
+	t.join()
+
+	if not server.ok.load():
+		return 1
+	if resp.status_code != 200:
+		return 2
+	body: str = resp.text().unwrap( 'text' )
+	if body != 'Wikipedia':
+		return 3
+	return 0
+''' ),
+			( 'connect_refused_surfaces_as_err', '''
+from http.client import HTTPConnection, HTTPError
+
+def main() -> i32:
+	result: Result[HTTPConnection, HTTPError] = HTTPConnection.connect( '127.0.0.1', u16( 18767 )) # nothing listening
+	if result.is_ok():
+		return 1
+	return 0
+''' ),
+		])
+
+
 if __name__ == '__main__':
 	unittest.main()

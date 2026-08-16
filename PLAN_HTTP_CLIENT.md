@@ -89,28 +89,41 @@ Current state of prerequisites
     variants yet. The socket library will need to add ConnectionReset, TimedOut,
     HostUnreachable, and NameResolutionFailed equivalents on both platforms.
 
-Minimal socket surface required (handoff contract for the socket-planning session)
+Socket surface — what actually landed (lib/socket.py, commit 863bfc8)
 
-http.client only needs blocking, synchronous TCP stream sockets — no UDP, no
-async/select. Concretely:
+The handoff contract below is superseded by this section - kept for history,
+not as the current source of truth. lib/socket.py landed with a slightly
+different shape than requested, close enough to build on directly:
 
-  Socket.connect(host: str, port: u16, timeout_ms: u32|None = None)
-      -> Result[Socket, SocketError]
-    Must resolve hostnames (DNS), not just accept literal IPs.
+  Socket.tcp( family: i32 = AF_INET ) -> Result[Socket, OSError]
+    Two-step construction (create, then connect), not a single
+    Socket.connect(host,port) factory.
+  socket.connect( host: str, port: u16 ) -> Result[None, OSError]
+  socket.send( buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]
+  socket.recv( buf: Ptr[u8], count: usize ) -> Result[usize, OSError]
+  socket.close(), __del__ auto-close — same idiom as BinaryReader/BinaryWriter.
 
-  socket.send(buf: ConstPtr[u8], count: usize) -> Result[usize, SocketError]
-  socket.recv(buf: Ptr[u8], count: usize) -> Result[usize, SocketError]
-    Same shape as fs.py's write_raw/read_raw. recv returning 0 means peer closed.
+Two real gaps versus what was asked for, both accepted as-is rather than
+reworked, for the reasons below:
 
-  socket.close(), and __del__ auto-closing — same idiom as BinaryReader/BinaryWriter
-    in lib/builtins/__File.py.
-
-  A SocketError @enum (Windows/POSIX @compiler.target pair, same pattern as OSError)
-    with at least: ConnectionRefused, ConnectionReset, TimedOut, HostUnreachable,
-    NameResolutionFailed, Other.
-
-Anything beyond this (SO_REUSEADDR, non-blocking mode, UDP, raw sockets) is not
-needed by http.client v1.
+  - No SocketError - errors are plain OSError (OSError(get_errno())/
+    OSError(WSAGetLastError()) raw-code construction, same as lib/fs.py).
+    OSError's own named variants (FileNotFoundError/AccessDenied/BrokenPipe/
+    Invalid/Other) don't cover network-specific codes like ConnectionRefused,
+    so any such failure just surfaces as OSError.Other - no fine-grained
+    categorization for v1. Good enough: http.client only needs to know
+    Ok-vs-Err here, not distinguish refused-vs-reset-vs-timeout yet.
+  - No timeout_ms parameter at all (blocking-only, no timeout support
+    anywhere in lib/socket.py yet). http.client's own timeout_ms= parameter
+    (see the Session.request() sketch below) stays reserved/no-op until
+    lib/socket.py itself grows timeout support - not blocking on it now.
+  - No DNS/getaddrinfo - lib/socket.py's own header comment states this
+    outright: "host a pre-resolved IPv4/IPv6 literal ... a self-contained
+    follow-up." Real hostnames (not IP literals) don't work yet. Flagged as
+    its own follow-up task (see task_a8b4e7c3 / "Add DNS/getaddrinfo
+    resolution to lib/socket.py"). Not a blocker for building/testing
+    HTTPConnection today: loopback testing against 127.0.0.1 (a literal)
+    works fine without it - only real-hostname support is blocked.
 
 Header representation — skip email.message for v1
 
@@ -121,6 +134,36 @@ in lib/http/client.py — an ordered, case-insensitive string multimap, matching
 everything an HTTP client needs without pulling in MIME semantics. If a real
 email.message ever lands for the smtp/email-parsing stdlib goals, http.client can
 be revisited to reuse it, but shouldn't block on that landing first.
+
+HTTPConnection/Response (Phase 3a — this is the layer actually being implemented
+now that Phase 1/2 are unblocked; not in the original sketch below, which jumped
+straight to Session):
+
+  class HTTPConnection:
+      __sock: Socket
+      __host: str
+      __port: u16
+
+      def __del__( self ) -> None: ...
+      @staticmethod
+      def connect( host: str, port: u16 = 80 ) -> Result[HTTPConnection, OSError]: ...
+      def request( self, method: str, path: str, headers: HTTPHeaders|None = None,
+          body: bytes|None = None ) -> Result[None, OSError]: ...
+      def getresponse( self ) -> Result[Response, HTTPError]: ...
+      def close( self ) -> None: ...
+
+  class Response:
+      status_code: u16
+      reason: str
+      headers: HTTPHeaders
+      content: bytes
+      def text( self ) -> Result[str, CodecError]: ...
+      def ok( self ) -> bool: ...
+
+Body reading (inside getresponse()) picks Content-Length, chunked (via Phase 0's
+decode_chunked), or read-until-close, matching HTTP/1.1 semantics for how a
+response body's own length is determined. host is an IP literal only for now
+(see "Socket surface" above) - real hostnames wait on task_a8b4e7c3.
 
 Draft API sketch (lib/http/client.py — NOT compilable yet, pins the surface only)
 
@@ -212,21 +255,66 @@ set — unlike CPython's stdlib http.client (which leaves that to urllib), match
 
 Implementation plan (phased, for once this moves from scoping to real work)
 
-  Phase 0 — pure functions, zero prerequisites, buildable NOW: HTTP status-line
-    parsing, header-line parsing into HTTPHeaders, chunked transfer-encoding
-    decode, request-line/header serialization, minimal URL splitting +
-    percent-encoding (for params=/form data=), base64 (for auth=).
+  Phase 0 — landed: HTTPError, HTTPHeaders, status-line/header-line parsing,
+    percent-encoding, base64 encoding (now a thin wrapper around lib/base64.py,
+    which landed after this file's own hand-rolled version - see that module),
+    chunked transfer-encoding decode. Covered by http_client_test.py's
+    HTTPClientPhase0Tests.
 
-  Phase 1 — blocked on socket library landing (parallel session, contract above).
+  Phase 1 — landed: lib/socket.py (commit 863bfc8). IP-literal-only (no DNS yet -
+    see "Socket surface" above and task_a8b4e7c3), sufficient for loopback testing.
 
-  Phase 2 — small private buffered-read helper over a raw socket (peek/read-exact/
-    read-until-chunk-boundary), local to lib/http/client.py.
+  Phase 2 — landed: _GrowableBuffer, a private doubling byte buffer local to
+    lib/http/client.py that accumulates recv() output across multiple calls
+    (find_double_crlf/slice_bytes/slice_str). Folded into Phase 3a below rather
+    than landing separately - the two were implemented and tested together.
 
-  Phase 3 — wire Phase 0 + 1 + 2 into Session.request()/Response, including the
-    cookie jar and redirect-following loop.
+  Phase 3a — landed: HTTPConnection (connect/request/getresponse/close) and
+    Response (status_code, reason, headers, content, text(), ok()). Wires
+    Phase 0 + 1 + 2 together; body reading picks Content-Length, chunked, or
+    read-until-close per RFC 7230. Every public method returns a bare
+    Result[_, HTTPError] (see "A real compiler gap found while landing Phase
+    3a" below - OSError from lib/socket.py collapses into HTTPError.Other()
+    rather than being part of the public error type). Does NOT include
+    Session's own ergonomics (params=/data=/json=/cookies=/auth=/redirects,
+    module-level get/post/...) - see Phase 3b. Covered by http_client_test.py's
+    HTTPConnectionLoopbackTests: a real loopback TCP round trip (background
+    thread plays a minimal server via lib/socket.py directly) for both a
+    Content-Length body and a chunked body, plus a connection-refused error
+    path. host is still an IP literal only (see Phase 1).
+
+  Phase 3b (separate future pass) — Session, wrapping HTTPConnection: cookie jar,
+    redirect-following loop, params=/data=/json=/auth= encoding, module-level
+    get()/post()/request() convenience functions. This is the bulk of the
+    "Draft API sketch" below beyond HTTPConnection/Response themselves.
+
+A real compiler gap found while landing Phase 3a
+
+Widening a bare @union error type (HTTPError) into a WIDER declared union
+return type (e.g. OSError|HTTPError) is broken, confirmed in at least three
+related ways: `.or_return()` on an HTTPError-returning call inside a function
+declared to return Result[_, OSError|HTTPError] mis-infers the target as a
+flattened union of HTTPError's own None-payload variant types instead of
+HTTPError itself; `Result.Err(e)` constructed directly from an HTTPError value
+inside such a function is "ambiguous ... inferred as both OSError|HTTPError
+and HTTPError"; and staging the value through an explicitly `OSError|HTTPError`
+-typed local first (lib/socket.py's own `_err_invalid()`-style workaround for
+an unrelated ambiguity) still fails there too ("expected OSError|HTTPError,
+got HTTPError"). lib/socket.py's own OSError (a plain @enum, not @union) widens
+into the SAME wider union just fine via `.or_return()` - the gap is specific to
+a @union member propagating into a wider union, not union-widening in general
+(union_coercion_rc_test.py's own passing tests are all T|None coercion, not
+this shape). Worked around by never declaring a union return type at all -
+every public HTTPConnection method returns a bare Result[_, HTTPError], with
+a handful of small `_*_or_http_err` helpers collapsing any OSError from lib/
+socket.py into HTTPError.Other() right at the call site (see lib/http/client.py
+'s own comment above _connect_or_http_err). Flagged as its own follow-up task
+(task_ef51cec6, "Fix @union error widening into a wider Result union" - same
+treatment as the earlier list[tuple[...]] gap, task_a8b4e7c3).
 
   Phase 4 (deferred/future plan doc) — HTTPSConnection/TLS, `json=`/`.json()` once
-    a json library exists, multipart `files=`, connection reuse.
+    a json library exists, multipart `files=`, connection reuse, real hostname
+    support once task_a8b4e7c3 (DNS) lands.
 
 Testing approach
 
