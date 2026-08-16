@@ -262,19 +262,6 @@ class SocketAddr:
 		return SocketAddr.__allocate__( __host = host, __port = port )
 
 
-# _err_invalid() — a real, pre-existing compiler bug (confirmed with a
-# minimal repro outside this file): a bare enum-member reference like
-# `OSError.Invalid` passed directly as a Result.Err(...) argument confuses
-# generic type inference between the enum and its own u32 backing type
-# ("type parameter 'E' is inferred as both builtins.OSError and
-# intrinsics.u32"). Staging the same value through an explicitly-typed local
-# first avoids it entirely, so every `Result.Err(OSError.Invalid)` in this
-# file goes through this one helper instead of the bare form.
-def _err_invalid() -> OSError:
-	err: OSError = OSError.Invalid
-	return err
-
-
 # ---------------------------------------------------------------------------
 # Address helpers — build a sockaddr from (host, port), decode one back to
 # a SocketAddr. compiler.addrof() only accepts a bare local variable (not a
@@ -288,7 +275,7 @@ def _build_sockaddr_in( host: str, port: u16 ) -> Result[SockAddrIn, OSError]:
 	ip_addr: u32 = 0
 	rc: i32 = inet_pton( AF_INET, host.get_cstr(), compiler.cast( Ptr[None], compiler.addrof( ip_addr )))
 	if rc != 1:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	with compiler.wrap_arithmetic:
 		family: u16 = u16( AF_INET )
 	return Result.Ok( SockAddrIn( sin_family = family, sin_port = _htons( port ), sin_addr = ip_addr ))
@@ -298,7 +285,7 @@ def _build_sockaddr_in6( host: str, port: u16 ) -> Result[SockAddrIn6, OSError]:
 	buf: bytearray = bytearray( 16 )
 	rc: i32 = inet_pton( AF_INET6, host.get_cstr(), compiler.cast( Ptr[None], buf.get_ptr() ))
 	if rc != 1:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	with compiler.wrap_arithmetic:
 		family: u16 = u16( AF_INET6 )
 	# bytearray has no scalar __getitem__ (only slice syntax, e.g. buf[:n] -
@@ -348,7 +335,7 @@ def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn
 	res_head: Ptr[None] = None
 	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
 	if rc != 0:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	results: list[SockAddrIn] = list[SockAddrIn]()
 	cur: Ptr[None] = res_head
 	while cur is not None:
@@ -367,7 +354,7 @@ def _resolve_v6( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn
 	res_head: Ptr[None] = None
 	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
 	if rc != 0:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	results: list[SockAddrIn6] = list[SockAddrIn6]()
 	cur: Ptr[None] = res_head
 	while cur is not None:
@@ -403,7 +390,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 	strbuf: bytearray = bytearray( 16 )  # "255.255.255.255\0" fits in 16
 	res = inet_ntop( AF_INET, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf.get_ptr(), usize( 16 ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 16 ))
 	with compiler.wrap_arithmetic:
@@ -412,7 +399,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 @compiler.target( os = not 'windows' )
 def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
@@ -420,7 +407,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 	strbuf: bytearray = bytearray( 16 )  # "255.255.255.255\0" fits in 16
 	res = inet_ntop( AF_INET, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf.get_ptr(), u32( 16 ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 16 ))
 	with compiler.wrap_arithmetic:
@@ -429,7 +416,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 
 # bytearray has no scalar __setitem__ either (same gap as __getitem__ above)
@@ -448,7 +435,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 	res = inet_ntop( AF_INET6, compiler.cast( Ptr[None], raw ), strbuf.get_ptr(), usize( 46 ))
 	sys.free( compiler.cast( Ptr[None], raw ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 46 ))
 	with compiler.wrap_arithmetic:
@@ -457,7 +444,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin6_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 @compiler.target( os = not 'windows' )
 def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
@@ -470,7 +457,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 	res = inet_ntop( AF_INET6, compiler.cast( Ptr[None], raw ), strbuf.get_ptr(), u32( 46 ))
 	sys.free( compiler.cast( Ptr[None], raw ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 46 ))
 	with compiler.wrap_arithmetic:
@@ -479,7 +466,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin6_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 
 # ---------------------------------------------------------------------------
@@ -832,7 +819,7 @@ class Socket:
 	def connect( self, host: str, port: u16 ) -> Result[None, OSError]:
 		if self.__family == AF_INET6:
 			candidates: list[SockAddrIn6] = _resolve_v6( host, port, SOCK_STREAM ).or_return()
-			last_err: OSError = _err_invalid()
+			last_err: OSError = OSError.Invalid
 			for i in range( len( candidates )):
 				addr: SockAddrIn6 = candidates.__getitem__( i ).unwrap( 'connect: candidate index' )
 				match _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr )), compiler.sizeof( SockAddrIn6 )):
@@ -843,7 +830,7 @@ class Socket:
 			return Result.Err( last_err )
 		else:
 			candidates4: list[SockAddrIn] = _resolve_v4( host, port, SOCK_STREAM ).or_return()
-			last_err4: OSError = _err_invalid()
+			last_err4: OSError = OSError.Invalid
 			for i in range( len( candidates4 )):
 				addr4: SockAddrIn = candidates4.__getitem__( i ).unwrap( 'connect: candidate index' )
 				match _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr4 )), compiler.sizeof( SockAddrIn )):
