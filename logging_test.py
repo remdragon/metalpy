@@ -11,6 +11,7 @@
 # warns against merging programs that depend on process-global one-time
 # init into a single executable.
 
+from pathlib import Path
 import unittest
 
 import test_support
@@ -63,7 +64,17 @@ def main() -> i32:
 	return 0
 '''
 
-_CUSTOM_FORMATTER_AND_FILE_HANDLER = '''
+# FileHandler appends (matching Python's own logging.FileHandler default
+# mode='a' - see lib/logging.py's own docstring), so this test's own output
+# file must be removed before AND after running, or repeated local runs
+# accumulate duplicate lines and the exact-match check below starts failing
+# on the SECOND+ run (never in a fresh checkout/CI, where the file doesn't
+# exist yet - confirmed via a real repro: first run passes, every run after
+# that fails, consistently, until the file is deleted). See
+# LoggingBehaviorTests' own setUp/tearDown.
+_FILE_HANDLER_OUTPUT_PATH = 'logging_test_output.txt'
+
+_CUSTOM_FORMATTER_AND_FILE_HANDLER = f'''
 import compiler
 import sys
 import logging
@@ -71,10 +82,10 @@ import logging
 class TagFormatter( logging.Formatter ):
 	@virtual
 	def format( self, record: logging.LogRecord ) -> str:
-		return f'[{record.name}] {record.message}'
+		return f'[{{record.name}}] {{record.message}}'
 
 def main() -> i32:
-	path: str = "logging_test_output.txt"
+	path: str = "{_FILE_HANDLER_OUTPUT_PATH}"
 
 	r = logging.FileHandler( path )
 	if r.is_err():
@@ -159,6 +170,21 @@ def main() -> i32:
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile logging tests' )
 class LoggingBehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def setUp( self ) -> None:
+		# the compiled program runs with subprocess.run's own default cwd
+		# (test_support.py's _build_and_run passes no cwd= override), which
+		# inherits the test RUNNER's cwd, not the exe's own temp directory -
+		# so _CUSTOM_FORMATTER_AND_FILE_HANDLER's relative output path
+		# lands here, not in some auto-cleaned temp dir. Removed before AND
+		# after (tearDown) rather than only one or the other: before, in
+		# case a prior interrupted run (Ctrl-C, a crash) left it behind;
+		# after, so this test doesn't leave droppings for the NEXT run
+		# (itself, or anything else that happens to look here) to trip over
+		Path( _FILE_HANDLER_OUTPUT_PATH ).unlink( missing_ok = True )
+
+	def tearDown( self ) -> None:
+		Path( _FILE_HANDLER_OUTPUT_PATH ).unlink( missing_ok = True )
+
 	def test_level_filtering( self ) -> None:
 		self.assert_programs_run([ ( 'level_filtering', _LEVEL_FILTERING ) ])
 
