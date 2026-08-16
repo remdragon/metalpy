@@ -14,29 +14,20 @@ import sys
 #       unsigned char  Data4[8];
 #   } GUID;
 #
-# Data4 is 8 separate u8 fields here, not a fixed-size array. SYNTAX.md's
-# `u8[8]`-style fixed-size inline array syntax now works for DECLARING a
-# field and zero-filling it at construction (`data4: u8[8] = 0`), but that's
-# not enough for this class: from_str() needs to set 8 independently-parsed
-# hex bytes into 8 specific positions, and __eq__/__ne__ need to compare
-# them one at a time - neither is possible yet, since element-level indexed
-# access (`f.data4[i]`) is still unimplemented ("u8[8] fields cannot be read
-# as a whole value yet (no element-level array access is implemented)",
-# confirmed by a real compile). This unrolled-fields form stays until that
-# follow-up lands.
+# Data4 is a real fixed-size inline array field (SYNTAX.md's `u8[8]` syntax),
+# matching the real Windows GUID struct's own Data4[8] layout exactly, now
+# that element-level indexed access (`f.data4[i]`, both read and write) is
+# implemented. A plain @cstruct's construction is still field=value sugar
+# only (no real __init__, and a FixedArrayType field only ever accepts a
+# `= 0` zero-fill at construction - see mpy_types.FixedArrayType's own
+# docstring), so from_str() builds a zero-filled GUID first, then assigns
+# each of the 8 parsed bytes into its own array slot afterward.
 @cstruct
 class GUID:
 	data1: u32
 	data2: u16
 	data3: u16
-	data4_0: u8
-	data4_1: u8
-	data4_2: u8
-	data4_3: u8
-	data4_4: u8
-	data4_5: u8
-	data4_6: u8
-	data4_7: u8
+	data4: u8[8]
 
 	@staticmethod
 	def from_str( s: str ) -> GUID:
@@ -62,28 +53,32 @@ class GUID:
 		g4: str = parts.__getitem__( 4 ).unwrap( 'invalid GUID string' )
 		if g0.byte_len() != 8 or g1.byte_len() != 4 or g2.byte_len() != 4 or g3.byte_len() != 4 or g4.byte_len() != 12:
 			sys.panic( 'invalid GUID string: expected 8-4-4-4-12 hex digits' )
-		return GUID(
+		g: GUID = GUID(
 			data1 = _parse_hex_u32( g0 ),
 			data2 = _parse_hex_u16( g1 ),
 			data3 = _parse_hex_u16( g2 ),
-			data4_0 = _parse_hex_u8( g3, 0 ),
-			data4_1 = _parse_hex_u8( g3, 2 ),
-			data4_2 = _parse_hex_u8( g4, 0 ),
-			data4_3 = _parse_hex_u8( g4, 2 ),
-			data4_4 = _parse_hex_u8( g4, 4 ),
-			data4_5 = _parse_hex_u8( g4, 6 ),
-			data4_6 = _parse_hex_u8( g4, 8 ),
-			data4_7 = _parse_hex_u8( g4, 10 ),
+			data4 = 0,
 		)
+		g.data4[0] = _parse_hex_u8( g3, 0 )
+		g.data4[1] = _parse_hex_u8( g3, 2 )
+		g.data4[2] = _parse_hex_u8( g4, 0 )
+		g.data4[3] = _parse_hex_u8( g4, 2 )
+		g.data4[4] = _parse_hex_u8( g4, 4 )
+		g.data4[5] = _parse_hex_u8( g4, 6 )
+		g.data4[6] = _parse_hex_u8( g4, 8 )
+		g.data4[7] = _parse_hex_u8( g4, 10 )
+		return g
 
 	def __eq__( self, other: GUID ) -> bool:
-		return (
-			self.data1 == other.data1 and self.data2 == other.data2 and self.data3 == other.data3
-			and self.data4_0 == other.data4_0 and self.data4_1 == other.data4_1
-			and self.data4_2 == other.data4_2 and self.data4_3 == other.data4_3
-			and self.data4_4 == other.data4_4 and self.data4_5 == other.data4_5
-			and self.data4_6 == other.data4_6 and self.data4_7 == other.data4_7
-		)
+		if self.data1 != other.data1 or self.data2 != other.data2 or self.data3 != other.data3:
+			return False
+		i: usize = 0
+		with compiler.wrap_arithmetic:
+			while i < 8:
+				if self.data4[i] != other.data4[i]:
+					return False
+				i += 1
+		return True
 
 	def __ne__( self, other: GUID ) -> bool:
 		return not self.__eq__( other )

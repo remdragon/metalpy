@@ -6559,9 +6559,9 @@ def main() -> i32:
 		return 2
 	if g.data3 != 0xbeef:
 		return 3
-	if g.data4_0 != 0xde or g.data4_1 != 0xad:
+	if g.data4[0] != 0xde or g.data4[1] != 0xad:
 		return 4
-	if g.data4_2 != 0xbe or g.data4_3 != 0xef or g.data4_4 != 0xde or g.data4_5 != 0xad or g.data4_6 != 0xbe or g.data4_7 != 0xef:
+	if g.data4[2] != 0xbe or g.data4[3] != 0xef or g.data4[4] != 0xde or g.data4[5] != 0xad or g.data4[6] != 0xbe or g.data4[7] != 0xef:
 		return 5
 	return 0
 ''' ),
