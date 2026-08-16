@@ -2590,6 +2590,90 @@ class FunctionLowering:
 				return elem, writeback
 		return self._lower_expr( value_node, None ), None
 
+	def _static_field_type_or_none( self, node: ast.expr ) -> Type|None:
+		''' like _static_type_of_value_expr, but NEVER calls discovery.fail()
+		- any lookup miss (unknown name, a method/property instead of a
+		plain field, a scope with no .names, ...) just returns None instead
+		of hard-erroring. Needed specifically for _fixed_array_index_target's
+		speculative "is this a FixedArrayType field?" peek: unlike sizeof(x)'s
+		fallback (always a genuine error if it misses), a MISS here is the
+		expected, common case - e.g. `obj.some_list_field[i]` or
+		`obj.some_property[i]` (a property returning something indexable)
+		must fall through to the ordinary _expr_Attribute/_lower_attr_target_obj
+		handling unchanged, not be mistaken for a real error. '''
+		if isinstance( node, ast.Name ):
+			name = self.lowering.discovery.find_name_or_none( node.id )
+			if not isinstance( name, Variable ):
+				return None
+			member = self._cfg.narrowed_member( node.id )
+			return member.type if member is not None else name.type
+		if isinstance( node, ast.Attribute ):
+			owner_type = self._static_field_type_or_none( node.value )
+			if owner_type is None:
+				return None
+			owner_type = self.lowering._ensure_resolved( owner_type )
+			if isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar ) and owner_type.base.stem in ( 'Ptr', 'ConstPtr' ):
+				owner_type = self.lowering._ensure_resolved( owner_type.args[0] )
+			if isinstance( owner_type, ( CStruct, RCClass )):
+				found = owner_type.chain_lookup( node.attr )
+			else:
+				names = getattr( owner_type, 'names', None )
+				found = names.get( node.attr ) if isinstance( names, dict ) else None
+			if not isinstance( found, Variable ):
+				return None
+			# resolve the VARIABLE itself first, same as _attr_lookup's own
+			# `self._ensure_resolved( found ); return found` - found.type can
+			# still be a lazily-deferred placeholder until found itself is
+			# resolved (confirmed by a real repro: `g: Foo = make()` then
+			# `g.b[i]`, Foo only reached indirectly through make()'s return
+			# type rather than a direct Foo() construction in the same
+			# statement, left found.type unresolved here and silently
+			# misidentified a genuine FixedArrayType field as "not one")
+			self.lowering._ensure_resolved( found )
+			return found.type
+		return None
+
+	def _fixed_array_index_target( self, attr_node: ast.Attribute, index_node: ast.expr ) -> tuple[ir.Operand,str,FixedArrayType,ir.Operand]|None:
+		''' `f.arr[i]` where `f.arr` (attr_node) statically resolves to a
+		FixedArrayType field - returns (root_obj, attr_name, array_type,
+		index_operand) ready for ir.GetAttrIndex/SetAttrIndex, or None if it
+		doesn't (every other subscript shape is handled unchanged by the
+		ordinary paths in _expr_Subscript/_stmt_Assign). Checked via
+		_static_field_type_or_none FIRST, before lowering attr_node.value
+		for real - that helper emits no IR, never fails, and never evaluates
+		attr_node, so a non-match here doesn't double-evaluate the root
+		object (the same "lower it exactly once" concern
+		_lower_attr_target_obj's own docstring explains) and doesn't
+		misfire a spurious error for some other legitimate attribute shape
+		(property, method-value, ...). This is also why deeper/non-Name
+		roots (e.g. `make().arr[i]`) fall through unrecognized rather than
+		being specially rejected here: the helper only walks Name/Attribute
+		chains, so anything else just resolves to None and reaches the
+		ordinary whole-value-read rejection below, same as before this
+		feature existed.
+
+		A literal constant index out of [0, count) is rejected at compile
+		time, same as tuple's own compile-time-constant index check - the
+		one bit of free bounds checking available here (FixedArrayType's
+		count, unlike a raw Ptr[T], is always known at compile time). A
+		non-constant (runtime) index is otherwise unchecked, matching
+		Ptr[T]/ConstPtr[T]'s own GetItem convention - this is a raw inline
+		C array field, not a general-purpose bounds-checked container (see
+		FixedArrayType's own docstring). '''
+		array_type = self._static_field_type_or_none( attr_node )
+		if not isinstance( array_type, FixedArrayType ):
+			return None
+		if ( isinstance( index_node, ast.Constant ) and isinstance( index_node.value, int )
+				and not isinstance( index_node.value, bool ) and not ( 0 <= index_node.value < array_type.count )):
+			self.lowering.discovery.fail(
+				f'index {index_node.value} out of range for {array_type.qualname} (0..{array_type.count-1}): {ast.unparse(index_node)}',
+				index_node,
+			)
+		root = self._lower_expr( attr_node.value, None )
+		index_type = self.lowering.discovery.get_intrinsics()['usize']
+		index = self._lower_expr( index_node, index_type )
+		return root, attr_node.attr, array_type, index
+
 	def _resolve_narrow_member( self, name: str, member_stem: str, node: ast.AST ) -> Variable:
 		# type_resolver.py hands down only a STEM (see its own comment on
 		# why - resolved against the TEXTUAL/abstract union at that pass,
@@ -2763,6 +2847,13 @@ class FunctionLowering:
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
+			if isinstance( target.value, ast.Attribute ):
+				fixed = self._fixed_array_index_target( target.value, target.slice )
+				if fixed is not None:
+					root, attr, array_type, index = fixed
+					operand = self._lower_expr( node.value, array_type.elem_type )
+					self._emit( ir.SetAttrIndex( obj = root, attr = attr, index = index, value = operand ))
+					return
 			obj = self._lower_expr( target.value, None )
 			setitem_fn = self.lowering._find_method( obj.type, '__setitem__' )
 			if setitem_fn is None:
@@ -6039,6 +6130,13 @@ class FunctionLowering:
 		return self._maybe_consume_result( node, dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
 
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
+		if isinstance( node.value, ast.Attribute ) and not isinstance( node.slice, ast.Slice ):
+			fixed = self._fixed_array_index_target( node.value, node.slice )
+			if fixed is not None:
+				root, attr, array_type, index = fixed
+				dest = self._new_temp( array_type.elem_type )
+				self._emit( ir.GetAttrIndex( dest = dest, obj = root, attr = attr, index = index ))
+				return self._maybe_castwrap_pointer( dest, expected_type )
 		obj = self._lower_expr( node.value, None )
 		if isinstance( node.slice, ast.Slice ):
 			return self._lower_slice_subscript( node, obj )
