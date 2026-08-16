@@ -11185,11 +11185,27 @@ class FixedSizeArrayFieldTests( test_support.RealCompileMixin, CompilerTestCase 
 	(2) a `= 0` field default / explicit `ClassName(field=0)` construction
 	argument, meaning "zero-fill the whole array" (the one shape a C
 	designated initializer can express, `.field = {0}`). Reading a
-	FixedArrayType field back out as a whole value, or assigning one after
-	construction, is explicitly rejected with a clean error rather than
-	reaching emission and producing invalid C - element-level indexed
-	access is a separate, real, currently-unimplemented follow-up (the same
-	kind of gap this repo's own bytearray has today), not attempted here. '''
+	FixedArrayType field back out as a WHOLE value, or assigning one as a
+	whole value after construction, is still explicitly rejected with a
+	clean error rather than reaching emission and producing invalid C.
+
+	Element-level indexed access (`f.arr[i]` read/write, both a literal and
+	a runtime index) is now implemented, via a new pair of IR instructions,
+	ir.GetAttrIndex/ir.SetAttrIndex (see their own docstrings) - obj+attr,
+	like AddrOfField, rather than composing GetAttr+GetItem, since a real C
+	array member is never itself a loadable VALUE to compose from (the
+	restriction just above). Emission spells one flat `(obj)OP field[index]`
+	C expression, targeting the field's REAL storage in place, the same
+	"addressable in place, not a copy" property AddrOfField's own fix cared
+	about. A literal constant index out of [0, count) is rejected at compile
+	time (mirrors tuple's own compile-time-constant-index bounds check); a
+	runtime index is otherwise unchecked, matching Ptr[T]/ConstPtr[T]'s own
+	GetItem convention - this stays a raw inline C array, not a general-
+	purpose bounds-checked container. Recognized only when the field access
+	is rooted at a plain Name/Attribute chain (lowering.py's
+	_static_field_type_or_none) - a deeper/Call-rooted root (e.g.
+	`make().arr[i]`) simply isn't recognized and falls through to the
+	ordinary whole-value-read rejection above, unchanged. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -11249,7 +11265,112 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# element-level indexed write then indexed read round-trips
+			# correctly, AND writing one index doesn't corrupt an ADJACENT
+			# index or an adjacent scalar struct field - a real "does this
+			# write actually target the right byte, not spill into its
+			# neighbors" proof, not just "compiles" (mirrors AddrofFieldAccess
+			# RealCompileTests' own "writes through to the real struct field,
+			# leaves the OTHER field untouched" shape)
+			( 'fixed_array_indexed_write_then_read_roundtrips_without_corrupting_neighbors', '''
+@cstruct
+class Foo:
+	a: u32 = 0
+	b: u8[8] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	f = Foo()
+	f.b[0] = 65
+	f.b[7] = 200
+	if f.b[0] != 65:
+		return 1
+	if f.b[7] != 200:
+		return 2
+	if f.b[1] != 0: # adjacent index untouched
+		return 3
+	if f.b[6] != 0: # adjacent index untouched
+		return 4
+	if f.a != u32( 0 ): # adjacent scalar field untouched
+		return 5
+	if f.c != u32( 0 ): # adjacent scalar field untouched
+		return 6
+	return 0
+''' ),
+			# a RUNTIME index variable (not just a literal) - the shape
+			# GUID.from_str needs (data4[i] = value for a loop-computed i,
+			# not hardcoded indices)
+			( 'fixed_array_indexed_access_with_a_runtime_index_variable', '''
+import compiler
+
+@cstruct
+class Foo:
+	b: u8[8] = 0
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		f = Foo()
+		i: usize = usize( 0 )
+		while i < usize( 8 ):
+			f.b[i] = u8( i )
+			i = i + usize( 1 )
+		j: usize = usize( 0 )
+		while j < usize( 8 ):
+			if f.b[j] != u8( j ):
+				return 1
+			j = j + usize( 1 )
+	return 0
+''' ),
 		] )
+
+	def test_fixed_array_indexed_write_literal_index_out_of_range_is_rejected_at_compile_time( self ) -> None:
+		# free bounds checking available ONLY for a literal constant index
+		# (the count is always known at compile time) - mirrors tuple's own
+		# compile-time-constant-index bounds check
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	f.b[8] = 1', # count is 8, valid indices are 0..7
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_indexed_read_literal_index_out_of_range_is_rejected_at_compile_time( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	x = f.b[8]',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	def test_assigning_fixed_array_field_as_a_whole_value_after_construction_is_still_rejected( self ) -> None:
+		# indexed access is new; whole-value assignment (no subscript at
+		# all) must still be rejected exactly as before - this fix only
+		# ever ADDS the f.b[i] = ... shape, never loosens the plain
+		# f.b = ... rejection
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	f.b = 0',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be assigned after construction', self.discovery.errors.errors[0] )
 
 	def test_out_of_range_field_annotation_type_still_rejects_generic_subscript_errors( self ) -> None:
 		# negative check: an actually-invalid subscript (a real, non-generic,

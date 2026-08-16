@@ -143,6 +143,43 @@ class SetItem( Instruction ):
 	def test_repr( self ) -> str:
 		return f'SetItem( obj={self.obj!r}, index={self.index!r}, value={self.value!r} )'
 
+@dataclass( kw_only = True )
+class GetAttrIndex( Instruction ):
+	# f.arr[i] - element-level read of a FixedArrayType field (mpy_types.
+	# FixedArrayType, `u8[8]`-style inline C array). obj is always the ROOT
+	# object holding the field (never itself a GetAttr result), the same
+	# "obj+attr, not obj already reduced to the field's own value" shape
+	# AddrOfField uses and for the same reason: a real C array member
+	# decays to a pointer on use, but is never itself a loadable VALUE (no
+	# `dest = (obj).field;` exists to build on) - so this is a distinct
+	# instruction rather than GetAttr+GetItem composed, letting emission
+	# spell one flat `(obj)OP field[index]` expression directly against the
+	# field's real storage. Unchecked (no bounds check emitted), matching
+	# Ptr[T]/ConstPtr[T]'s own GetItem convention - see lowering.py's
+	# _lower_fixed_array_index for the one bit of free compile-time
+	# checking a LITERAL constant index still gets, same as tuple indexing.
+	dest: Temp
+	obj: Operand
+	attr: str
+	index: Operand
+
+	def test_repr( self ) -> str:
+		return f'GetAttrIndex( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r}, index={self.index!r} )'
+
+@dataclass( kw_only = True )
+class SetAttrIndex( Instruction ):
+	# f.arr[i] = value - element-level write, the SetItem-shaped sibling of
+	# GetAttrIndex above (see its own docstring). Targets the field's REAL
+	# storage in place, same "obj is always the root, one flat `(obj)OP
+	# field[index] = value` expression" reasoning as AddrOfField.
+	obj: Operand
+	attr: str
+	index: Operand
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'SetAttrIndex( obj={self.obj!r}, attr={self.attr!r}, index={self.index!r}, value={self.value!r} )'
+
 # Arithmetic (mode-specific opcodes) + bitwise + unary.
 #
 # dest's type differs by mode: Wrap/Saturate produce a plain T; Check

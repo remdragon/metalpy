@@ -2376,6 +2376,16 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		op = _member_access_operator( instr.obj.type )
 		return [ f'\t{_emit_operand(instr.dest)} = &({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
 
+	if isinstance( instr, ir.GetAttrIndex ):
+		# f.arr[i] - one flat C expression, (obj)OP field[index] - see
+		# GetAttrIndex's own docstring for why this targets the field
+		# directly rather than composing GetAttr+GetItem
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}];' ]
+	if isinstance( instr, ir.SetAttrIndex ):
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}] = {_emit_operand(instr.value)};' ]
+
 
 	if isinstance( instr, ir.SizeOf ):
 		# a real class-like type's size is whatever the C compiler itself
