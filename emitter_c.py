@@ -924,6 +924,50 @@ def _union_member( union: TaggedUnion, member_type: Type ) -> tuple[int,Variable
 			return i, attr
 	raise AssertionError( f'{member_type.qualname} is not a member of {union.qualname}' )
 
+def _extern_nullable_pointer_leaf( return_type: Type|None ) -> Variable|None:
+	''' If `return_type` is exactly a 2-leaf TaggedUnion of [Ptr[T]/ConstPtr[T],
+	NoneType] (what an @extern function's `Ptr[T]|None`-style return annotation
+	resolves to - see discovery.py's visit_BinOp/_get_or_create_union), return
+	the pointer leaf's own attribute (attr.type is the Ptr/ConstPtr
+	Specialization). Else None.
+
+	Only meaningful for an @extern function's return type. The REAL foreign C
+	ABI for "a pointer, or NULL" has no tag at all - the null-ness of the
+	pointer itself IS the discriminant - but the ordinary tagged-union
+	representation this compiler otherwise gives every T|None (a real 1-byte
+	tag field plus a payload union, see _union_tag_data_fields) needs an
+	explicit tag written by WHOEVER constructs the value. An ordinary metalpy
+	function returning T|None writes that tag explicitly, in source, on every
+	return path (a literal `return None` or `return some_ptr` each resolve to
+	a distinct member-constructor call - see Lowering._coerce_into_union). An
+	@extern declaration has no such body to write it: declaring the foreign
+	function's own C prototype to return the tagged-union STRUCT BY VALUE
+	(_function_prototype's plain c_type(function.return_type), pre-fix) is
+	simply wrong - the real DLL/so export returns a bare pointer in a single
+	register, not a possibly-larger-than-register-width struct via the
+	compiler's own struct-return ABI (hidden out-pointer for anything wider
+	than one register under the Microsoft x64 convention this project
+	targets) - confirmed via a real repro (ws2_32's inet_ntop declared
+	ConstPtr[u8]|None: compiles and links fine, but the returned pointer VALUE
+	comes back corrupted/wrong at runtime, silently - not a crash, not a
+	non-null-vs-null confusion, an outright wrong bit pattern). This helper
+	lets both _function_prototype (declare the REAL raw-pointer C return
+	type) and the ir.Call emission (bridge that raw pointer into the tagged
+	union by hand, based on a runtime null check, since there is no
+	compile-time-known branch to pick the tag the way _coerce_into_union's
+	ordinary call sites have) recognize the shape and cooperate. '''
+	if not isinstance( return_type, TaggedUnion ) or len( return_type.attributes ) != 2:
+		return None
+	ptr_leaf: Variable|None = None
+	none_leaf: Variable|None = None
+	for attr in return_type.attributes:
+		t = attr.type
+		if isinstance( t, Scalar ) and t.stem == 'NoneType':
+			none_leaf = attr
+		elif isinstance( t, Specialization ) and isinstance( t.base, Scalar ) and t.base.stem in ( 'Ptr', 'ConstPtr' ):
+			ptr_leaf = attr
+	return ptr_leaf if ( ptr_leaf is not None and none_leaf is not None ) else None
+
 def _emit_widen_error( dest_expr: str, e_fn: Type, src_expr: str, e_op: Type ) -> list[str]:
 	''' assign the error value `src_expr` (of type e_op) into the error lvalue
 	`dest_expr` (of type e_fn), WIDENING when they differ. e_fn is guaranteed
@@ -1084,6 +1128,17 @@ def _function_prototype( function: Function ) -> str:
 	# symbol from the foreign library, not from this translation unit
 	if function.extern_lib is not None:
 		name = function.extern_symbol
+		# a `Ptr[T]|None`-style return annotation on an @extern function is
+		# bridged into the tagged-union representation AT THE CALL SITE (see
+		# ir.Call's own emission, _extern_nullable_pointer_leaf) - the real
+		# foreign symbol's actual ABI returns a bare, possibly-null pointer
+		# in a single register, never the tagged-union struct by value, so
+		# the PROTOTYPE has to say so too, or the two disagree on calling
+		# convention (a real, confirmed silent-corruption bug - see
+		# _extern_nullable_pointer_leaf's own docstring)
+		ptr_leaf = _extern_nullable_pointer_leaf( function.return_type )
+		if ptr_leaf is not None:
+			ret = c_type( ptr_leaf.type )
 		# generic @extern monomorphized to different pointer types
 		# share the same C symbol — use void* for all object pointers
 		# to avoid conflicting prototypes for the same symbol
@@ -2201,6 +2256,40 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# straight C type error. Mirrors that exact existing rule rather
 		# than inventing a new one.
 		if instr.dest is not None and not _returns_void_in_c( instr.target.return_type ):
+			if instr.target.extern_lib is not None:
+				ptr_leaf = _extern_nullable_pointer_leaf( instr.target.return_type )
+				if ptr_leaf is not None:
+					# bridge the real, tagless "pointer or NULL" foreign ABI
+					# result into this language's tagged-union representation
+					# by hand - _function_prototype already declared the
+					# extern symbol's own C return type as the bare pointer
+					# (ptr_leaf.type), matching the real ABI, so call_expr
+					# here genuinely yields a raw pointer, not a struct; there
+					# is no compile-time-known branch to pick the tag the way
+					# an ordinary `return some_ptr`/`return None` has (see
+					# _extern_nullable_pointer_leaf's own docstring) - so the
+					# tag is picked at RUNTIME, from the pointer's own
+					# null-ness, the one bit of information the foreign ABI
+					# actually carries
+					dest_expr = _emit_operand( instr.dest )
+					raw_name = f'{dest_expr}$extern_raw'
+					raw_ctype = c_type( ptr_leaf.type )
+					union = instr.target.return_type
+					assert isinstance( union, TaggedUnion )
+					tag_field, data_field = _union_tag_data_fields( union )
+					ptr_ordinal, ptr_attr = _union_member( union, ptr_leaf.type )
+					none_leaf = next( a for a in union.attributes if a is not ptr_attr )
+					none_ordinal, _ = _union_member( union, none_leaf.type )
+					ptr_field = _field_name( f'v_{ptr_attr.stem}' )
+					return [
+						f'\t{raw_ctype} {raw_name} = {call_expr};',
+						f'\tif ( {raw_name} ) {{',
+						f'\t\t{dest_expr}.{tag_field} = {ptr_ordinal};',
+						f'\t\t{dest_expr}.{data_field}.{ptr_field} = {raw_name};',
+						f'\t}} else {{',
+						f'\t\t{dest_expr}.{tag_field} = {none_ordinal};',
+						f'\t}}',
+					]
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
 		return [ f'\t{call_expr};' ]
 

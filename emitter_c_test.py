@@ -10827,6 +10827,105 @@ def main() -> i32:
 		] )
 
 
+class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real, confirmed silent-data-corruption bug: an
+	`@extern` function declared with a `T|None` return type where T is a
+	pointer (Ptr[T]/ConstPtr[T]) got its C prototype declared as returning
+	the FULL tagged-union struct BY VALUE (plain c_type(function.return_type))
+	- but the real foreign symbol's actual ABI just returns a bare, possibly-
+	null pointer in a single register. The mismatched calling convention
+	silently corrupted the returned pointer VALUE (not a crash, not a
+	null-vs-non-null confusion - the wrong bit pattern, non-null but
+	incorrect). Confirmed via ws2_32's real inet_ntop, whose documented
+	contract is "returns pStringBuf on success": before the fix, the
+	returned pointer compared unequal to pStringBuf even on success. Fixed
+	in emitter_c.py: _extern_nullable_pointer_leaf recognizes the
+	Ptr[T]|None-on-an-@extern-return shape; _function_prototype declares the
+	REAL raw-pointer C return type (matching the actual foreign ABI) instead
+	of the tagged-union struct; ir.Call's own emission bridges the raw
+	pointer result into the tagged-union representation by hand, picking the
+	tag at RUNTIME from the pointer's own null-ness (there's no compile-time
+	branch to pick it from, unlike an ordinary metalpy function's own
+	`return some_ptr`/`return None`, each of which resolves to a distinct,
+	explicit union-member-constructor call). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@unittest.skipUnless( os.name == 'nt', 'needs a real Winsock DLL to call (ws2_32.dll)' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact shape that demonstrated the bug: inet_ntop's real,
+			# documented contract is "returns pStringBuf on success" - a
+			# pointer EQUALITY check against a buffer this program itself
+			# passed in, not just a null/non-null check, so a corrupted (but
+			# still non-null) return value is caught, not just a crash
+			( 'nullable_pointer_extern_return_roundtrips_correctly', '''
+import compiler
+import sys
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_ntop' )
+def inet_ntop_union( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]|None: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr_val: u32 = u32( 0x0100007F ) # 127.0.0.1
+	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
+	sys.memzero( strbuf, usize( 16 ))
+	res = inet_ntop_union( 2, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 ))
+	match res:
+		case None:
+			sys.free( strbuf )
+			return 1 # real failure - AF_INET should never actually fail here
+		case _:
+			if res != strbuf: # pre-fix: fires - the returned pointer VALUE was wrong
+				sys.free( strbuf )
+				return 2
+	sys.free( strbuf )
+	return 0
+''' ),
+			# the null branch: an invalid address family makes inet_ntop
+			# return NULL for real - confirms the runtime tag-selection
+			# still correctly picks the None leaf (not just the Ptr leaf
+			# unconditionally)
+			( 'nullable_pointer_extern_return_null_case_still_recognized_as_none', '''
+import compiler
+import sys
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_ntop' )
+def inet_ntop_union( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]|None: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr_val: u32 = u32( 0x0100007F )
+	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
+	sys.memzero( strbuf, usize( 16 ))
+	res = inet_ntop_union( 999, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 )) # invalid family -> real NULL
+	match res:
+		case None:
+			sys.free( strbuf )
+			return 0
+		case _:
+			sys.free( strbuf )
+			return 1
+''' ),
+		] )
+
+
 class LocalImportAnnotationResolutionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' A function-body-local `from X import Y` immediately followed by a
 	same-function annotation using Y (`h: Y = ...`) previously failed to
