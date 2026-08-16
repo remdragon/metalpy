@@ -11369,8 +11369,8 @@ def main() -> i32:
 
 
 class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
-	''' Regression test for a real, confirmed silent-data-corruption bug: an
-	`@extern` function declared with a `T|None` return type where T is a
+	''' Regression coverage for a real, confirmed silent-data-corruption bug:
+	an `@extern` function declared with a `T|None` return type where T is a
 	pointer (Ptr[T]/ConstPtr[T]) got its C prototype declared as returning
 	the FULL tagged-union struct BY VALUE (plain c_type(function.return_type))
 	- but the real foreign symbol's actual ABI just returns a bare, possibly-
@@ -11378,17 +11378,25 @@ class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin
 	silently corrupted the returned pointer VALUE (not a crash, not a
 	null-vs-non-null confusion - the wrong bit pattern, non-null but
 	incorrect). Confirmed via ws2_32's real inet_ntop, whose documented
-	contract is "returns pStringBuf on success": before the fix, the
-	returned pointer compared unequal to pStringBuf even on success. Fixed
-	in emitter_c.py: _extern_nullable_pointer_leaf recognizes the
-	Ptr[T]|None-on-an-@extern-return shape; _function_prototype declares the
-	REAL raw-pointer C return type (matching the actual foreign ABI) instead
-	of the tagged-union struct; ir.Call's own emission bridges the raw
-	pointer result into the tagged-union representation by hand, picking the
-	tag at RUNTIME from the pointer's own null-ness (there's no compile-time
-	branch to pick it from, unlike an ordinary metalpy function's own
-	`return some_ptr`/`return None`, each of which resolves to a distinct,
-	explicit union-member-constructor call). '''
+	contract is "returns pStringBuf on success": before the original fix,
+	the returned pointer compared unequal to pStringBuf even on success.
+
+	That original fix bridged the union at the extern call site (auto-
+	wrapping a raw pointer result back into a tagged union, picking the tag
+	at runtime from the pointer's own null-ness) - a workaround, not a real
+	fix, and one that only covered RETURN types (the identical shape on an
+	extern PARAMETER was never fixed at all). Superseded: `T|None` (and any
+	other TaggedUnion, and RCClass) is now a compile-time error on any
+	`@extern` parameter or return type (see
+	Discovery._reject_non_c_type_on_extern_signature) - there is no longer
+	any bridging to test. What's left worth testing for real, against the
+	real DLL: the CORRECT idiom this compiler already supports natively -
+	a bare, inherently-nullable `Ptr[T]`/`ConstPtr[T]` return, checked with
+	`is None` (exactly what lib/windows/ws2_32.py's own inet_ntop, and
+	lib/socket.py's real caller of it, already do) - still needs to
+	round-trip the real pointer VALUE correctly, not just null-vs-non-null,
+	against the actual foreign ABI. RejectionTests below covers the new
+	compile-time ban itself. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -11411,7 +11419,7 @@ import sys
 def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
 
 @extern( 'ws2_32', 'inet_ntop' )
-def inet_ntop_union( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]|None: ...
+def inet_ntop_nullable( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]: ...
 
 def main() -> i32:
 	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
@@ -11421,22 +11429,20 @@ def main() -> i32:
 	addr_val: u32 = u32( 0x0100007F ) # 127.0.0.1
 	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
 	sys.memzero( strbuf, usize( 16 ))
-	res = inet_ntop_union( 2, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 ))
-	match res:
-		case None:
-			sys.free( strbuf )
-			return 1 # real failure - AF_INET should never actually fail here
-		case _:
-			if res != strbuf: # pre-fix: fires - the returned pointer VALUE was wrong
-				sys.free( strbuf )
-				return 2
+	res = inet_ntop_nullable( 2, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 ))
+	if res is None:
+		sys.free( strbuf )
+		return 1 # real failure - AF_INET should never actually fail here
+	if res != strbuf: # pre-fix (on the return-type bridging hack): fired - the returned pointer VALUE was wrong
+		sys.free( strbuf )
+		return 2
 	sys.free( strbuf )
 	return 0
 ''' ),
 			# the null branch: an invalid address family makes inet_ntop
-			# return NULL for real - confirms the runtime tag-selection
-			# still correctly picks the None leaf (not just the Ptr leaf
-			# unconditionally)
+			# return NULL for real - confirms a bare nullable pointer's own
+			# `is None` still correctly recognizes it, with no tag/union
+			# machinery involved at all
 			( 'nullable_pointer_extern_return_null_case_still_recognized_as_none', '''
 import compiler
 import sys
@@ -11445,7 +11451,7 @@ import sys
 def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
 
 @extern( 'ws2_32', 'inet_ntop' )
-def inet_ntop_union( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]|None: ...
+def inet_ntop_nullable( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]: ...
 
 def main() -> i32:
 	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
@@ -11455,16 +11461,96 @@ def main() -> i32:
 	addr_val: u32 = u32( 0x0100007F )
 	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
 	sys.memzero( strbuf, usize( 16 ))
-	res = inet_ntop_union( 999, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 )) # invalid family -> real NULL
-	match res:
-		case None:
-			sys.free( strbuf )
-			return 0
-		case _:
-			sys.free( strbuf )
-			return 1
+	res = inet_ntop_nullable( 999, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 )) # invalid family -> real NULL
+	if res is None:
+		sys.free( strbuf )
+		return 0
+	sys.free( strbuf )
+	return 1
 ''' ),
 		] )
+
+
+class ExternNonCTypeSignatureRejectionTests( CompilerTestCase ):
+	''' Discovery._reject_non_c_type_on_extern_signature: an `@extern`
+	function's foreign C symbol has no notion of this compiler's own
+	RC-managed objects or synthesized tagged unions - only a genuine plain C
+	value (a Scalar, a @cstruct/@cunion, a raw CType, a CEnum, a function
+	pointer, or Ptr[T]/ConstPtr[T] to one of those) crosses that boundary
+	correctly. Covers both halves of what the old auto-bridging hack
+	(3e0e325f, removed) left exposed: a TaggedUnion on a PARAMETER (never
+	fixed at all, since the hack only ever special-cased RETURN types) and a
+	TaggedUnion on a RETURN (previously silently bridged instead of
+	rejected) - plus RCClass, which the old hack never considered either
+	way. Each fixture calls the offending @extern function from main() -
+	an @extern function's own parameter/return types are only resolved (and
+	only then can this check ever fire) once something actually schedules
+	it, mirroring how every other Function's signature resolution is lazy
+	in this compiler (see discovery.py's _make_function_resolver). '''
+
+	def _assert_rejected( self, code: str, expected_substring: str ) -> None:
+		self._run( code )
+		self.assertTrue(
+			any( expected_substring in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
+	def test_extern_parameter_tagged_union_rejected( self ) -> None:
+		# the previously-unexercised, never-fixed twin of the return-side bug:
+		# _lower_call_args -> _coerce_into_union would have built a full
+		# tag+payload struct for this argument and handed it to a foreign
+		# symbol expecting a bare pointer register - now a compile error
+		# instead of a silent ABI mismatch
+		self._assert_rejected( '''
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn( p: ConstPtr[u8]|None ) -> i32: ...
+
+def main() -> i32:
+	some_extern_fn( None )
+	return 0
+''', 'cannot cross an @extern boundary' )
+
+	def test_extern_return_tagged_union_rejected( self ) -> None:
+		# the exact shape 3e0e325f's now-removed auto-bridging hack used to
+		# paper over instead of rejecting outright
+		self._assert_rejected( '''
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn() -> ConstPtr[u8]|None: ...
+
+def main() -> i32:
+	some_extern_fn()
+	return 0
+''', 'cannot cross an @extern boundary' )
+
+	def test_extern_parameter_rcclass_rejected( self ) -> None:
+		# an RCClass reference already happens to be pointer-shaped in the
+		# generated C, but it points at THIS compiler's own ObjectHeader-
+		# prefixed layout, not a plain C value any foreign library was
+		# compiled to understand or refcount correctly
+		self._assert_rejected( '''
+class Foo:
+	x: i32
+
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn( f: Foo ) -> i32: ...
+
+def main() -> i32:
+	some_extern_fn( Foo( x = 1 ) )
+	return 0
+''', 'cannot cross an @extern boundary' )
+
+	def test_extern_return_rcclass_rejected( self ) -> None:
+		self._assert_rejected( '''
+class Foo:
+	x: i32
+
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn() -> Foo: ...
+
+def main() -> i32:
+	some_extern_fn()
+	return 0
+''', 'cannot cross an @extern boundary' )
 
 
 class LocalImportAnnotationResolutionTests( test_support.RealCompileMixin, CompilerTestCase ):
