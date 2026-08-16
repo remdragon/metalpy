@@ -520,19 +520,20 @@ def _build_request_head( method: str, path: str, host: str, headers: HTTPHeaders
 
 # Every socket-facing call in this file is funneled through one of the
 # _*_or_http_err helpers below rather than propagated as a bare OSError via
-# .or_return()/Result.Err(e). Confirmed by a real compile: widening a bare
-# @union error type (HTTPError) - or a value of it, staged through an
+# .or_return()/Result.Err(e). This used to be a required workaround: widening
+# a bare @union error type (HTTPError) - or a value of it, staged through an
 # explicitly-typed local, or via .or_return() - into a WIDER union return
-# type (OSError|HTTPError) is broken in at least three different ways here
+# type (OSError|HTTPError) was broken in at least three different ways here
 # (ambiguous generic inference on Result.Err(e); "expected
-# OSError|HTTPError, got HTTPError" on the staging assignment itself). lib/
-# socket.py's own OSError, a plain @enum (not @union), does NOT hit this -
-# only HTTPError does. Rather than chase a compiler fix, every public
-# HTTPConnection method just returns a bare Result[_, HTTPError] throughout,
-# collapsing any OSError from lib/socket.py into HTTPError.Other() at the
-# one place each Socket call happens - simpler than it sounds, and it also
-# means HTTPConnection's own public error type stays a single, simple
-# HTTPError instead of leaking lib/socket.py's OSError as part of its API.
+# OSError|HTTPError, got HTTPError" on the staging assignment itself). That
+# compiler bug is now FIXED (type_resolver._atomic_leaves, lowering.py's
+# _coerce_or_check_operand, emitter_c.py's _emit_widen_error - see
+# union_widening_test.py), so propagating a real OSError|HTTPError here is
+# an option again, not a compile error. Kept as-is anyway: collapsing every
+# Socket-facing OSError into HTTPError.Other() right at the call site is
+# still arguably better API design on its own merits - HTTPConnection's own
+# public error type stays a single, simple HTTPError instead of leaking
+# lib/socket.py's OSError as part of its API - not just a workaround anymore.
 
 def _connect_or_http_err( host: str, port: u16 ) -> Result[Socket, HTTPError]:
 	match Socket.tcp():

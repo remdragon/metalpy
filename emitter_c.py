@@ -1007,17 +1007,30 @@ def _emit_widen_error( dest_expr: str, e_fn: Type, src_expr: str, e_op: Type ) -
 		return [ f'\t\t{dest_expr} = {src_expr};' ] # identical layout - plain struct copy (fast path, copies any payload already)
 	assert isinstance( e_fn, TaggedUnion ), f'widening into a non-union error type {e_fn!r}'
 	fn_tag, fn_data = _union_tag_data_fields( e_fn )
-	if not isinstance( e_op, TaggedUnion ):
-		# single class -> set the wide union's variant tag AND copy its
-		# payload pointer into the matching v_<member> field
+	# e_op is only genuinely FLATTENABLE into e_fn's own member list when it's
+	# itself a synthesized ANONYMOUS union (file is None) - the same
+	# distinguishing test discovery.py's _get_or_create_union already uses when
+	# flattening a wider union's own operands (only an anonymous operand
+	# contributes its own leaves; a real user `@union class Foo:` stays a
+	# single opaque member wherever it's nested). A NOMINAL union (e.g.
+	# HTTPError, itself one of e_fn's own members verbatim) takes the
+	# single-class path below just like any plain class leaf does - remapping
+	# ITS OWN internal variants against e_fn's member list would look for e.g.
+	# HTTPError's None-payload variant types as members of e_fn, which they
+	# never are (type_resolver._atomic_leaves applies this identical
+	# distinction to the type-checking side of the same widening, at lowering
+	# time - see its own docstring).
+	if not ( isinstance( e_op, TaggedUnion ) and e_op.file is None ):
+		# single class (or nominal union) -> set the wide union's variant tag AND
+		# copy its payload pointer into the matching v_<member> field
 		ordinal, fn_attr = _union_member( e_fn, e_op )
 		fn_field = _field_name( f'v_{fn_attr.stem}' )
 		return [
 			f'\t\t{dest_expr}.{fn_tag} = {ordinal};',
 			f'\t\t{dest_expr}.{fn_data}.{fn_field} = {src_expr};',
 		]
-	# e_op is itself a (narrower) union -> remap each member's tag AND copy
-	# its payload at runtime, one case per e_op member
+	# e_op is itself an anonymous (narrower) union -> remap each member's tag AND
+	# copy its payload at runtime, one case per e_op member
 	op_tag, op_data = _union_tag_data_fields( e_op )
 	lines = [ f'\t\tswitch ( ({src_expr}).{op_tag} ) {{' ]
 	for i, op_attr in enumerate( e_op.attributes ):
