@@ -8316,6 +8316,117 @@ def main() -> i32:
 		] )
 
 
+class ReflectedAndOverloadedBinopDunderTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `_lower_binop_values`'s dunder-dispatch tries, in order: (1) a
+	forward dunder (`str.__add__`, ...) on `left.type`, Overload-aware via
+	`_find_dunder_for_arg` (same mechanism `OverloadedDunderComparisonTests`
+	exercises for `==`/`!=`); (2) if that doesn't apply - including when
+	`left.type` is `Scalar` and so has no dunder mechanism of its own at
+	all, e.g. `5 + some_vector` - the REFLECTED, differently-named dunder
+	(`str.__radd__`, ...) on `right.type` (mirrors Python's real protocol:
+	unlike `==`/`!=`, which reflects onto the SAME method name with
+	receiver/argument swapped, every genuinely asymmetric binop gets its
+	own distinctly-named reflected method, since e.g. `a - b` and `b - a`
+	are never interchangeable the way `a == b`/`b == a` are).
+
+	This surfaced a second real gap while developing: `_lower_binary_
+	operands` (which hints a bare literal toward the OTHER operand's own
+	type, so e.g. an untyped int literal added to an f64 infers f64) used
+	to hint UNCONDITIONALLY, including toward a non-scalar CLASS target
+	(`5 + some_vector` hinted `5` toward `Vector`) - hitting `_expr_
+	Constant`'s own literal-compatibility check ("an int literal cannot be
+	used where Vector is expected") before this dispatch was ever reached.
+	Fixed by only hinting toward an actual `Scalar` target (or the
+	existing Ptr-offset special case), leaving a literal to infer its own
+	natural type otherwise - exactly what the reflected-dunder lookup
+	needs to find e.g. `Vector.__radd__(other: i32)`. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'binop_forward_overload_and_reflected_dunder', '''
+class Vector:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __add__( self, other: Vector ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other.x )
+	def __add__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+	def __radd__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+	def __sub__( self, other: Vector ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x - other.x )
+	# __rsub__'s own contract (matching Python's real protocol) is
+	# "return other - self", NOT "self - other" - asymmetric, easy to
+	# get backwards, exactly what this case is checking
+	def __rsub__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( other - self.x )
+
+def main() -> i32:
+	v: Vector = Vector( 3 )
+	w: Vector = Vector( 4 )
+	# forward, same-class overload (Vector-typed operand)
+	r1: Vector = v + w
+	if r1.x != 7:
+		return 1
+	# forward, Overload-aware cross-type (i32-typed operand -
+	# picks Vector's OWN __add__(other: i32) overload)
+	r2: Vector = v + 10
+	if r2.x != 13:
+		return 2
+	# reflected: i32 (Scalar) has no forward dunder of its own,
+	# so this must find Vector.__radd__ on the RIGHT operand
+	r3: Vector = 5 + v
+	if r3.x != 8:
+		return 3
+	# asymmetric operator, forward
+	r4: Vector = v - w
+	if r4.x != -1:
+		return 4
+	# asymmetric operator, reflected - MUST compute "10 - v.x",
+	# not "v.x - 10" (the exact mistake a naive reflected-call
+	# implementation could make)
+	r5: Vector = 10 - v
+	if r5.x != 7:
+		return 5
+	return 0
+''' ),
+			# a real RC-lifetime check - every dunder here constructs a
+			# fresh Vector (a real RCClass); confirms no leak/double-free
+			# under repetition for both the forward-overload and the
+			# reflected paths
+			( 'binop_reflected_dunder_rc_no_leak_under_repetition', '''
+class Vector:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __radd__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			v: Vector = Vector( 3 )
+			r: Vector = 5 + v
+			if r.x != 8:
+				return 1
+			i += 1
+	return 0
+''' ),
+		] )
+
+
 class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile-and-run companion to GenericMethodDispatchTests'
 	test_union_receiver_dispatch_applies_per_leaf_scalar_widening - proves
