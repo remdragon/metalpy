@@ -6798,6 +6798,50 @@ class FunctionLowering:
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
 		return dest
 
+	def _find_eq_method_for_arg( self, owner_type: Type|None, name: str, arg_type: Type ) -> Function|None:
+		''' like self.lowering._find_method, but Overload-aware: if `name`
+		resolves to a real Overload group on owner_type (multiple defs
+		sharing the name - e.g. int.__eq__(other: int) alongside a second
+		int.__eq__(other: i32) cross-dunder overload), picks the ONE
+		implementation whose single declared parameter type exactly matches
+		arg_type, rather than silently treating the whole group as "no such
+		method" the way a bare _find_method does (a real, confirmed gap:
+		_find_method's own `isinstance(found, Function)` check returns None
+		for an Overload - before this fix, adding a second int.__eq__
+		overload SILENTLY broke the pre-existing int==int comparison too,
+		since it fell through to comparing by raw pointer identity instead
+		of calling __eq__ at all, confirmed via a real repro).
+
+		Deliberately narrow, not a general replacement for _find_method
+		everywhere (see the dedicated _find_method-Overload-blindness
+		investigation this repo's memory tracks separately, likely a wider
+		fix): every caller HERE already knows the exact concrete argument
+		type it wants to match against (this is comparison dispatch, not a
+		call site needing real runtime dispatch across multiple candidate
+		argument shapes), so a simple single-parameter-type scan over the
+		Overload's own implementations suffices - no need for
+		overload_resolution.py's own general ConditionalDispatch machinery. '''
+		owner_type = self.lowering._ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass ) ):
+			found = owner_type.chain_lookup( name )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( name ) if isinstance( names, dict ) else None
+		# a plain (non-Overload) Function is checked against arg_type here
+		# too, NOT returned unconditionally the way a bare _find_method
+		# would - a real bug caught during development: str only has ONE
+		# __eq__(other: str), so this branch used to hand it back for ANY
+		# arg_type (even i32), and the caller then emitted a Call passing
+		# a mismatched scalar where struct builtins$str* was expected
+		candidates = found.implementations if isinstance( found, Overload ) else ( [ found ] if isinstance( found, Function ) else [] )
+		for impl in candidates:
+			if impl.resolve is not None:
+				impl.resolve()
+			if impl.parameters and len( impl.parameters ) == 1 \
+					and self.lowering._type_resolver._same_type( impl.parameters[0].type, arg_type ):
+				return impl
+		return None
+
 	def _lower_eq_or_ne( self, node: ast.Compare, left: ir.Operand, expected_type: Type|None, negate: bool ) -> ir.Operand:
 		''' `==`/`!=`, for ANY left operand (scalar or not) - unlike every
 		other comparison operator, Eq/NotEq are the one shape a union can
@@ -6837,7 +6881,16 @@ class FunctionLowering:
 		     both are reinstated explicitly here since strict=False below
 		     skips them). '''
 		method_name = '__ne__' if negate else '__eq__'
-		method = self.lowering._find_method( left.type, method_name ) if not isinstance( left.type, Scalar ) else None
+		# _find_eq_method_for_arg, not the plain _find_method: this is the
+		# "receiver and argument end up the SAME type" fast path (right,
+		# once lowered below, is hinted toward left.type when left isn't a
+		# union - the common case), so the wanted implementation is
+		# whichever one declares its own parameter as exactly left.type -
+		# see _find_eq_method_for_arg's own docstring for why a plain
+		# _find_method silently breaks this once a class ever declares a
+		# SECOND __eq__/__ne__ overload (e.g. int.__eq__(other: i32)
+		# alongside the pre-existing int.__eq__(other: int))
+		method = self._find_eq_method_for_arg( left.type, method_name, left.type ) if not isinstance( left.type, Scalar ) else None
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		# the hint handed to the comparator's own lowering below: left.type,
 		# EXCEPT when left.type is ITSELF a union - hinting a plain leaf
@@ -6998,13 +7051,18 @@ class FunctionLowering:
 			return _LeafPairEq( 'none_false' )
 		if self.lowering._type_resolver._same_type( left_type, right_type ):
 			return _LeafPairEq( 'same_type' )
-		method = self.lowering._find_method( left_type, method_name ) if not isinstance( left_type, Scalar ) else None
-		if method is not None and method.parameters and len( method.parameters ) == 1 \
-				and self.lowering._type_resolver._same_type( method.parameters[0].type, right_type ):
+		# _find_eq_method_for_arg, not the plain _find_method - see its own
+		# docstring: a class declaring TWO __eq__/__ne__ signatures (the
+		# same-type one plus a genuine cross-type one, e.g. int.__eq__
+		# (other: i32) alongside int.__eq__(other: int)) registers as a
+		# real Overload, which a bare _find_method silently treats as "no
+		# such method" - the exact shape this whole 'cross_dunder' branch
+		# exists to use
+		method = self._find_eq_method_for_arg( left_type, method_name, right_type ) if not isinstance( left_type, Scalar ) else None
+		if method is not None:
 			return _LeafPairEq( 'cross_dunder', method = method, reflected = False )
-		reflected_method = self.lowering._find_method( right_type, method_name ) if not isinstance( right_type, Scalar ) else None
-		if reflected_method is not None and reflected_method.parameters and len( reflected_method.parameters ) == 1 \
-				and self.lowering._type_resolver._same_type( reflected_method.parameters[0].type, left_type ):
+		reflected_method = self._find_eq_method_for_arg( right_type, method_name, left_type ) if not isinstance( right_type, Scalar ) else None
+		if reflected_method is not None:
 			return _LeafPairEq( 'cross_dunder', method = reflected_method, reflected = True )
 		return _LeafPairEq( 'error' )
 
