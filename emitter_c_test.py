@@ -7786,6 +7786,86 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
+			# `t[0] is None`/`is not None` narrowing directly on a tuple
+			# constant-index Subscript, with no intermediate named local -
+			# type_resolver.py's _type_of_expr had no ast.Subscript case at
+			# all, so this used to fall through to _lower_is_comparison's own
+			# flat-Cmp fallback and emit invalid C comparing a union STRUCT
+			# against a bare int/another struct
+			( 'tuple_subscript_is_none_narrowing_without_a_local', '''
+def main() -> i32:
+	t: tuple[str|None, i32] = ( None, 5 )
+	if t[0] is not None:
+		return 1
+	if t[1] != 5:
+		return 2
+	u: tuple[str|None, i32] = ( "hi", 6 )
+	if u[0] is None:
+		return 3
+	if u[1] != 6:
+		return 4
+	return 0
+''' ),
+			# `union_val == leaf` / `!=` - comparing a still-union-typed value
+			# directly against a leaf, with no match-based extraction needed
+			# first. Used to fall through to the plain dunder-or-flat-Cmp path,
+			# which either called a leaf's dunder with a UNION-typed argument
+			# (a real type mismatch in the generated C) or compared two union
+			# STRUCTS directly (C rejects this outright) - see
+			# _lower_union_eq_against_leaf. Covers an RC leaf (str), a scalar
+			# leaf (i32), the None member via == / != (not is/is not, which
+			# already worked), and negation of each
+			( 'union_leaf_equality_str_and_scalar_and_none', '''
+def main() -> i32:
+	x: str|None = "hi"
+	if x != "hi":
+		return 1
+	if x == "bye":
+		return 2
+	y: str|None = None
+	if y == "hi":
+		return 3
+	if not ( y != "hi" ):
+		return 4
+	if not ( y == None ):
+		return 5
+	if y != None:
+		return 6
+	n: i32|None = 42
+	if n != 42:
+		return 7
+	if n == 7:
+		return 8
+	m: i32|None = None
+	if m == 42:
+		return 9
+	return 0
+''' ),
+			# a real RC-lifetime check for the new payload-comparison path -
+			# _lower_union_eq_against_leaf's own narrowed/payload_dest/tag_dest
+			# temps are all bare GetAttr borrows (never fresh_temp()-registered,
+			# same as _lower_union_receiver_call's identical extraction), so
+			# none of them should need - or get - any incref/decref of their
+			# own; this repeats the comparison 1000x and checks the RC leaf's
+			# own refcount never drifts
+			( 'union_leaf_equality_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			if compiler.refcount( s ) != 1:
+				return 1
+			x: str|None = s
+			if compiler.refcount( s ) != 2: # the union now holds a reference too
+				return 2
+			if x != "HELLO":
+				return 3
+			if compiler.refcount( s ) != 2: # comparing must not have changed it
+				return 4
+			i += 1
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )

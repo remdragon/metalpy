@@ -6655,6 +6655,17 @@ class FunctionLowering:
 					dest = self._new_temp( expected_type or method.return_type )
 					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
 					return dest
+				if isinstance( node.ops[0], ( ast.Eq, ast.NotEq )):
+					# no user __eq__/__ne__ on left's own type - if left is
+					# itself a union (T|None, Result[T,E], any @union),
+					# falling through to the flat Cmp below would compare
+					# two STRUCTS directly, which C rejects outright
+					# ("invalid operands to binary expression"). Structural
+					# union-vs-leaf equality instead - see the method's own
+					# docstring
+					union_eq = self._lower_union_eq_against_leaf( node, left, negate = isinstance( node.ops[0], ast.NotEq ))
+					if union_eq is not None:
+						return union_eq
 			# non-scalar without a matching dunder — fall through to
 			# flat Cmp (pointer comparison), same pre-dunder behavior
 
@@ -6666,6 +6677,114 @@ class FunctionLowering:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
+		return dest
+
+	def _lower_union_eq_against_leaf( self, node: ast.Compare, union_operand: ir.Operand, negate: bool ) -> ir.Operand|None:
+		''' `union_val == leaf_expr` / `!=`, once union_val's own type has
+		already been confirmed to have no user __eq__/__ne__ of its own -
+		structural equality against a single LEAF value (a bare None
+		included): the union must currently hold the member matching the
+		other side's own NATURAL type, and (unless that member is NoneType,
+		which carries no real payload) the member's own payload must compare
+		equal too, via the same dunder-or-flat-Cmp choice an ordinary
+		leaf-vs-leaf comparison already makes (see _lower_operand_compare).
+		Same tag/data/v_<member> extraction _lower_union_receiver_call/
+		_maybe_unwrap_union_arg already use for an analogous purpose, just
+		feeding a Cmp instead of a Call.
+
+		Returns None ONLY when union_operand's type isn't actually a
+		TaggedUnion - the caller's own pre-existing flat-Cmp fallback handles
+		that case unchanged, and node.comparators[0] is never touched here in
+		that branch, so there's no double-evaluation risk. Once union_operand
+		IS confirmed a union, this never returns None: a comparator whose own
+		natural type matches none of the union's members (including "another
+		instance of the SAME union type" - full structural union-vs-union
+		equality isn't implemented yet) is reported as a compile error
+		instead, since node.comparators[0] has ALREADY been lowered once by
+		then (its own type had to be determined first) - falling through to
+		the caller's fallback from there would lower it a SECOND time,
+		double-evaluating any side effect it has (e.g. `x == get_y()`).
+
+		Only ever consulted for the "union is the LEFT operand" direction
+		(see _expr_Compare's own call site) - `leaf_expr == union_val` (union
+		on the RIGHT) is a separate, not-yet-covered gap, left as the
+		pre-existing (broken) behavior rather than guessed at asymmetrically
+		here. '''
+		shape = self.lowering._type_resolver._tagged_union_shape( union_operand.type )
+		if shape is None:
+			return None
+		base, members = shape
+		leaf = self._lower_expr( node.comparators[0], None )
+		member = next( ( attr for attr in members if self.lowering._type_resolver._same_type( attr.type, leaf.type ) ), None )
+		if member is None:
+			self.lowering.discovery.fail(
+				f'{ast.unparse(node)}: {leaf.type.qualname if leaf.type else "?"} is not a member of {union_operand.type.qualname} '
+				f'(comparing two DIFFERENT union values structurally is not yet supported)',
+				node,
+			)
+		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( base )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		tag_dest = self._new_temp( tag_attr.type )
+		self._emit( ir.GetAttr( dest = tag_dest, obj = union_operand, attr = tag_attr.stem ))
+		tag_match = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = tag_match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] )))
+		dest = self._new_temp( bool_cls )
+		none_type = self.lowering.discovery.get_none_type()
+		if member.type is none_type:
+			# NoneType carries no real payload - tag equality alone decides
+			# it (mirrors _lower_is_comparison's identical None-only
+			# shortcut below), no branching needed at all
+			if negate:
+				self._emit( ir.Not( dest = dest, operand = tag_match ))
+			else:
+				self._emit( ir.Assign( dest = dest, src = tag_match ))
+			return dest
+		# tag_dest/payload_dest/narrowed below are all GetAttr dests, never
+		# fresh_temp()-registered (see _emit's own comment: only Call/Allocate
+		# results are) - so neither branch below needs any incref/decref
+		# bookkeeping around them, unlike the ternary-merge RC bug this shape
+		# might otherwise superficially resemble (see verifying-compiled-
+		# programs memory's own account of that fix); `dest` itself is always
+		# bool, never RC, so the two-branch merge into it needs no fresh_temp()
+		# call either (contrast _expr_IfExp's own merge dest, which can be any
+		# RC type and explicitly needs one)
+		mismatch_label = self._new_label( 'union_eq_tag_mismatch' )
+		end_label = self._new_label( 'union_eq_end' )
+		self._emit( ir.JumpIfFalse( cond = tag_match, target = mismatch_label ))
+		payload_dest = self._new_temp( payload_cls )
+		self._emit( ir.GetAttr( dest = payload_dest, obj = union_operand, attr = data_attr.stem ))
+		narrowed = self._new_temp( member.type )
+		self._emit( ir.GetAttr( dest = narrowed, obj = payload_dest, attr = f'v_{member.stem}' ))
+		payload_op = self._lower_operand_compare( narrowed, leaf, negate, node )
+		self._emit( ir.Assign( dest = dest, src = payload_op ))
+		self._emit( ir.Jump( target = end_label ))
+		self._emit( ir.Label( name = mismatch_label ))
+		self._emit( ir.Assign( dest = dest, src = ir.Const( type = bool_cls, value = negate )))
+		self._emit( ir.Label( name = end_label ))
+		return dest
+
+	def _lower_operand_compare( self, left: ir.Operand, right: ir.Operand, negate: bool, node: ast.AST ) -> ir.Operand:
+		''' Eq/NotEq between two ALREADY-LOWERED operands of the SAME
+		(non-union) type - the same dunder-or-flat-Cmp choice _expr_Compare's
+		own top-level dispatch makes from AST nodes, reimplemented against
+		operands directly since _lower_union_eq_against_leaf's own narrowed
+		payload has no AST node of its own to re-dispatch through (mirrors
+		_coerce_or_check_operand's identical "no node to re-evaluate"
+		posture). '''
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if not isinstance( left.type, Scalar ):
+			method_name = '__ne__' if negate else '__eq__'
+			method = self.lowering._find_method( left.type, method_name )
+			if method is not None:
+				self.lowering._ensure_resolved( method )
+				self.lowering.schedule( method.return_type )
+				for p in ( method.parameters or [] ):
+					self.lowering.schedule( p.type )
+				dest = self._new_temp( method.return_type )
+				self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
+				return dest
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = dest, op = ir.CmpOp.NE if negate else ir.CmpOp.EQ, left = left, right = right ))
 		return dest
 
 	def _lower_is_comparison( self, node: ast.Compare, negate: bool ) -> ir.Operand:
