@@ -574,14 +574,19 @@ class Tests( unittest.TestCase ):
 		myerror_cls = mod.get_local( 'MyError' )
 		if result_cls.resolve is not None:
 			result_cls.resolve()
-		result_i32_myerror = self.discovery._get_or_create_specialization( result_cls, [ i32, myerror_cls ] )
-
 		v = Variable( stem = 'v', qualname = '__test__.foo.v', file = Path( '__test__.py' ), line = 11, type = i32 )
-		t0 = ir.Temp( type = result_i32_myerror, id = 0 ) # get_result()'s Result
 		t1 = ir.Temp( type = i32, id = 1 )                # unwrapped via OrReturn
 
 		fn = self.compiler._lower( foo_fn )
 		get_result_fn = mod.get_local( 'get_result' )
+		# get_result_fn's return type is read AFTER _lower (like foo_fn's
+		# return_type below) since resolving foo_fn's call to get_result()
+		# eagerly monomorphizes get_result_fn's declared return type from a
+		# Specialization to the real RCClass/CStruct - constructing our own
+		# Specialization via _get_or_create_specialization here would give a
+		# distinct (if structurally equal) object, not what the real temp
+		# in the lowered IR now carries
+		t0 = ir.Temp( type = get_result_fn.return_type, id = 0 ) # get_result()'s Result
 		self._assert_ir( fn, [
 			ir.FuncStart( name = '__test__.foo', params = [], return_type = foo_fn.return_type ),
 			ir.DeclareTemp( temp = t0 ),

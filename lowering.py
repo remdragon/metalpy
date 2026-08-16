@@ -5720,14 +5720,23 @@ class FunctionLowering:
 		shape. A wrong-typed element is rejected the ordinary way by the
 		_lower_expr(elt, elem_type) call below - the general assignability
 		check already covers it, nothing extra needed here. '''
+		# _as_specialization, not a bare isinstance(expected_type,
+		# Specialization) check - expected_type may already have been
+		# eagerly monomorphized to the real list[T] RCClass by
+		# TypeResolver.resolve_declared_types (a function's own declared
+		# return type, a variable's own annotation, ...) by the time this
+		# runs, same duality _same_type exists to handle elsewhere -
+		# without this, a perfectly valid list[T]-typed context wrongly
+		# fails with "needs a known list[T] target type"
+		spec = self.lowering._type_resolver._as_specialization( expected_type )
 		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
-		if not ( isinstance( expected_type, Specialization ) and isinstance( resolved, RCClass )
-				and expected_type.base.stem == 'list' and len( expected_type.args ) == 1 ):
+		if not ( spec is not None and isinstance( resolved, RCClass )
+				and spec.base.stem == 'list' and len( spec.args ) == 1 ):
 			self.lowering.discovery.fail(
 				f'list literal needs a known list[T] target type from context (e.g. an annotation or return type): {ast.unparse(node)}',
 				node,
 			)
-		elem_type = expected_type.args[0]
+		elem_type = spec.args[0]
 		dest = self._construct_generic_instance( expected_type, node )
 		if not node.elts:
 			return dest
@@ -5764,14 +5773,17 @@ class FunctionLowering:
 		real add(elt) call per element - unlike list[T].append, set[T].add
 		returns plain None (no Result[None,OverflowError] to unwrap), so
 		this skips _expr_List's errmsg/unwrap dance entirely. '''
+		# _as_specialization, not a bare isinstance(expected_type,
+		# Specialization) check - see _expr_List's own identical comment
+		spec = self.lowering._type_resolver._as_specialization( expected_type )
 		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
-		if not ( isinstance( expected_type, Specialization ) and isinstance( resolved, RCClass )
-				and expected_type.base.stem == 'set' and len( expected_type.args ) == 1 ):
+		if not ( spec is not None and isinstance( resolved, RCClass )
+				and spec.base.stem == 'set' and len( spec.args ) == 1 ):
 			self.lowering.discovery.fail(
 				f'set literal needs a known set[T] target type from context (e.g. an annotation or return type): {ast.unparse(node)}',
 				node,
 			)
-		elem_type = expected_type.args[0]
+		elem_type = spec.args[0]
 		dest = self._construct_generic_instance( expected_type, node )
 		if not node.elts:
 			# the standard parser never actually produces an empty ast.Set

@@ -397,13 +397,25 @@ class Compiler:
 				)
 
 	def _virtual_signatures_match( self, a: Function, b: Function ) -> bool:
-		if a.return_type is not b.return_type:
+		# _same_type, not raw `is` - an override's own declared type and its
+		# base method's own declared type can be two different objects for
+		# the identical type (one eagerly monomorphized via some OTHER call
+		# reference resolving it first, the other still a bare
+		# Specialization) - same duality TypeResolver._same_type exists to
+		# handle elsewhere. Confirmed via a real repro: TypeResolver.
+		# resolve_declared_types eagerly monomorphizing a plain declared
+		# parameter/return type wherever a Function gets resolved for a
+		# real call made an @virtual override's own signature-match check
+		# here start seeing false positives, since only ONE side of the
+		# comparison (whichever method something else happened to call
+		# first) had been through that path by the time this runs.
+		if not self.type_resolver._same_type( a.return_type, b.return_type ):
 			return False
 		a_params = a.parameters or []
 		b_params = b.parameters or []
 		if len( a_params ) != len( b_params ):
 			return False
-		return all( ap.type is bp.type for ap, bp in zip( a_params, b_params ))
+		return all( self.type_resolver._same_type( ap.type, bp.type ) for ap, bp in zip( a_params, b_params ))
 
 	def _schedule_interface_vtable_impls( self, cls: CStruct ) -> None:
 		# every slot's ACTUAL implementing Function (found by walking cls's
