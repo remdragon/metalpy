@@ -219,7 +219,13 @@ class RealCompileMixin:
 			self.assertEqual( link_result.returncode, 0,
 				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
 			try:
-				return subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = timeout )
+				# cwd=tmp: a compiled program that writes/reads a relative
+				# path (csv_*_test.py's File.binary_writer('some.tmp'), etc)
+				# otherwise inherits the TEST RUNNER's own cwd, littering the
+				# repo/worktree root with files that never get cleaned up.
+				# tmp already gets deleted when this `with` block exits, so
+				# this is free cleanup too.
+				return subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = timeout, cwd = tmp )
 			except subprocess.TimeoutExpired:
 				self.fail( f'exe did not finish within {timeout}s' )
 
