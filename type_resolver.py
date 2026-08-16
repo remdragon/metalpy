@@ -3322,6 +3322,37 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return None
 			found = names.get( node.attr )
 			return found.type if isinstance( found, Variable ) else None
+		if isinstance( node, ast.Subscript ):
+			# tuple[...]'s own constant-index element access ONLY (t[0]) -
+			# mirrors lowering.py's _expr_Subscript tuple branch exactly
+			# (same tuple_storage.tuple_type_for/valid-index logic), needed
+			# so `t[0] is None` can narrow at all now that tuple[T|None,...]
+			# construction actually works (a real repro: none_first[0] is
+			# not None, on a tuple[str|None,i32] local, used to fall through
+			# to _lower_is_comparison's own flat-Cmp path and emit invalid C
+			# comparing a union STRUCT against a bare int). Every OTHER
+			# subscript shape (list[T]/dict[K,V]/a user __getitem__, ...) is
+			# deliberately left unresolved here - this class's own docstring
+			# already documents that returning None for an unrecognized
+			# shape is fine (narrowing just doesn't fire, same as any other
+			# expression this best-effort pass doesn't understand), and
+			# those shapes would need real generic-container type inference
+			# this pass was never meant to duplicate from lowering.py
+			owner_type = self._type_of_expr( node.value )
+			if owner_type is None:
+				return None
+			owner_type = self.resolver.ensure_resolved( owner_type )
+			tuple_type = self.resolver.tuple_storage.tuple_type_for( owner_type )
+			if tuple_type is None:
+				return None
+			valid_index = (
+				isinstance( node.slice, ast.Constant )
+				and isinstance( node.slice.value, int )
+				and not isinstance( node.slice.value, bool )
+			)
+			if not valid_index or not ( 0 <= node.slice.value < len( tuple_type.elem_types )):
+				return None
+			return tuple_type.elem_types[ node.slice.value ]
 		if isinstance( node, ast.Call ):
 			# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - a call to a
 			# GENERIC function (explicit gen[i32](...) or inferred
