@@ -10,7 +10,7 @@ import arithmetic_mode
 import cfg
 import ir
 from discovery import Discovery, is_stub_body
-from errors import CompileError
+from errors import CompileError, RedundantCompilationError
 from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec, validate_float_spec
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
@@ -991,6 +991,8 @@ class Lowering:
 			return trampoline
 
 		self._ensure_resolved( method )
+		if method.broken:
+			raise RedundantCompilationError() # already reported at the point method's own resolution failed - see Name.broken
 		if method.parameters is None:
 			self.discovery.fail( f'{method.qualname} could not be resolved (see earlier error)', method.node )
 		self.schedule( method.return_type )
@@ -1249,6 +1251,8 @@ class Lowering:
 		return self._type_resolver._attr_lookup_callable( owner_type, attr, ctx )
 
 	def _match_call_args( self, target: Function, call: ast.Call ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
+		if target.broken:
+			raise RedundantCompilationError() # already reported at the point target's own resolution failed - see Name.broken
 		if target.parameters is None:
 			# target's own parameter resolution already failed (and recorded
 			# an error - see discovery.py's _resolve_guarded/_make_function_
@@ -1629,7 +1633,7 @@ class FunctionLowering:
 						# baked in once
 						if isinstance( fn.cls, Specialization ):
 							concrete_union = self.lowering.monomorphize_class( fn.cls )
-							payload_cls = concrete_union.names['data'].type
+							payload_cls = concrete_union.get_local_or_raise( 'data' ).type
 							fn.add_name( '$payload_cls', payload_cls )
 
 					for param in fn.parameters or []:
@@ -2475,7 +2479,7 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'del only supports a single local variable name: {ast.unparse(node)}', node )
 		target = node.targets[0]
 		fn = self._current_fn
-		existing = fn.names.get( target.id )
+		existing = fn.get_local_or_raise( target.id )
 		if not isinstance( existing, Variable ):
 			self.lowering.discovery.fail( f'{target.id!r} is not a local variable, cannot del it', node )
 		try:
@@ -2520,7 +2524,7 @@ class FunctionLowering:
 		if not mod:
 			self.lowering.discovery.fail( f'module {package!r} not found', node )
 		for alias in node.names:
-			item = mod.names.get( alias.name )
+			item = mod.get_local_or_raise( alias.name )
 			if item is None:
 				self.lowering.discovery.fail( f'module {package} does not export {alias.name!r}', node )
 			self._current_fn.add_name( alias.asname or alias.name, item )
@@ -2568,7 +2572,16 @@ class FunctionLowering:
 		)
 		fn.add_name( var.stem, var )
 		if node.value is not None:
-			operand = self._lower_expr( node.value, var_type )
+			try:
+				operand = self._lower_expr( node.value, var_type )
+			except CompileError:
+				# var is already registered (above) with a plausible
+				# declared type but no real value/instructions behind it -
+				# mark it broken so a later reference raises
+				# RedundantCompilationError instead of using it as if it
+				# were genuinely initialized (see Name.broken)
+				var.broken = True
+				raise
 			# Only NOW, after the RHS is fully lowered, swap var.type for
 			# its resolved (monomorphized, if a Specialization) form -
 			# ensure_resolved()'s own contract: "the SINGLE place a
@@ -2679,7 +2692,7 @@ class FunctionLowering:
 		handling unchanged, not be mistaken for a real error. '''
 		if isinstance( node, ast.Name ):
 			name = self.lowering.discovery.find_name_or_none( node.id )
-			if not isinstance( name, Variable ):
+			if not isinstance( name, Variable ) or name.broken:
 				return None
 			member = self._cfg.narrowed_member( node.id )
 			return member.type if member is not None else name.type
@@ -2691,11 +2704,17 @@ class FunctionLowering:
 			if isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar ) and owner_type.base.stem in ( 'Ptr', 'ConstPtr' ):
 				owner_type = self.lowering._ensure_resolved( owner_type.args[0] )
 			if isinstance( owner_type, ( CStruct, RCClass )):
-				found = owner_type.chain_lookup( node.attr )
+				try:
+					found = owner_type.chain_lookup( node.attr )
+				except RedundantCompilationError:
+					# a broken inherited member is exactly as much "not
+					# statically known" as a genuine miss, for this
+					# speculative-peek contract - never raise here
+					return None
 			else:
 				names = getattr( owner_type, 'names', None )
 				found = names.get( node.attr ) if isinstance( names, dict ) else None
-			if not isinstance( found, Variable ):
+			if not isinstance( found, Variable ) or found.broken:
 				return None
 			# resolve the VARIABLE itself first, same as _attr_lookup's own
 			# `self._ensure_resolved( found ); return found` - found.type can
@@ -2750,6 +2769,52 @@ class FunctionLowering:
 		index = self._lower_expr( index_node, index_type )
 		return root, attr_node.attr, array_type, index
 
+	def _existing_local_or_none( self, target_id: str, node: ast.AST, context: str ) -> Variable|None:
+		''' find_name_or_none, but treating a previously-BROKEN entry as if
+		it weren't there at all - free to redeclare cleanly via
+		_declare_local below, same as a genuinely first assignment, since
+		nothing usable was ever produced for it. Shared by _stmt_Assign,
+		_expr_NamedExpr (walrus), and _bind_loop_target - all three mirror
+		the same "reuse existing, else declare fresh" rule (see their own
+		comments). `context` only feeds the not-a-variable error message,
+		which differs slightly per caller. '''
+		existing = self.lowering.discovery.find_name_or_none( target_id )
+		if existing is None or existing.broken:
+			return None
+		if not isinstance( existing, Variable ):
+			self.lowering.discovery.fail( f'{target_id!r} is not a variable, {context}', node )
+		return existing
+
+	def _declare_local( self, target_id: str, node: ast.AST, lower_rhs: Callable[[Type|None],ir.Operand], *, default_type: Type|None = None ) -> tuple[Variable,ir.Operand]:
+		''' the RHS is lowered BEFORE target_id is registered - not the
+		other way around - because it may reference target_id itself: a
+		bare Name target's own read/write desugaring (_stmt_AugAssign's
+		`x += 1` -> `x = x + 1`, threaded straight through _stmt_Assign)
+		relies on a genuinely-undeclared x's OWN read, inside that
+		synthesized RHS, still failing "not defined" normally - registering
+		x first would make that read find a freshly-declared, empty x
+		instead. Only on FAILURE is a (broken) placeholder registered here,
+		in the except clause - the actual fix for the gap that otherwise let
+		a later, separate reference to target_id report a spurious "not
+		defined" cascade on top of the real, original error (see
+		Name.broken). Shared by the "no prior declaration" branches of
+		_stmt_Assign, _expr_NamedExpr (walrus), and _bind_loop_target.
+		`default_type` is only meaningful for _bind_loop_target's own
+		fallback when value_expr has no type of its own to infer from (e.g.
+		range()'s implicit literal start) - every other caller leaves it
+		None, inferring purely from the RHS. '''
+		fn = self._current_fn
+		try:
+			operand = lower_rhs( default_type )
+		except CompileError:
+			broken = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True )
+			fn.add_name( broken.stem, broken )
+			raise
+		var = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type )
+		fn.add_name( var.stem, var )
+		self.lowering.schedule( var.type )
+		return var, operand
+
 	def _resolve_narrow_member( self, name: str, member_stem: str, node: ast.AST ) -> Variable:
 		# type_resolver.py hands down only a STEM (see its own comment on
 		# why - resolved against the TEXTUAL/abstract union at that pass,
@@ -2789,10 +2854,8 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
 		target = node.targets[0]
 		if isinstance( target, ast.Name ):
-			existing = self.lowering.discovery.find_name_or_none( target.id )
+			existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 			if existing is not None:
-				if not isinstance( existing, Variable ):
-					self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 				self._cfg.unnarrow( target.id ) # a real reassignment invalidates whatever this name was previously narrowed to - see cfg.py's own comment
 				operand = self._lower_expr( node.value, existing.type )
 				for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
@@ -2802,17 +2865,7 @@ class FunctionLowering:
 				# first assignment to a name with no prior declaration - same
 				# as an AnnAssign, but the type is inferred from the RHS
 				# instead of coming from an explicit annotation
-				operand = self._lower_expr( node.value, None )
-				fn = self._current_fn
-				var = Variable(
-					stem = target.id,
-					qualname = f'{fn.qualname}.{target.id}',
-					file = fn.file,
-					line = node.lineno,
-					type = operand.type,
-				)
-				fn.add_name( var.stem, var )
-				self.lowering.schedule( var.type )
+				var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( node.value, expected ))
 				# type_resolver.py's visit_Match desugars `match r:` into
 				# `__match_subj_N = r; if ...` and marks the synthesized
 				# Assign with these two attributes (see its own comment) -
@@ -3994,18 +4047,12 @@ class FunctionLowering:
 		# - except a fresh declaration falls back to `default_type` instead
 		# of failing outright, since value_expr may be a bare literal
 		# (range()'s implicit start=0) with no type of its own to infer from
-		existing = self.lowering.discovery.find_name_or_none( target.id )
-		if existing is not None and not isinstance( existing, Variable ):
-			self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot use it as a for loop target', node )
-		expected = existing.type if existing is not None else default_type
-		operand = self._lower_expr( value_expr, expected )
+		existing = self._existing_local_or_none( target.id, node, 'cannot use it as a for loop target' )
 		if existing is not None:
+			operand = self._lower_expr( value_expr, existing.type )
 			self._emit( ir.Assign( dest = existing, src = operand ))
 			return existing
-		fn = self._current_fn
-		var = Variable( stem = target.id, qualname = f'{fn.qualname}.{target.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type )
-		fn.add_name( var.stem, var )
-		self.lowering.schedule( var.type )
+		var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( value_expr, expected ), default_type = default_type )
 		self._emit( ir.Assign( dest = var, src = operand ))
 		return var
 
@@ -4714,7 +4761,7 @@ class FunctionLowering:
 				f'{ast.unparse(node)}: expected {union.qualname}, got a type that is not one of its members',
 				node,
 			)
-		ctor_fn = union.names[leaf.stem]
+		ctor_fn = union.get_local_or_raise( leaf.stem )
 		self.lowering.schedule( ctor_fn )
 		self.lowering.schedule( ctor_fn.return_type )
 		for p in ctor_fn.parameters or []:
@@ -4809,27 +4856,15 @@ class FunctionLowering:
 		(moot anyway - this language has no comprehensions). '''
 		target = node.target
 		assert isinstance( target, ast.Name )
-		existing = self.lowering.discovery.find_name_or_none( target.id )
+		existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 		if existing is not None:
-			if not isinstance( existing, Variable ):
-				self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 			self._cfg.unnarrow( target.id )
 			operand = self._lower_expr( node.value, existing.type )
 			for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
 				self._emit( instr )
 			self._emit( ir.Assign( dest = existing, src = operand ))
 			return existing
-		operand = self._lower_expr( node.value, None )
-		fn = self._current_fn
-		var = Variable(
-			stem = target.id,
-			qualname = f'{fn.qualname}.{target.id}',
-			file = fn.file,
-			line = node.lineno,
-			type = operand.type,
-		)
-		fn.add_name( var.stem, var )
-		self.lowering.schedule( var.type )
+		var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( node.value, expected ))
 		is_alias = self.lowering._is_aliasing_expr( node.value, operand )
 		for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node ):
 			self._emit( instr )
@@ -4931,6 +4966,8 @@ class FunctionLowering:
 			method_spec = self.lowering.discovery._get_or_create_specialization( fn, current_spec.args )
 			fn = self.lowering._monomorphized_function( method_spec )
 		self.lowering._ensure_resolved( fn )
+		if fn.broken:
+			raise RedundantCompilationError() # already reported at the point fn's own resolution failed - see Name.broken
 		if fn.parameters is None:
 			self.lowering.discovery.fail( f'{fn.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
 		return self.lowering._function_ref_operand( fn )
@@ -5621,7 +5658,7 @@ class FunctionLowering:
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
 		result_spec = self.lowering.discovery._get_or_create_specialization( result_cls, [ payload_type, error_type ])
 		concrete_result_cls = self.lowering._ensure_resolved( result_spec )
-		unwrap = concrete_result_cls.names.get( 'unwrap' )
+		unwrap = concrete_result_cls.get_local_or_raise( 'unwrap' )
 		self.lowering._ensure_resolved( unwrap ) # schedules unwrap itself as a compile unit - see _expr_JoinedStr's own identical comment on init/append/get_ptr
 		self.lowering.schedule( unwrap.return_type )
 		for p in ( unwrap.parameters or [] ):
@@ -5720,7 +5757,7 @@ class FunctionLowering:
 		cls_spec = self.lowering.discovery._get_or_create_specialization( unsafelist_cls, [ str_type ])
 		concrete_cls = self.lowering._ensure_resolved( cls_spec )
 
-		init = concrete_cls.names.get( '__init__' )
+		init = concrete_cls.get_local_or_raise( '__init__' )
 		self.lowering._ensure_resolved( init ) # schedules init ITSELF as a compile unit - monomorphize_class's own per-method substitution loop only builds+caches the substituted Function, it never schedules any of them for real emission on its own (confirmed via a real repro: an unscheduled monomorphized method compiles fine at the CALL SITE but is never actually emitted, producing a C "call to undeclared function" link-time-shaped error)
 		self.lowering.schedule( init.return_type )
 		for p in ( init.parameters or [] ):
@@ -5734,7 +5771,7 @@ class FunctionLowering:
 
 		none_type = self.lowering.discovery.get_none_type()
 		overflow_error_cls = self.lowering.discovery.find_name( 'OverflowError', node )
-		append = concrete_cls.names.get( 'append' )
+		append = concrete_cls.get_local_or_raise( 'append' )
 		self.lowering._ensure_resolved( append ) # see init's own comment on why this is needed
 		self.lowering.schedule( append.return_type )
 		for p in ( append.parameters or [] ):
@@ -5751,7 +5788,7 @@ class FunctionLowering:
 		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
 		ptr_str_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ str_type ])
 		index_error_cls = self.lowering.discovery.find_name( 'IndexError', node )
-		get_ptr = concrete_cls.names.get( 'get_ptr' )
+		get_ptr = concrete_cls.get_local_or_raise( 'get_ptr' )
 		self.lowering._ensure_resolved( get_ptr ) # see init's own comment on why this is needed
 		self.lowering.schedule( get_ptr.return_type )
 		for p in ( get_ptr.parameters or [] ):
@@ -5795,6 +5832,8 @@ class FunctionLowering:
 		# RC mechanism (cfg.py's is_rc/rc_leaves/assign/move) applies
 		# completely unchanged from here on, no special-casing needed
 		self.lowering._ensure_resolved( method )
+		if method.broken:
+			raise RedundantCompilationError() # already reported at the point method's own resolution failed - see Name.broken
 		if method.parameters is None:
 			self.lowering.discovery.fail( f'{method.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
 		arg_types = [ p.type for p in method.parameters ]
@@ -6034,7 +6073,7 @@ class FunctionLowering:
 		would extend this, not work around it. '''
 		resolved_cls = self.lowering._ensure_resolved( target_cls )
 		assert isinstance( resolved_cls, ClassLike ), f'internal compiler error: {resolved_cls} is not constructible'
-		init = resolved_cls.names.get( '__init__' )
+		init = resolved_cls.get_local_or_raise( '__init__' )
 		assert isinstance( init, Function ), f'internal compiler error: {resolved_cls.qualname} has no usable __init__'
 		self.lowering.schedule( resolved_cls )
 		self.lowering._ensure_resolved( init )
@@ -7958,7 +7997,7 @@ class FunctionLowering:
 		if shape is not None:
 			base, members = shape
 			self.lowering._ensure_resolved( base )
-			direct = base.names.get( func_node.attr )
+			direct = base.get_local_or_raise( func_node.attr )
 			if not isinstance( direct, ( Function, Overload )):
 				return self.lowering._type_resolver._resolve_union_receiver_members( base, members, func_node.attr, func_node ), receiver
 		target = self.lowering._type_resolver._attr_lookup_callable( receiver.type, func_node.attr, func_node )
@@ -8251,11 +8290,11 @@ class FunctionLowering:
 				# comment for why that copy's own data field is already
 				# correctly substituted)
 				concrete_union = self.lowering._ensure_resolved( fn_cls )
-				tag_field = concrete_union.names.get( 'tag' )
-				data_field = concrete_union.names.get( 'data' )
+				tag_field = concrete_union.get_local_or_raise( 'tag' )
+				data_field = concrete_union.get_local_or_raise( 'data' )
 			else:
-				tag_field = target_cls.names.get( 'tag' )
-				data_field = target_cls.names.get( 'data' )
+				tag_field = target_cls.get_local_or_raise( 'tag' )
+				data_field = target_cls.get_local_or_raise( 'data' )
 			assert isinstance( tag_field, Variable ) and isinstance( data_field, Variable ), \
 				f'{target_cls.qualname}: UnionStorage.get() has not run yet - no real tag/data storage to allocate'
 			declared = { tag_field.stem: tag_field, data_field.stem: data_field }
@@ -8605,7 +8644,7 @@ class FunctionLowering:
 			self_type = concrete_cls
 			args, kwargs = self._lower_call_args( init, node )
 		else:
-			init = target_cls.names.get( '__init__' )
+			init = target_cls.get_local_or_raise( '__init__' )
 			if isinstance( init, Function ):
 				assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
 			if init is None:

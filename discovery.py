@@ -8,7 +8,7 @@ from typing import Any, Callable, Generator, NoReturn
 
 # local imports
 import compile_time_transformer
-from errors import CompileError, ErrorCollector
+from errors import CompileError, ErrorCollector, RedundantCompilationError
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, FixedArrayType, GeneratorType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
@@ -353,7 +353,7 @@ class Discovery( ast.NodeVisitor ):
 		try:
 			body()
 		except CompileError:
-			pass
+			target.broken = True
 		finally:
 			target.resolve = None
 
@@ -619,6 +619,10 @@ class Discovery( ast.NodeVisitor ):
 		found = self.find_name_or_none( name )
 		if found is None:
 			self.fail( f'name {name!r} is not defined', ctx )
+		if found.broken:
+			# the real error was already recorded once, at the point this
+			# name's own creation/resolution failed - see Name.broken
+			raise RedundantCompilationError()
 		return found
 
 	def visit( self, node: ast.AST ) -> Any:
@@ -1155,7 +1159,7 @@ class Discovery( ast.NodeVisitor ):
 			self.fail( f'module {package!r} not found', node )
 		for alias in node.names:
 			#print( f'{self.module_stack[-1].qualname=} {package=} {node.level=} {node.module=} {alias.name=}' )
-			item = mod.names.get( alias.name )
+			item = mod.get_local_or_raise( alias.name )
 			if not item:
 				self.fail( f'module {package} does not export {alias.name!r}', node )
 			scope.add_name( alias.asname or alias.name, item )
@@ -1598,7 +1602,17 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		try:
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			# scope.add_name already ran above, so class_obj.resolve would
+			# otherwise be left at its dataclass default of None here - the
+			# exact value that means "already resolved, nothing to do"
+			# everywhere else - indistinguishable from a genuinely fine
+			# class to any later reference. broken makes that reference
+			# raise RedundantCompilationError instead (see Name.broken).
+			class_obj.broken = True
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1620,9 +1634,13 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		self._parse_type_params( node.type_params, class_obj )
+		try:
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1654,21 +1672,31 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		if node.bases:
-			# @interface-ness is NOT inherited implicitly - a CStruct
-			# subclassing an @interface CStruct must itself be declared
-			# @interface too (this method only runs when it was), and its
-			# base must itself already be an @interface CStruct, not a plain
-			# one. Deliberately conservative - see "Subclassing mechanics" in
-			# PLAN_SUBCLASSING_VTABLES_COM.md.
-			base = self.visit( node.bases[0] )
-			if not ( isinstance( base, CStruct ) and base.is_interface ):
-				self.fail( f'{qualname} cannot subclass {base.qualname} (@interface can only subclass another @interface CStruct)', node )
-			class_obj.base = base
+		try:
+			if node.bases:
+				# @interface-ness is NOT inherited implicitly - a CStruct
+				# subclassing an @interface CStruct must itself be declared
+				# @interface too (this method only runs when it was), and its
+				# base must itself already be an @interface CStruct, not a plain
+				# one. Deliberately conservative - see "Subclassing mechanics" in
+				# PLAN_SUBCLASSING_VTABLES_COM.md.
+				base = self.visit( node.bases[0] )
+				if not ( isinstance( base, CStruct ) and base.is_interface ):
+					self.fail( f'{qualname} cannot subclass {base.qualname} (@interface can only subclass another @interface CStruct)', node )
+				class_obj.base = base
 
-		self._parse_type_params( node.type_params, class_obj )
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			# base resolution above runs BEFORE class_obj.resolve is ever
+			# assigned below - a failure here would otherwise leave .resolve
+			# at its dataclass default of None, indistinguishable from
+			# "already resolved fine" to anything checking `.resolve is
+			# None` (see _parse_ClassDef_CEnum's own comment for the general
+			# shape of this landmine)
+			class_obj.broken = True
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1690,9 +1718,13 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		self._parse_type_params( node.type_params, class_obj )
+		try:
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1714,9 +1746,13 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		self._parse_type_params( node.type_params, class_obj )
+		try:
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1741,17 +1777,24 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		if node.bases:
-			# resolved eagerly, in the enclosing scope, exactly like Python
-			# itself requires the base to already exist when this statement runs
-			base = self.visit( node.bases[0] )
-			if not isinstance( base, RCClass ):
-				self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)', node )
-			class_obj.base = base
+		try:
+			if node.bases:
+				# resolved eagerly, in the enclosing scope, exactly like Python
+				# itself requires the base to already exist when this statement runs
+				base = self.visit( node.bases[0] )
+				if not isinstance( base, RCClass ):
+					self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)', node )
+				class_obj.base = base
 
-		self._parse_type_params( node.type_params, class_obj )
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			# base resolution above runs BEFORE class_obj.resolve is ever
+			# assigned below - see _parse_ClassDef_Interface's own comment
+			# for why that makes a failure here otherwise invisible
+			class_obj.broken = True
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -2120,7 +2163,16 @@ class Discovery( ast.NodeVisitor ):
 		self._parse_type_params( node.type_params, fn )
 
 		scope = self.scope_stack[-1]
-		existing = scope.names.get( fn.stem )
+		# a raw peek, not a "consume this known-good member" lookup (unlike
+		# get_local_or_raise's other call sites) - existing here feeds
+		# overload-group-formation branching below, which already handles
+		# a plain Function vs an Overload vs nothing at all; a BROKEN
+		# existing Function is deliberately left to that same branching
+		# rather than special-cased, since folding it into a fresh group as
+		# a (broken) sibling implementation is the same "own resolve()
+		# fails, doesn't taint the group" behavior _resolve_guarded already
+		# gives every other overload member
+		existing = scope.get_local( fn.stem )
 
 		# group membership is settled before the resolver is created (below) so
 		# it can be threaded straight into the closure, the same way module/

@@ -181,8 +181,8 @@ class Compiler:
 			mod = self.disco.import_name( module_qualname )
 		except FileNotFoundError:
 			return
-		unit = mod.names.get( attr_name )
-		if unit is None:
+		unit = mod.get_local( attr_name )
+		if unit is None or unit.broken:
 			return
 		self._enqueue( unit )
 		self._drain()

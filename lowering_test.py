@@ -3306,11 +3306,15 @@ class Tests( unittest.TestCase ):
 		# _make_function_resolver body - before fn.parameters is ever
 		# assigned, so it's left at its None default. discovery.py's
 		# _resolve_guarded swallows that CompileError so helper's own
-		# broken definition is reported once, not re-raised - but that
-		# used to leave any CALLER of helper crashing with an unhandled
-		# TypeError ('NoneType' object is not iterable) inside
-		# _match_call_args, instead of just reporting a second, clean
-		# compile error here at the call site
+		# broken definition is reported once, not re-raised, AND marks
+		# helper.broken - which used to leave any CALLER of helper
+		# crashing with an unhandled TypeError ('NoneType' object is not
+		# iterable) inside _match_call_args, then (once that was first
+		# fixed) reporting a second, redundant "could not be resolved"
+		# message at the call site; now it's a silent
+		# RedundantCompilationError instead (see mpy_types.Name.broken) -
+		# the real error was already recorded once, at helper's own
+		# definition
 		code = '\n'.join([
 			'def helper( x ) -> i32:',
 			'	return x',
@@ -3321,8 +3325,123 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
 		self.assertIn( "helper parameter 'x' has no type annotation", self.discovery.errors.errors[0] )
-		self.assertIn( 'helper could not be resolved', self.discovery.errors.errors[1] )
+
+	def test_broken_local_assignment_does_not_cascade_to_later_read( self ) -> None:
+		# x's own initializer fails to compile (undefined_fn doesn't exist) -
+		# the bare-assignment path used to skip registering x entirely when
+		# that happened, so the later `return x` reported its OWN, spurious
+		# "name 'x' is not defined" on top of the real error. Now x gets
+		# registered BROKEN on failure (see lowering.py's _declare_local),
+		# so the later read raises a silent RedundantCompilationError
+		# instead (see mpy_types.Name.broken).
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	x = undefined_fn()',
+			'	return x',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "name 'undefined_fn' is not defined", self.discovery.errors.errors[0] )
+
+	def test_broken_annotated_local_does_not_cascade_to_later_read( self ) -> None:
+		# _stmt_AnnAssign registers x BEFORE lowering its initializer
+		# (unlike plain Assign) - a failed initializer used to leave a
+		# plausible-looking, but never actually initialized, Variable
+		# sitting in scope; the later `return x` would proceed as if it
+		# had a real value instead of raising cleanly.
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = undefined_fn()',
+			'	return x',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "name 'undefined_fn' is not defined", self.discovery.errors.errors[0] )
+
+	def test_broken_local_assignment_heals_on_redeclaration( self ) -> None:
+		# a later, genuinely fresh assignment to the same name must NOT be
+		# blocked by the earlier broken one - free to redeclare cleanly,
+		# same as a first assignment, since nothing usable was ever
+		# produced for the broken attempt.
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	x = undefined_fn()',
+			'	x = 5',
+			'	return x',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "name 'undefined_fn' is not defined", self.discovery.errors.errors[0] )
+		x_var = self.discovery.main.get_local( 'x' )
+		self.assertIsNotNone( x_var )
+		self.assertFalse( x_var.broken )
+
+	def test_augassign_to_undeclared_name_still_fails_cleanly_not_cascading( self ) -> None:
+		# _stmt_AugAssign desugars `x += 1` into `x = x + 1`, threaded
+		# through _stmt_Assign's own "no prior declaration" branch - the
+		# synthesized RHS reads x itself, so x must NOT be registered
+		# until AFTER that RHS is lowered (see _declare_local's own
+		# comment), or the self-read would find a freshly-declared, empty
+		# x instead of correctly failing "not defined". Guards against
+		# regressing that ordering while fixing the broken-local gap above.
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x += 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "name 'x' is not defined", self.discovery.errors.errors[0] )
+
+	def test_broken_base_class_used_later_does_not_cascade( self ) -> None:
+		# Baz's base-class resolution fails eagerly, before Baz.resolve is
+		# even assigned (see discovery.py's _parse_ClassDef_RCClass) -
+		# without marking Baz broken there, Baz.resolve stays at its
+		# dataclass default of None, indistinguishable from "already
+		# resolved fine" to the later construction call below.
+		code = '\n'.join([
+			'@cstruct',
+			'class Bar:',
+			'	pass',
+			'',
+			'class Baz( Bar ):',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	b = Baz()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'cannot subclass', self.discovery.errors.errors[0] )
+
+	def test_broken_generic_function_referenced_later_does_not_cascade( self ) -> None:
+		# alloc's own parameter resolution fails - a generic function, so
+		# the later alloc[u32](...) call site goes through monomorphize.py's
+		# monomorphized_function, which reads base.parameters directly.
+		# Without checking base.broken there, a fully-failed base (whose
+		# .parameters stays None) would silently substitute ZERO parameters
+		# into the monomorphized copy instead of failing at all.
+		code = '\n'.join([
+			'def alloc[T]( count ) -> usize:',
+			'	with compiler.wrap_arithmetic:',
+			'		return count * compiler.sizeof( T )',
+			'',
+			'def main() -> None:',
+			'	x: usize = alloc[u32]( 10 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "alloc parameter 'count' has no type annotation", self.discovery.errors.errors[0] )
 
 	def test_call_free_function_positional_and_keyword( self ) -> None:
 		code = '\n'.join([

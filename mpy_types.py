@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Union
 
+# local imports:
+from errors import RedundantCompilationError
+
 @dataclass( kw_only = True )
 class Name:
 	stem: str # local name like 'str' instead of 'builtins.str'
@@ -12,6 +15,16 @@ class Name:
 	# we don't always know where a name is defined the first time we see it:
 	file: Path|None
 	line: int|None
+
+	# set once, permanently, when this name's own creation/resolution
+	# raised a CompileError - see Discovery._resolve_guarded and
+	# lowering.py's per-kind equivalents. Never cleared: a broken symbol is
+	# only ever attempted once (same convention .resolve = None already
+	# follows). Checked by ScopeMixin.get_local_or_raise/Discovery.find_name
+	# so a later reference raises RedundantCompilationError instead of
+	# either using a half-built object or reporting a confusing second
+	# error - the real one was already recorded at the point of failure.
+	broken: bool = False
 
 @dataclass( kw_only = True )
 class Type( Name ):
@@ -120,6 +133,23 @@ class ScopeMixin:
 
 	def get_local( self, name: str ) -> Name|None:
 		return self.names.get( name )
+
+	def get_local_or_raise( self, name: str ) -> Name|None:
+		''' like get_local, but raises RedundantCompilationError instead of
+		handing back a name whose own creation/resolution already failed.
+		Still returns None (not an error) for a name that's genuinely
+		absent - only a caller that needs "this must exist" should keep
+		failing on that separately, same as today. Every ordinary "look up
+		a specific, known member on an already-in-hand scope object" call
+		site should go through this instead of touching .names directly,
+		so a broken member doesn't surface as a second, confusing failure
+		downstream - get_local itself stays a raw, never-raising accessor,
+		since tests rely on it to inspect a deliberately-broken object's
+		state directly. '''
+		found = self.get_local( name )
+		if found is not None and found.broken:
+			raise RedundantCompilationError()
+		return found
 
 	def in_private_scope( self, scope: 'Type|None' ) -> bool:
 		''' true if `scope` (whatever class the function currently being
@@ -548,7 +578,7 @@ class InheritanceChainMixin:
 		while node is not None:
 			if node.resolve is not None: # each level's .names is populated lazily, same "None means already resolved" convention as everywhere else - a base's own body may not have run yet just because the derived class's own resolve() (already done by the caller) ran
 				node.resolve()
-			found = node.names.get( name )
+			found = node.get_local_or_raise( name ) # every real InheritanceChainMixin (RCClass/CStruct) is also a ScopeMixin
 			if found is not None:
 				return found
 			node = node.base

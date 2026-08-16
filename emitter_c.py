@@ -910,8 +910,8 @@ def _result_tag_data_names( result_spec: Type ) -> tuple[str,str,str,str]:
 	NAMES are looked up dynamically here. '''
 	base = result_spec.base if isinstance( result_spec, Specialization ) else result_spec
 	assert isinstance( base, TaggedUnion ), f'{base!r}: Result must be a real @union'
-	tag_attr = base.names.get( 'tag' )
-	data_attr = base.names.get( 'data' )
+	tag_attr = base.get_local_or_raise( 'tag' )
+	data_attr = base.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{base.qualname}: _tagged_union_storage has not run yet - no real storage shape to read'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem ), _field_name( 'v_Ok' ), _field_name( 'v_Err' )
@@ -921,8 +921,8 @@ def _union_tag_data_fields( union: TaggedUnion ) -> tuple[str,str]:
 	Result[T,E] when E is itself a union like ZeroDivisionError|OverflowError).
 	Same UnionStorage-synthesized 'tag'/'data' shape _result_tag_data_names
 	reads for the outer Result, just for the inner error union. '''
-	tag_attr = union.names.get( 'tag' )
-	data_attr = union.names.get( 'data' )
+	tag_attr = union.get_local_or_raise( 'tag' )
+	data_attr = union.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{union.qualname}: union storage not synthesized (UnionStorage.get must run before emit)'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem )
@@ -3076,8 +3076,8 @@ def emit_tagged_union( union: TaggedUnion ) -> str:
 	# already populated by the time this runs: a TaggedUnion only ever
 	# becomes a real compile unit (lands in compiler.tagged_unions) via a
 	# construction or match site that already called _tagged_union_storage.
-	tag_attr = union.names.get( 'tag' )
-	data_attr = union.names.get( 'data' )
+	tag_attr = union.get_local_or_raise( 'tag' )
+	data_attr = union.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{union.qualname}: _tagged_union_storage has not run yet - no real storage shape to emit'
 	name = mangle_type( union )
@@ -3349,7 +3349,7 @@ def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 			# `data` field (the payload CUnion) - .attributes holds the
 			# LOGICAL members (Ok/Err/...) instead, which aren't part of
 			# the actual C struct layout at all (see emit_tagged_union)
-			data_attr = cls.names.get( 'data' )
+			data_attr = cls.get_local_or_raise( 'data' )
 			dep_types = [ data_attr.type ] if isinstance( data_attr, Variable ) else []
 		else:
 			dep_types = [ attr.type for attr in cls.attributes ]

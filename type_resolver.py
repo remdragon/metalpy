@@ -1933,7 +1933,7 @@ class TypeResolver:
 		# 1. captured parameters - unconditional, always valid from
 		# construction onward (unchanged from every earlier phase)
 		for p in fn.parameters or []:
-			attr = backing_cls.names.get( p.stem )
+			attr = backing_cls.get_local_or_raise( p.stem )
 			assert isinstance( attr, Variable )
 			body.extend( self._build_field_teardown_ast(
 				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = p.stem, ctx = ast.Load() ),
@@ -2205,7 +2205,7 @@ class TypeResolver:
 			self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
 
 			self.schedule( backing_cls )
-			self.schedule( backing_cls.names['__next__'] )
+			self.schedule( backing_cls.get_local_or_raise( '__next__' ))
 			self.schedule( result_union )
 
 			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
@@ -3715,8 +3715,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return None
 		spec = self.discovery._get_or_create_specialization( target_cls, args )
 		concrete_cls = self.resolver.monomorphizer.monomorphize_class( spec )
-		concrete_init = concrete_cls.names.get( '__init__' )
-		if not isinstance( concrete_init, Function ):
+		concrete_init = concrete_cls.get_local( '__init__' )
+		if not isinstance( concrete_init, Function ) or concrete_init.broken:
 			return None # shouldn't happen (monomorphize_class's own method loop always substitutes a plain __init__ too), but stay silent/consistent with this pass's own discipline rather than assert
 		return concrete_cls, concrete_init
 
@@ -3809,8 +3809,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				if target.resolve is not None:
 					target.resolve()
-				init = target.names.get( '__init__' )
-				if isinstance( init, Function ):
+				init = target.get_local( '__init__' )
+				if isinstance( init, Function ) and not init.broken:
 					self.resolver._resolve_callable( init )
 				construction = self._try_resolve_generic_construction( node, target, init )
 				if construction is not None:
@@ -3887,7 +3887,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if not mod:
 			self.discovery.fail( f'module {package!r} not found', node )
 		for alias in node.names:
-			item = mod.names.get( alias.name )
+			item = mod.get_local_or_raise( alias.name )
 			if item is None:
 				self.discovery.fail( f'module {package} does not export {alias.name!r}', node )
 			self.fn.add_name( alias.asname or alias.name, item )

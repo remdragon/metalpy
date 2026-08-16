@@ -231,6 +231,13 @@ def resolve_call(
 	for fn in ( *stubs, *implementations ):
 		if fn.resolve is not None:
 			fn.resolve()
+	# a broken member (its own resolution already failed and was recorded
+	# once, at that failure - see mpy_types.Name.broken) simply doesn't
+	# participate below, exactly as if it were never defined, rather than
+	# either poisoning the whole overload group or crashing later on a
+	# None .parameters
+	stubs = [ fn for fn in stubs if not fn.broken ]
+	implementations = [ fn for fn in implementations if not fn.broken ]
 
 	call_slots: list[int|str] = [ *range( len( args )), *kwargs.keys() ]
 	arg_leaves: dict[int|str,tuple[Type,...]] = {
