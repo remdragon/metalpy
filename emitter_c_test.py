@@ -8180,6 +8180,105 @@ def main() -> i32:
 	# assignment/call-return-type check, not anything new here.
 
 
+class OverloadedDunderComparisonTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `_classify_leaf_pair_eq`'s 'cross_dunder' rule (see
+	`_lower_eq_dispatch`'s own docstring) needs a class to declare TWO
+	`__eq__`/`__ne__` signatures - one matching its own type (the ordinary
+	case), one matching the OTHER concrete type it's being compared
+	against (e.g. `int.__eq__(other: i32)` alongside the pre-existing
+	`int.__eq__(other: int)`) - which registers as a real `Overload`
+	(`mpy_types.Overload`, "stands in for a Function when multiple defs
+	share a name"), not a plain `Function`.
+
+	This is a REAL, confirmed regression class, not a hypothetical: a bare
+	`_find_method` returns `None` for anything that isn't a `Function`
+	(`isinstance(found, Function)`), so it silently treats a whole
+	Overload group as "no such method" - before `_find_eq_method_for_arg`
+	was added (see its own docstring in `lowering.py`), adding a SECOND
+	`__eq__` overload to `int` silently broke the ALREADY-correct,
+	pre-existing `int == int` comparison too (it fell through to comparing
+	by raw pointer identity instead of calling `__eq__` at all - confirmed
+	via the generated C directly: `$t2 = (a) == (b);` comparing two
+	`struct builtins$int*` values, not a real value comparison), on top of
+	`int == i32` never finding the cross-dunder overload at all (both
+	landing on `_classify_leaf_pair_eq`'s `'error'`/`TypeError` path
+	instead). `_find_eq_method_for_arg` fixes both by picking the ONE
+	implementation whose own declared parameter matches the wanted type,
+	for a plain `Function` too, not just an `Overload` (an actual second
+	bug caught mid-fix: the first version of this helper validated the
+	parameter match for the `Overload` branch but returned a plain
+	`Function` unconditionally, un-checked - confirmed via a real
+	regression: `str.__eq__(other: str)` got silently misapplied to an
+	`i32` argument during a DIFFERENT comparison this exact class's own
+	member `int` was mixed into, generating a real "incompatible integer
+	to pointer conversion" C error).
+
+	lib/builtins/__int.py's `int` gained a real
+	`__eq__( self, other: i32 ) -> bool` overload (alongside its
+	pre-existing `__eq__( self, other: int ) -> bool`) specifically to
+	exercise this - "an int and an i32 CAN be equal but are technically
+	different types" is a real, intentional use case for the
+	`'cross_dunder'` rule, not just a synthetic test fixture. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'int_eq_int_overload_group_still_uses_real_comparison', '''
+def main() -> i32:
+	a: int = int( 5 )
+	b: int = int( 5 )
+	if not ( a == b ):
+		return 1
+	c: int = int( 6 )
+	if a == c:
+		return 2
+	if not ( a != c ):
+		return 3
+	if a != b:
+		return 4
+	return 0
+''' ),
+			( 'int_eq_i32_cross_dunder_both_directions', '''
+def main() -> i32:
+	a: int = int( 5 )
+	d: i32 = 5
+	if not ( a == d ):
+		return 1
+	if not ( d == a ):
+		return 2
+	e: i32 = 6
+	if a == e:
+		return 3
+	if e == a:
+		return 4
+	if not ( a != e ):
+		return 5
+	if not ( e != a ):
+		return 6
+	return 0
+''' ),
+			# a real RC-lifetime check - the cross-dunder Call itself
+			# constructs a fresh `int` (via `int(other)` inside
+			# `__eq__`'s own body) purely to reuse `compare()`; confirms
+			# no leak/double-free under repetition
+			( 'int_eq_i32_cross_dunder_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			a: int = int( 5 )
+			d: i32 = 5
+			if not ( a == d ):
+				return 1
+			i += 1
+	return 0
+''' ),
+		] )
+
+
 class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile-and-run companion to GenericMethodDispatchTests'
 	test_union_receiver_dispatch_applies_per_leaf_scalar_widening - proves

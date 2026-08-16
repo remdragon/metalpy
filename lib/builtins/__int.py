@@ -368,8 +368,14 @@ class int:
 	def __eq__( self, other: int ) -> bool:
 		return self.compare( other ) == 0
 
+	def __eq__( self, other: i32 ) -> bool:
+		return self.compare( int( other ) ) == 0
+
 	def __ne__( self, other: int ) -> bool:
 		return self.compare( other ) != 0
+
+	def __ne__( self, other: i32 ) -> bool:
+		return self.compare( int( other ) ) != 0
 
 	def __lt__( self, other: int ) -> bool:
 		return self.compare( other ) < 0
