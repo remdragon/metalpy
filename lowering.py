@@ -2358,8 +2358,8 @@ class FunctionLowering:
 		fn_t, fn_e = fn_shape
 		if op_t is not fn_t or op_e is fn_e:
 			return None # different Ok type entirely, or errors already match (not this method's concern)
-		fn_e_leaves = fn_e.leaves()
-		if not all( leaf in fn_e_leaves for leaf in op_e.leaves() ):
+		fn_e_leaves = tr._atomic_leaves( fn_e )
+		if not all( leaf in fn_e_leaves for leaf in tr._atomic_leaves( op_e )):
 			return None # op's error isn't covered by fn's - a genuine mismatch, not widenable
 		# fn_type is guaranteed Result-shaped here (fn_shape matched), so
 		# schedule/monomorphize it the same way _stmt_Return's own caller
@@ -4311,18 +4311,27 @@ class FunctionLowering:
 			elif isinstance( expected_type, Specialization ) and isinstance( expected_type.base, TaggedUnion ):
 				expected_union = self.lowering.monomorphize_class( expected_type )
 		if expected_union is not None and operand.type is not expected_union:
-			# _coerce_into_union is for wrapping a PLAIN LEAF value (its own
-			# docstring: "operand.type is exactly one of the union's own
-			# leaves") - if operand is ITSELF union-shaped (e.g. a genuinely
-			# unrelated Result[T,OtherE] flowing into a Result[T,E]-expected
-			# context), it can never legitimately BE one of expected_union's
-			# own leaves, so attempting coercion here would just misfire with
-			# a confusing "not one of its members" message. Leave operand
-			# untouched instead - the general type-mismatch check in
-			# _stmt_Return (or an equivalent caller-side check) reports this
-			# far more clearly than _coerce_into_union ever could
-			operand_base = operand.type.base if isinstance( operand.type, Specialization ) else operand.type
-			if not isinstance( operand_base, TaggedUnion ):
+			# operand being ITSELF union-shaped does NOT automatically rule out
+			# coercion - a nominal @union (e.g. HTTPError) is exactly as valid a
+			# member of a WIDER union (OSError|HTTPError) as any plain leaf type
+			# is. But it doesn't automatically qualify either: operand can ALSO be
+			# a genuinely unrelated Result[T,OtherE] flowing into a Result[T,E]-
+			# expected context (Result is itself a TaggedUnion-based
+			# Specialization) - that shape is handled by a SEPARATE mechanism
+			# entirely (_stmt_Return's own _maybe_widen_return_result, emitting
+			# ir.WidenResult), which must get the first chance to run, not be
+			# preempted by a hard failure here. So this only actually invokes
+			# _coerce_into_union (which hard-fails on a genuine mismatch) when
+			# operand's whole type already verbatim matches one of expected_
+			# union's own leaf attribute types - the same check _coerce_into_
+			# union would use to decide to wrap it anyway, just performed as a
+			# non-failing probe first so a genuine non-member (e.g. that
+			# unrelated Result[T,OtherE]) is left untouched for its own,
+			# more-specific caller-side handling instead
+			if any(
+				self.lowering._type_resolver._same_type( attr.type, operand.type )
+				for attr in expected_union.attributes
+			):
 				operand = self._coerce_into_union( operand, expected_union, node )
 		# a derived RCClass value flowing into a base-class context (arg, return,
 		# assignment) is an upcast: struct Derived* -> struct Base*, which C

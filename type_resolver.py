@@ -2617,6 +2617,26 @@ class TypeResolver:
 		b_backing = b.backing if isinstance( b, TupleType ) else b
 		return a_backing is not None and a_backing is b_backing
 
+	def _atomic_leaves( self, t: Type ) -> list[Type]:
+		''' like t.leaves(), but treats a NOMINAL @union class (t.file is not
+		None) as a single opaque leaf - itself - rather than decomposing into
+		its own variants' payload types. Mirrors the exact anonymous-vs-
+		nominal distinction discovery.py's _get_or_create_union already uses
+		when flattening a wider union's own operands (only a synthesized
+		anonymous union, t.file is None, is fair game to flatten there too).
+		t.leaves() itself stays general-purpose - RC-leaf decomposition
+		genuinely wants a union's real payload types even when it's nominal
+		(see TaggedUnion.is_rc()) - this is the separate "is t covered by /
+		a member of some other union" notion _require_result_return and
+		_maybe_widen_return_result need instead. Without this, a nominal
+		@union (e.g. HTTPError, all-None-payload variants) widening into a
+		bigger union (OSError|HTTPError) decomposed into its own variants'
+		payload types (five NoneTypes) instead of being compared as the one
+		opaque HTTPError member it actually is. '''
+		if isinstance( t, TaggedUnion ) and t.file is None:
+			return t.leaves()
+		return [ t ]
+
 	def _result_shape( self, t: Type|None ) -> tuple[Type,Type]|None:
 		''' (T, E) if `t` is Result[T,E], else None. '''
 		result_cls = self.discovery.find_name_or_none( 'Result' )
@@ -2649,10 +2669,10 @@ class TypeResolver:
 		spec = self._as_specialization( return_type )
 		covered = False
 		if fn is not None and spec is not None and spec.base is result_cls and len( spec.args ) == 2:
-			fn_error_leaves = spec.args[1].leaves()
-			covered = all( leaf in fn_error_leaves for leaf in error_cls.leaves() )
+			fn_error_leaves = self._atomic_leaves( spec.args[1] )
+			covered = all( leaf in fn_error_leaves for leaf in self._atomic_leaves( error_cls ))
 		if not covered:
-			want = ' | '.join( sorted( leaf.stem for leaf in error_cls.leaves() ))
+			want = ' | '.join( sorted( leaf.stem for leaf in self._atomic_leaves( error_cls )))
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
 				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
