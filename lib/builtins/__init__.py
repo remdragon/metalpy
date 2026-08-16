@@ -218,7 +218,20 @@ class bytearray:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.get_const_ptr() called after release()'
 		return self.__data
-	
+
+	def __getitem__( self, index: usize ) -> Result[u8,IndexError]:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__getitem__() called after release()'
+		if index >= self.__len:
+			return Result.Err( IndexError() )
+		return Result.Ok( self.__data[index] )
+
+	def __setitem__( self, index: usize, value: u8 ) -> None:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__setitem__() called after release()'
+			assert index < self.__len, 'bytearray.__setitem__() index out of range'
+		self.__data[index] = value
+
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.decode() called after release()'

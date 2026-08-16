@@ -11244,6 +11244,78 @@ def main() -> i32:
 		self.assertIn( 'must be rooted at a bare local variable', self.discovery.errors.errors[0] )
 
 
+class ByteArrayScalarIndexingRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real gap: bytearray had no scalar
+	__getitem__/__setitem__ (only slice syntax via get_ptr()/get_const_ptr()/
+	_byte_slice) - `buf[0] = 65`/`x: u8 = buf[0]` failed at C-compile time
+	with e.g. "assigning to 'struct builtins$bytearray' from incompatible
+	type 'uint8_t'" (the generated C treated buf[0] as indexing the WHOLE
+	struct rather than dispatching through __getitem__/__setitem__, since
+	neither existed to dispatch through). bytes/bytearray fully support
+	buf[i]/buf[i] = x in real Python. lib/socket.py's own real code worked
+	around this throughout by always going through .get_ptr()[i]/
+	.get_const_ptr()[i] (raw pointer indexing, which already worked) instead.
+
+	Fixed by adding real __getitem__(self, index: usize) ->
+	Result[u8,IndexError] / __setitem__(self, index: usize, value: u8) ->
+	None methods to bytearray in lib/builtins/__init__.py, following the
+	existing UnsafeList/dict __getitem__/__setitem__ patterns already in
+	that file, and matching bytearray's own debug-mode BYTEARRAY_INVALID-
+	after-release assertion style already used by its other methods (plus a
+	debug-mode index-in-range assertion for __setitem__, which has no
+	Result to report an out-of-range write through, matching its own bare
+	`-> None` signature). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact repro shape from the task report - buf[0] = ...
+			# (bare subscript assignment) and x: u8 = buf[0] (bare
+			# subscript read) both used to fail at C-compile time
+			( 'bytearray_scalar_getitem_setitem_bare_subscript_syntax', '''
+def helper() -> Result[i32, IndexError]:
+	buf: bytearray = bytearray( 4 )
+	buf[0] = 65
+	x: u8 = buf[0]
+	if x != 65:
+		return Result.Ok( 1 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match helper():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 2
+''' ),
+			# explicit .__getitem__()/.__setitem__() calls (not just the
+			# bare subscript sugar), and an out-of-range __getitem__
+			# correctly reports Err rather than reading out of bounds
+			( 'bytearray_explicit_getitem_setitem_calls_and_out_of_range_getitem', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 4 )
+	buf.__setitem__( 0, 65 )
+	buf.__setitem__( 3, 99 )
+	v0: u8 = buf.__getitem__( 0 ).unwrap( 'index 0 in range' )
+	v3: u8 = buf.__getitem__( 3 ).unwrap( 'index 3 in range' )
+	if v0 != 65:
+		return 1
+	if v3 != 99:
+		return 2
+	match buf.__getitem__( 4 ): # one past the end - out of range
+		case Result.Ok( _ ):
+			return 3
+		case Result.Err( _ ):
+			pass
+	return 0
+''' ),
+		] )
+
+
 class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression test for a real, confirmed silent-data-corruption bug: an
 	`@extern` function declared with a `T|None` return type where T is a
