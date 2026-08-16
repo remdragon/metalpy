@@ -319,15 +319,18 @@ def _build_sockaddr_in6( host: str, port: u16 ) -> Result[SockAddrIn6, OSError]:
 # _build_sockaddr_in/6 above follow), rather than passing a numeric-service
 # string, which would need its own int->str dependency just for this.
 #
-# A bogus/unresolvable host collapses to the same OSError.Invalid
-# _build_sockaddr_in/6 already return for an unparseable IP literal - real
-# getaddrinfo() failures come back as EAI_* codes on POSIX (a wholly separate
-# namespace from errno, NOT safe to feed into OSError's own errno-based
-# construction - confirmed against the real getaddrinfo(3) contract) and as
-# WSA*-compatible-but-still-unlisted codes on Windows, so neither side has a
-# meaningful existing OSError variant to map to; collapsing both to Invalid
-# keeps the error surface simple and testable rather than leaking a
-# namespace-confused numeric code.
+# A bogus/unresolvable host returns OSError.NameResolutionFailed, distinct
+# from the OSError.Invalid _build_sockaddr_in/6 return for an unparseable IP
+# literal - these are genuinely different failures (a syntactically-bad
+# address vs. a well-formed hostname that just doesn't resolve) and collapsing
+# them into one code would leave callers unable to tell "fix your input" from
+# "the network/DNS didn't cooperate". NameResolutionFailed is a real,
+# specific OSError member rather than the raw getaddrinfo() return code
+# itself: on POSIX that code is EAI_*, a wholly separate namespace from errno
+# (NOT safe to feed into OSError's own errno-based construction - confirmed
+# against the real getaddrinfo(3) contract), and on Windows it IS a real
+# WSAHOST_NOT_FOUND-compatible code but only the single most common failure
+# gets a name here, same as every other OSError member.
 # ---------------------------------------------------------------------------
 
 def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn], OSError]:
@@ -335,7 +338,7 @@ def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn
 	res_head: Ptr[None] = None
 	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
 	if rc != 0:
-		return Result.Err( OSError.Invalid )
+		return Result.Err( OSError.NameResolutionFailed )
 	results: list[SockAddrIn] = list[SockAddrIn]()
 	cur: Ptr[None] = res_head
 	while cur is not None:
@@ -354,7 +357,7 @@ def _resolve_v6( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn
 	res_head: Ptr[None] = None
 	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
 	if rc != 0:
-		return Result.Err( OSError.Invalid )
+		return Result.Err( OSError.NameResolutionFailed )
 	results: list[SockAddrIn6] = list[SockAddrIn6]()
 	cur: Ptr[None] = res_head
 	while cur is not None:

@@ -283,10 +283,11 @@ def main() -> i32:
 	return 0
 '''
 
-# A bogus/unresolvable hostname must fail connect() with OSError.Invalid -
-# same bucket _build_sockaddr_in/6 already use for an unparseable IP literal
-# (see lib/socket.py's own _resolve_v4/_resolve_v6 comment for why getaddrinfo's
-# own EAI_*/WSA* failure codes aren't mapped to a more specific OSError variant).
+# A bogus/unresolvable hostname must fail connect() with
+# OSError.NameResolutionFailed - distinct from OSError.Invalid, which
+# _build_sockaddr_in/6 still use for a syntactically-unparseable IP literal
+# (see lib/socket.py's own _resolve_v4/_resolve_v6 comment for why the two
+# are kept separate rather than collapsed into one bucket).
 _CONNECT_BOGUS_HOSTNAME = '''
 import socket
 
@@ -296,7 +297,7 @@ def main() -> i32:
 		case Result.Ok( _ ):
 			return 1  # should have failed - not a resolvable hostname
 		case Result.Err( e ):
-			if e != OSError.Invalid:
+			if e != OSError.NameResolutionFailed:
 				return 2
 	return 0
 '''
@@ -367,7 +368,7 @@ def main() -> i32:
 		case Result.Ok( _ ):
 			return 1  # should have failed - not a resolvable hostname
 		case Result.Err( e ):
-			if e != OSError.Invalid:
+			if e != OSError.NameResolutionFailed:
 				return 2
 	return 0
 '''
