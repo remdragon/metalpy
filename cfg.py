@@ -49,25 +49,22 @@ class OwnState( Enum ):
 	COPY = 'copy'
 	MOVED = 'moved'
 
-# is_rc/rc_leaves/_is_direct_pointer_rc all used to be open-coded isinstance
-# ladders right here, which is how the same bug shipped three separate times:
-# a new Type kind appeared, this ladder wasn't updated, and the new kind
-# silently defaulted to "not RC" (nested-union leaf -> leak; generic union's
+# rc_leaves/_is_direct_pointer_rc used to be open-coded isinstance ladders
+# right here, which is how the same bug shipped three separate times: a new
+# Type kind appeared, this ladder wasn't updated, and the new kind silently
+# defaulted to "not RC" (nested-union leaf -> leak; generic union's
 # unsubstituted TypeVar leaves -> UAF; unresolved union -> order-dependent
 # UAF). Each type kind now answers for itself - see mpy_types.Type's own
 # is_rc/is_rc_pointer/rc_leaves, which carry the full history of those bugs.
-# These stay as module-level names purely because ~20 call sites in this file
-# and lowering.py already spell them that way.
-
-def is_rc( t: Type ) -> bool:
-	return t.is_rc()
+# These two stay as module-level names purely because their call sites in
+# this file and lowering.py already spell them that way. is_result_type
+# likewise delegates to mpy_types.Type.is_result_type(), but stays a free
+# function (rather than being replaced by direct .is_result_type() calls)
+# since every call site passes a Type|None and needs the None-guard.
 
 def is_result_type( t: Type|None ) -> bool:
 	''' True when `t` is a concrete Result[T,E] specialization. '''
-	if t is None:
-		return False
-	base = t.base if isinstance( t, Specialization ) else t
-	return isinstance( base, TaggedUnion ) and base.stem == 'Result'
+	return t is not None and t.is_result_type()
 
 def rc_leaves( t: Type ) -> list[Type]:
 	return t.rc_leaves()

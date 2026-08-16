@@ -6,7 +6,6 @@ import queue
 import threading
 
 # local imports:
-from cfg import is_rc
 from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
@@ -1312,7 +1311,7 @@ class TypeResolver:
 		]
 		live_flag_attrs = [
 			Variable( stem = self._live_flag_stem( stem ), qualname = f'{qualname}.{self._live_flag_stem( stem )}', file = fn.file, line = fn.line, type = bool_cls )
-			for stem, t in locals_decl.items() if is_rc( t )
+			for stem, t in locals_decl.items() if t.is_rc()
 		]
 		extra_attrs = [
 			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
@@ -1750,7 +1749,7 @@ class TypeResolver:
 		# _rename_and_track_liveness/_build_generator_destructor) -
 		# scalar/non-RC locals need nothing, same posture as before this
 		# phase
-		rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
+		rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
 
 		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - a single
 		# shared mutable cell, advanced in program order as each guard
@@ -1928,7 +1927,7 @@ class TypeResolver:
 		if defer_sites:
 			rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
 			dtor_renamer = _GeneratorNameRenamer( rename_targets )
-			rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
+			rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
 			body.extend( self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, fn.node ), dtor_renamer, rc_local_stems ))
 
 		# 1. captured parameters - unconditional, always valid from
@@ -1945,7 +1944,7 @@ class TypeResolver:
 		# non-RC (scalar/CEnum/...) locals need no teardown at all, same
 		# as every earlier phase
 		for stem, t in locals_decl.items():
-			if not is_rc( t ):
+			if not t.is_rc():
 				continue
 			teardown = self._build_field_teardown_ast(
 				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = stem, ctx = ast.Load() ),
@@ -2051,7 +2050,7 @@ class TypeResolver:
 			ast.copy_location( name_node, fn.node )
 			keywords.append( ast.keyword( arg = p.stem, value = name_node ) )
 		for stem, t in locals_decl.items():
-			if is_rc( t ):
+			if t.is_rc():
 				# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - never read
 				# before its own first real assignment (gated by the
 				# companion live-flag field below, checked by the
@@ -2062,7 +2061,7 @@ class TypeResolver:
 			else:
 				zero = ast.Constant( value = False if ( isinstance( t, Scalar ) and t.stem == 'bool' ) else 0 )
 			keywords.append( ast.keyword( arg = stem, value = zero ) )
-			if is_rc( t ):
+			if t.is_rc():
 				keywords.append( ast.keyword( arg = self._live_flag_stem( stem ), value = ast.Constant( value = False ) ) )
 		for stem, ( _t, expr ) in extra_fields.items():
 			keywords.append( ast.keyword( arg = stem, value = expr ) )

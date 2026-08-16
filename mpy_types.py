@@ -49,6 +49,11 @@ class Type( Name ):
 		question as is_rc_pointer() below. '''
 		return False
 
+	def is_result_type( self ) -> bool:
+		''' True when this type is a concrete Result[T,E] specialization -
+		overridden on TaggedUnion, delegated on Specialization. '''
+		return False
+
 	def is_rc_pointer( self ) -> bool:
 		''' this type's OWN runtime representation IS a single, bare RC
 		pointer - so a Retain/Release can be applied to a value of this type
@@ -216,6 +221,7 @@ class Specialization( Type ):
 	# Without it, every generic-class/generic-union instance method's own
 	# `self` (already typed as a Specialization) wrongly looks untracked.
 	def is_rc( self ) -> bool: return self.base.is_rc()
+	def is_result_type( self ) -> bool: return self.base.is_result_type()
 	def is_rc_pointer( self ) -> bool: return self.base.is_rc_pointer()
 	def has_object_header( self ) -> bool: return self.base.has_object_header()
 	def has_vtable( self ) -> bool: return self.base.has_vtable()
@@ -790,6 +796,9 @@ class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backin
 		# union (never generic/Specialization-wrapped by construction) or has
 		# already had its params substituted by whichever caller is asking.
 		return any( leaf.is_rc() for leaf in self._resolved_leaves() )
+
+	def is_result_type( self ) -> bool:
+		return self.stem == 'Result'
 
 	def is_rc_pointer( self ) -> bool:
 		# a union's runtime shape is a tag+data VALUE STRUCT, never a bare
