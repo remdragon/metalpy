@@ -850,6 +850,66 @@ class Lowering:
 			found = names.get( name ) if isinstance( names, dict ) else None
 		return found if isinstance( found, Function ) else None
 
+	def _find_method_or_overload( self, owner_type: Type|None, name: str ) -> Function|Overload|None:
+		''' like _find_method, but ALSO recognizes an Overload-grouped method
+		(multiple @overload-decorated defs sharing the name - mpy_types.
+		Overload "stands in for a Function when multiple defs share a name")
+		instead of silently treating it exactly as if the type had no such
+		method at all. _find_method itself stays Function-only: its OTHER
+		callers (container-protocol dunders, binop/unary dunder dispatch, the
+		for-loop __next__ probe, ...) never learned to CALL an Overload
+		target, so widening it there would just trade one silent gap for a
+		crash the first time one of those methods was ever declared as an
+		overload group. This narrower sibling exists for callers that DO
+		know how to dispatch through one - see _lower_dunder_overload_call -
+		currently only the comparison-dunder (==/!=/</>/<=/>=) call sites.
+		No shipped dunder is currently declared this way; this just stops
+		comparison dispatch from silently falling back to a flat pointer-
+		comparison Cmp (or failing to find a real, existing method) the
+		moment one is. '''
+		owner_type = self._ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass )):
+			found = owner_type.chain_lookup( name )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( name ) if isinstance( names, dict ) else None
+		return found if isinstance( found, ( Function, Overload )) else None
+
+	def _find_matching_eq_candidate( self, owner_type: Type|None, other_type: Type, method_name: str ) -> Function|None:
+		''' probes owner_type for a real __eq__/__ne__ whose single declared
+		parameter matches other_type exactly (_same_type) - the criterion
+		_classify_leaf_pair_eq's own cross-leaf-type dunder dispatch has
+		always used. Unlike a bare _find_method_or_overload result, this
+		looks INSIDE an Overload group for the one candidate (if any) whose
+		signature actually matches other_type. A plain linear search, not a
+		real runtime dispatch decision: discovery.py's own well-formedness
+		checks (_check_overload_ambiguity) already guarantee at most one
+		candidate can match a single concrete parameter type, and both leaf
+		types here are already statically concrete by the time
+		_classify_leaf_pair_eq runs (unlike an ordinary call site, where an
+		argument's type can itself still be ambiguous/union-shaped - that's
+		what overload_resolution.resolve_call/_lower_dunder_overload_call are
+		for, elsewhere). '''
+		found = self._find_method_or_overload( owner_type, method_name )
+		candidates = ( *found.stubs, *found.implementations ) if isinstance( found, Overload ) else ( ( found, ) if found is not None else () )
+		for candidate in candidates:
+			# an Overload group member's .parameters stays None (Function's
+			# own docstring: "None means already resolved; otherwise call it
+			# to populate parameters/return_type") until something actually
+			# calls .resolve() on it - unlike a PLAIN (non-overloaded) method,
+			# which every existing caller here already reaches only after
+			# something else (attribute lookup, construction, ...) forced its
+			# resolution first. An Overload group member reached only through
+			# THIS probe may never have been resolved at all yet, so it has
+			# to be forced here explicitly - mirrors overload_resolution.
+			# resolve_call's own identical "for fn in (*stubs,*implementations):
+			# if fn.resolve is not None: fn.resolve()" pass.
+			if candidate.resolve is not None:
+				candidate.resolve()
+			if candidate.parameters and len( candidate.parameters ) == 1 and self._type_resolver._same_type( candidate.parameters[0].type, other_type ):
+				return candidate
+		return None
+
 	def _find_iterator_next_method( self, owner_type: Type|None ) -> Function|None:
 		# PLAN_GENERATORS.md Phase 3 - a non-failing probe (same posture as
 		# _find_method above): "this type has no __next__" is a normal
@@ -6775,7 +6835,10 @@ class FunctionLowering:
 		if not isinstance( left.type, Scalar ):
 			method_name = _COMP_DUNDER.get( type( node.ops[0] ))
 			if method_name is not None:
-				method = self.lowering._find_method( left.type, method_name )
+				method = self.lowering._find_method_or_overload( left.type, method_name )
+				if isinstance( method, Overload ):
+					right = self._lower_expr( node.comparators[0], left.type )
+					return self._lower_dunder_overload_call( method, left, [ right ], expected_type, node )
 				if method is not None:
 					right = self._lower_expr( node.comparators[0], left.type )
 					self.lowering._ensure_resolved( method )
@@ -6796,6 +6859,37 @@ class FunctionLowering:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
+		return dest
+
+	def _lower_dunder_overload_call( self, overload: Overload, receiver: ir.Operand, args: list[ir.Operand], expected_type: Type|None, node: ast.AST ) -> ir.Operand:
+		''' calls an Overload-grouped comparison dunder (found via
+		Lowering._find_method_or_overload) against already-lowered operands -
+		the comparison-dispatch equivalent of _lower_call's own Overload
+		branch (real ConditionalDispatch/ranking machinery via
+		overload_resolution.resolve_call), which only ever sees ordinary
+		AST-argument calls. Deliberately narrower than that branch: every
+		comparison dunder takes exactly `self` + one already-lowered operand,
+		no kwargs, no @move, no literal-narrowing concerns (args are already
+		lowered, not raw AST) - so this reuses resolve_call/
+		_lower_conditional_dispatch directly rather than re-deriving their
+		full generality. '''
+		self.lowering._ensure_resolved( overload )
+		arg_types = [ a.type for a in args ]
+		try:
+			branches, resolved = overload_resolution.resolve_call(
+				overload.stubs, overload.implementations, arg_types, {},
+				qualname = overload.qualname, same_type = self.lowering._type_resolver._same_type,
+			)
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+		if branches:
+			return self._lower_conditional_dispatch( node, branches, resolved, args, {}, expected_type, want_result = True )
+		self.lowering._ensure_resolved( resolved )
+		self.lowering.schedule( resolved.return_type )
+		for p in ( resolved.parameters or [] ):
+			self.lowering.schedule( p.type )
+		dest = self._new_temp( expected_type or resolved.return_type )
+		self._emit( ir.Call( dest = dest, target = resolved, receiver = receiver, args = args, kwargs = {} ))
 		return dest
 
 	def _lower_eq_or_ne( self, node: ast.Compare, left: ir.Operand, expected_type: Type|None, negate: bool ) -> ir.Operand:
@@ -6837,7 +6931,7 @@ class FunctionLowering:
 		     both are reinstated explicitly here since strict=False below
 		     skips them). '''
 		method_name = '__ne__' if negate else '__eq__'
-		method = self.lowering._find_method( left.type, method_name ) if not isinstance( left.type, Scalar ) else None
+		method = self.lowering._find_method_or_overload( left.type, method_name ) if not isinstance( left.type, Scalar ) else None
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		# the hint handed to the comparator's own lowering below: left.type,
 		# EXCEPT when left.type is ITSELF a union - hinting a plain leaf
@@ -6869,6 +6963,8 @@ class FunctionLowering:
 			else:
 				right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
 				return self._lower_eq_dispatch( node, left, left_shape, right, right_shape, negate )
+		if isinstance( method, Overload ):
+			return self._lower_dunder_overload_call( method, left, [ right ], expected_type, node )
 		if method is not None:
 			self.lowering._ensure_resolved( method )
 			self.lowering.schedule( method.return_type )
@@ -6998,13 +7094,11 @@ class FunctionLowering:
 			return _LeafPairEq( 'none_false' )
 		if self.lowering._type_resolver._same_type( left_type, right_type ):
 			return _LeafPairEq( 'same_type' )
-		method = self.lowering._find_method( left_type, method_name ) if not isinstance( left_type, Scalar ) else None
-		if method is not None and method.parameters and len( method.parameters ) == 1 \
-				and self.lowering._type_resolver._same_type( method.parameters[0].type, right_type ):
+		method = self.lowering._find_matching_eq_candidate( left_type, right_type, method_name ) if not isinstance( left_type, Scalar ) else None
+		if method is not None:
 			return _LeafPairEq( 'cross_dunder', method = method, reflected = False )
-		reflected_method = self.lowering._find_method( right_type, method_name ) if not isinstance( right_type, Scalar ) else None
-		if reflected_method is not None and reflected_method.parameters and len( reflected_method.parameters ) == 1 \
-				and self.lowering._type_resolver._same_type( reflected_method.parameters[0].type, left_type ):
+		reflected_method = self.lowering._find_matching_eq_candidate( right_type, left_type, method_name ) if not isinstance( right_type, Scalar ) else None
+		if reflected_method is not None:
 			return _LeafPairEq( 'cross_dunder', method = reflected_method, reflected = True )
 		return _LeafPairEq( 'error' )
 
@@ -7212,7 +7306,9 @@ class FunctionLowering:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		if not isinstance( left.type, Scalar ):
 			method_name = '__ne__' if negate else '__eq__'
-			method = self.lowering._find_method( left.type, method_name )
+			method = self.lowering._find_method_or_overload( left.type, method_name )
+			if isinstance( method, Overload ):
+				return self._lower_dunder_overload_call( method, left, [ right ], None, node )
 			if method is not None:
 				self.lowering._ensure_resolved( method )
 				self.lowering.schedule( method.return_type )

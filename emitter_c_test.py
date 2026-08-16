@@ -8786,6 +8786,102 @@ def main() -> i32:
 		] )
 
 
+class OverloadedDunderComparisonRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression test for a real, latent gap: lowering.py's _find_method
+	explicitly returned None for an Overload-grouped method ("return found
+	if isinstance(found, Function) else None") - if a class declared a
+	dunder (e.g. __eq__) as multiple @overload signatures instead of one
+	plain def, every comparison-dunder dispatch site treated the class as
+	if it had NO such method at all, silently falling back to a flat
+	pointer-comparison Cmp (same-type case) or failing to find a cross-type
+	candidate that genuinely existed (different-type case, misclassified as
+	an 'error'/TypeError cell). Never exercised before - no dunder anywhere
+	in this codebase was declared as an Overload group.
+
+	Fixed via Lowering._find_method_or_overload (a sibling probe that DOES
+	recognize an Overload, used only by the comparison-dispatch call sites
+	that know how to call one - _lower_method_or_overload itself is left
+	Function-only for its other, unaudited callers) plus two ways of
+	actually calling what it finds: _lower_dunder_overload_call (real
+	overload_resolution.resolve_call + _lower_conditional_dispatch, reused
+	from _lower_call's own Overload branch, for the same-leaf-type fast
+	path in _lower_eq_or_ne/_lower_operand_compare/the </>/<=/>= dispatch)
+	and _find_matching_eq_candidate (a plain linear search for the one
+	candidate matching a statically-known OTHER leaf type, for
+	_classify_leaf_pair_eq's cross-type grid classification, which already
+	knows both leaf types concretely and never needed real runtime
+	dispatch). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# same-leaf-type fast path (_lower_eq_or_ne's own method lookup,
+			# right.type already equal to left.type) - exercises
+			# _lower_dunder_overload_call's real ConditionalDispatch/
+			# resolve_call machinery, reused unchanged from _lower_call's own
+			# Overload branch
+			( 'overloaded_eq_same_type_dispatches_to_real_dunder', '''
+class Box:
+	value: i32
+
+	def __init__( self, value: i32 ):
+		self.value = value
+
+	@overload
+	def __eq__( self, other: Box ) -> bool:
+		return self.value == other.value
+
+	@overload
+	def __eq__( self, other: i32 ) -> bool:
+		return self.value == other
+
+def main() -> i32:
+	a: Box = Box( 5 )
+	b: Box = Box( 5 )
+	c: Box = Box( 6 )
+	if not ( a == b ):
+		return 1
+	if a == c:
+		return 2
+	return 0
+''' ),
+			# cross-leaf-type path (_lower_eq_dispatch/_classify_leaf_pair_eq,
+			# right.type genuinely different from left.type) - exercises
+			# _find_matching_eq_candidate's search INSIDE the Overload group
+			# for the one candidate whose declared parameter matches the
+			# other side's concrete type
+			( 'overloaded_eq_cross_type_dispatches_to_real_dunder', '''
+class Box:
+	value: i32
+
+	def __init__( self, value: i32 ):
+		self.value = value
+
+	@overload
+	def __eq__( self, other: Box ) -> bool:
+		return self.value == other.value
+
+	@overload
+	def __eq__( self, other: i32 ) -> bool:
+		return self.value == other
+
+def main() -> i32:
+	a: Box = Box( 5 )
+	n: i32 = 5
+	m: i32 = 6
+	if not ( a == n ):
+		return 1
+	if a == m:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Codec.decode widened to bytes|bytearray, against the REAL Utf8
 	class (not a synthetic stand-in) - constructing a real Utf8() instance
