@@ -8922,6 +8922,90 @@ def main() -> i32:
 		] )
 
 
+class OverloadedDunderComparisonExtraSitesRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' companion to OverloadedDunderComparisonTests (int.__eq__/__ne__(i32)
+	above): that fix landed FunctionLowering._find_eq_method_for_arg,
+	scoped to _lower_eq_or_ne's same-type fast path and
+	_classify_leaf_pair_eq's cross-type classification (==/!= only). Two
+	OTHER call sites had the exact same _find_method-returns-None-for-an-
+	Overload gap (found separately, then reconciled with the above fix on
+	merge): _expr_Compare's general </>/<=/>= dunder dispatch, and
+	_lower_operand_compare (the union-leaf-pair equality helper used once a
+	leaf pairing is classified 'same_type'). Both are now fixed the same
+	way, reusing _find_eq_method_for_arg (every caller here already knows
+	the argument's own concrete type - strict=True lowering forces it to
+	match the receiver's type, or a union leaf's own narrowed payload type,
+	before dispatch is even reached, so no real runtime ambiguity is
+	possible the way an ordinary call's overload resolution has to handle). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# _expr_Compare's general </>/<=/>= dunder dispatch: an Overload
+			# group for __lt__ (needed to trigger the gap at all) must still
+			# find and call the real Box-vs-Box implementation, not silently
+			# fall back to flat pointer comparison
+			( 'overloaded_lt_still_dispatches_to_real_dunder', '''
+class Box:
+	value: i32
+
+	def __init__( self, value: i32 ):
+		self.value = value
+
+	@overload
+	def __lt__( self, other: Box ) -> bool:
+		return self.value < other.value
+
+	@overload
+	def __lt__( self, other: i32 ) -> bool:
+		return self.value < other
+
+def main() -> i32:
+	a: Box = Box( 5 )
+	b: Box = Box( 6 )
+	if not ( a < b ):
+		return 1
+	if b < a:
+		return 2
+	return 0
+''' ),
+			# _lower_operand_compare, reached via _classify_leaf_pair_eq's
+			# 'same_type' cell: comparing a union (Box|None) against a plain
+			# Box narrows to a same-type Box-vs-Box pairing internally, which
+			# _emit_leaf_pair_eq_value routes through _lower_operand_compare
+			# rather than _lower_eq_or_ne's own AST-driven fast path
+			( 'overloaded_eq_via_union_leaf_still_dispatches_to_real_dunder', '''
+class Box:
+	value: i32
+
+	def __init__( self, value: i32 ):
+		self.value = value
+
+	@overload
+	def __eq__( self, other: Box ) -> bool:
+		return self.value == other.value
+
+	@overload
+	def __eq__( self, other: i32 ) -> bool:
+		return self.value == other
+
+def main() -> i32:
+	a: Box|None = Box( 5 )
+	b: Box = Box( 5 )
+	c: Box = Box( 6 )
+	if not ( a == b ):
+		return 1
+	if a == c:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Codec.decode widened to bytes|bytearray, against the REAL Utf8
 	class (not a synthetic stand-in) - constructing a real Utf8() instance

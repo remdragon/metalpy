@@ -6775,7 +6775,15 @@ class FunctionLowering:
 		if not isinstance( left.type, Scalar ):
 			method_name = _COMP_DUNDER.get( type( node.ops[0] ))
 			if method_name is not None:
-				method = self.lowering._find_method( left.type, method_name )
+				# _find_eq_method_for_arg, not the plain _find_method - see
+				# its own docstring: right, lowered with strict=True just
+				# below, is already guaranteed to end up exactly left.type
+				# (coerced or rejected) before this dunder lookup even
+				# matters, so the wanted implementation is whichever one
+				# declares its own parameter as exactly left.type - same
+				# "caller already knows the wanted arg type" shape as
+				# _lower_eq_or_ne's own same-type fast path
+				method = self._find_eq_method_for_arg( left.type, method_name, left.type )
 				if method is not None:
 					right = self._lower_expr( node.comparators[0], left.type )
 					self.lowering._ensure_resolved( method )
@@ -6813,14 +6821,21 @@ class FunctionLowering:
 		of calling __eq__ at all, confirmed via a real repro).
 
 		Deliberately narrow, not a general replacement for _find_method
-		everywhere (see the dedicated _find_method-Overload-blindness
-		investigation this repo's memory tracks separately, likely a wider
-		fix): every caller HERE already knows the exact concrete argument
-		type it wants to match against (this is comparison dispatch, not a
-		call site needing real runtime dispatch across multiple candidate
-		argument shapes), so a simple single-parameter-type scan over the
-		Overload's own implementations suffices - no need for
-		overload_resolution.py's own general ConditionalDispatch machinery. '''
+		everywhere: every caller here already knows the exact concrete
+		argument type it wants to match against (this is comparison
+		dispatch, not a call site needing real runtime dispatch across
+		multiple candidate argument shapes), so a simple single-parameter-
+		type scan over the Overload's own implementations suffices - no
+		need for overload_resolution.py's own general ConditionalDispatch
+		machinery. Also used by _expr_Compare's </>/<=/>= dispatch and
+		_lower_operand_compare - both call sites where `strict=True`
+		lowering already forces the argument operand to exactly the
+		receiver's own type before dispatch is even reached, so the same
+		"caller already knows the wanted arg type" precondition holds
+		there too, not just for ==/!=. _find_method's other ~25 call sites
+		elsewhere in this file (container-protocol dunders, binop/unary
+		dispatch, ...) are unrelated and stay untouched - a separate,
+		wider-scoped Overload-blindness gap, not fixed here. '''
 		owner_type = self.lowering._ensure_resolved( owner_type )
 		if isinstance( owner_type, ( CStruct, RCClass ) ):
 			found = owner_type.chain_lookup( name )
@@ -7270,7 +7285,11 @@ class FunctionLowering:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		if not isinstance( left.type, Scalar ):
 			method_name = '__ne__' if negate else '__eq__'
-			method = self.lowering._find_method( left.type, method_name )
+			# _find_eq_method_for_arg, not the plain _find_method - both
+			# operands are already known to share the SAME type (this
+			# method's own docstring), so the wanted implementation is
+			# whichever one declares its own parameter as exactly left.type
+			method = self._find_eq_method_for_arg( left.type, method_name, left.type )
 			if method is not None:
 				self.lowering._ensure_resolved( method )
 				self.lowering.schedule( method.return_type )
