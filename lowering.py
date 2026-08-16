@@ -7236,13 +7236,41 @@ class FunctionLowering:
 		# was found)
 		self._emit( ir.JumpIfTrue( cond = is_err_temp, target = err_label ))
 
-		# Ok branch: self is fully constructed - hand it off
+		# Ok branch: self is fully constructed - hand it off. Result.Ok(...)'s
+		# own construction (field_value(), called from inside its body) takes
+		# an independent Incref'd copy of self_var for the Ok payload it
+		# builds - self_var's OWN original reference is a SEPARATE unit that
+		# still needs its own release, exactly once, on every path. Dropped
+		# right here (self_var's ownership "moves" into the Ok payload,
+		# leaving exactly the one Ok-owned reference alive) via cfg.decref()+
+		# manually_decreffed() - the same pair _lower_compiler_decref uses
+		# for compiler.decref(x) - rather than left to cfg's own automatic
+		# scope-exit release: self_var is pushed as one single, branch-
+		# unaware OWNED entry (this method never calls enter_branch()/
+		# restore() around the Ok/Err split below - it's raw Jump/Label IR,
+		# invisible to that reconciliation machinery), so a compile-time
+		# entry.cancelled=True in only ONE of the two branches would wrongly
+		# suppress the automatic release on the OTHER, still-live path too
+		# (confirmed by a real regression while fixing the Err-branch bug
+		# below: cancelling self_var's entry only in the Err branch's own
+		# lowering code silently deleted its release from the Ok/success
+		# path as well, since cfg tracks one flat sequence, not per-branch
+		# state - a leak, compiler.refcount() reading 3 instead of 1 after
+		# an otherwise-correct unwrap()). Explicitly decref'ing (and
+		# cancelling) self_var in BOTH branches, symmetrically, keeps cfg's
+		# single cancelled flag valid no matter which one actually runs -
+		# each runtime path already contains its own manual release before
+		# the shared epilogue is ever reached
 		ok_expr = ast.Call(
 			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
 			args = [ ast.Name( id = self_var.stem, ctx = ast.Load() ) ], keywords = [],
 		)
 		ast.copy_location( ok_expr, node )
 		ok_value = self._lower_expr( ok_expr, outer_result_type )
+		for instr in self._cfg.decref( concrete_cls, self_var ):
+			self._emit( instr )
+		for instr in self._cfg.manually_decreffed( self_var ):
+			self._emit( instr )
 		for instr in self._cfg_assign( dest_var, ok_value, is_alias = False, node = node, track_result = False ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = dest_var, src = ok_value ))
@@ -7250,9 +7278,18 @@ class FunctionLowering:
 
 		# Err branch: self never became valid - drop its own refcount
 		# (but __del__ is never invoked on it - SYNTAX.md), propagate the
-		# same error, re-wrapped for THIS construction's own Result[Foo,E]
+		# same error, re-wrapped for THIS construction's own Result[Foo,E].
+		# Same cfg.decref()+manually_decreffed() pair as the Ok branch above,
+		# for the same reason - a bare ir.Decref here left self_var's own
+		# binding OWNED in cfg's bookkeeping, so the function's own scope-
+		# exit epilogue decref'd self_var a SECOND time on top of this one -
+		# a real double-free on every failed fallible construction, not yet
+		# triggered by a repro (the only reported crash was Ok-path)
 		self._emit( ir.Label( name = err_label ))
-		self._emit( ir.Decref( value = self_var ))
+		for instr in self._cfg.decref( concrete_cls, self_var ):
+			self._emit( instr )
+		for instr in self._cfg.manually_decreffed( self_var ):
+			self._emit( instr )
 		err_expr = ast.Call(
 			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
 			args = [ ast.Attribute(
@@ -7262,11 +7299,80 @@ class FunctionLowering:
 		)
 		ast.copy_location( err_expr, node )
 		err_value = self._lower_expr( err_expr, outer_result_type )
+		# dest_var was ALREADY assigned once above, in the Ok branch - cfg
+		# saw that assignment first (this method never calls enter_branch()/
+		# restore() around the Ok/Err split, so cfg's single flat pass has
+		# no notion that the two are mutually exclusive) and is therefore
+		# convinced dest_var is currently a live, OWNED Result value. Its
+		# own cfg_assign() below would "helpfully" emit a decref releasing
+		# dest_var's CURRENT value before overwriting it with err_value -
+		# correct for a genuine reassignment, but WRONG here: at runtime,
+		# whichever branch actually reaches this point, the Ok branch's own
+		# assignment never ran, so dest_var's storage is uninitialized
+		# garbage - releasing it is a real, confirmed crash (illegal
+		# instruction / access violation), found by a regression test that
+		# loops a failing fallible construction: the very FIRST failure at
+		# any given call site hits this, no loop required, just never
+		# exercised by any existing test since none of them construct a
+		# class whose __init__ can actually fail. cfg.move() here discards
+		# the Ok branch's own binding as a pure cancellation (no Incref/
+		# Decref - exactly like abandoning a value that was never really
+		# there) rather than a release, so the reassignment below sees
+		# dest_var as un-owned and skips the bogus stale-value decref;
+		# move() also collapses both branches onto the SAME epilogue entry
+		# (reused, not duplicated) so whichever value dest_var ends up
+		# holding still gets released exactly once downstream
+		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
+			self._emit( instr )
 		for instr in self._cfg_assign( dest_var, err_value, is_alias = False, node = node, track_result = False ):
 			self._emit( instr )
 		self._emit( ir.Assign( dest = dest_var, src = err_value ))
 		self._emit( ir.Label( name = end_label ))
-		return dest_var
+		# dest_var is a persistent hidden-local Variable (needed above so the
+		# synthesized Result.Ok/Err ast.Call machinery has a real Name to
+		# reference), not an ir.Temp - but every OTHER Call in this file
+		# returns a genuine ir.Temp, and callers rely on that: _is_aliasing_
+		# expr treats `Foo(...)` (an ast.Call node) as always-fresh (is_alias
+		# =False, no Incref needed to store it into a new binding) on the
+		# assumption - stated in its own docstring - that "a well-behaved
+		# callee already accounts for that on its own side", i.e. hands back
+		# a value whose ownership transfers cleanly with a bare pointer copy.
+		# Returning dest_var directly broke that assumption: cfg.assign()'s
+		# own "ownership transfers into dest, untrack the momentary Temp"
+		# branch (see its own docstring) only ever fires for isinstance(src,
+		# ir.Temp), so `r = Foo(...)` left dest_var independently OWNED in
+		# cfg's own bookkeeping AT THE SAME TIME r became its own independent
+		# owner of the identical value - two tracked owners, one real
+		# reference, decref'd twice at scope exit. Confirmed by a real,
+		# repeated compile-and-run crash (segfault): two fallible
+		# constructions of the same class in one function, or a single one
+		# whose Result is retained/queried (.is_ok()) rather than immediately
+		# consumed, both over-released the constructed object.
+		#
+		# Moving dest_var's value into a genuine fresh Temp here (registered
+		# via fresh_temp(), exactly like every Call/Allocate dest already is
+		# in _emit()) restores that contract: cfg.move() cancels dest_var's
+		# own pending epilogue decref (ownership transfers out, no Incref/
+		# Decref of its own), and the Temp then gets the SAME automatic
+		# handling as any other fresh Call result - untracked cleanly if
+		# consumed into a new binding (`r = Foo(...)`), or self-released by
+		# its own DeleteTemp at the end of this statement if merely used as
+		# a transient receiver (`Foo(...).unwrap(...)`) and never bound at
+		# all. The naive alternative (just cfg.move()-ing dest_var and
+		# returning it as-is, tried first) fixed the crash above but broke
+		# the OTHER direction instead - a real, confirmed LEAK: dest_var's
+		# own release is what balances Result.Ok's own retain_object() when
+		# nothing else ever claims independent ownership of that reference
+		# (e.g. a receiver never stored into a named binding), and simply
+		# cancelling it with nothing left to release it lost that reference
+		# forever. compiler.refcount() on the unwrapped value read 3 (should
+		# have been 1) before this Temp indirection was added.
+		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
+			self._emit( instr )
+		final = self._new_temp( outer_result_type )
+		self._emit( ir.Assign( dest = final, src = dest_var ))
+		self._cfg.fresh_temp( final, outer_result_type )
+		return final
 
 	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
 		# ScalarName(x) - Python's own int(x)/float(x)-style constructor-as-

@@ -908,6 +908,197 @@ def main() -> i32:
 ''' ),
 		] )
 
+class FallibleInitConstructionRCLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for a real, confirmed double-free in fallible
+	`__init__()` construction (SYNTAX.md's "Fallible __init__() Construction"
+	- __init__ declared -> Result[None,E] makes `Foo(...)` itself yield
+	Result[Foo,E]), found by reading the emitted C directly. Two independent
+	over-release bugs lived in lowering.py's _emit_fallible_construction:
+
+	1. dest_var (the hidden local threading the synthesized Result.Ok/Err
+	   wrapping through) is a persistent Variable, not an ir.Temp - so unlike
+	   every other fresh Call/Allocate result in this file, cfg.assign()'s
+	   own "ownership transfers into dest, untrack the momentary Temp" branch
+	   never fired for it when the caller consumed the returned value (e.g.
+	   `r = Foo(...)`). dest_var stayed independently OWNED in cfg's own
+	   bookkeeping on top of whatever the caller's own binding tracked for
+	   the SAME object, so BOTH got decref'd at their own scope exit - a
+	   real double-free, confirmed via direct compile-and-run (access
+	   violation) with two fallible constructions of the same class in one
+	   function, or a single one whose Result is retained/queried
+	   (.is_ok()/.is_err()) rather than immediately match-extracted (a bare
+	   match-and-extract happened to mask it: unwrap()'s own move-out of the
+	   payload neutralizes the OUTER binding's own entry first, leaving only
+	   dest_var's spurious decref to actually fire - net correct by
+	   coincidence, not because the underlying tracking was ever right).
+	   Fixed by cfg.move()'ing dest_var (the same primitive move[T] call
+	   arguments use) right before returning it, cancelling its own pending
+	   epilogue decref once its value is handed off.
+	2. The Err branch's self_var cleanup used a bare `ir.Decref(value=
+	   self_var)` instead of the compiler.decref()-style
+	   cfg.decref()+cfg.manually_decreffed() pair - so self_var's own
+	   binding stayed OWNED in cfg's bookkeeping and got decref'd AGAIN at
+	   the function's own scope exit on top of this explicit one, double-
+	   freeing the failed instance on every Err return. Fixed by routing
+	   through cfg.decref()+manually_decreffed(), mirroring
+	   _lower_compiler_decref's own compiler.decref(x) handling exactly.
+
+	Every case below loops hundreds of times with a real heap allocation per
+	iteration (matching this codebase's own rc_lifetime_repeated_*_no_leak
+	convention above) rather than checking just one iteration: a single
+	double-free doesn't reliably corrupt the heap badly enough to crash
+	immediately, but repetition makes both directions (double-free AND any
+	leak from an over-corrected fix) show up reliably. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the original repro: TWO fallible constructions of the same
+			# class in one function, each only queried via is_ok() (never
+			# match-extracted) - this is exactly the shape that segfaulted
+			( 'two_fallible_constructions_one_function_ok_path', '''
+class MyError:
+	pass
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	r1: Result[Box, MyError] = Box( 5 )
+	ok1: bool = r1.is_ok()
+	r2: Result[Box, MyError] = Box( 6 )
+	ok2: bool = r2.is_ok()
+	if not ok1:
+		return 1
+	if not ok2:
+		return 2
+	return 0
+''' ),
+			# a SINGLE fallible construction per iteration, retained and only
+			# queried (never match-extracted or unwrap()'d) - dest_var's own
+			# leftover decref, unmasked by any move-out, double-frees the
+			# constructed object almost immediately under repetition
+			( 'fallible_construction_retained_and_queried_no_extraction_no_double_free', '''
+class MyError:
+	pass
+
+class Widget:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 500:
+			r: Result[Widget, MyError] = Widget( v = i )
+			if r.is_err():
+				return 1
+			i += 1
+		return 0
+''' ),
+			# the Err path specifically, repeated - targets self_var's own
+			# double-decref bug (bare ir.Decref never cancelled cfg's own
+			# pending epilogue release for it)
+			( 'fallible_construction_err_path_repeated_no_double_free', '''
+class MyError:
+	pass
+
+class Validated:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 500:
+			r: Result[Validated, MyError] = Validated( v = -1 )
+			if not r.is_err():
+				return 1
+			i += 1
+		return 0
+''' ),
+			# precise refcount accounting (not just "doesn't crash"): after a
+			# single fallible construction is unwrap()'d, EXACTLY TWO owning
+			# references should be live - self_var's own original reference
+			# (dropped from cfg's automatic, branch-unaware scope-exit
+			# tracking and released explicitly instead - see
+			# _emit_fallible_construction's own Ok-branch comment) plus
+			# unwrap()'s own retained copy (Result.unwrap's accessor takes an
+			# independent Incref'd copy rather than moving the payload out -
+			# see lib/builtins/__init__.py's Result class docstring). NOT 1:
+			# an earlier version of this fix assumed 1 and asserted it here,
+			# which was itself wrong - catches either an over-release
+			# (crashes before this check even reads a valid header) or a
+			# leak (an extra, un-decref'd reference from an over-corrected
+			# fix) in the same assertion
+			( 'fallible_construction_unwrap_leaves_exactly_two_references', '''
+class MyError:
+	pass
+
+class Gadget:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		r: Result[Gadget, MyError] = Gadget( 7 )
+		if r.is_err():
+			return 1
+		g: Gadget = r.unwrap( 'construction failed' )
+		if g.v != 7:
+			return 2
+		rc: usize = compiler.refcount( g )
+		if rc != 2:
+			return compiler.cast( i32, 3 + rc )
+		return 0
+''' ),
+			# a fallible construction that fails on its VERY FIRST attempt at
+			# a given call site (no loop needed) - dest_var gets assigned in
+			# BOTH the Ok and Err branches of _emit_fallible_construction,
+			# but cfg sees them as one flat sequence (no enter_branch()/
+			# restore() around the Ok/Err split), so it treated the Err
+			# branch's assignment as a REASSIGNMENT of an already-live
+			# dest_var, emitting a decref of dest_var's "previous value"
+			# before overwriting it - except the Ok branch never actually
+			# ran on this path, so dest_var's storage was uninitialized
+			# garbage. A real, confirmed crash (illegal instruction),
+			# distinct from the double-free bugs above and not caught by any
+			# existing test since none of them construct a class whose
+			# __init__ can actually fail
+			( 'fallible_construction_fails_on_first_attempt_no_crash', '''
+class MyError:
+	pass
+
+class Validated:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	r: Result[Validated, MyError] = Validated( -1 )
+	if not r.is_err():
+		return 1
+	return 0
+''' ),
+		] )
+
 class RCClassSubclassingPhase4Tests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 4 of the RCClass-subclassing plan: @virtual for RCClass,
 	unifying destructor dispatch with @virtual dispatch. ObjectHeader's
