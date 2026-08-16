@@ -8163,21 +8163,58 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 
-	# NOTE: a fallible comparison's Result[bool,TypeError] used directly
-	# where a plain bool is required WITHOUT first being explicitly
-	# consumed (`if compare(...):`, `x: bool = compare(...)`) does NOT
-	# currently produce a compile-time error the way _check_assignable
-	# ought to reject it - confirmed as a real, PRE-EXISTING bug entirely
-	# unrelated to this feature (reproduces identically with an ordinary,
-	# already-shipped `Result[i32,OverflowError]`-returning function, zero
-	# union-union comparison involved): assigning ANY Result-returning
-	# call's result directly to a mismatched local type passes discovery
-	# with no errors at all, then the EMITTER produces C a real compiler
-	# rejects outright ("assigning to 'bool' from incompatible type
-	# 'struct Result...'"). Filed for separate follow-up - out of scope
-	# for this feature, which itself does the right thing (no implicit
-	# consumption, see the test above); the gap is in the GENERAL
-	# assignment/call-return-type check, not anything new here.
+	def test_result_returning_call_assigned_to_mismatched_local_type_is_rejected( self ) -> None:
+		# FIXED (was a real, pre-existing bug, entirely unrelated to this
+		# feature - reproduces identically with an ordinary, already-shipped
+		# Result[i32,OverflowError]-returning function, zero union-union
+		# comparison involved): assigning a Result-returning call's value
+		# directly to a mismatched declared local type used to pass
+		# discovery with zero errors, then the EMITTER produced C a real
+		# compiler rejected outright ("assigning to 'int32_t' from
+		# incompatible type 'struct Result...'"). Root cause was in
+		# _lower_call's own dest-typing for an ordinary (non-generic,
+		# non-union-widening) call: it typed `dest` as `expected_type`
+		# whenever one was given, even when expected_type was a genuinely
+		# DIFFERENT type from the callee's own real return type - not just a
+		# different Specialization representation of the same instantiation
+		# - which fooled _coerce_or_check_operand's own mismatch check into
+		# never seeing a mismatch at all (operand.type already equalled
+		# expected_type by construction). Now dest stays typed as the
+		# callee's real return type whenever expected_type isn't actually
+		# the same type, so the ordinary coercion-or-rejection tail gets an
+		# honest look and correctly rejects this.
+		self._run( '''
+def maybe_get() -> Result[i32,OverflowError]:
+	return Result.Ok( 5 )
+
+def main() -> i32:
+	x: i32 = maybe_get()
+	return 0
+''' )
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'expected intrinsics.i32', errors[0] )
+		self.assertIn( 'got builtins.Result', errors[0] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_result_returning_call_assigned_to_matching_result_type_still_compiles( self ) -> None:
+		# no-regression companion to the rejection test above: a Result-
+		# returning call assigned to an already-matching Result[T,E]-typed
+		# local (the ordinary, correct usage) must keep compiling and
+		# running exactly as before this fix - dest is still typed via the
+		# "same type, different representation" branch, not force-rejected
+		self._run( '''
+def maybe_get() -> Result[i32,OverflowError]:
+	return Result.Ok( 5 )
+
+def main() -> i32:
+	x: Result[i32,OverflowError] = maybe_get()
+	if x.unwrap_or( 0 ) != 5:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ) )
 
 
 class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):

@@ -9995,8 +9995,30 @@ class FunctionLowering:
 				# value's own REAL type back, not this hint bounced straight
 				# through) would otherwise silently override dest with a
 				# meaningless, unresolvable type instead of what the callee
-				# actually returns
-				dest = self._new_temp( target_return_type if isinstance( expected_type, TypeVar ) else ( expected_type or target_return_type ))
+				# actually returns.
+				#
+				# Beyond the TypeVar case, expected_type is only safe to use
+				# for dest when it's the SAME type as target_return_type (just
+				# possibly a different Specialization/TupleType representation
+				# of the identical instantiation - _same_type's own docstring)
+				# - using it whenever merely non-None, regardless of whether it
+				# actually matches, let a genuinely mismatched declared local
+				# type (`x: i32 = a_result_returning_call()`) silently retype
+				# dest to i32 while the callee's real C prototype still returns
+				# the whole Result struct, producing invalid C AND skipping
+				# _coerce_or_check_operand's own mismatch rejection below
+				# entirely (operand.type came back already equal to
+				# expected_type, so its "still mismatched past this point"
+				# check never even saw a mismatch to catch). A genuine
+				# mismatch here now falls through with dest correctly typed as
+				# target_return_type instead, so the coercion-or-rejection
+				# tail gets an honest look at it.
+				if isinstance( expected_type, TypeVar ):
+					dest = self._new_temp( target_return_type )
+				elif expected_type is not None and target_return_type is not None and not self.lowering._type_resolver._same_type( target_return_type, expected_type ):
+					dest = self._new_temp( target_return_type )
+				else:
+					dest = self._new_temp( expected_type or target_return_type )
 			self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return dest
 		else:
