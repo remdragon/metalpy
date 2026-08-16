@@ -3,7 +3,7 @@ import ast
 import copy
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Callable, Iterable
 
 # local imports:
 import arithmetic_mode
@@ -118,6 +118,32 @@ class _LeafPairEq:
 	method: Function|None = None
 	reflected: bool = False
 
+@dataclass( frozen = True )
+class _LeafPairBinop:
+	''' _lower_binop_dispatch's own PASS 1 classification of one (left leaf
+	type, right leaf type) grid cell for a union-involving +-*//%|&^ - see
+	that method's own docstring for the full per-kind rule. `success_type`
+	is None only for 'error' (no valid operation for this leaf pair at
+	all); `error_type` is None whenever this cell CAN'T fail (infallible
+	scalar arithmetic under the current mode, or a dunder whose own
+	declared return type isn't itself Result[T,E]) - a cell can carry both
+	(a fallible scalar op, or a dunder returning Result[T,E]) or neither.
+	`opcode`/`extra` are 'scalar' only (mirrors _lower_arithmetic_op's own
+	two parameters of the same name - `extra` is the lowered panic-mode
+	message operand, or None for every other mode). `method`/`reflected`
+	are 'dunder' only, same meaning as _LeafPairEq's own pair - `reflected
+	= True` means this was found via right_type's own REFLECTED,
+	DIFFERENTLY-NAMED method (__radd__ etc, not __eq__/__ne__'s
+	same-name-swapped-roles reflection - see _REFLECTED_BINOP_DUNDER's own
+	comment on why binops need the different convention). '''
+	kind: str   # 'scalar' | 'dunder' | 'error'
+	success_type: Type|None = None
+	error_type: Type|None = None
+	opcode: type|None = None
+	extra: ir.Operand|None = None
+	method: Function|None = None
+	reflected: bool = False
+
 # ast.UnaryOp operator -> the dunder method name to dispatch to for a
 # non-scalar operand (int.__neg__, ...). Scalar operands always go through
 # arithmetic mode instead. ast.UAdd/ast.Invert are deliberately not mapped -
@@ -152,6 +178,17 @@ _FLOAT_UNSUPPORTED_BINOPS: dict[type,str] = {
 	ast.LShift: '<<', ast.RShift: '>>',
 	ast.FloorDiv: '//', ast.Mod: '%',
 }
+
+def _dedup_types( types: Iterable[Type] ) -> list[Type]:
+	''' first-seen-order dedup by qualname, for _lower_binop_dispatch's own
+	success/error type aggregation - discovery._get_or_create_union already
+	dedupes internally, but the CALLER needs a deduped Python list first to
+	decide whether to collapse to a single plain type (len == 1) or actually
+	synthesize a union (len > 1). '''
+	seen: dict[str,Type] = {}
+	for t in types:
+		seen.setdefault( t.qualname, t )
+	return list( seen.values() )
 
 
 class Lowering:
@@ -6280,6 +6317,28 @@ class FunctionLowering:
 		left_is_const = isinstance( left_node, ast.Constant )
 		right_is_const = isinstance( right_node, ast.Constant )
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+		# expected_type is the OUTER statement's own target (e.g. `r:
+		# Result[i32|int,E] = x + y`'s Result[...]) - hinting an OPERAND's
+		# own lowering with it directly is wrong whenever expected_type is
+		# a union: if the operand's OWN natural type happens to exactly
+		# equal one of its leaves (x: i32|int here, matching Result's own
+		# Ok leaf exactly), _coerce_or_check_operand's union-wrap coercion
+		# silently wraps x into Result.Ok(x) BEFORE _lower_binop_values
+		# ever runs - x's type is then Result[...], not i32|int, breaking
+		# both ordinary dunder lookup and _lower_binop_dispatch's own
+		# union-shape detection. Same bug CLASS _lower_eq_or_ne's own
+		# right_hint fix already covers for left.type being a union - this
+		# is the expected_type-cascades-from-the-caller counterpart,
+		# confirmed via a real repro (`r: Result[i32|int,E] = x + y`,
+		# x/y: i32|int). None here lets the operand infer its own natural
+		# type instead, exactly as if no hint had been given at all.
+		# _tagged_union_shape, not a raw isinstance check - expected_type
+		# here can still be a Specialization wrapping a TaggedUnion base
+		# (a generic Result[T,E] annotation not yet monomorphized) rather
+		# than a bare TaggedUnion already - same Specialization-vs-plain
+		# duality _tagged_union_shape already exists to paper over
+		# everywhere else in this file
+		operand_hint = expected_type if self.lowering._type_resolver._tagged_union_shape( expected_type ) is None else None
 		# pointer arithmetic (ptr + offset) is never homogeneous the way
 		# ordinary scalar +/- is - hinting the OTHER (non-pointer) side with
 		# the pointer's own type here (as every branch below otherwise
@@ -6301,7 +6360,7 @@ class FunctionLowering:
 		# _lower_binop_values' own deliberately stricter "both operands must
 		# already be the SAME float type, cast explicitly" rule entirely.
 		if left_is_const and not right_is_const:
-			right = self._lower_expr( right_node, expected_type, strict = False )
+			right = self._lower_expr( right_node, operand_hint, strict = False )
 			# only hint the literal toward right.type when that's actually a
 			# meaningful target for a literal to become (a scalar, or the
 			# existing Ptr-offset special case) - hinting toward an arbitrary
@@ -6321,7 +6380,7 @@ class FunctionLowering:
 				left_hint = None
 			left = self._lower_expr( left_node, left_hint, strict = False )
 		elif right_is_const and not left_is_const:
-			left = self._lower_expr( left_node, expected_type, strict = False )
+			left = self._lower_expr( left_node, operand_hint, strict = False )
 			if self.lowering._type_resolver._is_ptr_specialization( left.type ):
 				right_hint = usize_cls
 			elif isinstance( left.type, Scalar ):
@@ -6330,11 +6389,30 @@ class FunctionLowering:
 				right_hint = None
 			right = self._lower_expr( right_node, right_hint, strict = False )
 		else:
-			left = self._lower_expr( left_node, expected_type, strict = False )
+			left = self._lower_expr( left_node, operand_hint, strict = False )
 			if infer_right_from_left:
-				right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( left.type ) else ( expected_type or left.type )
+				if self.lowering._type_resolver._is_ptr_specialization( left.type ):
+					right_hint = usize_cls
+				elif operand_hint is not None:
+					right_hint = operand_hint
+				elif self.lowering._type_resolver._tagged_union_shape( left.type ) is not None:
+					# same "don't hint an operand's own lowering with a
+					# union" principle as operand_hint above, just via a
+					# DIFFERENT path: left.type here is the fallback hint
+					# for right when nothing else applies, but if left
+					# happens to be a union operand (x: Vector|i32),
+					# hinting right (a PLAIN Vector-typed operand, no
+					# union of its own) with it wrongly wraps right into
+					# THAT union too - widening the leaf-pair grid with a
+					# cell the source never actually expressed. Confirmed
+					# via a real repro (Boxed|int + Boxed wrongly widened
+					# right into Boxed|int too, inventing an (int,int)
+					# grid cell that doesn't exist in the source at all)
+					right_hint = None
+				else:
+					right_hint = left.type
 			else:
-				right_hint = expected_type
+				right_hint = operand_hint
 			right = self._lower_expr( right_node, right_hint, strict = False )
 		return left, right
 
@@ -6351,6 +6429,20 @@ class FunctionLowering:
 		# always lowers both sides fresh from AST. `node` is only ever
 		# read for its `.op` (ast.BinOp and ast.AugAssign both have one)
 		# and as an error-reporting location - never for `.left`/`.right`.
+
+		# either operand union-typed (`x: i32|int; y: i32|int; x + y`) - a
+		# whole separate dispatch, mirroring _lower_eq_or_ne's identical
+		# fork for ==/!=: a union operand has no dunder/scalar-arithmetic
+		# shape of its OWN, only its individual LEAVES do, so every
+		# (left leaf, right leaf) pairing needs its own classification -
+		# see _lower_binop_dispatch's own docstring. Left completely
+		# untouched below when neither operand is a union - existing,
+		# already-verified dunder/reflected-dunder/scalar-arithmetic
+		# tail keeps handling that case exactly as it does today.
+		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
+		right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
+		if left_shape is not None or right_shape is not None:
+			return self._lower_binop_dispatch( node, left, left_shape, right, right_shape )
 
 		# try the dunder method (str.__add__, ...) first on left.type, then -
 		# mirroring Python's real protocol - the REFLECTED, differently-named
@@ -7344,6 +7436,408 @@ class FunctionLowering:
 		self.lowering._schedule_rcclass_construction( type_error_cls, dest.type )
 		self._emit( ir.Allocate( dest = dest, cls = type_error_cls, fields = {} ))
 		return dest
+
+	def _lower_binop_dispatch(
+		self, node: 'ast.BinOp|ast.AugAssign', left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None,
+	) -> ir.Operand:
+		''' +-*//%|&^ once at least one operand is union-typed - the
+		arithmetic counterpart of _lower_eq_dispatch, covering all three
+		arities the same way (a non-union operand is a degenerate
+		single-leaf "shape", no tag dispatch needed on that axis). Builds a
+		full (left leaf x right leaf) grid via _classify_leaf_pair_binop,
+		then SYNTHESIZES the expression's own result type from whatever the
+		grid actually produces - unlike equality (always plain bool),
+		different leaf pairs here can produce genuinely different concrete
+		types (i32+i32 -> i32 vs Vector+Vector -> Vector), and not every
+		call site has an expected_type to coerce into, so a fresh union of
+		the DISTINCT success types is synthesized via discovery.
+		_get_or_create_union - collapsing to a single plain type when every
+		reachable pair happens to agree (e.g. int|i32 + int where both
+		int.__add__(int) and int.__radd__(i32) return plain int - must NOT
+		become a degenerate 1-member union).
+
+		Three independent sources of fallibility all fold into ONE
+		synthesized error-type union the same way: (1) a leaf pair with no
+		valid operation at all -> TypeError (mirrors equality's own
+		'error' cell); (2) plain scalar arithmetic's own EXISTING checked-
+		arithmetic fallibility, respecting the CURRENT arithmetic mode per
+		cell (_classify_leaf_pair_binop calls the exact same
+		_resolve_checked_error the non-union scalar path already uses -
+		wrap_arithmetic/saturate_arithmetic/panic_arithmetic are honored
+		exactly as they are today, never bypassed); (3) a resolved
+		dunder's own declared return type can ITSELF be Result[T,E] - its
+		E folds in too, not just its T used as-is (detected via cfg.
+		is_result_type + _tagged_union_shape, the same Result-shape
+		detection the rest of the compiler already uses).
+
+		Deliberately does NOT reuse the plain scalar path's own auto-
+		`.or_return()` consumption (_consume_checked_result) for a
+		fallible cell - same "no compiler binop modes" principle
+		_lower_eq_dispatch already settled: a fallible union binop's
+		Result[...] is simply the expression's own real value, returned
+		as-is (see _emit_binop_fallible_split). '''
+		left_types = [ m.type for m in left_shape[1] ] if left_shape is not None else [ left.type ]
+		right_types = [ m.type for m in right_shape[1] ] if right_shape is not None else [ right.type ]
+		method_name = _BINOP_DUNDER.get( type( node.op ))
+		reflected_name = _REFLECTED_BINOP_DUNDER.get( method_name ) if method_name is not None else None
+		grid = [
+			[ self._classify_leaf_pair_binop( node, method_name, reflected_name, lt, rt ) for rt in right_types ]
+			for lt in left_types
+		]
+		success_types = _dedup_types( cell.success_type for row in grid for cell in row if cell.success_type is not None )
+		error_types = _dedup_types( cell.error_type for row in grid for cell in row if cell.error_type is not None )
+		fallible = bool( error_types )
+		success_type = success_types[0] if len( success_types ) == 1 else self.lowering.discovery._get_or_create_union( success_types )
+		self.lowering.schedule( success_type )
+		if isinstance( success_type, TaggedUnion ):
+			self.lowering._union_storage.get( success_type )
+		error_type: Type|None = None
+		if fallible:
+			error_type = error_types[0] if len( error_types ) == 1 else self.lowering.discovery._get_or_create_union( error_types )
+			self.lowering.schedule( error_type )
+			if isinstance( error_type, TaggedUnion ):
+				self.lowering._union_storage.get( error_type )
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ success_type, error_type ] )
+			self.lowering.schedule( check_type )
+			result_union = self.lowering.monomorphize_class( check_type )
+			self.lowering._union_storage.get( result_union )
+			dest = self._new_temp( result_union )
+		else:
+			result_union = None
+			dest = self._new_temp( success_type )
+		self._emit_binop_dispatch_tree( node, left, left_shape, right, right_shape, grid, dest, success_type, error_type, result_union )
+		return dest
+
+	def _classify_leaf_pair_binop( self, node: 'ast.BinOp|ast.AugAssign', method_name: str|None, reflected_name: str|None, left_type: Type, right_type: Type ) -> _LeafPairBinop:
+		''' one grid cell of _lower_binop_dispatch's own classification -
+		see that method's docstring for the full rule. A leaf pair that
+		can't type-check at all (mismatched float types, an operator with
+		no floating-point meaning, or neither side has a usable dunder)
+		becomes an 'error' cell (contributing TypeError) rather than an
+		immediate compile failure - mirrors _classify_leaf_pair_eq's own
+		identical choice: a single bad pairing doesn't reject the WHOLE
+		union expression, it becomes one runtime-checkable branch of it. '''
+		type_error_cls = self.lowering.discovery.find_name( 'TypeError', node )
+		if isinstance( left_type, Scalar ) and isinstance( right_type, Scalar ):
+			is_float = _is_float_scalar( left_type ) or _is_float_scalar( right_type )
+			if is_float and ( left_type is not right_type or _FLOAT_UNSUPPORTED_BINOPS.get( type( node.op )) is not None ):
+				return _LeafPairBinop( 'error', error_type = type_error_cls )
+			opcode, extra = ( self._arithmetic_mode[-1].GetFloatBinOp( node ) if is_float else self._arithmetic_mode[-1].GetBinOp( node ))
+			if opcode is None:
+				return _LeafPairBinop( 'error', error_type = type_error_cls )
+			error_type = None
+			if opcode.checked_errors and extra is None:
+				error_type, _alternatives = self._resolve_checked_error( node, opcode, left_type )
+			return _LeafPairBinop( 'scalar', success_type = left_type, error_type = error_type, opcode = opcode, extra = extra )
+		method = self._find_dunder_for_arg( left_type, method_name, right_type ) if method_name is not None and not isinstance( left_type, Scalar ) else None
+		reflected = False
+		if method is None and reflected_name is not None and not isinstance( right_type, Scalar ):
+			method = self._find_dunder_for_arg( right_type, reflected_name, left_type )
+			reflected = method is not None
+		if method is None:
+			return _LeafPairBinop( 'error', error_type = type_error_cls )
+		self.lowering._ensure_resolved( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		if cfg.is_result_type( method.return_type ):
+			shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
+			assert shape is not None and len( shape[1] ) == 2
+			return _LeafPairBinop( 'dunder', success_type = shape[1][0].type, error_type = shape[1][1].type, method = method, reflected = reflected )
+		return _LeafPairBinop( 'dunder', success_type = method.return_type, method = method, reflected = reflected )
+
+	def _emit_binop_dispatch_tree(
+		self, node: 'ast.BinOp|ast.AugAssign', left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None,
+		grid: list[list[_LeafPairBinop]], dest: ir.Temp, success_type: Type, error_type: Type|None, result_union: TaggedUnion|None,
+	) -> None:
+		''' nested 2-level tag dispatch - see _emit_eq_dispatch_tree's own
+		docstring, this is the identical shape (same union_storage.get /
+		GetAttr+Cmp+JumpIfFalse / _extract_union_payload primitive, N-1
+		members tested per axis, last is the untested default). Differs
+		only in the per-cell body: a binop cell can itself be
+		independently fallible (checked scalar arithmetic under the
+		current mode, or a dunder declaring Result[T,E]) - see
+		_emit_binop_fallible_split for that inner Ok/Err decomposition,
+		reached only from cells that need it. '''
+		none_type = self.lowering.discovery.get_none_type()
+		end_label = self._new_label( 'binop_dispatch_end' )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if left_shape is not None:
+			left_base, left_members = left_shape
+			# not _union_storage.get(left_base) - see _emit_binop_fallible_
+			# split's own comment on why a Specialization's abstract base
+			# (e.g. left is itself a Result[T,E]-typed operand) needs the
+			# concrete, monomorphized union instead for storage purposes
+			left_concrete = self.lowering.monomorphize_class( left.type ) if isinstance( left.type, Specialization ) else left_base
+			left_tag_attr, left_data_attr, left_payload_cls, left_tags = self.lowering._union_storage.get( left_concrete )
+			n_left = len( left_members )
+		else:
+			n_left = 1
+		if right_shape is not None:
+			right_base, right_members = right_shape
+			right_concrete = self.lowering.monomorphize_class( right.type ) if isinstance( right.type, Specialization ) else right_base
+			right_tag_attr, right_data_attr, right_payload_cls, right_tags = self.lowering._union_storage.get( right_concrete )
+			n_right = len( right_members )
+		else:
+			n_right = 1
+
+		for i in range( n_left ):
+			is_last_left = ( i == n_left - 1 )
+			if left_shape is not None:
+				lm = left_members[i]
+				if not is_last_left:
+					next_left_label = self._new_label( 'binop_dispatch_left_next' )
+					tag_dest = self._new_temp( left_tag_attr.type )
+					self._emit( ir.GetAttr( dest = tag_dest, obj = left, attr = left_tag_attr.stem ))
+					match = self._new_temp( bool_cls )
+					self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = left_tag_attr.type, value = left_tags[lm.stem] )))
+					self._emit( ir.JumpIfFalse( cond = match, target = next_left_label ))
+				narrowed_left = left if lm.type is none_type else self._extract_union_payload( left, left_data_attr, left_payload_cls, lm )
+			else:
+				narrowed_left = left
+
+			for j in range( n_right ):
+				is_last_right = ( j == n_right - 1 )
+				if right_shape is not None:
+					rm = right_members[j]
+					if not is_last_right:
+						next_right_label = self._new_label( 'binop_dispatch_right_next' )
+						tag_dest2 = self._new_temp( right_tag_attr.type )
+						self._emit( ir.GetAttr( dest = tag_dest2, obj = right, attr = right_tag_attr.stem ))
+						match2 = self._new_temp( bool_cls )
+						self._emit( ir.Cmp( dest = match2, op = ir.CmpOp.EQ, left = tag_dest2, right = ir.Const( type = right_tag_attr.type, value = right_tags[rm.stem] )))
+						self._emit( ir.JumpIfFalse( cond = match2, target = next_right_label ))
+					narrowed_right = right if rm.type is none_type else self._extract_union_payload( right, right_data_attr, right_payload_cls, rm )
+				else:
+					narrowed_right = right
+
+				self._emit_binop_cell( node, narrowed_left, narrowed_right, grid[i][j], dest, success_type, error_type, result_union, end_label )
+
+				if right_shape is not None and not is_last_right:
+					self._emit( ir.Label( name = next_right_label ))
+			if left_shape is not None and not is_last_left:
+				self._emit( ir.Label( name = next_left_label ))
+		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, dest.type )
+
+	def _emit_binop_cell(
+		self, node: 'ast.BinOp|ast.AugAssign', narrowed_left: ir.Operand, narrowed_right: ir.Operand,
+		cell: _LeafPairBinop, dest: ir.Temp, success_type: Type, error_type: Type|None, result_union: TaggedUnion|None, end_label: str,
+	) -> None:
+		''' one grid cell's codegen - see _lower_binop_dispatch's own
+		docstring for what each kind means. A cell with its own
+		error_type set needs the extra Ok/Err decomposition
+		(_emit_binop_fallible_split); every other cell just produces one
+		plain value directly. '''
+		if cell.kind == 'error':
+			error_instance = self._build_type_error_instance( node )
+			assert error_type is not None and result_union is not None   # an 'error' cell always contributes TypeError, so the whole expression is always fallible whenever one exists
+			value = self._coerce_binop_value( error_instance, error_type, result_union, node )
+			self._finish_binop_result_branch( error_instance, value, dest, end_label )
+			return
+		if cell.kind == 'scalar':
+			if cell.error_type is None:
+				value = self._lower_arithmetic_op( node, cell.opcode, cell.extra, cell.success_type, { 'left': narrowed_left, 'right': narrowed_right }, 'binary' )
+				value = self._coerce_binop_value( value, success_type, result_union, node )
+				self._finish_binop_cell( dest, value, end_label )
+				return
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ cell.success_type, cell.error_type ] )
+			self.lowering.schedule( check_type )
+			check_dest = self._new_temp( check_type )
+			self._emit( cell.opcode( dest = check_dest, left = narrowed_left, right = narrowed_right ))
+			self._emit_binop_fallible_split( node, check_dest, dest, success_type, error_type, result_union, end_label )
+			return
+		assert cell.kind == 'dunder' and cell.method is not None
+		receiver, arg = ( narrowed_right, narrowed_left ) if cell.reflected else ( narrowed_left, narrowed_right )
+		self.lowering.schedule( cell.method.return_type )
+		call_dest = self._new_temp( cell.method.return_type )
+		self._emit( ir.Call( dest = call_dest, target = cell.method, receiver = receiver, args = [ arg ], kwargs = {} ))
+		if cell.error_type is None:
+			value = self._coerce_binop_value( call_dest, success_type, result_union, node )
+			self._finish_binop_cell( dest, value, end_label )
+			return
+		self._emit_binop_fallible_split( node, call_dest, dest, success_type, error_type, result_union, end_label )
+
+	def _coerce_binop_value( self, value: ir.Operand, axis_type: Type, result_union: TaggedUnion|None, node: ast.AST ) -> ir.Operand:
+		''' two-step coercion for ONE axis (success or error) of the
+		synthesized dispatch: first into that axis's own aggregate type
+		(success_type/error_type - itself a TaggedUnion only when more
+		than one distinct type is actually possible on this axis; a
+		cell's own produced value only ever matches ONE LEAF of it, never
+		axis_type itself directly, whenever axis_type genuinely is a
+		union), THEN - only when the whole expression is fallible - into
+		result_union's own matching Ok/Err slot (a cell's value NEVER
+		already matches result_union directly: result_union's own two
+		leaves are success_type/error_type as a WHOLE, never one leaf's
+		own concrete type - so this second step, unlike the first, is
+		never skippable once result_union is present). Callers pass
+		axis_type = success_type for a success-axis value, error_type
+		for an error-axis value (always non-None whenever reached, since
+		producing an error value at all implies the whole expression is
+		fallible).
+
+		When BOTH steps run, the intermediate axis_type-wrapped value is
+		itself a fresh, independently fresh_temp()-tracked Call result
+		(same shape as every other branch-local temp this whole dispatch
+		tree produces) - the second _coerce_into_union call makes its OWN
+		independent embedded reference via its own ctor's incref (a
+		tag-gated copy of whichever member is active, since axis_type is
+		itself RC-carrying whenever this path is taken), so the
+		intermediate's OWN reference is now redundant and needs releasing
+		- same inline decref+untrack pattern _finish_binop_result_branch
+		already uses for raw_temp, for the identical reason (a temp local
+		to only ONE cell/branch of a larger dispatch tree can't rely on
+		the outer per-statement flush). '''
+		if isinstance( axis_type, TaggedUnion ) and not self.lowering._type_resolver._same_type( value.type, axis_type ):
+			intermediate = self._coerce_into_union( value, axis_type, node )
+			if result_union is None:
+				return intermediate
+			value = self._coerce_into_union( intermediate, result_union, node )
+			for instr in self._cfg.decref( intermediate.type, intermediate ):
+				self._emit( instr )
+			self._cfg.untrack_temp( intermediate )
+			return value
+		if result_union is not None:
+			value = self._coerce_into_union( value, result_union, node )
+		return value
+
+	def _finish_binop_cell( self, dest: ir.Temp, value: ir.Operand, end_label: str ) -> None:
+		# mirrors _emit_eq_dispatch_tree's own identical per-cell tail -
+		# untrack value (a no-op unless it's RC-carrying - both
+		# untrack_temp/fresh_temp check internally) so its own eventual
+		# delete_temp() doesn't ALSO decref the same object dest now holds
+		self._cfg.untrack_temp( value )
+		self._emit( ir.Assign( dest = dest, src = value ))
+		self._emit( ir.Jump( target = end_label ))
+
+	def _finish_binop_result_branch( self, raw_temp: ir.Temp, value: ir.Operand, dest: ir.Temp, end_label: str ) -> None:
+		''' shared tail for every branch of _emit_binop_fallible_split (and
+		the 'error' cell above, whose own error_instance is the identical
+		shape) - raw_temp is a branch-local, independently fresh_temp()-
+		tracked value (a checked op's check_dest, a dunder Call's own
+		dest, or _build_type_error_instance's own Allocate result) whose
+		OWN payload `value` was just extracted from (via _coerce_into_
+		union, whose synthesized ctor already increfs `value` - see
+		_build_type_error_instance's own docstring for why this specific
+		incref-then-decref pairing is correctly balanced). Since this is
+		only ONE branch of a larger dispatch tree, the outer unconditional
+		per-statement flush can't be relied on for raw_temp (same bug
+		class _emit_eq_dispatch_tree's own two ASAN-confirmed RC fixes
+		already cover) - decref + untrack it here, inline, unconditionally
+		within this branch only. '''
+		for instr in self._cfg.decref( raw_temp.type, raw_temp ):
+			self._emit( instr )
+		self._cfg.untrack_temp( raw_temp )
+		self._finish_binop_cell( dest, value, end_label )
+
+	def _emit_binop_fallible_split(
+		self, node: ast.AST, raw_temp: ir.Temp, dest: ir.Temp, success_type: Type, error_type: Type, result_union: TaggedUnion|None, end_label: str,
+	) -> None:
+		''' raw_temp is a not-yet-consumed Result[T,E] value (a checked
+		scalar op's own check_dest, or a dunder's own Call result whose
+		declared return type is itself Result[T,E]) - decomposed via ONE
+		more nested Ok/Err tag-check (bounded, always exactly 2 members -
+		Result's own shape), coercing whichever branch fires into the
+		OUTER dest, deliberately WITHOUT _consume_checked_result's own
+		auto-`.or_return()` consumption (see _lower_binop_dispatch's own
+		docstring - this fallible value IS the expression's own real
+		value here, not propagated to the enclosing function). Extracted
+		via _extract_union_payload, which returns a bare, un-incref'd
+		BORROW (unlike every other value this whole dispatch tree
+		produces, which are always already-owned fresh Call/opcode
+		results) - _coerce_binop_value's own _coerce_into_union call(s)
+		are what give it a real +1 reference; result_union is guaranteed
+		non-None whenever this is reached (a cell only gets here when its
+		own error_type is set, which is exactly what makes the WHOLE
+		expression fallible). '''
+		assert result_union is not None
+		shape = self.lowering._type_resolver._tagged_union_shape( raw_temp.type )
+		assert shape is not None and len( shape[1] ) == 2
+		base, members = shape
+		# NOT _union_storage.get(base): base is _tagged_union_shape's own
+		# deliberately-ABSTRACT return (shared tag values across every
+		# instantiation of the same generic union) - raw_temp.type here is
+		# routinely a Result[T,E] SPECIALIZATION (a scalar op's own
+		# check_type, or a dunder's declared Result[T,E] return type), and
+		# the ABSTRACT Result class's own payload union has no real C
+		# definition at all (its fields are bare, unsubstituted T/E
+		# TypeVars) - confirmed via a real repro ("incomplete type 'union
+		# builtins$Result$data'" from clang). union_storage needs THIS
+		# instantiation's own concrete, monomorphized union instead - same
+		# "monomorphize_class if Specialization else itself" pattern
+		# _coerce_or_check_operand already uses for the identical reason.
+		concrete_union = self.lowering.monomorphize_class( raw_temp.type ) if isinstance( raw_temp.type, Specialization ) else raw_temp.type
+		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( concrete_union )
+		ok_member, err_member = members[0], members[1]
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		err_label = self._new_label( 'binop_result_err' )
+		tag_dest = self._new_temp( tag_attr.type )
+		self._emit( ir.GetAttr( dest = tag_dest, obj = raw_temp, attr = tag_attr.stem ))
+		match = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[ok_member.stem] )))
+		self._emit( ir.JumpIfFalse( cond = match, target = err_label ))
+		# Ok branch
+		ok_payload = self._extract_union_payload( raw_temp, data_attr, payload_cls, ok_member )
+		ok_value = self._coerce_binop_value( ok_payload, success_type, result_union, node )
+		self._finish_binop_result_branch( raw_temp, ok_value, dest, end_label )
+		self._emit( ir.Label( name = err_label ))
+		# Err branch - err_member's own type might ITSELF be a multi-member
+		# ANONYMOUS union (signed Div/Mod's own ZeroDivisionError|
+		# OverflowError - see _resolve_checked_error) - one more bounded
+		# nested unwrap to reach a concrete leaf class before coercing
+		# into the OUTER error union. Gated on file is None (the same
+		# "synthesized, not a real declared type" marker
+		# discovery._get_or_create_union's own flattening logic already
+		# uses) - a NOMINAL @union error type (e.g. a real `@union class
+		# IntError: DivideByZero: None; ...`) is just as much an opaque
+		# LEAF as any plain marker class, exactly like a nominal @union
+		# leaf flowing into a WIDER union elsewhere in this compiler (see
+		# _coerce_into_union's own "nominal @union is exactly as valid a
+		# member... as any plain leaf type" comment) - unwrapping ITS OWN
+		# variants here would be wrong, confirmed via a real repro
+		# (int.__add__'s own Result[int,IntError] wrongly tried to
+		# decompose IntError's OWN internal DivideByZero/... variants
+		# instead of treating the whole IntError value as one leaf)
+		err_payload = self._extract_union_payload( raw_temp, data_attr, payload_cls, err_member )
+		err_shape = self.lowering._type_resolver._tagged_union_shape( err_payload.type )
+		if err_shape is not None and err_shape[0].file is None and len( err_shape[1] ) > 1:
+			self._emit_nested_error_unwrap( node, err_payload, err_shape, raw_temp, dest, error_type, result_union, end_label )
+		else:
+			err_value = self._coerce_binop_value( err_payload, error_type, result_union, node )
+			self._finish_binop_result_branch( raw_temp, err_value, dest, end_label )
+
+	def _emit_nested_error_unwrap(
+		self, node: ast.AST, err_union_operand: ir.Operand, err_shape: tuple[TaggedUnion,list[Variable]],
+		raw_temp: ir.Temp, dest: ir.Temp, error_type: Type, result_union: TaggedUnion, end_label: str,
+	) -> None:
+		''' one leaf pair's own checked error type can itself be a
+		multi-member anonymous union (signed Div/Mod's ZeroDivisionError|
+		OverflowError) - unwraps it down to the one concrete leaf class
+		before coercing into the OUTER (already-flattened, individual-
+		classes) error union. Bounded to exactly this one extra level -
+		_resolve_checked_error never produces a nested union of unions. '''
+		base, members = err_shape
+		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( base )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		n = len( members )
+		for i, member in enumerate( members ):
+			is_last = ( i == n - 1 )
+			if not is_last:
+				next_label = self._new_label( 'binop_error_unwrap_next' )
+				tag_dest = self._new_temp( tag_attr.type )
+				self._emit( ir.GetAttr( dest = tag_dest, obj = err_union_operand, attr = tag_attr.stem ))
+				match = self._new_temp( bool_cls )
+				self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] )))
+				self._emit( ir.JumpIfFalse( cond = match, target = next_label ))
+			concrete = self._extract_union_payload( err_union_operand, data_attr, payload_cls, member )
+			value = self._coerce_binop_value( concrete, error_type, result_union, node )
+			self._finish_binop_result_branch( raw_temp, value, dest, end_label )
+			if not is_last:
+				self._emit( ir.Label( name = next_label ))
 
 	def _lower_operand_compare( self, left: ir.Operand, right: ir.Operand, negate: bool, node: ast.AST ) -> ir.Operand:
 		''' Eq/NotEq between two ALREADY-LOWERED operands of the SAME

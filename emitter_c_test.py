@@ -8427,6 +8427,183 @@ def main() -> i32:
 		] )
 
 
+class UnionBinopDispatchTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `_lower_binop_dispatch`'s own union-vs-union +-*//%|&^ dispatch -
+	the arithmetic counterpart of the union-vs-union ==/!= dispatch
+	(UnionLeafCoercionTests), reusing the SAME 2-level tag-dispatch shape
+	but adding two things equality never needed: leaf pairs can produce
+	genuinely DIFFERENT result types (synthesized into a fresh union,
+	collapsing to a single plain type when every reachable pair agrees),
+	and THREE independent fallibility sources - a leaf pair with no valid
+	operation (TypeError), plain scalar arithmetic's own EXISTING checked-
+	arithmetic fallibility (respecting the current arithmetic mode per
+	cell, never bypassed), and a resolved dunder's own declared Result[T,E]
+	return type - all folding into ONE synthesized error union.
+
+	Found (not caused) while developing: `_lower_binary_operands` hinted
+	an operand's own lowering with the OUTER expected_type/the OTHER
+	operand's own type whenever neither side was a literal, even when
+	that hint was ITSELF (or resolved to) a union - silently wrapping a
+	plain leaf operand into that union via _coerce_or_check_operand's
+	union-wrap coercion before this dispatch ever saw it (e.g. `r:
+	Result[i32|int,E] = x + y` wrapped x itself into Result[...]; `Boxed|
+	int + Boxed` wrapped the right, non-union Boxed operand into Boxed|int
+	too, inventing a grid cell the source never expressed). Fixed by
+	guarding every such hint against the target being (or resolving to,
+	via _tagged_union_shape) a union - same principle _lower_eq_or_ne
+	already established for its own right_hint, just via two different
+	cascade paths this feature was the first to actually exercise.
+
+	Also found: a nominal @union error type (e.g. int's own IntError,
+	which has its own real variants like DivideByZero) is just as much an
+	opaque LEAF as any plain marker class - the nested-error-unwrap logic
+	(for _resolve_checked_error's own ANONYMOUS multi-class unions, e.g.
+	signed //'s ZeroDivisionError|OverflowError) must never try to
+	decompose a nominal union's OWN variants the same way; gated on
+	`file is None` (the same "synthesized, not really declared" marker
+	discovery._get_or_create_union's own flattening logic already uses). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'union_binop_scalar_and_dunder_dispatch', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		# infallible (i32,i32) scalar cell reached at runtime, but the
+		# expression's OWN static type is still fallible (int|i32 cross
+		# pairs have no dunder connecting them, int.__add__(int) is
+		# itself fallible) - confirms the dispatch doesn't silently
+		# generate invalid C for the union operands (the original bug:
+		# raw structs added directly), and that wrap_arithmetic mode is
+		# still respected per-cell (no OverflowError contributed here)
+		x: i32|int = 3
+		y: i32|int = 4
+		r1: Result[i32|int,IntError|TypeError] = x + y
+		if r1.is_err():
+			return 1
+
+		# (int,int) dunder-fallible cell - int.__add__(int) itself
+		# returns Result[int,IntError]; its own E must fold into the
+		# aggregate error union, not be used as-is
+		a: i32|int = int( 10 )
+		b: i32|int = int( 20 )
+		r2: Result[i32|int,IntError|TypeError] = a + b
+		if r2.is_err():
+			return 2
+
+		# both mismatch directions -> TypeError, no valid dunder either way
+		c: i32|int = 5
+		d: i32|int = int( 6 )
+		r3: Result[i32|int,IntError|TypeError] = c + d
+		if not r3.is_err():
+			return 3
+
+		e: i32|int = int( 7 )
+		f: i32|int = 8
+		r4: Result[i32|int,IntError|TypeError] = e + f
+		if not r4.is_err():
+			return 4
+
+		# AugAssign with a union operand - shares _lower_binop_values,
+		# should pick up the same dispatch with no special-casing needed.
+		# All-Scalar union (i32|i64) keeps this infallible (no cross-
+		# type-mismatch 'error' cell for two Scalars, unlike i32|int) so
+		# it stores back into g directly, no Result involved
+		g: i32|i64 = 9
+		g += 1
+	return 0
+''' ),
+			( 'union_binop_collapse_to_single_type', '''
+class Vector:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __add__( self, other: Vector ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other.x )
+	def __radd__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+
+def main() -> i32:
+	# every reachable leaf pair produces plain Vector - the result must
+	# be bound directly as Vector, NOT wrapped in a degenerate 1-member
+	# union (Vector.__add__(Vector) and Vector.__radd__(i32) both
+	# declared to return plain Vector)
+	p: Vector|i32 = Vector( 3 )
+	q: Vector = Vector( 4 )
+	r1: Vector = p + q
+	if r1.x != 7:
+		return 1
+
+	p2: Vector|i32 = 5
+	r2: Vector = p2 + q
+	if r2.x != 9:
+		return 2
+	return 0
+''' ),
+			( 'union_binop_nested_multi_error_unwrap', '''
+class NoAdd:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+def main() -> i32:
+	# default (checked) mode: signed i32 // i32 has checked_errors =
+	# (ZeroDivisionError, OverflowError) - a genuine multi-member
+	# ANONYMOUS error union contributed by ONE cell, exercising the
+	# bounded extra nested-unwrap level, alongside a separate TypeError
+	# contributed by the (i32,NoAdd)/(NoAdd,i32) mismatch cells - all
+	# three must land as distinct members of ONE aggregate error union
+	a: i32|NoAdd = 10
+	b: i32|NoAdd = 0
+	r1: Result[i32,ZeroDivisionError|OverflowError|TypeError] = a // b
+	if not r1.is_err():
+		return 1
+
+	c: i32|NoAdd = 20
+	d: i32|NoAdd = 4
+	r2: Result[i32,ZeroDivisionError|OverflowError|TypeError] = c // d
+	if r2.is_err():
+		return 2
+
+	e: i32|NoAdd = NoAdd( 1 )
+	f: i32|NoAdd = 2
+	r3: Result[i32,ZeroDivisionError|OverflowError|TypeError] = e // f
+	if not r3.is_err():
+		return 3
+	return 0
+''' ),
+			# RC-lifetime check under repetition - every cell kind that
+			# carries a real RC value (dunder-fallible Ok/Err, both TypeError
+			# 'error' cells) exercised 1000x. Verified separately under
+			# gcc -fsanitize=address before adding this (clean - no leak/UAF)
+			( 'union_binop_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			a: i32|int = int( 3 )
+			b: i32|int = int( 4 )
+			r1: Result[i32|int,IntError|TypeError] = a + b
+			if r1.is_err():
+				return 1
+
+			c: i32|int = 5
+			d: i32|int = int( 6 )
+			r2: Result[i32|int,IntError|TypeError] = c + d
+			if not r2.is_err():
+				return 2
+
+			i += 1
+	return 0
+''' ),
+		] )
+
+
 class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile-and-run companion to GenericMethodDispatchTests'
 	test_union_receiver_dispatch_applies_per_leaf_scalar_widening - proves
