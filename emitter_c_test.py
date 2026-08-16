@@ -11100,6 +11100,150 @@ def main() -> i32:
 		self.assertIn( 'cannot be read as a whole value', self.discovery.errors.errors[0] )
 
 
+class AddrofFieldAccessRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real, confirmed gap: `compiler.addrof(x)`
+	rejected any argument that wasn't a bare local-variable Name outright
+	("compiler.addrof(...) argument must be a bare local variable, not
+	compiler.addrof(f.a)"), even a single level of plain field access on an
+	already-stable local (`compiler.addrof(f.a)`) - a very common C idiom
+	needed by any FFI code that fills one field of a stack struct via an
+	out-parameter (e.g. inet_pton(af, str, &addr.sin_addr)), forcing
+	callers to stage the value through an extra local first.
+
+	Investigated and confirmed safe to widen for exactly this shape: a bare
+	Name's own operand is always a genuine, stable-lifetime Variable (never
+	a Temp), and requiring the field-access chain's ROOT to be one too
+	preserves that same guarantee one level deeper (a field of an already-
+	stable object is itself just as addressable - C's own well-defined
+	`&x.field`/`&x->field`). Deliberately NOT widened further: a Call-
+	rooted argument (`compiler.addrof(make().field)`) is a real, not just
+	theoretical, dangling-pointer risk (the call's own result is a
+	TEMPORARY with no guaranteed lifetime past the current statement under
+	this compiler's RC discipline) and a multi-level chain
+	(`compiler.addrof(a.b.c)`) is unneeded, unanalyzed extra scope - both
+	still rejected with a clear message.
+
+	Fixed via a new ir.AddrOfField instruction (distinct from
+	AddrOf(GetAttr(...)) - GetAttr loads a COPY of the field's value into a
+	fresh temp, whose address would be the copy's, not the real field's,
+	defeating the entire point of the FFI out-parameter idiom this exists
+	for) - emits one flat `&(obj)OP field` C expression, obj always the
+	chain's root object. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# write-through proof, not just "compiles": a callee writes
+			# through the pointer into ONE field of a caller's stack
+			# struct, and the OTHER field must stay untouched - confirms
+			# the address genuinely targets the real field's own storage
+			# inside the original struct, not some throwaway copy
+			( 'addrof_field_writes_through_to_the_real_struct_field', '''
+@cstruct
+class Foo:
+	a: u32 = 0
+	b: u32 = 0
+
+def write_via_ptr( p: Ptr[u32] ) -> None:
+	p[0] = u32( 42 )
+	return
+
+def main() -> i32:
+	f = Foo()
+	write_via_ptr( compiler.addrof( f.b ))
+	if f.b != u32( 42 ):
+		return 1
+	if f.a != u32( 0 ):
+		return 2
+	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@unittest.skipUnless( os.name == 'nt', 'needs a real Winsock DLL to call (ws2_32.dll)' )
+	def test_real_ffi_out_parameter_shape_compiles_and_runs( self ) -> None:
+		# the exact motivating shape from the task report: a real Win32 FFI
+		# call filling ONE field of a stack struct via compiler.addrof on
+		# that field directly (inet_pton's own real, documented contract),
+		# not staged through an extra local first
+		self.assert_programs_run([
+			( 'inet_pton_writes_into_a_nested_struct_field_via_addrof', '''
+import compiler
+import sys
+
+@cstruct
+class InAddr:
+	s_addr: u32 = 0
+
+@cstruct
+class SockAddrIn:
+	sin_family: i16 = 0
+	sin_port: u16 = 0
+	sin_addr: InAddr
+	sin_zero0: u32 = 0
+	sin_zero1: u32 = 0
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_pton' )
+def inet_pton( family: i32, pszAddrString: ConstPtr[u8], pAddrBuf: Ptr[None] ) -> i32: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr: SockAddrIn = SockAddrIn( sin_addr = InAddr() )
+	rc: i32 = inet_pton( 2, '127.0.0.1'.get_cstr(), compiler.cast( Ptr[None], compiler.addrof( addr.sin_addr )))
+	if rc != 1:
+		return 1
+	if addr.sin_addr.s_addr != u32( 0x0100007F ):
+		return 2
+	return 0
+''' ),
+		] )
+
+	def test_addrof_rejects_multi_level_field_chain( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Inner:',
+			'	x: u32 = 0',
+			'',
+			'@cstruct',
+			'class Outer:',
+			'	inner: Inner',
+			'	y: u32 = 0',
+			'',
+			'def main() -> None:',
+			'	o = Outer( inner = Inner() )',
+			'	compiler.addrof( o.inner.x )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only one level of field access is supported', self.discovery.errors.errors[0] )
+
+	def test_addrof_rejects_call_rooted_field_access( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	a: u32 = 0',
+			'',
+			'def make() -> Foo:',
+			'	return Foo()',
+			'',
+			'def main() -> None:',
+			'	compiler.addrof( make().a )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'must be rooted at a bare local variable', self.discovery.errors.errors[0] )
+
+
 class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression test for a real, confirmed silent-data-corruption bug: an
 	`@extern` function declared with a `T|None` return type where T is a

@@ -3126,15 +3126,59 @@ class FunctionLowering:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
 		# must be a bare local variable/parameter name (matches SYNTAX.md's
 		# "local variable" wording and C's own lvalue-only restriction on
-		# &), not an arbitrary expression. _expr_Name already only ever
-		# resolves to a Variable (never a Temp), so requiring the argument's
-		# AST shape to be ast.Name is what actually enforces this - lowering
-		# it via _lower_expr like any other value would silently accept e.g.
-		# compiler.addrof(x.field), which has no address to take here (no
-		# field-layout computation exists yet - that's an emitter concern)
+		# &), OR exactly one level of plain field access ROOTED at one
+		# (x.field, e.g. compiler.addrof(addr.sin_addr) - the common "fill
+		# one field of a stack struct via a C out-parameter" FFI idiom,
+		# e.g. inet_pton(af, str, &addr.sin_addr)). Investigated and
+		# confirmed safe for exactly this shape: a bare Name's own operand
+		# (_expr_Name) is always a genuine, stable-lifetime Variable (never
+		# a Temp) - requiring the CHAIN'S ROOT to be one too is what
+		# preserves that same "well-defined, stable lvalue" guarantee one
+		# level deeper (a plain field of an already-stable object is itself
+		# just as stable/addressable - C's own `&x.field`/`&x->field`).
+		# Deliberately NOT extended to a Call/Subscript/deeper chain root
+		# (e.g. compiler.addrof(get_foo().field) or compiler.addrof(a.b.c)):
+		# a Call's own result is a TEMPORARY whose lifetime this compiler's
+		# RC discipline doesn't guarantee outlives the current statement (a
+		# real dangling-pointer risk, not just an implementation gap), and a
+		# deeper chain is un-analyzed extra scope, not needed by the one
+		# real motivating case - both rejected with a clear message rather
+		# than silently mishandled.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.addrof(...) takes exactly one argument: {ast.unparse(node)}', node )
 		arg_node = node.args[0]
+		if isinstance( arg_node, ast.Attribute ):
+			if not isinstance( arg_node.value, ast.Name ):
+				self.lowering.discovery.fail(
+					f'compiler.addrof(...) field-access argument must be rooted at a bare local variable, '
+					f'not {ast.unparse(node)} (only one level of field access is supported)',
+					node,
+				)
+			root = self._lower_expr( arg_node.value, None )
+			attr_var = self.lowering._attr_lookup( root.type, arg_node.attr, arg_node )
+			if isinstance( attr_var.type, FixedArrayType ):
+				# same restriction _expr_Attribute's own GetAttr guard
+				# enforces for an ordinary read - see FixedArrayType's own
+				# docstring (no element-level access exists yet either, so
+				# there's nothing meaningful to take the address of beyond
+				# the whole array, which C already lets an ordinary bare-
+				# array-field expression decay to on its own without &)
+				self.lowering.discovery.fail(
+					f'{ast.unparse(node)}: {attr_var.type.qualname} fields have no addrof support yet '
+					f'(no element-level array access is implemented)',
+					node,
+				)
+			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+			pointee = attr_var.type
+			# same RC-pointee-depth rule the bare-Name path below applies -
+			# see its own comment for why (Ptr[Foo] already spells `Foo*`,
+			# so &-ing an RC-typed FIELD needs the same extra Ptr level)
+			if self.lowering._type_resolver._is_RC( pointee ):
+				pointee = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ pointee ] )
+			ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ pointee ] )
+			dest = self._new_temp( ptr_type )
+			self._emit( ir.AddrOfField( dest = dest, obj = root, attr = arg_node.attr ))
+			return dest
 		if not isinstance( arg_node, ast.Name ):
 			self.lowering.discovery.fail( f'compiler.addrof(...) argument must be a bare local variable, not {ast.unparse(node)}', node )
 		value = self._lower_expr( arg_node, None )

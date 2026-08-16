@@ -519,6 +519,27 @@ class AddrOf( Instruction ): # compiler.addrof(x) - yields &x, x a local variabl
 	def test_repr( self ) -> str:
 		return f'AddrOf( dest={self.dest!r}, value={self.value!r} )'
 
+@dataclass( kw_only = True )
+class AddrOfField( Instruction ):
+	# compiler.addrof(x.field) - yields &(x.field)/&(x->field) directly, one
+	# level of field access on a bare local/parameter x (see lowering.py's
+	# _lower_compiler_addrof for why deeper chains/non-Name roots aren't
+	# accepted). Distinct from AddrOf(GetAttr(...)) - GetAttr loads a COPY of
+	# the field's value into a fresh temp, whose address would be the copy's,
+	# not the real field's (useless for the FFI out-parameter idiom this
+	# exists for, e.g. inet_pton(af, str, &addr.sin_addr) needs the callee to
+	# write into `addr` itself). obj is always the ROOT object (never itself
+	# a GetAttr result) so emission can spell one flat `&(obj)OP field`
+	# expression, OP chosen the same way GetAttr/SetAttr already choose it
+	# (_member_access_operator - '.' for a plain value, '->' for an RCClass
+	# instance or a raw Ptr[T]/ConstPtr[T]).
+	dest: Temp
+	obj: Operand
+	attr: str
+
+	def test_repr( self ) -> str:
+		return f'AddrOfField( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r} )'
+
 class AtomicRMWOp( Enum ): # compiler.atomic_add/atomic_sub/atomic_exchange - fetch-and-op, dest gets the value BEFORE the op
 	ADD = 'add'
 	SUB = 'sub'

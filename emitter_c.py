@@ -2355,6 +2355,14 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 	if isinstance( instr, ir.AddrOf ):
 		return [ f'\t{_emit_operand(instr.dest)} = &{_emit_operand(instr.value)};' ]
 
+	if isinstance( instr, ir.AddrOfField ):
+		# compiler.addrof(x.field) - one flat C expression, &(obj)OP field -
+		# see AddrOfField's own docstring for why this is a distinct
+		# instruction from AddrOf(GetAttr(...)) (that would take the
+		# address of a freshly loaded COPY, not the real field)
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = &({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
+
 
 	if isinstance( instr, ir.SizeOf ):
 		# a real class-like type's size is whatever the C compiler itself
