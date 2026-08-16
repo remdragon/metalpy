@@ -5770,9 +5770,32 @@ class FunctionLowering:
 			# guessed at, see PLAN_TUPLE.md's own "Deferred" list. An empty
 			# `()` reaches here too (len 0) - same deferral.
 			self.lowering.discovery.fail( f'tuple literals need at least 2 elements: {ast.unparse(node)}', node )
+		# per-element expected types, threaded down the same way
+		# _lower_allocate_fields threads field.type into each field's own
+		# _lower_expr call - without this, a leaf value destined for a
+		# union-typed element (e.g. `bytes` into a declared
+		# tuple[bytes|None, str|None]) never goes through
+		# _coerce_or_check_operand's union-coercion, AND the tuple type
+		# inferred below from the elements' own NATURAL (uncoerced) types
+		# would differ from expected_type - two distinct backing RCClasses
+		# for what's supposed to be one tuple type, with only the natural
+		# one's allocator actually scheduled (_schedule_rcclass_
+		# construction below) while dest ends up typed as the OTHER
+		# (expected) one - exactly the "call to undeclared function"/
+		# "assigning incompatible type" emitter bug this comment is here
+		# to prevent regressing. Only applied when arity matches - a
+		# genuine arity mismatch is a real type error better left to
+		# whatever assignment/return-type check already reports it
+		# clearly, not guessed at here.
+		expected_elem_types: list[Type]|None = (
+			expected_type.elem_types
+			if isinstance( expected_type, TupleType ) and len( expected_type.elem_types ) == len( node.elts )
+			else None
+		)
 		operands: list[ir.Operand] = []
-		for elt in node.elts:
-			value = self._lower_expr( elt, None )
+		for i, elt in enumerate( node.elts ):
+			elem_expected = expected_elem_types[i] if expected_elem_types is not None else None
+			value = self._lower_expr( elt, elem_expected )
 			# same per-field RC-retain emission _lower_allocate_fields's own
 			# field-value loop uses for every other class's field=value
 			# construction sugar - a fresh value (Allocate/Call/Constant)
