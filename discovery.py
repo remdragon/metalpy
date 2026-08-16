@@ -1275,6 +1275,39 @@ class Discovery( ast.NodeVisitor ):
 				node,
 			)
 
+	def _reject_non_c_type_on_extern_signature( self, t: 'Type|None', node: ast.AST, context: str ) -> None:
+		''' an @extern function's foreign C symbol has no notion of this
+		compiler's own RC-managed objects or synthesized tagged unions - only
+		a genuine plain C value crosses that boundary correctly. Allowlisted
+		(not denylisted) deliberately: this codebase's own is_rc()/
+		is_rc_pointer() ladder (mpy_types.py's own comment on Type.is_rc)
+		documents three separate real bugs from exactly the denylist failure
+		mode - a new Type kind silently defaulting to "safe" because nothing
+		added it to the reject list. A plain C value is one of: Scalar
+		(i32/u8/.../bool/NoneType/...), @cstruct/@cunion (CStruct/CUnion),
+		a raw foreign C type (CType, e.g. lib/posix/pthread.py's pthread_t,
+		already used by value as a real extern parameter), a C enum (CEnum),
+		or a function-pointer signature (CallableType, Ptr[Callable[...]]) -
+		anything else (TaggedUnion's tag+payload struct has no foreign-ABI
+		counterpart at all; RCClass is heap-allocated with this compiler's
+		own ObjectHeader prefix, unsafe even though it happens to already be
+		pointer-shaped in the generated C; tuple[...]/Iterator[T]/generic
+		containers are all RC-backed the same way) is rejected. Ptr[T]/
+		ConstPtr[T] are unwrapped recursively first - a pointer to a bad type
+		is exactly as unsafe as the bad type itself (e.g. Ptr[Ptr[str]]). '''
+		leaf = t
+		while isinstance( leaf, Specialization ) and isinstance( leaf.base, Scalar ) and leaf.base.stem in ( 'Ptr', 'ConstPtr' ):
+			leaf = leaf.args[0]
+		if isinstance( leaf, ( Scalar, CStruct, CUnion, CType, CEnum, CallableType )):
+			return
+		qualname = getattr( leaf, 'qualname', leaf )
+		self.fail(
+			f'{context}: {qualname} cannot cross an @extern boundary - only a plain C value type (a scalar, '
+			f'@cstruct/@cunion, a raw C type, a C enum, a function pointer, or Ptr[T]/ConstPtr[T] to one of '
+			f'those) is allowed here: {ast.unparse(node)}',
+			node,
+		)
+
 	def visit_Assign( self, node: ast.Assign ) -> Name|None:
 		scope = self.scope_stack[-1]
 		if isinstance( scope, CEnum ):
@@ -2282,6 +2315,8 @@ class Discovery( ast.NodeVisitor ):
 								param_type = param_type.inner
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							self._reject_fixed_array_outside_struct_field( param_type, fn, arg, f'{fn.qualname} parameter {arg.arg!r}' )
+							if fn.extern_lib is not None:
+								self._reject_non_c_type_on_extern_signature( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
 								stem = arg.arg,
 								qualname = self._get_qualname( arg.arg ),
@@ -2319,6 +2354,8 @@ class Discovery( ast.NodeVisitor ):
 							fn.return_type = self.visit( fn.node.returns )
 							self._reject_bare_interface_value_type( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
 							self._reject_fixed_array_outside_struct_field( fn.return_type, fn, fn.node.returns, f'{fn.qualname} return type' )
+							if fn.extern_lib is not None:
+								self._reject_non_c_type_on_extern_signature( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
 						else:
 							fn.return_type = self.get_none_type()
 			# set self done *before* touching any overload siblings below - a

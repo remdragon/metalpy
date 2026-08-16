@@ -80,7 +80,7 @@ def readlink(
 	...
 
 @extern( 'c', 'strerror' )
-def strerror( errnum: i32 ) -> ConstPtr[u8]|None:
+def strerror( errnum: i32 ) -> ConstPtr[u8]:
 	...
 
 @extern( 'c', 'strnlen' )
