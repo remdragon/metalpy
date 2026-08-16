@@ -5805,9 +5805,20 @@ class FunctionLowering:
 		# (`x: tuple[i32,str] = (1,"a")`) hands down the SAME bare,
 		# unresolved TupleType discovery.py's visit_Subscript produced for
 		# the annotation (interned - same object as tt above), not yet
-		# swapped for backing_cls
+		# swapped for backing_cls. Only trust it when it actually resolves to
+		# THIS tuple's own backing class though - expected_type can just as
+		# easily be an unrelated OUTER context (e.g. a `tuple[T,T]|None`
+		# parameter's own union, handed down so _coerce_or_check_operand can
+		# wrap the result into it afterward) rather than a description of the
+		# tuple itself; interning guarantees identity in the genuine-match
+		# case, so anything else must fall back to backing_cls, not be
+		# trusted as dest's real type (a real bug: a tuple literal passed as
+		# a `tuple[str,str]|None` argument used to set dest.type to the
+		# UNION's own TaggedUnion, which isn't an RCClass, crashing emitter_c
+		# .py's Allocate emission with `assert isinstance(concrete_cls,
+		# RCClass)` since the union coercion never got a chance to run).
 		resolved_expected = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
-		dest = self._new_temp( resolved_expected or backing_cls )
+		dest = self._new_temp( resolved_expected if resolved_expected is backing_cls else backing_cls )
 		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
 		return dest
 

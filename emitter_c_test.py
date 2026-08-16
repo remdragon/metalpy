@@ -7634,6 +7634,52 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			# regression test: a TUPLE leaf (not a plain RCClass/str leaf like
+			# every case above) flowing into a T|None-typed slot - found via
+			# real lib/http/client.py Session work (auth: tuple[str,str]|None).
+			# lowering.py's _expr_Tuple used to trust `expected_type` blindly
+			# for its own dest's type, even when expected_type was this outer
+			# union (a coercion HINT meant for _coerce_or_check_operand to act
+			# on afterward, not a description of the tuple itself) - so dest
+			# ended up typed as the union's own TaggedUnion (a value struct,
+			# never an RCClass) instead of the tuple's real backing RCClass,
+			# crashing emitter_c.py's Allocate emission outright with `assert
+			# isinstance(concrete_cls, RCClass)` before ever reaching
+			# _coerce_into_union. Covers both a real tuple value and None
+			# flowing through the same parameter, plus a repeated-call
+			# refcount check (mirrors rc_leaf_refcount_correct_after_repeated_
+			# calls above) since the tuple's own str elements are RC and a
+			# double-incref/masked-decref in the coercion path wouldn't show
+			# up as a crash, just a drifting refcount.
+			( 'tuple_leaf_coerces_into_union', '''
+def creds( x: tuple[str,str]|None = None ) -> i32:
+	if x is None:
+		return 0
+	t: tuple[str,str] = x
+	if t[0] != 'user':
+		return 1
+	if t[1] != 'pass':
+		return 2
+	return 3
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		if creds() != 0:
+			return 1
+		if creds( ( 'user', 'pass' ) ) != 3:
+			return 2
+		i: i32 = 0
+		while i < 1000:
+			u: str = 'user'.upper().lower()
+			if compiler.refcount( u ) != 1:
+				return 3
+			if creds( ( u, 'pass' ) ) != 3:
+				return 4
+			if compiler.refcount( u ) != 1:
+				return 5
+			i += 1
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
