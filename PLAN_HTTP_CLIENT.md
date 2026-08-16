@@ -305,60 +305,59 @@ Implementation plan (phased, for once this moves from scoping to real work)
     server inspect the raw bytes it actually received, not just checking
     the client-side response.
 
-A real compiler gap found while landing Phase 3a
+Four real compiler gaps found while landing this plan - all now fixed
 
-Widening a bare @union error type (HTTPError) into a WIDER declared union
-return type (e.g. OSError|HTTPError) is broken, confirmed in at least three
-related ways: `.or_return()` on an HTTPError-returning call inside a function
-declared to return Result[_, OSError|HTTPError] mis-infers the target as a
-flattened union of HTTPError's own None-payload variant types instead of
-HTTPError itself; `Result.Err(e)` constructed directly from an HTTPError value
-inside such a function is "ambiguous ... inferred as both OSError|HTTPError
-and HTTPError"; and staging the value through an explicitly `OSError|HTTPError`
--typed local first (lib/socket.py's own `_err_invalid()`-style workaround for
-an unrelated ambiguity) still fails there too ("expected OSError|HTTPError,
-got HTTPError"). lib/socket.py's own OSError (a plain @enum, not @union) widens
-into the SAME wider union just fine via `.or_return()` - the gap is specific to
-a @union member propagating into a wider union, not union-widening in general
-(union_coercion_rc_test.py's own passing tests are all T|None coercion, not
-this shape). Worked around by never declaring a union return type at all -
-every public HTTPConnection method returns a bare Result[_, HTTPError], with
-a handful of small `_*_or_http_err` helpers collapsing any OSError from lib/
-socket.py into HTTPError.Other() right at the call site (see lib/http/client.py
-'s own comment above _connect_or_http_err). Flagged as its own follow-up task
-(task_ef51cec6, "Fix @union error widening into a wider Result union" - same
-treatment as the earlier list[tuple[...]] gap, task_a8b4e7c3).
+Each was flagged as its own follow-up task while lib/http/client.py worked
+around it; all four have since landed on master, and every workaround below
+has been reverted back to the originally-intended shape. Kept here as a
+historical record (worth knowing if similar tuple/union code elsewhere in
+this codebase was hitting the same walls before these fixes landed).
 
-DNS landed since the above was written: task_a8b4e7c3 shipped as commit
-f794edb ("socket: add getaddrinfo-based hostname resolution") - Socket.connect()
-now resolves real hostnames transparently, not just IP literals. No lib/http/
-client.py changes were needed - HTTPConnection.connect()/Session already just
-call sock.connect(host, port) and get hostname support for free.
+1. No DNS/getaddrinfo in lib/socket.py (task_a8b4e7c3) - host had to be a
+   pre-resolved IP literal. Fixed by commit f794edb ("socket: add
+   getaddrinfo-based hostname resolution") - Socket.connect() now resolves
+   real hostnames transparently. No lib/http/client.py changes were needed
+   either way - HTTPConnection.connect()/Session already just called
+   sock.connect(host, port) and got hostname support for free once the fix
+   landed underneath them.
 
-Two more compiler gaps found while landing Phase 3b
+2. Widening a bare @union error type (HTTPError) into a WIDER declared union
+   return type (e.g. OSError|HTTPError) was broken three related ways -
+   .or_return(), a direct return Result.Err(e), and a staged explicitly-
+   typed local all failed (task_ef51cec6). Worked around by never declaring
+   a union return type at all - every public HTTPConnection method returns
+   a bare Result[_, HTTPError], with small `_*_or_http_err` helpers
+   collapsing any OSError from lib/socket.py into HTTPError.Other() at the
+   call site. Fixed by commit a4ca6a3 ("Fix union widening: nominal @union
+   error types can now widen into a bigger union"). NOT reverted -
+   collapsing every Socket-facing OSError into HTTPError.Other() is still
+   arguably better API design on its own merits (HTTPConnection's own
+   public error type stays a single, simple HTTPError instead of leaking
+   lib/socket.py's OSError), so the design was kept deliberately once fixed,
+   not just left as a stale workaround - see lib/http/client.py's own
+   comment above `_connect_or_http_err`.
 
-Both forced real API deviations from the original "Draft API sketch" below -
-see Phase 3b's own entry above for what actually shipped instead.
+3. tuple[T|None, ...] (a union as a tuple's own ELEMENT type) generated C
+   that didn't compile (task_34251c9f) - `_encode_body()` originally
+   returned tuple[bytes|None, str|None], and the generated C called an
+   allocator function that was never declared anywhere in the translation
+   unit, plus assigned raw pointers directly into fields that should have
+   been tagged-union structs. Worked around with a small dedicated
+   _EncodedBody class (two fields) instead of a tuple return type. Fixed by
+   commit 98c2010 ("tuple: coerce elements into their declared union types
+   during construction") - reverted back to `tuple[bytes|None, str|None]`,
+   _EncodedBody removed.
 
-1. tuple[T|None, ...] (a union as a tuple's own ELEMENT type) generates C that
-   doesn't compile - a real, uncaught emitter bug, not just a type-checking
-   gap: `_encode_body()` originally returned tuple[bytes|None, str|None], and
-   the generated C called an allocator function
-   (sys$alloc$$g$tuple$...$or$...) that was never declared anywhere in the
-   translation unit, plus assigned raw pointers directly into fields that
-   should have been tagged-union structs. Confirmed narrow to tuple ELEMENTS
-   specifically - plain tuple[T1,T2] and T|None as an ordinary local/
-   parameter/field both work fine on their own. Worked around with a small
-   dedicated _EncodedBody class (two fields) instead of a tuple return type.
-   Flagged as task_34251c9f.
-
-2. tuple[...] as a MEMBER of an outer union (the inverse of #1) crashes the
+4. tuple[...] as a MEMBER of an outer union (the inverse of #3) crashed the
    emitter outright - not a bad-compile-error, an uncaught Python
-   AssertionError inside emit_c() itself ("assert isinstance(concrete_cls,
-   RCClass)"), the moment a real tuple[str,str] value actually flows through
-   a tuple[str,str]|None-typed parameter (auth=('user','pass') in this case).
-   Worked around by giving auth= a dedicated BasicAuth(user, password) class
-   instead of requests' own bare-tuple ergonomics. Flagged as task_827c2650.
+   AssertionError inside emit_c() itself, the moment a real tuple[str,str]
+   value flowed through a tuple[str,str]|None-typed parameter (auth=
+   ('user','pass') in this case) (task_827c2650). Worked around by giving
+   auth= a dedicated BasicAuth(user, password) class instead of requests'
+   own bare-tuple ergonomics. Fixed by commit 0c3ab27 ("Fix tuple-in-union
+   Allocate crash: don't trust expected_type blindly for dest's type") -
+   reverted back to `auth: tuple[str,str]|None`, BasicAuth removed. auth=
+   now matches requests' own `auth=(user, password)` ergonomics exactly.
 
   Phase 4 (deferred/future plan doc) — HTTPSConnection/TLS, `json=`/`.json()` once
     a json library exists, multipart `files=`, connection reuse.

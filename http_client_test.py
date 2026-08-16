@@ -522,7 +522,7 @@ import compiler
 import threading
 from atomic import Atomic
 from socket import Socket
-from http.client import Session, Response, BasicAuth
+from http.client import Session, Response
 
 class FormAuthServer:
 	port: u16
@@ -583,7 +583,7 @@ def main() -> i32:
 	form: dict[str,str] = dict[str,str]()
 	form[ 'a' ] = '1'
 	form[ 'b' ] = '2'
-	r: Response = s.post( 'http://127.0.0.1:18772/submit', form = form, auth = BasicAuth( 'user', 'pass' )).unwrap( 'client request' )
+	r: Response = s.post( 'http://127.0.0.1:18772/submit', form = form, auth = ( 'user', 'pass' )).unwrap( 'client request' )
 	t.join()
 
 	if r.status_code != 200:

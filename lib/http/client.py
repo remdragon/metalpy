@@ -731,27 +731,6 @@ class HTTPConnection:
 		# right after getresponse() returns.
 		return Result.Ok( Response( parsed_status[1], parsed_status[2], headers, content, '' ))
 
-# NOT tuple[str,str]|None (requests' own auth=(user, password) tuple
-# ergonomics) - a real emitter CRASH, confirmed directly: a tuple type as a
-# MEMBER of an outer union (as opposed to task_34251c9f's sibling bug, a
-# union as a tuple's own ELEMENT) makes emit_c() hit an uncaught
-# AssertionError ("assert isinstance(concrete_cls, RCClass)") the moment a
-# real tuple value actually flows through such a parameter at a real call
-# site - not just a bad-compile-error, an outright compiler crash. A plain
-# 2-field class sidesteps it entirely, the same way _EncodedBody sidesteps
-# task_34251c9f (see that class's own comment) - tracked separately as
-# task_827c2650 since the failure mode (a crash, not bad C) and the code
-# path (union-containing-tuple, not tuple-containing-union) are both
-# different from task_34251c9f, even though the underlying problem area
-# (tuple_storage.py/union interaction) is clearly related.
-class BasicAuth:
-	user: str
-	password: str
-
-	def __init__( self, user: str, password: str ) -> None:
-		self.user = user
-		self.password = password
-
 # ---------------------------------------------------------------------------
 # URL parsing - minimal, http:// only (no TLS - see PLAN_HTTP_CLIENT.md's
 # Phase 4), absolute URLs only (no relative-URL resolution, needed for
@@ -861,33 +840,17 @@ def _copy_headers( h: HTTPHeaders ) -> HTTPHeaders:
 
 _MAX_REDIRECTS: usize = 10
 
-# NOT tuple[bytes|None, str|None] - a real emitter bug, confirmed directly:
-# a tuple whose ELEMENT types are themselves optional unions generates
-# broken C (a call to an undeclared sys$alloc$$g$tuple$...$or$... allocator,
-# plus raw-pointer field assignments where a tagged-union struct assignment
-# was needed - the per-element union-coercion step tuple construction
-# needs just isn't happening for this shape). A plain class with the same
-# two fields sidesteps it entirely - Optional class FIELDS are unaffected
-# (this file's own HTTPHeaders.get() etc. already return T|None fine; the
-# bug is specific to a tuple ELEMENT being a union, not optionality itself).
-class _EncodedBody:
-	body: bytes|None
-	content_type: str|None
-
-	def __init__( self, body: bytes|None, content_type: str|None ) -> None:
-		self.body = body
-		self.content_type = content_type
-
-def _encode_body( data: bytes|str|None, form: dict[str,str]|None ) -> _EncodedBody:
-	''' data and form are mutually exclusive (form wins if somehow both are
-	given - not expected in practice). Kept as two separate optional
-	parameters rather than one requests-style bytes|str|dict|None union:
-	match-based dispatch across a 3-real-type union (bytes|str|dict[str,str],
-	plus None) is untested territory in this codebase (the only confirmed
-	match-on-union-member precedent, union_coercion_rc_test.py's Box|None,
-	is a single real type - see PLAN_HTTP_CLIENT.md's own note on this), and
-	dict[str,str] specifically nested inside a wider union raises the same
-	generic-argument-in-a-union-position question the list[tuple[...]] gap
+def _encode_body( data: bytes|str|None, form: dict[str,str]|None ) -> tuple[bytes|None, str|None]:
+	''' -> (body bytes, Content-Type to set if not already present). data and
+	form are mutually exclusive (form wins if somehow both are given - not
+	expected in practice). Kept as two separate optional parameters rather
+	than one requests-style bytes|str|dict|None union: match-based dispatch
+	across a 3-real-type union (bytes|str|dict[str,str], plus None) is
+	untested territory in this codebase (the only confirmed match-on-union-
+	member precedent, union_coercion_rc_test.py's Box|None, is a single real
+	type - see PLAN_HTTP_CLIENT.md's own note on this), and dict[str,str]
+	specifically nested inside a wider union raises the same generic-
+	argument-in-a-union-position question the list[tuple[...]] gap
 	(task_a8b4e7c3's sibling, already fixed once) was about. Splitting form=
 	out avoids the question entirely rather than gambling on untested
 	compiler territory here too. '''
@@ -895,20 +858,20 @@ def _encode_body( data: bytes|str|None, form: dict[str,str]|None ) -> _EncodedBo
 		f: dict[str,str] = form
 		encoded: str = _form_encode( f )
 		body: bytes = encoded.encode().unwrap( '_encode_body: form encoding is always ASCII' )
-		return _EncodedBody( body, 'application/x-www-form-urlencoded' )
+		return ( body, 'application/x-www-form-urlencoded' )
 	if data is not None:
 		match data:
 			case bytes( b ):
-				return _EncodedBody( b, None )
+				return ( b, None )
 			case str( s ):
 				sb: bytes = s.encode().unwrap( '_encode_body: request body string must be valid UTF-8' )
-				return _EncodedBody( sb, None )
-	return _EncodedBody( None, None )
+				return ( sb, None )
+	return ( None, None )
 
 def _is_redirect_status( status_code: u16 ) -> bool:
 	return status_code == 301 or status_code == 302 or status_code == 303 or status_code == 307 or status_code == 308
 
-def _build_request_headers( session_headers: HTTPHeaders, content_type: str|None, extra_headers: HTTPHeaders|None, cookie_header: str|None, auth: BasicAuth|None ) -> HTTPHeaders:
+def _build_request_headers( session_headers: HTTPHeaders, content_type: str|None, extra_headers: HTTPHeaders|None, cookie_header: str|None, auth: tuple[str,str]|None ) -> HTTPHeaders:
 	''' merges session defaults + a computed Content-Type + per-call headers=
 	(highest precedence among headers) + the Cookie jar + auth= into one
 	HTTPHeaders for a single request. A plain (non-looping) function
@@ -930,8 +893,8 @@ def _build_request_headers( session_headers: HTTPHeaders, content_type: str|None
 		ch: str = cookie_header
 		request_headers.set( 'Cookie', ch )
 	if auth is not None:
-		a: BasicAuth = auth
-		credentials: str = a.user + ':' + a.password
+		a: tuple[str,str] = auth
+		credentials: str = a[0] + ':' + a[1]
 		cred_bytes: bytes = credentials.encode().unwrap( '_build_request_headers: auth= must be valid UTF-8' )
 		request_headers.set( 'Authorization', 'Basic ' + base64_encode( cred_bytes ))
 	return request_headers
@@ -1007,14 +970,14 @@ class Session:
 		form: dict[str,str]|None = None,
 		headers: HTTPHeaders|None = None,
 		cookies: dict[str,str]|None = None,
-		auth: BasicAuth|None = None,
+		auth: tuple[str,str]|None = None,
 		allow_redirects: bool = True,
 	) -> Result[Response, HTTPError]:
 		current_method: str = method
 		current_url: str = url
-		encoded_body: _EncodedBody = _encode_body( data, form )
-		current_body: bytes|None = encoded_body.body
-		content_type: str|None = encoded_body.content_type
+		encoded_body: tuple[bytes|None, str|None] = _encode_body( data, form )
+		current_body: bytes|None = encoded_body[0]
+		content_type: str|None = encoded_body[1]
 
 		redirect_count: usize = 0
 		with compiler.panic_arithmetic( 'bounded by _MAX_REDIRECTS, cannot overflow' ):
@@ -1059,31 +1022,31 @@ class Session:
 				current_url = next_url
 
 	def get( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 		return self.request( 'GET', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 	def post( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 		return self.request( 'POST', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 	def put( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 		return self.request( 'PUT', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 	def patch( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 		return self.request( 'PATCH', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 	def delete( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 		return self.request( 'DELETE', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 	def head( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
 		return self.request( 'HEAD', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 	def options( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 		return self.request( 'OPTIONS', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 # ---------------------------------------------------------------------------
@@ -1093,29 +1056,29 @@ class Session:
 # ---------------------------------------------------------------------------
 
 def get( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 	return Session().get( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 def post( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 	return Session().post( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 def put( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 	return Session().put( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 def patch( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 	return Session().patch( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 def delete( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 	return Session().delete( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 def head( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
 	return Session().head( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 def options( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: BasicAuth|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 	return Session().options( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
