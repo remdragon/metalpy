@@ -329,6 +329,20 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			( 'unresolvable_hostname_surfaces_as_name_resolution_failed', '''
+from http.client import HTTPConnection, HTTPError
+
+def main() -> i32:
+	# .invalid is reserved (RFC 2606) - guaranteed to never resolve, same
+	# hostname socket_test.py's own resolution-failure tests already use
+	match HTTPConnection.connect( 'this-host-should-not-exist.invalid', u16( 80 )):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( HTTPError.NameResolutionFailed( _ )):
+			return 0
+		case Result.Err( _ ):
+			return 2
+''' ),
 		])
 
 

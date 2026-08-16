@@ -83,11 +83,12 @@ Current state of prerequisites
     splitter and a percent-encoder on top of. These are cheap, buildable today, and
     needed for `params=`, form-encoded `data=`, and `auth=` (HTTP Basic → base64).
 
-  Error codes: lib/posix/errors.py's PosixError already defines
-    ConnectionRefused = 111 (ECONNREFUSED) — staged in advance for this. lib/builtins/
-    __errors.py's OSError (both @compiler.target variants) has no network-specific
-    variants yet. The socket library will need to add ConnectionReset, TimedOut,
-    HostUnreachable, and NameResolutionFailed equivalents on both platforms.
+  Error codes: written when none of this existed yet - since landed. lib/builtins/
+    __errors.py's OSError (both @compiler.target variants) now has ConnectionRefused,
+    ConnectionReset, TimedOut, AddressInUse, WouldBlock, and NameResolutionFailed,
+    added alongside lib/socket.py itself. HTTPConnection.connect() distinguishes
+    HTTPError.NameResolutionFailed from every other connect() failure (which still
+    collapses to HTTPError.Other()) - see "Socket-facing OSError" note further down.
 
 Socket surface — what actually landed (lib/socket.py, commit 863bfc8)
 
@@ -106,13 +107,20 @@ different shape than requested, close enough to build on directly:
 Two real gaps versus what was asked for, both accepted as-is rather than
 reworked, for the reasons below:
 
-  - No SocketError - errors are plain OSError (OSError(get_errno())/
-    OSError(WSAGetLastError()) raw-code construction, same as lib/fs.py).
-    OSError's own named variants (FileNotFoundError/AccessDenied/BrokenPipe/
-    Invalid/Other) don't cover network-specific codes like ConnectionRefused,
-    so any such failure just surfaces as OSError.Other - no fine-grained
-    categorization for v1. Good enough: http.client only needs to know
-    Ok-vs-Err here, not distinguish refused-vs-reset-vs-timeout yet.
+  - No SocketError - errors are plain OSError, same as lib/fs.py. STALE as of
+    lib/socket.py's own later growth: OSError gained ConnectionRefused,
+    ConnectionReset, TimedOut, AddressInUse, WouldBlock, and
+    NameResolutionFailed variants (added alongside lib/socket.py itself, not
+    part of its original landing). http.client itself still collapses every
+    connect() failure to HTTPError.Other() EXCEPT NameResolutionFailed, which
+    HTTPConnection.connect() distinguishes explicitly (`os_err ==
+    OSError.NameResolutionFailed` - confirmed this comparison against a
+    caught, non-bare-reference OSError value works via a real compile,
+    untested territory before this) - the one case a caller is likely to
+    want to handle differently (retry vs. give up on a typo'd hostname).
+    Further granularity (refused vs. reset vs. timed out) remains
+    unexposed - not needed by anything built here yet, easy to add the same
+    way if a real caller needs it.
   - No timeout_ms parameter at all (blocking-only, no timeout support
     anywhere in lib/socket.py yet). http.client's own timeout_ms= parameter
     (see the Session.request() sketch below) stays reserved/no-op until

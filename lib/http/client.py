@@ -43,6 +43,7 @@ class HTTPError:
 	InvalidURL: None
 	TooManyRedirects: None
 	BadStatus: None
+	NameResolutionFailed: None
 	Other: None
 
 # ---------------------------------------------------------------------------
@@ -541,7 +542,16 @@ def _connect_or_http_err( host: str, port: u16 ) -> Result[Socket, HTTPError]:
 			match sock.connect( host, port ):
 				case Result.Ok( _ ):
 					return Result.Ok( sock )
-				case Result.Err( _ ):
+				case Result.Err( os_err ):
+					# distinguish "couldn't even resolve the hostname" from
+					# every other connect() failure (refused, reset, timed
+					# out, ...) - the one OSError variant a caller is likely
+					# to want to handle differently (e.g. retry vs. give up
+					# immediately on a typo'd hostname). Every other OSError
+					# still collapses to Other() - see this function's own
+					# header comment on why that stays deliberate, not a gap.
+					if os_err == OSError.NameResolutionFailed:
+						return Result.Err( HTTPError.NameResolutionFailed( None ))
 					return Result.Err( HTTPError.Other( None ))
 		case Result.Err( _ ):
 			return Result.Err( HTTPError.Other( None ))
