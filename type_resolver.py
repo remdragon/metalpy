@@ -4581,7 +4581,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		unique = self._label_id
 		self._label_id += 1
 		subj_name = f'__match_subj_{unique}'
-		subj_assign = ast.Assign( targets = [ ast.Name( id = subj_name, ctx = ast.Store() ) ], value = self.generic_visit_expr( node.subject ))
+		subj_assign = ast.Assign( targets = [ ast.Name( id = subj_name, ctx = ast.Store() ) ], value = self.visit( node.subject ))
 		ast.copy_location( subj_assign, node )
 		# two attributes lowering.py's own _stmt_Assign reads (getattr(...,
 		# default), same bridging technique visit_Call's own resolved_callee
