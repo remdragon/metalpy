@@ -3370,7 +3370,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			kwarg_types[kw.arg] = kw_type
 		try:
 			_, resolved = overload_resolution.resolve_call(
-				group.stubs, group.implementations, arg_types, kwarg_types, qualname = group.qualname,
+				group.stubs, group.implementations, arg_types, kwarg_types,
+				qualname = group.qualname, same_type = self.resolver._same_type,
 			)
 		except CompileError:
 			return None
@@ -3382,7 +3383,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			**{ i: tuple( t.leaves() ) for i, t in enumerate( arg_types ) },
 			**{ name: tuple( t.leaves() ) for name, t in kwarg_types.items() },
 		}
-		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves ):
+		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves, self.resolver._same_type ):
 			return winning_stub.return_type
 		return resolved.return_type
 
@@ -4853,6 +4854,16 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# records before raising, same trap 876fdc0 already fixed for
 			# `self.foo()` - this is the same gap, just for an ordinary
 			# extracted payload binding instead of the `self` parameter).
+			# Same fix independently also closes a second gap: without a
+			# self.locals entry, a later `if v is not None:` inside the same
+			# case body couldn't recognize v as a narrowable union-typed
+			# name (_is_none_narrowing_shape's own _type_of_expr call
+			# returned None for it), silently skipping the narrowing an
+			# ordinary local would get - confirmed via a real compile:
+			# `match r: case Result.Ok(v): if v is not None: x = v` (v:
+			# i32|None) failed to narrow, rejecting `x = v` as
+			# i32|None-into-i32, even though the identical pattern against a
+			# plain `v: i32|None = ...` local already narrowed correctly.
 			self.locals[ pattern.name ] = self._type_of_expr( subj_expr )
 			return test, [ bind ]
 

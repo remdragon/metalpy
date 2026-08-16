@@ -726,7 +726,39 @@ class Discovery( ast.NodeVisitor ):
 		# actually needed (Lowering._find_module_for, once something
 		# schedules one of this union's synthesized member constructors,
 		# not just reads its tag/data fields directly).
-		ordered = sorted( operands, key = lambda t: t.qualname )
+		#
+		# operands are flattened here (any operand that is ITSELF an
+		# anonymous union - t.file is None, never a real user `@union class`
+		# - contributes its own leaves instead of itself) and deduped by
+		# qualname before sorting. Needed for e.g. Result[T,E].unwrap_or's
+		# own `T|None` return annotation: ordinary AST-level parsing already
+		# flattens a literal `T|None` into the two operands [T, NoneType]
+		# before either is resolved (this class's own visit_BinOp/
+		# _flatten_union above), but that flattening can't see through a
+		# TypeVar - monomorphize.py's substitute_type_params substitutes T
+		# with a concrete type AFTER that AST-level flattening already ran,
+		# so when T is itself bound to an Optional (e.g. i32|None), the
+		# substituted operand list becomes [i32|None, NoneType] - one
+		# already-a-union operand plus a second, redundant NoneType. Without
+		# flattening here, that nested union was kept as a single opaque
+		# member whose OWN qualname already contains '|', producing a
+		# doubled "NoneType" in the outer key (e.g.
+		# "intrinsics.NoneType|intrinsics.NoneType|intrinsics.i32") instead
+		# of collapsing to the correct, flat "intrinsics.NoneType|
+		# intrinsics.i32" - confirmed via a real compile of
+		# Result[i32|None,str].unwrap_or(), which failed with exactly that
+		# doubled-NoneType mismatch against the (correctly flat) Ok-payload
+		# type before this fix.
+		flattened: list[Type] = []
+		for operand in operands:
+			if isinstance( operand, TaggedUnion ) and operand.file is None:
+				flattened.extend( attr.type for attr in operand.attributes )
+			else:
+				flattened.append( operand )
+		deduped: dict[str,Type] = {}
+		for operand in flattened:
+			deduped.setdefault( operand.qualname, operand )
+		ordered = sorted( deduped.values(), key = lambda t: t.qualname )
 		key = '|'.join( t.qualname for t in ordered )
 		if union := self._unions.get( key ):
 			return union
@@ -1803,6 +1835,7 @@ class Discovery( ast.NodeVisitor ):
 		is_private = False
 		is_virtual = False
 		is_inline = False
+		is_property = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
@@ -1829,6 +1862,8 @@ class Discovery( ast.NodeVisitor ):
 					is_virtual = True
 				case 'inline':
 					is_inline = True
+				case 'property':
+					is_property = True
 				case 'extern':
 					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
@@ -1877,6 +1912,24 @@ class Discovery( ast.NodeVisitor ):
 			# above already uses (reject outright rather than silently
 			# building something with no coherent meaning)
 			self.fail( f'@virtual {qualname} cannot also be @staticmethod/@classmethod - no receiver to dispatch through', node )
+
+		if is_property:
+			# read-only getter only for now - no @x.setter (that needs its
+			# own exemption from the "already defined" duplicate-name check
+			# below, the same way @overload gets one; no datetime/timedelta
+			# need is driving that yet). Must be an ordinary instance method
+			# with exactly one parameter (self) - no other positional/
+			# keyword/*args/**kwargs params, since `obj.attr` (no call
+			# parens) never supplies any.
+			if class_obj is None:
+				self.fail( f'@property {qualname} is only valid on a method, not a free function', node )
+			if is_static or is_classmethod:
+				self.fail( f'@property {qualname} cannot also be @staticmethod/@classmethod - a property reads through an instance', node )
+			if is_overload:
+				self.fail( f'@property {qualname} cannot also be @overload - a property has exactly one signature', node )
+			all_params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+			if len( all_params ) != 1 or node.args.vararg is not None or node.args.kwarg is not None:
+				self.fail( f'@property {qualname} must take exactly `self` and no other parameters', node )
 
 		if is_inline:
 			# PLAN_INLINE.md - each of these interacts with the real call
@@ -1957,6 +2010,7 @@ class Discovery( ast.NodeVisitor ):
 			is_virtual = is_virtual,
 			is_overload = is_overload,
 			is_inline = is_inline,
+			is_property = is_property,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,

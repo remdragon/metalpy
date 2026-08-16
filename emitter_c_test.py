@@ -4897,6 +4897,105 @@ def main() -> i32:
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bare_literal_via_return_and_construction( self ) -> None:
+		# _expr_Constant's own CEnum handling (distinct from _stmt_Return's
+		# coercion tested above) - a BARE integer literal, not a named local,
+		# validated/typed against the CEnum's own underlying scalar, both via
+		# a plain `return 1` and via an explicit Color(1) construction call
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_via_return() -> Color:
+	return 1
+
+def get_via_construct() -> Color:
+	return Color( 1 )
+
+def main() -> i32:
+	a: Color = get_via_return()
+	if a != Color.Blue:
+		return 1
+	b: Color = get_via_construct()
+	if b != Color.Blue:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_kind_mismatched_literal_rejected_cleanly_not_crashed( self ) -> None:
+		# _expr_Constant's own CEnum branch used to exempt EVERY CEnum
+		# expected_type from kind-validation outright (meant only for a raw
+		# INT literal's own magnitude, per the construction-call comment) -
+		# a kind-mismatched literal (a bare string, here) sailed through
+		# untyped-checked, tagging the resulting Const with the CEnum type
+		# while its own .value stayed the Python string - confirmed to crash
+		# emitter_c.py's _emit_const with an uncaught Python
+		# NotImplementedError (a raw traceback, not a compile error) rather
+		# than being cleanly rejected. Exercises the bare-literal-via-return
+		# shape directly (distinct from test_genuinely_mismatched_return_
+		# type_still_rejected above, which uses a named local of the wrong
+		# type, not a mismatched literal)
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_wrong() -> Color:
+	return 'not a color'
+
+def main() -> i32:
+	c: Color = get_wrong()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_kind_mismatched_construction_literal_rejected_cleanly_not_crashed( self ) -> None:
+		# same bug, the OTHER call site that reaches _expr_Constant's CEnum
+		# branch: an explicit Color(...) construction call whose own argument
+		# is a kind-mismatched literal. _try_lower_construct_call's own CEnum
+		# branch only validates an INT literal's own magnitude directly -
+		# anything else is deferred entirely to _expr_Constant, so this
+		# crashed the identical way before the fix
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def main() -> i32:
+	c: Color = Color( 'bad' )
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_out_of_range_literal_rejected( self ) -> None:
+		# the magnitude check (previously only reachable via the
+		# construction-call path's own separate, duplicate check) now also
+		# applies via the bare-literal-return path, using the CEnum's own
+		# underlying scalar's real range rather than skipping validation
+		self._run( '''
+@enum( u8 )
+class Small:
+	A = 0
+	B = 1
+
+def get_bad() -> Small:
+	return 999
+
+def main() -> i32:
+	s: Small = get_bad()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
 
 class AtomicRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for compiler.atomic_*(Ptr[T], ...)
@@ -5159,6 +5258,85 @@ def main() -> i32:
 	rc2: usize = compiler.refcount( w )
 	if rc2 != rc0:
 		return 5
+	return 0
+''' ),
+		] )
+
+
+class PropertyRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for @property (lowering.py's _expr_
+	Attribute is_property branch) - unlike the IR-shape assertions in
+	lowering_test.py, these confirm the generated code actually calls the
+	getter and produces the right value, and (for an RC-typed property)
+	doesn't leak or double-free the returned value across repeated reads. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# obj.attr (no call parens) actually calls the getter - a plain
+			# GetAttr would find no real field named 'doubled' and fail to
+			# compile at all, so a successful compile+correct value together
+			# confirm the Call-based dispatch is really happening
+			( 'scalar_property_computed_from_field', '''
+class Box:
+	x: i32
+
+	@property
+	def doubled( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x * 2
+
+def main() -> i32:
+	b: Box = Box( x = 21 )
+	if b.doubled != 42:
+		return 1
+	return 0
+''' ),
+			# the property's result participates in an ordinary expression
+			# exactly like a real field would - not just a bare read
+			( 'property_used_in_expression', '''
+class Box:
+	x: i32
+
+	@property
+	def doubled( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x * 2
+
+def main() -> i32:
+	b: Box = Box( x = 5 )
+	with compiler.wrap_arithmetic:
+		y: i32 = b.doubled + 1
+	if y != 11:
+		return 1
+	return 0
+''' ),
+			# an RC-typed property (returns a fresh str each read) read
+			# repeatedly in a loop - a missing/wrong incref or decref on the
+			# Call's own result would leak or double-free, and 200
+			# iterations is enough for that to reliably surface
+			( 'rc_typed_property_read_in_a_loop', '''
+class Greeter:
+	name: str
+
+	@property
+	def greeting( self ) -> str:
+		return "hello " + self.name
+
+def main() -> i32:
+	g: Greeter = Greeter( name = "world" )
+	i: i32 = 0
+	while i < 200:
+		if len( g.greeting ) != 11:
+			return 1
+		with compiler.wrap_arithmetic:
+			i += 1
 	return 0
 ''' ),
 		] )
@@ -7730,6 +7908,57 @@ def main() -> i32:
 	if combine( 2, 3 ) != 5:
 		return 1
 	if combine( 7 ) != 70:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class OverloadGenericSubstitutionMatchingRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' overload_resolution.py's own _contains/_intersect/_subtract used a raw
+	`is` identity check to decide whether a call-site argument's type matches
+	an @overload candidate's own declared parameter type - _leaf_is_accepted's
+	own claimed invariant ("the existing dedup caches already guarantee 'same
+	type' is the same object") turned out not to hold in general: a generic
+	function's own list[T], specialized to list[i32], is a DIFFERENT
+	Specialization object than an @overload candidate's own freshly-annotated
+	list[i32] parameter - the exact same duality TypeResolver._same_type
+	exists to handle elsewhere in this compiler. Before the fix, calling
+	through a generic function into an @overload group with a generic-
+	substituted argument type raised "no matching overload" for a call that
+	should resolve cleanly - confirmed via a real repro
+	(PLAN_COMPILER_BUG_SWEEP.md). Fixed by threading a caller-supplied
+	`same_type` predicate (TypeResolver._same_type) through resolve_call/
+	stub_covers_call, defaulting to plain `is` so overload_resolution_test.
+	py's own isolated unit tests (which never exercise this duality) stay
+	unchanged. This also unblocks two OTHER, previously-unconfirmed fixes
+	(lowering.py's _lower_dispatch_tests/_maybe_unwrap_union_arg, fixed in an
+	earlier pass but gated behind this same upstream bug) - the runtime
+	conditional-dispatch shape below genuinely exercises both. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'generic_substituted_argument_matches_overload_candidate', '''
+@overload
+def handle( x: list[i32] ) -> i32:
+	return 1
+
+@overload
+def handle( x: str ) -> i32:
+	return 2
+
+def dispatch[T]( v: list[T]|str ) -> i32:
+	return handle( v )
+
+def main() -> i32:
+	if dispatch[i32]( list[i32]() ) != 1:
+		return 1
+	if dispatch[i32]( 'hi' ) != 2:
 		return 2
 	return 0
 ''' ),

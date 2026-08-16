@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import itertools
 import math
+from typing import Callable
 
 # local imports:
 from errors import CompileError
@@ -33,19 +34,44 @@ original call, and expressed purely positionally (see _translate_indices).
 # Type and its subclasses (mpy_types.py) are plain, non-frozen dataclasses -
 # structurally-equal and therefore unhashable. Every per-slot "set of
 # possible types" here is a plain tuple, with membership/intersection/
-# difference done as identity-based linear scans, never a real set/
-# frozenset (which would silently fall back to structural equality) -
-# mirrors mpy_types.py's own _leaf_is_accepted, which is identity-based for
-# exactly the same reason.
+# difference done as a linear scan against a caller-supplied `same_type`
+# predicate (defaulting to raw `is`), never a real set/frozenset (which
+# would silently fall back to structural equality) - mirrors mpy_types.py's
+# own _leaf_is_accepted, which is identity-based BY DEFAULT for exactly the
+# same reason (avoiding a wrong/expensive full structural comparison).
+#
+# `is` alone is not actually sufficient, though its own docstring's claim
+# ("the existing dedup caches already guarantee 'same type' is the same
+# object") turned out not to hold in general: a bare Specialization and its
+# own EAGERLY MONOMORPHIZED form (produced by generic-parameter
+# substitution, e.g. a generic function's own list[T] specialized to
+# list[i32]) are two different Python objects for the identical
+# instantiation - the same duality TypeResolver._same_type exists to
+# handle elsewhere (_check_assignable/_unify_type_param/_coerce_into_union/
+# ...). Confirmed via a real repro (PLAN_COMPILER_BUG_SWEEP.md): an
+# @overload candidate's own freshly-annotated `list[i32]` parameter failed
+# to match a generic-substituted `list[i32]` call-site argument, raising
+# "no matching overload" for a call that should resolve cleanly.
+#
+# This module still can't hard-depend on TypeResolver/Monomorphizer
+# directly (see the module's own "pure function of types, no Discovery
+# reference" docstring, load-bearing for overload_resolution_test.py's own
+# isolated unit tests) - so `same_type` is INJECTED by the caller instead,
+# defaulting to plain `is` (preserving every existing unit test's behavior
+# unchanged, since none of them exercise the generic-substitution
+# duality). lowering.py/type_resolver.py, the two real production callers,
+# pass TypeResolver._same_type.
+def _identity_same_type( a: Type, b: Type ) -> bool:
+	return a is b
 
-def _contains( types: tuple[Type,...], t: Type ) -> bool:
-	return any( t is x for x in types )
+def _contains( types: tuple[Type,...], t: Type, same_type: Callable[[Type,Type],bool] = _identity_same_type ) -> bool:
+	return any( same_type( t, x ) for x in types )
 
-def _intersect( a: tuple[Type,...], b: tuple[Type,...] ) -> tuple[Type,...]:
-	return tuple( x for x in a if _contains( b, x ) )
+def _intersect( a: tuple[Type,...], b: tuple[Type,...], same_type: Callable[[Type,Type],bool] = _identity_same_type ) -> tuple[Type,...]:
+	return tuple( x for x in a if _contains( b, x, same_type ) )
 
-def _subtract( a: tuple[Type,...], b: tuple[Type,...] ) -> tuple[Type,...]:
-	return tuple( x for x in a if not _contains( b, x ) )
+def _subtract( a: tuple[Type,...], b: tuple[Type,...], same_type: Callable[[Type,Type],bool] = _identity_same_type ) -> tuple[Type,...]:
+	return tuple( x for x in a if not _contains( b, x, same_type ) )
 
 # pure insurance against the theoretical exponential blowup (each candidate
 # can split a state into up to N+1 pieces, N = parameter count) - every real
@@ -103,7 +129,10 @@ def _translate_indices( member: Function, call_slots: list[int|str] ) -> tuple[i
 		return None
 	return tuple( indices )
 
-def stub_covers_call( stub: Function, call_slots: list[int|str], arg_leaves: dict[int|str,tuple[Type,...]] ) -> bool:
+def stub_covers_call(
+	stub: Function, call_slots: list[int|str], arg_leaves: dict[int|str,tuple[Type,...]],
+	same_type: Callable[[Type,Type],bool] = _identity_same_type,
+) -> bool:
 	'''
 	True iff `stub`'s own declared parameter types, at every one of the
 	call's actual slots, fully accept every leaf the call supplies there -
@@ -126,7 +155,7 @@ def stub_covers_call( stub: Function, call_slots: list[int|str], arg_leaves: dic
 	params = stub.parameters or []
 	for slot, idx in zip( call_slots, indices ):
 		required = tuple( params[idx].type.leaves() )
-		if not all( _contains( required, leaf ) for leaf in arg_leaves[slot] ):
+		if not all( _contains( required, leaf, same_type ) for leaf in arg_leaves[slot] ):
 			return False
 	return True
 
@@ -151,7 +180,10 @@ def _build_candidates( members: list[Function], call_slots: list[int|str], targe
 		candidates.append( _Candidate( member = member, target = target, required = required, target_params = target_params ))
 	return candidates
 
-def _sweep( state: _State, required: tuple[tuple[Type,...],...] ) -> tuple[tuple[tuple[Type,...],...], tuple[bool,...], list[_State]]:
+def _sweep(
+	state: _State, required: tuple[tuple[Type,...],...],
+	same_type: Callable[[Type,Type],bool] = _identity_same_type,
+) -> tuple[tuple[tuple[Type,...],...], tuple[bool,...], list[_State]]:
 	''' standard box-subtraction sweep, one dimension (call-slot) at a time.
 	Returns (matched, needs_check, misses):
 	- matched[i] is state.slots[i] ∩ required[i] (state.slots[i], narrowed to what this candidate accepts at slot i)
@@ -162,9 +194,9 @@ def _sweep( state: _State, required: tuple[tuple[Type,...],...] ) -> tuple[tuple
 	needs_check: list[bool] = []
 	prefix: list[tuple[Type,...]] = []
 	for i in range( len( state.slots )):
-		inter = _intersect( state.slots[i], required[i] )
+		inter = _intersect( state.slots[i], required[i], same_type )
 		matched.append( inter )
-		remainder = _subtract( state.slots[i], required[i] )
+		remainder = _subtract( state.slots[i], required[i], same_type )
 		needs_check.append( bool( remainder ))
 		if remainder:
 			piece = tuple( prefix ) + ( remainder, ) + tuple( state.slots[i + 1:] )
@@ -180,6 +212,7 @@ def resolve_call(
 	kwargs: dict[str,Type],
 	*,
 	qualname: str,
+	same_type: Callable[[Type,Type],bool] = _identity_same_type,
 ) -> tuple[list[ConditionalDispatch],Function]:
 	'''
 	Resolves an overloaded call site to either a single unconditional target
@@ -187,6 +220,13 @@ def resolve_call(
 	falling through to a trailing default. Raises CompileError, unrecorded
 	(no Discovery/AST reference here by design) - the caller (lowering.py's
 	_lower_call) records it via Discovery.fail().
+
+	`same_type` - see _identity_same_type's own module-level comment - lets
+	the real, production callers (lowering.py, type_resolver.py) pass
+	TypeResolver._same_type so a generic-substituted argument type and a
+	textually-identical-but-differently-resolved candidate parameter type
+	are correctly recognized as the same type, without this module itself
+	needing to depend on TypeResolver/Monomorphizer directly.
 	'''
 	for fn in ( *stubs, *implementations ):
 		if fn.resolve is not None:
@@ -225,7 +265,7 @@ def resolve_call(
 	for candidate in overload_candidates:
 		next_states: list[_State] = []
 		for state in states:
-			matched, needs_check, misses = _sweep( state, candidate.required )
+			matched, needs_check, misses = _sweep( state, candidate.required, same_type )
 			spend( len( misses ))
 			next_states.extend( misses )
 			if all( matched ):
@@ -255,7 +295,7 @@ def resolve_call(
 		size = math.prod( len( s ) for s in state.slots ) if state.slots else 1
 		spend( size )
 		for combo in itertools.product( *state.slots ):
-			found = [ c for c in plain_candidates if all( _contains( c.required[i], combo[i] ) for i in range( len( combo )) ) ]
+			found = [ c for c in plain_candidates if all( _contains( c.required[i], combo[i], same_type ) for i in range( len( combo )) ) ]
 			if len( found ) != 1:
 				unresolved.append(( combo, found ))
 				continue
@@ -281,10 +321,10 @@ def resolve_call(
 		target_candidate = next( c for c in plain_candidates if c.target is target )
 		for i in range( len( call_slots )):
 			own_leaves = [ c[i] for c in own ]
-			if any( leaf is not own_leaves[0] for leaf in own_leaves[1:] ):
+			if any( not same_type( leaf, own_leaves[0] ) for leaf in own_leaves[1:] ):
 				continue # this slot still varies within this branch - can't be a single-value condition
 			shared_leaf = own_leaves[0]
-			if any( o[i] is not shared_leaf for o in others ):
+			if any( not same_type( o[i], shared_leaf ) for o in others ):
 				conditions.append(( target_candidate.target_params[i], shared_leaf ))
 		matches.append( _RankedMatch( target = target, conditions = conditions ))
 
