@@ -283,10 +283,27 @@ Implementation plan (phased, for once this moves from scoping to real work)
     Content-Length body and a chunked body, plus a connection-refused error
     path. host is still an IP literal only (see Phase 1).
 
-  Phase 3b (separate future pass) — Session, wrapping HTTPConnection: cookie jar,
-    redirect-following loop, params=/data=/json=/auth= encoding, module-level
-    get()/post()/request() convenience functions. This is the bulk of the
-    "Draft API sketch" below beyond HTTPConnection/Response themselves.
+  Phase 3b — landed: Session (cookie jar, redirect-following loop with a
+    10-redirect cap, params=/form=/auth= encoding) and module-level get()/
+    post()/put()/patch()/delete()/head()/options()/request(), each a one-off
+    Session() underneath. Two API deviations from the original sketch below,
+    both forced by real emitter bugs found while landing this (see "Two more
+    compiler gaps found while landing Phase 3b" below):
+      - `data=` is bytes|str|None only - a separate `form=` dict[str,str]
+        parameter handles application/x-www-form-urlencoded bodies, instead
+        of one requests-style bytes|str|dict|None union.
+      - `auth=` takes a BasicAuth(user, password) instance, not a bare
+        (user, password) tuple.
+    `json=`/`.json()` remain deferred (no json library yet, unchanged from
+    the original plan). Relative Location headers on a redirect aren't
+    resolved (only absolute http:// Location values are followed - treated
+    as "don't redirect" otherwise, not an error). Covered by
+    http_client_test.py's SessionLoopbackTests: cookie-jar harvest+replay
+    across two real requests, a real 302 redirect followed transparently
+    (with params= merged + percent-encoded into the pre-redirect request),
+    and a form POST with Basic auth - all verified by having the fake
+    server inspect the raw bytes it actually received, not just checking
+    the client-side response.
 
 A real compiler gap found while landing Phase 3a
 
@@ -312,9 +329,39 @@ socket.py into HTTPError.Other() right at the call site (see lib/http/client.py
 (task_ef51cec6, "Fix @union error widening into a wider Result union" - same
 treatment as the earlier list[tuple[...]] gap, task_a8b4e7c3).
 
+DNS landed since the above was written: task_a8b4e7c3 shipped as commit
+f794edb ("socket: add getaddrinfo-based hostname resolution") - Socket.connect()
+now resolves real hostnames transparently, not just IP literals. No lib/http/
+client.py changes were needed - HTTPConnection.connect()/Session already just
+call sock.connect(host, port) and get hostname support for free.
+
+Two more compiler gaps found while landing Phase 3b
+
+Both forced real API deviations from the original "Draft API sketch" below -
+see Phase 3b's own entry above for what actually shipped instead.
+
+1. tuple[T|None, ...] (a union as a tuple's own ELEMENT type) generates C that
+   doesn't compile - a real, uncaught emitter bug, not just a type-checking
+   gap: `_encode_body()` originally returned tuple[bytes|None, str|None], and
+   the generated C called an allocator function
+   (sys$alloc$$g$tuple$...$or$...) that was never declared anywhere in the
+   translation unit, plus assigned raw pointers directly into fields that
+   should have been tagged-union structs. Confirmed narrow to tuple ELEMENTS
+   specifically - plain tuple[T1,T2] and T|None as an ordinary local/
+   parameter/field both work fine on their own. Worked around with a small
+   dedicated _EncodedBody class (two fields) instead of a tuple return type.
+   Flagged as task_34251c9f.
+
+2. tuple[...] as a MEMBER of an outer union (the inverse of #1) crashes the
+   emitter outright - not a bad-compile-error, an uncaught Python
+   AssertionError inside emit_c() itself ("assert isinstance(concrete_cls,
+   RCClass)"), the moment a real tuple[str,str] value actually flows through
+   a tuple[str,str]|None-typed parameter (auth=('user','pass') in this case).
+   Worked around by giving auth= a dedicated BasicAuth(user, password) class
+   instead of requests' own bare-tuple ergonomics. Flagged as task_827c2650.
+
   Phase 4 (deferred/future plan doc) — HTTPSConnection/TLS, `json=`/`.json()` once
-    a json library exists, multipart `files=`, connection reuse, real hostname
-    support once task_a8b4e7c3 (DNS) lands.
+    a json library exists, multipart `files=`, connection reuse.
 
 Testing approach
 
