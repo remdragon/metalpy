@@ -26,6 +26,11 @@ class ZeroDivisionError: pass
 class FloatingPointError: pass
 class IndexError: pass
 class KeyError: pass
+# structural `==`/`!=` between two operands where at least one (left, right)
+# leaf-type pairing has no valid comparison (see lowering.py's
+# _lower_eq_dispatch/_classify_leaf_pair_eq) produces Result[bool,TypeError]
+# purely as a tag, same empty-marker shape as the others above
+class TypeError: pass
 
 # FNV-1a, 64-bit - a plain, fast, deterministic byte hash. Shared by
 # str.__hash__ (below) and dict[K,V]'s own _hash_key (see __init__.py's

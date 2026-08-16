@@ -2,7 +2,7 @@
 import ast
 import copy
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Callable
 
 # local imports:
@@ -78,6 +78,24 @@ _COMP_DUNDER: dict[type,str] = {
 	ast.Gt: '__gt__',
 	ast.GtE: '__ge__',
 }
+
+@dataclass( frozen = True )
+class _LeafPairEq:
+	''' _lower_eq_dispatch's own PASS 1 classification of one (left leaf
+	type, right leaf type) grid cell - see that method's own docstring for
+	the full per-kind rule. `method`/`reflected` are only meaningful for
+	kind == 'cross_dunder': `reflected = False` means the match was found
+	via left_type's own __eq__/__ne__ (receiver=left, arg=right);
+	`reflected = True` means it was found via the REFLECTED call instead -
+	right_type's own __eq__/__ne__ (receiver=right, arg=left). Both
+	attempts look up the SAME method name (mirrors Python's real equality
+	protocol: unlike an asymmetric operator such as `+`, which falls back
+	to a DIFFERENTLY-NAMED `__radd__` on the right side, `==`/`!=` has no
+	separate reflected-name method - only __eq__/__ne__ itself, with
+	receiver/argument roles swapped for the second attempt). '''
+	kind: str   # 'none_true' | 'none_false' | 'same_type' | 'cross_dunder' | 'error'
+	method: Function|None = None
+	reflected: bool = False
 
 # ast.UnaryOp operator -> the dunder method name to dispatch to for a
 # non-scalar operand (int.__neg__, ...). Scalar operands always go through
@@ -6849,12 +6867,8 @@ class FunctionLowering:
 				self._emit( ir.CastWrap( dest = widened, operand = right ))
 				right = widened
 			else:
-				if left_shape is not None:
-					return self._build_union_leaf_eq( node, left, left_shape, right, negate )
 				right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
-				if right_shape is not None:
-					return self._build_union_leaf_eq( node, right, right_shape, left, negate )
-				self._check_assignable( right, left.type, node.comparators[0] )
+				return self._lower_eq_dispatch( node, left, left_shape, right, right_shape, negate )
 		if method is not None:
 			self.lowering._ensure_resolved( method )
 			self.lowering.schedule( method.return_type )
@@ -6863,79 +6877,329 @@ class FunctionLowering:
 			dest = self._new_temp( expected_type or method.return_type )
 			self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
 			return dest
+		if left_shape is not None:
+			# right.type IS left.type (the fast-path check above), and both
+			# are the exact SAME union - genuinely no dunder of its own was
+			# found. A flat Cmp below would compare two STRUCTS directly (C
+			# rejects this) even though both operands are already known to
+			# be the identical union type - route through the general
+			# dispatch instead of assuming "same type -> flat Cmp is safe",
+			# which only holds for scalars/pointers, never for a TaggedUnion
+			return self._lower_eq_dispatch( node, left, left_shape, right, left_shape, negate )
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = ir.CmpOp.NE if negate else ir.CmpOp.EQ, left = left, right = right ))
 		return dest
 
-	def _build_union_leaf_eq(
-		self, node: ast.Compare, union_operand: ir.Operand, shape: tuple[TaggedUnion,list[Variable]], leaf: ir.Operand, negate: bool,
+	def _lower_eq_dispatch(
+		self, node: ast.Compare, left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None, negate: bool,
 	) -> ir.Operand:
-		''' shared core for both directions above: structural equality
-		between an already-confirmed union operand and an already-lowered
-		leaf (a bare None included) - the union must currently hold the
-		member matching the leaf's own NATURAL type, and (unless that
-		member is NoneType, which carries no real payload) the member's own
-		payload must compare equal too, via the same dunder-or-flat-Cmp
-		choice an ordinary leaf-vs-leaf comparison already makes (see
-		_lower_operand_compare). Same tag/data/v_<member> extraction
-		_lower_union_receiver_call/_maybe_unwrap_union_arg already use for
-		an analogous purpose, just feeding a Cmp instead of a Call.
+		''' `==`/`!=` once the ordinary fast path (a real dunder whose
+		declared parameter already matches right's natural type, or a safe
+		scalar widening) has already been tried and didn't apply - the general
+		case, covering all three arities uniformly: neither operand is a
+		union, exactly one is, or both are. A non-union operand is treated as
+		a degenerate single-leaf "shape" (its own type, no tag dispatch
+		needed) - this is what lets one mechanism replace what used to be two
+		separate ones (a leaf-vs-union binary tag test, and a plain
+		_check_assignable rejection for two ordinary non-union types), not
+		just generalize a new third case alongside them.
 
-		Never returns None: both operands are ALREADY lowered by the time
-		either call site in _lower_eq_or_ne reaches here (union on the left
-		or the right), so there's no double-evaluation risk left to avoid
-		by declining - a leaf whose own natural type matches
-		none of the union's members (including "another instance of the
-		SAME union type" - full structural union-vs-union equality isn't
-		implemented yet) is reported as a compile error instead. '''
-		base, members = shape
-		member = next( ( attr for attr in members if self.lowering._type_resolver._same_type( attr.type, leaf.type ) ), None )
-		if member is None:
-			self.lowering.discovery.fail(
-				f'{ast.unparse(node)}: {leaf.type.qualname if leaf.type else "?"} is not a member of {union_operand.type.qualname} '
-				f'(comparing two DIFFERENT union values structurally is not yet supported)',
-				node,
-			)
-		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( base )
+		Builds a full (left leaf type x right leaf type) grid via
+		_classify_leaf_pair_eq - EVERY cell, not just whichever member happens
+		to be "the matching one": comparing a union's CURRENTLY-INACTIVE
+		member against the other side is not automatically "not equal" just
+		because the tag doesn't match right now - it still needs the exact
+		same same-type/cross-dunder/error classification as any other pairing
+		(confirmed as a real gap in the narrower predecessor of this method,
+		which only ever tested T|None-shaped unions - there, the "wrong"
+		member was always NoneType, so its own hardcoded "wrong tag = not
+		equal" shortcut happened to coincide with the correct answer by luck,
+		not by construction; a union with two non-None members would have
+		gotten this wrong).
+
+		Per-cell rule (final, confirmed): both leaves NoneType -> trivially
+		equal. Exactly one is NoneType -> trivially not equal (comparing
+		anything against None is always well-defined - the Optional-check
+		idiom - never an error, regardless of whether the OTHER side's
+		declared type actually includes None as a possible member). Same
+		concrete non-None type on both sides -> the existing
+		_lower_operand_compare (dunder-or-flat-Cmp), unchanged. Different
+		concrete non-None types -> Python's real equality protocol: try
+		left_type's own __eq__/__ne__ first, then the REFLECTED call
+		(right_type's own __eq__/__ne__, receiver/arg swapped - see
+		_LeafPairEq's own docstring for why this isn't the same asymmetry as
+		__radd__). Neither applies -> TypeError.
+
+		Deliberately NOT gated on whether a union is actually involved: ANY
+		'error' cell makes the whole comparison's result Result[bool,
+		TypeError] uniformly, even when NEITHER side is a union at all (a
+		single, statically-certain mismatch, e.g. two unrelated classes) -
+		the user's own call: in practice a bare `if a == b:` without
+		explicitly consuming the Result still hits an ordinary "expected bool,
+		got Result[...]" mismatch either way, so nothing is lost by not
+		special-casing the no-union case into a bespoke, immediate compile
+		error the way the narrower predecessor of this method did - and the
+		user gains the ability to explicitly consume/inspect a genuine
+		type-confusion at runtime if they actually want to (`(a == b).unwrap_or(...)`,
+		a match, ...), using the SAME Result[T,E] machinery every other
+		fallible operation already provides, no special-casing needed.
+
+		Deliberately does NOT reuse arithmetic's/subscript's own
+		_maybe_consume_result auto-`.or_return()` consumption - explicitly
+		rejected (no new "compiler binop mode" concept wanted): a fallible
+		comparison's Result[bool,TypeError] is simply the expression's own
+		real value, returned as-is. '''
+		left_types = [ m.type for m in left_shape[1] ] if left_shape is not None else [ left.type ]
+		right_types = [ m.type for m in right_shape[1] ] if right_shape is not None else [ right.type ]
+		method_name = '__ne__' if negate else '__eq__'
+		grid = [
+			[ self._classify_leaf_pair_eq( lt, rt, node, method_name ) for rt in right_types ]
+			for lt in left_types
+		]
+		fallible = any( cell.kind == 'error' for row in grid for cell in row )
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		tag_dest = self._new_temp( tag_attr.type )
-		self._emit( ir.GetAttr( dest = tag_dest, obj = union_operand, attr = tag_attr.stem ))
-		tag_match = self._new_temp( bool_cls )
-		self._emit( ir.Cmp( dest = tag_match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] )))
-		dest = self._new_temp( bool_cls )
+		if fallible:
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			type_error_cls = self.lowering.discovery.find_name( 'TypeError', node )
+			# result_union (the monomorphized, real TaggedUnion with concrete
+			# .attributes) is what _coerce_into_union needs to find Ok/Err's own
+			# synthesized member constructors, AND what dest itself must be
+			# typed as - unlike _emit_checked_op's own Result[T,E] (used only
+			# as a Check-mode opcode's dest, never directly compared against a
+			# function's own declared return type by IDENTITY), a fully-
+			# concrete generic annotation like `-> Result[bool,TypeError]`
+			# (every type arg already concrete, no TypeVars left to bind) gets
+			# EAGERLY monomorphized by the time _current_fn.return_type is
+			# read (confirmed via a real repro) - _stmt_Return's own identity
+			# check then requires dest.type to be that SAME monomorphized
+			# object, not the bare Specialization
+			check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ bool_cls, type_error_cls ] )
+			self.lowering.schedule( check_type )
+			result_union = self.lowering.monomorphize_class( check_type )
+			self.lowering._union_storage.get( result_union )
+			dest = self._new_temp( result_union )
+		else:
+			result_union = None
+			dest = self._new_temp( bool_cls )
+		self._emit_eq_dispatch_tree( node, left, left_shape, right, right_shape, grid, dest, negate, bool_cls, result_union )
+		return dest
+
+	def _classify_leaf_pair_eq( self, left_type: Type, right_type: Type, node: ast.AST, method_name: str ) -> _LeafPairEq:
+		''' one grid cell of _lower_eq_dispatch's own classification - see
+		that method's docstring for the full rule. Pure type-level, no IR. '''
 		none_type = self.lowering.discovery.get_none_type()
-		if member.type is none_type:
-			# NoneType carries no real payload - tag equality alone decides
-			# it (mirrors _lower_is_comparison's identical None-only
-			# shortcut below), no branching needed at all
-			if negate:
-				self._emit( ir.Not( dest = dest, operand = tag_match ))
+		left_is_none = left_type is none_type
+		right_is_none = right_type is none_type
+		if left_is_none and right_is_none:
+			return _LeafPairEq( 'none_true' )
+		if left_is_none or right_is_none:
+			return _LeafPairEq( 'none_false' )
+		if self.lowering._type_resolver._same_type( left_type, right_type ):
+			return _LeafPairEq( 'same_type' )
+		method = self.lowering._find_method( left_type, method_name ) if not isinstance( left_type, Scalar ) else None
+		if method is not None and method.parameters and len( method.parameters ) == 1 \
+				and self.lowering._type_resolver._same_type( method.parameters[0].type, right_type ):
+			return _LeafPairEq( 'cross_dunder', method = method, reflected = False )
+		reflected_method = self.lowering._find_method( right_type, method_name ) if not isinstance( right_type, Scalar ) else None
+		if reflected_method is not None and reflected_method.parameters and len( reflected_method.parameters ) == 1 \
+				and self.lowering._type_resolver._same_type( reflected_method.parameters[0].type, left_type ):
+			return _LeafPairEq( 'cross_dunder', method = reflected_method, reflected = True )
+		return _LeafPairEq( 'error' )
+
+	def _emit_eq_dispatch_tree(
+		self, node: ast.Compare, left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None,
+		grid: list[list[_LeafPairEq]], dest: ir.Temp, negate: bool, bool_cls: Type, result_union: TaggedUnion|None,
+	) -> None:
+		''' nested 2-level tag dispatch shared by every arity _lower_eq_
+		dispatch handles - disambiguates LEFT's active member first (skipped
+		entirely when left_shape is None - a non-union operand is used
+		directly, no tag test, matching a real union's own "last candidate
+		needs no test either" shape), then WITHIN each left branch,
+		disambiguates RIGHT's the same way. Reuses the identical
+		union_storage.get(base) -> (tag_attr, data_attr, payload_cls, tags)
+		primitive and GetAttr(tag)+Cmp EQ+JumpIfFalse / GetAttr(data)+
+		GetAttr(v_<member>) IR shape already used identically in
+		_lower_dispatch_tests/_maybe_unwrap_union_arg/_match_union_member
+		(type_resolver.py) - not reinvented here. Union members are never
+		themselves further unions (nested unions are flattened at discovery
+		time), so this recursion is bounded to exactly 2 levels regardless of
+		how many members either side has. '''
+		none_type = self.lowering.discovery.get_none_type()
+		end_label = self._new_label( 'eq_dispatch_end' )
+		if left_shape is not None:
+			left_base, left_members = left_shape
+			left_tag_attr, left_data_attr, left_payload_cls, left_tags = self.lowering._union_storage.get( left_base )
+			n_left = len( left_members )
+		else:
+			n_left = 1
+		if right_shape is not None:
+			right_base, right_members = right_shape
+			right_tag_attr, right_data_attr, right_payload_cls, right_tags = self.lowering._union_storage.get( right_base )
+			n_right = len( right_members )
+		else:
+			n_right = 1
+
+		for i in range( n_left ):
+			is_last_left = ( i == n_left - 1 )
+			if left_shape is not None:
+				lm = left_members[i]
+				if not is_last_left:
+					next_left_label = self._new_label( 'eq_dispatch_left_next' )
+					tag_dest = self._new_temp( left_tag_attr.type )
+					self._emit( ir.GetAttr( dest = tag_dest, obj = left, attr = left_tag_attr.stem ))
+					match = self._new_temp( bool_cls )
+					self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = left_tag_attr.type, value = left_tags[lm.stem] )))
+					self._emit( ir.JumpIfFalse( cond = match, target = next_left_label ))
+				if lm.type is none_type:
+					narrowed_left = left   # never read - every cell using this row has left leaf type NoneType, handled without touching the operand at all
+				else:
+					narrowed_left = self._extract_union_payload( left, left_data_attr, left_payload_cls, lm )
 			else:
-				self._emit( ir.Assign( dest = dest, src = tag_match ))
-			return dest
-		# tag_dest/payload_dest/narrowed below are all GetAttr dests, never
-		# fresh_temp()-registered (see _emit's own comment: only Call/Allocate
-		# results are) - so neither branch below needs any incref/decref
-		# bookkeeping around them, unlike the ternary-merge RC bug this shape
-		# might otherwise superficially resemble (see verifying-compiled-
-		# programs memory's own account of that fix); `dest` itself is always
-		# bool, never RC, so the two-branch merge into it needs no fresh_temp()
-		# call either (contrast _expr_IfExp's own merge dest, which can be any
-		# RC type and explicitly needs one)
-		mismatch_label = self._new_label( 'union_eq_tag_mismatch' )
-		end_label = self._new_label( 'union_eq_end' )
-		self._emit( ir.JumpIfFalse( cond = tag_match, target = mismatch_label ))
+				narrowed_left = left
+
+			for j in range( n_right ):
+				is_last_right = ( j == n_right - 1 )
+				if right_shape is not None:
+					rm = right_members[j]
+					if not is_last_right:
+						next_right_label = self._new_label( 'eq_dispatch_right_next' )
+						tag_dest2 = self._new_temp( right_tag_attr.type )
+						self._emit( ir.GetAttr( dest = tag_dest2, obj = right, attr = right_tag_attr.stem ))
+						match2 = self._new_temp( bool_cls )
+						self._emit( ir.Cmp( dest = match2, op = ir.CmpOp.EQ, left = tag_dest2, right = ir.Const( type = right_tag_attr.type, value = right_tags[rm.stem] )))
+						self._emit( ir.JumpIfFalse( cond = match2, target = next_right_label ))
+					if rm.type is none_type:
+						narrowed_right = right
+					else:
+						narrowed_right = self._extract_union_payload( right, right_data_attr, right_payload_cls, rm )
+				else:
+					narrowed_right = right
+
+				cell = grid[i][j]
+				if cell.kind == 'error':
+					error_instance = self._build_type_error_instance( node )
+					value: ir.Operand = error_instance
+				else:
+					error_instance = None
+					value = self._emit_leaf_pair_eq_value( node, narrowed_left, narrowed_right, cell, negate, bool_cls )
+				if result_union is not None:
+					value = self._coerce_into_union( value, result_union, node )
+					if error_instance is not None:
+						# error_instance is its own fresh, independently
+						# fresh_temp()-tracked ir.Allocate result (see
+						# _build_type_error_instance's own docstring).
+						# _coerce_into_union's synthesized constructor Call
+						# just above already increfs it into the Result's Err
+						# payload (refcount 1 -> 2) - in ORDINARY, single-
+						# path code (a plain `return Result.Err(SomeClass())`
+						# statement), the caller-side temp's own natural
+						# end-of-STATEMENT decref would bring it back down to
+						# 1, leaving the Result as sole owner. That natural
+						# per-statement flush can't be relied on here though:
+						# this whole per-cell block is only ONE branch of a
+						# larger dispatch tree, and the flush fires
+						# unconditionally for EVERY temp still tracked
+						# REGARDLESS of which branch actually executed -
+						# first found via a real ASAN SEGV (release_object()
+						# on an uninitialized C local from a branch that was
+						# never taken when this was left tracked-for-outer-
+						# flush; then a real ASAN LEAK when it was untracked
+						# outright with no decref of its own at all). The
+						# correct fix is the SAME "just do it inline,
+						# unconditionally-but-only-within-this-branch" shape
+						# the whole surrounding dispatch tree already uses -
+						# emit the decref explicitly, right here, then
+						# untrack it so the outer flush doesn't ALSO decref
+						# whatever ends up in this same temp slot on a
+						# DIFFERENT invocation's DIFFERENT branch
+						for instr in self._cfg.decref( error_instance.type, error_instance ):
+							self._emit( instr )
+						self._cfg.untrack_temp( error_instance )
+				self._emit( ir.Assign( dest = dest, src = value ))
+				# value (when RC-carrying - only possible in the fallible/
+				# Result case, since every OTHER branch produces a plain
+				# bool) is its own independently fresh_temp()-tracked temp
+				# (either _coerce_into_union's own Call dest, or - for a
+				# 'same_type'/'cross_dunder' cell whose own value already
+				# happened to need no wrapping - never RC to begin with) -
+				# untrack it here so ITS OWN eventual delete_temp() doesn't
+				# ALSO decref the same object dest now holds too. Mirrors
+				# _expr_IfExp's identical "untrack the fresh branch value,
+				# fresh_temp() the merge dest once instead" split for a
+				# multi-branch-into-one-dest merge - same bug class, same
+				# fix, generalized from 2 branches to N. A no-op whenever
+				# value isn't RC-carrying at all (untrack_temp/fresh_temp
+				# both check rc_leaves/isinstance internally).
+				self._cfg.untrack_temp( value )
+				self._emit( ir.Jump( target = end_label ))
+				if right_shape is not None and not is_last_right:
+					self._emit( ir.Label( name = next_right_label ))
+			if left_shape is not None and not is_last_left:
+				self._emit( ir.Label( name = next_left_label ))
+		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, dest.type )
+
+	def _extract_union_payload( self, union_operand: ir.Operand, data_attr: Variable, payload_cls: CUnion, member: Variable ) -> ir.Temp:
+		''' the two-GetAttr "read one member's own payload out of a union's
+		data storage" shape _build_union_leaf_eq/_maybe_unwrap_union_arg both
+		used to duplicate independently - factored out here since
+		_emit_eq_dispatch_tree now needs it on both axes. Both dests are bare
+		GetAttr reads, never fresh_temp()-registered (see _emit's own comment
+		- only Call/Allocate results are), so callers need no incref/decref
+		bookkeeping around the returned value. '''
 		payload_dest = self._new_temp( payload_cls )
 		self._emit( ir.GetAttr( dest = payload_dest, obj = union_operand, attr = data_attr.stem ))
 		narrowed = self._new_temp( member.type )
 		self._emit( ir.GetAttr( dest = narrowed, obj = payload_dest, attr = f'v_{member.stem}' ))
-		payload_op = self._lower_operand_compare( narrowed, leaf, negate, node )
-		self._emit( ir.Assign( dest = dest, src = payload_op ))
-		self._emit( ir.Jump( target = end_label ))
-		self._emit( ir.Label( name = mismatch_label ))
-		self._emit( ir.Assign( dest = dest, src = ir.Const( type = bool_cls, value = negate )))
-		self._emit( ir.Label( name = end_label ))
+		return narrowed
+
+	def _emit_leaf_pair_eq_value( self, node: ast.AST, narrowed_left: ir.Operand, narrowed_right: ir.Operand, cell: _LeafPairEq, negate: bool, bool_cls: Type ) -> ir.Operand:
+		''' produces a plain bool operand for one grid cell whose kind isn't
+		'error' (Result-wrapping, if any, is _emit_eq_dispatch_tree's own job,
+		kept out of here so this stays usable for both the infallible and
+		fallible codegen shapes unchanged). '''
+		if cell.kind == 'none_true':
+			return ir.Const( type = bool_cls, value = not negate )
+		if cell.kind == 'none_false':
+			return ir.Const( type = bool_cls, value = negate )
+		if cell.kind == 'same_type':
+			return self._lower_operand_compare( narrowed_left, narrowed_right, negate, node )
+		assert cell.kind == 'cross_dunder' and cell.method is not None
+		method = cell.method
+		receiver, arg = ( narrowed_right, narrowed_left ) if cell.reflected else ( narrowed_left, narrowed_right )
+		self.lowering._ensure_resolved( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		dest = self._new_temp( method.return_type )
+		self._emit( ir.Call( dest = dest, target = method, receiver = receiver, args = [ arg ], kwargs = {} ))
+		return dest
+
+	def _build_type_error_instance( self, node: ast.AST ) -> ir.Temp:
+		''' constructs a bare TypeError() instance - the first internal
+		(non-AST-driven) construction site for a trivial marker-error class
+		anywhere in this file (every existing one, OverflowError() etc., is
+		only ever written in real library .py source). Mirrors the general
+		class-construction tail's own RCClass branch
+		(_schedule_rcclass_construction + bare ir.Allocate), simplified since
+		TypeError is guaranteed zero-field. dest is a fresh, Allocate-
+		registered temp (see _emit's own fresh_temp() rule) - immediately
+		consumed by the caller's own _coerce_into_union, whose synthesized
+		member-ctor Call increfs it into the Result's Err payload; the
+		ordinary end-of-scope decref of dest itself brings the refcount back
+		down to the single reference the Result now owns - same fresh-temp +
+		union-ctor-incref shape any ordinary Result.Err(SomeClass()) already
+		uses, no new RC mechanism. '''
+		type_error_cls = self.lowering.discovery.find_name( 'TypeError', node )
+		self.lowering._ensure_resolved( type_error_cls )
+		self.lowering.schedule( type_error_cls )
+		dest = self._new_temp( type_error_cls )
+		assert isinstance( type_error_cls, RCClass )
+		self.lowering._schedule_rcclass_construction( type_error_cls, dest.type )
+		self._emit( ir.Allocate( dest = dest, cls = type_error_cls, fields = {} ))
 		return dest
 
 	def _lower_operand_compare( self, left: ir.Operand, right: ir.Operand, negate: bool, node: ast.AST ) -> ir.Operand:
