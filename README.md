@@ -73,6 +73,7 @@ Features that are being scoped and built right now:
 	* email.message (needed by http client)
 	* http client
 	* json library
+	* tkinter library
 
 Features that are planned but not built yet:
 	* with statements (there is a compiler hack for defer/errdefer using with
