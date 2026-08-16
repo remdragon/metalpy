@@ -10827,6 +10827,133 @@ def main() -> i32:
 		] )
 
 
+class CEnumConstructionArgumentShapeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real bug: `EnumName(value)` (CEnum construction,
+	e.g. `OSError(rc)`) was rejected with a confusing "expected EnumName, got
+	<value's own type>" whenever `value` was a bare `ast.Name` (a local
+	variable or parameter reference), while the IDENTICAL underlying value
+	via a Call or BinOp argument (`OSError(get_rc())`, `OSError(rc + 0)`)
+	compiled fine - an inconsistency across argument AST SHAPE, not a real
+	difference in what was being constructed.
+
+	Root cause: `_try_lower_construct_call`'s CEnum branch used to pass
+	target_cls (the enum type ITSELF) as `_lower_expr`'s `expected_type` for
+	the argument, for every argument shape. A bare `ast.Name` operand
+	(`_expr_Name`) ignores `expected_type` and keeps its own declared type,
+	so the later `_check_assignable` correctly (if confusingly-worded)
+	rejected a genuine underlying-type mismatch - `OSError`'s value_type is
+	u32, and a plain `i32` local doesn't automatically become one. But an
+	ordinary Call/BinOp argument's own result-typing tail (`_lower_call`'s
+	final dest allocation, `expected_type or target_return_type`) SILENTLY
+	relabeled the destination temp's type to target_cls directly, with no
+	check that the callee's real return type was even compatible - so those
+	shapes "worked" by accident, not because they were validated.
+
+	Fixed: every non-literal argument shape now lowers against value_type
+	(the underlying scalar, the argument's real natural type space) and is
+	explicitly relabeled onto the enum type via CastWrap - the same zero-
+	cost, well-defined C reinterpret cast an explicit T(x) scalar cast uses,
+	consistent across every argument shape, and permissive of genuine
+	cross-signedness reinterpretation (OSError's own construction is
+	documented as "a plain cast to the enum's underlying type", the same
+	promise an explicit u32(-11)-style WinAPI cast makes). A literal integer
+	argument keeps its own pre-existing fast path (a plain ir.Const, no
+	runtime cast) unchanged. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact repro shape: a bare local variable argument to a
+			# CEnum constructor, feeding straight into Result.Err(...) -
+			# used to be rejected outright
+			( 'bare_name_argument_to_enum_constructor_compiles_and_runs', '''
+def f() -> Result[None, OSError]:
+	rc: i32 = -5
+	return Result.Err( OSError( rc ))
+
+def main() -> i32:
+	r = f()
+	if r.is_err():
+		return 0
+	return 1
+''' ),
+			# consistency check: bare Name / Call / BinOp / literal argument
+			# shapes must all produce the SAME bit-exact underlying value for
+			# the identical logical error code, and a plain assignment back
+			# to the enum's own value_type (already-established, unrelated
+			# CEnum<->value_type duality) must read that same value back out
+			( 'enum_constructor_argument_shapes_agree_bit_exactly', '''
+import compiler
+
+def get_rc() -> i32:
+	return -5
+
+def main() -> i32:
+	rc: i32 = -5
+	e_name: OSError = OSError( rc )
+	e_call: OSError = OSError( get_rc() )
+	with compiler.wrap_arithmetic:
+		e_binop: OSError = OSError( rc + 0 )
+	e_member: OSError = OSError.FileNotFoundError
+
+	v_name: u32 = e_name
+	v_call: u32 = e_call
+	v_binop: u32 = e_binop
+	expected: u32 = u32( -5 )
+
+	if v_name != expected:
+		return 1
+	if v_call != expected:
+		return 2
+	if v_binop != expected:
+		return 3
+	if e_member != OSError.FileNotFoundError:
+		return 4
+	return 0
+''' ),
+			# a routed-through-a-parameter shape (not just a local) - the
+			# task's own report specifically called out that this ALSO
+			# failed identically (not a locals-vs-parameters distinction)
+			( 'bare_name_parameter_argument_to_enum_constructor_compiles_and_runs', '''
+def mk( code: i32 ) -> OSError:
+	return OSError( code )
+
+def main() -> i32:
+	e: OSError = mk( -5 )
+	v: u32 = e
+	if v != u32( -5 ):
+		return 1
+	return 0
+''' ),
+			# the literal fast path (unaffected by this fix) - still folds to
+			# a plain constant and still range-checks correctly
+			( 'literal_argument_to_enum_constructor_still_works', '''
+def main() -> i32:
+	e: OSError = OSError( 2 )
+	if e != OSError.FileNotFoundError:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_out_of_range_literal_still_rejected( self ) -> None:
+		# negative check: the pre-existing literal magnitude/range validation
+		# (unrelated to and unchanged by this fix) must still reject a
+		# genuinely out-of-range literal argument, not just silently accept
+		# everything now that non-literal shapes are more permissive
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	e: OSError = OSError( 99999999999 )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+
 class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression test for a real, confirmed silent-data-corruption bug: an
 	`@extern` function declared with a `T|None` return type where T is a

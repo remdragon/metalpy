@@ -7170,8 +7170,89 @@ class FunctionLowering:
 			# lower the argument directly — no arithmetic-mode semantics
 			# needed here; a CEnum has exactly the same runtime
 			# representation as its underlying type, so OSError(42) is
-			# just the value 42 with the enum type
-			return self._lower_expr( node.args[0], target_cls )
+			# just the value 42 with the enum type.
+			#
+			# The argument's own natural type space is value_type (the
+			# underlying scalar), NEVER target_cls (the enum itself) - passing
+			# target_cls down as _lower_expr's expected_type here (the
+			# pre-fix code) was a category error that only ever incidentally
+			# "worked" for a couple of argument shapes, not because it was
+			# correct: a bare ast.Name/Variable operand (_expr_Name) ignores
+			# expected_type entirely and keeps its own declared type, so
+			# _check_assignable's later CEnum<->value_type exemption
+			# correctly ran and correctly rejected a genuine kind mismatch
+			# (e.g. i32 for a u32-backed enum) - but a Call/BinOp argument's
+			# own result-typing tail (_lower_call's final dest allocation,
+			# `expected_type or target_return_type`) instead SILENTLY
+			# relabeled the destination temp's own type to target_cls
+			# directly, with no check at all that the callee's real return
+			# type was even a scalar, let alone value_type - confirmed via a
+			# real repro: OSError(get_rc()) (get_rc() -> i32) and
+			# OSError(rc + 0) both compiled silently, while the exact same
+			# value through a bare local, OSError(rc), was rejected as "rc:
+			# expected builtins.OSError, got intrinsics.i32" - an
+			# inconsistency across argument SHAPE, not a real distinction in
+			# what's being constructed. Fixed by routing every shape through
+			# the SAME real scalar-cast machinery T(x)/compiler.cast(T,x)
+			# already use (_lower_scalar_cast) - value_type is authoritative
+			# (matching this construction's own "plain cast to the
+			# underlying type" contract), any argument expression a plain
+			# scalar cast would accept is accepted here too, and the result
+			# is then relabeled (CastWrap, a zero-cost same-bits retag, same
+			# as an RCClass upcast/safe scalar widening/pointer interchange
+			# elsewhere in this file) to target_cls.
+			assert isinstance( value_type, Scalar ), f'{target_cls.qualname}: CEnum value_type must be a scalar, got {value_type!r}'
+			if isinstance( arg_node, ast.Constant ) and type( arg_node.value ) is int:
+				# the already-range-checked literal fast path: unchanged from
+				# before this fix - _expr_Constant already folds a CEnum-
+				# expected int literal straight into an ir.Const tagged with
+				# target_cls directly (kind+magnitude already validated, here
+				# and in _expr_Constant itself), no runtime Temp/CastWrap
+				# needed. Keeping this path bypassed by the general fix below
+				# preserves that constant-folding (real callers/tests rely on
+				# a literal CEnum construction lowering to a bare ir.Const,
+				# not a cast instruction).
+				return self._lower_expr( node.args[0], target_cls )
+			# every NON-literal shape (bare Name, Call, BinOp, ...): the
+			# argument's own natural type space is value_type (the underlying
+			# scalar), NEVER target_cls (the enum itself) - passing target_cls
+			# down as _lower_expr's expected_type here (the pre-fix code, for
+			# every argument shape) was a category error that only ever
+			# incidentally "worked" for a couple of shapes, not because it was
+			# correct: a bare ast.Name/Variable operand (_expr_Name) ignores
+			# expected_type entirely and keeps its own declared type, so
+			# _check_assignable's later CEnum<->value_type exemption correctly
+			# ran and correctly rejected a genuine kind mismatch (e.g. i32 for
+			# a u32-backed enum) - but a Call/BinOp argument's own result-
+			# typing tail (_lower_call's final dest allocation, `expected_type
+			# or target_return_type`) instead SILENTLY relabeled the
+			# destination temp's own type to target_cls directly, with no
+			# check at all that the callee's real return type was even a
+			# scalar, let alone value_type - confirmed via a real repro:
+			# OSError(get_rc()) (get_rc() -> i32) and OSError(rc + 0) both
+			# compiled silently, while the exact same value through a bare
+			# local, OSError(rc), was rejected as "rc: expected
+			# builtins.OSError, got intrinsics.i32" - an inconsistency across
+			# argument SHAPE, not a real distinction in what's being
+			# constructed. Fixed by lowering the argument against value_type
+			# (strict=False - a HINT only, e.g. so an untyped nested literal
+			# still settles on the right width; the real, authoritative check
+			# that the argument is even scalar-shaped happens explicitly
+			# below) and relabeling via CastWrap - a plain `(ctype)(operand)`
+			# C cast (see emitter_c.py's _emit_cast 'wrap' mode), exactly C's
+			# well-defined integer conversion rules, safe for the real cross-
+			# signedness/width reinterpretation this construction call
+			# promises, the same as an explicit T(x) scalar cast.
+			arg_operand = self._lower_expr( node.args[0], value_type, strict = False )
+			if not isinstance( arg_operand.type, Scalar ):
+				self.lowering.discovery.fail(
+					f'{target_cls.qualname}(...) argument must be a scalar value, got '
+					f'{arg_operand.type.qualname if arg_operand.type is not None else "?"}: {ast.unparse(node)}',
+					node,
+				)
+			dest = self._new_temp( target_cls )
+			self._emit( ir.CastWrap( dest = dest, operand = arg_operand ) )
+			return dest
 
 		if not isinstance( target_cls, ClassLike ):
 			return None
