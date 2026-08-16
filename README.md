@@ -46,6 +46,7 @@ Features that exist now:
 		most common use-cases are implemented and working
 	* inline functions
 		right now restricted to simple bodies (WIP extending this)
+	* blocking TCP/UDP sockets over IPv4/IPv6 (lib/socket.py)
 
 Features that are being scoped and built right now:
 	* global object initialization on startup
@@ -53,7 +54,6 @@ Features that are being scoped and built right now:
 
 Features that are planned but not built yet:
 	* threadsafe Queue
-	* socket library
 	* http client/server classes
 	* smtp library
 	* email parsing

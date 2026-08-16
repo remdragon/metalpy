@@ -710,8 +710,6 @@ io interfaces ( stdin, stdout, stderr )
 	entirely - see lib/sys.py's panic() comment), and the POSIX side of all of
 	the above (only @compiler.target(os='windows') is implemented).
 
-socket class
-
 threading
 
 other issues:
