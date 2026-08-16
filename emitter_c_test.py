@@ -7943,6 +7943,149 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
+			# union-vs-union - both operands independently union-typed, the
+			# one shape _build_union_leaf_eq's own predecessor explicitly
+			# refused ("comparing two DIFFERENT union values structurally is
+			# not yet supported"). Same-shaped (str|None vs str|None) here -
+			# covers all 4 leaf-pair combinations (str/str-same, str/str-
+			# different, str/None, None/str, None/None already covered
+			# above via the union-on-one-side tests) for both == and != -
+			# must be INFALLIBLE (no Result involved at all - assigning the
+			# comparison's own result straight to a bool local, not
+			# Result[bool,TypeError], is itself part of what's being tested:
+			# it would be a compile error if this were fallible)
+			( 'union_union_equality_same_shape_all_leaf_pairs', '''
+def main() -> i32:
+	x: str|None = "hi"
+	y: str|None = "hi"
+	same: bool = x == y
+	if not same:
+		return 1
+	if x != y:
+		return 2
+	z: str|None = None
+	diff: bool = x == z
+	if diff:
+		return 3
+	if not ( z != y ):
+		return 4
+	w: str|None = None
+	both_none: bool = w == z
+	if not both_none:
+		return 5
+	if w != z:
+		return 6
+	a: str|None = "bye"
+	if x == a:
+		return 7
+	if not ( x != a ):
+		return 8
+	return 0
+''' ),
+			# differently-shaped unions, mirroring the exact worked example
+			# used to design this feature (i32|str vs i32|str|None) - covers
+			# a genuine 'error' cell (i32 vs str, no dunder connects them,
+			# TypeError) alongside valid cells (same-type, and the None row/
+			# column, which is well-defined regardless of the OTHER side's
+			# own declared member set). The comparison's own result here IS
+			# Result[bool,TypeError] - consumed explicitly via match/
+			# unwrap_or, proving it behaves exactly like any other real
+			# Result value, no special machinery needed to use it
+			( 'union_union_equality_differently_shaped_with_type_error_cell', '''
+def compare( a: i32|str, b: i32|str|None ) -> Result[bool,TypeError]:
+	return a == b
+
+def main() -> i32:
+	match compare( 5, 5 ):
+		case Result.Ok( v ):
+			if not v:
+				return 1
+		case Result.Err( e ):
+			return 2
+	match compare( "hi", "bye" ):
+		case Result.Ok( v ):
+			if v:
+				return 3
+		case Result.Err( e ):
+			return 4
+	match compare( 5, "hi" ):
+		case Result.Ok( v ):
+			return 5
+		case Result.Err( e ):
+			pass
+	match compare( "hi", None ):
+		case Result.Ok( v ):
+			if v:
+				return 6
+		case Result.Err( e ):
+			return 7
+	match compare( 5, None ):
+		case Result.Ok( v ):
+			if v:
+				return 8
+		case Result.Err( e ):
+			return 9
+	if compare( 5, "hi" ).unwrap_or( True ) != True:
+		return 10
+	return 0
+''' ),
+			# a real RC-lifetime check for the fallible path specifically -
+			# genuinely new territory: _build_type_error_instance is the
+			# first internal (non-AST-driven) construction site for a
+			# trivial marker-error class anywhere in this file. Repeats both
+			# a pure-TypeError comparison AND an infallible comparison
+			# involving a real RC leaf (str) 1000x, checking the RC leaf's
+			# own refcount never drifts - this is what actually caught two
+			# real bugs during development (a SEGV from decref'ing an
+			# uninitialized branch-local TypeError() temp, then a leak from
+			# over-correcting it to never decref at all), confirmed clean
+			# only via a real gcc -fsanitize=address run, not just this
+			# real-compile-and-run check alone
+			( 'union_union_equality_fallible_path_rc_no_leak_under_repetition', '''
+def compare( a: i32|str, b: i32|str|None ) -> Result[bool,TypeError]:
+	return a == b
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			match compare( 5, "hi" ):
+				case Result.Ok( v ):
+					return 1
+				case Result.Err( e ):
+					pass
+			s: str = 'hello'.upper()
+			if compiler.refcount( s ) != 1:
+				return 2
+			match compare( 5, s ):
+				case Result.Ok( v ):
+					return 3
+				case Result.Err( e ):
+					pass
+			if compiler.refcount( s ) != 1:
+				return 4
+			i += 1
+	return 0
+''' ),
+			# regression guard: a union WITHOUT a None member compared
+			# against a bare None literal used to hard-fail ("i32 is not a
+			# member of str|i32") under the narrower predecessor of this
+			# dispatch. Under the generalized per-leaf-pair grid, this is
+			# now a well-defined, always-not-equal comparison instead (rule
+			# 2 - exactly one leaf is NoneType - never required the OTHER
+			# side to actually declare None as a possible member) - a real,
+			# intentional correctness improvement, not a regression, so this
+			# tests the NEW correct behavior rather than asserting the old
+			# hard-fail persists
+			( 'union_without_none_member_compared_against_none_is_well_defined', '''
+def main() -> i32:
+	x: str|i32 = "hi"
+	if x == None:
+		return 1
+	if not ( x != None ):
+		return 2
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -7974,6 +8117,67 @@ def main() -> i32:
 	return 0
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_plain_non_nullable_type_against_bare_none_is_still_a_compile_error( self ) -> None:
+		# regression guard, unaffected by the union-union dispatch work: a
+		# PLAIN (non-union) str compared against a bare None literal never
+		# reaches _lower_eq_dispatch at all - _expr_Compare's own right_hint
+		# stays left.type=str (left isn't a union), so the None literal gets
+		# hinted toward str and _expr_Constant's own pre-existing guard
+		# ("None cannot be used where builtins.str is expected") rejects it
+		# before any union-comparison code ever runs. Must stay exactly this
+		# - a non-nullable value can never actually BE None, so allowing the
+		# comparison at all (even as a well-defined "always False") would
+		# hide what's very likely a real bug at the call site
+		self._run( '''
+def main() -> i32:
+	s: str = "hi"
+	if s == None:
+		return 1
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fallible_comparison_result_never_requires_enclosing_return_type( self ) -> None:
+		# a fallible union-union comparison (Result[bool,TypeError]) is
+		# deliberately NOT auto-consumed via arithmetic's/subscript's own
+		# _maybe_consume_result mechanism (no new "compiler binop mode"
+		# concept) - so, unlike checked arithmetic, using one should NEVER
+		# require the ENCLOSING function to itself return a covering
+		# Result[_,TypeError]. main() here returns plain i32 and explicitly
+		# consumes the fallible comparison via .unwrap_or(...) - if this
+		# were wrongly wired through the arithmetic-style auto-consumption
+		# path instead, it would fail to compile with a
+		# "requires the enclosing function to return Result[_,TypeError]"
+		# error the same way an un-wrapped checked-arithmetic op would
+		self._run( '''
+def compare( a: i32|str, b: i32|str|None ) -> Result[bool,TypeError]:
+	return a == b
+
+def main() -> i32:
+	if compare( 5, "hi" ).unwrap_or( False ):
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	# NOTE: a fallible comparison's Result[bool,TypeError] used directly
+	# where a plain bool is required WITHOUT first being explicitly
+	# consumed (`if compare(...):`, `x: bool = compare(...)`) does NOT
+	# currently produce a compile-time error the way _check_assignable
+	# ought to reject it - confirmed as a real, PRE-EXISTING bug entirely
+	# unrelated to this feature (reproduces identically with an ordinary,
+	# already-shipped `Result[i32,OverflowError]`-returning function, zero
+	# union-union comparison involved): assigning ANY Result-returning
+	# call's result directly to a mismatched local type passes discovery
+	# with no errors at all, then the EMITTER produces C a real compiler
+	# rejects outright ("assigning to 'bool' from incompatible type
+	# 'struct Result...'"). Filed for separate follow-up - out of scope
+	# for this feature, which itself does the right thing (no implicit
+	# consumption, see the test above); the gap is in the GENERAL
+	# assignment/call-return-type check, not anything new here.
 
 
 class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
