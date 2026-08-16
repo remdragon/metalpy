@@ -4036,6 +4036,26 @@ class FunctionLowering:
 			return True
 		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
 			return False
+		if self.lowering._defer_kind_of_call( stmt.value ) is not None:
+			# defer(...)/errdefer(...) as an if-branch's LAST statement (a
+			# natural, common shape - arm a cleanup right before the branch
+			# falls through) is not itself a real call: `defer`/`errdefer`
+			# are recognized purely by this AST shape (_stmt_Expr, before
+			# ordinary call resolution ever runs - see this file's own
+			# module docstring), never registered as an actual Name anywhere.
+			# Falling through to _resolve_callee_target below tried to look
+			# up 'defer' as an ordinary callable and failed outright ("name
+			# 'defer' is not defined") - a real, confirmed compile error on
+			# every defer/errdefer that happens to be the last statement of
+			# a non-terminating if-branch (found via lib/builtins/__str.py's
+			# `if loc is not None: defer(freelocale(loc))`, the only defer
+			# call in this codebase shaped that way - every other call site
+			# happens to sit at the top level or right after an early-return
+			# guard, never as an if-branch's own last statement, which is
+			# why this went unnoticed until real POSIX-target compilation
+			# actually exercised it). defer/errdefer always falls through
+			# (arms a flag, never diverges) - never NoReturn-shaped
+			return False
 		target = self.lowering._type_resolver._resolve_callee_target( stmt.value.func )
 		fn = target.base if isinstance( target, Specialization ) else target
 		if not isinstance( fn, Function ):

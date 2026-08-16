@@ -6242,6 +6242,137 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 
+class DeferAsLastStatementOfNonTerminatingIfBranchTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression tests for a real compile error in lowering.py's
+	_stmt_diverges: `defer(...)`/`errdefer(...)` used as the LAST statement
+	of an if-branch that doesn't itself terminate (no return/break/continue,
+	just falls through to whatever comes after the if) failed to compile
+	with "name 'defer' is not defined".
+
+	_stmt_If calls _stmt_diverges on a branch's last statement to decide
+	whether that branch's own ending state can reach the if's join point at
+	all (used for narrowing/bindings merge - see _stmt_diverges' own
+	docstring). _stmt_diverges recognizes a bare call-expression statement
+	and tries to resolve its callee to check for a -> NoReturn return type
+	(catching sys.panic()-shaped branches) - but defer/errdefer are never
+	real, resolvable callables; they're recognized purely by AST shape
+	(_stmt_Expr, before ordinary call resolution ever runs - see this
+	file's own module docstring on defer/errdefer). _stmt_diverges didn't
+	share that recognition, so `defer(expr)`/`errdefer(expr)` as a branch's
+	own last statement fell through to _resolve_callee_target, which tried
+	to look up the bare name 'defer' as an ordinary function and failed
+	outright.
+
+	Found via lib/builtins/__str.py's case_map (POSIX target): `if loc is
+	not None: defer(freelocale(loc))` is the only defer call in the whole
+	codebase shaped exactly this way - every other call site either sits at
+	a function's top level or right after an early-return guard clause
+	(`if loc is None: return False` then an UNCONDITIONAL defer below it),
+	never as an if-branch's own last statement - which is why this went
+	unnoticed until real POSIX-target compilation (WSL/gcc, not just
+	Windows/clang/MSVC) actually exercised that code path for the first
+	time. Fixed by having _stmt_diverges recognize the defer/errdefer AST
+	shape (the same check _stmt_Expr already uses) and treat it as non-
+	diverging - defer/errdefer always falls through (arms a flag, never
+	itself returns/panics), never NoReturn-shaped. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_defer_as_only_statement_of_non_terminating_if_branch( self ) -> None:
+		# proves the fix is real, not just "compiles": bump() must actually
+		# run when the defer was armed (should_arm=True), and must NOT run
+		# a second time when it wasn't (should_arm=False) - a Ptr[i32]
+		# out-param makes the deferred call's own side effect directly
+		# observable from main()
+		self._run( '''
+def bump( counter: Ptr[i32] ) -> None:
+	with compiler.wrap_arithmetic:
+		counter[0] = counter[0] + 1
+
+def maybe_defer( should_arm: bool, counter: Ptr[i32] ) -> None:
+	if should_arm:
+		defer( bump( counter ))
+	return
+
+def main() -> i32:
+	n: i32 = 0
+	maybe_defer( True, compiler.addrof( n ))
+	if n != 1:
+		return 1
+	maybe_defer( False, compiler.addrof( n ))
+	if n != 1:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_errdefer_as_only_statement_of_non_terminating_if_branch( self ) -> None:
+		self._run( _RESULT_FIXTURE + '\n' + '''
+def bump( counter: Ptr[i32] ) -> None:
+	with compiler.wrap_arithmetic:
+		counter[0] = counter[0] + 1
+
+def maybe_errdefer( should_arm: bool, fail: bool, counter: Ptr[i32] ) -> Result[i32,OverflowError]:
+	if should_arm:
+		errdefer( bump( counter ))
+	if fail:
+		return Result.Err( OverflowError() )
+	return Result.Ok( 5 )
+
+def main() -> i32:
+	n: i32 = 0
+	r1: Result[i32,OverflowError] = maybe_errdefer( True, True, compiler.addrof( n ))
+	if not r1.is_err():
+		return 1
+	if n != 1:
+		return 2
+	r2: Result[i32,OverflowError] = maybe_errdefer( True, False, compiler.addrof( n ))
+	if not r2.is_ok():
+		return 3
+	if n != 1:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_str_upper_matches_the_exact_reported_shape( self ) -> None:
+		# the ACTUAL originally-failing code (lib/builtins/__str.py's
+		# case_map, minus the POSIX-only towupper_l plumbing this test
+		# doesn't need): `if loc is not None: defer(freelocale(loc))` -
+		# same "if <cond>: defer(...)" shape with nothing after the if,
+		# confirming the fix covers the real repro, not just a synthetic
+		# stand-in
+		self._run( '''
+def maybe_release( loc: Ptr[None], counter: Ptr[i32] ) -> None:
+	if loc is not None:
+		defer( bump( counter ))
+	return
+
+def bump( counter: Ptr[i32] ) -> None:
+	with compiler.wrap_arithmetic:
+		counter[0] = counter[0] + 1
+
+def main() -> i32:
+	n: i32 = 0
+	sentinel: i32 = 0
+	maybe_release( compiler.addrof( sentinel ), compiler.addrof( n ))
+	if n != 1:
+		return 1
+	maybe_release( None, compiler.addrof( n ))
+	if n != 1:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+
 class GUIDTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/guid.py's GUID type - PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3
 	(COM specifics). Needs import_builtins=True (str.split, list[str]). '''
