@@ -14,12 +14,16 @@ import sys
 #       unsigned char  Data4[8];
 #   } GUID;
 #
-# Data4 is 8 separate u8 fields here, not a fixed-size array - SYNTAX.md
-# documents a `u8[8]`-style fixed-size inline array syntax, but nothing in
-# discovery.py/emitter_c.py actually implements it yet (confirmed by
-# direct investigation - it's aspirational documentation, not a working
-# feature). This is exactly the plan's own documented fallback for that
-# case.
+# Data4 is 8 separate u8 fields here, not a fixed-size array. SYNTAX.md's
+# `u8[8]`-style fixed-size inline array syntax now works for DECLARING a
+# field and zero-filling it at construction (`data4: u8[8] = 0`), but that's
+# not enough for this class: from_str() needs to set 8 independently-parsed
+# hex bytes into 8 specific positions, and __eq__/__ne__ need to compare
+# them one at a time - neither is possible yet, since element-level indexed
+# access (`f.data4[i]`) is still unimplemented ("u8[8] fields cannot be read
+# as a whole value yet (no element-level array access is implemented)",
+# confirmed by a real compile). This unrolled-fields form stays until that
+# follow-up lands.
 @cstruct
 class GUID:
 	data1: u32
