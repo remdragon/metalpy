@@ -7487,6 +7487,112 @@ def main() -> i32:
 		return 3
 	return 0
 ''' ),
+			# regression test: a tuple whose ELEMENT type is itself a union
+			# (tuple[str|None, i32], not the tuple as a whole being optional) -
+			# lib/http/client.py's _encode_body() hit this exact shape
+			# (tuple[bytes|None, str|None]) and had to work around it with a
+			# dedicated class instead (see that file's own comment). Before the
+			# fix, _expr_Tuple lowered each element with expected_type=None,
+			# so a leaf value never got coerced into the declared union - the
+			# tuple type inferred from the elements' own NATURAL types then
+			# differed from the annotation's tuple[str|None,i32], leaving the
+			# real (annotated) backing class's own allocator function
+			# unscheduled ("call to undeclared function ...") and each field
+			# assignment storing a raw leaf into what the emitter declared as
+			# a tagged-union-typed field ("assigning to ... from incompatible
+			# type"). Both the None and non-None leaf both need checking, on
+			# both an unannotated inline construction and a separately
+			# annotated local.
+			( 'tuple_element_union_none_and_value_cases', '''
+def main() -> i32:
+	none_first: tuple[str|None, i32] = ( None, 5 )
+	# bind the constant-index read to a named local, then extract the leaf
+	# via match - same pattern union_coercion_rc_test.py's own passing
+	# tests already use. `x is None` narrowing (type_resolver.py's
+	# _type_of_expr) has no ast.Subscript case, and comparing a still-
+	# union-typed value directly against a literal (`x != "hi"`) has no
+	# dunder/flat-Cmp support either - both pre-existing, unrelated gaps
+	# (neither specific to tuples: they'd reproduce on any bare str|None
+	# local too), sidestepped here rather than fixed, to keep this
+	# regression test scoped to the tuple-construction bug alone
+	first_none: str|None = none_first[0]
+	match first_none:
+		case str( unexpected ):
+			return 1
+		case None:
+			pass
+	if none_first[1] != 5:
+		return 2
+	value_first: tuple[str|None, i32] = ( "hi", 6 )
+	first_value: str|None = value_first[0]
+	match first_value:
+		case str( got ):
+			if got != "hi":
+				return 3
+		case None:
+			return 4
+	if value_first[1] != 6:
+		return 5
+	return 0
+''' ),
+			# TWO independent union elements in the same tuple - the exact
+			# arity/shape of the real _encode_body() bug (tuple[bytes|None,
+			# str|None]), using str for both since bytes literals aren't
+			# needed to exercise the same coercion code path
+			( 'tuple_two_independent_union_elements', '''
+def main() -> i32:
+	t: tuple[str|None, str|None] = ( "body", None )
+	first: str|None = t[0]
+	match first:
+		case str( got ):
+			if got != "body":
+				return 1
+		case None:
+			return 2
+	second: str|None = t[1]
+	match second:
+		case str( unexpected ):
+			return 3
+		case None:
+			pass
+	return 0
+''' ),
+		] )
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class TupleUnionElementRCTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' RC-correctness regression test for the tuple[T|None,...] fix above -
+	construction must incref an aliasing leaf EXACTLY once (going through
+	_coerce_into_union's own constructor Incref, same as any other union-
+	typed field/local - see union_coercion_rc_test.py) and the tuple's own
+	scope-exit teardown must release it back down again, not leak or double-
+	free it. 'held'.upper() (not a literal) forces a real heap allocation -
+	an immortal string literal can't tell a leak/over-release apart from
+	doing nothing. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'union_element_construction_increfs_once_and_releases_on_scope_exit', '''
+def during_refcount( s: str ) -> usize:
+	t: tuple[str|None, i32] = ( s, 1 )
+	return compiler.refcount( s )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		s: str = 'held'.upper()
+		before: usize = compiler.refcount( s )
+		during: usize = during_refcount( s )
+		if during != before + 1:
+			return 1
+		after: usize = compiler.refcount( s )
+		if after != before:
+			return 2
+	return 0
+''' ),
 		] )
 
 
