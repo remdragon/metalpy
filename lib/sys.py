@@ -16,7 +16,20 @@ def alloc[T]( count: usize ) -> Ptr[T]:
 	if ptr is None:
 		panic( 'out of memory' )
 	if compiler.target.debug:
-		memzero( ptr, count )
+		# 0xCD ("uninitialized" - MSVC debug heap's own convention), not a
+		# zero-fill: correctness must never depend on freshly allocated
+		# memory happening to read as zero/null - release builds get real,
+		# unfilled garbage here (this whole block is debug-only), so any
+		# code relying on implicit zero-init would only ever "work" in
+		# debug and corrupt memory in release. Filling with a nonzero
+		# poison byte instead makes that class of bug reproduce in BOTH
+		# configurations - a null-pointer read/deref would misleadingly
+		# "just work" here otherwise. Also fixes a real, separate bug this
+		# call used to have: `count` is the number of T-sized ELEMENTS
+		# (e.g. 1 for a single object), not the allocation's own byte size
+		# - passing it here left everything past the first `count` bytes
+		# of a multi-byte T completely unfilled
+		mempoison( ptr, byte_count )
 	return ptr
 
 # ---------------------------------------------------------------------------
@@ -107,6 +120,20 @@ def memzero( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
 def memzero( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
 	from crt import memset
 	memset( ptr, 0, count )
+	return ptr
+
+# debug-only "uninitialized" poison fill - see alloc[T]'s own comment on why
+# this is deliberately NOT zero
+@compiler.target( os = 'windows' )
+def mempoison( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
+	from windows.ntdll import RtlFillMemory
+	RtlFillMemory( ptr, count, 0xCD )
+	return ptr
+
+@compiler.target( os = not 'windows' )
+def mempoison( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
+	from crt import memset
+	memset( ptr, 0xCD, count )
 	return ptr
 
 @compiler.target( os = 'windows' )

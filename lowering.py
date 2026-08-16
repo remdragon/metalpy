@@ -2219,6 +2219,32 @@ class FunctionLowering:
 			self._cfg.check_unchecked_results( value )
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
+		# a fallible __init__'s own Err-path return, before construction
+		# completes - forces the INLINE return_() unwind below rather than
+		# ever letting current_epilogue_label() hand out one of the
+		# function's shared closing-brace labels. That shared ladder is
+		# built ONCE, using self._epilogue_stack's FINAL cancelled-state as
+		# of the function's own closing brace - a LATER return in this same
+		# __init__ that reaches complete_construction() (this construction's
+		# eventual success path, cancelling every attribute entry so
+		# ownership transfers cleanly into the now-complete self) would
+		# retroactively wipe out the very decref this EARLIER Err return's
+		# already-committed jump depends on, since Epilogue.cancelled is one
+		# mutable flag shared by every jump into that entry's label, not a
+		# per-jump-site snapshot. Confirmed by a real repro: an RC attribute
+		# assigned before a later-failing validation, on the Err path,
+		# silently stopped being released the moment a later Ok-path return
+		# in the same __init__ completed construction - masked as a leak
+		# (not a crash) only because the CALL SITE's own release of self
+		# used to fall back to the generic per-class destructor's
+		# unconditional field cascade, independently releasing the same
+		# attribute again; that fallback is gone now (see
+		# _emit_fallible_construction's own comment on why it had to be
+		# removed - it also unconditionally touched attributes that were
+		# NEVER assigned at all, reading uninitialized memory), so this
+		# construction's own inline unwind is now the ONLY place whichever
+		# attributes it assigned ever get released on this path
+		construction_err_path = False
 		if self._construction_self is not None:
 			# every return in a non-fallible __init__ is unconditionally
 			# success (construction_fallible is False, so the `and` below
@@ -2233,7 +2259,9 @@ class FunctionLowering:
 			is_success = not ( self._construction_fallible and self.lowering._is_result_err_call( node.value ) is not None )
 			if is_success:
 				self._complete_construction_or_fail( self._current_fn )
-		label = self._cfg.current_epilogue_label( value )
+			else:
+				construction_err_path = True
+		label = None if construction_err_path else self._cfg.current_epilogue_label( value )
 		# the innermost active multi-statement @inline splice, if this
 		# return is reached from one of its own pre-return statements (see
 		# _splice_multi_statement_inline_body/self._inline_scope_vars' own
@@ -7403,18 +7431,66 @@ class FunctionLowering:
 		self._emit( ir.Assign( dest = dest_var, src = ok_value ))
 		self._emit( ir.Jump( target = end_label ))
 
-		# Err branch: self never became valid - drop its own refcount
-		# (but __del__ is never invoked on it - SYNTAX.md), propagate the
-		# same error, re-wrapped for THIS construction's own Result[Foo,E].
-		# Same cfg.decref()+manually_decreffed() pair as the Ok branch above,
-		# for the same reason - a bare ir.Decref here left self_var's own
-		# binding OWNED in cfg's bookkeeping, so the function's own scope-
-		# exit epilogue decref'd self_var a SECOND time on top of this one -
-		# a real double-free on every failed fallible construction, not yet
-		# triggered by a repro (the only reported crash was Ok-path)
+		# Err branch: self never became valid - free its own storage (but
+		# __del__ is never invoked on it - SYNTAX.md), propagate the same
+		# error, re-wrapped for THIS construction's own Result[Foo,E].
+		#
+		# Deliberately NOT self._cfg.decref(concrete_cls, self_var) (an
+		# ordinary release_object() call, the same one used to destroy any
+		# fully-valid instance of concrete_cls): that goes through the
+		# class's single, shared vtable destructor (type_resolver.py's
+		# _synthesize_rcclass_destructor), which unconditionally (1) calls
+		# self.__del__() if declared - forbidden here by SYNTAX.md - and (2)
+		# decrefs EVERY RC-typed attribute, including ones this __init__
+		# never reached an assignment for on the path that actually failed.
+		# self is only PARTIALLY constructed here - an attribute release_
+		# object's destructor reads is whatever raw bytes sys.alloc's
+		# allocator happened to return, not a valid reference - releasing it
+		# is a real, confirmed STATUS_HEAP_CORRUPTION (0xC0000374), reading/
+		# decrementing a refcount through a garbage pointer. __init__'s own
+		# Err-path return_() unwind (_stmt_Return's construction_err_path
+		# special case - see its own comment) already released whichever RC
+		# attributes IT assigned, using its own precise, path-sensitive CFG
+		# state; self's underlying allocation just needs freeing now, exactly
+		# like _synthesize_rcclass_destructor's own step 3 (sys.free(self)),
+		# skipping its steps 1 (__del__) and 2 (field cascade) entirely -
+		# self_var's own refcount is guaranteed exactly 1 here (fresh from
+		# sys.alloc, never escaped anywhere else - check_self_escape()
+		# forbids passing self out of __init__ before construction completes,
+		# which this failed path never reaches), so there's no other owner to
+		# race with a bare free. manually_decreffed(self_var) still runs
+		# below, same as before - self_var's own epilogue entry (pushed by
+		# the _cfg_assign near this method's own top) still needs neutralizing
+		# regardless of which release mechanism actually ran, or the
+		# function's own scope-exit epilogue would try to release it a SECOND
+		# time on top of this
+		# emitted as raw IR (mirroring init_result's own ir.Call near this
+		# method's own top), NOT as synthesized-AST-plus-_lower_expr the way
+		# ok_expr/err_expr above are - unlike Result.Ok/Err (synthesized
+		# specifically to reuse REAL Result-construction lowering, per this
+		# method's own opening comment), sys.free(ptr) has no sugar worth
+		# reusing, and building it as `ast.Name(id='sys', ...)` was actually
+		# tried first and failed: _lower_expr re-resolves node.func's own
+		# receiver by ordinary namespace lookup before ever consulting node.
+		# resolved_callee, which only short-circuits OVERLOAD selection, not
+		# name resolution - "name 'sys' is not defined" in any file that
+		# never imports sys (confirmed by a real regression: lowering_test.
+		# py's own fallible-init shape test, whose fixture never imports
+		# sys). type_resolver.py's _synthesize_rcclass_destructor gets away
+		# with the identical AST shape only because its own FunctionDef is
+		# scheduled and resolved through the compiler's synthesized-code
+		# path, never through an ordinary file's own import-gated namespace
+		# at all
+		sys_module = self.lowering.discovery.modules['sys']
+		free_overload = sys_module.get_local( 'free' )
+		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
+		self.lowering._ensure_resolved( free_fn )
+		free_ptr_type = free_fn.parameters[0].type
+		# label before the cast - JumpIfTrue above jumps straight here
 		self._emit( ir.Label( name = err_label ))
-		for instr in self._cfg.decref( concrete_cls, self_var ):
-			self._emit( instr )
+		cast_dest = self._new_temp( free_ptr_type )
+		self._emit( ir.CastWrap( dest = cast_dest, operand = self_var ))
+		self._emit( ir.Call( dest = None, target = free_fn, receiver = None, args = [ cast_dest ], kwargs = {} ))
 		for instr in self._cfg.manually_decreffed( self_var ):
 			self._emit( instr )
 		err_expr = ast.Call(
