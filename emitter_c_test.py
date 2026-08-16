@@ -7842,7 +7842,7 @@ def main() -> i32:
 	return 0
 ''' ),
 			# a real RC-lifetime check for the new payload-comparison path -
-			# _lower_union_eq_against_leaf's own narrowed/payload_dest/tag_dest
+			# _build_union_leaf_eq's own narrowed/payload_dest/tag_dest
 			# temps are all bare GetAttr borrows (never fresh_temp()-registered,
 			# same as _lower_union_receiver_call's identical extraction), so
 			# none of them should need - or get - any incref/decref of their
@@ -7866,6 +7866,83 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
+			# `leaf == union_val` / `!=` - union on the RIGHT, the mirror
+			# image of union_leaf_equality_str_and_scalar_and_none above.
+			# Covers an RC leaf (str), a scalar leaf (i32), and the None
+			# member via a BARE `None` literal specifically - NoneType has
+			# no __eq__/__ne__ of its own at all (unlike str/i32, which at
+			# least have a real dunder to look up and reject), so `None ==
+			# x` never even reached a dunder lookup before this fix; only
+			# _lower_eq_or_ne's own unconditional (regardless of left being
+			# Scalar) entry point for Eq/NotEq can see both operands
+			# together and recognize the shape
+			( 'union_leaf_equality_leaf_on_left_str_scalar_and_none', '''
+def main() -> i32:
+	x: str|None = "hi"
+	if "hi" != x:
+		return 1
+	if "bye" == x:
+		return 2
+	y: str|None = None
+	if "hi" == y:
+		return 3
+	if not ( "hi" != y ):
+		return 4
+	if not ( None == y ):
+		return 5
+	if None == x:
+		return 6
+	n: i32|None = 42
+	if 42 != n:
+		return 7
+	if 7 == n:
+		return 8
+	m: i32|None = None
+	if 5 == m:
+		return 9
+	return 0
+''' ),
+			# scalar widening (i32 -> i64, ...) must still apply for a
+			# PLAIN scalar == / != comparison with no union on either side -
+			# _lower_eq_or_ne's own strict=False lowering skips
+			# _coerce_or_check_operand's built-in widening coercion
+			# specifically so the union checks can run first, so this must
+			# be reinstated manually (see its own docstring) or an ordinary
+			# `i64 == i32` comparison - which used to auto-widen the i32
+			# side before comparing, exactly like `_lower_binop_values` -
+			# would regress into a spurious compile error
+			( 'plain_scalar_widening_still_applies_no_union_involved', '''
+def main() -> i32:
+	a: i64 = 5
+	b: i32 = 5
+	if a != b:
+		return 1
+	c: i32 = 6
+	if a == c:
+		return 2
+	return 0
+''' ),
+			# a real RC-lifetime check for the union-on-the-RIGHT direction -
+			# same shape as union_leaf_equality_rc_no_leak_under_repetition
+			# above, just with the leaf/union operands swapped
+			( 'union_leaf_equality_leaf_on_left_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			if compiler.refcount( s ) != 1:
+				return 1
+			x: str|None = s
+			if compiler.refcount( s ) != 2:
+				return 2
+			if "HELLO" != x:
+				return 3
+			if compiler.refcount( s ) != 2:
+				return 4
+			i += 1
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -7878,6 +7955,22 @@ def helper( x: str|None ) -> bool:
 
 def main() -> i32:
 	helper( 5 )
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_non_leaf_type_on_the_right_is_a_compile_error( self ) -> None:
+		# same as test_non_leaf_type_is_a_compile_error above, but with the
+		# union on the RIGHT of the comparison (_lower_eq_or_ne's own
+		# "union on the right" branch) - a genuine mismatch there must stay
+		# a real compile error too, not silently pass a union-typed value
+		# where int.__eq__'s own leaf parameter expects a plain int
+		self._run( '''
+def main() -> i32:
+	x: str|None = "hi"
+	if 5 == x:
+		return 1
 	return 0
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )

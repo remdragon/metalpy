@@ -6738,8 +6738,22 @@ class FunctionLowering:
 		if isinstance( node.ops[0], ( ast.In, ast.NotIn )):
 			return self._lower_in_comparison( node, negate = isinstance( node.ops[0], ast.NotIn ))
 
-		# non-scalar left operand — try the dunder method (str.__eq__, ...)
 		left = self._lower_expr( node.left, None )
+		if isinstance( node.ops[0], ( ast.Eq, ast.NotEq )):
+			# Eq/NotEq get their OWN unified path (_lower_eq_or_ne), tried
+			# BEFORE the scalar-vs-non-scalar fork below (unlike every other
+			# operator) - a union can appear on EITHER side regardless of
+			# whether the OTHER side happens to be scalar: `None == x` (a
+			# bare None literal - NoneType is itself Scalar, see discovery.
+			# py's get_none_type - has no dunder of its own at all) or `5 ==
+			# n` (a bare int literal, also Scalar) both need the same
+			# union-on-the-right handling as `"hi" == x`. The generic
+			# method-lookup-on-non-scalar-left dispatch below can never
+			# cover either shape, since it never even runs when left is
+			# Scalar.
+			return self._lower_eq_or_ne( node, left, expected_type, negate = isinstance( node.ops[0], ast.NotEq ))
+
+		# non-scalar left operand — try the dunder method (<, >, <=, >=, ...)
 		if not isinstance( left.type, Scalar ):
 			method_name = _COMP_DUNDER.get( type( node.ops[0] ))
 			if method_name is not None:
@@ -6753,17 +6767,6 @@ class FunctionLowering:
 					dest = self._new_temp( expected_type or method.return_type )
 					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
 					return dest
-				if isinstance( node.ops[0], ( ast.Eq, ast.NotEq )):
-					# no user __eq__/__ne__ on left's own type - if left is
-					# itself a union (T|None, Result[T,E], any @union),
-					# falling through to the flat Cmp below would compare
-					# two STRUCTS directly, which C rejects outright
-					# ("invalid operands to binary expression"). Structural
-					# union-vs-leaf equality instead - see the method's own
-					# docstring
-					union_eq = self._lower_union_eq_against_leaf( node, left, negate = isinstance( node.ops[0], ast.NotEq ))
-					if union_eq is not None:
-						return union_eq
 			# non-scalar without a matching dunder — fall through to
 			# flat Cmp (pointer comparison), same pre-dunder behavior
 
@@ -6777,42 +6780,116 @@ class FunctionLowering:
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
 		return dest
 
-	def _lower_union_eq_against_leaf( self, node: ast.Compare, union_operand: ir.Operand, negate: bool ) -> ir.Operand|None:
-		''' `union_val == leaf_expr` / `!=`, once union_val's own type has
-		already been confirmed to have no user __eq__/__ne__ of its own -
-		structural equality against a single LEAF value (a bare None
-		included): the union must currently hold the member matching the
-		other side's own NATURAL type, and (unless that member is NoneType,
-		which carries no real payload) the member's own payload must compare
-		equal too, via the same dunder-or-flat-Cmp choice an ordinary
-		leaf-vs-leaf comparison already makes (see _lower_operand_compare).
-		Same tag/data/v_<member> extraction _lower_union_receiver_call/
-		_maybe_unwrap_union_arg already use for an analogous purpose, just
-		feeding a Cmp instead of a Call.
+	def _lower_eq_or_ne( self, node: ast.Compare, left: ir.Operand, expected_type: Type|None, negate: bool ) -> ir.Operand:
+		''' `==`/`!=`, for ANY left operand (scalar or not) - unlike every
+		other comparison operator, Eq/NotEq are the one shape a union can
+		ever meaningfully participate in (see _build_union_leaf_eq), and a
+		union can show up on either side regardless of the OTHER side's own
+		scalar-ness, so this doesn't share the non-scalar-left gate the rest
+		of _expr_Compare's dunder dispatch still uses.
+		Lowers node.comparators[0] EXACTLY ONCE (hinted toward left.type,
+		non-strict - see the strict=False comment below), then tries, in
+		order:
+		  1. a real user __eq__/__ne__ on left's own type, when the
+		     comparator's own natural type already matches left.type (the
+		     ordinary/common case - unchanged behavior, byte-for-byte the
+		     same dunder Call this used to emit before this method existed);
+		  2. left is a union and the comparator is one of its own leaves
+		     (`x == "hi"` where x: str|None - union on the LEFT);
+		  3. the comparator is ITSELF a union containing left.type as a
+		     member (`"hi" == x` or `None == x` - union on the RIGHT, the
+		     mirror image of (2); NoneType in particular has no __eq__ of
+		     its own at all, so a bare `None == x` never even reaches a
+		     dunder lookup, and a bare int literal defaults to i32 - also
+		     Scalar - so neither shape can be caught by gating on "left is
+		     non-scalar" the way every other operator still does; only this
+		     unified method, entered unconditionally for Eq/NotEq regardless
+		     of left's own scalar-ness, sees both operands together and can
+		     recognize the shape);
+		  4. neither a matching dunder nor a recognized union - the
+		     ORIGINAL pre-union-support behavior: a safe scalar widening
+		     (i32->i64, ...) if one applies, else flat Cmp (pointer
+		     comparison, or an ordinary same-type scalar compare) when the
+		     comparator's natural type already matches left.type, or a
+		     genuine type-mismatch compile error otherwise - reported via
+		     _check_assignable the same way strict=True used to reject it
+		     (before this method existed, that rejection - and the scalar
+		     widening - ran INSIDE the right-hand _lower_expr call itself,
+		     earlier than the dunder-vs-flat-Cmp fork could even be reached;
+		     both are reinstated explicitly here since strict=False below
+		     skips them). '''
+		method_name = '__ne__' if negate else '__eq__'
+		method = self.lowering._find_method( left.type, method_name ) if not isinstance( left.type, Scalar ) else None
+		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
+		# the hint handed to the comparator's own lowering below: left.type,
+		# EXCEPT when left.type is ITSELF a union - hinting a plain leaf
+		# comparator toward a union expected_type would trigger _coerce_or_
+		# check_operand's own (unconditional, not strict-gated) union-WRAP
+		# coercion, turning a bare `"hi"` into a FULLY WRAPPED str|None
+		# value before this method ever gets a look at it - defeating the
+		# whole point of the union checks below (right.type would already
+		# equal left.type by then, both union structs, and the code would
+		# fall straight through to a flat Cmp comparing two STRUCTS
+		# directly - confirmed by a real regression while developing this
+		# fix). None here (natural inference only) matches exactly what the
+		# union-on-the-left case always did, pre-unification.
+		right_hint = None if left_shape is not None else left.type
+		# strict=False: skips _coerce_or_check_operand's final
+		# _check_assignable rejection AND its scalar-widening coercion
+		# (both gated on strict) specifically so a still-mismatched right
+		# (after every OTHER, unconditional coercion - union-wrap, RCClass
+		# upcast, pointer cast - already had its chance) can be checked
+		# HERE, against BOTH operands' own shapes, instead of failing (or
+		# silently widening) blind - both are reinstated manually below in
+		# the same order _coerce_or_check_operand itself would try them.
+		right = self._lower_expr( node.comparators[0], right_hint, strict = False )
+		if right.type is not left.type:
+			if self._is_safe_scalar_widening( right.type, left.type ):
+				widened = self._new_temp( left.type )
+				self._emit( ir.CastWrap( dest = widened, operand = right ))
+				right = widened
+			else:
+				if left_shape is not None:
+					return self._build_union_leaf_eq( node, left, left_shape, right, negate )
+				right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
+				if right_shape is not None:
+					return self._build_union_leaf_eq( node, right, right_shape, left, negate )
+				self._check_assignable( right, left.type, node.comparators[0] )
+		if method is not None:
+			self.lowering._ensure_resolved( method )
+			self.lowering.schedule( method.return_type )
+			for p in ( method.parameters or [] ):
+				self.lowering.schedule( p.type )
+			dest = self._new_temp( expected_type or method.return_type )
+			self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
+			return dest
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = dest, op = ir.CmpOp.NE if negate else ir.CmpOp.EQ, left = left, right = right ))
+		return dest
 
-		Returns None ONLY when union_operand's type isn't actually a
-		TaggedUnion - the caller's own pre-existing flat-Cmp fallback handles
-		that case unchanged, and node.comparators[0] is never touched here in
-		that branch, so there's no double-evaluation risk. Once union_operand
-		IS confirmed a union, this never returns None: a comparator whose own
-		natural type matches none of the union's members (including "another
-		instance of the SAME union type" - full structural union-vs-union
-		equality isn't implemented yet) is reported as a compile error
-		instead, since node.comparators[0] has ALREADY been lowered once by
-		then (its own type had to be determined first) - falling through to
-		the caller's fallback from there would lower it a SECOND time,
-		double-evaluating any side effect it has (e.g. `x == get_y()`).
+	def _build_union_leaf_eq(
+		self, node: ast.Compare, union_operand: ir.Operand, shape: tuple[TaggedUnion,list[Variable]], leaf: ir.Operand, negate: bool,
+	) -> ir.Operand:
+		''' shared core for both directions above: structural equality
+		between an already-confirmed union operand and an already-lowered
+		leaf (a bare None included) - the union must currently hold the
+		member matching the leaf's own NATURAL type, and (unless that
+		member is NoneType, which carries no real payload) the member's own
+		payload must compare equal too, via the same dunder-or-flat-Cmp
+		choice an ordinary leaf-vs-leaf comparison already makes (see
+		_lower_operand_compare). Same tag/data/v_<member> extraction
+		_lower_union_receiver_call/_maybe_unwrap_union_arg already use for
+		an analogous purpose, just feeding a Cmp instead of a Call.
 
-		Only ever consulted for the "union is the LEFT operand" direction
-		(see _expr_Compare's own call site) - `leaf_expr == union_val` (union
-		on the RIGHT) is a separate, not-yet-covered gap, left as the
-		pre-existing (broken) behavior rather than guessed at asymmetrically
-		here. '''
-		shape = self.lowering._type_resolver._tagged_union_shape( union_operand.type )
-		if shape is None:
-			return None
+		Never returns None: both operands are ALREADY lowered by the time
+		either call site in _lower_eq_or_ne reaches here (union on the left
+		or the right), so there's no double-evaluation risk left to avoid
+		by declining - a leaf whose own natural type matches
+		none of the union's members (including "another instance of the
+		SAME union type" - full structural union-vs-union equality isn't
+		implemented yet) is reported as a compile error instead. '''
 		base, members = shape
-		leaf = self._lower_expr( node.comparators[0], None )
 		member = next( ( attr for attr in members if self.lowering._type_resolver._same_type( attr.type, leaf.type ) ), None )
 		if member is None:
 			self.lowering.discovery.fail(
@@ -6863,12 +6940,11 @@ class FunctionLowering:
 
 	def _lower_operand_compare( self, left: ir.Operand, right: ir.Operand, negate: bool, node: ast.AST ) -> ir.Operand:
 		''' Eq/NotEq between two ALREADY-LOWERED operands of the SAME
-		(non-union) type - the same dunder-or-flat-Cmp choice _expr_Compare's
-		own top-level dispatch makes from AST nodes, reimplemented against
-		operands directly since _lower_union_eq_against_leaf's own narrowed
-		payload has no AST node of its own to re-dispatch through (mirrors
-		_coerce_or_check_operand's identical "no node to re-evaluate"
-		posture). '''
+		(non-union) type - the same dunder-or-flat-Cmp choice _lower_eq_or_ne
+		makes from AST nodes, reimplemented against operands directly since
+		_build_union_leaf_eq's own narrowed payload has no AST node of its
+		own to re-dispatch through (mirrors _coerce_or_check_operand's
+		identical "no node to re-evaluate" posture). '''
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		if not isinstance( left.type, Scalar ):
 			method_name = '__ne__' if negate else '__eq__'
