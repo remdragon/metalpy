@@ -2798,14 +2798,65 @@ class TypeResolver:
 			self._resolve_callable( found )
 		return found
 
+	def resolve_declared_types( self, fn: Function ) -> None:
+		''' resolve()s `fn` (if not already) then eagerly monomorphizes any
+		fully-concrete, ClassLike-based Specialization directly typing one
+		of its own declared parameters or its return type - the SAME
+		eager-monomorphize step Monomorphizer.substitute_type_params
+		already applies to a SUBSTITUTED field/parameter (monomorphize.py,
+		the Specialization branch), just for a PLAIN, never-substituted
+		declaration (an ordinary function's own `def f(x: list[i32])`, an
+		@overload candidate's own parameter, ...), which never goes
+		through substitute_type_params at all - discovery.py's own
+		annotation resolver (_get_or_create_specialization) is the only
+		thing that ever builds its .type/.parameters[*].type, and stops
+		there, at the bare Specialization wrapper. Without this, a
+		generic-substituted argument type (already monomorphized to the
+		real RCClass by substitute_type_params - see its own TaggedUnion/
+		Specialization branches) and an @overload candidate's own plain
+		`list[i32]` parameter end up as two DIFFERENT kinds of object for
+		the identical instantiation - a real RCClass vs. a bare
+		Specialization wrapper - which `is` can never bridge no matter how
+		well the Specialization layer itself is interned (confirmed via a
+		real repro: PLAN_COMPILER_BUG_SWEEP.md's overload_resolution.py
+		fix, which papered over this with an injected `_same_type`
+		predicate instead of closing the gap here, at its actual source).
+
+		PLAN_RESOLVE_CLASS_SPECIALIZATIONS.md's own "Source 2" - proposed,
+		attempted, and reverted (18 test failures) before origin-tracking
+		(_as_specialization/_same_type) existed to keep the many
+		`isinstance(t, Specialization)` shape-checks elsewhere working once
+		the type they're checking is no longer wrapped. That mechanism is
+		now in place (see `_result_shape`/`_require_result_return`, both
+		already `_as_specialization`-based) - this only wires the two real
+		production callers of `overload_resolution.resolve_call` through
+		this method (both already the sole place a Function/Overload's own
+		members get `.resolve()`d for a real call site), the narrowest
+		slice of the original plan that closes the specific duality this
+		was found through, not the full "every declared type everywhere"
+		sweep the original plan scoped - that stays a separate, bigger
+		piece of work if it's ever wanted. '''
+		if fn.resolve is not None:
+			fn.resolve()
+		for param in fn.parameters or []:
+			param.type = self._eagerly_monomorphize_declared_type( param.type )
+		fn.return_type = self._eagerly_monomorphize_declared_type( fn.return_type )
+
+	def _eagerly_monomorphize_declared_type( self, t: Type|None ) -> Type|None:
+		if (
+			isinstance( t, Specialization ) and isinstance( t.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum ))
+			and self.monomorphizer._is_concrete( t )
+		):
+			self.schedule( t )
+			return self.monomorphizer.monomorphize_class( t )
+		return t
+
 	def _resolve_callable( self, callee: Function|Overload ) -> None:
 		if isinstance( callee, Function ):
-			if callee.resolve is not None:
-				callee.resolve()
+			self.resolve_declared_types( callee )
 		else:
 			for fn in ( *callee.stubs, *callee.implementations ):
-				if fn.resolve is not None:
-					fn.resolve()
+				self.resolve_declared_types( fn )
 
 	def _resolve_union_receiver_members( self, union: TaggedUnion, members: list[Variable], attr: str, ctx: ast.AST ):
 		# imported here to avoid circular dependency
@@ -3355,8 +3406,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		resolve_call itself raising - just returns None, same discipline as
 		every other branch of _type_of_expr. '''
 		for fn in ( *group.stubs, *group.implementations ):
-			if fn.resolve is not None:
-				fn.resolve()
+			self.resolver.resolve_declared_types( fn )
 		if any( kw.arg is None for kw in node.keywords ):
 			return None
 		arg_types = [ self._type_of_expr( a ) for a in node.args ]
@@ -3930,17 +3980,20 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subject_type = self._type_of_expr( subject_expr )
 		if subject_type is None:
 			return None # can't determine - leave as ordinary `is`/`is not`, lowering's own _lower_is_comparison handles the non-union fallback
-		# unwrap a Specialization to its ABSTRACT base, same as
-		# Lowering._tagged_union_shape - "does this have a None member" is
-		# substitution-independent (None doesn't vary by specialization), so
-		# no monomorphize_class call is needed here. Critically, must NOT
-		# call ensure_resolved(subject_type) first: that would swap a
-		# Specialization for its MONOMORPHIZED copy, whose own tag/data
-		# (already built by monomorphize_class) would collide with
+		# _as_specialization, not a bare isinstance(subject_type, Specialization) -
+		# subject_type may already be eagerly-monomorphized (resolve_declared_
+		# types) to the concrete union itself; base must still resolve to the
+		# ABSTRACT union so it agrees with whatever else compares against it
+		# by identity (union_storage.get's own cache key, any caller that
+		# resolves a pattern's Owner by NAME - always the abstract class).
+		# Critically, must NOT call ensure_resolved(subject_type) first: that
+		# would swap a Specialization for its MONOMORPHIZED copy, whose own
+		# tag/data (already built by monomorphize_class) would collide with
 		# UnionStorage.get() trying to synthesize them again as if for a
 		# fresh union (same mistake, and fix, as lowering.py's
 		# _lower_allocate_fields TaggedUnion branch had)
-		base = subject_type.base if isinstance( subject_type, Specialization ) else subject_type
+		spec = self.resolver._as_specialization( subject_type )
+		base = spec.base if spec is not None else subject_type
 		if not isinstance( base, TaggedUnion ):
 			return None
 		members = self._resolved_union_members( subject_type, base )
@@ -4026,7 +4079,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subj_type = self._type_of_expr( subject_expr )
 		if subj_type is None:
 			self.discovery.fail( f'type(...) is ...: cannot determine the type of {ast.unparse(subject_expr)}: {ast.unparse(node)}', node )
-		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+		base = spec.base if spec is not None else subj_type
 		if not isinstance( base, TaggedUnion ):
 			self.discovery.fail( f'type(...) is ...: {ast.unparse(subject_expr)} is not a union type: {ast.unparse(node)}', node )
 		members = self._resolved_union_members( subj_type, base )
@@ -4053,11 +4107,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		expr_type = self._type_of_expr( expr_node )
 		if expr_type is None:
 			return None
-		base = expr_type.base if isinstance( expr_type, Specialization ) else expr_type
+		# _as_specialization, not a bare isinstance check - expr_type may
+		# already be eagerly-monomorphized (resolve_declared_types), see
+		# visit_Match's own comment
+		spec = self.resolver._as_specialization( expr_type )
+		base = spec.base if spec is not None else expr_type
 		if not isinstance( base, TaggedUnion ):
 			return None
-		if isinstance( expr_type, Specialization ):
-			members = self.resolver.monomorphizer.monomorphize_class( expr_type ).attributes
+		if spec is not None:
+			members = self.resolver.monomorphizer.monomorphize_class( spec ).attributes
 		else:
 			self.resolver.ensure_resolved( base )
 			for attr in base.attributes:
@@ -4182,7 +4240,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subj_type = self._type_of_expr( subject_expr )
 		if subj_type is None:
 			return None
-		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+		base = spec.base if spec is not None else subj_type
 		if not isinstance( base, TaggedUnion ):
 			return None
 		members = self._resolved_union_members( subj_type, base )
@@ -4638,7 +4697,23 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# exact same resolved member objects (identity matters - see
 		# _resolve_case_member's own comment on "owner is not base").
 		subj_type = self.locals.get( subj_name )
-		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		# _as_specialization, not a bare isinstance(subj_type, Specialization) -
+		# subj_type can now be an EAGERLY-MONOMORPHIZED concrete union (e.g.
+		# csv.reader()'s return type, once resolve_declared_types has run for
+		# it) rather than a bare Specialization wrapper. Treating that
+		# concrete union as `base` directly is wrong: _resolve_case_member
+		# below matches each case pattern's Owner (`Result.Ok`) against the
+		# ABSTRACT class's own member objects (textual patterns are always
+		# resolved through the abstract, generic `Result`, never through a
+		# concrete specialization) - `members` must come from that SAME
+		# abstract base or every case fails to match its own pattern by
+		# identity (confirmed via a real repro: a second, independently-
+		# compiled call site sharing the same already-monomorphized callee
+		# silently dropped one match arm's whole body - see
+		# resolve_declared_types's own docstring for why the return type is
+		# no longer reliably a bare Specialization here)
+		spec = self.resolver._as_specialization( subj_type )
+		base = spec.base if spec is not None else subj_type
 		members = self._resolved_union_members( subj_type, base ) if isinstance( base, TaggedUnion ) else []
 		last_is_wildcard = bool( node.cases ) and isinstance( node.cases[-1].pattern, ast.MatchAs ) and node.cases[-1].pattern.pattern is None
 		last_guaranteed = last_is_wildcard
@@ -4889,7 +4964,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			subj_type = self._type_of_expr( subj_expr )
 			if subj_type is None:
 				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
-			base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+			spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+			base = spec.base if spec is not None else subj_type
 			if not isinstance( base, TaggedUnion ):
 				self.discovery.fail( f'case None: requires a union-typed subject, got {getattr( subj_type, "qualname", subj_type )}: {ast.unparse(pattern)}', node )
 			members = self._resolved_union_members( subj_type, base )
@@ -4938,7 +5014,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			subj_type = self._type_of_expr( subj_expr )
 			if subj_type is None:
 				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
-			base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+			spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+			base = spec.base if spec is not None else subj_type
 			if not isinstance( base, TaggedUnion ):
 				self.discovery.fail( f'{ast.unparse(pattern)}: match subject is not a union type', node )
 			members = self._resolved_union_members( subj_type, base )
@@ -4957,8 +5034,14 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		TypeVars on the abstract base) via monomorphize_class - mirrors
 		visit_Compare's own `x is None` rewrite and
 		_rewrite_tagged_union_truthiness exactly. '''
-		if isinstance( subj_type, Specialization ):
-			return self.resolver.monomorphizer.monomorphize_class( subj_type ).attributes
+		# _as_specialization, not a bare isinstance(subj_type, Specialization) -
+		# subj_type may already be eagerly-monomorphized (resolve_declared_
+		# types) to the concrete union itself, not a Specialization wrapper -
+		# still needs the substituted (not abstract/TypeVar-typed) attrs, same
+		# as the genuine-Specialization case below
+		spec = self.resolver._as_specialization( subj_type )
+		if spec is not None:
+			return self.resolver.monomorphizer.monomorphize_class( spec ).attributes
 		self.resolver.ensure_resolved( base )
 		for attr in base.attributes:
 			self.resolver.ensure_resolved( attr )
