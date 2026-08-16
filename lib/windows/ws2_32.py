@@ -185,3 +185,31 @@ def inet_ntop(
 	StringBufSize: usize,
 ) -> ConstPtr[u8]:
 	...
+
+# getaddrinfo/freeaddrinfo — hostname resolution. Real declaration lives in
+# ws2tcpip.h (confirmed against the real SDK header), but header='ws2tcpip.h'
+# is NOT usable here - a real compile confirms it drags in windows.h (same
+# transitive-include problem WSAStartup's own comment above already hit),
+# which collides with prototypes this compiler's own generated C emits for
+# unrelated functions (memset/memcpy/WriteFile/SetConsoleOutputCP etc), a
+# hard compile error. So this stays a plain @extern with no header=, exactly
+# like every other Winsock function in this file: hints/res are opaque
+# Ptr[None]/Ptr[Ptr[None]] on our side (lib/socket.py owns the actual
+# ADDRINFOA field layout via its own _AddrInfo cstruct, since that's memory
+# this compiler's own generated code reads directly) - the linker resolves
+# the real ws2_32.dll export regardless of our prototype's exact spelling,
+# same as inet_pton/inet_ntop above already rely on.
+@extern( 'ws2_32', 'getaddrinfo' )
+def getaddrinfo(
+	pNodeName: ConstPtr[u8],
+	pServiceName: ConstPtr[u8],
+	pHints: Ptr[None],
+	ppResult: Ptr[Ptr[None]],
+) -> i32:
+	...
+
+@extern( 'ws2_32', 'freeaddrinfo' )
+def freeaddrinfo(
+	pAddrInfo: Ptr[None],
+) -> None:
+	...

@@ -41,6 +41,7 @@ if compiler.target.os == 'windows':
 		shutdown as _c_shutdown, getsockname as _c_getsockname,
 		setsockopt as _c_setsockopt,
 		inet_pton, inet_ntop,
+		getaddrinfo, freeaddrinfo,
 	)
 else:
 	SOCKET: TypeAlias = i32
@@ -93,6 +94,17 @@ else:
 	# T|None as an @extern return type).
 	@extern( 'c', 'inet_ntop' )
 	def inet_ntop( family: i32, src: Ptr[None], dst: Ptr[u8], size: u32 ) -> ConstPtr[u8]:
+		...
+	# getaddrinfo/freeaddrinfo - no header=, matching every other extern in
+	# this POSIX branch (see windows/ws2_32.py's own copy of this comment for
+	# why hints/res stay opaque Ptr[None]/Ptr[Ptr[None]] here too - the same
+	# reasoning applies even though POSIX's netdb.h doesn't hit the specific
+	# windows.h conflict that rules header= out on the Windows side).
+	@extern( 'c', 'getaddrinfo' )
+	def getaddrinfo( node: ConstPtr[u8], service: ConstPtr[u8], hints: Ptr[None], res: Ptr[Ptr[None]] ) -> i32:
+		...
+	@extern( 'c', 'freeaddrinfo' )
+	def freeaddrinfo( res: Ptr[None] ) -> None:
 		...
 
 
@@ -173,6 +185,48 @@ class SockAddrIn6:
 	sin6_addr_14:  u8 = 0
 	sin6_addr_15:  u8 = 0
 	sin6_scope_id: u32 = 0
+
+
+# ---------------------------------------------------------------------------
+# _AddrInfo — struct addrinfo, for hostname resolution (getaddrinfo). Field
+# order genuinely differs by OS (confirmed against the real headers: Windows
+# SDK's ws2def.h and glibc's netdb.h) - Windows' ADDRINFOA puts ai_canonname
+# BEFORE ai_addr and sizes ai_addrlen as size_t; POSIX's addrinfo puts
+# ai_addr BEFORE ai_canonname and sizes ai_addrlen as socklen_t (u32). Same
+# "textbook ABI, one body per OS" treatment as SockAddrIn/SockAddrIn6 above,
+# just field-order divergence instead of a width divergence.
+#
+# ai_addr/ai_canonname/ai_next stay opaque Ptr[None]/Ptr[u8], never a typed
+# struct* field - matching this file's and ws2_32.py's own established
+# posture for structured pointers we don't allocate ourselves. ai_addr only
+# gets reinterpreted into a real SockAddrIn/SockAddrIn6 pointer at the point
+# of use (_resolve_v4/_resolve_v6 below); ai_next only ever gets cast back
+# to Ptr[_AddrInfo] to keep walking the linked list of results.
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'windows' )
+@cstruct
+class _AddrInfo:
+	ai_flags:     i32 = 0
+	ai_family:    i32 = 0
+	ai_socktype:  i32 = 0
+	ai_protocol:  i32 = 0
+	ai_addrlen:   usize = usize( 0 )
+	ai_canonname: Ptr[u8] = None
+	ai_addr:      Ptr[None] = None
+	ai_next:      Ptr[None] = None
+
+@compiler.target( os = not 'windows' )
+@cstruct
+class _AddrInfo:
+	ai_flags:     i32 = 0
+	ai_family:    i32 = 0
+	ai_socktype:  i32 = 0
+	ai_protocol:  i32 = 0
+	ai_addrlen:   u32 = 0
+	ai_addr:      Ptr[None] = None
+	ai_canonname: Ptr[u8] = None
+	ai_next:      Ptr[None] = None
 
 
 def _htons( port: u16 ) -> u16:
@@ -261,6 +315,77 @@ def _build_sockaddr_in6( host: str, port: u16 ) -> Result[SockAddrIn6, OSError]:
 		sin6_addr_8 = p[8], sin6_addr_9 = p[9], sin6_addr_10 = p[10], sin6_addr_11 = p[11],
 		sin6_addr_12 = p[12], sin6_addr_13 = p[13], sin6_addr_14 = p[14], sin6_addr_15 = p[15],
 	))
+
+
+# ---------------------------------------------------------------------------
+# Hostname resolution — getaddrinfo() walk, one function per address family
+# (mirrors every other family-dispatched pair in this file, e.g. Socket.bind/
+# connect's own `if self.__family == AF_INET6: ... else: ...` split).
+# hints.ai_family is always set to the family being resolved, so getaddrinfo
+# itself filters out any non-matching results (POSIX/Winsock guarantee) - no
+# family check is needed while walking. Numeric IP literals ("127.0.0.1",
+# "::1") keep working here for free: getaddrinfo recognizes them without any
+# extra flag and returns a single result with no real DNS round trip.
+#
+# service is always NULL; the port is folded into each result's own sockaddr
+# by re-constructing it (never mutating a field in place - same rule
+# _build_sockaddr_in/6 above follow), rather than passing a numeric-service
+# string, which would need its own int->str dependency just for this.
+#
+# A bogus/unresolvable host collapses to the same OSError.Invalid
+# _build_sockaddr_in/6 already return for an unparseable IP literal - real
+# getaddrinfo() failures come back as EAI_* codes on POSIX (a wholly separate
+# namespace from errno, NOT safe to feed into OSError's own errno-based
+# construction - confirmed against the real getaddrinfo(3) contract) and as
+# WSA*-compatible-but-still-unlisted codes on Windows, so neither side has a
+# meaningful existing OSError variant to map to; collapsing both to Invalid
+# keeps the error surface simple and testable rather than leaking a
+# namespace-confused numeric code.
+# ---------------------------------------------------------------------------
+
+def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn], OSError]:
+	hints: _AddrInfo = _AddrInfo( ai_family = AF_INET, ai_socktype = socktype )
+	res_head: Ptr[None] = None
+	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
+	if rc != 0:
+		return Result.Err( _err_invalid() )
+	results: list[SockAddrIn] = list[SockAddrIn]()
+	cur: Ptr[None] = res_head
+	while cur is not None:
+		node: Ptr[_AddrInfo] = compiler.cast( Ptr[_AddrInfo], cur )
+		info: _AddrInfo = node[0]
+		addr_ptr: Ptr[SockAddrIn] = compiler.cast( Ptr[SockAddrIn], info.ai_addr )
+		found: SockAddrIn = addr_ptr[0]
+		results.append( SockAddrIn( sin_family = found.sin_family, sin_port = _htons( port ), sin_addr = found.sin_addr )).unwrap( 'resolve v4: append' )
+		cur = info.ai_next
+	freeaddrinfo( res_head )
+	return Result.Ok( results )
+
+
+def _resolve_v6( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn6], OSError]:
+	hints: _AddrInfo = _AddrInfo( ai_family = AF_INET6, ai_socktype = socktype )
+	res_head: Ptr[None] = None
+	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
+	if rc != 0:
+		return Result.Err( _err_invalid() )
+	results: list[SockAddrIn6] = list[SockAddrIn6]()
+	cur: Ptr[None] = res_head
+	while cur is not None:
+		node: Ptr[_AddrInfo] = compiler.cast( Ptr[_AddrInfo], cur )
+		info: _AddrInfo = node[0]
+		addr_ptr: Ptr[SockAddrIn6] = compiler.cast( Ptr[SockAddrIn6], info.ai_addr )
+		found: SockAddrIn6 = addr_ptr[0]
+		results.append( SockAddrIn6(
+			sin6_family = found.sin6_family, sin6_port = _htons( port ), sin6_flowinfo = found.sin6_flowinfo,
+			sin6_addr_0 = found.sin6_addr_0, sin6_addr_1 = found.sin6_addr_1, sin6_addr_2 = found.sin6_addr_2, sin6_addr_3 = found.sin6_addr_3,
+			sin6_addr_4 = found.sin6_addr_4, sin6_addr_5 = found.sin6_addr_5, sin6_addr_6 = found.sin6_addr_6, sin6_addr_7 = found.sin6_addr_7,
+			sin6_addr_8 = found.sin6_addr_8, sin6_addr_9 = found.sin6_addr_9, sin6_addr_10 = found.sin6_addr_10, sin6_addr_11 = found.sin6_addr_11,
+			sin6_addr_12 = found.sin6_addr_12, sin6_addr_13 = found.sin6_addr_13, sin6_addr_14 = found.sin6_addr_14, sin6_addr_15 = found.sin6_addr_15,
+			sin6_scope_id = found.sin6_scope_id,
+		)).unwrap( 'resolve v6: append' )
+		cur = info.ai_next
+	freeaddrinfo( res_head )
+	return Result.Ok( results )
 
 
 # inet_ntop's size parameter is size_t on Windows but socklen_t (u32) on
@@ -697,13 +822,36 @@ class Socket:
 			peer_addr: SocketAddr = _sockaddr_in_to_addr( peer4 ).or_return()
 		return Result.Ok(( Socket._from_raw( conn, self.__family ), peer_addr ))
 
+	# Resolves host (a hostname OR a numeric IP literal - getaddrinfo handles
+	# both) via _resolve_v4/_resolve_v6, then tries each candidate address in
+	# order (happy-eyeballs-lite: a hostname with several A/AAAA records of
+	# this socket's own family isn't uncommon) until one connects, returning
+	# the last candidate's error if every one of them fails. bind()/sendto()
+	# deliberately stay literal-IP-only (unchanged) - PLAN_HTTP_CLIENT.md's
+	# own socket contract only calls for connect() to resolve hostnames.
 	def connect( self, host: str, port: u16 ) -> Result[None, OSError]:
 		if self.__family == AF_INET6:
-			addr: SockAddrIn6 = _build_sockaddr_in6( host, port ).or_return()
-			return _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr )), compiler.sizeof( SockAddrIn6 ))
+			candidates: list[SockAddrIn6] = _resolve_v6( host, port, SOCK_STREAM ).or_return()
+			last_err: OSError = _err_invalid()
+			for i in range( len( candidates )):
+				addr: SockAddrIn6 = candidates.__getitem__( i ).unwrap( 'connect: candidate index' )
+				match _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr )), compiler.sizeof( SockAddrIn6 )):
+					case Result.Ok( _ ):
+						return Result.Ok( None )
+					case Result.Err( e ):
+						last_err = e
+			return Result.Err( last_err )
 		else:
-			addr4: SockAddrIn = _build_sockaddr_in( host, port ).or_return()
-			return _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr4 )), compiler.sizeof( SockAddrIn ))
+			candidates4: list[SockAddrIn] = _resolve_v4( host, port, SOCK_STREAM ).or_return()
+			last_err4: OSError = _err_invalid()
+			for i in range( len( candidates4 )):
+				addr4: SockAddrIn = candidates4.__getitem__( i ).unwrap( 'connect: candidate index' )
+				match _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr4 )), compiler.sizeof( SockAddrIn )):
+					case Result.Ok( _ ):
+						return Result.Ok( None )
+					case Result.Err( e ):
+						last_err4 = e
+			return Result.Err( last_err4 )
 
 	def send( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		return _send_raw( self.__sock, buf, count )
@@ -764,3 +912,33 @@ class Socket:
 	@staticmethod
 	def udp( family: i32 = AF_INET ) -> Result[Socket, OSError]:
 		return Socket.create( family, SOCK_DGRAM )
+
+
+# ---------------------------------------------------------------------------
+# resolve() — a standalone hostname->IP-literal-strings lookup, built on the
+# same _resolve_v4/_resolve_v6 machinery Socket.connect() uses internally.
+# Not part of the PLAN_HTTP_CLIENT.md socket contract (which only needs
+# Socket.connect() to resolve transparently) but a natural, cheap-to-expose
+# building block on top of it - useful on its own and gives the resolver a
+# directly testable surface independent of a live TCP connect().
+#
+# port is irrelevant to a pure address lookup, so _resolve_v4/_v6 are called
+# with a dummy 0 and the port is dropped again (via SocketAddr.host()) rather
+# than exposing SocketAddr's own host+port pairing here, which would wrongly
+# imply the port means something.
+# ---------------------------------------------------------------------------
+
+def resolve( host: str, family: i32 = AF_INET ) -> Result[list[str], OSError]:
+	_ensure_wsa_started().or_return()
+	out: list[str] = list[str]()
+	if family == AF_INET6:
+		candidates: list[SockAddrIn6] = _resolve_v6( host, u16( 0 ), SOCK_STREAM ).or_return()
+		for i in range( len( candidates )):
+			addr: SocketAddr = _sockaddr_in6_to_addr( candidates.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
+			out.append( addr.host() ).unwrap( 'resolve: append' )
+	else:
+		candidates4: list[SockAddrIn] = _resolve_v4( host, u16( 0 ), SOCK_STREAM ).or_return()
+		for i in range( len( candidates4 )):
+			addr4: SocketAddr = _sockaddr_in_to_addr( candidates4.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
+			out.append( addr4.host() ).unwrap( 'resolve: append' )
+	return Result.Ok( out )

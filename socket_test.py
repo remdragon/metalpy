@@ -228,6 +228,150 @@ def main() -> i32:
 	return 0
 '''
 
+# connect() now resolves hostnames via getaddrinfo() instead of requiring a
+# pre-resolved IP literal - 'localhost' is the standard hermetic choice
+# (every OS resolves it locally, no real DNS round trip). Binds an ephemeral
+# loopback listener first (same pattern as _TCP_LOOPBACK_ECHO) so the actual
+# connect target is real and live, then connects to it BY HOSTNAME.
+_TCP_CONNECT_BY_HOSTNAME = '''
+import socket
+
+def main() -> i32:
+	server: socket.Socket = socket.Socket.tcp().unwrap( 'server create' )
+	server.bind( '127.0.0.1', u16( 0 )).unwrap( 'server bind' )
+	server.listen().unwrap( 'server listen' )
+	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
+
+	client: socket.Socket = socket.Socket.tcp().unwrap( 'client create' )
+	client.connect( 'localhost', bound.port() ).unwrap( 'client connect via hostname' )
+
+	match server.accept():
+		case Result.Ok( pair ):
+			conn: socket.Socket = pair[0]
+		case Result.Err( _ ):
+			return 1
+
+	conn.close()
+	client.close()
+	server.close()
+	return 0
+'''
+
+# Same as above but AF_INET6 - exercises _resolve_v6/hints.ai_family=AF_INET6
+# specifically (getaddrinfo's own family filtering), not just the AF_INET path.
+_TCP_CONNECT_BY_HOSTNAME_IPV6 = '''
+import socket
+
+def main() -> i32:
+	server: socket.Socket = socket.Socket.tcp( socket.AF_INET6 ).unwrap( 'server create' )
+	server.bind( '::1', u16( 0 )).unwrap( 'server bind' )
+	server.listen().unwrap( 'server listen' )
+	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
+
+	client: socket.Socket = socket.Socket.tcp( socket.AF_INET6 ).unwrap( 'client create' )
+	client.connect( 'localhost', bound.port() ).unwrap( 'client connect via hostname' )
+
+	match server.accept():
+		case Result.Ok( pair ):
+			conn: socket.Socket = pair[0]
+		case Result.Err( _ ):
+			return 1
+
+	conn.close()
+	client.close()
+	server.close()
+	return 0
+'''
+
+# A bogus/unresolvable hostname must fail connect() with OSError.Invalid -
+# same bucket _build_sockaddr_in/6 already use for an unparseable IP literal
+# (see lib/socket.py's own _resolve_v4/_resolve_v6 comment for why getaddrinfo's
+# own EAI_*/WSA* failure codes aren't mapped to a more specific OSError variant).
+_CONNECT_BOGUS_HOSTNAME = '''
+import socket
+
+def main() -> i32:
+	client: socket.Socket = socket.Socket.tcp().unwrap( 'client create' )
+	match client.connect( 'this-host-should-not-exist.invalid', u16( 80 )):
+		case Result.Ok( _ ):
+			return 1  # should have failed - not a resolvable hostname
+		case Result.Err( e ):
+			if e != OSError.Invalid:
+				return 2
+	return 0
+'''
+
+# Numeric IP literals must keep working through connect() now that it always
+# routes through getaddrinfo() (real getaddrinfo recognizes numeric literals
+# without any extra flag, per POSIX/Winsock - this is the regression check).
+_CONNECT_BY_IP_LITERAL_STILL_WORKS = '''
+import socket
+
+def main() -> i32:
+	server: socket.Socket = socket.Socket.tcp().unwrap( 'server create' )
+	server.bind( '127.0.0.1', u16( 0 )).unwrap( 'server bind' )
+	server.listen().unwrap( 'server listen' )
+	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
+
+	client: socket.Socket = socket.Socket.tcp().unwrap( 'client create' )
+	client.connect( '127.0.0.1', bound.port() ).unwrap( 'client connect via IP literal' )
+
+	match server.accept():
+		case Result.Ok( pair ):
+			conn: socket.Socket = pair[0]
+		case Result.Err( _ ):
+			return 1
+
+	conn.close()
+	client.close()
+	server.close()
+	return 0
+'''
+
+# socket.resolve() - the standalone hostname->IP-literal-strings lookup built
+# on the same _resolve_v4/_resolve_v6 machinery connect() uses internally.
+# Checked for both families since resolve() takes an explicit family arg.
+_RESOLVE_LOCALHOST = '''
+import socket
+
+def main() -> i32:
+	v4: list[str] = socket.resolve( 'localhost', socket.AF_INET ).unwrap( 'resolve v4' )
+	if len( v4 ) == 0:
+		return 1
+	found_v4: bool = False
+	for i in range( len( v4 )):
+		if v4.__getitem__( i ).unwrap( 'v4 idx' ) == '127.0.0.1':
+			found_v4 = True
+	if not found_v4:
+		return 2
+
+	v6: list[str] = socket.resolve( 'localhost', socket.AF_INET6 ).unwrap( 'resolve v6' )
+	if len( v6 ) == 0:
+		return 3
+	found_v6: bool = False
+	for i in range( len( v6 )):
+		if v6.__getitem__( i ).unwrap( 'v6 idx' ) == '::1':
+			found_v6 = True
+	if not found_v6:
+		return 4
+
+	return 0
+'''
+
+# resolve() on a bogus hostname must fail the same way connect() does.
+_RESOLVE_BOGUS_HOSTNAME = '''
+import socket
+
+def main() -> i32:
+	match socket.resolve( 'this-host-should-not-exist.invalid', socket.AF_INET ):
+		case Result.Ok( _ ):
+			return 1  # should have failed - not a resolvable hostname
+		case Result.Err( e ):
+			if e != OSError.Invalid:
+				return 2
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile socket tests' )
 class SocketBehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -256,6 +400,24 @@ class SocketBehaviorTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_bind_invalid_address( self ) -> None:
 		self._run( _BIND_INVALID_ADDRESS )
+
+	def test_tcp_connect_by_hostname( self ) -> None:
+		self._run( _TCP_CONNECT_BY_HOSTNAME )
+
+	def test_tcp_connect_by_hostname_ipv6( self ) -> None:
+		self._run( _TCP_CONNECT_BY_HOSTNAME_IPV6 )
+
+	def test_connect_bogus_hostname( self ) -> None:
+		self._run( _CONNECT_BOGUS_HOSTNAME )
+
+	def test_connect_by_ip_literal_still_works( self ) -> None:
+		self._run( _CONNECT_BY_IP_LITERAL_STILL_WORKS )
+
+	def test_resolve_localhost( self ) -> None:
+		self._run( _RESOLVE_LOCALHOST )
+
+	def test_resolve_bogus_hostname( self ) -> None:
+		self._run( _RESOLVE_BOGUS_HOSTNAME )
 
 
 if __name__ == '__main__':
