@@ -209,15 +209,11 @@ def main() -> None:
 		if active_target['os'] == 'windows' and exe_path.suffix != '.exe':
 			exe_path = exe_path.with_suffix( exe_path.suffix + '.exe' )
 		ldflags = args.ldflags
-		libs = set( compiler.extern_libs )
-		for lib in sorted( libs ):
+		for lib in sorted( compiler.extern_libs ):
 			if lib == 'c':
 				continue
 			if lib not in ldflags:
-				if cc.name == 'cl':
-					flag = f'{lib}.lib'
-				else:
-					flag = f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( cc, lib, compiler.extern_libs[lib], verbose = args.v )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip )
 		if link_result.returncode != 0:
