@@ -5553,7 +5553,15 @@ class Tests( unittest.TestCase ):
 		# prototyping the RCClass-subclassing plan's Phase 2 fallible
 		# super().__init__() chaining, unrelated to subclassing itself)
 		self.assertIn( 'JumpIfTrue', kinds ) # is_err() branch on Bar(...)'s own construction result
-		self.assertIn( 'Decref', kinds ) # self decref'd on the Err path
+		# self decref'd on the OK path (its own original reference dropped
+		# once ownership moves into the Ok payload - see _emit_fallible_
+		# construction's own comment). The Err path no longer decrefs self at
+		# all: it frees self's raw allocation directly (ir.CastWrap+ir.Call
+		# to sys.free) rather than going through the class's ordinary,
+		# shared vtable destructor - see _emit_fallible_construction's own
+		# comment on why a partially-constructed self can never safely go
+		# through that path
+		self.assertIn( 'Decref', kinds )
 		self.assertIn( 'Jump', kinds )
 
 	def test_missing_attribute_is_a_compile_error( self ) -> None:

@@ -940,14 +940,47 @@ class FallibleInitConstructionRCLifetimeTests( test_support.RealCompileMixin, Co
 	   through cfg.decref()+manually_decreffed(), mirroring
 	   _lower_compiler_decref's own compiler.decref(x) handling exactly.
 
+	3. The Err branch's self_var cleanup (even after fix #2 above routed it
+	   through cfg.decref()+manually_decreffed() instead of a bare
+	   ir.Decref) still released self via the class's ordinary, SHARED
+	   vtable destructor - the exact same one used to destroy any fully-
+	   valid instance, which unconditionally decrefs EVERY RC-typed
+	   attribute. self is only PARTIALLY constructed on the Err path -
+	   reading an attribute this __init__ never reached an assignment for
+	   reads whatever raw, unrelated bytes sys.alloc's allocator happened to
+	   return, not a valid reference. A real, confirmed
+	   STATUS_HEAP_CORRUPTION (0xC0000374 on Windows), not just a logical
+	   bug - see fallible_construction_unassigned_rc_field_on_err_path_no_
+	   crash below. A second, subtler half of the same bug: even an
+	   attribute that WAS assigned before the failing Err path could
+	   silently stop being released by __init__'s OWN unwind the moment a
+	   LATER, textually-subsequent success-path return in the same __init__
+	   completed construction (Epilogue.cancelled is one mutable flag
+	   shared by every jump into that entry's label, not a per-jump-site
+	   snapshot - build_epilogue_ladder() bakes in the FINAL state, not the
+	   state as of each earlier jump's own time) - masked as a leak, not a
+	   crash, only because the generic-destructor fallback this fix removes
+	   happened to independently release the same attribute again on its
+	   own way out; see fallible_construction_assigned_rc_field_before_
+	   later_err_no_leak below. Fixed in two parts: _stmt_Return's own
+	   Err-path-of-a-fallible-__init__ case now always does an inline
+	   (never shared-label) unwind, so it correctly releases exactly
+	   whichever RC attributes were actually assigned along the path taken,
+	   using its own precise, path-sensitive CFG state; and
+	   _emit_fallible_construction's Err branch no longer releases self via
+	   the generic destructor at all - it frees self's raw allocation
+	   directly (sys.free), skipping both the field cascade (now entirely
+	   __init__'s own responsibility) and any user __del__ (forbidden on
+	   this path regardless, per SYNTAX.md).
+
 	Every RC-lifetime case below loops hundreds of times with a real heap
 	allocation per iteration (matching this codebase's own
 	rc_lifetime_repeated_*_no_leak convention above) rather than checking
 	just one iteration: a single double-free doesn't reliably corrupt the
 	heap badly enough to crash immediately, but repetition makes both
 	directions (double-free AND any leak from an over-corrected fix) show up
-	reliably. The final case (fallible_construction_as_direct_match_subject)
-	is unrelated to RC lifetime - it's a compiler-crash (AssertionError)
+	reliably. The fallible_construction_as_direct_match_subject case is
+	unrelated to RC lifetime - it's a compiler-crash (AssertionError)
 	regression in type_resolver.py's visit_Match, deterministic on the first
 	attempt, so it doesn't need the loop convention. '''
 	def setUp( self ) -> None:
@@ -1132,6 +1165,113 @@ def main() -> i32:
 				return b.v - 5
 			case Result.Err( e ):
 				return 99
+''' ),
+			# a THIRD, distinct bug from the two RC/double-free ones above and
+			# the match-subject compiler crash just above: a class with an RC-
+			# typed field that ISN'T assigned along the path that returns Result.
+			# Err(...) - self is only PARTIALLY constructed on this path, but
+			# _emit_fallible_construction's own Err-branch cleanup used to release
+			# self via the class's ordinary, shared vtable destructor
+			# (release_object -> $$__destructor__), the SAME one used to destroy
+			# any fully-valid instance - which unconditionally decrefs EVERY RC-
+			# typed field, including `held` here, which was never written on this
+			# path. Reading self->held then reads whatever raw bytes sys.alloc's
+			# allocator happened to return (release builds never zero fresh
+			# allocations at all; even the debug-only fill lib/sys.py's alloc[T]
+			# applies is deliberately a nonzero poison byte, not zero - see its
+			# own comment), so release_object() dereferences/decrements a
+			# refcount through a garbage pointer - a real, confirmed
+			# STATUS_HEAP_CORRUPTION (0xC0000374) on Windows, not just a logical
+			# bug. Fixed in two parts: (1) __init__'s own Err-path return now
+			# always does an inline (never shared-label) unwind, so it correctly
+			# releases only whichever RC attributes IT actually assigned, using
+			# its own precise, path-sensitive CFG state (_stmt_Return's
+			# construction_err_path special case); (2) the call site's Err-branch
+			# release of self no longer goes through the generic destructor at
+			# all - it frees self's raw allocation directly (sys.free), skipping
+			# both the field cascade and any user __del__ (forbidden here by
+			# SYNTAX.md regardless)
+			( 'fallible_construction_unassigned_rc_field_on_err_path_no_crash', '''
+class MyError:
+	pass
+
+class Holder:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Box:
+	tag: i32
+	held: Holder
+	def __init__( self, tag: i32, held: Holder ) -> Result[None, MyError]:
+		if tag < 0:
+			return Result.Err( MyError() )
+		self.tag = tag
+		self.held = held
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		h: Holder = Holder( 7 )
+		i: i32 = 0
+		while i < 500:
+			r: Result[Box, MyError] = Box( -1, h )
+			if not r.is_err():
+				return 1
+			i += 1
+		return 0
+''' ),
+			# the companion shape to the one just above: the RC-typed field IS
+			# assigned before a LATER validation fails and returns Result.
+			# Err(...) - exercises the OTHER half of the same fix.
+			# complete_construction()'s own success-path cancellation (run by a
+			# LATER, textually-subsequent Result.Ok(...) return in the same
+			# __init__) mutates a mutable Epilogue.cancelled flag shared by every
+			# jump into that entry's label - before this fix, an EARLIER Err-path
+			# return that had already committed to a shared epilogue label
+			# (while `held`'s entry was still live) silently lost its own decref
+			# of `held` the moment that LATER success path ran
+			# complete_construction(), since build_epilogue_ladder() bakes each
+			# entry's FINAL cancelled state into every jump site that shares it,
+			# not the state as of each jump's own time - a real leak, masked
+			# only by the call site's own generic-destructor fallback (removed
+			# by this same fix, for the never-assigned case above)
+			# coincidentally releasing `held` again on its way out. Checks exact
+			# refcount, not just "doesn't crash" - a leak wouldn't crash within
+			# 500 iterations either
+			( 'fallible_construction_assigned_rc_field_before_later_err_no_leak', '''
+class MyError:
+	pass
+
+class Holder:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Box:
+	tag: i32
+	held: Holder
+	def __init__( self, tag: i32, held: Holder, extra: i32 ) -> Result[None, MyError]:
+		self.held = held
+		if extra < 0:
+			return Result.Err( MyError() )
+		self.tag = tag
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		h: Holder = Holder( 7 )
+		before: usize = compiler.refcount( h )
+		i: i32 = 0
+		while i < 500:
+			r: Result[Box, MyError] = Box( 3, h, -1 )
+			if not r.is_err():
+				return 1
+			i += 1
+		after: usize = compiler.refcount( h )
+		if before != after:
+			return compiler.cast( i32, 2 + after )
+		return 0
 ''' ),
 		] )
 
