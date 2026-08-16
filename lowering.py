@@ -8729,7 +8729,9 @@ class FunctionLowering:
 				winning_stub = next( ( s for s in target.stubs if s.bound_to is fn ), None )
 				if (
 					winning_stub is not None and winning_stub.return_type is not fn.return_type
-					and overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves )
+					and overload_resolution.stub_covers_call(
+						winning_stub, call_slots, arg_leaves, self.lowering._type_resolver._same_type,
+					)
 				):
 					# only actually narrow (build a distinct replace()'d copy)
 					# when the stub's own return type is genuinely a DIFFERENT
@@ -8766,7 +8768,10 @@ class FunctionLowering:
 				return fn
 
 			try:
-				branches, resolved = overload_resolution.resolve_call( target.stubs, target.implementations, arg_types, kwarg_types, qualname = target.qualname )
+				branches, resolved = overload_resolution.resolve_call(
+				target.stubs, target.implementations, arg_types, kwarg_types,
+				qualname = target.qualname, same_type = self.lowering._type_resolver._same_type,
+			)
 			except CompileError as e:
 				# resolve_call is a pure function of types with no
 				# AST/Discovery reference by design - it raises unrecorded,
@@ -8790,7 +8795,9 @@ class FunctionLowering:
 			winning_stub = next( ( s for s in target.stubs if s.bound_to is resolved ), None )
 			if (
 				winning_stub is not None and winning_stub.return_type is not resolved.return_type
-				and overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves )
+				and overload_resolution.stub_covers_call(
+					winning_stub, call_slots, arg_leaves, self.lowering._type_resolver._same_type,
+				)
 			):
 				narrowed_return_type = winning_stub.return_type
 			target = resolved

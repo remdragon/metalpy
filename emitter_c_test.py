@@ -7723,6 +7723,57 @@ def main() -> i32:
 		] )
 
 
+class OverloadGenericSubstitutionMatchingRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' overload_resolution.py's own _contains/_intersect/_subtract used a raw
+	`is` identity check to decide whether a call-site argument's type matches
+	an @overload candidate's own declared parameter type - _leaf_is_accepted's
+	own claimed invariant ("the existing dedup caches already guarantee 'same
+	type' is the same object") turned out not to hold in general: a generic
+	function's own list[T], specialized to list[i32], is a DIFFERENT
+	Specialization object than an @overload candidate's own freshly-annotated
+	list[i32] parameter - the exact same duality TypeResolver._same_type
+	exists to handle elsewhere in this compiler. Before the fix, calling
+	through a generic function into an @overload group with a generic-
+	substituted argument type raised "no matching overload" for a call that
+	should resolve cleanly - confirmed via a real repro
+	(PLAN_COMPILER_BUG_SWEEP.md). Fixed by threading a caller-supplied
+	`same_type` predicate (TypeResolver._same_type) through resolve_call/
+	stub_covers_call, defaulting to plain `is` so overload_resolution_test.
+	py's own isolated unit tests (which never exercise this duality) stay
+	unchanged. This also unblocks two OTHER, previously-unconfirmed fixes
+	(lowering.py's _lower_dispatch_tests/_maybe_unwrap_union_arg, fixed in an
+	earlier pass but gated behind this same upstream bug) - the runtime
+	conditional-dispatch shape below genuinely exercises both. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'generic_substituted_argument_matches_overload_candidate', '''
+@overload
+def handle( x: list[i32] ) -> i32:
+	return 1
+
+@overload
+def handle( x: str ) -> i32:
+	return 2
+
+def dispatch[T]( v: list[T]|str ) -> i32:
+	return handle( v )
+
+def main() -> i32:
+	if dispatch[i32]( list[i32]() ) != 1:
+		return 1
+	if dispatch[i32]( 'hi' ) != 2:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class Utf8CodecRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Codec.decode widened to bytes|bytearray, against the REAL Utf8
 	class (not a synthetic stand-in) - constructing a real Utf8() instance

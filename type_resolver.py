@@ -3370,7 +3370,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			kwarg_types[kw.arg] = kw_type
 		try:
 			_, resolved = overload_resolution.resolve_call(
-				group.stubs, group.implementations, arg_types, kwarg_types, qualname = group.qualname,
+				group.stubs, group.implementations, arg_types, kwarg_types,
+				qualname = group.qualname, same_type = self.resolver._same_type,
 			)
 		except CompileError:
 			return None
@@ -3382,7 +3383,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			**{ i: tuple( t.leaves() ) for i, t in enumerate( arg_types ) },
 			**{ name: tuple( t.leaves() ) for name, t in kwarg_types.items() },
 		}
-		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves ):
+		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves, self.resolver._same_type ):
 			return winning_stub.return_type
 		return resolved.return_type
 

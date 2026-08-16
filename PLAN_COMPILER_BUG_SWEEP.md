@@ -72,19 +72,13 @@ specifically to treat these as equal, and several call sites use it correctly
   (emitter_c_test.py).
 - `lowering.py`'s `_lower_dispatch_tests` and `_maybe_unwrap_union_arg` (both
   `attr.type is leaf_type`/`attr.type is target_type`) - fixed via
-  `_same_type` for consistency with the rest of the codebase, but **no
-  positive repro could be constructed for either**: both are only ever
-  reached through the overload-dispatch mechanism
-  (`_lower_conditional_dispatch`), which is gated by `overload_resolution.py`'s
-  own SEPARATE identity-based leaf matching (`_leaf_is_accepted`, the
-  "awareness only" item below) - a call site that would trigger THIS
-  duality gets rejected by THAT earlier check first, before ever reaching
-  these two lines. The fix is a strict superset of the old behavior (only
-  accepts more correct programs, can never wrongly reject one already
-  accepted), so applied anyway for consistency; full suite green regardless.
-  No dedicated regression test added for these two specifically, since none
-  could be constructed - would need the `overload_resolution.py` item fixed
-  first to ever exercise them with a legitimately-mismatched-but-equal leaf.
+  `_same_type` for consistency with the rest of the codebase. **Now
+  independently confirmed reachable**, since `overload_resolution.py`'s own
+  identity-based matching (below) has since been fixed too - the repro that
+  proves that fix (`OverloadGenericSubstitutionMatchingRealCompileTests`,
+  emitter_c_test.py) genuinely reaches real runtime conditional-dispatch
+  codegen (`.tag` checks in the generated C), exercising both these lines
+  for real.
 
 **Fixed** (both, this pass):
 
@@ -153,16 +147,35 @@ specifically to treat these as equal, and several call sites use it correctly
   all. No dedicated regression test added, for the same reason as those
   two.
 
-**Awareness only - deliberately identity-based by design, per their own
-comments. Do not touch without separately confirming the design intent still
-holds:**
+**Fixed** (was "awareness only" - confirmed with the user that the
+documented design assumption no longer held, then fixed):
+
+- `overload_resolution.py`'s `_contains`/`_intersect`/`_subtract` (and the
+  combo-dispatch leaf comparisons inside `resolve_call` itself) claimed the
+  existing dedup/interning caches guarantee "same type == same object" for
+  every Type this module ever compares - confirmed FALSE via a real repro:
+  a generic function's own `list[T]`, specialized to `list[i32]`, is a
+  different `Specialization` object than an `@overload` candidate's own
+  freshly-annotated `list[i32]` parameter, raising "no matching overload"
+  for a call that should resolve cleanly. This also fully explains why the
+  two `lowering.py` dispatch candidates above couldn't get a positive repro
+  in the previous pass - this bug gated them.
+
+  This module is deliberately dependency-free ("pure function of types, no
+  Discovery reference" - own docstring, load-bearing for
+  `overload_resolution_test.py`'s isolated unit tests), so it can't just
+  call `TypeResolver._same_type` directly. Fixed by threading a
+  caller-supplied `same_type` predicate through `resolve_call`/
+  `stub_covers_call`/`_contains`/`_intersect`/`_subtract`, defaulting to
+  plain `is` (every existing unit test - all built from simple, non-generic
+  classes - is unaffected); `lowering.py`/`type_resolver.py`, the two real
+  production callers, now pass `TypeResolver._same_type`. Regression test:
+  `OverloadGenericSubstitutionMatchingRealCompileTests` (emitter_c_test.py).
 
 - [cfg.py:1251](cfg.py:1251) (`_tag_gated_refcount_instructions`) - `members =
-  [m for m in t.attributes if any(m.type is leaf for leaf in leaves)]`.
-- [overload_resolution.py:41-48](overload_resolution.py:41) (`_contains`/
-  `_intersect`/`_subtract`) - relies on the existing dedup/interning caches
-  (`_get_or_create_union`/`_specialization`/`_move`) guaranteeing "same type ==
-  same object" for the specific universe these functions operate over.
+  [m for m in t.attributes if any(m.type is leaf for leaf in leaves)]` -
+  still genuinely "awareness only", not investigated this pass. Do not
+  touch without separately confirming its own design intent still holds.
 
 ## Shape 2 - parallel type-resolution paths that drifted out of sync
 
@@ -315,13 +328,13 @@ which needs no hint).
 5. ~~`lowering.py`'s `_expr_Constant`/`_emit_const` crash~~ - **fixed**, see
    above. Found reachable via TWO call sites (bare literal return/assignment,
    and explicit `Color(...)` construction), both now cleanly rejected.
-6. Everything under "awareness only" - do not fix without first confirming with
-   the user that the documented deliberate-design reasoning no longer holds.
-   Note: `overload_resolution.py`'s `_leaf_is_accepted`/`_contains` (its own
-   identity-based design, documented as relying on the dedup caches) is now
-   the more load-bearing of the two "awareness only" items - it's the reason
-   two of the `lowering.py` Shape 1 candidates couldn't get a positive repro;
-   worth reconsidering whether it should move up in priority.
+6. ~~`overload_resolution.py`'s `_contains`/`_intersect`/`_subtract`~~ -
+   **fixed**, see above (user confirmed the design assumption no longer held,
+   then approved the fix). Also retroactively confirmed the two `lowering.py`
+   Shape 1 dispatch candidates as genuinely reachable.
+7. `cfg.py:1251` (`_tag_gated_refcount_instructions`) - the one remaining
+   "awareness only" item. Do not fix without first confirming with the user
+   that its own documented deliberate-design reasoning no longer holds.
 
 ## Verification plan for any fix made from this list
 
