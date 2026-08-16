@@ -10,7 +10,7 @@ from typing import Any, Callable, Generator, NoReturn
 import compile_time_transformer
 from errors import CompileError, ErrorCollector
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, GeneratorType, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, FixedArrayType, GeneratorType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
 	Module, _is_covered_by, _overlaps, int_stem_range,
 )
@@ -249,6 +249,7 @@ class Discovery( ast.NodeVisitor ):
 		self._callables: dict[str,CallableType] = {}
 		self._closures: dict[str,ClosureType] = {}
 		self._tuples: dict[str,TupleType] = {}
+		self._fixed_arrays: dict[str,FixedArrayType] = {}
 
 		# lazily detected the first time a has_library(...) check (decorator
 		# or compiler.has_library(...) expression - see _matches_has_library/
@@ -781,7 +782,7 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType|GeneratorType:
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType|FixedArrayType|GeneratorType:
 		# move[T]/copy[T] are compiler syntax, not a real generic lookup -
 		# recognized textually here the same way @move is recognized
 		# textually as a decorator name in _parse_function, rather than
@@ -895,6 +896,27 @@ class Discovery( ast.NodeVisitor ):
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
 		if not type_params:
+			# ElemType[N] where N is a bare positive integer constant, and
+			# ElemType isn't itself generic - SYNTAX.md's "Fixed-Size Inline
+			# Array (inside @struct): u16[32], u8[8]", not a generic type
+			# argument (a genuine generic subscript's own slice is always a
+			# TYPE expression, an ast.Name/Attribute/Subscript/BinOp, never a
+			# bare int Constant - so this can never misfire against a real
+			# generic instantiation; every actual one already returned above
+			# via the type_params-truthy path this branch is the `else` of).
+			# See FixedArrayType's own docstring for why this is recognized
+			# here (right where a bad subscript would otherwise unconditionally
+			# fail) but restricted to @cstruct/@cunion FIELD position only -
+			# enforced by the two call sites that matter (_make_annotation_
+			# resolver for class/module-level AnnAssign, and _parse_function's
+			# parameter/return-type resolution), not here (this method has no
+			# notion of "which position is this annotation in").
+			if ( isinstance( base, Type ) and isinstance( node.slice, ast.Constant )
+					and isinstance( node.slice.value, int ) and not isinstance( node.slice.value, bool ) ):
+				count = node.slice.value
+				if count <= 0:
+					self.fail( f'fixed-size array count must be a positive integer, got {count}: {ast.unparse(node)}', node )
+				return self._get_or_create_fixed_array( base, count )
 			self.fail( f'{base.qualname} is not generic, cannot subscript it', node )
 
 		slice_node = node.slice
@@ -969,6 +991,24 @@ class Discovery( ast.NodeVisitor ):
 		)
 		self._tuples[key] = tt
 		return tt
+
+	def _get_or_create_fixed_array( self, elem_type: Type, count: int ) -> FixedArrayType:
+		# key mirrors _get_or_create_tuple_type's own qualname convention -
+		# see FixedArrayType's own docstring for why this is a distinct kind
+		# from an ordinary generic Specialization
+		key = f'{elem_type.qualname}[{count}]'
+		if fa := self._fixed_arrays.get( key ):
+			return fa
+		fa = FixedArrayType(
+			stem = key,
+			qualname = key,
+			file = None,
+			line = None,
+			elem_type = elem_type,
+			count = count,
+		)
+		self._fixed_arrays[key] = fa
+		return fa
 
 	def _get_or_create_closure_type( self, arg_types: list[Type], return_type: Type ) -> ClosureType:
 		key = f'Closure[[{",".join( a.qualname for a in arg_types )}],{return_type.qualname}]'
@@ -1181,9 +1221,34 @@ class Discovery( ast.NodeVisitor ):
 				with ( self.scope_context( scope ) if scope is not module else nullcontext() ):
 					var_obj.type = self.visit( annotation )
 					self._reject_bare_interface_value_type( var_obj.type, annotation, var_obj.qualname )
+					self._reject_fixed_array_outside_struct_field( var_obj.type, scope, annotation, var_obj.qualname )
 		def resolve() -> None:
 			self._resolve_guarded( var_obj, body )
 		return resolve
+
+	def _reject_fixed_array_outside_struct_field( self, t: 'Type|None', scope: 'Module|ClassLike|Function', node: ast.AST, context: str ) -> None:
+		''' a FixedArrayType (`u8[8]`-style fixed-size inline array - see its
+		own docstring) is only a legal field annotation on a plain @cstruct/
+		@cunion - never a module-level global, an RCClass/@interface field
+		(both are always heap-allocated/pointer-accessed, and this fix's own
+		zero-fill-only construction path is scoped to the plain-value stack-
+		construction compound-literal shape, not the RCClass/@interface `->
+		field = value;` per-field ASSIGNMENT shape, which cannot legally
+		target a C array at all), or a @union/@enum member (neither has
+		plain data fields in this sense). Checked at every annotation-
+		resolution site that can produce a FixedArrayType (this one for
+		module/class-level AnnAssign; _parse_function's parameter/return-type
+		resolution has its own identical call), rather than letting a bad
+		usage silently reach emission and produce invalid C. '''
+		if not isinstance( t, FixedArrayType ):
+			return
+		if isinstance( scope, ( CStruct, CUnion )) and not ( isinstance( scope, CStruct ) and scope.is_interface ):
+			return
+		self.fail(
+			f'{context}: a fixed-size inline array type ({t.qualname}) is only allowed as a plain @cstruct/@cunion field, '
+			f'not here: {ast.unparse(node)}',
+			node,
+		)
 
 	def _reject_bare_interface_value_type( self, t: 'Type|None', node: ast.AST, context: str ) -> None:
 		''' an @interface CStruct is never a plain value type - self,
@@ -2216,6 +2281,7 @@ class Discovery( ast.NodeVisitor ):
 							if is_move or is_copy:
 								param_type = param_type.inner
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
+							self._reject_fixed_array_outside_struct_field( param_type, fn, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
 								stem = arg.arg,
 								qualname = self._get_qualname( arg.arg ),
@@ -2252,6 +2318,7 @@ class Discovery( ast.NodeVisitor ):
 						if fn.node.returns is not None:
 							fn.return_type = self.visit( fn.node.returns )
 							self._reject_bare_interface_value_type( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
+							self._reject_fixed_array_outside_struct_field( fn.return_type, fn, fn.node.returns, f'{fn.qualname} return type' )
 						else:
 							fn.return_type = self.get_none_type()
 			# set self done *before* touching any overload siblings below - a

@@ -10827,6 +10827,378 @@ def main() -> i32:
 		] )
 
 
+class CEnumConstructionArgumentShapeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real bug: `EnumName(value)` (CEnum construction,
+	e.g. `OSError(rc)`) was rejected with a confusing "expected EnumName, got
+	<value's own type>" whenever `value` was a bare `ast.Name` (a local
+	variable or parameter reference), while the IDENTICAL underlying value
+	via a Call or BinOp argument (`OSError(get_rc())`, `OSError(rc + 0)`)
+	compiled fine - an inconsistency across argument AST SHAPE, not a real
+	difference in what was being constructed.
+
+	Root cause: `_try_lower_construct_call`'s CEnum branch used to pass
+	target_cls (the enum type ITSELF) as `_lower_expr`'s `expected_type` for
+	the argument, for every argument shape. A bare `ast.Name` operand
+	(`_expr_Name`) ignores `expected_type` and keeps its own declared type,
+	so the later `_check_assignable` correctly (if confusingly-worded)
+	rejected a genuine underlying-type mismatch - `OSError`'s value_type is
+	u32, and a plain `i32` local doesn't automatically become one. But an
+	ordinary Call/BinOp argument's own result-typing tail (`_lower_call`'s
+	final dest allocation, `expected_type or target_return_type`) SILENTLY
+	relabeled the destination temp's type to target_cls directly, with no
+	check that the callee's real return type was even compatible - so those
+	shapes "worked" by accident, not because they were validated.
+
+	Fixed: every non-literal argument shape now lowers against value_type
+	(the underlying scalar, the argument's real natural type space) and is
+	explicitly relabeled onto the enum type via CastWrap - the same zero-
+	cost, well-defined C reinterpret cast an explicit T(x) scalar cast uses,
+	consistent across every argument shape, and permissive of genuine
+	cross-signedness reinterpretation (OSError's own construction is
+	documented as "a plain cast to the enum's underlying type", the same
+	promise an explicit u32(-11)-style WinAPI cast makes). A literal integer
+	argument keeps its own pre-existing fast path (a plain ir.Const, no
+	runtime cast) unchanged. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact repro shape: a bare local variable argument to a
+			# CEnum constructor, feeding straight into Result.Err(...) -
+			# used to be rejected outright
+			( 'bare_name_argument_to_enum_constructor_compiles_and_runs', '''
+def f() -> Result[None, OSError]:
+	rc: i32 = -5
+	return Result.Err( OSError( rc ))
+
+def main() -> i32:
+	r = f()
+	if r.is_err():
+		return 0
+	return 1
+''' ),
+			# consistency check: bare Name / Call / BinOp / literal argument
+			# shapes must all produce the SAME bit-exact underlying value for
+			# the identical logical error code, and a plain assignment back
+			# to the enum's own value_type (already-established, unrelated
+			# CEnum<->value_type duality) must read that same value back out
+			( 'enum_constructor_argument_shapes_agree_bit_exactly', '''
+import compiler
+
+def get_rc() -> i32:
+	return -5
+
+def main() -> i32:
+	rc: i32 = -5
+	e_name: OSError = OSError( rc )
+	e_call: OSError = OSError( get_rc() )
+	with compiler.wrap_arithmetic:
+		e_binop: OSError = OSError( rc + 0 )
+	e_member: OSError = OSError.FileNotFoundError
+
+	v_name: u32 = e_name
+	v_call: u32 = e_call
+	v_binop: u32 = e_binop
+	expected: u32 = u32( -5 )
+
+	if v_name != expected:
+		return 1
+	if v_call != expected:
+		return 2
+	if v_binop != expected:
+		return 3
+	if e_member != OSError.FileNotFoundError:
+		return 4
+	return 0
+''' ),
+			# a routed-through-a-parameter shape (not just a local) - the
+			# task's own report specifically called out that this ALSO
+			# failed identically (not a locals-vs-parameters distinction)
+			( 'bare_name_parameter_argument_to_enum_constructor_compiles_and_runs', '''
+def mk( code: i32 ) -> OSError:
+	return OSError( code )
+
+def main() -> i32:
+	e: OSError = mk( -5 )
+	v: u32 = e
+	if v != u32( -5 ):
+		return 1
+	return 0
+''' ),
+			# the literal fast path (unaffected by this fix) - still folds to
+			# a plain constant and still range-checks correctly
+			( 'literal_argument_to_enum_constructor_still_works', '''
+def main() -> i32:
+	e: OSError = OSError( 2 )
+	if e != OSError.FileNotFoundError:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_out_of_range_literal_still_rejected( self ) -> None:
+		# negative check: the pre-existing literal magnitude/range validation
+		# (unrelated to and unchanged by this fix) must still reject a
+		# genuinely out-of-range literal argument, not just silently accept
+		# everything now that non-literal shapes are more permissive
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	e: OSError = OSError( 99999999999 )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+
+class FixedSizeArrayFieldTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for SYNTAX.md's documented-but-unimplemented
+	"Fixed-Size Inline Array (inside @struct): u16[32], u8[8]" - a bare
+	`ElemType[N]` field annotation used to fail outright at annotation-
+	resolution time ("intrinsics.u8 is not generic, cannot subscript it" -
+	visit_Subscript's generic-subscript path unconditionally rejected any
+	non-generic base). lib/guid.py's own GUID class already documented
+	hitting this exact gap for its `Data4[8]` field and worked around it by
+	unrolling into 8 separate `data4_0..data4_7: u8` fields instead.
+
+	Fixed via a new mpy_types.FixedArrayType, recognized in discovery.py's
+	visit_Subscript (a non-generic base subscripted by a bare positive int
+	constant, as opposed to a real generic type argument - which always
+	uses a TYPE expression as its slice, never a bare int, so this can
+	never misfire against a genuine generic instantiation) and given a real
+	C array declarator in struct/union body emission (`TYPE NAME[N];`,
+	special-cased in _struct_or_union_body the same way _declarator already
+	special-cases a function-pointer field's own discontinuous C syntax).
+
+	Deliberately scoped, not a general-purpose value type: a bare C array
+	is not assignable via `=` at all (only a whole containing struct/union
+	is), so this fix only supports (1) declaring the field, inside a plain
+	@cstruct/@cunion only - rejected everywhere else (parameters, return
+	types, module/class-level variables, RCClass/@interface fields) - and
+	(2) a `= 0` field default / explicit `ClassName(field=0)` construction
+	argument, meaning "zero-fill the whole array" (the one shape a C
+	designated initializer can express, `.field = {0}`). Reading a
+	FixedArrayType field back out as a whole value, or assigning one after
+	construction, is explicitly rejected with a clean error rather than
+	reaching emission and producing invalid C - element-level indexed
+	access is a separate, real, currently-unimplemented follow-up (the same
+	kind of gap this repo's own bytearray has today), not attempted here. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact SYNTAX.md-documented shape - a real @cstruct with a
+			# fixed-size inline array field, zero-filled by default,
+			# constructed bare, real sizeof() confirms correct C layout (no
+			# silent size-0/opaque-type fallback)
+			( 'fixed_array_field_declares_and_zero_fill_constructs', '''
+import compiler
+
+@cstruct
+class Foo:
+	a: u16 = 0
+	b: u8[8] = 0
+
+def main() -> i32:
+	f = Foo()
+	sz: usize = compiler.sizeof( Foo )
+	if sz != usize( 10 ):
+		return 1
+	return 0
+''' ),
+			# explicit ClassName(field=0) construction argument (not just the
+			# class-body default) - same zero-fill path, different call site
+			( 'fixed_array_field_explicit_zero_construction_argument', '''
+@cstruct
+class Foo:
+	a: u16 = 0
+	b: u8[8] = 0
+
+def main() -> i32:
+	f = Foo( a = 5, b = 0 )
+	if f.a != 5:
+		return 1
+	return 0
+''' ),
+			# multiple array fields of different element types/counts in one
+			# struct, interleaved with scalar fields - mirrors SYNTAX.md's own
+			# DynamicTimeZoneInformation worked example almost verbatim
+			( 'multiple_fixed_array_fields_interleaved_with_scalars', '''
+@cstruct
+class Multi:
+	bias: i32 = 0
+	name: u16[32] = 0
+	date: u16[8] = 0
+	flag: u8 = 0
+	pad: u8[3] = 0
+
+def main() -> i32:
+	m = Multi( bias = 7 )
+	if m.bias != 7:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_out_of_range_field_annotation_type_still_rejects_generic_subscript_errors( self ) -> None:
+		# negative check: an actually-invalid subscript (a real, non-generic,
+		# non-array-shaped misuse) must still be rejected the same way it
+		# always was - this fix only ever WIDENS what's accepted (a non-
+		# generic base + a bare positive int constant slice), never narrows
+		# the existing "not generic, cannot subscript it" rejection for
+		# every other shape
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	x: bool[i32] = None', # bool is non-generic, i32 is a TYPE not an int constant - still invalid
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'not generic', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_field_rejected_as_parameter_type( self ) -> None:
+		self._run( '\n'.join([
+			'def f( x: u8[8] ) -> i32:',
+			'	return 0',
+			'',
+			'def main() -> None:',
+			'	f( 0 )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_field_rejected_as_module_global( self ) -> None:
+		self._run( '\n'.join([
+			'g: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	x = g',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_reading_fixed_array_field_as_a_whole_value_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	x = f.b',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be read as a whole value', self.discovery.errors.errors[0] )
+
+
+class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real, confirmed silent-data-corruption bug: an
+	`@extern` function declared with a `T|None` return type where T is a
+	pointer (Ptr[T]/ConstPtr[T]) got its C prototype declared as returning
+	the FULL tagged-union struct BY VALUE (plain c_type(function.return_type))
+	- but the real foreign symbol's actual ABI just returns a bare, possibly-
+	null pointer in a single register. The mismatched calling convention
+	silently corrupted the returned pointer VALUE (not a crash, not a
+	null-vs-non-null confusion - the wrong bit pattern, non-null but
+	incorrect). Confirmed via ws2_32's real inet_ntop, whose documented
+	contract is "returns pStringBuf on success": before the fix, the
+	returned pointer compared unequal to pStringBuf even on success. Fixed
+	in emitter_c.py: _extern_nullable_pointer_leaf recognizes the
+	Ptr[T]|None-on-an-@extern-return shape; _function_prototype declares the
+	REAL raw-pointer C return type (matching the actual foreign ABI) instead
+	of the tagged-union struct; ir.Call's own emission bridges the raw
+	pointer result into the tagged-union representation by hand, picking the
+	tag at RUNTIME from the pointer's own null-ness (there's no compile-time
+	branch to pick it from, unlike an ordinary metalpy function's own
+	`return some_ptr`/`return None`, each of which resolves to a distinct,
+	explicit union-member-constructor call). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@unittest.skipUnless( os.name == 'nt', 'needs a real Winsock DLL to call (ws2_32.dll)' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact shape that demonstrated the bug: inet_ntop's real,
+			# documented contract is "returns pStringBuf on success" - a
+			# pointer EQUALITY check against a buffer this program itself
+			# passed in, not just a null/non-null check, so a corrupted (but
+			# still non-null) return value is caught, not just a crash
+			( 'nullable_pointer_extern_return_roundtrips_correctly', '''
+import compiler
+import sys
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_ntop' )
+def inet_ntop_union( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]|None: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr_val: u32 = u32( 0x0100007F ) # 127.0.0.1
+	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
+	sys.memzero( strbuf, usize( 16 ))
+	res = inet_ntop_union( 2, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 ))
+	match res:
+		case None:
+			sys.free( strbuf )
+			return 1 # real failure - AF_INET should never actually fail here
+		case _:
+			if res != strbuf: # pre-fix: fires - the returned pointer VALUE was wrong
+				sys.free( strbuf )
+				return 2
+	sys.free( strbuf )
+	return 0
+''' ),
+			# the null branch: an invalid address family makes inet_ntop
+			# return NULL for real - confirms the runtime tag-selection
+			# still correctly picks the None leaf (not just the Ptr leaf
+			# unconditionally)
+			( 'nullable_pointer_extern_return_null_case_still_recognized_as_none', '''
+import compiler
+import sys
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_ntop' )
+def inet_ntop_union( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]|None: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr_val: u32 = u32( 0x0100007F )
+	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
+	sys.memzero( strbuf, usize( 16 ))
+	res = inet_ntop_union( 999, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 )) # invalid family -> real NULL
+	match res:
+		case None:
+			sys.free( strbuf )
+			return 0
+		case _:
+			sys.free( strbuf )
+			return 1
+''' ),
+		] )
+
+
 class LocalImportAnnotationResolutionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' A function-body-local `from X import Y` immediately followed by a
 	same-function annotation using Y (`h: Y = ...`) previously failed to
