@@ -4828,21 +4828,35 @@ class Tests( unittest.TestCase ):
 			'	return',
 		])
 		mod = self._import( code )
-		none_type = self.discovery.get_none_type()
 		int_cls = mod.get_local( 'int' )
 		group = mod.get_local( 'foo' )
 		int_impl = group.implementations[0]
 		if int_impl.resolve is not None:
 			int_impl.resolve()
-		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 15, type = int_cls )
 
 		fn = self._lower_main()
-		self._assert_ir( fn, [
-			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
-			ir.Call( dest = None, target = int_impl, args = [ x ], kwargs = {} ),
-			ir.Return( value = None ),
-			ir.FuncEnd( name = 'main' ),
-		])
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# 2 calls, not 1: x's own plain `int` type doesn't match int_impl's
+		# real declared parameter type (int|None, a union) - x must first be
+		# coerced into it via the union's own synthesized member constructor
+		# (mirrors test_leaf_value_coerced_into_union_via_synthesized_
+		# constructor's identical shape for an ordinary, non-overloaded
+		# call), THEN the real, unconditional call to int_impl runs with the
+		# coerced value. Before this fix, this exact case (a non-literal
+		# argument whose plain type is a LEAF of an overloaded call's
+		# winning target's own union-typed parameter) skipped that coercion
+		# entirely - confirmed via a real compile producing a genuine
+		# "passing 'int32_t' to parameter of incompatible type 'struct
+		# $__u$$...'" C mismatch for the equivalent real-builtins shape
+		calls = [ instr for instr in fn.instructions if isinstance( instr, ir.Call ) ]
+		self.assertEqual( len( calls ), 2 )
+		coerce_call, real_call = calls
+		self.assertEqual( coerce_call.target.stem, 'int' )
+		self.assertEqual( len( coerce_call.args ), 1 )
+		self.assertEqual( coerce_call.args[0].stem, 'x' )
+		self.assertIs( coerce_call.args[0].type, int_cls )
+		self.assertIs( real_call.target, int_impl )
+		self.assertEqual( real_call.args, [ coerce_call.dest ] )
 
 	def test_overload_call_on_generic_class_specialization_substitutes_class_type_params( self ) -> None:
 		# regression test: an @overload group declared inside a generic

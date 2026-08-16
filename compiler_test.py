@@ -379,9 +379,22 @@ def main() -> None:
 ''' )
 		names = self._function_names()
 		self.assertIn( 'main', names )
-		# exactly one of the two plain implementations was scheduled, never
-		# the whole group and never the stub (stubs have no body to lower)
-		self.assertEqual( len( names ), 2 )
+		self.assertIn( '__main__.foo', names )
+		# 3, not 2: exactly one of the two plain implementations was
+		# scheduled (never the whole group and never the stub - stubs have
+		# no body to lower), PLUS the union's own synthesized 'int' member
+		# constructor - x's own plain `int` type doesn't match the winning
+		# implementation's real declared parameter type (int|None, a union),
+		# so it must be coerced into it first (see lowering_test.py's
+		# test_overload_call_resolves_to_unconditional_target for the exact
+		# IR shape this produces). Before this fix, that coercion was
+		# skipped entirely for this exact case (a non-literal argument whose
+		# plain type is a LEAF of an overloaded call's winning target's own
+		# union-typed parameter) - confirmed via a real compile of the
+		# equivalent real-builtins shape, which produced a genuine "passing
+		# 'int32_t' to parameter of incompatible type 'struct $__u$$...'" C
+		# mismatch
+		self.assertEqual( len( names ), 3 )
 
 	def test_multi_branch_dispatch_resolves_via_runtime_tag_check( self ) -> None:
 		# a union-typed argument (x: int|str) makes foo(x) ambiguous at
