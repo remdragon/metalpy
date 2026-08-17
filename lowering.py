@@ -4580,7 +4580,31 @@ class FunctionLowering:
 				self.lowering._type_resolver._same_type( attr.type, operand.type )
 				for attr in expected_union.attributes
 			):
+				was_fresh = self._cfg.is_fresh_temp( operand )
+				pre_coerce = operand
 				operand = self._coerce_into_union( operand, expected_union, node )
+				if was_fresh:
+					# _coerce_into_union's own ctor call unconditionally
+					# increfs whatever it wraps (needed when the wrapped
+					# value is a BORROWED reference its own caller still
+					# needs afterward) - but a value that was already a
+					# fresh, solely-owned temp here (a Call/Allocate
+					# result) doesn't need that extra reference kept
+					# alive too: release it right here, in place, rather
+					# than leaving it as a dangling pending-temp
+					# obligation for whatever later flush would otherwise
+					# decref it unconditionally. Confirmed as a real bug
+					# via a ternary branch specifically (ASAN: SEGV
+					# reading uninitialized stack memory on the OTHER
+					# branch, where this temp was never even created) -
+					# every other caller of this shared coercion tail has
+					# the identical gap, just silently masked there by
+					# dumb luck (a non-branching statement's own
+					# unconditional flush still nets the right refcount
+					# when there's no branch boundary for it to straddle).
+					for instr in self._cfg.decref( pre_coerce.type, pre_coerce ):
+						self._emit( instr )
+					self._cfg.untrack_temp( pre_coerce )
 		# a derived RCClass value flowing into a base-class context (arg, return,
 		# assignment) is an upcast: struct Derived* -> struct Base*, which C
 		# rejects without an explicit cast. A CastWrap is a borrowed reinterpret

@@ -1486,6 +1486,23 @@ class CFGState:
 		if rc_leaves( t ):
 			self._temp_states[temp.id] = t
 
+	def is_fresh_temp( self, operand: ir.Operand ) -> bool:
+		''' True when `operand` is a still-tracked, fresh/owned temp (a
+		Call/Allocate result registered via fresh_temp() above, not yet
+		consumed into a named binding or untracked) - NOT the same as
+		`isinstance(operand, ir.Temp)` alone: some Temps are deliberately
+		never registered (a bare borrowing cast, e.g. compiler.cast(...) or
+		list._read_element's own returned slot - see this class's own
+		untrack_temp docstring and lowering.py's matching comments), so
+		checking membership in _temp_states is the only reliable signal.
+		Used by callers (e.g. _coerce_or_check_operand) that need to
+		release/untrack a PRE-coercion operand in place, rather than
+		leaving it as a dangling pending-temp obligation for whatever
+		later flush would otherwise decref it unconditionally - safe only
+		when the operand was genuinely fresh to begin with, never for a
+		borrowed one. '''
+		return isinstance( operand, ir.Temp ) and operand.id in self._temp_states
+
 	def delete_temp( self, temp: ir.Temp ) -> list[ir.Instruction]:
 		t = self._temp_states.pop( temp.id, None )
 		if t is None:
