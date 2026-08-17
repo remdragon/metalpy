@@ -944,6 +944,23 @@ class Function( Type, ScopeMixin ):
 	# way @overload gets one).
 	is_property: bool = False
 
+	# @fallible_arithmetic - a dunder (e.g. int.__floordiv__, or a scalar-
+	# registered __add__) whose Result[T,E] return should be consumed by
+	# binop dispatch through the SAME ambient-arithmetic-mode machinery
+	# scalar Check-mode opcodes already use (_consume_checked_result),
+	# instead of being left opaque for the caller to .unwrap()/.or_return()
+	# explicitly. Named for what it marks (arithmetic that can fail and
+	# should thread through wrap/saturate/panic_arithmetic too), not
+	# "checked" - that word already means something narrower and different
+	# in this file (ArithmeticChecked/Check-mode opcodes/checked_errors -
+	# the DEFAULT mode specifically), and this flag's own behavior spans
+	# every mode, not just that one. Only consulted by _lower_binop_values/
+	# _classify_leaf_pair_binop for real ast.BinOp operator dispatch - never
+	# for explicit method-call syntax. Return-type shape (must be
+	# Result[T,E]) is validated where it's used, not here - return_type
+	# isn't resolved yet at parse time (see .resolve).
+	is_fallible_arithmetic: bool = False
+
 def _leaf_is_accepted( leaf: Type, declared: Type ) -> bool:
 	# identity-based deliberately, not `==` - Type dataclasses have structural
 	# equality (comparing every field, including mutable dicts/lists), which is

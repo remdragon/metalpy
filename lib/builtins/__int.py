@@ -18,10 +18,26 @@
 # digit counts is wrapped in a single `with compiler.panic_arithmetic(...)`
 # per method (SYNTAX.md Section 5) instead -- one declarative statement
 # instead of a manual checked-call before every `+`. Genuine, expected
-# failure conditions (allocation failure, division by zero, malformed input,
-# narrowing a value too big for a fixed-width type) still go through
-# `Result[T, IntError]` rather than being panics, since those aren't bugs --
-# they're normal outcomes a caller needs to handle.
+# failure conditions (malformed input, narrowing a value too big for a
+# fixed-width type) still go through `Result[T, IntError]` rather than being
+# panics, since those aren't bugs -- they're normal outcomes a caller needs
+# to handle. Division by zero is the same canonical `ZeroDivisionError`
+# scalar division already raises (lib/builtins/__init__.py), not a fourth
+# IntError variant -- divmod()/__floordiv__()/__mod__() declare
+# `Result[_, IntError|ZeroDivisionError]` (IntError there is purely a
+# type-system formality, carried through from internal bookkeeping calls
+# that never actually reach Err in practice - see divmod()'s own comment),
+# so ZeroDivisionError composes cleanly with scalar division in a shared
+# error union, and __floordiv__/__mod__ (@fallible_arithmetic) participate in the
+# caller's ambient
+# arithmetic mode the same way a bare checked `/` on a scalar already does:
+# `with compiler.panic_arithmetic(...): a // b` auto-panics, default mode
+# auto-propagates. __add__/__sub__/__mul__/__neg__ stay unconditionally
+# `Result[int, IntError]`, deliberately NOT @fallible_arithmetic or mode-aware -
+# arbitrary-precision add/sub/mul/negate can't overflow (the digit buffer
+# just grows; sys.alloc panics on OOM rather than returning a Result - see
+# clone()'s own comment), so unlike division there's no failure mode for a
+# `with compiler.wrap_arithmetic:`/etc. block to meaningfully retarget.
 
 import sys
 
@@ -49,7 +65,6 @@ import sys
 # referenced bare.
 @union
 class IntError:
-	DivideByZero: None
 	InvalidDigit: None
 	Overflow: None
 	Other: None
@@ -503,9 +518,16 @@ class int:
 	# doesn't reach into struct fields - see PLAN_TUPLE.md's own "why
 	# RCClass, not CStruct" reasoning) - a real, if narrow, leak this
 	# migration fixes as a side effect, not just a workaround removed.
-	def divmod( self, divisor: int ) -> Result[tuple[int,int], IntError]:
+	def divmod( self, divisor: int ) -> Result[tuple[int,int], IntError|ZeroDivisionError]:
+		# IntError here is purely a type-system formality carried through
+		# from the .or_return() calls on _add_magnitude/_subtract_magnitude/
+		# _shift_and_add_digit below (bookkeeping Result[None,IntError] -
+		# never actually reachable as Err in practice, since sys.alloc
+		# panics on OOM rather than returning one - see clone()'s own
+		# comment) - the only error THIS method itself ever really produces
+		# is ZeroDivisionError.
 		if divisor.is_zero():
-			return Result.Err( IntError.DivideByZero( None ))
+			return Result.Err( ZeroDivisionError() )
 
 		base = divisor.clone()
 		base.__is_negative = False
@@ -563,11 +585,13 @@ class int:
 
 		return Result.Ok( ( quotient, remainder ))
 
-	def __floordiv__( self, other: int ) -> Result[int, IntError]:
+	@fallible_arithmetic
+	def __floordiv__( self, other: int ) -> Result[int, IntError|ZeroDivisionError]:
 		result = self.divmod( other ).or_return()
 		return Result.Ok( result[0] )
 
-	def __mod__( self, other: int ) -> Result[int, IntError]:
+	@fallible_arithmetic
+	def __mod__( self, other: int ) -> Result[int, IntError|ZeroDivisionError]:
 		result = self.divmod( other ).or_return()
 		return Result.Ok( result[1] )
 

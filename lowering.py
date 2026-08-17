@@ -88,6 +88,22 @@ _REFLECTED_BINOP_DUNDER: dict[str,str] = {
 	'__xor__': '__rxor__',
 }
 
+# ArithmeticMode subclass -> the mode-qualified dunder name prefix binop
+# dispatch tries FIRST, before falling back to the base name (__add__ ->
+# __wrapped_add__ under ArithmeticWrap, __saturated_add__ under
+# ArithmeticSaturate). ArithmeticChecked/ArithmeticPanic aren't here - they
+# always use the base name directly (no separate "panicked" spelling; a
+# @fallible_arithmetic dunder's own is_fallible_arithmetic consumption
+# already handles the panic-vs-propagate distinction). This is the whole
+# mechanism that lets a
+# class like `int` (which never registers __wrapped_add__) stay mode-
+# independent with zero isinstance(Scalar)-style special-casing anywhere:
+# the qualified lookup just misses and falls through to __add__.
+_MODE_DUNDER_PREFIX: dict[type,str] = {
+	arithmetic_mode.ArithmeticWrap: 'wrapped',
+	arithmetic_mode.ArithmeticSaturate: 'saturated',
+}
+
 # ast comparison operator -> the dunder method name to dispatch to for a
 # non-scalar left operand (str.__eq__, etc.). Scalar operands go through
 # flat ir.Cmp instead.
@@ -3363,6 +3379,51 @@ class FunctionLowering:
 		self._emit( ir.RefCount( dest = dest, value = value ))
 		return dest
 
+	def _lower_compiler_checked_binop( self, node: ast.Call, intrinsic_name: str, opcode: type, expected_type: Type|None ) -> ir.Operand:
+		# compiler.checked_add(a, b)/wrapped_add(a, b)/saturated_add(a, b) -
+		# FIXED primitives (unlike bare `+`, which reads self._arithmetic_
+		# mode[-1] to pick BETWEEN AddCheck/AddWrap/AddSaturate): each of
+		# these always resolves to exactly one opcode. Intended body for a
+		# scalar-registered, @inline'd `__add__`/`__wrapped_add__`/
+		# `__saturated_add__` (see lib/builtins - i32.__add__ etc.) - which
+		# opcode a given SOURCE `+` actually gets still comes from ambient
+		# mode picking which of these three dunders binop dispatch resolves
+		# to (mode-qualified name lookup in _lower_binop_values), not from
+		# anything read here.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		if not isinstance( left.type, Scalar ) or _is_float_scalar( left.type ) or left.type is not right.type:
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) arguments must both be the same non-float scalar type - got '
+				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		result_type = expected_type if expected_type is not None and isinstance( expected_type, Scalar ) else left.type
+		if not opcode.checked_errors:
+			# wrapped_add/saturated_add - infallible, _lower_arithmetic_op's
+			# own infallible branch (single instruction, no Result at all)
+			# is exactly right
+			return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
+		# checked_add - deliberately does NOT auto-consume the way a bare
+		# checked `+` would (_lower_arithmetic_op's own check-mode branch
+		# always does, regardless of caller context - arithmetic modes
+		# don't translate through a function call boundary, inline or not,
+		# by design). This returns the RAW Result[result_type,error_type]
+		# value instead, matching a @fallible_arithmetic dunder's own declared return
+		# type exactly - so whatever calls/inlines this dunder can
+		# uniformly consume it via ambient mode at the DISPATCH site
+		# (_emit_binop_dunder_call's is_fallible_arithmetic handling), the same way
+		# whether this call ends up inlined or not.
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		error_type, _alternatives = self._resolve_checked_error( node, opcode, result_type )
+		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ result_type, error_type ] )
+		self.lowering.schedule( check_type )
+		check_dest = self._new_temp( check_type )
+		self._emit( opcode( dest = check_dest, left = left, right = right ))
+		return check_dest
+
 	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
 		# must be a bare local variable/parameter name (matches SYNTAX.md's
@@ -6556,27 +6617,24 @@ class FunctionLowering:
 		# reflected method instead of the same name reflected.
 		method_name = _BINOP_DUNDER.get( type( node.op ))
 		if method_name is not None:
-			if not isinstance( left.type, Scalar ):
-				method = self._find_dunder_for_arg( left.type, method_name, right.type )
+			# NOT gated on isinstance(left.type, Scalar)/isinstance(right.type,
+			# Scalar) anymore - _find_dunder_for_arg already resolves a
+			# scalar-registered dunder (i32.__add__ = ...; see lib/builtins)
+			# identically to a real class's own method (both just read
+			# .names - see _find_method's own owner-kind branch). A Scalar
+			# with nothing registered under this name just misses, exactly
+			# like a class that doesn't define the dunder at all - no special
+			# case needed for "this operand has no dunder mechanism".
+			for candidate in self._mode_qualified_dunder_names( method_name ):
+				method = self._find_dunder_for_arg( left.type, candidate, right.type )
 				if method is not None:
-					self.lowering._ensure_resolved( method )
-					self.lowering.schedule( method.return_type )
-					for p in ( method.parameters or [] ):
-						self.lowering.schedule( p.type )
-					dest = self._new_temp( expected_type or method.return_type )
-					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
-					return dest
+					return self._emit_binop_dunder_call( node, method, left, right, expected_type )
 			reflected_name = _REFLECTED_BINOP_DUNDER.get( method_name )
-			if reflected_name is not None and not isinstance( right.type, Scalar ):
-				reflected_method = self._find_dunder_for_arg( right.type, reflected_name, left.type )
-				if reflected_method is not None:
-					self.lowering._ensure_resolved( reflected_method )
-					self.lowering.schedule( reflected_method.return_type )
-					for p in ( reflected_method.parameters or [] ):
-						self.lowering.schedule( p.type )
-					dest = self._new_temp( expected_type or reflected_method.return_type )
-					self._emit( ir.Call( dest = dest, target = reflected_method, receiver = right, args = [ left ], kwargs = {} ))
-					return dest
+			if reflected_name is not None:
+				for candidate in self._mode_qualified_dunder_names( reflected_name ):
+					reflected_method = self._find_dunder_for_arg( right.type, candidate, left.type )
+					if reflected_method is not None:
+						return self._emit_binop_dunder_call( node, reflected_method, right, left, expected_type )
 
 		# a float on EITHER side takes the GetFloatBinOp path (plain IEEE, or
 		# inf/nan-checked, depending on the active mode) rather than the integer
@@ -6607,6 +6665,75 @@ class FunctionLowering:
 
 		opcode, extra = self._arithmetic_mode[-1].GetBinOp( node )
 		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
+
+	def _mode_qualified_dunder_names( self, base_name: str ) -> list[str]:
+		# see _MODE_DUNDER_PREFIX's own module-level comment for the full
+		# rationale - the candidate dunder name(s) to try, in order, for
+		# binop dispatch given the CURRENT ambient arithmetic mode
+		prefix = _MODE_DUNDER_PREFIX.get( type( self._arithmetic_mode[-1] ))
+		if prefix is None:
+			return [ base_name ]
+		return [ f'__{prefix}_{base_name.strip( "_" )}__', base_name ]
+
+	def _emit_binop_dunder_call( self, node: 'ast.BinOp|ast.AugAssign', method: Function, receiver: ir.Operand, arg: ir.Operand, expected_type: Type|None ) -> ir.Operand:
+		# shared tail for the forward/reflected dunder-call cases in
+		# _lower_binop_values above - handles a plain class method
+		# (int.__add__, ...) and a scalar-registered one (i32.__add__ = ...,
+		# see lib/builtins) identically, since _find_dunder_for_arg already
+		# resolved both the same way. `method.cls is None` means a genuine
+		# free function was registered onto a Scalar (never had `self`
+		# stripped by discovery) - same fix _lower_method_call/the general
+		# _lower_call already apply: the receiver becomes a plain leading
+		# positional arg instead of ir.Call.receiver.
+		#
+		# is_inline is checked BEFORE is_fallible_arithmetic, not instead of it: @inline
+		# splicing (_lower_inline_call) never auto-consumes anything on its
+		# own - arithmetic modes don't translate through a function call
+		# boundary just because it happens to be inlined away (that's a
+		# deliberate design choice, not a gap - see compiler.checked_add's
+		# own comment). A @fallible_arithmetic+@inline method's spliced trailing return
+		# (typically a compiler.checked_add/wrapped_add/saturated_add
+		# intrinsic call) hands back its raw, real return value - for
+		# is_fallible_arithmetic methods that's a genuine, unconsumed Result[T,E],
+		# exactly matching the declared signature. So is_fallible_arithmetic consumption
+		# below runs uniformly on whatever came back, whether that value
+		# was produced by a real ir.Call or by a splice - this is what makes
+		# `with compiler.panic_arithmetic(...): a // b` (a, b: int) auto-
+		# panic, and default-mode `a // b` auto-propagate, exactly like a
+		# bare scalar `+` already does.
+		self.lowering._ensure_resolved( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		call_receiver = None if method.cls is None else receiver
+		call_args = [ receiver, arg ] if method.cls is None else [ arg ]
+		if method.is_inline:
+			result = self._lower_inline_call( node, method, call_receiver, call_args, {}, method.return_type, True )
+			assert result is not None # want_result=True above guarantees this
+		else:
+			# expected_type describes the FINAL, post-consumption value (e.g.
+			# `q1: int = a // b`'s expected_type is the success type `int`,
+			# not the intermediate Result[int,E]) - for an is_fallible_
+			# arithmetic method the dest here is that raw, unconsumed Result,
+			# so it must always be typed as method.return_type exactly, never
+			# expected_type. Using expected_type here silently mistyped the
+			# Call's dest, which downstream Unwrap/OrJump lowering then
+			# tried to treat as the wrong Result shape - a real, confirmed
+			# bug (an assertion in _result_tag_data_names, whose own error-
+			# message formatting then hit an unrelated circular-repr hang
+			# instead of failing cleanly).
+			dest_type = method.return_type if method.is_fallible_arithmetic else ( expected_type or method.return_type )
+			dest = self._new_temp( dest_type )
+			self._emit( ir.Call( dest = dest, target = method, receiver = call_receiver, args = call_args, kwargs = {} ))
+			result = dest
+		if not method.is_fallible_arithmetic:
+			return result
+		shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
+		assert shape is not None and len( shape[1] ) == 2, f'@fallible_arithmetic {method.qualname} must declare a Result[T,E] return type'
+		success_type = shape[1][0].type
+		mode = self._arithmetic_mode[-1]
+		extra = mode.extra if isinstance( mode, arithmetic_mode.ArithmeticPanic ) else None
+		return self._consume_checked_result( node, result, success_type, extra )
 
 	def _lower_arithmetic_op( self, node: ast.AST, opcode: type|None, extra: ir.Operand|None, result_type: Type, operand_kwargs: dict, kind: str ) -> ir.Operand:
 		# shared by _lower_scalar_cast/_expr_BinOp/_expr_UnaryOp - each just
@@ -10145,6 +10272,18 @@ class FunctionLowering:
 
 			case 'refcount':
 				result = self._lower_compiler_refcount( node, expected_type )
+				return result if want_result else None
+
+			case 'checked_add':
+				result = self._lower_compiler_checked_binop( node, 'checked_add', ir.AddCheck, expected_type )
+				return result if want_result else None
+
+			case 'wrapped_add':
+				result = self._lower_compiler_checked_binop( node, 'wrapped_add', ir.AddWrap, expected_type )
+				return result if want_result else None
+
+			case 'saturated_add':
+				result = self._lower_compiler_checked_binop( node, 'saturated_add', ir.AddSaturate, expected_type )
 				return result if want_result else None
 
 			case 'cast':

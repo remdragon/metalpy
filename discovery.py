@@ -1984,6 +1984,7 @@ class Discovery( ast.NodeVisitor ):
 		is_virtual = False
 		is_inline = False
 		is_property = False
+		is_fallible_arithmetic = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
@@ -2012,6 +2013,8 @@ class Discovery( ast.NodeVisitor ):
 					is_inline = True
 				case 'property':
 					is_property = True
+				case 'fallible_arithmetic':
+					is_fallible_arithmetic = True
 				case 'extern':
 					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
@@ -2078,6 +2081,12 @@ class Discovery( ast.NodeVisitor ):
 			all_params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
 			if len( all_params ) != 1 or node.args.vararg is not None or node.args.kwarg is not None:
 				self.fail( f'@property {qualname} must take exactly `self` and no other parameters', node )
+
+		if is_fallible_arithmetic and is_abstract:
+			# nothing ever actually runs to produce a Result to consume -
+			# same "no coherent meaning" reasoning as @inline+@abstractmethod
+			# above
+			self.fail( f'@fallible_arithmetic {qualname} cannot also be @abstractmethod - no body to produce a Result', node )
 
 		if is_inline:
 			# PLAN_INLINE.md - each of these interacts with the real call
@@ -2159,6 +2168,7 @@ class Discovery( ast.NodeVisitor ):
 			is_overload = is_overload,
 			is_inline = is_inline,
 			is_property = is_property,
+			is_fallible_arithmetic = is_fallible_arithmetic,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,
