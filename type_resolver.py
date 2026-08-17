@@ -4164,7 +4164,25 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		(or just `x.data.v_bool` when the leaf type IS bool).
 		Returns None when the type isn't a TaggedUnion, has no None member,
 		or has multiple non-None variants (auto-generated union __bool__ is
-		future work). '''
+		future work).
+
+		`not x` (a UnaryOp wrapping the same shape - e.g. `if not tz:`) is
+		handled here too, by recursing on the unwrapped operand and negating
+		the result - lowering.py's own _expr_UnaryOp assumes ANY `not`
+		operand is already a plain scalar (`ir.Not`/emitter_c.py's bare
+		`!operand`), which is invalid C for a TaggedUnion's struct
+		representation; this rewrite runs first (visit_If/visit_While call
+		it on their own node.test before any other visitation), replacing
+		the whole `not x` with `not (tag_cmp and value_expr)` - both
+		operands of that inner BoolOp are real bools, so the OUTER `not`
+		lowers through the ordinary (correct) scalar path unchanged. '''
+		if isinstance( expr_node, ast.UnaryOp ) and isinstance( expr_node.op, ast.Not ):
+			inner = self._rewrite_tagged_union_truthiness( expr_node.operand, ctx_node )
+			if inner is None:
+				return None
+			negated = ast.UnaryOp( op = ast.Not(), operand = inner )
+			ast.copy_location( negated, ctx_node )
+			return negated
 		expr_type = self._type_of_expr( expr_node )
 		if expr_type is None:
 			return None
