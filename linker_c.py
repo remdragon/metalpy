@@ -17,6 +17,28 @@ import subprocess
 import sys
 
 
+def resolve_no_crt( no_crt: bool, asan: bool ) -> bool:
+	'''
+	--asan requires the C runtime: the ASan runtime library itself depends on
+	CRT symbols (getenv, memcpy, malloc, ...) regardless of what the user's
+	own program needs, so a no-CRT link against it dies with a wall of
+	LNK2019s. Force real CRT linking whenever asan is requested, overriding
+	whatever no_crt the caller auto-detected.
+
+	Must be called BEFORE emitter_c.emit_c(), not just before
+	CcTool.compile()/link(): no_crt also selects which entry-point shape
+	emit_c() generates (a hand-rolled mainCRTStartup stub that calls main(),
+	vs plain main() as the real entry) - overriding only the compile/link
+	flags after C source generation would link CRT-provided startup code
+	against a source file that still defines its own conflicting
+	mainCRTStartup, trading one wall of link errors for another.
+	'''
+	if asan and no_crt:
+		print( 'WARNING - --asan requires the C runtime - forcing CRT linking (no_crt=True request ignored)', file = sys.stderr )
+		return False
+	return no_crt
+
+
 def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 	''' publish a disk-cache entry so a concurrent reader sees either the
 	complete previous state or the complete new one, never a half-written file.
