@@ -82,7 +82,7 @@ def main() -> i32:
 '''
 
 _DATE_BEHAVIOR = '''
-from datetime import date, timedelta
+from datetime import date, timedelta, localtz
 
 def main() -> i32:
 	r1 = date( 2024, 3, 10 )
@@ -147,6 +147,22 @@ def main() -> i32:
 	if not ( d1 == date( 2024, 3, 10 ).unwrap( 'valid' ) ):
 		return 20
 
+	# date - timedelta -> date (the __sub__ overload, mirroring __add__)
+	minus5 = d2 - timedelta( days = 5 )
+	if minus5.isoformat() != '2024-03-10':
+		return 21
+	if not ( minus5 == d1 ):
+		return 22
+
+	# tz-defaulting: date.today()/fromtimestamp() with tz omitted uses the
+	# system's own local zone (localtz()), same result as passing it
+	# explicitly
+	explicit_tz = localtz()
+	if date.today() != date.today( explicit_tz ):
+		return 23
+	if date.fromtimestamp( 1_700_000_000.0 ) != date.fromtimestamp( 1_700_000_000.0, explicit_tz ):
+		return 24
+
 	return 0
 '''
 
@@ -191,7 +207,7 @@ def main() -> i32:
 _DATETIME_FIXED_OFFSET_BEHAVIOR = '''
 import compiler
 import zoneinfo
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, localtz
 
 def main() -> i32:
 	tz = zoneinfo.ZoneInfo.fixed_offset( 19800, '+05:30' )
@@ -219,10 +235,10 @@ def main() -> i32:
 	if not ( dt1 == datetime( 2024, 6, 15, 10, 30, 0, tzinfo = tz ).unwrap( 'valid' ) ):
 		return 5
 
-	d = dt1.to_date()
+	d = dt1.date()
 	if d.isoformat() != '2024-06-15':
 		return 6
-	t = dt1.to_time()
+	t = dt1.time()
 	if t.isoformat() != '10:30:00':
 		return 7
 
@@ -231,6 +247,33 @@ def main() -> i32:
 		return 8
 	if datetime( 2024, 1, 1, 25, 0, 0, tzinfo = tz ).is_ok():
 		return 9
+
+	# datetime - timedelta -> datetime (the __sub__ overload, mirroring
+	# __add__ - also Result-returning, for the same overflow reason)
+	dt3 = dt1 - timedelta( hours = 1 )
+	dt3u: datetime = dt3.unwrap( 'valid' )
+	if dt3u.isoformat() != '2024-06-15T09:30:00+05:30':
+		return 10
+	dt3b: datetime = ( dt1 - timedelta( minutes = 60 ) ).unwrap( 'valid' )
+	if not ( dt3u == dt3b ):
+		return 11
+
+	# datetime - timedelta overflowing past year 9999 -> Err, matching
+	# __add__'s own overflow handling (dt - timedelta(days=-1) is dt +
+	# timedelta(days=1))
+	r_edge = datetime( 9999, 12, 31, 23, 59, 59, tzinfo = tz )
+	edge: datetime = r_edge.unwrap( 'valid' )
+	if ( edge - timedelta( days = -1 ) ).is_ok():
+		return 12
+
+	# tz-defaulting: now()/fromtimestamp()/astimezone() with tz omitted use
+	# the system's own local zone (localtz()), same result as passing it
+	# explicitly
+	explicit_tz = localtz()
+	if datetime.fromtimestamp( 1_700_000_000.0 ) != datetime.fromtimestamp( 1_700_000_000.0, explicit_tz ):
+		return 13
+	if dt1.astimezone() != dt1.astimezone( explicit_tz ):
+		return 14
 
 	return 0
 '''
