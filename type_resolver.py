@@ -3198,6 +3198,45 @@ class TypeResolver:
 				# OWN resolution is broken), unrelated to var itself
 				pass
 
+	def resolve_parameter_default( self, target: Function, param: Parameter ) -> None:
+		''' resolve_global_init's sibling for a parameter's own DEFAULT VALUE
+		expression - lowering.py's _lower_call_args lowers `param.default`
+		directly at every CALL SITE that omits the argument, inside the
+		CALLING function's own lowering, never as part of target's OWN body
+		(resolve_function_body only ever walks fn.node.body - a parameter's
+		default lives on fn.node.args instead) - and often before target
+		itself has had its own turn on the compile-unit queue at all (a
+		caller only needs target.resolve() to have populated .parameters,
+		already guaranteed by the time _lower_call_args runs). Without this,
+		a construction call embedded in a default (`def f(x: Foo = Foo()):
+		...`) never gets item 3's eager __init__ pre-resolution, tripping
+		lowering.py's own _try_lower_construct_call assert ("... was not
+		resolved before construction") exactly the way an unresolved global
+		initializer once did (see resolve_global_init) - confirmed as a
+		real, reachable crash (not theoretical): a class constructed only
+		ever as another function's own defaulted-parameter value, called
+		from a THIRD function that omits that argument, reaches real
+		lowering with its __init__ never pre-resolved. Memoized by
+		id(param.default), the same idempotent-even-if-reached-twice
+		convention every sibling here uses - a shared default can be
+		lowered at more than one omitted-argument call site. '''
+		if param.default is None:
+			return
+		if id( param.default ) in self._body_resolved:
+			return
+		self._body_resolved.add( id( param.default ))
+		module = self._find_module_for( target )
+		with self.discovery.module_context( module ):
+			with self.discovery.scope_context( target ):
+				resolver = _ReferenceResolver( self, None )
+				try:
+					param.default = resolver.visit( param.default )
+				except CompileError:
+					# same recovery discipline as resolve_global_init - already
+					# recorded, and lowering.py's own _lower_call_args re-reaches
+					# and re-reports the same failure moments later
+					pass
+
 
 class _ReferenceResolver( ast.NodeTransformer ):
 	'''
