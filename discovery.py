@@ -214,7 +214,14 @@ class Discovery( ast.NodeVisitor ):
 		self.paths: list[Path] = list( paths ) if paths else []
 		if not self.paths:
 			self.paths.append( Path( __file__ ).parent / 'lib' )
-			self.paths.append( Path( '.' ))
+			# resolved, not bare Path('.') - a module found through this entry
+			# would otherwise carry a relative .file while every other module
+			# (including one passed an already-.resolve()'d entry filename)
+			# carries an absolute one, so plain Path equality (e.g.
+			# _check_qualname_collisions' same-file exemption, type_resolver's
+			# _find_module_for) silently treats the same file on disk as two
+			# different ones
+			self.paths.append( Path( '.' ).resolve() )
 		self.active_target = active_target if active_target is not None else _detect_active_target()
 		self.compiler_module = CompilerModule(
 			stem = 'compiler',
