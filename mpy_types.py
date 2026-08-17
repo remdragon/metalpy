@@ -26,9 +26,27 @@ class Name:
 	# error - the real one was already recorded at the point of failure.
 	broken: bool = False
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Type( Name ):
 	''' maybe only use this to distinguish types from values '''
+
+	def __repr__( self ) -> str:
+		# every Type subclass below opts out of the dataclass-generated repr
+		# (repr=False) and inherits this one instead, deliberately never
+		# recursing into another field. dataclasses' auto-repr is only guarded
+		# against a field re-entering the SAME object already on the repr call
+		# stack (reprlib.recursive_repr, keyed by id(self)) - it does nothing
+		# for a DAG where the same object is reachable via multiple sibling
+		# fields (e.g. Specialization.base and Specialization.args both
+		# pointing at a shared prior type): each convergence re-expands the
+		# whole subtree, so a chain of N such diamonds costs O(3^N) - a real,
+		# reproduced hang (confirmed: depth 10 already produces a 9.7MB repr
+		# in 88ms; the depth seen from a real compiler bug ran the process out
+		# of 24+GB of RAM before ever raising). A mistyped Type value reaching
+		# an assertion's error message must fail fast, not become a resource-
+		# exhaustion trap - so this never walks into another Type's own fields.
+		return f'<{type(self).__name__} {self.qualname!r}>'
+
 	def leaves( self ) -> list['Type']:
 		# a single concrete type is its own only leaf - TaggedUnion overrides
 		# this to return its member types instead. shared by overload
@@ -174,7 +192,7 @@ class ScopeMixin:
 		base = scope.base if isinstance( scope, Specialization ) else scope
 		return base is self
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Scalar( Type, ScopeMixin ):
 	'''
 	isize, usize, i32, u32, etc - also used for generic pointer intrinsics
@@ -208,11 +226,11 @@ def int_stem_range( t: Scalar ) -> tuple[int,int]:
 		return -(2**(bits-1)), 2**(bits-1) - 1
 	return 0, 2**bits - 1
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class TypeVar( Type ):
 	''' a placeholder for one of a generic's type parameters, e.g. T in class Result[T,E] '''
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Specialization( Type ):
 	''' a generic base type applied to concrete (or still-typevar) type arguments, e.g. Result[i32,IntError] '''
 	base: Type
@@ -361,7 +379,7 @@ def _ownership_annotation_error( t: 'Type', question: str ) -> AssertionError:
 		f'Call .unwrap_ownership() first.'
 	)
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Move( Type ):
 	''' `move[T]` in annotation position - ownership of a T is transferred into this binding rather than borrowed/copied. The CFG uses this to know the source binding must be invalidated after the transfer.
 
@@ -384,7 +402,7 @@ class Move( Type ):
 	def has_object_header( self ) -> bool: raise _ownership_annotation_error( self, 'has_object_header' )
 	def has_vtable( self ) -> bool: raise _ownership_annotation_error( self, 'has_vtable' )
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Copy( Type ):
 	''' `copy[T]` in annotation position - the callee wants its own
 	independent reference (an explicit INCREF in its own prologue, a
@@ -405,7 +423,7 @@ class Copy( Type ):
 	def has_object_header( self ) -> bool: raise _ownership_annotation_error( self, 'has_object_header' )
 	def has_vtable( self ) -> bool: raise _ownership_annotation_error( self, 'has_vtable' )
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CallableType( Type ):
 	''' `Callable[[Arg1,Arg2,...], Ret]` in annotation position - a bare
 	function SIGNATURE used as a type (see PLAN_CALLABLE.md), for typing a
@@ -421,7 +439,7 @@ class CallableType( Type ):
 	arg_types: list[Type]
 	return_type: Type
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class FixedArrayType( Type ):
 	''' `ElemType[N]` used as a @cstruct/@cunion FIELD annotation only
 	(SYNTAX.md's "Fixed-Size Inline Array": `u16[32]`, `u8[8]`) - a real,
@@ -455,7 +473,7 @@ class FixedArrayType( Type ):
 	elem_type: Type
 	count: int
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class TupleType( Type ):
 	''' `tuple[T0, T1, ..., Tn]` in annotation position (see PLAN_TUPLE.md) -
 	a heterogeneous, fixed-arity value group. Unlike list[T]/dict[K,V]
@@ -504,7 +522,7 @@ class TupleType( Type ):
 	# this annotation. The emitter never allocates a TupleType directly - it
 	# allocates the backing RCClass, which answers True on its own behalf.
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class GeneratorType( Type ):
 	''' `Iterator[T]` (infallible) or `Generator[T,E]` (fallible,
 	PLAN_GENERATORS.md Phase 4/roadmap Phase 4) in a function's own return
@@ -673,7 +691,7 @@ class InheritanceChainMixin:
 			attrs.extend( node.attributes )
 		return attrs
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted class
 	# base is resolved eagerly at class-creation time, same as type_params -
 	# Python itself requires a base class to already exist when the `class
@@ -706,7 +724,7 @@ class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted c
 	def has_object_header( self ) -> bool: return True
 	def has_vtable( self ) -> bool: return True
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class ClosureType( RCClass ):
 	''' `Closure[[Arg1,Arg2,...], Ret]` - a bound-method VALUE (`worker.run`
 	used as a value, not called - see PLAN_CALLABLE.md's own "closure in
@@ -732,7 +750,7 @@ class ClosureType( RCClass ):
 	arg_types: list[Type] = field( default_factory = list )
 	return_type: Type|None = None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 	# base is only meaningful for @interface CStructs (single inheritance,
 	# same "resolved eagerly at class-creation time" reasoning as
@@ -763,7 +781,7 @@ class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 		# check is exactly this question.
 		return self.is_interface
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:
 	type_params: list[TypeVar]|None = None
 	attributes: list[Variable] = field( default_factory = list )
@@ -771,7 +789,7 @@ class CUnion( Type, ScopeMixin ): # @cunion class Foo:
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backing type for synthesized anonymous unions (X|Y)
 	# each variant is an attribute: name -> type. Synthesized anonymous
 	# unions are built fully-formed directly (never deferred, resolve stays
@@ -856,7 +874,7 @@ def by_value_dependency( t: 'Type|None' ) -> 'CStruct|CUnion|TaggedUnion|None':
 	base = t.base if isinstance( t, Specialization ) else t
 	return base if isinstance( base, ( CStruct, CUnion, TaggedUnion )) else None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	value_type: Type
 	next_auto: int = 0
@@ -865,7 +883,7 @@ class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CType( Type ):
 	''' a C type defined in an external header, referenced by bare name.
 	Used with compiler.c_type('pthread_mutex_t', header='pthread.h') -
@@ -877,7 +895,7 @@ class CType( Type ):
 # anything that can own methods/be a Function's .cls
 ClassLike = Union[ RCClass, CStruct, CUnion, TaggedUnion, CEnum ]
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Function( Type, ScopeMixin ):
 	cls: ClassLike|None
 	node: ast.FunctionDef # whole def - node.args/.returns resolved lazily, node.body untouched until IR generation
@@ -1002,7 +1020,7 @@ class ConditionalDispatch:
 	conditions: list[tuple[Parameter,Type]]
 	function: Function
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Overload( Type ):
 	'''
 	stands in for a Function when multiple defs share a name in the same scope.
