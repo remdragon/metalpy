@@ -1391,6 +1391,31 @@ class CFGState:
 			# into dest, not a second independent owner - untrack it so its
 			# own eventual DeleteTemp doesn't ALSO decref the same object
 			self._temp_states.pop( src.id, None )
+		if dest.is_global:
+			# a global's storage isn't scoped to THIS function's own
+			# epilogue at all - whatever gets stored now must persist for
+			# FUTURE reads by other calls, long after this function
+			# returns (unlike an ordinary local, whose lifetime genuinely
+			# IS bounded by the function). Mirrors attr_replace()'s own
+			# model (a struct/union field's contents also aren't function-
+			# scoped, never tracked in self.bindings at all) rather than an
+			# ordinary local's push-a-fresh-epilogue-entry REPLACE below:
+			# release whatever the global currently holds (unconditionally
+			# - safe even the very first touch, when it's still whatever
+			# its own initializer set, since decref on a non-RC-tagged
+			# union member is already a documented no-op), store the new
+			# value, and never register a per-function decref obligation
+			# for it. self.bindings is never touched for a global here, so
+			# it can never reach merge_if's branch-reconciliation logic
+			# either - there's no function-scoped ownership state to
+			# disagree about in the first place. (A prior version of this
+			# fix DID push a function-scoped entry for a global, gated by a
+			# runtime ownership flag - that was wrong: decref'ing a global
+			# at ITS ASSIGNING FUNCTION's own exit would free the very
+			# value the global is supposed to keep alive for the NEXT
+			# call, a real use-after-free on the following read.)
+			instructions += self._decref_instructions( dest.type, dest ) # reads dest's CURRENT (pre-overwrite) value
+			return instructions
 		existing = self.bindings.get( dest.stem )
 		if existing is not None and existing.entry is not None:
 			if existing.state in ( OwnState.OWNED, OwnState.COPY ):
