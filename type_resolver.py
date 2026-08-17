@@ -3319,7 +3319,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			narrowed = self._narrowed.get( node.id )
 			if narrowed is not None and len( narrowed ) == 1:
 				return narrowed[0]
-			return self.locals.get( node.id )
+			local_type = self.locals.get( node.id )
+			if local_type is not None:
+				return local_type
+			# self.locals only ever gets populated from params/self/body-
+			# locals (see __init__/visit_AnnAssign/visit_Assign above) -
+			# never from a module-level global, so a global subject fell
+			# through here as unresolvable, and everything downstream that
+			# needs a real type (is-None narrowing chief among them -
+			# _is_none_narrowing_shape bails outright when this returns
+			# None) silently declined for a global the exact same way it
+			# would for a genuinely undefined name. Ordinary scope-chain
+			# name resolution already has a global's real declared type on
+			# hand - fall back to it here, same as lowering.py's own name
+			# resolution already does for a global read.
+			found = self.discovery.find_name_or_none( node.id )
+			if not isinstance( found, Variable ):
+				return None
+			# a global Variable's own .type is populated lazily (via its
+			# .resolve callable, same as everywhere else in this pass that
+			# hands a not-yet-resolved object onward - see this class's own
+			# ensure_resolved) - a param/local's type is always already
+			# resolved by the time self.locals records it, so this was
+			# never needed above; a global reached here for the first time
+			# in THIS function still has type=None until forced.
+			self.resolver.ensure_resolved( found )
+			return found.type
 		if isinstance( node, ast.Attribute ):
 			owner_type = self._type_of_expr( node.value )
 			if owner_type is None:
