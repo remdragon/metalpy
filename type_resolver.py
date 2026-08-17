@@ -4228,11 +4228,27 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if isinstance( leaf_type, Scalar ) and leaf_type.stem == 'bool':
 			value_expr: ast.expr = payload_expr
 		else:
-			value_expr = ast.Call(
-				func = ast.Attribute( value = payload_expr, attr = '__bool__', ctx = ast.Load() ),
-				args = [],
-				keywords = [],
-			)
+			# only synthesize the .__bool__() call when the leaf type
+			# actually defines one - real Python's own default object
+			# truthiness is always-True unless __bool__/__len__ is
+			# overridden, but this compiler doesn't auto-synthesize a
+			# default __bool__ method the way Python effectively does, so
+			# a class with no override would otherwise hit a hard "not
+			# callable" resolution failure here just for participating in
+			# a T|None truthiness check - matching Python's real default
+			# directly (a bare Constant(True), no call at all) instead of
+			# requiring every such class to hand-write a trivial `return
+			# True` override.
+			chain_lookup = getattr( leaf_type, 'chain_lookup', None )
+			has_bool_method = chain_lookup is not None and chain_lookup( '__bool__' ) is not None
+			if has_bool_method:
+				value_expr = ast.Call(
+					func = ast.Attribute( value = payload_expr, attr = '__bool__', ctx = ast.Load() ),
+					args = [],
+					keywords = [],
+				)
+			else:
+				value_expr = ast.Constant( value = True )
 			ast.copy_location( value_expr, ctx_node )
 		# synthesize: tag_cmp and value_expr
 		result = ast.BoolOp( op = ast.And(), values = [ tag_cmp, value_expr ] )
