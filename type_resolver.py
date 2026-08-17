@@ -4548,6 +4548,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._narrowed = case_entry_narrowed
 		narrowed_visited = [ self._build_narrow_marker( subject_name, narrow_member, node ), *narrowed_visited ]
 		other_visited = _visit_stmts( other_body )
+		# the OTHER branch has no comparison to narrow it from - but if ITS
+		# OWN code reassigns subject_name to exactly the narrowed member's
+		# type (the "if x is None: x = Owned(...)" idiom - self.locals
+		# tracks this via visit_Assign's own bookkeeping above), it ends up
+		# narrowed too, just via a fresh value instead of a proven
+		# comparison. Without this, cfg.py's own _merge_narrowed_soft sees
+		# the fact on only ONE branch (the comparison-proven one) and drops
+		# it entirely, even though both branches provably agree by the join
+		# point. Skipped when the branch terminates (return/break/continue/
+		# raise as its own last statement) - nothing past it reaches the
+		# join, so there's nothing for this marker to narrow, and appending
+		# one after a terminator would corrupt cfg.py's own terminates
+		# detection (which keys off the branch's LAST statement).
+		other_terminates = bool( other_body ) and isinstance( other_body[-1], ( ast.Return, ast.Break, ast.Continue, ast.Raise ))
+		if not other_terminates and self.locals.get( subject_name ) is narrow_member.type:
+			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_member, node ) ]
 		if is_not:
 			node.body, node.orelse = narrowed_visited, other_visited
 		else:
