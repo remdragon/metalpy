@@ -4478,6 +4478,19 @@ class FunctionLowering:
 			self._emit( ir.Label( name = end_label ))
 		else:
 			self._emit( ir.Label( name = else_label ))
+			# false_extra used to always be empty here (merge_if's "fresh on
+			# exactly one branch" case can only ever populate
+			# false_instructions when a real ast.orelse existed, since
+			# false_end is otherwise just entry_bindings copied verbatim -
+			# see false_end's own fallback above) - but merge_if's
+			# ownership-disagreement flag reconciliation (the "if x is
+			# None: x = Owned(...)" idiom, no else needed) DOES need to land
+			# a disarm Assign on exactly this implicit "condition was
+			# false" path - dropping it here would silently leave the flag
+			# permanently armed, decref'ing a merely-borrowed value at the
+			# eventual epilogue.
+			for instr in false_extra:
+				self._emit( instr )
 
 	# --- expressions -----------------------------------------------------------
 
