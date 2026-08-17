@@ -677,19 +677,55 @@ class CFGState:
 		for name in set( true_end ) | set( false_end ):
 			in_true = name in true_end
 			in_false = name in false_end
+			true_binding = true_end.get( name )
+			false_binding = false_end.get( name )
 			if in_true and in_false:
-				if true_end[name].state != false_end[name].state:
-					raise CompileError(
-						f"{ctx}: {name!r} is in an indeterminate state after the if - "
-						f"{true_end[name].state.value} on one branch, {false_end[name].state.value} on the other"
+				assert true_binding is not None and false_binding is not None
+				if true_binding.state != false_binding.state:
+					# ALIVENESS agrees (the variable definitely exists both
+					# ways - that's what got it here), only OWNERSHIP
+					# disagrees. That's not the hazard the error below exists
+					# for (a variable that might not exist at all) - it's the
+					# ordinary "fill in a default when still borrowed" idiom
+					# (`if x is None: x = Owned(...)`). Only OWNED/COPY-vs-
+					# BORROWED is safe to reconcile this way (the value is
+					# valid either way, only "do we own it" differs) - any
+					# OTHER disagreement (MOVED involved, etc) stays a hard
+					# error, unchanged.
+					owning, borrowed = (
+						( true_binding, false_binding ) if true_binding.state in ( OwnState.OWNED, OwnState.COPY )
+						else ( false_binding, true_binding )
 					)
+					if not ( owning.state in ( OwnState.OWNED, OwnState.COPY ) and borrowed.state == OwnState.BORROWED ):
+						raise CompileError(
+							f"{ctx}: {name!r} is in an indeterminate state after the if - "
+							f"{true_binding.state.value} on one branch, {false_binding.state.value} on the other"
+						)
+					# synthesize a runtime flag so the eventual epilogue
+					# decides AT RUNTIME whether to decref, instead of
+					# requiring the compiler to know statically which branch
+					# ran - reuses _mint_cancel_flag()'s own flag-guarded-
+					# entry mechanism (_neutralize()'s "disarm instead of
+					# statically cancel" pattern) rather than inventing a
+					# second one; default-True-at-prologue already gives the
+					# owning branch its correct value for free, only the
+					# borrowed branch needs an explicit disarm
+					flag = self._mint_cancel_flag()
+					disarm = [ ir.Assign( dest = flag, src = ir.Const( type = flag.type, value = False )) ]
+					if true_binding is borrowed:
+						true_instructions += disarm
+					else:
+						false_instructions += disarm
+					entry = self._push( owning.operand, owning.type, owning.state )
+					entry.flag = flag
+					continue
 				prior = entry_bindings.get( name )
 				already_live = (
 					prior is not None
-					and prior.entry is true_end[name].entry
-					and prior.entry is false_end[name].entry
+					and prior.entry is true_binding.entry
+					and prior.entry is false_binding.entry
 				)
-				reestablish( name, true_end[name], already_live )
+				reestablish( name, true_binding, already_live )
 				continue
 			if name in entry_bindings:
 				raise CompileError(
@@ -700,7 +736,8 @@ class CFGState:
 			# fine (per your clarification: confined to that branch, no
 			# matching assignment needed on the other) - tear it down
 			# inside THAT branch's own code only
-			binding = true_end[name] if in_true else false_end[name]
+			binding = true_binding if in_true else false_binding
+			assert binding is not None
 			decref = self._decref_instructions( binding.type, binding.operand ) if binding.state in ( OwnState.OWNED, OwnState.COPY ) else []
 			if in_true:
 				true_instructions += decref
@@ -1513,13 +1550,17 @@ class CFGState:
 	# --- entry cancellation (move/del/compiler.decref) ----------------------
 
 	def _mint_cancel_flag( self ) -> Variable:
-		''' a fresh runtime bool for _neutralize()'s flag-guarded branch -
-		mirrors push_defer()'s own flag exactly (a real Variable, spliced in
-		as a body_start init by lowering.py's _emit_epilogue - see
-		cancel_flags()), except armed (True) by default instead of disarmed:
-		a defer flag starts False and gets armed by the defer statement
-		itself; this one starts True (still needs releasing) and gets
-		disarmed by whichever of move()/deleted()/manually_decreffed()
+		''' a fresh runtime bool for _neutralize()'s flag-guarded branch, OR
+		for merge_if()'s own ownership-disagreement reconciliation (an
+		OWNED/COPY-vs-BORROWED split across an if's two branches - "fill in
+		a default when still borrowed") - both share the identical shape, so
+		this one minting helper covers both callers. Mirrors push_defer()'s
+		own flag exactly (a real Variable, spliced in as a body_start init by
+		lowering.py's _emit_epilogue - see cancel_flags()), except armed
+		(True) by default instead of disarmed: a defer flag starts False and
+		gets armed by the defer statement itself; this one starts True
+		(still needs releasing) and gets disarmed by whichever of move()/
+		deleted()/manually_decreffed()/merge_if()'s own borrowed-branch case
 		actually neutralizes the entry - see _neutralize(). '''
 		index = len( self._cancel_flags )
 		qualname = f'{self.fn.qualname}.__cancel_flag_{index}' if self.fn is not None else f'__cancel_flag_{index}'
