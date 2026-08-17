@@ -3492,7 +3492,45 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			else:
 				target = self._try_resolve_callable_namespace( node.func )
 			if isinstance( target, Function ):
-				target = self.resolver.ensure_resolved( target )
+				# resolve_declared_types, NOT ensure_resolved - this is pure
+				# type inference (what type would `x = ...` bind, not a real
+				# call being lowered), so target itself never needs
+				# scheduling as a compile unit here - ensure_resolved's
+				# unconditional scheduling side effect (see its own
+				# docstring) means an @inline target would otherwise get
+				# compiled as real, dead, never-called code purely from
+				# being assigned to a local (confirmed by a real repro: any
+				# `x = receiver.some_inline_method()` reaches exactly this
+				# line during type inference, before lowering.py's own,
+				# already-inline-aware call-emission ever runs - same root
+				# cause lowering.py's _resolve_call_target already carves
+				# out for its own, later call site). resolve_declared_types
+				# still does everything actually needed here: resolves
+				# target's signature and (separately) schedules/monomorphizes
+				# its OWN return type, just never target itself. Still need
+				# ensure_generator_synthesized explicitly, though - unlike
+				# scheduling, that one's genuinely still required here (a
+				# generator's real return type only exists after synthesis -
+				# ensure_resolved calls it for exactly this reason, see its
+				# own PLAN_GENERATORS.md comment; dropping it broke real
+				# `for x in a_generator_call():` type inference, confirmed
+				# by a real repro, since it's a no-op for the overwhelming
+				# majority of ordinary, non-generator functions anyway).
+				# Order matters: ensure_resolved's own sequence is resolve()
+				# THEN ensure_generator_synthesized (which itself checks
+				# fn.return_type, so it needs the bare annotation populated
+				# first) - resolve_declared_types' own eager monomorphize
+				# step has to come LAST, after synthesis may have rewritten
+				# return_type into a real GeneratorType, or it eagerly
+				# monomorphizes the PRE-synthesis annotation instead
+				# (confirmed by a real repro: reversing this order broke
+				# even the most basic generator - "contains yield but is
+				# not declared -> Iterator[T]" on a function that plainly
+				# was).
+				if target.resolve is not None:
+					target.resolve()
+				self.resolver.ensure_generator_synthesized( target )
+				self.resolver.resolve_declared_types( target )
 				return target.return_type if isinstance( target, Function ) else None
 			if isinstance( target, Overload ):
 				# an @overload-decorated method group (e.g. Result[T,E].

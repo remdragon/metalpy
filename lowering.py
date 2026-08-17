@@ -62,6 +62,7 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.Mult: '__mul__',
 	ast.FloorDiv: '__floordiv__',
 	ast.Mod: '__mod__',
+	ast.Div: '__truediv__', # float-only in practice (see lib/builtins/__scalar_arith.py) - int has no `/`, only `//`
 	ast.BitOr: '__or__',
 	ast.BitAnd: '__and__',
 	ast.BitXor: '__xor__',
@@ -83,6 +84,7 @@ _REFLECTED_BINOP_DUNDER: dict[str,str] = {
 	'__mul__': '__rmul__',
 	'__floordiv__': '__rfloordiv__',
 	'__mod__': '__rmod__',
+	'__truediv__': '__rtruediv__',
 	'__or__': '__ror__',
 	'__and__': '__rand__',
 	'__xor__': '__rxor__',
@@ -95,13 +97,44 @@ _REFLECTED_BINOP_DUNDER: dict[str,str] = {
 # always use the base name directly (no separate "panicked" spelling; a
 # @fallible_arithmetic dunder's own is_fallible_arithmetic consumption
 # already handles the panic-vs-propagate distinction). This is the whole
-# mechanism that lets a
-# class like `int` (which never registers __wrapped_add__) stay mode-
-# independent with zero isinstance(Scalar)-style special-casing anywhere:
-# the qualified lookup just misses and falls through to __add__.
+# mechanism that lets a class like `int` (which never registers
+# __wrapped_add__) stay mode-independent with zero isinstance(Scalar)-style
+# special-casing anywhere: the qualified lookup just misses and falls
+# through to __add__.
 _MODE_DUNDER_PREFIX: dict[type,str] = {
 	arithmetic_mode.ArithmeticWrap: 'wrapped',
 	arithmetic_mode.ArithmeticSaturate: 'saturated',
+}
+
+# (operation kind, mode) -> the ir.BinOp opcode compiler.checked_*/wrapped_*/
+# saturated_* resolve to for INTEGER operands - see _lower_compiler_checked_
+# binop. 'floordiv'/'mod' stay fallible (ZeroDivisionError) in every mode -
+# see ir.py's own DivWrap/DivSaturate/ModWrap/ModSaturate comments - unlike
+# add/sub/mul, which are only fallible under 'checked'.
+_CHECKED_BINOP_OPCODES: dict[tuple[str,str],type] = {
+	( 'add', 'checked' ): ir.AddCheck, ( 'add', 'wrapped' ): ir.AddWrap, ( 'add', 'saturated' ): ir.AddSaturate,
+	( 'sub', 'checked' ): ir.SubCheck, ( 'sub', 'wrapped' ): ir.SubWrap, ( 'sub', 'saturated' ): ir.SubSaturate,
+	( 'mul', 'checked' ): ir.MulCheck, ( 'mul', 'wrapped' ): ir.MulWrap, ( 'mul', 'saturated' ): ir.MulSaturate,
+	( 'floordiv', 'checked' ): ir.Div, ( 'floordiv', 'wrapped' ): ir.DivWrap, ( 'floordiv', 'saturated' ): ir.DivSaturate,
+	( 'mod', 'checked' ): ir.Mod, ( 'mod', 'wrapped' ): ir.ModWrap, ( 'mod', 'saturated' ): ir.ModSaturate,
+}
+
+# same idea for FLOAT operands - wrap/saturate raw-IEEE add/sub/mul reuse the
+# integer Wrap opcodes (their emitter codegen is already type-generic, see
+# _emit_wrap_arith); there's no float 'saturated' opcode distinct from
+# 'wrapped' at all (arithmetic_mode.py's own ArithmeticSaturate.GetFloatBinOp
+# delegates to _raw_float_binop, identically to ArithmeticWrap) - the
+# library-level saturated_add/etc dunders for f32/f64 call compiler.
+# wrapped_add directly instead of a separate saturated intrinsic (see
+# lib/builtins/__scalar_arith.py), so 'saturated' is deliberately absent
+# here. No 'floordiv'/'mod' entries either - float has no // or % in this
+# language's arithmetic-mode system (arithmetic_mode.py's GetFloatBinOp has
+# no case for either).
+_CHECKED_FLOAT_BINOP_OPCODES: dict[tuple[str,str],type] = {
+	( 'add', 'checked' ): ir.FAddCheck, ( 'add', 'wrapped' ): ir.AddWrap,
+	( 'sub', 'checked' ): ir.FSubCheck, ( 'sub', 'wrapped' ): ir.SubWrap,
+	( 'mul', 'checked' ): ir.FMulCheck, ( 'mul', 'wrapped' ): ir.MulWrap,
+	( 'truediv', 'checked' ): ir.FloatDivCheck, ( 'truediv', 'wrapped' ): ir.FloatDiv,
 }
 
 # ast comparison operator -> the dunder method name to dispatch to for a
@@ -2320,8 +2353,21 @@ class FunctionLowering:
 			# rejected, confirmed via a real repro
 			is_cenum_to_underlying = isinstance( value.type, CEnum ) and value.type.value_type is fn_type
 			is_underlying_to_cenum = isinstance( fn_type, CEnum ) and value.type is fn_type.value_type
+			# the mirror image of expected_concrete above: value.type can
+			# ALSO still be a raw, un-monomorphized Specialization here (a
+			# compiler.checked_add(...)-style intrinsic's own check_dest,
+			# see _lower_compiler_checked_binop's own comment on why IT
+			# can't be pre-monomorphized either - the emitter needs its
+			# Specialization .args) - monomorphize it the same way before
+			# the identity comparison, rather than requiring every producer
+			# of a same-statement-escaping Result value to guess which form
+			# the compare side wants
+			value_concrete = value.type
+			if isinstance( value.type, Specialization ) and isinstance( value.type.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				value_concrete = self.lowering.monomorphize_class( value.type )
 			if (
 				value.type is not fn_type and value.type is not expected_concrete
+				and value_concrete is not fn_type and value_concrete is not expected_concrete
 				and not is_cenum_to_underlying and not is_underlying_to_cenum
 			):
 				widened = self._maybe_widen_return_result( node, value, fn_type )
@@ -3379,47 +3425,66 @@ class FunctionLowering:
 		self._emit( ir.RefCount( dest = dest, value = value ))
 		return dest
 
-	def _lower_compiler_checked_binop( self, node: ast.Call, intrinsic_name: str, opcode: type, expected_type: Type|None ) -> ir.Operand:
-		# compiler.checked_add(a, b)/wrapped_add(a, b)/saturated_add(a, b) -
+	def _lower_compiler_checked_binop( self, node: ast.Call, intrinsic_name: str, kind: str, mode: str, expected_type: Type|None ) -> ir.Operand:
+		# compiler.checked_add(a, b)/wrapped_add(a, b)/saturated_add(a, b)/
+		# checked_sub(...)/.../checked_truediv(a, b)/wrapped_truediv(a, b) -
 		# FIXED primitives (unlike bare `+`, which reads self._arithmetic_
 		# mode[-1] to pick BETWEEN AddCheck/AddWrap/AddSaturate): each of
-		# these always resolves to exactly one opcode. Intended body for a
-		# scalar-registered, @inline'd `__add__`/`__wrapped_add__`/
-		# `__saturated_add__` (see lib/builtins - i32.__add__ etc.) - which
-		# opcode a given SOURCE `+` actually gets still comes from ambient
-		# mode picking which of these three dunders binop dispatch resolves
-		# to (mode-qualified name lookup in _lower_binop_values), not from
-		# anything read here.
+		# these always resolves to exactly one opcode PER OPERAND TYPE (int
+		# vs float pick a different opcode for the same kind/mode pair -
+		# see _CHECKED_BINOP_OPCODES/_CHECKED_FLOAT_BINOP_OPCODES below -
+		# but which one is picked never depends on ambient arithmetic mode).
+		# Intended body for a scalar-registered, @inline'd `__add__`/
+		# `__wrapped_add__`/`__saturated_add__`/etc (see lib/builtins/
+		# __scalar_arith.py) - which opcode a given SOURCE `+`/`//`/etc
+		# actually gets still comes from ambient mode picking which of
+		# these dunders binop dispatch resolves to (mode-qualified name
+		# lookup in _lower_binop_values), not from anything read here.
 		if len( node.args ) != 2 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
 		left = self._lower_expr( node.args[0], None )
 		right = self._lower_expr( node.args[1], None )
-		if not isinstance( left.type, Scalar ) or _is_float_scalar( left.type ) or left.type is not right.type:
+		is_float = _is_float_scalar( left.type )
+		opcode = ( _CHECKED_FLOAT_BINOP_OPCODES if is_float else _CHECKED_BINOP_OPCODES ).get(( kind, mode ))
+		if not isinstance( left.type, Scalar ) or left.type is not right.type or opcode is None:
 			self.lowering.discovery.fail(
-				f'compiler.{intrinsic_name}(...) arguments must both be the same non-float scalar type - got '
+				f'compiler.{intrinsic_name}(...) arguments must both be the same scalar type supporting {kind!r} - got '
 				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
 				node,
 			)
 		result_type = expected_type if expected_type is not None and isinstance( expected_type, Scalar ) else left.type
 		if not opcode.checked_errors:
-			# wrapped_add/saturated_add - infallible, _lower_arithmetic_op's
-			# own infallible branch (single instruction, no Result at all)
-			# is exactly right
+			# wrapped_*/saturated_* on add/sub/mul, wrapped_truediv - fully
+			# infallible, _lower_arithmetic_op's own infallible branch
+			# (single instruction, no Result at all) is exactly right
 			return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
-		# checked_add - deliberately does NOT auto-consume the way a bare
-		# checked `+` would (_lower_arithmetic_op's own check-mode branch
-		# always does, regardless of caller context - arithmetic modes
-		# don't translate through a function call boundary, inline or not,
-		# by design). This returns the RAW Result[result_type,error_type]
-		# value instead, matching a @fallible_arithmetic dunder's own declared return
-		# type exactly - so whatever calls/inlines this dunder can
-		# uniformly consume it via ambient mode at the DISPATCH site
-		# (_emit_binop_dunder_call's is_fallible_arithmetic handling), the same way
-		# whether this call ends up inlined or not.
+		# checked_*, and wrapped_/saturated_floordiv/mod (still fallible -
+		# ZeroDivisionError persists in every mode, see ir.py's own
+		# DivWrap/DivSaturate/ModWrap/ModSaturate comments) - deliberately
+		# does NOT auto-consume the way a bare checked `+` would
+		# (_lower_arithmetic_op's own check-mode branch always does,
+		# regardless of caller context - arithmetic modes don't translate
+		# through a function call boundary, inline or not, by design). This
+		# returns the RAW Result[result_type,error_type] value instead,
+		# matching a @fallible_arithmetic dunder's own declared return type
+		# exactly - so whatever calls/inlines this dunder can uniformly
+		# consume it via ambient mode at the DISPATCH site
+		# (_emit_binop_dunder_call's is_fallible_arithmetic handling), the
+		# same way whether this call ends up inlined or not.
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
 		error_type, _alternatives = self._resolve_checked_error( node, opcode, result_type )
 		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ result_type, error_type ] )
 		self.lowering.schedule( check_type )
+		# NOT monomorphized - _emit_check_arith (emitter_c.py) needs this
+		# temp's type to stay a Specialization (reads .args[0] for the
+		# success type) exactly like _emit_checked_op's identical, older
+		# check_dest already relies on. This value deliberately escapes as
+		# a real `return` value though (unlike _emit_checked_op's own
+		# check_dest, always consumed same-statement via _consume_checked_
+		# result) - see _stmt_Return's own comment on why it tries
+		# monomorphize_class(value.type) too, not just value.type itself,
+		# to match a Specialization-typed return against a function's
+		# already-monomorphized declared return type.
 		check_dest = self._new_temp( check_type )
 		self._emit( opcode( dest = check_dest, left = left, right = right ))
 		return check_dest
@@ -6701,7 +6766,16 @@ class FunctionLowering:
 		# `with compiler.panic_arithmetic(...): a // b` (a, b: int) auto-
 		# panic, and default-mode `a // b` auto-propagate, exactly like a
 		# bare scalar `+` already does.
-		self.lowering._ensure_resolved( method )
+		# _resolve_call_target, NOT _ensure_resolved - the latter
+		# unconditionally schedules its target as a real compile unit as a
+		# side effect (see its own docstring), which for an @inline target
+		# means compiling it as real, dead, never-called code (confirmed by
+		# a real repro - see _resolve_call_target's own identical carve-out
+		# and comment, already relied on by the general _lower_call path;
+		# this is the same fix, needed again here since dunder-dispatch
+		# resolves its own target independently rather than going through
+		# that shared path)
+		self.lowering._resolve_call_target( method )
 		self.lowering.schedule( method.return_type )
 		for p in ( method.parameters or [] ):
 			self.lowering.schedule( p.type )
@@ -10274,16 +10348,16 @@ class FunctionLowering:
 				result = self._lower_compiler_refcount( node, expected_type )
 				return result if want_result else None
 
-			case 'checked_add':
-				result = self._lower_compiler_checked_binop( node, 'checked_add', ir.AddCheck, expected_type )
-				return result if want_result else None
-
-			case 'wrapped_add':
-				result = self._lower_compiler_checked_binop( node, 'wrapped_add', ir.AddWrap, expected_type )
-				return result if want_result else None
-
-			case 'saturated_add':
-				result = self._lower_compiler_checked_binop( node, 'saturated_add', ir.AddSaturate, expected_type )
+			case 'checked_add' | 'wrapped_add' | 'saturated_add' | 'checked_sub' | 'wrapped_sub' | 'saturated_sub' | \
+				'checked_mul' | 'wrapped_mul' | 'saturated_mul' | 'checked_floordiv' | 'wrapped_floordiv' | 'saturated_floordiv' | \
+				'checked_mod' | 'wrapped_mod' | 'saturated_mod' | 'checked_truediv' | 'wrapped_truediv':
+				# every compiler.<mode>_<kind>(a, b) intrinsic shares one
+				# lowering - see _lower_compiler_checked_binop and
+				# _CHECKED_BINOP_OPCODES/_CHECKED_FLOAT_BINOP_OPCODES for how
+				# (kind, mode) picks the actual opcode per operand type
+				name = self.lowering._is_compiler_call( node )
+				mode, _sep, kind = name.partition( '_' )
+				result = self._lower_compiler_checked_binop( node, name, kind, mode, expected_type )
 				return result if want_result else None
 
 			case 'cast':
