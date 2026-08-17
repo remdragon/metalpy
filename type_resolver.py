@@ -4065,6 +4065,44 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		is_not = isinstance( test.ops[0], ast.IsNot )
 		return subject_expr, base, members, none_member, is_not
 
+	def _bare_truthiness_narrowing_shape( self, test: ast.expr ) -> tuple[ast.expr,TaggedUnion,list[Variable],Variable,bool]|None:
+		''' `if x:` / `if not x:` against a union-typed, bare-Name x - a
+		DIFFERENT shape from _is_none_narrowing_shape's own `is None`/`is
+		not None` comparison, but narrows the same way. Only the TRUTHY
+		case narrows: it always safely implies non-None (None is always
+		falsy, so truthy entails not-None), regardless of whether the
+		leaf's own __bool__ could ALSO be False for a real, non-None
+		instance (e.g. an empty str) - a falsy leaf is still non-None. The
+		FALSY case is deliberately left un-narrowed: it could be None OR a
+		real-but-falsy leaf, so nothing new is provable there in general
+		(unlike is-None narrowing's own else branch, which DOES prove
+		non-None). Same single-non-None-member restriction as
+		_is_none_narrowing_shape/_rewrite_tagged_union_truthiness. Returns
+		the identical shape _is_none_narrowing_shape does so visit_If's
+		existing narrowing machinery (built for that comparison case)
+		drives this one too, unchanged - only is_not's OWN meaning differs
+		here (True selects the TRUTHY branch, not the not-None one). '''
+		is_not = True
+		subject_expr = test
+		if isinstance( test, ast.UnaryOp ) and isinstance( test.op, ast.Not ):
+			subject_expr = test.operand
+			is_not = False
+		if not isinstance( subject_expr, ast.Name ):
+			return None
+		subject_type = self._type_of_expr( subject_expr )
+		if subject_type is None:
+			return None
+		spec = self.resolver._as_specialization( subject_type )
+		base = spec.base if spec is not None else subject_type
+		if not isinstance( base, TaggedUnion ):
+			return None
+		members = self._resolved_union_members( subject_type, base )
+		none_type = self.discovery.get_none_type()
+		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
+		if none_member is None:
+			return None
+		return subject_expr, base, members, none_member, is_not
+
 	def visit_Compare( self, node: ast.Compare ) -> ast.expr:
 		self.generic_visit( node )
 		if len( node.ops ) != 1 or not isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
@@ -4437,6 +4475,11 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# test) would otherwise already have destroyed this shape by the time
 		# it's looked for
 		none_shape = self._is_none_narrowing_shape( node.test )
+		if none_shape is None:
+			# not an `is None`/`is not None` comparison - try the bare
+			# truthiness shape instead (`if x:`/`if not x:`), see its own
+			# docstring for why only its TRUTHY branch narrows
+			none_shape = self._bare_truthiness_narrowing_shape( node.test )
 		subject_name: str|None = None
 		narrow_member: Variable|None = None
 		is_not = False
