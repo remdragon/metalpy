@@ -76,7 +76,22 @@ class Compiler:
 		self.extern_libs: dict[str,set[str]] = {}
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
-		module = self.disco.import_code( code, filename, scope )
+		# pass the entry module's own eventual qualname through as `package` so
+		# disco.import_code registers it in disco.modules BEFORE scanning its
+		# body, same as any nested `import X`/`from X import Y` reaches
+		# (discovery.py's own import_code comment on the `package is not None`
+		# branch) - without this, a self-import inside the entry module itself
+		# (`import foo` written in foo.py, the file being compiled) can't find
+		# itself here yet, falls through to a fresh file-system lookup, and
+		# re-parses the same source as an independent second Module - real
+		# "already defined" collisions for every top-level name, further
+		# masked into a mismatched-Module-identity cascade downstream
+		# (type_resolver.py's _find_module_for) by self.paths' own unresolved
+		# relative '.' entry not matching this file's already-absolute path.
+		# Mirrors discovery.py's own non-folding qualname formula - an entry
+		# file is never a folding (__init__.py-style) module in practice
+		package = f'{scope}.{filename.stem}' if scope else filename.stem
+		module = self.disco.import_code( code, filename, scope, package = package )
 		# entry modules aren't registered in disco.modules on their own (that's
 		# keyed by import package name, for nested imports reached via `import
 		# X`) - stage 2 needs to be able to find any module by file (see
@@ -85,7 +100,8 @@ class Compiler:
 		return module
 
 	def import_file( self, filename: Path, scope: str|None = None ) -> Module:
-		module = self.disco.import_file( filename, scope )
+		package = f'{scope}.{filename.stem}' if scope else filename.stem
+		module = self.disco.import_file( filename, scope, package = package )
 		self.disco.modules[module.qualname] = module
 		return module
 
