@@ -947,13 +947,14 @@ class str:
 		grouping requested". '''
 		count: usize = self.byte_len() # ASCII-only digit text - byte length is codepoint count here
 		if count <= 3:
-			# self is a BORROWED parameter - returning it directly needs an
-			# explicit incref first, the same "explicit incref after a
-			# borrowing return" pattern str.concat's own comment documents
-			# (a real, confirmed use-after-free was found taking this
-			# shortcut without it elsewhere - see float._group_integer_
-			# part's own comment for the full account).
-			compiler.incref( self )
+			# self is a BORROWED parameter (never pushed onto the epilogue
+			# stack - cfg.py's _enter_parameter()) - a bare `return self`
+			# already gets its own +1 from _stmt_Return's own aliasing-
+			# return incref (lowering.py); an explicit compiler.incref(self)
+			# here on top of that double-counts and LEAKS (confirmed via
+			# ASAN/LeakSanitizer). NOT the same situation as str.concat's
+			# own loop-local incref, which guards a fresh LOCAL (its own
+			# live epilogue entry) rather than a directly-returned parameter.
 			return self
 		groups: list[str] = list[str]() # least-significant GROUP first
 		end: usize = count

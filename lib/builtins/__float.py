@@ -91,17 +91,13 @@ def _group_integer_part( digits: str, sep: str ) -> str:
 	rest: str = digits._byte_slice( dot_index, digits.byte_len() )
 	count: usize = int_part.byte_len() # ASCII-only digit text - byte length is codepoint count here
 	if count <= 3:
-		# digits is a BORROWED parameter (ordinary, non-move calling
-		# convention) - returning it directly as this function's own result
-		# needs an explicit incref first, giving the caller a real +1 of its
-		# own, the same "explicit incref after a borrowing return" pattern
-		# str.concat's own comment documents (lib/builtins/__init__.py) -
-		# without it, this function's own local `digits` going out of scope
-		# on return double-releases the very value the caller still holds a
-		# reference to (confirmed by a real crash/garbage-read while writing
-		# this, the exact failure shape that pattern's own comment warns
-		# about).
-		compiler.incref( digits )
+		# digits is a BORROWED parameter (never pushed onto the epilogue
+		# stack - cfg.py's _enter_parameter()) - a bare `return digits`
+		# already gets its own +1 from _stmt_Return's own aliasing-return
+		# incref (lowering.py); an explicit compiler.incref(digits) here on
+		# top of that double-counts and LEAKS (confirmed via ASAN/
+		# LeakSanitizer - see str._insert_thousands_sep's own comment,
+		# lib/builtins/__init__.py, for the identical bug found there).
 		return digits
 	groups: list[str] = list[str]() # least-significant GROUP first
 	end: usize = count
