@@ -246,6 +246,66 @@ i64.__saturated_mul__ = i64__saturated_mul__i64
 @fallible_arithmetic
 @private
 @inline
+def i128__add__i128( value: i128, other: i128 ) -> Result[i128,OverflowError]:
+	return compiler.checked_add( value, other )
+
+@private
+@inline
+def i128__wrapped_add__i128( value: i128, other: i128 ) -> i128:
+	return compiler.wrapped_add( value, other )
+
+@private
+@inline
+def i128__saturated_add__i128( value: i128, other: i128 ) -> i128:
+	return compiler.saturated_add( value, other )
+
+i128.__add__ = i128__add__i128
+i128.__wrapped_add__ = i128__wrapped_add__i128
+i128.__saturated_add__ = i128__saturated_add__i128
+
+@fallible_arithmetic
+@private
+@inline
+def i128__sub__i128( value: i128, other: i128 ) -> Result[i128,OverflowError]:
+	return compiler.checked_sub( value, other )
+
+@private
+@inline
+def i128__wrapped_sub__i128( value: i128, other: i128 ) -> i128:
+	return compiler.wrapped_sub( value, other )
+
+@private
+@inline
+def i128__saturated_sub__i128( value: i128, other: i128 ) -> i128:
+	return compiler.saturated_sub( value, other )
+
+i128.__sub__ = i128__sub__i128
+i128.__wrapped_sub__ = i128__wrapped_sub__i128
+i128.__saturated_sub__ = i128__saturated_sub__i128
+
+@fallible_arithmetic
+@private
+@inline
+def i128__mul__i128( value: i128, other: i128 ) -> Result[i128,OverflowError]:
+	return compiler.checked_mul( value, other )
+
+@private
+@inline
+def i128__wrapped_mul__i128( value: i128, other: i128 ) -> i128:
+	return compiler.wrapped_mul( value, other )
+
+@private
+@inline
+def i128__saturated_mul__i128( value: i128, other: i128 ) -> i128:
+	return compiler.saturated_mul( value, other )
+
+i128.__mul__ = i128__mul__i128
+i128.__wrapped_mul__ = i128__wrapped_mul__i128
+i128.__saturated_mul__ = i128__saturated_mul__i128
+
+@fallible_arithmetic
+@private
+@inline
 def isize__add__isize( value: isize, other: isize ) -> Result[isize,OverflowError]:
 	return compiler.checked_add( value, other )
 
@@ -546,6 +606,66 @@ u64.__saturated_mul__ = u64__saturated_mul__u64
 @fallible_arithmetic
 @private
 @inline
+def u128__add__u128( value: u128, other: u128 ) -> Result[u128,OverflowError]:
+	return compiler.checked_add( value, other )
+
+@private
+@inline
+def u128__wrapped_add__u128( value: u128, other: u128 ) -> u128:
+	return compiler.wrapped_add( value, other )
+
+@private
+@inline
+def u128__saturated_add__u128( value: u128, other: u128 ) -> u128:
+	return compiler.saturated_add( value, other )
+
+u128.__add__ = u128__add__u128
+u128.__wrapped_add__ = u128__wrapped_add__u128
+u128.__saturated_add__ = u128__saturated_add__u128
+
+@fallible_arithmetic
+@private
+@inline
+def u128__sub__u128( value: u128, other: u128 ) -> Result[u128,OverflowError]:
+	return compiler.checked_sub( value, other )
+
+@private
+@inline
+def u128__wrapped_sub__u128( value: u128, other: u128 ) -> u128:
+	return compiler.wrapped_sub( value, other )
+
+@private
+@inline
+def u128__saturated_sub__u128( value: u128, other: u128 ) -> u128:
+	return compiler.saturated_sub( value, other )
+
+u128.__sub__ = u128__sub__u128
+u128.__wrapped_sub__ = u128__wrapped_sub__u128
+u128.__saturated_sub__ = u128__saturated_sub__u128
+
+@fallible_arithmetic
+@private
+@inline
+def u128__mul__u128( value: u128, other: u128 ) -> Result[u128,OverflowError]:
+	return compiler.checked_mul( value, other )
+
+@private
+@inline
+def u128__wrapped_mul__u128( value: u128, other: u128 ) -> u128:
+	return compiler.wrapped_mul( value, other )
+
+@private
+@inline
+def u128__saturated_mul__u128( value: u128, other: u128 ) -> u128:
+	return compiler.saturated_mul( value, other )
+
+u128.__mul__ = u128__mul__u128
+u128.__wrapped_mul__ = u128__wrapped_mul__u128
+u128.__saturated_mul__ = u128__saturated_mul__u128
+
+@fallible_arithmetic
+@private
+@inline
 def usize__add__usize( value: usize, other: usize ) -> Result[usize,OverflowError]:
 	return compiler.checked_add( value, other )
 
@@ -782,6 +902,50 @@ i64.__saturated_mod__ = i64__saturated_mod__i64
 @fallible_arithmetic
 @private
 @inline
+def i128__floordiv__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError|OverflowError]:
+	return compiler.checked_floordiv( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def i128__wrapped_floordiv__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
+	return compiler.wrapped_floordiv( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def i128__saturated_floordiv__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
+	return compiler.saturated_floordiv( value, other )
+
+i128.__floordiv__ = i128__floordiv__i128
+i128.__wrapped_floordiv__ = i128__wrapped_floordiv__i128
+i128.__saturated_floordiv__ = i128__saturated_floordiv__i128
+
+@fallible_arithmetic
+@private
+@inline
+def i128__mod__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError|OverflowError]:
+	return compiler.checked_mod( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def i128__wrapped_mod__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
+	return compiler.wrapped_mod( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def i128__saturated_mod__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
+	return compiler.saturated_mod( value, other )
+
+i128.__mod__ = i128__mod__i128
+i128.__wrapped_mod__ = i128__wrapped_mod__i128
+i128.__saturated_mod__ = i128__saturated_mod__i128
+
+@fallible_arithmetic
+@private
+@inline
 def isize__floordiv__isize( value: isize, other: isize ) -> Result[isize,ZeroDivisionError|OverflowError]:
 	return compiler.checked_floordiv( value, other )
 
@@ -998,6 +1162,50 @@ def u64__saturated_mod__u64( value: u64, other: u64 ) -> Result[u64,ZeroDivision
 u64.__mod__ = u64__mod__u64
 u64.__wrapped_mod__ = u64__wrapped_mod__u64
 u64.__saturated_mod__ = u64__saturated_mod__u64
+
+@fallible_arithmetic
+@private
+@inline
+def u128__floordiv__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
+	return compiler.checked_floordiv( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def u128__wrapped_floordiv__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
+	return compiler.wrapped_floordiv( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def u128__saturated_floordiv__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
+	return compiler.saturated_floordiv( value, other )
+
+u128.__floordiv__ = u128__floordiv__u128
+u128.__wrapped_floordiv__ = u128__wrapped_floordiv__u128
+u128.__saturated_floordiv__ = u128__saturated_floordiv__u128
+
+@fallible_arithmetic
+@private
+@inline
+def u128__mod__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
+	return compiler.checked_mod( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def u128__wrapped_mod__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
+	return compiler.wrapped_mod( value, other )
+
+@fallible_arithmetic
+@private
+@inline
+def u128__saturated_mod__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
+	return compiler.saturated_mod( value, other )
+
+u128.__mod__ = u128__mod__u128
+u128.__wrapped_mod__ = u128__wrapped_mod__u128
+u128.__saturated_mod__ = u128__saturated_mod__u128
 
 @fallible_arithmetic
 @private

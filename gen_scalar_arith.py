@@ -7,12 +7,20 @@
 # lowering.py's _lower_compiler_checked_binop/_CHECKED_BINOP_OPCODES/
 # _CHECKED_FLOAT_BINOP_OPCODES for the underlying mechanism, and memory file
 # fallible_arithmetic_decorator_and_int_division_fix.md for the design
-# rationale. i128/u128 deliberately excluded - not covered by the earlier
-# design discussion, left for a follow-up once their overflow-builtin
-# support is separately confirmed.
+# rationale. i128/u128 included - MSVC's own 64-bit __metalpy_wideint/
+# __metalpy_wideuint fallback (no native 128-bit type - see emitter_c.py's
+# own typedefs and linker_c.has_i128) already makes __metalpy_add_overflow/
+# etc's existing _Generic dispatch match correctly under every compiler
+# (matches int64_t/uint64_t under MSVC's fallback, __int128/unsigned
+# __int128 directly under clang/gcc) - confirmed via a real repro across
+# all 3 compilers, including that checked_add's overflow boundary lands at
+# the RIGHT width for each (64-bit under MSVC, true 128-bit under
+# clang/gcc), matching the already-established, already-tested has_i128
+# design (see wide_int_test.py) - nothing i128/u128-specific was needed
+# here beyond just listing them below.
 
-SIGNED_INT_TYPES = [ 'i8', 'i16', 'i32', 'i64', 'isize' ]
-UNSIGNED_INT_TYPES = [ 'u8', 'u16', 'u32', 'u64', 'usize' ]
+SIGNED_INT_TYPES = [ 'i8', 'i16', 'i32', 'i64', 'i128', 'isize' ]
+UNSIGNED_INT_TYPES = [ 'u8', 'u16', 'u32', 'u64', 'u128', 'usize' ]
 INT_TYPES = SIGNED_INT_TYPES + UNSIGNED_INT_TYPES
 FLOAT_TYPES = [ 'f32', 'f64' ]
 
