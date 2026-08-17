@@ -9083,6 +9083,54 @@ class DefaultValueModuleContextTests( unittest.TestCase ):
 			self.assertNotIn( '__main__.py', discovery.errors.errors[0] )
 
 
+class DefaultValueConstructionTests( unittest.TestCase ):
+	''' a construction call embedded in a parameter's own default value
+	(`def f( x: Foo = Foo() ) -> Foo:`) used to crash lowering.py's own
+	_try_lower_construct_call assert ("... was not resolved before
+	construction") once a caller actually omitted that argument.
+	type_resolver.py's own eager __init__-signature pre-resolution
+	(_ReferenceResolver, via resolve_function_body) only ever walks
+	fn.node.body - a parameter's default lives on fn.node.args instead,
+	which resolve_function_body never visits - so the construction call
+	inside it reached real lowering without ever having been pre-resolved,
+	exactly the same bug shape resolve_global_init was already added to fix
+	for a global variable's own construction-call initializer (confirmed
+	via a real repro - see resolve_parameter_default's own docstring). '''
+
+	def test_construction_call_in_a_default_value_does_not_crash( self ) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( '\n'.join([
+				'class Foo:',
+				'	x: i32',
+				'	def __init__( self, x: i32 = 1 ) -> None:',
+				'		self.x = x',
+				'',
+				'def f( x: Foo = Foo() ) -> Foo:', # the only construction of
+				# Foo anywhere in this program - never a direct Call node
+				# inside any function BODY, only inside this default
+				'	return x',
+			]), encoding = 'utf-8' )
+			( root / '__main__.py' ).write_text( '\n'.join([
+				'from a import f',
+				'def main() -> i32:',
+				'	obj = f()', # x omitted - forces the default to be lowered
+				'	return obj.x',
+			]), encoding = 'utf-8' )
+			# real RCClass construction needs sys.alloc, so builtins (plus the
+			# real lib/) has to be importable here, unlike the sibling class's
+			# plain-i32-default tests just above
+			disco = Discovery(
+				paths = [ root, Path( discovery.__file__ ).parent / 'lib' ],
+				import_builtins = True,
+			)
+			compiler = Compiler( disco )
+			compiler.import_file( root / '__main__.py' )
+			compiler.run()
+			self.assertEqual( disco.errors.errors, [] )
+
+
 class OverloadMoveResolutionTests( unittest.TestCase ):
 	''' move(...) sugar used to only be recognized once a single concrete
 	Function target was already chosen (_check_move_argument, reachable

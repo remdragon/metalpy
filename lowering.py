@@ -9301,6 +9301,14 @@ class FunctionLowering:
 		given.update( kwargs.keys() )
 		for param in target.parameters or []:
 			if param.stem not in given and param.default is not None:
+				# a construction call embedded in the default (`x: Foo =
+				# Foo()`) needs the same eager __init__ pre-resolution an
+				# ordinary body statement gets from _ReferenceResolver -
+				# defaults live on fn.node.args, never walked by resolve_
+				# function_body's fn.node.body loop, and are lowered here,
+				# often before target's own turn on the compile queue ever
+				# comes up - see resolve_parameter_default's own docstring
+				self.lowering._type_resolver.resolve_parameter_default( target, param )
 				# lowered in the CALLEE's own module/scope, not the
 				# caller's (matching the identical field-default pattern
 				# above in _lower_allocate_fields) - a default expression
@@ -10600,6 +10608,10 @@ class FunctionLowering:
 			given.update( kwargs.keys() )
 			for param in target.parameters or []:
 				if param.stem not in given and param.default is not None:
+					# see _lower_call_args's identical call for why this is
+					# needed - a construction call embedded in this default
+					# otherwise never gets its __init__ eagerly pre-resolved
+					self.lowering._type_resolver.resolve_parameter_default( target, param )
 					default_operand = self._lower_expr( param.default, param.type )
 					kwargs[param.stem] = default_operand
 		else:
