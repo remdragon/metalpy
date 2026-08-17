@@ -53,19 +53,19 @@ for t in INT_TYPES:
 		fn_saturated = f'{t}{saturated_dunder}{t}'
 
 		emit( '@fallible_arithmetic' )
-		emit( '@private' )
+		#emit( '@private' )
 		emit( '@inline' )
 		emit( f'def {fn_checked}( value: {t}, other: {t} ) -> Result[{t},OverflowError]:' )
 		emit( f'\treturn compiler.checked_{op}( value, other )' )
 		emit()
 
-		emit( '@private' )
+		#emit( '@private' )
 		emit( '@inline' )
 		emit( f'def {fn_wrapped}( value: {t}, other: {t} ) -> {t}:' )
 		emit( f'\treturn compiler.wrapped_{op}( value, other )' )
 		emit()
 
-		emit( '@private' )
+		#emit( '@private' )
 		emit( '@inline' )
 		emit( f'def {fn_saturated}( value: {t}, other: {t} ) -> {t}:' )
 		emit( f'\treturn compiler.saturated_{op}( value, other )' )
@@ -88,7 +88,7 @@ for t in INT_TYPES:
 		fn_saturated = f'{t}{saturated_dunder}{t}'
 
 		emit( '@fallible_arithmetic' )
-		emit( '@private' )
+		#emit( '@private' )
 		emit( '@inline' )
 		emit( f'def {fn_checked}( value: {t}, other: {t} ) -> Result[{t},{error_type}]:' )
 		emit( f'\treturn compiler.checked_{op}( value, other )' )
@@ -98,14 +98,14 @@ for t in INT_TYPES:
 		# inline, not surfaced as an error - see ir.py's DivWrap/DivSaturate/
 		# ModWrap/ModSaturate comments), signed or not
 		emit( '@fallible_arithmetic' )
-		emit( '@private' )
+		#emit( '@private' )
 		emit( '@inline' )
 		emit( f'def {fn_wrapped}( value: {t}, other: {t} ) -> Result[{t},ZeroDivisionError]:' )
 		emit( f'\treturn compiler.wrapped_{op}( value, other )' )
 		emit()
 
 		emit( '@fallible_arithmetic' )
-		emit( '@private' )
+		#emit( '@private' )
 		emit( '@inline' )
 		emit( f'def {fn_saturated}( value: {t}, other: {t} ) -> Result[{t},ZeroDivisionError]:' )
 		emit( f'\treturn compiler.saturated_{op}( value, other )' )
@@ -129,14 +129,14 @@ for t in FLOAT_TYPES:
 		fn_saturated = f'{t}{saturated_dunder}{t}'
 
 		emit( '@fallible_arithmetic' )
-		emit( '@private' )
+		#emit( '@private' )
 		emit( '@inline' )
 		emit( f'def {fn_checked}( value: {t}, other: {t} ) -> Result[{t},FloatingPointError]:' )
 		emit( f'\treturn compiler.checked_{op}( value, other )' )
 		emit()
 
 		emit( '@private' )
-		emit( '@inline' )
+		#emit( '@inline' )
 		emit( f'def {fn_wrapped}( value: {t}, other: {t} ) -> {t}:' )
 		emit( f'\treturn compiler.wrapped_{op}( value, other )' )
 		emit()
@@ -145,7 +145,7 @@ for t in FLOAT_TYPES:
 		# so this delegates straight to the SAME wrapped_* intrinsic rather
 		# than a nonexistent compiler.saturated_* one
 		emit( '@private' )
-		emit( '@inline' )
+		#emit( '@inline' )
 		emit( f'def {fn_saturated}( value: {t}, other: {t} ) -> {t}:' )
 		emit( f'\treturn compiler.wrapped_{op}( value, other )' )
 		emit()
@@ -167,19 +167,19 @@ for t in FLOAT_TYPES:
 	fn_saturated = f'{t}{saturated_dunder}{t}'
 
 	emit( '@fallible_arithmetic' )
-	emit( '@private' )
+	#emit( '@private' )
 	emit( '@inline' )
 	emit( f'def {fn_checked}( value: {t}, other: {t} ) -> Result[{t},ZeroDivisionError|FloatingPointError]:' )
 	emit( f'\treturn compiler.checked_truediv( value, other )' )
 	emit()
 
-	emit( '@private' )
+	#emit( '@private' )
 	emit( '@inline' )
 	emit( f'def {fn_wrapped}( value: {t}, other: {t} ) -> {t}:' )
 	emit( f'\treturn compiler.wrapped_truediv( value, other )' )
 	emit()
 
-	emit( '@private' )
+	#emit( '@private' )
 	emit( '@inline' )
 	emit( f'def {fn_saturated}( value: {t}, other: {t} ) -> {t}:' )
 	emit( f'\treturn compiler.wrapped_truediv( value, other )' )

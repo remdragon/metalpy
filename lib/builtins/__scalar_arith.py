@@ -4,17 +4,14 @@
 # for the full rationale and the mechanism this relies on).
 
 @fallible_arithmetic
-@private
 @inline
 def i8__add__i8( value: i8, other: i8 ) -> Result[i8,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def i8__wrapped_add__i8( value: i8, other: i8 ) -> i8:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def i8__saturated_add__i8( value: i8, other: i8 ) -> i8:
 	return compiler.saturated_add( value, other )
@@ -24,17 +21,14 @@ i8.__wrapped_add__ = i8__wrapped_add__i8
 i8.__saturated_add__ = i8__saturated_add__i8
 
 @fallible_arithmetic
-@private
 @inline
 def i8__sub__i8( value: i8, other: i8 ) -> Result[i8,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def i8__wrapped_sub__i8( value: i8, other: i8 ) -> i8:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def i8__saturated_sub__i8( value: i8, other: i8 ) -> i8:
 	return compiler.saturated_sub( value, other )
@@ -44,17 +38,14 @@ i8.__wrapped_sub__ = i8__wrapped_sub__i8
 i8.__saturated_sub__ = i8__saturated_sub__i8
 
 @fallible_arithmetic
-@private
 @inline
 def i8__mul__i8( value: i8, other: i8 ) -> Result[i8,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def i8__wrapped_mul__i8( value: i8, other: i8 ) -> i8:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def i8__saturated_mul__i8( value: i8, other: i8 ) -> i8:
 	return compiler.saturated_mul( value, other )
@@ -64,17 +55,14 @@ i8.__wrapped_mul__ = i8__wrapped_mul__i8
 i8.__saturated_mul__ = i8__saturated_mul__i8
 
 @fallible_arithmetic
-@private
 @inline
 def i16__add__i16( value: i16, other: i16 ) -> Result[i16,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def i16__wrapped_add__i16( value: i16, other: i16 ) -> i16:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def i16__saturated_add__i16( value: i16, other: i16 ) -> i16:
 	return compiler.saturated_add( value, other )
@@ -84,17 +72,14 @@ i16.__wrapped_add__ = i16__wrapped_add__i16
 i16.__saturated_add__ = i16__saturated_add__i16
 
 @fallible_arithmetic
-@private
 @inline
 def i16__sub__i16( value: i16, other: i16 ) -> Result[i16,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def i16__wrapped_sub__i16( value: i16, other: i16 ) -> i16:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def i16__saturated_sub__i16( value: i16, other: i16 ) -> i16:
 	return compiler.saturated_sub( value, other )
@@ -104,17 +89,14 @@ i16.__wrapped_sub__ = i16__wrapped_sub__i16
 i16.__saturated_sub__ = i16__saturated_sub__i16
 
 @fallible_arithmetic
-@private
 @inline
 def i16__mul__i16( value: i16, other: i16 ) -> Result[i16,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def i16__wrapped_mul__i16( value: i16, other: i16 ) -> i16:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def i16__saturated_mul__i16( value: i16, other: i16 ) -> i16:
 	return compiler.saturated_mul( value, other )
@@ -124,17 +106,14 @@ i16.__wrapped_mul__ = i16__wrapped_mul__i16
 i16.__saturated_mul__ = i16__saturated_mul__i16
 
 @fallible_arithmetic
-@private
 @inline
 def i32__add__i32( value: i32, other: i32 ) -> Result[i32,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def i32__wrapped_add__i32( value: i32, other: i32 ) -> i32:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def i32__saturated_add__i32( value: i32, other: i32 ) -> i32:
 	return compiler.saturated_add( value, other )
@@ -144,17 +123,14 @@ i32.__wrapped_add__ = i32__wrapped_add__i32
 i32.__saturated_add__ = i32__saturated_add__i32
 
 @fallible_arithmetic
-@private
 @inline
 def i32__sub__i32( value: i32, other: i32 ) -> Result[i32,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def i32__wrapped_sub__i32( value: i32, other: i32 ) -> i32:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def i32__saturated_sub__i32( value: i32, other: i32 ) -> i32:
 	return compiler.saturated_sub( value, other )
@@ -164,17 +140,14 @@ i32.__wrapped_sub__ = i32__wrapped_sub__i32
 i32.__saturated_sub__ = i32__saturated_sub__i32
 
 @fallible_arithmetic
-@private
 @inline
 def i32__mul__i32( value: i32, other: i32 ) -> Result[i32,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def i32__wrapped_mul__i32( value: i32, other: i32 ) -> i32:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def i32__saturated_mul__i32( value: i32, other: i32 ) -> i32:
 	return compiler.saturated_mul( value, other )
@@ -184,17 +157,14 @@ i32.__wrapped_mul__ = i32__wrapped_mul__i32
 i32.__saturated_mul__ = i32__saturated_mul__i32
 
 @fallible_arithmetic
-@private
 @inline
 def i64__add__i64( value: i64, other: i64 ) -> Result[i64,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def i64__wrapped_add__i64( value: i64, other: i64 ) -> i64:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def i64__saturated_add__i64( value: i64, other: i64 ) -> i64:
 	return compiler.saturated_add( value, other )
@@ -204,17 +174,14 @@ i64.__wrapped_add__ = i64__wrapped_add__i64
 i64.__saturated_add__ = i64__saturated_add__i64
 
 @fallible_arithmetic
-@private
 @inline
 def i64__sub__i64( value: i64, other: i64 ) -> Result[i64,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def i64__wrapped_sub__i64( value: i64, other: i64 ) -> i64:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def i64__saturated_sub__i64( value: i64, other: i64 ) -> i64:
 	return compiler.saturated_sub( value, other )
@@ -224,17 +191,14 @@ i64.__wrapped_sub__ = i64__wrapped_sub__i64
 i64.__saturated_sub__ = i64__saturated_sub__i64
 
 @fallible_arithmetic
-@private
 @inline
 def i64__mul__i64( value: i64, other: i64 ) -> Result[i64,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def i64__wrapped_mul__i64( value: i64, other: i64 ) -> i64:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def i64__saturated_mul__i64( value: i64, other: i64 ) -> i64:
 	return compiler.saturated_mul( value, other )
@@ -244,17 +208,14 @@ i64.__wrapped_mul__ = i64__wrapped_mul__i64
 i64.__saturated_mul__ = i64__saturated_mul__i64
 
 @fallible_arithmetic
-@private
 @inline
 def i128__add__i128( value: i128, other: i128 ) -> Result[i128,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def i128__wrapped_add__i128( value: i128, other: i128 ) -> i128:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def i128__saturated_add__i128( value: i128, other: i128 ) -> i128:
 	return compiler.saturated_add( value, other )
@@ -264,17 +225,14 @@ i128.__wrapped_add__ = i128__wrapped_add__i128
 i128.__saturated_add__ = i128__saturated_add__i128
 
 @fallible_arithmetic
-@private
 @inline
 def i128__sub__i128( value: i128, other: i128 ) -> Result[i128,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def i128__wrapped_sub__i128( value: i128, other: i128 ) -> i128:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def i128__saturated_sub__i128( value: i128, other: i128 ) -> i128:
 	return compiler.saturated_sub( value, other )
@@ -284,17 +242,14 @@ i128.__wrapped_sub__ = i128__wrapped_sub__i128
 i128.__saturated_sub__ = i128__saturated_sub__i128
 
 @fallible_arithmetic
-@private
 @inline
 def i128__mul__i128( value: i128, other: i128 ) -> Result[i128,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def i128__wrapped_mul__i128( value: i128, other: i128 ) -> i128:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def i128__saturated_mul__i128( value: i128, other: i128 ) -> i128:
 	return compiler.saturated_mul( value, other )
@@ -304,17 +259,14 @@ i128.__wrapped_mul__ = i128__wrapped_mul__i128
 i128.__saturated_mul__ = i128__saturated_mul__i128
 
 @fallible_arithmetic
-@private
 @inline
 def isize__add__isize( value: isize, other: isize ) -> Result[isize,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def isize__wrapped_add__isize( value: isize, other: isize ) -> isize:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def isize__saturated_add__isize( value: isize, other: isize ) -> isize:
 	return compiler.saturated_add( value, other )
@@ -324,17 +276,14 @@ isize.__wrapped_add__ = isize__wrapped_add__isize
 isize.__saturated_add__ = isize__saturated_add__isize
 
 @fallible_arithmetic
-@private
 @inline
 def isize__sub__isize( value: isize, other: isize ) -> Result[isize,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def isize__wrapped_sub__isize( value: isize, other: isize ) -> isize:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def isize__saturated_sub__isize( value: isize, other: isize ) -> isize:
 	return compiler.saturated_sub( value, other )
@@ -344,17 +293,14 @@ isize.__wrapped_sub__ = isize__wrapped_sub__isize
 isize.__saturated_sub__ = isize__saturated_sub__isize
 
 @fallible_arithmetic
-@private
 @inline
 def isize__mul__isize( value: isize, other: isize ) -> Result[isize,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def isize__wrapped_mul__isize( value: isize, other: isize ) -> isize:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def isize__saturated_mul__isize( value: isize, other: isize ) -> isize:
 	return compiler.saturated_mul( value, other )
@@ -364,17 +310,14 @@ isize.__wrapped_mul__ = isize__wrapped_mul__isize
 isize.__saturated_mul__ = isize__saturated_mul__isize
 
 @fallible_arithmetic
-@private
 @inline
 def u8__add__u8( value: u8, other: u8 ) -> Result[u8,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def u8__wrapped_add__u8( value: u8, other: u8 ) -> u8:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def u8__saturated_add__u8( value: u8, other: u8 ) -> u8:
 	return compiler.saturated_add( value, other )
@@ -384,17 +327,14 @@ u8.__wrapped_add__ = u8__wrapped_add__u8
 u8.__saturated_add__ = u8__saturated_add__u8
 
 @fallible_arithmetic
-@private
 @inline
 def u8__sub__u8( value: u8, other: u8 ) -> Result[u8,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def u8__wrapped_sub__u8( value: u8, other: u8 ) -> u8:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def u8__saturated_sub__u8( value: u8, other: u8 ) -> u8:
 	return compiler.saturated_sub( value, other )
@@ -404,17 +344,14 @@ u8.__wrapped_sub__ = u8__wrapped_sub__u8
 u8.__saturated_sub__ = u8__saturated_sub__u8
 
 @fallible_arithmetic
-@private
 @inline
 def u8__mul__u8( value: u8, other: u8 ) -> Result[u8,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def u8__wrapped_mul__u8( value: u8, other: u8 ) -> u8:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def u8__saturated_mul__u8( value: u8, other: u8 ) -> u8:
 	return compiler.saturated_mul( value, other )
@@ -424,17 +361,14 @@ u8.__wrapped_mul__ = u8__wrapped_mul__u8
 u8.__saturated_mul__ = u8__saturated_mul__u8
 
 @fallible_arithmetic
-@private
 @inline
 def u16__add__u16( value: u16, other: u16 ) -> Result[u16,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def u16__wrapped_add__u16( value: u16, other: u16 ) -> u16:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def u16__saturated_add__u16( value: u16, other: u16 ) -> u16:
 	return compiler.saturated_add( value, other )
@@ -444,17 +378,14 @@ u16.__wrapped_add__ = u16__wrapped_add__u16
 u16.__saturated_add__ = u16__saturated_add__u16
 
 @fallible_arithmetic
-@private
 @inline
 def u16__sub__u16( value: u16, other: u16 ) -> Result[u16,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def u16__wrapped_sub__u16( value: u16, other: u16 ) -> u16:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def u16__saturated_sub__u16( value: u16, other: u16 ) -> u16:
 	return compiler.saturated_sub( value, other )
@@ -464,17 +395,14 @@ u16.__wrapped_sub__ = u16__wrapped_sub__u16
 u16.__saturated_sub__ = u16__saturated_sub__u16
 
 @fallible_arithmetic
-@private
 @inline
 def u16__mul__u16( value: u16, other: u16 ) -> Result[u16,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def u16__wrapped_mul__u16( value: u16, other: u16 ) -> u16:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def u16__saturated_mul__u16( value: u16, other: u16 ) -> u16:
 	return compiler.saturated_mul( value, other )
@@ -484,17 +412,14 @@ u16.__wrapped_mul__ = u16__wrapped_mul__u16
 u16.__saturated_mul__ = u16__saturated_mul__u16
 
 @fallible_arithmetic
-@private
 @inline
 def u32__add__u32( value: u32, other: u32 ) -> Result[u32,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def u32__wrapped_add__u32( value: u32, other: u32 ) -> u32:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def u32__saturated_add__u32( value: u32, other: u32 ) -> u32:
 	return compiler.saturated_add( value, other )
@@ -504,17 +429,14 @@ u32.__wrapped_add__ = u32__wrapped_add__u32
 u32.__saturated_add__ = u32__saturated_add__u32
 
 @fallible_arithmetic
-@private
 @inline
 def u32__sub__u32( value: u32, other: u32 ) -> Result[u32,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def u32__wrapped_sub__u32( value: u32, other: u32 ) -> u32:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def u32__saturated_sub__u32( value: u32, other: u32 ) -> u32:
 	return compiler.saturated_sub( value, other )
@@ -524,17 +446,14 @@ u32.__wrapped_sub__ = u32__wrapped_sub__u32
 u32.__saturated_sub__ = u32__saturated_sub__u32
 
 @fallible_arithmetic
-@private
 @inline
 def u32__mul__u32( value: u32, other: u32 ) -> Result[u32,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def u32__wrapped_mul__u32( value: u32, other: u32 ) -> u32:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def u32__saturated_mul__u32( value: u32, other: u32 ) -> u32:
 	return compiler.saturated_mul( value, other )
@@ -544,17 +463,14 @@ u32.__wrapped_mul__ = u32__wrapped_mul__u32
 u32.__saturated_mul__ = u32__saturated_mul__u32
 
 @fallible_arithmetic
-@private
 @inline
 def u64__add__u64( value: u64, other: u64 ) -> Result[u64,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def u64__wrapped_add__u64( value: u64, other: u64 ) -> u64:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def u64__saturated_add__u64( value: u64, other: u64 ) -> u64:
 	return compiler.saturated_add( value, other )
@@ -564,17 +480,14 @@ u64.__wrapped_add__ = u64__wrapped_add__u64
 u64.__saturated_add__ = u64__saturated_add__u64
 
 @fallible_arithmetic
-@private
 @inline
 def u64__sub__u64( value: u64, other: u64 ) -> Result[u64,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def u64__wrapped_sub__u64( value: u64, other: u64 ) -> u64:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def u64__saturated_sub__u64( value: u64, other: u64 ) -> u64:
 	return compiler.saturated_sub( value, other )
@@ -584,17 +497,14 @@ u64.__wrapped_sub__ = u64__wrapped_sub__u64
 u64.__saturated_sub__ = u64__saturated_sub__u64
 
 @fallible_arithmetic
-@private
 @inline
 def u64__mul__u64( value: u64, other: u64 ) -> Result[u64,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def u64__wrapped_mul__u64( value: u64, other: u64 ) -> u64:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def u64__saturated_mul__u64( value: u64, other: u64 ) -> u64:
 	return compiler.saturated_mul( value, other )
@@ -604,17 +514,14 @@ u64.__wrapped_mul__ = u64__wrapped_mul__u64
 u64.__saturated_mul__ = u64__saturated_mul__u64
 
 @fallible_arithmetic
-@private
 @inline
 def u128__add__u128( value: u128, other: u128 ) -> Result[u128,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def u128__wrapped_add__u128( value: u128, other: u128 ) -> u128:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def u128__saturated_add__u128( value: u128, other: u128 ) -> u128:
 	return compiler.saturated_add( value, other )
@@ -624,17 +531,14 @@ u128.__wrapped_add__ = u128__wrapped_add__u128
 u128.__saturated_add__ = u128__saturated_add__u128
 
 @fallible_arithmetic
-@private
 @inline
 def u128__sub__u128( value: u128, other: u128 ) -> Result[u128,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def u128__wrapped_sub__u128( value: u128, other: u128 ) -> u128:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def u128__saturated_sub__u128( value: u128, other: u128 ) -> u128:
 	return compiler.saturated_sub( value, other )
@@ -644,17 +548,14 @@ u128.__wrapped_sub__ = u128__wrapped_sub__u128
 u128.__saturated_sub__ = u128__saturated_sub__u128
 
 @fallible_arithmetic
-@private
 @inline
 def u128__mul__u128( value: u128, other: u128 ) -> Result[u128,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def u128__wrapped_mul__u128( value: u128, other: u128 ) -> u128:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def u128__saturated_mul__u128( value: u128, other: u128 ) -> u128:
 	return compiler.saturated_mul( value, other )
@@ -664,17 +565,14 @@ u128.__wrapped_mul__ = u128__wrapped_mul__u128
 u128.__saturated_mul__ = u128__saturated_mul__u128
 
 @fallible_arithmetic
-@private
 @inline
 def usize__add__usize( value: usize, other: usize ) -> Result[usize,OverflowError]:
 	return compiler.checked_add( value, other )
 
-@private
 @inline
 def usize__wrapped_add__usize( value: usize, other: usize ) -> usize:
 	return compiler.wrapped_add( value, other )
 
-@private
 @inline
 def usize__saturated_add__usize( value: usize, other: usize ) -> usize:
 	return compiler.saturated_add( value, other )
@@ -684,17 +582,14 @@ usize.__wrapped_add__ = usize__wrapped_add__usize
 usize.__saturated_add__ = usize__saturated_add__usize
 
 @fallible_arithmetic
-@private
 @inline
 def usize__sub__usize( value: usize, other: usize ) -> Result[usize,OverflowError]:
 	return compiler.checked_sub( value, other )
 
-@private
 @inline
 def usize__wrapped_sub__usize( value: usize, other: usize ) -> usize:
 	return compiler.wrapped_sub( value, other )
 
-@private
 @inline
 def usize__saturated_sub__usize( value: usize, other: usize ) -> usize:
 	return compiler.saturated_sub( value, other )
@@ -704,17 +599,14 @@ usize.__wrapped_sub__ = usize__wrapped_sub__usize
 usize.__saturated_sub__ = usize__saturated_sub__usize
 
 @fallible_arithmetic
-@private
 @inline
 def usize__mul__usize( value: usize, other: usize ) -> Result[usize,OverflowError]:
 	return compiler.checked_mul( value, other )
 
-@private
 @inline
 def usize__wrapped_mul__usize( value: usize, other: usize ) -> usize:
 	return compiler.wrapped_mul( value, other )
 
-@private
 @inline
 def usize__saturated_mul__usize( value: usize, other: usize ) -> usize:
 	return compiler.saturated_mul( value, other )
@@ -724,19 +616,16 @@ usize.__wrapped_mul__ = usize__wrapped_mul__usize
 usize.__saturated_mul__ = usize__saturated_mul__usize
 
 @fallible_arithmetic
-@private
 @inline
 def i8__floordiv__i8( value: i8, other: i8 ) -> Result[i8,ZeroDivisionError|OverflowError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i8__wrapped_floordiv__i8( value: i8, other: i8 ) -> Result[i8,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i8__saturated_floordiv__i8( value: i8, other: i8 ) -> Result[i8,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -746,19 +635,16 @@ i8.__wrapped_floordiv__ = i8__wrapped_floordiv__i8
 i8.__saturated_floordiv__ = i8__saturated_floordiv__i8
 
 @fallible_arithmetic
-@private
 @inline
 def i8__mod__i8( value: i8, other: i8 ) -> Result[i8,ZeroDivisionError|OverflowError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i8__wrapped_mod__i8( value: i8, other: i8 ) -> Result[i8,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i8__saturated_mod__i8( value: i8, other: i8 ) -> Result[i8,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -768,19 +654,16 @@ i8.__wrapped_mod__ = i8__wrapped_mod__i8
 i8.__saturated_mod__ = i8__saturated_mod__i8
 
 @fallible_arithmetic
-@private
 @inline
 def i16__floordiv__i16( value: i16, other: i16 ) -> Result[i16,ZeroDivisionError|OverflowError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i16__wrapped_floordiv__i16( value: i16, other: i16 ) -> Result[i16,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i16__saturated_floordiv__i16( value: i16, other: i16 ) -> Result[i16,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -790,19 +673,16 @@ i16.__wrapped_floordiv__ = i16__wrapped_floordiv__i16
 i16.__saturated_floordiv__ = i16__saturated_floordiv__i16
 
 @fallible_arithmetic
-@private
 @inline
 def i16__mod__i16( value: i16, other: i16 ) -> Result[i16,ZeroDivisionError|OverflowError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i16__wrapped_mod__i16( value: i16, other: i16 ) -> Result[i16,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i16__saturated_mod__i16( value: i16, other: i16 ) -> Result[i16,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -812,19 +692,16 @@ i16.__wrapped_mod__ = i16__wrapped_mod__i16
 i16.__saturated_mod__ = i16__saturated_mod__i16
 
 @fallible_arithmetic
-@private
 @inline
 def i32__floordiv__i32( value: i32, other: i32 ) -> Result[i32,ZeroDivisionError|OverflowError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i32__wrapped_floordiv__i32( value: i32, other: i32 ) -> Result[i32,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i32__saturated_floordiv__i32( value: i32, other: i32 ) -> Result[i32,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -834,19 +711,16 @@ i32.__wrapped_floordiv__ = i32__wrapped_floordiv__i32
 i32.__saturated_floordiv__ = i32__saturated_floordiv__i32
 
 @fallible_arithmetic
-@private
 @inline
 def i32__mod__i32( value: i32, other: i32 ) -> Result[i32,ZeroDivisionError|OverflowError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i32__wrapped_mod__i32( value: i32, other: i32 ) -> Result[i32,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i32__saturated_mod__i32( value: i32, other: i32 ) -> Result[i32,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -856,19 +730,16 @@ i32.__wrapped_mod__ = i32__wrapped_mod__i32
 i32.__saturated_mod__ = i32__saturated_mod__i32
 
 @fallible_arithmetic
-@private
 @inline
 def i64__floordiv__i64( value: i64, other: i64 ) -> Result[i64,ZeroDivisionError|OverflowError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i64__wrapped_floordiv__i64( value: i64, other: i64 ) -> Result[i64,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i64__saturated_floordiv__i64( value: i64, other: i64 ) -> Result[i64,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -878,19 +749,16 @@ i64.__wrapped_floordiv__ = i64__wrapped_floordiv__i64
 i64.__saturated_floordiv__ = i64__saturated_floordiv__i64
 
 @fallible_arithmetic
-@private
 @inline
 def i64__mod__i64( value: i64, other: i64 ) -> Result[i64,ZeroDivisionError|OverflowError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i64__wrapped_mod__i64( value: i64, other: i64 ) -> Result[i64,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i64__saturated_mod__i64( value: i64, other: i64 ) -> Result[i64,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -900,19 +768,16 @@ i64.__wrapped_mod__ = i64__wrapped_mod__i64
 i64.__saturated_mod__ = i64__saturated_mod__i64
 
 @fallible_arithmetic
-@private
 @inline
 def i128__floordiv__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError|OverflowError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i128__wrapped_floordiv__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i128__saturated_floordiv__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -922,19 +787,16 @@ i128.__wrapped_floordiv__ = i128__wrapped_floordiv__i128
 i128.__saturated_floordiv__ = i128__saturated_floordiv__i128
 
 @fallible_arithmetic
-@private
 @inline
 def i128__mod__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError|OverflowError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i128__wrapped_mod__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def i128__saturated_mod__i128( value: i128, other: i128 ) -> Result[i128,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -944,19 +806,16 @@ i128.__wrapped_mod__ = i128__wrapped_mod__i128
 i128.__saturated_mod__ = i128__saturated_mod__i128
 
 @fallible_arithmetic
-@private
 @inline
 def isize__floordiv__isize( value: isize, other: isize ) -> Result[isize,ZeroDivisionError|OverflowError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def isize__wrapped_floordiv__isize( value: isize, other: isize ) -> Result[isize,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def isize__saturated_floordiv__isize( value: isize, other: isize ) -> Result[isize,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -966,19 +825,16 @@ isize.__wrapped_floordiv__ = isize__wrapped_floordiv__isize
 isize.__saturated_floordiv__ = isize__saturated_floordiv__isize
 
 @fallible_arithmetic
-@private
 @inline
 def isize__mod__isize( value: isize, other: isize ) -> Result[isize,ZeroDivisionError|OverflowError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def isize__wrapped_mod__isize( value: isize, other: isize ) -> Result[isize,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def isize__saturated_mod__isize( value: isize, other: isize ) -> Result[isize,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -988,19 +844,16 @@ isize.__wrapped_mod__ = isize__wrapped_mod__isize
 isize.__saturated_mod__ = isize__saturated_mod__isize
 
 @fallible_arithmetic
-@private
 @inline
 def u8__floordiv__u8( value: u8, other: u8 ) -> Result[u8,ZeroDivisionError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u8__wrapped_floordiv__u8( value: u8, other: u8 ) -> Result[u8,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u8__saturated_floordiv__u8( value: u8, other: u8 ) -> Result[u8,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -1010,19 +863,16 @@ u8.__wrapped_floordiv__ = u8__wrapped_floordiv__u8
 u8.__saturated_floordiv__ = u8__saturated_floordiv__u8
 
 @fallible_arithmetic
-@private
 @inline
 def u8__mod__u8( value: u8, other: u8 ) -> Result[u8,ZeroDivisionError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u8__wrapped_mod__u8( value: u8, other: u8 ) -> Result[u8,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u8__saturated_mod__u8( value: u8, other: u8 ) -> Result[u8,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -1032,19 +882,16 @@ u8.__wrapped_mod__ = u8__wrapped_mod__u8
 u8.__saturated_mod__ = u8__saturated_mod__u8
 
 @fallible_arithmetic
-@private
 @inline
 def u16__floordiv__u16( value: u16, other: u16 ) -> Result[u16,ZeroDivisionError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u16__wrapped_floordiv__u16( value: u16, other: u16 ) -> Result[u16,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u16__saturated_floordiv__u16( value: u16, other: u16 ) -> Result[u16,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -1054,19 +901,16 @@ u16.__wrapped_floordiv__ = u16__wrapped_floordiv__u16
 u16.__saturated_floordiv__ = u16__saturated_floordiv__u16
 
 @fallible_arithmetic
-@private
 @inline
 def u16__mod__u16( value: u16, other: u16 ) -> Result[u16,ZeroDivisionError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u16__wrapped_mod__u16( value: u16, other: u16 ) -> Result[u16,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u16__saturated_mod__u16( value: u16, other: u16 ) -> Result[u16,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -1076,19 +920,16 @@ u16.__wrapped_mod__ = u16__wrapped_mod__u16
 u16.__saturated_mod__ = u16__saturated_mod__u16
 
 @fallible_arithmetic
-@private
 @inline
 def u32__floordiv__u32( value: u32, other: u32 ) -> Result[u32,ZeroDivisionError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u32__wrapped_floordiv__u32( value: u32, other: u32 ) -> Result[u32,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u32__saturated_floordiv__u32( value: u32, other: u32 ) -> Result[u32,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -1098,19 +939,16 @@ u32.__wrapped_floordiv__ = u32__wrapped_floordiv__u32
 u32.__saturated_floordiv__ = u32__saturated_floordiv__u32
 
 @fallible_arithmetic
-@private
 @inline
 def u32__mod__u32( value: u32, other: u32 ) -> Result[u32,ZeroDivisionError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u32__wrapped_mod__u32( value: u32, other: u32 ) -> Result[u32,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u32__saturated_mod__u32( value: u32, other: u32 ) -> Result[u32,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -1120,19 +958,16 @@ u32.__wrapped_mod__ = u32__wrapped_mod__u32
 u32.__saturated_mod__ = u32__saturated_mod__u32
 
 @fallible_arithmetic
-@private
 @inline
 def u64__floordiv__u64( value: u64, other: u64 ) -> Result[u64,ZeroDivisionError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u64__wrapped_floordiv__u64( value: u64, other: u64 ) -> Result[u64,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u64__saturated_floordiv__u64( value: u64, other: u64 ) -> Result[u64,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -1142,19 +977,16 @@ u64.__wrapped_floordiv__ = u64__wrapped_floordiv__u64
 u64.__saturated_floordiv__ = u64__saturated_floordiv__u64
 
 @fallible_arithmetic
-@private
 @inline
 def u64__mod__u64( value: u64, other: u64 ) -> Result[u64,ZeroDivisionError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u64__wrapped_mod__u64( value: u64, other: u64 ) -> Result[u64,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u64__saturated_mod__u64( value: u64, other: u64 ) -> Result[u64,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -1164,19 +996,16 @@ u64.__wrapped_mod__ = u64__wrapped_mod__u64
 u64.__saturated_mod__ = u64__saturated_mod__u64
 
 @fallible_arithmetic
-@private
 @inline
 def u128__floordiv__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u128__wrapped_floordiv__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u128__saturated_floordiv__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -1186,19 +1015,16 @@ u128.__wrapped_floordiv__ = u128__wrapped_floordiv__u128
 u128.__saturated_floordiv__ = u128__saturated_floordiv__u128
 
 @fallible_arithmetic
-@private
 @inline
 def u128__mod__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u128__wrapped_mod__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def u128__saturated_mod__u128( value: u128, other: u128 ) -> Result[u128,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -1208,19 +1034,16 @@ u128.__wrapped_mod__ = u128__wrapped_mod__u128
 u128.__saturated_mod__ = u128__saturated_mod__u128
 
 @fallible_arithmetic
-@private
 @inline
 def usize__floordiv__usize( value: usize, other: usize ) -> Result[usize,ZeroDivisionError]:
 	return compiler.checked_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def usize__wrapped_floordiv__usize( value: usize, other: usize ) -> Result[usize,ZeroDivisionError]:
 	return compiler.wrapped_floordiv( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def usize__saturated_floordiv__usize( value: usize, other: usize ) -> Result[usize,ZeroDivisionError]:
 	return compiler.saturated_floordiv( value, other )
@@ -1230,19 +1053,16 @@ usize.__wrapped_floordiv__ = usize__wrapped_floordiv__usize
 usize.__saturated_floordiv__ = usize__saturated_floordiv__usize
 
 @fallible_arithmetic
-@private
 @inline
 def usize__mod__usize( value: usize, other: usize ) -> Result[usize,ZeroDivisionError]:
 	return compiler.checked_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def usize__wrapped_mod__usize( value: usize, other: usize ) -> Result[usize,ZeroDivisionError]:
 	return compiler.wrapped_mod( value, other )
 
 @fallible_arithmetic
-@private
 @inline
 def usize__saturated_mod__usize( value: usize, other: usize ) -> Result[usize,ZeroDivisionError]:
 	return compiler.saturated_mod( value, other )
@@ -1252,18 +1072,15 @@ usize.__wrapped_mod__ = usize__wrapped_mod__usize
 usize.__saturated_mod__ = usize__saturated_mod__usize
 
 @fallible_arithmetic
-@private
 @inline
 def f32__add__f32( value: f32, other: f32 ) -> Result[f32,FloatingPointError]:
 	return compiler.checked_add( value, other )
 
 @private
-@inline
 def f32__wrapped_add__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_add( value, other )
 
 @private
-@inline
 def f32__saturated_add__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_add( value, other )
 
@@ -1272,18 +1089,15 @@ f32.__wrapped_add__ = f32__wrapped_add__f32
 f32.__saturated_add__ = f32__saturated_add__f32
 
 @fallible_arithmetic
-@private
 @inline
 def f32__sub__f32( value: f32, other: f32 ) -> Result[f32,FloatingPointError]:
 	return compiler.checked_sub( value, other )
 
 @private
-@inline
 def f32__wrapped_sub__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_sub( value, other )
 
 @private
-@inline
 def f32__saturated_sub__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_sub( value, other )
 
@@ -1292,18 +1106,15 @@ f32.__wrapped_sub__ = f32__wrapped_sub__f32
 f32.__saturated_sub__ = f32__saturated_sub__f32
 
 @fallible_arithmetic
-@private
 @inline
 def f32__mul__f32( value: f32, other: f32 ) -> Result[f32,FloatingPointError]:
 	return compiler.checked_mul( value, other )
 
 @private
-@inline
 def f32__wrapped_mul__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_mul( value, other )
 
 @private
-@inline
 def f32__saturated_mul__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_mul( value, other )
 
@@ -1312,18 +1123,15 @@ f32.__wrapped_mul__ = f32__wrapped_mul__f32
 f32.__saturated_mul__ = f32__saturated_mul__f32
 
 @fallible_arithmetic
-@private
 @inline
 def f64__add__f64( value: f64, other: f64 ) -> Result[f64,FloatingPointError]:
 	return compiler.checked_add( value, other )
 
 @private
-@inline
 def f64__wrapped_add__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_add( value, other )
 
 @private
-@inline
 def f64__saturated_add__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_add( value, other )
 
@@ -1332,18 +1140,15 @@ f64.__wrapped_add__ = f64__wrapped_add__f64
 f64.__saturated_add__ = f64__saturated_add__f64
 
 @fallible_arithmetic
-@private
 @inline
 def f64__sub__f64( value: f64, other: f64 ) -> Result[f64,FloatingPointError]:
 	return compiler.checked_sub( value, other )
 
 @private
-@inline
 def f64__wrapped_sub__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_sub( value, other )
 
 @private
-@inline
 def f64__saturated_sub__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_sub( value, other )
 
@@ -1352,18 +1157,15 @@ f64.__wrapped_sub__ = f64__wrapped_sub__f64
 f64.__saturated_sub__ = f64__saturated_sub__f64
 
 @fallible_arithmetic
-@private
 @inline
 def f64__mul__f64( value: f64, other: f64 ) -> Result[f64,FloatingPointError]:
 	return compiler.checked_mul( value, other )
 
 @private
-@inline
 def f64__wrapped_mul__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_mul( value, other )
 
 @private
-@inline
 def f64__saturated_mul__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_mul( value, other )
 
@@ -1372,17 +1174,14 @@ f64.__wrapped_mul__ = f64__wrapped_mul__f64
 f64.__saturated_mul__ = f64__saturated_mul__f64
 
 @fallible_arithmetic
-@private
 @inline
 def f32__truediv__f32( value: f32, other: f32 ) -> Result[f32,ZeroDivisionError|FloatingPointError]:
 	return compiler.checked_truediv( value, other )
 
-@private
 @inline
 def f32__wrapped_truediv__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_truediv( value, other )
 
-@private
 @inline
 def f32__saturated_truediv__f32( value: f32, other: f32 ) -> f32:
 	return compiler.wrapped_truediv( value, other )
@@ -1392,17 +1191,14 @@ f32.__wrapped_truediv__ = f32__wrapped_truediv__f32
 f32.__saturated_truediv__ = f32__saturated_truediv__f32
 
 @fallible_arithmetic
-@private
 @inline
 def f64__truediv__f64( value: f64, other: f64 ) -> Result[f64,ZeroDivisionError|FloatingPointError]:
 	return compiler.checked_truediv( value, other )
 
-@private
 @inline
 def f64__wrapped_truediv__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_truediv( value, other )
 
-@private
 @inline
 def f64__saturated_truediv__f64( value: f64, other: f64 ) -> f64:
 	return compiler.wrapped_truediv( value, other )
