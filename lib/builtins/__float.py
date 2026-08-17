@@ -91,13 +91,6 @@ def _group_integer_part( digits: str, sep: str ) -> str:
 	rest: str = digits._byte_slice( dot_index, digits.byte_len() )
 	count: usize = int_part.byte_len() # ASCII-only digit text - byte length is codepoint count here
 	if count <= 3:
-		# digits is a BORROWED parameter (never pushed onto the epilogue
-		# stack - cfg.py's _enter_parameter()) - a bare `return digits`
-		# already gets its own +1 from _stmt_Return's own aliasing-return
-		# incref (lowering.py); an explicit compiler.incref(digits) here on
-		# top of that double-counts and LEAKS (confirmed via ASAN/
-		# LeakSanitizer - see str._insert_thousands_sep's own comment,
-		# lib/builtins/__init__.py, for the identical bug found there).
 		return digits
 	groups: list[str] = list[str]() # least-significant GROUP first
 	end: usize = count
@@ -201,7 +194,6 @@ def _f64_fixed_digits_raw( value: f64, precision: usize, type_char: i32, alt: bo
 		buf: Ptr[u8] = sys.alloc[u8]( buf_size )
 		n: i32 = compiler.format_f64( buf, buf_size, i32( precision ), type_char, alt, magnitude )
 		if n < 0:
-			sys.free( buf )
 			sys.panic( 'f-string float formatting failed' )
 		return str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
 			'compiler.format_f64 produced invalid utf-8 (unreachable - only ASCII digits, \'.\', and \'e\'/\'E\'/\'+\'/\'-\' are ever written)'
@@ -460,7 +452,6 @@ def _f64_repr_digits_raw( value: f64 ) -> str:
 		while True:
 			n = compiler.format_f64( buf, _REPR_SEARCH_BUF_SIZE, i32( precision ), _TYPE_CHAR_E, False, magnitude )
 			if n < 0:
-				sys.free( buf )
 				sys.panic( 'f-string float repr formatting failed' )
 			parsed: f64 = compiler.parse_f64( compiler.cast( ConstPtr[u8], buf ))
 			if parsed == magnitude or precision >= _MAX_REPR_SIGNIFICANT_DIGITS - 1:
