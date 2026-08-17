@@ -45,12 +45,31 @@ def get_local_timezone_name() -> str:
 	# sys_readlink syscall or libc wrapper
 	from posix.fs import readlink
 	target_path = readlink( '/etc/localtime' ).unwrap_or()
-	
-	if target_path:
-		idx = target_path.find( 'zoneinfo/' )
-		if idx != -1:
-			return target_path[idx+9:]
-	
+	# spelled as two bare `is None`/`==` early-returns (not the original
+	# `if target_path:`) - this compiler's if-narrowing only recognizes a
+	# bare `is None`/`is not None` Compare as its whole test, never a
+	# plain truthiness check, so `if target_path:` left target_path
+	# unnarrowed (str|None) for the .find() call below, a real, previously
+	# unexercised compile error (this function was never actually
+	# compiled under a POSIX target before lib/zoneinfo.py's own tz-
+	# default fix started calling it) - same "is None", not "not x" or
+	# bare truthiness, idiom used throughout lib/datetime.py this session
+	if target_path is None:
+		return _read_etc_timezone_file()
+	if target_path == '':
+		return _read_etc_timezone_file()
+	# find() returns Result[usize,IndexError], not a Python-style -1
+	# sentinel (a second, independent pre-existing bug in this function,
+	# also never caught before it was first actually compiled) - checked
+	# via is_ok()/unwrap(), matching str.find()'s own real signature and
+	# every other real caller in this codebase (e.g. lib/csv.py's
+	# field.find(...).is_ok()).
+	found = target_path.find( 'zoneinfo/' )
+	if found.is_ok():
+		idx: usize = found.unwrap( 'checked is_ok' )
+		with compiler.wrap_arithmetic:
+			start: usize = idx + 9
+		return target_path[start:]
 	return _read_etc_timezone_file()
 
 
