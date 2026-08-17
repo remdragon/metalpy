@@ -55,7 +55,7 @@ def _parse_args() -> argparse.Namespace:
 	p.add_argument( '--strip', action = 'store_true',
 		help = 'strip symbols / fold identical code for a smaller binary' )
 	p.add_argument( '--asan', action = 'store_true',
-		help = 'build with AddressSanitizer (requires the C runtime - not compatible with a freestanding/no-CRT program)' )
+		help = 'build with AddressSanitizer (requires the C runtime - forces CRT linking for a program that would otherwise build freestanding/no-CRT)' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
@@ -171,6 +171,7 @@ def main() -> None:
 
 	# --- stage 5: emit C ---
 	no_crt = 'c' not in compiler.extern_libs
+	no_crt = linker_c.resolve_no_crt( no_crt, args.asan )
 	c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
 
 	# --- -c: emit C source only ---
@@ -183,11 +184,6 @@ def main() -> None:
 	# --- stage 6: compiler was already detected above (needed early for has_i128) ---
 	if cc is None:
 		_die( 'no C compiler found (try --cc or METALPY_CC)' )
-
-	if args.asan and no_crt:
-		_die( "--asan requires a program that imports the C runtime (e.g. `import c`) - "
-			"it has nothing to instrument against metalpy's own freestanding allocator, "
-			"and the no-CRT path excludes the ASan runtime's own CRT dependencies too" )
 
 	with tempfile.TemporaryDirectory() as tmp:
 		src_path = Path( tmp ) / 'generated.c'
