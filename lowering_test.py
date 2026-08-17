@@ -4612,6 +4612,47 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'too many positional arguments', self.discovery.errors.errors[0] )
 
+	def test_missing_required_positional_argument_rejected( self ) -> None:
+		code = '\n'.join([
+			'def foo( a: i32, b: i32 ) -> i32:',
+			'	return a',
+			'',
+			'def main() -> None:',
+			'	x: i32 = foo( 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'missing required argument', self.discovery.errors.errors[0] )
+		self.assertIn( "'b'", self.discovery.errors.errors[0] )
+
+	def test_missing_required_keyword_only_argument_rejected( self ) -> None:
+		code = '\n'.join([
+			'def foo( a: i32, *, b: i32 ) -> i32:',
+			'	return a',
+			'',
+			'def main() -> None:',
+			'	x: i32 = foo( 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'missing required argument', self.discovery.errors.errors[0] )
+		self.assertIn( "'b'", self.discovery.errors.errors[0] )
+
+	def test_defaulted_argument_omission_is_not_flagged_as_missing( self ) -> None:
+		code = '\n'.join([
+			'def foo( a: i32, b: i32 = 2 ) -> i32:',
+			'	return a',
+			'',
+			'def main() -> None:',
+			'	x: i32 = foo( 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_union_storage_is_memoized_across_constructions( self ) -> None:
 		# construction elsewhere in the same function (or a different one)
 		# must reference the SAME synthesized tag/data/payload-class objects
