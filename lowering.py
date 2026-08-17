@@ -1250,7 +1250,7 @@ class Lowering:
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
 		return self._type_resolver._attr_lookup_callable( owner_type, attr, ctx )
 
-	def _match_call_args( self, target: Function, call: ast.Call ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
+	def _match_call_args( self, target: Function, call: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
 		if target.broken:
 			raise RedundantCompilationError() # already reported at the point target's own resolution failed - see Name.broken
 		if target.parameters is None:
@@ -1264,6 +1264,15 @@ class Lowering:
 		if any( kw.arg is None for kw in call.keywords ):
 			self.discovery.fail( f'**kwargs not supported yet: {ast.unparse(call)}', call )
 		positional_params = [ p for p in target.parameters if not p.is_vararg and not p.is_kwarg and not p.is_kwonly ]
+		# a Scalar-registered method's receiver (_lower_call's own "a
+		# Scalar-registered method" comment) isn't threaded through call.args
+		# at all - it's spliced into target's own first positional parameter
+		# directly, later, by the caller - so that parameter is pre-matched
+		# here rather than checked against the call site's own args
+		receiver_param = None
+		if receiver_fills_first_param and positional_params:
+			receiver_param = positional_params[0]
+			positional_params = positional_params[1:]
 		if len( call.args ) > len( positional_params ):
 			self.discovery.fail( f'too many positional arguments: {ast.unparse(call)}', call )
 		positional = list( zip( positional_params, call.args ))
@@ -1273,6 +1282,18 @@ class Lowering:
 			if param is None:
 				self.discovery.fail( f'{target.qualname} has no parameter {kw.arg!r}', call )
 			keyword.append(( param, kw.value ))
+		# "too many positional arguments" above only catches an EXCESS of
+		# arguments - nothing previously checked the other direction (a
+		# required parameter, no default, never matched by either list),
+		# so a call could silently omit one and mis-typecheck downstream
+		# instead of failing cleanly here.
+		matched_params = { id( p ) for p, _ in positional } | { id( p ) for p, _ in keyword }
+		if receiver_param is not None:
+			matched_params.add( id( receiver_param ))
+		missing = [ p.stem for p in target.parameters if not p.is_vararg and not p.is_kwarg and p.default is None and id( p ) not in matched_params ]
+		if missing:
+			missing_repr = ', '.join( repr( m ) for m in missing )
+			self.discovery.fail( f'{target.qualname} missing required argument(s) {missing_repr}: {ast.unparse(call)}', call )
 		positional = [ ( param, self._check_move_argument( target, param, expr, call )) for param, expr in positional ]
 		keyword = [ ( param, self._check_move_argument( target, param, expr, call )) for param, expr in keyword ]
 		return positional, keyword
@@ -9212,7 +9233,7 @@ class FunctionLowering:
 		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
-	def _lower_call_args( self, target: Function, node: ast.Call ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
+	def _lower_call_args( self, target: Function, node: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
 		# shared by the plain call path (_lower_call's own else branch) and
 		# _lower_generic_function_call: lowers positional/keyword args
 		# straight against target's own already-concrete declared parameter
@@ -9224,7 +9245,7 @@ class FunctionLowering:
 		# expected type at all, and move hooks apply in a separate pass
 		# afterward instead), so forcing them through this helper would
 		# change what expected_type each argument actually gets
-		positional, keyword = self.lowering._match_call_args( target, node )
+		positional, keyword = self.lowering._match_call_args( target, node, receiver_fills_first_param = receiver_fills_first_param )
 		args = []
 		for param, expr in positional:
 			operand = self._lower_expr( expr, param.type )
@@ -10546,7 +10567,8 @@ class FunctionLowering:
 					kwargs[param.stem] = default_operand
 		else:
 			self.lowering._resolve_call_target( target )
-			args, kwargs = self._lower_call_args( target, node )
+			receiver_fills_first_param = receiver is not None and isinstance( target, Function ) and target.cls is None
+			args, kwargs = self._lower_call_args( target, node, receiver_fills_first_param = receiver_fills_first_param )
 
 		if receiver is not None and isinstance( target, Function ) and target.cls is None:
 			# a Scalar-registered method (`SomeScalar.method = some_free_
