@@ -7187,6 +7187,54 @@ class FunctionLowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
+	def _flush_ifexp_branch_temps( self, start_idx: int, *keep: ir.Operand ) -> None:
+		# a ternary branch can lower an arbitrarily deep sub-expression (e.g.
+		# `prefix + str('.') + k`, two chained str.__add__ Calls) that
+		# DeclareTemp's its own intermediate temps (the '.'  literal-wrap
+		# temp, and the first __add__'s own result, consumed as the second
+		# __add__'s receiver) via the ordinary self._new_temp() path - every
+		# one of those lands in self._pending_temps exactly like any other
+		# temp. _expr_IfExp only ever untrack_temp()'s/increfs the branch's
+		# OWN final value (`true_val`/`false_val` below) - it never touches
+		# these purely-intermediate temps, so left alone they'd survive in
+		# _pending_temps all the way to the ENCLOSING STATEMENT's own
+		# _flush_pending_temps() (e.g. _stmt_Return's, called once after
+		# BOTH branches have already merged at end_label) - which then
+		# decref's them UNCONDITIONALLY, including in whichever branch did
+		# NOT run and therefore never assigned into that temp's C variable
+		# at all, releasing raw stack garbage. Confirmed as a real,
+		# reproducible stack-overflow crash (not just a leak/UAF): the
+		# garbage pointer's own "vtable" field is whatever happened to be on
+		# the stack, so release_object's vtable->destroy call jumps
+		# somewhere essentially random.
+		#
+		# The fix: flush each branch's OWN intermediate temps (added to
+		# _pending_temps since `start_idx`, i.e. everything DeclareTemp'd
+		# while lowering just THIS branch) right here, inside the branch,
+		# before the Jump to end_label - exactly mirroring how the already-
+		# correct if/else STATEMENT form gets this right for free (each
+		# branch is its own statement, so _lower_stmt's per-statement
+		# pending_temps save/flush/restore already scopes it correctly).
+		# `keep` (the branch's own dest/final-value temps) is excluded -
+		# their ownership is already fully resolved by the incref/
+		# untrack_temp() decision made just above each call site, and dest
+		# in particular is still actively in use afterward (assigned into,
+		# then read again once both branches merge) so it must not be
+		# DeleteTemp'd here even though the actual decref side would
+		# already be a safe no-op for it (cfg.fresh_temp() only registers
+		# dest AFTER both branches, so cfg.delete_temp(dest) can't fire a
+		# real release yet regardless - this is about not emitting a
+		# spurious "this temp is done" marker on a temp that visibly isn't).
+		branch_temps = self._pending_temps[ start_idx: ]
+		self._pending_temps = self._pending_temps[ : start_idx ]
+		keep_ids = { k.id for k in keep if isinstance( k, ir.Temp ) }
+		for t in reversed( branch_temps ):
+			if t.id in keep_ids:
+				continue
+			for instr in self._cfg.delete_temp( t ):
+				self._emit( instr )
+			self._emit( ir.DeleteTemp( temp = t ))
+
 	def _expr_IfExp( self, node: ast.IfExp, expected_type: Type|None ) -> ir.Operand:
 		# ternary `x if cond else y` — both branches assign to the same
 		# dest temp, then merge at end_label. Use JumpIfTrue so the true
@@ -7208,6 +7256,17 @@ class FunctionLowering:
 		# confirmed as a real, reproducible UAF/double-free via direct
 		# testing (`str('-') if cond else str('+')` corrupted/crashed
 		# before this fix), not just reasoning from the code shape.
+		#
+		# Each branch's own PURELY INTERMEDIATE temps (e.g. every temp a
+		# chained `prefix + str('.') + k` concatenation DeclareTemp's along
+		# the way, none of which is `true_val`/`false_val` itself) are
+		# flushed inside that branch via _flush_ifexp_branch_temps - see its
+		# own comment for why: left to the enclosing statement's normal
+		# end-of-statement flush, they leak past end_label and get
+		# unconditionally decref'd even in the branch that never ran,
+		# releasing an uninitialized C local - a real, reproducible stack-
+		# overflow crash (release_object on stack garbage), not just a
+		# leak/UAF, confirmed via direct testing.
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		cond = self._lower_expr( node.test, bool_cls )
 		else_label = self._new_label( 'ifexp_else' )
@@ -7215,6 +7274,7 @@ class FunctionLowering:
 		dest = self._new_temp( expected_type ) if expected_type is not None else None
 		self._emit( ir.JumpIfFalse( cond = cond, target = else_label ))
 		# true branch
+		true_branch_start = len( self._pending_temps )
 		true_val = self._lower_expr( node.body, expected_type )
 		if dest is None:
 			dest = self._new_temp( true_val.type )
@@ -7223,16 +7283,19 @@ class FunctionLowering:
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( true_val )
+		self._flush_ifexp_branch_temps( true_branch_start, dest, true_val )
 		self._emit( ir.Assign( dest = dest, src = true_val ))
 		self._emit( ir.Jump( target = end_label ))
 		# false branch
 		self._emit( ir.Label( name = else_label ))
+		false_branch_start = len( self._pending_temps )
 		false_val = self._lower_expr( node.orelse, dest.type )
 		if self.lowering._is_aliasing_expr( node.orelse, false_val ):
 			for instr in self._cfg.incref( dest.type, false_val ):
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( false_val )
+		self._flush_ifexp_branch_temps( false_branch_start, dest, false_val )
 		self._emit( ir.Assign( dest = dest, src = false_val ))
 		self._emit( ir.Label( name = end_label ))
 		self._cfg.fresh_temp( dest, dest.type )
