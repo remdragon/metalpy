@@ -972,7 +972,7 @@ class str:
 		string stays on the side the search started from). '''
 		found: isize = self.find( sep )
 		if found == isize( -1 ):
-			return ( str( self ), str( '' ), str( '' ))
+			return ( self, '', '' )
 		self_len: usize = self.byte_len()
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			idx: usize = usize( found )
@@ -986,7 +986,7 @@ class str:
 		whole string stays there). '''
 		found: isize = self.rfind( sep )
 		if found == isize( -1 ):
-			return ( str( '' ), str( '' ), str( self ))
+			return ( '', '', self )
 		self_len: usize = self.byte_len()
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			idx: usize = usize( found )
@@ -1237,7 +1237,7 @@ class str:
 		trailing literal character, subtract that themselves before
 		calling - see lowering.py's _lower_float_format_spec). '''
 		dot_index: usize = self.byte_len()
-		dot_found: isize = self.find( str( '.' ))
+		dot_found: isize = self.find( '.' )
 		if dot_found != isize( -1 ):
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				dot_index = usize( dot_found )

@@ -82,7 +82,7 @@ def _group_integer_part( digits: str, sep: str ) -> str:
 	reconstructs the plain digit text unchanged"), so callers never need to
 	special-case "no grouping requested". '''
 	dot_index: usize = digits.byte_len()
-	found: isize = digits.find( str( '.' ))
+	found: isize = digits.find( '.' )
 	if found != isize( -1 ):
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			dot_index = usize( found )
@@ -257,10 +257,10 @@ def _f64_none_type_digits_raw( value: f64, precision: usize, alt: bool ) -> str:
 	raw: str = _f64_fixed_digits_raw( value, precision, _TYPE_CHAR_G, alt )
 	if raw == 'nan' or raw == 'inf':
 		return raw
-	has_dot: bool = raw.find( str( '.' )) != isize( -1 )
+	has_dot: bool = raw.find( '.' ) != isize( -1 )
 	if has_dot:
 		return raw
-	has_exp: bool = raw.find( str( 'e' )) != isize( -1 )
+	has_exp: bool = raw.find( 'e' ) != isize( -1 )
 	if has_exp:
 		return raw
 	return raw + '.0'
@@ -331,13 +331,13 @@ def _f64_repr_from_scientific( sci_text: str ) -> str:
 	is already the FEWEST significant digits that round-trip exactly (see
 	this function's only caller). '''
 	e_index: usize = sci_text.byte_len()
-	e_found: isize = sci_text.find( str( 'e' ))
+	e_found: isize = sci_text.find( 'e' )
 	if e_found != isize( -1 ):
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			e_index = usize( e_found )
 	mantissa: str = sci_text._byte_slice( 0, e_index )
 	dot_index: usize = mantissa.byte_len()
-	dot_found: isize = mantissa.find( str( '.' ))
+	dot_found: isize = mantissa.find( '.' )
 	if dot_found != isize( -1 ):
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			dot_index = usize( dot_found )

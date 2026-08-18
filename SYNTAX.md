@@ -74,7 +74,7 @@ Because Metal Py `str` is internally stored as a null-terminated C-string, this 
 * **`bytes`/`bytearray`** support a smaller subset so far: `find`, `split`, `startswith`, `endswith` (plus `decode(codec)`, `len()`, and indexing/slicing). `strip`/`index`/etc. are not yet implemented for these two types.
 * **`find`/`rfind` return `isize`, with `-1` meaning "not found"** (Python's own `str.find()` convention) — they never fail or panic.
 * **`index`/`rindex` return `Result[usize, IndexError]`** instead — for callers that consider "not found" itself an error worth propagating via `match`/`.or_return()`/`.is_err()`, rather than a plain `!= -1` conditional. They never panic either.
-* `bytes`/`bytearray`'s `find`/`startswith`/`endswith`/`split` take their needle/prefix/suffix/separator argument as plain `bytes` (not `bytes|bytearray`) — a bare `bytes` literal argument (e.g. `data.find(b'\r\n')`) cannot currently be type-inferred against a union-typed parameter. Pass an explicit `bytes(some_bytearray)` conversion if the needle is itself a `bytearray`. A bare `bytes` literal also can't currently be used directly as a method-call *receiver* (`b''.split(...)`) — assign it to a `bytes`-typed local first.
+* `bytes`/`bytearray`'s `find`/`startswith`/`endswith`/`split` all take their needle/prefix/suffix/separator argument as `bytes|bytearray` — either type works interchangeably on either side (a `bytearray` needle against a `bytes` haystack, and vice versa), including bare literal receivers/arguments (`b''.split(...)`, `data.find(b'\r\n')`) directly, with no typed-local workaround needed.
 
 ```metalpy
 request: bytes = b'GET /hello HTTP/1.1'
@@ -96,7 +96,7 @@ match s.index( 'beef' ):          # index() returns a real Result instead
 
 ### `str()` vs. f-strings — converting values to text
 
-`str.__init__` is a **copy constructor only** (`str(some_str)` copies `some_str`) — `str(42)` and `str(some_bytes)` do **not** compile; there is no int/bytes-to-str conversion via the `str(...)` constructor.
+`str` is fully immutable and has **no public constructor at all** — not even a copy constructor. `str(some_str)`, `str(42)`, and `str(some_bytes)` all do **not** compile; there is no `str(...)` conversion path for anything. Since `str` never needs deep-copying (nothing can mutate it), a function that used to "return a copy" of an existing `str` just returns/reuses that same value directly.
 
 F-string interpolation (`f"{x}"`) is the real stringification mechanism: with no format spec (or `!s`), it calls `x.__str__()`; with `!r`/`!a`, `x.__repr__()`; a `str` value is used as-is. This currently only works when `x` is already `str`, the boxed arbitrary-precision `int`, or another class that defines its own `__str__`/`__repr__` — **fixed-width scalar types (`i32`, `u16`, `usize`, `f32`, `f64`, `bool`, ...) have no `__str__`/`__repr__` of their own**, so `f"{n}"` for a bare `u16` port number, for example, does not compile today. Converting a fixed-width integer to text currently requires hand-rolled digit conversion (see `lib/http/client.py`'s own `_usize_to_str` for the established idiom), or boxing it through the arbitrary-precision `int` type first where the width allows it (`int(i32(x))`).
 
