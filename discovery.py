@@ -2410,6 +2410,27 @@ class Discovery( ast.NodeVisitor ):
 							is_copy = isinstance( param_type, Copy )
 							if is_move or is_copy:
 								param_type = param_type.inner
+								if fn.is_inline:
+									# @inline splicing binds self/every parameter
+									# zero-copy, always treated as borrowed at the
+									# splice boundary (lowering.py's
+									# _lower_inline_call - "no _cfg_assign/incref
+									# here, deliberately... borrowed, no incref at
+									# the boundary") - a move[T]/copy[T] param's
+									# real ownership-transfer/prologue-incref
+									# semantics have never been reasoned through
+									# for that boundary (see inline_splice_
+									# aliasing_return_incref_bug_fixed.md: even
+									# plain borrowed aliasing returns needed a
+									# real fix here). Reject outright rather than
+									# risk a silent refcount bug - same "no
+									# coherent meaning yet" reasoning the
+									# @inline+@move whole-function check below
+									# already uses
+									self.fail(
+										f'@inline {fn.qualname} parameter {arg.arg!r} cannot be move[T]/copy[T] - not supported',
+										arg,
+									)
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							self._reject_fixed_array_outside_struct_field( param_type, fn, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							if fn.extern_lib is not None:
