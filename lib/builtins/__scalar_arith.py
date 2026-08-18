@@ -402,7 +402,7 @@ f64.__truediv__ = f_truediv_checked[f64]
 f64.__wrapped_truediv__ = f_truediv_wrapped[f64]
 f64.__saturated_truediv__ = f_truediv_saturated[f64]
 
-# --- int bitwise (&/|/^) - single variant, no mode qualification -----
+# --- int/bool bitwise (&/|/^) - single variant, no mode qualification -
 
 i8.__and__ = i_and[i8]
 i8.__or__ = i_or[i8]
@@ -440,6 +440,9 @@ u128.__xor__ = i_xor[u128]
 usize.__and__ = i_and[usize]
 usize.__or__ = i_or[usize]
 usize.__xor__ = i_xor[usize]
+bool.__and__ = i_and[bool]
+bool.__or__ = i_or[bool]
+bool.__xor__ = i_xor[bool]
 
 # --- int shifts (<< checked/wrapped/saturated, >> single variant) ---
 

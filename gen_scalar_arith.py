@@ -242,9 +242,15 @@ for t in FLOAT_TYPES:
 	emit( f'{t}.{mode_dunder( dunder, "saturated" )} = f_truediv_saturated[{t}]' )
 emit()
 
-emit( '# --- int bitwise (&/|/^) - single variant, no mode qualification -----' )
+emit( '# --- int/bool bitwise (&/|/^) - single variant, no mode qualification -' )
 emit()
-for t in INT_TYPES:
+# bool is scalar (a valid compiler.bitand/bitor/bitxor operand type just like
+# any int), and & / | / ^ on bool has real, well-defined boolean-algebra
+# meaning (unlike shift, which bool has no sensible meaning for and never
+# type-checks in this language to begin with) - genuinely was reaching this
+# old fallback tail (unlike every int type, bool had NO dunder registered at
+# all here before), a real gap this rollout would otherwise have left behind
+for t in ( *INT_TYPES, 'bool' ):
 	for kind, dunder in ( ( 'and', '__and__' ), ( 'or', '__or__' ), ( 'xor', '__xor__' ) ):
 		emit( f'{t}.{dunder} = i_{kind}[{t}]' )
 emit()
