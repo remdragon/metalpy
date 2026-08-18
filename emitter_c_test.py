@@ -9020,11 +9020,25 @@ class UnionBinopDispatchTests( test_support.RealCompileMixin, CompilerTestCase )
 	but adding two things equality never needed: leaf pairs can produce
 	genuinely DIFFERENT result types (synthesized into a fresh union,
 	collapsing to a single plain type when every reachable pair agrees),
-	and THREE independent fallibility sources - a leaf pair with no valid
-	operation (TypeError), plain scalar arithmetic's own EXISTING checked-
-	arithmetic fallibility (respecting the current arithmetic mode per
-	cell, never bypassed), and a resolved dunder's own declared Result[T,E]
-	return type - all folding into ONE synthesized error union.
+	and error sources fold into ONE synthesized error union - a leaf pair
+	with no valid operation (TypeError), or a resolved dunder's own
+	declared Result[T,E] return type.
+
+	No separate "scalar" classification anymore - a Scalar operand's own
+	arithmetic is just another dunder lookup now (mode-qualified, exactly
+	like the non-union path: i32.__add__/__wrapped_add__/__saturated_add__,
+	see lib/builtins/__scalar_arith.py), found via the SAME
+	_find_dunder_for_arg/_mode_qualified_dunder_names machinery - one
+	source of truth, not two independent reimplementations (see
+	[[binop_fallback_eliminated]]/[[fallible_arithmetic_decorator_and_int_division_fix]]
+	for how the non-union path itself got here). A cell whose method is
+	`is_fallible_arithmetic` (a scalar-registered arithmetic dunder, or
+	int.__floordiv__/__mod__) is ALWAYS consumed via the ambient
+	arithmetic mode at emission time - even reached from deep inside this
+	union grid - exactly like it already behaves in the non-union path,
+	never folded into this expression's own aggregate error union. Only a
+	REGULAR dunder's own declared Result[T,E] (int.__add__, or a
+	hand-declared multi-member anonymous error union) folds in.
 
 	Found (not caused) while developing: `_lower_binary_operands` hinted
 	an operand's own lowering with the OUTER expected_type/the OTHER
@@ -9043,9 +9057,9 @@ class UnionBinopDispatchTests( test_support.RealCompileMixin, CompilerTestCase )
 	Also found: a nominal @union error type (e.g. int's own IntError,
 	which has its own real variants like DivideByZero) is just as much an
 	opaque LEAF as any plain marker class - the nested-error-unwrap logic
-	(for _resolve_checked_error's own ANONYMOUS multi-class unions, e.g.
-	signed //'s ZeroDivisionError|OverflowError) must never try to
-	decompose a nominal union's OWN variants the same way; gated on
+	(for a REGULAR dunder's own genuine multi-member ANONYMOUS error
+	union, e.g. a hand-declared `-> Result[T, ErrorA|ErrorB]`) must never
+	try to decompose a nominal union's OWN variants the same way; gated on
 	`file is None` (the same "synthesized, not really declared" marker
 	discovery._get_or_create_union's own flattening logic already uses). '''
 	def setUp( self ) -> None:
@@ -9092,14 +9106,6 @@ def main() -> i32:
 		r4: Result[i32|int,IntError|TypeError] = e + f
 		if not r4.is_err():
 			return 4
-
-		# AugAssign with a union operand - shares _lower_binop_values,
-		# should pick up the same dispatch with no special-casing needed.
-		# All-Scalar union (i32|i64) keeps this infallible (no cross-
-		# type-mismatch 'error' cell for two Scalars, unlike i32|int) so
-		# it stores back into g directly, no Result involved
-		g: i32|i64 = 9
-		g += 1
 	return 0
 ''' ),
 			( 'union_binop_collapse_to_single_type', '''
@@ -9129,38 +9135,111 @@ def main() -> i32:
 	r2: Vector = p2 + q
 	if r2.x != 9:
 		return 2
+
+	# AugAssign with a union-typed target - shares _lower_binop_values,
+	# picks up the same dispatch with no special-casing needed. The
+	# collapsed plain-Vector result must coerce back into p3's own
+	# declared Vector|i32 union type (the SAME general assignment-
+	# coercion machinery an ordinary `p3: Vector|i32 = some_vector`
+	# already uses, not anything new to this dispatch). Compiling and
+	# running successfully IS the assertion here - Vector has no __eq__
+	# of its own, so a value-comparison check would just compare
+	# pointers, not x; r1/r2 above already prove the underlying
+	# arithmetic itself is correct
+	p3: Vector|i32 = Vector( 3 )
+	p3 += q
 	return 0
 ''' ),
-			( 'union_binop_nested_multi_error_unwrap', '''
-class NoAdd:
+			( 'union_binop_scalar_cell_respects_ambient_mode', '''
+class NoFloorDiv:
 	x: i32
 	def __init__( self, x: i32 ) -> None:
 		self.x = x
 
 def main() -> i32:
-	# default (checked) mode: signed i32 // i32 has checked_errors =
-	# (ZeroDivisionError, OverflowError) - a genuine multi-member
-	# ANONYMOUS error union contributed by ONE cell, exercising the
-	# bounded extra nested-unwrap level, alongside a separate TypeError
-	# contributed by the (i32,NoAdd)/(NoAdd,i32) mismatch cells - all
-	# three must land as distinct members of ONE aggregate error union
-	a: i32|NoAdd = 10
-	b: i32|NoAdd = 0
-	r1: Result[i32,ZeroDivisionError|OverflowError|TypeError] = a // b
+	# i32.__floordiv__ is @fallible_arithmetic - reached from a union
+	# grid cell (i32,i32), it must STILL auto-consume via the ambient
+	# mode (here panic_arithmetic, which needs no enclosing Result
+	# coverage at all - _require_result_return is skipped whenever the
+	# mode's own `extra` is set) exactly like the non-union path
+	# already does, rather than folding ZeroDivisionError/OverflowError
+	# into this expression's own aggregate. The (i32,NoFloorDiv)/
+	# (NoFloorDiv,i32) mismatch cells still contribute TypeError as
+	# their own, separate, genuinely-aggregated error
+	with compiler.panic_arithmetic( 'unexpected div failure' ):
+		a: i32|NoFloorDiv = 10
+		b: i32|NoFloorDiv = 5
+		r1: Result[i32,TypeError] = a // b
+		if r1.is_err():
+			return 1
+
+		c: i32|NoFloorDiv = 20
+		d: i32|NoFloorDiv = NoFloorDiv( 4 )
+		r2: Result[i32,TypeError] = c // d
+		if not r2.is_err():
+			return 2
+	return 0
+''' ),
+			( 'union_binop_nested_multi_error_unwrap', '''
+class ErrorA:
+	pass
+class ErrorB:
+	pass
+
+class Dicey:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __floordiv__( self, other: Dicey ) -> Result[Dicey,ErrorA|ErrorB]:
+		if other.x == 0:
+			return Result.Err( ErrorA() )
+		if self.x < 0:
+			return Result.Err( ErrorB() )
+		# zero already ruled out above, but i32.__floordiv__ is itself
+		# @fallible_arithmetic and needs ITS OWN ambient mode regardless
+		# of the guard already having ruled the failure case out -
+		# panic_arithmetic is the one mode that needs no enclosing
+		# Result[_,ZeroDivisionError] coverage at all, and is genuinely
+		# unreachable here given the guard above
+		with compiler.panic_arithmetic( 'unreachable: other.x == 0 already ruled out' ):
+			return Result.Ok( Dicey( self.x // other.x ) )
+
+class NoFloorDiv2:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+def main() -> i32:
+	# Dicey.__floordiv__ is a REGULAR (not @fallible_arithmetic) dunder
+	# declaring a genuine multi-member ANONYMOUS error union directly in
+	# its own return type - exercises the bounded extra nested-unwrap
+	# level (_emit_nested_error_unwrap), alongside a separate TypeError
+	# contributed by the (Dicey,NoFloorDiv2)/(NoFloorDiv2,Dicey)
+	# mismatch cells - all three must land as distinct members of ONE
+	# aggregate error union
+	a: Dicey|NoFloorDiv2 = Dicey( 10 )
+	b: Dicey|NoFloorDiv2 = Dicey( 0 )
+	r1: Result[Dicey,ErrorA|ErrorB|TypeError] = a // b
 	if not r1.is_err():
 		return 1
 
-	c: i32|NoAdd = 20
-	d: i32|NoAdd = 4
-	r2: Result[i32,ZeroDivisionError|OverflowError|TypeError] = c // d
-	if r2.is_err():
+	c: Dicey|NoFloorDiv2 = Dicey( -10 )
+	d: Dicey|NoFloorDiv2 = Dicey( 4 )
+	r2: Result[Dicey,ErrorA|ErrorB|TypeError] = c // d
+	if not r2.is_err():
 		return 2
 
-	e: i32|NoAdd = NoAdd( 1 )
-	f: i32|NoAdd = 2
-	r3: Result[i32,ZeroDivisionError|OverflowError|TypeError] = e // f
-	if not r3.is_err():
+	e: Dicey|NoFloorDiv2 = Dicey( 20 )
+	f: Dicey|NoFloorDiv2 = Dicey( 4 )
+	r3: Result[Dicey,ErrorA|ErrorB|TypeError] = e // f
+	if r3.is_err():
 		return 3
+
+	g: Dicey|NoFloorDiv2 = NoFloorDiv2( 1 )
+	h: Dicey|NoFloorDiv2 = Dicey( 2 )
+	r4: Result[Dicey,ErrorA|ErrorB|TypeError] = g // h
+	if not r4.is_err():
+		return 4
 	return 0
 ''' ),
 			# RC-lifetime check under repetition - every cell kind that
