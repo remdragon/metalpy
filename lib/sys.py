@@ -109,7 +109,7 @@ def memset( ptr: Ptr[u8], fill: u8, count: usize ) -> Ptr[u8]:
 @compiler.target( os = not 'windows' )
 def memset( ptr: Ptr[u8], fill: u8, count: usize ) -> Ptr[u8]:
 	from crt import memset as _memset
-	_memset( ptr, fill, count )
+	_memset( ptr, i32( fill ), count )
 	return ptr
 
 @compiler.target( os = 'windows' )
