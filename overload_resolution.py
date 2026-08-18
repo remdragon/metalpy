@@ -6,7 +6,7 @@ from typing import Callable
 
 # local imports:
 from errors import CompileError
-from mpy_types import Type, Function, Parameter, ConditionalDispatch
+from mpy_types import Type, Function, Parameter, ConditionalDispatch, TypeVar
 
 '''
 Resolves an overloaded call site to a runtime dispatch plan. Pure function
@@ -90,6 +90,18 @@ class _Candidate:
 	target: Function              # what actually gets scheduled/called (member.bound_to if a stub, else member itself)
 	required: tuple[tuple[Type,...],...]      # per call-slot (aligned via _translate_indices), member's own declared type's leaves
 	target_params: tuple[Parameter,...]       # per call-slot, target's own Parameter - used to build runtime conditions/find the call-site operand later (lowering.py's _dispatch_operand_for_param looks a Parameter up by identity within target.parameters)
+	# per call-slot, True iff member's own declared parameter type there is a
+	# BARE TypeVar (e.g. `x: T` on a generic `def foo[T](x: T)`) - a genuine
+	# type, but one whose only .leaves() is the TypeVar object itself, which
+	# can never same_type-match a real concrete argument type (see this
+	# module's own header comment). Such a slot accepts every leaf by
+	# construction (lowering.py monomorphizes T from whatever the real
+	# argument type turns out to be - see _lower_overload_generic_call), so
+	# it's treated as a wildcard everywhere below rather than as "required
+	# type: TypeVar" - the lowest-priority fallback when a concrete candidate
+	# also matches, never a source of the "no matching overload"/ambiguity
+	# errors on its own.
+	wildcard: tuple[bool,...]
 
 @dataclass( kw_only = True )
 class _RankedMatch:
@@ -173,27 +185,41 @@ def _build_candidates( members: list[Function], call_slots: list[int|str], targe
 		target = targets[ id( member ) ]
 		target_params_list = target.parameters or []
 		required = tuple( tuple( params[i].type.leaves() ) for i in indices )
+		wildcard = tuple( isinstance( params[i].type, TypeVar ) for i in indices )
 		target_params = tuple(
 			target_params_list[i] if i < len( target_params_list ) else params[i]
 			for i in indices
 		)
-		candidates.append( _Candidate( member = member, target = target, required = required, target_params = target_params ))
+		candidates.append( _Candidate( member = member, target = target, required = required, target_params = target_params, wildcard = wildcard ))
 	return candidates
 
 def _sweep(
 	state: _State, required: tuple[tuple[Type,...],...],
 	same_type: Callable[[Type,Type],bool] = _identity_same_type,
+	wildcard: tuple[bool,...] = (),
 ) -> tuple[tuple[tuple[Type,...],...], tuple[bool,...], list[_State]]:
 	''' standard box-subtraction sweep, one dimension (call-slot) at a time.
 	Returns (matched, needs_check, misses):
 	- matched[i] is state.slots[i] ∩ required[i] (state.slots[i], narrowed to what this candidate accepts at slot i)
 	- needs_check[i] is True iff state.slots[i] wasn't already fully covered by required[i] (i.e. a real runtime check is needed at this slot for this state to conclude it's this candidate)
-	- misses is the list of non-overlapping leftover pieces (state minus this candidate's coverage), each with the same shape as state.slots, already filtered to drop any piece that's empty at some slot (impossible) '''
+	- misses is the list of non-overlapping leftover pieces (state minus this candidate's coverage), each with the same shape as state.slots, already filtered to drop any piece that's empty at some slot (impossible)
+
+	`wildcard[i]` (see _Candidate's own field) short-circuits slot i to a full,
+	no-remainder, no-runtime-check match regardless of required[i] - a bare
+	TypeVar-typed parameter accepts every leaf, so there's never anything left
+	over for a later candidate to claim at that slot. Defaults to all-False
+	(every existing caller/test that never passes it keeps the old behavior
+	unchanged). '''
 	misses: list[_State] = []
 	matched: list[tuple[Type,...]] = []
 	needs_check: list[bool] = []
 	prefix: list[tuple[Type,...]] = []
 	for i in range( len( state.slots )):
+		if i < len( wildcard ) and wildcard[i]:
+			matched.append( state.slots[i] )
+			needs_check.append( False )
+			prefix.append( state.slots[i] )
+			continue
 		inter = _intersect( state.slots[i], required[i], same_type )
 		matched.append( inter )
 		remainder = _subtract( state.slots[i], required[i], same_type )
@@ -231,6 +257,13 @@ def resolve_call(
 	for fn in ( *stubs, *implementations ):
 		if fn.resolve is not None:
 			fn.resolve()
+	# a broken member (its own resolution already failed and was recorded
+	# once, at that failure - see mpy_types.Name.broken) simply doesn't
+	# participate below, exactly as if it were never defined, rather than
+	# either poisoning the whole overload group or crashing later on a
+	# None .parameters
+	stubs = [ fn for fn in stubs if not fn.broken ]
+	implementations = [ fn for fn in implementations if not fn.broken ]
 
 	call_slots: list[int|str] = [ *range( len( args )), *kwargs.keys() ]
 	arg_leaves: dict[int|str,tuple[Type,...]] = {
@@ -238,7 +271,20 @@ def resolve_call(
 		**{ name: tuple( t.leaves() ) for name, t in kwargs.items() },
 	}
 
-	overload_members = sorted( [ *stubs, *( f for f in implementations if f.is_overload ) ], key = lambda f: f.line )
+	# a member with any bare-TypeVar-typed parameter (see _Candidate.wildcard)
+	# always sorts LAST, regardless of its own declaration line - it accepts
+	# every leaf at that slot, so trying it before a concrete sibling would
+	# swallow the whole remaining state via box subtraction and starve every
+	# later candidate, however the user happened to order the defs in source.
+	# This is what makes a generic overload behave as a genuine lowest-
+	# priority fallback rather than a source-order footgun.
+	def _is_wildcard_member( fn: Function ) -> bool:
+		return any( isinstance( p.type, TypeVar ) for p in ( fn.parameters or [] ) )
+
+	overload_members = sorted(
+		[ *stubs, *( f for f in implementations if f.is_overload ) ],
+		key = lambda f: ( _is_wildcard_member( f ), f.line ),
+	)
 	plains = [ f for f in implementations if not f.is_overload ]
 	targets = {
 		**{ id( m ): ( m.bound_to if m in stubs else m ) for m in overload_members },
@@ -265,7 +311,7 @@ def resolve_call(
 	for candidate in overload_candidates:
 		next_states: list[_State] = []
 		for state in states:
-			matched, needs_check, misses = _sweep( state, candidate.required, same_type )
+			matched, needs_check, misses = _sweep( state, candidate.required, same_type, candidate.wildcard )
 			spend( len( misses ))
 			next_states.extend( misses )
 			if all( matched ):
@@ -295,7 +341,20 @@ def resolve_call(
 		size = math.prod( len( s ) for s in state.slots ) if state.slots else 1
 		spend( size )
 		for combo in itertools.product( *state.slots ):
-			found = [ c for c in plain_candidates if all( _contains( c.required[i], combo[i], same_type ) for i in range( len( combo )) ) ]
+			found = [
+				c for c in plain_candidates
+				if all( c.wildcard[i] or _contains( c.required[i], combo[i], same_type ) for i in range( len( combo )) )
+			]
+			# a candidate that matched fully WITHOUT relying on any wildcard
+			# slot is always preferred over one that only matched because a
+			# bare TypeVar parameter accepts anything - mirrors the sweep
+			# ordering above (concrete beats generic) for the plain-
+			# implementation resolution path, and keeps a genuinely
+			# concrete-vs-concrete ambiguity (both len > 1 with no wildcard
+			# involved) reported exactly as before this change
+			concrete_found = [ c for c in found if not any( c.wildcard ) ]
+			if concrete_found:
+				found = concrete_found
 			if len( found ) != 1:
 				unresolved.append(( combo, found ))
 				continue

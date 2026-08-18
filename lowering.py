@@ -1,21 +1,23 @@
 # stdlib imports:
 import ast
 import copy
+import itertools
+import math
 from contextlib import nullcontext
-from dataclasses import replace
-from typing import Callable
+from dataclasses import dataclass, replace
+from typing import Callable, Iterable
 
 # local imports:
 import arithmetic_mode
 import cfg
 import ir
 from discovery import Discovery, is_stub_body
-from errors import CompileError
+from errors import CompileError, RedundantCompilationError
 from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec, validate_float_spec
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
-	CallableType, ClosureType, TupleType, int_stem_range,
+	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -62,9 +64,79 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.Mult: '__mul__',
 	ast.FloorDiv: '__floordiv__',
 	ast.Mod: '__mod__',
+	ast.Div: '__truediv__', # float-only in practice (see lib/builtins/__scalar_arith.py) - int has no `/`, only `//`
 	ast.BitOr: '__or__',
 	ast.BitAnd: '__and__',
 	ast.BitXor: '__xor__',
+}
+
+# forward binop dunder name -> its REFLECTED counterpart, mirroring Python's
+# real protocol: `a + b` tries `a.__add__(b)` first, and - if that isn't
+# applicable (no such dunder on left.type at all, OR left.type is Scalar and
+# so has no dunder mechanism of its own to begin with, e.g. `5 + some_vector`)
+# - falls back to `b.__radd__(a)`. Unlike `==`/`!=` (see _LeafPairEq's own
+# docstring on why equality reflects onto the SAME method name, just with
+# receiver/argument swapped), every one of these is a genuinely asymmetric
+# operator - Python gives each one its own DIFFERENTLY-NAMED reflected
+# method, not a reflected call to the same name, since e.g. `a - b` and
+# `b - a` are never interchangeable the way `a == b`/`b == a` are.
+_REFLECTED_BINOP_DUNDER: dict[str,str] = {
+	'__add__': '__radd__',
+	'__sub__': '__rsub__',
+	'__mul__': '__rmul__',
+	'__floordiv__': '__rfloordiv__',
+	'__mod__': '__rmod__',
+	'__truediv__': '__rtruediv__',
+	'__or__': '__ror__',
+	'__and__': '__rand__',
+	'__xor__': '__rxor__',
+}
+
+# ArithmeticMode subclass -> the mode-qualified dunder name prefix binop
+# dispatch tries FIRST, before falling back to the base name (__add__ ->
+# __wrapped_add__ under ArithmeticWrap, __saturated_add__ under
+# ArithmeticSaturate). ArithmeticChecked/ArithmeticPanic aren't here - they
+# always use the base name directly (no separate "panicked" spelling; a
+# @fallible_arithmetic dunder's own is_fallible_arithmetic consumption
+# already handles the panic-vs-propagate distinction). This is the whole
+# mechanism that lets a class like `int` (which never registers
+# __wrapped_add__) stay mode-independent with zero isinstance(Scalar)-style
+# special-casing anywhere: the qualified lookup just misses and falls
+# through to __add__.
+_MODE_DUNDER_PREFIX: dict[type,str] = {
+	arithmetic_mode.ArithmeticWrap: 'wrapped',
+	arithmetic_mode.ArithmeticSaturate: 'saturated',
+}
+
+# (operation kind, mode) -> the ir.BinOp opcode compiler.checked_*/wrapped_*/
+# saturated_* resolve to for INTEGER operands - see _lower_compiler_checked_
+# binop. 'floordiv'/'mod' stay fallible (ZeroDivisionError) in every mode -
+# see ir.py's own DivWrap/DivSaturate/ModWrap/ModSaturate comments - unlike
+# add/sub/mul, which are only fallible under 'checked'.
+_CHECKED_BINOP_OPCODES: dict[tuple[str,str],type] = {
+	( 'add', 'checked' ): ir.AddCheck, ( 'add', 'wrapped' ): ir.AddWrap, ( 'add', 'saturated' ): ir.AddSaturate,
+	( 'sub', 'checked' ): ir.SubCheck, ( 'sub', 'wrapped' ): ir.SubWrap, ( 'sub', 'saturated' ): ir.SubSaturate,
+	( 'mul', 'checked' ): ir.MulCheck, ( 'mul', 'wrapped' ): ir.MulWrap, ( 'mul', 'saturated' ): ir.MulSaturate,
+	( 'floordiv', 'checked' ): ir.Div, ( 'floordiv', 'wrapped' ): ir.DivWrap, ( 'floordiv', 'saturated' ): ir.DivSaturate,
+	( 'mod', 'checked' ): ir.Mod, ( 'mod', 'wrapped' ): ir.ModWrap, ( 'mod', 'saturated' ): ir.ModSaturate,
+}
+
+# same idea for FLOAT operands - wrap/saturate raw-IEEE add/sub/mul reuse the
+# integer Wrap opcodes (their emitter codegen is already type-generic, see
+# _emit_wrap_arith); there's no float 'saturated' opcode distinct from
+# 'wrapped' at all (arithmetic_mode.py's own ArithmeticSaturate.GetFloatBinOp
+# delegates to _raw_float_binop, identically to ArithmeticWrap) - the
+# library-level saturated_add/etc dunders for f32/f64 call compiler.
+# wrapped_add directly instead of a separate saturated intrinsic (see
+# lib/builtins/__scalar_arith.py), so 'saturated' is deliberately absent
+# here. No 'floordiv'/'mod' entries either - float has no // or % in this
+# language's arithmetic-mode system (arithmetic_mode.py's GetFloatBinOp has
+# no case for either).
+_CHECKED_FLOAT_BINOP_OPCODES: dict[tuple[str,str],type] = {
+	( 'add', 'checked' ): ir.FAddCheck, ( 'add', 'wrapped' ): ir.AddWrap,
+	( 'sub', 'checked' ): ir.FSubCheck, ( 'sub', 'wrapped' ): ir.SubWrap,
+	( 'mul', 'checked' ): ir.FMulCheck, ( 'mul', 'wrapped' ): ir.MulWrap,
+	( 'truediv', 'checked' ): ir.FloatDivCheck, ( 'truediv', 'wrapped' ): ir.FloatDiv,
 }
 
 # ast comparison operator -> the dunder method name to dispatch to for a
@@ -78,6 +150,50 @@ _COMP_DUNDER: dict[type,str] = {
 	ast.Gt: '__gt__',
 	ast.GtE: '__ge__',
 }
+
+@dataclass( frozen = True )
+class _LeafPairEq:
+	''' _lower_eq_dispatch's own PASS 1 classification of one (left leaf
+	type, right leaf type) grid cell - see that method's own docstring for
+	the full per-kind rule. `method`/`reflected` are only meaningful for
+	kind == 'cross_dunder': `reflected = False` means the match was found
+	via left_type's own __eq__/__ne__ (receiver=left, arg=right);
+	`reflected = True` means it was found via the REFLECTED call instead -
+	right_type's own __eq__/__ne__ (receiver=right, arg=left). Both
+	attempts look up the SAME method name (mirrors Python's real equality
+	protocol: unlike an asymmetric operator such as `+`, which falls back
+	to a DIFFERENTLY-NAMED `__radd__` on the right side, `==`/`!=` has no
+	separate reflected-name method - only __eq__/__ne__ itself, with
+	receiver/argument roles swapped for the second attempt). '''
+	kind: str   # 'none_true' | 'none_false' | 'same_type' | 'cross_dunder' | 'error'
+	method: Function|None = None
+	reflected: bool = False
+
+@dataclass( frozen = True )
+class _LeafPairBinop:
+	''' _lower_binop_dispatch's own PASS 1 classification of one (left leaf
+	type, right leaf type) grid cell for a union-involving +-*//%|&^ - see
+	that method's own docstring for the full per-kind rule. `success_type`
+	is None only for 'error' (no valid operation for this leaf pair at
+	all); `error_type` is None whenever this cell CAN'T fail (infallible
+	scalar arithmetic under the current mode, or a dunder whose own
+	declared return type isn't itself Result[T,E]) - a cell can carry both
+	(a fallible scalar op, or a dunder returning Result[T,E]) or neither.
+	`opcode`/`extra` are 'scalar' only (mirrors _lower_arithmetic_op's own
+	two parameters of the same name - `extra` is the lowered panic-mode
+	message operand, or None for every other mode). `method`/`reflected`
+	are 'dunder' only, same meaning as _LeafPairEq's own pair - `reflected
+	= True` means this was found via right_type's own REFLECTED,
+	DIFFERENTLY-NAMED method (__radd__ etc, not __eq__/__ne__'s
+	same-name-swapped-roles reflection - see _REFLECTED_BINOP_DUNDER's own
+	comment on why binops need the different convention). '''
+	kind: str   # 'scalar' | 'dunder' | 'error'
+	success_type: Type|None = None
+	error_type: Type|None = None
+	opcode: type|None = None
+	extra: ir.Operand|None = None
+	method: Function|None = None
+	reflected: bool = False
 
 # ast.UnaryOp operator -> the dunder method name to dispatch to for a
 # non-scalar operand (int.__neg__, ...). Scalar operands always go through
@@ -113,6 +229,17 @@ _FLOAT_UNSUPPORTED_BINOPS: dict[type,str] = {
 	ast.LShift: '<<', ast.RShift: '>>',
 	ast.FloorDiv: '//', ast.Mod: '%',
 }
+
+def _dedup_types( types: Iterable[Type] ) -> list[Type]:
+	''' first-seen-order dedup by qualname, for _lower_binop_dispatch's own
+	success/error type aggregation - discovery._get_or_create_union already
+	dedupes internally, but the CALLER needs a deduped Python list first to
+	decide whether to collapse to a single plain type (len == 1) or actually
+	synthesize a union (len > 1). '''
+	seen: dict[str,Type] = {}
+	for t in types:
+		seen.setdefault( t.qualname, t )
+	return list( seen.values() )
 
 
 class Lowering:
@@ -830,6 +957,7 @@ class Lowering:
 		else:
 			names = getattr( owner_type, 'names', None )
 			found = names.get( name ) if isinstance( names, dict ) else None
+		found = self._resolve_scalar_name( found )
 		return found if isinstance( found, Function ) else None
 
 	def _find_iterator_next_method( self, owner_type: Type|None ) -> Function|None:
@@ -915,6 +1043,8 @@ class Lowering:
 			return trampoline
 
 		self._ensure_resolved( method )
+		if method.broken:
+			raise RedundantCompilationError() # already reported at the point method's own resolution failed - see Name.broken
 		if method.parameters is None:
 			self.discovery.fail( f'{method.qualname} could not be resolved (see earlier error)', method.node )
 		self.schedule( method.return_type )
@@ -1161,6 +1291,18 @@ class Lowering:
 	def _monomorphized_function( self, spec: Specialization ) -> Function:
 		return self._monomorphizer.monomorphized_function( spec )
 
+	def _resolve_scalar_name( self, found: Name|None ) -> Name|None:
+		''' Scalar.names may hold a raw Specialization - a generic dunder/
+		method registered via `TypeName.method = generic_fn[T]`, stored
+		as-is by discovery.py's visit_Assign since a Monomorphizer isn't
+		constructible that early. Every reader of Scalar.names funnels the
+		looked-up value through here first so a Specialization transparently
+		becomes the real, concrete Function it stands for, instead of
+		silently falling through an `isinstance(found, Function)` check
+		(what every existing caller already does) as if the name were
+		never registered at all. '''
+		return self._monomorphized_function( found ) if isinstance( found, Specialization ) else found
+
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
 		return self._monomorphizer.monomorphize_class( spec )
 
@@ -1172,7 +1314,9 @@ class Lowering:
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
 		return self._type_resolver._attr_lookup_callable( owner_type, attr, ctx )
 
-	def _match_call_args( self, target: Function, call: ast.Call ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
+	def _match_call_args( self, target: Function, call: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[tuple[Parameter,ast.expr]],list[tuple[Parameter,ast.expr]]]:
+		if target.broken:
+			raise RedundantCompilationError() # already reported at the point target's own resolution failed - see Name.broken
 		if target.parameters is None:
 			# target's own parameter resolution already failed (and recorded
 			# an error - see discovery.py's _resolve_guarded/_make_function_
@@ -1184,6 +1328,15 @@ class Lowering:
 		if any( kw.arg is None for kw in call.keywords ):
 			self.discovery.fail( f'**kwargs not supported yet: {ast.unparse(call)}', call )
 		positional_params = [ p for p in target.parameters if not p.is_vararg and not p.is_kwarg and not p.is_kwonly ]
+		# a Scalar-registered method's receiver (_lower_call's own "a
+		# Scalar-registered method" comment) isn't threaded through call.args
+		# at all - it's spliced into target's own first positional parameter
+		# directly, later, by the caller - so that parameter is pre-matched
+		# here rather than checked against the call site's own args
+		receiver_param = None
+		if receiver_fills_first_param and positional_params:
+			receiver_param = positional_params[0]
+			positional_params = positional_params[1:]
 		if len( call.args ) > len( positional_params ):
 			self.discovery.fail( f'too many positional arguments: {ast.unparse(call)}', call )
 		positional = list( zip( positional_params, call.args ))
@@ -1193,6 +1346,18 @@ class Lowering:
 			if param is None:
 				self.discovery.fail( f'{target.qualname} has no parameter {kw.arg!r}', call )
 			keyword.append(( param, kw.value ))
+		# "too many positional arguments" above only catches an EXCESS of
+		# arguments - nothing previously checked the other direction (a
+		# required parameter, no default, never matched by either list),
+		# so a call could silently omit one and mis-typecheck downstream
+		# instead of failing cleanly here.
+		matched_params = { id( p ) for p, _ in positional } | { id( p ) for p, _ in keyword }
+		if receiver_param is not None:
+			matched_params.add( id( receiver_param ))
+		missing = [ p.stem for p in target.parameters if not p.is_vararg and not p.is_kwarg and p.default is None and id( p ) not in matched_params ]
+		if missing:
+			missing_repr = ', '.join( repr( m ) for m in missing )
+			self.discovery.fail( f'{target.qualname} missing required argument(s) {missing_repr}: {ast.unparse(call)}', call )
 		positional = [ ( param, self._check_move_argument( target, param, expr, call )) for param, expr in positional ]
 		keyword = [ ( param, self._check_move_argument( target, param, expr, call )) for param, expr in keyword ]
 		return positional, keyword
@@ -1553,7 +1718,7 @@ class FunctionLowering:
 						# baked in once
 						if isinstance( fn.cls, Specialization ):
 							concrete_union = self.lowering.monomorphize_class( fn.cls )
-							payload_cls = concrete_union.names['data'].type
+							payload_cls = concrete_union.get_local_or_raise( 'data' ).type
 							fn.add_name( '$payload_cls', payload_cls )
 
 					for param in fn.parameters or []:
@@ -2069,6 +2234,40 @@ class FunctionLowering:
 			self._emit( ir.DeleteTemp( temp = t ))
 		self._pending_temps = []
 
+	def _incref_aliasing_return( self, node_expr: ast.expr, value: 'ir.Operand|None', *, force: bool = False ) -> None:
+		''' shared by _stmt_Return and @inline splicing (_lower_inline_call/
+		_splice_multi_statement_inline_body): an ALIASING return expression
+		(self.lowering._is_aliasing_expr - `return self`/`return self.x`)
+		hands back a reference someone else still independently owns, so the
+		caller needs its own +1 - regardless of whether the return happens
+		through a real call boundary or is spliced in directly. Skipping this
+		for the spliced case (confirmed by a real refcount() repro) silently
+		drops the Incref an @inline'd `return self` would otherwise get from
+		a real, non-inlined call to the same function.
+
+		`force` bypasses the has_live_entry() check below - needed by the
+		@inline splice callers specifically: self/a parameter is bound
+		zero-copy (SAME Variable identity as whatever the caller passed in -
+		see _lower_inline_call's own "no _cfg_assign/incref here, deliberately"
+		comment), so has_live_entry(value) would answer "does the CALLER's own
+		operand happen to be a live owned local in the OUTER scope" instead of
+		"is this splice's self/parameter borrowed" - the wrong question
+		whenever the caller's argument was itself a plain owned local (exactly
+		the str(s) repro: s has its own live entry in main(), so an unforced
+		check wrongly concluded "already a move, no Incref needed"). @inline
+		splice callers already know from their own binding loop that self/
+		every parameter is always treated as borrowed at the splice boundary
+		(same loop, same comment), so they pass force=True for those; a
+		multi-statement splice's own pre-return-declared local (a real,
+		splice-scoped self._cfg entry, not aliased to any outer identity)
+		still needs the ordinary has_live_entry check, so force stays False
+		for those. '''
+		if value is None or not self.lowering._is_aliasing_expr( node_expr, value ):
+			return
+		if force or not self._cfg.has_live_entry( value ):
+			for instr in self._cfg.incref( value.type, value ):
+				self._emit( instr )
+
 	def _stmt_Return( self, node: ast.Return ) -> None:
 		if self._in_deferred_body:
 			# a defer/errdefer body's code runs later, replayed inline at the
@@ -2113,9 +2312,7 @@ class FunctionLowering:
 		# holder of the returned value, double-counted as the SAME
 		# reference) where 3 are live once the caller's copy exists,
 		# leading to a premature free the moment either one dropped.
-		if value is not None and self.lowering._is_aliasing_expr( node.value, value ) and not self._cfg.has_live_entry( value ):
-			for instr in self._cfg.incref( value.type, value ):
-				self._emit( instr )
+		self._incref_aliasing_return( node.value, value )
 		# what actually gets returned/assigned into the return-value slot
 		# below - defaults to `value` itself, reassigned to a widened temp
 		# further down when the covered-Result-error-widening case applies.
@@ -2203,8 +2400,21 @@ class FunctionLowering:
 			# rejected, confirmed via a real repro
 			is_cenum_to_underlying = isinstance( value.type, CEnum ) and value.type.value_type is fn_type
 			is_underlying_to_cenum = isinstance( fn_type, CEnum ) and value.type is fn_type.value_type
+			# the mirror image of expected_concrete above: value.type can
+			# ALSO still be a raw, un-monomorphized Specialization here (a
+			# compiler.checked_add(...)-style intrinsic's own check_dest,
+			# see _lower_compiler_checked_binop's own comment on why IT
+			# can't be pre-monomorphized either - the emitter needs its
+			# Specialization .args) - monomorphize it the same way before
+			# the identity comparison, rather than requiring every producer
+			# of a same-statement-escaping Result value to guess which form
+			# the compare side wants
+			value_concrete = value.type
+			if isinstance( value.type, Specialization ) and isinstance( value.type.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				value_concrete = self.lowering.monomorphize_class( value.type )
 			if (
 				value.type is not fn_type and value.type is not expected_concrete
+				and value_concrete is not fn_type and value_concrete is not expected_concrete
 				and not is_cenum_to_underlying and not is_underlying_to_cenum
 			):
 				widened = self._maybe_widen_return_result( node, value, fn_type )
@@ -2239,7 +2449,7 @@ class FunctionLowering:
 		# used to fall back to the generic per-class destructor's
 		# unconditional field cascade, independently releasing the same
 		# attribute again; that fallback is gone now (see
-		# _emit_fallible_construction's own comment on why it had to be
+		# _lower_compiler_raw_free's own comment (used by the synthesized $$__new__'s Err branch) on why it had to be
 		# removed - it also unconditionally touched attributes that were
 		# NEVER assigned at all, reading uninitialized memory), so this
 		# construction's own inline unwind is now the ONLY place whichever
@@ -2358,8 +2568,8 @@ class FunctionLowering:
 		fn_t, fn_e = fn_shape
 		if op_t is not fn_t or op_e is fn_e:
 			return None # different Ok type entirely, or errors already match (not this method's concern)
-		fn_e_leaves = fn_e.leaves()
-		if not all( leaf in fn_e_leaves for leaf in op_e.leaves() ):
+		fn_e_leaves = tr._atomic_leaves( fn_e )
+		if not all( leaf in fn_e_leaves for leaf in tr._atomic_leaves( op_e )):
 			return None # op's error isn't covered by fn's - a genuine mismatch, not widenable
 		# fn_type is guaranteed Result-shaped here (fn_shape matched), so
 		# schedule/monomorphize it the same way _stmt_Return's own caller
@@ -2399,11 +2609,11 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'del only supports a single local variable name: {ast.unparse(node)}', node )
 		target = node.targets[0]
 		fn = self._current_fn
-		existing = fn.names.get( target.id )
+		existing = fn.get_local_or_raise( target.id )
 		if not isinstance( existing, Variable ):
 			self.lowering.discovery.fail( f'{target.id!r} is not a local variable, cannot del it', node )
 		try:
-			instructions = self._cfg.deleted( existing )
+			instructions = self._cfg.deleted( existing, self._current_fn.qualname )
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
 		for instr in instructions:
@@ -2444,7 +2654,7 @@ class FunctionLowering:
 		if not mod:
 			self.lowering.discovery.fail( f'module {package!r} not found', node )
 		for alias in node.names:
-			item = mod.names.get( alias.name )
+			item = mod.get_local_or_raise( alias.name )
 			if item is None:
 				self.lowering.discovery.fail( f'module {package} does not export {alias.name!r}', node )
 			self._current_fn.add_name( alias.asname or alias.name, item )
@@ -2474,7 +2684,15 @@ class FunctionLowering:
 		if not isinstance( node.target, ast.Name ):
 			self.lowering.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
 		fn = self._current_fn
+		# Volatile[T] resolves transparently to plain T (discovery.py's
+		# visit_Subscript strips it) - detected here, separately, by peeking
+		# at the raw annotation AST so this ONE call site (the only thing
+		# that needs to know) can tag the resulting Variable's storage.
+		is_volatile = ( isinstance( node.annotation, ast.Subscript ) and isinstance( node.annotation.value, ast.Name )
+				and node.annotation.value.id == 'Volatile' )
 		var_type = self.lowering.discovery.visit( node.annotation )
+		if is_volatile and var_type.is_rc():
+			self.lowering.discovery.fail( f'Volatile[...] does not support refcounted types: {ast.unparse(node)}', node )
 		# var_type starts as whatever discovery.visit() returns - often a
 		# bare, un-monomorphized Specialization - and STAYS that way for
 		# var's own construction/_lower_expr's expected_type below. Fixed
@@ -2489,10 +2707,20 @@ class FunctionLowering:
 			file = fn.file,
 			line = node.lineno,
 			type = var_type,
+			is_volatile = is_volatile,
 		)
-		fn.add_name( var.stem, var )
+		fn.add_name( var.stem, var ) # scoped to the whole function body regardless of node.value (no block scoping - see cfg.py's own module docstring) - a bare declaration (node.value is None) deliberately does NOT mark it live in self._cfg (see below); a later real assignment does, via assign()'s own unconditional self._live.add()
 		if node.value is not None:
-			operand = self._lower_expr( node.value, var_type )
+			try:
+				operand = self._lower_expr( node.value, var_type )
+			except CompileError:
+				# var is already registered (above) with a plausible
+				# declared type but no real value/instructions behind it -
+				# mark it broken so a later reference raises
+				# RedundantCompilationError instead of using it as if it
+				# were genuinely initialized (see Name.broken)
+				var.broken = True
+				raise
 			# Only NOW, after the RHS is fully lowered, swap var.type for
 			# its resolved (monomorphized, if a Specialization) form -
 			# ensure_resolved()'s own contract: "the SINGLE place a
@@ -2590,6 +2818,142 @@ class FunctionLowering:
 				return elem, writeback
 		return self._lower_expr( value_node, None ), None
 
+	def _static_field_type_or_none( self, node: ast.expr ) -> Type|None:
+		''' like _static_type_of_value_expr, but NEVER calls discovery.fail()
+		- any lookup miss (unknown name, a method/property instead of a
+		plain field, a scope with no .names, ...) just returns None instead
+		of hard-erroring. Needed specifically for _fixed_array_index_target's
+		speculative "is this a FixedArrayType field?" peek: unlike sizeof(x)'s
+		fallback (always a genuine error if it misses), a MISS here is the
+		expected, common case - e.g. `obj.some_list_field[i]` or
+		`obj.some_property[i]` (a property returning something indexable)
+		must fall through to the ordinary _expr_Attribute/_lower_attr_target_obj
+		handling unchanged, not be mistaken for a real error. '''
+		if isinstance( node, ast.Name ):
+			name = self.lowering.discovery.find_name_or_none( node.id )
+			if not isinstance( name, Variable ) or name.broken:
+				return None
+			member = self._cfg.narrowed_member( node.id )
+			return member.type if member is not None else name.type
+		if isinstance( node, ast.Attribute ):
+			owner_type = self._static_field_type_or_none( node.value )
+			if owner_type is None:
+				return None
+			owner_type = self.lowering._ensure_resolved( owner_type )
+			if isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar ) and owner_type.base.stem in ( 'Ptr', 'ConstPtr' ):
+				owner_type = self.lowering._ensure_resolved( owner_type.args[0] )
+			if isinstance( owner_type, ( CStruct, RCClass )):
+				try:
+					found = owner_type.chain_lookup( node.attr )
+				except RedundantCompilationError:
+					# a broken inherited member is exactly as much "not
+					# statically known" as a genuine miss, for this
+					# speculative-peek contract - never raise here
+					return None
+			else:
+				names = getattr( owner_type, 'names', None )
+				found = names.get( node.attr ) if isinstance( names, dict ) else None
+			if not isinstance( found, Variable ) or found.broken:
+				return None
+			# resolve the VARIABLE itself first, same as _attr_lookup's own
+			# `self._ensure_resolved( found ); return found` - found.type can
+			# still be a lazily-deferred placeholder until found itself is
+			# resolved (confirmed by a real repro: `g: Foo = make()` then
+			# `g.b[i]`, Foo only reached indirectly through make()'s return
+			# type rather than a direct Foo() construction in the same
+			# statement, left found.type unresolved here and silently
+			# misidentified a genuine FixedArrayType field as "not one")
+			self.lowering._ensure_resolved( found )
+			return found.type
+		return None
+
+	def _fixed_array_index_target( self, attr_node: ast.Attribute, index_node: ast.expr ) -> tuple[ir.Operand,str,FixedArrayType,ir.Operand]|None:
+		''' `f.arr[i]` where `f.arr` (attr_node) statically resolves to a
+		FixedArrayType field - returns (root_obj, attr_name, array_type,
+		index_operand) ready for ir.GetAttrIndex/SetAttrIndex, or None if it
+		doesn't (every other subscript shape is handled unchanged by the
+		ordinary paths in _expr_Subscript/_stmt_Assign). Checked via
+		_static_field_type_or_none FIRST, before lowering attr_node.value
+		for real - that helper emits no IR, never fails, and never evaluates
+		attr_node, so a non-match here doesn't double-evaluate the root
+		object (the same "lower it exactly once" concern
+		_lower_attr_target_obj's own docstring explains) and doesn't
+		misfire a spurious error for some other legitimate attribute shape
+		(property, method-value, ...). This is also why deeper/non-Name
+		roots (e.g. `make().arr[i]`) fall through unrecognized rather than
+		being specially rejected here: the helper only walks Name/Attribute
+		chains, so anything else just resolves to None and reaches the
+		ordinary whole-value-read rejection below, same as before this
+		feature existed.
+
+		A literal constant index out of [0, count) is rejected at compile
+		time, same as tuple's own compile-time-constant index check - the
+		one bit of free bounds checking available here (FixedArrayType's
+		count, unlike a raw Ptr[T], is always known at compile time). A
+		non-constant (runtime) index is otherwise unchecked, matching
+		Ptr[T]/ConstPtr[T]'s own GetItem convention - this is a raw inline
+		C array field, not a general-purpose bounds-checked container (see
+		FixedArrayType's own docstring). '''
+		array_type = self._static_field_type_or_none( attr_node )
+		if not isinstance( array_type, FixedArrayType ):
+			return None
+		if ( isinstance( index_node, ast.Constant ) and isinstance( index_node.value, int )
+				and not isinstance( index_node.value, bool ) and not ( 0 <= index_node.value < array_type.count )):
+			self.lowering.discovery.fail(
+				f'index {index_node.value} out of range for {array_type.qualname} (0..{array_type.count-1}): {ast.unparse(index_node)}',
+				index_node,
+			)
+		root = self._lower_expr( attr_node.value, None )
+		index_type = self.lowering.discovery.get_intrinsics()['usize']
+		index = self._lower_expr( index_node, index_type )
+		return root, attr_node.attr, array_type, index
+
+	def _existing_local_or_none( self, target_id: str, node: ast.AST, context: str ) -> Variable|None:
+		''' find_name_or_none, but treating a previously-BROKEN entry as if
+		it weren't there at all - free to redeclare cleanly via
+		_declare_local below, same as a genuinely first assignment, since
+		nothing usable was ever produced for it. Shared by _stmt_Assign,
+		_expr_NamedExpr (walrus), and _bind_loop_target - all three mirror
+		the same "reuse existing, else declare fresh" rule (see their own
+		comments). `context` only feeds the not-a-variable error message,
+		which differs slightly per caller. '''
+		existing = self.lowering.discovery.find_name_or_none( target_id )
+		if existing is None or existing.broken:
+			return None
+		if not isinstance( existing, Variable ):
+			self.lowering.discovery.fail( f'{target_id!r} is not a variable, {context}', node )
+		return existing
+
+	def _declare_local( self, target_id: str, node: ast.AST, lower_rhs: Callable[[Type|None],ir.Operand], *, default_type: Type|None = None ) -> tuple[Variable,ir.Operand]:
+		''' the RHS is lowered BEFORE target_id is registered - not the
+		other way around - because it may reference target_id itself: a
+		bare Name target's own read/write desugaring (_stmt_AugAssign's
+		`x += 1` -> `x = x + 1`, threaded straight through _stmt_Assign)
+		relies on a genuinely-undeclared x's OWN read, inside that
+		synthesized RHS, still failing "not defined" normally - registering
+		x first would make that read find a freshly-declared, empty x
+		instead. Only on FAILURE is a (broken) placeholder registered here,
+		in the except clause - the actual fix for the gap that otherwise let
+		a later, separate reference to target_id report a spurious "not
+		defined" cascade on top of the real, original error (see
+		Name.broken). Shared by the "no prior declaration" branches of
+		_stmt_Assign, _expr_NamedExpr (walrus), and _bind_loop_target.
+		`default_type` is only meaningful for _bind_loop_target's own
+		fallback when value_expr has no type of its own to infer from (e.g.
+		range()'s implicit literal start) - every other caller leaves it
+		None, inferring purely from the RHS. '''
+		fn = self._current_fn
+		try:
+			operand = lower_rhs( default_type )
+		except CompileError:
+			broken = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True )
+			fn.add_name( broken.stem, broken )
+			raise
+		var = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type )
+		fn.add_name( var.stem, var )
+		self.lowering.schedule( var.type )
+		return var, operand
+
 	def _resolve_narrow_member( self, name: str, member_stem: str, node: ast.AST ) -> Variable:
 		# type_resolver.py hands down only a STEM (see its own comment on
 		# why - resolved against the TEXTUAL/abstract union at that pass,
@@ -2629,10 +2993,8 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
 		target = node.targets[0]
 		if isinstance( target, ast.Name ):
-			existing = self.lowering.discovery.find_name_or_none( target.id )
+			existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 			if existing is not None:
-				if not isinstance( existing, Variable ):
-					self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 				self._cfg.unnarrow( target.id ) # a real reassignment invalidates whatever this name was previously narrowed to - see cfg.py's own comment
 				operand = self._lower_expr( node.value, existing.type )
 				for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
@@ -2642,17 +3004,7 @@ class FunctionLowering:
 				# first assignment to a name with no prior declaration - same
 				# as an AnnAssign, but the type is inferred from the RHS
 				# instead of coming from an explicit annotation
-				operand = self._lower_expr( node.value, None )
-				fn = self._current_fn
-				var = Variable(
-					stem = target.id,
-					qualname = f'{fn.qualname}.{target.id}',
-					file = fn.file,
-					line = node.lineno,
-					type = operand.type,
-				)
-				fn.add_name( var.stem, var )
-				self.lowering.schedule( var.type )
+				var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( node.value, expected ))
 				# type_resolver.py's visit_Match desugars `match r:` into
 				# `__match_subj_N = r; if ...` and marks the synthesized
 				# Assign with these two attributes (see its own comment) -
@@ -2685,6 +3037,17 @@ class FunctionLowering:
 		elif isinstance( target, ast.Attribute ):
 			obj, writeback = self._lower_attr_target_obj( target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, target.attr, target )
+			if isinstance( attr_var.type, FixedArrayType ):
+				# same restriction as the GetAttr (read) side - a bare C array
+				# member is never assignable via `=` (only a whole containing
+				# struct/union is, via the compound-literal construction path
+				# _lower_allocate_fields already handles) - see
+				# FixedArrayType's own docstring
+				self.lowering.discovery.fail(
+					f'{ast.unparse(target)}: {attr_var.type.qualname} fields cannot be assigned after construction '
+					f'(no element-level array access is implemented)',
+					target,
+				)
 			operand = self._lower_expr( node.value, attr_var.type )
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> = value, inside __init__ construction itself -
@@ -2752,6 +3115,13 @@ class FunctionLowering:
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
+			if isinstance( target.value, ast.Attribute ):
+				fixed = self._fixed_array_index_target( target.value, target.slice )
+				if fixed is not None:
+					root, attr, array_type, index = fixed
+					operand = self._lower_expr( node.value, array_type.elem_type )
+					self._emit( ir.SetAttrIndex( obj = root, attr = attr, index = index, value = operand ))
+					return
 			obj = self._lower_expr( target.value, None )
 			setitem_fn = self.lowering._find_method( obj.type, '__setitem__' )
 			if setitem_fn is None:
@@ -2783,6 +3153,62 @@ class FunctionLowering:
 					call_dest = self._new_temp( setitem_fn.return_type )
 					self._emit( ir.Call( dest = call_dest, target = setitem_fn, receiver = obj, args = [ index, operand ], kwargs = {} ))
 					self._maybe_consume_result( node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+		elif isinstance( target, ast.Tuple ):
+			# `(a, b) = t` / `a, b = t` - both spellings parse to the same
+			# ast.Assign(targets=[ast.Tuple(...)]) shape. node.value is
+			# lowered exactly ONCE (not per-element) since it may be
+			# side-effecting (sock.accept().or_return()) - each element is
+			# then a raw GetAttr off the tuple's own _0/_1/... fields,
+			# genuinely aliasing the tuple's own storage, the identical
+			# shape _expr_Subscript's tuple-constant-index read already
+			# established (and already fixed a real use-after-free for -
+			# see its own is_tuple_element_read comment) - is_alias=True
+			# unconditionally for a fresh declaration, re-derived from the
+			# coercion result for a reassignment (a union-widening coerce
+			# already increfs the leaf it wraps internally; treating that
+			# as still-aliasing would double-incref).
+			if any( isinstance( elt, ast.Starred ) for elt in target.elts ):
+				self.lowering.discovery.fail( f'starred unpacking targets are not supported: {ast.unparse(node)}', node )
+			if not all( isinstance( elt, ast.Name ) for elt in target.elts ):
+				self.lowering.discovery.fail( f'unpacking targets must be plain names (nested tuple targets are not supported): {ast.unparse(node)}', node )
+			fn = self._current_fn
+			try:
+				value = self._lower_expr( node.value, None )
+				resolved_value_type = self.lowering._ensure_resolved( value.type )
+				tuple_type = self.lowering._tuple_storage.tuple_type_for( resolved_value_type )
+				if tuple_type is None:
+					self.lowering.discovery.fail( f'cannot unpack a non-tuple value: {ast.unparse(node)}', node )
+				if len( tuple_type.elem_types ) != len( target.elts ):
+					self.lowering.discovery.fail(
+						f'unpacking target has {len(target.elts)} name(s), value has {len(tuple_type.elem_types)}: {ast.unparse(node)}',
+						node,
+					)
+				for i, elt in enumerate( target.elts ):
+					assert isinstance( elt, ast.Name )
+					attr_var = self.lowering._attr_lookup( resolved_value_type, f'_{i}', node )
+					elem = self._new_temp( attr_var.type )
+					self._emit( ir.GetAttr( dest = elem, obj = value, attr = f'_{i}' ))
+					existing = self._existing_local_or_none( elt.id, node, 'cannot assign to it' )
+					if existing is not None:
+						self._cfg.unnarrow( elt.id )
+						final = self._coerce_or_check_operand( elem, existing.type, node )
+						is_alias = not getattr( final, 'is_union_coerce_result', False )
+						for instr in self._cfg_assign( existing, final, is_alias = is_alias, node = node ):
+							self._emit( instr )
+						self._emit( ir.Assign( dest = existing, src = final ))
+					else:
+						var = Variable( stem = elt.id, qualname = f'{fn.qualname}.{elt.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = elem.type )
+						fn.add_name( var.stem, var )
+						self.lowering.schedule( var.type )
+						for instr in self._cfg_assign( var, elem, is_alias = True, node = node ):
+							self._emit( instr )
+						self._emit( ir.Assign( dest = var, src = elem ))
+			except CompileError:
+				for elt in target.elts:
+					if isinstance( elt, ast.Name ) and self.lowering.discovery.find_name_or_none( elt.id ) is None:
+						broken = Variable( stem = elt.id, qualname = f'{fn.qualname}.{elt.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True )
+						fn.add_name( broken.stem, broken )
+				raise
 		else:
 			self.lowering.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 
@@ -2915,6 +3341,9 @@ class FunctionLowering:
 			return
 		if self.lowering._is_compiler_call( node.value ) == 'decref_dynamic':
 			self._lower_compiler_decref_dynamic( node.value )
+			return
+		if self.lowering._is_compiler_call( node.value ) == '__raw_free__':
+			self._lower_compiler_raw_free( node.value )
 			return
 		if not isinstance( node.value, ast.Call ):
 			self.lowering.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
@@ -3111,19 +3540,173 @@ class FunctionLowering:
 		self._emit( ir.RefCount( dest = dest, value = value ))
 		return dest
 
+	def _lower_compiler_checked_binop( self, node: ast.Call, intrinsic_name: str, kind: str, mode: str, expected_type: Type|None ) -> ir.Operand:
+		# compiler.checked_add(a, b)/wrapped_add(a, b)/saturated_add(a, b)/
+		# checked_sub(...)/.../checked_truediv(a, b)/wrapped_truediv(a, b) -
+		# FIXED primitives (unlike bare `+`, which reads self._arithmetic_
+		# mode[-1] to pick BETWEEN AddCheck/AddWrap/AddSaturate): each of
+		# these always resolves to exactly one opcode PER OPERAND TYPE (int
+		# vs float pick a different opcode for the same kind/mode pair -
+		# see _CHECKED_BINOP_OPCODES/_CHECKED_FLOAT_BINOP_OPCODES below -
+		# but which one is picked never depends on ambient arithmetic mode).
+		# Intended body for a scalar-registered, @inline'd `__add__`/
+		# `__wrapped_add__`/`__saturated_add__`/etc (see lib/builtins/
+		# __scalar_arith.py) - which opcode a given SOURCE `+`/`//`/etc
+		# actually gets still comes from ambient mode picking which of
+		# these dunders binop dispatch resolves to (mode-qualified name
+		# lookup in _lower_binop_values), not from anything read here.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		is_float = _is_float_scalar( left.type )
+		opcode = ( _CHECKED_FLOAT_BINOP_OPCODES if is_float else _CHECKED_BINOP_OPCODES ).get(( kind, mode ))
+		if not isinstance( left.type, Scalar ) or left.type is not right.type or opcode is None:
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) arguments must both be the same scalar type supporting {kind!r} - got '
+				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		result_type = expected_type if expected_type is not None and isinstance( expected_type, Scalar ) else left.type
+		if not opcode.checked_errors:
+			# wrapped_*/saturated_* on add/sub/mul, wrapped_truediv - fully
+			# infallible, _lower_arithmetic_op's own infallible branch
+			# (single instruction, no Result at all) is exactly right
+			return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
+		# checked_*, and wrapped_/saturated_floordiv/mod (still fallible -
+		# ZeroDivisionError persists in every mode, see ir.py's own
+		# DivWrap/DivSaturate/ModWrap/ModSaturate comments) - deliberately
+		# does NOT auto-consume the way a bare checked `+` would
+		# (_lower_arithmetic_op's own check-mode branch always does,
+		# regardless of caller context - arithmetic modes don't translate
+		# through a function call boundary, inline or not, by design). This
+		# returns the RAW Result[result_type,error_type] value instead,
+		# matching a @fallible_arithmetic dunder's own declared return type
+		# exactly - so whatever calls/inlines this dunder can uniformly
+		# consume it via ambient mode at the DISPATCH site
+		# (_emit_binop_dunder_call's is_fallible_arithmetic handling), the
+		# same way whether this call ends up inlined or not.
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		error_type, _alternatives = self._resolve_checked_error( node, opcode, result_type )
+		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ result_type, error_type ] )
+		self.lowering.schedule( check_type )
+		# NOT monomorphized - _emit_check_arith (emitter_c.py) needs this
+		# temp's type to stay a Specialization (reads .args[0] for the
+		# success type) exactly like _emit_checked_op's identical, older
+		# check_dest already relies on. This value deliberately escapes as
+		# a real `return` value though (unlike _emit_checked_op's own
+		# check_dest, always consumed same-statement via _consume_checked_
+		# result) - see _stmt_Return's own comment on why it tries
+		# monomorphize_class(value.type) too, not just value.type itself,
+		# to match a Specialization-typed return against a function's
+		# already-monomorphized declared return type.
+		check_dest = self._new_temp( check_type )
+		self._emit( opcode( dest = check_dest, left = left, right = right ))
+		return check_dest
+
+	def _lower_compiler_checked_convert( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.checked_convert(T, x) - the single fixed-mode intrinsic
+		# behind every scalar .to_T() conversion method (lib/builtins/
+		# __scalar_arith.py) - a genuine numeric VALUE-range check against
+		# T's own [MIN,MAX], independent of bit width (unlike compiler.
+		# cast(T,x)/T(x) construct-cast syntax, which only range-checks a
+		# NARROWING conversion - see _lower_scalar_cast). Always fallible
+		# (ir.ConvertCheck), unlike checked_add/etc's wrapped_*/saturated_*
+		# siblings - there's no "wrapped"/"saturated" variant of a value-
+		# range check that means anything different, so .to_T() only ever
+		# needs this one intrinsic (see mode-consumption at the DISPATCH
+		# site - ambient mode still governs how the Result gets consumed,
+		# same as any other @fallible_arithmetic method, just never changes
+		# the check itself).
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.checked_convert(...) takes exactly two arguments (target type, value): {ast.unparse(node)}', node )
+		target_type = getattr( node.args[0], 'resolved_type', None )
+		if target_type is None:
+			target_type = self.lowering._try_resolve_namespace( node.args[0] )
+		if not isinstance( target_type, Scalar ) or target_type.stem in ( 'f32', 'f64' ):
+			self.lowering.discovery.fail(
+				f'compiler.checked_convert(...) first argument must be an integer scalar type: {ast.unparse(node)}', node,
+			)
+		operand = self._lower_expr( node.args[1], None )
+		if not isinstance( operand.type, Scalar ) or operand.type.stem in ( 'f32', 'f64' ):
+			self.lowering.discovery.fail(
+				f'compiler.checked_convert(...) second argument must be an integer scalar value, got '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		overflow_cls = self.lowering.discovery.find_name( 'OverflowError', node )
+		# NOT monomorphized - same reasoning as _lower_compiler_checked_binop's
+		# own check_dest above: _emit_convert_check (emitter_c.py) needs
+		# this temp's type to stay a Specialization (reads .args[0] for the
+		# target type)
+		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ target_type, overflow_cls ] )
+		self.lowering.schedule( check_type )
+		check_dest = self._new_temp( check_type )
+		self._emit( ir.ConvertCheck( dest = check_dest, operand = operand ))
+		return check_dest
+
 	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
 		# must be a bare local variable/parameter name (matches SYNTAX.md's
 		# "local variable" wording and C's own lvalue-only restriction on
-		# &), not an arbitrary expression. _expr_Name already only ever
-		# resolves to a Variable (never a Temp), so requiring the argument's
-		# AST shape to be ast.Name is what actually enforces this - lowering
-		# it via _lower_expr like any other value would silently accept e.g.
-		# compiler.addrof(x.field), which has no address to take here (no
-		# field-layout computation exists yet - that's an emitter concern)
+		# &), OR exactly one level of plain field access ROOTED at one
+		# (x.field, e.g. compiler.addrof(addr.sin_addr) - the common "fill
+		# one field of a stack struct via a C out-parameter" FFI idiom,
+		# e.g. inet_pton(af, str, &addr.sin_addr)). Investigated and
+		# confirmed safe for exactly this shape: a bare Name's own operand
+		# (_expr_Name) is always a genuine, stable-lifetime Variable (never
+		# a Temp) - requiring the CHAIN'S ROOT to be one too is what
+		# preserves that same "well-defined, stable lvalue" guarantee one
+		# level deeper (a plain field of an already-stable object is itself
+		# just as stable/addressable - C's own `&x.field`/`&x->field`).
+		# Deliberately NOT extended to a Call/Subscript/deeper chain root
+		# (e.g. compiler.addrof(get_foo().field) or compiler.addrof(a.b.c)):
+		# a Call's own result is a TEMPORARY whose lifetime this compiler's
+		# RC discipline doesn't guarantee outlives the current statement (a
+		# real dangling-pointer risk, not just an implementation gap), and a
+		# deeper chain is un-analyzed extra scope, not needed by the one
+		# real motivating case - both rejected with a clear message rather
+		# than silently mishandled.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.addrof(...) takes exactly one argument: {ast.unparse(node)}', node )
 		arg_node = node.args[0]
+		if isinstance( arg_node, ast.Attribute ):
+			if not isinstance( arg_node.value, ast.Name ):
+				self.lowering.discovery.fail(
+					f'compiler.addrof(...) field-access argument must be rooted at a bare local variable, '
+					f'not {ast.unparse(node)} (only one level of field access is supported)',
+					node,
+				)
+			root = self._lower_expr( arg_node.value, None )
+			attr_var = self.lowering._attr_lookup( root.type, arg_node.attr, arg_node )
+			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+			if isinstance( attr_var.type, FixedArrayType ):
+				# compiler.addrof(x.field) where field is ElemType[N] ->
+				# Ptr[ElemType], via C's own array-to-pointer decay - NOT
+				# &(x.field), which would be a pointer TO the array
+				# (ElemType(*)[N]), a different C type than the declared
+				# Ptr[ElemType] destination even though the address value
+				# is identical. Safe for the same reason ordinary field
+				# addrof is: `obj` is a real, stable-lifetime lvalue (a
+				# bare local, or one level of field access rooted at one),
+				# and a fixed-size array member of a stable object is
+				# itself just as stable. See ir.ArrayFieldPtr's own
+				# docstring for the emission this builds.
+				elem_ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ attr_var.type.elem_type ] )
+				dest = self._new_temp( elem_ptr_type )
+				self._emit( ir.ArrayFieldPtr( dest = dest, obj = root, attr = arg_node.attr ))
+				return dest
+			pointee = attr_var.type
+			# same RC-pointee-depth rule the bare-Name path below applies -
+			# see its own comment for why (Ptr[Foo] already spells `Foo*`,
+			# so &-ing an RC-typed FIELD needs the same extra Ptr level)
+			if self.lowering._type_resolver._is_RC( pointee ):
+				pointee = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ pointee ] )
+			ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ pointee ] )
+			dest = self._new_temp( ptr_type )
+			self._emit( ir.AddrOfField( dest = dest, obj = root, attr = arg_node.attr ))
+			return dest
 		if not isinstance( arg_node, ast.Name ):
 			self.lowering.discovery.fail( f'compiler.addrof(...) argument must be a bare local variable, not {ast.unparse(node)}', node )
 		value = self._lower_expr( arg_node, None )
@@ -3300,15 +3883,22 @@ class FunctionLowering:
 	def _lower_scalar_cast( self, target_type: Scalar, source: ast.expr|ir.Operand, node: ast.AST ) -> ir.Operand:
 		# shared by compiler.cast(T, x) and T(x) construction-sugar - the
 		# one place the actual Scalar-to-Scalar conversion logic lives.
-		# `source` is EITHER an unlowered ast.expr (a bare literal - always
-		# succeeds via bit-reinterpretation, decided at compile time, no
-		# Result involved - -11 reinterpreted as u32 is exactly the
-		# well-defined two's-complement value real WinAPI constants like
-		# STD_OUTPUT_HANDLE rely on) OR an already-lowered ir.Operand (a
-		# real runtime value, where "does this fit" is a genuine runtime
-		# question - respects self._arithmetic_mode exactly like +/-/*
-		# already do, reusing the same Check/Wrap/Saturate/panic_arithmetic
-		# machinery, not a separate concept)
+		# `source` is EITHER an unlowered ast.expr (a bare literal) OR an
+		# already-lowered ir.Operand (a real runtime value). For a pure
+		# int<->int conversion (float involved is handled separately below,
+		# unchanged), the rule is purely a bit-width question, identical for
+		# a literal and a runtime value alike (see the width comparison
+		# below and its own comment): same-width or widening ALWAYS
+		# succeeds, unconditionally, in every arithmetic mode (a pure bit-
+		# reinterpretation - -1 reinterpreted as u32 is exactly the well-
+		# defined two's-complement value real WinAPI constants like
+		# STD_OUTPUT_HANDLE rely on); only a genuinely NARROWING conversion
+		# can ever fail, and that stays mode-aware (respects self.
+		# _arithmetic_mode exactly like +/-/* already do, reusing the same
+		# Check/Wrap/Saturate/panic_arithmetic machinery) - see SYNTAX.md's
+		# own T(x) section for the full rationale, including why this is
+		# deliberately a DIFFERENT, narrower rule than x.to_T() (a value-
+		# range check, independent of width - see compiler.checked_convert).
 		if isinstance( source, ast.expr ):
 			# an EXPLICIT float-literal cast to a non-float scalar (i32(1.5),
 			# compiler.cast(u8, 3.9)) truncates toward zero at compile time -
@@ -3319,12 +3909,29 @@ class FunctionLowering:
 			# (float value preserved, or int bit-reinterpretation via _lower_expr)
 			if isinstance( source, ast.Constant ) and isinstance( source.value, float ) and not _is_float_scalar( target_type ):
 				return ir.Const( type = target_type, value = int( source.value ) )
-			# a literal argument to an EXPLICIT cast is intentional bit-
-			# reinterpretation (see this method's own docstring above) -
-			# exempt from _expr_Constant's own range check, unlike a plain
-			# literal flowing into a type via assignment/argument/return
+			# a bare int literal's own natural type is i32 (_expr_Constant's
+			# own "a literal's OWN Python type always determines its natural
+			# type" rule, used whenever no expected_type applies) - applying
+			# the SAME same-width/widening-vs-narrowing rule the runtime
+			# branch below uses, relative to THAT natural i32 width, is what
+			# makes a literal and an equivalent runtime i32 argument behave
+			# IDENTICALLY through T(x) - closing the exact inconsistency
+			# this whole mechanism exists for (previously: u32(-1) always
+			# succeeded via a blanket exemption, but u32(some_i32_var
+			# holding -1) went through the real, then still mode-aware,
+			# checked-cast path - now both are simply never fallible in the
+			# first place, since i32->u32 is same-width). Only a genuinely
+			# NARROWING literal (target narrower than i32) still needs
+			# range-checking - e.g. u8(-10000) is still a hard, mode-
+			# independent compile-time error, matching how `x: u8 = -10000`
+			# already behaves everywhere else literals flow into a
+			# concrete integer type.
+			allow_bit_reinterpret = True
+			if isinstance( source, ast.Constant ) and type( source.value ) is int and not _is_float_scalar( target_type ):
+				i32 = self.lowering.discovery.get_intrinsics()['i32']
+				allow_bit_reinterpret = target_type.sizeof >= i32.sizeof
 			prev_allow_bit_reinterpret = self._allow_literal_bit_reinterpret
-			self._allow_literal_bit_reinterpret = True
+			self._allow_literal_bit_reinterpret = allow_bit_reinterpret
 			try:
 				return self._lower_expr( source, target_type )
 			finally:
@@ -3339,9 +3946,50 @@ class FunctionLowering:
 		source_is_float = _is_float_scalar( operand.type )
 		if target_is_float or source_is_float:
 			opcode, extra = self._arithmetic_mode[-1].GetFloatCast( target_is_float = target_is_float, source_is_float = source_is_float )
-		else:
-			opcode, extra = self._arithmetic_mode[-1].GetCast()
+			return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
+		if target_type.sizeof >= operand.type.sizeof:
+			# same-width or widening int<->int - always succeeds, in every
+			# mode, no Result involved: matches CastWrap's own bare-C-cast
+			# emitter code (a plain `(ctype)(operand)`), just no longer
+			# gated behind wrap-mode specifically. A real, deliberate
+			# behavior change from this conversion's own prior semantics
+			# (confirmed via a real repro: u32(some_i32_holding_a_negative_
+			# value) previously REQUIRED an enclosing Result under checked/
+			# panic mode, only wrap mode was unconditional) - see this
+			# function's own top-of-method comment and SYNTAX.md.
+			return self._lower_arithmetic_op( node, ir.CastWrap, None, target_type, { 'operand': operand }, 'cast' )
+		opcode, extra = self._arithmetic_mode[-1].GetCast()
 		return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
+
+	def _lower_compiler_raw_alloc( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.__raw_alloc__(T) - allocate a fresh RCClass instance with
+		# every field left UNINITIALIZED: no field validation, no __init__
+		# call. This is the exact alloc _try_lower_construct_call used to
+		# emit inline (dest = new temp, schedule sys.alloc[T], ir.Allocate
+		# with an empty fields dict) - factored out here so a synthesized
+		# $$__new__ body (type_resolver.py's
+		# _synthesize_rcclass_constructor) can spell "allocate self, THEN
+		# call __init__ myself" as ordinary AST rather than raw IR. Not
+		# meant for ordinary user code (there's no field-completeness check
+		# at all - the caller is on the hook for calling __init__ or
+		# compiler.__raw_free__'ing it before it ever escapes), same
+		# internal-only posture as compiler.decref_dynamic.
+		#
+		# node.args[0].resolved_type, like compiler.cast's first argument,
+		# lets compiler-synthesized AST hand over a concrete RCClass object
+		# directly (including a monomorphized generic with no user-
+		# spellable name), bypassing ordinary namespace resolution.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__raw_alloc__(...) takes exactly one argument: {ast.unparse(node)}', node )
+		target_type = getattr( node.args[0], 'resolved_type', None )
+		if target_type is None:
+			target_type = self.lowering._try_resolve_namespace( node.args[0] )
+		if not isinstance( target_type, RCClass ):
+			self.lowering.discovery.fail( f'compiler.__raw_alloc__(...) argument must be a concrete RCClass: {ast.unparse(node)}', node )
+		dest = self._new_temp( target_type )
+		self.lowering._schedule_rcclass_construction( target_type, dest.type )
+		self._emit( ir.Allocate( dest = dest, cls = target_type, fields = {} ))
+		return dest
 
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.cast(T, x) - T is a TYPE reference (resolved via
@@ -3518,6 +4166,41 @@ class FunctionLowering:
 			node,
 		)
 
+	def _lower_compiler_raw_free( self, node: ast.Call ) -> None:
+		# compiler.__raw_free__(x) - free a raw, not-yet-fully-alive RCClass
+		# allocation (compiler.__raw_alloc__'s own product, once __init__
+		# has failed) WITHOUT running the class's real destructor. An
+		# ordinary decref-to-zero would call the synthesized
+		# $$__destructor__, which reads every field as though __init__ had
+		# already populated them - on a raw, not-yet-initialized alloc
+		# that's still garbage, a real heap-corruption bug (see
+		# type_resolver.py's _synthesize_rcclass_constructor, fallible
+		# body, and _emit_fallible_construction's own former Err branch,
+		# whose logic this generalizes). Frees the backing storage directly
+		# via sys.free - the same thing _synthesize_rcclass_destructor's
+		# own step 3 does, skipping its __del__/field-cascade steps 1/2
+		# entirely - then cancels x's pending automatic scope-exit release
+		# via manually_decreffed, the same pairing compiler.decref(x) uses
+		# just above, minus the real Decref that precedes it there.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__raw_free__(...) takes exactly one argument: {ast.unparse(node)}', node )
+		operand = self._lower_expr( node.args[0], None )
+		if not isinstance( operand.type, RCClass ):
+			self.lowering.discovery.fail(
+				f'compiler.__raw_free__(...) argument must be a bare RCClass value, not '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		sys_module = self.lowering.discovery.modules['sys']
+		free_overload = sys_module.get_local( 'free' )
+		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
+		self.lowering._ensure_resolved( free_fn )
+		cast_dest = self._new_temp( free_fn.parameters[0].type )
+		self._emit( ir.CastWrap( dest = cast_dest, operand = operand ))
+		self._emit( ir.Call( dest = None, target = free_fn, receiver = None, args = [ cast_dest ], kwargs = {} ))
+		for instr in self._cfg.manually_decreffed( operand ):
+			self._emit( instr )
+
 	def _lower_compiler_incref( self, node: ast.Call ) -> None:
 		# compiler.incref(x) — emit the real Incref sequence for x, via
 		# cfg.py's own union-aware incref(). Same conditional no-op-for-
@@ -3628,7 +4311,7 @@ class FunctionLowering:
 		test = self._lower_expr( node.test, bool_cls )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -3655,17 +4338,19 @@ class FunctionLowering:
 		# state to build the natural-exit candidate.
 		is_while_true = isinstance( node.test, ast.Constant ) and node.test.value is True
 		natural_exit_narrowed: dict[str,list[Variable]] | None = None
+		natural_exit_live: set[str] | None = None
 		if not is_while_true:
 			natural_exit_narrowed = dict( loop_snapshot.narrowed )
 			exit_name = getattr( node, 'exit_narrows_name', None )
 			if exit_name is not None:
 				member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
 				natural_exit_narrowed[exit_name] = [ member ]
-		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed )
+			natural_exit_live = set( loop_snapshot.live )
+		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed, natural_exit_live, break_live )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
-	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> list[dict[str,list[Variable]]]:
+	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> tuple[list[dict[str,list[Variable]]],list[set[str]]]:
 		self._loop_depth += 1
 		self._loop_labels.append(( continue_label, break_label, loop_snapshot ))
 		# see cfg.py's CFGState.enter_loop's own docstring: lets
@@ -3676,6 +4361,7 @@ class FunctionLowering:
 		# actually get emitted)
 		self._cfg.enter_loop( loop_snapshot.stack_depth )
 		break_narrowed: list[dict[str,list[Variable]]] = []
+		break_live: list[set[str]] = []
 		try:
 			for stmt in body:
 				try:
@@ -3683,15 +4369,16 @@ class FunctionLowering:
 				except CompileError:
 					continue
 		finally:
-			# Phase 8: every narrowed-state snapshot recorded by a `break`
-			# reached while lowering this body (cfg.py's own
-			# record_break_narrowed(), called from _stmt_Break below) -
-			# handed back to the caller (_stmt_While/for-loop lowerers) to
-			# merge with the loop's own natural exit via merge_loop_exits()
-			break_narrowed = self._cfg.exit_loop()
+			# Phase 8: every narrowed-state/live-state snapshot recorded by a
+			# `break` reached while lowering this body (cfg.py's own
+			# record_break_narrowed()/record_break_live(), called from
+			# _stmt_Break below) - handed back to the caller (_stmt_While/
+			# for-loop lowerers) to merge with the loop's own natural exit
+			# via merge_loop_exits()
+			break_narrowed, break_live = self._cfg.exit_loop()
 			self._loop_labels.pop()
 			self._loop_depth -= 1
-		return break_narrowed
+		return break_narrowed, break_live
 
 	def _check_loop_exit_unchecked_results( self, loop_snapshot: object, node: ast.AST ) -> None:
 		try:
@@ -3710,8 +4397,11 @@ class FunctionLowering:
 		# with every other break/the loop's own natural exit once that
 		# loop's own body is fully lowered. Before unwind_to() below (which
 		# doesn't touch _narrowed at all, but ordering it first here keeps
-		# this call sitting right next to unwind_to()'s own snapshot read)
+		# this call sitting right next to unwind_to()'s own snapshot read).
+		# record_break_live() is the definite-assignment analogue, captured
+		# alongside it for the identical reason.
 		self._cfg.record_break_narrowed()
+		self._cfg.record_break_live()
 		for instr in self._cfg.unwind_to( loop_snapshot ):
 			self._emit( instr )
 		self._emit( ir.Jump( target = break_label ))
@@ -3736,6 +4426,11 @@ class FunctionLowering:
 		fn = self._current_fn
 		var = Variable( stem = stem, qualname = f'{fn.qualname}.{stem}', file = fn.file, line = getattr( node, 'lineno', None ), type = type )
 		fn.add_name( stem, var )
+		# every caller unconditionally assigns this right after declaring it
+		# (no user code runs in between - see each call site's own next
+		# line/statement), so it's live from here on, same bucket as a
+		# parameter - see cfg.py's mark_live() docstring
+		self._cfg.mark_live( stem )
 		self.lowering.schedule( type )
 		return var
 
@@ -3772,19 +4467,15 @@ class FunctionLowering:
 		# - except a fresh declaration falls back to `default_type` instead
 		# of failing outright, since value_expr may be a bare literal
 		# (range()'s implicit start=0) with no type of its own to infer from
-		existing = self.lowering.discovery.find_name_or_none( target.id )
-		if existing is not None and not isinstance( existing, Variable ):
-			self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot use it as a for loop target', node )
-		expected = existing.type if existing is not None else default_type
-		operand = self._lower_expr( value_expr, expected )
+		existing = self._existing_local_or_none( target.id, node, 'cannot use it as a for loop target' )
 		if existing is not None:
+			operand = self._lower_expr( value_expr, existing.type )
 			self._emit( ir.Assign( dest = existing, src = operand ))
+			self._cfg.mark_live( existing.stem ) # this bypasses _cfg_assign like the rest of this function does (pre-existing, not touched here) - liveness alone still needs marking, since it's unconditionally assigned right here regardless
 			return existing
-		fn = self._current_fn
-		var = Variable( stem = target.id, qualname = f'{fn.qualname}.{target.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type )
-		fn.add_name( var.stem, var )
-		self.lowering.schedule( var.type )
+		var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( value_expr, expected ), default_type = default_type )
 		self._emit( ir.Assign( dest = var, src = operand ))
+		self._cfg.mark_live( var.stem )
 		return var
 
 	def _stmt_For( self, node: ast.For ) -> None:
@@ -3842,7 +4533,7 @@ class FunctionLowering:
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -3856,7 +4547,7 @@ class FunctionLowering:
 		# for any for-loop) is still a real candidate to reconcile against
 		# every break_narrowed collected above - same merge_loop_exits()
 		# used by _stmt_While
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
 		self._emit( ir.Label( name = continue_label ))
 		# the increment is a compiler-synthesized implementation detail of
@@ -3927,7 +4618,7 @@ class FunctionLowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -3936,7 +4627,7 @@ class FunctionLowering:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
 		# Phase 8 - see _lower_for_range's own identical call/comment
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
 		self._emit( ir.Label( name = continue_label ))
 		incr = self._new_temp( usize_cls )
@@ -4028,7 +4719,7 @@ class FunctionLowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4037,7 +4728,7 @@ class FunctionLowering:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
 		# Phase 8 - see _lower_for_range's own identical call/comment
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
 		self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
@@ -4127,6 +4818,7 @@ class FunctionLowering:
 		true_end = dict( self._cfg.bindings )
 		true_end_results = self._cfg.unchecked_results()
 		true_end_narrowed = self._cfg.narrowed_snapshot()
+		true_end_live = self._cfg.live_snapshot()
 		# return/break/continue as a branch's own last statement means
 		# that branch never reaches the if's join point at all - see
 		# merge_if()'s own comment on why that has to be treated
@@ -4151,12 +4843,14 @@ class FunctionLowering:
 			false_end = dict( self._cfg.bindings )
 			false_end_results = self._cfg.unchecked_results()
 			false_end_narrowed = self._cfg.narrowed_snapshot()
+			false_end_live = self._cfg.live_snapshot()
 			false_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
 		else:
 			false_captured = []
 			false_end = dict( entry_snapshot.bindings )
 			false_end_results = set( entry_snapshot.results )
 			false_end_narrowed = dict( entry_snapshot.narrowed )
+			false_end_live = set( entry_snapshot.live )
 			false_terminates = False
 
 		self._cfg.restore( entry_snapshot )
@@ -4167,11 +4861,20 @@ class FunctionLowering:
 				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
 				true_terminates = true_terminates, false_terminates = false_terminates,
 				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
+				true_end_live = true_end_live, false_end_live = false_end_live,
 			)
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
-		for name in removed:
-			del self._current_fn.names[name]
+		# `removed` only drives the RC Decref instructions above (already
+		# spliced into true_extra/false_extra) - it must NOT also remove
+		# these names from fn.names. This language has no block scoping (see
+		# cfg.py's own module docstring): a name introduced anywhere in the
+		# function body stays a real name for the rest of it. Whether a
+		# later reference is actually valid is now the new _live mechanism's
+		# job (_expr_Name's own liveness gate) - it correctly reports "not
+		# initialized on all code branches" for exactly this case, instead
+		# of the misleading "is not defined" this loop used to produce by
+		# deleting the name out from under a later reference entirely.
 
 		for instr in true_captured:
 			self._emit( instr )
@@ -4188,6 +4891,19 @@ class FunctionLowering:
 			self._emit( ir.Label( name = end_label ))
 		else:
 			self._emit( ir.Label( name = else_label ))
+			# false_extra used to always be empty here (merge_if's "fresh on
+			# exactly one branch" case can only ever populate
+			# false_instructions when a real ast.orelse existed, since
+			# false_end is otherwise just entry_bindings copied verbatim -
+			# see false_end's own fallback above) - but merge_if's
+			# ownership-disagreement flag reconciliation (the "if x is
+			# None: x = Owned(...)" idiom, no else needed) DOES need to land
+			# a disarm Assign on exactly this implicit "condition was
+			# false" path - dropping it here would silently leave the flag
+			# permanently armed, decref'ing a merely-borrowed value at the
+			# eventual epilogue.
+			for instr in false_extra:
+				self._emit( instr )
 
 	# --- expressions -----------------------------------------------------------
 
@@ -4256,19 +4972,52 @@ class FunctionLowering:
 			elif isinstance( expected_type, Specialization ) and isinstance( expected_type.base, TaggedUnion ):
 				expected_union = self.lowering.monomorphize_class( expected_type )
 		if expected_union is not None and operand.type is not expected_union:
-			# _coerce_into_union is for wrapping a PLAIN LEAF value (its own
-			# docstring: "operand.type is exactly one of the union's own
-			# leaves") - if operand is ITSELF union-shaped (e.g. a genuinely
-			# unrelated Result[T,OtherE] flowing into a Result[T,E]-expected
-			# context), it can never legitimately BE one of expected_union's
-			# own leaves, so attempting coercion here would just misfire with
-			# a confusing "not one of its members" message. Leave operand
-			# untouched instead - the general type-mismatch check in
-			# _stmt_Return (or an equivalent caller-side check) reports this
-			# far more clearly than _coerce_into_union ever could
-			operand_base = operand.type.base if isinstance( operand.type, Specialization ) else operand.type
-			if not isinstance( operand_base, TaggedUnion ):
+			# operand being ITSELF union-shaped does NOT automatically rule out
+			# coercion - a nominal @union (e.g. HTTPError) is exactly as valid a
+			# member of a WIDER union (OSError|HTTPError) as any plain leaf type
+			# is. But it doesn't automatically qualify either: operand can ALSO be
+			# a genuinely unrelated Result[T,OtherE] flowing into a Result[T,E]-
+			# expected context (Result is itself a TaggedUnion-based
+			# Specialization) - that shape is handled by a SEPARATE mechanism
+			# entirely (_stmt_Return's own _maybe_widen_return_result, emitting
+			# ir.WidenResult), which must get the first chance to run, not be
+			# preempted by a hard failure here. So this only actually invokes
+			# _coerce_into_union (which hard-fails on a genuine mismatch) when
+			# operand's whole type already verbatim matches one of expected_
+			# union's own leaf attribute types - the same check _coerce_into_
+			# union would use to decide to wrap it anyway, just performed as a
+			# non-failing probe first so a genuine non-member (e.g. that
+			# unrelated Result[T,OtherE]) is left untouched for its own,
+			# more-specific caller-side handling instead
+			if any(
+				self.lowering._type_resolver._same_type( attr.type, operand.type )
+				for attr in expected_union.attributes
+			):
+				was_fresh = self._cfg.is_fresh_temp( operand )
+				pre_coerce = operand
 				operand = self._coerce_into_union( operand, expected_union, node )
+				if was_fresh:
+					# _coerce_into_union's own ctor call unconditionally
+					# increfs whatever it wraps (needed when the wrapped
+					# value is a BORROWED reference its own caller still
+					# needs afterward) - but a value that was already a
+					# fresh, solely-owned temp here (a Call/Allocate
+					# result) doesn't need that extra reference kept
+					# alive too: release it right here, in place, rather
+					# than leaving it as a dangling pending-temp
+					# obligation for whatever later flush would otherwise
+					# decref it unconditionally. Confirmed as a real bug
+					# via a ternary branch specifically (ASAN: SEGV
+					# reading uninitialized stack memory on the OTHER
+					# branch, where this temp was never even created) -
+					# every other caller of this shared coercion tail has
+					# the identical gap, just silently masked there by
+					# dumb luck (a non-branching statement's own
+					# unconditional flush still nets the right refcount
+					# when there's no branch boundary for it to straddle).
+					for instr in self._cfg.decref( pre_coerce.type, pre_coerce ):
+						self._emit( instr )
+					self._cfg.untrack_temp( pre_coerce )
 		# a derived RCClass value flowing into a base-class context (arg, return,
 		# assignment) is an upcast: struct Derived* -> struct Base*, which C
 		# rejects without an explicit cast. A CastWrap is a borrowed reinterpret
@@ -4483,7 +5232,7 @@ class FunctionLowering:
 				f'{ast.unparse(node)}: expected {union.qualname}, got a type that is not one of its members',
 				node,
 			)
-		ctor_fn = union.names[leaf.stem]
+		ctor_fn = union.get_local_or_raise( leaf.stem )
 		self.lowering.schedule( ctor_fn )
 		self.lowering.schedule( ctor_fn.return_type )
 		for p in ctor_fn.parameters or []:
@@ -4504,6 +5253,14 @@ class FunctionLowering:
 			return self._lower_function_ref( name, node )
 		if not isinstance( name, Variable ):
 			self.lowering.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
+		# definite-assignment gate: a local (never a global - those aren't
+		# tracked by this function's own _live set at all, see cfg.py's
+		# is_live() docstring) that's in scope (fn.names, so find_name above
+		# already succeeded) but not provably assigned on every path that
+		# reaches here - e.g. a bare `x: T` declaration only assigned inside
+		# one if-branch, then read unconditionally after it
+		if not name.is_global and not self._cfg.is_live( node.id ):
+			self.lowering.discovery.fail( f'{node.id!r} is not initialized on all code branches', node )
 		self.lowering._ensure_resolved( name )
 		member = self._cfg.narrowed_member( node.id )
 		# _same_type, not raw `is` - same PLAN_COMPILER_BUG_SWEEP.md audit
@@ -4578,27 +5335,15 @@ class FunctionLowering:
 		(moot anyway - this language has no comprehensions). '''
 		target = node.target
 		assert isinstance( target, ast.Name )
-		existing = self.lowering.discovery.find_name_or_none( target.id )
+		existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 		if existing is not None:
-			if not isinstance( existing, Variable ):
-				self.lowering.discovery.fail( f'{target.id!r} is not a variable, cannot assign to it', node )
 			self._cfg.unnarrow( target.id )
 			operand = self._lower_expr( node.value, existing.type )
 			for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
 				self._emit( instr )
 			self._emit( ir.Assign( dest = existing, src = operand ))
 			return existing
-		operand = self._lower_expr( node.value, None )
-		fn = self._current_fn
-		var = Variable(
-			stem = target.id,
-			qualname = f'{fn.qualname}.{target.id}',
-			file = fn.file,
-			line = node.lineno,
-			type = operand.type,
-		)
-		fn.add_name( var.stem, var )
-		self.lowering.schedule( var.type )
+		var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( node.value, expected ))
 		is_alias = self.lowering._is_aliasing_expr( node.value, operand )
 		for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node ):
 			self._emit( instr )
@@ -4700,6 +5445,8 @@ class FunctionLowering:
 			method_spec = self.lowering.discovery._get_or_create_specialization( fn, current_spec.args )
 			fn = self.lowering._monomorphized_function( method_spec )
 		self.lowering._ensure_resolved( fn )
+		if fn.broken:
+			raise RedundantCompilationError() # already reported at the point fn's own resolution failed - see Name.broken
 		if fn.parameters is None:
 			self.lowering.discovery.fail( f'{fn.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
 		return self.lowering._function_ref_operand( fn )
@@ -4878,6 +5625,22 @@ class FunctionLowering:
 		return self.lowering._function_ref_operand( synthetic )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
+		# ArrType[N] field's own supported literal (see FixedArrayType's own
+		# docstring): a bare `0` means "zero-fill the whole array" - the one
+		# value this construction path knows how to emit (a C11 `{0}`
+		# designated-initializer payload, valid only inside the class-body
+		# compound-literal construction shape - see emitter_c.py's
+		# _emit_const). Handled first/separately since none of the ordinary
+		# scalar-literal validation below (int range checks, CEnum duality,
+		# ...) applies to this type at all.
+		if isinstance( expected_type, FixedArrayType ):
+			if type( node.value ) is not int or node.value != 0:
+				self.lowering.discovery.fail(
+					f'{ast.unparse(node)}: {expected_type.qualname} only supports a 0 (zero-fill) literal here - '
+					f'per-element array construction is not implemented',
+					node,
+				)
+			return ir.Const( type = expected_type, value = 0 )
 		# a floating-point literal can only be typed as a float. If context
 		# hints it toward a non-float scalar (an integer), that's a silent-
 		# truncation trap - reject it. Catches `i + 1.5` (the literal hinted to
@@ -5036,6 +5799,13 @@ class FunctionLowering:
 				if expected_type is None:
 					self.lowering.discovery.fail(
 						f'cannot infer the type of literal {node.value!r} - no str type available ({ast.unparse(node)})',
+						node,
+					)
+			elif isinstance( node.value, bytes ):
+				expected_type = self.lowering.discovery.find_name_or_none( 'bytes' )
+				if expected_type is None:
+					self.lowering.discovery.fail(
+						f'cannot infer the type of literal {node.value!r} - no bytes type available ({ast.unparse(node)})',
 						node,
 					)
 			elif node.value is None:
@@ -5374,7 +6144,7 @@ class FunctionLowering:
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
 		result_spec = self.lowering.discovery._get_or_create_specialization( result_cls, [ payload_type, error_type ])
 		concrete_result_cls = self.lowering._ensure_resolved( result_spec )
-		unwrap = concrete_result_cls.names.get( 'unwrap' )
+		unwrap = concrete_result_cls.get_local_or_raise( 'unwrap' )
 		self.lowering._ensure_resolved( unwrap ) # schedules unwrap itself as a compile unit - see _expr_JoinedStr's own identical comment on init/append/get_ptr
 		self.lowering.schedule( unwrap.return_type )
 		for p in ( unwrap.parameters or [] ):
@@ -5473,7 +6243,7 @@ class FunctionLowering:
 		cls_spec = self.lowering.discovery._get_or_create_specialization( unsafelist_cls, [ str_type ])
 		concrete_cls = self.lowering._ensure_resolved( cls_spec )
 
-		init = concrete_cls.names.get( '__init__' )
+		init = concrete_cls.get_local_or_raise( '__init__' )
 		self.lowering._ensure_resolved( init ) # schedules init ITSELF as a compile unit - monomorphize_class's own per-method substitution loop only builds+caches the substituted Function, it never schedules any of them for real emission on its own (confirmed via a real repro: an unscheduled monomorphized method compiles fine at the CALL SITE but is never actually emitted, producing a C "call to undeclared function" link-time-shaped error)
 		self.lowering.schedule( init.return_type )
 		for p in ( init.parameters or [] ):
@@ -5487,7 +6257,7 @@ class FunctionLowering:
 
 		none_type = self.lowering.discovery.get_none_type()
 		overflow_error_cls = self.lowering.discovery.find_name( 'OverflowError', node )
-		append = concrete_cls.names.get( 'append' )
+		append = concrete_cls.get_local_or_raise( 'append' )
 		self.lowering._ensure_resolved( append ) # see init's own comment on why this is needed
 		self.lowering.schedule( append.return_type )
 		for p in ( append.parameters or [] ):
@@ -5504,7 +6274,7 @@ class FunctionLowering:
 		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
 		ptr_str_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ str_type ])
 		index_error_cls = self.lowering.discovery.find_name( 'IndexError', node )
-		get_ptr = concrete_cls.names.get( 'get_ptr' )
+		get_ptr = concrete_cls.get_local_or_raise( 'get_ptr' )
 		self.lowering._ensure_resolved( get_ptr ) # see init's own comment on why this is needed
 		self.lowering.schedule( get_ptr.return_type )
 		for p in ( get_ptr.parameters or [] ):
@@ -5548,6 +6318,8 @@ class FunctionLowering:
 		# RC mechanism (cfg.py's is_rc/rc_leaves/assign/move) applies
 		# completely unchanged from here on, no special-casing needed
 		self.lowering._ensure_resolved( method )
+		if method.broken:
+			raise RedundantCompilationError() # already reported at the point method's own resolution failed - see Name.broken
 		if method.parameters is None:
 			self.lowering.discovery.fail( f'{method.qualname} could not be resolved (see earlier error): {ast.unparse(node)}', node )
 		arg_types = [ p.type for p in method.parameters ]
@@ -5659,6 +6431,21 @@ class FunctionLowering:
 				return self._lower_method_call( obj, node.attr, [], expected_type or method.return_type, node )
 			return self._lower_bound_method_closure( node, obj, method, expected_type )
 		attr_var = self.lowering._attr_lookup( obj.type, node.attr, node )
+		if isinstance( attr_var.type, FixedArrayType ):
+			# a bare C array member isn't assignable via `=` at all (only a
+			# whole containing struct/union is, or an explicit memcpy) - see
+			# FixedArrayType's own docstring. Reading it out as an ordinary
+			# value (`x = f.b`) would need ir.GetAttr's emission to do
+			# something other than a plain `dest = (obj).field;` assignment,
+			# which isn't implemented (no element-level access exists yet
+			# either, the same gap this repo's own bytearray has today) -
+			# rejected here with a clear message rather than silently
+			# reaching emitter_c.py and producing invalid C.
+			self.lowering.discovery.fail(
+				f'{ast.unparse(node)}: {attr_var.type.qualname} fields cannot be read as a whole value yet '
+				f'(no element-level array access is implemented)',
+				node,
+			)
 		dest = self._new_temp( attr_var.type )
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
 		# a pointer-typed field passed into a differently-typed pointer parameter
@@ -5684,9 +6471,32 @@ class FunctionLowering:
 			# guessed at, see PLAN_TUPLE.md's own "Deferred" list. An empty
 			# `()` reaches here too (len 0) - same deferral.
 			self.lowering.discovery.fail( f'tuple literals need at least 2 elements: {ast.unparse(node)}', node )
+		# per-element expected types, threaded down the same way
+		# _lower_allocate_fields threads field.type into each field's own
+		# _lower_expr call - without this, a leaf value destined for a
+		# union-typed element (e.g. `bytes` into a declared
+		# tuple[bytes|None, str|None]) never goes through
+		# _coerce_or_check_operand's union-coercion, AND the tuple type
+		# inferred below from the elements' own NATURAL (uncoerced) types
+		# would differ from expected_type - two distinct backing RCClasses
+		# for what's supposed to be one tuple type, with only the natural
+		# one's allocator actually scheduled (_schedule_rcclass_
+		# construction below) while dest ends up typed as the OTHER
+		# (expected) one - exactly the "call to undeclared function"/
+		# "assigning incompatible type" emitter bug this comment is here
+		# to prevent regressing. Only applied when arity matches - a
+		# genuine arity mismatch is a real type error better left to
+		# whatever assignment/return-type check already reports it
+		# clearly, not guessed at here.
+		expected_elem_types: list[Type]|None = (
+			expected_type.elem_types
+			if isinstance( expected_type, TupleType ) and len( expected_type.elem_types ) == len( node.elts )
+			else None
+		)
 		operands: list[ir.Operand] = []
-		for elt in node.elts:
-			value = self._lower_expr( elt, None )
+		for i, elt in enumerate( node.elts ):
+			elem_expected = expected_elem_types[i] if expected_elem_types is not None else None
+			value = self._lower_expr( elt, elem_expected )
 			# same per-field RC-retain emission _lower_allocate_fields's own
 			# field-value loop uses for every other class's field=value
 			# construction sugar - a fresh value (Allocate/Call/Constant)
@@ -5710,9 +6520,20 @@ class FunctionLowering:
 		# (`x: tuple[i32,str] = (1,"a")`) hands down the SAME bare,
 		# unresolved TupleType discovery.py's visit_Subscript produced for
 		# the annotation (interned - same object as tt above), not yet
-		# swapped for backing_cls
+		# swapped for backing_cls. Only trust it when it actually resolves to
+		# THIS tuple's own backing class though - expected_type can just as
+		# easily be an unrelated OUTER context (e.g. a `tuple[T,T]|None`
+		# parameter's own union, handed down so _coerce_or_check_operand can
+		# wrap the result into it afterward) rather than a description of the
+		# tuple itself; interning guarantees identity in the genuine-match
+		# case, so anything else must fall back to backing_cls, not be
+		# trusted as dest's real type (a real bug: a tuple literal passed as
+		# a `tuple[str,str]|None` argument used to set dest.type to the
+		# UNION's own TaggedUnion, which isn't an RCClass, crashing emitter_c
+		# .py's Allocate emission with `assert isinstance(concrete_cls,
+		# RCClass)` since the union coercion never got a chance to run).
 		resolved_expected = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
-		dest = self._new_temp( resolved_expected or backing_cls )
+		dest = self._new_temp( resolved_expected if resolved_expected is backing_cls else backing_cls )
 		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
 		return dest
 
@@ -5738,7 +6559,7 @@ class FunctionLowering:
 		would extend this, not work around it. '''
 		resolved_cls = self.lowering._ensure_resolved( target_cls )
 		assert isinstance( resolved_cls, ClassLike ), f'internal compiler error: {resolved_cls} is not constructible'
-		init = resolved_cls.names.get( '__init__' )
+		init = resolved_cls.get_local_or_raise( '__init__' )
 		assert isinstance( init, Function ), f'internal compiler error: {resolved_cls.qualname} has no usable __init__'
 		self.lowering.schedule( resolved_cls )
 		self.lowering._ensure_resolved( init )
@@ -5910,6 +6731,13 @@ class FunctionLowering:
 		return self._maybe_consume_result( node, dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
 
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
+		if isinstance( node.value, ast.Attribute ) and not isinstance( node.slice, ast.Slice ):
+			fixed = self._fixed_array_index_target( node.value, node.slice )
+			if fixed is not None:
+				root, attr, array_type, index = fixed
+				dest = self._new_temp( array_type.elem_type )
+				self._emit( ir.GetAttrIndex( dest = dest, obj = root, attr = attr, index = index ))
+				return self._maybe_castwrap_pointer( dest, expected_type )
 		obj = self._lower_expr( node.value, None )
 		if isinstance( node.slice, ast.Slice ):
 			return self._lower_slice_subscript( node, obj )
@@ -6014,6 +6842,28 @@ class FunctionLowering:
 		left_is_const = isinstance( left_node, ast.Constant )
 		right_is_const = isinstance( right_node, ast.Constant )
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+		# expected_type is the OUTER statement's own target (e.g. `r:
+		# Result[i32|int,E] = x + y`'s Result[...]) - hinting an OPERAND's
+		# own lowering with it directly is wrong whenever expected_type is
+		# a union: if the operand's OWN natural type happens to exactly
+		# equal one of its leaves (x: i32|int here, matching Result's own
+		# Ok leaf exactly), _coerce_or_check_operand's union-wrap coercion
+		# silently wraps x into Result.Ok(x) BEFORE _lower_binop_values
+		# ever runs - x's type is then Result[...], not i32|int, breaking
+		# both ordinary dunder lookup and _lower_binop_dispatch's own
+		# union-shape detection. Same bug CLASS _lower_eq_or_ne's own
+		# right_hint fix already covers for left.type being a union - this
+		# is the expected_type-cascades-from-the-caller counterpart,
+		# confirmed via a real repro (`r: Result[i32|int,E] = x + y`,
+		# x/y: i32|int). None here lets the operand infer its own natural
+		# type instead, exactly as if no hint had been given at all.
+		# _tagged_union_shape, not a raw isinstance check - expected_type
+		# here can still be a Specialization wrapping a TaggedUnion base
+		# (a generic Result[T,E] annotation not yet monomorphized) rather
+		# than a bare TaggedUnion already - same Specialization-vs-plain
+		# duality _tagged_union_shape already exists to paper over
+		# everywhere else in this file
+		operand_hint = expected_type if self.lowering._type_resolver._tagged_union_shape( expected_type ) is None else None
 		# pointer arithmetic (ptr + offset) is never homogeneous the way
 		# ordinary scalar +/- is - hinting the OTHER (non-pointer) side with
 		# the pointer's own type here (as every branch below otherwise
@@ -6035,19 +6885,59 @@ class FunctionLowering:
 		# _lower_binop_values' own deliberately stricter "both operands must
 		# already be the SAME float type, cast explicitly" rule entirely.
 		if left_is_const and not right_is_const:
-			right = self._lower_expr( right_node, expected_type, strict = False )
-			left_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( right.type ) else right.type
+			right = self._lower_expr( right_node, operand_hint, strict = False )
+			# only hint the literal toward right.type when that's actually a
+			# meaningful target for a literal to become (a scalar, or the
+			# existing Ptr-offset special case) - hinting toward an arbitrary
+			# non-scalar CLASS (e.g. `5 + some_vector`, right.type=Vector) hits
+			# _expr_Constant's own literal-compatibility check ("an int literal
+			# cannot be used where Vector is expected") before this expression
+			# ever reaches _lower_binop_values' own dunder/reflected-dunder
+			# dispatch - confirmed via a real repro. None here lets the
+			# literal infer its own natural type instead, same as it would
+			# with no hint at all, so the reflected-dunder lookup below can
+			# still find e.g. Vector.__radd__(other: i32) matching it.
+			if self.lowering._type_resolver._is_ptr_specialization( right.type ):
+				left_hint = usize_cls
+			elif isinstance( right.type, Scalar ):
+				left_hint = right.type
+			else:
+				left_hint = None
 			left = self._lower_expr( left_node, left_hint, strict = False )
 		elif right_is_const and not left_is_const:
-			left = self._lower_expr( left_node, expected_type, strict = False )
-			right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( left.type ) else left.type
+			left = self._lower_expr( left_node, operand_hint, strict = False )
+			if self.lowering._type_resolver._is_ptr_specialization( left.type ):
+				right_hint = usize_cls
+			elif isinstance( left.type, Scalar ):
+				right_hint = left.type
+			else:
+				right_hint = None
 			right = self._lower_expr( right_node, right_hint, strict = False )
 		else:
-			left = self._lower_expr( left_node, expected_type, strict = False )
+			left = self._lower_expr( left_node, operand_hint, strict = False )
 			if infer_right_from_left:
-				right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( left.type ) else ( expected_type or left.type )
+				if self.lowering._type_resolver._is_ptr_specialization( left.type ):
+					right_hint = usize_cls
+				elif operand_hint is not None:
+					right_hint = operand_hint
+				elif self.lowering._type_resolver._tagged_union_shape( left.type ) is not None:
+					# same "don't hint an operand's own lowering with a
+					# union" principle as operand_hint above, just via a
+					# DIFFERENT path: left.type here is the fallback hint
+					# for right when nothing else applies, but if left
+					# happens to be a union operand (x: Vector|i32),
+					# hinting right (a PLAIN Vector-typed operand, no
+					# union of its own) with it wrongly wraps right into
+					# THAT union too - widening the leaf-pair grid with a
+					# cell the source never actually expressed. Confirmed
+					# via a real repro (Boxed|int + Boxed wrongly widened
+					# right into Boxed|int too, inventing an (int,int)
+					# grid cell that doesn't exist in the source at all)
+					right_hint = None
+				else:
+					right_hint = left.type
 			else:
-				right_hint = expected_type
+				right_hint = operand_hint
 			right = self._lower_expr( right_node, right_hint, strict = False )
 		return left, right
 
@@ -6065,19 +6955,53 @@ class FunctionLowering:
 		# read for its `.op` (ast.BinOp and ast.AugAssign both have one)
 		# and as an error-reporting location - never for `.left`/`.right`.
 
-		# non-scalar left operand — try the dunder method (str.__add__, ...)
-		if not isinstance( left.type, Scalar ):
-			method_name = _BINOP_DUNDER.get( type( node.op ))
-			if method_name is not None:
-				method = self.lowering._find_method( left.type, method_name )
+		# either operand union-typed (`x: i32|int; y: i32|int; x + y`) - a
+		# whole separate dispatch, mirroring _lower_eq_or_ne's identical
+		# fork for ==/!=: a union operand has no dunder/scalar-arithmetic
+		# shape of its OWN, only its individual LEAVES do, so every
+		# (left leaf, right leaf) pairing needs its own classification -
+		# see _lower_binop_dispatch's own docstring. Left completely
+		# untouched below when neither operand is a union - existing,
+		# already-verified dunder/reflected-dunder/scalar-arithmetic
+		# tail keeps handling that case exactly as it does today.
+		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
+		right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
+		if left_shape is not None or right_shape is not None:
+			return self._lower_binop_dispatch( node, left, left_shape, right, right_shape )
+
+		# try the dunder method (str.__add__, ...) first on left.type, then -
+		# mirroring Python's real protocol - the REFLECTED, differently-named
+		# dunder on right.type (str.__radd__, ...) if the forward one isn't
+		# applicable. Unlike the old code, this ISN'T gated on left.type
+		# being non-Scalar: a Scalar left operand has no dunder of its own to
+		# try (skip straight to reflected), but that must NOT also skip
+		# giving right.type's own reflected dunder a chance - e.g. `5 +
+		# some_vector` needs some_vector's own __radd__(other: i32), the
+		# exact same "Scalar operand can't have a forward dunder, but the
+		# OTHER side's own dunder is still a real candidate" gap _lower_eq_
+		# or_ne's own unconditional-Eq/NotEq-dispatch fix already closed for
+		# ==/!=; this is the binop counterpart, with a differently-named
+		# reflected method instead of the same name reflected.
+		method_name = _BINOP_DUNDER.get( type( node.op ))
+		if method_name is not None:
+			# NOT gated on isinstance(left.type, Scalar)/isinstance(right.type,
+			# Scalar) anymore - _find_dunder_for_arg already resolves a
+			# scalar-registered dunder (i32.__add__ = ...; see lib/builtins)
+			# identically to a real class's own method (both just read
+			# .names - see _find_method's own owner-kind branch). A Scalar
+			# with nothing registered under this name just misses, exactly
+			# like a class that doesn't define the dunder at all - no special
+			# case needed for "this operand has no dunder mechanism".
+			for candidate in self._mode_qualified_dunder_names( method_name ):
+				method = self._find_dunder_for_arg( left.type, candidate, right.type )
 				if method is not None:
-					self.lowering._ensure_resolved( method )
-					self.lowering.schedule( method.return_type )
-					for p in ( method.parameters or [] ):
-						self.lowering.schedule( p.type )
-					dest = self._new_temp( expected_type or method.return_type )
-					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
-					return dest
+					return self._emit_binop_dunder_call( node, method, left, right, expected_type )
+			reflected_name = _REFLECTED_BINOP_DUNDER.get( method_name )
+			if reflected_name is not None:
+				for candidate in self._mode_qualified_dunder_names( reflected_name ):
+					reflected_method = self._find_dunder_for_arg( right.type, candidate, left.type )
+					if reflected_method is not None:
+						return self._emit_binop_dunder_call( node, reflected_method, right, left, expected_type )
 
 		# a float on EITHER side takes the GetFloatBinOp path (plain IEEE, or
 		# inf/nan-checked, depending on the active mode) rather than the integer
@@ -6108,6 +7032,94 @@ class FunctionLowering:
 
 		opcode, extra = self._arithmetic_mode[-1].GetBinOp( node )
 		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
+
+	def _mode_qualified_dunder_names( self, base_name: str ) -> list[str]:
+		# see _MODE_DUNDER_PREFIX's own module-level comment for the full
+		# rationale - the candidate dunder name(s) to try, in order, for
+		# binop dispatch given the CURRENT ambient arithmetic mode
+		prefix = _MODE_DUNDER_PREFIX.get( type( self._arithmetic_mode[-1] ))
+		if prefix is None:
+			return [ base_name ]
+		return [ f'__{prefix}_{base_name.strip( "_" )}__', base_name ]
+
+	def _emit_binop_dunder_call( self, node: 'ast.BinOp|ast.AugAssign', method: Function, receiver: ir.Operand, arg: ir.Operand, expected_type: Type|None ) -> ir.Operand:
+		# shared tail for the forward/reflected dunder-call cases in
+		# _lower_binop_values above - a thin, binop-shaped wrapper over
+		# _emit_fallible_method_call (a two-operand call: receiver + one
+		# arg), which does the real work and is reused by any OTHER call
+		# needing the identical "resolve+schedule, splice-or-Call, consume
+		# via ambient mode if @fallible_arithmetic" treatment (e.g. .to_T()
+		# conversion dispatch - a one-operand call, no second arg)
+		return self._emit_fallible_method_call( node, method, receiver, [ arg ], expected_type )
+
+	def _emit_fallible_method_call( self, node: ast.AST, method: Function, receiver: ir.Operand|None, args: list[ir.Operand], expected_type: Type|None ) -> ir.Operand:
+		# handles a plain class method (int.__add__, ...) and a
+		# scalar-registered one (i32.__add__ = ..., see lib/builtins)
+		# identically, since the caller's own dunder/method lookup already
+		# resolved both the same way. `method.cls is None` means a genuine
+		# free function was registered onto a Scalar (never had `self`
+		# stripped by discovery) - same fix _lower_method_call/the general
+		# _lower_call already apply: the receiver becomes a plain leading
+		# positional arg instead of ir.Call.receiver.
+		#
+		# is_inline is checked BEFORE is_fallible_arithmetic, not instead of it: @inline
+		# splicing (_lower_inline_call) never auto-consumes anything on its
+		# own - arithmetic modes don't translate through a function call
+		# boundary just because it happens to be inlined away (that's a
+		# deliberate design choice, not a gap - see compiler.checked_add's
+		# own comment). A @fallible_arithmetic+@inline method's spliced trailing return
+		# (typically a compiler.checked_add/wrapped_add/saturated_add/
+		# checked_convert intrinsic call) hands back its raw, real return
+		# value - for is_fallible_arithmetic methods that's a genuine,
+		# unconsumed Result[T,E], exactly matching the declared signature.
+		# So is_fallible_arithmetic consumption below runs uniformly on
+		# whatever came back, whether that value was produced by a real
+		# ir.Call or by a splice - this is what makes `with compiler.
+		# panic_arithmetic(...): a // b` (a, b: int) auto-panic, and
+		# default-mode `a // b` auto-propagate, exactly like a bare scalar
+		# `+` already does.
+		# _resolve_call_target, NOT _ensure_resolved - the latter
+		# unconditionally schedules its target as a real compile unit as a
+		# side effect (see its own docstring), which for an @inline target
+		# means compiling it as real, dead, never-called code (confirmed by
+		# a real repro - see _resolve_call_target's own identical carve-out
+		# and comment, already relied on by the general _lower_call path;
+		# this is the same fix, needed again here since dunder-dispatch
+		# resolves its own target independently rather than going through
+		# that shared path)
+		self.lowering._resolve_call_target( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		call_receiver = None if method.cls is None else receiver
+		call_args = ( [ receiver ] + args ) if method.cls is None else args
+		if method.is_inline:
+			result = self._lower_inline_call( node, method, call_receiver, call_args, {}, method.return_type, True )
+			assert result is not None # want_result=True above guarantees this
+		else:
+			# expected_type describes the FINAL, post-consumption value (e.g.
+			# `q1: int = a // b`'s expected_type is the success type `int`,
+			# not the intermediate Result[int,E]) - for an is_fallible_
+			# arithmetic method the dest here is that raw, unconsumed Result,
+			# so it must always be typed as method.return_type exactly, never
+			# expected_type. Using expected_type here silently mistyped the
+			# Call's dest, which downstream Unwrap/OrJump lowering then
+			# tried to treat as the wrong Result shape - a real, confirmed
+			# bug (an assertion in _result_tag_data_names, whose own error-
+			# message formatting then hit an unrelated circular-repr hang
+			# instead of failing cleanly).
+			dest_type = method.return_type if method.is_fallible_arithmetic else ( expected_type or method.return_type )
+			dest = self._new_temp( dest_type )
+			self._emit( ir.Call( dest = dest, target = method, receiver = call_receiver, args = call_args, kwargs = {} ))
+			result = dest
+		if not method.is_fallible_arithmetic:
+			return result
+		shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
+		assert shape is not None and len( shape[1] ) == 2, f'@fallible_arithmetic {method.qualname} must declare a Result[T,E] return type'
+		success_type = shape[1][0].type
+		mode = self._arithmetic_mode[-1]
+		extra = mode.extra if isinstance( mode, arithmetic_mode.ArithmeticPanic ) else None
+		return self._consume_checked_result( node, result, success_type, extra )
 
 	def _lower_arithmetic_op( self, node: ast.AST, opcode: type|None, extra: ir.Operand|None, result_type: Type, operand_kwargs: dict, kind: str ) -> ir.Operand:
 		# shared by _lower_scalar_cast/_expr_BinOp/_expr_UnaryOp - each just
@@ -6424,6 +7436,61 @@ class FunctionLowering:
 			opcode, extra = self._arithmetic_mode[-1].GetUnaryOp( node )
 		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'operand': operand }, 'unary' )
 
+	def _flush_branch_temps( self, start_idx: int, *keep: ir.Operand ) -> None:
+		# shared by _expr_BoolOp and _expr_IfExp: both lower a SEQUENCE of
+		# conditionally-skippable sub-expressions (BoolOp operands after a
+		# short-circuit jump; the IfExp branch that didn't run) into the
+		# same straight-line instruction stream. A sub-expression that
+		# chains multiple calls (e.g. `field.find(x)` receiver consumed by
+		# `.is_ok()`, or `prefix + str('.') + k`'s two chained __add__s)
+		# DeclareTemp's its own intermediate temps via the ordinary
+		# self._new_temp() path - every one of those lands in
+		# self._pending_temps exactly like any other temp. Neither method
+		# ever touches these purely-intermediate temps itself (only the
+		# construct's own final value - `operand`/`true_val`/`false_val` -
+		# gets special handling), so left alone they'd survive in
+		# _pending_temps all the way to the ENCLOSING STATEMENT's own
+		# _flush_pending_temps() (e.g. _stmt_Return's, called once after
+		# every operand/branch has already merged at end_label) - which
+		# then decref's them UNCONDITIONALLY, including for whichever
+		# operand/branch never actually ran (skipped by an earlier
+		# operand's short-circuit jump, or the branch not taken), reading
+		# tag/payload data off an uninitialized C local. Confirmed as a
+		# real, reproducible crash in both shapes - not just a leak/UAF:
+		# _expr_IfExp's case releases a garbage object pointer through a
+		# garbage vtable (a stack-overflow crash); _expr_BoolOp's case
+		# reads a garbage union tag and, whenever it happens to look like
+		# the RC leaf, releases a garbage pointer straight from the stack
+		# (a STATUS_BREAKPOINT crash under MSVC - confirmed with as few as
+		# 2 chained `field.find(x).is_ok() or field.find(y).is_ok()`
+		# operands, whenever the first one short-circuits).
+		#
+		# The fix: flush each operand/branch's OWN intermediate temps
+		# (added to _pending_temps since `start_idx`, i.e. everything
+		# DeclareTemp'd while lowering just this one) right here, before
+		# moving on to the next operand or the branch's own Jump/merge -
+		# exactly mirroring how the already-correct if/else STATEMENT form
+		# gets this right for free (each branch is its own statement, so
+		# _lower_stmt's per-statement pending_temps save/flush/restore
+		# already scopes it correctly). `keep` (the construct's own
+		# dest/final-value temps) is excluded - their ownership is already
+		# fully resolved by the incref/untrack_temp() decision made just
+		# above each call site (IfExp) or is simply never RC to begin with
+		# (BoolOp's `operand` is always bool), and dest in particular is
+		# still actively in use afterward (assigned into, then read again
+		# once every operand/branch merges) so it must not be DeleteTemp'd
+		# here even though the actual decref side would already be a safe
+		# no-op for it.
+		branch_temps = self._pending_temps[ start_idx: ]
+		self._pending_temps = self._pending_temps[ : start_idx ]
+		keep_ids = { k.id for k in keep if isinstance( k, ir.Temp ) }
+		for t in reversed( branch_temps ):
+			if t.id in keep_ids:
+				continue
+			for instr in self._cfg.delete_temp( t ):
+				self._emit( instr )
+			self._emit( ir.DeleteTemp( temp = t ))
+
 	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:
 		# short-circuit and/or: evaluate operands left to right, each into
 		# the same dest temp, stopping early (jump to end) as soon as the
@@ -6433,13 +7500,22 @@ class FunctionLowering:
 		# passes, an inner tag check on the payload - reading the payload
 		# before confirming the outer tag would be reading the wrong
 		# union member's storage)
+		#
+		# Each operand's own intermediate temps (e.g. `field.find(x)`'s
+		# Result temp, consumed as `.is_ok()`'s receiver) are flushed via
+		# _flush_branch_temps right after that operand's own code runs,
+		# before any later operand's short-circuit jump could skip past a
+		# temp this operand already finished with - see that method's own
+		# comment for the confirmed crash this fixes.
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		is_and = isinstance( node.op, ast.And )
 		end_label = self._new_label( 'booland' if is_and else 'boolor' )
 		dest = self._new_temp( bool_cls )
 		for i, value_node in enumerate( node.values ):
+			operand_start = len( self._pending_temps )
 			operand = self._lower_expr( value_node, bool_cls )
 			self._emit( ir.Assign( dest = dest, src = operand ))
+			self._flush_branch_temps( operand_start, dest, operand )
 			if i < len( node.values ) - 1:
 				jump_opcode = ir.JumpIfFalse if is_and else ir.JumpIfTrue
 				self._emit( jump_opcode( cond = dest, target = end_label ))
@@ -6467,6 +7543,17 @@ class FunctionLowering:
 		# confirmed as a real, reproducible UAF/double-free via direct
 		# testing (`str('-') if cond else str('+')` corrupted/crashed
 		# before this fix), not just reasoning from the code shape.
+		#
+		# Each branch's own PURELY INTERMEDIATE temps (e.g. every temp a
+		# chained `prefix + str('.') + k` concatenation DeclareTemp's along
+		# the way, none of which is `true_val`/`false_val` itself) are
+		# flushed inside that branch via _flush_branch_temps - see its own
+		# comment for why: left to the enclosing statement's normal
+		# end-of-statement flush, they leak past end_label and get
+		# unconditionally decref'd even in the branch that never ran,
+		# releasing an uninitialized C local - a real, reproducible stack-
+		# overflow crash (release_object on stack garbage), not just a
+		# leak/UAF, confirmed via direct testing.
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		cond = self._lower_expr( node.test, bool_cls )
 		else_label = self._new_label( 'ifexp_else' )
@@ -6474,6 +7561,7 @@ class FunctionLowering:
 		dest = self._new_temp( expected_type ) if expected_type is not None else None
 		self._emit( ir.JumpIfFalse( cond = cond, target = else_label ))
 		# true branch
+		true_branch_start = len( self._pending_temps )
 		true_val = self._lower_expr( node.body, expected_type )
 		if dest is None:
 			dest = self._new_temp( true_val.type )
@@ -6482,16 +7570,19 @@ class FunctionLowering:
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( true_val )
+		self._flush_branch_temps( true_branch_start, dest, true_val )
 		self._emit( ir.Assign( dest = dest, src = true_val ))
 		self._emit( ir.Jump( target = end_label ))
 		# false branch
 		self._emit( ir.Label( name = else_label ))
+		false_branch_start = len( self._pending_temps )
 		false_val = self._lower_expr( node.orelse, dest.type )
 		if self.lowering._is_aliasing_expr( node.orelse, false_val ):
 			for instr in self._cfg.incref( dest.type, false_val ):
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( false_val )
+		self._flush_branch_temps( false_branch_start, dest, false_val )
 		self._emit( ir.Assign( dest = dest, src = false_val ))
 		self._emit( ir.Label( name = end_label ))
 		self._cfg.fresh_temp( dest, dest.type )
@@ -6511,12 +7602,34 @@ class FunctionLowering:
 		if isinstance( node.ops[0], ( ast.In, ast.NotIn )):
 			return self._lower_in_comparison( node, negate = isinstance( node.ops[0], ast.NotIn ))
 
-		# non-scalar left operand — try the dunder method (str.__eq__, ...)
 		left = self._lower_expr( node.left, None )
+		if isinstance( node.ops[0], ( ast.Eq, ast.NotEq )):
+			# Eq/NotEq get their OWN unified path (_lower_eq_or_ne), tried
+			# BEFORE the scalar-vs-non-scalar fork below (unlike every other
+			# operator) - a union can appear on EITHER side regardless of
+			# whether the OTHER side happens to be scalar: `None == x` (a
+			# bare None literal - NoneType is itself Scalar, see discovery.
+			# py's get_none_type - has no dunder of its own at all) or `5 ==
+			# n` (a bare int literal, also Scalar) both need the same
+			# union-on-the-right handling as `"hi" == x`. The generic
+			# method-lookup-on-non-scalar-left dispatch below can never
+			# cover either shape, since it never even runs when left is
+			# Scalar.
+			return self._lower_eq_or_ne( node, left, expected_type, negate = isinstance( node.ops[0], ast.NotEq ))
+
+		# non-scalar left operand — try the dunder method (<, >, <=, >=, ...)
 		if not isinstance( left.type, Scalar ):
 			method_name = _COMP_DUNDER.get( type( node.ops[0] ))
 			if method_name is not None:
-				method = self.lowering._find_method( left.type, method_name )
+				# _find_dunder_for_arg, not the plain _find_method - see
+				# its own docstring: right, lowered with strict=True just
+				# below, is already guaranteed to end up exactly left.type
+				# (coerced or rejected) before this dunder lookup even
+				# matters, so the wanted implementation is whichever one
+				# declares its own parameter as exactly left.type - same
+				# "caller already knows the wanted arg type" shape as
+				# _lower_eq_or_ne's own same-type fast path
+				method = self._find_dunder_for_arg( left.type, method_name, left.type )
 				if method is not None:
 					right = self._lower_expr( node.comparators[0], left.type )
 					self.lowering._ensure_resolved( method )
@@ -6537,6 +7650,930 @@ class FunctionLowering:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
+		return dest
+
+	def _find_dunder_for_arg( self, owner_type: Type|None, name: str, arg_type: Type ) -> Function|None:
+		''' like self.lowering._find_method, but Overload-aware: if `name`
+		resolves to a real Overload group on owner_type (multiple defs
+		sharing the name - e.g. int.__eq__(other: int) alongside a second
+		int.__eq__(other: i32) cross-dunder overload), picks the ONE
+		implementation whose single declared parameter type exactly matches
+		arg_type, rather than silently treating the whole group as "no such
+		method" the way a bare _find_method does (a real, confirmed gap:
+		_find_method's own `isinstance(found, Function)` check returns None
+		for an Overload - before this fix, adding a second int.__eq__
+		overload SILENTLY broke the pre-existing int==int comparison too,
+		since it fell through to comparing by raw pointer identity instead
+		of calling __eq__ at all, confirmed via a real repro).
+
+		Deliberately narrow, not a general replacement for _find_method
+		everywhere: every caller here already knows the exact concrete
+		argument type it wants to match against (comparison dispatch and
+		binop/reflected-binop dispatch, not a call site needing real
+		runtime dispatch across multiple candidate argument shapes), so a
+		simple single-parameter-type scan over the Overload's own
+		implementations suffices - no need for overload_resolution.py's
+		own general ConditionalDispatch machinery. Used by: _lower_eq_or_ne
+		and _classify_leaf_pair_eq (==/!=, both directions),
+		_expr_Compare's </>/<=/>= dispatch, _lower_operand_compare, and
+		_lower_binop_values' forward/reflected dunder dispatch (+-*//%|&^ and
+		their __r<op>__ counterparts) - every one of these already forces
+		(or already knows) the argument operand's exact type before dispatch
+		is even reached, so the same "caller already knows the wanted arg
+		type" precondition holds throughout. _find_method's other ~20
+		remaining call sites elsewhere in this file (container-protocol
+		dunders like __getitem__/__contains__/__next__, unary dispatch, ...)
+		are unrelated and stay untouched - unary in particular can't
+		meaningfully be Overloaded on argument type at all (no second
+		operand to disambiguate against) - the rest are a separate,
+		wider-scoped Overload-blindness gap, not fixed here. '''
+		owner_type = self.lowering._ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass ) ):
+			found = owner_type.chain_lookup( name )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( name ) if isinstance( names, dict ) else None
+		found = self.lowering._resolve_scalar_name( found )
+		# a plain (non-Overload) Function is checked against arg_type here
+		# too, NOT returned unconditionally the way a bare _find_method
+		# would - a real bug caught during development: str only has ONE
+		# __eq__(other: str), so this branch used to hand it back for ANY
+		# arg_type (even i32), and the caller then emitted a Call passing
+		# a mismatched scalar where struct builtins$str* was expected
+		candidates = found.implementations if isinstance( found, Overload ) else ( [ found ] if isinstance( found, Function ) else [] )
+		for impl in candidates:
+			if impl.resolve is not None:
+				impl.resolve()
+			params = impl.parameters or []
+			# a Scalar-registered dunder (impl.cls is None - a free function
+			# whose receiver was never stripped by discovery, unlike a real
+			# class method) declares its receiver as an ORDINARY leading
+			# parameter (`def i32__add__i32(value: i32, other: i32)`), so
+			# the operand to match against arg_type is params[1], not
+			# params[0] - a real, confirmed bug found via a real repro
+			# (`return a + b` from a function declared to return exactly
+			# Result[i32,OverflowError] double-wrapped the Result, because
+			# this check unconditionally required exactly ONE parameter and
+			# so NEVER matched any Scalar-registered dunder at all, silently
+			# falling through to the older, pre-dunder-dispatch direct-
+			# opcode path below instead - which mistypes result_type as the
+			# outer expected_type instead of falling back to left.type,
+			# specifically when expected_type happens to already BE the
+			# checked-Result shape the binop's own dunder dispatch was
+			# supposed to produce). The existing test suite never caught
+			# this because every existing test assigns the binop to an
+			# unannotated local first (`c = a + b; return Result.Ok(c)`),
+			# never returning the binop expression directly.
+			arg_index = 1 if impl.cls is None else 0
+			if len( params ) == arg_index + 1 and self.lowering._type_resolver._same_type( params[arg_index].type, arg_type ):
+				return impl
+		return None
+
+	def _lower_eq_or_ne( self, node: ast.Compare, left: ir.Operand, expected_type: Type|None, negate: bool ) -> ir.Operand:
+		''' `==`/`!=`, for ANY left operand (scalar or not) - unlike every
+		other comparison operator, Eq/NotEq are the one shape a union can
+		ever meaningfully participate in (see _build_union_leaf_eq), and a
+		union can show up on either side regardless of the OTHER side's own
+		scalar-ness, so this doesn't share the non-scalar-left gate the rest
+		of _expr_Compare's dunder dispatch still uses.
+		Lowers node.comparators[0] EXACTLY ONCE (hinted toward left.type,
+		non-strict - see the strict=False comment below), then tries, in
+		order:
+		  1. a real user __eq__/__ne__ on left's own type, when the
+		     comparator's own natural type already matches left.type (the
+		     ordinary/common case - unchanged behavior, byte-for-byte the
+		     same dunder Call this used to emit before this method existed);
+		  2. left is a union and the comparator is one of its own leaves
+		     (`x == "hi"` where x: str|None - union on the LEFT);
+		  3. the comparator is ITSELF a union containing left.type as a
+		     member (`"hi" == x` or `None == x` - union on the RIGHT, the
+		     mirror image of (2); NoneType in particular has no __eq__ of
+		     its own at all, so a bare `None == x` never even reaches a
+		     dunder lookup, and a bare int literal defaults to i32 - also
+		     Scalar - so neither shape can be caught by gating on "left is
+		     non-scalar" the way every other operator still does; only this
+		     unified method, entered unconditionally for Eq/NotEq regardless
+		     of left's own scalar-ness, sees both operands together and can
+		     recognize the shape);
+		  4. neither a matching dunder nor a recognized union - the
+		     ORIGINAL pre-union-support behavior: a safe scalar widening
+		     (i32->i64, ...) if one applies, else flat Cmp (pointer
+		     comparison, or an ordinary same-type scalar compare) when the
+		     comparator's natural type already matches left.type, or a
+		     genuine type-mismatch compile error otherwise - reported via
+		     _check_assignable the same way strict=True used to reject it
+		     (before this method existed, that rejection - and the scalar
+		     widening - ran INSIDE the right-hand _lower_expr call itself,
+		     earlier than the dunder-vs-flat-Cmp fork could even be reached;
+		     both are reinstated explicitly here since strict=False below
+		     skips them). '''
+		method_name = '__ne__' if negate else '__eq__'
+		# _find_dunder_for_arg, not the plain _find_method: this is the
+		# "receiver and argument end up the SAME type" fast path (right,
+		# once lowered below, is hinted toward left.type when left isn't a
+		# union - the common case), so the wanted implementation is
+		# whichever one declares its own parameter as exactly left.type -
+		# see _find_dunder_for_arg's own docstring for why a plain
+		# _find_method silently breaks this once a class ever declares a
+		# SECOND __eq__/__ne__ overload (e.g. int.__eq__(other: i32)
+		# alongside the pre-existing int.__eq__(other: int))
+		method = self._find_dunder_for_arg( left.type, method_name, left.type ) if not isinstance( left.type, Scalar ) else None
+		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
+		# the hint handed to the comparator's own lowering below: left.type,
+		# EXCEPT when left.type is ITSELF a union - hinting a plain leaf
+		# comparator toward a union expected_type would trigger _coerce_or_
+		# check_operand's own (unconditional, not strict-gated) union-WRAP
+		# coercion, turning a bare `"hi"` into a FULLY WRAPPED str|None
+		# value before this method ever gets a look at it - defeating the
+		# whole point of the union checks below (right.type would already
+		# equal left.type by then, both union structs, and the code would
+		# fall straight through to a flat Cmp comparing two STRUCTS
+		# directly - confirmed by a real regression while developing this
+		# fix). None here (natural inference only) matches exactly what the
+		# union-on-the-left case always did, pre-unification.
+		right_hint = None if left_shape is not None else left.type
+		# strict=False: skips _coerce_or_check_operand's final
+		# _check_assignable rejection AND its scalar-widening coercion
+		# (both gated on strict) specifically so a still-mismatched right
+		# (after every OTHER, unconditional coercion - union-wrap, RCClass
+		# upcast, pointer cast - already had its chance) can be checked
+		# HERE, against BOTH operands' own shapes, instead of failing (or
+		# silently widening) blind - both are reinstated manually below in
+		# the same order _coerce_or_check_operand itself would try them.
+		right = self._lower_expr( node.comparators[0], right_hint, strict = False )
+		if right.type is not left.type:
+			if self._is_safe_scalar_widening( right.type, left.type ):
+				widened = self._new_temp( left.type )
+				self._emit( ir.CastWrap( dest = widened, operand = right ))
+				right = widened
+			else:
+				right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
+				return self._lower_eq_dispatch( node, left, left_shape, right, right_shape, negate )
+		if method is not None:
+			self.lowering._ensure_resolved( method )
+			self.lowering.schedule( method.return_type )
+			for p in ( method.parameters or [] ):
+				self.lowering.schedule( p.type )
+			dest = self._new_temp( expected_type or method.return_type )
+			self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
+			return dest
+		if left_shape is not None:
+			# right.type IS left.type (the fast-path check above), and both
+			# are the exact SAME union - genuinely no dunder of its own was
+			# found. A flat Cmp below would compare two STRUCTS directly (C
+			# rejects this) even though both operands are already known to
+			# be the identical union type - route through the general
+			# dispatch instead of assuming "same type -> flat Cmp is safe",
+			# which only holds for scalars/pointers, never for a TaggedUnion
+			return self._lower_eq_dispatch( node, left, left_shape, right, left_shape, negate )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = dest, op = ir.CmpOp.NE if negate else ir.CmpOp.EQ, left = left, right = right ))
+		return dest
+
+	def _lower_eq_dispatch(
+		self, node: ast.Compare, left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None, negate: bool,
+	) -> ir.Operand:
+		''' `==`/`!=` once the ordinary fast path (a real dunder whose
+		declared parameter already matches right's natural type, or a safe
+		scalar widening) has already been tried and didn't apply - the general
+		case, covering all three arities uniformly: neither operand is a
+		union, exactly one is, or both are. A non-union operand is treated as
+		a degenerate single-leaf "shape" (its own type, no tag dispatch
+		needed) - this is what lets one mechanism replace what used to be two
+		separate ones (a leaf-vs-union binary tag test, and a plain
+		_check_assignable rejection for two ordinary non-union types), not
+		just generalize a new third case alongside them.
+
+		Builds a full (left leaf type x right leaf type) grid via
+		_classify_leaf_pair_eq - EVERY cell, not just whichever member happens
+		to be "the matching one": comparing a union's CURRENTLY-INACTIVE
+		member against the other side is not automatically "not equal" just
+		because the tag doesn't match right now - it still needs the exact
+		same same-type/cross-dunder/error classification as any other pairing
+		(confirmed as a real gap in the narrower predecessor of this method,
+		which only ever tested T|None-shaped unions - there, the "wrong"
+		member was always NoneType, so its own hardcoded "wrong tag = not
+		equal" shortcut happened to coincide with the correct answer by luck,
+		not by construction; a union with two non-None members would have
+		gotten this wrong).
+
+		Per-cell rule (final, confirmed): both leaves NoneType -> trivially
+		equal. Exactly one is NoneType -> trivially not equal (comparing
+		anything against None is always well-defined - the Optional-check
+		idiom - never an error, regardless of whether the OTHER side's
+		declared type actually includes None as a possible member). Same
+		concrete non-None type on both sides -> the existing
+		_lower_operand_compare (dunder-or-flat-Cmp), unchanged. Different
+		concrete non-None types -> Python's real equality protocol: try
+		left_type's own __eq__/__ne__ first, then the REFLECTED call
+		(right_type's own __eq__/__ne__, receiver/arg swapped - see
+		_LeafPairEq's own docstring for why this isn't the same asymmetry as
+		__radd__). Neither applies -> TypeError.
+
+		Deliberately NOT gated on whether a union is actually involved: ANY
+		'error' cell makes the whole comparison's result Result[bool,
+		TypeError] uniformly, even when NEITHER side is a union at all (a
+		single, statically-certain mismatch, e.g. two unrelated classes) -
+		the user's own call: in practice a bare `if a == b:` without
+		explicitly consuming the Result still hits an ordinary "expected bool,
+		got Result[...]" mismatch either way, so nothing is lost by not
+		special-casing the no-union case into a bespoke, immediate compile
+		error the way the narrower predecessor of this method did - and the
+		user gains the ability to explicitly consume/inspect a genuine
+		type-confusion at runtime if they actually want to (`(a == b).unwrap_or(...)`,
+		a match, ...), using the SAME Result[T,E] machinery every other
+		fallible operation already provides, no special-casing needed.
+
+		Deliberately does NOT reuse arithmetic's/subscript's own
+		_maybe_consume_result auto-`.or_return()` consumption - explicitly
+		rejected (no new "compiler binop mode" concept wanted): a fallible
+		comparison's Result[bool,TypeError] is simply the expression's own
+		real value, returned as-is. '''
+		left_types = [ m.type for m in left_shape[1] ] if left_shape is not None else [ left.type ]
+		right_types = [ m.type for m in right_shape[1] ] if right_shape is not None else [ right.type ]
+		method_name = '__ne__' if negate else '__eq__'
+		grid = [
+			[ self._classify_leaf_pair_eq( lt, rt, node, method_name ) for rt in right_types ]
+			for lt in left_types
+		]
+		fallible = any( cell.kind == 'error' for row in grid for cell in row )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if fallible:
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			type_error_cls = self.lowering.discovery.find_name( 'TypeError', node )
+			# result_union (the monomorphized, real TaggedUnion with concrete
+			# .attributes) is what _coerce_into_union needs to find Ok/Err's own
+			# synthesized member constructors, AND what dest itself must be
+			# typed as - unlike _emit_checked_op's own Result[T,E] (used only
+			# as a Check-mode opcode's dest, never directly compared against a
+			# function's own declared return type by IDENTITY), a fully-
+			# concrete generic annotation like `-> Result[bool,TypeError]`
+			# (every type arg already concrete, no TypeVars left to bind) gets
+			# EAGERLY monomorphized by the time _current_fn.return_type is
+			# read (confirmed via a real repro) - _stmt_Return's own identity
+			# check then requires dest.type to be that SAME monomorphized
+			# object, not the bare Specialization
+			check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ bool_cls, type_error_cls ] )
+			self.lowering.schedule( check_type )
+			result_union = self.lowering.monomorphize_class( check_type )
+			self.lowering._union_storage.get( result_union )
+			dest = self._new_temp( result_union )
+		else:
+			result_union = None
+			dest = self._new_temp( bool_cls )
+		self._emit_eq_dispatch_tree( node, left, left_shape, right, right_shape, grid, dest, negate, bool_cls, result_union )
+		return dest
+
+	def _classify_leaf_pair_eq( self, left_type: Type, right_type: Type, node: ast.AST, method_name: str ) -> _LeafPairEq:
+		''' one grid cell of _lower_eq_dispatch's own classification - see
+		that method's docstring for the full rule. Pure type-level, no IR. '''
+		none_type = self.lowering.discovery.get_none_type()
+		left_is_none = left_type is none_type
+		right_is_none = right_type is none_type
+		if left_is_none and right_is_none:
+			return _LeafPairEq( 'none_true' )
+		if left_is_none or right_is_none:
+			return _LeafPairEq( 'none_false' )
+		if self.lowering._type_resolver._same_type( left_type, right_type ):
+			return _LeafPairEq( 'same_type' )
+		# _find_dunder_for_arg, not the plain _find_method - see its own
+		# docstring: a class declaring TWO __eq__/__ne__ signatures (the
+		# same-type one plus a genuine cross-type one, e.g. int.__eq__
+		# (other: i32) alongside int.__eq__(other: int)) registers as a
+		# real Overload, which a bare _find_method silently treats as "no
+		# such method" - the exact shape this whole 'cross_dunder' branch
+		# exists to use
+		method = self._find_dunder_for_arg( left_type, method_name, right_type ) if not isinstance( left_type, Scalar ) else None
+		if method is not None:
+			return _LeafPairEq( 'cross_dunder', method = method, reflected = False )
+		reflected_method = self._find_dunder_for_arg( right_type, method_name, left_type ) if not isinstance( right_type, Scalar ) else None
+		if reflected_method is not None:
+			return _LeafPairEq( 'cross_dunder', method = reflected_method, reflected = True )
+		return _LeafPairEq( 'error' )
+
+	def _emit_eq_dispatch_tree(
+		self, node: ast.Compare, left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None,
+		grid: list[list[_LeafPairEq]], dest: ir.Temp, negate: bool, bool_cls: Type, result_union: TaggedUnion|None,
+	) -> None:
+		''' nested 2-level tag dispatch shared by every arity _lower_eq_
+		dispatch handles - disambiguates LEFT's active member first (skipped
+		entirely when left_shape is None - a non-union operand is used
+		directly, no tag test, matching a real union's own "last candidate
+		needs no test either" shape), then WITHIN each left branch,
+		disambiguates RIGHT's the same way. Reuses the identical
+		union_storage.get(base) -> (tag_attr, data_attr, payload_cls, tags)
+		primitive and GetAttr(tag)+Cmp EQ+JumpIfFalse / GetAttr(data)+
+		GetAttr(v_<member>) IR shape already used identically in
+		_lower_dispatch_tests/_maybe_unwrap_union_arg/_match_union_member
+		(type_resolver.py) - not reinvented here. Union members are never
+		themselves further unions (nested unions are flattened at discovery
+		time), so this recursion is bounded to exactly 2 levels regardless of
+		how many members either side has. '''
+		none_type = self.lowering.discovery.get_none_type()
+		end_label = self._new_label( 'eq_dispatch_end' )
+		if left_shape is not None:
+			left_base, left_members = left_shape
+			left_tag_attr, left_data_attr, left_payload_cls, left_tags = self.lowering._union_storage.get( left_base )
+			n_left = len( left_members )
+		else:
+			n_left = 1
+		if right_shape is not None:
+			right_base, right_members = right_shape
+			right_tag_attr, right_data_attr, right_payload_cls, right_tags = self.lowering._union_storage.get( right_base )
+			n_right = len( right_members )
+		else:
+			n_right = 1
+
+		for i in range( n_left ):
+			is_last_left = ( i == n_left - 1 )
+			if left_shape is not None:
+				lm = left_members[i]
+				if not is_last_left:
+					next_left_label = self._new_label( 'eq_dispatch_left_next' )
+					tag_dest = self._new_temp( left_tag_attr.type )
+					self._emit( ir.GetAttr( dest = tag_dest, obj = left, attr = left_tag_attr.stem ))
+					match = self._new_temp( bool_cls )
+					self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = left_tag_attr.type, value = left_tags[lm.stem] )))
+					self._emit( ir.JumpIfFalse( cond = match, target = next_left_label ))
+				if lm.type is none_type:
+					narrowed_left = left   # never read - every cell using this row has left leaf type NoneType, handled without touching the operand at all
+				else:
+					narrowed_left = self._extract_union_payload( left, left_data_attr, left_payload_cls, lm )
+			else:
+				narrowed_left = left
+
+			for j in range( n_right ):
+				is_last_right = ( j == n_right - 1 )
+				if right_shape is not None:
+					rm = right_members[j]
+					if not is_last_right:
+						next_right_label = self._new_label( 'eq_dispatch_right_next' )
+						tag_dest2 = self._new_temp( right_tag_attr.type )
+						self._emit( ir.GetAttr( dest = tag_dest2, obj = right, attr = right_tag_attr.stem ))
+						match2 = self._new_temp( bool_cls )
+						self._emit( ir.Cmp( dest = match2, op = ir.CmpOp.EQ, left = tag_dest2, right = ir.Const( type = right_tag_attr.type, value = right_tags[rm.stem] )))
+						self._emit( ir.JumpIfFalse( cond = match2, target = next_right_label ))
+					if rm.type is none_type:
+						narrowed_right = right
+					else:
+						narrowed_right = self._extract_union_payload( right, right_data_attr, right_payload_cls, rm )
+				else:
+					narrowed_right = right
+
+				cell = grid[i][j]
+				if cell.kind == 'error':
+					error_instance = self._build_type_error_instance( node )
+					value: ir.Operand = error_instance
+				else:
+					error_instance = None
+					value = self._emit_leaf_pair_eq_value( node, narrowed_left, narrowed_right, cell, negate, bool_cls )
+				if result_union is not None:
+					value = self._coerce_into_union( value, result_union, node )
+					if error_instance is not None:
+						# error_instance is its own fresh, independently
+						# fresh_temp()-tracked ir.Allocate result (see
+						# _build_type_error_instance's own docstring).
+						# _coerce_into_union's synthesized constructor Call
+						# just above already increfs it into the Result's Err
+						# payload (refcount 1 -> 2) - in ORDINARY, single-
+						# path code (a plain `return Result.Err(SomeClass())`
+						# statement), the caller-side temp's own natural
+						# end-of-STATEMENT decref would bring it back down to
+						# 1, leaving the Result as sole owner. That natural
+						# per-statement flush can't be relied on here though:
+						# this whole per-cell block is only ONE branch of a
+						# larger dispatch tree, and the flush fires
+						# unconditionally for EVERY temp still tracked
+						# REGARDLESS of which branch actually executed -
+						# first found via a real ASAN SEGV (release_object()
+						# on an uninitialized C local from a branch that was
+						# never taken when this was left tracked-for-outer-
+						# flush; then a real ASAN LEAK when it was untracked
+						# outright with no decref of its own at all). The
+						# correct fix is the SAME "just do it inline,
+						# unconditionally-but-only-within-this-branch" shape
+						# the whole surrounding dispatch tree already uses -
+						# emit the decref explicitly, right here, then
+						# untrack it so the outer flush doesn't ALSO decref
+						# whatever ends up in this same temp slot on a
+						# DIFFERENT invocation's DIFFERENT branch
+						for instr in self._cfg.decref( error_instance.type, error_instance ):
+							self._emit( instr )
+						self._cfg.untrack_temp( error_instance )
+				self._emit( ir.Assign( dest = dest, src = value ))
+				# value (when RC-carrying - only possible in the fallible/
+				# Result case, since every OTHER branch produces a plain
+				# bool) is its own independently fresh_temp()-tracked temp
+				# (either _coerce_into_union's own Call dest, or - for a
+				# 'same_type'/'cross_dunder' cell whose own value already
+				# happened to need no wrapping - never RC to begin with) -
+				# untrack it here so ITS OWN eventual delete_temp() doesn't
+				# ALSO decref the same object dest now holds too. Mirrors
+				# _expr_IfExp's identical "untrack the fresh branch value,
+				# fresh_temp() the merge dest once instead" split for a
+				# multi-branch-into-one-dest merge - same bug class, same
+				# fix, generalized from 2 branches to N. A no-op whenever
+				# value isn't RC-carrying at all (untrack_temp/fresh_temp
+				# both check rc_leaves/isinstance internally).
+				self._cfg.untrack_temp( value )
+				self._emit( ir.Jump( target = end_label ))
+				if right_shape is not None and not is_last_right:
+					self._emit( ir.Label( name = next_right_label ))
+			if left_shape is not None and not is_last_left:
+				self._emit( ir.Label( name = next_left_label ))
+		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, dest.type )
+
+	def _extract_union_payload( self, union_operand: ir.Operand, data_attr: Variable, payload_cls: CUnion, member: Variable ) -> ir.Temp:
+		''' the two-GetAttr "read one member's own payload out of a union's
+		data storage" shape _build_union_leaf_eq/_maybe_unwrap_union_arg both
+		used to duplicate independently - factored out here since
+		_emit_eq_dispatch_tree now needs it on both axes. Both dests are bare
+		GetAttr reads, never fresh_temp()-registered (see _emit's own comment
+		- only Call/Allocate results are), so callers need no incref/decref
+		bookkeeping around the returned value. '''
+		payload_dest = self._new_temp( payload_cls )
+		self._emit( ir.GetAttr( dest = payload_dest, obj = union_operand, attr = data_attr.stem ))
+		narrowed = self._new_temp( member.type )
+		self._emit( ir.GetAttr( dest = narrowed, obj = payload_dest, attr = f'v_{member.stem}' ))
+		return narrowed
+
+	def _emit_leaf_pair_eq_value( self, node: ast.AST, narrowed_left: ir.Operand, narrowed_right: ir.Operand, cell: _LeafPairEq, negate: bool, bool_cls: Type ) -> ir.Operand:
+		''' produces a plain bool operand for one grid cell whose kind isn't
+		'error' (Result-wrapping, if any, is _emit_eq_dispatch_tree's own job,
+		kept out of here so this stays usable for both the infallible and
+		fallible codegen shapes unchanged). '''
+		if cell.kind == 'none_true':
+			return ir.Const( type = bool_cls, value = not negate )
+		if cell.kind == 'none_false':
+			return ir.Const( type = bool_cls, value = negate )
+		if cell.kind == 'same_type':
+			return self._lower_operand_compare( narrowed_left, narrowed_right, negate, node )
+		assert cell.kind == 'cross_dunder' and cell.method is not None
+		method = cell.method
+		receiver, arg = ( narrowed_right, narrowed_left ) if cell.reflected else ( narrowed_left, narrowed_right )
+		self.lowering._ensure_resolved( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		dest = self._new_temp( method.return_type )
+		self._emit( ir.Call( dest = dest, target = method, receiver = receiver, args = [ arg ], kwargs = {} ))
+		return dest
+
+	def _build_type_error_instance( self, node: ast.AST ) -> ir.Temp:
+		''' constructs a bare TypeError() instance - the first internal
+		(non-AST-driven) construction site for a trivial marker-error class
+		anywhere in this file (every existing one, OverflowError() etc., is
+		only ever written in real library .py source). Mirrors the general
+		class-construction tail's own RCClass branch
+		(_schedule_rcclass_construction + bare ir.Allocate), simplified since
+		TypeError is guaranteed zero-field. dest is a fresh, Allocate-
+		registered temp (see _emit's own fresh_temp() rule) - immediately
+		consumed by the caller's own _coerce_into_union, whose synthesized
+		member-ctor Call increfs it into the Result's Err payload; the
+		ordinary end-of-scope decref of dest itself brings the refcount back
+		down to the single reference the Result now owns - same fresh-temp +
+		union-ctor-incref shape any ordinary Result.Err(SomeClass()) already
+		uses, no new RC mechanism. '''
+		type_error_cls = self.lowering.discovery.find_name( 'TypeError', node )
+		self.lowering._ensure_resolved( type_error_cls )
+		self.lowering.schedule( type_error_cls )
+		dest = self._new_temp( type_error_cls )
+		assert isinstance( type_error_cls, RCClass )
+		self.lowering._schedule_rcclass_construction( type_error_cls, dest.type )
+		self._emit( ir.Allocate( dest = dest, cls = type_error_cls, fields = {} ))
+		return dest
+
+	def _lower_binop_dispatch(
+		self, node: 'ast.BinOp|ast.AugAssign', left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None,
+	) -> ir.Operand:
+		''' +-*//%|&^ once at least one operand is union-typed - the
+		arithmetic counterpart of _lower_eq_dispatch, covering all three
+		arities the same way (a non-union operand is a degenerate
+		single-leaf "shape", no tag dispatch needed on that axis). Builds a
+		full (left leaf x right leaf) grid via _classify_leaf_pair_binop,
+		then SYNTHESIZES the expression's own result type from whatever the
+		grid actually produces - unlike equality (always plain bool),
+		different leaf pairs here can produce genuinely different concrete
+		types (i32+i32 -> i32 vs Vector+Vector -> Vector), and not every
+		call site has an expected_type to coerce into, so a fresh union of
+		the DISTINCT success types is synthesized via discovery.
+		_get_or_create_union - collapsing to a single plain type when every
+		reachable pair happens to agree (e.g. int|i32 + int where both
+		int.__add__(int) and int.__radd__(i32) return plain int - must NOT
+		become a degenerate 1-member union).
+
+		Three independent sources of fallibility all fold into ONE
+		synthesized error-type union the same way: (1) a leaf pair with no
+		valid operation at all -> TypeError (mirrors equality's own
+		'error' cell); (2) plain scalar arithmetic's own EXISTING checked-
+		arithmetic fallibility, respecting the CURRENT arithmetic mode per
+		cell (_classify_leaf_pair_binop calls the exact same
+		_resolve_checked_error the non-union scalar path already uses -
+		wrap_arithmetic/saturate_arithmetic/panic_arithmetic are honored
+		exactly as they are today, never bypassed); (3) a resolved
+		dunder's own declared return type can ITSELF be Result[T,E] - its
+		E folds in too, not just its T used as-is (detected via cfg.
+		is_result_type + _tagged_union_shape, the same Result-shape
+		detection the rest of the compiler already uses).
+
+		Deliberately does NOT reuse the plain scalar path's own auto-
+		`.or_return()` consumption (_consume_checked_result) for a
+		fallible cell - same "no compiler binop modes" principle
+		_lower_eq_dispatch already settled: a fallible union binop's
+		Result[...] is simply the expression's own real value, returned
+		as-is (see _emit_binop_fallible_split). '''
+		left_types = [ m.type for m in left_shape[1] ] if left_shape is not None else [ left.type ]
+		right_types = [ m.type for m in right_shape[1] ] if right_shape is not None else [ right.type ]
+		method_name = _BINOP_DUNDER.get( type( node.op ))
+		reflected_name = _REFLECTED_BINOP_DUNDER.get( method_name ) if method_name is not None else None
+		grid = [
+			[ self._classify_leaf_pair_binop( node, method_name, reflected_name, lt, rt ) for rt in right_types ]
+			for lt in left_types
+		]
+		success_types = _dedup_types( cell.success_type for row in grid for cell in row if cell.success_type is not None )
+		error_types = _dedup_types( cell.error_type for row in grid for cell in row if cell.error_type is not None )
+		fallible = bool( error_types )
+		success_type = success_types[0] if len( success_types ) == 1 else self.lowering.discovery._get_or_create_union( success_types )
+		self.lowering.schedule( success_type )
+		if isinstance( success_type, TaggedUnion ):
+			self.lowering._union_storage.get( success_type )
+		error_type: Type|None = None
+		if fallible:
+			error_type = error_types[0] if len( error_types ) == 1 else self.lowering.discovery._get_or_create_union( error_types )
+			self.lowering.schedule( error_type )
+			if isinstance( error_type, TaggedUnion ):
+				self.lowering._union_storage.get( error_type )
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ success_type, error_type ] )
+			self.lowering.schedule( check_type )
+			result_union = self.lowering.monomorphize_class( check_type )
+			self.lowering._union_storage.get( result_union )
+			dest = self._new_temp( result_union )
+		else:
+			result_union = None
+			dest = self._new_temp( success_type )
+		self._emit_binop_dispatch_tree( node, left, left_shape, right, right_shape, grid, dest, success_type, error_type, result_union )
+		return dest
+
+	def _classify_leaf_pair_binop( self, node: 'ast.BinOp|ast.AugAssign', method_name: str|None, reflected_name: str|None, left_type: Type, right_type: Type ) -> _LeafPairBinop:
+		''' one grid cell of _lower_binop_dispatch's own classification -
+		see that method's docstring for the full rule. A leaf pair that
+		can't type-check at all (mismatched float types, an operator with
+		no floating-point meaning, or neither side has a usable dunder)
+		becomes an 'error' cell (contributing TypeError) rather than an
+		immediate compile failure - mirrors _classify_leaf_pair_eq's own
+		identical choice: a single bad pairing doesn't reject the WHOLE
+		union expression, it becomes one runtime-checkable branch of it. '''
+		type_error_cls = self.lowering.discovery.find_name( 'TypeError', node )
+		if isinstance( left_type, Scalar ) and isinstance( right_type, Scalar ):
+			is_float = _is_float_scalar( left_type ) or _is_float_scalar( right_type )
+			if is_float and ( left_type is not right_type or _FLOAT_UNSUPPORTED_BINOPS.get( type( node.op )) is not None ):
+				return _LeafPairBinop( 'error', error_type = type_error_cls )
+			opcode, extra = ( self._arithmetic_mode[-1].GetFloatBinOp( node ) if is_float else self._arithmetic_mode[-1].GetBinOp( node ))
+			if opcode is None:
+				return _LeafPairBinop( 'error', error_type = type_error_cls )
+			error_type = None
+			if opcode.checked_errors and extra is None:
+				error_type, _alternatives = self._resolve_checked_error( node, opcode, left_type )
+			return _LeafPairBinop( 'scalar', success_type = left_type, error_type = error_type, opcode = opcode, extra = extra )
+		method = self._find_dunder_for_arg( left_type, method_name, right_type ) if method_name is not None and not isinstance( left_type, Scalar ) else None
+		reflected = False
+		if method is None and reflected_name is not None and not isinstance( right_type, Scalar ):
+			method = self._find_dunder_for_arg( right_type, reflected_name, left_type )
+			reflected = method is not None
+		if method is None:
+			return _LeafPairBinop( 'error', error_type = type_error_cls )
+		self.lowering._ensure_resolved( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		if cfg.is_result_type( method.return_type ):
+			shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
+			assert shape is not None and len( shape[1] ) == 2
+			return _LeafPairBinop( 'dunder', success_type = shape[1][0].type, error_type = shape[1][1].type, method = method, reflected = reflected )
+		return _LeafPairBinop( 'dunder', success_type = method.return_type, method = method, reflected = reflected )
+
+	def _emit_binop_dispatch_tree(
+		self, node: 'ast.BinOp|ast.AugAssign', left: ir.Operand, left_shape: tuple[TaggedUnion,list[Variable]]|None,
+		right: ir.Operand, right_shape: tuple[TaggedUnion,list[Variable]]|None,
+		grid: list[list[_LeafPairBinop]], dest: ir.Temp, success_type: Type, error_type: Type|None, result_union: TaggedUnion|None,
+	) -> None:
+		''' nested 2-level tag dispatch - see _emit_eq_dispatch_tree's own
+		docstring, this is the identical shape (same union_storage.get /
+		GetAttr+Cmp+JumpIfFalse / _extract_union_payload primitive, N-1
+		members tested per axis, last is the untested default). Differs
+		only in the per-cell body: a binop cell can itself be
+		independently fallible (checked scalar arithmetic under the
+		current mode, or a dunder declaring Result[T,E]) - see
+		_emit_binop_fallible_split for that inner Ok/Err decomposition,
+		reached only from cells that need it. '''
+		none_type = self.lowering.discovery.get_none_type()
+		end_label = self._new_label( 'binop_dispatch_end' )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if left_shape is not None:
+			left_base, left_members = left_shape
+			# not _union_storage.get(left_base) - see _emit_binop_fallible_
+			# split's own comment on why a Specialization's abstract base
+			# (e.g. left is itself a Result[T,E]-typed operand) needs the
+			# concrete, monomorphized union instead for storage purposes
+			left_concrete = self.lowering.monomorphize_class( left.type ) if isinstance( left.type, Specialization ) else left_base
+			left_tag_attr, left_data_attr, left_payload_cls, left_tags = self.lowering._union_storage.get( left_concrete )
+			n_left = len( left_members )
+		else:
+			n_left = 1
+		if right_shape is not None:
+			right_base, right_members = right_shape
+			right_concrete = self.lowering.monomorphize_class( right.type ) if isinstance( right.type, Specialization ) else right_base
+			right_tag_attr, right_data_attr, right_payload_cls, right_tags = self.lowering._union_storage.get( right_concrete )
+			n_right = len( right_members )
+		else:
+			n_right = 1
+
+		for i in range( n_left ):
+			is_last_left = ( i == n_left - 1 )
+			if left_shape is not None:
+				lm = left_members[i]
+				if not is_last_left:
+					next_left_label = self._new_label( 'binop_dispatch_left_next' )
+					tag_dest = self._new_temp( left_tag_attr.type )
+					self._emit( ir.GetAttr( dest = tag_dest, obj = left, attr = left_tag_attr.stem ))
+					match = self._new_temp( bool_cls )
+					self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = left_tag_attr.type, value = left_tags[lm.stem] )))
+					self._emit( ir.JumpIfFalse( cond = match, target = next_left_label ))
+				narrowed_left = left if lm.type is none_type else self._extract_union_payload( left, left_data_attr, left_payload_cls, lm )
+			else:
+				narrowed_left = left
+
+			for j in range( n_right ):
+				is_last_right = ( j == n_right - 1 )
+				if right_shape is not None:
+					rm = right_members[j]
+					if not is_last_right:
+						next_right_label = self._new_label( 'binop_dispatch_right_next' )
+						tag_dest2 = self._new_temp( right_tag_attr.type )
+						self._emit( ir.GetAttr( dest = tag_dest2, obj = right, attr = right_tag_attr.stem ))
+						match2 = self._new_temp( bool_cls )
+						self._emit( ir.Cmp( dest = match2, op = ir.CmpOp.EQ, left = tag_dest2, right = ir.Const( type = right_tag_attr.type, value = right_tags[rm.stem] )))
+						self._emit( ir.JumpIfFalse( cond = match2, target = next_right_label ))
+					narrowed_right = right if rm.type is none_type else self._extract_union_payload( right, right_data_attr, right_payload_cls, rm )
+				else:
+					narrowed_right = right
+
+				self._emit_binop_cell( node, narrowed_left, narrowed_right, grid[i][j], dest, success_type, error_type, result_union, end_label )
+
+				if right_shape is not None and not is_last_right:
+					self._emit( ir.Label( name = next_right_label ))
+			if left_shape is not None and not is_last_left:
+				self._emit( ir.Label( name = next_left_label ))
+		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, dest.type )
+
+	def _emit_binop_cell(
+		self, node: 'ast.BinOp|ast.AugAssign', narrowed_left: ir.Operand, narrowed_right: ir.Operand,
+		cell: _LeafPairBinop, dest: ir.Temp, success_type: Type, error_type: Type|None, result_union: TaggedUnion|None, end_label: str,
+	) -> None:
+		''' one grid cell's codegen - see _lower_binop_dispatch's own
+		docstring for what each kind means. A cell with its own
+		error_type set needs the extra Ok/Err decomposition
+		(_emit_binop_fallible_split); every other cell just produces one
+		plain value directly. '''
+		if cell.kind == 'error':
+			error_instance = self._build_type_error_instance( node )
+			assert error_type is not None and result_union is not None   # an 'error' cell always contributes TypeError, so the whole expression is always fallible whenever one exists
+			value = self._coerce_binop_value( error_instance, error_type, result_union, node )
+			self._finish_binop_result_branch( error_instance, value, dest, end_label )
+			return
+		if cell.kind == 'scalar':
+			if cell.error_type is None:
+				value = self._lower_arithmetic_op( node, cell.opcode, cell.extra, cell.success_type, { 'left': narrowed_left, 'right': narrowed_right }, 'binary' )
+				value = self._coerce_binop_value( value, success_type, result_union, node )
+				self._finish_binop_cell( dest, value, end_label )
+				return
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ cell.success_type, cell.error_type ] )
+			self.lowering.schedule( check_type )
+			check_dest = self._new_temp( check_type )
+			self._emit( cell.opcode( dest = check_dest, left = narrowed_left, right = narrowed_right ))
+			self._emit_binop_fallible_split( node, check_dest, dest, success_type, error_type, result_union, end_label )
+			return
+		assert cell.kind == 'dunder' and cell.method is not None
+		receiver, arg = ( narrowed_right, narrowed_left ) if cell.reflected else ( narrowed_left, narrowed_right )
+		self.lowering.schedule( cell.method.return_type )
+		call_dest = self._new_temp( cell.method.return_type )
+		self._emit( ir.Call( dest = call_dest, target = cell.method, receiver = receiver, args = [ arg ], kwargs = {} ))
+		if cell.error_type is None:
+			value = self._coerce_binop_value( call_dest, success_type, result_union, node )
+			self._finish_binop_cell( dest, value, end_label )
+			return
+		self._emit_binop_fallible_split( node, call_dest, dest, success_type, error_type, result_union, end_label )
+
+	def _coerce_binop_value( self, value: ir.Operand, axis_type: Type, result_union: TaggedUnion|None, node: ast.AST ) -> ir.Operand:
+		''' two-step coercion for ONE axis (success or error) of the
+		synthesized dispatch: first into that axis's own aggregate type
+		(success_type/error_type - itself a TaggedUnion only when more
+		than one distinct type is actually possible on this axis; a
+		cell's own produced value only ever matches ONE LEAF of it, never
+		axis_type itself directly, whenever axis_type genuinely is a
+		union), THEN - only when the whole expression is fallible - into
+		result_union's own matching Ok/Err slot (a cell's value NEVER
+		already matches result_union directly: result_union's own two
+		leaves are success_type/error_type as a WHOLE, never one leaf's
+		own concrete type - so this second step, unlike the first, is
+		never skippable once result_union is present). Callers pass
+		axis_type = success_type for a success-axis value, error_type
+		for an error-axis value (always non-None whenever reached, since
+		producing an error value at all implies the whole expression is
+		fallible).
+
+		When BOTH steps run, the intermediate axis_type-wrapped value is
+		itself a fresh, independently fresh_temp()-tracked Call result
+		(same shape as every other branch-local temp this whole dispatch
+		tree produces) - the second _coerce_into_union call makes its OWN
+		independent embedded reference via its own ctor's incref (a
+		tag-gated copy of whichever member is active, since axis_type is
+		itself RC-carrying whenever this path is taken), so the
+		intermediate's OWN reference is now redundant and needs releasing
+		- same inline decref+untrack pattern _finish_binop_result_branch
+		already uses for raw_temp, for the identical reason (a temp local
+		to only ONE cell/branch of a larger dispatch tree can't rely on
+		the outer per-statement flush). '''
+		if isinstance( axis_type, TaggedUnion ) and not self.lowering._type_resolver._same_type( value.type, axis_type ):
+			intermediate = self._coerce_into_union( value, axis_type, node )
+			if result_union is None:
+				return intermediate
+			value = self._coerce_into_union( intermediate, result_union, node )
+			for instr in self._cfg.decref( intermediate.type, intermediate ):
+				self._emit( instr )
+			self._cfg.untrack_temp( intermediate )
+			return value
+		if result_union is not None:
+			value = self._coerce_into_union( value, result_union, node )
+		return value
+
+	def _finish_binop_cell( self, dest: ir.Temp, value: ir.Operand, end_label: str ) -> None:
+		# mirrors _emit_eq_dispatch_tree's own identical per-cell tail -
+		# untrack value (a no-op unless it's RC-carrying - both
+		# untrack_temp/fresh_temp check internally) so its own eventual
+		# delete_temp() doesn't ALSO decref the same object dest now holds
+		self._cfg.untrack_temp( value )
+		self._emit( ir.Assign( dest = dest, src = value ))
+		self._emit( ir.Jump( target = end_label ))
+
+	def _finish_binop_result_branch( self, raw_temp: ir.Temp, value: ir.Operand, dest: ir.Temp, end_label: str ) -> None:
+		''' shared tail for every branch of _emit_binop_fallible_split (and
+		the 'error' cell above, whose own error_instance is the identical
+		shape) - raw_temp is a branch-local, independently fresh_temp()-
+		tracked value (a checked op's check_dest, a dunder Call's own
+		dest, or _build_type_error_instance's own Allocate result) whose
+		OWN payload `value` was just extracted from (via _coerce_into_
+		union, whose synthesized ctor already increfs `value` - see
+		_build_type_error_instance's own docstring for why this specific
+		incref-then-decref pairing is correctly balanced). Since this is
+		only ONE branch of a larger dispatch tree, the outer unconditional
+		per-statement flush can't be relied on for raw_temp (same bug
+		class _emit_eq_dispatch_tree's own two ASAN-confirmed RC fixes
+		already cover) - decref + untrack it here, inline, unconditionally
+		within this branch only. '''
+		for instr in self._cfg.decref( raw_temp.type, raw_temp ):
+			self._emit( instr )
+		self._cfg.untrack_temp( raw_temp )
+		self._finish_binop_cell( dest, value, end_label )
+
+	def _emit_binop_fallible_split(
+		self, node: ast.AST, raw_temp: ir.Temp, dest: ir.Temp, success_type: Type, error_type: Type, result_union: TaggedUnion|None, end_label: str,
+	) -> None:
+		''' raw_temp is a not-yet-consumed Result[T,E] value (a checked
+		scalar op's own check_dest, or a dunder's own Call result whose
+		declared return type is itself Result[T,E]) - decomposed via ONE
+		more nested Ok/Err tag-check (bounded, always exactly 2 members -
+		Result's own shape), coercing whichever branch fires into the
+		OUTER dest, deliberately WITHOUT _consume_checked_result's own
+		auto-`.or_return()` consumption (see _lower_binop_dispatch's own
+		docstring - this fallible value IS the expression's own real
+		value here, not propagated to the enclosing function). Extracted
+		via _extract_union_payload, which returns a bare, un-incref'd
+		BORROW (unlike every other value this whole dispatch tree
+		produces, which are always already-owned fresh Call/opcode
+		results) - _coerce_binop_value's own _coerce_into_union call(s)
+		are what give it a real +1 reference; result_union is guaranteed
+		non-None whenever this is reached (a cell only gets here when its
+		own error_type is set, which is exactly what makes the WHOLE
+		expression fallible). '''
+		assert result_union is not None
+		shape = self.lowering._type_resolver._tagged_union_shape( raw_temp.type )
+		assert shape is not None and len( shape[1] ) == 2
+		base, members = shape
+		# NOT _union_storage.get(base): base is _tagged_union_shape's own
+		# deliberately-ABSTRACT return (shared tag values across every
+		# instantiation of the same generic union) - raw_temp.type here is
+		# routinely a Result[T,E] SPECIALIZATION (a scalar op's own
+		# check_type, or a dunder's declared Result[T,E] return type), and
+		# the ABSTRACT Result class's own payload union has no real C
+		# definition at all (its fields are bare, unsubstituted T/E
+		# TypeVars) - confirmed via a real repro ("incomplete type 'union
+		# builtins$Result$data'" from clang). union_storage needs THIS
+		# instantiation's own concrete, monomorphized union instead - same
+		# "monomorphize_class if Specialization else itself" pattern
+		# _coerce_or_check_operand already uses for the identical reason.
+		concrete_union = self.lowering.monomorphize_class( raw_temp.type ) if isinstance( raw_temp.type, Specialization ) else raw_temp.type
+		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( concrete_union )
+		ok_member, err_member = members[0], members[1]
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		err_label = self._new_label( 'binop_result_err' )
+		tag_dest = self._new_temp( tag_attr.type )
+		self._emit( ir.GetAttr( dest = tag_dest, obj = raw_temp, attr = tag_attr.stem ))
+		match = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[ok_member.stem] )))
+		self._emit( ir.JumpIfFalse( cond = match, target = err_label ))
+		# Ok branch
+		ok_payload = self._extract_union_payload( raw_temp, data_attr, payload_cls, ok_member )
+		ok_value = self._coerce_binop_value( ok_payload, success_type, result_union, node )
+		self._finish_binop_result_branch( raw_temp, ok_value, dest, end_label )
+		self._emit( ir.Label( name = err_label ))
+		# Err branch - err_member's own type might ITSELF be a multi-member
+		# ANONYMOUS union (signed Div/Mod's own ZeroDivisionError|
+		# OverflowError - see _resolve_checked_error) - one more bounded
+		# nested unwrap to reach a concrete leaf class before coercing
+		# into the OUTER error union. Gated on file is None (the same
+		# "synthesized, not a real declared type" marker
+		# discovery._get_or_create_union's own flattening logic already
+		# uses) - a NOMINAL @union error type (e.g. a real `@union class
+		# IntError: DivideByZero: None; ...`) is just as much an opaque
+		# LEAF as any plain marker class, exactly like a nominal @union
+		# leaf flowing into a WIDER union elsewhere in this compiler (see
+		# _coerce_into_union's own "nominal @union is exactly as valid a
+		# member... as any plain leaf type" comment) - unwrapping ITS OWN
+		# variants here would be wrong, confirmed via a real repro
+		# (int.__add__'s own Result[int,IntError] wrongly tried to
+		# decompose IntError's OWN internal DivideByZero/... variants
+		# instead of treating the whole IntError value as one leaf)
+		err_payload = self._extract_union_payload( raw_temp, data_attr, payload_cls, err_member )
+		err_shape = self.lowering._type_resolver._tagged_union_shape( err_payload.type )
+		if err_shape is not None and err_shape[0].file is None and len( err_shape[1] ) > 1:
+			self._emit_nested_error_unwrap( node, err_payload, err_shape, raw_temp, dest, error_type, result_union, end_label )
+		else:
+			err_value = self._coerce_binop_value( err_payload, error_type, result_union, node )
+			self._finish_binop_result_branch( raw_temp, err_value, dest, end_label )
+
+	def _emit_nested_error_unwrap(
+		self, node: ast.AST, err_union_operand: ir.Operand, err_shape: tuple[TaggedUnion,list[Variable]],
+		raw_temp: ir.Temp, dest: ir.Temp, error_type: Type, result_union: TaggedUnion, end_label: str,
+	) -> None:
+		''' one leaf pair's own checked error type can itself be a
+		multi-member anonymous union (signed Div/Mod's ZeroDivisionError|
+		OverflowError) - unwraps it down to the one concrete leaf class
+		before coercing into the OUTER (already-flattened, individual-
+		classes) error union. Bounded to exactly this one extra level -
+		_resolve_checked_error never produces a nested union of unions. '''
+		base, members = err_shape
+		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( base )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		n = len( members )
+		for i, member in enumerate( members ):
+			is_last = ( i == n - 1 )
+			if not is_last:
+				next_label = self._new_label( 'binop_error_unwrap_next' )
+				tag_dest = self._new_temp( tag_attr.type )
+				self._emit( ir.GetAttr( dest = tag_dest, obj = err_union_operand, attr = tag_attr.stem ))
+				match = self._new_temp( bool_cls )
+				self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] )))
+				self._emit( ir.JumpIfFalse( cond = match, target = next_label ))
+			concrete = self._extract_union_payload( err_union_operand, data_attr, payload_cls, member )
+			value = self._coerce_binop_value( concrete, error_type, result_union, node )
+			self._finish_binop_result_branch( raw_temp, value, dest, end_label )
+			if not is_last:
+				self._emit( ir.Label( name = next_label ))
+
+	def _lower_operand_compare( self, left: ir.Operand, right: ir.Operand, negate: bool, node: ast.AST ) -> ir.Operand:
+		''' Eq/NotEq between two ALREADY-LOWERED operands of the SAME
+		(non-union) type - the same dunder-or-flat-Cmp choice _lower_eq_or_ne
+		makes from AST nodes, reimplemented against operands directly since
+		_build_union_leaf_eq's own narrowed payload has no AST node of its
+		own to re-dispatch through (mirrors _coerce_or_check_operand's
+		identical "no node to re-evaluate" posture). '''
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if not isinstance( left.type, Scalar ):
+			method_name = '__ne__' if negate else '__eq__'
+			# _find_dunder_for_arg, not the plain _find_method - both
+			# operands are already known to share the SAME type (this
+			# method's own docstring), so the wanted implementation is
+			# whichever one declares its own parameter as exactly left.type
+			method = self._find_dunder_for_arg( left.type, method_name, left.type )
+			if method is not None:
+				self.lowering._ensure_resolved( method )
+				self.lowering.schedule( method.return_type )
+				for p in ( method.parameters or [] ):
+					self.lowering.schedule( p.type )
+				dest = self._new_temp( method.return_type )
+				self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
+				return dest
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = dest, op = ir.CmpOp.NE if negate else ir.CmpOp.EQ, left = left, right = right ))
 		return dest
 
 	def _lower_is_comparison( self, node: ast.Compare, negate: bool ) -> ir.Operand:
@@ -6631,7 +8668,7 @@ class FunctionLowering:
 		if shape is not None:
 			base, members = shape
 			self.lowering._ensure_resolved( base )
-			direct = base.names.get( func_node.attr )
+			direct = base.get_local_or_raise( func_node.attr )
 			if not isinstance( direct, ( Function, Overload )):
 				return self.lowering._type_resolver._resolve_union_receiver_members( base, members, func_node.attr, func_node ), receiver
 		target = self.lowering._type_resolver._attr_lookup_callable( receiver.type, func_node.attr, func_node )
@@ -6924,11 +8961,11 @@ class FunctionLowering:
 				# comment for why that copy's own data field is already
 				# correctly substituted)
 				concrete_union = self.lowering._ensure_resolved( fn_cls )
-				tag_field = concrete_union.names.get( 'tag' )
-				data_field = concrete_union.names.get( 'data' )
+				tag_field = concrete_union.get_local_or_raise( 'tag' )
+				data_field = concrete_union.get_local_or_raise( 'data' )
 			else:
-				tag_field = target_cls.names.get( 'tag' )
-				data_field = target_cls.names.get( 'data' )
+				tag_field = target_cls.get_local_or_raise( 'tag' )
+				data_field = target_cls.get_local_or_raise( 'data' )
 			assert isinstance( tag_field, Variable ) and isinstance( data_field, Variable ), \
 				f'{target_cls.qualname}: UnionStorage.get() has not run yet - no real tag/data storage to allocate'
 			declared = { tag_field.stem: tag_field, data_field.stem: data_field }
@@ -7145,6 +9182,38 @@ class FunctionLowering:
 		if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 			target_cls = self.lowering._ensure_resolved( target_cls )
 
+		# T(...) where T defines a static __call__ dispatches to
+		# T.__call__(...) instead of construction - rewrite node.func to
+		# Attribute(T, '__call__') in place and bail out (returning None
+		# here just makes this recognizer decline, same as any other
+		# shape mismatch): the remaining recognizers below in _lower_call's
+		# own tuple all safely no-op against an Attribute ending in
+		# '__call__' (none matches that shape), and _resolve_callee's
+		# existing ClassName.static_method(...) path (already used by
+		# int.from_str(...)) picks the rewritten node.func up unchanged
+		# once the recognizer loop falls through - no new call-resolution
+		# logic needed downstream. Reuses target_cls (already resolved just
+		# above, including the generic-Specialization case) rather than a
+		# second _try_resolve_namespace call - same reasoning as this
+		# whole check's own placement, right after that resolution and
+		# before the CEnum branch: no-op for the overwhelming common case
+		# (target_cls isn't ClassLike, or has no local __call__), so every
+		# OTHER class's construction stays byte-for-byte unchanged.
+		if isinstance( target_cls, ClassLike ):
+			call_member = target_cls.get_local( '__call__' )
+			if call_member is not None:
+				members = call_member.implementations if isinstance( call_member, Overload ) else [ call_member ]
+				if not all( isinstance( m, Function ) and m.is_static for m in members ):
+					self.lowering.discovery.fail(
+						f'{target_cls.qualname}.__call__ must be declared @staticmethod to be used as {target_cls.qualname}(...): {ast.unparse(node)}',
+						node,
+					)
+					return None
+				new_func = ast.Attribute( value = node.func, attr = '__call__', ctx = ast.Load() )
+				ast.copy_location( new_func, node.func )
+				node.func = new_func
+				return None
+
 		# CEnum construction: EnumName(value) is a plain cast to the
 		# enum's underlying type — no allocation, no refcounting, just
 		# reinterpret the raw integer as the enum type. e.g. OSError(ENOENT)
@@ -7170,8 +9239,89 @@ class FunctionLowering:
 			# lower the argument directly — no arithmetic-mode semantics
 			# needed here; a CEnum has exactly the same runtime
 			# representation as its underlying type, so OSError(42) is
-			# just the value 42 with the enum type
-			return self._lower_expr( node.args[0], target_cls )
+			# just the value 42 with the enum type.
+			#
+			# The argument's own natural type space is value_type (the
+			# underlying scalar), NEVER target_cls (the enum itself) - passing
+			# target_cls down as _lower_expr's expected_type here (the
+			# pre-fix code) was a category error that only ever incidentally
+			# "worked" for a couple of argument shapes, not because it was
+			# correct: a bare ast.Name/Variable operand (_expr_Name) ignores
+			# expected_type entirely and keeps its own declared type, so
+			# _check_assignable's later CEnum<->value_type exemption
+			# correctly ran and correctly rejected a genuine kind mismatch
+			# (e.g. i32 for a u32-backed enum) - but a Call/BinOp argument's
+			# own result-typing tail (_lower_call's final dest allocation,
+			# `expected_type or target_return_type`) instead SILENTLY
+			# relabeled the destination temp's own type to target_cls
+			# directly, with no check at all that the callee's real return
+			# type was even a scalar, let alone value_type - confirmed via a
+			# real repro: OSError(get_rc()) (get_rc() -> i32) and
+			# OSError(rc + 0) both compiled silently, while the exact same
+			# value through a bare local, OSError(rc), was rejected as "rc:
+			# expected builtins.OSError, got intrinsics.i32" - an
+			# inconsistency across argument SHAPE, not a real distinction in
+			# what's being constructed. Fixed by routing every shape through
+			# the SAME real scalar-cast machinery T(x)/compiler.cast(T,x)
+			# already use (_lower_scalar_cast) - value_type is authoritative
+			# (matching this construction's own "plain cast to the
+			# underlying type" contract), any argument expression a plain
+			# scalar cast would accept is accepted here too, and the result
+			# is then relabeled (CastWrap, a zero-cost same-bits retag, same
+			# as an RCClass upcast/safe scalar widening/pointer interchange
+			# elsewhere in this file) to target_cls.
+			assert isinstance( value_type, Scalar ), f'{target_cls.qualname}: CEnum value_type must be a scalar, got {value_type!r}'
+			if isinstance( arg_node, ast.Constant ) and type( arg_node.value ) is int:
+				# the already-range-checked literal fast path: unchanged from
+				# before this fix - _expr_Constant already folds a CEnum-
+				# expected int literal straight into an ir.Const tagged with
+				# target_cls directly (kind+magnitude already validated, here
+				# and in _expr_Constant itself), no runtime Temp/CastWrap
+				# needed. Keeping this path bypassed by the general fix below
+				# preserves that constant-folding (real callers/tests rely on
+				# a literal CEnum construction lowering to a bare ir.Const,
+				# not a cast instruction).
+				return self._lower_expr( node.args[0], target_cls )
+			# every NON-literal shape (bare Name, Call, BinOp, ...): the
+			# argument's own natural type space is value_type (the underlying
+			# scalar), NEVER target_cls (the enum itself) - passing target_cls
+			# down as _lower_expr's expected_type here (the pre-fix code, for
+			# every argument shape) was a category error that only ever
+			# incidentally "worked" for a couple of shapes, not because it was
+			# correct: a bare ast.Name/Variable operand (_expr_Name) ignores
+			# expected_type entirely and keeps its own declared type, so
+			# _check_assignable's later CEnum<->value_type exemption correctly
+			# ran and correctly rejected a genuine kind mismatch (e.g. i32 for
+			# a u32-backed enum) - but a Call/BinOp argument's own result-
+			# typing tail (_lower_call's final dest allocation, `expected_type
+			# or target_return_type`) instead SILENTLY relabeled the
+			# destination temp's own type to target_cls directly, with no
+			# check at all that the callee's real return type was even a
+			# scalar, let alone value_type - confirmed via a real repro:
+			# OSError(get_rc()) (get_rc() -> i32) and OSError(rc + 0) both
+			# compiled silently, while the exact same value through a bare
+			# local, OSError(rc), was rejected as "rc: expected
+			# builtins.OSError, got intrinsics.i32" - an inconsistency across
+			# argument SHAPE, not a real distinction in what's being
+			# constructed. Fixed by lowering the argument against value_type
+			# (strict=False - a HINT only, e.g. so an untyped nested literal
+			# still settles on the right width; the real, authoritative check
+			# that the argument is even scalar-shaped happens explicitly
+			# below) and relabeling via CastWrap - a plain `(ctype)(operand)`
+			# C cast (see emitter_c.py's _emit_cast 'wrap' mode), exactly C's
+			# well-defined integer conversion rules, safe for the real cross-
+			# signedness/width reinterpretation this construction call
+			# promises, the same as an explicit T(x) scalar cast.
+			arg_operand = self._lower_expr( node.args[0], value_type, strict = False )
+			if not isinstance( arg_operand.type, Scalar ):
+				self.lowering.discovery.fail(
+					f'{target_cls.qualname}(...) argument must be a scalar value, got '
+					f'{arg_operand.type.qualname if arg_operand.type is not None else "?"}: {ast.unparse(node)}',
+					node,
+				)
+			dest = self._new_temp( target_cls )
+			self._emit( ir.CastWrap( dest = dest, operand = arg_operand ) )
+			return dest
 
 		if not isinstance( target_cls, ClassLike ):
 			return None
@@ -7197,7 +9347,7 @@ class FunctionLowering:
 			self_type = concrete_cls
 			args, kwargs = self._lower_call_args( init, node )
 		else:
-			init = target_cls.names.get( '__init__' )
+			init = target_cls.get_local_or_raise( '__init__' )
 			if isinstance( init, Function ):
 				assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
 			if init is None:
@@ -7226,26 +9376,41 @@ class FunctionLowering:
 				self_type = target_cls
 				args, kwargs = self._lower_call_args( init, node )
 
-		# self_temp.type is self_type - already scheduled above (schedule
-		# (target_cls) for the plain case, _ensure_resolved(cls_spec) for the
-		# generic case), so no separate schedule() call is needed here.
-		# ir.Allocate's own `cls`, unlike self_temp.type, is always the
-		# ABSTRACT target_cls - the emitter only uses it for an RCClass-vs-not
-		# check, never field layout (values are in `fields`, and the mangled
-		# alloc name comes from dest.type, not cls - see emitter_c.py's own
-		# ir.Allocate handling)
-		self_temp = self._new_temp( self_type )
-		self.lowering._schedule_rcclass_construction( target_cls, self_temp.type )
-		self._emit( ir.Allocate( dest = self_temp, cls = target_cls, fields = {} ))
-
+		# self_type is either already concrete (plain/resolved_construction
+		# branches) or a generic-class Specialization (_lower_generic_
+		# construction_args' own cls_spec) - _ensure_resolved is a no-op-
+		# ish pass-through for an already-concrete class (same as
+		# elsewhere in this file), so this one line handles both uniformly
 		self.lowering.schedule( init.return_type )
 		for param in init.parameters or []:
 			self.lowering.schedule( param.type )
-
-		if not self.lowering._init_fallibility( init ):
-			self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
-			return self_temp
-		return self._emit_fallible_construction( node, self_type, init, self_temp, args, kwargs, expected_type )
+		if isinstance( self_type, Specialization ):
+			# self_type was already resolved above (either by this method's
+			# own earlier branches - target.schedule/_ensure_resolved(cls_spec)
+			# in _lower_generic_construction_args - or by resolved_construction's
+			# own pre-resolution) - re-calling _ensure_resolved would just
+			# redundantly re-schedule() the same Specialization a second
+			# time for no benefit (schedule()'s own id-based _seen dedup
+			# makes it harmless, just wasted work) - .monomorphized is the
+			# same cache Monomorphizer.monomorphize_class itself reads
+			# (mpy_types.py's Specialization), a plain, side-effect-free
+			# read of what's already there
+			concrete_cls = self_type.monomorphized if self_type.monomorphized is not None else self.lowering._ensure_resolved( self_type )
+		else:
+			concrete_cls = self_type
+		assert isinstance( concrete_cls, RCClass ), f'internal compiler error: {self_type=} did not resolve to a concrete RCClass'
+		# synthesize (idempotent, memoized) rather than rely solely on the
+		# compiler.py class-registration trigger - schedule() is a
+		# deferred queue, so THIS call site needs $$__new__'s live Function
+		# object available right now, not whenever it eventually gets
+		# dequeued (see _synthesize_rcclass_constructor's own docstring)
+		self.lowering._type_resolver._synthesize_rcclass_constructor( concrete_cls, init )
+		new_fn = concrete_cls.get_local( '$$__new__' )
+		assert isinstance( new_fn, Function ), f'internal compiler error: {concrete_cls.qualname} has no synthesized $$__new__'
+		self.lowering.schedule( new_fn.return_type )
+		dest = self._new_temp( new_fn.return_type )
+		self._emit( ir.Call( dest = dest, target = new_fn, receiver = None, args = args, kwargs = kwargs ))
+		return dest
 
 	def _lower_and_infer_call_args(
 		self, node: ast.Call, callee: Function, type_params: list[TypeVar], bindings: dict[int,Type], qualname: str,
@@ -7337,257 +9502,6 @@ class FunctionLowering:
 		self.lowering._ensure_resolved( cls_spec ) # also populates init_spec.monomorphized as a side effect - same (init, concrete_args) key monomorphize_class's own method-substitution loop uses
 		monomorphized_init = self.lowering._ensure_resolved( init_spec )
 		return cls_spec, monomorphized_init, args, kwargs
-
-	def _emit_fallible_construction(
-		self, node: ast.Call, concrete_cls: RCClass|Specialization, init: Function, self_temp: ir.Temp,
-		args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None,
-	) -> ir.Operand:
-		# __init__ is fallible (Result[None,E]) - Foo(...) becomes
-		# Result[Foo,E] (SYNTAX.md). The actual Ok/Err wrapping reuses REAL
-		# Result.Ok/Result.Err call-lowering (via synthesized AST
-		# referencing hidden locals - _declare_hidden_local, the same
-		# technique the for-loop scaffolding already uses) rather than
-		# hand-building ResultPayload's own internal shape here - only the
-		# branch structure itself (and self_temp's own decref on Err, not
-		# expressible as source syntax) is raw IR, mirroring
-		# _lower_conditional_dispatch's own style
-		init_result = self._new_temp( init.return_type )
-		self._emit( ir.Call( dest = init_result, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
-
-		# track_result=False throughout this method's own hidden locals -
-		# result_var/dest_var are compiler-internal Result-typed scaffolding
-		# (see cfg.assign()'s own comment): result_var's is_err-ness is
-		# already unconditionally checked right below by the synthesized
-		# branch itself (that's the whole point of this method), and
-		# dest_var is just a relay for whichever of ok_value/err_value wins -
-		# the REAL obligation lands on whatever binding the OUTER `Foo(...)`
-		# expression's own result gets assigned into, tracked normally there
-		unique = self._label_id
-		self_var = self._declare_hidden_local( f'__ctor_self_{unique}', concrete_cls, node )
-		for instr in self._cfg_assign( self_var, self_temp, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = self_var, src = self_temp ))
-
-		result_var = self._declare_hidden_local( f'__ctor_result_{unique}', init.return_type, node )
-		for instr in self._cfg_assign( result_var, init_result, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = result_var, src = init_result ))
-
-		# _result_shape, not init.return_type.args[1] directly -
-		# init.return_type may already be the real, monomorphized Result
-		# object itself (not a Specialization wrapper) - see Monomorphizer.
-		# origin_of's own docstring. Guaranteed to succeed here: the only
-		# caller (_try_lower_construct_call) already confirmed init is
-		# fallible (Result[None,_]-shaped) via _init_fallibility before
-		# ever reaching this method
-		error_cls = self.lowering._type_resolver._result_shape( init.return_type )[1]
-		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		outer_result_type = expected_type or self.lowering.discovery._get_or_create_specialization( result_cls, [ concrete_cls, error_cls ] )
-		dest_var = self._declare_hidden_local( f'__ctor_dest_{unique}', outer_result_type, node )
-
-		is_err_fn = self.lowering._attr_lookup_callable( init.return_type, 'is_err', node )
-		self.lowering._ensure_resolved( is_err_fn )
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		is_err_temp = self._new_temp( bool_cls )
-		self._emit( ir.Call( dest = is_err_temp, target = is_err_fn, receiver = result_var, args = [], kwargs = {} ))
-
-		err_label = self._new_label( 'ctor_err' )
-		end_label = self._new_label( 'ctor_end' )
-		# JumpIfTrue, not JumpIfFalse - is_err_temp holds is_err()'s own
-		# result, so a jump-to-err has to fire when it's TRUE (a bug found
-		# while prototyping Phase 2's fallible super().__init__() chaining -
-		# JumpIfFalse here meant "not an error -> jump to the error branch",
-		# inverted, for EVERY fallible RCClass __init__ in the language, not
-		# just a subclassed one - confirmed on a clean checkout before any
-		# RCClass-subclassing work, so unrelated to it beyond being how it
-		# was found)
-		self._emit( ir.JumpIfTrue( cond = is_err_temp, target = err_label ))
-
-		# Ok branch: self is fully constructed - hand it off. Result.Ok(...)'s
-		# own construction (field_value(), called from inside its body) takes
-		# an independent Incref'd copy of self_var for the Ok payload it
-		# builds - self_var's OWN original reference is a SEPARATE unit that
-		# still needs its own release, exactly once, on every path. Dropped
-		# right here (self_var's ownership "moves" into the Ok payload,
-		# leaving exactly the one Ok-owned reference alive) via cfg.decref()+
-		# manually_decreffed() - the same pair _lower_compiler_decref uses
-		# for compiler.decref(x) - rather than left to cfg's own automatic
-		# scope-exit release: self_var is pushed as one single, branch-
-		# unaware OWNED entry (this method never calls enter_branch()/
-		# restore() around the Ok/Err split below - it's raw Jump/Label IR,
-		# invisible to that reconciliation machinery), so a compile-time
-		# entry.cancelled=True in only ONE of the two branches would wrongly
-		# suppress the automatic release on the OTHER, still-live path too
-		# (confirmed by a real regression while fixing the Err-branch bug
-		# below: cancelling self_var's entry only in the Err branch's own
-		# lowering code silently deleted its release from the Ok/success
-		# path as well, since cfg tracks one flat sequence, not per-branch
-		# state - a leak, compiler.refcount() reading 3 instead of 1 after
-		# an otherwise-correct unwrap()). Explicitly decref'ing (and
-		# cancelling) self_var in BOTH branches, symmetrically, keeps cfg's
-		# single cancelled flag valid no matter which one actually runs -
-		# each runtime path already contains its own manual release before
-		# the shared epilogue is ever reached
-		ok_expr = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
-			args = [ ast.Name( id = self_var.stem, ctx = ast.Load() ) ], keywords = [],
-		)
-		ast.copy_location( ok_expr, node )
-		ok_value = self._lower_expr( ok_expr, outer_result_type )
-		for instr in self._cfg.decref( concrete_cls, self_var ):
-			self._emit( instr )
-		for instr in self._cfg.manually_decreffed( self_var ):
-			self._emit( instr )
-		for instr in self._cfg_assign( dest_var, ok_value, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = dest_var, src = ok_value ))
-		self._emit( ir.Jump( target = end_label ))
-
-		# Err branch: self never became valid - free its own storage (but
-		# __del__ is never invoked on it - SYNTAX.md), propagate the same
-		# error, re-wrapped for THIS construction's own Result[Foo,E].
-		#
-		# Deliberately NOT self._cfg.decref(concrete_cls, self_var) (an
-		# ordinary release_object() call, the same one used to destroy any
-		# fully-valid instance of concrete_cls): that goes through the
-		# class's single, shared vtable destructor (type_resolver.py's
-		# _synthesize_rcclass_destructor), which unconditionally (1) calls
-		# self.__del__() if declared - forbidden here by SYNTAX.md - and (2)
-		# decrefs EVERY RC-typed attribute, including ones this __init__
-		# never reached an assignment for on the path that actually failed.
-		# self is only PARTIALLY constructed here - an attribute release_
-		# object's destructor reads is whatever raw bytes sys.alloc's
-		# allocator happened to return, not a valid reference - releasing it
-		# is a real, confirmed STATUS_HEAP_CORRUPTION (0xC0000374), reading/
-		# decrementing a refcount through a garbage pointer. __init__'s own
-		# Err-path return_() unwind (_stmt_Return's construction_err_path
-		# special case - see its own comment) already released whichever RC
-		# attributes IT assigned, using its own precise, path-sensitive CFG
-		# state; self's underlying allocation just needs freeing now, exactly
-		# like _synthesize_rcclass_destructor's own step 3 (sys.free(self)),
-		# skipping its steps 1 (__del__) and 2 (field cascade) entirely -
-		# self_var's own refcount is guaranteed exactly 1 here (fresh from
-		# sys.alloc, never escaped anywhere else - check_self_escape()
-		# forbids passing self out of __init__ before construction completes,
-		# which this failed path never reaches), so there's no other owner to
-		# race with a bare free. manually_decreffed(self_var) still runs
-		# below, same as before - self_var's own epilogue entry (pushed by
-		# the _cfg_assign near this method's own top) still needs neutralizing
-		# regardless of which release mechanism actually ran, or the
-		# function's own scope-exit epilogue would try to release it a SECOND
-		# time on top of this
-		# emitted as raw IR (mirroring init_result's own ir.Call near this
-		# method's own top), NOT as synthesized-AST-plus-_lower_expr the way
-		# ok_expr/err_expr above are - unlike Result.Ok/Err (synthesized
-		# specifically to reuse REAL Result-construction lowering, per this
-		# method's own opening comment), sys.free(ptr) has no sugar worth
-		# reusing, and building it as `ast.Name(id='sys', ...)` was actually
-		# tried first and failed: _lower_expr re-resolves node.func's own
-		# receiver by ordinary namespace lookup before ever consulting node.
-		# resolved_callee, which only short-circuits OVERLOAD selection, not
-		# name resolution - "name 'sys' is not defined" in any file that
-		# never imports sys (confirmed by a real regression: lowering_test.
-		# py's own fallible-init shape test, whose fixture never imports
-		# sys). type_resolver.py's _synthesize_rcclass_destructor gets away
-		# with the identical AST shape only because its own FunctionDef is
-		# scheduled and resolved through the compiler's synthesized-code
-		# path, never through an ordinary file's own import-gated namespace
-		# at all
-		sys_module = self.lowering.discovery.modules['sys']
-		free_overload = sys_module.get_local( 'free' )
-		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
-		self.lowering._ensure_resolved( free_fn )
-		free_ptr_type = free_fn.parameters[0].type
-		# label before the cast - JumpIfTrue above jumps straight here
-		self._emit( ir.Label( name = err_label ))
-		cast_dest = self._new_temp( free_ptr_type )
-		self._emit( ir.CastWrap( dest = cast_dest, operand = self_var ))
-		self._emit( ir.Call( dest = None, target = free_fn, receiver = None, args = [ cast_dest ], kwargs = {} ))
-		for instr in self._cfg.manually_decreffed( self_var ):
-			self._emit( instr )
-		err_expr = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
-			args = [ ast.Attribute(
-				value = ast.Attribute( value = ast.Name( id = result_var.stem, ctx = ast.Load() ), attr = 'data', ctx = ast.Load() ),
-				attr = 'v_Err', ctx = ast.Load(),
-			) ], keywords = [],
-		)
-		ast.copy_location( err_expr, node )
-		err_value = self._lower_expr( err_expr, outer_result_type )
-		# dest_var was ALREADY assigned once above, in the Ok branch - cfg
-		# saw that assignment first (this method never calls enter_branch()/
-		# restore() around the Ok/Err split, so cfg's single flat pass has
-		# no notion that the two are mutually exclusive) and is therefore
-		# convinced dest_var is currently a live, OWNED Result value. Its
-		# own cfg_assign() below would "helpfully" emit a decref releasing
-		# dest_var's CURRENT value before overwriting it with err_value -
-		# correct for a genuine reassignment, but WRONG here: at runtime,
-		# whichever branch actually reaches this point, the Ok branch's own
-		# assignment never ran, so dest_var's storage is uninitialized
-		# garbage - releasing it is a real, confirmed crash (illegal
-		# instruction / access violation), found by a regression test that
-		# loops a failing fallible construction: the very FIRST failure at
-		# any given call site hits this, no loop required, just never
-		# exercised by any existing test since none of them construct a
-		# class whose __init__ can actually fail. cfg.move() here discards
-		# the Ok branch's own binding as a pure cancellation (no Incref/
-		# Decref - exactly like abandoning a value that was never really
-		# there) rather than a release, so the reassignment below sees
-		# dest_var as un-owned and skips the bogus stale-value decref;
-		# move() also collapses both branches onto the SAME epilogue entry
-		# (reused, not duplicated) so whichever value dest_var ends up
-		# holding still gets released exactly once downstream
-		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
-			self._emit( instr )
-		for instr in self._cfg_assign( dest_var, err_value, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = dest_var, src = err_value ))
-		self._emit( ir.Label( name = end_label ))
-		# dest_var is a persistent hidden-local Variable (needed above so the
-		# synthesized Result.Ok/Err ast.Call machinery has a real Name to
-		# reference), not an ir.Temp - but every OTHER Call in this file
-		# returns a genuine ir.Temp, and callers rely on that: _is_aliasing_
-		# expr treats `Foo(...)` (an ast.Call node) as always-fresh (is_alias
-		# =False, no Incref needed to store it into a new binding) on the
-		# assumption - stated in its own docstring - that "a well-behaved
-		# callee already accounts for that on its own side", i.e. hands back
-		# a value whose ownership transfers cleanly with a bare pointer copy.
-		# Returning dest_var directly broke that assumption: cfg.assign()'s
-		# own "ownership transfers into dest, untrack the momentary Temp"
-		# branch (see its own docstring) only ever fires for isinstance(src,
-		# ir.Temp), so `r = Foo(...)` left dest_var independently OWNED in
-		# cfg's own bookkeeping AT THE SAME TIME r became its own independent
-		# owner of the identical value - two tracked owners, one real
-		# reference, decref'd twice at scope exit. Confirmed by a real,
-		# repeated compile-and-run crash (segfault): two fallible
-		# constructions of the same class in one function, or a single one
-		# whose Result is retained/queried (.is_ok()) rather than immediately
-		# consumed, both over-released the constructed object.
-		#
-		# Moving dest_var's value into a genuine fresh Temp here (registered
-		# via fresh_temp(), exactly like every Call/Allocate dest already is
-		# in _emit()) restores that contract: cfg.move() cancels dest_var's
-		# own pending epilogue decref (ownership transfers out, no Incref/
-		# Decref of its own), and the Temp then gets the SAME automatic
-		# handling as any other fresh Call result - untracked cleanly if
-		# consumed into a new binding (`r = Foo(...)`), or self-released by
-		# its own DeleteTemp at the end of this statement if merely used as
-		# a transient receiver (`Foo(...).unwrap(...)`) and never bound at
-		# all. The naive alternative (just cfg.move()-ing dest_var and
-		# returning it as-is, tried first) fixed the crash above but broke
-		# the OTHER direction instead - a real, confirmed LEAK: dest_var's
-		# own release is what balances Result.Ok's own retain_object() when
-		# nothing else ever claims independent ownership of that reference
-		# (e.g. a receiver never stored into a named binding), and simply
-		# cancelling it with nothing left to release it lost that reference
-		# forever. compiler.refcount() on the unwrapped value read 3 (should
-		# have been 1) before this Temp indirection was added.
-		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
-			self._emit( instr )
-		final = self._new_temp( outer_result_type )
-		self._emit( ir.Assign( dest = final, src = dest_var ))
-		self._cfg.fresh_temp( final, outer_result_type )
-		return final
 
 	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
 		# ScalarName(x) - Python's own int(x)/float(x)-style constructor-as-
@@ -7765,7 +9679,7 @@ class FunctionLowering:
 		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None )
 		return unwrapped if want_result else None
 
-	def _lower_call_args( self, target: Function, node: ast.Call ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
+	def _lower_call_args( self, target: Function, node: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
 		# shared by the plain call path (_lower_call's own else branch) and
 		# _lower_generic_function_call: lowers positional/keyword args
 		# straight against target's own already-concrete declared parameter
@@ -7777,7 +9691,7 @@ class FunctionLowering:
 		# expected type at all, and move hooks apply in a separate pass
 		# afterward instead), so forcing them through this helper would
 		# change what expected_type each argument actually gets
-		positional, keyword = self.lowering._match_call_args( target, node )
+		positional, keyword = self.lowering._match_call_args( target, node, receiver_fills_first_param = receiver_fills_first_param )
 		args = []
 		for param, expr in positional:
 			operand = self._lower_expr( expr, param.type )
@@ -7796,6 +9710,14 @@ class FunctionLowering:
 		given.update( kwargs.keys() )
 		for param in target.parameters or []:
 			if param.stem not in given and param.default is not None:
+				# a construction call embedded in the default (`x: Foo =
+				# Foo()`) needs the same eager __init__ pre-resolution an
+				# ordinary body statement gets from _ReferenceResolver -
+				# defaults live on fn.node.args, never walked by resolve_
+				# function_body's fn.node.body loop, and are lowered here,
+				# often before target's own turn on the compile queue ever
+				# comes up - see resolve_parameter_default's own docstring
+				self.lowering._type_resolver.resolve_parameter_default( target, param )
 				# lowered in the CALLEE's own module/scope, not the
 				# caller's (matching the identical field-default pattern
 				# above in _lower_allocate_fields) - a default expression
@@ -7843,7 +9765,19 @@ class FunctionLowering:
 		self._inlining_stack.append( id( target ))
 		try:
 			if len( stmts ) > 1:
-				return self._splice_multi_statement_inline_body( node, target, receiver, args, kwargs, expected_type, want_result, stmts )
+				# the splice's own pre-return statements bind self/params
+				# (and declare their own alpha-renamed locals) directly on
+				# the shared self._cfg - unlike provisional.names (a fresh,
+				# single-use, discarded Function), self._cfg._live is NOT
+				# reverted internally by _splice_multi_statement_inline_body
+				# itself, so it's done here instead: wholesale snapshot/
+				# restore around the whole call - see set_live()'s own
+				# docstring for why a full revert is safe here
+				saved_live = self._cfg.live_snapshot()
+				try:
+					return self._splice_multi_statement_inline_body( node, target, receiver, args, kwargs, expected_type, want_result, stmts )
+				finally:
+					self._cfg.set_live( saved_live )
 
 			bindings: dict[str,ir.Operand] = {} if receiver is None else { 'self': receiver }
 			for i, param in enumerate( target.parameters or [] ):
@@ -7893,6 +9827,8 @@ class FunctionLowering:
 			# above) and to guarantee it's evaluated exactly once even if the
 			# spliced body references self/that parameter more than once
 			saved: dict[str,object] = {}
+			saved_live: dict[str,bool] = {}
+			bound_ids: set[int] = set() # see _incref_aliasing_return's own `force` doc - every self/parameter binding here is always treated as borrowed
 			for stem, operand in bindings.items():
 				if isinstance( operand, Variable ):
 					fresh = operand
@@ -7905,8 +9841,23 @@ class FunctionLowering:
 					)
 					self._inline_binding_id += 1
 					self._emit( ir.Assign( dest = fresh, src = operand ))
+				bound_ids.add( id( fresh ))
 				saved[stem] = target.names.get( stem )
 				target.names[stem] = fresh
+				# liveness is keyed by `stem` (the literal 'self'/parameter
+				# name the spliced body's own ast.Name nodes reference it
+				# by, via target.names) NOT fresh.stem (which differs for
+				# the synthesized-local fallback above, and even for the
+				# zero-copy case is the CALLER's own variable's stem, e.g.
+				# 'b' for a `b.get_len()` receiver, not 'self'). Bypasses
+				# _cfg_assign like the rest of this binding deliberately
+				# does (see this method's own "no _cfg_assign/incref here"
+				# comment above) - still unconditionally bound right here.
+				# Saved/restored the same shadow-and-restore way target.
+				# names itself is, in case `stem` collides with an outer
+				# name that wasn't actually live before this splice.
+				saved_live[stem] = self._cfg.is_live( stem )
+				self._cfg.mark_live( stem )
 
 			return_expr = stmts[-1].value
 			module = self.lowering._find_module_for( target )
@@ -7914,7 +9865,11 @@ class FunctionLowering:
 				with self.lowering.discovery.module_context( module ):
 					with self.lowering.discovery.scope_context( target ):
 						result = self._lower_expr( return_expr, expected_type or target.return_type )
+						self._incref_aliasing_return( return_expr, result, force = id( result ) in bound_ids )
 			finally:
+				for stem, was_live in saved_live.items():
+					if not was_live:
+						self._cfg.unmark_live( stem )
 				for stem, old in saved.items():
 					if old is None:
 						target.names.pop( stem, None )
@@ -8021,6 +9976,7 @@ class FunctionLowering:
 		# bind self/params into the PROVISIONAL's own names dict - same
 		# logic the single-statement path above uses for target.names,
 		# just no save/restore needed (provisional is single-use)
+		bound_ids: set[int] = set() # see _incref_aliasing_return's own `force` doc - every self/parameter binding here is always treated as borrowed
 		for stem, operand in bindings.items():
 			if isinstance( operand, Variable ):
 				fresh = operand
@@ -8033,7 +9989,14 @@ class FunctionLowering:
 				)
 				self._inline_binding_id += 1
 				self._emit( ir.Assign( dest = fresh, src = operand ))
+			bound_ids.add( id( fresh ))
 			provisional.names[stem] = fresh
+			# liveness keyed by `stem` (see _lower_inline_call's own
+			# identical single-statement-path comment) - the caller
+			# (_lower_inline_call) reverts self._cfg's ENTIRE live set once
+			# this whole splice returns, so no per-stem save/restore is
+			# needed here, unlike provisional.names/that other path
+			self._cfg.mark_live( stem )
 
 		# early/nested-return + defer/errdefer/.or_return() generalization -
 		# a splice-local "epilogue" scope for the pre-return statements: an
@@ -8163,6 +10126,7 @@ class FunctionLowering:
 					# single-statement/original multi-statement code always
 					# computed it
 					result = self._lower_expr( return_stmt.value, expected_type )
+					self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
 					return result if want_result else None
 
 				assert scope_label is not None and exited_flag is not None and merge_label is not None
@@ -8201,6 +10165,7 @@ class FunctionLowering:
 				self._emit( ir.Jump( target = converge_label ))
 				self._emit( ir.Label( name = normal_label ))
 				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+				self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
 				self._emit( ir.Assign( dest = result, src = trailing_value ))
 				# trailing_value's own ownership (if it's a bare temp - e.g.
 				# the Result.Ok(x) construction temp a trailing `return
@@ -8291,6 +10256,22 @@ class FunctionLowering:
 		for param, _expr in keyword:
 			self._apply_move_hook( param, kwargs[param.stem], target.qualname )
 
+		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
+		# else: this parameter position doesn't mention any of type_params
+		# (a concrete parameter, or a nested type whose base doesn't even
+		# match the argument's) - nothing to infer here. Not an error by
+		# itself: a genuine argument-type mismatch isn't checked anywhere
+		# yet (no general type-checking pass exists), same as every other
+		# call site in this file today
+
+	def _finish_generic_call( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# shared tail of _lower_inferred_generic_call (extracted verbatim,
+		# unchanged) and _lower_overload_generic_call below - once `bindings`
+		# holds every type param inferable from the ARGUMENTS alone (however
+		# they were obtained: interleaved lower+unify for a bare generic-
+		# function call, or unified against already-lowered operands for a
+		# resolved Overload-group generic candidate), monomorphizing and
+		# emitting the call is identical either way.
 		missing = [ tv for tv in target.type_params or [] if id( tv ) not in bindings ]
 		if missing:
 			# return-only inference: a still-unbound type param that never
@@ -8336,12 +10317,182 @@ class FunctionLowering:
 		if monomorphized.is_inline:
 			return self._lower_inline_call( node, monomorphized, receiver, args, kwargs, expected_type, want_result )
 		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
-		# else: this parameter position doesn't mention any of type_params
-		# (a concrete parameter, or a nested type whose base doesn't even
-		# match the argument's) - nothing to infer here. Not an error by
-		# itself: a genuine argument-type mismatch isn't checked anywhere
-		# yet (no general type-checking pass exists), same as every other
-		# call site in this file today
+
+	def _lower_overload_generic_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# an Overload group's own overload_resolution.resolve_call picked a
+		# GENERIC candidate (target.type_params truthy - e.g. a `[T](x: T)`
+		# alternative sharing a name with one or more concrete overloads) as
+		# either the sole unconditional match or the trailing default of a
+		# runtime ConditionalDispatch. Unlike _lower_inferred_generic_call,
+		# args/kwargs are ALREADY lowered operands here (resolve_call needed
+		# their real types before it could even pick this candidate - see the
+		# Overload branch's own _lower_overload_arg call, above) - so there's
+		# no interleaved lower+unify to do, just unification directly against
+		# each already-known operand's own .type, then the identical
+		# monomorphize-and-emit tail _lower_inferred_generic_call itself
+		# funnels into via _finish_generic_call.
+		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by overload_resolution.resolve_call'
+		type_params = target.type_params or []
+		bindings: dict[int,Type] = {}
+		for param, operand in zip( target.parameters or [], args ):
+			self.lowering._unify_type_param( type_params, param.type, operand.type, bindings, node, target.qualname )
+		for param in target.parameters or []:
+			if param.stem in kwargs:
+				self.lowering._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, target.qualname )
+		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
+
+	# defensive cap on how many distinct per-tag monomorphizations
+	# _expand_dispatch_target will synthesize for ONE generic branch -
+	# mirrors overload_resolution.py's own _MAX_TRACKED_STATES spirit (a
+	# named, trivially-adjustable constant, not a hard architectural limit).
+	# Every real lib/ overload group is 1-2 params/2-4 leaves - nowhere near
+	# this before it'd be a genuine sign of a mis-scoped overload group
+	# rather than a legitimate need for more combos
+	_MAX_DISPATCH_COMBOS = 64
+
+	def _dispatch_remaining_leaves(
+		self, node: ast.Call, target: Function, param: Parameter,
+		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
+	) -> list[Type]:
+		# every leaf `param` could still be, once THIS branch's own runtime
+		# tag check(s) (if any) have already excluded every other candidate -
+		# see _expand_dispatch_target's own comment. `known` (keyed by
+		# id(param)) covers whatever this branch's own condition (or an
+		# earlier _expand_dispatch_target combo) already pinned down
+		# explicitly - returned as the sole element, no further narrowing
+		# needed. Every OTHER parameter is narrowed from the real call-site
+		# operand's own (possibly still union) type, minus whatever leaves
+		# `claimed` (built from every OTHER branch's own conditions - only
+		# ever non-empty for the trailing default) already accounts for
+		# elsewhere. Exactly one leaf here means this parameter is statically
+		# resolvable (_monomorphize_dispatch_target); more than one is what
+		# _expand_dispatch_target splits into distinct per-leaf branches.
+		if id( param ) in known:
+			return [ known[ id( param ) ] ]
+		operand = self.lowering._dispatch_operand_for_param( node, target, param, args, kwargs )
+		already = claimed.get( id( operand ), [] )
+		return [
+			leaf for leaf in operand.type.leaves()
+			if not any( self.lowering._type_resolver._same_type( leaf, c ) for c in already )
+		]
+
+	def _monomorphize_dispatch_target(
+		self, node: ast.Call, target: Function,
+		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
+	) -> Function:
+		# monomorphizes a GENERIC branch/default of a runtime-dispatched
+		# Overload call in place, so the rest of _lower_conditional_dispatch
+		# (which schedules every branch's target as an ordinary, concrete
+		# compile unit) never sees a bare TypeVar parameter. Unlike
+		# _lower_overload_generic_call (which unifies T against the FULL,
+		# possibly-union call-site operand type, for the "sole unconditional
+		# match" case), a ConditionalDispatch branch/default only ever runs
+		# once every OTHER branch's own runtime tag check has excluded its own
+		# leaf(s) - _dispatch_remaining_leaves resolves the real, narrower
+		# type(s) reaching THIS target at each parameter. Caller contract:
+		# every parameter must already resolve to EXACTLY one leaf here (see
+		# _expand_dispatch_target, the only real caller) - asserted, not
+		# re-validated, since by the time this is called any genuine
+		# ambiguity has already been split into a separate combo.
+		type_params = target.type_params or []
+		bindings: dict[int,Type] = {}
+		for param in target.parameters or []:
+			remaining = self._dispatch_remaining_leaves( node, target, param, known, args, kwargs, claimed )
+			assert len( remaining ) == 1, (
+				f'internal compiler error - {target.qualname} parameter {param.stem!r} not resolved to exactly '
+				f'one leaf before monomorphizing ({len(remaining)} remaining) - _expand_dispatch_target caller contract violated'
+			)
+			self.lowering._unify_type_param( type_params, param.type, remaining[0], bindings, node, target.qualname )
+		missing = [ tv for tv in type_params if id( tv ) not in bindings ]
+		if missing:
+			# every real lib/ generic overload binds every type param
+			# directly off a parameter (see this module's own note on
+			# real-world overload group shapes) - return-only inference
+			# (_infer_return_only_type_params) is a materially bigger
+			# feature to wire through a runtime-dispatched branch (it needs
+			# to actually lower the body to infer the return type) and isn't
+			# attempted here; fails clearly rather than silently
+			self.lowering.discovery.fail(
+				f'a generic overload of {target.qualname} cannot be one branch of a runtime-dispatched call '
+				f'(type parameter(s) {", ".join(tv.stem for tv in missing)} aren\'t bound by any parameter - '
+				f'return-only inference isn\'t supported here yet): {ast.unparse(node)}',
+				node,
+			)
+		inferred_args = [ bindings[id(tv)] for tv in type_params ]
+		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
+		return self.lowering._monomorphized_function( spec )
+
+	def _remap_conditions(
+		self, original_params: list[Parameter], new_params: list[Parameter], conditions: list[tuple[Parameter,Type]],
+	) -> list[tuple[Parameter,Type]]:
+		# a monomorphized Function has its own, distinct Parameter objects
+		# (same count/order as the generic original - substitution never
+		# reorders or drops parameters) - a runtime condition built against
+		# the ORIGINAL generic function's own Parameter identity (from
+		# resolve_call, or from an earlier _expand_dispatch_target combo)
+		# has to be re-pointed at the monomorphized function's corresponding
+		# one before _lower_dispatch_tests/_dispatch_operand_for_param can
+		# find it there (identity lookup, not structural equality - see
+		# their own docstrings)
+		return [
+			( new_params[ next( i for i, op in enumerate( original_params ) if op is p ) ], leaf_type )
+			for p, leaf_type in conditions
+		]
+
+	def _expand_dispatch_target(
+		self, node: ast.Call, target: Function,
+		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
+	) -> list[tuple[list[tuple[Parameter,Type]],Function]]:
+		'''
+		Resolves a GENERIC branch/default of a runtime-dispatched Overload
+		call into one or more concrete (extra_conditions, monomorphized
+		Function) pairs. Most of the time this is exactly one entry with no
+		extra conditions - the EASY case (_monomorphize_dispatch_target's own
+		docstring): every parameter's real leaf is already pinned to exactly
+		one value here, either explicitly (`known`, from this branch's own
+		runtime condition) or by elimination (`claimed`, only ever populated
+		for the trailing default).
+
+		When one or more parameters can still legitimately be more than one
+		leaf here - the HARD case this dispatch machinery used to reject
+		outright - this ONE branch is split into one synthetic entry PER
+		combination of those parameters' remaining leaves, each monomorphized
+		with its own distinct T binding and given its own extra runtime
+		condition(s) pinning exactly that combination. This turns "this one
+		generic branch might need any of N different C functions at runtime,
+		selected by a tag no single Call target can express" into N ordinary,
+		individually-concrete branches - exactly the shape
+		_lower_conditional_dispatch already knows how to schedule, just more
+		of them. The caller (the Overload branch of _lower_call) is
+		responsible for splicing these into the overall branches/default
+		list and picking exactly one overall entry to remain the trailing,
+		unconditioned default.
+		'''
+		params = target.parameters or []
+		remaining_by_id = {
+			id( p ): self._dispatch_remaining_leaves( node, target, p, known, args, kwargs, claimed )
+			for p in params
+		}
+		ambiguous = [ p for p in params if len( remaining_by_id[ id( p ) ] ) != 1 ]
+		if not ambiguous:
+			return [ ( [], self._monomorphize_dispatch_target( node, target, known, args, kwargs, claimed )) ]
+		combo_count = math.prod( len( remaining_by_id[ id( p ) ] ) for p in ambiguous )
+		if combo_count > self._MAX_DISPATCH_COMBOS:
+			self.lowering.discovery.fail(
+				f'a generic overload of {target.qualname} used as a runtime-dispatched branch would need '
+				f'{combo_count} separate per-type monomorphizations here (more than {self._MAX_DISPATCH_COMBOS}) - '
+				f'narrow the overloaded parameter types: {ast.unparse(node)}',
+				node,
+			)
+		results: list[tuple[list[tuple[Parameter,Type]],Function]] = []
+		for combo in itertools.product( *( remaining_by_id[ id( p ) ] for p in ambiguous )):
+			combo_known = dict( known )
+			combo_known.update({ id( p ): leaf for p, leaf in zip( ambiguous, combo ) })
+			monomorphized = self._monomorphize_dispatch_target( node, target, combo_known, args, kwargs, claimed )
+			new_params = monomorphized.parameters or []
+			extra_conditions = self._remap_conditions( params, new_params, list( zip( ambiguous, combo )))
+			results.append(( extra_conditions, monomorphized ))
+		return results
 
 	def _infer_return_only_type_params( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], return_only: list[TypeVar] ) -> Function:
 		# PLAN_RETURN_INFERENCE.md - non-@inline variant: a bare generic
@@ -8634,8 +10785,28 @@ class FunctionLowering:
 				result = self._lower_compiler_refcount( node, expected_type )
 				return result if want_result else None
 
+			case 'checked_add' | 'wrapped_add' | 'saturated_add' | 'checked_sub' | 'wrapped_sub' | 'saturated_sub' | \
+				'checked_mul' | 'wrapped_mul' | 'saturated_mul' | 'checked_floordiv' | 'wrapped_floordiv' | 'saturated_floordiv' | \
+				'checked_mod' | 'wrapped_mod' | 'saturated_mod' | 'checked_truediv' | 'wrapped_truediv':
+				# every compiler.<mode>_<kind>(a, b) intrinsic shares one
+				# lowering - see _lower_compiler_checked_binop and
+				# _CHECKED_BINOP_OPCODES/_CHECKED_FLOAT_BINOP_OPCODES for how
+				# (kind, mode) picks the actual opcode per operand type
+				name = self.lowering._is_compiler_call( node )
+				mode, _sep, kind = name.partition( '_' )
+				result = self._lower_compiler_checked_binop( node, name, kind, mode, expected_type )
+				return result if want_result else None
+
 			case 'cast':
 				result = self._lower_compiler_cast( node, expected_type )
+				return result if want_result else None
+
+			case 'checked_convert':
+				result = self._lower_compiler_checked_convert( node, expected_type )
+				return result if want_result else None
+
+			case '__raw_alloc__':
+				result = self._lower_compiler_raw_alloc( node, expected_type )
 				return result if want_result else None
 
 			case 'addrof':
@@ -9005,7 +11176,88 @@ class FunctionLowering:
 					)
 				branches = [ ConditionalDispatch( conditions = b.conditions, function = _resolve_original( b.function )) for b in branches ]
 				resolved = _resolve_original( resolved )
-				return self._lower_conditional_dispatch( node, branches, resolved, args, kwargs, expected_type, want_result )
+				if resolved.type_params or any( b.function.type_params for b in branches ):
+					# a GENERIC candidate as one branch (or the trailing
+					# default) of a runtime-dispatched overload group: which
+					# concrete C symbol to call has to be fixed at compile
+					# time (this compiler has no vtable/runtime-polymorphic
+					# dispatch concept anywhere) - reachable only when the
+					# call's own union-typed argument has leaves routing to
+					# more than one overload, at least one of them generic.
+					#
+					# Whatever leaf(s) of the union still reach one particular
+					# generic branch/default get resolved STATICALLY, either
+					# explicitly (a non-default branch always has its own
+					# runtime condition(s) - see overload_resolution.
+					# resolve_call) or by elimination (the trailing default:
+					# the call's real leaves at that slot, minus whatever
+					# every OTHER branch's own condition already claims
+					# there). The common case is exactly ONE leaf - T is
+					# knowable at compile time same as any other generic
+					# call, and this branch is monomorphized in place before
+					# ever reaching _lower_conditional_dispatch (which
+					# unconditionally schedules every branch's target as an
+					# ordinary, already-concrete compile unit).
+					#
+					# When 2+ leaves can still legitimately reach ONE generic
+					# branch (e.g. a 3+-member union where only one member
+					# has a concrete overload - every OTHER member falls
+					# through to the SAME generic default, each needing its
+					# own distinct monomorphization) - _expand_dispatch_target
+					# splits that ONE branch into one new, individually-
+					# concrete branch PER leaf, each with its own extra
+					# runtime condition pinning exactly that leaf. Exactly
+					# one overall entry (see `default_fn` below) stays the
+					# trailing, unconditioned default - by construction, once
+					# every OTHER entry's own condition has been tested and
+					# excluded, only that one's own territory can remain, so
+					# it never needs a check of its own either way.
+					# every leaf already spoken for by a CONCRETE candidate,
+					# keyed by the real call-site operand it came from - not
+					# just whichever branches happen to carry an explicit
+					# runtime condition: a concrete candidate that ends up as
+					# the trailing default has its own condition computed
+					# then discarded by resolve_call (see its own "own
+					# leaves" comment - a default never needs one), so
+					# reading conditions alone under-counts. A concrete
+					# function's own declared parameter type unambiguously
+					# IS the one leaf it handles, condition or not - reading
+					# .parameters directly instead is both simpler and
+					# correct for every concrete candidate, branch or default.
+					claimed: dict[int,list[Type]] = {}
+					for b in ( *branches, ConditionalDispatch( conditions = [], function = resolved )):
+						if b.function.type_params:
+							continue
+						for p in b.function.parameters or []:
+							if p.type is None:
+								continue
+							operand = self.lowering._dispatch_operand_for_param( node, b.function, p, args, kwargs )
+							claimed.setdefault( id( operand ), [] ).append( p.type )
+					new_branches: list[ConditionalDispatch] = []
+					for b in branches:
+						if not b.function.type_params:
+							new_branches.append( b )
+							continue
+						original_params = b.function.parameters or []
+						known = { id( p ): t for p, t in b.conditions }
+						for extra_conditions, monomorphized in self._expand_dispatch_target( node, b.function, known, args, kwargs, claimed ):
+							new_params = monomorphized.parameters or []
+							remapped = self._remap_conditions( original_params, new_params, b.conditions )
+							new_branches.append( ConditionalDispatch( conditions = remapped + extra_conditions, function = monomorphized ))
+					branches = new_branches
+					if resolved.type_params:
+						# the LAST expansion becomes the new trailing default
+						# (its own extra_conditions are dropped - see the
+						# comment above); every OTHER expansion is a genuine
+						# new conditioned branch, appended after the ones
+						# above (lowest priority, matching resolve_call's own
+						# "default is whatever's left once every real branch
+						# is excluded" convention)
+						*extra, ( _, default_fn ) = self._expand_dispatch_target( node, resolved, {}, args, kwargs, claimed )
+						for extra_conditions, monomorphized in extra:
+							new_branches.append( ConditionalDispatch( conditions = extra_conditions, function = monomorphized ))
+						resolved = default_fn
+				return self._lower_conditional_dispatch( node, branches, resolved, receiver, args, kwargs, expected_type, want_result )
 			winning_stub = next( ( s for s in target.stubs if s.bound_to is resolved ), None )
 			if (
 				winning_stub is not None and winning_stub.return_type is not resolved.return_type
@@ -9015,6 +11267,28 @@ class FunctionLowering:
 			):
 				narrowed_return_type = winning_stub.return_type
 			target = resolved
+			if target.type_params:
+				# resolve_call picked a GENERIC candidate (see overload_
+				# resolution.py's own wildcard/TypeVar handling) - target is
+				# still the abstract, unspecialized Function here, never a
+				# real compile unit of its own (only ITS monomorphized
+				# Specialization ever is - see _emit_generic_call's own
+				# scheduling). Deliberately skips _ensure_resolved(target)
+				# below (unlike the concrete case) - resolve_call() already
+				# resolved every group member internally, and
+				# _ensure_resolved's own unconditional schedule() would
+				# register this bare abstract Function as a real compile
+				# unit, reaching the emitter with a still-bare TypeVar
+				# parameter (confirmed via a real repro: emitter_c.py's
+				# c_type() crashes with NotImplementedError on the TypeVar
+				# itself). Route through the same inference+monomorphization
+				# machinery a bare generic-function call uses instead of
+				# falling into the rest of this branch, which assumes a
+				# concrete target.parameters (union-coercion, move
+				# validation, default-arg filling) and the shared call-
+				# emission tail below, neither of which apply to an
+				# unspecialized generic target.
+				return self._lower_overload_generic_call( node, target, receiver, args, kwargs, expected_type, want_result )
 			self.lowering._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
 
 			# args/kwargs were lowered by _lower_overload_arg BEFORE target was
@@ -9095,11 +11369,16 @@ class FunctionLowering:
 			given.update( kwargs.keys() )
 			for param in target.parameters or []:
 				if param.stem not in given and param.default is not None:
+					# see _lower_call_args's identical call for why this is
+					# needed - a construction call embedded in this default
+					# otherwise never gets its __init__ eagerly pre-resolved
+					self.lowering._type_resolver.resolve_parameter_default( target, param )
 					default_operand = self._lower_expr( param.default, param.type )
 					kwargs[param.stem] = default_operand
 		else:
 			self.lowering._resolve_call_target( target )
-			args, kwargs = self._lower_call_args( target, node )
+			receiver_fills_first_param = receiver is not None and isinstance( target, Function ) and target.cls is None
+			args, kwargs = self._lower_call_args( target, node, receiver_fills_first_param = receiver_fills_first_param )
 
 		if receiver is not None and isinstance( target, Function ) and target.cls is None:
 			# a Scalar-registered method (`SomeScalar.method = some_free_
@@ -9228,22 +11507,50 @@ class FunctionLowering:
 				# value's own REAL type back, not this hint bounced straight
 				# through) would otherwise silently override dest with a
 				# meaningless, unresolvable type instead of what the callee
-				# actually returns
-				dest = self._new_temp( target_return_type if isinstance( expected_type, TypeVar ) else ( expected_type or target_return_type ))
+				# actually returns.
+				#
+				# Beyond the TypeVar case, expected_type is only safe to use
+				# for dest when it's the SAME type as target_return_type (just
+				# possibly a different Specialization/TupleType representation
+				# of the identical instantiation - _same_type's own docstring)
+				# - using it whenever merely non-None, regardless of whether it
+				# actually matches, let a genuinely mismatched declared local
+				# type (`x: i32 = a_result_returning_call()`) silently retype
+				# dest to i32 while the callee's real C prototype still returns
+				# the whole Result struct, producing invalid C AND skipping
+				# _coerce_or_check_operand's own mismatch rejection below
+				# entirely (operand.type came back already equal to
+				# expected_type, so its "still mismatched past this point"
+				# check never even saw a mismatch to catch). A genuine
+				# mismatch here now falls through with dest correctly typed as
+				# target_return_type instead, so the coercion-or-rejection
+				# tail gets an honest look at it.
+				if isinstance( expected_type, TypeVar ):
+					dest = self._new_temp( target_return_type )
+				elif expected_type is not None and target_return_type is not None and not self.lowering._type_resolver._same_type( target_return_type, expected_type ):
+					dest = self._new_temp( target_return_type )
+				else:
+					dest = self._new_temp( expected_type or target_return_type )
 			self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return dest
 		else:
 			self._emit( ir.Call( dest = None, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return None
 
-	def _lower_conditional_dispatch( self, node: ast.Call, branches: list[ConditionalDispatch], default: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+	def _lower_conditional_dispatch( self, node: ast.Call, branches: list[ConditionalDispatch], default: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# a union-typed argument's runtime tag decides which overload
 		# implementation actually runs (e.g. len(copy_from) where
 		# copy_from: bytes|bytearray resolves to two candidates, bytes and
 		# bytearray). Reuses the same tag/data/v_<member> machinery match
 		# statements use (UnionStorage.get) - branches are tried in
 		# priority order, falling through to `default` (no test needed -
-		# it's whatever's left once every more specific branch is excluded)
+		# it's whatever's left once every more specific branch is excluded).
+		# `receiver` is the SAME instance operand for every branch (an
+		# Overload group is either entirely bound methods sharing one
+		# receiver, or entirely receiver-less free functions/statics - never
+		# a mix) - already scheduled/move-tracked by _lower_call before ever
+		# reaching here, so it's just threaded through unchanged into each
+		# branch's own ir.Call, same as `args`/`kwargs` already are.
 		self.lowering._ensure_resolved( default )
 		for branch in branches:
 			self.lowering._ensure_resolved( branch.function )
@@ -9253,10 +11560,10 @@ class FunctionLowering:
 		for branch in branches:
 			next_label = self._new_label( 'dispatch_next' )
 			self._lower_dispatch_tests( node, branch.function, branch.conditions, args, kwargs, next_label )
-			self._emit_dispatch_call( branch.function, args, kwargs, dest, want_result )
+			self._emit_dispatch_call( branch.function, receiver, args, kwargs, dest, want_result )
 			self._emit( ir.Jump( target = end_label ))
 			self._emit( ir.Label( name = next_label ))
-		self._emit_dispatch_call( default, args, kwargs, dest, want_result )
+		self._emit_dispatch_call( default, receiver, args, kwargs, dest, want_result )
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
@@ -9290,7 +11597,7 @@ class FunctionLowering:
 			self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] ) ))
 			self._emit( ir.JumpIfFalse( cond = cmp_dest, target = next_label ))
 
-	def _emit_dispatch_call( self, target: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], dest: ir.Temp|None, want_result: bool ) -> None:
+	def _emit_dispatch_call( self, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], dest: ir.Temp|None, want_result: bool ) -> None:
 		params = target.parameters or []
 		unwrapped_args = [ self._maybe_unwrap_union_arg( a, p.type ) for a, p in zip( args, params ) ]
 		unwrapped_kwargs = {
@@ -9300,7 +11607,7 @@ class FunctionLowering:
 		self.lowering.schedule( target.return_type )
 		for p in params:
 			self.lowering.schedule( p.type )
-		self._emit( ir.Call( dest = dest if want_result else None, target = target, receiver = None, args = unwrapped_args, kwargs = unwrapped_kwargs ))
+		self._emit( ir.Call( dest = dest if want_result else None, target = target, receiver = receiver, args = unwrapped_args, kwargs = unwrapped_kwargs ))
 
 	def _maybe_unwrap_union_arg( self, operand: ir.Operand, target_type: Type|None ) -> ir.Operand:
 		# a union-typed call-site argument (copy_from: bytes|bytearray)

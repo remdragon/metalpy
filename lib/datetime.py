@@ -36,7 +36,6 @@
 # not an oversight.
 
 import compiler
-import sys
 from _civil_calendar import days_from_civil, civil_from_days, weekday_from_days, days_in_month
 from math import floordiv_i64, floormod_i64
 from zoneinfo import ZoneInfo
@@ -46,6 +45,13 @@ _US_PER_SECOND: i64 = 1_000_000
 _US_PER_DAY: i64 = 86_400_000_000
 _SECONDS_PER_DAY: i64 = 86400
 
+__localtz: ZoneInfo|None = None
+
+def localtz() -> ZoneInfo:
+	global __localtz
+	if __localtz is None:
+		__localtz = ZoneInfo()
+	return __localtz
 
 @union
 class DateError:
@@ -224,22 +230,25 @@ class date:
 		return civil_from_days( self._epoch_day ).day
 
 	@staticmethod
-	def today( tz: ZoneInfo ) -> date:
-		''' tz is required (no zero-arg form, unlike Python's date.today())
-		- "today" is itself timezone-dependent (a calendar day rolls over
-		at local midnight, which differs per zone), and there's no "OS
-		local zone" default to silently fall back to in this design (see
-		this module's own docstring on why datetime.tzinfo is mandatory) -
-		use time.get_local_timezone_name() to pass one explicitly. '''
+	def today( tz: ZoneInfo|None = None ) -> date:
+		''' tz omitted defaults to the system's own configured local zone
+		(see localtz()) - "today" is itself timezone-dependent (a calendar
+		day rolls over at local midnight, which differs per zone), so the
+		result is always a fully tz-aware, unambiguous date either way;
+		the default only saves typing one out, it doesn't reintroduce the
+		ambiguity this module's own docstring is about (that's
+		datetime.tzinfo staying mandatory, unrelated to this). '''
 		import time as _time
 		now: f64 = _time.time()
 		return date.fromtimestamp( now, tz )
 
 	@staticmethod
-	def fromtimestamp( t: f64, tz: ZoneInfo ) -> date:
+	def fromtimestamp( t: f64, tz: ZoneInfo|None = None ) -> date:
+		''' tz omitted defaults to the system's own configured local zone -
+		see today()'s own docstring. '''
 		with compiler.wrap_arithmetic:
 			epoch_seconds: i64 = i64( t )
-		offset: i32 = tz.utcoffset( epoch_seconds )
+		offset: i32 = ( tz or localtz() ).utcoffset( epoch_seconds )
 		with compiler.wrap_arithmetic:
 			local_seconds: i64 = epoch_seconds + i64( offset )
 		epoch_day: i64 = floordiv_i64( local_seconds, _SECONDS_PER_DAY )
@@ -274,14 +283,17 @@ class date:
 		return date._from_epoch_day( new_epoch_day )
 
 	def __sub__( self, other: date ) -> timedelta:
-		''' date - date -> timedelta only (the more common case) - date -
-		timedelta isn't supported directly (a second __sub__ overload for it
-		hit confusing operator-dispatch behavior when combined with
-		@overload - not pursued for this pass); use `d + (-delta)` instead. '''
+		''' date - date -> timedelta; see the __sub__(timedelta) overload
+		below for date - timedelta -> date. '''
 		with compiler.wrap_arithmetic:
 			diff_days: i64 = self._epoch_day - other._epoch_day
 			diff_days32: i32 = i32( diff_days )
 		return timedelta( days = diff_days32 )
+
+	def __sub__( self, delta: timedelta ) -> date:
+		''' date - timedelta -> date, via __add__(-delta) - see its own
+		docstring. '''
+		return self.__add__( -delta )
 
 	def __eq__( self, other: date ) -> bool:
 		return self._epoch_day == other._epoch_day
@@ -415,6 +427,8 @@ def _format_utc_offset( offset_seconds: i32 ) -> str:
 		mm: i32 = ( abs_offset // 60 ) % 60
 	return f'{sign}{int(hh):02d}:{int(mm):02d}'
 
+__date: TypeAlias = date
+__time: TypeAlias = time
 
 class datetime:
 	''' always tz-aware - tzinfo is a required field, never optional/
@@ -447,16 +461,6 @@ class datetime:
 		*,
 		tzinfo: ZoneInfo,
 	) -> Result[None, DateError]:
-		# self.tzinfo is assigned FIRST, before any validation that can
-		# return Err - a real, confirmed compiler bug (heap corruption,
-		# reported separately) means a fallible __init__ that returns Err
-		# before assigning an RC-typed field leaves that field as raw,
-		# uninitialized allocator memory (sys$alloc doesn't zero it), and
-		# the Err-path cleanup releases self's fields unconditionally,
-		# including that uninitialized one - releasing garbage as if it
-		# were a valid pointer. Assigning tzinfo up front means it's always
-		# a real, valid reference by the time any Err path can be taken.
-		self.tzinfo = tzinfo
 		if year < 1 or year > 9999:
 			return Result.Err( DateError.InvalidYear( None ) )
 		if month < 1 or month > 12:
@@ -479,6 +483,7 @@ class datetime:
 		self.minute = minute
 		self.second = second
 		self.microsecond = microsecond
+		self.tzinfo = tzinfo
 		return Result.Ok( None )
 
 	def _utcoffset_seconds( self ) -> i32:
@@ -523,9 +528,13 @@ class datetime:
 			return f64( epoch_seconds ) + f64( self.microsecond ) / 1_000_000.0
 
 	@staticmethod
-	def _from_epoch( epoch_seconds: i64, microsecond: i32, tz: ZoneInfo ) -> datetime:
+	def _from_epoch( epoch_seconds: i64, microsecond: i32, tz: ZoneInfo|None = None ) -> datetime:
 		''' UTC instant -> wall-clock: unambiguous (a real UTC instant maps
-		to exactly one offset), unlike _to_epoch_seconds's own direction. '''
+		to exactly one offset), unlike _to_epoch_seconds's own direction.
+		tz omitted defaults to the system's own configured local zone -
+		see date.today()'s own docstring. '''
+		if not tz:
+			tz = localtz()
 		offset: i32 = tz.utcoffset( epoch_seconds )
 		with compiler.wrap_arithmetic:
 			local_seconds: i64 = epoch_seconds + i64( offset )
@@ -544,44 +553,47 @@ class datetime:
 			)
 
 	@staticmethod
-	def now( tz: ZoneInfo ) -> datetime:
-		''' tz is required - no zero-arg form, unlike Python's datetime.
-		now() - there's no "OS local zone" default to silently fall back to
-		in this design (see this module's own docstring); use
-		time.get_local_timezone_name() to pass one explicitly. '''
+	def now( tz: ZoneInfo|None = None ) -> datetime:
+		''' tz omitted defaults to the system's own configured local zone -
+		see date.today()'s own docstring. '''
 		import time as _time
 		t: f64 = _time.time()
 		return datetime.fromtimestamp( t, tz )
 
 	@staticmethod
-	def fromtimestamp( t: f64, tz: ZoneInfo ) -> datetime:
+	def fromtimestamp( t: f64, tz: ZoneInfo|None = None ) -> datetime:
 		''' t before the 1970 epoch (negative) is a known, undocumented-
 		precision edge case - i64(t) truncates toward zero, not floor, so a
 		fractional negative t's microsecond component can come out wrong.
-		Not a concern for any realistic "current time" use. '''
+		Not a concern for any realistic "current time" use. tz omitted
+		defaults to the system's own configured local zone - see
+		date.today()'s own docstring. '''
 		with compiler.wrap_arithmetic:
 			epoch_seconds: i64 = i64( t )
 			frac: f64 = t - f64( epoch_seconds )
 			microsecond: i32 = i32( frac * 1_000_000.0 )
 		return datetime._from_epoch( epoch_seconds, microsecond, tz )
 
-	def astimezone( self, tz: ZoneInfo ) -> datetime:
+	def astimezone( self, tz: ZoneInfo|None = None ) -> datetime:
+		''' tz omitted defaults to the system's own configured local zone -
+		i.e. "convert to local time" - see date.today()'s own docstring. '''
 		epoch_seconds: i64 = self._to_epoch_seconds()
 		return datetime._from_epoch( epoch_seconds, self.microsecond, tz )
 
-	def to_date( self ) -> date:
-		''' named to_date(), not Python's own date() - a bare `date(...)`
-		call inside a method of this same name would resolve to the METHOD
-		itself, not the module-level class (confirmed directly this
-		session) - a small, documented deviation from Python's exact method
-		name to sidestep it. '''
-		r = date( self.year, self.month, self.day )
+	def date( self ) -> __date:
+		''' named date()/time() (matching Python), not to_date()/to_time() -
+		a bare `date(...)`/`-> date` inside a method of this same name
+		resolves to the METHOD itself, not the module-level class
+		(confirmed directly) - __date/__time (module-scope TypeAlias
+		names, defined just above this class) are immune to that
+		shadowing since they're never also a class member name. '''
+		r = __date( self.year, self.month, self.day )
 		return r.unwrap( 'datetime: constructed from already-valid fields, unreachable' )
 
-	def to_time( self ) -> time:
-		''' named to_time(), not Python's own time() - see to_date()'s own
-		comment for why. '''
-		r = time( self.hour, self.minute, self.second, self.microsecond )
+	def time( self ) -> __time:
+		''' see date()'s own docstring for why __time (not a bare `time`)
+		is used. '''
+		r = __time( self.hour, self.minute, self.second, self.microsecond )
 		return r.unwrap( 'datetime: constructed from already-valid fields, unreachable' )
 
 	def __add__( self, delta: timedelta ) -> Result[datetime, DateError]:
@@ -630,12 +642,13 @@ class datetime:
 		purpose is eliminating exactly this kind of ambiguity, always
 		computing the real elapsed time (matching what .timestamp() would
 		give) is the right choice here, not bug-for-bug Python fidelity.
-		datetime - timedelta isn't supported directly (same @overload/
-		operator-dispatch issue noted on date.__sub__) - use
-		`dt + (-delta)` instead. '''
+		'''
 		with compiler.wrap_arithmetic:
 			diff_us: i64 = ( self._to_epoch_seconds() - other._to_epoch_seconds() ) * _US_PER_SECOND + i64( self.microsecond ) - i64( other.microsecond )
 		return timedelta._from_total_us( diff_us )
+
+	def __sub__( self, delta: timedelta ) -> Result[datetime,DateError]:
+		return self.__add__( -delta )
 
 	def _cmp_key( self ) -> i64:
 		with compiler.wrap_arithmetic:

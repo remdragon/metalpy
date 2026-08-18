@@ -41,6 +41,7 @@ if compiler.target.os == 'windows':
 		shutdown as _c_shutdown, getsockname as _c_getsockname,
 		setsockopt as _c_setsockopt,
 		inet_pton, inet_ntop,
+		getaddrinfo, freeaddrinfo,
 	)
 else:
 	SOCKET: TypeAlias = i32
@@ -93,6 +94,17 @@ else:
 	# T|None as an @extern return type).
 	@extern( 'c', 'inet_ntop' )
 	def inet_ntop( family: i32, src: Ptr[None], dst: Ptr[u8], size: u32 ) -> ConstPtr[u8]:
+		...
+	# getaddrinfo/freeaddrinfo - no header=, matching every other extern in
+	# this POSIX branch (see windows/ws2_32.py's own copy of this comment for
+	# why hints/res stay opaque Ptr[None]/Ptr[Ptr[None]] here too - the same
+	# reasoning applies even though POSIX's netdb.h doesn't hit the specific
+	# windows.h conflict that rules header= out on the Windows side).
+	@extern( 'c', 'getaddrinfo' )
+	def getaddrinfo( node: ConstPtr[u8], service: ConstPtr[u8], hints: Ptr[None], res: Ptr[Ptr[None]] ) -> i32:
+		...
+	@extern( 'c', 'freeaddrinfo' )
+	def freeaddrinfo( res: Ptr[None] ) -> None:
 		...
 
 
@@ -175,6 +187,48 @@ class SockAddrIn6:
 	sin6_scope_id: u32 = 0
 
 
+# ---------------------------------------------------------------------------
+# _AddrInfo — struct addrinfo, for hostname resolution (getaddrinfo). Field
+# order genuinely differs by OS (confirmed against the real headers: Windows
+# SDK's ws2def.h and glibc's netdb.h) - Windows' ADDRINFOA puts ai_canonname
+# BEFORE ai_addr and sizes ai_addrlen as size_t; POSIX's addrinfo puts
+# ai_addr BEFORE ai_canonname and sizes ai_addrlen as socklen_t (u32). Same
+# "textbook ABI, one body per OS" treatment as SockAddrIn/SockAddrIn6 above,
+# just field-order divergence instead of a width divergence.
+#
+# ai_addr/ai_canonname/ai_next stay opaque Ptr[None]/Ptr[u8], never a typed
+# struct* field - matching this file's and ws2_32.py's own established
+# posture for structured pointers we don't allocate ourselves. ai_addr only
+# gets reinterpreted into a real SockAddrIn/SockAddrIn6 pointer at the point
+# of use (_resolve_v4/_resolve_v6 below); ai_next only ever gets cast back
+# to Ptr[_AddrInfo] to keep walking the linked list of results.
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'windows' )
+@cstruct
+class _AddrInfo:
+	ai_flags:     i32 = 0
+	ai_family:    i32 = 0
+	ai_socktype:  i32 = 0
+	ai_protocol:  i32 = 0
+	ai_addrlen:   usize = usize( 0 )
+	ai_canonname: Ptr[u8] = None
+	ai_addr:      Ptr[None] = None
+	ai_next:      Ptr[None] = None
+
+@compiler.target( os = not 'windows' )
+@cstruct
+class _AddrInfo:
+	ai_flags:     i32 = 0
+	ai_family:    i32 = 0
+	ai_socktype:  i32 = 0
+	ai_protocol:  i32 = 0
+	ai_addrlen:   u32 = 0
+	ai_addr:      Ptr[None] = None
+	ai_canonname: Ptr[u8] = None
+	ai_next:      Ptr[None] = None
+
+
 def _htons( port: u16 ) -> u16:
 	''' host to network byte order. Pure bit-twiddling, no FFI needed:
 	every supported arch (x64/arm64) is little-endian in practice, network
@@ -208,19 +262,6 @@ class SocketAddr:
 		return SocketAddr.__allocate__( __host = host, __port = port )
 
 
-# _err_invalid() — a real, pre-existing compiler bug (confirmed with a
-# minimal repro outside this file): a bare enum-member reference like
-# `OSError.Invalid` passed directly as a Result.Err(...) argument confuses
-# generic type inference between the enum and its own u32 backing type
-# ("type parameter 'E' is inferred as both builtins.OSError and
-# intrinsics.u32"). Staging the same value through an explicitly-typed local
-# first avoids it entirely, so every `Result.Err(OSError.Invalid)` in this
-# file goes through this one helper instead of the bare form.
-def _err_invalid() -> OSError:
-	err: OSError = OSError.Invalid
-	return err
-
-
 # ---------------------------------------------------------------------------
 # Address helpers — build a sockaddr from (host, port), decode one back to
 # a SocketAddr. compiler.addrof() only accepts a bare local variable (not a
@@ -234,7 +275,7 @@ def _build_sockaddr_in( host: str, port: u16 ) -> Result[SockAddrIn, OSError]:
 	ip_addr: u32 = 0
 	rc: i32 = inet_pton( AF_INET, host.get_cstr(), compiler.cast( Ptr[None], compiler.addrof( ip_addr )))
 	if rc != 1:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	with compiler.wrap_arithmetic:
 		family: u16 = u16( AF_INET )
 	return Result.Ok( SockAddrIn( sin_family = family, sin_port = _htons( port ), sin_addr = ip_addr ))
@@ -244,7 +285,7 @@ def _build_sockaddr_in6( host: str, port: u16 ) -> Result[SockAddrIn6, OSError]:
 	buf: bytearray = bytearray( 16 )
 	rc: i32 = inet_pton( AF_INET6, host.get_cstr(), compiler.cast( Ptr[None], buf.get_ptr() ))
 	if rc != 1:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	with compiler.wrap_arithmetic:
 		family: u16 = u16( AF_INET6 )
 	# bytearray has no scalar __getitem__ (only slice syntax, e.g. buf[:n] -
@@ -263,6 +304,80 @@ def _build_sockaddr_in6( host: str, port: u16 ) -> Result[SockAddrIn6, OSError]:
 	))
 
 
+# ---------------------------------------------------------------------------
+# Hostname resolution — getaddrinfo() walk, one function per address family
+# (mirrors every other family-dispatched pair in this file, e.g. Socket.bind/
+# connect's own `if self.__family == AF_INET6: ... else: ...` split).
+# hints.ai_family is always set to the family being resolved, so getaddrinfo
+# itself filters out any non-matching results (POSIX/Winsock guarantee) - no
+# family check is needed while walking. Numeric IP literals ("127.0.0.1",
+# "::1") keep working here for free: getaddrinfo recognizes them without any
+# extra flag and returns a single result with no real DNS round trip.
+#
+# service is always NULL; the port is folded into each result's own sockaddr
+# by re-constructing it (never mutating a field in place - same rule
+# _build_sockaddr_in/6 above follow), rather than passing a numeric-service
+# string, which would need its own int->str dependency just for this.
+#
+# A bogus/unresolvable host returns OSError.NameResolutionFailed, distinct
+# from the OSError.Invalid _build_sockaddr_in/6 return for an unparseable IP
+# literal - these are genuinely different failures (a syntactically-bad
+# address vs. a well-formed hostname that just doesn't resolve) and collapsing
+# them into one code would leave callers unable to tell "fix your input" from
+# "the network/DNS didn't cooperate". NameResolutionFailed is a real,
+# specific OSError member rather than the raw getaddrinfo() return code
+# itself: on POSIX that code is EAI_*, a wholly separate namespace from errno
+# (NOT safe to feed into OSError's own errno-based construction - confirmed
+# against the real getaddrinfo(3) contract), and on Windows it IS a real
+# WSAHOST_NOT_FOUND-compatible code but only the single most common failure
+# gets a name here, same as every other OSError member.
+# ---------------------------------------------------------------------------
+
+def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn], OSError]:
+	hints: _AddrInfo = _AddrInfo( ai_family = AF_INET, ai_socktype = socktype )
+	res_head: Ptr[None] = None
+	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
+	if rc != 0:
+		return Result.Err( OSError.NameResolutionFailed )
+	results: list[SockAddrIn] = list[SockAddrIn]()
+	cur: Ptr[None] = res_head
+	while cur is not None:
+		node: Ptr[_AddrInfo] = compiler.cast( Ptr[_AddrInfo], cur )
+		info: _AddrInfo = node[0]
+		addr_ptr: Ptr[SockAddrIn] = compiler.cast( Ptr[SockAddrIn], info.ai_addr )
+		found: SockAddrIn = addr_ptr[0]
+		results.append( SockAddrIn( sin_family = found.sin_family, sin_port = _htons( port ), sin_addr = found.sin_addr )).unwrap( 'resolve v4: append' )
+		cur = info.ai_next
+	freeaddrinfo( res_head )
+	return Result.Ok( results )
+
+
+def _resolve_v6( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn6], OSError]:
+	hints: _AddrInfo = _AddrInfo( ai_family = AF_INET6, ai_socktype = socktype )
+	res_head: Ptr[None] = None
+	rc: i32 = getaddrinfo( host.get_cstr(), None, compiler.cast( Ptr[None], compiler.addrof( hints )), compiler.addrof( res_head ))
+	if rc != 0:
+		return Result.Err( OSError.NameResolutionFailed )
+	results: list[SockAddrIn6] = list[SockAddrIn6]()
+	cur: Ptr[None] = res_head
+	while cur is not None:
+		node: Ptr[_AddrInfo] = compiler.cast( Ptr[_AddrInfo], cur )
+		info: _AddrInfo = node[0]
+		addr_ptr: Ptr[SockAddrIn6] = compiler.cast( Ptr[SockAddrIn6], info.ai_addr )
+		found: SockAddrIn6 = addr_ptr[0]
+		results.append( SockAddrIn6(
+			sin6_family = found.sin6_family, sin6_port = _htons( port ), sin6_flowinfo = found.sin6_flowinfo,
+			sin6_addr_0 = found.sin6_addr_0, sin6_addr_1 = found.sin6_addr_1, sin6_addr_2 = found.sin6_addr_2, sin6_addr_3 = found.sin6_addr_3,
+			sin6_addr_4 = found.sin6_addr_4, sin6_addr_5 = found.sin6_addr_5, sin6_addr_6 = found.sin6_addr_6, sin6_addr_7 = found.sin6_addr_7,
+			sin6_addr_8 = found.sin6_addr_8, sin6_addr_9 = found.sin6_addr_9, sin6_addr_10 = found.sin6_addr_10, sin6_addr_11 = found.sin6_addr_11,
+			sin6_addr_12 = found.sin6_addr_12, sin6_addr_13 = found.sin6_addr_13, sin6_addr_14 = found.sin6_addr_14, sin6_addr_15 = found.sin6_addr_15,
+			sin6_scope_id = found.sin6_scope_id,
+		)).unwrap( 'resolve v6: append' )
+		cur = info.ai_next
+	freeaddrinfo( res_head )
+	return Result.Ok( results )
+
+
 # inet_ntop's size parameter is size_t on Windows but socklen_t (u32) on
 # POSIX - a genuine per-platform width difference (confirmed against both
 # real prototypes), not a style choice, so unlike most of this file these
@@ -278,7 +393,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 	strbuf: bytearray = bytearray( 16 )  # "255.255.255.255\0" fits in 16
 	res = inet_ntop( AF_INET, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf.get_ptr(), usize( 16 ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 16 ))
 	with compiler.wrap_arithmetic:
@@ -287,7 +402,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 @compiler.target( os = not 'windows' )
 def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
@@ -295,7 +410,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 	strbuf: bytearray = bytearray( 16 )  # "255.255.255.255\0" fits in 16
 	res = inet_ntop( AF_INET, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf.get_ptr(), u32( 16 ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 16 ))
 	with compiler.wrap_arithmetic:
@@ -304,7 +419,7 @@ def _sockaddr_in_to_addr( sa: SockAddrIn ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 
 # bytearray has no scalar __setitem__ either (same gap as __getitem__ above)
@@ -323,7 +438,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 	res = inet_ntop( AF_INET6, compiler.cast( Ptr[None], raw ), strbuf.get_ptr(), usize( 46 ))
 	sys.free( compiler.cast( Ptr[None], raw ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 46 ))
 	with compiler.wrap_arithmetic:
@@ -332,7 +447,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin6_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 @compiler.target( os = not 'windows' )
 def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
@@ -345,7 +460,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 	res = inet_ntop( AF_INET6, compiler.cast( Ptr[None], raw ), strbuf.get_ptr(), u32( 46 ))
 	sys.free( compiler.cast( Ptr[None], raw ))
 	if res is None:
-		return Result.Err( _err_invalid() )
+		return Result.Err( OSError.Invalid )
 	from crt import strnlen
 	slen: usize = strnlen( strbuf.get_const_ptr(), usize( 46 ))
 	with compiler.wrap_arithmetic:
@@ -354,7 +469,7 @@ def _sockaddr_in6_to_addr( sa: SockAddrIn6 ) -> Result[SocketAddr, OSError]:
 		case Result.Ok( host ):
 			return Result.Ok( SocketAddr._from_parts( host, _htons( sa.sin6_port )))
 		case Result.Err( _ ):
-			return Result.Err( _err_invalid() )
+			return Result.Err( OSError.Invalid )
 
 
 # ---------------------------------------------------------------------------
@@ -606,17 +721,35 @@ def _set_reuseaddr_raw( sock: SOCKET, enable: bool ) -> Result[None, OSError]:
 # ---------------------------------------------------------------------------
 # WSAStartup-once lifecycle — no "run at import" mechanism exists in this
 # language (module-level code is declarative, not imperative init-on-first-
-# use), so a lazy CAS guard on lib/atomic.py's Atomic[bool] does the job.
-# The loser SPINS on the flag rather than racing ahead of an in-flight
-# WSAStartup call, closing the narrow window a bare "proceed after losing
-# the CAS" would leave open. WSACleanup() is deliberately never called
-# (matches CPython's own behavior; no natural process-exit hook here).
+# use), so a lazy CAS guard does the job. A tri-state (really 4-state)
+# Atomic[i32] state machine, NOT a bare Atomic[bool]: a bool CAS can't let a
+# spinning loser distinguish "nobody has started yet" from "the winner just
+# finished (with either outcome)" - both collapse to the same False value.
+# The original bool version's failure path reset the flag back to False "to
+# allow a later retry" - but that's exactly the same value a loser is
+# spinning to see turn True, so a loser spinning at the moment the winner's
+# WSAStartup call failed would wait for True forever (or until some
+# unrelated FUTURE caller happened to retry and succeed) instead of ever
+# observing the failure. Every transition here is monotonic (NOT_STARTED ->
+# IN_PROGRESS -> {DONE_OK, DONE_ERR}, never backwards), so a spinning loser
+# is guaranteed to see a terminal state - DONE_ERR is now STICKY (not reset
+# back to NOT_STARTED), matching CPython's own socket module, which also
+# never retries WSAStartup after a failure. WSACleanup() is deliberately
+# never called (matches CPython's own behavior; no natural process-exit
+# hook here).
 # ---------------------------------------------------------------------------
 
+_WSA_NOT_STARTED: i32 = 0
+_WSA_IN_PROGRESS: i32 = 1
+_WSA_DONE_OK:     i32 = 2
+_WSA_DONE_ERR:    i32 = 3
+
 if compiler.target.os == 'windows':
-	_wsa_started: Atomic[bool] = Atomic[bool]( False )
+	_wsa_state: Atomic[i32] = Atomic[i32]( _WSA_NOT_STARTED )
+	_wsa_error: Atomic[i32] = Atomic[i32]( 0 )  # valid only once _wsa_state == _WSA_DONE_ERR
 else:
-	_wsa_started: Atomic[bool] = Atomic[bool]( False )  # unused on POSIX, kept unconditional for a single declaration site
+	_wsa_state: Atomic[i32] = Atomic[i32]( _WSA_NOT_STARTED )  # unused on POSIX, kept unconditional for a single declaration site
+	_wsa_error: Atomic[i32] = Atomic[i32]( 0 )
 
 # Two top-level bodies, not a function nested inside the if-block above -
 # matches the proven shape every other OS-differentiated function in this
@@ -625,28 +758,40 @@ else:
 # this codebase).
 @compiler.target( os = 'windows' )
 def _ensure_wsa_started() -> Result[None, OSError]:
-	if _wsa_started.load():
-		return Result.Ok( None )
-	expected: bool = False
-	if _wsa_started.compare_exchange( compiler.addrof( expected ), True ):
-		wsa_buf: Ptr[u8] = sys.alloc[u8]( 512 )  # WSADATA is well under 512 bytes on any real Windows
-		startup_rc: i32 = WSAStartup( 0x0202, compiler.cast( Ptr[None], wsa_buf ))  # MAKEWORD(2,2)
-		sys.free( compiler.cast( Ptr[None], wsa_buf ))
-		if startup_rc != 0:
-			_wsa_started.store( False )  # allow a later retry
-			# `+ 0` is deliberate, not decorative: OSError(startup_rc) alone
-			# hits a real, pre-existing compiler bug (confirmed with a
-			# minimal repro outside this file) where a bare variable-name
-			# argument to an enum constructor is misdiagnosed as a type
-			# mismatch ("expected builtins.OSError, got intrinsics.i32"),
-			# while any non-bare-Name expression of the same value (a call,
-			# or this arithmetic no-op) type-checks fine.
+	while True:
+		state: i32 = _wsa_state.load()
+		if state == _WSA_DONE_OK:
+			return Result.Ok( None )
+		if state == _WSA_DONE_ERR:
+			# `+ 0` is deliberate, not decorative: OSError(...) alone hits a
+			# real, pre-existing compiler bug (confirmed with a minimal
+			# repro outside this file) where a bare variable-name argument
+			# to an enum constructor is misdiagnosed as a type mismatch
+			# ("expected builtins.OSError, got intrinsics.i32"), while any
+			# non-bare-Name expression of the same value (a call, or this
+			# arithmetic no-op) type-checks fine.
 			with compiler.wrap_arithmetic:
-				return Result.Err( OSError( startup_rc + 0 ))
-		return Result.Ok( None )
-	while not _wsa_started.load():
-		pass  # loser spins until the winner's WSAStartup call completes
-	return Result.Ok( None )
+				return Result.Err( OSError( _wsa_error.load() + 0 ))
+		if state == _WSA_NOT_STARTED:
+			expected: i32 = _WSA_NOT_STARTED
+			if _wsa_state.compare_exchange( compiler.addrof( expected ), _WSA_IN_PROGRESS ):
+				# won the race - the only caller that will ever call
+				# WSAStartup for this process
+				wsa_buf: Ptr[u8] = sys.alloc[u8]( 512 )  # WSADATA is well under 512 bytes on any real Windows
+				startup_rc: i32 = WSAStartup( 0x0202, compiler.cast( Ptr[None], wsa_buf ))  # MAKEWORD(2,2)
+				sys.free( compiler.cast( Ptr[None], wsa_buf ))
+				if startup_rc != 0:
+					_wsa_error.store( startup_rc )
+					_wsa_state.store( _WSA_DONE_ERR )
+				else:
+					_wsa_state.store( _WSA_DONE_OK )
+				continue  # loop back around - the DONE_OK/DONE_ERR branch above now returns
+			# lost the CAS: someone else is already IN_PROGRESS (or finished
+			# between our load and our CAS attempt) - fall through and spin
+		# state == _WSA_IN_PROGRESS (either genuinely, or because we just
+		# lost the CAS above) - another thread is running WSAStartup right
+		# now; spin until it reaches a terminal state
+		pass
 
 @compiler.target( os = not 'windows' )
 def _ensure_wsa_started() -> Result[None, OSError]:
@@ -697,16 +842,57 @@ class Socket:
 			peer_addr: SocketAddr = _sockaddr_in_to_addr( peer4 ).or_return()
 		return Result.Ok(( Socket._from_raw( conn, self.__family ), peer_addr ))
 
+	# Resolves host (a hostname OR a numeric IP literal - getaddrinfo handles
+	# both) via _resolve_v4/_resolve_v6, then tries each candidate address in
+	# order (happy-eyeballs-lite: a hostname with several A/AAAA records of
+	# this socket's own family isn't uncommon) until one connects, returning
+	# the last candidate's error if every one of them fails. bind()/sendto()
+	# deliberately stay literal-IP-only (unchanged) - PLAN_HTTP_CLIENT.md's
+	# own socket contract only calls for connect() to resolve hostnames.
 	def connect( self, host: str, port: u16 ) -> Result[None, OSError]:
 		if self.__family == AF_INET6:
-			addr: SockAddrIn6 = _build_sockaddr_in6( host, port ).or_return()
-			return _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr )), compiler.sizeof( SockAddrIn6 ))
+			candidates: list[SockAddrIn6] = _resolve_v6( host, port, SOCK_STREAM ).or_return()
+			last_err: OSError = OSError.Invalid
+			for i in range( len( candidates )):
+				addr: SockAddrIn6 = candidates.__getitem__( i ).unwrap( 'connect: candidate index' )
+				match _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr )), compiler.sizeof( SockAddrIn6 )):
+					case Result.Ok( _ ):
+						return Result.Ok( None )
+					case Result.Err( e ):
+						last_err = e
+			return Result.Err( last_err )
 		else:
-			addr4: SockAddrIn = _build_sockaddr_in( host, port ).or_return()
-			return _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr4 )), compiler.sizeof( SockAddrIn ))
+			candidates4: list[SockAddrIn] = _resolve_v4( host, port, SOCK_STREAM ).or_return()
+			last_err4: OSError = OSError.Invalid
+			for i in range( len( candidates4 )):
+				addr4: SockAddrIn = candidates4.__getitem__( i ).unwrap( 'connect: candidate index' )
+				match _connect_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( addr4 )), compiler.sizeof( SockAddrIn )):
+					case Result.Ok( _ ):
+						return Result.Ok( None )
+					case Result.Err( e ):
+						last_err4 = e
+			return Result.Err( last_err4 )
 
 	def send( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		return _send_raw( self.__sock, buf, count )
+
+	def send_all( self, buf: ConstPtr[u8], count: usize ) -> Result[None, OSError]:
+		''' loops send() until every byte in buf[0:count) is sent, or an
+		error occurs - send() itself can do short writes, so a caller that
+		actually needs "all N bytes went out" has to loop (mirrors lib/
+		http/client.py's own hand-rolled _send_all, promoted here so future
+		Socket consumers - e.g. a hand-rolled HTTP server - don't need
+		their own copy). A 0-byte send mid-loop (the peer stopped
+		accepting data) is reported as OSError.BrokenPipe, the existing
+		OSError member that already names this condition. '''
+		sent: usize = 0
+		with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+			while sent < count:
+				n: usize = self.send( buf + sent, count - sent ).or_return()
+				if n == 0:
+					return Result.Err( OSError.BrokenPipe )
+				sent += n
+		return Result.Ok( None )
 
 	def recv( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		return _recv_raw( self.__sock, buf, count )
@@ -764,3 +950,96 @@ class Socket:
 	@staticmethod
 	def udp( family: i32 = AF_INET ) -> Result[Socket, OSError]:
 		return Socket.create( family, SOCK_DGRAM )
+
+
+# ---------------------------------------------------------------------------
+# RecvBuffer — accumulates bytes read off a Socket across multiple recv()
+# calls. A single recv() may return less than requested, and the total
+# message length usually isn't known up front - the exact problem lib/http/
+# client.py's own hand-rolled _GrowableBuffer was built to solve (see that
+# file's own comment). Promoted here (not HTTP-specific) so a future Socket
+# consumer (a raw TCP protocol, a simple line-based server, a hand-rolled
+# HTTP server's own request-line parsing, ...) doesn't need to reinvent it.
+# Deliberately narrow - accumulate + expose the raw accumulated bytes only,
+# NOT a general buffered-reader-with-readline() abstraction (out of scope
+# here; HTTP's own header/chunk-framing logic stays in lib/http/client.py,
+# which could build on top of this type instead of duplicating the growth/
+# fill machinery as a future refactor - not done as part of this change).
+# ---------------------------------------------------------------------------
+
+class RecvBuffer:
+	__data: Ptr[u8]
+	__len: usize
+	__cap: usize
+
+	def __init__( self, initial_cap: usize = 4096 ) -> None:
+		self.__cap = initial_cap
+		self.__data = sys.alloc[u8]( self.__cap )
+		self.__len = 0
+
+	def __del__( self ) -> None:
+		sys.free( self.__data )
+
+	def len( self ) -> usize:
+		return self.__len
+
+	def get_const_ptr( self ) -> ConstPtr[u8]:
+		return self.__data
+
+	def _grow( self, min_additional: usize ) -> None:
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			needed: usize = self.__len + min_additional
+		if needed <= self.__cap:
+			return
+		new_cap: usize = self.__cap
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			while new_cap < needed:
+				new_cap = new_cap * 2
+		new_data: Ptr[u8] = sys.alloc[u8]( new_cap )
+		sys.memcpy( new_data, self.__data, self.__len )
+		sys.free( self.__data )
+		self.__data = new_data
+		self.__cap = new_cap
+
+	def fill_from( self, sock: Socket, chunk_size: usize = 4096 ) -> Result[usize, OSError]:
+		''' one recv() call, appended to the buffer. Returns the number of
+		bytes read - 0 means the peer closed the connection (EOF), matching
+		Socket.recv()'s own convention; not itself an error. '''
+		self._grow( chunk_size )
+		with compiler.wrap_arithmetic:
+			dest: Ptr[u8] = self.__data + self.__len
+			room: usize = self.__cap - self.__len
+		n: usize = sock.recv( dest, room ).or_return()
+		with compiler.wrap_arithmetic:
+			self.__len += n
+		return Result.Ok( n )
+
+
+# ---------------------------------------------------------------------------
+# resolve() — a standalone hostname->IP-literal-strings lookup, built on the
+# same _resolve_v4/_resolve_v6 machinery Socket.connect() uses internally.
+# Not part of the PLAN_HTTP_CLIENT.md socket contract (which only needs
+# Socket.connect() to resolve transparently) but a natural, cheap-to-expose
+# building block on top of it - useful on its own and gives the resolver a
+# directly testable surface independent of a live TCP connect().
+#
+# port is irrelevant to a pure address lookup, so _resolve_v4/_v6 are called
+# with a dummy 0 and the port is dropped again (via SocketAddr.host()) rather
+# than exposing SocketAddr's own host+port pairing here, which would wrongly
+# imply the port means something.
+# ---------------------------------------------------------------------------
+
+def resolve( host: str, family: i32 = AF_INET ) -> Result[list[str], OSError]:
+	_ensure_wsa_started().or_return()
+	out: list[str] = list[str]()
+	if family == AF_INET6:
+		candidates: list[SockAddrIn6] = _resolve_v6( host, u16( 0 ), SOCK_STREAM ).or_return()
+		for i in range( len( candidates )):
+			addr: SocketAddr = _sockaddr_in6_to_addr( candidates.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
+			out.append( addr.host() ).unwrap( 'resolve: append' )
+	else:
+		candidates4: list[SockAddrIn] = _resolve_v4( host, u16( 0 ), SOCK_STREAM ).or_return()
+		for i in range( len( candidates4 )):
+			addr4: SocketAddr = _sockaddr_in_to_addr( candidates4.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
+			out.append( addr4.host() ).unwrap( 'resolve: append' )
+	return Result.Ok( out )

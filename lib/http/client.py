@@ -1,8 +1,6 @@
 '''
-HTTP wire-format primitives - the zero-prerequisite "Phase 0" slice of
-PLAN_HTTP_CLIENT.md. Everything here is a pure str/bytes transform with no
-socket or buffered-I/O dependency, so it can be built and tested before the
-socket library (a separate, parallel effort) lands.
+HTTP wire-format primitives, plus a low-level one-connection-at-a-time client
+(HTTPConnection/Response) built on lib/socket.py - see PLAN_HTTP_CLIENT.md.
 
 HTTPError       - error type shared by every function/class below
 HTTPHeaders     - ordered, case-insensitive multimap for request/response headers
@@ -11,14 +9,21 @@ parse_header_line  - "Name: value" -> (name, value)
 parse_headers      - a raw CRLF-joined header block -> HTTPHeaders
 base64_encode      - standard (padded) base64 encoding of bytes, for auth=
 decode_chunked     - decodes an already-fully-buffered chunked-transfer body
+HTTPConnection     - connect/request/getresponse/close over one TCP connection
+Response           - status_code/reason/headers/content of a received response
+Session            - cookie jar + redirect-following requests.Session-style layer
+get/post/put/patch/delete/head/options/request - module-level Session convenience
 
-Session/Response/request() (the socket-dependent pieces - Phase 1-3 of
-PLAN_HTTP_CLIENT.md) are not part of this file yet.
+host may be a real hostname now - lib/socket.py's Socket.connect() resolves it
+via getaddrinfo internally (commit f794edb). https:// URLs aren't supported yet
+(no TLS - see PLAN_HTTP_CLIENT.md's Phase 4).
 '''
 
 import sys
 import compiler
 import base64
+from socket import Socket
+from urllib.parse import quote
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -35,6 +40,10 @@ class HTTPError:
 	MalformedHeader: None
 	UnexpectedEOF: None
 	ChunkSizeInvalid: None
+	InvalidURL: None
+	TooManyRedirects: None
+	BadStatus: None
+	NameResolutionFailed: None
 	Other: None
 
 # ---------------------------------------------------------------------------
@@ -292,3 +301,737 @@ def decode_chunked( data: bytes ) -> Result[bytes, HTTPError]:
 			pos = data_start + size + 2
 
 	return Result.Ok( bytes.from_bytearray( move( out )))
+
+# ---------------------------------------------------------------------------
+# small integer <-> str helpers - int (the boxed arbitrary-precision type)
+# only converts from/to i32 (lib/builtins/__int.py), not usize, and a
+# Content-Length can legitimately need the full usize range - spelled out
+# directly rather than routed through int, matching this codebase's own
+# established "ASCII digits by hand" idiom (see lib/builtins/__int.py's own
+# _ASCII_ZERO-based from_str/digit-count code).
+# ---------------------------------------------------------------------------
+
+_ASCII_ZERO: u8 = 0x30
+_ASCII_NINE: u8 = 0x39
+
+def _usize_to_str( n: usize ) -> str:
+	if n == 0:
+		return '0'
+	digits: bytearray = bytearray( 20 ) # a u64 fits in at most 20 decimal digits
+	d_ptr: Ptr[u8] = digits.get_ptr()
+	count: usize = 0
+	v: usize = n
+	with compiler.panic_arithmetic( 'usize has at most 20 decimal digits, divisor is a nonzero literal' ):
+		while v > 0:
+			d_ptr[count] = u8( v % 10 ) + _ASCII_ZERO
+			v = v // 10
+			count += 1
+	with compiler.panic_arithmetic( 'count is bounded by 20, cannot overflow' ):
+		out: bytearray = bytearray( count + 1 ) # +1 zero terminator
+	out_ptr: Ptr[u8] = out.get_ptr()
+	i: usize = 0
+	with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+		while i < count:
+			out_ptr[i] = d_ptr[ count - 1 - i ] # digits were built least-significant-first
+			i += 1
+	return str.from_cstr( move( out )).unwrap( '_usize_to_str: unreachable - pure ASCII digits' )
+
+def _usize_from_str( s: str ) -> Result[usize, HTTPError]:
+	if s.byte_len() == 0:
+		return Result.Err( HTTPError.MalformedHeader( None ))
+	cstr: ConstPtr[u8] = s.get_cstr()
+	n: usize = s.byte_len()
+	value: usize = 0
+	i: usize = 0
+	with compiler.panic_arithmetic( 'a Content-Length within usize range' ):
+		while i < n:
+			ch: u8 = cstr[i]
+			if ch < _ASCII_ZERO or ch > _ASCII_NINE:
+				return Result.Err( HTTPError.MalformedHeader( None ))
+			value = value * 10 + usize( ch - _ASCII_ZERO )
+			i += 1
+	return Result.Ok( value )
+
+# ---------------------------------------------------------------------------
+# _GrowableBuffer - accumulates bytes read off a Socket across multiple
+# recv() calls. bytearray() itself is fixed-size at construction (see lib/
+# builtins/__init__.py) with no append/extend, so this is a small hand-
+# rolled doubling buffer, the same "count/allocate-exact/fill" discipline
+# used throughout this codebase, just amortized across repeated growth
+# instead of computed once up front - the total size isn't known ahead of
+# time here (it depends on how many recv() calls a response takes).
+# ---------------------------------------------------------------------------
+
+class _GrowableBuffer:
+	__data: Ptr[u8]
+	__len: usize
+	__cap: usize
+
+	def __init__( self ) -> None:
+		self.__cap = 4096
+		self.__data = sys.alloc[u8]( self.__cap )
+		self.__len = 0
+
+	def __del__( self ) -> None:
+		sys.free( self.__data )
+
+	def len( self ) -> usize:
+		return self.__len
+
+	def _grow( self, min_additional: usize ) -> None:
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			needed: usize = self.__len + min_additional
+		if needed <= self.__cap:
+			return
+		new_cap: usize = self.__cap
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			while new_cap < needed:
+				new_cap = new_cap * 2
+		new_data: Ptr[u8] = sys.alloc[u8]( new_cap )
+		sys.memcpy( new_data, self.__data, self.__len )
+		sys.free( self.__data )
+		self.__data = new_data
+		self.__cap = new_cap
+
+	def fill_from( self, sock: Socket ) -> Result[usize, OSError]:
+		''' one recv() call, appended to the buffer. Returns the number of
+		bytes read - 0 means the peer closed the connection. '''
+		self._grow( 4096 )
+		with compiler.wrap_arithmetic:
+			dest: Ptr[u8] = self.__data + self.__len
+			room: usize = self.__cap - self.__len
+		n: usize = sock.recv( dest, room ).or_return()
+		with compiler.wrap_arithmetic:
+			self.__len += n
+		return Result.Ok( n )
+
+	def find_double_crlf( self, start: usize ) -> Result[usize, IndexError]:
+		''' offset of the first "\\r\\n\\r\\n" at or after start, or Err if
+		not (yet) present - the header/body boundary. '''
+		if self.__len < 4:
+			return Result.Err( IndexError() )
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			last_start: usize = self.__len - 4
+		i: usize = start
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			while i <= last_start:
+				if self.__data[i] == _CR and self.__data[i+1] == _LF and self.__data[i+2] == _CR and self.__data[i+3] == _LF:
+					return Result.Ok( i )
+				i += 1
+		return Result.Err( IndexError() )
+
+	def slice_bytes( self, start: usize, end: usize ) -> bytes:
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			n: usize = end - start
+			src: ConstPtr[u8] = self.__data + start
+		out: bytearray = bytearray( n )
+		sys.memcpy( out.get_ptr(), src, n )
+		return bytes.from_bytearray( move( out ))
+
+	def slice_str( self, start: usize, end: usize ) -> Result[str, CodecError]:
+		# NOT str.from_cstr(ptr, size) - that overload requires the SOURCE
+		# buffer to already be null-terminated at size-1 (confirmed directly:
+		# it copies `size` bytes as-is and rejects a nonzero last byte), and
+		# this buffer's raw network bytes have no such terminator anywhere.
+		# bytearray(n+1) is zero-filled by construction (see lib/builtins/
+		# __init__.py's bytearray.__init__) and never written at its own
+		# last index below, so it's null-terminated by construction instead -
+		# same approach quote()/base64_encode above already use.
+		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
+			n: usize = end - start
+			src: ConstPtr[u8] = self.__data + start
+			buf_size: usize = n + 1
+		out: bytearray = bytearray( buf_size )
+		sys.memcpy( out.get_ptr(), src, n )
+		return str.from_cstr( move( out ))
+
+# ---------------------------------------------------------------------------
+# request building / sending
+# ---------------------------------------------------------------------------
+
+def _build_request_head( method: str, path: str, host: str, headers: HTTPHeaders|None, body: bytes|None ) -> str:
+	head: str = method + ' ' + path + ' HTTP/1.1\r\n' + 'Host: ' + host + '\r\n'
+	if headers is not None:
+		n: usize = headers.__len__()
+		i: usize = 0
+		for i in range( n ):
+			name: str = headers.name_at( i ).unwrap( '_build_request_head: index in bounds by construction' )
+			value: str = headers.value_at( i ).unwrap( '_build_request_head: index in bounds by construction' )
+			head = head + name + ': ' + value + '\r\n'
+	if body is not None:
+		head = head + 'Content-Length: ' + _usize_to_str( body.__len__() ) + '\r\n'
+	return head + '\r\n'
+
+# Every socket-facing call in this file is funneled through one of the
+# _*_or_http_err helpers below rather than propagated as a bare OSError via
+# .or_return()/Result.Err(e). This used to be a required workaround: widening
+# a bare @union error type (HTTPError) - or a value of it, staged through an
+# explicitly-typed local, or via .or_return() - into a WIDER union return
+# type (OSError|HTTPError) was broken in at least three different ways here
+# (ambiguous generic inference on Result.Err(e); "expected
+# OSError|HTTPError, got HTTPError" on the staging assignment itself). That
+# compiler bug is now FIXED (type_resolver._atomic_leaves, lowering.py's
+# _coerce_or_check_operand, emitter_c.py's _emit_widen_error - see
+# union_widening_test.py), so propagating a real OSError|HTTPError here is
+# an option again, not a compile error. Kept as-is anyway: collapsing every
+# Socket-facing OSError into HTTPError.Other() right at the call site is
+# still arguably better API design on its own merits - HTTPConnection's own
+# public error type stays a single, simple HTTPError instead of leaking
+# lib/socket.py's OSError as part of its API - not just a workaround anymore.
+
+def _connect_or_http_err( host: str, port: u16 ) -> Result[Socket, HTTPError]:
+	match Socket.tcp():
+		case Result.Ok( sock ):
+			match sock.connect( host, port ):
+				case Result.Ok( _ ):
+					return Result.Ok( sock )
+				case Result.Err( os_err ):
+					# distinguish "couldn't even resolve the hostname" from
+					# every other connect() failure (refused, reset, timed
+					# out, ...) - the one OSError variant a caller is likely
+					# to want to handle differently (e.g. retry vs. give up
+					# immediately on a typo'd hostname). Every other OSError
+					# still collapses to Other() - see this function's own
+					# header comment on why that stays deliberate, not a gap.
+					if os_err == OSError.NameResolutionFailed:
+						return Result.Err( HTTPError.NameResolutionFailed( None ))
+					return Result.Err( HTTPError.Other( None ))
+		case Result.Err( _ ):
+			return Result.Err( HTTPError.Other( None ))
+
+def _send_or_http_err( sock: Socket, ptr: ConstPtr[u8], length: usize ) -> Result[usize, HTTPError]:
+	match sock.send( ptr, length ):
+		case Result.Ok( n ):
+			return Result.Ok( n )
+		case Result.Err( _ ):
+			return Result.Err( HTTPError.Other( None ))
+
+def _fill_or_http_err( buf: _GrowableBuffer, sock: Socket ) -> Result[usize, HTTPError]:
+	match buf.fill_from( sock ):
+		case Result.Ok( n ):
+			return Result.Ok( n )
+		case Result.Err( _ ):
+			return Result.Err( HTTPError.Other( None ))
+
+def _send_all( sock: Socket, ptr: ConstPtr[u8], length: usize ) -> Result[None, HTTPError]:
+	sent: usize = 0
+	with compiler.panic_arithmetic( 'bounded by length, cannot overflow' ):
+		while sent < length:
+			n: usize = _send_or_http_err( sock, ptr + sent, length - sent ).or_return()
+			if n == 0:
+				return Result.Err( HTTPError.UnexpectedEOF( None ))
+			sent += n
+	return Result.Ok( None )
+
+# ---------------------------------------------------------------------------
+# Response - the result of HTTPConnection.getresponse()
+# ---------------------------------------------------------------------------
+
+class Response:
+	status_code: u16
+	reason: str
+	headers: HTTPHeaders
+	content: bytes
+	url: str # the URL actually fetched - the final one, after any redirects
+
+	def __init__( self, status_code: u16, reason: str, headers: HTTPHeaders, content: bytes, url: str ) -> None:
+		self.status_code = status_code
+		self.reason = reason
+		self.headers = headers
+		self.content = content
+		self.url = url
+
+	def text( self ) -> Result[str, CodecError]:
+		return self.content.decode()
+
+	def ok( self ) -> bool:
+		return self.status_code < 400
+
+	def raise_for_status( self ) -> Result[None, HTTPError]:
+		if self.status_code >= 400:
+			return Result.Err( HTTPError.BadStatus( None ))
+		return Result.Ok( None )
+
+# ---------------------------------------------------------------------------
+# response body reading - one function per Content-Length/chunked/until-
+# close strategy. Split out of getresponse() itself (rather than inlined
+# per-branch) so each has a single, straight-line return path - definite-
+# assignment tracking for a shared post-if local reassigned from inside a
+# nested `while True: ... break` didn't hold up under a real compile.
+# ---------------------------------------------------------------------------
+
+def _read_chunked_body( sock: Socket, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
+	with compiler.panic_arithmetic( 'a real chunked body fits well within usize' ):
+		while True:
+			body_bytes: bytes = buf.slice_bytes( body_start, buf.len() )
+			match decode_chunked( body_bytes ):
+				case Result.Ok( d ):
+					return Result.Ok( d )
+				case Result.Err( HTTPError.ChunkSizeInvalid( _ )):
+					return Result.Err( HTTPError.ChunkSizeInvalid( None ))
+				case Result.Err( _ ):
+					pass # UnexpectedEOF - not a full chunked body yet, keep reading
+			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			if n == 0:
+				return Result.Err( HTTPError.UnexpectedEOF( None ))
+
+def _read_content_length_body( sock: Socket, buf: _GrowableBuffer, body_start: usize, content_length: usize ) -> Result[bytes, HTTPError]:
+	with compiler.panic_arithmetic( 'a real Content-Length body fits well within usize' ):
+		while True:
+			with compiler.panic_arithmetic( 'bounded by buf.len(), cannot overflow' ):
+				have: usize = buf.len() - body_start
+			if have >= content_length:
+				break
+			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			if n == 0:
+				return Result.Err( HTTPError.UnexpectedEOF( None ))
+	with compiler.wrap_arithmetic:
+		body_end: usize = body_start + content_length
+	return Result.Ok( buf.slice_bytes( body_start, body_end ))
+
+def _read_until_close_body( sock: Socket, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
+	with compiler.panic_arithmetic( 'a real response body fits well within usize' ):
+		while True:
+			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			if n == 0:
+				break
+	return Result.Ok( buf.slice_bytes( body_start, buf.len() ))
+
+# ---------------------------------------------------------------------------
+# HTTPConnection - one TCP connection, one request/response at a time.
+# Mirrors lib/builtins/__File.py's handle shape: an owned resource field (a
+# Socket, itself already RC-managed with its own auto-closing __del__ - no
+# HTTPConnection.__del__ needed, the field's own teardown cascades), a
+# private constructor, ordinary Result-returning methods.
+# ---------------------------------------------------------------------------
+
+class HTTPConnection:
+	__sock: Socket
+	__host: str
+	__port: u16
+
+	def close( self ) -> None:
+		self.__sock.close()
+
+	@staticmethod
+	def connect( host: str, port: u16 = 80 ) -> Result[HTTPConnection, HTTPError]:
+		''' host may be a real hostname - lib/socket.py's own Socket.connect()
+		resolves it via getaddrinfo internally. '''
+		sock: Socket = _connect_or_http_err( host, port ).or_return()
+		return Result.Ok( HTTPConnection.__allocate__( __sock = sock, __host = host, __port = port ))
+
+	def request( self, method: str, path: str, headers: HTTPHeaders|None = None, body: bytes|None = None ) -> Result[None, HTTPError]:
+		head: str = _build_request_head( method, path, self.__host, headers, body )
+		head_bytes: bytes = head.encode().unwrap( '_build_request_head: unreachable - pure ASCII output' )
+		_send_all( self.__sock, head_bytes.get_const_ptr(), head_bytes.__len__() ).or_return()
+		if body is not None:
+			content: bytes = body
+			_send_all( self.__sock, content.get_const_ptr(), content.__len__() ).or_return()
+		return Result.Ok( None )
+
+	def getresponse( self ) -> Result[Response, HTTPError]:
+		buf: _GrowableBuffer = _GrowableBuffer()
+
+		# --- read until the status-line+headers block is fully buffered ---
+		header_end: usize = 0
+		with compiler.panic_arithmetic( 'a real HTTP response header block fits well within usize' ):
+			while True:
+				found: Result[usize, IndexError] = buf.find_double_crlf( 0 )
+				match found:
+					case Result.Ok( offset ):
+						header_end = offset
+						break
+					case Result.Err( _ ):
+						pass
+				n: usize = _fill_or_http_err( buf, self.__sock ).or_return()
+				if n == 0:
+					return Result.Err( HTTPError.UnexpectedEOF( None ))
+
+		header_block: str = buf.slice_str( 0, header_end ).unwrap( 'getresponse: invalid UTF-8 in status line/headers' )
+		with compiler.wrap_arithmetic:
+			body_start: usize = header_end + 4
+
+		first: tuple[str,str,str] = header_block.partition( '\r\n' )
+		status_line: str = first[0]
+		rest_headers: str = first[2]
+
+		parsed_status: tuple[str,u16,str] = parse_status_line( status_line ).or_return()
+		headers: HTTPHeaders = parse_headers( rest_headers ).or_return()
+
+		# --- read the body, per whichever length strategy the headers say ---
+		transfer_encoding: str|None = headers.get( 'Transfer-Encoding' )
+		is_chunked: bool = False
+		if transfer_encoding is not None:
+			te: str = transfer_encoding
+			is_chunked = te.lower() == 'chunked'
+
+		content: bytes = bytes.from_bytearray( move( bytearray( 0 )))
+		if is_chunked:
+			content = _read_chunked_body( self.__sock, buf, body_start ).or_return()
+		else:
+			content_length_str: str|None = headers.get( 'Content-Length' )
+			if content_length_str is not None:
+				cl: str = content_length_str
+				content_length: usize = _usize_from_str( cl ).or_return()
+				content = _read_content_length_body( self.__sock, buf, body_start, content_length ).or_return()
+			else:
+				# no Content-Length, not chunked - read until the peer closes
+				content = _read_until_close_body( self.__sock, buf, body_start ).or_return()
+
+		# url left blank here - HTTPConnection only knows host/port/path, not
+		# the scheme a caller reached it through; Session.request() (the only
+		# caller that actually knows the full URL) fills this field in itself
+		# right after getresponse() returns.
+		return Result.Ok( Response( parsed_status[1], parsed_status[2], headers, content, '' ))
+
+# ---------------------------------------------------------------------------
+# URL parsing - minimal, http:// only (no TLS - see PLAN_HTTP_CLIENT.md's
+# Phase 4), absolute URLs only (no relative-URL resolution, needed for
+# redirect Location headers below - a relative Location is an error for v1).
+# ---------------------------------------------------------------------------
+
+class ParsedURL:
+	scheme: str
+	host: str
+	port: u16
+	path: str # path + query, e.g. "/foo?bar=1" - everything after host[:port]
+
+	def __init__( self, scheme: str, host: str, port: u16, path: str ) -> None:
+		self.scheme = scheme
+		self.host = host
+		self.port = port
+		self.path = path
+
+def _u16_from_str( s: str ) -> Result[u16, HTTPError]:
+	n: usize = _usize_from_str( s ).or_return()
+	if n > 65535:
+		return Result.Err( HTTPError.InvalidURL( None ))
+	with compiler.panic_arithmetic( 'bounded by the check above, cannot overflow' ):
+		return Result.Ok( u16( n ))
+
+def _parse_url( url: str ) -> Result[ParsedURL, HTTPError]:
+	scheme_split: tuple[str,str,str] = url.partition( '://' )
+	if scheme_split[1].byte_len() == 0:
+		return Result.Err( HTTPError.InvalidURL( None ))
+	scheme: str = scheme_split[0].lower()
+	if scheme != 'http':
+		# https:// (or anything else) isn't reachable without TLS support
+		return Result.Err( HTTPError.InvalidURL( None ))
+	rest: str = scheme_split[2]
+	if rest.byte_len() == 0:
+		return Result.Err( HTTPError.InvalidURL( None ))
+
+	path_split: tuple[str,str,str] = rest.partition( '/' )
+	hostport: str = path_split[0]
+	path: str = '/'
+	if path_split[1].byte_len() != 0:
+		path = '/' + path_split[2]
+
+	hp_split: tuple[str,str,str] = hostport.partition( ':' )
+	host: str = hp_split[0]
+	if host.byte_len() == 0:
+		return Result.Err( HTTPError.InvalidURL( None ))
+	port: u16 = 80
+	if hp_split[1].byte_len() != 0:
+		port = _u16_from_str( hp_split[2] ).or_return()
+
+	return Result.Ok( ParsedURL( scheme, host, port, path ))
+
+# ---------------------------------------------------------------------------
+# query-string / form encoding - dict[str,str] iterated via key_at/value_at
+# (lib/builtins/__init__.py's dict[K,V] positional accessors), percent-
+# encoded via urllib.parse's quote().
+# ---------------------------------------------------------------------------
+
+def _merge_query_params( path: str, params: dict[str,str]|None ) -> str:
+	if params is None:
+		return path
+	p: dict[str,str] = params
+	n: usize = p.__len__()
+	if n == 0:
+		return path
+	parts: list[str] = list[str]()
+	i: usize = 0
+	for i in range( n ):
+		key: str = p.key_at( i ).unwrap( '_merge_query_params: index in bounds by construction' )
+		value: str = p.value_at( i ).unwrap( '_merge_query_params: index in bounds by construction' )
+		parts.append( quote( key ) + '=' + quote( value ) ).unwrap( '_merge_query_params: append failed' )
+	sep: str = '&'
+	found: isize = path.find( '?' )
+	if found == isize( -1 ):
+		sep = '?'
+	return path + sep + '&'.join( parts )
+
+def _form_encode( data: dict[str,str] ) -> str:
+	n: usize = data.__len__()
+	parts: list[str] = list[str]()
+	i: usize = 0
+	for i in range( n ):
+		key: str = data.key_at( i ).unwrap( '_form_encode: index in bounds by construction' )
+		value: str = data.value_at( i ).unwrap( '_form_encode: index in bounds by construction' )
+		parts.append( quote( key ) + '=' + quote( value ) ).unwrap( '_form_encode: append failed' )
+	return '&'.join( parts )
+
+def _copy_headers( h: HTTPHeaders ) -> HTTPHeaders:
+	out: HTTPHeaders = HTTPHeaders()
+	n: usize = h.__len__()
+	i: usize = 0
+	for i in range( n ):
+		name: str = h.name_at( i ).unwrap( '_copy_headers: index in bounds by construction' )
+		value: str = h.value_at( i ).unwrap( '_copy_headers: index in bounds by construction' )
+		out.add( name, value )
+	return out
+
+# ---------------------------------------------------------------------------
+# Session - cookie jar + redirect-following layer over HTTPConnection.
+# Mirrors requests.Session; see PLAN_HTTP_CLIENT.md's Phase 3b. Every request
+# opens a fresh HTTPConnection (no keep-alive/connection pooling - see the
+# plan's own Phase 4). data is bytes|str|None rather than requests' own
+# bytes|str|dict|None - a dict-shaped form body goes through the separate
+# form= parameter instead (see _encode_body's own comment on why).
+# ---------------------------------------------------------------------------
+
+_MAX_REDIRECTS: usize = 10
+
+def _encode_body( data: bytes|str|None, form: dict[str,str]|None ) -> tuple[bytes|None, str|None]:
+	''' -> (body bytes, Content-Type to set if not already present). data and
+	form are mutually exclusive (form wins if somehow both are given - not
+	expected in practice). Kept as two separate optional parameters rather
+	than one requests-style bytes|str|dict|None union: match-based dispatch
+	across a 3-real-type union (bytes|str|dict[str,str], plus None) is
+	untested territory in this codebase (the only confirmed match-on-union-
+	member precedent, union_coercion_rc_test.py's Box|None, is a single real
+	type - see PLAN_HTTP_CLIENT.md's own note on this), and dict[str,str]
+	specifically nested inside a wider union raises the same generic-
+	argument-in-a-union-position question the list[tuple[...]] gap
+	(task_a8b4e7c3's sibling, already fixed once) was about. Splitting form=
+	out avoids the question entirely rather than gambling on untested
+	compiler territory here too. '''
+	if form is not None:
+		f: dict[str,str] = form
+		encoded: str = _form_encode( f )
+		body: bytes = encoded.encode().unwrap( '_encode_body: form encoding is always ASCII' )
+		return ( body, 'application/x-www-form-urlencoded' )
+	if data is not None:
+		match data:
+			case bytes( b ):
+				return ( b, None )
+			case str( s ):
+				sb: bytes = s.encode().unwrap( '_encode_body: request body string must be valid UTF-8' )
+				return ( sb, None )
+	return ( None, None )
+
+def _is_redirect_status( status_code: u16 ) -> bool:
+	return status_code == 301 or status_code == 302 or status_code == 303 or status_code == 307 or status_code == 308
+
+def _build_request_headers( session_headers: HTTPHeaders, content_type: str|None, extra_headers: HTTPHeaders|None, cookie_header: str|None, auth: tuple[str,str]|None ) -> HTTPHeaders:
+	''' merges session defaults + a computed Content-Type + per-call headers=
+	(highest precedence among headers) + the Cookie jar + auth= into one
+	HTTPHeaders for a single request. A plain (non-looping) function
+	specifically so `is not None` narrowing works - see Session.request()'s
+	own comment on why this couldn't just be inlined in its while loop. '''
+	request_headers: HTTPHeaders = _copy_headers( session_headers )
+	if content_type is not None:
+		ct: str = content_type
+		request_headers.set( 'Content-Type', ct )
+	if extra_headers is not None:
+		h: HTTPHeaders = extra_headers
+		hn: usize = h.__len__()
+		hi: usize = 0
+		for hi in range( hn ):
+			hname: str = h.name_at( hi ).unwrap( '_build_request_headers: index in bounds by construction' )
+			hvalue: str = h.value_at( hi ).unwrap( '_build_request_headers: index in bounds by construction' )
+			request_headers.set( hname, hvalue )
+	if cookie_header is not None:
+		ch: str = cookie_header
+		request_headers.set( 'Cookie', ch )
+	if auth is not None:
+		a: tuple[str,str] = auth
+		credentials: str = a[0] + ':' + a[1]
+		cred_bytes: bytes = credentials.encode().unwrap( '_build_request_headers: auth= must be valid UTF-8' )
+		request_headers.set( 'Authorization', 'Basic ' + base64_encode( cred_bytes ))
+	return request_headers
+
+def _next_redirect_url( response: Response, allow_redirects: bool ) -> str:
+	''' the URL to redirect to, or '' if this response isn't a redirect that
+	should be followed - an empty-string sentinel rather than str|None so
+	Session.request()'s own while loop never needs to narrow an Optional
+	(see its own comment on why that doesn't work inside that loop). Only
+	absolute http:// Location values are followed - a relative Location
+	needs URL-resolution-against-the-original this pass doesn't implement,
+	so it's treated as "don't redirect" rather than an error. '''
+	if not allow_redirects:
+		return ''
+	if not _is_redirect_status( response.status_code ):
+		return ''
+	location: str|None = response.headers.get( 'Location' )
+	if location is not None:
+		loc: str = location
+		if loc.startswith( 'http://' ):
+			return loc
+	return ''
+
+class Session:
+	headers: HTTPHeaders
+	__cookies: dict[str,str]
+
+	def __init__( self ) -> None:
+		self.headers = HTTPHeaders()
+		self.__cookies = dict[str,str]()
+
+	def _harvest_cookies( self, response_headers: HTTPHeaders ) -> None:
+		set_cookies: list[str] = response_headers.get_all( 'Set-Cookie' )
+		n: usize = set_cookies.__len__()
+		i: usize = 0
+		for i in range( n ):
+			raw: str = set_cookies.__getitem__( i ).unwrap( '_harvest_cookies: index in bounds by construction' )
+			first_part: tuple[str,str,str] = raw.partition( ';' )
+			kv: tuple[str,str,str] = first_part[0].partition( '=' )
+			if kv[1].byte_len() == 0:
+				continue
+			name: str = kv[0].strip()
+			value: str = kv[2].strip()
+			if name.byte_len() == 0:
+				continue
+			self.__cookies[ name ] = value
+
+	def _build_cookie_header( self, extra: dict[str,str]|None ) -> str|None:
+		n: usize = self.__cookies.__len__()
+		extra_n: usize = 0
+		if extra is not None:
+			e: dict[str,str] = extra
+			extra_n = e.__len__()
+		if n == 0 and extra_n == 0:
+			return None
+		parts: list[str] = list[str]()
+		i: usize = 0
+		for i in range( n ):
+			name: str = self.__cookies.key_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
+			value: str = self.__cookies.value_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
+			parts.append( name + '=' + value ).unwrap( '_build_cookie_header: append failed' )
+		if extra is not None:
+			e2: dict[str,str] = extra
+			for i in range( extra_n ):
+				name = e2.key_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
+				value = e2.value_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
+				parts.append( name + '=' + value ).unwrap( '_build_cookie_header: append failed' )
+		return '; '.join( parts )
+
+	def request( self, method: str, url: str,
+		params: dict[str,str]|None = None,
+		data: bytes|str|None = None,
+		form: dict[str,str]|None = None,
+		headers: HTTPHeaders|None = None,
+		cookies: dict[str,str]|None = None,
+		auth: tuple[str,str]|None = None,
+		allow_redirects: bool = True,
+	) -> Result[Response, HTTPError]:
+		current_method: str = method
+		current_url: str = url
+		encoded_body: tuple[bytes|None, str|None] = _encode_body( data, form )
+		current_body: bytes|None = encoded_body[0]
+		content_type: str|None = encoded_body[1]
+
+		redirect_count: usize = 0
+		with compiler.panic_arithmetic( 'bounded by _MAX_REDIRECTS, cannot overflow' ):
+			while True:
+				parsed: ParsedURL = _parse_url( current_url ).or_return()
+				full_path: str = _merge_query_params( parsed.path, params )
+				# `x is not None` narrowing doesn't hold up inside a `while
+				# True:` loop body here (confirmed by several real compiles:
+				# every one of content_type/headers/cookie_header/auth/
+				# location failed to narrow inside this loop, not just the
+				# ones actually reassigned elsewhere in it - narrowing
+				# apparently doesn't survive a loop back-edge at all, not
+				# just mutation specifically). Every Optional this loop needs
+				# is instead threaded through as a bare parameter into a
+				# plain (non-looping) helper function below, where the same
+				# narrowing pattern DOES work (matches getresponse()'s own
+				# working straight-line narrowing).
+				cookie_header: str|None = self._build_cookie_header( cookies )
+				request_headers: HTTPHeaders = _build_request_headers( self.headers, content_type, headers, cookie_header, auth )
+
+				conn: HTTPConnection = HTTPConnection.connect( parsed.host, parsed.port ).or_return()
+				conn.request( current_method, full_path, request_headers, current_body ).or_return()
+				response: Response = conn.getresponse().or_return()
+				conn.close()
+				response.url = current_url
+				self._harvest_cookies( response.headers )
+
+				# '' is a "don't redirect" sentinel, not Optional - see
+				# _next_redirect_url's own comment for why
+				next_url: str = _next_redirect_url( response, allow_redirects )
+				if next_url.byte_len() == 0:
+					return Result.Ok( response )
+
+				if redirect_count >= _MAX_REDIRECTS:
+					return Result.Err( HTTPError.TooManyRedirects( None ))
+				redirect_count += 1
+
+				if response.status_code == 301 or response.status_code == 302 or response.status_code == 303:
+					current_method = 'GET'
+					current_body = None
+					content_type = None
+				current_url = next_url
+
+	def get( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'GET', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+	def post( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'POST', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+	def put( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'PUT', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+	def patch( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'PATCH', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+	def delete( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'DELETE', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+	def head( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
+		return self.request( 'HEAD', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+	def options( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'OPTIONS', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+# ---------------------------------------------------------------------------
+# module-level convenience - each a one-off Session() underneath, matching
+# requests.get()/requests.post()/etc. (and the PHP fetch() reference's own
+# module-level fetch() wrapping a one-off Session).
+# ---------------------------------------------------------------------------
+
+def get( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	return Session().get( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+def post( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	return Session().post( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+def put( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	return Session().put( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+def patch( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	return Session().patch( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+def delete( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	return Session().delete( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+def head( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
+	return Session().head( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+
+def options( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
+	return Session().options( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )

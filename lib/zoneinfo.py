@@ -16,6 +16,7 @@
 # resolved on the other OS.
 
 import compiler
+import time
 
 class TTInfo:
 	utcoffset: i32  # offset from UTC, in SECONDS (matches TZif's own on-disk
@@ -35,7 +36,13 @@ class ZoneInfo:
 	transition_times: list[i64]  # sorted ascending, parallel to transition_rules
 	transition_rules: list[TTInfo]
 
-	def __init__( self, key: str ) -> None:
+	def __init__( self, key: str|None = None ) -> None:
+		''' key omitted (or None) defaults to the system's own configured
+		local zone (time.get_local_timezone_name()) - still fully
+		tz-aware/unambiguous either way, just chosen for the caller instead
+		of typed out. '''
+		if key is None:
+			key = time.get_local_timezone_name()
 		self.name = key
 		self.default_rule = TTInfo( utcoffset = 0, is_dst = False, abbr = '' )
 		self.transition_times = []

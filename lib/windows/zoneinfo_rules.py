@@ -19,7 +19,7 @@
 import compiler
 import sys
 from zoneinfo import ZoneInfo, TTInfo
-from windows.time import _decode_ascii_utf16z, _field_ptr_u16
+from windows.time import _decode_ascii_utf16z
 from _civil_calendar import days_from_civil, days_in_month
 from math import floormod_i64
 
@@ -105,7 +105,7 @@ def _find_zone_by_key_name( win_name: str ) -> Ptr[u8]:
 	reusing the same scratch buffer across iterations until a match is
 	found, so only one allocation is made regardless of how many entries are
 	scanned. '''
-	from windows.kernel32 import DynamicTimeZoneInformation, _TZKEYNAME_SIZE, _TZKEYNAME_OFFSET
+	from windows.kernel32 import DynamicTimeZoneInformation, _TZKEYNAME_SIZE
 	from windows.advapi32 import EnumDynamicTimeZoneInformation, ERROR_SUCCESS, ERROR_NO_MORE_ITEMS
 
 	struct_size: usize = compiler.sizeof( DynamicTimeZoneInformation )
@@ -126,8 +126,7 @@ def _find_zone_by_key_name( win_name: str ) -> Ptr[u8]:
 			sys.free( raw )
 			sys.panic( 'zoneinfo: EnumDynamicTimeZoneInformation failed' )
 
-		opaque_ptr: Ptr[None] = compiler.cast( Ptr[None], dtzi_ptr )
-		key_ptr: Ptr[u16] = _field_ptr_u16( opaque_ptr, _TZKEYNAME_OFFSET )
+		key_ptr: Ptr[u16] = compiler.addrof( dtzi_ptr.TimeZoneKeyName )
 		candidate: str = _decode_ascii_utf16z( key_ptr, _TZKEYNAME_SIZE )
 		if candidate == win_name:
 			return raw
