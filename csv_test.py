@@ -246,6 +246,36 @@ def main() -> i32:
 		case Result.Err( e ):
 			return 7
 ''' ),
+			# investigation repro for the compiler-bug comment at
+			# lib/csv.py:244-250 (_format_field's if/elif workaround) -
+			# NOT wired into _format_field itself, that shape must stay as
+			# the shipped if/elif regardless of this test's outcome. This
+			# is the exact rejected shape: a single `or`-chain of 4
+			# `field.find(X).is_ok()` calls, joined all the way instead of
+			# split into separate if/elif branches. Cases cover every
+			# short-circuit position (no match at all - every operand
+			# actually runs; match on the 1st/2nd/3rd/4th operand - all
+			# preceding operands run, everything after is skipped) since a
+			# short-circuit-cleanup bug specifically needs operands that
+			# are genuinely skipped at runtime, not just present in the
+			# source.
+			( 'boolop_or_chain_of_find_is_ok_repro', '''
+def needs_quote_or_chain( field: str, delimiter: str, quotechar: str ) -> bool:
+	return field.find( delimiter ).is_ok() or field.find( quotechar ).is_ok() or field.find( '\\r' ).is_ok() or field.find( '\\n' ).is_ok()
+
+def main() -> i32:
+	if needs_quote_or_chain( 'plain', ',', '"' ) != False: # no match - all 4 operands run
+		return 1
+	if needs_quote_or_chain( 'a,b', ',', '"' ) != True: # 1st operand matches - short-circuits immediately
+		return 2
+	if needs_quote_or_chain( 'a"b', ',', '"' ) != True: # 2nd operand matches - 1st ran and was false, then short-circuits
+		return 3
+	if needs_quote_or_chain( 'a\\rb', ',', '"' ) != True: # 3rd operand matches - 1st/2nd ran false, then short-circuits
+		return 4
+	if needs_quote_or_chain( 'a\\nb', ',', '"' ) != True: # 4th (last) operand matches - all 4 operands run
+		return 5
+	return 0
+''' ),
 		])
 
 
