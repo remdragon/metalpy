@@ -56,6 +56,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'strip symbols / fold identical code for a smaller binary' )
 	p.add_argument( '--asan', action = 'store_true',
 		help = 'build with AddressSanitizer (requires the C runtime - forces CRT linking for a program that would otherwise build freestanding/no-CRT)' )
+	p.add_argument( '--show-warnings', action = 'store_true',
+		help = 'print compiler warnings even on a successful build (off by default - the shared builtins runtime currently emits pre-existing warnings on every build)' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
@@ -199,6 +201,14 @@ def main() -> None:
 				src_path.rename( c_path )
 				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
+		elif args.show_warnings and compile_result.stdout.strip():
+			# build succeeded but the compiler still had something to say (e.g.
+			# -Wall/-Wextra or /W4 warnings) - opt-in only: the shared builtins
+			# runtime currently emits warnings of its own on every build, so
+			# printing this unconditionally would make --show-warnings the
+			# only way to ever get quiet output again
+			print( f'mpy: {cc.name} compile warnings:', file = sys.stderr )
+			print( compile_result.stdout, file = sys.stderr )
 
 		# --- link .o → executable ---
 		exe_path = (args.output or args.source.with_suffix( '' )).resolve()
@@ -220,6 +230,9 @@ def main() -> None:
 				src_path.rename( c_path )
 				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
+		elif args.show_warnings and link_result.stdout.strip():
+			print( f'mpy: {cc.name} link warnings:', file = sys.stderr )
+			print( link_result.stdout, file = sys.stderr )
 
 		print( f'mpy: built {exe_path}' )
 
