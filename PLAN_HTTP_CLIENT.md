@@ -389,8 +389,55 @@ this codebase was hitting the same walls before these fixes landed).
    reverted back to `auth: tuple[str,str]|None`, BasicAuth removed. auth=
    now matches requests' own `auth=(user, password)` ergonomics exactly.
 
-  Phase 4 (deferred/future plan doc) — HTTPSConnection/TLS, `json=`/`.json()` once
-    a json library exists, multipart `files=`, connection reuse.
+  Phase 4a — landed: `json=` (on Session/post/put/patch and their module-level
+    counterparts) and `Response.json()`, built on lib/json.py (commit cc116c9)
+    - `json=` serializes via json.dumps() and sets Content-Type: application/
+    json if not already present; `.json()` parses `.content` via json.loads(),
+    collapsing either a UTF-8 decode failure or a JSON parse failure into
+    HTTPError.InvalidJSON. `json=`/`data=`/`form=` remain mutually exclusive,
+    checked in that priority order (json= wins if more than one is somehow
+    given). Covered by http_client_test.py's session_json_request_and_response:
+    a real loopback POST with json=, server verifies the raw Content-Type and
+    JSON body bytes, response comes back as its own JSON body, parsed back via
+    .json() and read through object_get()/as_str()/as_int(). Two real compiler
+    gaps found while landing this - see "Compiler gaps found while landing
+    Phase 4a" below.
+
+  Phase 4b (deferred/future plan doc) — HTTPSConnection/TLS (no TLS library
+    exists at all yet - a large separate undertaking), multipart `files=`,
+    connection reuse/keep-alive.
+
+Compiler gaps found while landing Phase 4a
+
+1. A tuple literal passed DIRECTLY as Result.Ok(...)'s own argument, where
+   the enclosing function's declared return type wraps a tuple with union
+   element types (Result[tuple[bytes|None,str|None], HTTPError] here), left
+   T ambiguous - "inferred as both tuple[bytes|None,str|None] and
+   tuple[bytes,str]" (a real compile error). This is a narrower case than
+   task_34251c9f (a union AS a tuple's own element - fixed by 98c2010): here
+   the tuple/union shape itself is fine on its own (it's exactly what
+   task_34251c9f fixed), the NEW gap is specifically Result.Ok(...) inferring
+   its own T from a bare tuple-literal argument rather than the function's
+   declared return type. Worked around by staging every such tuple literal
+   through an explicitly `tuple[bytes|None,str|None]`-typed local first, then
+   passing THAT to Result.Ok() - see _encode_body's own comment. Flagged as
+   task_ffb0bdb5.
+
+2. A nested `match` (every arm returning) directly inside an `if x is not
+   None:` block, immediately followed by a plain `if` checking a DIFFERENT
+   parameter, produced a nonsensical diagnostic on the unrelated parameter -
+   "'form' is not initialized on all code branches", where `form` is an
+   ordinary always-bound parameter never touched by the preceding block.
+   Worked around by extracting the nested-match branch into its own small
+   single-return-statement helper function (_encode_json_body) - matches
+   this file's own established "extract into a plain helper" pattern for
+   narrowing-related compiler gaps (_build_request_headers/_next_redirect_url).
+   Flagged as task_ccb9f3d6.
+
+3. (Not a compiler bug - a real bug in this file, found and fixed the same
+   way): a match-arm capture bound to the name `text` inside Response.json()
+   collided with Response's own text() method, "'text' is not a variable,
+   cannot assign to it". Fixed by renaming the capture to `decoded`.
 
 Testing approach
 

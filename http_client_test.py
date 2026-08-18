@@ -661,6 +661,87 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			( 'session_json_request_and_response', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response
+from json import JSONValue
+
+class JsonServer:
+	port: u16
+	ready: Atomic[bool]
+	ok: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.ok = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				recv_total: usize = 0
+				attempts: usize = 0
+				req: str = ''
+				with compiler.wrap_arithmetic:
+					while attempts < 50:
+						dest: Ptr[u8] = buf.get_ptr() + recv_total
+						room: usize = 4096 - recv_total
+						n: usize = conn.recv( dest, room ).unwrap( 'server: recv' )
+						recv_total += n
+						attempts += 1
+						req = buf.decode().unwrap( 'server: decode' )
+						has_ct0: bool = req.find( 'Content-Type: application/json' ) != isize( -1 )
+						has_body0: bool = req.find( '{"a":1,"b":"hello"}' ) != isize( -1 )
+						if ( has_ct0 and has_body0 ) or n == 0:
+							break
+				has_ct: bool = req.find( 'Content-Type: application/json' ) != isize( -1 )
+				has_body: bool = req.find( '{"a":1,"b":"hello"}' ) != isize( -1 )
+				if has_ct and has_body:
+					self.ok.store( True )
+				resp: str = 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: 25\\r\\n\\r\\n{"status":"ok","count":3}'
+				rb: bytes = resp.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: JsonServer = JsonServer( u16( 18774 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	body: JSONValue = JSONValue.object()
+	body.object_set( 'a', JSONValue.from_int( int( 1 ))).unwrap( 'object_set a' )
+	body.object_set( 'b', JSONValue.from_str( 'hello' )).unwrap( 'object_set b' )
+	r: Response = s.post( 'http://127.0.0.1:18774/submit', json = body ).unwrap( 'client request' )
+	t.join()
+
+	if r.status_code != 200:
+		return 1
+	if not server.ok.load():
+		return 2
+
+	parsed: JSONValue = r.json().unwrap( 'response json' )
+	status: str = parsed.object_get( 'status' ).unwrap( 'get status' ).as_str().unwrap( 'as_str' )
+	if status != 'ok':
+		return 3
+	count: int = parsed.object_get( 'count' ).unwrap( 'get count' ).as_int().unwrap( 'as_int' )
+	if count != int( 3 ):
+		return 4
+	return 0
+''' ),
 		])
 
 

@@ -19,7 +19,8 @@ via getaddrinfo internally (commit f794edb). https:// URLs aren't supported yet
 (no TLS - see PLAN_HTTP_CLIENT.md's Phase 4). URL parsing/query encoding is
 built on lib/urllib/parse.py (urlsplit/urlencode/parse_qsl/urljoin) rather
 than hand-rolled here - redirect Location headers may now be relative,
-resolved against the request URL via urljoin().
+resolved against the request URL via urljoin(). json= (on post/put/patch)
+and Response.json() are built on lib/json.py.
 '''
 
 import sys
@@ -27,6 +28,7 @@ import compiler
 import base64
 from socket import Socket
 from urllib.parse import urlencode, parse_qsl, urlsplit, urljoin, SplitResult
+from json import loads, dumps, JSONValue
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -47,6 +49,7 @@ class HTTPError:
 	TooManyRedirects: None
 	BadStatus: None
 	NameResolutionFailed: None
+	InvalidJSON: None
 	Other: None
 
 # ---------------------------------------------------------------------------
@@ -547,6 +550,23 @@ class Response:
 	def text( self ) -> Result[str, CodecError]:
 		return self.content.decode()
 
+	def json( self ) -> Result[JSONValue, HTTPError]:
+		''' parses content as JSON (via lib/json.py's loads()) - the body must
+		already be valid UTF-8 (content.decode() failing, or the decoded text
+		not being valid JSON, both collapse to HTTPError.InvalidJSON). '''
+		# capture bound to `decoded`, not `text` - `text` collides with this
+		# class's own text() method name (confirmed via a real compile:
+		# "'text' is not a variable, cannot assign to it")
+		match self.text():
+			case Result.Ok( decoded ):
+				match loads( decoded ):
+					case Result.Ok( value ):
+						return Result.Ok( value )
+					case Result.Err( _ ):
+						return Result.Err( HTTPError.InvalidJSON( None ))
+			case Result.Err( _ ):
+				return Result.Err( HTTPError.InvalidJSON( None ))
+
 	def ok( self ) -> bool:
 		return self.status_code < 400
 
@@ -804,33 +824,60 @@ def _copy_headers( h: HTTPHeaders ) -> HTTPHeaders:
 
 _MAX_REDIRECTS: usize = 10
 
-def _encode_body( data: bytes|str|None, form: dict[str,str]|None ) -> tuple[bytes|None, str|None]:
-	''' -> (body bytes, Content-Type to set if not already present). data and
-	form are mutually exclusive (form wins if somehow both are given - not
-	expected in practice). Kept as two separate optional parameters rather
-	than one requests-style bytes|str|dict|None union: match-based dispatch
-	across a 3-real-type union (bytes|str|dict[str,str], plus None) is
-	untested territory in this codebase (the only confirmed match-on-union-
-	member precedent, union_coercion_rc_test.py's Box|None, is a single real
-	type - see PLAN_HTTP_CLIENT.md's own note on this), and dict[str,str]
-	specifically nested inside a wider union raises the same generic-
-	argument-in-a-union-position question the list[tuple[...]] gap
-	(task_a8b4e7c3's sibling, already fixed once) was about. Splitting form=
-	out avoids the question entirely rather than gambling on untested
-	compiler territory here too. '''
+def _encode_json_body( json_value: JSONValue ) -> Result[tuple[bytes|None, str|None], HTTPError]:
+	''' split out of _encode_body() itself - a nested match (each arm
+	returning) directly inside `if json_value is not None:`, immediately
+	followed by another `if form is not None:` check on a DIFFERENT
+	parameter, hit a real compiler diagnostic bug ("'form' is not
+	initialized on all code branches" - form is an ordinary parameter,
+	always bound - confirmed via a real compile). A single-return-statement
+	call site sidesteps it entirely, matching this file's own established
+	"extract into a plain non-looping helper" pattern used elsewhere (see
+	_build_request_headers/_next_redirect_url's own comments). '''
+	match dumps( json_value ):
+		case Result.Ok( text ):
+			body: bytes = text.encode().unwrap( '_encode_json_body: json.dumps() output is always valid UTF-8' )
+			result: tuple[bytes|None, str|None] = ( body, 'application/json' )
+			return Result.Ok( result )
+		case Result.Err( _ ):
+			return Result.Err( HTTPError.InvalidJSON( None ))
+
+def _encode_body( data: bytes|str|None, form: dict[str,str]|None, json_value: JSONValue|None ) -> Result[tuple[bytes|None, str|None], HTTPError]:
+	''' -> (body bytes, Content-Type to set if not already present). json_value,
+	form, and data are mutually exclusive (checked in that priority order if
+	somehow more than one is given - not expected in practice). form/json_value
+	are kept as their own separate optional parameters rather than one
+	requests-style bytes|str|dict|JSONValue|None union: match-based dispatch
+	across a real multi-type union is untested territory in this codebase (the
+	only confirmed match-on-union-member precedent, union_coercion_rc_test.py's
+	Box|None, is a single real type - see PLAN_HTTP_CLIENT.md's own note on
+	this), and dict[str,str]/JSONValue specifically nested inside a wider union
+	raises the same generic-argument-in-a-union-position question the
+	list[tuple[...]] gap (task_a8b4e7c3's sibling, already fixed once) was
+	about. Splitting them out avoids the question entirely rather than
+	gambling on untested compiler territory here too. Returns a Result (unlike
+	the plain data=/form= paths, which can't fail) because json_value can:
+	dumps() rejects a non-finite float anywhere in the value. '''
+	if json_value is not None:
+		jv: JSONValue = json_value
+		return _encode_json_body( jv )
 	if form is not None:
 		f: dict[str,str] = form
 		encoded: str = _form_encode( f )
-		body: bytes = encoded.encode().unwrap( '_encode_body: form encoding is always ASCII' )
-		return ( body, 'application/x-www-form-urlencoded' )
+		form_body: bytes = encoded.encode().unwrap( '_encode_body: form encoding is always ASCII' )
+		form_result: tuple[bytes|None, str|None] = ( form_body, 'application/x-www-form-urlencoded' )
+		return Result.Ok( form_result )
 	if data is not None:
 		match data:
 			case bytes( b ):
-				return ( b, None )
+				bytes_result: tuple[bytes|None, str|None] = ( b, None )
+				return Result.Ok( bytes_result )
 			case str( s ):
 				sb: bytes = s.encode().unwrap( '_encode_body: request body string must be valid UTF-8' )
-				return ( sb, None )
-	return ( None, None )
+				str_result: tuple[bytes|None, str|None] = ( sb, None )
+				return Result.Ok( str_result )
+	empty_result: tuple[bytes|None, str|None] = ( None, None )
+	return Result.Ok( empty_result )
 
 def _is_redirect_status( status_code: u16 ) -> bool:
 	return status_code == 301 or status_code == 302 or status_code == 303 or status_code == 307 or status_code == 308
@@ -936,6 +983,7 @@ class Session:
 		params: dict[str,str]|None = None,
 		data: bytes|str|None = None,
 		form: dict[str,str]|None = None,
+		json: JSONValue|None = None,
 		headers: HTTPHeaders|None = None,
 		cookies: dict[str,str]|None = None,
 		auth: tuple[str,str]|None = None,
@@ -943,7 +991,7 @@ class Session:
 	) -> Result[Response, HTTPError]:
 		current_method: str = method
 		current_url: str = url
-		encoded_body: tuple[bytes|None, str|None] = _encode_body( data, form )
+		encoded_body: tuple[bytes|None, str|None] = _encode_body( data, form, json ).or_return()
 		current_body: bytes|None = encoded_body[0]
 		content_type: str|None = encoded_body[1]
 
@@ -993,17 +1041,17 @@ class Session:
 		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 		return self.request( 'GET', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
-	def post( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+	def post( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
 		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'POST', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		return self.request( 'POST', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
-	def put( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+	def put( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
 		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'PUT', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		return self.request( 'PUT', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
-	def patch( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+	def patch( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
 		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'PATCH', url, params = params, data = data, form = form, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		return self.request( 'PATCH', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 	def delete( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
 		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
@@ -1027,17 +1075,17 @@ def get( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None 
 	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
 	return Session().get( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
-def post( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+def post( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
 	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().post( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	return Session().post( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
-def put( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+def put( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
 	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().put( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	return Session().put( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
-def patch( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, params: dict[str,str]|None = None,
+def patch( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
 	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().patch( url, data = data, form = form, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	return Session().patch( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
 
 def delete( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
 	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
