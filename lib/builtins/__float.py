@@ -503,61 +503,102 @@ f64._repr_digits_raw = _f64_repr_digits_raw
 @private
 def _f32_sign_prefix( value: f32, mode: str ) -> str:
 	''' f32 has no format-spec digit conversion of its own - widens to f64
-	and delegates, same as _f32_fixed_digits/_f32_percent_digits below.
-	Widening f32 -> f64 is always exact (every f32 value is exactly
-	representable in f64), so this loses no precision beyond what value
-	already had. '''
-	return f64( value )._sign_prefix( mode )
+	and delegates, same as every other _f32_* function below. Widening f32
+	-> f64 is always exact (every f32 value, including NaN/Infinity, is
+	exactly representable in f64 - a NaN/Infinity source stays NaN/
+	Infinity, not "produced" by the cast), so this loses no precision
+	beyond what value already had.
+
+	The `f64( value )` conversion itself is a checked-mode float cast by
+	default (lowering.py's _lower_scalar_cast -> arithmetic_mode.py's
+	GetFloatCast - the SAME opcode covers every to-float direction, with
+	no widening-vs-narrowing distinction, since the checked contract is
+	about "could the RESULT be non-finite", not "could this specific
+	conversion lose bits" - checked mode's own established philosophy
+	elsewhere, e.g. finite-plus-finite float addition that overflows to
+	infinity is flagged too, even though IEEE754 defines that outcome).
+	That's a real requirement for a NaN/Infinity SOURCE, not a compiler
+	false positive - but every one of these functions exists specifically
+	to produce a text representation of whatever value f32 already holds,
+	including "nan"/"inf" (matching f64.__str__'s own confirmed behavior
+	on non-finite input) - panicking here would make it impossible to
+	print/format a non-finite f32 via any of the natural spellings
+	(str(f), f.__str__(), f'{f}'). `with compiler.wrap_arithmetic:` is the
+	textually-correct choice for this specific direction, not a "silently
+	wrong on overflow" shortcut the way integer wrap is: per arithmetic_
+	mode.py's own _raw_float_cast, wrap-mode float widening lowers to a
+	single plain C cast (`(double)(value)`) - the literal, unconditional,
+	standard, lossless widening operation, identical in EVERY arithmetic
+	mode for this direction; only the CHECKED-mode wrapper (a Result the
+	caller must then unwrap/propagate) actually differs, and every one of
+	these functions has no way to return that Result (they're all plain
+	`-> str`) nor any reason to reject a value merely for being non-finite
+	when the whole point is to render it as text. Confirmed via a real
+	compile: nothing in this codebase ever exercised these bodies before
+	(f'{f32_value}' failed to compile with the exact same error every
+	other spelling below does), so this had never been caught. '''
+	with compiler.wrap_arithmetic:
+		return f64( value )._sign_prefix( mode )
 
 
 @private
 def _f32_fixed_digits( value: f32, precision: usize, type_char: i32, alt: bool, sep: str ) -> str:
-	return f64( value )._fixed_digits( precision, type_char, alt, sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._fixed_digits( precision, type_char, alt, sep )
 
 
 @private
 def _f32_fixed_digits_raw( value: f32, precision: usize, type_char: i32, alt: bool ) -> str:
-	return f64( value )._fixed_digits_raw( precision, type_char, alt )
+	with compiler.wrap_arithmetic:
+		return f64( value )._fixed_digits_raw( precision, type_char, alt )
 
 
 @private
 def _f32_percent_digits( value: f32, precision: usize, alt: bool, sep: str ) -> str:
-	return f64( value )._percent_digits( precision, alt, sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._percent_digits( precision, alt, sep )
 
 
 @private
 def _f32_percent_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
-	return f64( value )._percent_digits_raw( precision, alt )
+	with compiler.wrap_arithmetic:
+		return f64( value )._percent_digits_raw( precision, alt )
 
 
 @private
 def _f32_none_type_digits( value: f32, precision: usize, alt: bool, sep: str ) -> str:
-	return f64( value )._none_type_digits( precision, alt, sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._none_type_digits( precision, alt, sep )
 
 
 @private
 def _f32_none_type_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
-	return f64( value )._none_type_digits_raw( precision, alt )
+	with compiler.wrap_arithmetic:
+		return f64( value )._none_type_digits_raw( precision, alt )
 
 
 @private
 def _f32_repr_digits( value: f32, sep: str ) -> str:
-	return f64( value )._repr_digits( sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._repr_digits( sep )
 
 
 @private
 def _f32_repr_digits_raw( value: f32 ) -> str:
-	return f64( value )._repr_digits_raw()
+	with compiler.wrap_arithmetic:
+		return f64( value )._repr_digits_raw()
 
 
 @private
 def _f32_str( value: f32 ) -> str:
-	return f64( value ).__str__()
+	with compiler.wrap_arithmetic:
+		return f64( value ).__str__()
 
 
 @private
 def _f32_repr( value: f32 ) -> str:
-	return f64( value ).__repr__()
+	with compiler.wrap_arithmetic:
+		return f64( value ).__repr__()
 
 
 f32._sign_prefix = _f32_sign_prefix
