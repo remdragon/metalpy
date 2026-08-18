@@ -71,3 +71,27 @@ def time() -> f64:
 	clock_gettime( CLOCK_REALTIME, compiler.addrof( ts ) )
 	with compiler.wrap_arithmetic:
 		return f64( ts.tv_sec ) + f64( ts.tv_nsec ) / 1.0e9
+
+
+# ---------------------------------------------------------------------------
+# get_local_timezone_name() -> str  the OS's configured local zone name -
+# 'America/New_York'-style on POSIX, a native Windows zone name (e.g.
+# 'Eastern Standard Time') unless windows_zones.install() has been called
+# (see lib/windows_zones.py) on Windows. Both platform bodies already
+# existed (windows/time.py, posix/time.py) but were never re-exported from
+# this top-level module the way monotonic()/time() already are - this is
+# that dispatcher, added for lib/datetime.py's factories (date.today(tz),
+# datetime.now(tz), ...), which need an easy way for a caller to get their
+# local zone name to pass in explicitly (tz stays a required argument on
+# those factories regardless - see lib/datetime.py's own docstring for why).
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'windows' )
+def get_local_timezone_name() -> str:
+	from windows.time import get_local_timezone_name as _get_local_timezone_name
+	return _get_local_timezone_name()
+
+@compiler.target( os = not 'windows' )
+def get_local_timezone_name() -> str:
+	from posix.time import get_local_timezone_name as _get_local_timezone_name
+	return _get_local_timezone_name()

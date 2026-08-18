@@ -9,7 +9,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function, Overload,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, FixedArrayType, Function, Overload,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
@@ -789,6 +789,21 @@ def c_type( t: Type|None ) -> str:
 		return mangle_type( t ) # the typedef name itself, no struct/union prefix
 	if isinstance( t, CType ):
 		return t.c_name
+	if isinstance( t, FixedArrayType ):
+		# never reached on a legitimate path: a struct/union FIELD of this
+		# type is special-cased directly in _struct_or_union_body (C's own
+		# discontinuous array declarator, "TYPE NAME[N]", doesn't fit this
+		# function's plain "return a type string" shape at all) - discovery.py
+		# already rejects every OTHER annotation position (parameter, return
+		# type, local/global variable) before this module ever runs, and
+		# reading a FixedArrayType field back out as an ordinary value isn't
+		# implemented (see FixedArrayType's own docstring) - so reaching this
+		# function with one at all means something upstream failed to guard
+		# a position that needs its own guard, not a legitimate use.
+		raise NotImplementedError(
+			f'c_type: {t.qualname} (a fixed-size inline array) cannot be spelled as an ordinary C type - '
+			f'it only exists as a @cstruct/@cunion FIELD, handled directly by _struct_or_union_body'
+		)
 	raise NotImplementedError( f'c_type: unsupported type {t!r}' )
 
 def _is_noreturn( t: Type|None ) -> bool:
@@ -831,20 +846,22 @@ def _function_pointer_c_type( fn_type: CallableType ) -> tuple[str,list[str]]:
 	params = [ c_type( a ) for a in fn_type.arg_types ]
 	return ret, params
 
-def _declarator( t: Type|None, name: str ) -> str:
+def _declarator( t: Type|None, name: str, *, volatile: bool = False ) -> str:
 	''' "TYPE NAME" for an ordinary parameter/local-variable declaration -
 	except when t is Ptr[Callable[...]], where C's function-pointer syntax
 	is the one declarator shape that ISN'T "prefix type, then name": the
 	name goes INSIDE the parens (RetType (*name)(ParamTypes)), so plain
 	string concatenation of c_type(t) and name can't express it. Scoped to
 	parameter/local declarations only (see PLAN_CALLABLE.md) - not struct
-	fields (nothing needs that yet). '''
+	fields (nothing needs that yet). `volatile` is for Volatile[T] locals
+	(_stmt_AnnAssign) only - never set for a function-pointer declarator. '''
 	fn_type = _callable_ptr_type( t )
+	prefix = 'volatile ' if volatile else ''
 	if fn_type is None:
-		return f'{c_type(t)} {name}'
+		return f'{prefix}{c_type(t)} {name}'
 	ret, params = _function_pointer_c_type( fn_type )
 	params_str = ', '.join( params ) if params else 'void'
-	return f'{ret} (*{name})( {params_str} )'
+	return f'{prefix}{ret} (*{name})( {params_str} )'
 
 def _value_spelling( t: Type ) -> str:
 	''' the C spelling of T's OWN VALUE representation - unlike c_type(),
@@ -895,8 +912,8 @@ def _result_tag_data_names( result_spec: Type ) -> tuple[str,str,str,str]:
 	NAMES are looked up dynamically here. '''
 	base = result_spec.base if isinstance( result_spec, Specialization ) else result_spec
 	assert isinstance( base, TaggedUnion ), f'{base!r}: Result must be a real @union'
-	tag_attr = base.names.get( 'tag' )
-	data_attr = base.names.get( 'data' )
+	tag_attr = base.get_local_or_raise( 'tag' )
+	data_attr = base.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{base.qualname}: _tagged_union_storage has not run yet - no real storage shape to read'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem ), _field_name( 'v_Ok' ), _field_name( 'v_Err' )
@@ -906,8 +923,8 @@ def _union_tag_data_fields( union: TaggedUnion ) -> tuple[str,str]:
 	Result[T,E] when E is itself a union like ZeroDivisionError|OverflowError).
 	Same UnionStorage-synthesized 'tag'/'data' shape _result_tag_data_names
 	reads for the outer Result, just for the inner error union. '''
-	tag_attr = union.names.get( 'tag' )
-	data_attr = union.names.get( 'data' )
+	tag_attr = union.get_local_or_raise( 'tag' )
+	data_attr = union.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{union.qualname}: union storage not synthesized (UnionStorage.get must run before emit)'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem )
@@ -948,17 +965,30 @@ def _emit_widen_error( dest_expr: str, e_fn: Type, src_expr: str, e_op: Type ) -
 		return [ f'\t\t{dest_expr} = {src_expr};' ] # identical layout - plain struct copy (fast path, copies any payload already)
 	assert isinstance( e_fn, TaggedUnion ), f'widening into a non-union error type {e_fn!r}'
 	fn_tag, fn_data = _union_tag_data_fields( e_fn )
-	if not isinstance( e_op, TaggedUnion ):
-		# single class -> set the wide union's variant tag AND copy its
-		# payload pointer into the matching v_<member> field
+	# e_op is only genuinely FLATTENABLE into e_fn's own member list when it's
+	# itself a synthesized ANONYMOUS union (file is None) - the same
+	# distinguishing test discovery.py's _get_or_create_union already uses when
+	# flattening a wider union's own operands (only an anonymous operand
+	# contributes its own leaves; a real user `@union class Foo:` stays a
+	# single opaque member wherever it's nested). A NOMINAL union (e.g.
+	# HTTPError, itself one of e_fn's own members verbatim) takes the
+	# single-class path below just like any plain class leaf does - remapping
+	# ITS OWN internal variants against e_fn's member list would look for e.g.
+	# HTTPError's None-payload variant types as members of e_fn, which they
+	# never are (type_resolver._atomic_leaves applies this identical
+	# distinction to the type-checking side of the same widening, at lowering
+	# time - see its own docstring).
+	if not ( isinstance( e_op, TaggedUnion ) and e_op.file is None ):
+		# single class (or nominal union) -> set the wide union's variant tag AND
+		# copy its payload pointer into the matching v_<member> field
 		ordinal, fn_attr = _union_member( e_fn, e_op )
 		fn_field = _field_name( f'v_{fn_attr.stem}' )
 		return [
 			f'\t\t{dest_expr}.{fn_tag} = {ordinal};',
 			f'\t\t{dest_expr}.{fn_data}.{fn_field} = {src_expr};',
 		]
-	# e_op is itself a (narrower) union -> remap each member's tag AND copy
-	# its payload at runtime, one case per e_op member
+	# e_op is itself an anonymous (narrower) union -> remap each member's tag AND
+	# copy its payload at runtime, one case per e_op member
 	op_tag, op_data = _union_tag_data_fields( e_op )
 	lines = [ f'\t\tswitch ( ({src_expr}).{op_tag} ) {{' ]
 	for i, op_attr in enumerate( e_op.attributes ):
@@ -1008,7 +1038,15 @@ def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]]
 		lines.append( '\tchar dummy;' )
 	else:
 		for field_name, field_type in attrs:
-			lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+			if isinstance( field_type, FixedArrayType ):
+				# C's array declarator is discontinuous ("TYPE NAME[N];", not
+				# a plain prefix type followed by the name - see
+				# FixedArrayType's own docstring and _declarator's identical
+				# function-pointer special case) - _field_type_spelling's
+				# plain "TYPE NAME" concatenation can't express this
+				lines.append( f'\t{c_type(field_type.elem_type)} {_field_name(field_name)}[{field_type.count}];' )
+			else:
+				lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 
@@ -1185,6 +1223,16 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 	return f'(-{signed_expr})' if value < 0 else signed_expr
 
 def _emit_const( c: ir.Const ) -> str:
+	if isinstance( c.type, FixedArrayType ):
+		# the one supported FixedArrayType value (see its own docstring and
+		# lowering.py's _expr_Constant fixed-array branch): a bare `0`
+		# literal means "zero-fill the whole array" - the one shape a
+		# C11 initializer can express for an embedded array field, valid
+		# ONLY inside a designated-initializer compound literal (a plain
+		# @cstruct's own stack-construction shape - see ir.Allocate's
+		# emission), never as an ordinary assignment target
+		assert c.value == 0, f'_emit_const: {c.type.qualname} only supports a 0 (zero-fill) constant, got {c.value!r}'
+		return '{0}'
 	if isinstance( c.value, bool ):
 		return 'true' if c.value else 'false'
 	if isinstance( c.value, float ) or ( isinstance( c.value, int ) and _is_float_type( c.type )):
@@ -1851,6 +1899,74 @@ def _emit_cast( instr ) -> list[str]:
 		'\t}',
 	]
 
+def _emit_convert_check( instr: 'ir.ConvertCheck' ) -> list[str]:
+	# compiler.checked_convert(T, x) - value-preserving numeric conversion:
+	# succeeds iff operand's VALUE fits in target's own [MIN,MAX], entirely
+	# independent of bit width. Deliberately NOT the same code path as
+	# CastCheck (T(x)/compiler.cast(T,x)'s own check opcode, reached only
+	# for a NARROWING conversion - see _lower_scalar_cast's width
+	# comparison) - see ir.ConvertCheck's own comment for why these are two
+	# separate opcodes despite needing near-identical comparison math. This
+	# is a deliberate, close adaptation of _emit_cast's own check-mode
+	# branch (same u128/wideint/wideuint/MSVC-fallback edge cases apply
+	# here identically - see that function's own extensive comments for
+	# the full rationale of each), kept as an independent function rather
+	# than a shared helper so the two opcodes' emitters stay independently
+	# readable/modifiable.
+	target_type = instr.dest.type.args[0]
+	operand = _emit_operand( instr.operand )
+	stem = target_type.stem if isinstance( target_type, Scalar ) else None
+	ctype = c_type( target_type )
+	min_c, max_c = _int_min_max_bit_pattern( stem )
+	source_stem = instr.operand.type.stem if isinstance( instr.operand.type, Scalar ) else None
+	dest = _temp_name( instr.dest.id )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+	err_ctype = c_type( _result_error_type( instr.dest.type ))
+
+	if stem == 'u128' and source_stem != 'u128':
+		out_of_range = None if source_stem is not None and _is_unsigned_stem( source_stem ) else f'( ({operand}) < 0 )'
+		if out_of_range is None:
+			return [ f'\t{dest}.{tag_f} = 0;', f'\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});' ]
+		return [
+			'\t{',
+			f'\t\tbool __overflow = {out_of_range};',
+			'\t\tif ( __overflow ) {',
+			f'\t\t\t{dest}.{tag_f} = 1;',
+			f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
+			'\t\t} else {',
+			f'\t\t\t{dest}.{tag_f} = 0;',
+			f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+			'\t\t}',
+			'\t}',
+		]
+
+	wide_ctype = '__metalpy_wideuint' if source_stem is not None and _is_unsigned_stem( source_stem ) else '__metalpy_wideint'
+	wide_decl = f'{wide_ctype} __wide = ({wide_ctype})({operand});'
+	upper_needs_unsigned_domain = wide_ctype == '__metalpy_wideint' and stem in ( 'u64', 'usize' )
+	upper_bound = (
+		f'( (__metalpy_wideuint)(__wide) > (__metalpy_wideuint)({max_c}) )'
+		if upper_needs_unsigned_domain else
+		f'( __wide > ({wide_ctype})({max_c}) )'
+	)
+	overflow = (
+		upper_bound
+		if wide_ctype == '__metalpy_wideuint' else
+		f'( __wide < ({wide_ctype})({min_c}) ) || {upper_bound}'
+	)
+	return [
+		'\t{',
+		f'\t\t{wide_decl}',
+		f'\t\tbool __overflow = {overflow};',
+		'\t\tif ( __overflow ) {',
+		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
+		'\t\t} else {',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+		'\t\t}',
+		'\t}',
+	]
+
 # --- comparisons / control flow / calls / member access -----------------------
 
 _CMP_SYMBOLS = {
@@ -2053,14 +2169,14 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# C `{ }` blocks)
 		name = _c_local_name( instr.variable.stem )
 		declared.add( name )
-		return [ f'\t{_declarator( instr.variable.type, name )};' ]
+		return [ f'\t{_declarator( instr.variable.type, name, volatile = instr.variable.is_volatile )};' ]
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
 			name = _c_local_name( instr.dest.stem )
 			if name not in declared:
 				declared.add( name )
-				return [ f'\t{_declarator( instr.dest.type, name )} = {src};' ]
+				return [ f'\t{_declarator( instr.dest.type, name, volatile = instr.dest.is_volatile )} = {src};' ]
 			return [ f'\t{name} = {src};' ]
 		# a global Variable is declared separately at file scope (Phase 7 -
 		# emit_global) - never re-declared here, only assigned
@@ -2117,6 +2233,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return _emit_neg( instr )
 	if type( instr ) in _CAST_MODE:
 		return _emit_cast( instr )
+	if isinstance( instr, ir.ConvertCheck ):
+		return _emit_convert_check( instr )
 
 	if isinstance( instr, ir.Cmp ):
 		symbol = _CMP_SYMBOLS[instr.op]
@@ -2187,7 +2305,20 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		else:
 			has_args = bool( arg_texts )
 			call_expr = f'{target_name}( {", ".join(arg_texts)} )' if has_args else f'{target_name}()'
-		if instr.dest is not None:
+		# _returns_void_in_c, not just `instr.dest is not None`: a generic
+		# method's declared return type can be a real, non-None type T
+		# that just happens to RESOLVE to NoneType for THIS
+		# monomorphization (e.g. UnsafeDict._owned_value's V, for a
+		# dict[K, None]) - lowering.py still creates a real dest temp for
+		# it (the declared type isn't literally the bare `None` annotation
+		# lowering.py's OWN NoneType-return special-casing checks
+		# elsewhere), but the CALLEE's own C function is void
+		# (_returns_void_in_c already makes it so, for both its prototype
+		# and its own `return;` - see that helper's own comment).
+		# Assigning `dest = <call to a void function>;` anyway is a
+		# straight C type error. Mirrors that exact existing rule rather
+		# than inventing a new one.
+		if instr.dest is not None and not _returns_void_in_c( instr.target.return_type ):
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
 		return [ f'\t{call_expr};' ]
 
@@ -2219,6 +2350,39 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 
 	if isinstance( instr, ir.AddrOf ):
 		return [ f'\t{_emit_operand(instr.dest)} = &{_emit_operand(instr.value)};' ]
+
+	if isinstance( instr, ir.AddrOfField ):
+		# compiler.addrof(x.field) - one flat C expression, &(obj)OP field -
+		# see AddrOfField's own docstring for why this is a distinct
+		# instruction from AddrOf(GetAttr(...)) (that would take the
+		# address of a freshly loaded COPY, not the real field)
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = &({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
+
+	if isinstance( instr, ir.ArrayFieldPtr ):
+		# compiler.addrof(x.field) where field is a FixedArrayType - one
+		# flat C expression, (obj)OP field, deliberately with NO leading &
+		# (see ArrayFieldPtr's own docstring: a real C array member decays
+		# to a pointer to its first element on use - &-ing it would give a
+		# pointer-TO-array instead, a different, mismatched C type)
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
+
+	if isinstance( instr, ir.AddrOfArrayIndex ):
+		# compiler.addrof(x.field[i]) - one flat C expression,
+		# &(obj)OP field[index] - see AddrOfArrayIndex's own docstring
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = &(({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}]);' ]
+
+	if isinstance( instr, ir.GetAttrIndex ):
+		# f.arr[i] - one flat C expression, (obj)OP field[index] - see
+		# GetAttrIndex's own docstring for why this targets the field
+		# directly rather than composing GetAttr+GetItem
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}];' ]
+	if isinstance( instr, ir.SetAttrIndex ):
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}] = {_emit_operand(instr.value)};' ]
 
 
 	if isinstance( instr, ir.SizeOf ):
@@ -2658,14 +2822,45 @@ def _emit_one_string_literal( qualname: str, value: str|bytes ) -> list[str]:
 	name = _string_literal_name( qualname, value )
 	data_name = f'{name}$data'
 	struct_name = mangle_qualname( qualname )
-	return [
+	lines = [
 		f'static const uint8_t {data_name}[] = {_c_string_literal(data_bytes)};',
+	]
+	extra_field_lines: list[str] = []
+	if qualname == 'builtins.str':
+		# str also caches __char_count/__index (lib/builtins/__init__.py's
+		# str._from_owned_cstr) - a literal is baked directly here rather
+		# than going through that runtime construction path, so it must
+		# independently bake the SAME cached metadata. Computed in Python at
+		# compile time instead of C: a Python str's own len()/iteration is
+		# already the Unicode codepoint sequence, so no UTF-8 decoding is
+		# needed here (unlike the runtime scan, which has to decode). Same
+		# entries=(byte_size>>8)+1 sizing formula as the runtime path, so a
+		# literal's __index is indistinguishable in shape from a runtime-
+		# constructed str's - __getitem__ doesn't know or care which built it.
+		assert isinstance( value, str )
+		index_name = f'{name}$index'
+		byte_size = len( data_bytes )
+		entries = ( byte_size >> 8 ) + 1
+		offsets = [ 0 ] * entries
+		byte_offset = 0
+		for i, ch in enumerate( value ):
+			if ( i & 0xFF ) == 0:
+				offsets[ i >> 8 ] = byte_offset
+			byte_offset += len( ch.encode( 'utf-8' ))
+		lines.append( f'static const uintptr_t {index_name}[] = {{ {", ".join(str(o) for o in offsets)} }};' )
+		extra_field_lines = [
+			f'\t.{_field_name("__char_count")} = {len(value)},',
+			f'\t.{_field_name("__index")} = (uintptr_t*){index_name},',
+		]
+	lines += [
 		f'static struct {struct_name} {name} = {{',
 		f'\t.$header = {{ .ref_count = METALPY_IMMORTAL_REFCOUNT }},',
 		f'\t.{_field_name(data_field)} = {data_name},',
 		f'\t.{_field_name(len_field)} = {len(data_bytes)},',
+		*extra_field_lines,
 		'};',
 	]
+	return lines
 
 def _emit_string_literals( compiler: Compiler ) -> list[str]:
 	# a program-wide collection pass, since C requires each static object
@@ -2999,8 +3194,8 @@ def emit_tagged_union( union: TaggedUnion ) -> str:
 	# already populated by the time this runs: a TaggedUnion only ever
 	# becomes a real compile unit (lands in compiler.tagged_unions) via a
 	# construction or match site that already called _tagged_union_storage.
-	tag_attr = union.names.get( 'tag' )
-	data_attr = union.names.get( 'data' )
+	tag_attr = union.get_local_or_raise( 'tag' )
+	data_attr = union.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{union.qualname}: _tagged_union_storage has not run yet - no real storage shape to emit'
 	name = mangle_type( union )
@@ -3272,7 +3467,7 @@ def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 			# `data` field (the payload CUnion) - .attributes holds the
 			# LOGICAL members (Ok/Err/...) instead, which aren't part of
 			# the actual C struct layout at all (see emit_tagged_union)
-			data_attr = cls.names.get( 'data' )
+			data_attr = cls.get_local_or_raise( 'data' )
 			dep_types = [ data_attr.type ] if isinstance( data_attr, Variable ) else []
 		else:
 			dep_types = [ attr.type for attr in cls.attributes ]

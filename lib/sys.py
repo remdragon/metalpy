@@ -16,13 +16,16 @@ def alloc[T]( count: usize ) -> Ptr[T]:
 	if ptr is None:
 		panic( 'out of memory' )
 	if compiler.target.debug:
-		memzero( ptr, count )
+		# 0xCD ("uninitialized" - MSVC debug heap's own convention)
+		# this helps catch bugs like use-after-free
+		# we don't zero-fill because that can also hide bugs
+		mempoison( ptr, byte_count )
 	return ptr
 
 # ---------------------------------------------------------------------------
-# stdout: minimal stream object (see TODO.txt - full IO interfaces, including
-# a real stderr, buffering, and reading, are still future work; this is just
-# enough for print()).
+# stdout/stderr: minimal stream objects (see TODO.txt - full IO interfaces,
+# including buffering and reading, are still future work; this is just
+# enough for print() and lib/logging.py's StreamHandler).
 # ---------------------------------------------------------------------------
 
 class _Stdout:
@@ -38,6 +41,20 @@ class _Stdout:
 		return write_all( 1, s.get_cstr(), s.byte_len() ) # STDOUT_FILENO is 1
 
 stdout: _Stdout = _Stdout()
+
+class _Stderr:
+	@compiler.target( os = 'windows' )
+	def write( self, s: str ) -> Result[None,OSError]:
+		from fs import write_all
+		from windows.kernel32 import GetStdHandle, STD_ERROR_HANDLE
+		return write_all( GetStdHandle( STD_ERROR_HANDLE ), s.get_cstr(), s.byte_len() )
+
+	@compiler.target( os = not 'windows' )
+	def write( self, s: str ) -> Result[None,OSError]:
+		from fs import write_all
+		return write_all( 2, s.get_cstr(), s.byte_len() ) # STDERR_FILENO is 2
+
+stderr: _Stderr = _Stderr()
 
 @compiler.target( os = 'windows' )
 def cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
@@ -84,6 +101,18 @@ def memmove( dest: Ptr[u8], src: ConstPtr[u8], count: usize ) -> Ptr[u8]:
 	return _crt_memmove( dest, src, count )
 
 @compiler.target( os = 'windows' )
+def memset( ptr: Ptr[u8], fill: u8, count: usize ) -> Ptr[u8]:
+	from windows.ntdll import RtlFillMemory
+	RtlFillMemory( ptr, count, fill )
+	return ptr
+
+@compiler.target( os = not 'windows' )
+def memset( ptr: Ptr[u8], fill: u8, count: usize ) -> Ptr[u8]:
+	from crt import memset as _memset
+	_memset( ptr, fill, count )
+	return ptr
+
+@compiler.target( os = 'windows' )
 def memzero( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
 	from windows.ntdll import RtlZeroMemory
 	RtlZeroMemory( ptr, count )
@@ -91,8 +120,11 @@ def memzero( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
 
 @compiler.target( os = not 'windows' )
 def memzero( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
-	from crt import memset
 	memset( ptr, 0, count )
+	return ptr
+
+def mempoison( ptr: Ptr[u8], count: usize ) -> Ptr[u8]:
+	memset( ptr, 0xCD, count )
 	return ptr
 
 @compiler.target( os = 'windows' )

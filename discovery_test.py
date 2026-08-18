@@ -34,7 +34,7 @@ class ImportTests( unittest.TestCase ):
 			expect_package: str
 
 			@staticmethod
-			def new_test( expect_package: str ) -> MockDiscovery:
+			def new_test( expect_package: str ) -> 'MockDiscovery':
 				disco = MockDiscovery( import_builtins = False )
 				disco.expect_package = expect_package
 				return disco
@@ -207,6 +207,61 @@ class Foo:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self.assertIsNotNone( mod.get_local( 'Foo' ))
+
+	def test_bare_call_expression_at_module_level_is_a_clean_compile_error( self ) -> None:
+		# the real bug this covers: ast.Expr IS in _SUPPORTED_BODY_STATEMENTS
+		# (unlike AugAssign/for above), so a bare call statement with no
+		# assignment target used to sail through this scan with zero errors
+		# and then simply never reach any IR/emission path - it vanished
+		# from the compiled program silently. visit_Expr now rejects
+		# anything that's neither a recognized compiler.* directive nor an
+		# inert literal
+		self._import( '''
+some_undefined_function()
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'unsupported statement', self.discovery.errors.errors[0] )
+
+	def test_bare_call_expression_in_class_body_is_a_clean_compile_error( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	some_undefined_function()
+	x: i32
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve() # class bodies are scanned lazily - see ShallowScanTests
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'unsupported statement', self.discovery.errors.errors[0] )
+
+	def test_module_docstring_is_still_silently_accepted( self ) -> None:
+		# a bare literal statement (a docstring, or a `...` stub) has no
+		# side effect to lose either way - this is the single most common
+		# bare-expression-statement idiom in real Python and must keep
+		# working
+		mod = self._import( '''
+"""a module docstring"""
+x: i32 = 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIsNotNone( mod.get_local( 'x' ))
+
+	def test_class_docstring_is_still_silently_accepted( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	"""a class docstring"""
+	x: i32
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIsNotNone( foo.get_local( 'x' ))
+
+	def test_require_header_directive_still_works( self ) -> None:
+		self._import( '''
+compiler.require_header( 'pthread.h' )
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'pthread.h', self.discovery.required_headers )
 
 
 class ShallowScanTests( unittest.TestCase ):
@@ -1781,21 +1836,14 @@ class Foo:
 		self.assertTrue( release.is_move )
 
 
-class UnsupportedDecoratorTests( unittest.TestCase ):
+class PropertyDecoratorTests( unittest.TestCase ):
 	def setUp( self ) -> None:
 		self.discovery = discovery.Discovery( import_builtins = False )
 
 	def _import( self, code: str ) -> Module:
 		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
 
-	def test_property_is_not_yet_supported( self ) -> None:
-		# intentionally unimplemented for now, deferred until other problems
-		# are solved (see Discovery/ARCHITECTURE.md discussion) - this test
-		# just locks in that it fails loudly rather than silently doing the
-		# wrong thing, so implementing it later is a deliberate decision.
-		# @property lives inside the class body, which is itself deferred
-		# behind .resolve() (see ShallowScanTests), so the error only
-		# surfaces once something actually asks for it
+	def test_property_decorator_flag_on_function( self ) -> None:
 		mod = self._import( '''
 class Foo:
 	@property
@@ -1804,7 +1852,66 @@ class Foo:
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
-		self.assertIn( 'unsupported function decorator', self.discovery.errors.errors[0] )
+		bar = foo.get_local( 'bar' )
+		self.assertTrue( bar.is_property )
+
+	def test_property_on_free_function_errors( self ) -> None:
+		# a free function is parsed eagerly at import time (unlike a class
+		# method, deferred behind the class's own .resolve() - see the other
+		# tests here), so the error already fired during _import itself
+		self._import( '''
+@property
+def bar() -> i32:
+	return 1
+''' )
+		self.assertIn( 'only valid on a method', self.discovery.errors.errors[0] )
+
+	def test_property_with_extra_parameter_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	def bar( self, extra: i32 ) -> i32:
+		return extra
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'must take exactly `self`', self.discovery.errors.errors[0] )
+
+	def test_property_combined_with_staticmethod_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	@staticmethod
+	def bar() -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @staticmethod/@classmethod', self.discovery.errors.errors[0] )
+
+	def test_property_combined_with_classmethod_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	@classmethod
+	def bar( cls ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @staticmethod/@classmethod', self.discovery.errors.errors[0] )
+
+	def test_property_combined_with_overload_errors( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	@property
+	@overload
+	def bar( self ) -> i32:
+		return 1
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertIn( 'cannot also be @overload', self.discovery.errors.errors[0] )
 
 
 class OrReturnReservedNameTests( unittest.TestCase ):
@@ -2846,6 +2953,54 @@ def malloc( size: usize ) -> Ptr[u8]:
 		fn.resolve()
 		self.assertEqual( fn.extern_lib, 'c' )
 		self.assertEqual( fn.extern_symbol, 'malloc' )
+		self.assertEqual( fn.extern_dlls, () )
+
+	def test_extern_dll_single_string_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertEqual( fn.extern_lib, 'tcl86t' )
+		self.assertEqual( fn.extern_dlls, ( 'tcl86t.dll', ) )
+
+	def test_extern_dll_list_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertEqual( fn.extern_dlls, ( 'tcl86t.dll', 'zlib1.dll' ) )
+
+	def test_extern_dll_tuple_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = ( 'tcl86t.dll', 'zlib1.dll' ) )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertEqual( fn.extern_dlls, ( 'tcl86t.dll', 'zlib1.dll' ) )
+
+	def test_extern_dll_non_string_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 123 )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		self.assertTrue( any( 'dll= must be a string literal or a list/tuple of string literals' in e for e in disco.errors.errors ))
+
+	def test_extern_dll_list_with_non_string_element_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 123 ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		self.assertTrue( any( 'dll= must be a string literal or a list/tuple of string literals' in e for e in disco.errors.errors ))
 
 	def test_ordinary_function_has_no_extern_fields( self ) -> None:
 		disco, mod = self._import( '''

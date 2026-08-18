@@ -715,13 +715,11 @@ f-string support
 File class
 
 io interfaces ( stdin, stdout, stderr )
-	sys.stdout: minimal Windows-only write() exists (lib/sys.py's _Stdout),
-	enough for print(). Still missing: a real stream object (buffering, flush,
-	read), stdin, stderr (panic() currently bypasses a real stderr stream
-	entirely - see lib/sys.py's panic() comment), and the POSIX side of all of
-	the above (only @compiler.target(os='windows') is implemented).
-
-socket class
+	sys.stdout/sys.stderr: minimal write() exists for both (lib/sys.py's
+	_Stdout/_Stderr), enough for print() and lib/logging.py's StreamHandler.
+	Still missing: a real stream object (buffering, flush, read), stdin, and
+	panic() still bypasses sys.stderr and writes directly via its own
+	private _write_stderr_cstr (see lib/sys.py's panic() comment).
 
 threading
 

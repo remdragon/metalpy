@@ -58,12 +58,11 @@ class FloatBehaviorTests( unittest.TestCase ):
 			# already has whatever the generated boilerplate itself needs too
 			# (kernel32 on a no-CRT Windows build - windows._console/sys.exit
 			# are compiler-forced reachable, see Compiler.force_reachable)
-			libs = set( compiler.extern_libs )
 			ldflags = ''
-			for lib in sorted( libs ):
+			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
@@ -762,12 +761,17 @@ def main() -> i32:
 	# --- signed INT_MIN/-1 is defined per mode (item 2) ---------------------
 
 	def test_int_min_div_checked_panics( self ) -> None:
-		# checked/panic: INT_MIN / -1 (and INT_MIN % -1) is an OverflowError
+		# checked/panic: INT_MIN / -1 (and INT_MIN % -1) is an OverflowError.
+		# i8::MIN constructed directly (-128), not via the old i8(128)
+		# bit-reinterpretation idiom - that literal no longer bypasses the
+		# range check (128 doesn't fit i8's real value range, confirmed
+		# with the user as a deliberate, wanted change - see lowering_
+		# test.py's test_narrowing_literal_cast_is_range_checked)
 		self._assert_program_panics( '''
 def main() -> i32:
 	with compiler.panic_arithmetic("ov"):
 		neg_one: i8 = -1
-		mn: i8 = i8(128)
+		mn: i8 = -128
 		q: i8 = mn // neg_one
 	return 0
 ''' )
@@ -775,7 +779,7 @@ def main() -> i32:
 def main() -> i32:
 	with compiler.panic_arithmetic("ov"):
 		neg_one: i8 = -1
-		mn: i8 = i8(128)
+		mn: i8 = -128
 		m: i8 = mn % neg_one
 	return 0
 ''' )
@@ -798,8 +802,8 @@ def sdiv( a: i8, b: i8 ) -> Result[i8, ZeroDivisionError]:
 		return Result.Ok( a // b )
 
 def main() -> i32:
-	mn: i8 = i8(128)
-	neg_one: i8 = i8(255)
+	mn: i8 = -128
+	neg_one: i8 = -1
 	wq: Result[i8, ZeroDivisionError] = wdiv( mn, neg_one )
 	match wq:
 		case Result.Ok( v ):
@@ -841,6 +845,52 @@ def main() -> i32:
 			return 2
 	return 0
 ''', [ 'unsigned 200//4 == 50', 'unsigned div Err (unexpected)' ] )
+
+	def test_f64_str_and_repr_direct_call( self ) -> None:
+		# f64.__str__/f64.__repr__ are attached via post-hoc assignment
+		# (f64.__str__ = _f64_str in lib/builtins/__float.py), not declared
+		# inside a class body - discovery.py never strips a "self" off
+		# _f64_str's own single `value: f64` parameter the way it would for
+		# an ordinary method, so a Call built with BOTH a receiver AND the
+		# untouched parameter list double-counted the receiver, crashing
+		# emitter_c.py's _emit_call_args with a bare KeyError('value') the
+		# moment user code called f.__str__()/f.__repr__() directly (as
+		# opposed to via f-string interpolation, which reaches the same
+		# formatter through a different, already-correct call path -
+		# lowering.py's own _lower_method_call). Confirmed to crash before
+		# the fix (lowering.py's _lower_call, the general call-lowering
+		# path every ordinary `receiver.method()` call site goes through,
+		# now carries the same "receiver is really just a leading
+		# positional argument for a Scalar-attached free function"
+		# adjustment _lower_method_call already had for its own narrower
+		# set of f-string-only callers).
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	f: f64 = 3.5
+	s: str = f.__str__()
+	if s != '3.5':
+		return 1
+	r: str = f.__repr__()
+	if r != '3.5':
+		return 2
+	return 0
+''', [ 'f64.__str__() == "3.5"', 'f64.__repr__() == "3.5"' ] )
+
+	def test_f64_str_via_local_receiver_variable( self ) -> None:
+		# same call shape, but through a receiver bound to an ordinary named
+		# local first (rather than a fresh literal) - the exact shape
+		# lib/json.py's dumps() originally hit this bug through
+		self._assert_program_succeeds( '''
+def format_value( value: f64 ) -> str:
+	return value.__str__()
+
+def main() -> i32:
+	f: f64 = 2.0
+	got: str = format_value( f )
+	if got != '2.0':
+		return 1
+	return 0
+''', [ 'format_value(f64) via .__str__() == "2.0"' ] )
 
 
 if __name__ == '__main__':

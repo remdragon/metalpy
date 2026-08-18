@@ -16,6 +16,7 @@
 # resolved on the other OS.
 
 import compiler
+import time
 
 class TTInfo:
 	utcoffset: i32  # offset from UTC, in SECONDS (matches TZif's own on-disk
@@ -35,7 +36,13 @@ class ZoneInfo:
 	transition_times: list[i64]  # sorted ascending, parallel to transition_rules
 	transition_rules: list[TTInfo]
 
-	def __init__( self, key: str ) -> None:
+	def __init__( self, key: str|None = None ) -> None:
+		''' key omitted (or None) defaults to the system's own configured
+		local zone (time.get_local_timezone_name()) - still fully
+		tz-aware/unambiguous either way, just chosen for the caller instead
+		of typed out. '''
+		if key is None:
+			key = time.get_local_timezone_name()
 		self.name = key
 		self.default_rule = TTInfo( utcoffset = 0, is_dst = False, abbr = '' )
 		self.transition_times = []
@@ -82,6 +89,27 @@ class ZoneInfo:
 
 	def abbr( self, timestamp: i64 ) -> str:
 		return self.get_ttinfo( timestamp ).abbr
+
+	@staticmethod
+	def fixed_offset( offset_seconds: i32, name: str = '' ) -> ZoneInfo:
+		''' a synthetic zone with one unconditional rule, no DST, no OS
+		lookup - resolves Python's datetime.timezone(timedelta(...)) case
+		for lib/datetime.py, which has no separate lightweight tzinfo/
+		timezone class (datetime.tzinfo is always a concrete ZoneInfo - see
+		that module's own docstring for why: no RCClass dynamic dispatch in
+		this compiler, and @interface/vtable is a COM-specific, manual-
+		lifetime mechanism, a poor fit here). Purely additive: get_ttinfo's
+		binary search already handles empty transition_times correctly
+		(lo stays 0, unconditionally returns default_rule) - no core
+		behavior change. Plain ZoneInfo('UTC') already works on both
+		platforms for the UTC case; this is only for offsets that don't
+		correspond to any real IANA zone. '''
+		return ZoneInfo.__allocate__(
+			name = name,
+			default_rule = TTInfo( utcoffset = offset_seconds, is_dst = False, abbr = name ),
+			transition_times = [],
+			transition_rules = [],
+		)
 
 
 @compiler.target( os = 'windows' )

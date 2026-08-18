@@ -24,20 +24,34 @@ to Python as possible, here are the solutions that I came up with:
 	* "everything is an object" is not supported
 	* Multiple Inheritance is not supported
 		- very hard to get right for very little benefit
+	* deterministic __del__(), the __del__() method fires immediately when an
+		object's refcount goes to 0, no more work-arounds to make sure resources
+		clean up in a tiny manner
 
 Features that exist now:
 
+	* native integer types with different arithmetic modes
+		default checked - creates a OverflowError or ZeroDivisionError
+		wrap arithmetic - overflows just wrap (ZeroDivision still checked)
+		saturate arithmetic - overflows clamp to the min/max (ZeroDivision still checked)
+		panic arithmetic - overflows and ZeroDivision panic (error message and abort
 	* memory-management through automatic ref-counting
 	* unbounded int class
 	* threadsafe list
 	* threadsafe dict
+	* threadsafe set
 	* tuple
 	* anonymous unions like int|str with both compile time and runtime type narrowing
-	* subclasses
+	* subclasses (single inheritance only)
 	* file i/o
+		- we broke significantly away from python's open() method here, because
+		  the mode string is difficult for type-safety and cannot express all
+		  valid combinations if file i/o
 	* generic functions and classes
 	* threading, non-reentrant Lock, atomic primitives
 	* same-named functions chosen at either compile-time or run-time based on parameters
+		- 2 layers of resolution, normal functions must have an exact type match
+		- @overload functions are first-match wins
 	* ability to create actual C structs (can interact directly with COM interfaces)
 	* on Windows, the stdlib avoids linking against msvcrt. However, use of any
 		feature that requires the C runtime will bring it in.
@@ -45,38 +59,62 @@ Features that exist now:
 	* f-strings
 		most common use-cases are implemented and working
 	* inline functions
-		right now restricted to simple bodies (WIP extending this)
+	* blocking TCP/UDP sockets over IPv4/IPv6 (lib/socket.py)
+	* global object initialization on startup
+	* re library
+	* dependency report showing every object included in the compilation and
+		what triggered its inclusion, useful for troubleshooting executable
+		bloat.
 
 Features that are being scoped and built right now:
-	* global object initialization on startup
-	* generators
+	* generators (mostly functional, currently researching the ability to
+		support inline generators)
+	* url parser
+	* email.message (needed by http client)
+	* http client
+	* json library
+	* tkinter library
 
 Features that are planned but not built yet:
+	* with statements (there is a compiler hack for defer/errdefer using with
+		statement syntax, but this isn't general with support yet)
 	* threadsafe Queue
-	* socket library
-	* http client/server classes
+	* http server
 	* smtp library
 	* email parsing
-	* re library
-	* json library
 	* parser library
+	* unblocking socket i/o and file i/o
 
 Features that would be nice to have:
 	* pip-like package manager
 
 Python functionality that I have no plans to implement:
 	* async/await
+		- I'm open to others wanting to do this work, no interest in it myself
 	* multiple inheritance
+		- too many footguns for too little benefit
 	* everything is an object
+		- performance nightmare
 	* monkey-patching
+		- requires everything is an object
 	* Exceptions
+		- rust-inspired Result objects for mandatory and deterministic error handling
 
-Other thoughts:
+Other thoughts / features:
 
-Right now, metalpy uses Python's own AST parser and uses a C compiler to generate
+Right now, MetalPy uses Python's own AST parser and uses a C compiler to generate
 the actual executable. This gives MetalPy a lot of portability. While I plan to build
 a parser library, I don't have any plan to make MetalPy self-hosting. There are some
 small things about MetalPy's syntax that could be made nicer by stepping away from
 Python's parser, but restricting to Python's AST parser opens up a lot of opportunities
 to use existing tools for source code analysis.
 
+MetalPy does not create .obj files. It does a lazy evaluation of everything main
+could possibly touch, and then only fully evaluates items that are actually
+needed for the executable. If a function is never called by main or by any other
+function reached indirectly, the MetalPy compiler never evens walks through the
+body of the unused function.
+
+MetalPy tries very hard to avoid msvcrt on Windows builds, but if users need
+to link to it for whatever reason, MetalPy doesn't prevent, it just doesn't
+need it for the stdlib (yet).

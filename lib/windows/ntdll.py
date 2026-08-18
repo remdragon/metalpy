@@ -34,6 +34,14 @@ def RtlZeroMemory(
 ) -> None:
 	...
 
+@extern( 'ntdll', 'RtlFillMemory' )
+def RtlFillMemory(
+	ptr: Ptr[u8],
+	length: usize,
+	fill: u8,
+) -> None:
+	...
+
 # ntdll.dll internally links a small set of plain C-runtime string functions
 # and exports them (confirmed via `dumpbin /exports ntdll.dll`: strlen,
 # strnlen, strcpy, strcmp, ... are all present). Calling these instead of
