@@ -130,7 +130,7 @@ def main() -> i32:
 	if f1 != 3.5:
 		return 1
 	d1: str = json.dumps( v1 ).unwrap( 'dumps 3.5' )
-	if d1.find( '.' ).is_err():
+	if d1.find( '.' ) == -1:
 		return 2
 
 	v2: json.JSONValue = json.loads( '1.0e2' ).unwrap( 'loads 1.0e2' )
