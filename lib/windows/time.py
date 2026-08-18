@@ -28,16 +28,20 @@ def _decode_ascii_utf16z( ptr: Ptr[u16], max_len: usize ) -> str:
 
 
 def _field_ptr_u16( struct_ptr: Ptr[None], byte_offset: usize ) -> Ptr[u16]:
-	''' compiler.addrof(...) only accepts a bare local-variable name, not a
-	field expression (e.g. compiler.addrof(tz_info.TimeZoneKeyName_0) is a
-	hard compile error - verified directly this session), so there is no
-	direct way to get a pointer AT one of DynamicTimeZoneInformation's
-	decomposed u16 fields. Callers instead already hold a Ptr[None] to the
-	whole struct (see get_local_timezone_name's own tz_info, which is
-	heap-allocated rather than a bare local for an unrelated reason - see
-	its own comment) - this just advances it by byte_offset. See kernel32.
-	py's own _TZNAME_OFFSET/_TZKEYNAME_OFFSET comment for how each offset
-	is derived and kept in sync with the struct. '''
+	''' compiler.addrof(...) doesn't support a FixedArrayType field yet
+	(e.g. compiler.addrof(tz_info.TimeZoneKeyName) fails with "u16[128]
+	fields have no addrof support yet" - verified directly this session),
+	so there is no direct way to get a Ptr[u16] at the START of
+	DynamicTimeZoneInformation's TimeZoneKeyName array for a bulk/
+	multi-element decode (element-level indexed access, f.arr[i], DOES
+	work now, but only for one element at a time - not what a null-
+	terminated-string scan needs). Callers instead already hold a
+	Ptr[None] to the whole struct (see get_local_timezone_name's own
+	tz_info, which is heap-allocated rather than a bare local for an
+	unrelated reason - see its own comment) - this just advances it by
+	byte_offset. See kernel32.py's own _TZNAME_OFFSET/_TZKEYNAME_OFFSET
+	comment for how each offset is derived and kept in sync with the
+	struct. '''
 	raw: Ptr[u8] = compiler.cast( Ptr[u8], struct_ptr )
 	with compiler.wrap_arithmetic:
 		field_bytes: Ptr[u8] = raw + byte_offset
@@ -83,7 +87,7 @@ def get_local_timezone_name() -> str:
 	result: str = 'UTC'
 	if status != 0xFFFFFFFF:
 		opaque_ptr: Ptr[None] = compiler.cast( Ptr[None], tz_info )
-		if tz_info.TimeZoneKeyName_0 != 0:
+		if tz_info.TimeZoneKeyName[0] != 0:
 			key_ptr: Ptr[u16] = _field_ptr_u16( opaque_ptr, _TZKEYNAME_OFFSET )
 			win_name: str = _decode_ascii_utf16z( key_ptr, _TZKEYNAME_SIZE )
 			# windows_zones.to_iana() was always meant to back this lookup
