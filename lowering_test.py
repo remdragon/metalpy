@@ -3191,7 +3191,7 @@ class Tests( unittest.TestCase ):
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertEqual( kinds.count( 'Label' ), 3 ) # start, continue, end
+		self.assertEqual( kinds.count( 'Label' ), 2 ) # start, end - continue_label omitted, the body never uses `continue`
 		self.assertEqual( kinds.count( 'Cmp' ), 1 )
 		self.assertEqual( kinds.count( 'JumpIfFalse' ), 1 )
 		self.assertEqual( kinds.count( 'AddWrap' ), 1 ) # the hidden increment - always AddWrap, regardless of ambient arithmetic mode
@@ -3256,7 +3256,7 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertEqual( kinds.count( 'Call' ), 2 ) # __len__() once, __getitem__(i) once per compiled iteration-body
-		self.assertEqual( kinds.count( 'Label' ), 3 )
+		self.assertEqual( kinds.count( 'Label' ), 2 ) # start, end - continue_label omitted, the body never uses `continue`
 		self.assertEqual( kinds.count( 'AddWrap' ), 1 )
 		# Result.or_return-flavored auto-unwrap only fires when __getitem__
 		# actually returns a Result - this Box's __getitem__ returns plain
