@@ -764,7 +764,16 @@ class CFGState:
 				if already_live:
 					self.bindings[name] = binding
 				else:
-					self._push( binding.operand, binding.type, binding.state )
+					# key=name, not the default (binding.operand.stem) - for
+					# an ordinary local these are identical, but for a
+					# 'self.<attr>'-keyed construction binding (attr_assign's
+					# own convention) operand.stem is just the bare attribute
+					# name ('a'), not the tracking key ('self.a') -
+					# defaulting silently re-keyed the reconciled entry under
+					# the wrong name, so complete_construction()'s own
+					# f'self.{attr.stem}' membership check never found it
+					# again even though both branches genuinely set it
+					self._push( binding.operand, binding.type, binding.state, key = name )
 			else:
 				self.bindings[name] = _Binding( operand = binding.operand, type = binding.type, state = binding.state, entry = None )
 

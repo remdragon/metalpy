@@ -868,6 +868,35 @@ def bar( self_obj: Bar ) -> None:
 		self.assertIn( 'self.n', self.state.bindings )
 		self.assertEqual( len( self.state._epilogue_stack ), 0 ) # no entry - nothing to decref, ever
 
+	def test_attr_assigned_on_both_if_branches_survives_merge_and_completes( self ) -> None:
+		# regression test for a real, confirmed bug: merge_if()'s own
+		# reestablish() helper called self._push(...) without key=name for
+		# a binding that's fresh on BOTH branches (attr_assign'd for the
+		# first time independently on each side) - _push()'s own default
+		# (key=operand.stem) is fine for an ordinary local (stem IS the
+		# tracking key there) but wrong for a 'self.<attr>'-keyed
+		# construction binding, where operand.stem is just the bare
+		# attribute name ('n') not the tracking key ('self.n'). Silently
+		# re-keyed the reconciled entry, so complete_construction()'s own
+		# f'self.{attr.stem}' membership check could never find it again -
+		# a real "must initialize" false positive for code that assigns
+		# every attribute on every branch (confirmed via a real `mpy.py`
+		# compile of the equivalent if/else __init__ shape, both before
+		# and after this fix)
+		i32 = self.discovery.get_intrinsics()['i32']
+		entry = self.state.snapshot()
+		self.state.attr_assign( self.n_attr, ir.Const( type = i32, value = 1 ), is_alias = False )
+		true_end = dict( self.state.bindings )
+		self.state.restore( entry )
+		self.state.attr_assign( self.n_attr, ir.Const( type = i32, value = 2 ), is_alias = False )
+		false_end = dict( self.state.bindings )
+		self.state.restore( entry )
+		self.state.merge_if( entry.bindings, true_end, false_end, 'Bar.__init__' )
+		self.assertIn( 'self.n', self.state.bindings )
+		self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
+		self.state.attr_assign( self.b_attr, self._new_temp( self.b_attr.type ), is_alias = False )
+		self.state.complete_construction( 'Bar.__init__' ) # must not raise
+
 	def test_complete_construction_succeeds_and_cancels_entries_without_decref( self ) -> None:
 		self.state.attr_assign( self.a_attr, self._new_temp( self.a_attr.type ), is_alias = False )
 		self.state.attr_assign( self.b_attr, self._new_temp( self.b_attr.type ), is_alias = False )
