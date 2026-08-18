@@ -1435,6 +1435,7 @@ class Lowering:
 			self.schedule( del_fn )
 
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
+	_FALLIBLE_METHOD_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST, context_qualname: str ) -> None:
@@ -7017,8 +7018,22 @@ class FunctionLowering:
 		shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
 		assert shape is not None and len( shape[1] ) == 2, f'@fallible_arithmetic {method.qualname} must declare a Result[T,E] return type'
 		success_type = shape[1][0].type
+		error_type = shape[1][1].type
 		mode = self._arithmetic_mode[-1]
 		extra = mode.extra if isinstance( mode, arithmetic_mode.ArithmeticPanic ) else None
+		if extra is None:
+			# same requirement _lower_arithmetic_op's own Check-mode opcodes
+			# already enforce before emitting OrReturn/OrJump - missing here
+			# let an @fallible_arithmetic dunder call (int.__floordiv__/
+			# __mod__ via `//`/`%`, or a Scalar-registered arithmetic dunder)
+			# silently emit an OrReturn/OrJump into a function whose return
+			# type can't represent the error at all, crashing at C emission
+			# time instead of failing to compile cleanly - confirmed via a
+			# real repro (`r: int = a // b` inside a function declared -> i32)
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			self.lowering._type_resolver._require_result_return(
+				node, result_cls, error_type, self.lowering._FALLIBLE_METHOD_ALTERNATIVES, fn = self._current_fn,
+			)
 		return self._consume_checked_result( node, result, success_type, extra )
 
 	def _lower_arithmetic_op( self, node: ast.AST, opcode: type|None, extra: ir.Operand|None, result_type: Type, operand_kwargs: dict, kind: str ) -> ir.Operand:
