@@ -9672,11 +9672,15 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 	argument is CONCRETE (not itself union-typed) always resolves to a
 	single, statically-known branch at compile time either way. A UNION-
 	typed argument can force a real runtime ConditionalDispatch instead - a
-	generic branch/default there is now ALSO supported as long as whatever
+	generic branch/default there is now ALSO supported, whether whatever
 	leaf(s) still reach it are pinned to exactly one at compile time (see
-	_monomorphize_dispatch_target); only a generic branch that would itself
-	need to span 2+ distinct runtime leaves is still rejected (the last
-	test below - genuine per-tag monomorphization dispatch, out of scope). '''
+	_monomorphize_dispatch_target) or genuinely span 2+ distinct runtime
+	leaves (_expand_dispatch_target splits that one branch into one new,
+	individually-concrete, individually-monomorphized branch per leaf, each
+	with its own runtime tag check - a real per-tag dispatch table, not
+	just a compile-time shortcut). Only return-only type-param inference
+	(T appearing solely in the return type, never in any parameter) through
+	a runtime-dispatched branch remains unsupported (the last test below). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -9744,17 +9748,21 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 		self.compiler._lower( self.discovery.main )
 		self.assertEqual( self.discovery.errors.errors, [] )
 
-	def test_runtime_dispatched_union_argument_with_multi_leaf_generic_branch_is_rejected( self ) -> None:
-		# the genuinely harder shape the previous test's fix does NOT cover:
-		# a 3-leaf union where only ONE leaf has a concrete overload, so TWO
-		# distinct leaves (i32 and bool) both fall through to the SAME
-		# generic default - each would need its own distinct
-		# monomorphization chosen by a runtime tag no single Call target can
-		# express (this compiler has no vtable/runtime-polymorphic dispatch
-		# concept anywhere). Still rejected cleanly rather than reaching the
-		# emitter with a still-bare TypeVar parameter (confirmed via a real
-		# repro before either guard existed: emitter_c.py's c_type() raised
-		# NotImplementedError).
+	def test_runtime_dispatched_union_argument_with_multi_leaf_generic_branch_compiles( self ) -> None:
+		# the genuinely harder shape the previous test's fix alone does NOT
+		# cover: a 3-leaf union where only ONE leaf has a concrete overload,
+		# so TWO distinct leaves (i32 and bool) both fall through to the
+		# SAME generic default - each needs its own distinct
+		# monomorphization, selected by a runtime tag. This used to be
+		# rejected outright (this compiler has no vtable/runtime-
+		# polymorphic dispatch concept to fall back on) until
+		# _expand_dispatch_target started splitting the one ambiguous
+		# branch into one new, individually-concrete branch per leaf
+		# instead - a real per-tag monomorphization dispatch table, not
+		# just resolving T statically. See emitter_c_test.py's
+		# MultiLeafGenericDispatchRealCompileTests for the real compile+run
+		# confirmation this actually calls the RIGHT monomorphization per
+		# leaf at runtime, not just that it compiles.
 		code = '\n'.join([
 			'class Box:',
 			'	def get( self, x: str ) -> str:',
@@ -9774,6 +9782,38 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 			'	b: Box = Box()',
 			'	u: str|i32|bool = pick( 1 )',
 			'	b.get( u )',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_runtime_dispatched_union_argument_with_return_only_type_param_is_rejected( self ) -> None:
+		# the one remaining unsupported shape: a generic branch/default's
+		# own type param appears ONLY in its return type, never in any
+		# parameter - _monomorphize_dispatch_target's own "missing" check
+		# fails cleanly here rather than wiring through
+		# _infer_return_only_type_params (a materially bigger feature to
+		# thread through a runtime-dispatched branch, since it needs to
+		# actually lower the body to infer the return type; every real
+		# lib/ overload group binds T directly off a parameter instead).
+		code = '\n'.join([
+			'class Box:',
+			'	def get( self, x: str ) -> str:',
+			'		return x',
+			'',
+			'	def get[T, K]( self, x: T ) -> K:',
+			'		return compiler.uninitialized()',
+			'',
+			'def pick( flag: bool ) -> str|i32:',
+			'	if flag:',
+			'		return "hi"',
+			'	return 42',
+			'',
+			'def main() -> None:',
+			'	b: Box = Box()',
+			'	u: str|i32 = pick( True )',
+			'	n: i32 = b.get( u )',
 			'	return',
 		])
 		self._import( code )

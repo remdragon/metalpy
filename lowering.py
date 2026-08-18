@@ -1,6 +1,8 @@
 # stdlib imports:
 import ast
 import copy
+import itertools
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable
@@ -10382,40 +10384,40 @@ class FunctionLowering:
 				self.lowering._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, target.qualname )
 		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
 
-	def _dispatch_slot_binding(
+	# defensive cap on how many distinct per-tag monomorphizations
+	# _expand_dispatch_target will synthesize for ONE generic branch -
+	# mirrors overload_resolution.py's own _MAX_TRACKED_STATES spirit (a
+	# named, trivially-adjustable constant, not a hard architectural limit).
+	# Every real lib/ overload group is 1-2 params/2-4 leaves - nowhere near
+	# this before it'd be a genuine sign of a mis-scoped overload group
+	# rather than a legitimate need for more combos
+	_MAX_DISPATCH_COMBOS = 64
+
+	def _dispatch_remaining_leaves(
 		self, node: ast.Call, target: Function, param: Parameter,
 		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
-	) -> Type:
-		# the single concrete leaf `param` resolves to once THIS branch's own
-		# runtime tag check(s) (if any) have already excluded every other
-		# candidate - see _monomorphize_dispatch_target's own comment. `known`
-		# (keyed by id(param)) covers whatever this branch's own conditions
-		# already pinned down explicitly; every other parameter is narrowed
-		# from the real call-site operand's own (possibly still union) type,
-		# minus whatever leaves `claimed` (built from every OTHER branch's own
-		# conditions - only ever non-empty for the trailing default, which has
-		# no conditions of its own) already accounts for elsewhere. Fails
-		# cleanly, same message/shape as the pre-existing blanket rejection,
-		# if more than one leaf can still reach this target here - a genuinely
-		# harder case (per-tag monomorphization dispatch) this narrow fix
-		# doesn't attempt.
+	) -> list[Type]:
+		# every leaf `param` could still be, once THIS branch's own runtime
+		# tag check(s) (if any) have already excluded every other candidate -
+		# see _expand_dispatch_target's own comment. `known` (keyed by
+		# id(param)) covers whatever this branch's own condition (or an
+		# earlier _expand_dispatch_target combo) already pinned down
+		# explicitly - returned as the sole element, no further narrowing
+		# needed. Every OTHER parameter is narrowed from the real call-site
+		# operand's own (possibly still union) type, minus whatever leaves
+		# `claimed` (built from every OTHER branch's own conditions - only
+		# ever non-empty for the trailing default) already accounts for
+		# elsewhere. Exactly one leaf here means this parameter is statically
+		# resolvable (_monomorphize_dispatch_target); more than one is what
+		# _expand_dispatch_target splits into distinct per-leaf branches.
 		if id( param ) in known:
-			return known[ id( param ) ]
+			return [ known[ id( param ) ] ]
 		operand = self.lowering._dispatch_operand_for_param( node, target, param, args, kwargs )
 		already = claimed.get( id( operand ), [] )
-		remaining = [
+		return [
 			leaf for leaf in operand.type.leaves()
 			if not any( self.lowering._type_resolver._same_type( leaf, c ) for c in already )
 		]
-		if len( remaining ) != 1:
-			self.lowering.discovery.fail(
-				f'a generic overload of {target.qualname} cannot be one branch of a runtime-dispatched call '
-				f'(argument {param.stem!r} could still be {len(remaining)} different types at this branch - '
-				f'per-leaf monomorphization for a generic branch spanning more than one runtime type is not '
-				f'supported yet): {ast.unparse(node)}',
-				node,
-			)
-		return remaining[0]
 
 	def _monomorphize_dispatch_target(
 		self, node: ast.Call, target: Function,
@@ -10429,13 +10431,21 @@ class FunctionLowering:
 		# possibly-union call-site operand type, for the "sole unconditional
 		# match" case), a ConditionalDispatch branch/default only ever runs
 		# once every OTHER branch's own runtime tag check has excluded its own
-		# leaf(s) - _dispatch_slot_binding resolves the real, narrower type
-		# reaching THIS target at each parameter.
+		# leaf(s) - _dispatch_remaining_leaves resolves the real, narrower
+		# type(s) reaching THIS target at each parameter. Caller contract:
+		# every parameter must already resolve to EXACTLY one leaf here (see
+		# _expand_dispatch_target, the only real caller) - asserted, not
+		# re-validated, since by the time this is called any genuine
+		# ambiguity has already been split into a separate combo.
 		type_params = target.type_params or []
 		bindings: dict[int,Type] = {}
 		for param in target.parameters or []:
-			resolved_type = self._dispatch_slot_binding( node, target, param, known, args, kwargs, claimed )
-			self.lowering._unify_type_param( type_params, param.type, resolved_type, bindings, node, target.qualname )
+			remaining = self._dispatch_remaining_leaves( node, target, param, known, args, kwargs, claimed )
+			assert len( remaining ) == 1, (
+				f'internal compiler error - {target.qualname} parameter {param.stem!r} not resolved to exactly '
+				f'one leaf before monomorphizing ({len(remaining)} remaining) - _expand_dispatch_target caller contract violated'
+			)
+			self.lowering._unify_type_param( type_params, param.type, remaining[0], bindings, node, target.qualname )
 		missing = [ tv for tv in type_params if id( tv ) not in bindings ]
 		if missing:
 			# every real lib/ generic overload binds every type param
@@ -10454,6 +10464,78 @@ class FunctionLowering:
 		inferred_args = [ bindings[id(tv)] for tv in type_params ]
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		return self.lowering._monomorphized_function( spec )
+
+	def _remap_conditions(
+		self, original_params: list[Parameter], new_params: list[Parameter], conditions: list[tuple[Parameter,Type]],
+	) -> list[tuple[Parameter,Type]]:
+		# a monomorphized Function has its own, distinct Parameter objects
+		# (same count/order as the generic original - substitution never
+		# reorders or drops parameters) - a runtime condition built against
+		# the ORIGINAL generic function's own Parameter identity (from
+		# resolve_call, or from an earlier _expand_dispatch_target combo)
+		# has to be re-pointed at the monomorphized function's corresponding
+		# one before _lower_dispatch_tests/_dispatch_operand_for_param can
+		# find it there (identity lookup, not structural equality - see
+		# their own docstrings)
+		return [
+			( new_params[ next( i for i, op in enumerate( original_params ) if op is p ) ], leaf_type )
+			for p, leaf_type in conditions
+		]
+
+	def _expand_dispatch_target(
+		self, node: ast.Call, target: Function,
+		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
+	) -> list[tuple[list[tuple[Parameter,Type]],Function]]:
+		'''
+		Resolves a GENERIC branch/default of a runtime-dispatched Overload
+		call into one or more concrete (extra_conditions, monomorphized
+		Function) pairs. Most of the time this is exactly one entry with no
+		extra conditions - the EASY case (_monomorphize_dispatch_target's own
+		docstring): every parameter's real leaf is already pinned to exactly
+		one value here, either explicitly (`known`, from this branch's own
+		runtime condition) or by elimination (`claimed`, only ever populated
+		for the trailing default).
+
+		When one or more parameters can still legitimately be more than one
+		leaf here - the HARD case this dispatch machinery used to reject
+		outright - this ONE branch is split into one synthetic entry PER
+		combination of those parameters' remaining leaves, each monomorphized
+		with its own distinct T binding and given its own extra runtime
+		condition(s) pinning exactly that combination. This turns "this one
+		generic branch might need any of N different C functions at runtime,
+		selected by a tag no single Call target can express" into N ordinary,
+		individually-concrete branches - exactly the shape
+		_lower_conditional_dispatch already knows how to schedule, just more
+		of them. The caller (the Overload branch of _lower_call) is
+		responsible for splicing these into the overall branches/default
+		list and picking exactly one overall entry to remain the trailing,
+		unconditioned default.
+		'''
+		params = target.parameters or []
+		remaining_by_id = {
+			id( p ): self._dispatch_remaining_leaves( node, target, p, known, args, kwargs, claimed )
+			for p in params
+		}
+		ambiguous = [ p for p in params if len( remaining_by_id[ id( p ) ] ) != 1 ]
+		if not ambiguous:
+			return [ ( [], self._monomorphize_dispatch_target( node, target, known, args, kwargs, claimed )) ]
+		combo_count = math.prod( len( remaining_by_id[ id( p ) ] ) for p in ambiguous )
+		if combo_count > self._MAX_DISPATCH_COMBOS:
+			self.lowering.discovery.fail(
+				f'a generic overload of {target.qualname} used as a runtime-dispatched branch would need '
+				f'{combo_count} separate per-type monomorphizations here (more than {self._MAX_DISPATCH_COMBOS}) - '
+				f'narrow the overloaded parameter types: {ast.unparse(node)}',
+				node,
+			)
+		results: list[tuple[list[tuple[Parameter,Type]],Function]] = []
+		for combo in itertools.product( *( remaining_by_id[ id( p ) ] for p in ambiguous )):
+			combo_known = dict( known )
+			combo_known.update({ id( p ): leaf for p, leaf in zip( ambiguous, combo ) })
+			monomorphized = self._monomorphize_dispatch_target( node, target, combo_known, args, kwargs, claimed )
+			new_params = monomorphized.parameters or []
+			extra_conditions = self._remap_conditions( params, new_params, list( zip( ambiguous, combo )))
+			results.append(( extra_conditions, monomorphized ))
+		return results
 
 	def _infer_return_only_type_params( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], return_only: list[TypeVar] ) -> Function:
 		# PLAN_RETURN_INFERENCE.md - non-@inline variant: a bare generic
@@ -11138,45 +11220,54 @@ class FunctionLowering:
 					# call's own union-typed argument has leaves routing to
 					# more than one overload, at least one of them generic.
 					#
-					# The EASY sub-case (handled here): whatever leaf(s) of
-					# the union still reach one particular generic branch are
-					# already pinned down STATICALLY, either by that branch's
-					# own runtime condition(s) (a non-default branch always
-					# has one - see overload_resolution.resolve_call) or, for
-					# the trailing default, by elimination (the call's real
-					# leaves at that slot, minus whatever every OTHER
-					# branch's own condition already claims there) - if
-					# that's exactly one leaf, T is knowable at compile time
-					# same as any other generic call, and this branch can be
-					# monomorphized in place before ever reaching
-					# _lower_conditional_dispatch (which unconditionally
-					# schedules every branch's target as an ordinary, already-
-					# concrete compile unit - see _monomorphize_dispatch_target).
+					# Whatever leaf(s) of the union still reach one particular
+					# generic branch/default get resolved STATICALLY, either
+					# explicitly (a non-default branch always has its own
+					# runtime condition(s) - see overload_resolution.
+					# resolve_call) or by elimination (the trailing default:
+					# the call's real leaves at that slot, minus whatever
+					# every OTHER branch's own condition already claims
+					# there). The common case is exactly ONE leaf - T is
+					# knowable at compile time same as any other generic
+					# call, and this branch is monomorphized in place before
+					# ever reaching _lower_conditional_dispatch (which
+					# unconditionally schedules every branch's target as an
+					# ordinary, already-concrete compile unit).
 					#
-					# The HARD sub-case (still rejected, by
-					# _dispatch_slot_binding/_monomorphize_dispatch_target's
-					# own fail() calls below): a single generic branch that
-					# itself needs to cover 2+ distinct leaves (e.g. a 3+-
-					# member union where only one member has a concrete
-					# overload - every OTHER member falls through to the SAME
-					# generic default, each needing its own distinct
-					# monomorphization chosen by a runtime tag no single Call
-					# target can express) - a materially bigger feature
-					# (synthesizing a real per-tag dispatch table over
-					# distinct monomorphizations) than anything this dispatch
-					# machinery does today. Before this fix, EVERY generic-
-					# branch shape (easy or hard) hit this same blanket
-					# rejection rather than reaching the emitter, which would
-					# otherwise crash outright on a still-bare TypeVar
-					# parameter (confirmed via a real repro: str|i32 argument,
-					# concrete str overload + generic[T] fallback).
+					# When 2+ leaves can still legitimately reach ONE generic
+					# branch (e.g. a 3+-member union where only one member
+					# has a concrete overload - every OTHER member falls
+					# through to the SAME generic default, each needing its
+					# own distinct monomorphization) - _expand_dispatch_target
+					# splits that ONE branch into one new, individually-
+					# concrete branch PER leaf, each with its own extra
+					# runtime condition pinning exactly that leaf. Exactly
+					# one overall entry (see `default_fn` below) stays the
+					# trailing, unconditioned default - by construction, once
+					# every OTHER entry's own condition has been tested and
+					# excluded, only that one's own territory can remain, so
+					# it never needs a check of its own either way.
+					# every leaf already spoken for by a CONCRETE candidate,
+					# keyed by the real call-site operand it came from - not
+					# just whichever branches happen to carry an explicit
+					# runtime condition: a concrete candidate that ends up as
+					# the trailing default has its own condition computed
+					# then discarded by resolve_call (see its own "own
+					# leaves" comment - a default never needs one), so
+					# reading conditions alone under-counts. A concrete
+					# function's own declared parameter type unambiguously
+					# IS the one leaf it handles, condition or not - reading
+					# .parameters directly instead is both simpler and
+					# correct for every concrete candidate, branch or default.
 					claimed: dict[int,list[Type]] = {}
-					for b in branches:
-						for p, leaf_type in b.conditions:
+					for b in ( *branches, ConditionalDispatch( conditions = [], function = resolved )):
+						if b.function.type_params:
+							continue
+						for p in b.function.parameters or []:
+							if p.type is None:
+								continue
 							operand = self.lowering._dispatch_operand_for_param( node, b.function, p, args, kwargs )
-							claimed.setdefault( id( operand ), [] ).append( leaf_type )
-					if resolved.type_params:
-						resolved = self._monomorphize_dispatch_target( node, resolved, {}, args, kwargs, claimed )
+							claimed.setdefault( id( operand ), [] ).append( p.type )
 					new_branches: list[ConditionalDispatch] = []
 					for b in branches:
 						if not b.function.type_params:
@@ -11184,14 +11275,23 @@ class FunctionLowering:
 							continue
 						original_params = b.function.parameters or []
 						known = { id( p ): t for p, t in b.conditions }
-						monomorphized = self._monomorphize_dispatch_target( node, b.function, known, args, kwargs, {} )
-						new_params = monomorphized.parameters or []
-						remapped_conditions = [
-							( new_params[ next( i for i, op in enumerate( original_params ) if op is p ) ], leaf_type )
-							for p, leaf_type in b.conditions
-						]
-						new_branches.append( ConditionalDispatch( conditions = remapped_conditions, function = monomorphized ))
+						for extra_conditions, monomorphized in self._expand_dispatch_target( node, b.function, known, args, kwargs, claimed ):
+							new_params = monomorphized.parameters or []
+							remapped = self._remap_conditions( original_params, new_params, b.conditions )
+							new_branches.append( ConditionalDispatch( conditions = remapped + extra_conditions, function = monomorphized ))
 					branches = new_branches
+					if resolved.type_params:
+						# the LAST expansion becomes the new trailing default
+						# (its own extra_conditions are dropped - see the
+						# comment above); every OTHER expansion is a genuine
+						# new conditioned branch, appended after the ones
+						# above (lowest priority, matching resolve_call's own
+						# "default is whatever's left once every real branch
+						# is excluded" convention)
+						*extra, ( _, default_fn ) = self._expand_dispatch_target( node, resolved, {}, args, kwargs, claimed )
+						for extra_conditions, monomorphized in extra:
+							new_branches.append( ConditionalDispatch( conditions = extra_conditions, function = monomorphized ))
+						resolved = default_fn
 				return self._lower_conditional_dispatch( node, branches, resolved, receiver, args, kwargs, expected_type, want_result )
 			winning_stub = next( ( s for s in target.stubs if s.bound_to is resolved ), None )
 			if (
