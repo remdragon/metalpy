@@ -813,13 +813,31 @@ class Tests( unittest.TestCase ):
 		t0 = ir.Temp( type = result_i32_overflow, id = 0 ) # AddCheck's Result
 		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via Unwrap
 
+		# `a + 1` dispatches through i32.__add__ (a real, @inline dunder -
+		# see lib/builtins/__scalar_arith.py), NOT a bare AddCheck directly
+		# against the literal: the literal `1` isn't already a Variable, so
+		# _lower_inline_call's splice synthesizes a fresh local to bind the
+		# dunder's own `other` parameter to (same "only a genuinely computed
+		# operand needs the synthesized-local fallback" rule that applies to
+		# every @inline call, not special to this dunder) - looked up
+		# dynamically here (rather than hardcoding __scalar_arith.py's own
+		# file/line) so this test doesn't break if that file moves/changes
+		add_i32_fn = i32.names['__add__']
+		if add_i32_fn.resolve is not None:
+			add_i32_fn.resolve()
+		inline_other = Variable(
+			stem = '$inline0$other', qualname = f'{add_i32_fn.qualname}$$inline0$other',
+			file = add_i32_fn.file, line = add_i32_fn.line, type = i32,
+		)
+
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_ir( fn, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = inline_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.AddCheck( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.AddCheck( dest = t0, left = a, right = inline_other ),
 			ir.DeclareTemp( temp = t1 ),
 			ir.Unwrap( dest = t1, value = t0, errmsg = ir.Const( type = str_cls, value = 'bad arithmetic' ), panic = panic_fn ),
 			ir.Assign( dest = b, src = t1 ),

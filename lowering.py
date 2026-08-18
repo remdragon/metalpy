@@ -955,6 +955,7 @@ class Lowering:
 		else:
 			names = getattr( owner_type, 'names', None )
 			found = names.get( name ) if isinstance( names, dict ) else None
+		found = self._resolve_scalar_name( found )
 		return found if isinstance( found, Function ) else None
 
 	def _find_iterator_next_method( self, owner_type: Type|None ) -> Function|None:
@@ -1287,6 +1288,18 @@ class Lowering:
 
 	def _monomorphized_function( self, spec: Specialization ) -> Function:
 		return self._monomorphizer.monomorphized_function( spec )
+
+	def _resolve_scalar_name( self, found: Name|None ) -> Name|None:
+		''' Scalar.names may hold a raw Specialization - a generic dunder/
+		method registered via `TypeName.method = generic_fn[T]`, stored
+		as-is by discovery.py's visit_Assign since a Monomorphizer isn't
+		constructible that early. Every reader of Scalar.names funnels the
+		looked-up value through here first so a Specialization transparently
+		becomes the real, concrete Function it stands for, instead of
+		silently falling through an `isinstance(found, Function)` check
+		(what every existing caller already does) as if the name were
+		never registered at all. '''
+		return self._monomorphized_function( found ) if isinstance( found, Specialization ) else found
 
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
 		return self._monomorphizer.monomorphize_class( spec )
@@ -7478,6 +7491,7 @@ class FunctionLowering:
 		else:
 			names = getattr( owner_type, 'names', None )
 			found = names.get( name ) if isinstance( names, dict ) else None
+		found = self.lowering._resolve_scalar_name( found )
 		# a plain (non-Overload) Function is checked against arg_type here
 		# too, NOT returned unconditionally the way a bare _find_method
 		# would - a real bug caught during development: str only has ONE
@@ -7488,8 +7502,28 @@ class FunctionLowering:
 		for impl in candidates:
 			if impl.resolve is not None:
 				impl.resolve()
-			if impl.parameters and len( impl.parameters ) == 1 \
-					and self.lowering._type_resolver._same_type( impl.parameters[0].type, arg_type ):
+			params = impl.parameters or []
+			# a Scalar-registered dunder (impl.cls is None - a free function
+			# whose receiver was never stripped by discovery, unlike a real
+			# class method) declares its receiver as an ORDINARY leading
+			# parameter (`def i32__add__i32(value: i32, other: i32)`), so
+			# the operand to match against arg_type is params[1], not
+			# params[0] - a real, confirmed bug found via a real repro
+			# (`return a + b` from a function declared to return exactly
+			# Result[i32,OverflowError] double-wrapped the Result, because
+			# this check unconditionally required exactly ONE parameter and
+			# so NEVER matched any Scalar-registered dunder at all, silently
+			# falling through to the older, pre-dunder-dispatch direct-
+			# opcode path below instead - which mistypes result_type as the
+			# outer expected_type instead of falling back to left.type,
+			# specifically when expected_type happens to already BE the
+			# checked-Result shape the binop's own dunder dispatch was
+			# supposed to produce). The existing test suite never caught
+			# this because every existing test assigns the binop to an
+			# unannotated local first (`c = a + b; return Result.Ok(c)`),
+			# never returning the binop expression directly.
+			arg_index = 1 if impl.cls is None else 0
+			if len( params ) == arg_index + 1 and self.lowering._type_resolver._same_type( params[arg_index].type, arg_type ):
 				return impl
 		return None
 

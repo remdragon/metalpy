@@ -1374,10 +1374,18 @@ class Discovery( ast.NodeVisitor ):
 				# into the shared intrinsic Scalar's own .names, resolved
 				# eagerly (the RHS function must already be def'd earlier
 				# in the same file, same top-to-bottom limitation
-				# _parse_type_alias already has)
+				# _parse_type_alias already has). The RHS may also be a
+				# generic specialization (`i32.__add__ = i__add__i[i32]`) -
+				# stored as the raw Specialization, NOT monomorphized here:
+				# Monomorphizer needs discovery/schedule/union_storage/
+				# tuple_storage, none of which exist yet at this (parse)
+				# stage - see lowering.py's _find_dunder_for_arg/_find_method
+				# and type_resolver.py's _attr_lookup_callable, the three
+				# places that monomorphize a Specialization found here
+				# on first actual use instead
 				value = self.visit( node.value )
-				if not isinstance( value, Function ):
-					self.fail( f'{ast.unparse(target)} = ... must assign a function: {ast.unparse(node)}', node )
+				if not isinstance( value, ( Function, Specialization )):
+					self.fail( f'{ast.unparse(target)} = ... must assign a function (or a generic specialization): {ast.unparse(node)}', node )
 				base.add_name( target.attr, value )
 				return None
 			# anything else with an Attribute target falls through to the

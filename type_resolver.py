@@ -2811,6 +2811,14 @@ class TypeResolver:
 			if not isinstance( names, dict ):
 				self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 			found = names.get( attr )
+		if isinstance( found, Specialization ):
+			# a Scalar-registered generic method (`i32.to_u32 = i__to__i[i32,u32]`)
+			# - discovery.py's visit_Assign stores the raw Specialization,
+			# unmonomorphized (no Monomorphizer exists that early) - resolve
+			# it to the real, concrete Function here, on first actual use,
+			# same as lowering.py's own _resolve_scalar_name does for the
+			# other two Scalar.names readers (_find_method/_find_dunder_for_arg)
+			found = self.monomorphizer.monomorphized_function( found )
 		if not isinstance( found, ( Function, Overload )):
 			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
 		if isinstance( found, ( Function, Overload )):
