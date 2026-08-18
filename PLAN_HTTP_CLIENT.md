@@ -76,12 +76,15 @@ Current state of prerequisites
     Recommend treating `.json()`/`json=` as deferred until a json library exists,
     while `.content`/`.text`/`data=` (raw bytes/str) work from day one.
 
-  URL parsing / form encoding / base64: none exist (no urllib, no percent-encoding
-    helper, no base64 anywhere in lib/). All three are pure string/byte transforms
-    with zero I/O dependency — str already has split/find/index/strip
-    (lib/builtins/__init__.py) to build a minimal scheme://host:port/path?query
-    splitter and a percent-encoder on top of. These are cheap, buildable today, and
-    needed for `params=`, form-encoded `data=`, and `auth=` (HTTP Basic → base64).
+  URL parsing / form encoding / base64: written when none of this existed yet —
+    since landed as real, general-purpose modules, and http.client migrated onto
+    both: lib/base64.py (see the base64_encode note elsewhere in this doc) and
+    lib/urllib/parse.py (quote/unquote, urlencode/parse_qsl, urlsplit/urlunsplit,
+    urljoin — commit 23baa97). http.client's own hand-rolled ParsedURL/
+    _parse_url/_merge_query_params/_form_encode were replaced with thin wrappers
+    around urlsplit()/parse_qsl()/urlencode() — see "urllib.parse migration"
+    further down for what that changed, including a real feature gain (relative
+    redirect Location headers, via urljoin(), previously unsupported).
 
   Error codes: written when none of this existed yet - since landed. lib/builtins/
     __errors.py's OSError (both @compiler.target variants) now has ConnectionRefused,
@@ -294,24 +297,43 @@ Implementation plan (phased, for once this moves from scoping to real work)
   Phase 3b — landed: Session (cookie jar, redirect-following loop with a
     10-redirect cap, params=/form=/auth= encoding) and module-level get()/
     post()/put()/patch()/delete()/head()/options()/request(), each a one-off
-    Session() underneath. Two API deviations from the original sketch below,
-    both forced by real emitter bugs found while landing this (see "Two more
-    compiler gaps found while landing Phase 3b" below):
-      - `data=` is bytes|str|None only - a separate `form=` dict[str,str]
-        parameter handles application/x-www-form-urlencoded bodies, instead
-        of one requests-style bytes|str|dict|None union.
-      - `auth=` takes a BasicAuth(user, password) instance, not a bare
-        (user, password) tuple.
+    Session() underneath. One API deviation from the original sketch below:
+    `data=` is bytes|str|None only - a separate `form=` dict[str,str]
+    parameter handles application/x-www-form-urlencoded bodies, instead of
+    one requests-style bytes|str|dict|None union (a real compiler gap made
+    `form=` a required workaround at the time - see "Four real compiler
+    gaps" below; `auth=` hit an analogous gap and was temporarily a
+    BasicAuth(user, password) class instead of a bare tuple, since reverted
+    back to `tuple[str,str]|None` once that gap was fixed - `form=` was kept
+    as its own parameter rather than reverted, since match-based dispatch
+    across a real 3-member bytes|str|dict union remains genuinely untested
+    territory even now, per _encode_body's own comment).
     `json=`/`.json()` remain deferred (no json library yet, unchanged from
-    the original plan). Relative Location headers on a redirect aren't
-    resolved (only absolute http:// Location values are followed - treated
-    as "don't redirect" otherwise, not an error). Covered by
-    http_client_test.py's SessionLoopbackTests: cookie-jar harvest+replay
-    across two real requests, a real 302 redirect followed transparently
-    (with params= merged + percent-encoded into the pre-redirect request),
+    the original plan). Relative Location headers on a redirect ARE now
+    resolved (via lib/urllib/parse.py's urljoin() - see "urllib.parse
+    migration" below; this was originally a gap, fixed once urljoin()
+    landed). Covered by http_client_test.py's SessionLoopbackTests:
+    cookie-jar harvest+replay across two real requests, a real 302 redirect
+    followed transparently (with params= merged + percent-encoded into the
+    pre-redirect request), a relative-Location redirect resolved correctly,
     and a form POST with Basic auth - all verified by having the fake
     server inspect the raw bytes it actually received, not just checking
     the client-side response.
+
+  urllib.parse migration (lib/urllib/parse.py, commit 23baa97) — http.client's
+    own hand-rolled ParsedURL/_parse_url/_merge_query_params/_form_encode were
+    replaced with thin wrappers around urlsplit()/parse_qsl()/urlencode()/
+    urljoin(). Two real, positive behavior changes came with it, not just a
+    refactor:
+      - Query-string/form encoding now goes through urlencode() (quote_plus:
+        space -> '+'), matching requests' own params=/data= dict encoding
+        exactly - the old hand-rolled version used quote()-style %20, a
+        subtle mismatch with what it was supposed to mirror.
+      - Redirect Location headers may now be relative, resolved against the
+        request URL via urljoin() (RFC 3986 5.3) - previously only absolute
+        http:// Location values were followed; a relative one silently
+        wasn't treated as a redirect at all. Covered by a new loopback test,
+        session_follows_relative_redirect.
 
 Four real compiler gaps found while landing this plan - all now fixed
 
