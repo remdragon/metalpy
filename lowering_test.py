@@ -9670,8 +9670,13 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 	FIRST fix alone still crashed the emitter with a bare TypeVar parameter
 	- see _lower_overload_generic_call/_finish_generic_call). A call whose
 	argument is CONCRETE (not itself union-typed) always resolves to a
-	single, statically-known branch at compile time either way - see the
-	next test for the one shape still rejected. '''
+	single, statically-known branch at compile time either way. A UNION-
+	typed argument can force a real runtime ConditionalDispatch instead - a
+	generic branch/default there is now ALSO supported as long as whatever
+	leaf(s) still reach it are pinned to exactly one at compile time (see
+	_monomorphize_dispatch_target); only a generic branch that would itself
+	need to span 2+ distinct runtime leaves is still rejected (the last
+	test below - genuine per-tag monomorphization dispatch, out of scope). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -9702,17 +9707,20 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 		self.compiler._lower( self.discovery.main )
 		self.assertEqual( self.discovery.errors.errors, [] )
 
-	def test_runtime_dispatched_union_argument_with_generic_branch_is_rejected( self ) -> None:
-		# unlike a concrete argument (always statically resolved - see
-		# above), a UNION-typed argument can force overload_resolution.
-		# resolve_call to return a real runtime ConditionalDispatch, whose
-		# branches (including the trailing default) _lower_conditional_
-		# dispatch always schedules as concrete, callable C symbols - a
-		# generic branch has no single such symbol (this compiler has no
-		# runtime-polymorphic dispatch), so it's rejected with a clean
-		# compile error rather than reaching the emitter with a still-bare
-		# TypeVar parameter (confirmed via a real repro before this guard
-		# existed: emitter_c.py's c_type() raised NotImplementedError)
+	def test_runtime_dispatched_union_argument_with_generic_branch_resolving_one_leaf_compiles( self ) -> None:
+		# a UNION-typed argument can force overload_resolution.resolve_call
+		# to return a real runtime ConditionalDispatch, whose branches
+		# (including the trailing default) _lower_conditional_dispatch
+		# always schedules as concrete, callable C symbols - a generic
+		# branch has no single such symbol UNLESS whatever leaf(s) still
+		# reach it are already pinned down to exactly one at compile time
+		# (here: the union has exactly 2 leaves, str claimed by the concrete
+		# overload, so only i32 can ever reach the generic default) - see
+		# _monomorphize_dispatch_target. This used to be rejected outright
+		# (same blanket rejection the next test still exercises for the
+		# genuinely harder shape) until a real repro showed it doesn't
+		# actually need runtime-polymorphic dispatch: T is statically
+		# knowable here, same as any other generic call.
 		code = '\n'.join([
 			'class Box:',
 			'	def get( self, x: str ) -> str:',
@@ -9729,6 +9737,42 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 			'def main() -> None:',
 			'	b: Box = Box()',
 			'	u: str|i32 = pick( True )',
+			'	b.get( u )',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_runtime_dispatched_union_argument_with_multi_leaf_generic_branch_is_rejected( self ) -> None:
+		# the genuinely harder shape the previous test's fix does NOT cover:
+		# a 3-leaf union where only ONE leaf has a concrete overload, so TWO
+		# distinct leaves (i32 and bool) both fall through to the SAME
+		# generic default - each would need its own distinct
+		# monomorphization chosen by a runtime tag no single Call target can
+		# express (this compiler has no vtable/runtime-polymorphic dispatch
+		# concept anywhere). Still rejected cleanly rather than reaching the
+		# emitter with a still-bare TypeVar parameter (confirmed via a real
+		# repro before either guard existed: emitter_c.py's c_type() raised
+		# NotImplementedError).
+		code = '\n'.join([
+			'class Box:',
+			'	def get( self, x: str ) -> str:',
+			'		return x',
+			'',
+			'	def get[T]( self, x: T ) -> str:',
+			'		return "generic"',
+			'',
+			'def pick( flag: i32 ) -> str|i32|bool:',
+			'	if flag == 0:',
+			'		return "hi"',
+			'	if flag == 1:',
+			'		return 42',
+			'	return True',
+			'',
+			'def main() -> None:',
+			'	b: Box = Box()',
+			'	u: str|i32|bool = pick( 1 )',
 			'	b.get( u )',
 			'	return',
 		])
