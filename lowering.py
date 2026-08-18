@@ -3462,6 +3462,24 @@ class FunctionLowering:
 			self._emit( ir.SizeOf( dest = dest, type = target_type ))
 			return dest
 
+		# a FixedArrayType field (u8[N]/u16[N]-style) - folds to a compile-
+		# time constant the same way a plain Scalar's sizeof already does,
+		# PROVIDED the element type itself has a plain-int sizeof (true for
+		# every real element type this compiler's FixedArrayType is
+		# actually exercised with today - u8/u16/etc). An element type
+		# without one (a real class-like type, e.g. a hypothetical
+		# SomeStruct[N] field) would need the C compiler's own sizeof(...)
+		# to size correctly, same as any other class-like type below - not
+		# attempted here since no real FixedArrayType field with a non-
+		# scalar element type exists anywhere in this codebase yet; falls
+		# through to the same "not supported yet" error below rather than
+		# silently computing a wrong Python-int size for a type with no
+		# sizeof of its own.
+		if isinstance( target_type, FixedArrayType ):
+			elem_sizeof = getattr( target_type.elem_type, 'sizeof', None )
+			if elem_sizeof is not None:
+				return ir.Const( type = expected_type or usize_cls, value = elem_sizeof * target_type.count )
+
 		# a real class-like type (RCClass/CStruct/CUnion/TaggedUnion, or a
 		# concrete Specialization of one) - no field-layout algorithm exists
 		# in this compiler (nor should one - that's the C compiler's own

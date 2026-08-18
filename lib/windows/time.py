@@ -31,8 +31,6 @@ def get_local_timezone_name() -> str:
 	from windows.kernel32 import (
 		DynamicTimeZoneInformation,
 		GetDynamicTimeZoneInformation,
-		_TZNAME_SIZE,
-		_TZKEYNAME_SIZE,
 	)
 
 	# DynamicTimeZoneInformation is large (432 bytes, decomposed from three
@@ -65,7 +63,13 @@ def get_local_timezone_name() -> str:
 	if status != 0xFFFFFFFF:
 		if tz_info.TimeZoneKeyName[0] != 0:
 			key_ptr: Ptr[u16] = compiler.addrof( tz_info.TimeZoneKeyName )
-			win_name: str = _decode_ascii_utf16z( key_ptr, _TZKEYNAME_SIZE )
+			# element count derived from the field's own declared size
+			# (compiler.sizeof(x.arr) // compiler.sizeof(elem)), not a
+			# hand-copied constant that could drift out of sync with
+			# TimeZoneKeyName's real u16[128] declaration
+			with compiler.panic_arithmetic( 'field size and element size are both compile-time constants, never zero' ):
+				keyname_len: usize = compiler.sizeof( tz_info.TimeZoneKeyName ) // compiler.sizeof( u16 )
+			win_name: str = _decode_ascii_utf16z( key_ptr, keyname_len )
 			# windows_zones.to_iana() was always meant to back this lookup
 			# (see lib/windows_zones.py) - opt-in: a program that never
 			# calls windows_zones.install() gets None back and this
@@ -80,7 +84,9 @@ def get_local_timezone_name() -> str:
 				result = win_name
 		else:
 			name_ptr: Ptr[u16] = compiler.addrof( tz_info.StandardName )
-			result = _decode_ascii_utf16z( name_ptr, _TZNAME_SIZE )
+			with compiler.panic_arithmetic( 'field size and element size are both compile-time constants, never zero' ):
+				name_len: usize = compiler.sizeof( tz_info.StandardName ) // compiler.sizeof( u16 )
+			result = _decode_ascii_utf16z( name_ptr, name_len )
 
 	sys.free( raw )
 	return result

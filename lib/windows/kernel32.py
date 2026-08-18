@@ -7,9 +7,6 @@ STD_INPUT_HANDLE: u32 = u32( -10 )
 STD_OUTPUT_HANDLE: u32 = u32( -11 )
 STD_ERROR_HANDLE: u32 = u32( -12 )
 
-_TZNAME_SIZE: usize = 32
-_TZKEYNAME_SIZE: usize = 128
-
 @cstruct
 class SYSTEMTIME:
 	# wYear == 0 in a *Date field below means "yearly recurring rule" (wDay
