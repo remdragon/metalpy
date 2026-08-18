@@ -555,5 +555,32 @@ def main() -> None:
 ''' )
 		self.assertEqual( self.compiler.extern_dlls, set() )
 
+	def test_dll_list_registers_every_entry( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'zlib1.dll' } )
+
+	def test_dlls_union_across_multiple_reached_functions( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tk86t', 'Tk_Init', dll = 'tk86t.dll' )
+def Tk_Init( interp: Ptr[None] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tk_Init( None )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'tk86t.dll' } )
+
 if __name__ == '__main__':
 	unittest.main()

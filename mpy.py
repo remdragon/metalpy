@@ -243,20 +243,29 @@ def main() -> None:
 		# --- bundle runtime DLL dependencies declared via @extern(..., dll=...) -
 		# driven entirely by compiler.extern_dlls (populated only from functions
 		# actually reached/lowered, same reachability gate as extern_libs), never
-		# anything hardcoded to a particular library here. Best-effort: a missing
-		# DLL warns but doesn't fail the build - the exe already linked fine. ---
+		# anything hardcoded to a particular library here. Every declared name is
+		# something the author explicitly said this program needs at runtime, so
+		# unlike a merely-advisory step, failing to find or copy one fails the
+		# whole build - a program missing a runtime dependency it's known to need
+		# isn't safely deployable, and finding out via mpy's own exit code beats
+		# finding out when the shipped exe won't start on another machine. ---
+		bundle_errors: list[str] = []
 		for dll_name in sorted( compiler.extern_dlls ):
 			found = linker_c.find_dll( dll_name )
 			if found is None:
-				print( f'mpy: warning: could not locate {dll_name} on PATH to bundle into '
-					f'{exe_path.parent} - the built exe may not run without it available at runtime', file = sys.stderr )
+				bundle_errors.append( f'{dll_name}: not found on PATH' )
 				continue
 			dest = exe_path.parent / dll_name
 			try:
 				shutil.copy2( found, dest )
 				print( f'mpy: bundled {dest}' )
 			except OSError as e:
-				print( f'mpy: warning: could not bundle {found} to {dest}: {e}', file = sys.stderr )
+				bundle_errors.append( f'{dll_name}: {e}' )
+		if bundle_errors:
+			print( 'mpy: error: failed to bundle required runtime DLL(s):', file = sys.stderr )
+			for err in bundle_errors:
+				print( f'  {err}', file = sys.stderr )
+			sys.exit( 1 )
 
 if __name__ == '__main__':
 	main()

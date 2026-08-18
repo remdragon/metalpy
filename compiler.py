@@ -80,16 +80,17 @@ class Compiler:
 		# mpy_types.Function.extern_lib) - a future emitter/linker's call
 		# on what to do with that, not this registry's
 		self.extern_libs: dict[str,set[str]] = {}
-		# runtime DLLs declared via @extern(..., dll='<name>'), registered
-		# the same way and at the same point as extern_libs above - only
-		# ever populated from functions that were actually reached/lowered,
-		# never a static/declared-anywhere set, so a program that never
-		# calls into a given vendored library doesn't get its DLL bundled.
-		# A bare filename (e.g. 'tcl86t.dll'), not a path - mpy.py's
-		# post-link bundling step is what turns this into an actual file
-		# copy. See mpy_types.Function.extern_dll's own comment for why
-		# this is independent from extern_lib (different directories on a
-		# real machine, in general).
+		# runtime DLLs declared via @extern(..., dll='<name>'|[...]),
+		# registered the same way and at the same point as extern_libs
+		# above - only ever populated from functions that were actually
+		# reached/lowered, never a static/declared-anywhere set, so a
+		# program that never calls into a given vendored library doesn't
+		# get its DLL bundled. Bare filenames (e.g. 'tcl86t.dll'), not
+		# paths - mpy.py's post-link bundling step is what turns this into
+		# actual file copies. See mpy_types.Function.extern_dlls's own
+		# comment for why this is independent from extern_lib (different
+		# directories on a real machine, in general) and deliberately not
+		# auto-derived from scanning a DLL's own import table.
 		self.extern_dlls: set[str] = set()
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
@@ -324,8 +325,7 @@ class Compiler:
 			instructions = self.lowering.lower_function( unit )
 			if unit.extern_lib is not None:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
-				if unit.extern_dll is not None:
-					self.extern_dlls.add( unit.extern_dll )
+				self.extern_dlls.update( unit.extern_dlls )
 			lf = LoweredFunction( function = unit, instructions = instructions )
 			self.functions.append( lf )
 			self._lowered_functions[ id( unit ) ] = lf

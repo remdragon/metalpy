@@ -408,21 +408,31 @@ def malloc( size: usize ) -> Ptr[u8]:
 def HeapAlloc( hHeap: HANDLE, dwFlags: u32, dwBytes: usize ) -> Ptr[u8]:
 	...
 
-# Vendored/3rd-party DLL FFI, with a runtime bundling hint:
-@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+# Vendored/3rd-party DLL FFI, with a runtime bundling hint (single DLL,
+# or a list when the vendored library has its own further DLL
+# dependencies that also need to ship):
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_CreateInterp() -> Ptr[None]:
 	...
 ```
 
 `dll=` is optional and independent from the `lib` argument: `lib` ('tcl86t' above) is the
 import library linked against at build time, while `dll=` names the bare runtime DLL
-filename that must be loadable when the built program actually runs - the two can live in
-different directories on the build machine (e.g. a vendored library's `.lib` and `.dll`
-shipped separately). When a function declaring `dll=` is actually reached and compiled into
-the program, `mpy`'s build step locates that DLL on `PATH` and copies it next to the built
-executable automatically; a function that's declared but never called contributes nothing,
-and system DLLs (`kernel32`, `user32`, `ntdll`, ...) simply never declare `dll=` since
-they're always present on the target machine already.
+filename(s) that must be loadable when the built program actually runs - these can live in
+a different directory than `lib` on the build machine (e.g. a vendored library's `.lib` and
+`.dll` shipped separately), and a real DLL commonly has its own further DLL dependencies
+(e.g. `tcl86t.dll` also needs `zlib1.dll`) that must be listed explicitly too if they need
+bundling - the compiler deliberately never scans a DLL's own import table to discover these
+automatically, since a real dependency list mixes genuinely-vendored files with system
+components (`kernel32.dll`, various `api-ms-win-crt-*.dll` forwarders, ...) that must never
+be bundled, and reliably telling those apart without a maintained blacklist isn't possible.
+An explicit, author-supplied list sidesteps the question entirely - including the freedom to
+deliberately leave something like `VCRUNTIME140.dll` off the list if it's assumed already
+present on target machines. When a function declaring `dll=` is actually reached and
+compiled into the program, `mpy`'s build step locates each named DLL on `PATH` and copies it
+next to the built executable; a function that's declared but never called contributes
+nothing, and a declared DLL that can't be found anywhere on `PATH` fails the build. System
+DLLs simply never declare `dll=` in the first place.
 
 ### Target Platform Conditioning (`@compiler.target` & `compiler.target`)
 
