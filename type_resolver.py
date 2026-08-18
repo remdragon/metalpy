@@ -5272,6 +5272,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		enumerate every way a name could turn out to be local. '''
 		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
 			return True
+		if isinstance( stmt, ast.If ):
+			# the type_resolver.py-level analogue of lowering.py's own
+			# _stmt_diverges fix - an if/else both of whose branches
+			# diverge is itself terminating, even though it isn't literally
+			# a Return/Break/Continue. This is the exact shape a nested
+			# `match` statement desugars to (visit_Match below, chained
+			# ast.If via tail.orelse) whenever every case of the NESTED
+			# match returns - without this, a case whose own last statement
+			# is such a nested match wrongly reports terminates=False,
+			# feeding a live/non-terminating candidate into
+			# _merge_case_narrowing that should have been excluded entirely.
+			# Recursing through _stmt_diverges itself handles arbitrarily
+			# long desugared case chains. No orelse means the false path
+			# always falls through, so it can never qualify.
+			return (
+				bool( stmt.body ) and self._stmt_diverges( stmt.body[-1] )
+				and bool( stmt.orelse ) and self._stmt_diverges( stmt.orelse[-1] )
+			)
 		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
 			return False
 		root = stmt.value.func

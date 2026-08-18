@@ -4828,6 +4828,20 @@ class FunctionLowering:
 		today's existing (safe, if incomplete) behavior. '''
 		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
 			return True
+		if isinstance( stmt, ast.If ):
+			# an if/else BOTH of whose own branches diverge is itself
+			# terminating, even though it isn't literally a Return/Break/
+			# Continue - the shape a `match` statement desugars to
+			# (type_resolver.py's visit_Match, chained ast.If via
+			# tail.orelse) whenever every case returns. Recursing through
+			# _stmt_diverges itself (rather than a one-level check) handles
+			# arbitrarily long desugared case chains, each nested one level
+			# deeper than the last. No orelse at all means the false path
+			# always falls through, so it can never qualify.
+			return (
+				bool( stmt.body ) and self._stmt_diverges( stmt.body[-1] )
+				and bool( stmt.orelse ) and self._stmt_diverges( stmt.orelse[-1] )
+			)
 		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
 			return False
 		if self.lowering._defer_kind_of_call( stmt.value ) is not None:
