@@ -1306,6 +1306,34 @@ class Lowering:
 		never registered at all. '''
 		return self._monomorphized_function( found ) if isinstance( found, Specialization ) else found
 
+	def _resolve_receiver_generic_dunder( self, found: Name|None, owner_type: Type|None ) -> Name|None:
+		''' Ptr[T]/ConstPtr[T]'s own dunders (Ptr.__add__ = ptr_add_checked,
+		see lib/builtins/__ptr_arith.py) are registered as a BARE generic
+		Function (`found` here, still carrying its own unbound type param) -
+		unlike an ordinary scalar dunder (i32.__add__ = i_add_checked[i32]),
+		there's no concrete pointee type to specialize against AT
+		REGISTRATION time, since Ptr's own `.names` dict is shared across
+		every Ptr[X] (Specialization.names passes through to .base - see
+		mpy_types.py). The pointee type only becomes known at the CALL
+		SITE, from the receiver's own owner_type (Ptr[i32], say) - so
+		unlike _resolve_scalar_name's Specialization-already-known case,
+		this composes the specialization here instead, binding the
+		function's own type param to owner_type's pointee arg, then
+		monomorphizes it exactly like any other generic instantiation.
+		Confirmed via a real spike that skipping this step reaches the
+		emitter with a bare, unbound TypeVar and crashes
+		(NotImplementedError: c_type: unsupported type <TypeVar ...>) -
+		this is not optional defensive padding, it's required for Ptr/
+		ConstPtr dunder dispatch to work at all. '''
+		if (
+			isinstance( found, Function ) and found.type_params
+			and isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar )
+			and owner_type.base.stem in ( 'Ptr', 'ConstPtr' )
+		):
+			spec = self.discovery._get_or_create_specialization( found, list( owner_type.args ))
+			return self._monomorphized_function( spec )
+		return found
+
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
 		return self._monomorphizer.monomorphize_class( spec )
 
@@ -3647,6 +3675,67 @@ class FunctionLowering:
 		self.lowering.schedule( check_type )
 		check_dest = self._new_temp( check_type )
 		self._emit( ir.ConvertCheck( dest = check_dest, operand = operand ))
+		return check_dest
+
+	# (kind, mode) -> opcode for Ptr[T]/ConstPtr[T] +/- usize -> Ptr[T].
+	# Deliberately reuses the SAME AddCheck/AddWrap/SubCheck/SubWrap opcodes
+	# _CHECKED_BINOP_OPCODES already uses for plain scalar add/sub - both
+	# _emit_check_arith and _emit_wrap_arith (emitter_c.py) already branch
+	# on a POINTER-typed dest_type correctly (byte-offset uintptr_t round-
+	# trip, never sizeof(T)-scaled) - confirmed via Spike B, this already
+	# works today via the (about-to-be-retired) fallback path, just needs
+	# wiring through dunders now. No 'saturated' entry - saturating pointer
+	# arithmetic is a clean compile-time rejection instead (confirmed with
+	# the user: an address isn't a bounded numeric range the way an int is,
+	# "clamp to min/max" has no coherent meaning) - see
+	# _lower_compiler_ptr_binop's own handling of that mode.
+	_PTR_BINOP_OPCODES: dict[tuple[str,str],type] = {
+		( 'add', 'checked' ): ir.AddCheck, ( 'add', 'wrapped' ): ir.AddWrap,
+		( 'sub', 'checked' ): ir.SubCheck, ( 'sub', 'wrapped' ): ir.SubWrap,
+	}
+
+	def _lower_compiler_ptr_binop( self, node: ast.Call, intrinsic_name: str, kind: str, mode: str, expected_type: Type|None ) -> ir.Operand:
+		# compiler.checked_ptr_add(p, offset)/wrapped_ptr_add(...)/
+		# saturated_ptr_add(...)/checked_ptr_sub(...)/wrapped_ptr_sub(...)/
+		# saturated_ptr_sub(...) - the fixed-mode intrinsics behind Ptr[T]/
+		# ConstPtr[T]'s own __add__/__sub__ dunders (lib/builtins/
+		# __ptr_arith.py) for the Ptr[T] +/- usize -> Ptr[T] shape (pointer
+		# MINUS pointer, yielding a distance, is a separate shape/dunder -
+		# see compiler.ptr_sub_dist). Parallel to, not sharing code with,
+		# _lower_compiler_checked_binop - that method hard-requires
+		# left.type is right.type, but here the two operand types genuinely
+		# differ (Ptr[T], usize).
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		if not self.lowering._type_resolver._is_ptr_specialization( left.type ):
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) first argument must be a Ptr[T]/ConstPtr[T]: {ast.unparse(node)}', node,
+			)
+		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+		if right.type is not usize_cls:
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) second argument must be usize, got '
+				f'{right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		if mode == 'saturated':
+			self.lowering.discovery.fail(
+				f'saturating pointer arithmetic is not supported (an address is not a bounded numeric range - '
+				f'use checked or wrap mode instead): {ast.unparse(node)}',
+				node,
+			)
+		opcode = self._PTR_BINOP_OPCODES[( kind, mode )]
+		result_type = left.type
+		if not opcode.checked_errors:
+			return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		error_type, _alternatives = self._resolve_checked_error( node, opcode, result_type )
+		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ result_type, error_type ] )
+		self.lowering.schedule( check_type )
+		check_dest = self._new_temp( check_type )
+		self._emit( opcode( dest = check_dest, left = left, right = right ))
 		return check_dest
 
 	# ir.Shr (>>) joins these deliberately: right-shift by a valid amount is
@@ -7758,6 +7847,7 @@ class FunctionLowering:
 			names = getattr( owner_type, 'names', None )
 			found = names.get( name ) if isinstance( names, dict ) else None
 		found = self.lowering._resolve_scalar_name( found )
+		found = self.lowering._resolve_receiver_generic_dunder( found, owner_type )
 		# a plain (non-Overload) Function is checked against arg_type here
 		# too, NOT returned unconditionally the way a bare _find_method
 		# would - a real bug caught during development: str only has ONE
@@ -10872,6 +10962,14 @@ class FunctionLowering:
 
 			case 'bitand' | 'bitor' | 'bitxor' | 'rshift':
 				result = self._lower_compiler_bitwise( node, self.lowering._is_compiler_call( node ), expected_type )
+				return result if want_result else None
+
+			case 'checked_ptr_add' | 'wrapped_ptr_add' | 'saturated_ptr_add' | \
+				'checked_ptr_sub' | 'wrapped_ptr_sub' | 'saturated_ptr_sub':
+				name = self.lowering._is_compiler_call( node )
+				mode, _sep, rest = name.partition( '_' )
+				kind = 'add' if rest == 'ptr_add' else 'sub'
+				result = self._lower_compiler_ptr_binop( node, name, kind, mode, expected_type )
 				return result if want_result else None
 
 			case '__raw_alloc__':

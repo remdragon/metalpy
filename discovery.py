@@ -1414,7 +1414,35 @@ class Discovery( ast.NodeVisitor ):
 				value = self.visit( node.value )
 				if not isinstance( value, ( Function, Specialization )):
 					self.fail( f'{ast.unparse(target)} = ... must assign a function (or a generic specialization): {ast.unparse(node)}', node )
-				base.add_name( target.attr, value )
+				# a SECOND sigil assignment to the same name (e.g. Ptr.__sub__
+				# registered once for Ptr[T]-usize->Ptr[T], again for
+				# Ptr[T]-Ptr[T]->isize - two genuinely different shapes
+				# sharing one operator) forms an Overload group here,
+				# mirroring _parse_function's own identical same-name
+				# merging for ordinary `def` statements (~line 2248 above) -
+				# unlike that path, add_name is a bare dict overwrite with
+				# no merging of its own, so this needs its own explicit
+				# check. _find_dunder_for_arg already expects an Overload
+				# here and disambiguates by argument type (its own
+				# docstring's int.__eq__(other:int) vs (other:i32) example) -
+				# this is what actually lets that mechanism fire for a
+				# Scalar-sigil registration too, not just a real class's own
+				# same-named class-body defs.
+				existing = base.get_local( target.attr )
+				if isinstance( existing, Overload ):
+					existing.implementations.append( value )
+				elif isinstance( existing, ( Function, Specialization )):
+					module = self.module_stack[-1]
+					group = Overload(
+						stem = target.attr,
+						qualname = f'{base.qualname}.{target.attr}',
+						file = module.file,
+						line = node.lineno,
+						implementations = [ existing, value ],
+					)
+					base.add_name( target.attr, group )
+				else:
+					base.add_name( target.attr, value )
 				return None
 			# anything else with an Attribute target falls through to the
 			# ordinary failure below, unchanged
