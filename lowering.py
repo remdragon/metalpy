@@ -2219,6 +2219,40 @@ class FunctionLowering:
 			self._emit( ir.DeleteTemp( temp = t ))
 		self._pending_temps = []
 
+	def _incref_aliasing_return( self, node_expr: ast.expr, value: 'ir.Operand|None', *, force: bool = False ) -> None:
+		''' shared by _stmt_Return and @inline splicing (_lower_inline_call/
+		_splice_multi_statement_inline_body): an ALIASING return expression
+		(self.lowering._is_aliasing_expr - `return self`/`return self.x`)
+		hands back a reference someone else still independently owns, so the
+		caller needs its own +1 - regardless of whether the return happens
+		through a real call boundary or is spliced in directly. Skipping this
+		for the spliced case (confirmed by a real refcount() repro) silently
+		drops the Incref an @inline'd `return self` would otherwise get from
+		a real, non-inlined call to the same function.
+
+		`force` bypasses the has_live_entry() check below - needed by the
+		@inline splice callers specifically: self/a parameter is bound
+		zero-copy (SAME Variable identity as whatever the caller passed in -
+		see _lower_inline_call's own "no _cfg_assign/incref here, deliberately"
+		comment), so has_live_entry(value) would answer "does the CALLER's own
+		operand happen to be a live owned local in the OUTER scope" instead of
+		"is this splice's self/parameter borrowed" - the wrong question
+		whenever the caller's argument was itself a plain owned local (exactly
+		the str(s) repro: s has its own live entry in main(), so an unforced
+		check wrongly concluded "already a move, no Incref needed"). @inline
+		splice callers already know from their own binding loop that self/
+		every parameter is always treated as borrowed at the splice boundary
+		(same loop, same comment), so they pass force=True for those; a
+		multi-statement splice's own pre-return-declared local (a real,
+		splice-scoped self._cfg entry, not aliased to any outer identity)
+		still needs the ordinary has_live_entry check, so force stays False
+		for those. '''
+		if value is None or not self.lowering._is_aliasing_expr( node_expr, value ):
+			return
+		if force or not self._cfg.has_live_entry( value ):
+			for instr in self._cfg.incref( value.type, value ):
+				self._emit( instr )
+
 	def _stmt_Return( self, node: ast.Return ) -> None:
 		if self._in_deferred_body:
 			# a defer/errdefer body's code runs later, replayed inline at the
@@ -2263,9 +2297,7 @@ class FunctionLowering:
 		# holder of the returned value, double-counted as the SAME
 		# reference) where 3 are live once the caller's copy exists,
 		# leading to a premature free the moment either one dropped.
-		if value is not None and self.lowering._is_aliasing_expr( node.value, value ) and not self._cfg.has_live_entry( value ):
-			for instr in self._cfg.incref( value.type, value ):
-				self._emit( instr )
+		self._incref_aliasing_return( node.value, value )
 		# what actually gets returned/assigned into the return-value slot
 		# below - defaults to `value` itself, reassigned to a widened temp
 		# further down when the covered-Result-error-widening case applies.
@@ -9837,6 +9869,7 @@ class FunctionLowering:
 			# spliced body references self/that parameter more than once
 			saved: dict[str,object] = {}
 			saved_live: dict[str,bool] = {}
+			bound_ids: set[int] = set() # see _incref_aliasing_return's own `force` doc - every self/parameter binding here is always treated as borrowed
 			for stem, operand in bindings.items():
 				if isinstance( operand, Variable ):
 					fresh = operand
@@ -9849,6 +9882,7 @@ class FunctionLowering:
 					)
 					self._inline_binding_id += 1
 					self._emit( ir.Assign( dest = fresh, src = operand ))
+				bound_ids.add( id( fresh ))
 				saved[stem] = target.names.get( stem )
 				target.names[stem] = fresh
 				# liveness is keyed by `stem` (the literal 'self'/parameter
@@ -9872,6 +9906,7 @@ class FunctionLowering:
 				with self.lowering.discovery.module_context( module ):
 					with self.lowering.discovery.scope_context( target ):
 						result = self._lower_expr( return_expr, expected_type or target.return_type )
+						self._incref_aliasing_return( return_expr, result, force = id( result ) in bound_ids )
 			finally:
 				for stem, was_live in saved_live.items():
 					if not was_live:
@@ -9982,6 +10017,7 @@ class FunctionLowering:
 		# bind self/params into the PROVISIONAL's own names dict - same
 		# logic the single-statement path above uses for target.names,
 		# just no save/restore needed (provisional is single-use)
+		bound_ids: set[int] = set() # see _incref_aliasing_return's own `force` doc - every self/parameter binding here is always treated as borrowed
 		for stem, operand in bindings.items():
 			if isinstance( operand, Variable ):
 				fresh = operand
@@ -9994,6 +10030,7 @@ class FunctionLowering:
 				)
 				self._inline_binding_id += 1
 				self._emit( ir.Assign( dest = fresh, src = operand ))
+			bound_ids.add( id( fresh ))
 			provisional.names[stem] = fresh
 			# liveness keyed by `stem` (see _lower_inline_call's own
 			# identical single-statement-path comment) - the caller
@@ -10130,6 +10167,7 @@ class FunctionLowering:
 					# single-statement/original multi-statement code always
 					# computed it
 					result = self._lower_expr( return_stmt.value, expected_type )
+					self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
 					return result if want_result else None
 
 				assert scope_label is not None and exited_flag is not None and merge_label is not None
@@ -10168,6 +10206,7 @@ class FunctionLowering:
 				self._emit( ir.Jump( target = converge_label ))
 				self._emit( ir.Label( name = normal_label ))
 				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+				self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
 				self._emit( ir.Assign( dest = result, src = trailing_value ))
 				# trailing_value's own ownership (if it's a bare temp - e.g.
 				# the Result.Ok(x) construction temp a trailing `return

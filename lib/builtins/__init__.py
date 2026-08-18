@@ -441,10 +441,12 @@ class str:
 		sys.free( self.__data )
 		sys.free( self.__index )
 
+	@inline
 	def __str__( self ) -> str:
 		# str is immutable - str(x) is always just x itself, no copy.
 		return self
 
+	@inline
 	@staticmethod
 	def __call__[T]( x: T ) -> str:
 		# str(x) isn't a request to create a new str, but to convert
