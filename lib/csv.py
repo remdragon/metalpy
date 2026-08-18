@@ -242,20 +242,20 @@ class RowParser:
 
 def _format_field( field: str, delimiter: str, quotechar: str ) -> str:
 	# deliberately if/elif, NOT one `or`-chained boolean expression: a chain
-	# of 3+ `field.find(...).is_ok()` calls joined by `or` crashes at
-	# runtime under MSVC specifically (STATUS_BREAKPOINT, heap-corruption-
-	# flavored - confirmed via a minimal repro isolated down to exactly
-	# this shape; 2-deep `or` chains are fine). Real compiler bug in
-	# short-circuit-chain temporary cleanup, not something csv.py can fix -
-	# this is the workaround.
+	# of 3+ `field.find(...) != isize(-1)` comparisons joined by `or`
+	# crashes at runtime under MSVC specifically (STATUS_BREAKPOINT, heap-
+	# corruption-flavored - confirmed via a minimal repro isolated down to
+	# exactly this shape; 2-deep `or` chains are fine). Real compiler bug
+	# in short-circuit-chain temporary cleanup, not something csv.py can
+	# fix - this is the workaround.
 	needs_quote: bool = False
-	if field.find( delimiter ).is_ok():
+	if field.find( delimiter ) != isize( -1 ):
 		needs_quote = True
-	elif field.find( quotechar ).is_ok():
+	elif field.find( quotechar ) != isize( -1 ):
 		needs_quote = True
-	elif field.find( '\r' ).is_ok():
+	elif field.find( '\r' ) != isize( -1 ):
 		needs_quote = True
-	elif field.find( '\n' ).is_ok():
+	elif field.find( '\n' ) != isize( -1 ):
 		needs_quote = True
 	if not needs_quote:
 		return field

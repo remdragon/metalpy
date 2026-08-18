@@ -82,11 +82,10 @@ def _group_integer_part( digits: str, sep: str ) -> str:
 	reconstructs the plain digit text unchanged"), so callers never need to
 	special-case "no grouping requested". '''
 	dot_index: usize = digits.byte_len()
-	match digits.find( str( '.' )):
-		case Result.Ok( idx ):
-			dot_index = idx
-		case Result.Err( _ ):
-			pass
+	found: isize = digits.find( str( '.' ))
+	if found != isize( -1 ):
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			dot_index = usize( found )
 	int_part: str = digits._byte_slice( 0, dot_index )
 	rest: str = digits._byte_slice( dot_index, digits.byte_len() )
 	count: usize = int_part.byte_len() # ASCII-only digit text - byte length is codepoint count here
@@ -258,20 +257,10 @@ def _f64_none_type_digits_raw( value: f64, precision: usize, alt: bool ) -> str:
 	raw: str = _f64_fixed_digits_raw( value, precision, _TYPE_CHAR_G, alt )
 	if raw == str( 'nan' ) or raw == str( 'inf' ):
 		return raw
-	has_dot: bool = False
-	match raw.find( str( '.' )):
-		case Result.Ok( _ ):
-			has_dot = True
-		case Result.Err( _ ):
-			pass
+	has_dot: bool = raw.find( str( '.' )) != isize( -1 )
 	if has_dot:
 		return raw
-	has_exp: bool = False
-	match raw.find( str( 'e' )):
-		case Result.Ok( _ ):
-			has_exp = True
-		case Result.Err( _ ):
-			pass
+	has_exp: bool = raw.find( str( 'e' )) != isize( -1 )
 	if has_exp:
 		return raw
 	return raw + str( '.0' )
@@ -342,18 +331,16 @@ def _f64_repr_from_scientific( sci_text: str ) -> str:
 	is already the FEWEST significant digits that round-trip exactly (see
 	this function's only caller). '''
 	e_index: usize = sci_text.byte_len()
-	match sci_text.find( str( 'e' )):
-		case Result.Ok( idx ):
-			e_index = idx
-		case Result.Err( _ ):
-			pass
+	e_found: isize = sci_text.find( str( 'e' ))
+	if e_found != isize( -1 ):
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			e_index = usize( e_found )
 	mantissa: str = sci_text._byte_slice( 0, e_index )
 	dot_index: usize = mantissa.byte_len()
-	match mantissa.find( str( '.' )):
-		case Result.Ok( idx ):
-			dot_index = idx
-		case Result.Err( _ ):
-			pass
+	dot_found: isize = mantissa.find( str( '.' ))
+	if dot_found != isize( -1 ):
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			dot_index = usize( dot_found )
 	digits: str
 	if dot_index < mantissa.byte_len():
 		with compiler.panic_arithmetic( 'bounded by mantissa length' ):

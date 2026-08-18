@@ -814,8 +814,8 @@ def _merge_query_params( path: str, params: dict[str,str]|None ) -> str:
 		value: str = p.value_at( i ).unwrap( '_merge_query_params: index in bounds by construction' )
 		parts.append( percent_encode( key ) + '=' + percent_encode( value ) ).unwrap( '_merge_query_params: append failed' )
 	sep: str = '&'
-	found: Result[usize, IndexError] = path.find( '?' )
-	if found.is_err():
+	found: isize = path.find( '?' )
+	if found == isize( -1 ):
 		sep = '?'
 	return path + sep + '&'.join( parts )
 

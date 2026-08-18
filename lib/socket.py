@@ -721,17 +721,35 @@ def _set_reuseaddr_raw( sock: SOCKET, enable: bool ) -> Result[None, OSError]:
 # ---------------------------------------------------------------------------
 # WSAStartup-once lifecycle — no "run at import" mechanism exists in this
 # language (module-level code is declarative, not imperative init-on-first-
-# use), so a lazy CAS guard on lib/atomic.py's Atomic[bool] does the job.
-# The loser SPINS on the flag rather than racing ahead of an in-flight
-# WSAStartup call, closing the narrow window a bare "proceed after losing
-# the CAS" would leave open. WSACleanup() is deliberately never called
-# (matches CPython's own behavior; no natural process-exit hook here).
+# use), so a lazy CAS guard does the job. A tri-state (really 4-state)
+# Atomic[i32] state machine, NOT a bare Atomic[bool]: a bool CAS can't let a
+# spinning loser distinguish "nobody has started yet" from "the winner just
+# finished (with either outcome)" - both collapse to the same False value.
+# The original bool version's failure path reset the flag back to False "to
+# allow a later retry" - but that's exactly the same value a loser is
+# spinning to see turn True, so a loser spinning at the moment the winner's
+# WSAStartup call failed would wait for True forever (or until some
+# unrelated FUTURE caller happened to retry and succeed) instead of ever
+# observing the failure. Every transition here is monotonic (NOT_STARTED ->
+# IN_PROGRESS -> {DONE_OK, DONE_ERR}, never backwards), so a spinning loser
+# is guaranteed to see a terminal state - DONE_ERR is now STICKY (not reset
+# back to NOT_STARTED), matching CPython's own socket module, which also
+# never retries WSAStartup after a failure. WSACleanup() is deliberately
+# never called (matches CPython's own behavior; no natural process-exit
+# hook here).
 # ---------------------------------------------------------------------------
 
+_WSA_NOT_STARTED: i32 = 0
+_WSA_IN_PROGRESS: i32 = 1
+_WSA_DONE_OK:     i32 = 2
+_WSA_DONE_ERR:    i32 = 3
+
 if compiler.target.os == 'windows':
-	_wsa_started: Atomic[bool] = Atomic[bool]( False )
+	_wsa_state: Atomic[i32] = Atomic[i32]( _WSA_NOT_STARTED )
+	_wsa_error: Atomic[i32] = Atomic[i32]( 0 )  # valid only once _wsa_state == _WSA_DONE_ERR
 else:
-	_wsa_started: Atomic[bool] = Atomic[bool]( False )  # unused on POSIX, kept unconditional for a single declaration site
+	_wsa_state: Atomic[i32] = Atomic[i32]( _WSA_NOT_STARTED )  # unused on POSIX, kept unconditional for a single declaration site
+	_wsa_error: Atomic[i32] = Atomic[i32]( 0 )
 
 # Two top-level bodies, not a function nested inside the if-block above -
 # matches the proven shape every other OS-differentiated function in this
@@ -740,28 +758,40 @@ else:
 # this codebase).
 @compiler.target( os = 'windows' )
 def _ensure_wsa_started() -> Result[None, OSError]:
-	if _wsa_started.load():
-		return Result.Ok( None )
-	expected: bool = False
-	if _wsa_started.compare_exchange( compiler.addrof( expected ), True ):
-		wsa_buf: Ptr[u8] = sys.alloc[u8]( 512 )  # WSADATA is well under 512 bytes on any real Windows
-		startup_rc: i32 = WSAStartup( 0x0202, compiler.cast( Ptr[None], wsa_buf ))  # MAKEWORD(2,2)
-		sys.free( compiler.cast( Ptr[None], wsa_buf ))
-		if startup_rc != 0:
-			_wsa_started.store( False )  # allow a later retry
-			# `+ 0` is deliberate, not decorative: OSError(startup_rc) alone
-			# hits a real, pre-existing compiler bug (confirmed with a
-			# minimal repro outside this file) where a bare variable-name
-			# argument to an enum constructor is misdiagnosed as a type
-			# mismatch ("expected builtins.OSError, got intrinsics.i32"),
-			# while any non-bare-Name expression of the same value (a call,
-			# or this arithmetic no-op) type-checks fine.
+	while True:
+		state: i32 = _wsa_state.load()
+		if state == _WSA_DONE_OK:
+			return Result.Ok( None )
+		if state == _WSA_DONE_ERR:
+			# `+ 0` is deliberate, not decorative: OSError(...) alone hits a
+			# real, pre-existing compiler bug (confirmed with a minimal
+			# repro outside this file) where a bare variable-name argument
+			# to an enum constructor is misdiagnosed as a type mismatch
+			# ("expected builtins.OSError, got intrinsics.i32"), while any
+			# non-bare-Name expression of the same value (a call, or this
+			# arithmetic no-op) type-checks fine.
 			with compiler.wrap_arithmetic:
-				return Result.Err( OSError( startup_rc + 0 ))
-		return Result.Ok( None )
-	while not _wsa_started.load():
-		pass  # loser spins until the winner's WSAStartup call completes
-	return Result.Ok( None )
+				return Result.Err( OSError( _wsa_error.load() + 0 ))
+		if state == _WSA_NOT_STARTED:
+			expected: i32 = _WSA_NOT_STARTED
+			if _wsa_state.compare_exchange( compiler.addrof( expected ), _WSA_IN_PROGRESS ):
+				# won the race - the only caller that will ever call
+				# WSAStartup for this process
+				wsa_buf: Ptr[u8] = sys.alloc[u8]( 512 )  # WSADATA is well under 512 bytes on any real Windows
+				startup_rc: i32 = WSAStartup( 0x0202, compiler.cast( Ptr[None], wsa_buf ))  # MAKEWORD(2,2)
+				sys.free( compiler.cast( Ptr[None], wsa_buf ))
+				if startup_rc != 0:
+					_wsa_error.store( startup_rc )
+					_wsa_state.store( _WSA_DONE_ERR )
+				else:
+					_wsa_state.store( _WSA_DONE_OK )
+				continue  # loop back around - the DONE_OK/DONE_ERR branch above now returns
+			# lost the CAS: someone else is already IN_PROGRESS (or finished
+			# between our load and our CAS attempt) - fall through and spin
+		# state == _WSA_IN_PROGRESS (either genuinely, or because we just
+		# lost the CAS above) - another thread is running WSAStartup right
+		# now; spin until it reaches a terminal state
+		pass
 
 @compiler.target( os = not 'windows' )
 def _ensure_wsa_started() -> Result[None, OSError]:
@@ -846,6 +876,24 @@ class Socket:
 	def send( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		return _send_raw( self.__sock, buf, count )
 
+	def send_all( self, buf: ConstPtr[u8], count: usize ) -> Result[None, OSError]:
+		''' loops send() until every byte in buf[0:count) is sent, or an
+		error occurs - send() itself can do short writes, so a caller that
+		actually needs "all N bytes went out" has to loop (mirrors lib/
+		http/client.py's own hand-rolled _send_all, promoted here so future
+		Socket consumers - e.g. a hand-rolled HTTP server - don't need
+		their own copy). A 0-byte send mid-loop (the peer stopped
+		accepting data) is reported as OSError.BrokenPipe, the existing
+		OSError member that already names this condition. '''
+		sent: usize = 0
+		with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+			while sent < count:
+				n: usize = self.send( buf + sent, count - sent ).or_return()
+				if n == 0:
+					return Result.Err( OSError.BrokenPipe )
+				sent += n
+		return Result.Ok( None )
+
 	def recv( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		return _recv_raw( self.__sock, buf, count )
 
@@ -902,6 +950,69 @@ class Socket:
 	@staticmethod
 	def udp( family: i32 = AF_INET ) -> Result[Socket, OSError]:
 		return Socket.create( family, SOCK_DGRAM )
+
+
+# ---------------------------------------------------------------------------
+# RecvBuffer — accumulates bytes read off a Socket across multiple recv()
+# calls. A single recv() may return less than requested, and the total
+# message length usually isn't known up front - the exact problem lib/http/
+# client.py's own hand-rolled _GrowableBuffer was built to solve (see that
+# file's own comment). Promoted here (not HTTP-specific) so a future Socket
+# consumer (a raw TCP protocol, a simple line-based server, a hand-rolled
+# HTTP server's own request-line parsing, ...) doesn't need to reinvent it.
+# Deliberately narrow - accumulate + expose the raw accumulated bytes only,
+# NOT a general buffered-reader-with-readline() abstraction (out of scope
+# here; HTTP's own header/chunk-framing logic stays in lib/http/client.py,
+# which could build on top of this type instead of duplicating the growth/
+# fill machinery as a future refactor - not done as part of this change).
+# ---------------------------------------------------------------------------
+
+class RecvBuffer:
+	__data: Ptr[u8]
+	__len: usize
+	__cap: usize
+
+	def __init__( self, initial_cap: usize = 4096 ) -> None:
+		self.__cap = initial_cap
+		self.__data = sys.alloc[u8]( self.__cap )
+		self.__len = 0
+
+	def __del__( self ) -> None:
+		sys.free( self.__data )
+
+	def len( self ) -> usize:
+		return self.__len
+
+	def get_const_ptr( self ) -> ConstPtr[u8]:
+		return self.__data
+
+	def _grow( self, min_additional: usize ) -> None:
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			needed: usize = self.__len + min_additional
+		if needed <= self.__cap:
+			return
+		new_cap: usize = self.__cap
+		with compiler.panic_arithmetic( 'irrational buffer growth' ):
+			while new_cap < needed:
+				new_cap = new_cap * 2
+		new_data: Ptr[u8] = sys.alloc[u8]( new_cap )
+		sys.memcpy( new_data, self.__data, self.__len )
+		sys.free( self.__data )
+		self.__data = new_data
+		self.__cap = new_cap
+
+	def fill_from( self, sock: Socket, chunk_size: usize = 4096 ) -> Result[usize, OSError]:
+		''' one recv() call, appended to the buffer. Returns the number of
+		bytes read - 0 means the peer closed the connection (EOF), matching
+		Socket.recv()'s own convention; not itself an error. '''
+		self._grow( chunk_size )
+		with compiler.wrap_arithmetic:
+			dest: Ptr[u8] = self.__data + self.__len
+			room: usize = self.__cap - self.__len
+		n: usize = sock.recv( dest, room ).or_return()
+		with compiler.wrap_arithmetic:
+			self.__len += n
+		return Result.Ok( n )
 
 
 # ---------------------------------------------------------------------------

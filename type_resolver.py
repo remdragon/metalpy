@@ -5353,6 +5353,52 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			ast.copy_location( test, node )
 			return test, []
 
+		if isinstance( pattern, ast.MatchSequence ):
+			# `case (a, b):` / `case Result.Ok((a, b)):` - (a, b) inside a
+			# pattern parses to ast.MatchSequence. Arity is a static,
+			# compile-time fact about the subject's tuple type (checked
+			# below), unlike ast.MatchClass's real runtime tag Cmp, so no
+			# runtime test is needed for it - only each element's own
+			# sub-pattern test, ANDed together (mirrors ast.MatchAs's own
+			# "no test needed" ast.Constant(True) convention above).
+			# subj_expr here is always side-effect-free by construction (a
+			# bare match-subject Name, or an Attribute chain built by
+			# _match_union_member below) - re-lowering it into N synthesized
+			# ast.Subscript reads (one per element, each recursed into
+			# _match_pattern) is safe for exactly that reason, unlike
+			# lowering.py's own plain-assignment tuple-unpacking, which
+			# lowers node.value exactly once since IT can be side-effecting.
+			if any( isinstance( p, ast.MatchStar ) for p in pattern.patterns ):
+				self.discovery.fail( f'starred sequence patterns are not supported: {ast.unparse(pattern)}', node )
+			subj_type = self._type_of_expr( subj_expr )
+			if subj_type is None:
+				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
+			resolved_subj_type = self.resolver.ensure_resolved( subj_type )
+			tuple_type = self.resolver.tuple_storage.tuple_type_for( resolved_subj_type )
+			if tuple_type is None:
+				self.discovery.fail(
+					f'sequence pattern requires a tuple-typed subject, got {getattr( subj_type, "qualname", subj_type )}: {ast.unparse(pattern)}',
+					node,
+				)
+			if len( tuple_type.elem_types ) != len( pattern.patterns ):
+				self.discovery.fail(
+					f'sequence pattern has {len(pattern.patterns)} element(s), tuple has {len(tuple_type.elem_types)}: {ast.unparse(pattern)}',
+					node,
+				)
+			test: ast.expr = ast.Constant( value = True )
+			ast.copy_location( test, node )
+			binds: list[ast.stmt] = []
+			for i, subpattern in enumerate( pattern.patterns ):
+				elem_expr = ast.Subscript( value = subj_expr, slice = ast.Constant( value = i ), ctx = ast.Load() )
+				ast.copy_location( elem_expr, node )
+				elem_test, elem_binds = self._match_pattern( elem_expr, subpattern, node )
+				binds.extend( elem_binds )
+				if not ( isinstance( elem_test, ast.Constant ) and elem_test.value is True ):
+					combined = ast.BoolOp( op = ast.And(), values = [ test, elem_test ] )
+					ast.copy_location( combined, node )
+					test = combined
+			return test, binds
+
 		if not isinstance( pattern, ast.MatchClass ):
 			self.discovery.fail( f'unsupported match pattern: {ast.unparse(pattern)}', node )
 		if pattern.kwd_patterns or len( pattern.patterns ) != 1:

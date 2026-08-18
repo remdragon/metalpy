@@ -3097,6 +3097,62 @@ class FunctionLowering:
 					call_dest = self._new_temp( setitem_fn.return_type )
 					self._emit( ir.Call( dest = call_dest, target = setitem_fn, receiver = obj, args = [ index, operand ], kwargs = {} ))
 					self._maybe_consume_result( node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+		elif isinstance( target, ast.Tuple ):
+			# `(a, b) = t` / `a, b = t` - both spellings parse to the same
+			# ast.Assign(targets=[ast.Tuple(...)]) shape. node.value is
+			# lowered exactly ONCE (not per-element) since it may be
+			# side-effecting (sock.accept().or_return()) - each element is
+			# then a raw GetAttr off the tuple's own _0/_1/... fields,
+			# genuinely aliasing the tuple's own storage, the identical
+			# shape _expr_Subscript's tuple-constant-index read already
+			# established (and already fixed a real use-after-free for -
+			# see its own is_tuple_element_read comment) - is_alias=True
+			# unconditionally for a fresh declaration, re-derived from the
+			# coercion result for a reassignment (a union-widening coerce
+			# already increfs the leaf it wraps internally; treating that
+			# as still-aliasing would double-incref).
+			if any( isinstance( elt, ast.Starred ) for elt in target.elts ):
+				self.lowering.discovery.fail( f'starred unpacking targets are not supported: {ast.unparse(node)}', node )
+			if not all( isinstance( elt, ast.Name ) for elt in target.elts ):
+				self.lowering.discovery.fail( f'unpacking targets must be plain names (nested tuple targets are not supported): {ast.unparse(node)}', node )
+			fn = self._current_fn
+			try:
+				value = self._lower_expr( node.value, None )
+				resolved_value_type = self.lowering._ensure_resolved( value.type )
+				tuple_type = self.lowering._tuple_storage.tuple_type_for( resolved_value_type )
+				if tuple_type is None:
+					self.lowering.discovery.fail( f'cannot unpack a non-tuple value: {ast.unparse(node)}', node )
+				if len( tuple_type.elem_types ) != len( target.elts ):
+					self.lowering.discovery.fail(
+						f'unpacking target has {len(target.elts)} name(s), value has {len(tuple_type.elem_types)}: {ast.unparse(node)}',
+						node,
+					)
+				for i, elt in enumerate( target.elts ):
+					assert isinstance( elt, ast.Name )
+					attr_var = self.lowering._attr_lookup( resolved_value_type, f'_{i}', node )
+					elem = self._new_temp( attr_var.type )
+					self._emit( ir.GetAttr( dest = elem, obj = value, attr = f'_{i}' ))
+					existing = self._existing_local_or_none( elt.id, node, 'cannot assign to it' )
+					if existing is not None:
+						self._cfg.unnarrow( elt.id )
+						final = self._coerce_or_check_operand( elem, existing.type, node )
+						is_alias = not getattr( final, 'is_union_coerce_result', False )
+						for instr in self._cfg_assign( existing, final, is_alias = is_alias, node = node ):
+							self._emit( instr )
+						self._emit( ir.Assign( dest = existing, src = final ))
+					else:
+						var = Variable( stem = elt.id, qualname = f'{fn.qualname}.{elt.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = elem.type )
+						fn.add_name( var.stem, var )
+						self.lowering.schedule( var.type )
+						for instr in self._cfg_assign( var, elem, is_alias = True, node = node ):
+							self._emit( instr )
+						self._emit( ir.Assign( dest = var, src = elem ))
+			except CompileError:
+				for elt in target.elts:
+					if isinstance( elt, ast.Name ) and self.lowering.discovery.find_name_or_none( elt.id ) is None:
+						broken = Variable( stem = elt.id, qualname = f'{fn.qualname}.{elt.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True )
+						fn.add_name( broken.stem, broken )
+				raise
 		else:
 			self.lowering.discovery.fail( f'unsupported Assign target: {ast.unparse(node)}', node )
 

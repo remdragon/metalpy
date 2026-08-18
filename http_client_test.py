@@ -413,9 +413,9 @@ class CookieJarServer:
 						recv_total2 += n2
 						attempts2 += 1
 						req2 = buf2.decode().unwrap( 'server: decode 2' )
-						if req2.find( 'Cookie: sid=abc123' ).is_ok() or n2 == 0:
+						if req2.find( 'Cookie: sid=abc123' ) != isize( -1 ) or n2 == 0:
 							break
-				if req2.find( 'Cookie: sid=abc123' ).is_ok():
+				if req2.find( 'Cookie: sid=abc123' ) != isize( -1 ):
 					self.cookie_seen.store( True )
 				resp2: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'
 				rb2: bytes = resp2.encode().unwrap( 'server: encode 2' )
@@ -484,9 +484,9 @@ class RedirectServer:
 						recv_total1 += n1
 						attempts1 += 1
 						req1 = buf1.decode().unwrap( 'server: decode 1' )
-						if req1.find( '/search?q=hello%20world' ).is_ok() or n1 == 0:
+						if req1.find( '/search?q=hello%20world' ) != isize( -1 ) or n1 == 0:
 							break
-				if req1.find( '/search?q=hello%20world' ).is_ok():
+				if req1.find( '/search?q=hello%20world' ) != isize( -1 ):
 					self.saw_query.store( True )
 				resp1: str = 'HTTP/1.1 302 Found\\r\\nLocation: http://127.0.0.1:18771/final\\r\\nContent-Length: 0\\r\\n\\r\\n'
 				rb1: bytes = resp1.encode().unwrap( 'server: encode 1' )
@@ -569,14 +569,14 @@ class FormAuthServer:
 						recv_total += n
 						attempts += 1
 						req = buf.decode().unwrap( 'server: decode' )
-						has_ct0: bool = req.find( 'Content-Type: application/x-www-form-urlencoded' ).is_ok()
-						has_body0: bool = req.find( 'a=1&b=2' ).is_ok()
-						has_auth0: bool = req.find( 'Authorization: Basic dXNlcjpwYXNz' ).is_ok()
+						has_ct0: bool = req.find( 'Content-Type: application/x-www-form-urlencoded' ) != isize( -1 )
+						has_body0: bool = req.find( 'a=1&b=2' ) != isize( -1 )
+						has_auth0: bool = req.find( 'Authorization: Basic dXNlcjpwYXNz' ) != isize( -1 )
 						if ( has_ct0 and has_body0 and has_auth0 ) or n == 0:
 							break
-				has_ct: bool = req.find( 'Content-Type: application/x-www-form-urlencoded' ).is_ok()
-				has_body: bool = req.find( 'a=1&b=2' ).is_ok()
-				has_auth: bool = req.find( 'Authorization: Basic dXNlcjpwYXNz' ).is_ok()
+				has_ct: bool = req.find( 'Content-Type: application/x-www-form-urlencoded' ) != isize( -1 )
+				has_body: bool = req.find( 'a=1&b=2' ) != isize( -1 )
+				has_auth: bool = req.find( 'Authorization: Basic dXNlcjpwYXNz' ) != isize( -1 )
 				if has_ct and has_body and has_auth:
 					self.ok.store( True )
 				resp: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'

@@ -42,7 +42,7 @@ def _validate_key( key: str ) -> None:
 		sys.panic( 'zoneinfo: invalid key (empty)' )
 	if key.startswith( '/' ):
 		sys.panic( 'zoneinfo: invalid key (must be relative, not absolute)' )
-	if key.find( '..' ).is_ok():
+	if key.find( '..' ) != isize( -1 ):
 		sys.panic( "zoneinfo: invalid key (must not contain '..')" )
 
 

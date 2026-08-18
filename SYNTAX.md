@@ -66,6 +66,48 @@ class DynamicTimeZoneInformation:
 When passing a `str` to an FFI function or low-level API parameter expecting `ConstPtr[u8]`, user str.get_cstr().
 Because Metal Py `str` is internally stored as a null-terminated C-string, this lowering is safe and zero-cost.
 
+### String, Bytes & Bytearray Methods
+
+`str`/`bytes`/`bytearray` support Python-like search/manipulation methods, built directly on byte-level scanning — real callable methods, not sugar.
+
+* **`str`** has the full set: `find`/`rfind`, `index`/`rindex`, `split`/`rsplit`, `startswith`/`endswith`, `removeprefix`/`removesuffix`, `strip`/`lstrip`/`rstrip`, `replace`, `join`, `partition`/`rpartition`, `isascii`, plus `__contains__` (`sub in s`).
+* **`bytes`/`bytearray`** support a smaller subset so far: `find`, `split`, `startswith`, `endswith` (plus `decode(codec)`, `len()`, and indexing/slicing). `strip`/`index`/etc. are not yet implemented for these two types.
+* **`find`/`rfind` return `isize`, with `-1` meaning "not found"** (Python's own `str.find()` convention) — they never fail or panic.
+* **`index`/`rindex` return `Result[usize, IndexError]`** instead — for callers that consider "not found" itself an error worth propagating via `match`/`.or_return()`/`.is_err()`, rather than a plain `!= -1` conditional. They never panic either.
+* `bytes`/`bytearray`'s `find`/`startswith`/`endswith`/`split` take their needle/prefix/suffix/separator argument as plain `bytes` (not `bytes|bytearray`) — a bare `bytes` literal argument (e.g. `data.find(b'\r\n')`) cannot currently be type-inferred against a union-typed parameter. Pass an explicit `bytes(some_bytearray)` conversion if the needle is itself a `bytearray`. A bare `bytes` literal also can't currently be used directly as a method-call *receiver* (`b''.split(...)`) — assign it to a `bytes`-typed local first.
+
+```metalpy
+request: bytes = b'GET /hello HTTP/1.1'
+if request.find( b' ' ) != -1:
+	parts: list[bytes] = request.split( b' ' )   # [b'GET', b'/hello', b'HTTP/1.1']
+
+if not request.startswith( b'GET' ):
+	...
+
+s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
+if s.find( 'beef' ) == -1:        # find() never fails - check against -1
+	...
+match s.index( 'beef' ):          # index() returns a real Result instead
+	case Result.Ok( offset ):
+		...
+	case Result.Err( _ ):
+		...
+```
+
+### `str()` vs. f-strings — converting values to text
+
+`str.__init__` is a **copy constructor only** (`str(some_str)` copies `some_str`) — `str(42)` and `str(some_bytes)` do **not** compile; there is no int/bytes-to-str conversion via the `str(...)` constructor.
+
+F-string interpolation (`f"{x}"`) is the real stringification mechanism: with no format spec (or `!s`), it calls `x.__str__()`; with `!r`/`!a`, `x.__repr__()`; a `str` value is used as-is. This currently only works when `x` is already `str`, the boxed arbitrary-precision `int`, or another class that defines its own `__str__`/`__repr__` — **fixed-width scalar types (`i32`, `u16`, `usize`, `f32`, `f64`, `bool`, ...) have no `__str__`/`__repr__` of their own**, so `f"{n}"` for a bare `u16` port number, for example, does not compile today. Converting a fixed-width integer to text currently requires hand-rolled digit conversion (see `lib/http/client.py`'s own `_usize_to_str` for the established idiom), or boxing it through the arbitrary-precision `int` type first where the width allows it (`int(i32(x))`).
+
+```metalpy
+n: int = int( 42 )
+msg: str = f'count: {n}'          # OK - int has __str__
+
+port: u16 = 8080
+# msg2: str = f'port: {port}'     # does NOT compile - u16 has no __str__
+```
+
 ### Structs, Unions & Monomorphization
 * **Value Struct**: `@struct` decorator creates value-typed structs with fixed byte offsets.
 	undefined (yet) future work: struct member alignment
@@ -150,6 +192,14 @@ def concat( parts: slice[str] ) -> Result[str, OverflowError]:
 	with errdefer:
 		sys.free( new_buf )  # Clean up buffer if subsequent operations return Err
 
+def read_and_close( sock: Socket ) -> Result[str, OSError]:
+	buf: bytearray = bytearray( 4096 )
+	with defer:
+		sock.close()  # always runs on exit, whether Ok or Err - multiple statements allowed
+		print( 'connection closed' )
+	n: usize = sock.recv( buf.get_ptr(), 4096 ).or_return()
+	return buf[:n].decode( utf8 ).unwrap( 'utf8' )
+
 each defer/errdefer must only execute once, which means it is a syntax error to put one inside a loop
 
 If users need defer in a loop, they need to move the logic into a different function to get the defer out of the loop
@@ -162,6 +212,14 @@ If users need defer in a loop, they need to move the logic into a different func
 
 ### Result[T, E] & Panic Semantics
 Control flow does not use exceptions. Fallible functions return `Result[T, E]`.
+
+`E` has **no constraint on its shape** — it doesn't have to be an `@enum`/`@union` error type. A plain `str` (or any other type) works fine as `E`, though an enum-like error type is the more common/idiomatic choice for anything beyond a quick prototype:
+
+```metalpy
+def parse_port( s: str ) -> Result[u16, str]:
+	# ... 
+	return Result.Err( 'not a valid port number' )  # E can be str, not just an enum
+```
 
 * **`unwrap(errmsg: str) -> T`**:
   Checks if `Result` is `Ok`. If `Ok`, returns the value `T`. If `Err`, **triggers a panic** by calling `sys.panic(errmsg)`.
@@ -194,6 +252,26 @@ match src.release():
 	case Result.Err( OwnershipError.SharedReference( src2 )):
 		return bytes( src2 )
 ```
+
+### Tuple Destructuring
+
+A `tuple[T0, T1, ...]`-typed value can be unpacked into individual names, either as a plain assignment (`(a, b) = t` or bare `a, b = t` — both spellings are equivalent) or as a `match`/`case` pattern (`case (a, b):`, including nested inside a class pattern like `case Result.Ok((a, b)):`). This composes with `or_return()`: since `or_return()` on a `Result[tuple[...], E]` returns the tuple, it can be destructured directly.
+
+```metalpy
+def accept_one( server: Socket ) -> Result[i32, OSError]:
+	( conn, addr ) = server.accept().or_return()   # Result[tuple[Socket, SocketAddr], OSError]
+	print( addr.host() )
+	conn.close()
+	return Result.Ok( 0 )
+
+match make_pair():
+	case Result.Ok(( a, b )):
+		...
+	case Result.Err( _ ):
+		...
+```
+
+Destructuring targets must be plain names — nested tuple targets (`((a,b), c) = t`) and starred targets (`a, *rest = t`) are not supported.
 
 ---
 
@@ -356,7 +434,70 @@ class Result[T, E]:
 		return res
 ```
 
-## Generics
+---
+
+## 8. Program Entry Points & Standard Library Basics
+
+### Module-Level (Top-Level) Execution Rules
+
+At module scope, `import`/`from...import`, `class`/`def` definitions (including `@compiler.target`-decorated ones), `pass`, and global variable declarations/initializations are allowed. A **non**-constant `if`/`match`, loops, and `AugAssign` (`x += 1`) are all compile errors at module scope ("unsupported statement here"). A compile-time-constant `if`/`match` is folded down to just its taken branch's statements before anything else runs, so it's effectively allowed too.
+
+A global variable's initializer is **not** restricted to a compile-time constant — it can call ordinary functions at real program-startup time; the compiler synthesizes a `__metalpy_init_<name>()` function per initializer, called before `main()` runs.
+
+```metalpy
+MAX_RETRIES: i32 = 3               # compile-time constant - fine
+HANDLE: TypeAlias = Ptr[None]      # TypeAlias - just an ordinary AnnAssign
+
+def compute_default() -> i32:
+	return 42
+
+DEFAULT: i32 = compute_default()   # a real function call, evaluated at program startup - also fine
+
+@compiler.target( os = 'windows' )
+class WindowsSpecific:
+	pass
+```
+
+**A bare expression-statement at module scope (a function call with no assignment, e.g. a bare `print('hi')` line) is NOT rejected — but it's also never emitted or executed. It's silently dropped, with no compile error and no runtime effect.** This is a confirmed, real compiler gap (not a documented/intentional restriction) — avoid this shape entirely; there is no working idiom for "run this one statement at module scope" today outside of a global initializer's own evaluation.
+
+### `main()` Entry Point
+
+The program entry point is a function named `main`. Its return type must be `None` or a scalar integer type (`i32`, `u8`, `u32`, etc.) — never `Result[...]` or any other shape. `main` compiles directly to C's real `int main(...)` — the OS/CRT invokes it exactly like any C program's `main`, with **no** metalpy-level driver call needed (a top-level `sys.exit(main())`-style statement is not part of this codebase's actual convention, and per the module-scope rule just above, a bare one would be silently inert anyway). A `None`-returning `main()` synthesizes `return 0;`; any other declared return type has its `Return`'s operand emitted as the C `int main`'s return value directly. The return-type restriction isn't (yet) enforced as a dedicated, friendly compiler diagnostic — declaring `main() -> Result[...]` compiles cleanly through this compiler's own IR and only fails once the *generated C* is compiled, with a much less friendly C-level type error.
+
+```metalpy
+def main() -> i32:
+	print( 'hello' )
+	return 0
+```
+
+### `print()`
+
+`def print(msg: str, end: str = '\n') -> None` — a single positional `str` argument only, no `*args`, no `sep`. Combine multiple values into one string via an f-string first.
+
+```metalpy
+def log_connection( host: str ) -> None:
+	print( f'Connection from {host}' )   # not print( 'Connection from', host )
+```
+
+### `sys.exit()`
+
+`def exit(code: u32) -> NoReturn` — takes a `u32` exit code, not `i32`.
+
+### `codecs` — encoding/decoding text
+
+`from codecs.utf8 import utf8` imports the (already-constructed, stateless, shared) `utf8` codec instance. `str.encode(codec: Codec = utf8) -> Result[bytes, CodecError]` and `bytes.decode(codec: Codec = utf8) -> Result[str, CodecError]` / `bytearray.decode(codec: Codec = utf8) -> Result[str, CodecError]` both default to it already, so the explicit import is only needed to pass it by name or use a non-default codec.
+
+```metalpy
+from codecs.utf8 import utf8
+
+body: str = 'hello\r\n'
+encoded: bytes = body.encode( utf8 ).unwrap( 'ASCII text is always valid utf-8' )
+sock.send_all( encoded.get_const_ptr(), encoded.__len__() ).or_return()
+```
+
+---
+
+## 9. Generics
 
 each specialization of generics produces distinct code in the executable. Therefore,
 large complicated generic class can explode executable size. stdlib generics
@@ -382,7 +523,9 @@ bar1 = Bar( u32( 17 ))
 bar2 = Bar( str( 'foo' ))
 ```
 
-## Function overloads
+---
+
+## 10. Function Overloads
 
 Its possible to have functions with the same name.
 

@@ -5612,26 +5612,32 @@ class StrFindIndexSplitTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'find_and_index', '''
 def main() -> i32:
 	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
-	r0: Result[usize,IndexError] = s.find( '-' )
-	if r0.is_err() or r0.unwrap( 'x' ) != 8:
+	r0: isize = s.find( '-' )
+	if r0 != isize( 8 ):
 		return 1
-	r1: Result[usize,IndexError] = s.find( 'zzz' )
-	if r1.is_ok():
+	r1: isize = s.find( 'zzz' )
+	if r1 != isize( -1 ):
 		return 2
-	r2: Result[usize,IndexError] = s.find( '' )
-	if r2.is_err() or r2.unwrap( 'x' ) != 0:
+	r2: isize = s.find( '' )
+	if r2 != isize( 0 ):
 		return 3
-	if s.index( 'beef' ) != 4:
+	i0: Result[usize,IndexError] = s.index( 'beef' )
+	if i0.is_err() or i0.unwrap( 'x' ) != 4:
 		return 4
-	if s.find( s ).unwrap( 'x' ) != 0:
+	if s.find( s ) != isize( 0 ):
 		return 5
-	r3: Result[usize,IndexError] = s.find( 'toolongtoolongtoolongtoolongtoolongtoolong' )
-	if r3.is_ok():
+	r3: isize = s.find( 'toolongtoolongtoolongtoolongtoolongtoolong' )
+	if r3 != isize( -1 ):
 		return 6
 	# find() with an explicit start offset - resumes past the first match
-	r4: Result[usize,IndexError] = s.find( '-', 9 )
-	if r4.is_err() or r4.unwrap( 'x' ) != 13:
+	r4: isize = s.find( '-', 9 )
+	if r4 != isize( 13 ):
 		return 7
+	# index() on a missing substring returns Result.Err, never panics -
+	# the corrected (was: backwards/panicking) index()/find() convention
+	i1: Result[usize,IndexError] = s.index( 'zzz' )
+	if i1.is_ok():
+		return 8
 	return 0
 ''' ),
 			# the exact motivating case from PLAN_SUBCLASSING_VTABLES_COM.md's
@@ -5768,16 +5774,22 @@ def main() -> i32:
 ''' ),
 			( 'rfind_rindex', '''
 def main() -> i32:
-	r1: Result[usize,IndexError] = 'abcabc'.rfind( 'abc' )
-	if r1.unwrap( 'x' ) != 3:
+	r1: isize = 'abcabc'.rfind( 'abc' )
+	if r1 != isize( 3 ):
 		return 1
-	r2: Result[usize,IndexError] = 'abcabc'.rfind( 'nope' )
-	if r2.is_ok():
+	r2: isize = 'abcabc'.rfind( 'nope' )
+	if r2 != isize( -1 ):
 		return 2
-	if 'abcabc'.rindex( 'bc' ) != 4:
+	i1: Result[usize,IndexError] = 'abcabc'.rindex( 'bc' )
+	if i1.is_err() or i1.unwrap( 'x' ) != 4:
 		return 3
-	if 'abcabc'.rfind( '' ).unwrap( 'x' ) != 6:
+	if 'abcabc'.rfind( '' ) != isize( 6 ):
 		return 4
+	# rindex() on a missing substring returns Result.Err, never panics -
+	# the corrected (was: backwards/panicking) rindex()/rfind() convention
+	i2: Result[usize,IndexError] = 'abcabc'.rindex( 'nope' )
+	if i2.is_ok():
+		return 5
 	return 0
 ''' ),
 			( 'replace', '''
@@ -5847,14 +5859,21 @@ def main() -> i32:
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rindex_panics_when_not_found( self ) -> None:
+	def test_rindex_returns_err_and_never_panics_when_not_found( self ) -> None:
+		''' rindex()/index() no longer panic on a missing substring - that
+		was the old (backwards) behavior this method now explicitly
+		guards against regressing to. A clean exit 0 here (not a panic
+		exit code) is the actual assertion. '''
 		self._run( '''
 def main() -> i32:
-	'abc'.rindex( 'nope' )
-	return 0
+	match 'abc'.rindex( 'nope' ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 
 class StrPhase2PaddingTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -7557,7 +7576,196 @@ def main() -> i32:
 			pass
 	return 0
 ''' ),
+			# tuple destructuring - plain assignment: (a, b) = t and bare
+			# a, b = t both parse to the same AST shape
+			( 'tuple_unpack_plain_assignment', '''
+def main() -> i32:
+	t: tuple[i32, str] = ( 10, "hi" )
+	( a, b ) = t
+	if a != 10:
+		return 1
+	if b != "hi":
+		return 2
+	c, d = t
+	if c != 10 or d != "hi":
+		return 3
+	return 0
+''' ),
+			# reassigning EXISTING locals via unpacking, not fresh declarations
+			( 'tuple_unpack_reassigns_existing_local', '''
+def main() -> i32:
+	a: i32 = 0
+	b: str = "unset"
+	t: tuple[i32, str] = ( 42, "set" )
+	( a, b ) = t
+	if a != 42:
+		return 1
+	if b != "set":
+		return 2
+	return 0
+''' ),
+			# an RC element (str) destructured out then dropped - exercises the
+			# per-element incref (into the fresh local) plus the tuple's own
+			# eventual destructor cascade decref-ing its OWN _0/_1 fields, both
+			# firing without a crash (no ASan integration in this file - a
+			# clean exit code 0 is the same signal every other RC test here
+			# relies on)
+			( 'tuple_unpack_rc_element_dropped_without_crashing', '''
+def main() -> i32:
+	t: tuple[str, i32] = ( "owned", 5 )
+	( s, n ) = t
+	if n != 5:
+		return 1
+	return 0
+''' ),
+			# match-case tuple pattern - case Result.Ok((a, b)): on a real
+			# Result[tuple[...], ...], the actual motivating shape
+			# (sock.accept().or_return()-adjacent) from the webchat exercise
+			( 'tuple_unpack_via_match_case', '''
+class PairError:
+	pass
+
+def make_pair() -> Result[tuple[i32, str], PairError]:
+	return Result.Ok(( 7, "pair" ))
+
+def main() -> i32:
+	match make_pair():
+		case Result.Ok(( a, b )):
+			if a != 7:
+				return 1
+			if b != "pair":
+				return 2
+		case Result.Err( _ ):
+			return 3
+	return 0
+''' ),
+			# bare `case (a, b):` (not nested in a class pattern) against a
+			# plain tuple-typed subject
+			( 'tuple_unpack_bare_sequence_pattern', '''
+def main() -> i32:
+	t: tuple[i32, i32] = ( 3, 4 )
+	match t:
+		case ( a, b ):
+			if a != 3 or b != 4:
+				return 1
+		case _:
+			return 2
+	return 0
+''' ),
+			# RC-regression: before/after compiler.refcount() proves the
+			# destructuring incref fires exactly once - not zero (the bug this
+			# guards against: a raw GetAttr borrow skipped without its own
+			# incref, the same class of use-after-free _expr_Subscript's own
+			# tuple-index read already had and fixed), not twice
+			( 'tuple_unpack_rc_refcount_increments_exactly_once', '''
+class Box:
+	value: i32
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		t: tuple[Box, i32] = ( Box( value = 42 ), 7 )
+		before: usize = compiler.refcount( t[0] )
+		( a, n ) = t
+		after: usize = compiler.refcount( t[0] )
+		if after != before + 1:
+			return 1
+	if a.value != 42 or n != 7:
+		return 2
+	return 0
+''' ),
 		] )
+
+	def test_tuple_unpack_arity_mismatch_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32] = ( 1, 2 )',
+			'	( a, b, c ) = t',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'unpacking target has 3 name', errors[0] )
+
+	def test_tuple_unpack_non_tuple_value_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 5',
+			'	( a, b ) = x',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'cannot unpack a non-tuple value', errors[0] )
+
+	def test_tuple_unpack_starred_target_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	( a, *rest ) = t',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'starred unpacking targets are not supported', errors[0] )
+
+	def test_tuple_unpack_nested_tuple_target_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[tuple[i32,i32], i32] = ((1, 2), 3)',
+			'	( ( a, b ), c ) = t',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'nested tuple targets are not supported', errors[0] )
+
+	def test_match_sequence_pattern_arity_mismatch_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32] = ( 1, 2 )',
+			'	match t:',
+			'		case ( a, b, c ):',
+			'			return 1',
+			'		case _:',
+			'			return 0',
+		]))
+		errors = self.discovery.errors.errors
+		# a _match_pattern failure inside visit_Match cascades into a second,
+		# generic "unsupported statement: match ..." fallback error - a
+		# pre-existing behavior, not specific to sequence patterns (the same
+		# happens for e.g. an existing MatchClass arity failure, "match
+		# patterns support exactly one positional sub-pattern") - so this
+		# checks the SPECIFIC message is present, not an exact error count.
+		self.assertGreaterEqual( len( errors ), 1 )
+		self.assertIn( 'sequence pattern has 3 element', errors[0] )
+
+	def test_match_sequence_pattern_non_tuple_subject_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 5',
+			'	match x:',
+			'		case ( a, b ):',
+			'			return 1',
+			'		case _:',
+			'			return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertGreaterEqual( len( errors ), 1 ) # see arity-mismatch test's own comment on the cascade
+		self.assertIn( 'sequence pattern requires a tuple-typed subject', errors[0] )
+
+	def test_match_sequence_starred_pattern_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	match t:',
+			'		case ( a, *rest ):',
+			'			return 1',
+			'		case _:',
+			'			return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertGreaterEqual( len( errors ), 1 ) # see arity-mismatch test's own comment on the cascade
+		self.assertIn( 'starred sequence patterns are not supported', errors[0] )
 
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
@@ -8874,7 +9082,11 @@ def main() -> i32:
 			( 'str_slice_from_computed_find_offset', '''
 def main() -> i32:
 	target_path: str = "/usr/share/zoneinfo/America/New_York"
-	idx: usize = target_path.find( "zoneinfo/" ).unwrap( "expected match" )
+	found: isize = target_path.find( "zoneinfo/" )
+	if found == isize( -1 ):
+		return 2
+	with compiler.panic_arithmetic( 'bounded by target_path length, cannot overflow' ):
+		idx: usize = usize( found )
 	with compiler.wrap_arithmetic:
 		tz: str = target_path[idx+9:]
 	if tz != "America/New_York":
@@ -12521,6 +12733,212 @@ def main() -> i32:
 			return 3
 		case Result.Err( _ ):
 			pass
+	return 0
+''' ),
+		] )
+
+
+class BytesByteArrayFindSplitStartswithEndswithTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' find()/split()/startswith()/endswith() for bytes and bytearray
+	(lib/builtins/__init__.py) - missing gap surfaced by hand-writing an
+	HTTP request-line parser against raw socket-received bytes (there was
+	no way to find(b'\\r\\n')/split(b' ')/startswith(b'GET') on bytes at
+	all before this). Mirrors str's own find()/split()/startswith()/
+	endswith() (StrFindIndexSplitTests/StrPhase1MethodsTests above), with
+	the corrected isize/-1-sentinel find() convention from the start
+	(bytes has no Result-returning history to fix). bytes has no __eq__,
+	so content checks decode() to str first. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'bytes_find_found_and_not_found', '''
+def main() -> i32:
+	data: bytes = b'deadbeef-dead-beef-dead-beefdeadbeef'
+	if data.find( b'-' ) != isize( 8 ):
+		return 1
+	if data.find( b'zzz' ) != isize( -1 ):
+		return 2
+	if data.find( b'' ) != isize( 0 ):
+		return 3
+	# explicit start offset - resumes past the first match
+	if data.find( b'-', 9 ) != isize( 13 ):
+		return 4
+	if data.find( b'toolongtoolongtoolongtoolongtoolongtoolong' ) != isize( -1 ):
+		return 5
+	return 0
+''' ),
+			( 'bytes_split_http_request_line', '''
+def main() -> i32:
+	line: bytes = b'GET / HTTP/1.1'
+	parts: list[bytes] = line.split( b' ' )
+	if parts.__len__() != 3:
+		return 1
+	p0: bytes = parts.__getitem__( 0 ).unwrap( 'x' )
+	p1: bytes = parts.__getitem__( 1 ).unwrap( 'x' )
+	p2: bytes = parts.__getitem__( 2 ).unwrap( 'x' )
+	if p0.decode().unwrap( 'x' ) != 'GET':
+		return 2
+	if p1.decode().unwrap( 'x' ) != '/':
+		return 3
+	if p2.decode().unwrap( 'x' ) != 'HTTP/1.1':
+		return 4
+	return 0
+''' ),
+			( 'bytes_split_edge_cases', '''
+def main() -> i32:
+	empty_src: bytes = b''
+	empty: list[bytes] = empty_src.split( b',' )
+	if empty.__len__() != 1:
+		return 1
+	e0: bytes = empty.__getitem__( 0 ).unwrap( 'x' )
+	if e0.decode().unwrap( 'x' ) != '':
+		return 2
+
+	leading_src: bytes = b',a,b'
+	leading: list[bytes] = leading_src.split( b',' )
+	if leading.__len__() != 3:
+		return 3
+	l0: bytes = leading.__getitem__( 0 ).unwrap( 'x' )
+	if l0.decode().unwrap( 'x' ) != '':
+		return 4
+
+	no_sep_src: bytes = b'abc'
+	no_sep: list[bytes] = no_sep_src.split( b',' )
+	if no_sep.__len__() != 1:
+		return 5
+	n0: bytes = no_sep.__getitem__( 0 ).unwrap( 'x' )
+	if n0.decode().unwrap( 'x' ) != 'abc':
+		return 6
+
+	consecutive_src: bytes = b'a,,b'
+	consecutive: list[bytes] = consecutive_src.split( b',' )
+	if consecutive.__len__() != 3:
+		return 7
+	c1: bytes = consecutive.__getitem__( 1 ).unwrap( 'x' )
+	if c1.decode().unwrap( 'x' ) != '':
+		return 8
+	return 0
+''' ),
+			( 'bytes_startswith_endswith', '''
+def main() -> i32:
+	data: bytes = b'GET / HTTP/1.1'
+	if not data.startswith( b'GET' ):
+		return 1
+	if data.startswith( b'POST' ):
+		return 2
+	if not data.endswith( b'HTTP/1.1' ):
+		return 3
+	if data.endswith( b'GET' ):
+		return 4
+	if not data.startswith( b'' ):
+		return 5
+	if not data.endswith( b'' ):
+		return 6
+	if data.startswith( b'toolongtoolongtoolongtoolongtoolongtoolong' ):
+		return 7
+	# explicit start offset
+	if not data.startswith( b'/', 4 ):
+		return 8
+	return 0
+''' ),
+			( 'bytearray_find_split_startswith_endswith', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 5 )
+	buf[0] = 104 # h
+	buf[1] = 101 # e
+	buf[2] = 108 # l
+	buf[3] = 108 # l
+	buf[4] = 111 # o
+	if buf.find( b'llo' ) != isize( 2 ):
+		return 1
+	if buf.find( b'zzz' ) != isize( -1 ):
+		return 2
+	if not buf.startswith( b'he' ):
+		return 3
+	if not buf.endswith( b'llo' ):
+		return 4
+
+	parts: list[bytearray] = buf.split( b'l' )
+	if parts.__len__() != 3:
+		return 5
+	p0: bytearray = parts.__getitem__( 0 ).unwrap( 'x' )
+	p2: bytearray = parts.__getitem__( 2 ).unwrap( 'x' )
+	if p0.decode().unwrap( 'x' ) != 'he':
+		return 6
+	if p2.decode().unwrap( 'x' ) != 'o':
+		return 7
+	# each split piece is independently owned - mutating one must not
+	# affect the source buffer or its siblings
+	p0[0] = 90 # 'Z' - was 'h'
+	if buf.__getitem__( 0 ).unwrap( 'x' ) != 104:
+		return 8
+	if p2.decode().unwrap( 'x' ) != 'o':
+		return 9
+	return 0
+''' ),
+			( 'bytes_needle_into_bytearray_haystack', '''
+def main() -> i32:
+	# find()/startswith()/endswith()/split()'s needle parameter is plain
+	# bytes (not bytes|bytearray) - a bare bytes literal argument like
+	# b'\\r\\n' can't be type-inferred against a union parameter, and a
+	# bytes literal needle is overwhelmingly the real use case (HTTP
+	# request-line parsing, etc.) - a bytearray needle still works by
+	# converting it via the bytes(...) constructor first.
+	needle_ba: bytearray = bytearray( 5 )
+	needle_ba[0] = 119 # w
+	needle_ba[1] = 111 # o
+	needle_ba[2] = 114 # r
+	needle_ba[3] = 108 # l
+	needle_ba[4] = 100 # d
+	haystack: bytes = b'hello world'
+	if haystack.find( bytes( needle_ba )) != isize( 6 ):
+		return 1
+
+	haystack_ba: bytearray = bytearray( 11 )
+	src: bytes = b'hello world'
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 11:
+			haystack_ba[i] = src.get_const_ptr()[i]
+			i += 1
+	needle_bytes: bytes = b'world'
+	if haystack_ba.find( needle_bytes ) != isize( 6 ):
+		return 2
+	return 0
+''' ),
+			# the actual data[:received]-then-parse shape a hand-rolled HTTP
+			# server needs: bytearray slicing (already supported) combined
+			# with the new find()/split()/startswith() on the trimmed result
+			( 'bytearray_slice_then_parse_request_line', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	src: bytes = b'GET /hello HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n'
+	received: usize = src.__len__()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < received:
+			buf[i] = src.get_const_ptr()[i]
+			i += 1
+	trimmed: bytearray = buf[:received]
+	line_end: isize = trimmed.find( b'\\r\\n' )
+	if line_end == isize( -1 ):
+		return 1
+	with compiler.panic_arithmetic( 'bounded by trimmed length' ):
+		line_end_u: usize = usize( line_end )
+	line: bytearray = trimmed[:line_end_u]
+	if not line.startswith( b'GET' ):
+		return 2
+	parts: list[bytearray] = line.split( b' ' )
+	if parts.__len__() != 3:
+		return 3
+	path: bytearray = parts.__getitem__( 1 ).unwrap( 'x' )
+	if path.decode().unwrap( 'x' ) != '/hello':
+		return 4
 	return 0
 ''' ),
 		] )

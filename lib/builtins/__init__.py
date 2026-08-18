@@ -162,11 +162,72 @@ class slice[T]:
 		return self.get_unchecked( index )
 
 
+# shared byte-level helpers for bytes.find()/bytearray.find() (etc.) - pure
+# sys.memcmp over an explicit length, unlike str.find()'s UTF-8-aware
+# reasoning: bytes/bytearray carry no UTF-8-validity or null-terminator
+# guarantee, so nothing here infers where a match "safely" lands, length is
+# always explicit. Free functions (not methods on either class) so the
+# actual scan logic isn't duplicated between bytes and bytearray - mirrors
+# how Codec.decode (lib/codecs/utf8.py) already operates generically over a
+# bytes|bytearray union via the public len()/get_const_ptr() accessors.
+# Same -1-means-not-found convention as str.find() (see str.find() below).
+def _bytes_find_at( haystack: bytes|bytearray, needle: bytes|bytearray, start: usize ) -> isize:
+	self_len: usize = len( haystack )
+	sub_len: usize = len( needle )
+	if start > self_len:
+		return isize( -1 )
+	if sub_len == 0:
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			return isize( start )
+	with compiler.wrap_arithmetic: # start <= self_len, just checked above
+		remaining: usize = self_len - start
+	if sub_len > remaining:
+		return isize( -1 )
+	with compiler.wrap_arithmetic: # sub_len <= self_len, just checked above
+		last_start: usize = self_len - sub_len
+	haystack_ptr: ConstPtr[u8] = haystack.get_const_ptr()
+	needle_ptr: ConstPtr[u8] = needle.get_const_ptr()
+	i: usize = start
+	with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+		while i <= last_start:
+			if sys.memcmp( haystack_ptr + i, needle_ptr, sub_len ) == 0:
+				return isize( i )
+			i += 1
+	return isize( -1 )
+
+def _bytes_startswith_at( haystack: bytes|bytearray, prefix: bytes|bytearray, start: usize ) -> bool:
+	self_len: usize = len( haystack )
+	prefix_len: usize = len( prefix )
+	if start > self_len:
+		return False
+	if prefix_len == 0:
+		return True
+	with compiler.wrap_arithmetic: # start <= self_len, just checked above
+		remaining: usize = self_len - start
+	if prefix_len > remaining:
+		return False
+	with compiler.wrap_arithmetic: # start bounded by self_len above
+		candidate: ConstPtr[u8] = haystack.get_const_ptr() + start
+	return sys.memcmp( candidate, prefix.get_const_ptr(), prefix_len ) == 0
+
+def _bytes_endswith( haystack: bytes|bytearray, suffix: bytes|bytearray ) -> bool:
+	self_len: usize = len( haystack )
+	suffix_len: usize = len( suffix )
+	if suffix_len == 0:
+		return True
+	if suffix_len > self_len:
+		return False
+	with compiler.wrap_arithmetic: # suffix_len <= self_len, just checked above
+		offset: usize = self_len - suffix_len
+		candidate: ConstPtr[u8] = haystack.get_const_ptr() + offset
+	return sys.memcmp( candidate, suffix.get_const_ptr(), suffix_len ) == 0
+
+
 class bytes:
 	__data: ConstPtr[u8]
-	
+
 	__len: usize
-	
+
 	def __init__( self, copy_from: bytes|bytearray ) -> None:
 		self.__len = len( copy_from )
 		data = sys.alloc[u8]( self.__len )
@@ -193,9 +254,55 @@ class bytes:
 	
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
-	
+
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		return utf8.decode( self )
+
+	def find( self, sub: bytes, start: usize = 0 ) -> isize:
+		return _bytes_find_at( self, sub, start )
+
+	def startswith( self, prefix: bytes, start: usize = 0 ) -> bool:
+		return _bytes_startswith_at( self, prefix, start )
+
+	def endswith( self, suffix: bytes ) -> bool:
+		return _bytes_endswith( self, suffix )
+
+	@private
+	def _byte_slice( self, start: usize, end: usize ) -> bytes:
+		''' bytes [start, end) of self, as a new, independently-owned bytes -
+		the bytes-side counterpart to bytearray._byte_slice below. bytes has
+		no size-only public constructor (unlike bytearray), so this goes
+		through __allocate__ directly, the same way from_bytearray above
+		does. '''
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			piece_len: usize = end - start
+		new_data: Ptr[u8] = sys.alloc[u8]( piece_len )
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			src: ConstPtr[u8] = self.__data + start
+		sys.memcpy( new_data, src, piece_len )
+		return bytes.__allocate__( __data = new_data, __len = piece_len )
+
+	def split( self, sep: bytes ) -> list[bytes]:
+		''' splits self on every occurrence of sep - same semantics as
+		str.split() (lib/builtins/__init__.py), built on find()/_byte_slice
+		above rather than its own scanning logic. sep must not be empty. '''
+		if len( sep ) == 0:
+			sys.panic( 'bytes.split(...): separator must not be empty' )
+		result: list[bytes] = list[bytes]()
+		self_len: usize = self.__len__()
+		sep_len: usize = len( sep )
+		start: usize = 0
+		while True:
+			found: isize = self.find( sep, start )
+			if found == isize( -1 ):
+				result.append( self._byte_slice( start, self_len )).unwrap( 'bytes.split: append failed' )
+				break
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				match_start: usize = usize( found )
+			result.append( self._byte_slice( start, match_start )).unwrap( 'bytes.split: append failed' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				start = match_start + sep_len
+		return result
 
 BYTEARRAY_INVALID: Ptr[u8] = 0 # this is a sentinel to indicate a bytearray was released - matches lib/windows/kernel32.py's own INVALID_HANDLE_VALUE convention (a literal assigned directly to its real pointer type, not a same-width integer alias needing its own cast at every comparison site)
 
@@ -224,6 +331,21 @@ class bytearray:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.get_const_ptr() called after release()'
 		return self.__data
+
+	def find( self, sub: bytes, start: usize = 0 ) -> isize:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.find() called after release()'
+		return _bytes_find_at( self, sub, start )
+
+	def startswith( self, prefix: bytes, start: usize = 0 ) -> bool:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.startswith() called after release()'
+		return _bytes_startswith_at( self, prefix, start )
+
+	def endswith( self, suffix: bytes ) -> bool:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.endswith() called after release()'
+		return _bytes_endswith( self, suffix )
 
 	def __getitem__( self, index: usize ) -> Result[u8,IndexError]:
 		if compiler.target.debug:
@@ -272,6 +394,33 @@ class bytearray:
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			src: ConstPtr[u8] = self.__data + start
 		sys.memcpy( result.__data, src, piece_len )
+		return result
+
+	def split( self, sep: bytes ) -> list[bytearray]:
+		''' splits self on every occurrence of sep - same semantics as
+		bytes.split()/str.split() above. Each returned piece is an
+		independently-owned, freshly-allocated bytearray (_byte_slice
+		always allocates+copies, never aliases self's own buffer), so
+		mutating one piece afterward cannot affect self or its siblings.
+		sep must not be empty. '''
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.split() called after release()'
+		if len( sep ) == 0:
+			sys.panic( 'bytearray.split(...): separator must not be empty' )
+		result: list[bytearray] = list[bytearray]()
+		self_len: usize = self.__len__()
+		sep_len: usize = len( sep )
+		start: usize = 0
+		while True:
+			found: isize = self.find( sep, start )
+			if found == isize( -1 ):
+				result.append( self._byte_slice( start, self_len )).unwrap( 'bytearray.split: append failed' )
+				break
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				match_start: usize = usize( found )
+			result.append( self._byte_slice( start, match_start )).unwrap( 'bytearray.split: append failed' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				start = match_start + sep_len
 		return result
 
 class str:
@@ -433,28 +582,32 @@ class str:
 		# doesn't touch).
 		return self.byte_len() != 0
 
-	def find( self, sub: str, start: usize = 0 ) -> Result[usize,IndexError]:
+	def find( self, sub: str, start: usize = 0 ) -> isize:
 		''' byte offset of the first occurrence of sub in self, searching
 		from byte offset start onward (default 0 - the whole string; used
 		by split() below to resume searching just past each match, without
-		its own separate scanning logic). UTF-8-safe at the byte level even
-		though the scan itself is pure byte comparison (sys.memcmp): sub is
-		itself valid UTF-8 (str's own construction-time invariant - see
-		_from_owned_cstr), so a genuine match boundary can never be split
-		mid-codepoint - an ASCII byte or a UTF-8 leading/continuation byte
-		can only byte-for-byte equal the same kind of byte in sub, never
-		straddle one. Empty sub matches at offset start, same as Python's
-		str.find(''). '''
+		its own separate scanning logic). Returns -1 if not found (Python
+		str.find() convention - "not found" is an expected, common outcome
+		here, not an error; see index() below for the Result-returning
+		variant, for callers that DO want it treated as one). UTF-8-safe at
+		the byte level even though the scan itself is pure byte comparison
+		(sys.memcmp): sub is itself valid UTF-8 (str's own construction-
+		time invariant - see _from_owned_cstr), so a genuine match boundary
+		can never be split mid-codepoint - an ASCII byte or a UTF-8
+		leading/continuation byte can only byte-for-byte equal the same
+		kind of byte in sub, never straddle one. Empty sub matches at
+		offset start, same as Python's str.find(''). '''
 		self_len: usize = self.byte_len()
 		sub_len: usize = sub.byte_len()
 		if start > self_len:
-			return Result.Err( IndexError() )
+			return isize( -1 )
 		if sub_len == 0:
-			return Result.Ok( start )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				return isize( start )
 		with compiler.wrap_arithmetic: # start <= self_len, just checked above
 			remaining: usize = self_len - start
 		if sub_len > remaining:
-			return Result.Err( IndexError() )
+			return isize( -1 )
 		with compiler.wrap_arithmetic: # sub_len <= self_len, just checked above
 			last_start: usize = self_len - sub_len
 		i: usize = start
@@ -462,15 +615,21 @@ class str:
 			while i <= last_start:
 				candidate: ConstPtr[u8] = self.__data + i
 				if sys.memcmp( candidate, sub.__data, sub_len ) == 0:
-					return Result.Ok( i )
+					return isize( i )
 				i += 1
-		return Result.Err( IndexError() )
+		return isize( -1 )
 
-	def index( self, sub: str ) -> usize:
-		''' like find(), but panics instead of returning Err - matches
-		Python's str.index() raising ValueError where str.find() returns
-		-1, adapted to this language's panic-not-exceptions convention. '''
-		return self.find( sub ).unwrap( 'substring not found' )
+	def index( self, sub: str ) -> Result[usize, IndexError]:
+		''' like find(), but returns a Result instead of a -1 sentinel -
+		for callers that consider "not found" an error worth propagating
+		via match/.or_return()/.is_err(), rather than a plain conditional.
+		Never panics - unlike this method's old (backwards) behavior,
+		there is deliberately no unwrap()/sys.panic() anywhere in here. '''
+		offset: isize = self.find( sub )
+		if offset == isize( -1 ):
+			return Result.Err( IndexError() )
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			return Result.Ok( usize( offset ) )
 
 	@private
 	def _byte_slice( self, start: usize, end: usize ) -> str:
@@ -568,11 +727,12 @@ class str:
 		sep_len: usize = sep.byte_len()
 		start: usize = 0
 		while True:
-			found: Result[usize,IndexError] = self.find( sep, start )
-			if found.is_err():
+			found: isize = self.find( sep, start )
+			if found == isize( -1 ):
 				result.append( self._byte_slice( start, self_len )).unwrap( 'str.split: append failed' )
 				break
-			match_start: usize = found.unwrap( 'unreachable: find() confirmed is_ok' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				match_start: usize = usize( found )
 			result.append( self._byte_slice( start, match_start )).unwrap( 'str.split: append failed' )
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				start = match_start + sep_len
@@ -636,33 +796,41 @@ class str:
 			end: usize = self.byte_len() - suffix.byte_len()
 		return self._byte_slice( 0, end )
 
-	def rfind( self, sub: str ) -> Result[usize,IndexError]:
+	def rfind( self, sub: str ) -> isize:
 		''' byte offset of the LAST occurrence of sub in self - mirrors
-		find() above exactly, just scanning from the end. Empty sub
-		matches at self's own end (self_len), the mirror image of
-		find('')'s own vacuous match at offset 0. '''
+		find() above exactly, just scanning from the end, and shares its
+		-1-means-not-found convention (see rindex() below for the Result-
+		returning variant). Empty sub matches at self's own end
+		(self_len), the mirror image of find('')'s own vacuous match at
+		offset 0. '''
 		self_len: usize = self.byte_len()
 		sub_len: usize = sub.byte_len()
 		if sub_len == 0:
-			return Result.Ok( self_len )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				return isize( self_len )
 		if sub_len > self_len:
-			return Result.Err( IndexError() )
+			return isize( -1 )
 		with compiler.wrap_arithmetic: # sub_len <= self_len, just checked above
 			i: usize = self_len - sub_len
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			while True:
 				candidate: ConstPtr[u8] = self.__data + i
 				if sys.memcmp( candidate, sub.__data, sub_len ) == 0:
-					return Result.Ok( i )
+					return isize( i )
 				if i == 0:
 					break
 				i -= 1
-		return Result.Err( IndexError() )
+		return isize( -1 )
 
-	def rindex( self, sub: str ) -> usize:
-		''' like rfind(), but panics instead of returning Err - mirrors
-		index()'s own relationship to find() above. '''
-		return self.rfind( sub ).unwrap( 'substring not found' )
+	def rindex( self, sub: str ) -> Result[usize, IndexError]:
+		''' like rfind(), but returns a Result instead of a -1 sentinel -
+		mirrors index()'s own relationship to find() above. Never
+		panics. '''
+		offset: isize = self.rfind( sub )
+		if offset == isize( -1 ):
+			return Result.Err( IndexError() )
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			return Result.Ok( usize( offset ) )
 
 	def replace( self, old: str, new: str ) -> str:
 		''' every occurrence of old replaced with new - two-pass (count
@@ -679,11 +847,11 @@ class str:
 		occurrences: usize = 0
 		start: usize = 0
 		while True:
-			found: Result[usize,IndexError] = self.find( old, start )
-			if found.is_err():
+			found: isize = self.find( old, start )
+			if found == isize( -1 ):
 				break
-			match_start: usize = found.unwrap( 'unreachable: find() confirmed is_ok' )
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				match_start: usize = usize( found )
 				occurrences += 1
 				start = match_start + old_len
 
@@ -704,9 +872,10 @@ class str:
 		start = 0
 		while True:
 			found = self.find( old, start )
-			if found.is_err():
+			if found == isize( -1 ):
 				break
-			match_start = found.unwrap( 'unreachable: find() confirmed is_ok' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				match_start = usize( found )
 			with compiler.wrap_arithmetic:
 				piece_len: usize = match_start - start
 				sys.memcpy( buf + out, self.__data + start, piece_len )
@@ -767,30 +936,28 @@ class str:
 		Python's own str.partition() return shape exactly. sep not found:
 		(self, '', '') - Python's own no-match convention (the whole
 		string stays on the side the search started from). '''
-		found: Result[usize,IndexError] = self.find( sep )
-		match found:
-			case Result.Ok( idx ):
-				self_len: usize = self.byte_len()
-				with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
-					after_start: usize = idx + sep.byte_len()
-				return ( self._byte_slice( 0, idx ), sep, self._byte_slice( after_start, self_len ))
-			case Result.Err( _ ):
-				return ( str( self ), str( '' ), str( '' ))
+		found: isize = self.find( sep )
+		if found == isize( -1 ):
+			return ( str( self ), str( '' ), str( '' ))
+		self_len: usize = self.byte_len()
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			idx: usize = usize( found )
+			after_start: usize = idx + sep.byte_len()
+		return ( self._byte_slice( 0, idx ), sep, self._byte_slice( after_start, self_len ))
 
 	def rpartition( self, sep: str ) -> tuple[str,str,str]:
 		''' like partition() above, but splits at the LAST occurrence of
 		sep. Not found: ('', '', self) - the mirror image of partition()'s
 		own no-match convention (rpartition searches from the end, so the
 		whole string stays there). '''
-		found: Result[usize,IndexError] = self.rfind( sep )
-		match found:
-			case Result.Ok( idx ):
-				self_len: usize = self.byte_len()
-				with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
-					after_start: usize = idx + sep.byte_len()
-				return ( self._byte_slice( 0, idx ), sep, self._byte_slice( after_start, self_len ))
-			case Result.Err( _ ):
-				return ( str( '' ), str( '' ), str( self ))
+		found: isize = self.rfind( sep )
+		if found == isize( -1 ):
+			return ( str( '' ), str( '' ), str( self ))
+		self_len: usize = self.byte_len()
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			idx: usize = usize( found )
+			after_start: usize = idx + sep.byte_len()
+		return ( self._byte_slice( 0, idx ), sep, self._byte_slice( after_start, self_len ))
 
 	def isascii( self ) -> bool:
 		''' True if every byte is < 0x80 - vacuously True for an empty
@@ -1036,11 +1203,10 @@ class str:
 		trailing literal character, subtract that themselves before
 		calling - see lowering.py's _lower_float_format_spec). '''
 		dot_index: usize = self.byte_len()
-		match self.find( str( '.' )):
-			case Result.Ok( idx ):
-				dot_index = idx
-			case Result.Err( _ ):
-				pass
+		dot_found: isize = self.find( str( '.' ))
+		if dot_found != isize( -1 ):
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				dot_index = usize( dot_found )
 		int_part: str = self._byte_slice( 0, dot_index )
 		rest: str = self._byte_slice( dot_index, self.byte_len() )
 		rest_len: usize = rest.__len__()
@@ -1415,7 +1581,7 @@ class str:
 	# supports `sub in some_str` (see lowering.py's _lower_in_comparison) -
 	# reuses find()'s own byte-level scan rather than duplicating it
 	def __contains__( self, sub: str ) -> bool:
-		return self.find( sub ).is_ok()
+		return self.find( sub ) != isize( -1 )
 
 	def __hash__( self ) -> u64:
 		# content-based (never the pointer's own address) - two equal

@@ -58,16 +58,10 @@ def get_local_timezone_name() -> str:
 		return _read_etc_timezone_file()
 	if target_path == '':
 		return _read_etc_timezone_file()
-	# find() returns Result[usize,IndexError], not a Python-style -1
-	# sentinel (a second, independent pre-existing bug in this function,
-	# also never caught before it was first actually compiled) - checked
-	# via is_ok()/unwrap(), matching str.find()'s own real signature and
-	# every other real caller in this codebase (e.g. lib/csv.py's
-	# field.find(...).is_ok()).
-	found = target_path.find( 'zoneinfo/' )
-	if found.is_ok():
-		idx: usize = found.unwrap( 'checked is_ok' )
-		with compiler.wrap_arithmetic:
+	found: isize = target_path.find( 'zoneinfo/' )
+	if found != isize( -1 ):
+		with compiler.panic_arithmetic( 'bounded by target_path length, cannot overflow' ):
+			idx: usize = usize( found )
 			start: usize = idx + 9
 		return target_path[start:]
 	return _read_etc_timezone_file()
