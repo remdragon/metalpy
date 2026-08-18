@@ -199,6 +199,41 @@ for t in FLOAT_TYPES:
 	emit( f'{t}.{mode_dunder( dunder, "saturated" )} = f_truediv_saturated[{t}]' )
 emit()
 
+# ============================================================================
+# .to_T() - value-preserving numeric conversion, int<->int only this pass
+# (float conversions deferred - see SYNTAX.md). Genuinely separate from
+# T(x) (above): succeeds iff the source's VALUE fits target's [MIN,MAX],
+# independent of bit width - can fail even same-width (i8(-1).to_u8() must
+# fail; u8(i8(-1)) via T(x) never does). Exactly one check, no wrapped/
+# saturated variant - see compiler.checked_convert's own comment for why.
+# Self-conversion (T.to_T()) is generated separately below as a trivial,
+# always-infallible identity - provably always in-range, so it's plain
+# T-returning (no Result, not @fallible_arithmetic), matching the same
+# "genuinely infallible => don't wrap in Result" precedent
+# wrapped_add/saturated_add already established above.
+# ============================================================================
+
+emit( '@fallible_arithmetic' )
+emit( '@inline' )
+emit( 'def i_to_i[S,T]( value: S ) -> Result[T,OverflowError]:' )
+emit( '\treturn compiler.checked_convert( T, value )' )
+emit()
+
+emit( '@inline' )
+emit( 'def i_to_i_identity[T]( value: T ) -> T:' )
+emit( '\treturn value' )
+emit()
+
+emit( '# --- int-to-int value-preserving conversions ------------------------' )
+emit()
+for source in INT_TYPES:
+	for target in INT_TYPES:
+		if source == target:
+			emit( f'{source}.to_{target} = i_to_i_identity[{source}]' )
+		else:
+			emit( f'{source}.to_{target} = i_to_i[{source},{target}]' )
+	emit()
+
 from pathlib import Path
 Path( 'lib/builtins/__scalar_arith.py' ).write_text( '\n'.join( out ), encoding = 'utf-8' )
 print( f'wrote lib/builtins/__scalar_arith.py, {len(out)} lines' )
