@@ -337,9 +337,7 @@ def len( x: Foo ) -> usize:
 def len( x: Bar ) -> usize:
 	return x.__len__()
 
-def main() -> None:
-	f: Foo
-	b: Bar
+def main( f: Foo, b: Bar ) -> None:
 	x: usize = len( f )
 	y: usize = len( b )
 ''' )
@@ -373,15 +371,27 @@ def foo( x: int|None = None ) -> None:
 def foo( x: str ) -> None:
 	pass
 
-def main() -> None:
-	x: int
+def main( x: int ) -> None:
 	foo( x )
 ''' )
 		names = self._function_names()
 		self.assertIn( 'main', names )
-		# exactly one of the two plain implementations was scheduled, never
-		# the whole group and never the stub (stubs have no body to lower)
-		self.assertEqual( len( names ), 2 )
+		self.assertIn( '__main__.foo', names )
+		# 3, not 2: exactly one of the two plain implementations was
+		# scheduled (never the whole group and never the stub - stubs have
+		# no body to lower), PLUS the union's own synthesized 'int' member
+		# constructor - x's own plain `int` type doesn't match the winning
+		# implementation's real declared parameter type (int|None, a union),
+		# so it must be coerced into it first (see lowering_test.py's
+		# test_overload_call_resolves_to_unconditional_target for the exact
+		# IR shape this produces). Before this fix, that coercion was
+		# skipped entirely for this exact case (a non-literal argument whose
+		# plain type is a LEAF of an overloaded call's winning target's own
+		# union-typed parameter) - confirmed via a real compile of the
+		# equivalent real-builtins shape, which produced a genuine "passing
+		# 'int32_t' to parameter of incompatible type 'struct $__u$$...'" C
+		# mismatch
+		self.assertEqual( len( names ), 3 )
 
 	def test_multi_branch_dispatch_resolves_via_runtime_tag_check( self ) -> None:
 		# a union-typed argument (x: int|str) makes foo(x) ambiguous at
@@ -406,8 +416,7 @@ def foo( x: int ) -> None:
 def foo( x: str ) -> None:
 	pass
 
-def main() -> None:
-	x: int|str
+def main( x: int|str ) -> None:
 	foo( x )
 ''', Path( '__main__.py' ), scope = None )
 		self.compiler.run()
@@ -504,6 +513,74 @@ def main() -> None:
 	pass
 ''' )
 		self.assertEqual( self._extern_libs(), {} )
+
+class ExternDllDependencyTests( CompilerTestCase ):
+	''' compiler.extern_dlls - populated only from @extern(..., dll=...)
+	declarations on functions actually reached/lowered, the same
+	reachability gate ExternLibraryDependencyTests above verifies for
+	extern_libs (see compiler.py's Function-lowering branch: both are
+	registered together, from the same `if unit.extern_lib is not None:`
+	check). Drives mpy.py's post-link DLL-bundling step. '''
+
+	def test_called_extern_function_registers_its_dll( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll' } )
+
+	def test_declared_but_uncalled_extern_function_does_not_register_its_dll( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	pass
+''' )
+		self.assertEqual( self.compiler.extern_dlls, set() )
+
+	def test_extern_without_dll_leaves_the_registry_empty( self ) -> None:
+		self._run( '''
+@extern( 'c', 'malloc' )
+def malloc( size: usize ) -> Ptr[u8]:
+	...
+
+def main() -> None:
+	malloc( 4 )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, set() )
+
+	def test_dll_list_registers_every_entry( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'zlib1.dll' } )
+
+	def test_dlls_union_across_multiple_reached_functions( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tk86t', 'Tk_Init', dll = 'tk86t.dll' )
+def Tk_Init( interp: Ptr[None] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tk_Init( None )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'tk86t.dll' } )
 
 if __name__ == '__main__':
 	unittest.main()

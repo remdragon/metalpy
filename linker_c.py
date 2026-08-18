@@ -17,6 +17,28 @@ import subprocess
 import sys
 
 
+def resolve_no_crt( no_crt: bool, asan: bool ) -> bool:
+	'''
+	--asan requires the C runtime: the ASan runtime library itself depends on
+	CRT symbols (getenv, memcpy, malloc, ...) regardless of what the user's
+	own program needs, so a no-CRT link against it dies with a wall of
+	LNK2019s. Force real CRT linking whenever asan is requested, overriding
+	whatever no_crt the caller auto-detected.
+
+	Must be called BEFORE emitter_c.emit_c(), not just before
+	CcTool.compile()/link(): no_crt also selects which entry-point shape
+	emit_c() generates (a hand-rolled mainCRTStartup stub that calls main(),
+	vs plain main() as the real entry) - overriding only the compile/link
+	flags after C source generation would link CRT-provided startup code
+	against a source file that still defines its own conflicting
+	mainCRTStartup, trading one wall of link errors for another.
+	'''
+	if asan and no_crt:
+		print( 'WARNING - --asan requires the C runtime - forcing CRT linking (no_crt=True request ignored)', file = sys.stderr )
+		return False
+	return no_crt
+
+
 def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 	''' publish a disk-cache entry so a concurrent reader sees either the
 	complete previous state or the complete new one, never a half-written file.
@@ -311,6 +333,204 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 
 	atomic_write_cache( cache_file, '1' if available else '0' )
 	return available
+
+
+_NTDLL_PATH = Path( os.environ.get( 'SystemRoot', r'C:\Windows' ) ) / 'System32' / 'ntdll.dll'
+
+
+def _ntdll_toolchain( cc: CcTool ) -> tuple[str,str]:
+	'''
+	(export-lister, lib-builder) for reading/rebuilding an MS-COFF import
+	library - see build_ntdll_import_lib's docstring for why this exists at
+	all. Deliberately tied to `cc`, not just "whatever's on PATH": cl.exe
+	only runs after vcvars has put its whole VC\\Tools\\...\\bin\\Hostx64\\x64
+	directory on PATH, so MSVC's own dumpbin.exe/lib.exe are guaranteed to
+	be right there too - but clang needs no such thing (it locates link.exe
+	itself via its own internal Visual Studio probing, not PATH), so a build
+	using --cc clang without vcvars having ever run would newly require it
+	if this reached for dumpbin/lib.exe the same way. LLVM ships its own
+	drop-in equivalents (llvm-readobj/llvm-lib, MS-COFF compatible -
+	confirmed empirically: a .lib llvm-lib built from a hand-written .def
+	links fine against link.exe-produced objects) colocated with clang.exe
+	itself, so use those instead when cc is clang.
+	'''
+	if cc.name == 'cl':
+		dumpbin = shutil.which( 'dumpbin' )
+		lib_exe = shutil.which( 'lib' )
+		if not dumpbin or not lib_exe:
+			raise RuntimeError( "can't build a custom ntdll import library: dumpbin.exe/lib.exe not found on PATH "
+				"(they normally sit right alongside cl.exe once vcvars has run)" )
+		return dumpbin, lib_exe
+	if cc.name == 'clang':
+		bindir = Path( cc.path ).parent
+		readobj = bindir / 'llvm-readobj.exe'
+		llvmlib = bindir / 'llvm-lib.exe'
+		if not readobj.is_file() or not llvmlib.is_file():
+			raise RuntimeError( f"can't build a custom ntdll import library: llvm-readobj.exe/llvm-lib.exe not found alongside {cc.path}" )
+		return str( readobj ), str( llvmlib )
+	raise RuntimeError( f'generating a custom ntdll import library is not supported for compiler {cc.name!r} '
+		'(only cl/clang ever target Windows in this codebase - gcc here is WSL-only, for posix targets)' )
+
+
+def _parse_dumpbin_exports( text: str ) -> set[str]:
+	''' names of every real, named, non-forwarded export in a `dumpbin
+	/exports` listing. A forwarder line ("name = OtherDll.OtherName") and
+	an ordinal-only "[NONAME]" line both fail this line shape on purpose -
+	neither is a symbol @extern('ntdll', ...) could ever bind to directly. '''
+	import re
+	return set( re.findall( r'^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)\s*$', text, re.MULTILINE ) )
+
+
+def _parse_llvm_readobj_exports( text: str ) -> set[str]:
+	''' same as _parse_dumpbin_exports, for `llvm-readobj --coff-exports`'s
+	block-structured "Export { ... }" output. '''
+	names: set[str] = set()
+	name: str|None = None
+	forwarded = False
+	for raw in text.splitlines():
+		line = raw.strip()
+		if line == 'Export {':
+			name, forwarded = None, False
+		elif line.startswith( 'Name:' ):
+			name = line[ len( 'Name:' ): ].strip()
+		elif line.startswith( 'ForwardedTo:' ):
+			forwarded = True
+		elif line == '}':
+			if name and not forwarded:
+				names.add( name )
+			name, forwarded = None, False
+	return names
+
+
+def _real_ntdll_exports( cc: CcTool ) -> set[str]:
+	''' the real system ntdll.dll's own export table (NOT the Windows SDK's
+	curated ntdll.lib stub - see build_ntdll_import_lib's docstring). '''
+	lister, _ = _ntdll_toolchain( cc )
+	args = [ lister, '/exports', str( _NTDLL_PATH ) ] if cc.name == 'cl' else [ lister, '--coff-exports', str( _NTDLL_PATH ) ]
+	result = subprocess.run( args, capture_output = True, text = True )
+	if result.returncode != 0:
+		raise RuntimeError( f"failed to read {_NTDLL_PATH}'s export table:\n{result.stdout}{result.stderr}" )
+	return _parse_dumpbin_exports( result.stdout ) if cc.name == 'cl' else _parse_llvm_readobj_exports( result.stdout )
+
+
+def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False ) -> Path:
+	'''
+	Builds (and disk-caches) a small MS-COFF import library exposing exactly
+	`symbols` from the REAL system ntdll.dll, bypassing the Windows SDK's
+	own ntdll.lib import library entirely.
+
+	Why this exists: ntdll.dll's actual export table (confirmed via `dumpbin
+	/exports`) is far larger than what the SDK's ntdll.lib import library
+	exposes - that .lib is a curated, documented-APIs-only subset. strnlen
+	is a real, confirmed ntdll export the stub omits, which produces a real
+	LNK2019 at link time for any program that needs it despite the DLL
+	genuinely providing it (see lib/windows/ntdll.py's own note on its
+	strnlen binding - the motivating case for this function). Rather than
+	hand-roll a workaround per missing symbol, this generates a *real*
+	import library straight from the DLL's own export table, so any
+	genuine ntdll export metalpy declares via @extern works - not just
+	the SDK-blessed subset.
+
+	Scoped to `symbols` (not all ~2500 of ntdll's exports) rather than a
+	wholesale replacement of the SDK's ntdll.lib: those are the only names
+	any @extern('ntdll', ...) binding in this build could reference, and
+	staying scoped sidesteps having to correctly model data exports/
+	forwarders for symbols nothing here ever uses (ntdll's own export table
+	happens to have neither today, confirmed by parsing its full dump, but
+	nothing guarantees that stays true on every future Windows version).
+
+	Raises RuntimeError if a requested symbol is not actually a real,
+	named, non-forwarded export of the system ntdll.dll - a much clearer
+	error than the LNK2019 that would otherwise surface deep in the link
+	step for a genuine typo/nonexistent-symbol @extern binding.
+
+	Cached to disk under %TEMP%/metalpy/ntdll_import_lib/, keyed by
+	(compiler name, symbol set) - same spirit as has_symbol()'s own cache -
+	so the dumpbin/llvm-readobj probe and the lib.exe/llvm-lib build are
+	each only ever paid once per distinct (compiler, symbol set).
+	'''
+	import hashlib
+	import tempfile
+
+	key = hashlib.sha256( f'{cc.name}\0{",".join( sorted( symbols ))}'.encode() ).hexdigest()[:16]
+	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'ntdll_import_lib'
+	cache_dir.mkdir( parents = True, exist_ok = True )
+	lib_path = cache_dir / f'{key}.lib'
+	if lib_path.is_file():
+		# cache hit - skip both the export-table probe and the lib.exe/
+		# llvm-lib build below entirely, same spirit as has_symbol()'s own
+		# cache (this is the whole point of caching: a cache hit must not
+		# still pay for the thing being cached)
+		return lib_path
+
+	real_exports = _real_ntdll_exports( cc )
+	missing = symbols - real_exports
+	if missing:
+		raise RuntimeError(
+			f"ntdll.dll does not export {sorted( missing )} as real, named, non-forwarded "
+			f"symbols - check lib/windows/ntdll.py's @extern('ntdll', ...) declarations "
+			f"against a real `dumpbin /exports {_NTDLL_PATH}`" )
+
+	_, lib_builder = _ntdll_toolchain( cc )
+	with tempfile.TemporaryDirectory() as tmp:
+		def_path = Path( tmp ) / 'ntdll.def'
+		out_path = Path( tmp ) / 'ntdll.lib'
+		def_path.write_text(
+			'LIBRARY ntdll.dll\nEXPORTS\n' + '\n'.join( f'\t{s}' for s in sorted( symbols ) ) + '\n',
+			encoding = 'utf-8' )
+		# x64-only, matching this whole file's existing implicit assumption
+		# (compile()/link() above have no arch parameter either)
+		cmd = [ lib_builder, f'/def:{def_path}', f'/out:{out_path}', '/machine:x64', '/nologo' ]
+		if verbose:
+			print( ' '.join( cmd ), file = sys.stderr )
+		result = subprocess.run( cmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, text = True )
+		if result.returncode != 0 or not out_path.is_file():
+			raise RuntimeError( f'failed to build a custom ntdll import library:\n{result.stdout}' )
+		atomic_write_cache( lib_path, out_path.read_bytes() )
+	return lib_path
+
+
+def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool = False ) -> str:
+	'''
+	The linker flag/path for one @extern library dependency, given the set
+	of symbol names this build's program actually references from it.
+	Every library except 'ntdll' resolves the ordinary way (a plain -l/.lib
+	flag, searched against the compiler's own default library path) -
+	ntdll is special-cased because the SDK's own ntdll.lib is missing real
+	exports it should have (see build_ntdll_import_lib's docstring).
+	'''
+	if lib == 'ntdll':
+		return str( build_ntdll_import_lib( cc, symbols, verbose = verbose ) )
+	return f'{lib}.lib' if cc.name == 'cl' else f'-l{lib}'
+
+
+def find_dll( name: str ) -> Path|None:
+	'''
+	Locates a runtime DLL by bare filename (e.g. 'tcl86t.dll') for
+	bundling into a build's output directory - see mpy.py's post-link
+	step, driven by compiler.extern_dlls (populated from
+	@extern(..., dll=...) declarations on functions actually reached).
+
+	Searches PATH, in order - the same place a real Windows process
+	resolves an unqualified DLL import from, so "found here" is a direct
+	stand-in for "the exe would find this DLL too, if PATH weren't
+	different at run time" (e.g. on a machine without this build's own
+	dev tools installed). Not a general library search (no LIB/
+	LIBRARY_PATH, no system directories) - those are for the .lib import
+	library at link time, a different file that can live somewhere else
+	entirely (see mpy_types.Function.extern_dll's own comment).
+
+	Returns None (best-effort) if not found anywhere on PATH - mpy.py
+	warns and continues rather than failing the build over a bundling
+	step; the exe already linked successfully.
+	'''
+	for entry in os.environ.get( 'PATH', '' ).split( os.pathsep ):
+		if not entry:
+			continue
+		candidate = Path( entry ) / name
+		if candidate.is_file():
+			return candidate
+	return None
 
 
 def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:

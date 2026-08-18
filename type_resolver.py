@@ -6,7 +6,6 @@ import queue
 import threading
 
 # local imports:
-from cfg import is_rc
 from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
@@ -187,6 +186,7 @@ class TypeResolver:
 		# once, lazily, the first time an RCClass actually needs one
 		self._sys_free_scheduled: bool = False
 		self._destructors_synthesized: set[int] = set()
+		self._constructors_synthesized: set[int] = set() # id(RCClass) -> $$__new__ already synthesized - see _synthesize_rcclass_constructor
 		self._dtor_label_id = 0
 		self._sys_functions: dict[str,Function] = {}
 		# re-entrancy guard for _schedule_uniontype_storage: union_storage.
@@ -1312,7 +1312,7 @@ class TypeResolver:
 		]
 		live_flag_attrs = [
 			Variable( stem = self._live_flag_stem( stem ), qualname = f'{qualname}.{self._live_flag_stem( stem )}', file = fn.file, line = fn.line, type = bool_cls )
-			for stem, t in locals_decl.items() if is_rc( t )
+			for stem, t in locals_decl.items() if t.is_rc()
 		]
 		extra_attrs = [
 			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
@@ -1750,7 +1750,7 @@ class TypeResolver:
 		# _rename_and_track_liveness/_build_generator_destructor) -
 		# scalar/non-RC locals need nothing, same posture as before this
 		# phase
-		rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
+		rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
 
 		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - a single
 		# shared mutable cell, advanced in program order as each guard
@@ -1928,13 +1928,13 @@ class TypeResolver:
 		if defer_sites:
 			rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
 			dtor_renamer = _GeneratorNameRenamer( rename_targets )
-			rc_local_stems = { stem for stem, t in locals_decl.items() if is_rc( t ) }
+			rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
 			body.extend( self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, fn.node ), dtor_renamer, rc_local_stems ))
 
 		# 1. captured parameters - unconditional, always valid from
 		# construction onward (unchanged from every earlier phase)
 		for p in fn.parameters or []:
-			attr = backing_cls.names.get( p.stem )
+			attr = backing_cls.get_local_or_raise( p.stem )
 			assert isinstance( attr, Variable )
 			body.extend( self._build_field_teardown_ast(
 				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = p.stem, ctx = ast.Load() ),
@@ -1945,7 +1945,7 @@ class TypeResolver:
 		# non-RC (scalar/CEnum/...) locals need no teardown at all, same
 		# as every earlier phase
 		for stem, t in locals_decl.items():
-			if not is_rc( t ):
+			if not t.is_rc():
 				continue
 			teardown = self._build_field_teardown_ast(
 				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = stem, ctx = ast.Load() ),
@@ -2051,7 +2051,7 @@ class TypeResolver:
 			ast.copy_location( name_node, fn.node )
 			keywords.append( ast.keyword( arg = p.stem, value = name_node ) )
 		for stem, t in locals_decl.items():
-			if is_rc( t ):
+			if t.is_rc():
 				# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - never read
 				# before its own first real assignment (gated by the
 				# companion live-flag field below, checked by the
@@ -2062,7 +2062,7 @@ class TypeResolver:
 			else:
 				zero = ast.Constant( value = False if ( isinstance( t, Scalar ) and t.stem == 'bool' ) else 0 )
 			keywords.append( ast.keyword( arg = stem, value = zero ) )
-			if is_rc( t ):
+			if t.is_rc():
 				keywords.append( ast.keyword( arg = self._live_flag_stem( stem ), value = ast.Constant( value = False ) ) )
 		for stem, ( _t, expr ) in extra_fields.items():
 			keywords.append( ast.keyword( arg = stem, value = expr ) )
@@ -2206,7 +2206,7 @@ class TypeResolver:
 			self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
 
 			self.schedule( backing_cls )
-			self.schedule( backing_cls.names['__next__'] )
+			self.schedule( backing_cls.get_local_or_raise( '__next__' ))
 			self.schedule( result_union )
 
 			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
@@ -2401,6 +2401,237 @@ class TypeResolver:
 		)
 		fn.add_name( 'self', self_param )
 		self.schedule( fn )
+
+	def _synthesize_rcclass_constructor( self, cls: RCClass, init: Function ) -> None:
+		''' build an AST Function for $$__new__ - a per-class constructor
+		mirroring _synthesize_rcclass_destructor: allocate a raw,
+		uninitialized instance (compiler.__raw_alloc__) and call the
+		class's own __init__ on it, so every Foo(...) call site
+		(lowering.py's _try_lower_construct_call) can call this ONE
+		function instead of inlining alloc+header-init+__init__-call
+		machinery at every construction site. Unlike the destructor, this
+		is called DIRECTLY BY NAME - construction always knows its concrete
+		class statically, never dispatched through a vtable - so it needs
+		no emitter special-casing at all, ordinary Function emission
+		handles it.
+
+		Called ONLY eagerly from _try_lower_construct_call itself, never
+		from compiler._lower's own class-registration trigger the way the
+		destructor is: unlike the destructor (needed for every RCClass,
+		since any instance, however constructed, might need releasing),
+		$$__new__ is only ever needed by an actual `Foo(...)` construction
+		call site, which already synthesizes it eagerly itself, at the
+		exact moment it needs the live Function object (schedule() is a
+		deferred queue that can't guarantee that timing). Synthesizing it
+		unconditionally for every REGISTERED class too, regardless of
+		whether anything ever actually constructs it, was tried and
+		reverted: it forced a vtable reference (the header.vtable
+		assignment inside $$__new__'s own body) for classes never meant to
+		be constructed at all - a real regression, confirmed by a test
+		asserting an abstract base class, only ever used polymorphically
+		through a subclass, never gets its own vtable INSTANCE emitted.
+
+		`init` is used AS-IS instead of being re-derived via
+		cls.get_local('__init__') - required for a monomorphized generic
+		class: _try_lower_construct_call's own eager call already holds
+		the correctly-monomorphized __init__ (T substituted to the real
+		concrete type) as a local (_lower_generic_construction_args' own
+		monomorphized_init) - re-deriving it here via a fresh
+		cls.get_local('__init__') lookup instead is NOT reliably the same
+		object (confirmed by a real repro: Box(7) with T inferred purely
+		from the argument, no surrounding annotation - the fresh lookup
+		here produced an __init__ whose own parameter type was still the
+		bare, unsubstituted TypeVar T, crashing the emitter outright once
+		it tried to mangle a TypeVar into a C type). '''
+		if cls.type_params:
+			return  # only concrete RCClasses get a constructor
+		if id( cls ) in self._constructors_synthesized:
+			return
+		self._constructors_synthesized.add( id( cls ))
+
+		if cls.resolve is not None:
+			cls.resolve()
+		if not isinstance( init, Function ):
+			return  # an Overload - lowering.py's _try_lower_construct_call already rejects this case with its own error message
+		if init.resolve is not None:
+			init.resolve()
+		if any( p.is_vararg or p.is_kwarg or p.is_move or p.is_copy for p in ( init.parameters or [] )):
+			# no real __init__ in this codebase declares any of these -
+			# forwarding them correctly (re-spelling *args/**kwargs
+			# unpacking, or the explicit move(x)/copy(x) call-site marker
+			# move[T]/copy[T] params require) through a synthesized AST
+			# body is unsupported for now rather than silently miscompiled
+			self.discovery.fail(
+				f'{init.qualname}: *args/**kwargs/move[T]/copy[T] parameters are not supported yet for construction',
+				init.node,
+			)
+
+		none_type = self.discovery.get_none_type()
+		# fallibility check mirrors lowering.py's own Lowering._init_
+		# fallibility exactly (duplicated, not shared - that one lives on
+		# Lowering, not TypeResolver). _result_shape/find_name_or_none
+		# resolve 'Result' relative to discovery.module_stack[-1] - safe
+		# when this method runs eagerly (mid-lowering of some real
+		# function, module_stack already correctly populated), but
+		# module_stack can be genuinely EMPTY when reached from compiler.
+		# py's own class-registration trigger instead (confirmed by a real
+		# crash: IndexError in find_name_or_none, from a merged-executable
+		# test where no eager construction call site ever ran first) -
+		# push cls's own declaring module explicitly, same as
+		# resolve_function_body's own module_context push, so this is
+		# correct regardless of which trigger reached it first
+		with self.discovery.module_context( self._find_module_for( cls )):
+			if init.return_type is none_type:
+				fallible = False
+				error_cls = None
+				result_cls = None
+			else:
+				shape = self._result_shape( init.return_type )
+				if shape is None or shape[0] is not none_type:
+					self.discovery.fail(
+						f'{init.qualname} must return None or Result[None,_], got '
+						f'{init.return_type.qualname if init.return_type else None}',
+						init.node,
+					)
+				fallible = True
+				error_cls = shape[1]
+				result_cls = self.discovery.find_name_or_none( 'Result' )
+
+		qualname = f'{cls.qualname}$$__new__'
+		new_params: list[Parameter] = []
+		for p in ( init.parameters or [] ):
+			new_params.append( Parameter(
+				stem = p.stem, qualname = f'{qualname}.{p.stem}',
+				file = cls.file, line = cls.line, type = p.type,
+				is_posonly = p.is_posonly, is_kwonly = p.is_kwonly,
+			))
+
+		# self = compiler.__raw_alloc__(<cls>) - <cls> handed over directly
+		# via the resolved_type escape hatch (no natural source-level
+		# spelling for a monomorphized generic class - same technique the
+		# destructor's own <sys.free.ptr> node above uses)
+		class_ref = ast.Name( id = '<$$__new__.cls>', ctx = ast.Load() )
+		class_ref.resolved_type = cls
+		self_assign = ast.Assign(
+			targets = [ ast.Name( id = 'self', ctx = ast.Store() ) ],
+			value = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = '__raw_alloc__', ctx = ast.Load() ),
+				args = [ class_ref ], keywords = [],
+			),
+		)
+
+		# self.__init__(<forward every param>) - kwonly params must be
+		# forwarded as keywords (Python calling convention), everything
+		# else positionally; new_params' own stems/order are a direct 1:1
+		# copy of init.parameters, so this is always a valid, complete call
+		init_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__init__', ctx = ast.Load() ),
+			args = [ ast.Name( id = p.stem, ctx = ast.Load() ) for p in new_params if not p.is_kwonly ],
+			keywords = [ ast.keyword( arg = p.stem, value = ast.Name( id = p.stem, ctx = ast.Load() ) ) for p in new_params if p.is_kwonly ],
+		)
+
+		body: list[ast.stmt] = [ self_assign ]
+		if not fallible:
+			body.append( ast.Expr( init_call ))
+			body.append( ast.Return( value = ast.Name( id = 'self', ctx = ast.Load() )))
+			return_type: Type = cls
+		else:
+			body.append( ast.Assign( targets = [ ast.Name( id = 'result', ctx = ast.Store() ) ], value = init_call ))
+			is_err_call = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'result', ctx = ast.Load() ), attr = 'is_err', ctx = ast.Load() ),
+				args = [], keywords = [],
+			)
+			# Result.Err(result.data.v_Err) - same union-payload shape
+			# _emit_fallible_construction's own former Err branch used
+			err_expr = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+				args = [ ast.Attribute(
+					value = ast.Attribute( value = ast.Name( id = 'result', ctx = ast.Load() ), attr = 'data', ctx = ast.Load() ),
+					attr = 'v_Err', ctx = ast.Load(),
+				) ], keywords = [],
+			)
+			raw_free_stmt = ast.Expr( ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = '__raw_free__', ctx = ast.Load() ),
+				args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+			))
+			body.append( ast.If(
+				test = is_err_call,
+				body = [ raw_free_stmt, ast.Return( value = err_expr ) ],
+				orelse = [],
+			))
+			# self is fully constructed here. Result.Ok(self)'s own
+			# construction takes an INDEPENDENT incref'd copy of self for
+			# the payload it builds (confirmed empirically: returning
+			# Result.Ok(self) directly, relying on self's own scope-exit
+			# epilogue to release its original reference, leaked one ref
+			# per successful construction - the returned expression is
+			# Result.Ok(self)'s OWN result, not self itself, so the "return
+			# your own local directly, skip its release" fast path the
+			# plain non-fallible branch above relies on never applies here)
+			# - self's own original reference is a SEPARATE unit that still
+			# needs its own explicit release, same as the old raw-IR
+			# _emit_fallible_construction's own Ok branch had to do by hand.
+			#
+			# The intermediate `ok` local needs an explicit Result[cls,
+			# error_cls] annotation - Result.Ok(value)'s own E type param
+			# can never be inferred from `value: T` alone (SYNTAX.md/
+			# _lower_generic_construction_args's own comment on this), so a
+			# bare, un-annotated `ok = Result.Ok(self)` fails to infer E.
+			# For a MONOMORPHIZED GENERIC cls specifically, a by-name
+			# annotation (Result[Box, error_cls], built from cls.stem)
+			# would be actively WRONG, not just unspellable: cls.stem is
+			# still the ABSTRACT template's own bare name ('Box'), so
+			# ordinary scope lookup resolves the annotation's own T slot to
+			# the wrong (abstract) class - which then conflicts with T
+			# ALSO being inferred, correctly, as the concrete Box[i32] from
+			# self's own argument type, a genuine "T inferred as both X and
+			# Y" compile error (confirmed by a real repro: RCClassConstruct
+			# Tests' own generic-init-construction fallible-wrapping tests,
+			# which construct exactly this shape). Uses discovery.py's own
+			# node.resolved_type escape hatch instead (this session's own
+			# addition to visit_Name, mirroring the identical, already-
+			# established lowering.py-side convention _lower_compiler_cast/
+			# _lower_compiler_raw_alloc's own arguments already use) -
+			# tags a single Name node with the already-built, concrete
+			# Result[cls,error_cls] Specialization object directly
+			return_type = self.discovery._get_or_create_specialization( result_cls, [ cls, error_cls ])
+			ok_expr = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+				args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+			)
+			ok_annotation = ast.Name( id = '<$$__new__.result_type>', ctx = ast.Load() )
+			ok_annotation.resolved_type = return_type
+			decref_self_stmt = ast.Expr( ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+				args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+			))
+			body.append( ast.AnnAssign( target = ast.Name( id = 'ok', ctx = ast.Store() ), annotation = ok_annotation, value = ok_expr, simple = 1 ))
+			body.append( decref_self_stmt )
+			body.append( ast.Return( value = ast.Name( id = 'ok', ctx = ast.Load() )))
+
+		node = ast.FunctionDef(
+			name = '$$__new__',
+			args = ast.arguments(
+				posonlyargs = [], args = [], vararg = None,
+				kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [],
+			),
+			body = body, decorator_list = [], returns = None, type_params = [],
+			lineno = cls.line or 1, col_offset = 0,
+			end_lineno = cls.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+
+		fn = Function(
+			stem = '$$__new__', qualname = qualname,
+			file = cls.file, line = cls.line,
+			cls = cls, node = node,
+			parameters = new_params, return_type = return_type,
+			is_static = True, resolve = None,
+		)
+		for p in new_params:
+			fn.add_name( p.stem, p )
+		self.schedule( fn )
+		cls.add_name( '$$__new__', fn )
 
 	def _build_field_teardown_ast( self, field_expr: ast.Attribute, field_type: Type ) -> list[ast.stmt]:
 		''' recursively build AST statements to decref every RC leaf
@@ -2617,6 +2848,26 @@ class TypeResolver:
 		b_backing = b.backing if isinstance( b, TupleType ) else b
 		return a_backing is not None and a_backing is b_backing
 
+	def _atomic_leaves( self, t: Type ) -> list[Type]:
+		''' like t.leaves(), but treats a NOMINAL @union class (t.file is not
+		None) as a single opaque leaf - itself - rather than decomposing into
+		its own variants' payload types. Mirrors the exact anonymous-vs-
+		nominal distinction discovery.py's _get_or_create_union already uses
+		when flattening a wider union's own operands (only a synthesized
+		anonymous union, t.file is None, is fair game to flatten there too).
+		t.leaves() itself stays general-purpose - RC-leaf decomposition
+		genuinely wants a union's real payload types even when it's nominal
+		(see TaggedUnion.is_rc()) - this is the separate "is t covered by /
+		a member of some other union" notion _require_result_return and
+		_maybe_widen_return_result need instead. Without this, a nominal
+		@union (e.g. HTTPError, all-None-payload variants) widening into a
+		bigger union (OSError|HTTPError) decomposed into its own variants'
+		payload types (five NoneTypes) instead of being compared as the one
+		opaque HTTPError member it actually is. '''
+		if isinstance( t, TaggedUnion ) and t.file is None:
+			return t.leaves()
+		return [ t ]
+
 	def _result_shape( self, t: Type|None ) -> tuple[Type,Type]|None:
 		''' (T, E) if `t` is Result[T,E], else None. '''
 		result_cls = self.discovery.find_name_or_none( 'Result' )
@@ -2649,10 +2900,10 @@ class TypeResolver:
 		spec = self._as_specialization( return_type )
 		covered = False
 		if fn is not None and spec is not None and spec.base is result_cls and len( spec.args ) == 2:
-			fn_error_leaves = spec.args[1].leaves()
-			covered = all( leaf in fn_error_leaves for leaf in error_cls.leaves() )
+			fn_error_leaves = self._atomic_leaves( spec.args[1] )
+			covered = all( leaf in fn_error_leaves for leaf in self._atomic_leaves( error_cls ))
 		if not covered:
-			want = ' | '.join( sorted( leaf.stem for leaf in error_cls.leaves() ))
+			want = ' | '.join( sorted( leaf.stem for leaf in self._atomic_leaves( error_cls )))
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
 				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
@@ -2792,20 +3043,79 @@ class TypeResolver:
 			if not isinstance( names, dict ):
 				self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 			found = names.get( attr )
+		if isinstance( found, Specialization ):
+			# a Scalar-registered generic method (`i32.to_u32 = i__to__i[i32,u32]`)
+			# - discovery.py's visit_Assign stores the raw Specialization,
+			# unmonomorphized (no Monomorphizer exists that early) - resolve
+			# it to the real, concrete Function here, on first actual use,
+			# same as lowering.py's own _resolve_scalar_name does for the
+			# other two Scalar.names readers (_find_method/_find_dunder_for_arg)
+			found = self.monomorphizer.monomorphized_function( found )
 		if not isinstance( found, ( Function, Overload )):
 			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
 		if isinstance( found, ( Function, Overload )):
 			self._resolve_callable( found )
 		return found
 
+	def resolve_declared_types( self, fn: Function ) -> None:
+		''' resolve()s `fn` (if not already) then eagerly monomorphizes any
+		fully-concrete, ClassLike-based Specialization directly typing one
+		of its own declared parameters or its return type - the SAME
+		eager-monomorphize step Monomorphizer.substitute_type_params
+		already applies to a SUBSTITUTED field/parameter (monomorphize.py,
+		the Specialization branch), just for a PLAIN, never-substituted
+		declaration (an ordinary function's own `def f(x: list[i32])`, an
+		@overload candidate's own parameter, ...), which never goes
+		through substitute_type_params at all - discovery.py's own
+		annotation resolver (_get_or_create_specialization) is the only
+		thing that ever builds its .type/.parameters[*].type, and stops
+		there, at the bare Specialization wrapper. Without this, a
+		generic-substituted argument type (already monomorphized to the
+		real RCClass by substitute_type_params - see its own TaggedUnion/
+		Specialization branches) and an @overload candidate's own plain
+		`list[i32]` parameter end up as two DIFFERENT kinds of object for
+		the identical instantiation - a real RCClass vs. a bare
+		Specialization wrapper - which `is` can never bridge no matter how
+		well the Specialization layer itself is interned (confirmed via a
+		real repro: PLAN_COMPILER_BUG_SWEEP.md's overload_resolution.py
+		fix, which papered over this with an injected `_same_type`
+		predicate instead of closing the gap here, at its actual source).
+
+		PLAN_RESOLVE_CLASS_SPECIALIZATIONS.md's own "Source 2" - proposed,
+		attempted, and reverted (18 test failures) before origin-tracking
+		(_as_specialization/_same_type) existed to keep the many
+		`isinstance(t, Specialization)` shape-checks elsewhere working once
+		the type they're checking is no longer wrapped. That mechanism is
+		now in place (see `_result_shape`/`_require_result_return`, both
+		already `_as_specialization`-based) - this only wires the two real
+		production callers of `overload_resolution.resolve_call` through
+		this method (both already the sole place a Function/Overload's own
+		members get `.resolve()`d for a real call site), the narrowest
+		slice of the original plan that closes the specific duality this
+		was found through, not the full "every declared type everywhere"
+		sweep the original plan scoped - that stays a separate, bigger
+		piece of work if it's ever wanted. '''
+		if fn.resolve is not None:
+			fn.resolve()
+		for param in fn.parameters or []:
+			param.type = self._eagerly_monomorphize_declared_type( param.type )
+		fn.return_type = self._eagerly_monomorphize_declared_type( fn.return_type )
+
+	def _eagerly_monomorphize_declared_type( self, t: Type|None ) -> Type|None:
+		if (
+			isinstance( t, Specialization ) and isinstance( t.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum ))
+			and self.monomorphizer._is_concrete( t )
+		):
+			self.schedule( t )
+			return self.monomorphizer.monomorphize_class( t )
+		return t
+
 	def _resolve_callable( self, callee: Function|Overload ) -> None:
 		if isinstance( callee, Function ):
-			if callee.resolve is not None:
-				callee.resolve()
+			self.resolve_declared_types( callee )
 		else:
 			for fn in ( *callee.stubs, *callee.implementations ):
-				if fn.resolve is not None:
-					fn.resolve()
+				self.resolve_declared_types( fn )
 
 	def _resolve_union_receiver_members( self, union: TaggedUnion, members: list[Variable], attr: str, ctx: ast.AST ):
 		# imported here to avoid circular dependency
@@ -3115,7 +3425,57 @@ class TypeResolver:
 			try:
 				var.init = resolver.visit( var.init )
 			except CompileError:
-				pass # already recorded - lowering.py's own _lower_expr re-reaches and re-reports the same failure moments later, same recovery discipline as resolve_function_body's per-statement try/except
+				# already recorded - lowering.py's own lower_global re-reaches
+				# and re-reports the same failure moments later, same
+				# recovery discipline as resolve_function_body's per-
+				# statement try/except. var's own type-resolution failing is
+				# no longer reachable here at all (Compiler._lower's Variable
+				# branch raises RedundantCompilationError - silently - before
+				# ever calling this method, once var.broken is set - see
+				# mpy_types.Name.broken) - what CAN still land here is a
+				# failure specific to THIS method's own construction-call
+				# detection (e.g. constructing an instance of a class whose
+				# OWN resolution is broken), unrelated to var itself
+				pass
+
+	def resolve_parameter_default( self, target: Function, param: Parameter ) -> None:
+		''' resolve_global_init's sibling for a parameter's own DEFAULT VALUE
+		expression - lowering.py's _lower_call_args lowers `param.default`
+		directly at every CALL SITE that omits the argument, inside the
+		CALLING function's own lowering, never as part of target's OWN body
+		(resolve_function_body only ever walks fn.node.body - a parameter's
+		default lives on fn.node.args instead) - and often before target
+		itself has had its own turn on the compile-unit queue at all (a
+		caller only needs target.resolve() to have populated .parameters,
+		already guaranteed by the time _lower_call_args runs). Without this,
+		a construction call embedded in a default (`def f(x: Foo = Foo()):
+		...`) never gets item 3's eager __init__ pre-resolution, tripping
+		lowering.py's own _try_lower_construct_call assert ("... was not
+		resolved before construction") exactly the way an unresolved global
+		initializer once did (see resolve_global_init) - confirmed as a
+		real, reachable crash (not theoretical): a class constructed only
+		ever as another function's own defaulted-parameter value, called
+		from a THIRD function that omits that argument, reaches real
+		lowering with its __init__ never pre-resolved. Memoized by
+		id(param.default), the same idempotent-even-if-reached-twice
+		convention every sibling here uses - a shared default can be
+		lowered at more than one omitted-argument call site. '''
+		if param.default is None:
+			return
+		if id( param.default ) in self._body_resolved:
+			return
+		self._body_resolved.add( id( param.default ))
+		module = self._find_module_for( target )
+		with self.discovery.module_context( module ):
+			with self.discovery.scope_context( target ):
+				resolver = _ReferenceResolver( self, None )
+				try:
+					param.default = resolver.visit( param.default )
+				except CompileError:
+					# same recovery discipline as resolve_global_init - already
+					# recorded, and lowering.py's own _lower_call_args re-reaches
+					# and re-reports the same failure moments later
+					pass
 
 
 class _ReferenceResolver( ast.NodeTransformer ):
@@ -3238,7 +3598,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			narrowed = self._narrowed.get( node.id )
 			if narrowed is not None and len( narrowed ) == 1:
 				return narrowed[0]
-			return self.locals.get( node.id )
+			local_type = self.locals.get( node.id )
+			if local_type is not None:
+				return local_type
+			# self.locals only ever gets populated from params/self/body-
+			# locals (see __init__/visit_AnnAssign/visit_Assign above) -
+			# never from a module-level global, so a global subject fell
+			# through here as unresolvable, and everything downstream that
+			# needs a real type (is-None narrowing chief among them -
+			# _is_none_narrowing_shape bails outright when this returns
+			# None) silently declined for a global the exact same way it
+			# would for a genuinely undefined name. Ordinary scope-chain
+			# name resolution already has a global's real declared type on
+			# hand - fall back to it here, same as lowering.py's own name
+			# resolution already does for a global read.
+			found = self.discovery.find_name_or_none( node.id )
+			if not isinstance( found, Variable ):
+				return None
+			# a global Variable's own .type is populated lazily (via its
+			# .resolve callable, same as everywhere else in this pass that
+			# hands a not-yet-resolved object onward - see this class's own
+			# ensure_resolved) - a param/local's type is always already
+			# resolved by the time self.locals records it, so this was
+			# never needed above; a global reached here for the first time
+			# in THIS function still has type=None until forced.
+			self.resolver.ensure_resolved( found )
+			return found.type
 		if isinstance( node, ast.Attribute ):
 			owner_type = self._type_of_expr( node.value )
 			if owner_type is None:
@@ -3251,6 +3636,37 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return None
 			found = names.get( node.attr )
 			return found.type if isinstance( found, Variable ) else None
+		if isinstance( node, ast.Subscript ):
+			# tuple[...]'s own constant-index element access ONLY (t[0]) -
+			# mirrors lowering.py's _expr_Subscript tuple branch exactly
+			# (same tuple_storage.tuple_type_for/valid-index logic), needed
+			# so `t[0] is None` can narrow at all now that tuple[T|None,...]
+			# construction actually works (a real repro: none_first[0] is
+			# not None, on a tuple[str|None,i32] local, used to fall through
+			# to _lower_is_comparison's own flat-Cmp path and emit invalid C
+			# comparing a union STRUCT against a bare int). Every OTHER
+			# subscript shape (list[T]/dict[K,V]/a user __getitem__, ...) is
+			# deliberately left unresolved here - this class's own docstring
+			# already documents that returning None for an unrecognized
+			# shape is fine (narrowing just doesn't fire, same as any other
+			# expression this best-effort pass doesn't understand), and
+			# those shapes would need real generic-container type inference
+			# this pass was never meant to duplicate from lowering.py
+			owner_type = self._type_of_expr( node.value )
+			if owner_type is None:
+				return None
+			owner_type = self.resolver.ensure_resolved( owner_type )
+			tuple_type = self.resolver.tuple_storage.tuple_type_for( owner_type )
+			if tuple_type is None:
+				return None
+			valid_index = (
+				isinstance( node.slice, ast.Constant )
+				and isinstance( node.slice.value, int )
+				and not isinstance( node.slice.value, bool )
+			)
+			if not valid_index or not ( 0 <= node.slice.value < len( tuple_type.elem_types )):
+				return None
+			return tuple_type.elem_types[ node.slice.value ]
 		if isinstance( node, ast.Call ):
 			# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - a call to a
 			# GENERIC function (explicit gen[i32](...) or inferred
@@ -3316,7 +3732,45 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			else:
 				target = self._try_resolve_callable_namespace( node.func )
 			if isinstance( target, Function ):
-				target = self.resolver.ensure_resolved( target )
+				# resolve_declared_types, NOT ensure_resolved - this is pure
+				# type inference (what type would `x = ...` bind, not a real
+				# call being lowered), so target itself never needs
+				# scheduling as a compile unit here - ensure_resolved's
+				# unconditional scheduling side effect (see its own
+				# docstring) means an @inline target would otherwise get
+				# compiled as real, dead, never-called code purely from
+				# being assigned to a local (confirmed by a real repro: any
+				# `x = receiver.some_inline_method()` reaches exactly this
+				# line during type inference, before lowering.py's own,
+				# already-inline-aware call-emission ever runs - same root
+				# cause lowering.py's _resolve_call_target already carves
+				# out for its own, later call site). resolve_declared_types
+				# still does everything actually needed here: resolves
+				# target's signature and (separately) schedules/monomorphizes
+				# its OWN return type, just never target itself. Still need
+				# ensure_generator_synthesized explicitly, though - unlike
+				# scheduling, that one's genuinely still required here (a
+				# generator's real return type only exists after synthesis -
+				# ensure_resolved calls it for exactly this reason, see its
+				# own PLAN_GENERATORS.md comment; dropping it broke real
+				# `for x in a_generator_call():` type inference, confirmed
+				# by a real repro, since it's a no-op for the overwhelming
+				# majority of ordinary, non-generator functions anyway).
+				# Order matters: ensure_resolved's own sequence is resolve()
+				# THEN ensure_generator_synthesized (which itself checks
+				# fn.return_type, so it needs the bare annotation populated
+				# first) - resolve_declared_types' own eager monomorphize
+				# step has to come LAST, after synthesis may have rewritten
+				# return_type into a real GeneratorType, or it eagerly
+				# monomorphizes the PRE-synthesis annotation instead
+				# (confirmed by a real repro: reversing this order broke
+				# even the most basic generator - "contains yield but is
+				# not declared -> Iterator[T]" on a function that plainly
+				# was).
+				if target.resolve is not None:
+					target.resolve()
+				self.resolver.ensure_generator_synthesized( target )
+				self.resolver.resolve_declared_types( target )
 				return target.return_type if isinstance( target, Function ) else None
 			if isinstance( target, Overload ):
 				# an @overload-decorated method group (e.g. Result[T,E].
@@ -3355,8 +3809,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		resolve_call itself raising - just returns None, same discipline as
 		every other branch of _type_of_expr. '''
 		for fn in ( *group.stubs, *group.implementations ):
-			if fn.resolve is not None:
-				fn.resolve()
+			self.resolver.resolve_declared_types( fn )
 		if any( kw.arg is None for kw in node.keywords ):
 			return None
 		arg_types = [ self._type_of_expr( a ) for a in node.args ]
@@ -3370,7 +3823,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			kwarg_types[kw.arg] = kw_type
 		try:
 			_, resolved = overload_resolution.resolve_call(
-				group.stubs, group.implementations, arg_types, kwarg_types, qualname = group.qualname,
+				group.stubs, group.implementations, arg_types, kwarg_types,
+				qualname = group.qualname, same_type = self.resolver._same_type,
 			)
 		except CompileError:
 			return None
@@ -3382,7 +3836,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			**{ i: tuple( t.leaves() ) for i, t in enumerate( arg_types ) },
 			**{ name: tuple( t.leaves() ) for name, t in kwarg_types.items() },
 		}
-		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves ):
+		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves, self.resolver._same_type ):
 			return winning_stub.return_type
 		return resolved.return_type
 
@@ -3516,6 +3970,29 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			pairs.append(( param, kw.value ))
 		return pairs
 
+	def _natural_literal_type( self, node: ast.Constant ) -> Type|None:
+		''' a literal's own no-context default type, exactly mirroring
+		Lowering._expr_Constant's expected_type-is-None branch - deliberately
+		NOT the same mapping _type_of_expr's Constant branch uses (that one
+		means what an ANNOTATION spelling would: `int` the arbitrary-precision
+		class, `float` an alias for f32). Only for _infer_generic_args' own
+		trust_literals path below, where the question is what type the
+		argument literal will actually be lowered as. '''
+		intrinsics = self.discovery.get_intrinsics()
+		if node.value is None:
+			return self.discovery.get_none_type()
+		if isinstance( node.value, bool ):
+			return intrinsics['bool']
+		if isinstance( node.value, int ):
+			return intrinsics['i32']
+		if isinstance( node.value, float ):
+			return intrinsics['f64']
+		if isinstance( node.value, str ):
+			return self.discovery.find_name_or_none( 'str' )
+		if isinstance( node.value, bytes ):
+			return self.discovery.find_name_or_none( 'bytes' )
+		return None
+
 	def _infer_generic_args(
 		self, node: ast.Call, target: Function, type_params: list[TypeVar], *, trust_literals: bool = True,
 	) -> list[Type]|None:
@@ -3554,9 +4031,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return None
 		bindings: dict[int,Type] = {} # id(TypeVar) -> the concrete Type it was inferred as
 		for param, expr in pairs:
-			if not trust_literals and isinstance( expr, ast.Constant ):
-				continue
-			actual = self._type_of_expr( expr )
+			if isinstance( expr, ast.Constant ):
+				if not trust_literals:
+					continue
+				# a literal argument's inferred type must match what Lowering.
+				# _expr_Constant will ACTUALLY tag it as once this pass's
+				# binding turns the type param concrete (i32/f64/bool/str/
+				# bytes/NoneType) - NOT _type_of_expr's Constant mapping, which
+				# deliberately means the same thing an ANNOTATION would (42's
+				# `int` is the arbitrary-precision class, 3.14's `float` is an
+				# alias for f32). Using that mapping here bound T to the
+				# annotation-int/float type instead, so the literal then failed
+				# lowering's own compatible-stems check against its own
+				# concrete (non-scalar, or narrower-float) parameter type
+				actual = self._natural_literal_type( expr )
+			else:
+				actual = self._type_of_expr( expr )
 			if actual is None or isinstance( actual, TypeVar ):
 				continue # can't determine this one - not an error here, just doesn't contribute a binding (see the "missing" check below)
 			if not self._unify_type_param( type_params, param.type, actual, bindings ):
@@ -3614,8 +4104,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return None
 		spec = self.discovery._get_or_create_specialization( target_cls, args )
 		concrete_cls = self.resolver.monomorphizer.monomorphize_class( spec )
-		concrete_init = concrete_cls.names.get( '__init__' )
-		if not isinstance( concrete_init, Function ):
+		concrete_init = concrete_cls.get_local( '__init__' )
+		if not isinstance( concrete_init, Function ) or concrete_init.broken:
 			return None # shouldn't happen (monomorphize_class's own method loop always substitutes a plain __init__ too), but stay silent/consistent with this pass's own discipline rather than assert
 		return concrete_cls, concrete_init
 
@@ -3708,8 +4198,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				if target.resolve is not None:
 					target.resolve()
-				init = target.names.get( '__init__' )
-				if isinstance( init, Function ):
+				init = target.get_local( '__init__' )
+				if isinstance( init, Function ) and not init.broken:
 					self.resolver._resolve_callable( init )
 				construction = self._try_resolve_generic_construction( node, target, init )
 				if construction is not None:
@@ -3786,7 +4276,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if not mod:
 			self.discovery.fail( f'module {package!r} not found', node )
 		for alias in node.names:
-			item = mod.names.get( alias.name )
+			item = mod.get_local_or_raise( alias.name )
 			if item is None:
 				self.discovery.fail( f'module {package} does not export {alias.name!r}', node )
 			self.fn.add_name( alias.asname or alias.name, item )
@@ -3929,17 +4419,20 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subject_type = self._type_of_expr( subject_expr )
 		if subject_type is None:
 			return None # can't determine - leave as ordinary `is`/`is not`, lowering's own _lower_is_comparison handles the non-union fallback
-		# unwrap a Specialization to its ABSTRACT base, same as
-		# Lowering._tagged_union_shape - "does this have a None member" is
-		# substitution-independent (None doesn't vary by specialization), so
-		# no monomorphize_class call is needed here. Critically, must NOT
-		# call ensure_resolved(subject_type) first: that would swap a
-		# Specialization for its MONOMORPHIZED copy, whose own tag/data
-		# (already built by monomorphize_class) would collide with
+		# _as_specialization, not a bare isinstance(subject_type, Specialization) -
+		# subject_type may already be eagerly-monomorphized (resolve_declared_
+		# types) to the concrete union itself; base must still resolve to the
+		# ABSTRACT union so it agrees with whatever else compares against it
+		# by identity (union_storage.get's own cache key, any caller that
+		# resolves a pattern's Owner by NAME - always the abstract class).
+		# Critically, must NOT call ensure_resolved(subject_type) first: that
+		# would swap a Specialization for its MONOMORPHIZED copy, whose own
+		# tag/data (already built by monomorphize_class) would collide with
 		# UnionStorage.get() trying to synthesize them again as if for a
 		# fresh union (same mistake, and fix, as lowering.py's
 		# _lower_allocate_fields TaggedUnion branch had)
-		base = subject_type.base if isinstance( subject_type, Specialization ) else subject_type
+		spec = self.resolver._as_specialization( subject_type )
+		base = spec.base if spec is not None else subject_type
 		if not isinstance( base, TaggedUnion ):
 			return None
 		members = self._resolved_union_members( subject_type, base )
@@ -3948,6 +4441,44 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if none_member is None:
 			return None
 		is_not = isinstance( test.ops[0], ast.IsNot )
+		return subject_expr, base, members, none_member, is_not
+
+	def _bare_truthiness_narrowing_shape( self, test: ast.expr ) -> tuple[ast.expr,TaggedUnion,list[Variable],Variable,bool]|None:
+		''' `if x:` / `if not x:` against a union-typed, bare-Name x - a
+		DIFFERENT shape from _is_none_narrowing_shape's own `is None`/`is
+		not None` comparison, but narrows the same way. Only the TRUTHY
+		case narrows: it always safely implies non-None (None is always
+		falsy, so truthy entails not-None), regardless of whether the
+		leaf's own __bool__ could ALSO be False for a real, non-None
+		instance (e.g. an empty str) - a falsy leaf is still non-None. The
+		FALSY case is deliberately left un-narrowed: it could be None OR a
+		real-but-falsy leaf, so nothing new is provable there in general
+		(unlike is-None narrowing's own else branch, which DOES prove
+		non-None). Same single-non-None-member restriction as
+		_is_none_narrowing_shape/_rewrite_tagged_union_truthiness. Returns
+		the identical shape _is_none_narrowing_shape does so visit_If's
+		existing narrowing machinery (built for that comparison case)
+		drives this one too, unchanged - only is_not's OWN meaning differs
+		here (True selects the TRUTHY branch, not the not-None one). '''
+		is_not = True
+		subject_expr = test
+		if isinstance( test, ast.UnaryOp ) and isinstance( test.op, ast.Not ):
+			subject_expr = test.operand
+			is_not = False
+		if not isinstance( subject_expr, ast.Name ):
+			return None
+		subject_type = self._type_of_expr( subject_expr )
+		if subject_type is None:
+			return None
+		spec = self.resolver._as_specialization( subject_type )
+		base = spec.base if spec is not None else subject_type
+		if not isinstance( base, TaggedUnion ):
+			return None
+		members = self._resolved_union_members( subject_type, base )
+		none_type = self.discovery.get_none_type()
+		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
+		if none_member is None:
+			return None
 		return subject_expr, base, members, none_member, is_not
 
 	def visit_Compare( self, node: ast.Compare ) -> ast.expr:
@@ -4025,7 +4556,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subj_type = self._type_of_expr( subject_expr )
 		if subj_type is None:
 			self.discovery.fail( f'type(...) is ...: cannot determine the type of {ast.unparse(subject_expr)}: {ast.unparse(node)}', node )
-		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+		base = spec.base if spec is not None else subj_type
 		if not isinstance( base, TaggedUnion ):
 			self.discovery.fail( f'type(...) is ...: {ast.unparse(subject_expr)} is not a union type: {ast.unparse(node)}', node )
 		members = self._resolved_union_members( subj_type, base )
@@ -4048,15 +4580,37 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		(or just `x.data.v_bool` when the leaf type IS bool).
 		Returns None when the type isn't a TaggedUnion, has no None member,
 		or has multiple non-None variants (auto-generated union __bool__ is
-		future work). '''
+		future work).
+
+		`not x` (a UnaryOp wrapping the same shape - e.g. `if not tz:`) is
+		handled here too, by recursing on the unwrapped operand and negating
+		the result - lowering.py's own _expr_UnaryOp assumes ANY `not`
+		operand is already a plain scalar (`ir.Not`/emitter_c.py's bare
+		`!operand`), which is invalid C for a TaggedUnion's struct
+		representation; this rewrite runs first (visit_If/visit_While call
+		it on their own node.test before any other visitation), replacing
+		the whole `not x` with `not (tag_cmp and value_expr)` - both
+		operands of that inner BoolOp are real bools, so the OUTER `not`
+		lowers through the ordinary (correct) scalar path unchanged. '''
+		if isinstance( expr_node, ast.UnaryOp ) and isinstance( expr_node.op, ast.Not ):
+			inner = self._rewrite_tagged_union_truthiness( expr_node.operand, ctx_node )
+			if inner is None:
+				return None
+			negated = ast.UnaryOp( op = ast.Not(), operand = inner )
+			ast.copy_location( negated, ctx_node )
+			return negated
 		expr_type = self._type_of_expr( expr_node )
 		if expr_type is None:
 			return None
-		base = expr_type.base if isinstance( expr_type, Specialization ) else expr_type
+		# _as_specialization, not a bare isinstance check - expr_type may
+		# already be eagerly-monomorphized (resolve_declared_types), see
+		# visit_Match's own comment
+		spec = self.resolver._as_specialization( expr_type )
+		base = spec.base if spec is not None else expr_type
 		if not isinstance( base, TaggedUnion ):
 			return None
-		if isinstance( expr_type, Specialization ):
-			members = self.resolver.monomorphizer.monomorphize_class( expr_type ).attributes
+		if spec is not None:
+			members = self.resolver.monomorphizer.monomorphize_class( spec ).attributes
 		else:
 			self.resolver.ensure_resolved( base )
 			for attr in base.attributes:
@@ -4090,16 +4644,72 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if isinstance( leaf_type, Scalar ) and leaf_type.stem == 'bool':
 			value_expr: ast.expr = payload_expr
 		else:
-			value_expr = ast.Call(
-				func = ast.Attribute( value = payload_expr, attr = '__bool__', ctx = ast.Load() ),
-				args = [],
-				keywords = [],
-			)
+			# only synthesize the .__bool__() call when the leaf type
+			# actually defines one - real Python's own default object
+			# truthiness is always-True unless __bool__/__len__ is
+			# overridden, but this compiler doesn't auto-synthesize a
+			# default __bool__ method the way Python effectively does, so
+			# a class with no override would otherwise hit a hard "not
+			# callable" resolution failure here just for participating in
+			# a T|None truthiness check - matching Python's real default
+			# directly (a bare Constant(True), no call at all) instead of
+			# requiring every such class to hand-write a trivial `return
+			# True` override.
+			chain_lookup = getattr( leaf_type, 'chain_lookup', None )
+			has_bool_method = chain_lookup is not None and chain_lookup( '__bool__' ) is not None
+			if has_bool_method:
+				value_expr = ast.Call(
+					func = ast.Attribute( value = payload_expr, attr = '__bool__', ctx = ast.Load() ),
+					args = [],
+					keywords = [],
+				)
+			else:
+				value_expr = ast.Constant( value = True )
 			ast.copy_location( value_expr, ctx_node )
 		# synthesize: tag_cmp and value_expr
 		result = ast.BoolOp( op = ast.And(), values = [ tag_cmp, value_expr ] )
 		ast.copy_location( result, ctx_node )
 		return result
+
+	def _tagged_union_payload_expr( self, expr_node: ast.expr, ctx_node: ast.AST ) -> ast.expr|None:
+		''' the raw `expr.data.v_<T>` extraction alone (no truthiness test,
+		no __bool__() call) - used by visit_BoolOp's value-coalescing
+		rewrite for `x or y`'s TRUTHY branch, where `x` is proven non-None
+		by the very fact that branch is being taken, so the branch's own
+		VALUE should be the unwrapped T, not the still-Optional x (matching
+		Python: `x or y` narrows the "x" case exactly the same way an `if
+		x:` block would). Same type/shape restrictions as
+		_rewrite_tagged_union_truthiness (single non-None member) -
+		deliberately not factored to share code with it, since that method
+		has its own additional `not x` recursion this one never needs. '''
+		expr_type = self._type_of_expr( expr_node )
+		if expr_type is None:
+			return None
+		spec = self.resolver._as_specialization( expr_type )
+		base = spec.base if spec is not None else expr_type
+		if not isinstance( base, TaggedUnion ):
+			return None
+		if spec is not None:
+			members = self.resolver.monomorphizer.monomorphize_class( spec ).attributes
+		else:
+			self.resolver.ensure_resolved( base )
+			for attr in base.attributes:
+				self.resolver.ensure_resolved( attr )
+			members = base.attributes
+		none_type = self.discovery.get_none_type()
+		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
+		if none_member is None:
+			return None
+		non_none = [ m for m in members if m.type is not none_type ]
+		if len( non_none ) != 1:
+			return None
+		member = non_none[0]
+		_tag_attr, data_attr, _payload_cls, _tags = self.resolver.union_storage.get( base )
+		data_expr = ast.Attribute( value = expr_node, attr = data_attr.stem, ctx = ast.Load() )
+		ast.copy_location( data_expr, ctx_node )
+		payload_expr = ast.Attribute( value = data_expr, attr = f'v_{member.stem}', ctx = ast.Load() )
+		ast.copy_location( payload_expr, ctx_node )
+		return payload_expr
 
 	def _try_fold_is_rc_if( self, node: ast.If ) -> list[ast.stmt]|None:
 		''' rewrite 4: `if compiler.is_rc(T): A else: B` (T a generic class's
@@ -4181,7 +4791,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subj_type = self._type_of_expr( subject_expr )
 		if subj_type is None:
 			return None
-		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+		base = spec.base if spec is not None else subj_type
 		if not isinstance( base, TaggedUnion ):
 			return None
 		members = self._resolved_union_members( subj_type, base )
@@ -4282,6 +4893,11 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# test) would otherwise already have destroyed this shape by the time
 		# it's looked for
 		none_shape = self._is_none_narrowing_shape( node.test )
+		if none_shape is None:
+			# not an `is None`/`is not None` comparison - try the bare
+			# truthiness shape instead (`if x:`/`if not x:`), see its own
+			# docstring for why only its TRUTHY branch narrows
+			none_shape = self._bare_truthiness_narrowing_shape( node.test )
 		subject_name: str|None = None
 		narrow_member: Variable|None = None
 		is_not = False
@@ -4298,6 +4914,13 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
 		if rewritten is not None:
 			node.test = rewritten
+		elif isinstance( node.test, ast.BoolOp ):
+			# a bare `if x or y:`/`if x and y:` (the rewrite above only
+			# fires for the WHOLE test being a single T|None subject, not
+			# a BoolOp of several) still needs to reach visit_BoolOp in
+			# its plain bool-forcing mode, not the value-coalescing one -
+			# see visit_BoolOp's own is_condition_context comment
+			node.test.is_condition_context = True
 		node.test = self.visit( node.test )
 
 		def _visit_stmts( stmts: list[ast.stmt] ) -> list[ast.stmt]:
@@ -4325,6 +4948,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._narrowed = case_entry_narrowed
 		narrowed_visited = [ self._build_narrow_marker( subject_name, narrow_member, node ), *narrowed_visited ]
 		other_visited = _visit_stmts( other_body )
+		# the OTHER branch has no comparison to narrow it from - but if ITS
+		# OWN code reassigns subject_name to exactly the narrowed member's
+		# type (the "if x is None: x = Owned(...)" idiom - self.locals
+		# tracks this via visit_Assign's own bookkeeping above), it ends up
+		# narrowed too, just via a fresh value instead of a proven
+		# comparison. Without this, cfg.py's own _merge_narrowed_soft sees
+		# the fact on only ONE branch (the comparison-proven one) and drops
+		# it entirely, even though both branches provably agree by the join
+		# point. Skipped when the branch terminates (return/break/continue/
+		# raise as its own last statement) - nothing past it reaches the
+		# join, so there's nothing for this marker to narrow, and appending
+		# one after a terminator would corrupt cfg.py's own terminates
+		# detection (which keys off the branch's LAST statement).
+		other_terminates = bool( other_body ) and isinstance( other_body[-1], ( ast.Return, ast.Break, ast.Continue, ast.Raise ))
+		if not other_terminates and self.locals.get( subject_name ) is narrow_member.type:
+			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_member, node ) ]
 		if is_not:
 			node.body, node.orelse = narrowed_visited, other_visited
 		else:
@@ -4449,13 +5088,73 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._narrowed = case_entry_narrowed
 		return node
 
-	def visit_BoolOp( self, node: ast.BoolOp ) -> ast.BoolOp:
+	def visit_BoolOp( self, node: ast.BoolOp ) -> ast.expr:
+		# is_condition_context: set by visit_If/visit_While/visit_IfExp/
+		# visit_Assert on their OWN node.test right before dispatching
+		# into it (generic_visit or self.visit both eventually reach
+		# THIS method for a top-level BoolOp test) - those callers need a
+		# guaranteed bool result (Python's `if x or y:` only cares about
+		# truthiness, never which operand "won"), so they opt out of the
+		# value-coalescing rewrite below entirely, always getting the
+		# plain bool-forcing behavior instead - confirmed as a real
+		# regression via a pre-existing test (`if x or y:` against two
+		# TaggedUnion operands) that this rewrite silently broke before
+		# this flag existed: it turned the condition into a ternary
+		# PRODUCING one of the two operands, instead of combining both
+		# operands' own truthiness into a single bool.
+		#
+		# value-coalescing: real Python and/or semantics (the actual
+		# OPERAND survives, not a bool) - restricted to exactly 2
+		# operands, left operand a bare Name (safe to reference twice -
+		# once for its own truthiness, once as the resulting value -
+		# without re-evaluating a call/side-effecting expression a second
+		# time), whose type is a TaggedUnion with a None member (the
+		# "fill in a default when None/falsy" idiom, e.g. `tz or
+		# localtz()`). Desugars into an ordinary ternary, reusing
+		# visit_IfExp/_expr_IfExp's own already-correct rewrite/RC
+		# handling entirely rather than reimplementing it here: `x or y`
+		# is exactly `x if <truthy(x)> else y`; `x and y` is exactly `y
+		# if <truthy(x)> else x`. Anything outside this shape (more than
+		# 2 operands, a non-Name left operand, or a left operand that's
+		# plain bool/not a TaggedUnion at all) falls through unchanged to
+		# the existing bool-only path below (e.g. match's own nested-
+		# pattern tests, already bool on both sides).
+		if not getattr( node, 'is_condition_context', False ) and len( node.values ) == 2 and isinstance( node.values[0], ast.Name ):
+			left, right = node.values
+			truthy = self._rewrite_tagged_union_truthiness( left, node )
+			if truthy is not None:
+				is_and = isinstance( node.op, ast.And )
+				if is_and:
+					# x and y: truthy -> y (as-is); falsy -> x, UNCHANGED
+					# (matches real Python - a falsy-but-non-None x is still
+					# possible, so the falsy branch can't be unwrapped here;
+					# the ternary's own two branches naturally end up typed
+					# y's-type | x's-declared-type, same as Python's real
+					# `and` would produce)
+					body, orelse = right, left
+				else:
+					# x or y: truthy -> x, but UNWRAPPED to its non-None
+					# payload (this branch proves x isn't None, exactly like
+					# an `if x:` block would - matches _rewrite_tagged_
+					# union_truthiness's own narrowing for that shape);
+					# falsy -> y, as-is
+					unwrapped = self._tagged_union_payload_expr( left, node )
+					body, orelse = ( unwrapped if unwrapped is not None else left ), right
+				if_exp = ast.IfExp( test = truthy, body = body, orelse = orelse )
+				ast.copy_location( if_exp, node )
+				return self.visit_IfExp( if_exp )
 		# each operand of `and`/`or` is a boolean context — rewrite
 		# T|None operands BEFORE generic_visit recurses into the old nodes
 		for i, value in enumerate( node.values ):
 			rewritten = self._rewrite_tagged_union_truthiness( value, node )
 			if rewritten is not None:
 				node.values[i] = rewritten
+			elif isinstance( value, ast.BoolOp ):
+				# a nested boolop operand (`(a or b) or c`) is ALSO
+				# purely a boolean context here, once this outer BoolOp
+				# has reached this plain bool-forcing path itself - see
+				# visit_BoolOp's own is_condition_context comment
+				value.is_condition_context = True
 		self.generic_visit( node )
 		return node
 
@@ -4464,10 +5163,20 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
 		if rewritten is not None:
 			node.test = rewritten
+		elif isinstance( node.test, ast.BoolOp ):
+			# see visit_BoolOp's own is_condition_context comment - `z if
+			# (x or y) else w`'s own `(x or y)` must stay plain-bool, not
+			# get value-coalesced
+			node.test.is_condition_context = True
 		self.generic_visit( node )
 		return node
 
 	def visit_Assert( self, node: ast.Assert ) -> list[ast.stmt]:
+		if isinstance( node.test, ast.BoolOp ):
+			# see visit_BoolOp's own is_condition_context comment -
+			# `assert x or y, msg` must stay plain-bool, not get value-
+			# coalesced
+			node.test.is_condition_context = True
 		self.generic_visit( node )
 		if node.msg is None:
 			self.discovery.fail(
@@ -4576,11 +5285,134 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return False
 		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
 
+	def _try_fold_match_type( self, node: ast.Match ) -> list[ast.stmt]|None:
+		''' rewrite: `match type(<Name>): case ConcreteClass(binding): ...
+		case _: ...` - compile-time ARM SELECTION for a bare-Name subject
+		whose own static type is concrete (most usefully, a generic
+		method's own type-parameter-typed parameter/local, once
+		monomorphization has bound it to a concrete type) - same "declines
+		on the still-abstract body, folds once T is concrete" discipline
+		as _try_fold_is_rc_if (this pass runs once against the shared,
+		abstract body, where a generic T is still its own unbound TypeVar
+		and this correctly declines, and again against the monomorphized
+		copy's own deep-copied body once T is bound - see
+		resolve_function_body's own docstring), just for `match` instead
+		of `if`. This is a DIFFERENT rewrite from _rewrite_type_is_
+		comparison/visit_Match's own ordinary handling below: those require
+		the subject's static type to already be a TaggedUnion (a real,
+		tagged runtime value); this one is for the OPPOSITE case, a
+		non-union concrete type, where there is nothing to check at
+		runtime at all - the whole match collapses to exactly one arm's
+		own statements at compile time, no `ast.If`/Cmp left behind.
+
+		Two DIFFERENT kinds of "not yet" have to be told apart here, unlike
+		_try_fold_is_rc_if (whose own decline just lets visit_If's ordinary
+		machinery harmlessly re-visit compiler.is_rc(T) as a plain,
+		unrecognized Call - a no-op, never an error, since nothing else in
+		this class attaches any meaning to is_rc outside the fold):
+		visit_Match's own ordinary (TaggedUnion-only) handling below is
+		NOT that forgiving - the moment it can't determine the subject's
+		type, or determines it isn't a union, it calls discovery.fail()
+		OUTRIGHT (a real, PERMANENT error), because rewrite 2 (ordinary
+		match desugaring) is documented as substitution-INDEPENDENT and
+		was never meant to be retried on a second pass. So when the
+		subject genuinely IS `type(<Name>)` and Name's type is still an
+		unbound TypeVar - the one case that's certain to resolve cleanly
+		once monomorphization binds it - this returns the node COMPLETELY
+		UNTOUCHED (`[node]`, not None) rather than falling through, so
+		none of visit_Match's ordinary machinery ever sees it on this
+		pass at all. That's safe for the exact same reason _try_fold_is_
+		rc_if's own second pass is (see resolve_function_body's own
+		docstring): a monomorphized copy's body is independently deep-
+		copied, so the held, unvisited node here is simply revisited fresh
+		- and this time foldable - against THAT copy.
+		Every OTHER kind of doubt (not a `type(Name)` subject at all,
+		Name's type genuinely undeterminable for some unrelated reason,
+		Name's type IS a TaggedUnion, or any single arm shaped other than
+		a plain single-capture class pattern or a bare `case _:`) declines
+		with a plain None instead - these reproduce exactly the SAME
+		"cannot determine the match subject's type"/"is not a union type"
+		errors visit_Match's ordinary handling already gives `match
+		type(...)` today (never a supported shape before this rewrite
+		either), not a new regression. Once the shape is confirmed to
+		apply on a genuinely concrete, non-union type, though, this IS
+		authoritative - a concrete type with no covering arm is a real,
+		reported error (see the no-wildcard branch below), not a silent
+		no-op. '''
+		subject_expr = self._type_call_subject( node.subject )
+		if subject_expr is None or not isinstance( subject_expr, ast.Name ):
+			return None
+		subj_type = self._type_of_expr( subject_expr )
+		if isinstance( subj_type, TypeVar ):
+			return [ node ] # still abstract - hold unvisited for the monomorphized copy's own second pass, see docstring
+		if subj_type is None:
+			return None # genuinely undeterminable for some other reason - not this rewrite's doubt to resolve
+		spec = self.resolver._as_specialization( subj_type )
+		base = spec.base if spec is not None else subj_type
+		if isinstance( base, TaggedUnion ):
+			return None # `match type(x):` for a real union isn't a shape anything supports, before or after this rewrite - decline to the same pre-existing error
+		winning_stmts: list[ast.stmt]|None = None
+		winning_bind: str|None = None
+		for case in node.cases:
+			pattern = case.pattern
+			if isinstance( pattern, ast.MatchAs ) and pattern.pattern is None and pattern.name is None:
+				# a true, UNNAMED wildcard (case _:) - always matches. A
+				# NAMED bare pattern (case leftover:) is deliberately NOT
+				# treated as a wildcard here: it would mean binding the
+				# whole `type(other)` VALUE, and this compiler has no
+				# runtime type-object value to bind it to (see
+				# type_resolver.py's own "no runtime reflection/RTTI"
+				# comment, ~line 4090) - decline the whole fold instead of
+				# guessing what that should mean
+				winning_stmts = case.body
+				break
+			if not (
+				isinstance( pattern, ast.MatchClass ) and not pattern.kwd_patterns and not pattern.kwd_attrs
+				and len( pattern.patterns ) == 1 and isinstance( pattern.patterns[0], ast.MatchAs ) and pattern.patterns[0].pattern is None
+			):
+				return None # not a plain single-capture class pattern (or a named wildcard, handled above) - decline entirely, don't partially fold
+			leaf_type = self._try_resolve_callable_namespace( pattern.cls )
+			if leaf_type is None:
+				return None
+			if self.resolver._same_type( leaf_type, subj_type ):
+				winning_stmts = case.body
+				winning_bind = pattern.patterns[0].name
+				break
+		if winning_stmts is None:
+			self.discovery.fail( f'match type(...): no arm covers {getattr( subj_type, "qualname", subj_type )} for this instantiation: {ast.unparse(node)}', node )
+			return []
+		folded: list[ast.stmt] = []
+		if winning_bind is not None and winning_bind != subject_expr.id:
+			# subject already IS exactly the matched concrete type - no
+			# payload to extract (unlike a real TaggedUnion match's own
+			# .data.v_<member> unwrap), just a plain rebind. Skipped
+			# entirely when the capture reuses the subject's OWN name
+			# (`case str(other):` against `match type(other):`) - not just
+			# an optimization: synthesizing `other = other` for an RC-
+			# tracked type would self-alias-assign, and nothing else in
+			# this rewrite needs that statement to exist at all when the
+			# name already denotes the right value with the right type
+			rebind = ast.Assign( targets = [ ast.Name( id = winning_bind, ctx = ast.Store() ) ], value = subject_expr )
+			ast.copy_location( rebind, node )
+			folded.append( rebind )
+		if winning_bind is not None:
+			self.locals[winning_bind] = subj_type
+		for stmt in winning_stmts:
+			result = self.visit( stmt )
+			if isinstance( result, list ):
+				folded.extend( result )
+			elif result is not None:
+				folded.append( result )
+		return folded
+
 	def visit_Match( self, node: ast.Match ) -> list[ast.stmt]:
+		folded = self._try_fold_match_type( node )
+		if folded is not None:
+			return folded
 		unique = self._label_id
 		self._label_id += 1
 		subj_name = f'__match_subj_{unique}'
-		subj_assign = ast.Assign( targets = [ ast.Name( id = subj_name, ctx = ast.Store() ) ], value = self.generic_visit_expr( node.subject ))
+		subj_assign = ast.Assign( targets = [ ast.Name( id = subj_name, ctx = ast.Store() ) ], value = self.visit( node.subject ))
 		ast.copy_location( subj_assign, node )
 		# two attributes lowering.py's own _stmt_Assign reads (getattr(...,
 		# default), same bridging technique visit_Call's own resolved_callee
@@ -4637,7 +5469,23 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# exact same resolved member objects (identity matters - see
 		# _resolve_case_member's own comment on "owner is not base").
 		subj_type = self.locals.get( subj_name )
-		base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+		# _as_specialization, not a bare isinstance(subj_type, Specialization) -
+		# subj_type can now be an EAGERLY-MONOMORPHIZED concrete union (e.g.
+		# csv.reader()'s return type, once resolve_declared_types has run for
+		# it) rather than a bare Specialization wrapper. Treating that
+		# concrete union as `base` directly is wrong: _resolve_case_member
+		# below matches each case pattern's Owner (`Result.Ok`) against the
+		# ABSTRACT class's own member objects (textual patterns are always
+		# resolved through the abstract, generic `Result`, never through a
+		# concrete specialization) - `members` must come from that SAME
+		# abstract base or every case fails to match its own pattern by
+		# identity (confirmed via a real repro: a second, independently-
+		# compiled call site sharing the same already-monomorphized callee
+		# silently dropped one match arm's whole body - see
+		# resolve_declared_types's own docstring for why the return type is
+		# no longer reliably a bare Specialization here)
+		spec = self.resolver._as_specialization( subj_type )
+		base = spec.base if spec is not None else subj_type
 		members = self._resolved_union_members( subj_type, base ) if isinstance( base, TaggedUnion ) else []
 		last_is_wildcard = bool( node.cases ) and isinstance( node.cases[-1].pattern, ast.MatchAs ) and node.cases[-1].pattern.pattern is None
 		last_guaranteed = last_is_wildcard
@@ -4853,6 +5701,16 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# records before raising, same trap 876fdc0 already fixed for
 			# `self.foo()` - this is the same gap, just for an ordinary
 			# extracted payload binding instead of the `self` parameter).
+			# Same fix independently also closes a second gap: without a
+			# self.locals entry, a later `if v is not None:` inside the same
+			# case body couldn't recognize v as a narrowable union-typed
+			# name (_is_none_narrowing_shape's own _type_of_expr call
+			# returned None for it), silently skipping the narrowing an
+			# ordinary local would get - confirmed via a real compile:
+			# `match r: case Result.Ok(v): if v is not None: x = v` (v:
+			# i32|None) failed to narrow, rejecting `x = v` as
+			# i32|None-into-i32, even though the identical pattern against a
+			# plain `v: i32|None = ...` local already narrowed correctly.
 			self.locals[ pattern.name ] = self._type_of_expr( subj_expr )
 			return test, [ bind ]
 
@@ -4878,7 +5736,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			subj_type = self._type_of_expr( subj_expr )
 			if subj_type is None:
 				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
-			base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+			spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+			base = spec.base if spec is not None else subj_type
 			if not isinstance( base, TaggedUnion ):
 				self.discovery.fail( f'case None: requires a union-typed subject, got {getattr( subj_type, "qualname", subj_type )}: {ast.unparse(pattern)}', node )
 			members = self._resolved_union_members( subj_type, base )
@@ -4892,6 +5751,52 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[none_member.stem] ) ] )
 			ast.copy_location( test, node )
 			return test, []
+
+		if isinstance( pattern, ast.MatchSequence ):
+			# `case (a, b):` / `case Result.Ok((a, b)):` - (a, b) inside a
+			# pattern parses to ast.MatchSequence. Arity is a static,
+			# compile-time fact about the subject's tuple type (checked
+			# below), unlike ast.MatchClass's real runtime tag Cmp, so no
+			# runtime test is needed for it - only each element's own
+			# sub-pattern test, ANDed together (mirrors ast.MatchAs's own
+			# "no test needed" ast.Constant(True) convention above).
+			# subj_expr here is always side-effect-free by construction (a
+			# bare match-subject Name, or an Attribute chain built by
+			# _match_union_member below) - re-lowering it into N synthesized
+			# ast.Subscript reads (one per element, each recursed into
+			# _match_pattern) is safe for exactly that reason, unlike
+			# lowering.py's own plain-assignment tuple-unpacking, which
+			# lowers node.value exactly once since IT can be side-effecting.
+			if any( isinstance( p, ast.MatchStar ) for p in pattern.patterns ):
+				self.discovery.fail( f'starred sequence patterns are not supported: {ast.unparse(pattern)}', node )
+			subj_type = self._type_of_expr( subj_expr )
+			if subj_type is None:
+				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
+			resolved_subj_type = self.resolver.ensure_resolved( subj_type )
+			tuple_type = self.resolver.tuple_storage.tuple_type_for( resolved_subj_type )
+			if tuple_type is None:
+				self.discovery.fail(
+					f'sequence pattern requires a tuple-typed subject, got {getattr( subj_type, "qualname", subj_type )}: {ast.unparse(pattern)}',
+					node,
+				)
+			if len( tuple_type.elem_types ) != len( pattern.patterns ):
+				self.discovery.fail(
+					f'sequence pattern has {len(pattern.patterns)} element(s), tuple has {len(tuple_type.elem_types)}: {ast.unparse(pattern)}',
+					node,
+				)
+			test: ast.expr = ast.Constant( value = True )
+			ast.copy_location( test, node )
+			binds: list[ast.stmt] = []
+			for i, subpattern in enumerate( pattern.patterns ):
+				elem_expr = ast.Subscript( value = subj_expr, slice = ast.Constant( value = i ), ctx = ast.Load() )
+				ast.copy_location( elem_expr, node )
+				elem_test, elem_binds = self._match_pattern( elem_expr, subpattern, node )
+				binds.extend( elem_binds )
+				if not ( isinstance( elem_test, ast.Constant ) and elem_test.value is True ):
+					combined = ast.BoolOp( op = ast.And(), values = [ test, elem_test ] )
+					ast.copy_location( combined, node )
+					test = combined
+			return test, binds
 
 		if not isinstance( pattern, ast.MatchClass ):
 			self.discovery.fail( f'unsupported match pattern: {ast.unparse(pattern)}', node )
@@ -4927,7 +5832,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			subj_type = self._type_of_expr( subj_expr )
 			if subj_type is None:
 				self.discovery.fail( f'cannot determine the match subject\'s type: {ast.unparse(pattern)}', node )
-			base = subj_type.base if isinstance( subj_type, Specialization ) else subj_type
+			spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
+			base = spec.base if spec is not None else subj_type
 			if not isinstance( base, TaggedUnion ):
 				self.discovery.fail( f'{ast.unparse(pattern)}: match subject is not a union type', node )
 			members = self._resolved_union_members( subj_type, base )
@@ -4946,8 +5852,14 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		TypeVars on the abstract base) via monomorphize_class - mirrors
 		visit_Compare's own `x is None` rewrite and
 		_rewrite_tagged_union_truthiness exactly. '''
-		if isinstance( subj_type, Specialization ):
-			return self.resolver.monomorphizer.monomorphize_class( subj_type ).attributes
+		# _as_specialization, not a bare isinstance(subj_type, Specialization) -
+		# subj_type may already be eagerly-monomorphized (resolve_declared_
+		# types) to the concrete union itself, not a Specialization wrapper -
+		# still needs the substituted (not abstract/TypeVar-typed) attrs, same
+		# as the genuine-Specialization case below
+		spec = self.resolver._as_specialization( subj_type )
+		if spec is not None:
+			return self.resolver.monomorphizer.monomorphize_class( spec ).attributes
 		self.resolver.ensure_resolved( base )
 		for attr in base.attributes:
 			self.resolver.ensure_resolved( attr )

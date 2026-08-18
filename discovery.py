@@ -8,9 +8,9 @@ from typing import Any, Callable, Generator, NoReturn
 
 # local imports
 import compile_time_transformer
-from errors import CompileError, ErrorCollector
+from errors import CompileError, ErrorCollector, RedundantCompilationError
 from mpy_types import (
-	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, GeneratorType, Function, Overload,
+	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, FixedArrayType, GeneratorType, Function, Overload,
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
 	Module, _is_covered_by, _overlaps, int_stem_range,
 )
@@ -214,7 +214,14 @@ class Discovery( ast.NodeVisitor ):
 		self.paths: list[Path] = list( paths ) if paths else []
 		if not self.paths:
 			self.paths.append( Path( __file__ ).parent / 'lib' )
-			self.paths.append( Path( '.' ))
+			# resolved, not bare Path('.') - a module found through this entry
+			# would otherwise carry a relative .file while every other module
+			# (including one passed an already-.resolve()'d entry filename)
+			# carries an absolute one, so plain Path equality (e.g.
+			# _check_qualname_collisions' same-file exemption, type_resolver's
+			# _find_module_for) silently treats the same file on disk as two
+			# different ones
+			self.paths.append( Path( '.' ).resolve() )
 		self.active_target = active_target if active_target is not None else _detect_active_target()
 		self.compiler_module = CompilerModule(
 			stem = 'compiler',
@@ -249,6 +256,7 @@ class Discovery( ast.NodeVisitor ):
 		self._callables: dict[str,CallableType] = {}
 		self._closures: dict[str,ClosureType] = {}
 		self._tuples: dict[str,TupleType] = {}
+		self._fixed_arrays: dict[str,FixedArrayType] = {}
 
 		# lazily detected the first time a has_library(...) check (decorator
 		# or compiler.has_library(...) expression - see _matches_has_library/
@@ -352,7 +360,7 @@ class Discovery( ast.NodeVisitor ):
 		try:
 			body()
 		except CompileError:
-			pass
+			target.broken = True
 		finally:
 			target.resolve = None
 
@@ -618,6 +626,10 @@ class Discovery( ast.NodeVisitor ):
 		found = self.find_name_or_none( name )
 		if found is None:
 			self.fail( f'name {name!r} is not defined', ctx )
+		if found.broken:
+			# the real error was already recorded once, at the point this
+			# name's own creation/resolution failed - see Name.broken
+			raise RedundantCompilationError()
 		return found
 
 	def visit( self, node: ast.AST ) -> Any:
@@ -637,30 +649,56 @@ class Discovery( ast.NodeVisitor ):
 	# and inspects whatever comes back.
 
 	def visit_Expr( self, node: ast.Expr ) -> None:
-		# module-level compiler directives like
+		# module-level (or class-body) compiler directives like
 		# `compiler.require_header('pthread.h')` — recognized textually
 		# (same pattern as _is_compiler_target_call), not by actually
 		# resolving the `compiler` module
-		if isinstance( node.value, ast.Call ):
+		if (
+			isinstance( node.value, ast.Call )
+			and isinstance( node.value.func, ast.Attribute )
+			and isinstance( node.value.func.value, ast.Name )
+			and node.value.func.value.id == 'compiler'
+			and node.value.func.attr == 'require_header'
+		):
 			call = node.value
-			if (
-				isinstance( call.func, ast.Attribute )
-				and isinstance( call.func.value, ast.Name )
-				and call.func.value.id == 'compiler'
-			):
-				if call.func.attr == 'require_header':
-					if len( call.args ) != 1 or call.keywords:
-						self.fail( f'compiler.require_header(...) takes exactly one argument: {ast.unparse(node)}', node )
-					arg = call.args[0]
-					if not ( isinstance( arg, ast.Constant ) and isinstance( arg.value, str )):
-						self.fail( f'compiler.require_header(...) argument must be a string literal: {ast.unparse(node)}', node )
-					self.required_headers.add( arg.value )
-				return
-		# otherwise: a bare expression statement at module level that isn't a
-		# compiler directive — silently ignore (same as generic_visit, which
-		# would recurse into child nodes but find nothing useful this pass needs)
+			if len( call.args ) != 1 or call.keywords:
+				self.fail( f'compiler.require_header(...) takes exactly one argument: {ast.unparse(node)}', node )
+			arg = call.args[0]
+			if not ( isinstance( arg, ast.Constant ) and isinstance( arg.value, str )):
+				self.fail( f'compiler.require_header(...) argument must be a string literal: {ast.unparse(node)}', node )
+			self.required_headers.add( arg.value )
+			return
+		if isinstance( node.value, ast.Constant ):
+			# a bare literal (a module/class docstring, or a `...` stub
+			# placeholder) has no side effect either way it's read - silently
+			# ignoring it matches ordinary Python, where evaluating a lone
+			# literal statement is a no-op
+			return
+		# neither a recognized directive nor an inert literal: this compiler
+		# never executes a module/class body as code (main() is the only
+		# real entry point - see ARCHITECTURE.md), so a bare expression
+		# statement here - `print(...)`, `some_call()`, `x.y` - can never
+		# run. This used to fall through silently (same as generic_visit),
+		# so a call like this would compile clean and then vanish from the
+		# generated program with zero diagnostic. Reject it instead, same as
+		# every other statement kind this scan already rejects for being
+		# unreachable/meaningless here (AugAssign, loops, ...)
+		self.fail( f'unsupported statement here: {ast.unparse(node)}', node )
 
 	def visit_Name( self, node: ast.Name ) -> Name:
+		# node.resolved_type - the same compiler-synthesized-code escape
+		# hatch lowering.py's own _lower_compiler_cast/_try_resolve_
+		# namespace already use (see their own comments) - lets a
+		# synthesized ANNOTATION reference a concrete Type object directly,
+		# bypassing ordinary by-name scope resolution entirely. Needed for
+		# a monomorphized generic class specifically: its own .stem is
+		# still the ABSTRACT template's bare name (e.g. 'Box', not
+		# 'Box[i32]') - an ordinary find_name(node.id) lookup there
+		# resolves to the WRONG (abstract) class, not this concrete
+		# specialization, which has no real source-level spelling at all
+		resolved = getattr( node, 'resolved_type', None )
+		if resolved is not None:
+			return resolved
 		assert isinstance( node.ctx, ast.Load ), f'invalid context on {node=}' # internal invariant - Load is the only context an expression-position Name can have
 		name = self.find_name( node.id, node )
 		assert isinstance( name, Name ), f'invalid {name=} from {node=}' # internal invariant - every scope entry is a Name
@@ -726,7 +764,39 @@ class Discovery( ast.NodeVisitor ):
 		# actually needed (Lowering._find_module_for, once something
 		# schedules one of this union's synthesized member constructors,
 		# not just reads its tag/data fields directly).
-		ordered = sorted( operands, key = lambda t: t.qualname )
+		#
+		# operands are flattened here (any operand that is ITSELF an
+		# anonymous union - t.file is None, never a real user `@union class`
+		# - contributes its own leaves instead of itself) and deduped by
+		# qualname before sorting. Needed for e.g. Result[T,E].unwrap_or's
+		# own `T|None` return annotation: ordinary AST-level parsing already
+		# flattens a literal `T|None` into the two operands [T, NoneType]
+		# before either is resolved (this class's own visit_BinOp/
+		# _flatten_union above), but that flattening can't see through a
+		# TypeVar - monomorphize.py's substitute_type_params substitutes T
+		# with a concrete type AFTER that AST-level flattening already ran,
+		# so when T is itself bound to an Optional (e.g. i32|None), the
+		# substituted operand list becomes [i32|None, NoneType] - one
+		# already-a-union operand plus a second, redundant NoneType. Without
+		# flattening here, that nested union was kept as a single opaque
+		# member whose OWN qualname already contains '|', producing a
+		# doubled "NoneType" in the outer key (e.g.
+		# "intrinsics.NoneType|intrinsics.NoneType|intrinsics.i32") instead
+		# of collapsing to the correct, flat "intrinsics.NoneType|
+		# intrinsics.i32" - confirmed via a real compile of
+		# Result[i32|None,str].unwrap_or(), which failed with exactly that
+		# doubled-NoneType mismatch against the (correctly flat) Ok-payload
+		# type before this fix.
+		flattened: list[Type] = []
+		for operand in operands:
+			if isinstance( operand, TaggedUnion ) and operand.file is None:
+				flattened.extend( attr.type for attr in operand.attributes )
+			else:
+				flattened.append( operand )
+		deduped: dict[str,Type] = {}
+		for operand in flattened:
+			deduped.setdefault( operand.qualname, operand )
+		ordered = sorted( deduped.values(), key = lambda t: t.qualname )
 		key = '|'.join( t.qualname for t in ordered )
 		if union := self._unions.get( key ):
 			return union
@@ -749,7 +819,7 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType|GeneratorType:
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType|FixedArrayType|GeneratorType:
 		# move[T]/copy[T] are compiler syntax, not a real generic lookup -
 		# recognized textually here the same way @move is recognized
 		# textually as a decorator name in _parse_function, rather than
@@ -761,6 +831,21 @@ class Discovery( ast.NodeVisitor ):
 			if node.value.id == 'move':
 				return self._get_or_create_move( inner )
 			return self._get_or_create_copy( inner )
+
+		# Volatile[T] is compiler syntax too, but UNLIKE move/copy above it's
+		# deliberately not modeled as a wrapper Type: a Volatile[T] value
+		# must keep behaving as an ordinary T everywhere (arithmetic,
+		# comparisons, overload matching) - only its C declaration differs -
+		# so it resolves transparently to T itself here (every caller of
+		# discovery.visit() sees a plain T, with nothing further to unwrap).
+		# The few sites that need to know a local was declared Volatile[T]
+		# (currently just lowering.py's _stmt_AnnAssign) peek at the raw
+		# annotation AST node themselves, rather than this method threading
+		# a side-channel flag back through its Type-only return type.
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Volatile':
+			if isinstance( node.slice, ast.Tuple ):
+				self.fail( f'Volatile[...] takes exactly one type argument: {ast.unparse(node)}', node )
+			return self.visit( node.slice )
 
 		# Callable[[Arg1,Arg2,...], Ret] - also compiler syntax (see
 		# PLAN_CALLABLE.md), recognized the same textual way as move/copy
@@ -863,6 +948,27 @@ class Discovery( ast.NodeVisitor ):
 		base = self.visit( node.value )
 		type_params = getattr( base, 'type_params', None )
 		if not type_params:
+			# ElemType[N] where N is a bare positive integer constant, and
+			# ElemType isn't itself generic - SYNTAX.md's "Fixed-Size Inline
+			# Array (inside @struct): u16[32], u8[8]", not a generic type
+			# argument (a genuine generic subscript's own slice is always a
+			# TYPE expression, an ast.Name/Attribute/Subscript/BinOp, never a
+			# bare int Constant - so this can never misfire against a real
+			# generic instantiation; every actual one already returned above
+			# via the type_params-truthy path this branch is the `else` of).
+			# See FixedArrayType's own docstring for why this is recognized
+			# here (right where a bad subscript would otherwise unconditionally
+			# fail) but restricted to @cstruct/@cunion FIELD position only -
+			# enforced by the two call sites that matter (_make_annotation_
+			# resolver for class/module-level AnnAssign, and _parse_function's
+			# parameter/return-type resolution), not here (this method has no
+			# notion of "which position is this annotation in").
+			if ( isinstance( base, Type ) and isinstance( node.slice, ast.Constant )
+					and isinstance( node.slice.value, int ) and not isinstance( node.slice.value, bool ) ):
+				count = node.slice.value
+				if count <= 0:
+					self.fail( f'fixed-size array count must be a positive integer, got {count}: {ast.unparse(node)}', node )
+				return self._get_or_create_fixed_array( base, count )
 			self.fail( f'{base.qualname} is not generic, cannot subscript it', node )
 
 		slice_node = node.slice
@@ -937,6 +1043,24 @@ class Discovery( ast.NodeVisitor ):
 		)
 		self._tuples[key] = tt
 		return tt
+
+	def _get_or_create_fixed_array( self, elem_type: Type, count: int ) -> FixedArrayType:
+		# key mirrors _get_or_create_tuple_type's own qualname convention -
+		# see FixedArrayType's own docstring for why this is a distinct kind
+		# from an ordinary generic Specialization
+		key = f'{elem_type.qualname}[{count}]'
+		if fa := self._fixed_arrays.get( key ):
+			return fa
+		fa = FixedArrayType(
+			stem = key,
+			qualname = key,
+			file = None,
+			line = None,
+			elem_type = elem_type,
+			count = count,
+		)
+		self._fixed_arrays[key] = fa
+		return fa
 
 	def _get_or_create_closure_type( self, arg_types: list[Type], return_type: Type ) -> ClosureType:
 		key = f'Closure[[{",".join( a.qualname for a in arg_types )}],{return_type.qualname}]'
@@ -1083,7 +1207,7 @@ class Discovery( ast.NodeVisitor ):
 			self.fail( f'module {package!r} not found', node )
 		for alias in node.names:
 			#print( f'{self.module_stack[-1].qualname=} {package=} {node.level=} {node.module=} {alias.name=}' )
-			item = mod.names.get( alias.name )
+			item = mod.get_local_or_raise( alias.name )
 			if not item:
 				self.fail( f'module {package} does not export {alias.name!r}', node )
 			scope.add_name( alias.asname or alias.name, item )
@@ -1149,9 +1273,34 @@ class Discovery( ast.NodeVisitor ):
 				with ( self.scope_context( scope ) if scope is not module else nullcontext() ):
 					var_obj.type = self.visit( annotation )
 					self._reject_bare_interface_value_type( var_obj.type, annotation, var_obj.qualname )
+					self._reject_fixed_array_outside_struct_field( var_obj.type, scope, annotation, var_obj.qualname )
 		def resolve() -> None:
 			self._resolve_guarded( var_obj, body )
 		return resolve
+
+	def _reject_fixed_array_outside_struct_field( self, t: 'Type|None', scope: 'Module|ClassLike|Function', node: ast.AST, context: str ) -> None:
+		''' a FixedArrayType (`u8[8]`-style fixed-size inline array - see its
+		own docstring) is only a legal field annotation on a plain @cstruct/
+		@cunion - never a module-level global, an RCClass/@interface field
+		(both are always heap-allocated/pointer-accessed, and this fix's own
+		zero-fill-only construction path is scoped to the plain-value stack-
+		construction compound-literal shape, not the RCClass/@interface `->
+		field = value;` per-field ASSIGNMENT shape, which cannot legally
+		target a C array at all), or a @union/@enum member (neither has
+		plain data fields in this sense). Checked at every annotation-
+		resolution site that can produce a FixedArrayType (this one for
+		module/class-level AnnAssign; _parse_function's parameter/return-type
+		resolution has its own identical call), rather than letting a bad
+		usage silently reach emission and produce invalid C. '''
+		if not isinstance( t, FixedArrayType ):
+			return
+		if isinstance( scope, ( CStruct, CUnion )) and not ( isinstance( scope, CStruct ) and scope.is_interface ):
+			return
+		self.fail(
+			f'{context}: a fixed-size inline array type ({t.qualname}) is only allowed as a plain @cstruct/@cunion field, '
+			f'not here: {ast.unparse(node)}',
+			node,
+		)
 
 	def _reject_bare_interface_value_type( self, t: 'Type|None', node: ast.AST, context: str ) -> None:
 		''' an @interface CStruct is never a plain value type - self,
@@ -1177,6 +1326,39 @@ class Discovery( ast.NodeVisitor ):
 				f'only Ptr[{t.stem}]/ConstPtr[{t.stem}]: {ast.unparse(node)}',
 				node,
 			)
+
+	def _reject_non_c_type_on_extern_signature( self, t: 'Type|None', node: ast.AST, context: str ) -> None:
+		''' an @extern function's foreign C symbol has no notion of this
+		compiler's own RC-managed objects or synthesized tagged unions - only
+		a genuine plain C value crosses that boundary correctly. Allowlisted
+		(not denylisted) deliberately: this codebase's own is_rc()/
+		is_rc_pointer() ladder (mpy_types.py's own comment on Type.is_rc)
+		documents three separate real bugs from exactly the denylist failure
+		mode - a new Type kind silently defaulting to "safe" because nothing
+		added it to the reject list. A plain C value is one of: Scalar
+		(i32/u8/.../bool/NoneType/...), @cstruct/@cunion (CStruct/CUnion),
+		a raw foreign C type (CType, e.g. lib/posix/pthread.py's pthread_t,
+		already used by value as a real extern parameter), a C enum (CEnum),
+		or a function-pointer signature (CallableType, Ptr[Callable[...]]) -
+		anything else (TaggedUnion's tag+payload struct has no foreign-ABI
+		counterpart at all; RCClass is heap-allocated with this compiler's
+		own ObjectHeader prefix, unsafe even though it happens to already be
+		pointer-shaped in the generated C; tuple[...]/Iterator[T]/generic
+		containers are all RC-backed the same way) is rejected. Ptr[T]/
+		ConstPtr[T] are unwrapped recursively first - a pointer to a bad type
+		is exactly as unsafe as the bad type itself (e.g. Ptr[Ptr[str]]). '''
+		leaf = t
+		while isinstance( leaf, Specialization ) and isinstance( leaf.base, Scalar ) and leaf.base.stem in ( 'Ptr', 'ConstPtr' ):
+			leaf = leaf.args[0]
+		if isinstance( leaf, ( Scalar, CStruct, CUnion, CType, CEnum, CallableType )):
+			return
+		qualname = getattr( leaf, 'qualname', leaf )
+		self.fail(
+			f'{context}: {qualname} cannot cross an @extern boundary - only a plain C value type (a scalar, '
+			f'@cstruct/@cunion, a raw C type, a C enum, a function pointer, or Ptr[T]/ConstPtr[T] to one of '
+			f'those) is allowed here: {ast.unparse(node)}',
+			node,
+		)
 
 	def visit_Assign( self, node: ast.Assign ) -> Name|None:
 		scope = self.scope_stack[-1]
@@ -1220,10 +1402,18 @@ class Discovery( ast.NodeVisitor ):
 				# into the shared intrinsic Scalar's own .names, resolved
 				# eagerly (the RHS function must already be def'd earlier
 				# in the same file, same top-to-bottom limitation
-				# _parse_type_alias already has)
+				# _parse_type_alias already has). The RHS may also be a
+				# generic specialization (`i32.__add__ = i__add__i[i32]`) -
+				# stored as the raw Specialization, NOT monomorphized here:
+				# Monomorphizer needs discovery/schedule/union_storage/
+				# tuple_storage, none of which exist yet at this (parse)
+				# stage - see lowering.py's _find_dunder_for_arg/_find_method
+				# and type_resolver.py's _attr_lookup_callable, the three
+				# places that monomorphize a Specialization found here
+				# on first actual use instead
 				value = self.visit( node.value )
-				if not isinstance( value, Function ):
-					self.fail( f'{ast.unparse(target)} = ... must assign a function: {ast.unparse(node)}', node )
+				if not isinstance( value, ( Function, Specialization )):
+					self.fail( f'{ast.unparse(target)} = ... must assign a function (or a generic specialization): {ast.unparse(node)}', node )
 				base.add_name( target.attr, value )
 				return None
 			# anything else with an Attribute target falls through to the
@@ -1468,7 +1658,17 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		try:
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			# scope.add_name already ran above, so class_obj.resolve would
+			# otherwise be left at its dataclass default of None here - the
+			# exact value that means "already resolved, nothing to do"
+			# everywhere else - indistinguishable from a genuinely fine
+			# class to any later reference. broken makes that reference
+			# raise RedundantCompilationError instead (see Name.broken).
+			class_obj.broken = True
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1490,9 +1690,13 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		self._parse_type_params( node.type_params, class_obj )
+		try:
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1524,21 +1728,31 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		if node.bases:
-			# @interface-ness is NOT inherited implicitly - a CStruct
-			# subclassing an @interface CStruct must itself be declared
-			# @interface too (this method only runs when it was), and its
-			# base must itself already be an @interface CStruct, not a plain
-			# one. Deliberately conservative - see "Subclassing mechanics" in
-			# PLAN_SUBCLASSING_VTABLES_COM.md.
-			base = self.visit( node.bases[0] )
-			if not ( isinstance( base, CStruct ) and base.is_interface ):
-				self.fail( f'{qualname} cannot subclass {base.qualname} (@interface can only subclass another @interface CStruct)', node )
-			class_obj.base = base
+		try:
+			if node.bases:
+				# @interface-ness is NOT inherited implicitly - a CStruct
+				# subclassing an @interface CStruct must itself be declared
+				# @interface too (this method only runs when it was), and its
+				# base must itself already be an @interface CStruct, not a plain
+				# one. Deliberately conservative - see "Subclassing mechanics" in
+				# PLAN_SUBCLASSING_VTABLES_COM.md.
+				base = self.visit( node.bases[0] )
+				if not ( isinstance( base, CStruct ) and base.is_interface ):
+					self.fail( f'{qualname} cannot subclass {base.qualname} (@interface can only subclass another @interface CStruct)', node )
+				class_obj.base = base
 
-		self._parse_type_params( node.type_params, class_obj )
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			# base resolution above runs BEFORE class_obj.resolve is ever
+			# assigned below - a failure here would otherwise leave .resolve
+			# at its dataclass default of None, indistinguishable from
+			# "already resolved fine" to anything checking `.resolve is
+			# None` (see _parse_ClassDef_CEnum's own comment for the general
+			# shape of this landmine)
+			class_obj.broken = True
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1560,9 +1774,13 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		self._parse_type_params( node.type_params, class_obj )
+		try:
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1584,9 +1802,13 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		self._parse_type_params( node.type_params, class_obj )
+		try:
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1611,17 +1833,24 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
-		if node.bases:
-			# resolved eagerly, in the enclosing scope, exactly like Python
-			# itself requires the base to already exist when this statement runs
-			base = self.visit( node.bases[0] )
-			if not isinstance( base, RCClass ):
-				self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)', node )
-			class_obj.base = base
+		try:
+			if node.bases:
+				# resolved eagerly, in the enclosing scope, exactly like Python
+				# itself requires the base to already exist when this statement runs
+				base = self.visit( node.bases[0] )
+				if not isinstance( base, RCClass ):
+					self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)', node )
+				class_obj.base = base
 
-		self._parse_type_params( node.type_params, class_obj )
+			self._parse_type_params( node.type_params, class_obj )
 
-		unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			# base resolution above runs BEFORE class_obj.resolve is ever
+			# assigned below - see _parse_ClassDef_Interface's own comment
+			# for why that makes a failure here otherwise invisible
+			class_obj.broken = True
+			raise
 
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
@@ -1742,28 +1971,59 @@ class Discovery( ast.NodeVisitor ):
 		available = linker_c.has_symbol( cc, lib, symbol )
 		return available != negate
 
-	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None]:
-		# @extern('lib', 'symbol') or @extern('lib', 'symbol', header='<name>')
+	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,tuple[str,...]]:
+		# @extern('lib', 'symbol') or @extern('lib', 'symbol', header='<name>', dll='<name>'|['<name>', ...])
 		# 'lib' is the .lib/.so name to link against, except the literal
 		# 'c' which means the platform C runtime rather than a real file on
 		# disk - that distinction is a future emitter/linker's job to act
-		# on, not this parse step's
+		# on, not this parse step's. 'dll' is an unrelated, independent
+		# concern from 'lib': bare filename(s) of RUNTIME dll(s) this
+		# symbol needs loadable (e.g. 'tcl86t.dll') - not necessarily
+		# findable in the same directory as the .lib/.so 'lib' names (a
+		# vendored/3rd-party library's import lib and its runtime DLL can
+		# live in entirely different directories, e.g. a Python install's
+		# tcl86t.lib under .../tcl/ vs tcl86t.dll under .../DLLs/). A
+		# single string or a list/tuple of strings - a real DLL often has
+		# its OWN further DLL dependencies (e.g. tcl86t.dll also needs
+		# zlib1.dll), and those need bundling too, but the compiler
+		# deliberately does NOT scan for them automatically (see
+		# mpy_types.Function.extern_dlls's own comment on why: no reliable
+		# way to tell "needed vendored file" apart from "system DLL that
+		# must never be bundled" without a maintained blacklist) - the
+		# author lists everything actually needed, explicitly, including
+		# choosing to leave out something like VCRUNTIME140.dll if it's
+		# assumed already present on target machines. Declared per-function
+		# (same granularity as 'lib'/'header') so the compiler never has to
+		# guess which libs need bundling at all - system DLLs like
+		# kernel32/user32 simply never declare one - see mpy.py's post-link
+		# bundling step, which copies exactly the dll names collected from
+		# functions that were actually reached (compiler.extern_dlls).
 		if not isinstance( decorator, ast.Call ) or len( decorator.args ) < 2 or len( decorator.args ) > 3:
-			self.fail( f'@extern(lib, symbol[, header=...]) requires 2 or 3 positional arguments: {ast.unparse(decorator)}', node )
+			self.fail( f"@extern(lib, symbol[, header=...][, dll=...]) requires 2 or 3 positional arguments: {ast.unparse(decorator)}", node )
 		lib_arg, symbol_arg = decorator.args[0], decorator.args[1]
 		if not ( isinstance( lib_arg, ast.Constant ) and isinstance( lib_arg.value, str )):
 			self.fail( f'@extern(...) lib name must be a string literal: {ast.unparse(decorator)}', node )
 		if not ( isinstance( symbol_arg, ast.Constant ) and isinstance( symbol_arg.value, str )):
 			self.fail( f'@extern(...) symbol name must be a string literal: {ast.unparse(decorator)}', node )
 		header: str|None = None
+		dlls: tuple[str,...] = ()
 		for kw in decorator.keywords:
 			if kw.arg == 'header':
 				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
 					self.fail( f'@extern(...) header= must be a string literal: {ast.unparse(decorator)}', node )
 				header = kw.value.value
+			elif kw.arg == 'dll':
+				if isinstance( kw.value, ast.Constant ) and isinstance( kw.value.value, str ):
+					dlls = ( kw.value.value, )
+				elif isinstance( kw.value, ( ast.List, ast.Tuple ) ) and all(
+					isinstance( elt, ast.Constant ) and isinstance( elt.value, str ) for elt in kw.value.elts
+				):
+					dlls = tuple( elt.value for elt in kw.value.elts )
+				else:
+					self.fail( f"@extern(...) dll= must be a string literal or a list/tuple of string literals: {ast.unparse(decorator)}", node )
 			else:
 				self.fail( f'@extern(...) unexpected keyword argument {kw.arg!r}: {ast.unparse(decorator)}', node )
-		return lib_arg.value, symbol_arg.value, header
+		return lib_arg.value, symbol_arg.value, header, dlls
 
 	def _parse_function(
 		self,
@@ -1804,9 +2064,11 @@ class Discovery( ast.NodeVisitor ):
 		is_virtual = False
 		is_inline = False
 		is_property = False
+		is_fallible_arithmetic = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
+		extern_dlls: tuple[str,...] = ()
 		for decorator in node.decorator_list or []:
 			if self._is_compiler_target_call( decorator ):
 				if not self._matches_active_target( decorator ):
@@ -1832,8 +2094,10 @@ class Discovery( ast.NodeVisitor ):
 					is_inline = True
 				case 'property':
 					is_property = True
+				case 'fallible_arithmetic':
+					is_fallible_arithmetic = True
 				case 'extern':
-					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
+					extern_lib, extern_symbol, extern_header, extern_dlls = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
 					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
 
@@ -1898,6 +2162,12 @@ class Discovery( ast.NodeVisitor ):
 			all_params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
 			if len( all_params ) != 1 or node.args.vararg is not None or node.args.kwarg is not None:
 				self.fail( f'@property {qualname} must take exactly `self` and no other parameters', node )
+
+		if is_fallible_arithmetic and is_abstract:
+			# nothing ever actually runs to produce a Result to consume -
+			# same "no coherent meaning" reasoning as @inline+@abstractmethod
+			# above
+			self.fail( f'@fallible_arithmetic {qualname} cannot also be @abstractmethod - no body to produce a Result', node )
 
 		if is_inline:
 			# PLAN_INLINE.md - each of these interacts with the real call
@@ -1979,9 +2249,11 @@ class Discovery( ast.NodeVisitor ):
 			is_overload = is_overload,
 			is_inline = is_inline,
 			is_property = is_property,
+			is_fallible_arithmetic = is_fallible_arithmetic,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,
+			extern_dlls = extern_dlls,
 		)
 		if extern_header is not None:
 			self.required_headers.add( extern_header )
@@ -1990,7 +2262,16 @@ class Discovery( ast.NodeVisitor ):
 		self._parse_type_params( node.type_params, fn )
 
 		scope = self.scope_stack[-1]
-		existing = scope.names.get( fn.stem )
+		# a raw peek, not a "consume this known-good member" lookup (unlike
+		# get_local_or_raise's other call sites) - existing here feeds
+		# overload-group-formation branching below, which already handles
+		# a plain Function vs an Overload vs nothing at all; a BROKEN
+		# existing Function is deliberately left to that same branching
+		# rather than special-cased, since folding it into a fresh group as
+		# a (broken) sibling implementation is the same "own resolve()
+		# fails, doesn't taint the group" behavior _resolve_guarded already
+		# gives every other overload member
+		existing = scope.get_local( fn.stem )
 
 		# group membership is settled before the resolver is created (below) so
 		# it can be threaded straight into the closure, the same way module/
@@ -2183,7 +2464,31 @@ class Discovery( ast.NodeVisitor ):
 							is_copy = isinstance( param_type, Copy )
 							if is_move or is_copy:
 								param_type = param_type.inner
+								if fn.is_inline:
+									# @inline splicing binds self/every parameter
+									# zero-copy, always treated as borrowed at the
+									# splice boundary (lowering.py's
+									# _lower_inline_call - "no _cfg_assign/incref
+									# here, deliberately... borrowed, no incref at
+									# the boundary") - a move[T]/copy[T] param's
+									# real ownership-transfer/prologue-incref
+									# semantics have never been reasoned through
+									# for that boundary (see inline_splice_
+									# aliasing_return_incref_bug_fixed.md: even
+									# plain borrowed aliasing returns needed a
+									# real fix here). Reject outright rather than
+									# risk a silent refcount bug - same "no
+									# coherent meaning yet" reasoning the
+									# @inline+@move whole-function check below
+									# already uses
+									self.fail(
+										f'@inline {fn.qualname} parameter {arg.arg!r} cannot be move[T]/copy[T] - not supported',
+										arg,
+									)
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
+							self._reject_fixed_array_outside_struct_field( param_type, fn, arg, f'{fn.qualname} parameter {arg.arg!r}' )
+							if fn.extern_lib is not None:
+								self._reject_non_c_type_on_extern_signature( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
 								stem = arg.arg,
 								qualname = self._get_qualname( arg.arg ),
@@ -2220,6 +2525,9 @@ class Discovery( ast.NodeVisitor ):
 						if fn.node.returns is not None:
 							fn.return_type = self.visit( fn.node.returns )
 							self._reject_bare_interface_value_type( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
+							self._reject_fixed_array_outside_struct_field( fn.return_type, fn, fn.node.returns, f'{fn.qualname} return type' )
+							if fn.extern_lib is not None:
+								self._reject_non_c_type_on_extern_signature( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
 						else:
 							fn.return_type = self.get_none_type()
 			# set self done *before* touching any overload siblings below - a

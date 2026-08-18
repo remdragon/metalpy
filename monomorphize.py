@@ -5,6 +5,7 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
+from errors import RedundantCompilationError
 from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType, GeneratorType, by_value_dependency
 from tuple_storage import TupleStorage
 from union_storage import UnionStorage, build_member_constructor
@@ -304,6 +305,13 @@ class Monomorphizer:
 		base = spec.base
 		if base.resolve is not None:
 			base.resolve()
+		if base.broken:
+			# already reported at the point base's own resolution failed -
+			# without this, a fully-failed base (base.parameters is None)
+			# would silently substitute ZERO parameters into the
+			# monomorphized copy below instead of failing at all (see
+			# mpy_types.Name.broken)
+			raise RedundantCompilationError()
 		type_params = base.type_params
 		substituted_cls = base.cls
 		if not type_params and base.cls is not None and base.cls.type_params:
@@ -480,6 +488,14 @@ class Monomorphizer:
 			base = spec.base
 			if base.resolve is not None:
 				base.resolve()
+			if base.broken:
+				# already reported at the point base's own resolution
+				# failed - without this, a half-populated base (only some
+				# of its body's members registered, per the class-body-scan
+				# gap _parse_ClassDef_* now guards against) would silently
+				# build a wrong-shape specialization instead of failing at
+				# all (see mpy_types.Name.broken)
+				raise RedundantCompilationError()
 			for attr in base.attributes:
 				self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's own identical resolve loop
 			if isinstance( base, TaggedUnion ):

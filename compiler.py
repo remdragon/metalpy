@@ -6,7 +6,7 @@ import queue
 # local imports:
 import ir
 from discovery import Discovery, is_stub_body
-from errors import CompileError
+from errors import CompileError, RedundantCompilationError
 from lowering import Lowering
 from mpy_types import Module, Function, Overload, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization, by_value_dependency
 from type_resolver import TypeResolver
@@ -61,6 +61,12 @@ class Compiler:
 		self.lowering._compile_now = self._lower
 
 		self.functions: list[LoweredFunction] = []
+		# id(Function) -> its own already-built LoweredFunction - guards
+		# against the SAME underlying Function object being lowered+
+		# emitted twice through two different schedule()-tracked unit
+		# shapes (a Specialization wrapper vs the bare, already-
+		# monomorphized Function) - see _lower's own comment on this
+		self._lowered_functions: dict[int,LoweredFunction] = {}
 		self.rcclasses: list[RCClass] = []
 		self.cstructs: list[CStruct] = []
 		self.cunions: list[CUnion] = []
@@ -74,9 +80,36 @@ class Compiler:
 		# mpy_types.Function.extern_lib) - a future emitter/linker's call
 		# on what to do with that, not this registry's
 		self.extern_libs: dict[str,set[str]] = {}
+		# runtime DLLs declared via @extern(..., dll='<name>'|[...]),
+		# registered the same way and at the same point as extern_libs
+		# above - only ever populated from functions that were actually
+		# reached/lowered, never a static/declared-anywhere set, so a
+		# program that never calls into a given vendored library doesn't
+		# get its DLL bundled. Bare filenames (e.g. 'tcl86t.dll'), not
+		# paths - mpy.py's post-link bundling step is what turns this into
+		# actual file copies. See mpy_types.Function.extern_dlls's own
+		# comment for why this is independent from extern_lib (different
+		# directories on a real machine, in general) and deliberately not
+		# auto-derived from scanning a DLL's own import table.
+		self.extern_dlls: set[str] = set()
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
-		module = self.disco.import_code( code, filename, scope )
+		# pass the entry module's own eventual qualname through as `package` so
+		# disco.import_code registers it in disco.modules BEFORE scanning its
+		# body, same as any nested `import X`/`from X import Y` reaches
+		# (discovery.py's own import_code comment on the `package is not None`
+		# branch) - without this, a self-import inside the entry module itself
+		# (`import foo` written in foo.py, the file being compiled) can't find
+		# itself here yet, falls through to a fresh file-system lookup, and
+		# re-parses the same source as an independent second Module - real
+		# "already defined" collisions for every top-level name, further
+		# masked into a mismatched-Module-identity cascade downstream
+		# (type_resolver.py's _find_module_for) by self.paths' own unresolved
+		# relative '.' entry not matching this file's already-absolute path.
+		# Mirrors discovery.py's own non-folding qualname formula - an entry
+		# file is never a folding (__init__.py-style) module in practice
+		package = f'{scope}.{filename.stem}' if scope else filename.stem
+		module = self.disco.import_code( code, filename, scope, package = package )
 		# entry modules aren't registered in disco.modules on their own (that's
 		# keyed by import package name, for nested imports reached via `import
 		# X`) - stage 2 needs to be able to find any module by file (see
@@ -85,7 +118,8 @@ class Compiler:
 		return module
 
 	def import_file( self, filename: Path, scope: str|None = None ) -> Module:
-		module = self.disco.import_file( filename, scope )
+		package = f'{scope}.{filename.stem}' if scope else filename.stem
+		module = self.disco.import_file( filename, scope, package = package )
 		self.disco.modules[module.qualname] = module
 		return module
 
@@ -181,8 +215,8 @@ class Compiler:
 			mod = self.disco.import_name( module_qualname )
 		except FileNotFoundError:
 			return
-		unit = mod.names.get( attr_name )
-		if unit is None:
+		unit = mod.get_local( attr_name )
+		if unit is None or unit.broken:
 			return
 		self._enqueue( unit )
 		self._drain()
@@ -208,10 +242,34 @@ class Compiler:
 				unit.base.resolve()
 			self.type_resolver.resolve_function_body( unit.base ) # rewrites 1/2 against the abstract, shared-until-now body - see resolve_function_body's own docstring
 			monomorphized = self.type_resolver.ensure_resolved( unit ) # swaps the Specialization for its real, substituted Function - own deep-copied body (see Monomorphizer.monomorphized_function)
+			# a monomorphized generic method can be reached through TWO
+			# different unit "shapes" that schedule() (type_resolver.py)
+			# tracks as unrelated units - this Specialization wrapper
+			# (id(unit), scheduled by e.g. lowering.py's own generic-
+			# construction inference) AND the bare, already-monomorphized
+			# Function itself (id(monomorphized), scheduled by ordinary
+			# method-call lowering against an already-concrete receiver -
+			# e.g. a synthesized $$__new__ body calling self.__init__(...)
+			# once self's own type is already the concrete monomorphized
+			# class, no Specialization needed). schedule()'s own _seen
+			# dedup is id-based, so it can't catch this - both make it
+			# through independently. Guard on the ACTUAL underlying Function
+			# object (id(monomorphized), the thing that would actually get
+			# lowered+emitted) rather than id(unit), so either shape
+			# reaching here first "wins" and the other is a cheap no-op -
+			# confirmed by a real repro: a monomorphized RCClass's own
+			# __init__ emitted twice (duplicate C symbol) once a
+			# synthesized $$__new__ started calling it via an ordinary
+			# self.__init__(...) AST statement instead of raw IR
+			cached = self._lowered_functions.get( id( monomorphized ))
+			if cached is not None:
+				assert isinstance( cached, LoweredFunction )
+				return cached
 			self.type_resolver.resolve_function_body( monomorphized ) # rewrite 3 (generic-call resolution) against THIS copy's own body, now that its own type params are concretely bound
 			instructions = self.lowering.lower_function( monomorphized )
 			lf = LoweredFunction( function = monomorphized, instructions = instructions )
 			self.functions.append( lf )
+			self._lowered_functions[ id( monomorphized ) ] = lf
 			return lf
 		elif isinstance( unit, Specialization ) and isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
 			monomorphized = self.lowering.monomorphize_class( unit )
@@ -221,6 +279,21 @@ class Compiler:
 				if monomorphized not in self.rcclasses:
 					self.rcclasses.append( monomorphized )
 				self.type_resolver._synthesize_rcclass_destructor( monomorphized )
+				# NOT _synthesize_rcclass_constructor here - unlike the
+				# destructor (needed for EVERY RCClass, since any instance,
+				# however constructed, might need releasing), $$__new__ is
+				# only ever looked up from _try_lower_construct_call's own
+				# eager, self-sufficient call (lowering.py), which already
+				# guarantees its own availability - triggering it here too,
+				# unconditionally for every registered class, synthesizes
+				# (and thus references - the header.vtable assignment
+				# inside it) a constructor for classes NEVER actually
+				# constructed by any reachable user code, e.g. an abstract
+				# base only ever used polymorphically through a subclass -
+				# confirmed by a real regression: it made emitter_c.py
+				# start emitting that abstract base's own vtable instance
+				# (a real static object, referenced by the unwanted $$__new__),
+				# which a dedicated test asserts must never be emitted
 				self._validate_interface_vtable( monomorphized )
 				self._schedule_rcclass_vtable_impls( monomorphized )
 			elif isinstance( monomorphized, CStruct ):
@@ -239,14 +312,23 @@ class Compiler:
 					self.tagged_unions.append( monomorphized )
 			return monomorphized
 		elif isinstance( unit, Function ):
+			# same cross-shape dedup as the Specialization+Function branch
+			# above - a bare Function reached here may be the identical
+			# underlying object a Specialization wrapper already lowered
+			cached = self._lowered_functions.get( id( unit ))
+			if cached is not None:
+				assert isinstance( cached, LoweredFunction )
+				return cached
 			if unit.resolve is not None:
 				unit.resolve()
 			self.type_resolver.resolve_function_body( unit )
 			instructions = self.lowering.lower_function( unit )
 			if unit.extern_lib is not None:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
+				self.extern_dlls.update( unit.extern_dlls )
 			lf = LoweredFunction( function = unit, instructions = instructions )
 			self.functions.append( lf )
+			self._lowered_functions[ id( unit ) ] = lf
 			return lf
 		elif isinstance( unit, RCClass ):
 			if unit.resolve is not None:
@@ -258,6 +340,9 @@ class Compiler:
 			if unit not in self.rcclasses:
 				self.rcclasses.append( unit )
 				self.type_resolver._synthesize_rcclass_destructor( unit )
+				# NOT _synthesize_rcclass_constructor here - see the
+				# identical comment on the Specialization+RCClass branch
+				# above
 			self._validate_interface_vtable( unit )
 			self._schedule_rcclass_vtable_impls( unit )
 			return unit
@@ -320,6 +405,16 @@ class Compiler:
 		elif isinstance( unit, Variable ):
 			if unit.resolve is not None:
 				unit.resolve()
+			if unit.broken:
+				# unit's own type-resolution (discovery.py's _make_value_
+				# resolver) already failed and recorded the error once -
+				# resolve_global_init/lower_global below would independently
+				# re-visit the SAME init expression and report the identical
+				# failure a second time (see resolve_global_init's own
+				# comment, which already silences its OWN half of this exact
+				# duplicate but explicitly documents lower_global producing
+				# the other half)
+				raise RedundantCompilationError()
 			# a global's init expression needs the same construction-call
 			# pre-resolution an ordinary function body gets from resolve_
 			# function_body (below, Function branch) before lowering ever
@@ -397,13 +492,25 @@ class Compiler:
 				)
 
 	def _virtual_signatures_match( self, a: Function, b: Function ) -> bool:
-		if a.return_type is not b.return_type:
+		# _same_type, not raw `is` - an override's own declared type and its
+		# base method's own declared type can be two different objects for
+		# the identical type (one eagerly monomorphized via some OTHER call
+		# reference resolving it first, the other still a bare
+		# Specialization) - same duality TypeResolver._same_type exists to
+		# handle elsewhere. Confirmed via a real repro: TypeResolver.
+		# resolve_declared_types eagerly monomorphizing a plain declared
+		# parameter/return type wherever a Function gets resolved for a
+		# real call made an @virtual override's own signature-match check
+		# here start seeing false positives, since only ONE side of the
+		# comparison (whichever method something else happened to call
+		# first) had been through that path by the time this runs.
+		if not self.type_resolver._same_type( a.return_type, b.return_type ):
 			return False
 		a_params = a.parameters or []
 		b_params = b.parameters or []
 		if len( a_params ) != len( b_params ):
 			return False
-		return all( ap.type is bp.type for ap, bp in zip( a_params, b_params ))
+		return all( self.type_resolver._same_type( ap.type, bp.type ) for ap, bp in zip( a_params, b_params ))
 
 	def _schedule_interface_vtable_impls( self, cls: CStruct ) -> None:
 		# every slot's ACTUAL implementing Function (found by walking cls's

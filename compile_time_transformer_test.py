@@ -6,6 +6,8 @@ import unittest
 import compile_time_transformer as ctt
 import linker_c
 import test_support
+from compiler import Compiler
+from discovery import Discovery
 
 
 def _fold( src: str, active_target: dict[str,object], detect_cc = None ) -> str:
@@ -25,6 +27,24 @@ class ConstantFoldingTests( unittest.TestCase ):
 
 	def test_binop_division_by_zero_left_unfolded( self ) -> None:
 		self.assertEqual( _fold( 'x = 1 // 0', {} ), 'x = 1 // 0' )
+		self.assertEqual( _fold( 'x = 1 % 0', {} ), 'x = 1 % 0' )
+
+	def test_binop_floordiv_mod_are_c_truncating_not_python_floor( self ) -> None:
+		# this compiler's runtime // and % are C-style truncating (quotient
+		# toward zero, remainder sign matches the dividend), NOT Python's
+		# own floor-based semantics - folding must match whatever the
+		# runtime opcode would compute for the same operands (see
+		# lib/math.py's floordiv_i64/floormod_i64 comments)
+		self.assertEqual( _fold( 'x = -7 % 2', {} ), 'x = -1' )
+		self.assertEqual( _fold( 'x = 7 % -2', {} ), 'x = 1' )
+		self.assertEqual( _fold( 'x = -7 // 2', {} ), 'x = -3' )
+		self.assertEqual( _fold( 'x = 7 // -2', {} ), 'x = -3' )
+		self.assertEqual( _fold( 'x = -7 // -2', {} ), 'x = 3' )
+		self.assertEqual( _fold( 'x = -7 % -2', {} ), 'x = -1' )
+		# positive operands: C-truncating and Python-floor coincide, matches
+		# the pre-fix behavior exactly
+		self.assertEqual( _fold( 'x = 7 // 2', {} ), 'x = 3' )
+		self.assertEqual( _fold( 'x = 7 % 2', {} ), 'x = 1' )
 
 	def test_binop_non_constant_operand_left_unfolded( self ) -> None:
 		self.assertEqual( _fold( 'x = y + 1', {} ), 'x = y + 1' )
@@ -397,6 +417,77 @@ class TopLevelFoldingTests( unittest.TestCase ):
 		position relative to other top-level statements '''
 		src = "if True:\n\ta = 1\nb = 2"
 		self.assertEqual( self._fold_top( src, {} ), 'a = 1\nb = 2' )
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class RealCompileFoldConsistencyTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' the property that actually matters for // and % constant folding:
+	a folded (compile-time-constant) expression and the SAME expression
+	computed at runtime (operands hidden behind named locals, so this
+	pass can't fold it) must produce IDENTICAL results - fold-vs-no-fold
+	must never change program behavior. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_folded_and_runtime_mod_floordiv_agree_on_negative_operands( self ) -> None:
+		self.assert_programs_run([
+			( 'folded_negative_dividend_mod', '''
+def main() -> i32:
+	with compiler.panic_arithmetic('x'):
+		m: i32 = -7 % 2
+	if m != -1:
+		return 1
+	return 0
+''' ),
+			( 'runtime_negative_dividend_mod', '''
+def main() -> i32:
+	a: i32 = -7
+	b: i32 = 2
+	with compiler.panic_arithmetic('x'):
+		m: i32 = a % b
+	if m != -1:
+		return 1
+	return 0
+''' ),
+			( 'folded_negative_divisor_mod', '''
+def main() -> i32:
+	with compiler.panic_arithmetic('x'):
+		m: i32 = 7 % -2
+	if m != 1:
+		return 1
+	return 0
+''' ),
+			( 'runtime_negative_divisor_mod', '''
+def main() -> i32:
+	a: i32 = 7
+	b: i32 = -2
+	with compiler.panic_arithmetic('x'):
+		m: i32 = a % b
+	if m != 1:
+		return 1
+	return 0
+''' ),
+			( 'folded_negative_dividend_floordiv', '''
+def main() -> i32:
+	with compiler.panic_arithmetic('x'):
+		q: i32 = -7 // 2
+	if q != -3:
+		return 1
+	return 0
+''' ),
+			( 'runtime_negative_dividend_floordiv', '''
+def main() -> i32:
+	a: i32 = -7
+	b: i32 = 2
+	with compiler.panic_arithmetic('x'):
+		q: i32 = a // b
+	if q != -3:
+		return 1
+	return 0
+''' ),
+		])
 
 
 if __name__ == '__main__':

@@ -58,12 +58,11 @@ class FloatBehaviorTests( unittest.TestCase ):
 			# already has whatever the generated boilerplate itself needs too
 			# (kernel32 on a no-CRT Windows build - windows._console/sys.exit
 			# are compiler-forced reachable, see Compiler.force_reachable)
-			libs = set( compiler.extern_libs )
 			ldflags = ''
-			for lib in sorted( libs ):
+			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
@@ -762,12 +761,17 @@ def main() -> i32:
 	# --- signed INT_MIN/-1 is defined per mode (item 2) ---------------------
 
 	def test_int_min_div_checked_panics( self ) -> None:
-		# checked/panic: INT_MIN / -1 (and INT_MIN % -1) is an OverflowError
+		# checked/panic: INT_MIN / -1 (and INT_MIN % -1) is an OverflowError.
+		# i8::MIN constructed directly (-128), not via the old i8(128)
+		# bit-reinterpretation idiom - that literal no longer bypasses the
+		# range check (128 doesn't fit i8's real value range, confirmed
+		# with the user as a deliberate, wanted change - see lowering_
+		# test.py's test_narrowing_literal_cast_is_range_checked)
 		self._assert_program_panics( '''
 def main() -> i32:
 	with compiler.panic_arithmetic("ov"):
 		neg_one: i8 = -1
-		mn: i8 = i8(128)
+		mn: i8 = -128
 		q: i8 = mn // neg_one
 	return 0
 ''' )
@@ -775,7 +779,7 @@ def main() -> i32:
 def main() -> i32:
 	with compiler.panic_arithmetic("ov"):
 		neg_one: i8 = -1
-		mn: i8 = i8(128)
+		mn: i8 = -128
 		m: i8 = mn % neg_one
 	return 0
 ''' )
@@ -798,8 +802,8 @@ def sdiv( a: i8, b: i8 ) -> Result[i8, ZeroDivisionError]:
 		return Result.Ok( a // b )
 
 def main() -> i32:
-	mn: i8 = i8(128)
-	neg_one: i8 = i8(255)
+	mn: i8 = -128
+	neg_one: i8 = -1
 	wq: Result[i8, ZeroDivisionError] = wdiv( mn, neg_one )
 	match wq:
 		case Result.Ok( v ):

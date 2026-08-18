@@ -27,31 +27,10 @@ def _decode_ascii_utf16z( ptr: Ptr[u16], max_len: usize ) -> str:
 	return str._from_owned_cstr( buf, buf_size ).unwrap( 'windows zone name: unexpectedly non-ASCII' )
 
 
-def _field_ptr_u16( struct_ptr: Ptr[None], byte_offset: usize ) -> Ptr[u16]:
-	''' compiler.addrof(...) only accepts a bare local-variable name, not a
-	field expression (e.g. compiler.addrof(tz_info.TimeZoneKeyName_0) is a
-	hard compile error - verified directly this session), so there is no
-	direct way to get a pointer AT one of DynamicTimeZoneInformation's
-	decomposed u16 fields. Callers instead already hold a Ptr[None] to the
-	whole struct (see get_local_timezone_name's own tz_info, which is
-	heap-allocated rather than a bare local for an unrelated reason - see
-	its own comment) - this just advances it by byte_offset. See kernel32.
-	py's own _TZNAME_OFFSET/_TZKEYNAME_OFFSET comment for how each offset
-	is derived and kept in sync with the struct. '''
-	raw: Ptr[u8] = compiler.cast( Ptr[u8], struct_ptr )
-	with compiler.wrap_arithmetic:
-		field_bytes: Ptr[u8] = raw + byte_offset
-	return compiler.cast( Ptr[u16], field_bytes )
-
-
 def get_local_timezone_name() -> str:
 	from windows.kernel32 import (
 		DynamicTimeZoneInformation,
 		GetDynamicTimeZoneInformation,
-		_TZNAME_SIZE,
-		_TZNAME_OFFSET,
-		_TZKEYNAME_SIZE,
-		_TZKEYNAME_OFFSET,
 	)
 
 	# DynamicTimeZoneInformation is large (432 bytes, decomposed from three
@@ -82,10 +61,15 @@ def get_local_timezone_name() -> str:
 
 	result: str = 'UTC'
 	if status != 0xFFFFFFFF:
-		opaque_ptr: Ptr[None] = compiler.cast( Ptr[None], tz_info )
-		if tz_info.TimeZoneKeyName_0 != 0:
-			key_ptr: Ptr[u16] = _field_ptr_u16( opaque_ptr, _TZKEYNAME_OFFSET )
-			win_name: str = _decode_ascii_utf16z( key_ptr, _TZKEYNAME_SIZE )
+		if tz_info.TimeZoneKeyName[0] != 0:
+			key_ptr: Ptr[u16] = compiler.addrof( tz_info.TimeZoneKeyName )
+			# element count derived from the field's own declared size
+			# (compiler.sizeof(x.arr) // compiler.sizeof(elem)), not a
+			# hand-copied constant that could drift out of sync with
+			# TimeZoneKeyName's real u16[128] declaration
+			with compiler.panic_arithmetic( 'field size and element size are both compile-time constants, never zero' ):
+				keyname_len: usize = compiler.sizeof( tz_info.TimeZoneKeyName ) // compiler.sizeof( u16 )
+			win_name: str = _decode_ascii_utf16z( key_ptr, keyname_len )
 			# windows_zones.to_iana() was always meant to back this lookup
 			# (see lib/windows_zones.py) - opt-in: a program that never
 			# calls windows_zones.install() gets None back and this
@@ -99,8 +83,10 @@ def get_local_timezone_name() -> str:
 			else:
 				result = win_name
 		else:
-			name_ptr: Ptr[u16] = _field_ptr_u16( opaque_ptr, _TZNAME_OFFSET )
-			result = _decode_ascii_utf16z( name_ptr, _TZNAME_SIZE )
+			name_ptr: Ptr[u16] = compiler.addrof( tz_info.StandardName )
+			with compiler.panic_arithmetic( 'field size and element size are both compile-time constants, never zero' ):
+				name_len: usize = compiler.sizeof( tz_info.StandardName ) // compiler.sizeof( u16 )
+			result = _decode_ascii_utf16z( name_ptr, name_len )
 
 	sys.free( raw )
 	return result
