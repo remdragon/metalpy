@@ -41,34 +41,37 @@ def malloc(
 
 @extern( 'c', 'memset' )
 def memset(
-	ptr: Ptr[u8],
-	value: u8,
+	# void*/int/void* (not Ptr[u8]/u8) to match libc's real `void*
+	# memset(void*, int, size_t)` exactly - see free()'s comment above for
+	# why (GCC's -Wbuiltin-declaration-mismatch)
+	ptr: Ptr[None],
+	value: i32,
 	length: usize,
-) -> None:
+) -> Ptr[None]:
 	...
 
 @extern( 'c', 'memcpy' )
 def memcpy(
-	dest: Ptr[u8],
-	src: ConstPtr[u8],
+	dest: Ptr[None],
+	src: ConstPtr[None],
 	n: usize,
-) -> Ptr[u8]:
+) -> Ptr[None]:
 	...
 
 @extern( 'c', 'memcmp' )
 def memcmp(
-	a: ConstPtr[u8],
-	b: ConstPtr[u8],
+	a: ConstPtr[None],
+	b: ConstPtr[None],
 	n: usize,
 ) -> i32:
 	...
 
 @extern( 'c', 'memmove' )
 def memmove(
-	dest: Ptr[u8],
-	src: ConstPtr[u8],
+	dest: Ptr[None],
+	src: ConstPtr[None],
 	n: usize,
-) -> Ptr[u8]:
+) -> Ptr[None]:
 	...
 
 @extern( 'c', 'readlink' )
