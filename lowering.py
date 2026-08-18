@@ -1816,7 +1816,33 @@ class FunctionLowering:
 					except CompileError as e:
 						self.lowering.discovery.fail( str( e ), fn.node )
 
-					if self._cfg.current_epilogue_label() is not None or self._cfg.used_shared_epilogue_label() or self._cfg.cancel_flags():
+					# current_epilogue_label() (called with no operand below) is
+					# only a real question when the body can actually fall off
+					# the end into this closing brace (_body_may_fall_off_the_
+					# end() - False whenever the last top-level statement is
+					# already a literal `return`, which always terminates).
+					# Calling it unconditionally is self-fulfilling: merely
+					# asking it "is anything still live" captures whatever
+					# entry it finds (current_epilogue_label()'s own captured=
+					# True/_any_shared_label_used side effect) and manufactures
+					# a label for a fall-through that can never happen - e.g. a
+					# function whose sole `return x` returns its own live local
+					# directly (label=None, return_()'s inline unwind already
+					# handled everything, per _stmt_Return) left that local's
+					# entry on the stack uncancelled, and this check alone used
+					# to conjure a dead "L__epilogue__: release(x); return
+					# __return_value;" block after the real, unconditional
+					# `return x;` - confirmed via $$__new__ and any ordinary
+					# `def f() -> SomeRC: x = SomeRC(...); return x`.
+					# used_shared_epilogue_label()/cancel_flags() still catch
+					# every case that genuinely needs the ladder built (an
+					# EARLIER return already committed a goto into it, or a
+					# defer/errdefer flag needs its init spliced in) regardless
+					# of whether the body can fall off the end.
+					if (
+						( self.lowering._body_may_fall_off_the_end( fn.node.body ) and self._cfg.current_epilogue_label() is not None )
+						or self._cfg.used_shared_epilogue_label() or self._cfg.cancel_flags()
+					):
 						# some return (or OrJump) already jumped into the
 						# shared epilogue ladder (_stmt_Return/_consume_checked_
 						# result, via current_epilogue_label()), or nothing did
