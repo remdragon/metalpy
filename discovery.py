@@ -686,6 +686,19 @@ class Discovery( ast.NodeVisitor ):
 		self.fail( f'unsupported statement here: {ast.unparse(node)}', node )
 
 	def visit_Name( self, node: ast.Name ) -> Name:
+		# node.resolved_type - the same compiler-synthesized-code escape
+		# hatch lowering.py's own _lower_compiler_cast/_try_resolve_
+		# namespace already use (see their own comments) - lets a
+		# synthesized ANNOTATION reference a concrete Type object directly,
+		# bypassing ordinary by-name scope resolution entirely. Needed for
+		# a monomorphized generic class specifically: its own .stem is
+		# still the ABSTRACT template's bare name (e.g. 'Box', not
+		# 'Box[i32]') - an ordinary find_name(node.id) lookup there
+		# resolves to the WRONG (abstract) class, not this concrete
+		# specialization, which has no real source-level spelling at all
+		resolved = getattr( node, 'resolved_type', None )
+		if resolved is not None:
+			return resolved
 		assert isinstance( node.ctx, ast.Load ), f'invalid context on {node=}' # internal invariant - Load is the only context an expression-position Name can have
 		name = self.find_name( node.id, node )
 		assert isinstance( name, Name ), f'invalid {name=} from {node=}' # internal invariant - every scope entry is a Name

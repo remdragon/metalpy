@@ -61,6 +61,12 @@ class Compiler:
 		self.lowering._compile_now = self._lower
 
 		self.functions: list[LoweredFunction] = []
+		# id(Function) -> its own already-built LoweredFunction - guards
+		# against the SAME underlying Function object being lowered+
+		# emitted twice through two different schedule()-tracked unit
+		# shapes (a Specialization wrapper vs the bare, already-
+		# monomorphized Function) - see _lower's own comment on this
+		self._lowered_functions: dict[int,LoweredFunction] = {}
 		self.rcclasses: list[RCClass] = []
 		self.cstructs: list[CStruct] = []
 		self.cunions: list[CUnion] = []
@@ -224,10 +230,34 @@ class Compiler:
 				unit.base.resolve()
 			self.type_resolver.resolve_function_body( unit.base ) # rewrites 1/2 against the abstract, shared-until-now body - see resolve_function_body's own docstring
 			monomorphized = self.type_resolver.ensure_resolved( unit ) # swaps the Specialization for its real, substituted Function - own deep-copied body (see Monomorphizer.monomorphized_function)
+			# a monomorphized generic method can be reached through TWO
+			# different unit "shapes" that schedule() (type_resolver.py)
+			# tracks as unrelated units - this Specialization wrapper
+			# (id(unit), scheduled by e.g. lowering.py's own generic-
+			# construction inference) AND the bare, already-monomorphized
+			# Function itself (id(monomorphized), scheduled by ordinary
+			# method-call lowering against an already-concrete receiver -
+			# e.g. a synthesized $$__new__ body calling self.__init__(...)
+			# once self's own type is already the concrete monomorphized
+			# class, no Specialization needed). schedule()'s own _seen
+			# dedup is id-based, so it can't catch this - both make it
+			# through independently. Guard on the ACTUAL underlying Function
+			# object (id(monomorphized), the thing that would actually get
+			# lowered+emitted) rather than id(unit), so either shape
+			# reaching here first "wins" and the other is a cheap no-op -
+			# confirmed by a real repro: a monomorphized RCClass's own
+			# __init__ emitted twice (duplicate C symbol) once a
+			# synthesized $$__new__ started calling it via an ordinary
+			# self.__init__(...) AST statement instead of raw IR
+			cached = self._lowered_functions.get( id( monomorphized ))
+			if cached is not None:
+				assert isinstance( cached, LoweredFunction )
+				return cached
 			self.type_resolver.resolve_function_body( monomorphized ) # rewrite 3 (generic-call resolution) against THIS copy's own body, now that its own type params are concretely bound
 			instructions = self.lowering.lower_function( monomorphized )
 			lf = LoweredFunction( function = monomorphized, instructions = instructions )
 			self.functions.append( lf )
+			self._lowered_functions[ id( monomorphized ) ] = lf
 			return lf
 		elif isinstance( unit, Specialization ) and isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
 			monomorphized = self.lowering.monomorphize_class( unit )
@@ -237,6 +267,21 @@ class Compiler:
 				if monomorphized not in self.rcclasses:
 					self.rcclasses.append( monomorphized )
 				self.type_resolver._synthesize_rcclass_destructor( monomorphized )
+				# NOT _synthesize_rcclass_constructor here - unlike the
+				# destructor (needed for EVERY RCClass, since any instance,
+				# however constructed, might need releasing), $$__new__ is
+				# only ever looked up from _try_lower_construct_call's own
+				# eager, self-sufficient call (lowering.py), which already
+				# guarantees its own availability - triggering it here too,
+				# unconditionally for every registered class, synthesizes
+				# (and thus references - the header.vtable assignment
+				# inside it) a constructor for classes NEVER actually
+				# constructed by any reachable user code, e.g. an abstract
+				# base only ever used polymorphically through a subclass -
+				# confirmed by a real regression: it made emitter_c.py
+				# start emitting that abstract base's own vtable instance
+				# (a real static object, referenced by the unwanted $$__new__),
+				# which a dedicated test asserts must never be emitted
 				self._validate_interface_vtable( monomorphized )
 				self._schedule_rcclass_vtable_impls( monomorphized )
 			elif isinstance( monomorphized, CStruct ):
@@ -255,6 +300,13 @@ class Compiler:
 					self.tagged_unions.append( monomorphized )
 			return monomorphized
 		elif isinstance( unit, Function ):
+			# same cross-shape dedup as the Specialization+Function branch
+			# above - a bare Function reached here may be the identical
+			# underlying object a Specialization wrapper already lowered
+			cached = self._lowered_functions.get( id( unit ))
+			if cached is not None:
+				assert isinstance( cached, LoweredFunction )
+				return cached
 			if unit.resolve is not None:
 				unit.resolve()
 			self.type_resolver.resolve_function_body( unit )
@@ -263,6 +315,7 @@ class Compiler:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
 			lf = LoweredFunction( function = unit, instructions = instructions )
 			self.functions.append( lf )
+			self._lowered_functions[ id( unit ) ] = lf
 			return lf
 		elif isinstance( unit, RCClass ):
 			if unit.resolve is not None:
@@ -274,6 +327,9 @@ class Compiler:
 			if unit not in self.rcclasses:
 				self.rcclasses.append( unit )
 				self.type_resolver._synthesize_rcclass_destructor( unit )
+				# NOT _synthesize_rcclass_constructor here - see the
+				# identical comment on the Specialization+RCClass branch
+				# above
 			self._validate_interface_vtable( unit )
 			self._schedule_rcclass_vtable_impls( unit )
 			return unit

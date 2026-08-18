@@ -5925,13 +5925,31 @@ class Tests( unittest.TestCase ):
 		# parameter - a real Incref, same as it would be for an ordinary
 		# local (mirrors assign()'s own is_alias rule via attr_assign())
 		self.assertEqual( kinds, ['FuncStart', 'Incref', 'SetAttr', 'Return', 'FuncEnd'] )
-		# Bar(...) itself: Allocate self uninitialized, call __init__, hand
-		# self off directly (non-fallible - no Result wrapping at all)
+		# Bar(...) itself now collapses to a single call into the
+		# synthesized per-class $$__new__ constructor (mirrors the
+		# destructor's own single call, though $$__new__ is called
+		# directly by name rather than dispatched through the vtable) -
+		# no more inline Allocate/header-init/Call at each construction
+		# site (see type_resolver.py's _synthesize_rcclass_constructor)
 		main_lowered = self.compiler._lower( mod.get_local( 'main' ))
 		main_kinds = [ type( instr ).__name__ for instr in main_lowered.instructions ]
-		self.assertIn( 'Allocate', main_kinds )
+		# Foo() still allocates inline (main_kinds legitimately still has
+		# ONE Allocate for it - Foo has no own __init__, so it goes
+		# through the untouched no-__init__ field=value sugar path,
+		# _lower_allocate_fields, not $$__new__ synthesis at all) - only
+		# Bar's OWN construction is asserted to have collapsed away
+		self.assertFalse( any( type( i ).__name__ == 'Allocate' and i.cls.stem == 'Bar' for i in main_lowered.instructions ))
+		self.assertIn( 'Call', main_kinds )
 		self.assertNotIn( 'JumpIfFalse', main_kinds ) # no Ok/Err branch for a non-fallible __init__
-		allocate = next( i for i in main_lowered.instructions if type( i ).__name__ == 'Allocate' and i.cls.stem == 'Bar' )
+		# the synthesized $$__new__ itself does the alloc - registered
+		# directly into Bar.names (not .methods, unlike a user-declared
+		# method), so looked up via get_local rather than _method
+		bar_cls = mod.get_local( 'Bar' )
+		new_fn = bar_cls.get_local( '$$__new__' )
+		new_lowered = self.compiler._lower( new_fn )
+		new_kinds = [ type( instr ).__name__ for instr in new_lowered.instructions ]
+		self.assertIn( 'Allocate', new_kinds )
+		allocate = next( i for i in new_lowered.instructions if type( i ).__name__ == 'Allocate' and i.cls.stem == 'Bar' )
 		self.assertEqual( allocate.fields, {} ) # self starts fully uninitialized
 
 	def test_fallible_init_shape_has_ok_err_branches( self ) -> None:
@@ -5954,25 +5972,34 @@ class Tests( unittest.TestCase ):
 		lowered = self.compiler._lower( mod.get_local( 'main' ))
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in lowered.instructions ]
-		# JumpIfTrue, not JumpIfFalse - is_err_temp holds is_err()'s own
-		# result, so the jump to the err branch has to fire when it's TRUE.
-		# This assertion previously encoded a real, separate bug
-		# (_emit_fallible_construction emitted JumpIfFalse here, meaning
-		# "not an error -> jump to the error branch", inverted for EVERY
-		# fallible RCClass __init__ in the language - found and fixed while
-		# prototyping the RCClass-subclassing plan's Phase 2 fallible
-		# super().__init__() chaining, unrelated to subclassing itself)
-		self.assertIn( 'JumpIfTrue', kinds ) # is_err() branch on Bar(...)'s own construction result
+		# Bar(...) itself now collapses to a single call into the
+		# synthesized $$__new__ constructor, same as the non-fallible
+		# case - main's own instructions no longer contain any Ok/Err
+		# branch logic at all, that all moved into $$__new__'s own body
+		# (built from ordinary if/return AST now, not hand-spliced raw
+		# IR - see type_resolver.py's _synthesize_rcclass_constructor)
+		self.assertNotIn( 'JumpIfTrue', kinds )
+		self.assertIn( 'Call', kinds )
+		bar_cls = mod.get_local( 'Bar' )
+		new_fn = bar_cls.get_local( '$$__new__' )
+		new_lowered = self.compiler._lower( new_fn )
+		new_kinds = [ type( instr ).__name__ for instr in new_lowered.instructions ]
+		# ordinary `if result.is_err():` lowers to JumpIfFalse (skip the
+		# if-body when false), NOT JumpIfTrue - the polarity the old
+		# hand-spliced _emit_fallible_construction used (and, before its
+		# own fix, got backwards - see git history) is simply a different
+		# implementation detail now that this is ordinary statement
+		# lowering, not raw IR
+		self.assertIn( 'JumpIfFalse', new_kinds )
 		# self decref'd on the OK path (its own original reference dropped
-		# once ownership moves into the Ok payload - see _emit_fallible_
-		# construction's own comment). The Err path no longer decrefs self at
-		# all: it frees self's raw allocation directly (ir.CastWrap+ir.Call
-		# to sys.free) rather than going through the class's ordinary,
-		# shared vtable destructor - see _emit_fallible_construction's own
-		# comment on why a partially-constructed self can never safely go
-		# through that path
-		self.assertIn( 'Decref', kinds )
-		self.assertIn( 'Jump', kinds )
+		# once ownership moves into the Ok payload - see
+		# _synthesize_rcclass_constructor's own Ok-branch comment). The
+		# Err path never decrefs self at all: it frees self's raw
+		# allocation directly (compiler.__raw_free__ - CastWrap+Call to
+		# sys.free) rather than going through the class's ordinary, shared
+		# vtable destructor, since self is only partially constructed there
+		self.assertIn( 'Decref', new_kinds )
+		self.assertIn( 'CastWrap', new_kinds )
 
 	def test_missing_attribute_is_a_compile_error( self ) -> None:
 		code = '\n'.join([
