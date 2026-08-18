@@ -3009,7 +3009,7 @@ class EmitGlobalTests( CompilerTestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		g = self.compiler.globals[0]
 		src = emitter_c.emit_global( g )
-		self.assertEqual( src, 'uint32_t __main__$STD_OUTPUT_HANDLE = -11;' )
+		self.assertEqual( src, 'uint32_t __main__$STD_OUTPUT_HANDLE = (uint32_t)-11;' )
 		self.assertNotIn( '__metalpy_init', src ) # trivial - no init function needed
 
 class EmitGlobalRCClassTests( RCClassTestCase ):

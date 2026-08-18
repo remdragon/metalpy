@@ -1266,6 +1266,13 @@ def _emit_const( c: ir.Const ) -> str:
 		stem = c.type.stem if isinstance( c.type, Scalar ) else None
 		if stem in _WIDE_INT_STEMS:
 			return _emit_wide_int_const( c.value, stem )
+		if stem is not None and _is_unsigned_stem( stem ) and c.value < 0:
+			# a literal conversion like u32(-12) bit-reinterprets straight to a
+			# Const at lowering time (_lower_scalar_cast) rather than emitting a
+			# CastWrap, so there's no cast-emission path to go through here -
+			# cast explicitly or MSVC's /W4 flags the bare negative literal
+			# initializing an unsigned type as C4245
+			return f'({c_type(c.type)}){c.value}'
 		return str( c.value )
 	if c.value is None:
 		return '0' # NOTE: we would like to put 'nullptr' or 'NULL' here but its causing issues
