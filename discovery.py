@@ -819,6 +819,21 @@ class Discovery( ast.NodeVisitor ):
 				return self._get_or_create_move( inner )
 			return self._get_or_create_copy( inner )
 
+		# Volatile[T] is compiler syntax too, but UNLIKE move/copy above it's
+		# deliberately not modeled as a wrapper Type: a Volatile[T] value
+		# must keep behaving as an ordinary T everywhere (arithmetic,
+		# comparisons, overload matching) - only its C declaration differs -
+		# so it resolves transparently to T itself here (every caller of
+		# discovery.visit() sees a plain T, with nothing further to unwrap).
+		# The few sites that need to know a local was declared Volatile[T]
+		# (currently just lowering.py's _stmt_AnnAssign) peek at the raw
+		# annotation AST node themselves, rather than this method threading
+		# a side-channel flag back through its Type-only return type.
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Volatile':
+			if isinstance( node.slice, ast.Tuple ):
+				self.fail( f'Volatile[...] takes exactly one type argument: {ast.unparse(node)}', node )
+			return self.visit( node.slice )
+
 		# Callable[[Arg1,Arg2,...], Ret] - also compiler syntax (see
 		# PLAN_CALLABLE.md), recognized the same textual way as move/copy
 		# above rather than resolved as an ordinary generic base: its own

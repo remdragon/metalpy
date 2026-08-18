@@ -116,6 +116,38 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_annassign_volatile_sets_flag_and_strips_type( self ) -> None:
+		# Volatile[T] resolves transparently to plain T (discovery.py's
+		# visit_Subscript) - the Variable itself carries is_volatile=True,
+		# not a wrapper type, so it keeps behaving as an ordinary usize
+		# everywhere else (see the Volatile[T] design note in _stmt_AnnAssign)
+		code = '\n'.join([
+			'def main() -> None:',
+			'	i: Volatile[usize] = 0',
+			'	return',
+		])
+		usize = self.discovery.get_intrinsics()['usize']
+		none_type = self.discovery.get_none_type()
+		i = Variable( stem = 'i', qualname = 'main.i', file = Path( '__test__.py' ), line = 2, type = usize, is_volatile = True )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = i, src = ir.Const( type = usize, value = 0 )),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_annassign_volatile_rejects_rc_type( self ) -> None:
+		code = '\n'.join([
+			'class Box:',
+			'	v: i32 = 0',
+			'def main() -> None:',
+			'	b: Volatile[Box] = Box()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'Volatile[...] does not support refcounted types' in e for e in self.discovery.errors.errors ))
+
 	def test_augassign_desugars_to_binop_and_assign( self ) -> None:
 		# x += 1 lowers exactly like a hand-written x = x + 1 would - same
 		# AddWrap/Assign shape, honoring the active arithmetic mode

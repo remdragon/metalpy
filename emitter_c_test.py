@@ -1738,6 +1738,83 @@ def main() -> i32:
 ''' ),
 		] )
 
+class VolatileLocalTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for `Volatile[T]` local declarations - the
+	fix for a --release micro-benchmark loop (`for i in range(N): pass`)
+	being dead-code-eliminated by the C compiler under -O2/-O3 (no
+	observable side effects, statically-known trip count). Confirms both
+	that the qualifier actually lands in the generated C, and that a
+	Volatile[T] local otherwise behaves exactly like a plain T everywhere
+	(arithmetic, comparisons, reuse as a for-loop target). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact shape the benchmark needs: pre-declare `i: Volatile[
+			# usize]` before a `for i in range(...)` - _bind_loop_target's
+			# existing "reuse a same-named pre-declared local" path (the
+			# same one str.concat's own `i: usize = 0` uses) picks it up
+			# with no lowering changes of its own, so the loop's induction
+			# variable keeps its is_volatile flag through every iteration
+			( 'volatile_loop_counter_reused_as_for_target', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: Volatile[usize] = 0
+		for i in range( 1000 ):
+			pass
+		if i != 1000:
+			return 1
+		return 0
+''' ),
+			# ordinary arithmetic/comparisons on a Volatile[T] local work
+			# exactly like a plain T - it's a storage qualifier on the
+			# binding, not a distinct type (unlike move[T]/copy[T])
+			( 'volatile_local_arithmetic_and_comparison', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: Volatile[i32] = 10
+		x += 5
+		if x != 15:
+			return 1
+		if not ( x > 10 ):
+			return 2
+		y: i32 = x + 1
+		if y != 16:
+			return 3
+		return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_declaration_is_qualified_volatile_in_generated_c( self ) -> None:
+		self.compiler.import_code( '''
+def main() -> None:
+	i: Volatile[usize] = 0
+	return
+''', Path( '__main__.py' ), scope = None )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+		self.assertIn( 'volatile uintptr_t i', c_source )
+
+	def test_volatile_of_refcounted_type_is_rejected( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+class Box:
+	v: i32 = 0
+
+def main() -> None:
+	b: Volatile[Box] = Box()
+	return
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertTrue( any( 'Volatile[...] does not support refcounted types' in e for e in discovery.errors.errors ))
+
+
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
 		with tempfile.TemporaryDirectory() as tmp:

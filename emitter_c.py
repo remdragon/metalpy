@@ -846,20 +846,22 @@ def _function_pointer_c_type( fn_type: CallableType ) -> tuple[str,list[str]]:
 	params = [ c_type( a ) for a in fn_type.arg_types ]
 	return ret, params
 
-def _declarator( t: Type|None, name: str ) -> str:
+def _declarator( t: Type|None, name: str, *, volatile: bool = False ) -> str:
 	''' "TYPE NAME" for an ordinary parameter/local-variable declaration -
 	except when t is Ptr[Callable[...]], where C's function-pointer syntax
 	is the one declarator shape that ISN'T "prefix type, then name": the
 	name goes INSIDE the parens (RetType (*name)(ParamTypes)), so plain
 	string concatenation of c_type(t) and name can't express it. Scoped to
 	parameter/local declarations only (see PLAN_CALLABLE.md) - not struct
-	fields (nothing needs that yet). '''
+	fields (nothing needs that yet). `volatile` is for Volatile[T] locals
+	(_stmt_AnnAssign) only - never set for a function-pointer declarator. '''
 	fn_type = _callable_ptr_type( t )
+	prefix = 'volatile ' if volatile else ''
 	if fn_type is None:
-		return f'{c_type(t)} {name}'
+		return f'{prefix}{c_type(t)} {name}'
 	ret, params = _function_pointer_c_type( fn_type )
 	params_str = ', '.join( params ) if params else 'void'
-	return f'{ret} (*{name})( {params_str} )'
+	return f'{prefix}{ret} (*{name})( {params_str} )'
 
 def _value_spelling( t: Type ) -> str:
 	''' the C spelling of T's OWN VALUE representation - unlike c_type(),
@@ -2099,14 +2101,14 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# C `{ }` blocks)
 		name = _c_local_name( instr.variable.stem )
 		declared.add( name )
-		return [ f'\t{_declarator( instr.variable.type, name )};' ]
+		return [ f'\t{_declarator( instr.variable.type, name, volatile = instr.variable.is_volatile )};' ]
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
 			name = _c_local_name( instr.dest.stem )
 			if name not in declared:
 				declared.add( name )
-				return [ f'\t{_declarator( instr.dest.type, name )} = {src};' ]
+				return [ f'\t{_declarator( instr.dest.type, name, volatile = instr.dest.is_volatile )} = {src};' ]
 			return [ f'\t{name} = {src};' ]
 		# a global Variable is declared separately at file scope (Phase 7 -
 		# emit_global) - never re-declared here, only assigned
