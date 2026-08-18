@@ -470,6 +470,18 @@ class str:
 		# relies on).
 		return x
 
+	@staticmethod
+	def __call__[T]( x: T ) -> str:
+		# fallback for str(x) on anything that isn't already a str -
+		# defers to x's own __str__() the same way Python's str() does.
+		# Resolves per call site: overload_resolution.py's wildcard
+		# matching picks this only when the concrete str(x: str) overload
+		# above doesn't apply, then lowering.py monomorphizes T from the
+		# real argument type. Fails to compile (not a runtime error - this
+		# compiler has no such thing) for a T with no __str__ of its own,
+		# e.g. a bare i32 literal - use int(x).__str__() for that.
+		return x.__str__()
+
 	def __add__( self, other: str ) -> str:
 		if compiler.target.debug:
 			assert self.__byte_size > 0, 'invalid str instance (byte_size must be >0)'
