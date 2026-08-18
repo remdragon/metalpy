@@ -9797,6 +9797,140 @@ def main() -> i32:
 		] )
 
 
+class MultiLeafGenericDispatchRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' companion to OverloadRealCompileTests' own
+	generic_typevar_fallback_through_runtime_dispatch case: that one covers
+	the EASY sub-case of a generic branch/default of a runtime
+	ConditionalDispatch (exactly one leaf can still reach it, so T is
+	statically knowable). This is the genuinely harder sub-case: a 3+-leaf
+	union where 2 or more DISTINCT leaves both fall through to the SAME
+	generic branch - each needs its own distinct monomorphization, selected
+	by a runtime tag no single Call target can express (this compiler has
+	no vtable/runtime-polymorphic dispatch mechanism anywhere). Fixed by
+	lowering.py's _expand_dispatch_target: splits that ONE ambiguous branch
+	into one new, individually-concrete, individually-monomorphized branch
+	PER leaf, each with its own runtime tag check - a real per-tag dispatch
+	table synthesized at compile time, not just a shortcut for the
+	single-leaf case. Exercises: the generic default covering 2 of 3 leaves
+	(str claimed by a concrete overload, i32+bool both fall through), the
+	generic default covering 2 of 4 leaves (2 concrete overloads, i32+f64
+	fall through), and the SAME 3-leaf shape with the union's leaf order
+	flipped so the generic branch ISN'T the trailing default (a real,
+	explicitly-conditioned middle branch instead) - confirming
+	_expand_dispatch_target's own splicing works whichever position the
+	ambiguous branch started in. Each case actually CALLS every leaf and
+	checks the RIGHT monomorphization ran, not just that it compiles. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'generic_default_spans_two_of_three_leaves', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick( flag: i32 ) -> str|i32|bool:
+	if flag == 0:
+		return 'hi'
+	if flag == 1:
+		return 42
+	return True
+
+def main() -> i32:
+	b: Box = Box()
+	u0: str|i32|bool = pick( 0 )
+	u1: str|i32|bool = pick( 1 )
+	u2: str|i32|bool = pick( 2 )
+	if b.get( u0 ) != 'hi':
+		return 1
+	if b.get( u1 ) != 'generic':
+		return 2
+	if b.get( u2 ) != 'generic':
+		return 3
+	return 0
+''' ),
+			( 'generic_default_spans_two_of_four_leaves', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get( self, x: f64 ) -> str:
+		return 'float!'
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick( flag: i32 ) -> str|i32|bool|f64:
+	if flag == 0:
+		return 'hi'
+	if flag == 1:
+		return 42
+	if flag == 2:
+		return True
+	return 3.5
+
+def main() -> i32:
+	b: Box = Box()
+	u0: str|i32|bool|f64 = pick( 0 )
+	u1: str|i32|bool|f64 = pick( 1 )
+	u2: str|i32|bool|f64 = pick( 2 )
+	u3: str|i32|bool|f64 = pick( 3 )
+	if b.get( u0 ) != 'hi':
+		return 1
+	if b.get( u1 ) != 'generic':
+		return 2
+	if b.get( u2 ) != 'generic':
+		return 3
+	if b.get( u3 ) != 'float!':
+		return 4
+	return 0
+''' ),
+			# same 3-leaf shape as the first case, but the union's own leaf
+			# order is flipped (i32|bool|str instead of str|i32|bool) - the
+			# generic candidate no longer ends up as resolve_call's trailing
+			# default (see overload_resolution.py's own combo-ordering,
+			# which follows the union's leaf order, not any concrete-vs-
+			# generic priority) - it lands as a real, explicitly-conditioned
+			# middle branch instead, confirming _expand_dispatch_target's
+			# splicing works there too, not just for the default slot
+			( 'generic_multi_leaf_branch_not_the_trailing_default', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick( flag: i32 ) -> i32|bool|str:
+	if flag == 0:
+		return 42
+	if flag == 1:
+		return True
+	return 'hi'
+
+def main() -> i32:
+	b: Box = Box()
+	u0: i32|bool|str = pick( 0 )
+	u1: i32|bool|str = pick( 1 )
+	u2: i32|bool|str = pick( 2 )
+	if b.get( u0 ) != 'generic':
+		return 1
+	if b.get( u1 ) != 'generic':
+		return 2
+	if b.get( u2 ) != 'hi':
+		return 3
+	return 0
+''' ),
+		] )
+
+
 class OverloadGenericSubstitutionMatchingRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' overload_resolution.py's own _contains/_intersect/_subtract used a raw
 	`is` identity check to decide whether a call-site argument's type matches
