@@ -6033,6 +6033,18 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			( 'str_call_generic_fallback_uses_own_str_dunder', '''
+def main() -> i32:
+	pi: f64
+	with compiler.wrap_arithmetic:
+		pi = 3.5
+	s: str
+	with compiler.wrap_arithmetic:
+		s = str( pi )
+	if s == '':
+		return 1
+	return 0
+''' ),
 			( 'user_defined_static_call_dunder', '''
 class Converter:
 	@staticmethod
