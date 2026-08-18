@@ -1010,17 +1010,7 @@ def _flatten_into( value: JSONValue, prefix: str, out: dict[str, JSONValue] ) ->
 			while i < n:
 				k: str = obj.key_at( i ).unwrap( 'flatten: index in bounds by construction' )
 				v: JSONValue = obj.value_at( i ).unwrap( 'flatten: index in bounds by construction' )
-				# a ternary expression with a string-concatenation branch
-				# crashes at RUNTIME with a stack overflow - confirmed with a
-				# minimal repro with zero json.py/union involvement (any
-				# ternary mixing a bare-name branch with a str.__add__
-				# branch, in either position). A plain if/else STATEMENT
-				# does not hit this and is used here instead.
-				child_path: str
-				if prefix.byte_len() == 0:
-					child_path = k
-				else:
-					child_path = prefix + str( '.' ) + k
+				child_path: str = k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
 				_flatten_into( v, child_path, out )
 				with compiler.panic_arithmetic( 'walking a dict of known length index-by-index cannot overflow usize' ):
 					i += 1
