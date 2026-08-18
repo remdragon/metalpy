@@ -68,6 +68,8 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.BitOr: '__or__',
 	ast.BitAnd: '__and__',
 	ast.BitXor: '__xor__',
+	ast.LShift: '__lshift__',
+	ast.RShift: '__rshift__',
 }
 
 # forward binop dunder name -> its REFLECTED counterpart, mirroring Python's
@@ -119,6 +121,7 @@ _CHECKED_BINOP_OPCODES: dict[tuple[str,str],type] = {
 	( 'mul', 'checked' ): ir.MulCheck, ( 'mul', 'wrapped' ): ir.MulWrap, ( 'mul', 'saturated' ): ir.MulSaturate,
 	( 'floordiv', 'checked' ): ir.Div, ( 'floordiv', 'wrapped' ): ir.DivWrap, ( 'floordiv', 'saturated' ): ir.DivSaturate,
 	( 'mod', 'checked' ): ir.Mod, ( 'mod', 'wrapped' ): ir.ModWrap, ( 'mod', 'saturated' ): ir.ModSaturate,
+	( 'shl', 'checked' ): ir.ShlCheck, ( 'shl', 'wrapped' ): ir.ShlWrap, ( 'shl', 'saturated' ): ir.ShlSaturate,
 }
 
 # same idea for FLOAT operands - wrap/saturate raw-IEEE add/sub/mul reuse the
@@ -3646,16 +3649,23 @@ class FunctionLowering:
 		self._emit( ir.ConvertCheck( dest = check_dest, operand = operand ))
 		return check_dest
 
-	_BITWISE_OPCODES: dict[str,type] = { 'bitand': ir.BitAnd, 'bitor': ir.BitOr, 'bitxor': ir.BitXor }
+	# ir.Shr (>>) joins these deliberately: right-shift by a valid amount is
+	# always well-defined (this compiler doesn't check shift-amount-exceeds-
+	# width for either direction - a separate, pre-existing, out-of-scope
+	# concern), so it's single-opcode/infallible exactly like the bitwise
+	# ops - unlike << (Shl), which DOES have real Wrap/Check/Saturate
+	# variants (shifting bits out the top is a real, already-modeled
+	# concern) and flows through _lower_compiler_checked_binop instead,
+	# parallel to add/sub/mul.
+	_BITWISE_OPCODES: dict[str,type] = { 'bitand': ir.BitAnd, 'bitor': ir.BitOr, 'bitxor': ir.BitXor, 'rshift': ir.Shr }
 
 	def _lower_compiler_bitwise( self, node: ast.Call, intrinsic_name: str, expected_type: Type|None ) -> ir.Operand:
-		# compiler.bitand/bitor/bitxor(a, b) - the fixed-opcode intrinsics
-		# behind every scalar __and__/__or__/__xor__ dunder (lib/builtins/
-		# __scalar_arith.py). Unlike checked_add/etc, there is only ONE
-		# variant each - ir.BitAnd/BitOr/BitXor have no Wrap/Check/Saturate
-		# forms at all (bitwise ops can't overflow, so there's nothing for
-		# ambient arithmetic mode to ever have ambiguity about) - always
-		# infallible, plain T-returning, no Result involved.
+		# compiler.bitand/bitor/bitxor/rshift(a, b) - the fixed-opcode
+		# intrinsics behind every scalar __and__/__or__/__xor__/__rshift__
+		# dunder (lib/builtins/__scalar_arith.py). Unlike checked_add/etc,
+		# there is only ONE variant each - ir.BitAnd/BitOr/BitXor/Shr have
+		# no Wrap/Check/Saturate forms at all - always infallible, plain
+		# T-returning, no Result involved.
 		if len( node.args ) != 2 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
 		left = self._lower_expr( node.args[0], None )
@@ -10841,7 +10851,8 @@ class FunctionLowering:
 
 			case 'checked_add' | 'wrapped_add' | 'saturated_add' | 'checked_sub' | 'wrapped_sub' | 'saturated_sub' | \
 				'checked_mul' | 'wrapped_mul' | 'saturated_mul' | 'checked_floordiv' | 'wrapped_floordiv' | 'saturated_floordiv' | \
-				'checked_mod' | 'wrapped_mod' | 'saturated_mod' | 'checked_truediv' | 'wrapped_truediv':
+				'checked_mod' | 'wrapped_mod' | 'saturated_mod' | 'checked_truediv' | 'wrapped_truediv' | \
+				'checked_shl' | 'wrapped_shl' | 'saturated_shl':
 				# every compiler.<mode>_<kind>(a, b) intrinsic shares one
 				# lowering - see _lower_compiler_checked_binop and
 				# _CHECKED_BINOP_OPCODES/_CHECKED_FLOAT_BINOP_OPCODES for how
@@ -10859,7 +10870,7 @@ class FunctionLowering:
 				result = self._lower_compiler_checked_convert( node, expected_type )
 				return result if want_result else None
 
-			case 'bitand' | 'bitor' | 'bitxor':
+			case 'bitand' | 'bitor' | 'bitxor' | 'rshift':
 				result = self._lower_compiler_bitwise( node, self.lowering._is_compiler_call( node ), expected_type )
 				return result if want_result else None
 

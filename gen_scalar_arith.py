@@ -168,6 +168,36 @@ for kind, intrinsic in ( ( 'and', 'bitand' ), ( 'or', 'bitor' ), ( 'xor', 'bitxo
 	emit()
 
 # ============================================================================
+# generic bodies - shifts. << (shl) has real Wrap/Check/Saturate variants
+# (ir.ShlWrap/ShlCheck/ShlSaturate - shifting bits out the top is a real,
+# already-modeled concern), same 3-variant shape as add/sub/mul. >> (rshift)
+# has no such concept (this compiler doesn't check shift-amount-exceeds-
+# width for either direction), single-variant infallible like the bitwise
+# ops above.
+# ============================================================================
+
+emit( '@fallible_arithmetic' )
+emit( '@inline' )
+emit( 'def i_shl_checked[T]( value: T, other: T ) -> Result[T,OverflowError]:' )
+emit( '\treturn compiler.checked_shl( value, other )' )
+emit()
+
+emit( '@inline' )
+emit( 'def i_shl_wrapped[T]( value: T, other: T ) -> T:' )
+emit( '\treturn compiler.wrapped_shl( value, other )' )
+emit()
+
+emit( '@inline' )
+emit( 'def i_shl_saturated[T]( value: T, other: T ) -> T:' )
+emit( '\treturn compiler.saturated_shl( value, other )' )
+emit()
+
+emit( '@inline' )
+emit( 'def i_rshift[T]( value: T, other: T ) -> T:' )
+emit( '\treturn compiler.rshift( value, other )' )
+emit()
+
+# ============================================================================
 # registrations - one line per (type, dunder name), specializing the
 # matching generic body above
 # ============================================================================
@@ -217,6 +247,15 @@ emit()
 for t in INT_TYPES:
 	for kind, dunder in ( ( 'and', '__and__' ), ( 'or', '__or__' ), ( 'xor', '__xor__' ) ):
 		emit( f'{t}.{dunder} = i_{kind}[{t}]' )
+emit()
+
+emit( '# --- int shifts (<< checked/wrapped/saturated, >> single variant) ---' )
+emit()
+for t in INT_TYPES:
+	emit( f'{t}.__lshift__ = i_shl_checked[{t}]' )
+	emit( f'{t}.{mode_dunder( "__lshift__", "wrapped" )} = i_shl_wrapped[{t}]' )
+	emit( f'{t}.{mode_dunder( "__lshift__", "saturated" )} = i_shl_saturated[{t}]' )
+	emit( f'{t}.__rshift__ = i_rshift[{t}]' )
 emit()
 
 # ============================================================================
