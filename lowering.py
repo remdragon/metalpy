@@ -1,6 +1,8 @@
 # stdlib imports:
 import ast
 import copy
+import itertools
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable
@@ -2447,7 +2449,7 @@ class FunctionLowering:
 		# used to fall back to the generic per-class destructor's
 		# unconditional field cascade, independently releasing the same
 		# attribute again; that fallback is gone now (see
-		# _emit_fallible_construction's own comment on why it had to be
+		# _lower_compiler_raw_free's own comment (used by the synthesized $$__new__'s Err branch) on why it had to be
 		# removed - it also unconditionally touched attributes that were
 		# NEVER assigned at all, reading uninitialized memory), so this
 		# construction's own inline unwind is now the ONLY place whichever
@@ -3340,6 +3342,9 @@ class FunctionLowering:
 		if self.lowering._is_compiler_call( node.value ) == 'decref_dynamic':
 			self._lower_compiler_decref_dynamic( node.value )
 			return
+		if self.lowering._is_compiler_call( node.value ) == '__raw_free__':
+			self._lower_compiler_raw_free( node.value )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.lowering.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -3675,19 +3680,23 @@ class FunctionLowering:
 				)
 			root = self._lower_expr( arg_node.value, None )
 			attr_var = self.lowering._attr_lookup( root.type, arg_node.attr, arg_node )
-			if isinstance( attr_var.type, FixedArrayType ):
-				# same restriction _expr_Attribute's own GetAttr guard
-				# enforces for an ordinary read - see FixedArrayType's own
-				# docstring (no element-level access exists yet either, so
-				# there's nothing meaningful to take the address of beyond
-				# the whole array, which C already lets an ordinary bare-
-				# array-field expression decay to on its own without &)
-				self.lowering.discovery.fail(
-					f'{ast.unparse(node)}: {attr_var.type.qualname} fields have no addrof support yet '
-					f'(no element-level array access is implemented)',
-					node,
-				)
 			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+			if isinstance( attr_var.type, FixedArrayType ):
+				# compiler.addrof(x.field) where field is ElemType[N] ->
+				# Ptr[ElemType], via C's own array-to-pointer decay - NOT
+				# &(x.field), which would be a pointer TO the array
+				# (ElemType(*)[N]), a different C type than the declared
+				# Ptr[ElemType] destination even though the address value
+				# is identical. Safe for the same reason ordinary field
+				# addrof is: `obj` is a real, stable-lifetime lvalue (a
+				# bare local, or one level of field access rooted at one),
+				# and a fixed-size array member of a stable object is
+				# itself just as stable. See ir.ArrayFieldPtr's own
+				# docstring for the emission this builds.
+				elem_ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ attr_var.type.elem_type ] )
+				dest = self._new_temp( elem_ptr_type )
+				self._emit( ir.ArrayFieldPtr( dest = dest, obj = root, attr = arg_node.attr ))
+				return dest
 			pointee = attr_var.type
 			# same RC-pointee-depth rule the bare-Name path below applies -
 			# see its own comment for why (Ptr[Foo] already spells `Foo*`,
@@ -3952,6 +3961,36 @@ class FunctionLowering:
 		opcode, extra = self._arithmetic_mode[-1].GetCast()
 		return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
 
+	def _lower_compiler_raw_alloc( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.__raw_alloc__(T) - allocate a fresh RCClass instance with
+		# every field left UNINITIALIZED: no field validation, no __init__
+		# call. This is the exact alloc _try_lower_construct_call used to
+		# emit inline (dest = new temp, schedule sys.alloc[T], ir.Allocate
+		# with an empty fields dict) - factored out here so a synthesized
+		# $$__new__ body (type_resolver.py's
+		# _synthesize_rcclass_constructor) can spell "allocate self, THEN
+		# call __init__ myself" as ordinary AST rather than raw IR. Not
+		# meant for ordinary user code (there's no field-completeness check
+		# at all - the caller is on the hook for calling __init__ or
+		# compiler.__raw_free__'ing it before it ever escapes), same
+		# internal-only posture as compiler.decref_dynamic.
+		#
+		# node.args[0].resolved_type, like compiler.cast's first argument,
+		# lets compiler-synthesized AST hand over a concrete RCClass object
+		# directly (including a monomorphized generic with no user-
+		# spellable name), bypassing ordinary namespace resolution.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__raw_alloc__(...) takes exactly one argument: {ast.unparse(node)}', node )
+		target_type = getattr( node.args[0], 'resolved_type', None )
+		if target_type is None:
+			target_type = self.lowering._try_resolve_namespace( node.args[0] )
+		if not isinstance( target_type, RCClass ):
+			self.lowering.discovery.fail( f'compiler.__raw_alloc__(...) argument must be a concrete RCClass: {ast.unparse(node)}', node )
+		dest = self._new_temp( target_type )
+		self.lowering._schedule_rcclass_construction( target_type, dest.type )
+		self._emit( ir.Allocate( dest = dest, cls = target_type, fields = {} ))
+		return dest
+
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.cast(T, x) - T is a TYPE reference (resolved via
 		# _try_resolve_namespace, same as compiler.sizeof's argument, not
@@ -4126,6 +4165,41 @@ class FunctionLowering:
 			f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
 			node,
 		)
+
+	def _lower_compiler_raw_free( self, node: ast.Call ) -> None:
+		# compiler.__raw_free__(x) - free a raw, not-yet-fully-alive RCClass
+		# allocation (compiler.__raw_alloc__'s own product, once __init__
+		# has failed) WITHOUT running the class's real destructor. An
+		# ordinary decref-to-zero would call the synthesized
+		# $$__destructor__, which reads every field as though __init__ had
+		# already populated them - on a raw, not-yet-initialized alloc
+		# that's still garbage, a real heap-corruption bug (see
+		# type_resolver.py's _synthesize_rcclass_constructor, fallible
+		# body, and _emit_fallible_construction's own former Err branch,
+		# whose logic this generalizes). Frees the backing storage directly
+		# via sys.free - the same thing _synthesize_rcclass_destructor's
+		# own step 3 does, skipping its __del__/field-cascade steps 1/2
+		# entirely - then cancels x's pending automatic scope-exit release
+		# via manually_decreffed, the same pairing compiler.decref(x) uses
+		# just above, minus the real Decref that precedes it there.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__raw_free__(...) takes exactly one argument: {ast.unparse(node)}', node )
+		operand = self._lower_expr( node.args[0], None )
+		if not isinstance( operand.type, RCClass ):
+			self.lowering.discovery.fail(
+				f'compiler.__raw_free__(...) argument must be a bare RCClass value, not '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		sys_module = self.lowering.discovery.modules['sys']
+		free_overload = sys_module.get_local( 'free' )
+		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
+		self.lowering._ensure_resolved( free_fn )
+		cast_dest = self._new_temp( free_fn.parameters[0].type )
+		self._emit( ir.CastWrap( dest = cast_dest, operand = operand ))
+		self._emit( ir.Call( dest = None, target = free_fn, receiver = None, args = [ cast_dest ], kwargs = {} ))
+		for instr in self._cfg.manually_decreffed( operand ):
+			self._emit( instr )
 
 	def _lower_compiler_incref( self, node: ast.Call ) -> None:
 		# compiler.incref(x) — emit the real Incref sequence for x, via
@@ -9302,26 +9376,41 @@ class FunctionLowering:
 				self_type = target_cls
 				args, kwargs = self._lower_call_args( init, node )
 
-		# self_temp.type is self_type - already scheduled above (schedule
-		# (target_cls) for the plain case, _ensure_resolved(cls_spec) for the
-		# generic case), so no separate schedule() call is needed here.
-		# ir.Allocate's own `cls`, unlike self_temp.type, is always the
-		# ABSTRACT target_cls - the emitter only uses it for an RCClass-vs-not
-		# check, never field layout (values are in `fields`, and the mangled
-		# alloc name comes from dest.type, not cls - see emitter_c.py's own
-		# ir.Allocate handling)
-		self_temp = self._new_temp( self_type )
-		self.lowering._schedule_rcclass_construction( target_cls, self_temp.type )
-		self._emit( ir.Allocate( dest = self_temp, cls = target_cls, fields = {} ))
-
+		# self_type is either already concrete (plain/resolved_construction
+		# branches) or a generic-class Specialization (_lower_generic_
+		# construction_args' own cls_spec) - _ensure_resolved is a no-op-
+		# ish pass-through for an already-concrete class (same as
+		# elsewhere in this file), so this one line handles both uniformly
 		self.lowering.schedule( init.return_type )
 		for param in init.parameters or []:
 			self.lowering.schedule( param.type )
-
-		if not self.lowering._init_fallibility( init ):
-			self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
-			return self_temp
-		return self._emit_fallible_construction( node, self_type, init, self_temp, args, kwargs, expected_type )
+		if isinstance( self_type, Specialization ):
+			# self_type was already resolved above (either by this method's
+			# own earlier branches - target.schedule/_ensure_resolved(cls_spec)
+			# in _lower_generic_construction_args - or by resolved_construction's
+			# own pre-resolution) - re-calling _ensure_resolved would just
+			# redundantly re-schedule() the same Specialization a second
+			# time for no benefit (schedule()'s own id-based _seen dedup
+			# makes it harmless, just wasted work) - .monomorphized is the
+			# same cache Monomorphizer.monomorphize_class itself reads
+			# (mpy_types.py's Specialization), a plain, side-effect-free
+			# read of what's already there
+			concrete_cls = self_type.monomorphized if self_type.monomorphized is not None else self.lowering._ensure_resolved( self_type )
+		else:
+			concrete_cls = self_type
+		assert isinstance( concrete_cls, RCClass ), f'internal compiler error: {self_type=} did not resolve to a concrete RCClass'
+		# synthesize (idempotent, memoized) rather than rely solely on the
+		# compiler.py class-registration trigger - schedule() is a
+		# deferred queue, so THIS call site needs $$__new__'s live Function
+		# object available right now, not whenever it eventually gets
+		# dequeued (see _synthesize_rcclass_constructor's own docstring)
+		self.lowering._type_resolver._synthesize_rcclass_constructor( concrete_cls, init )
+		new_fn = concrete_cls.get_local( '$$__new__' )
+		assert isinstance( new_fn, Function ), f'internal compiler error: {concrete_cls.qualname} has no synthesized $$__new__'
+		self.lowering.schedule( new_fn.return_type )
+		dest = self._new_temp( new_fn.return_type )
+		self._emit( ir.Call( dest = dest, target = new_fn, receiver = None, args = args, kwargs = kwargs ))
+		return dest
 
 	def _lower_and_infer_call_args(
 		self, node: ast.Call, callee: Function, type_params: list[TypeVar], bindings: dict[int,Type], qualname: str,
@@ -9413,257 +9502,6 @@ class FunctionLowering:
 		self.lowering._ensure_resolved( cls_spec ) # also populates init_spec.monomorphized as a side effect - same (init, concrete_args) key monomorphize_class's own method-substitution loop uses
 		monomorphized_init = self.lowering._ensure_resolved( init_spec )
 		return cls_spec, monomorphized_init, args, kwargs
-
-	def _emit_fallible_construction(
-		self, node: ast.Call, concrete_cls: RCClass|Specialization, init: Function, self_temp: ir.Temp,
-		args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None,
-	) -> ir.Operand:
-		# __init__ is fallible (Result[None,E]) - Foo(...) becomes
-		# Result[Foo,E] (SYNTAX.md). The actual Ok/Err wrapping reuses REAL
-		# Result.Ok/Result.Err call-lowering (via synthesized AST
-		# referencing hidden locals - _declare_hidden_local, the same
-		# technique the for-loop scaffolding already uses) rather than
-		# hand-building ResultPayload's own internal shape here - only the
-		# branch structure itself (and self_temp's own decref on Err, not
-		# expressible as source syntax) is raw IR, mirroring
-		# _lower_conditional_dispatch's own style
-		init_result = self._new_temp( init.return_type )
-		self._emit( ir.Call( dest = init_result, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
-
-		# track_result=False throughout this method's own hidden locals -
-		# result_var/dest_var are compiler-internal Result-typed scaffolding
-		# (see cfg.assign()'s own comment): result_var's is_err-ness is
-		# already unconditionally checked right below by the synthesized
-		# branch itself (that's the whole point of this method), and
-		# dest_var is just a relay for whichever of ok_value/err_value wins -
-		# the REAL obligation lands on whatever binding the OUTER `Foo(...)`
-		# expression's own result gets assigned into, tracked normally there
-		unique = self._label_id
-		self_var = self._declare_hidden_local( f'__ctor_self_{unique}', concrete_cls, node )
-		for instr in self._cfg_assign( self_var, self_temp, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = self_var, src = self_temp ))
-
-		result_var = self._declare_hidden_local( f'__ctor_result_{unique}', init.return_type, node )
-		for instr in self._cfg_assign( result_var, init_result, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = result_var, src = init_result ))
-
-		# _result_shape, not init.return_type.args[1] directly -
-		# init.return_type may already be the real, monomorphized Result
-		# object itself (not a Specialization wrapper) - see Monomorphizer.
-		# origin_of's own docstring. Guaranteed to succeed here: the only
-		# caller (_try_lower_construct_call) already confirmed init is
-		# fallible (Result[None,_]-shaped) via _init_fallibility before
-		# ever reaching this method
-		error_cls = self.lowering._type_resolver._result_shape( init.return_type )[1]
-		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		outer_result_type = expected_type or self.lowering.discovery._get_or_create_specialization( result_cls, [ concrete_cls, error_cls ] )
-		dest_var = self._declare_hidden_local( f'__ctor_dest_{unique}', outer_result_type, node )
-
-		is_err_fn = self.lowering._attr_lookup_callable( init.return_type, 'is_err', node )
-		self.lowering._ensure_resolved( is_err_fn )
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		is_err_temp = self._new_temp( bool_cls )
-		self._emit( ir.Call( dest = is_err_temp, target = is_err_fn, receiver = result_var, args = [], kwargs = {} ))
-
-		err_label = self._new_label( 'ctor_err' )
-		end_label = self._new_label( 'ctor_end' )
-		# JumpIfTrue, not JumpIfFalse - is_err_temp holds is_err()'s own
-		# result, so a jump-to-err has to fire when it's TRUE (a bug found
-		# while prototyping Phase 2's fallible super().__init__() chaining -
-		# JumpIfFalse here meant "not an error -> jump to the error branch",
-		# inverted, for EVERY fallible RCClass __init__ in the language, not
-		# just a subclassed one - confirmed on a clean checkout before any
-		# RCClass-subclassing work, so unrelated to it beyond being how it
-		# was found)
-		self._emit( ir.JumpIfTrue( cond = is_err_temp, target = err_label ))
-
-		# Ok branch: self is fully constructed - hand it off. Result.Ok(...)'s
-		# own construction (field_value(), called from inside its body) takes
-		# an independent Incref'd copy of self_var for the Ok payload it
-		# builds - self_var's OWN original reference is a SEPARATE unit that
-		# still needs its own release, exactly once, on every path. Dropped
-		# right here (self_var's ownership "moves" into the Ok payload,
-		# leaving exactly the one Ok-owned reference alive) via cfg.decref()+
-		# manually_decreffed() - the same pair _lower_compiler_decref uses
-		# for compiler.decref(x) - rather than left to cfg's own automatic
-		# scope-exit release: self_var is pushed as one single, branch-
-		# unaware OWNED entry (this method never calls enter_branch()/
-		# restore() around the Ok/Err split below - it's raw Jump/Label IR,
-		# invisible to that reconciliation machinery), so a compile-time
-		# entry.cancelled=True in only ONE of the two branches would wrongly
-		# suppress the automatic release on the OTHER, still-live path too
-		# (confirmed by a real regression while fixing the Err-branch bug
-		# below: cancelling self_var's entry only in the Err branch's own
-		# lowering code silently deleted its release from the Ok/success
-		# path as well, since cfg tracks one flat sequence, not per-branch
-		# state - a leak, compiler.refcount() reading 3 instead of 1 after
-		# an otherwise-correct unwrap()). Explicitly decref'ing (and
-		# cancelling) self_var in BOTH branches, symmetrically, keeps cfg's
-		# single cancelled flag valid no matter which one actually runs -
-		# each runtime path already contains its own manual release before
-		# the shared epilogue is ever reached
-		ok_expr = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
-			args = [ ast.Name( id = self_var.stem, ctx = ast.Load() ) ], keywords = [],
-		)
-		ast.copy_location( ok_expr, node )
-		ok_value = self._lower_expr( ok_expr, outer_result_type )
-		for instr in self._cfg.decref( concrete_cls, self_var ):
-			self._emit( instr )
-		for instr in self._cfg.manually_decreffed( self_var ):
-			self._emit( instr )
-		for instr in self._cfg_assign( dest_var, ok_value, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = dest_var, src = ok_value ))
-		self._emit( ir.Jump( target = end_label ))
-
-		# Err branch: self never became valid - free its own storage (but
-		# __del__ is never invoked on it - SYNTAX.md), propagate the same
-		# error, re-wrapped for THIS construction's own Result[Foo,E].
-		#
-		# Deliberately NOT self._cfg.decref(concrete_cls, self_var) (an
-		# ordinary release_object() call, the same one used to destroy any
-		# fully-valid instance of concrete_cls): that goes through the
-		# class's single, shared vtable destructor (type_resolver.py's
-		# _synthesize_rcclass_destructor), which unconditionally (1) calls
-		# self.__del__() if declared - forbidden here by SYNTAX.md - and (2)
-		# decrefs EVERY RC-typed attribute, including ones this __init__
-		# never reached an assignment for on the path that actually failed.
-		# self is only PARTIALLY constructed here - an attribute release_
-		# object's destructor reads is whatever raw bytes sys.alloc's
-		# allocator happened to return, not a valid reference - releasing it
-		# is a real, confirmed STATUS_HEAP_CORRUPTION (0xC0000374), reading/
-		# decrementing a refcount through a garbage pointer. __init__'s own
-		# Err-path return_() unwind (_stmt_Return's construction_err_path
-		# special case - see its own comment) already released whichever RC
-		# attributes IT assigned, using its own precise, path-sensitive CFG
-		# state; self's underlying allocation just needs freeing now, exactly
-		# like _synthesize_rcclass_destructor's own step 3 (sys.free(self)),
-		# skipping its steps 1 (__del__) and 2 (field cascade) entirely -
-		# self_var's own refcount is guaranteed exactly 1 here (fresh from
-		# sys.alloc, never escaped anywhere else - check_self_escape()
-		# forbids passing self out of __init__ before construction completes,
-		# which this failed path never reaches), so there's no other owner to
-		# race with a bare free. manually_decreffed(self_var) still runs
-		# below, same as before - self_var's own epilogue entry (pushed by
-		# the _cfg_assign near this method's own top) still needs neutralizing
-		# regardless of which release mechanism actually ran, or the
-		# function's own scope-exit epilogue would try to release it a SECOND
-		# time on top of this
-		# emitted as raw IR (mirroring init_result's own ir.Call near this
-		# method's own top), NOT as synthesized-AST-plus-_lower_expr the way
-		# ok_expr/err_expr above are - unlike Result.Ok/Err (synthesized
-		# specifically to reuse REAL Result-construction lowering, per this
-		# method's own opening comment), sys.free(ptr) has no sugar worth
-		# reusing, and building it as `ast.Name(id='sys', ...)` was actually
-		# tried first and failed: _lower_expr re-resolves node.func's own
-		# receiver by ordinary namespace lookup before ever consulting node.
-		# resolved_callee, which only short-circuits OVERLOAD selection, not
-		# name resolution - "name 'sys' is not defined" in any file that
-		# never imports sys (confirmed by a real regression: lowering_test.
-		# py's own fallible-init shape test, whose fixture never imports
-		# sys). type_resolver.py's _synthesize_rcclass_destructor gets away
-		# with the identical AST shape only because its own FunctionDef is
-		# scheduled and resolved through the compiler's synthesized-code
-		# path, never through an ordinary file's own import-gated namespace
-		# at all
-		sys_module = self.lowering.discovery.modules['sys']
-		free_overload = sys_module.get_local( 'free' )
-		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
-		self.lowering._ensure_resolved( free_fn )
-		free_ptr_type = free_fn.parameters[0].type
-		# label before the cast - JumpIfTrue above jumps straight here
-		self._emit( ir.Label( name = err_label ))
-		cast_dest = self._new_temp( free_ptr_type )
-		self._emit( ir.CastWrap( dest = cast_dest, operand = self_var ))
-		self._emit( ir.Call( dest = None, target = free_fn, receiver = None, args = [ cast_dest ], kwargs = {} ))
-		for instr in self._cfg.manually_decreffed( self_var ):
-			self._emit( instr )
-		err_expr = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
-			args = [ ast.Attribute(
-				value = ast.Attribute( value = ast.Name( id = result_var.stem, ctx = ast.Load() ), attr = 'data', ctx = ast.Load() ),
-				attr = 'v_Err', ctx = ast.Load(),
-			) ], keywords = [],
-		)
-		ast.copy_location( err_expr, node )
-		err_value = self._lower_expr( err_expr, outer_result_type )
-		# dest_var was ALREADY assigned once above, in the Ok branch - cfg
-		# saw that assignment first (this method never calls enter_branch()/
-		# restore() around the Ok/Err split, so cfg's single flat pass has
-		# no notion that the two are mutually exclusive) and is therefore
-		# convinced dest_var is currently a live, OWNED Result value. Its
-		# own cfg_assign() below would "helpfully" emit a decref releasing
-		# dest_var's CURRENT value before overwriting it with err_value -
-		# correct for a genuine reassignment, but WRONG here: at runtime,
-		# whichever branch actually reaches this point, the Ok branch's own
-		# assignment never ran, so dest_var's storage is uninitialized
-		# garbage - releasing it is a real, confirmed crash (illegal
-		# instruction / access violation), found by a regression test that
-		# loops a failing fallible construction: the very FIRST failure at
-		# any given call site hits this, no loop required, just never
-		# exercised by any existing test since none of them construct a
-		# class whose __init__ can actually fail. cfg.move() here discards
-		# the Ok branch's own binding as a pure cancellation (no Incref/
-		# Decref - exactly like abandoning a value that was never really
-		# there) rather than a release, so the reassignment below sees
-		# dest_var as un-owned and skips the bogus stale-value decref;
-		# move() also collapses both branches onto the SAME epilogue entry
-		# (reused, not duplicated) so whichever value dest_var ends up
-		# holding still gets released exactly once downstream
-		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
-			self._emit( instr )
-		for instr in self._cfg_assign( dest_var, err_value, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = dest_var, src = err_value ))
-		self._emit( ir.Label( name = end_label ))
-		# dest_var is a persistent hidden-local Variable (needed above so the
-		# synthesized Result.Ok/Err ast.Call machinery has a real Name to
-		# reference), not an ir.Temp - but every OTHER Call in this file
-		# returns a genuine ir.Temp, and callers rely on that: _is_aliasing_
-		# expr treats `Foo(...)` (an ast.Call node) as always-fresh (is_alias
-		# =False, no Incref needed to store it into a new binding) on the
-		# assumption - stated in its own docstring - that "a well-behaved
-		# callee already accounts for that on its own side", i.e. hands back
-		# a value whose ownership transfers cleanly with a bare pointer copy.
-		# Returning dest_var directly broke that assumption: cfg.assign()'s
-		# own "ownership transfers into dest, untrack the momentary Temp"
-		# branch (see its own docstring) only ever fires for isinstance(src,
-		# ir.Temp), so `r = Foo(...)` left dest_var independently OWNED in
-		# cfg's own bookkeeping AT THE SAME TIME r became its own independent
-		# owner of the identical value - two tracked owners, one real
-		# reference, decref'd twice at scope exit. Confirmed by a real,
-		# repeated compile-and-run crash (segfault): two fallible
-		# constructions of the same class in one function, or a single one
-		# whose Result is retained/queried (.is_ok()) rather than immediately
-		# consumed, both over-released the constructed object.
-		#
-		# Moving dest_var's value into a genuine fresh Temp here (registered
-		# via fresh_temp(), exactly like every Call/Allocate dest already is
-		# in _emit()) restores that contract: cfg.move() cancels dest_var's
-		# own pending epilogue decref (ownership transfers out, no Incref/
-		# Decref of its own), and the Temp then gets the SAME automatic
-		# handling as any other fresh Call result - untracked cleanly if
-		# consumed into a new binding (`r = Foo(...)`), or self-released by
-		# its own DeleteTemp at the end of this statement if merely used as
-		# a transient receiver (`Foo(...).unwrap(...)`) and never bound at
-		# all. The naive alternative (just cfg.move()-ing dest_var and
-		# returning it as-is, tried first) fixed the crash above but broke
-		# the OTHER direction instead - a real, confirmed LEAK: dest_var's
-		# own release is what balances Result.Ok's own retain_object() when
-		# nothing else ever claims independent ownership of that reference
-		# (e.g. a receiver never stored into a named binding), and simply
-		# cancelling it with nothing left to release it lost that reference
-		# forever. compiler.refcount() on the unwrapped value read 3 (should
-		# have been 1) before this Temp indirection was added.
-		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
-			self._emit( instr )
-		final = self._new_temp( outer_result_type )
-		self._emit( ir.Assign( dest = final, src = dest_var ))
-		self._cfg.fresh_temp( final, outer_result_type )
-		return final
 
 	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
 		# ScalarName(x) - Python's own int(x)/float(x)-style constructor-as-
@@ -10503,40 +10341,40 @@ class FunctionLowering:
 				self.lowering._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, target.qualname )
 		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
 
-	def _dispatch_slot_binding(
+	# defensive cap on how many distinct per-tag monomorphizations
+	# _expand_dispatch_target will synthesize for ONE generic branch -
+	# mirrors overload_resolution.py's own _MAX_TRACKED_STATES spirit (a
+	# named, trivially-adjustable constant, not a hard architectural limit).
+	# Every real lib/ overload group is 1-2 params/2-4 leaves - nowhere near
+	# this before it'd be a genuine sign of a mis-scoped overload group
+	# rather than a legitimate need for more combos
+	_MAX_DISPATCH_COMBOS = 64
+
+	def _dispatch_remaining_leaves(
 		self, node: ast.Call, target: Function, param: Parameter,
 		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
-	) -> Type:
-		# the single concrete leaf `param` resolves to once THIS branch's own
-		# runtime tag check(s) (if any) have already excluded every other
-		# candidate - see _monomorphize_dispatch_target's own comment. `known`
-		# (keyed by id(param)) covers whatever this branch's own conditions
-		# already pinned down explicitly; every other parameter is narrowed
-		# from the real call-site operand's own (possibly still union) type,
-		# minus whatever leaves `claimed` (built from every OTHER branch's own
-		# conditions - only ever non-empty for the trailing default, which has
-		# no conditions of its own) already accounts for elsewhere. Fails
-		# cleanly, same message/shape as the pre-existing blanket rejection,
-		# if more than one leaf can still reach this target here - a genuinely
-		# harder case (per-tag monomorphization dispatch) this narrow fix
-		# doesn't attempt.
+	) -> list[Type]:
+		# every leaf `param` could still be, once THIS branch's own runtime
+		# tag check(s) (if any) have already excluded every other candidate -
+		# see _expand_dispatch_target's own comment. `known` (keyed by
+		# id(param)) covers whatever this branch's own condition (or an
+		# earlier _expand_dispatch_target combo) already pinned down
+		# explicitly - returned as the sole element, no further narrowing
+		# needed. Every OTHER parameter is narrowed from the real call-site
+		# operand's own (possibly still union) type, minus whatever leaves
+		# `claimed` (built from every OTHER branch's own conditions - only
+		# ever non-empty for the trailing default) already accounts for
+		# elsewhere. Exactly one leaf here means this parameter is statically
+		# resolvable (_monomorphize_dispatch_target); more than one is what
+		# _expand_dispatch_target splits into distinct per-leaf branches.
 		if id( param ) in known:
-			return known[ id( param ) ]
+			return [ known[ id( param ) ] ]
 		operand = self.lowering._dispatch_operand_for_param( node, target, param, args, kwargs )
 		already = claimed.get( id( operand ), [] )
-		remaining = [
+		return [
 			leaf for leaf in operand.type.leaves()
 			if not any( self.lowering._type_resolver._same_type( leaf, c ) for c in already )
 		]
-		if len( remaining ) != 1:
-			self.lowering.discovery.fail(
-				f'a generic overload of {target.qualname} cannot be one branch of a runtime-dispatched call '
-				f'(argument {param.stem!r} could still be {len(remaining)} different types at this branch - '
-				f'per-leaf monomorphization for a generic branch spanning more than one runtime type is not '
-				f'supported yet): {ast.unparse(node)}',
-				node,
-			)
-		return remaining[0]
 
 	def _monomorphize_dispatch_target(
 		self, node: ast.Call, target: Function,
@@ -10550,13 +10388,21 @@ class FunctionLowering:
 		# possibly-union call-site operand type, for the "sole unconditional
 		# match" case), a ConditionalDispatch branch/default only ever runs
 		# once every OTHER branch's own runtime tag check has excluded its own
-		# leaf(s) - _dispatch_slot_binding resolves the real, narrower type
-		# reaching THIS target at each parameter.
+		# leaf(s) - _dispatch_remaining_leaves resolves the real, narrower
+		# type(s) reaching THIS target at each parameter. Caller contract:
+		# every parameter must already resolve to EXACTLY one leaf here (see
+		# _expand_dispatch_target, the only real caller) - asserted, not
+		# re-validated, since by the time this is called any genuine
+		# ambiguity has already been split into a separate combo.
 		type_params = target.type_params or []
 		bindings: dict[int,Type] = {}
 		for param in target.parameters or []:
-			resolved_type = self._dispatch_slot_binding( node, target, param, known, args, kwargs, claimed )
-			self.lowering._unify_type_param( type_params, param.type, resolved_type, bindings, node, target.qualname )
+			remaining = self._dispatch_remaining_leaves( node, target, param, known, args, kwargs, claimed )
+			assert len( remaining ) == 1, (
+				f'internal compiler error - {target.qualname} parameter {param.stem!r} not resolved to exactly '
+				f'one leaf before monomorphizing ({len(remaining)} remaining) - _expand_dispatch_target caller contract violated'
+			)
+			self.lowering._unify_type_param( type_params, param.type, remaining[0], bindings, node, target.qualname )
 		missing = [ tv for tv in type_params if id( tv ) not in bindings ]
 		if missing:
 			# every real lib/ generic overload binds every type param
@@ -10575,6 +10421,78 @@ class FunctionLowering:
 		inferred_args = [ bindings[id(tv)] for tv in type_params ]
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		return self.lowering._monomorphized_function( spec )
+
+	def _remap_conditions(
+		self, original_params: list[Parameter], new_params: list[Parameter], conditions: list[tuple[Parameter,Type]],
+	) -> list[tuple[Parameter,Type]]:
+		# a monomorphized Function has its own, distinct Parameter objects
+		# (same count/order as the generic original - substitution never
+		# reorders or drops parameters) - a runtime condition built against
+		# the ORIGINAL generic function's own Parameter identity (from
+		# resolve_call, or from an earlier _expand_dispatch_target combo)
+		# has to be re-pointed at the monomorphized function's corresponding
+		# one before _lower_dispatch_tests/_dispatch_operand_for_param can
+		# find it there (identity lookup, not structural equality - see
+		# their own docstrings)
+		return [
+			( new_params[ next( i for i, op in enumerate( original_params ) if op is p ) ], leaf_type )
+			for p, leaf_type in conditions
+		]
+
+	def _expand_dispatch_target(
+		self, node: ast.Call, target: Function,
+		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
+	) -> list[tuple[list[tuple[Parameter,Type]],Function]]:
+		'''
+		Resolves a GENERIC branch/default of a runtime-dispatched Overload
+		call into one or more concrete (extra_conditions, monomorphized
+		Function) pairs. Most of the time this is exactly one entry with no
+		extra conditions - the EASY case (_monomorphize_dispatch_target's own
+		docstring): every parameter's real leaf is already pinned to exactly
+		one value here, either explicitly (`known`, from this branch's own
+		runtime condition) or by elimination (`claimed`, only ever populated
+		for the trailing default).
+
+		When one or more parameters can still legitimately be more than one
+		leaf here - the HARD case this dispatch machinery used to reject
+		outright - this ONE branch is split into one synthetic entry PER
+		combination of those parameters' remaining leaves, each monomorphized
+		with its own distinct T binding and given its own extra runtime
+		condition(s) pinning exactly that combination. This turns "this one
+		generic branch might need any of N different C functions at runtime,
+		selected by a tag no single Call target can express" into N ordinary,
+		individually-concrete branches - exactly the shape
+		_lower_conditional_dispatch already knows how to schedule, just more
+		of them. The caller (the Overload branch of _lower_call) is
+		responsible for splicing these into the overall branches/default
+		list and picking exactly one overall entry to remain the trailing,
+		unconditioned default.
+		'''
+		params = target.parameters or []
+		remaining_by_id = {
+			id( p ): self._dispatch_remaining_leaves( node, target, p, known, args, kwargs, claimed )
+			for p in params
+		}
+		ambiguous = [ p for p in params if len( remaining_by_id[ id( p ) ] ) != 1 ]
+		if not ambiguous:
+			return [ ( [], self._monomorphize_dispatch_target( node, target, known, args, kwargs, claimed )) ]
+		combo_count = math.prod( len( remaining_by_id[ id( p ) ] ) for p in ambiguous )
+		if combo_count > self._MAX_DISPATCH_COMBOS:
+			self.lowering.discovery.fail(
+				f'a generic overload of {target.qualname} used as a runtime-dispatched branch would need '
+				f'{combo_count} separate per-type monomorphizations here (more than {self._MAX_DISPATCH_COMBOS}) - '
+				f'narrow the overloaded parameter types: {ast.unparse(node)}',
+				node,
+			)
+		results: list[tuple[list[tuple[Parameter,Type]],Function]] = []
+		for combo in itertools.product( *( remaining_by_id[ id( p ) ] for p in ambiguous )):
+			combo_known = dict( known )
+			combo_known.update({ id( p ): leaf for p, leaf in zip( ambiguous, combo ) })
+			monomorphized = self._monomorphize_dispatch_target( node, target, combo_known, args, kwargs, claimed )
+			new_params = monomorphized.parameters or []
+			extra_conditions = self._remap_conditions( params, new_params, list( zip( ambiguous, combo )))
+			results.append(( extra_conditions, monomorphized ))
+		return results
 
 	def _infer_return_only_type_params( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], return_only: list[TypeVar] ) -> Function:
 		# PLAN_RETURN_INFERENCE.md - non-@inline variant: a bare generic
@@ -10885,6 +10803,10 @@ class FunctionLowering:
 
 			case 'checked_convert':
 				result = self._lower_compiler_checked_convert( node, expected_type )
+				return result if want_result else None
+
+			case '__raw_alloc__':
+				result = self._lower_compiler_raw_alloc( node, expected_type )
 				return result if want_result else None
 
 			case 'addrof':
@@ -11263,45 +11185,54 @@ class FunctionLowering:
 					# call's own union-typed argument has leaves routing to
 					# more than one overload, at least one of them generic.
 					#
-					# The EASY sub-case (handled here): whatever leaf(s) of
-					# the union still reach one particular generic branch are
-					# already pinned down STATICALLY, either by that branch's
-					# own runtime condition(s) (a non-default branch always
-					# has one - see overload_resolution.resolve_call) or, for
-					# the trailing default, by elimination (the call's real
-					# leaves at that slot, minus whatever every OTHER
-					# branch's own condition already claims there) - if
-					# that's exactly one leaf, T is knowable at compile time
-					# same as any other generic call, and this branch can be
-					# monomorphized in place before ever reaching
-					# _lower_conditional_dispatch (which unconditionally
-					# schedules every branch's target as an ordinary, already-
-					# concrete compile unit - see _monomorphize_dispatch_target).
+					# Whatever leaf(s) of the union still reach one particular
+					# generic branch/default get resolved STATICALLY, either
+					# explicitly (a non-default branch always has its own
+					# runtime condition(s) - see overload_resolution.
+					# resolve_call) or by elimination (the trailing default:
+					# the call's real leaves at that slot, minus whatever
+					# every OTHER branch's own condition already claims
+					# there). The common case is exactly ONE leaf - T is
+					# knowable at compile time same as any other generic
+					# call, and this branch is monomorphized in place before
+					# ever reaching _lower_conditional_dispatch (which
+					# unconditionally schedules every branch's target as an
+					# ordinary, already-concrete compile unit).
 					#
-					# The HARD sub-case (still rejected, by
-					# _dispatch_slot_binding/_monomorphize_dispatch_target's
-					# own fail() calls below): a single generic branch that
-					# itself needs to cover 2+ distinct leaves (e.g. a 3+-
-					# member union where only one member has a concrete
-					# overload - every OTHER member falls through to the SAME
-					# generic default, each needing its own distinct
-					# monomorphization chosen by a runtime tag no single Call
-					# target can express) - a materially bigger feature
-					# (synthesizing a real per-tag dispatch table over
-					# distinct monomorphizations) than anything this dispatch
-					# machinery does today. Before this fix, EVERY generic-
-					# branch shape (easy or hard) hit this same blanket
-					# rejection rather than reaching the emitter, which would
-					# otherwise crash outright on a still-bare TypeVar
-					# parameter (confirmed via a real repro: str|i32 argument,
-					# concrete str overload + generic[T] fallback).
+					# When 2+ leaves can still legitimately reach ONE generic
+					# branch (e.g. a 3+-member union where only one member
+					# has a concrete overload - every OTHER member falls
+					# through to the SAME generic default, each needing its
+					# own distinct monomorphization) - _expand_dispatch_target
+					# splits that ONE branch into one new, individually-
+					# concrete branch PER leaf, each with its own extra
+					# runtime condition pinning exactly that leaf. Exactly
+					# one overall entry (see `default_fn` below) stays the
+					# trailing, unconditioned default - by construction, once
+					# every OTHER entry's own condition has been tested and
+					# excluded, only that one's own territory can remain, so
+					# it never needs a check of its own either way.
+					# every leaf already spoken for by a CONCRETE candidate,
+					# keyed by the real call-site operand it came from - not
+					# just whichever branches happen to carry an explicit
+					# runtime condition: a concrete candidate that ends up as
+					# the trailing default has its own condition computed
+					# then discarded by resolve_call (see its own "own
+					# leaves" comment - a default never needs one), so
+					# reading conditions alone under-counts. A concrete
+					# function's own declared parameter type unambiguously
+					# IS the one leaf it handles, condition or not - reading
+					# .parameters directly instead is both simpler and
+					# correct for every concrete candidate, branch or default.
 					claimed: dict[int,list[Type]] = {}
-					for b in branches:
-						for p, leaf_type in b.conditions:
+					for b in ( *branches, ConditionalDispatch( conditions = [], function = resolved )):
+						if b.function.type_params:
+							continue
+						for p in b.function.parameters or []:
+							if p.type is None:
+								continue
 							operand = self.lowering._dispatch_operand_for_param( node, b.function, p, args, kwargs )
-							claimed.setdefault( id( operand ), [] ).append( leaf_type )
-					if resolved.type_params:
-						resolved = self._monomorphize_dispatch_target( node, resolved, {}, args, kwargs, claimed )
+							claimed.setdefault( id( operand ), [] ).append( p.type )
 					new_branches: list[ConditionalDispatch] = []
 					for b in branches:
 						if not b.function.type_params:
@@ -11309,14 +11240,23 @@ class FunctionLowering:
 							continue
 						original_params = b.function.parameters or []
 						known = { id( p ): t for p, t in b.conditions }
-						monomorphized = self._monomorphize_dispatch_target( node, b.function, known, args, kwargs, {} )
-						new_params = monomorphized.parameters or []
-						remapped_conditions = [
-							( new_params[ next( i for i, op in enumerate( original_params ) if op is p ) ], leaf_type )
-							for p, leaf_type in b.conditions
-						]
-						new_branches.append( ConditionalDispatch( conditions = remapped_conditions, function = monomorphized ))
+						for extra_conditions, monomorphized in self._expand_dispatch_target( node, b.function, known, args, kwargs, claimed ):
+							new_params = monomorphized.parameters or []
+							remapped = self._remap_conditions( original_params, new_params, b.conditions )
+							new_branches.append( ConditionalDispatch( conditions = remapped + extra_conditions, function = monomorphized ))
 					branches = new_branches
+					if resolved.type_params:
+						# the LAST expansion becomes the new trailing default
+						# (its own extra_conditions are dropped - see the
+						# comment above); every OTHER expansion is a genuine
+						# new conditioned branch, appended after the ones
+						# above (lowest priority, matching resolve_call's own
+						# "default is whatever's left once every real branch
+						# is excluded" convention)
+						*extra, ( _, default_fn ) = self._expand_dispatch_target( node, resolved, {}, args, kwargs, claimed )
+						for extra_conditions, monomorphized in extra:
+							new_branches.append( ConditionalDispatch( conditions = extra_conditions, function = monomorphized ))
+						resolved = default_fn
 				return self._lower_conditional_dispatch( node, branches, resolved, receiver, args, kwargs, expected_type, want_result )
 			winning_stub = next( ( s for s in target.stubs if s.bound_to is resolved ), None )
 			if (

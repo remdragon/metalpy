@@ -1495,9 +1495,8 @@ class CFGState:
 		track_result=False opts a specific destination out of ever becoming
 		a tracked obligation - used for compiler-synthesized locals whose
 		Result-ness is scaffolding, not something user code is expected to
-		inspect itself (the match-statement subject temp, and the hidden
-		locals _emit_fallible_construction threads a fallible __init__'s
-		Result through - see their own lowering.py call sites).
+		inspect itself (the match-statement subject temp - see its own
+		lowering.py call site).
 
 		borrow=True registers dest as a non-owning alias (BORROWED, like an
 		ordinary parameter - see _enter_parameter) instead of taking out its
