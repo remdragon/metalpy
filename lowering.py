@@ -2637,7 +2637,15 @@ class FunctionLowering:
 		if not isinstance( node.target, ast.Name ):
 			self.lowering.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
 		fn = self._current_fn
+		# Volatile[T] resolves transparently to plain T (discovery.py's
+		# visit_Subscript strips it) - detected here, separately, by peeking
+		# at the raw annotation AST so this ONE call site (the only thing
+		# that needs to know) can tag the resulting Variable's storage.
+		is_volatile = ( isinstance( node.annotation, ast.Subscript ) and isinstance( node.annotation.value, ast.Name )
+				and node.annotation.value.id == 'Volatile' )
 		var_type = self.lowering.discovery.visit( node.annotation )
+		if is_volatile and var_type.is_rc():
+			self.lowering.discovery.fail( f'Volatile[...] does not support refcounted types: {ast.unparse(node)}', node )
 		# var_type starts as whatever discovery.visit() returns - often a
 		# bare, un-monomorphized Specialization - and STAYS that way for
 		# var's own construction/_lower_expr's expected_type below. Fixed
@@ -2652,6 +2660,7 @@ class FunctionLowering:
 			file = fn.file,
 			line = node.lineno,
 			type = var_type,
+			is_volatile = is_volatile,
 		)
 		fn.add_name( var.stem, var ) # scoped to the whole function body regardless of node.value (no block scoping - see cfg.py's own module docstring) - a bare declaration (node.value is None) deliberately does NOT mark it live in self._cfg (see below); a later real assignment does, via assign()'s own unconditional self._live.add()
 		if node.value is not None:

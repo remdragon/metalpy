@@ -322,6 +322,9 @@ class Variable( Name ):
 	# local variables, neither of which is a standalone compile unit; this is
 	# what lets Compiler._enqueue tell them apart without a separate lookup
 	is_global: bool = False
+	# set only for a local declared `Volatile[T]` (_stmt_AnnAssign) - means
+	# its C storage must be qualified `volatile` (see emitter_c._declarator)
+	is_volatile: bool = False
 	# stage 2's lowered form of `init` (None until Compiler._lower's Variable
 	# branch runs) - kept directly on the Variable itself, not only reachable
 	# through compiler.globals' own LoweredGlobal list, so a global's own
