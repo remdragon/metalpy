@@ -9561,6 +9561,87 @@ class RejectMoveThroughUnionOrOverloadTests( unittest.TestCase ):
 		self.assertTrue( any( '@move-decorated overload' in e for e in self.discovery.errors.errors ) )
 
 
+class GenericOverloadDispatchTests( unittest.TestCase ):
+	''' an @overload (or plain, no-decorator) group can now mix a concrete
+	candidate with a generic `[T]` one sharing the same name - fixed a real
+	compiler gap where a TypeVar-typed candidate's own required leaves
+	(Type.leaves() returns [itself] for a bare TypeVar) could never
+	same_type-match a concrete call-site argument (overload_resolution.py's
+	_Candidate.wildcard), and where lowering.py's Overload dispatch branch
+	had no monomorphization step for a resolved generic candidate (the
+	FIRST fix alone still crashed the emitter with a bare TypeVar parameter
+	- see _lower_overload_generic_call/_finish_generic_call). A call whose
+	argument is CONCRETE (not itself union-typed) always resolves to a
+	single, statically-known branch at compile time either way - see the
+	next test for the one shape still rejected. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_concrete_call_prefers_concrete_overload_regardless_of_declaration_order( self ) -> None:
+		# the generic candidate declared FIRST in source must still lose to
+		# the concrete one for a str argument - dispatch priority is a
+		# property of each candidate's own shape (wildcard vs concrete),
+		# not which one the user happened to write first
+		code = '\n'.join([
+			'class Box:',
+			'	def get[T]( self, x: T ) -> str:',
+			'		return "generic"',
+			'',
+			'	def get( self, x: str ) -> str:',
+			'		return x',
+			'',
+			'def main() -> None:',
+			'	b: Box = Box()',
+			'	s: str = b.get( "hi" )',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_runtime_dispatched_union_argument_with_generic_branch_is_rejected( self ) -> None:
+		# unlike a concrete argument (always statically resolved - see
+		# above), a UNION-typed argument can force overload_resolution.
+		# resolve_call to return a real runtime ConditionalDispatch, whose
+		# branches (including the trailing default) _lower_conditional_
+		# dispatch always schedules as concrete, callable C symbols - a
+		# generic branch has no single such symbol (this compiler has no
+		# runtime-polymorphic dispatch), so it's rejected with a clean
+		# compile error rather than reaching the emitter with a still-bare
+		# TypeVar parameter (confirmed via a real repro before this guard
+		# existed: emitter_c.py's c_type() raised NotImplementedError)
+		code = '\n'.join([
+			'class Box:',
+			'	def get( self, x: str ) -> str:',
+			'		return x',
+			'',
+			'	def get[T]( self, x: T ) -> str:',
+			'		return "generic"',
+			'',
+			'def pick( flag: bool ) -> str|i32:',
+			'	if flag:',
+			'		return "hi"',
+			'	return 42',
+			'',
+			'def main() -> None:',
+			'	b: Box = Box()',
+			'	u: str|i32 = pick( True )',
+			'	b.get( u )',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue( any(
+			'generic overload' in e and 'runtime-dispatched call' in e
+			for e in self.discovery.errors.errors
+		))
+
+
 class InFunctionRelativeImportTests( unittest.TestCase ):
 	'''
 	function bodies are never walked by discovery.py's visitor, so an import
