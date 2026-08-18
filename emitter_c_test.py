@@ -9383,6 +9383,30 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# a bare bytes literal passed directly where the declared
+			# parameter type is a bytes|bytearray union - regression test
+			# for _expr_Constant's literal self-typing chain missing a
+			# `bytes` branch (str/int/float/bool/None already had one)
+			( 'decode_bytes_literal_into_union_param', '''
+from codecs.utf8 import utf8
+
+def decode_it( x: bytes|bytearray ) -> str:
+	return utf8.decode( x ).unwrap( 'decode failed' )
+
+def main() -> i32:
+	if decode_it( b'abc' ) != "abc":
+		return 1
+	return 0
+''' ),
+			# a bare bytes literal used directly as a method-call receiver -
+			# same root cause as above, but hit via receiver-type
+			# resolution (_resolve_callee) instead of call-argument lowering
+			( 'bytes_literal_as_receiver', '''
+def main() -> i32:
+	if b'abc'.decode().unwrap( 'decode failed' ) != "abc":
+		return 1
+	return 0
+''' ),
 			# mirrors the real forcing case: fs.py:24's
 			# codec.decode(buf[:nbytes]) shape - and, unlike the other
 			# cases here, relies entirely on decode()'s own now-fixed

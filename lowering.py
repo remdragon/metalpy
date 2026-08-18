@@ -5540,6 +5540,13 @@ class FunctionLowering:
 						f'cannot infer the type of literal {node.value!r} - no str type available ({ast.unparse(node)})',
 						node,
 					)
+			elif isinstance( node.value, bytes ):
+				expected_type = self.lowering.discovery.find_name_or_none( 'bytes' )
+				if expected_type is None:
+					self.lowering.discovery.fail(
+						f'cannot infer the type of literal {node.value!r} - no bytes type available ({ast.unparse(node)})',
+						node,
+					)
 			elif node.value is None:
 				expected_type = self.lowering.discovery.get_none_type()
 			else:
