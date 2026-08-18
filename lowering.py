@@ -2566,7 +2566,7 @@ class FunctionLowering:
 		if not isinstance( existing, Variable ):
 			self.lowering.discovery.fail( f'{target.id!r} is not a local variable, cannot del it', node )
 		try:
-			instructions = self._cfg.deleted( existing )
+			instructions = self._cfg.deleted( existing, self._current_fn.qualname )
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
 		for instr in instructions:
@@ -2653,7 +2653,7 @@ class FunctionLowering:
 			line = node.lineno,
 			type = var_type,
 		)
-		fn.add_name( var.stem, var )
+		fn.add_name( var.stem, var ) # scoped to the whole function body regardless of node.value (no block scoping - see cfg.py's own module docstring) - a bare declaration (node.value is None) deliberately does NOT mark it live in self._cfg (see below); a later real assignment does, via assign()'s own unconditional self._live.add()
 		if node.value is not None:
 			try:
 				operand = self._lower_expr( node.value, var_type )
@@ -4106,7 +4106,7 @@ class FunctionLowering:
 		test = self._lower_expr( node.test, bool_cls )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4133,17 +4133,19 @@ class FunctionLowering:
 		# state to build the natural-exit candidate.
 		is_while_true = isinstance( node.test, ast.Constant ) and node.test.value is True
 		natural_exit_narrowed: dict[str,list[Variable]] | None = None
+		natural_exit_live: set[str] | None = None
 		if not is_while_true:
 			natural_exit_narrowed = dict( loop_snapshot.narrowed )
 			exit_name = getattr( node, 'exit_narrows_name', None )
 			if exit_name is not None:
 				member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
 				natural_exit_narrowed[exit_name] = [ member ]
-		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed )
+			natural_exit_live = set( loop_snapshot.live )
+		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed, natural_exit_live, break_live )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
-	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> list[dict[str,list[Variable]]]:
+	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> tuple[list[dict[str,list[Variable]]],list[set[str]]]:
 		self._loop_depth += 1
 		self._loop_labels.append(( continue_label, break_label, loop_snapshot ))
 		# see cfg.py's CFGState.enter_loop's own docstring: lets
@@ -4154,6 +4156,7 @@ class FunctionLowering:
 		# actually get emitted)
 		self._cfg.enter_loop( loop_snapshot.stack_depth )
 		break_narrowed: list[dict[str,list[Variable]]] = []
+		break_live: list[set[str]] = []
 		try:
 			for stmt in body:
 				try:
@@ -4161,15 +4164,16 @@ class FunctionLowering:
 				except CompileError:
 					continue
 		finally:
-			# Phase 8: every narrowed-state snapshot recorded by a `break`
-			# reached while lowering this body (cfg.py's own
-			# record_break_narrowed(), called from _stmt_Break below) -
-			# handed back to the caller (_stmt_While/for-loop lowerers) to
-			# merge with the loop's own natural exit via merge_loop_exits()
-			break_narrowed = self._cfg.exit_loop()
+			# Phase 8: every narrowed-state/live-state snapshot recorded by a
+			# `break` reached while lowering this body (cfg.py's own
+			# record_break_narrowed()/record_break_live(), called from
+			# _stmt_Break below) - handed back to the caller (_stmt_While/
+			# for-loop lowerers) to merge with the loop's own natural exit
+			# via merge_loop_exits()
+			break_narrowed, break_live = self._cfg.exit_loop()
 			self._loop_labels.pop()
 			self._loop_depth -= 1
-		return break_narrowed
+		return break_narrowed, break_live
 
 	def _check_loop_exit_unchecked_results( self, loop_snapshot: object, node: ast.AST ) -> None:
 		try:
@@ -4188,8 +4192,11 @@ class FunctionLowering:
 		# with every other break/the loop's own natural exit once that
 		# loop's own body is fully lowered. Before unwind_to() below (which
 		# doesn't touch _narrowed at all, but ordering it first here keeps
-		# this call sitting right next to unwind_to()'s own snapshot read)
+		# this call sitting right next to unwind_to()'s own snapshot read).
+		# record_break_live() is the definite-assignment analogue, captured
+		# alongside it for the identical reason.
 		self._cfg.record_break_narrowed()
+		self._cfg.record_break_live()
 		for instr in self._cfg.unwind_to( loop_snapshot ):
 			self._emit( instr )
 		self._emit( ir.Jump( target = break_label ))
@@ -4214,6 +4221,11 @@ class FunctionLowering:
 		fn = self._current_fn
 		var = Variable( stem = stem, qualname = f'{fn.qualname}.{stem}', file = fn.file, line = getattr( node, 'lineno', None ), type = type )
 		fn.add_name( stem, var )
+		# every caller unconditionally assigns this right after declaring it
+		# (no user code runs in between - see each call site's own next
+		# line/statement), so it's live from here on, same bucket as a
+		# parameter - see cfg.py's mark_live() docstring
+		self._cfg.mark_live( stem )
 		self.lowering.schedule( type )
 		return var
 
@@ -4254,9 +4266,11 @@ class FunctionLowering:
 		if existing is not None:
 			operand = self._lower_expr( value_expr, existing.type )
 			self._emit( ir.Assign( dest = existing, src = operand ))
+			self._cfg.mark_live( existing.stem ) # this bypasses _cfg_assign like the rest of this function does (pre-existing, not touched here) - liveness alone still needs marking, since it's unconditionally assigned right here regardless
 			return existing
 		var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( value_expr, expected ), default_type = default_type )
 		self._emit( ir.Assign( dest = var, src = operand ))
+		self._cfg.mark_live( var.stem )
 		return var
 
 	def _stmt_For( self, node: ast.For ) -> None:
@@ -4314,7 +4328,7 @@ class FunctionLowering:
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4328,7 +4342,7 @@ class FunctionLowering:
 		# for any for-loop) is still a real candidate to reconcile against
 		# every break_narrowed collected above - same merge_loop_exits()
 		# used by _stmt_While
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
 		self._emit( ir.Label( name = continue_label ))
 		# the increment is a compiler-synthesized implementation detail of
@@ -4399,7 +4413,7 @@ class FunctionLowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4408,7 +4422,7 @@ class FunctionLowering:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
 		# Phase 8 - see _lower_for_range's own identical call/comment
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
 		self._emit( ir.Label( name = continue_label ))
 		incr = self._new_temp( usize_cls )
@@ -4500,7 +4514,7 @@ class FunctionLowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		break_narrowed = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4509,7 +4523,7 @@ class FunctionLowering:
 			self._emit( instr )
 		self._cfg.restore( loop_snapshot )
 		# Phase 8 - see _lower_for_range's own identical call/comment
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed )
+		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
 		self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
@@ -4599,6 +4613,7 @@ class FunctionLowering:
 		true_end = dict( self._cfg.bindings )
 		true_end_results = self._cfg.unchecked_results()
 		true_end_narrowed = self._cfg.narrowed_snapshot()
+		true_end_live = self._cfg.live_snapshot()
 		# return/break/continue as a branch's own last statement means
 		# that branch never reaches the if's join point at all - see
 		# merge_if()'s own comment on why that has to be treated
@@ -4623,12 +4638,14 @@ class FunctionLowering:
 			false_end = dict( self._cfg.bindings )
 			false_end_results = self._cfg.unchecked_results()
 			false_end_narrowed = self._cfg.narrowed_snapshot()
+			false_end_live = self._cfg.live_snapshot()
 			false_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
 		else:
 			false_captured = []
 			false_end = dict( entry_snapshot.bindings )
 			false_end_results = set( entry_snapshot.results )
 			false_end_narrowed = dict( entry_snapshot.narrowed )
+			false_end_live = set( entry_snapshot.live )
 			false_terminates = False
 
 		self._cfg.restore( entry_snapshot )
@@ -4639,11 +4656,20 @@ class FunctionLowering:
 				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
 				true_terminates = true_terminates, false_terminates = false_terminates,
 				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
+				true_end_live = true_end_live, false_end_live = false_end_live,
 			)
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
-		for name in removed:
-			del self._current_fn.names[name]
+		# `removed` only drives the RC Decref instructions above (already
+		# spliced into true_extra/false_extra) - it must NOT also remove
+		# these names from fn.names. This language has no block scoping (see
+		# cfg.py's own module docstring): a name introduced anywhere in the
+		# function body stays a real name for the rest of it. Whether a
+		# later reference is actually valid is now the new _live mechanism's
+		# job (_expr_Name's own liveness gate) - it correctly reports "not
+		# initialized on all code branches" for exactly this case, instead
+		# of the misleading "is not defined" this loop used to produce by
+		# deleting the name out from under a later reference entirely.
 
 		for instr in true_captured:
 			self._emit( instr )
@@ -5022,6 +5048,14 @@ class FunctionLowering:
 			return self._lower_function_ref( name, node )
 		if not isinstance( name, Variable ):
 			self.lowering.discovery.fail( f'{node.id!r} is not a value, cannot use it as an expression', node )
+		# definite-assignment gate: a local (never a global - those aren't
+		# tracked by this function's own _live set at all, see cfg.py's
+		# is_live() docstring) that's in scope (fn.names, so find_name above
+		# already succeeded) but not provably assigned on every path that
+		# reaches here - e.g. a bare `x: T` declaration only assigned inside
+		# one if-branch, then read unconditionally after it
+		if not name.is_global and not self._cfg.is_live( node.id ):
+			self.lowering.discovery.fail( f'{node.id!r} is not initialized on all code branches', node )
 		self.lowering._ensure_resolved( name )
 		member = self._cfg.narrowed_member( node.id )
 		# _same_type, not raw `is` - same PLAN_COMPILER_BUG_SWEEP.md audit
@@ -5560,6 +5594,13 @@ class FunctionLowering:
 				if expected_type is None:
 					self.lowering.discovery.fail(
 						f'cannot infer the type of literal {node.value!r} - no str type available ({ast.unparse(node)})',
+						node,
+					)
+			elif isinstance( node.value, bytes ):
+				expected_type = self.lowering.discovery.find_name_or_none( 'bytes' )
+				if expected_type is None:
+					self.lowering.discovery.fail(
+						f'cannot infer the type of literal {node.value!r} - no bytes type available ({ast.unparse(node)})',
 						node,
 					)
 			elif node.value is None:
@@ -7202,6 +7243,54 @@ class FunctionLowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
+	def _flush_ifexp_branch_temps( self, start_idx: int, *keep: ir.Operand ) -> None:
+		# a ternary branch can lower an arbitrarily deep sub-expression (e.g.
+		# `prefix + str('.') + k`, two chained str.__add__ Calls) that
+		# DeclareTemp's its own intermediate temps (the '.'  literal-wrap
+		# temp, and the first __add__'s own result, consumed as the second
+		# __add__'s receiver) via the ordinary self._new_temp() path - every
+		# one of those lands in self._pending_temps exactly like any other
+		# temp. _expr_IfExp only ever untrack_temp()'s/increfs the branch's
+		# OWN final value (`true_val`/`false_val` below) - it never touches
+		# these purely-intermediate temps, so left alone they'd survive in
+		# _pending_temps all the way to the ENCLOSING STATEMENT's own
+		# _flush_pending_temps() (e.g. _stmt_Return's, called once after
+		# BOTH branches have already merged at end_label) - which then
+		# decref's them UNCONDITIONALLY, including in whichever branch did
+		# NOT run and therefore never assigned into that temp's C variable
+		# at all, releasing raw stack garbage. Confirmed as a real,
+		# reproducible stack-overflow crash (not just a leak/UAF): the
+		# garbage pointer's own "vtable" field is whatever happened to be on
+		# the stack, so release_object's vtable->destroy call jumps
+		# somewhere essentially random.
+		#
+		# The fix: flush each branch's OWN intermediate temps (added to
+		# _pending_temps since `start_idx`, i.e. everything DeclareTemp'd
+		# while lowering just THIS branch) right here, inside the branch,
+		# before the Jump to end_label - exactly mirroring how the already-
+		# correct if/else STATEMENT form gets this right for free (each
+		# branch is its own statement, so _lower_stmt's per-statement
+		# pending_temps save/flush/restore already scopes it correctly).
+		# `keep` (the branch's own dest/final-value temps) is excluded -
+		# their ownership is already fully resolved by the incref/
+		# untrack_temp() decision made just above each call site, and dest
+		# in particular is still actively in use afterward (assigned into,
+		# then read again once both branches merge) so it must not be
+		# DeleteTemp'd here even though the actual decref side would
+		# already be a safe no-op for it (cfg.fresh_temp() only registers
+		# dest AFTER both branches, so cfg.delete_temp(dest) can't fire a
+		# real release yet regardless - this is about not emitting a
+		# spurious "this temp is done" marker on a temp that visibly isn't).
+		branch_temps = self._pending_temps[ start_idx: ]
+		self._pending_temps = self._pending_temps[ : start_idx ]
+		keep_ids = { k.id for k in keep if isinstance( k, ir.Temp ) }
+		for t in reversed( branch_temps ):
+			if t.id in keep_ids:
+				continue
+			for instr in self._cfg.delete_temp( t ):
+				self._emit( instr )
+			self._emit( ir.DeleteTemp( temp = t ))
+
 	def _expr_IfExp( self, node: ast.IfExp, expected_type: Type|None ) -> ir.Operand:
 		# ternary `x if cond else y` — both branches assign to the same
 		# dest temp, then merge at end_label. Use JumpIfTrue so the true
@@ -7223,6 +7312,17 @@ class FunctionLowering:
 		# confirmed as a real, reproducible UAF/double-free via direct
 		# testing (`str('-') if cond else str('+')` corrupted/crashed
 		# before this fix), not just reasoning from the code shape.
+		#
+		# Each branch's own PURELY INTERMEDIATE temps (e.g. every temp a
+		# chained `prefix + str('.') + k` concatenation DeclareTemp's along
+		# the way, none of which is `true_val`/`false_val` itself) are
+		# flushed inside that branch via _flush_ifexp_branch_temps - see its
+		# own comment for why: left to the enclosing statement's normal
+		# end-of-statement flush, they leak past end_label and get
+		# unconditionally decref'd even in the branch that never ran,
+		# releasing an uninitialized C local - a real, reproducible stack-
+		# overflow crash (release_object on stack garbage), not just a
+		# leak/UAF, confirmed via direct testing.
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		cond = self._lower_expr( node.test, bool_cls )
 		else_label = self._new_label( 'ifexp_else' )
@@ -7230,6 +7330,7 @@ class FunctionLowering:
 		dest = self._new_temp( expected_type ) if expected_type is not None else None
 		self._emit( ir.JumpIfFalse( cond = cond, target = else_label ))
 		# true branch
+		true_branch_start = len( self._pending_temps )
 		true_val = self._lower_expr( node.body, expected_type )
 		if dest is None:
 			dest = self._new_temp( true_val.type )
@@ -7238,16 +7339,19 @@ class FunctionLowering:
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( true_val )
+		self._flush_ifexp_branch_temps( true_branch_start, dest, true_val )
 		self._emit( ir.Assign( dest = dest, src = true_val ))
 		self._emit( ir.Jump( target = end_label ))
 		# false branch
 		self._emit( ir.Label( name = else_label ))
+		false_branch_start = len( self._pending_temps )
 		false_val = self._lower_expr( node.orelse, dest.type )
 		if self.lowering._is_aliasing_expr( node.orelse, false_val ):
 			for instr in self._cfg.incref( dest.type, false_val ):
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( false_val )
+		self._flush_ifexp_branch_temps( false_branch_start, dest, false_val )
 		self._emit( ir.Assign( dest = dest, src = false_val ))
 		self._emit( ir.Label( name = end_label ))
 		self._cfg.fresh_temp( dest, dest.type )
@@ -9613,7 +9717,19 @@ class FunctionLowering:
 		self._inlining_stack.append( id( target ))
 		try:
 			if len( stmts ) > 1:
-				return self._splice_multi_statement_inline_body( node, target, receiver, args, kwargs, expected_type, want_result, stmts )
+				# the splice's own pre-return statements bind self/params
+				# (and declare their own alpha-renamed locals) directly on
+				# the shared self._cfg - unlike provisional.names (a fresh,
+				# single-use, discarded Function), self._cfg._live is NOT
+				# reverted internally by _splice_multi_statement_inline_body
+				# itself, so it's done here instead: wholesale snapshot/
+				# restore around the whole call - see set_live()'s own
+				# docstring for why a full revert is safe here
+				saved_live = self._cfg.live_snapshot()
+				try:
+					return self._splice_multi_statement_inline_body( node, target, receiver, args, kwargs, expected_type, want_result, stmts )
+				finally:
+					self._cfg.set_live( saved_live )
 
 			bindings: dict[str,ir.Operand] = {} if receiver is None else { 'self': receiver }
 			for i, param in enumerate( target.parameters or [] ):
@@ -9663,6 +9779,7 @@ class FunctionLowering:
 			# above) and to guarantee it's evaluated exactly once even if the
 			# spliced body references self/that parameter more than once
 			saved: dict[str,object] = {}
+			saved_live: dict[str,bool] = {}
 			for stem, operand in bindings.items():
 				if isinstance( operand, Variable ):
 					fresh = operand
@@ -9677,6 +9794,20 @@ class FunctionLowering:
 					self._emit( ir.Assign( dest = fresh, src = operand ))
 				saved[stem] = target.names.get( stem )
 				target.names[stem] = fresh
+				# liveness is keyed by `stem` (the literal 'self'/parameter
+				# name the spliced body's own ast.Name nodes reference it
+				# by, via target.names) NOT fresh.stem (which differs for
+				# the synthesized-local fallback above, and even for the
+				# zero-copy case is the CALLER's own variable's stem, e.g.
+				# 'b' for a `b.get_len()` receiver, not 'self'). Bypasses
+				# _cfg_assign like the rest of this binding deliberately
+				# does (see this method's own "no _cfg_assign/incref here"
+				# comment above) - still unconditionally bound right here.
+				# Saved/restored the same shadow-and-restore way target.
+				# names itself is, in case `stem` collides with an outer
+				# name that wasn't actually live before this splice.
+				saved_live[stem] = self._cfg.is_live( stem )
+				self._cfg.mark_live( stem )
 
 			return_expr = stmts[-1].value
 			module = self.lowering._find_module_for( target )
@@ -9685,6 +9816,9 @@ class FunctionLowering:
 					with self.lowering.discovery.scope_context( target ):
 						result = self._lower_expr( return_expr, expected_type or target.return_type )
 			finally:
+				for stem, was_live in saved_live.items():
+					if not was_live:
+						self._cfg.unmark_live( stem )
 				for stem, old in saved.items():
 					if old is None:
 						target.names.pop( stem, None )
@@ -9804,6 +9938,12 @@ class FunctionLowering:
 				self._inline_binding_id += 1
 				self._emit( ir.Assign( dest = fresh, src = operand ))
 			provisional.names[stem] = fresh
+			# liveness keyed by `stem` (see _lower_inline_call's own
+			# identical single-statement-path comment) - the caller
+			# (_lower_inline_call) reverts self._cfg's ENTIRE live set once
+			# this whole splice returns, so no per-stem save/restore is
+			# needed here, unlike provisional.names/that other path
+			self._cfg.mark_live( stem )
 
 		# early/nested-return + defer/errdefer/.or_return() generalization -
 		# a splice-local "epilogue" scope for the pre-return statements: an

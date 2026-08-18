@@ -677,12 +677,12 @@ class int:
 		(complex logic orchestrated from lowering.py itself) elsewhere in
 		this same pass. '''
 		if self.__is_negative:
-			return str( '-' )
+			return '-'
 		if mode == '+':
-			return str( '+' )
+			return '+'
 		if mode == ' ':
-			return str( ' ' )
-		return str( '' )
+			return ' '
+		return ''
 
 	@private
 	def _to_radix_digits( self, base: i32, uppercase: bool ) -> str:
@@ -714,7 +714,7 @@ class int:
 		this gap, written before tuples existed to reach it) and fixed
 		there - see that function's own comment for the full account. '''
 		if self.is_zero():
-			return str( '0' )
+			return '0'
 		magnitude: int = self.clone()
 		magnitude.__is_negative = False
 		radix: int = int( base )
@@ -736,7 +736,7 @@ class int:
 			while i > 0:
 				i -= 1
 				ordered.append( digits.__getitem__( i ).unwrap( '_to_radix_digits: index in bounds by construction' )).unwrap( '_to_radix_digits: append failed' )
-		return str( '' ).join( ordered )
+		return ''.join( ordered )
 
 	@private
 	def _decimal_digits( self ) -> str:

@@ -258,13 +258,13 @@ class bytes:
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		return utf8.decode( self )
 
-	def find( self, sub: bytes, start: usize = 0 ) -> isize:
+	def find( self, sub: bytes|bytearray, start: usize = 0 ) -> isize:
 		return _bytes_find_at( self, sub, start )
 
-	def startswith( self, prefix: bytes, start: usize = 0 ) -> bool:
+	def startswith( self, prefix: bytes|bytearray, start: usize = 0 ) -> bool:
 		return _bytes_startswith_at( self, prefix, start )
 
-	def endswith( self, suffix: bytes ) -> bool:
+	def endswith( self, suffix: bytes|bytearray ) -> bool:
 		return _bytes_endswith( self, suffix )
 
 	@private
@@ -282,7 +282,7 @@ class bytes:
 		sys.memcpy( new_data, src, piece_len )
 		return bytes.__allocate__( __data = new_data, __len = piece_len )
 
-	def split( self, sep: bytes ) -> list[bytes]:
+	def split( self, sep: bytes|bytearray ) -> list[bytes]:
 		''' splits self on every occurrence of sep - same semantics as
 		str.split() (lib/builtins/__init__.py), built on find()/_byte_slice
 		above rather than its own scanning logic. sep must not be empty. '''
@@ -332,17 +332,17 @@ class bytearray:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.get_const_ptr() called after release()'
 		return self.__data
 
-	def find( self, sub: bytes, start: usize = 0 ) -> isize:
+	def find( self, sub: bytes|bytearray, start: usize = 0 ) -> isize:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.find() called after release()'
 		return _bytes_find_at( self, sub, start )
 
-	def startswith( self, prefix: bytes, start: usize = 0 ) -> bool:
+	def startswith( self, prefix: bytes|bytearray, start: usize = 0 ) -> bool:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.startswith() called after release()'
 		return _bytes_startswith_at( self, prefix, start )
 
-	def endswith( self, suffix: bytes ) -> bool:
+	def endswith( self, suffix: bytes|bytearray ) -> bool:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.endswith() called after release()'
 		return _bytes_endswith( self, suffix )
@@ -396,7 +396,7 @@ class bytearray:
 		sys.memcpy( result.__data, src, piece_len )
 		return result
 
-	def split( self, sep: bytes ) -> list[bytearray]:
+	def split( self, sep: bytes|bytearray ) -> list[bytearray]:
 		''' splits self on every occurrence of sep - same semantics as
 		bytes.split()/str.split() above. Each returned piece is an
 		independently-owned, freshly-allocated bytearray (_byte_slice
@@ -425,17 +425,41 @@ class bytearray:
 
 class str:
 	__data: ConstPtr[u8]
-	
+
 	__byte_size: usize # the number of bytes (code units) include the zero-terminater
-	
-	def __init__( self, copy_from: str ) -> None:
-		self.__byte_size = copy_from.__byte_size
-		data: Ptr[u8] = sys.alloc[u8]( self.__byte_size )
-		sys.memcpy( data, copy_from.__data, self.__byte_size )
-		self.__data = data
-	
+
+	__char_count: usize # Unicode codepoint count, computed once in _from_owned_cstr
+
+	__index: Ptr[usize] # owned, always-allocated sparse index: one entry per 256
+	                     # codepoints, storing the BYTE OFFSET where that group starts.
+	                     # entries = (__byte_size >> 8) + 1, a pure function of
+	                     # __byte_size so no separate stored length is needed - every
+	                     # codepoint takes >= 1 byte, so char_count <= byte_len <=
+	                     # byte_size, and idx >> 8 < entries for any valid idx.
+
+	# str is immutable, so there is no reason to ever deep-copy one - every
+	# call site that used to write str(existing_str) to hand back "a copy"
+	# now just returns/reuses that existing_str directly, picking up its own
+	# incref for free via the compiler's aliasing-return convention (see
+	# _stmt_Return / _expr_Tuple's field_value, the same mechanism
+	# _insert_thousands_sep's own comment already documents). Left commented
+	# out, not deleted, as the historical copy-constructor shape in case a
+	# real deep-copy need ever comes back.
+	# def __init__( self, copy_from: str ) -> None:
+	# 	self.__byte_size = copy_from.__byte_size
+	# 	data: Ptr[u8] = sys.alloc[u8]( self.__byte_size )
+	# 	sys.memcpy( data, copy_from.__data, self.__byte_size )
+	# 	self.__data = data
+	# 	self.__char_count = copy_from.__char_count
+	# 	with compiler.panic_arithmetic( 'index sizing bounded by byte_size, cannot overflow' ):
+	# 		entries: usize = ( self.__byte_size >> 8 ) + 1
+	# 	new_index: Ptr[usize] = sys.alloc[usize]( entries )
+	# 	sys.memcpy( new_index, copy_from.__index, entries * compiler.sizeof( usize ) )
+	# 	self.__index = new_index
+
 	def __del__( self ) -> None:
 		sys.free( self.__data )
+		sys.free( self.__index )
 	
 	def __add__( self, other: str ) -> str:
 		if compiler.target.debug:
@@ -549,25 +573,35 @@ class str:
 			return self.__byte_size - 1
 	
 	def __len__( self ) -> usize:
-		# Unicode code point count (real Python len(s) semantics) - counts
-		# bytes that are NOT UTF-8 continuation bytes (top two bits != 0b10).
-		# count/i are bounded by __byte_len (an existing buffer's length in bytes,
-		# already itself usize-representable), so they can't actually overflow -
-		# panic_arithmetic documents that invariant rather than forcing every
-		# caller through Result[usize,OverflowError] for something impossible.
-		count: usize = 0
-		i: usize = 0
-		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow' ):
-			assert self.__byte_size > 0, 'byte_size must be > 0'
-			byte_len: usize = self.__byte_size - 1
-			while i < byte_len:
-				c: u8 = self.__data[i]
-				if not c:
-					return count
-				if ( c & 0xC0 ) != 0x80:
-					count += 1
-				i += 1
-		return count
+		# Unicode code point count (real Python len(s) semantics) - O(1),
+		# precomputed once by _from_owned_cstr during its mandatory UTF-8
+		# validation scan (see __char_count's own field comment).
+		return self.__char_count
+
+	def __getitem__( self, idx: usize ) -> Result[str, IndexError]:
+		''' codepoint-indexed access (Python's s[i]) - no negative-index
+		support, matching list/bytearray/dict/set.__getitem__ here, none of
+		which support negative indices either. Jumps to the nearest <=256-
+		codepoint group via __index (O(1)), then decodes forward through at
+		most 255 codepoints to reach idx's own start byte offset - same
+		decode_utf8_at-forward-through-consumed-bytes shape lstrip/rstrip
+		below already use, just bounded to one group instead of the whole
+		string. '''
+		if idx >= self.__char_count:
+			return Result.Err( IndexError() )
+		group: usize = idx >> 8
+		i: usize = self.__index[group]
+		remaining: usize = idx & 0xFF
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'bounded by remaining < 256 within a valid group, cannot overflow' ):
+			j: usize = 0
+			while j < remaining:
+				decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				i += consumed
+				j += 1
+			decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+			end: usize = i + consumed
+		return Result.Ok( self._byte_slice( i, end ))
 
 	def __bool__( self ) -> bool:
 		# Python-style str truthiness: empty string is falsy. byte_len()
@@ -664,7 +698,7 @@ class str:
 		max_count codepoints. '''
 		self_count: usize = self.__len__()
 		if self_count <= max_count:
-			return str( self )
+			return self
 		count: usize = 0
 		i: usize = 0
 		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow' ):
@@ -784,14 +818,14 @@ class str:
 		''' self with prefix removed if present, else an unchanged copy -
 		matches Python's str.removeprefix(). '''
 		if not self.startswith( prefix ):
-			return str( self )
+			return self
 		return self._byte_slice( prefix.byte_len(), self.byte_len() )
 
 	def removesuffix( self, suffix: str ) -> str:
 		''' self with suffix removed if present, else an unchanged copy -
 		matches Python's str.removesuffix(). '''
 		if not self.endswith( suffix ):
-			return str( self )
+			return self
 		with compiler.wrap_arithmetic: # suffix_len <= self_len, endswith() just confirmed it
 			end: usize = self.byte_len() - suffix.byte_len()
 		return self._byte_slice( 0, end )
@@ -856,7 +890,7 @@ class str:
 				start = match_start + old_len
 
 		if occurrences == 0:
-			return str( self )
+			return self
 
 		new_size: usize = 1 # zero terminator
 		with compiler.panic_arithmetic( 'irrational string length' ):
@@ -903,7 +937,7 @@ class str:
 		text collection in (e.g. split()'s own return type). '''
 		count: usize = parts.__len__()
 		if count == 0:
-			return str( '' )
+			return ''
 		self_len: usize = self.byte_len()
 		new_size: usize = 1 # zero terminator
 		i: usize = 0
@@ -984,7 +1018,7 @@ class str:
 			sys.panic( 'str.ljust(...): fillchar must be exactly one character' )
 		self_count: usize = self.__len__()
 		if self_count >= width:
-			return str( self )
+			return self
 		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
 			pad_count: usize = width - self_count
 		self_len: usize = self.byte_len()
@@ -1012,7 +1046,7 @@ class str:
 			sys.panic( 'str.rjust(...): fillchar must be exactly one character' )
 		self_count: usize = self.__len__()
 		if self_count >= width:
-			return str( self )
+			return self
 		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
 			pad_count: usize = width - self_count
 		self_len: usize = self.byte_len()
@@ -1044,7 +1078,7 @@ class str:
 			sys.panic( 'str.center(...): fillchar must be exactly one character' )
 		self_count: usize = self.__len__()
 		if self_count >= width:
-			return str( self )
+			return self
 		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
 			pad_count: usize = width - self_count
 		with compiler.panic_arithmetic( 'unreachable: dividing by the literal 2' ):
@@ -1233,7 +1267,7 @@ class str:
 		motivated - self is the receiver float's code needs to dispatch
 		on, and only a real str method (not a Scalar.names-registered free
 		function) can be reached that way. '''
-		if self == str( 'nan' ) or self == str( 'inf' ):
+		if self == 'nan' or self == 'inf':
 			return self._pad_after_prefix( prefix, width, fill )
 		return self._pad_and_group_before_dot( prefix, width, fill, sep )
 
@@ -1248,7 +1282,7 @@ class str:
 		has_sign: bool = self_len > 0 and ( self.__data[0] == 0x2B or self.__data[0] == 0x2D ) # '+' or '-'
 		self_count: usize = self.__len__()
 		if self_count >= width:
-			return str( self )
+			return self
 		with compiler.panic_arithmetic( 'bounded by width, cannot overflow' ):
 			pad_count: usize = width - self_count
 		with compiler.panic_arithmetic( 'irrational string length' ):
@@ -1636,7 +1670,7 @@ class str:
 		itself uses. '''
 		self_len: usize = self.byte_len()
 		if self_len == 0:
-			return str( self )
+			return self
 		new_size: usize = 1 # zero terminator
 		i: usize = 0
 		consumed: usize = 0
@@ -1678,7 +1712,7 @@ class str:
 		swapcase() above has. '''
 		self_len: usize = self.byte_len()
 		if self_len == 0:
-			return str( self )
+			return self
 		new_size: usize = 1 # zero terminator
 		i: usize = 0
 		consumed: usize = 0
@@ -1754,16 +1788,27 @@ class str:
 			byte_len = byte_size_including_zero_terminator - 1
 		if ptr[byte_len] != 0:
 			return Result.Err( CodecError( 'utf-8', 'missing 0-terminator' ))
-		
+
+		# sparse codepoint-position index (see __index's own field comment) -
+		# built alongside the validation scan below at zero extra passes.
+		with compiler.panic_arithmetic( 'index sizing bounded by byte_size, cannot overflow' ):
+			entries: usize = ( byte_size_including_zero_terminator >> 8 ) + 1
+		index: Ptr[usize] = sys.alloc[usize]( entries )
+		errdefer( sys.free( index ))
+		char_count: usize = 0
+
 		# walk through ptr and confirm valid utf-8 encoding or return CodecError
 		i: usize = 0
 		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow ' ):
 			while i < byte_len:
+				if ( char_count & 0xFF ) == 0:
+					index[char_count >> 8] = i
 				byte1 = ptr[i]
-				
+
 				# 1-byte sequence (ASCII): 0xxxxxxx
 				if (byte1 & 0x80) == 0x00:
 					i += 1
+					char_count += 1
 					continue
 				
 				# unexpected continuation byte as a leading byte
@@ -1781,6 +1826,7 @@ class str:
 					if (byte2 & 0xC0) != 0x80:
 						return Result.Err( CodecError( 'utf-8', 'Invalid continuation byte in 2-byte sequence' ))
 					i += 2
+					char_count += 1
 
 				# 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
 				elif (byte1 & 0xF0) == 0xE0:
@@ -1797,6 +1843,7 @@ class str:
 					if byte1 == 0xED and byte2 >= 0xA0:
 						return Result.Err( CodecError( 'utf-8', 'UTF-16 surrogate half' ))
 					i += 3
+					char_count += 1
 
 				# 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
 				elif (byte1 & 0xF8) == 0xF0:
@@ -1816,6 +1863,7 @@ class str:
 					if byte1 > 0xF4:
 						return Result.Err( CodecError( 'utf-8', 'Code point exceeds maximum valid Unicode (sequence prefix > 0xF4)' ))
 					i += 4
+					char_count += 1
 
 				# Invalid leading bytes (0xF5..0xFF)
 				else:
@@ -1824,6 +1872,8 @@ class str:
 		s: str = str.__allocate__(
 			__data = ptr,
 			__byte_size = byte_size_including_zero_terminator,
+			__char_count = char_count,
+			__index = index,
 		)
 		return Result.Ok( s )
 
@@ -1895,7 +1945,7 @@ class CaseFolding:
 		# two passes
 		self_len: usize = s.byte_len()
 		if self_len == 0:
-			return str( s )
+			return s
 		data: ConstPtr[u8] = s.get_const_ptr()
 
 		new_size: usize = 1 # zero terminator

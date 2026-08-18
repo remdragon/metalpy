@@ -48,7 +48,7 @@ _TYPE_CHAR_F: i32 = 102 # ord('f')
 _TYPE_CHAR_G: i32 = 103 # ord('g') - the "no type char at all" default's own underlying conversion, see _f64_none_type_digits_raw
 _TYPE_CHAR_E: i32 = 101 # ord('e') - _f64_repr_digits_raw's own shortest-round-trip search always uses this conversion (see its own comment on why 'e', not 'f'/'g')
 
-_DECIMAL_DIGIT_CHARS: str = str( '0123456789' ) # _f64_exponent_text's own hand-built int-to-string table - see its own comment on why not a general-purpose one
+_DECIMAL_DIGIT_CHARS: str = '0123456789' # _f64_exponent_text's own hand-built int-to-string table - see its own comment on why not a general-purpose one
 
 # 17 significant digits is always enough to exactly round-trip any IEEE754
 # double (the standard DBL_DECIMAL_DIG guarantee) - _f64_repr_digits_raw's
@@ -128,12 +128,12 @@ def _f64_sign_prefix( value: f64, mode: str ) -> str:
 	calls this on the ORIGINAL, un-scaled value - multiplying by the
 	positive constant 100 never changes the sign). '''
 	if value < 0.0:
-		return str( '-' )
+		return '-'
 	if mode == '+':
-		return str( '+' )
+		return '+'
 	if mode == ' ':
-		return str( ' ' )
-	return str( '' )
+		return ' '
+	return ''
 
 
 @private
@@ -183,9 +183,9 @@ def _f64_fixed_digits_raw( value: f64, precision: usize, type_char: i32, alt: bo
 	__metalpy_isnan/__metalpy_isinf macros already used for checked
 	arithmetic (emitter_c.py's PROLOGUE). '''
 	if compiler.is_nan( value ):
-		return str( 'nan' )
+		return 'nan'
 	if compiler.is_inf( value ):
-		return str( 'inf' )
+		return 'inf'
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		with compiler.panic_arithmetic( 'an integer-digit bound plus a decimal point plus precision fractional digits plus a zero terminator cannot overflow usize for any real f-string format spec' ):
@@ -234,7 +234,7 @@ def _f64_percent_digits( value: f64, precision: usize, alt: bool, sep: str ) -> 
 	unaffected by scaling by the positive constant 100, so lowering.py
 	still calls _f64_sign_prefix on the ORIGINAL, un-scaled value for this
 	case - no separate percent-specific sign handling needed. '''
-	return _group_integer_part( _f64_percent_digits_raw( value, precision, alt ), sep ) + str( '%' )
+	return _group_integer_part( _f64_percent_digits_raw( value, precision, alt ), sep ) + '%'
 
 
 @private
@@ -255,7 +255,7 @@ def _f64_none_type_digits_raw( value: f64, precision: usize, alt: bool ) -> str:
 	are also passed through unchanged - the "always show a fractional
 	digit" tweak only applies to FIXED-point results. '''
 	raw: str = _f64_fixed_digits_raw( value, precision, _TYPE_CHAR_G, alt )
-	if raw == str( 'nan' ) or raw == str( 'inf' ):
+	if raw == 'nan' or raw == 'inf':
 		return raw
 	has_dot: bool = raw.find( str( '.' )) != isize( -1 )
 	if has_dot:
@@ -263,7 +263,7 @@ def _f64_none_type_digits_raw( value: f64, precision: usize, alt: bool ) -> str:
 	has_exp: bool = raw.find( str( 'e' )) != isize( -1 )
 	if has_exp:
 		return raw
-	return raw + str( '.0' )
+	return raw + '.0'
 
 
 @private
@@ -371,24 +371,24 @@ def _f64_repr_from_scientific( sci_text: str ) -> str:
 			with compiler.wrap_arithmetic:
 				int_digit_count: usize = usize( exponent ) + 1
 			if int_digit_count >= digit_count:
-				return digits.ljust( int_digit_count, str( '0' )) + str( '.0' )
+				return digits.ljust( int_digit_count, '0' ) + '.0'
 			int_part: str = digits._byte_slice( 0, int_digit_count )
 			frac_part: str = digits._byte_slice( int_digit_count, digit_count )
-			return int_part + str( '.' ) + frac_part
+			return int_part + '.' + frac_part
 		with compiler.wrap_arithmetic:
 			zero_count: usize = usize( -exponent ) - 1
-		leading_zeros: str = str( '' ).rjust( zero_count, str( '0' ))
-		return str( '0.' ) + leading_zeros + digits
+		leading_zeros: str = ''.rjust( zero_count, '0' )
+		return '0.' + leading_zeros + digits
 
 	mantissa_text: str
 	if digit_count > 1:
-		mantissa_text = digits._byte_slice( 0, 1 ) + str( '.' ) + digits._byte_slice( 1, digit_count )
+		mantissa_text = digits._byte_slice( 0, 1 ) + '.' + digits._byte_slice( 1, digit_count )
 	else:
 		mantissa_text = digits
-	exp_sign: str = str( '-' ) if exponent < 0 else str( '+' )
+	exp_sign: str = '-' if exponent < 0 else '+'
 	with compiler.wrap_arithmetic:
 		exp_magnitude: i32 = -exponent if exponent < 0 else exponent
-	return mantissa_text + str( 'e' ) + exp_sign + _f64_exponent_text( exp_magnitude )
+	return mantissa_text + 'e' + exp_sign + _f64_exponent_text( exp_magnitude )
 
 
 @private
@@ -426,11 +426,11 @@ def _f64_repr_digits_raw( value: f64 ) -> str:
 	"0.0" anyway, but skipping the search entirely for a known, constant
 	answer is simpler and cheaper). '''
 	if compiler.is_nan( value ):
-		return str( 'nan' )
+		return 'nan'
 	if compiler.is_inf( value ):
-		return str( 'inf' )
+		return 'inf'
 	if value == 0.0:
-		return str( '0.0' )
+		return '0.0'
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		buf: Ptr[u8] = sys.alloc[u8]( _REPR_SEARCH_BUF_SIZE )
@@ -460,7 +460,7 @@ def _f64_str( value: f64 ) -> str:
 	''' bare f"{x}" (no format spec at all) / str(x) - real Python's own
 	str(float)/repr(float) are identical, always (unlike int, where they
 	merely happen to coincide) - see _f64_repr below. '''
-	return _f64_sign_prefix( value, str( '-' )) + _f64_repr_digits_raw( value )
+	return _f64_sign_prefix( value, '-' ) + _f64_repr_digits_raw( value )
 
 
 @private

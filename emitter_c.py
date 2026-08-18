@@ -2735,14 +2735,45 @@ def _emit_one_string_literal( qualname: str, value: str|bytes ) -> list[str]:
 	name = _string_literal_name( qualname, value )
 	data_name = f'{name}$data'
 	struct_name = mangle_qualname( qualname )
-	return [
+	lines = [
 		f'static const uint8_t {data_name}[] = {_c_string_literal(data_bytes)};',
+	]
+	extra_field_lines: list[str] = []
+	if qualname == 'builtins.str':
+		# str also caches __char_count/__index (lib/builtins/__init__.py's
+		# str._from_owned_cstr) - a literal is baked directly here rather
+		# than going through that runtime construction path, so it must
+		# independently bake the SAME cached metadata. Computed in Python at
+		# compile time instead of C: a Python str's own len()/iteration is
+		# already the Unicode codepoint sequence, so no UTF-8 decoding is
+		# needed here (unlike the runtime scan, which has to decode). Same
+		# entries=(byte_size>>8)+1 sizing formula as the runtime path, so a
+		# literal's __index is indistinguishable in shape from a runtime-
+		# constructed str's - __getitem__ doesn't know or care which built it.
+		assert isinstance( value, str )
+		index_name = f'{name}$index'
+		byte_size = len( data_bytes )
+		entries = ( byte_size >> 8 ) + 1
+		offsets = [ 0 ] * entries
+		byte_offset = 0
+		for i, ch in enumerate( value ):
+			if ( i & 0xFF ) == 0:
+				offsets[ i >> 8 ] = byte_offset
+			byte_offset += len( ch.encode( 'utf-8' ))
+		lines.append( f'static const uintptr_t {index_name}[] = {{ {", ".join(str(o) for o in offsets)} }};' )
+		extra_field_lines = [
+			f'\t.{_field_name("__char_count")} = {len(value)},',
+			f'\t.{_field_name("__index")} = (uintptr_t*){index_name},',
+		]
+	lines += [
 		f'static struct {struct_name} {name} = {{',
 		f'\t.$header = {{ .ref_count = METALPY_IMMORTAL_REFCOUNT }},',
 		f'\t.{_field_name(data_field)} = {data_name},',
 		f'\t.{_field_name(len_field)} = {len(data_bytes)},',
+		*extra_field_lines,
 		'};',
 	]
+	return lines
 
 def _emit_string_literals( compiler: Compiler ) -> list[str]:
 	# a program-wide collection pass, since C requires each static object

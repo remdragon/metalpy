@@ -297,8 +297,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef get( self ) -> T:',
 			'\t\treturn self.v',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]',
+			'def main( b: Box[i32] ) -> None:', # a parameter, not a bare local - definitely assigned from entry, and (unlike a real Box[i32](...) construction) doesn't pull lib/sys.py's own str/builtins dependency into this import_builtins=False test
 			'\tx = b.get()',
 			'\treturn',
 		]))
@@ -331,8 +330,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef set( self, x: T ) -> None:',
 			'\t\tself.v = x',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]|Box[u32]',
+			'def main( b: Box[i32]|Box[u32] ) -> None:', # a parameter, not a bare local - see the identical comment in test_generic_rcclass_method_call_through_concrete_receiver_is_substituted
 			'\tx: i32 = 5',
 			'\tb.set( x )',
 			'\treturn',
@@ -365,8 +363,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef set( self, x: T ) -> None:',
 			'\t\tself.v = x',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]|Box[i64]',
+			'def main( b: Box[i32]|Box[i64] ) -> None:', # a parameter, not a bare local - see the identical comment in test_generic_rcclass_method_call_through_concrete_receiver_is_substituted
 			'\tx: i32 = 5',
 			'\tb.set( x )',
 			'\treturn',
@@ -2778,6 +2775,12 @@ _BUILTINS_STR_FIXTURE = '\n'.join([
 	'class str:',
 	'	__data: ConstPtr[u8]',
 	'	__byte_size: usize',
+	# mirrors real builtins.str's __char_count/__index fields (lib/builtins/
+	# __init__.py) - _emit_one_string_literal (emitter_c.py) unconditionally
+	# bakes both into every str literal it emits, so this fixture needs the
+	# same shape even though nothing in these tests reads either field.
+	'	__char_count: usize',
+	'	__index: Ptr[usize]',
 	'',
 	'	def get_data( self ) -> ConstPtr[u8]:',
 	'		return self.__data',
@@ -5874,6 +5877,133 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+
+class StrLenGetitemIndexTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' O(1) str.__len__() (__char_count) and the new codepoint-indexed
+	str.__getitem__() (sparse __index, one entry per 256 codepoints) - both
+	computed for free during _from_owned_cstr's existing mandatory UTF-8
+	validation scan (lib/builtins/__init__.py). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'empty_string', '''
+def main() -> i32:
+	s: str = ''
+	if len( s ) != 0:
+		return 1
+	r: Result[str,IndexError] = s.__getitem__( 0 )
+	if r.is_ok():
+		return 2
+	return 0
+''' ),
+			( 'single_ascii_char', '''
+def main() -> i32:
+	s: str = 'x'
+	if len( s ) != 1:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'x':
+		return 2
+	r: Result[str,IndexError] = s.__getitem__( 1 )
+	if r.is_ok():
+		return 3
+	return 0
+''' ),
+			( 'exactly_256_codepoints', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	s: str = run_of_a( 256 )
+	if len( s ) != 256:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'a':
+		return 2
+	if s.__getitem__( 255 ).unwrap( 'x' ) != 'a':
+		return 3
+	r: Result[str,IndexError] = s.__getitem__( 256 )
+	if r.is_ok():
+		return 4
+	return 0
+''' ),
+			( '257_codepoints_crosses_index_boundary', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	s: str = run_of_a( 256 ) + 'b'
+	if len( s ) != 257:
+		return 1
+	if s.__getitem__( 255 ).unwrap( 'x' ) != 'a':
+		return 2
+	if s.__getitem__( 256 ).unwrap( 'x' ) != 'b':
+		return 3
+	return 0
+''' ),
+			( 'multibyte_codepoint_index_ne_byte_offset', '''
+def main() -> i32:
+	s: str = 'héllo'
+	if len( s ) != 5:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'h':
+		return 2
+	if s.__getitem__( 1 ).unwrap( 'x' ) != 'é':
+		return 3
+	if s.__getitem__( 2 ).unwrap( 'x' ) != 'l':
+		return 4
+	if s.__getitem__( 4 ).unwrap( 'x' ) != 'o':
+		return 5
+	if s.byte_len() != 6: # 4 ascii + 2-byte 'é'
+		return 6
+	return 0
+''' ),
+			( 'out_of_range_index_is_err', '''
+def main() -> i32:
+	s: str = 'abc'
+	r: Result[str,IndexError] = s.__getitem__( 3 )
+	if r.is_ok():
+		return 1
+	r2: Result[str,IndexError] = s.__getitem__( 1000000 )
+	if r2.is_ok():
+		return 2
+	return 0
+''' ),
+			( 'group_boundary_string_still_readable_after_construction', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	original: str = run_of_a( 256 ) + 'zb'
+	if original.__getitem__( 256 ).unwrap( 'x' ) != 'z':
+		return 1
+	if len( original ) != 258:
+		return 2
+	return 0
+''' ),
+		])
 
 
 class StrPhase2PaddingTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -9598,6 +9728,30 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# a bare bytes literal passed directly where the declared
+			# parameter type is a bytes|bytearray union - regression test
+			# for _expr_Constant's literal self-typing chain missing a
+			# `bytes` branch (str/int/float/bool/None already had one)
+			( 'decode_bytes_literal_into_union_param', '''
+from codecs.utf8 import utf8
+
+def decode_it( x: bytes|bytearray ) -> str:
+	return utf8.decode( x ).unwrap( 'decode failed' )
+
+def main() -> i32:
+	if decode_it( b'abc' ) != "abc":
+		return 1
+	return 0
+''' ),
+			# a bare bytes literal used directly as a method-call receiver -
+			# same root cause as above, but hit via receiver-type
+			# resolution (_resolve_callee) instead of call-argument lowering
+			( 'bytes_literal_as_receiver', '''
+def main() -> i32:
+	if b'abc'.decode().unwrap( 'decode failed' ) != "abc":
+		return 1
+	return 0
+''' ),
 			# mirrors the real forcing case: fs.py:24's
 			# codec.decode(buf[:nbytes]) shape - and, unlike the other
 			# cases here, relies entirely on decode()'s own now-fixed
@@ -11595,14 +11749,30 @@ class IfExpTempLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
 		# reasoning for why a bare single-shot check isn't enough to catch
 		# a leak (as opposed to the double-free, which a single shot alone
 		# already reliably reproduced).
+		# dash/plus + '' (not bare '-'.lstrip()/'+'.lstrip() directly in the
+		# ternary): a BARE method-call receiver on a str LITERAL, used as
+		# BOTH ternary branches, was found (while adapting this test off the
+		# now-removed str copy-constructor) to hit a SEPARATE, still-open
+		# double-free in _expr_IfExp - confirmed independent of this fix's
+		# own __char_count/__index change (repros identically with plain
+		# int(1) if cond else int(2)-shaped construct calls being FINE, but
+		# two fresh ORDINARY METHOD calls merged via a ternary crashing
+		# under MSVC's debug heap regardless of receiver - literal or a
+		# bound local - every time; task flagged separately, not fixed
+		# here). dash/plus + '' still produces two genuinely fresh,
+		# independently-owned allocations each iteration (str.__add__ always
+		# allocates - see __init__.py), it just does it via a BinOp instead
+		# of a bare method Call, which doesn't hit the open bug.
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		i: i32 = 0
 		cond: bool = True
+		dash: str = '-'
+		plus: str = '+'
 		while i < 1000:
-			x: str = str( '-' ) if cond else str( '+' )
-			expected: str = str( '-' ) if cond else str( '+' )
+			x: str = ( dash + '' ) if cond else ( plus + '' )
+			expected: str = ( dash + '' ) if cond else ( plus + '' )
 			if x != expected:
 				return 1
 			if compiler.refcount( x ) != 1:
@@ -11624,17 +11794,17 @@ def main() -> i32:
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		a: str = str( 'A' )
-		b: str = str( 'B' )
+		a: str = 'A'.lstrip()
+		b: str = 'B'.lstrip()
 		cond: bool = True
 		z: str = a if cond else b
-		if z != str( 'A' ):
+		if z != 'A':
 			return 1
 		if compiler.refcount( a ) != 2:
 			return 2
 		if compiler.refcount( z ) != 2:
 			return 3
-		if a != str( 'A' ) or b != str( 'B' ):
+		if a != 'A' or b != 'B':
 			return 4
 		return 0
 ''' )
@@ -11649,19 +11819,122 @@ def main() -> i32:
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		existing: str = str( 'lower' )
+		existing: str = 'lower'.lstrip()
 		cond: bool = False
 		result: str = existing.upper() if cond else existing
-		if result != str( 'lower' ):
+		if result != 'lower':
 			return 1
 		if compiler.refcount( existing ) != 2:
 			return 2
 		cond2: bool = True
 		result2: str = existing.upper() if cond2 else existing
-		if result2 != str( 'LOWER' ):
+		if result2 != 'LOWER':
 			return 3
 		if compiler.refcount( result2 ) != 1:
 			return 4
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_inside_their_own_branch( self ) -> None:
+		# regression for a SEPARATE, later bug in this same method: unlike
+		# the fresh-vs-aliasing cases above (where the branch's own FINAL
+		# value is the only temp involved), `prefix + str('.') + k` chains
+		# TWO str.__add__ calls, each DeclareTemp-ing its own INTERMEDIATE
+		# temp (the '.' literal-wrap, and the first __add__'s own result,
+		# consumed as the second __add__'s receiver) that this method never
+		# untrack_temp()'s or increfs at all - it only ever handles the
+		# branch's own final value. Left in lowering.py's per-STATEMENT
+		# _pending_temps list, those intermediate temps survived past
+		# end_label and got unconditionally decref'd by the ENCLOSING
+		# statement's own flush - including in the branch that never ran,
+		# releasing an uninitialized C local. Confirmed as a real, 100%
+		# reproducible STACK OVERFLOW at runtime (Windows exit 3221225501 /
+		# 0xC00000FD - release_object() on stack garbage jumping through a
+		# garbage vtable pointer), not a leak/UAF - the compiled program
+		# crashed on every run, before this fix. Found while implementing
+		# lib/json.py's flatten(), building dotted/bracketed path strings
+		# for nested JSON keys via exactly this ternary shape.
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_when_concat_is_the_true_branch( self ) -> None:
+		# same bug, concatenation on the OTHER side of the ternary (the
+		# TRUE branch instead of the false one) - confirms the fix isn't
+		# accidentally specific to which branch runs the chained __add__s
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return prefix + str( '.' ) + k if prefix.byte_len() != 0 else k
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_in_both_branches( self ) -> None:
+		# BOTH branches chain a concatenation (no bare-Name branch at all) -
+		# each branch's own intermediate temps must be flushed independently
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return ( prefix + str( '!' )) if prefix.byte_len() == 0 else ( prefix + str( '.' ) + k )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != '!':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_when_result_bound_to_a_local_first( self ) -> None:
+		# the ternary's own result is bound to a named local before being
+		# returned/used, rather than consumed directly at the call site -
+		# confirmed not specific to a bare `return <ternary>`
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	result: str = k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
+	return result
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -12744,10 +13017,16 @@ class BytesByteArrayFindSplitStartswithEndswithTests( test_support.RealCompileMi
 	HTTP request-line parser against raw socket-received bytes (there was
 	no way to find(b'\\r\\n')/split(b' ')/startswith(b'GET') on bytes at
 	all before this). Mirrors str's own find()/split()/startswith()/
-	endswith() (StrFindIndexSplitTests/StrPhase1MethodsTests above), with
-	the corrected isize/-1-sentinel find() convention from the start
-	(bytes has no Result-returning history to fix). bytes has no __eq__,
-	so content checks decode() to str first. '''
+	endswith(), with the corrected isize/-1-sentinel find() convention
+	from the start (bytes has no Result-returning history to fix). bytes
+	has no __eq__, so content checks decode() to str first.
+
+	needle/prefix/suffix/sep parameters are bytes|bytearray, and bare
+	literal receivers/arguments are used directly throughout - both now
+	work because _expr_Constant's literal self-typing chain gained a
+	bytes branch (previously bytes literals could not infer their type
+	either as a union member or as a bare method-call receiver; see
+	[[bytes_literal_type_inference_gaps_fixed]]). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -12789,34 +13068,32 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			# a bare bytes literal receiver throughout - no typed-local
+			# workaround needed now that literal receivers self-type
 			( 'bytes_split_edge_cases', '''
 def main() -> i32:
-	empty_src: bytes = b''
-	empty: list[bytes] = empty_src.split( b',' )
+	empty: list[bytes] = b''.split( b',' )
 	if empty.__len__() != 1:
 		return 1
 	e0: bytes = empty.__getitem__( 0 ).unwrap( 'x' )
 	if e0.decode().unwrap( 'x' ) != '':
 		return 2
 
-	leading_src: bytes = b',a,b'
-	leading: list[bytes] = leading_src.split( b',' )
+	leading: list[bytes] = b',a,b'.split( b',' )
 	if leading.__len__() != 3:
 		return 3
 	l0: bytes = leading.__getitem__( 0 ).unwrap( 'x' )
 	if l0.decode().unwrap( 'x' ) != '':
 		return 4
 
-	no_sep_src: bytes = b'abc'
-	no_sep: list[bytes] = no_sep_src.split( b',' )
+	no_sep: list[bytes] = b'abc'.split( b',' )
 	if no_sep.__len__() != 1:
 		return 5
 	n0: bytes = no_sep.__getitem__( 0 ).unwrap( 'x' )
 	if n0.decode().unwrap( 'x' ) != 'abc':
 		return 6
 
-	consecutive_src: bytes = b'a,,b'
-	consecutive: list[bytes] = consecutive_src.split( b',' )
+	consecutive: list[bytes] = b'a,,b'.split( b',' )
 	if consecutive.__len__() != 3:
 		return 7
 	c1: bytes = consecutive.__getitem__( 1 ).unwrap( 'x' )
@@ -12881,14 +13158,12 @@ def main() -> i32:
 		return 9
 	return 0
 ''' ),
-			( 'bytes_needle_into_bytearray_haystack', '''
+			# find()/startswith()/endswith()/split()'s needle/sep parameter
+			# is bytes|bytearray - a bytearray needle now works directly
+			# against a bytes haystack, and vice versa, with no bytes(...)/
+			# bytearray(...) conversion needed on either side
+			( 'bytes_bytearray_cross_type_needle_haystack', '''
 def main() -> i32:
-	# find()/startswith()/endswith()/split()'s needle parameter is plain
-	# bytes (not bytes|bytearray) - a bare bytes literal argument like
-	# b'\\r\\n' can't be type-inferred against a union parameter, and a
-	# bytes literal needle is overwhelmingly the real use case (HTTP
-	# request-line parsing, etc.) - a bytearray needle still works by
-	# converting it via the bytes(...) constructor first.
 	needle_ba: bytearray = bytearray( 5 )
 	needle_ba[0] = 119 # w
 	needle_ba[1] = 111 # o
@@ -12896,8 +13171,10 @@ def main() -> i32:
 	needle_ba[3] = 108 # l
 	needle_ba[4] = 100 # d
 	haystack: bytes = b'hello world'
-	if haystack.find( bytes( needle_ba )) != isize( 6 ):
+	if haystack.find( needle_ba ) != isize( 6 ):
 		return 1
+	if not haystack.endswith( needle_ba ):
+		return 2
 
 	haystack_ba: bytearray = bytearray( 11 )
 	src: bytes = b'hello world'
@@ -12906,14 +13183,16 @@ def main() -> i32:
 		while i < 11:
 			haystack_ba[i] = src.get_const_ptr()[i]
 			i += 1
-	needle_bytes: bytes = b'world'
-	if haystack_ba.find( needle_bytes ) != isize( 6 ):
-		return 2
+	# bare bytes literal needle directly against a bytearray haystack
+	if haystack_ba.find( b'world' ) != isize( 6 ):
+		return 3
+	if not haystack_ba.startswith( b'hello' ):
+		return 4
 	return 0
 ''' ),
 			# the actual data[:received]-then-parse shape a hand-rolled HTTP
 			# server needs: bytearray slicing (already supported) combined
-			# with the new find()/split()/startswith() on the trimmed result
+			# with find()/split()/startswith() on the trimmed result
 			( 'bytearray_slice_then_parse_request_line', '''
 def main() -> i32:
 	buf: bytearray = bytearray( 128 )
