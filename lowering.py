@@ -10249,6 +10249,22 @@ class FunctionLowering:
 		for param, _expr in keyword:
 			self._apply_move_hook( param, kwargs[param.stem], target.qualname )
 
+		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
+		# else: this parameter position doesn't mention any of type_params
+		# (a concrete parameter, or a nested type whose base doesn't even
+		# match the argument's) - nothing to infer here. Not an error by
+		# itself: a genuine argument-type mismatch isn't checked anywhere
+		# yet (no general type-checking pass exists), same as every other
+		# call site in this file today
+
+	def _finish_generic_call( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# shared tail of _lower_inferred_generic_call (extracted verbatim,
+		# unchanged) and _lower_overload_generic_call below - once `bindings`
+		# holds every type param inferable from the ARGUMENTS alone (however
+		# they were obtained: interleaved lower+unify for a bare generic-
+		# function call, or unified against already-lowered operands for a
+		# resolved Overload-group generic candidate), monomorphizing and
+		# emitting the call is identical either way.
 		missing = [ tv for tv in target.type_params or [] if id( tv ) not in bindings ]
 		if missing:
 			# return-only inference: a still-unbound type param that never
@@ -10294,12 +10310,29 @@ class FunctionLowering:
 		if monomorphized.is_inline:
 			return self._lower_inline_call( node, monomorphized, receiver, args, kwargs, expected_type, want_result )
 		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
-		# else: this parameter position doesn't mention any of type_params
-		# (a concrete parameter, or a nested type whose base doesn't even
-		# match the argument's) - nothing to infer here. Not an error by
-		# itself: a genuine argument-type mismatch isn't checked anywhere
-		# yet (no general type-checking pass exists), same as every other
-		# call site in this file today
+
+	def _lower_overload_generic_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		# an Overload group's own overload_resolution.resolve_call picked a
+		# GENERIC candidate (target.type_params truthy - e.g. a `[T](x: T)`
+		# alternative sharing a name with one or more concrete overloads) as
+		# either the sole unconditional match or the trailing default of a
+		# runtime ConditionalDispatch. Unlike _lower_inferred_generic_call,
+		# args/kwargs are ALREADY lowered operands here (resolve_call needed
+		# their real types before it could even pick this candidate - see the
+		# Overload branch's own _lower_overload_arg call, above) - so there's
+		# no interleaved lower+unify to do, just unification directly against
+		# each already-known operand's own .type, then the identical
+		# monomorphize-and-emit tail _lower_inferred_generic_call itself
+		# funnels into via _finish_generic_call.
+		assert target.resolve is None, f'internal compiler error - {target=} was not fully resolved by overload_resolution.resolve_call'
+		type_params = target.type_params or []
+		bindings: dict[int,Type] = {}
+		for param, operand in zip( target.parameters or [], args ):
+			self.lowering._unify_type_param( type_params, param.type, operand.type, bindings, node, target.qualname )
+		for param in target.parameters or []:
+			if param.stem in kwargs:
+				self.lowering._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, target.qualname )
+		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
 
 	def _infer_return_only_type_params( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], return_only: list[TypeVar] ) -> Function:
 		# PLAN_RETURN_INFERENCE.md - non-@inline variant: a bare generic
@@ -10973,6 +11006,33 @@ class FunctionLowering:
 						f'move(...) through a runtime-dispatched overload group is not supported: {ast.unparse(node)}',
 						node,
 					)
+				if resolved.type_params or any( b.function.type_params for b in branches ):
+					# a GENERIC candidate as one branch (or the trailing
+					# default) of a runtime-dispatched overload group isn't
+					# supported: which concrete C symbol to call has to be
+					# fixed at compile time (this compiler has no vtable/
+					# runtime-polymorphic dispatch concept anywhere), but
+					# which leaf(s) of the call's
+					# union-typed argument actually reach a generic branch
+					# can genuinely vary at runtime (e.g. a 3+-member union
+					# where only one member has a concrete overload - every
+					# OTHER member falls through to the same generic default,
+					# each needing its own distinct monomorphization chosen
+					# by a runtime tag no single Call target can express).
+					# Rejected cleanly here rather than reaching
+					# _lower_conditional_dispatch, which unconditionally
+					# schedules every branch's target as a real, concrete
+					# compile unit and would otherwise crash the EMITTER
+					# (not even a clean compile error) the first time it hit
+					# a still-bare TypeVar parameter - confirmed via a real
+					# repro (str|i32 argument, concrete str overload +
+					# generic[T] fallback)
+					self.lowering.discovery.fail(
+						f'a generic overload of {target.qualname} cannot be one branch of a runtime-dispatched call '
+						f'(the argument type is a union whose leaves route to more than one overload, at least one of '
+						f'them generic) - not supported yet: {ast.unparse(node)}',
+						node,
+					)
 				branches = [ ConditionalDispatch( conditions = b.conditions, function = _resolve_original( b.function )) for b in branches ]
 				resolved = _resolve_original( resolved )
 				return self._lower_conditional_dispatch( node, branches, resolved, args, kwargs, expected_type, want_result )
@@ -10985,6 +11045,28 @@ class FunctionLowering:
 			):
 				narrowed_return_type = winning_stub.return_type
 			target = resolved
+			if target.type_params:
+				# resolve_call picked a GENERIC candidate (see overload_
+				# resolution.py's own wildcard/TypeVar handling) - target is
+				# still the abstract, unspecialized Function here, never a
+				# real compile unit of its own (only ITS monomorphized
+				# Specialization ever is - see _emit_generic_call's own
+				# scheduling). Deliberately skips _ensure_resolved(target)
+				# below (unlike the concrete case) - resolve_call() already
+				# resolved every group member internally, and
+				# _ensure_resolved's own unconditional schedule() would
+				# register this bare abstract Function as a real compile
+				# unit, reaching the emitter with a still-bare TypeVar
+				# parameter (confirmed via a real repro: emitter_c.py's
+				# c_type() crashes with NotImplementedError on the TypeVar
+				# itself). Route through the same inference+monomorphization
+				# machinery a bare generic-function call uses instead of
+				# falling into the rest of this branch, which assumes a
+				# concrete target.parameters (union-coercion, move
+				# validation, default-arg filling) and the shared call-
+				# emission tail below, neither of which apply to an
+				# unspecialized generic target.
+				return self._lower_overload_generic_call( node, target, receiver, args, kwargs, expected_type, want_result )
 			self.lowering._ensure_resolved( target ) # resolve_call() already resolved every group member internally - this just schedules the chosen one
 
 			# args/kwargs were lowered by _lower_overload_arg BEFORE target was
