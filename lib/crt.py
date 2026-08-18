@@ -13,7 +13,7 @@ def __error() -> Ptr[i32]:
 @extern( 'c', '_exit' )
 def _exit(
 	status: i32,
-) -> None:
+) -> NoReturn:
 	...
 
 @extern( 'c', 'free' )

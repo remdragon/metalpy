@@ -23,13 +23,39 @@ from mpy_types import (
 # verbatim from C_EMITTER.md - avoids any Windows-CRT (msvcrt) dependency
 # from metalpy's own stdlib output; atomic because __del__ can run on any
 # thread the moment a refcount hits 0.
-PROLOGUE = '''\
+# PROLOGUE used to be one monolithic always-emitted blob (verbatim from
+# C_EMITTER.md's own proposal). Split into pieces here so emit_c() can leave
+# out the ones a given program doesn't need (retain_object/release_object/
+# the format_f64+parse_f64 pair) - avoids -Wunused-function on every build
+# that doesn't happen to retain/release an RCClass or format/parse a float
+# (i.e. most trivial programs). PROLOGUE itself (the full concatenation)
+# stays around unchanged for callers that want the whole thing regardless
+# (see emitter_c_test.py's own release_object test).
+_PROLOGUE_HEADER = '''\
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdatomic.h>
 
 #define METALPY_IMMORTAL_REFCOUNT INT32_MAX
+
+// marks a static const that's legitimately unreferenced in SOME compiled
+// programs but not others (a CEnum member no compiled code happens to name,
+// a class's own vtable instance when nothing constructs it this time round)
+// - unlike retain_object/__metalpy_format_f64/.../the format_f64+parse_f64
+// pair (see emit_c), these aren't worth conditionally emitting: a CEnum
+// member reference always constant-folds away before it ever reaches this
+// module (lowering.py's own _expr_Attribute), so "referenced" can only ever
+// be judged by matching against ir.Allocate call sites one at a time - real
+// dead-code elimination, not a cheap "does the IR use this instruction
+// kind anywhere" check. MSVC doesn't warn on an unused static/static const
+// at all (confirmed directly - no /W4 diagnostic for it), so this only
+// needs to matter to GCC/Clang.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define __metalpy_maybe_unused
+#else
+#define __metalpy_maybe_unused __attribute__((unused))
+#endif
 
 // the one universal, ALWAYS-leading member of every RCClass's own vtable
 // type, whatever else that type goes on to add for its own @virtual
@@ -60,13 +86,22 @@ typedef struct {
 	// __metalpy_ObjectVtbl instance, no synthesized type of its own.
 	const __metalpy_ObjectVtbl* vtable;
 } ObjectHeader;
+'''
 
+# only needed where an ir.Incref is actually emitted (see emit_c) - a
+# program that only ever gives up references (or never touches an RCClass
+# at all) never calls this
+_PROLOGUE_RETAIN = '''\
 static inline void retain_object( ObjectHeader* obj ) {
 	if ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {
 		atomic_fetch_add( &obj->ref_count, 1 );
 	}
 }
+'''
 
+# only needed where an ir.Decref/DecrefDynamic is actually emitted (see
+# emit_c)
+_PROLOGUE_RELEASE = '''\
 // the destructor was previously an explicit argument, passed as a compile-
 // time literal at every call site - redundant with the header's own
 // vtable field (set once at construction), which every caller can
@@ -88,7 +123,9 @@ static inline void release_object( ObjectHeader* obj ) {
 		}
 	}
 }
+'''
 
+_PROLOGUE_ARITH = '''\
 // metalpy arithmetic intrinsics — dispatch to compiler builtins (GCC/Clang)
 // or manual checks (MSVC). All metalpy scalars are <= 64 bits.
 //
@@ -339,6 +376,15 @@ static inline bool __metalpy_isinf_f64( double x ) {
 #define __metalpy_nanf() __builtin_nanf("")
 #define __metalpy_nan()  __builtin_nan("")
 #endif
+'''
+
+# only needed where an ir.FormatFloat/ir.ParseFloat is actually emitted (see
+# emit_c) - i.e. a program that formats/parses a float as text (str(f),
+# f-string float formatting, float(s)). Kept as one unit (not split further
+# per-function) - both halves share the Windows branch's GetModuleHandleA/
+# LoadLibraryA/GetProcAddress declarations and msvcrt resolution, and the
+# common case uses both anyway (see lib/builtins/__float.py's repr search).
+_PROLOGUE_FLOAT_CONV = '''\
 // backs compiler.format_f64(buf, size, precision, type_char, alt, value)
 // (lowering.py's _lower_compiler_format_f64 / ir.FormatFloat) - writes
 // value's fixed-precision decimal digits into buf via a dynamically-built
@@ -500,6 +546,12 @@ static inline double __metalpy_parse_f64( const char* text ) {
 }
 #endif
 '''
+
+# the full, unconditional concatenation - kept for callers that want every
+# PROLOGUE helper regardless of whether a specific program needs it (e.g.
+# emitter_c_test.py's own release_object test). emit_c() itself assembles
+# the pieces above selectively instead of using this directly.
+PROLOGUE = _PROLOGUE_HEADER + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_CONV
 
 
 
@@ -2128,6 +2180,16 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		declared.add( name )
 	for instr in fn.instructions:
 		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
+	if _has_self( function ) and not function.is_destructor and not re.search( r'\bself\b', '\n'.join( lines[1:] )):
+		# a method whose body never reads self (e.g. UnsafeList._read_element,
+		# whose is_rc(T) branch only ever touches its slot argument) still
+		# has to take it - dropping self from the C signature would make it
+		# a different function shape per instantiation, and every call site
+		# already passes it uniformly. (void)self silences -Wunused-parameter
+		# without an attribute (MSVC doesn't support __attribute__ and
+		# doesn't warn on this by default anyway - see _c_local_name('self')
+		# itself never colliding with a real local, so this text search is safe)
+		lines.insert( 1, '\t(void)self;' )
 	lines.append( '}' )
 	return '\n'.join( lines )
 
@@ -3020,9 +3082,16 @@ def emit_interface_vtable_instance( cls: CStruct ) -> str|None:
 		field_inits.append( f'.{_field_name(slot.stem)} = ({_fn_ptr_cast_type(ret, params)}){mangle_qualname(impl.qualname)}' )
 	vtbl_type = _interface_vtbl_name( cls )
 	instance_name = f'{mangle_type(cls)}$$vtable'
+	# not every class reachable enough to get a full body emitted is ever
+	# actually constructed by THIS program (e.g. only reached through a
+	# subclass's own Allocate, or merely type-referenced) - unlike PROLOGUE's
+	# retain_object/etc (see emit_c), telling "constructed" from "not" here
+	# means matching every ir.Allocate site one at a time, real dead-code
+	# elimination rather than a cheap instruction-kind check - not worth it
+	# for a warning; see __metalpy_maybe_unused's own comment
 	if field_inits:
-		return f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
-	return f'static const {vtbl_type} {instance_name} = {{0}};'
+		return f'__metalpy_maybe_unused static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
+	return f'__metalpy_maybe_unused static const {vtbl_type} {instance_name} = {{0}};'
 
 # --- RCClass vtable dispatch (RCClass-subclassing plan, Phase 4) -----------
 #
@@ -3139,7 +3208,10 @@ def emit_rcclass_vtable_instance( cls: RCClass ) -> str|None:
 		for slot, impl in zip( slots, slot_impls ):
 			ret, params = _vtable_slot_c_type( owner, slot )
 			field_inits.append( f'.{_field_name(slot.stem)} = ({_fn_ptr_cast_type(ret, params)}){mangle_qualname(impl.qualname)}' )
-	return f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
+	# see emit_interface_vtable_instance's identical comment: not every
+	# concrete RCClass reachable enough to get a full body is actually
+	# constructed by this particular program
+	return f'__metalpy_maybe_unused static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
 
 def emit_cstruct( cls: CStruct ) -> str:
 	attrs: list[tuple[str,Type]]
@@ -3182,7 +3254,12 @@ def emit_cenum( cls: CEnum ) -> str:
 	value_ctype = c_type( cls.value_type )
 	lines = [ f'typedef {value_ctype} {name};' ]
 	for key, value in cls.members.items():
-		lines.append( f'static const {name} {name}${key} = {value};' )
+		# a member reference (OSError.FileNotFoundError) always constant-
+		# folds to a bare ir.Const at lowering time (see lowering.py's
+		# _expr_Attribute) - this symbol itself is never referenced by any
+		# compiled program, so it's unconditionally -Wunused-const-variable-
+		# eligible on GCC/Clang; see __metalpy_maybe_unused's own comment
+		lines.append( f'__metalpy_maybe_unused static const {name} {name}${key} = {value};' )
 	return '\n'.join( lines )
 
 def emit_tagged_union( union: TaggedUnion ) -> str:
@@ -3520,12 +3597,31 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# tag would be pure bookkeeping noise, not a needed flag - and, unlike
 	# Windows, adding it would incorrectly flip no_crt for any caller that
 	# reads compiler.extern_libs before emit_c().
-	if compiler.disco.active_target['os'] == 'windows' and any(
+	uses_float_conv = any(
 		isinstance( instr, ( ir.FormatFloat, ir.ParseFloat ) ) for lf in compiler.functions for instr in lf.instructions
-	):
+	)
+	if compiler.disco.active_target['os'] == 'windows' and uses_float_conv:
 		compiler.extern_libs.setdefault( 'kernel32', set() ).add( 'GetProcAddress' )
 
-	parts: list[str] = [ PROLOGUE ]
+	# selective PROLOGUE assembly - _PROLOGUE_HEADER/_PROLOGUE_ARITH are
+	# always needed (ObjectHeader/vtable typedefs, arithmetic intrinsics),
+	# but retain_object/release_object/the format_f64+parse_f64 pair are
+	# real "static inline" FUNCTIONS that trigger -Wunused-function (clang;
+	# gcc doesn't warn on unused static inline, MSVC doesn't warn on unused
+	# static at all) whenever a program doesn't happen to need them - most
+	# commonly a trivial program with no RCClass traffic and no float
+	# formatting/parsing at all. Only emitting what's actually referenced
+	# avoids that instead of suppressing the warning after the fact.
+	uses_incref = any( isinstance( instr, ir.Incref ) for lf in compiler.functions for instr in lf.instructions )
+	uses_decref = any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for lf in compiler.functions for instr in lf.instructions )
+	parts: list[str] = [ _PROLOGUE_HEADER ]
+	if uses_incref:
+		parts.append( _PROLOGUE_RETAIN )
+	if uses_decref:
+		parts.append( _PROLOGUE_RELEASE )
+	parts.append( _PROLOGUE_ARITH )
+	if uses_float_conv:
+		parts.append( _PROLOGUE_FLOAT_CONV )
 
 	# collect #include requirements from all modules whose symbols are
 	# compiled into this translation unit

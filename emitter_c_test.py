@@ -1954,6 +1954,7 @@ def main() -> i32:
 		color.values = { 0: 'Red', 1: 'Green' }
 		harness = '\n'.join([
 			'#include <stdint.h>',
+			'#define __metalpy_maybe_unused', # real compiles get this from PROLOGUE - see its own comment
 			emitter_c.emit_cenum( color ),
 			'int main( void ) {',
 			'\treturn (int)__main__$Color$Red;',
