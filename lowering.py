@@ -3783,6 +3783,29 @@ class FunctionLowering:
 		self._emit( opcode( dest = check_dest, left = left, right = right ))
 		return check_dest
 
+	def _lower_compiler_ptr_diff( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.ptr_sub_dist(a, b) - Ptr[T]/ConstPtr[T] - Ptr[T]/ConstPtr[T]
+		# -> isize, the fixed-opcode intrinsic behind Ptr[T]/ConstPtr[T]'s own
+		# __sub__ dunder for the pointer-MINUS-pointer shape (ptr_sub_dist[T]
+		# in lib/builtins/__ptr_arith.py) - distinct from the Ptr[T]-usize ->
+		# Ptr[T] offset-subtraction shape _lower_compiler_ptr_binop handles
+		# above (same __sub__ name, disambiguated at the dunder-lookup level
+		# by _find_dunder_for_arg's arg-type matching, not here). Infallible,
+		# single opcode - see ir.PtrDiff's own comment for why there's no
+		# wrap/check/saturate split for a pointer distance.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.ptr_sub_dist(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		if not self.lowering._type_resolver._is_ptr_specialization( left.type ) or left.type is not right.type:
+			self.lowering.discovery.fail(
+				f'compiler.ptr_sub_dist(...) arguments must both be the same Ptr[T]/ConstPtr[T] type - got '
+				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		isize_cls = self.lowering.discovery.get_intrinsics()['isize']
+		return self._lower_arithmetic_op( node, ir.PtrDiff, None, isize_cls, { 'left': left, 'right': right }, 'binary' )
+
 	# ir.Shr (>>) joins these deliberately: right-shift by a valid amount is
 	# always well-defined (this compiler doesn't check shift-amount-exceeds-
 	# width for either direction - a separate, pre-existing, out-of-scope
@@ -7910,7 +7933,6 @@ class FunctionLowering:
 			names = getattr( owner_type, 'names', None )
 			found = names.get( name ) if isinstance( names, dict ) else None
 		found = self.lowering._resolve_scalar_name( found )
-		found = self.lowering._resolve_receiver_generic_dunder( found, owner_type )
 		# a plain (non-Overload) Function is checked against arg_type here
 		# too, NOT returned unconditionally the way a bare _find_method
 		# would - a real bug caught during development: str only has ONE
@@ -7942,8 +7964,26 @@ class FunctionLowering:
 			# unannotated local first (`c = a + b; return Result.Ok(c)`),
 			# never returning the binop expression directly.
 			arg_index = 1 if impl.cls is None else 0
-			if len( params ) == arg_index + 1 and self.lowering._type_resolver._same_type( params[arg_index].type, arg_type ):
-				return impl
+			if len( params ) != arg_index + 1:
+				continue
+			param_type = params[arg_index].type
+			# either an exact match (the ordinary case - e.g. usize against
+			# a `other: usize` param), or a wildcard match against a still-
+			# generic candidate's OWN type-param-typed parameter (e.g.
+			# ptr_sub_dist[T]'s `other: Ptr[T]` against a concrete Ptr[i32]
+			# arg_type - _same_type can't structurally match an unbound
+			# TypeVar, so this is a separate, narrower check: same base,
+			# and the param's own type arg is one of impl's own type_params -
+			# any Ptr[whatever] arg_type counts, since T gets bound from the
+			# RECEIVER below via _resolve_receiver_generic_dunder anyway,
+			# which is what actually pins this parameter's concrete type).
+			is_wildcard = (
+				isinstance( param_type, Specialization ) and isinstance( arg_type, Specialization )
+				and param_type.base is arg_type.base
+				and any( isinstance( a, TypeVar ) and any( a is tv for tv in impl.type_params or [] ) for a in param_type.args )
+			)
+			if is_wildcard or self.lowering._type_resolver._same_type( param_type, arg_type ):
+				return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
 		return None
 
 	def _lower_eq_or_ne( self, node: ast.Compare, left: ir.Operand, expected_type: Type|None, negate: bool ) -> ir.Operand:
@@ -11033,6 +11073,10 @@ class FunctionLowering:
 				mode, _sep, rest = name.partition( '_' )
 				kind = 'add' if rest == 'ptr_add' else 'sub'
 				result = self._lower_compiler_ptr_binop( node, name, kind, mode, expected_type )
+				return result if want_result else None
+
+			case 'ptr_sub_dist':
+				result = self._lower_compiler_ptr_diff( node, expected_type )
 				return result if want_result else None
 
 			case '__raw_alloc__':

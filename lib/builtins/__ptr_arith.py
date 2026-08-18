@@ -98,12 +98,17 @@ Ptr.__wrapped_radd__ = ptr_add_wrapped
 Ptr.__saturated_add__ = ptr_add_saturated
 Ptr.__saturated_radd__ = ptr_add_saturated
 Ptr.__sub__ = ptr_sub_offset_checked
+Ptr.__sub__ = ptr_sub_dist               # Ptr[T]-Ptr[T]->isize: second __sub__ registration, merged into
+                                          # an Overload by discovery.py; disambiguated from the offset shape
+                                          # above by _find_dunder_for_arg's arg-type matching (usize vs
+                                          # Ptr[T], the latter via TypeVar-wildcard matching - see that
+                                          # method's own comment). Mode-independent: __wrapped_sub__/
+                                          # __saturated_sub__ below only cover the offset shape (usize),
+                                          # so under wrap/saturate mode a Ptr[T]-Ptr[T] lookup misses there
+                                          # and falls back to this base __sub__ Overload, same as any other
+                                          # mode-qualified-name-miss fallback.
 Ptr.__wrapped_sub__ = ptr_sub_offset_wrapped
 Ptr.__saturated_sub__ = ptr_sub_offset_saturated
-# Ptr[T] - Ptr[T] -> isize (ptr_sub_dist above) NOT registered yet - needs
-# _find_dunder_for_arg's arg-type matching to be TypeVar-wildcard-aware
-# first (a still-generic `other: Ptr[T]` parameter can't structurally
-# match a concrete Ptr[i32] arg_type today) - separate follow-up step.
 
 ConstPtr.__add__ = const_ptr_add_checked
 ConstPtr.__radd__ = const_ptr_add_checked
@@ -112,5 +117,6 @@ ConstPtr.__wrapped_radd__ = const_ptr_add_wrapped
 ConstPtr.__saturated_add__ = const_ptr_add_saturated
 ConstPtr.__saturated_radd__ = const_ptr_add_saturated
 ConstPtr.__sub__ = const_ptr_sub_offset_checked
+ConstPtr.__sub__ = const_ptr_sub_dist    # ConstPtr[T]-ConstPtr[T]->isize - see Ptr.__sub__ above
 ConstPtr.__wrapped_sub__ = const_ptr_sub_offset_wrapped
 ConstPtr.__saturated_sub__ = const_ptr_sub_offset_saturated

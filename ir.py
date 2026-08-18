@@ -269,6 +269,14 @@ class BitOr( BinOp ): pass
 class BitXor( BinOp ): pass
 class Shr( BinOp ): pass
 
+# Ptr[T]/ConstPtr[T] - Ptr[T]/ConstPtr[T] -> isize: raw byte distance between
+# two pointers (never sizeof(T)-scaled, consistent with this compiler's other
+# pointer arithmetic - see emitter_c.py's _is_pointer_type). Infallible: an
+# address difference can't meaningfully overflow/underflow the way pointer
+# ADDITION can against a fixed-size buffer, so unlike Add/Sub there's no
+# Wrap/Check/Saturate split here, just one opcode.
+class PtrDiff( BinOp ): pass
+
 @dataclass( kw_only = True )
 class UnaryOp( Instruction ):
 	dest: Temp
