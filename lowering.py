@@ -6689,6 +6689,31 @@ class FunctionLowering:
 		# nowhere natural to bind (no single fixed signature, or no
 		# receiver at all - closures only wrap a REAL bound instance call)
 		method = self.lowering._find_method( obj.type, node.attr )
+		if method is None:
+			# _find_method itself can't distinguish "no such attribute at
+			# all" from "found a real Overload group, silently discarded
+			# it" - see its own isinstance(found, Function) check. Re-probe
+			# here (identical chain_lookup/names shape) specifically to
+			# give a clear diagnostic for the latter case, which
+			# _attr_lookup below would otherwise ALSO reject, but with the
+			# misleading "no such attribute" message - an overloaded
+			# method genuinely has nowhere to bind as a bare value (no
+			# single fixed signature to close over), same restriction the
+			# comment above already states for generic/overloaded methods;
+			# this just reports it accurately instead of via the wrong
+			# error text. Purely diagnostic - both paths were already a
+			# compile error either way, nothing here changes what compiles
+			resolved_owner = self.lowering._ensure_resolved( obj.type )
+			if isinstance( resolved_owner, ( CStruct, RCClass )):
+				maybe_overload = resolved_owner.chain_lookup( node.attr )
+			else:
+				owner_names = getattr( resolved_owner, 'names', None )
+				maybe_overload = owner_names.get( node.attr ) if isinstance( owner_names, dict ) else None
+			if isinstance( maybe_overload, Overload ):
+				self.lowering.discovery.fail(
+					f'{node.attr!r} is an overloaded method and cannot be referenced as a value - call it directly instead: {ast.unparse(node)}',
+					node,
+				)
 		if (
 			isinstance( method, Function ) and method.cls is not None
 			and not method.is_static and not method.is_classmethod
