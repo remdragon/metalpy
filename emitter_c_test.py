@@ -11452,6 +11452,109 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_inside_their_own_branch( self ) -> None:
+		# regression for a SEPARATE, later bug in this same method: unlike
+		# the fresh-vs-aliasing cases above (where the branch's own FINAL
+		# value is the only temp involved), `prefix + str('.') + k` chains
+		# TWO str.__add__ calls, each DeclareTemp-ing its own INTERMEDIATE
+		# temp (the '.' literal-wrap, and the first __add__'s own result,
+		# consumed as the second __add__'s receiver) that this method never
+		# untrack_temp()'s or increfs at all - it only ever handles the
+		# branch's own final value. Left in lowering.py's per-STATEMENT
+		# _pending_temps list, those intermediate temps survived past
+		# end_label and got unconditionally decref'd by the ENCLOSING
+		# statement's own flush - including in the branch that never ran,
+		# releasing an uninitialized C local. Confirmed as a real, 100%
+		# reproducible STACK OVERFLOW at runtime (Windows exit 3221225501 /
+		# 0xC00000FD - release_object() on stack garbage jumping through a
+		# garbage vtable pointer), not a leak/UAF - the compiled program
+		# crashed on every run, before this fix. Found while implementing
+		# lib/json.py's flatten(), building dotted/bracketed path strings
+		# for nested JSON keys via exactly this ternary shape.
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_when_concat_is_the_true_branch( self ) -> None:
+		# same bug, concatenation on the OTHER side of the ternary (the
+		# TRUE branch instead of the false one) - confirms the fix isn't
+		# accidentally specific to which branch runs the chained __add__s
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return prefix + str( '.' ) + k if prefix.byte_len() != 0 else k
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_in_both_branches( self ) -> None:
+		# BOTH branches chain a concatenation (no bare-Name branch at all) -
+		# each branch's own intermediate temps must be flushed independently
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return ( prefix + str( '!' )) if prefix.byte_len() == 0 else ( prefix + str( '.' ) + k )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != '!':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_when_result_bound_to_a_local_first( self ) -> None:
+		# the ternary's own result is bound to a named local before being
+		# returned/used, rather than consumed directly at the call site -
+		# confirmed not specific to a bare `return <ternary>`
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	result: str = k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
+	return result
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( str( '' ), 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 class CallableTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
