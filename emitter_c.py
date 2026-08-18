@@ -2298,6 +2298,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		op = _member_access_operator( instr.obj.type )
 		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
 
+	if isinstance( instr, ir.AddrOfArrayIndex ):
+		# compiler.addrof(x.field[i]) - one flat C expression,
+		# &(obj)OP field[index] - see AddrOfArrayIndex's own docstring
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = &(({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}]);' ]
+
 	if isinstance( instr, ir.GetAttrIndex ):
 		# f.arr[i] - one flat C expression, (obj)OP field[index] - see
 		# GetAttrIndex's own docstring for why this targets the field
