@@ -9112,6 +9112,40 @@ class AssignabilityCheckTests( unittest.TestCase ):
 		]))
 		self.assertTrue( any( isinstance( i, ir.CastWrap ) for i in fn.instructions ) )
 
+	# --- Overload-blindness follow-up: bare method-value reference -----------
+
+	def test_bare_overloaded_method_reference_gets_a_specific_diagnostic( self ) -> None:
+		# _find_method's own isinstance(found, Function) check silently
+		# discards a real Overload group - _expr_Attribute used to fall
+		# through to _attr_lookup's generic "no such attribute" message for
+		# this, even though the attribute plainly exists (Result.unwrap_or
+		# is a real, shipped Overload - two same-named defs in
+		# lib/builtins/__init__.py). An overloaded method genuinely has no
+		# single signature to bind as a bare value/closure - this needs a
+		# clear message saying THAT, not a wrong "doesn't exist" one. Both
+		# paths were already a compile error either way; only the message
+		# changes
+		self._assert_rejected( '\n'.join([
+			'def main() -> i32:',
+			'	r: Result[i32,TypeError] = Result.Ok( 5 )',
+			'	f = r.unwrap_or',
+			'	return 0',
+		]), needle = 'overloaded method' )
+
+	def test_calling_an_overloaded_method_normally_still_works( self ) -> None:
+		# additive-only: the new bare-value-reference diagnostic above must
+		# not affect the ordinary call-with-args path at all, which routes
+		# through _lower_method_call (Overload-aware resolution), never
+		# _find_method/this new check
+		self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			'	r: Result[i32,TypeError] = Result.Ok( 5 )',
+			'	v: i32 = r.unwrap_or( 0 )',
+			'	if v != 5:',
+			'		return 1',
+			'	return 0',
+		]))
+
 
 class WalrusOperatorTests( unittest.TestCase ):
 	''' _expr_NamedExpr (ast.NamedExpr, `x := expr`) - PLAN_POSIX_FEATURE.md's
