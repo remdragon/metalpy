@@ -114,7 +114,7 @@ def GetTimeZoneInformationForYear(
 @extern( 'kernel32', 'ExitProcess' )
 def ExitProcess(
 	uExitCode: u32,
-) -> None:
+) -> NoReturn:
 	...
 
 @extern( 'kernel32', 'GetLastError' )
