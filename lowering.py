@@ -6852,9 +6852,18 @@ class FunctionLowering:
 
 	def _emit_binop_dunder_call( self, node: 'ast.BinOp|ast.AugAssign', method: Function, receiver: ir.Operand, arg: ir.Operand, expected_type: Type|None ) -> ir.Operand:
 		# shared tail for the forward/reflected dunder-call cases in
-		# _lower_binop_values above - handles a plain class method
-		# (int.__add__, ...) and a scalar-registered one (i32.__add__ = ...,
-		# see lib/builtins) identically, since _find_dunder_for_arg already
+		# _lower_binop_values above - a thin, binop-shaped wrapper over
+		# _emit_fallible_method_call (a two-operand call: receiver + one
+		# arg), which does the real work and is reused by any OTHER call
+		# needing the identical "resolve+schedule, splice-or-Call, consume
+		# via ambient mode if @fallible_arithmetic" treatment (e.g. .to_T()
+		# conversion dispatch - a one-operand call, no second arg)
+		return self._emit_fallible_method_call( node, method, receiver, [ arg ], expected_type )
+
+	def _emit_fallible_method_call( self, node: ast.AST, method: Function, receiver: ir.Operand|None, args: list[ir.Operand], expected_type: Type|None ) -> ir.Operand:
+		# handles a plain class method (int.__add__, ...) and a
+		# scalar-registered one (i32.__add__ = ..., see lib/builtins)
+		# identically, since the caller's own dunder/method lookup already
 		# resolved both the same way. `method.cls is None` means a genuine
 		# free function was registered onto a Scalar (never had `self`
 		# stripped by discovery) - same fix _lower_method_call/the general
@@ -6867,15 +6876,16 @@ class FunctionLowering:
 		# boundary just because it happens to be inlined away (that's a
 		# deliberate design choice, not a gap - see compiler.checked_add's
 		# own comment). A @fallible_arithmetic+@inline method's spliced trailing return
-		# (typically a compiler.checked_add/wrapped_add/saturated_add
-		# intrinsic call) hands back its raw, real return value - for
-		# is_fallible_arithmetic methods that's a genuine, unconsumed Result[T,E],
-		# exactly matching the declared signature. So is_fallible_arithmetic consumption
-		# below runs uniformly on whatever came back, whether that value
-		# was produced by a real ir.Call or by a splice - this is what makes
-		# `with compiler.panic_arithmetic(...): a // b` (a, b: int) auto-
-		# panic, and default-mode `a // b` auto-propagate, exactly like a
-		# bare scalar `+` already does.
+		# (typically a compiler.checked_add/wrapped_add/saturated_add/
+		# checked_convert intrinsic call) hands back its raw, real return
+		# value - for is_fallible_arithmetic methods that's a genuine,
+		# unconsumed Result[T,E], exactly matching the declared signature.
+		# So is_fallible_arithmetic consumption below runs uniformly on
+		# whatever came back, whether that value was produced by a real
+		# ir.Call or by a splice - this is what makes `with compiler.
+		# panic_arithmetic(...): a // b` (a, b: int) auto-panic, and
+		# default-mode `a // b` auto-propagate, exactly like a bare scalar
+		# `+` already does.
 		# _resolve_call_target, NOT _ensure_resolved - the latter
 		# unconditionally schedules its target as a real compile unit as a
 		# side effect (see its own docstring), which for an @inline target
@@ -6890,7 +6900,7 @@ class FunctionLowering:
 		for p in ( method.parameters or [] ):
 			self.lowering.schedule( p.type )
 		call_receiver = None if method.cls is None else receiver
-		call_args = [ receiver, arg ] if method.cls is None else [ arg ]
+		call_args = ( [ receiver ] + args ) if method.cls is None else args
 		if method.is_inline:
 			result = self._lower_inline_call( node, method, call_receiver, call_args, {}, method.return_type, True )
 			assert result is not None # want_result=True above guarantees this
