@@ -18,11 +18,27 @@
 # the caller must pass an extra library search path (e.g. mpy's --ldflags
 # "/LIBPATH:<dir>" for MSVC, or LIBRARY_PATH for gcc/clang) pointing at
 # wherever tcl86t.lib/tk86t.lib live (e.g. a Python install's `tcl/`
-# subdirectory). Running the resulting exe additionally requires
-# tcl86t.dll/tk86t.dll on PATH, and TCL_LIBRARY/TK_LIBRARY environment
+# subdirectory) - this part is still not auto-discovered.
+#
+# The RUNTIME DLLs themselves (tcl86t.dll/tk86t.dll, plus tcl86t.dll's own
+# further dependency on zlib1.dll) ARE auto-bundled by mpy's build step, via
+# the dll= declarations below (@extern's dll= mechanism - see SYNTAX.md
+# §6). Confirmed via `dumpbin /dependents` against the real DLLs this
+# session: tcl86t.dll depends on zlib1.dll (needs bundling) and
+# VCRUNTIME140.dll (deliberately NOT listed - assumed already present on
+# target machines, matching real tkinter's own C-runtime-redistributable
+# assumption); tk86t.dll depends on neither tcl86t.dll nor zlib1.dll
+# directly (Tk binds to Tcl at runtime through Tcl's stub-table mechanism,
+# not a PE-level import - see tk86t.dll's own dumpbin output, no tcl86t.dll
+# entry), only VCRUNTIME140.dll (also left unlisted) beyond ordinary system
+# DLLs (kernel32/user32/gdi32/shell32/comdlg32/ole32/comctl32/imm32/the
+# api-ms-win-crt-*.dll forwarders), so its own functions list only
+# 'tk86t.dll' itself.
+#
+# Still not auto-discovered or bundled: TCL_LIBRARY/TK_LIBRARY environment
 # variables pointing at the Tcl/Tk script library (the tcl8.6/tk8.6
-# directories of .tcl scripts Tcl_Init()/Tk_Init() load at runtime) - none
-# of this is bundled or auto-discovered by this module.
+# directories of .tcl scripts Tcl_Init()/Tk_Init() load at runtime) - a
+# directory of many files, not a single DLL dependency dll= can express.
 
 Tcl_Interp: TypeAlias = Ptr[None]
 
@@ -37,23 +53,23 @@ TCL_OK: i32 = 0
 TCL_DONT_WAIT: i32 = 2
 TCL_ALL_EVENTS: i32 = -3
 
-@extern( 'tcl86t', 'Tcl_CreateInterp' )
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_CreateInterp() -> Tcl_Interp:
 	...
 
-@extern( 'tcl86t', 'Tcl_Init' )
+@extern( 'tcl86t', 'Tcl_Init', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_Init( interp: Tcl_Interp ) -> i32:
 	...
 
-@extern( 'tk86t', 'Tk_Init' )
+@extern( 'tk86t', 'Tk_Init', dll = 'tk86t.dll' )
 def Tk_Init( interp: Tcl_Interp ) -> i32:
 	...
 
-@extern( 'tcl86t', 'Tcl_Eval' )
+@extern( 'tcl86t', 'Tcl_Eval', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_Eval( interp: Tcl_Interp, script: ConstPtr[u8] ) -> i32:
 	...
 
-@extern( 'tcl86t', 'Tcl_GetStringResult' )
+@extern( 'tcl86t', 'Tcl_GetStringResult', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_GetStringResult( interp: Tcl_Interp ) -> ConstPtr[u8]:
 	...
 
@@ -61,7 +77,7 @@ def Tcl_GetStringResult( interp: Tcl_Interp ) -> ConstPtr[u8]:
 # -> int, the classic (pre-Tcl_Obj) Tcl_CmdProc shape - the simplest command
 # callback signature Tcl_CreateCommand accepts, sufficient for a fixed
 # trampoline that doesn't need to inspect its arguments.
-@extern( 'tcl86t', 'Tcl_CreateCommand' )
+@extern( 'tcl86t', 'Tcl_CreateCommand', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_CreateCommand(
 	interp: Tcl_Interp,
 	cmdName: ConstPtr[u8],
@@ -71,17 +87,17 @@ def Tcl_CreateCommand(
 ) -> Ptr[None]:
 	...
 
-@extern( 'tcl86t', 'Tcl_DoOneEvent' )
+@extern( 'tcl86t', 'Tcl_DoOneEvent', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_DoOneEvent( flags: i32 ) -> i32:
 	...
 
-@extern( 'tcl86t', 'Tcl_DeleteInterp' )
+@extern( 'tcl86t', 'Tcl_DeleteInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
 def Tcl_DeleteInterp( interp: Tcl_Interp ) -> None:
 	...
 
 # Number of toplevel windows still open - a real Tk_MainLoop-shaped
 # mainloop (below, in lib/tkinter.py) runs until this reaches 0, i.e. until
 # the user closes the last window, same as real tkinter's mainloop().
-@extern( 'tk86t', 'Tk_GetNumMainWindows' )
+@extern( 'tk86t', 'Tk_GetNumMainWindows', dll = 'tk86t.dll' )
 def Tk_GetNumMainWindows() -> i32:
 	...
