@@ -251,8 +251,13 @@ def main() -> i32:
 			# NOT wired into _format_field itself, that shape must stay as
 			# the shipped if/elif regardless of this test's outcome. This
 			# is the exact rejected shape: a single `or`-chain of 4
-			# `field.find(X).is_ok()` calls, joined all the way instead of
-			# split into separate if/elif branches. Cases cover every
+			# Result-returning `.is_ok()` calls, joined all the way instead
+			# of split into separate if/elif branches - uses index()
+			# (not find(), which now returns a plain isize sentinel, not a
+			# Result, since the str.find()/index() convention swap - see
+			# lib/builtins/__init__.py) so this still genuinely exercises
+			# an RC-leaf @union (Result[usize,IndexError]) BoolOp operand,
+			# the actual bug shape this test needs. Cases cover every
 			# short-circuit position (no match at all - every operand
 			# actually runs; match on the 1st/2nd/3rd/4th operand - all
 			# preceding operands run, everything after is skipped) since a
@@ -261,7 +266,7 @@ def main() -> i32:
 			# source.
 			( 'boolop_or_chain_of_find_is_ok_repro', '''
 def needs_quote_or_chain( field: str, delimiter: str, quotechar: str ) -> bool:
-	return field.find( delimiter ).is_ok() or field.find( quotechar ).is_ok() or field.find( '\\r' ).is_ok() or field.find( '\\n' ).is_ok()
+	return field.index( delimiter ).is_ok() or field.index( quotechar ).is_ok() or field.index( '\\r' ).is_ok() or field.index( '\\n' ).is_ok()
 
 def main() -> i32:
 	if needs_quote_or_chain( 'plain', ',', '"' ) != False: # no match - all 4 operands run
