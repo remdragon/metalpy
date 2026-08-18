@@ -11940,6 +11940,38 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fresh_ordinary_method_call_branches_no_double_free( self ) -> None:
+		# _flush_ifexp_branch_temps (see its own comment) was written to fix
+		# a chained-concat intermediate-temp leak, but the SAME leak shape
+		# also happens for an ordinary METHOD call with a defaulted union-
+		# typed argument: str.lstrip()'s `chars: str|None = None` default
+		# materializes via its own Call, DeclareTemp-ing a temp that is
+		# neither branch's own true_val/false_val. Before the fix, that temp
+		# leaked into the enclosing statement's shared _pending_temps and got
+		# unconditionally decref'd for BOTH branches after end_label,
+		# including whichever branch never ran - reading/releasing an
+		# uninitialized C local. Crashed under MSVC's debug heap (0x80000003)
+		# after ~hundreds of iterations; did NOT crash under clang, and did
+		# NOT reproduce with construct calls (str(...)) or a BinOp/dunder
+		# call instead - only two fresh ordinary-method-Call-shaped branches
+		# trigger it. Confirmed via direct testing, not just reasoning.
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		cond: bool = True
+		while i < 1000:
+			x: str = '-'.lstrip() if cond else '+'.lstrip()
+			if compiler.refcount( x ) != 1:
+				return 2
+			cond = not cond
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 class CallableTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see

@@ -26,9 +26,9 @@ This document defines the language constructs, syntax rules, type system, error 
 * str: immutable strings, guaranteed to be valid utf8 and null-terminated.
 * bytes: immutable sequence of bytes (u8)
 * bytearray: mutable sequence of bytes (u8)
-* list[T]: mutable list of objects
-* dict[K,V]: mutable map/dictionary of key/value pairs
-* set[T]: mutable collection of unique values
+* list[T]: threadsafe mutable list of objects
+* dict[K,V]: threadsafe mutable map/dictionary of key/value pairs
+* set[T]: threadsafe mutable collection of unique values
 * tuple: immutable collection of values
 
 ### Pointers, Slices & Fixed-Size Inline Arrays
