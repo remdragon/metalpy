@@ -6006,6 +6006,59 @@ def main() -> i32:
 		])
 
 
+class CallDunderConstructDispatchTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' T(...) dispatches to a static T.__call__(...) instead of construction
+	when one is defined - lowering.py's _rewrite_call_dunder_call. str's own
+	__call__(x: str) -> str (lib/builtins/__init__.py) is the concrete
+	motivating case: str is immutable, so str(x) just reuses x, no copy. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_call_is_identity_not_a_copy', '''
+def main() -> i32:
+	s: str = 'hello'.lstrip() # forces a real, non-immortal-literal allocation
+	if compiler.refcount( s ) != 1:
+		return 1
+	t: str = str( s )
+	if t != s:
+		return 2
+	if compiler.refcount( s ) != 2:
+		return 3
+	if compiler.refcount( t ) != 2:
+		return 4
+	return 0
+''' ),
+			( 'user_defined_static_call_dunder', '''
+class Converter:
+	@staticmethod
+	def __call__( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + 1
+
+def main() -> i32:
+	if Converter( 41 ) != 42:
+		return 1
+	return 0
+''' ),
+			( 'ordinary_construction_unaffected_without_call_dunder', '''
+class Point:
+	x: i32
+	y: i32
+
+def main() -> i32:
+	p: Point = Point( x = 1, y = 2 )
+	if p.x != 1 or p.y != 2:
+		return 1
+	return 0
+''' ),
+		])
+
+
 class StrPhase2PaddingTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Phase 2 of TODO.txt's str-methods plan: ljust/rjust/zfill
 	(lib/builtins/__init__.py). '''

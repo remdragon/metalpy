@@ -4466,6 +4466,88 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'is private', self.discovery.errors.errors[0] )
 
+	def test_call_dunder_dispatches_instead_of_construction( self ) -> None:
+		# T(...) where T defines a static __call__ dispatches there instead
+		# of construction - no ir.Allocate at all, an ordinary ir.Call
+		# targeting __call__, matching how ClassName.static_method(...)
+		# already resolves for e.g. int.from_str(...).
+		code = '\n'.join([
+			'@cstruct',
+			'class Converter:',
+			'	@staticmethod',
+			'	def __call__( x: i32 ) -> i32:',
+			'		return x',
+			'',
+			'def main() -> i32:',
+			'	return Converter( 41 )',
+		])
+		mod = self._import( code )
+		converter_cls = mod.get_local( 'Converter' )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertFalse( any( isinstance( i, ir.Allocate ) for i in fn.instructions ) )
+		call_instr = next( i for i in fn.instructions if isinstance( i, ir.Call ))
+		self.assertIs( call_instr.target, converter_cls.get_local( '__call__' ))
+		self.assertIsNone( call_instr.receiver )
+
+	def test_call_dunder_absent_construction_unchanged( self ) -> None:
+		# the same shape as above, but Foo has no __call__ at all - ordinary
+		# field=value construction sugar must still fire unchanged (the
+		# ~100% common case this pre-pass must stay a no-op for)
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'',
+			'def main() -> Foo:',
+			'	return Foo( x = 1 )',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocate_instr = next( i for i in fn.instructions if isinstance( i, ir.Allocate ))
+		self.assertIs( allocate_instr.cls, foo_cls )
+
+	def test_call_dunder_must_be_static( self ) -> None:
+		# an ordinary (non-static) __call__ can't be used for T(...)
+		# dispatch - there's no receiver instance to bind self to yet
+		code = '\n'.join([
+			'@cstruct',
+			'class Bad:',
+			'	def __call__( self, x: i32 ) -> i32:',
+			'		return x',
+			'',
+			'def main() -> i32:',
+			'	return Bad( 1 )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any(
+			'__call__' in e and 'staticmethod' in e for e in self.discovery.errors.errors
+		), self.discovery.errors.errors )
+
+	def test_call_dunder_explicit_attribute_spelling_still_works( self ) -> None:
+		# T.__call__(...), spelled out explicitly rather than via T(...)
+		# sugar, must resolve identically (exercises the early-return guard
+		# for an already-Attribute callee in the rewrite pre-pass)
+		code = '\n'.join([
+			'@cstruct',
+			'class Converter:',
+			'	@staticmethod',
+			'	def __call__( x: i32 ) -> i32:',
+			'		return x',
+			'',
+			'def main() -> i32:',
+			'	return Converter.__call__( 41 )',
+		])
+		mod = self._import( code )
+		converter_cls = mod.get_local( 'Converter' )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call_instr = next( i for i in fn.instructions if isinstance( i, ir.Call ))
+		self.assertIs( call_instr.target, converter_cls.get_local( '__call__' ))
+
 	def test_allocate_missing_field_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'@cstruct',
