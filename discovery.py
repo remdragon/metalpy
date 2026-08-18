@@ -819,6 +819,21 @@ class Discovery( ast.NodeVisitor ):
 				return self._get_or_create_move( inner )
 			return self._get_or_create_copy( inner )
 
+		# Volatile[T] is compiler syntax too, but UNLIKE move/copy above it's
+		# deliberately not modeled as a wrapper Type: a Volatile[T] value
+		# must keep behaving as an ordinary T everywhere (arithmetic,
+		# comparisons, overload matching) - only its C declaration differs -
+		# so it resolves transparently to T itself here (every caller of
+		# discovery.visit() sees a plain T, with nothing further to unwrap).
+		# The few sites that need to know a local was declared Volatile[T]
+		# (currently just lowering.py's _stmt_AnnAssign) peek at the raw
+		# annotation AST node themselves, rather than this method threading
+		# a side-channel flag back through its Type-only return type.
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Volatile':
+			if isinstance( node.slice, ast.Tuple ):
+				self.fail( f'Volatile[...] takes exactly one type argument: {ast.unparse(node)}', node )
+			return self.visit( node.slice )
+
 		# Callable[[Arg1,Arg2,...], Ret] - also compiler syntax (see
 		# PLAN_CALLABLE.md), recognized the same textual way as move/copy
 		# above rather than resolved as an ordinary generic base: its own
@@ -2403,6 +2418,27 @@ class Discovery( ast.NodeVisitor ):
 							is_copy = isinstance( param_type, Copy )
 							if is_move or is_copy:
 								param_type = param_type.inner
+								if fn.is_inline:
+									# @inline splicing binds self/every parameter
+									# zero-copy, always treated as borrowed at the
+									# splice boundary (lowering.py's
+									# _lower_inline_call - "no _cfg_assign/incref
+									# here, deliberately... borrowed, no incref at
+									# the boundary") - a move[T]/copy[T] param's
+									# real ownership-transfer/prologue-incref
+									# semantics have never been reasoned through
+									# for that boundary (see inline_splice_
+									# aliasing_return_incref_bug_fixed.md: even
+									# plain borrowed aliasing returns needed a
+									# real fix here). Reject outright rather than
+									# risk a silent refcount bug - same "no
+									# coherent meaning yet" reasoning the
+									# @inline+@move whole-function check below
+									# already uses
+									self.fail(
+										f'@inline {fn.qualname} parameter {arg.arg!r} cannot be move[T]/copy[T] - not supported',
+										arg,
+									)
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							self._reject_fixed_array_outside_struct_field( param_type, fn, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							if fn.extern_lib is not None:

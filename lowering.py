@@ -2232,6 +2232,40 @@ class FunctionLowering:
 			self._emit( ir.DeleteTemp( temp = t ))
 		self._pending_temps = []
 
+	def _incref_aliasing_return( self, node_expr: ast.expr, value: 'ir.Operand|None', *, force: bool = False ) -> None:
+		''' shared by _stmt_Return and @inline splicing (_lower_inline_call/
+		_splice_multi_statement_inline_body): an ALIASING return expression
+		(self.lowering._is_aliasing_expr - `return self`/`return self.x`)
+		hands back a reference someone else still independently owns, so the
+		caller needs its own +1 - regardless of whether the return happens
+		through a real call boundary or is spliced in directly. Skipping this
+		for the spliced case (confirmed by a real refcount() repro) silently
+		drops the Incref an @inline'd `return self` would otherwise get from
+		a real, non-inlined call to the same function.
+
+		`force` bypasses the has_live_entry() check below - needed by the
+		@inline splice callers specifically: self/a parameter is bound
+		zero-copy (SAME Variable identity as whatever the caller passed in -
+		see _lower_inline_call's own "no _cfg_assign/incref here, deliberately"
+		comment), so has_live_entry(value) would answer "does the CALLER's own
+		operand happen to be a live owned local in the OUTER scope" instead of
+		"is this splice's self/parameter borrowed" - the wrong question
+		whenever the caller's argument was itself a plain owned local (exactly
+		the str(s) repro: s has its own live entry in main(), so an unforced
+		check wrongly concluded "already a move, no Incref needed"). @inline
+		splice callers already know from their own binding loop that self/
+		every parameter is always treated as borrowed at the splice boundary
+		(same loop, same comment), so they pass force=True for those; a
+		multi-statement splice's own pre-return-declared local (a real,
+		splice-scoped self._cfg entry, not aliased to any outer identity)
+		still needs the ordinary has_live_entry check, so force stays False
+		for those. '''
+		if value is None or not self.lowering._is_aliasing_expr( node_expr, value ):
+			return
+		if force or not self._cfg.has_live_entry( value ):
+			for instr in self._cfg.incref( value.type, value ):
+				self._emit( instr )
+
 	def _stmt_Return( self, node: ast.Return ) -> None:
 		if self._in_deferred_body:
 			# a defer/errdefer body's code runs later, replayed inline at the
@@ -2276,9 +2310,7 @@ class FunctionLowering:
 		# holder of the returned value, double-counted as the SAME
 		# reference) where 3 are live once the caller's copy exists,
 		# leading to a premature free the moment either one dropped.
-		if value is not None and self.lowering._is_aliasing_expr( node.value, value ) and not self._cfg.has_live_entry( value ):
-			for instr in self._cfg.incref( value.type, value ):
-				self._emit( instr )
+		self._incref_aliasing_return( node.value, value )
 		# what actually gets returned/assigned into the return-value slot
 		# below - defaults to `value` itself, reassigned to a widened temp
 		# further down when the covered-Result-error-widening case applies.
@@ -2650,7 +2682,15 @@ class FunctionLowering:
 		if not isinstance( node.target, ast.Name ):
 			self.lowering.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
 		fn = self._current_fn
+		# Volatile[T] resolves transparently to plain T (discovery.py's
+		# visit_Subscript strips it) - detected here, separately, by peeking
+		# at the raw annotation AST so this ONE call site (the only thing
+		# that needs to know) can tag the resulting Variable's storage.
+		is_volatile = ( isinstance( node.annotation, ast.Subscript ) and isinstance( node.annotation.value, ast.Name )
+				and node.annotation.value.id == 'Volatile' )
 		var_type = self.lowering.discovery.visit( node.annotation )
+		if is_volatile and var_type.is_rc():
+			self.lowering.discovery.fail( f'Volatile[...] does not support refcounted types: {ast.unparse(node)}', node )
 		# var_type starts as whatever discovery.visit() returns - often a
 		# bare, un-monomorphized Specialization - and STAYS that way for
 		# var's own construction/_lower_expr's expected_type below. Fixed
@@ -2665,6 +2705,7 @@ class FunctionLowering:
 			file = fn.file,
 			line = node.lineno,
 			type = var_type,
+			is_volatile = is_volatile,
 		)
 		fn.add_name( var.stem, var ) # scoped to the whole function body regardless of node.value (no block scoping - see cfg.py's own module docstring) - a bare declaration (node.value is None) deliberately does NOT mark it live in self._cfg (see below); a later real assignment does, via assign()'s own unconditional self._live.add()
 		if node.value is not None:
@@ -9872,6 +9913,7 @@ class FunctionLowering:
 			# spliced body references self/that parameter more than once
 			saved: dict[str,object] = {}
 			saved_live: dict[str,bool] = {}
+			bound_ids: set[int] = set() # see _incref_aliasing_return's own `force` doc - every self/parameter binding here is always treated as borrowed
 			for stem, operand in bindings.items():
 				if isinstance( operand, Variable ):
 					fresh = operand
@@ -9884,6 +9926,7 @@ class FunctionLowering:
 					)
 					self._inline_binding_id += 1
 					self._emit( ir.Assign( dest = fresh, src = operand ))
+				bound_ids.add( id( fresh ))
 				saved[stem] = target.names.get( stem )
 				target.names[stem] = fresh
 				# liveness is keyed by `stem` (the literal 'self'/parameter
@@ -9907,6 +9950,7 @@ class FunctionLowering:
 				with self.lowering.discovery.module_context( module ):
 					with self.lowering.discovery.scope_context( target ):
 						result = self._lower_expr( return_expr, expected_type or target.return_type )
+						self._incref_aliasing_return( return_expr, result, force = id( result ) in bound_ids )
 			finally:
 				for stem, was_live in saved_live.items():
 					if not was_live:
@@ -10017,6 +10061,7 @@ class FunctionLowering:
 		# bind self/params into the PROVISIONAL's own names dict - same
 		# logic the single-statement path above uses for target.names,
 		# just no save/restore needed (provisional is single-use)
+		bound_ids: set[int] = set() # see _incref_aliasing_return's own `force` doc - every self/parameter binding here is always treated as borrowed
 		for stem, operand in bindings.items():
 			if isinstance( operand, Variable ):
 				fresh = operand
@@ -10029,6 +10074,7 @@ class FunctionLowering:
 				)
 				self._inline_binding_id += 1
 				self._emit( ir.Assign( dest = fresh, src = operand ))
+			bound_ids.add( id( fresh ))
 			provisional.names[stem] = fresh
 			# liveness keyed by `stem` (see _lower_inline_call's own
 			# identical single-statement-path comment) - the caller
@@ -10165,6 +10211,7 @@ class FunctionLowering:
 					# single-statement/original multi-statement code always
 					# computed it
 					result = self._lower_expr( return_stmt.value, expected_type )
+					self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
 					return result if want_result else None
 
 				assert scope_label is not None and exited_flag is not None and merge_label is not None
@@ -10203,6 +10250,7 @@ class FunctionLowering:
 				self._emit( ir.Jump( target = converge_label ))
 				self._emit( ir.Label( name = normal_label ))
 				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+				self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
 				self._emit( ir.Assign( dest = result, src = trailing_value ))
 				# trailing_value's own ownership (if it's a bare temp - e.g.
 				# the Result.Ok(x) construction temp a trailing `return
@@ -10377,6 +10425,79 @@ class FunctionLowering:
 			if param.stem in kwargs:
 				self.lowering._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, target.qualname )
 		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
+
+	def _dispatch_slot_binding(
+		self, node: ast.Call, target: Function, param: Parameter,
+		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
+	) -> Type:
+		# the single concrete leaf `param` resolves to once THIS branch's own
+		# runtime tag check(s) (if any) have already excluded every other
+		# candidate - see _monomorphize_dispatch_target's own comment. `known`
+		# (keyed by id(param)) covers whatever this branch's own conditions
+		# already pinned down explicitly; every other parameter is narrowed
+		# from the real call-site operand's own (possibly still union) type,
+		# minus whatever leaves `claimed` (built from every OTHER branch's own
+		# conditions - only ever non-empty for the trailing default, which has
+		# no conditions of its own) already accounts for elsewhere. Fails
+		# cleanly, same message/shape as the pre-existing blanket rejection,
+		# if more than one leaf can still reach this target here - a genuinely
+		# harder case (per-tag monomorphization dispatch) this narrow fix
+		# doesn't attempt.
+		if id( param ) in known:
+			return known[ id( param ) ]
+		operand = self.lowering._dispatch_operand_for_param( node, target, param, args, kwargs )
+		already = claimed.get( id( operand ), [] )
+		remaining = [
+			leaf for leaf in operand.type.leaves()
+			if not any( self.lowering._type_resolver._same_type( leaf, c ) for c in already )
+		]
+		if len( remaining ) != 1:
+			self.lowering.discovery.fail(
+				f'a generic overload of {target.qualname} cannot be one branch of a runtime-dispatched call '
+				f'(argument {param.stem!r} could still be {len(remaining)} different types at this branch - '
+				f'per-leaf monomorphization for a generic branch spanning more than one runtime type is not '
+				f'supported yet): {ast.unparse(node)}',
+				node,
+			)
+		return remaining[0]
+
+	def _monomorphize_dispatch_target(
+		self, node: ast.Call, target: Function,
+		known: dict[int,Type], args: list[ir.Operand], kwargs: dict[str,ir.Operand], claimed: dict[int,list[Type]],
+	) -> Function:
+		# monomorphizes a GENERIC branch/default of a runtime-dispatched
+		# Overload call in place, so the rest of _lower_conditional_dispatch
+		# (which schedules every branch's target as an ordinary, concrete
+		# compile unit) never sees a bare TypeVar parameter. Unlike
+		# _lower_overload_generic_call (which unifies T against the FULL,
+		# possibly-union call-site operand type, for the "sole unconditional
+		# match" case), a ConditionalDispatch branch/default only ever runs
+		# once every OTHER branch's own runtime tag check has excluded its own
+		# leaf(s) - _dispatch_slot_binding resolves the real, narrower type
+		# reaching THIS target at each parameter.
+		type_params = target.type_params or []
+		bindings: dict[int,Type] = {}
+		for param in target.parameters or []:
+			resolved_type = self._dispatch_slot_binding( node, target, param, known, args, kwargs, claimed )
+			self.lowering._unify_type_param( type_params, param.type, resolved_type, bindings, node, target.qualname )
+		missing = [ tv for tv in type_params if id( tv ) not in bindings ]
+		if missing:
+			# every real lib/ generic overload binds every type param
+			# directly off a parameter (see this module's own note on
+			# real-world overload group shapes) - return-only inference
+			# (_infer_return_only_type_params) is a materially bigger
+			# feature to wire through a runtime-dispatched branch (it needs
+			# to actually lower the body to infer the return type) and isn't
+			# attempted here; fails clearly rather than silently
+			self.lowering.discovery.fail(
+				f'a generic overload of {target.qualname} cannot be one branch of a runtime-dispatched call '
+				f'(type parameter(s) {", ".join(tv.stem for tv in missing)} aren\'t bound by any parameter - '
+				f'return-only inference isn\'t supported here yet): {ast.unparse(node)}',
+				node,
+			)
+		inferred_args = [ bindings[id(tv)] for tv in type_params ]
+		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
+		return self.lowering._monomorphized_function( spec )
 
 	def _infer_return_only_type_params( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], return_only: list[TypeVar] ) -> Function:
 		# PLAN_RETURN_INFERENCE.md - non-@inline variant: a bare generic
@@ -11050,36 +11171,72 @@ class FunctionLowering:
 						f'move(...) through a runtime-dispatched overload group is not supported: {ast.unparse(node)}',
 						node,
 					)
-				if resolved.type_params or any( b.function.type_params for b in branches ):
-					# a GENERIC candidate as one branch (or the trailing
-					# default) of a runtime-dispatched overload group isn't
-					# supported: which concrete C symbol to call has to be
-					# fixed at compile time (this compiler has no vtable/
-					# runtime-polymorphic dispatch concept anywhere), but
-					# which leaf(s) of the call's
-					# union-typed argument actually reach a generic branch
-					# can genuinely vary at runtime (e.g. a 3+-member union
-					# where only one member has a concrete overload - every
-					# OTHER member falls through to the same generic default,
-					# each needing its own distinct monomorphization chosen
-					# by a runtime tag no single Call target can express).
-					# Rejected cleanly here rather than reaching
-					# _lower_conditional_dispatch, which unconditionally
-					# schedules every branch's target as a real, concrete
-					# compile unit and would otherwise crash the EMITTER
-					# (not even a clean compile error) the first time it hit
-					# a still-bare TypeVar parameter - confirmed via a real
-					# repro (str|i32 argument, concrete str overload +
-					# generic[T] fallback)
-					self.lowering.discovery.fail(
-						f'a generic overload of {target.qualname} cannot be one branch of a runtime-dispatched call '
-						f'(the argument type is a union whose leaves route to more than one overload, at least one of '
-						f'them generic) - not supported yet: {ast.unparse(node)}',
-						node,
-					)
 				branches = [ ConditionalDispatch( conditions = b.conditions, function = _resolve_original( b.function )) for b in branches ]
 				resolved = _resolve_original( resolved )
-				return self._lower_conditional_dispatch( node, branches, resolved, args, kwargs, expected_type, want_result )
+				if resolved.type_params or any( b.function.type_params for b in branches ):
+					# a GENERIC candidate as one branch (or the trailing
+					# default) of a runtime-dispatched overload group: which
+					# concrete C symbol to call has to be fixed at compile
+					# time (this compiler has no vtable/runtime-polymorphic
+					# dispatch concept anywhere) - reachable only when the
+					# call's own union-typed argument has leaves routing to
+					# more than one overload, at least one of them generic.
+					#
+					# The EASY sub-case (handled here): whatever leaf(s) of
+					# the union still reach one particular generic branch are
+					# already pinned down STATICALLY, either by that branch's
+					# own runtime condition(s) (a non-default branch always
+					# has one - see overload_resolution.resolve_call) or, for
+					# the trailing default, by elimination (the call's real
+					# leaves at that slot, minus whatever every OTHER
+					# branch's own condition already claims there) - if
+					# that's exactly one leaf, T is knowable at compile time
+					# same as any other generic call, and this branch can be
+					# monomorphized in place before ever reaching
+					# _lower_conditional_dispatch (which unconditionally
+					# schedules every branch's target as an ordinary, already-
+					# concrete compile unit - see _monomorphize_dispatch_target).
+					#
+					# The HARD sub-case (still rejected, by
+					# _dispatch_slot_binding/_monomorphize_dispatch_target's
+					# own fail() calls below): a single generic branch that
+					# itself needs to cover 2+ distinct leaves (e.g. a 3+-
+					# member union where only one member has a concrete
+					# overload - every OTHER member falls through to the SAME
+					# generic default, each needing its own distinct
+					# monomorphization chosen by a runtime tag no single Call
+					# target can express) - a materially bigger feature
+					# (synthesizing a real per-tag dispatch table over
+					# distinct monomorphizations) than anything this dispatch
+					# machinery does today. Before this fix, EVERY generic-
+					# branch shape (easy or hard) hit this same blanket
+					# rejection rather than reaching the emitter, which would
+					# otherwise crash outright on a still-bare TypeVar
+					# parameter (confirmed via a real repro: str|i32 argument,
+					# concrete str overload + generic[T] fallback).
+					claimed: dict[int,list[Type]] = {}
+					for b in branches:
+						for p, leaf_type in b.conditions:
+							operand = self.lowering._dispatch_operand_for_param( node, b.function, p, args, kwargs )
+							claimed.setdefault( id( operand ), [] ).append( leaf_type )
+					if resolved.type_params:
+						resolved = self._monomorphize_dispatch_target( node, resolved, {}, args, kwargs, claimed )
+					new_branches: list[ConditionalDispatch] = []
+					for b in branches:
+						if not b.function.type_params:
+							new_branches.append( b )
+							continue
+						original_params = b.function.parameters or []
+						known = { id( p ): t for p, t in b.conditions }
+						monomorphized = self._monomorphize_dispatch_target( node, b.function, known, args, kwargs, {} )
+						new_params = monomorphized.parameters or []
+						remapped_conditions = [
+							( new_params[ next( i for i, op in enumerate( original_params ) if op is p ) ], leaf_type )
+							for p, leaf_type in b.conditions
+						]
+						new_branches.append( ConditionalDispatch( conditions = remapped_conditions, function = monomorphized ))
+					branches = new_branches
+				return self._lower_conditional_dispatch( node, branches, resolved, receiver, args, kwargs, expected_type, want_result )
 			winning_stub = next( ( s for s in target.stubs if s.bound_to is resolved ), None )
 			if (
 				winning_stub is not None and winning_stub.return_type is not resolved.return_type
@@ -11359,14 +11516,20 @@ class FunctionLowering:
 			self._emit( ir.Call( dest = None, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return None
 
-	def _lower_conditional_dispatch( self, node: ast.Call, branches: list[ConditionalDispatch], default: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+	def _lower_conditional_dispatch( self, node: ast.Call, branches: list[ConditionalDispatch], default: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# a union-typed argument's runtime tag decides which overload
 		# implementation actually runs (e.g. len(copy_from) where
 		# copy_from: bytes|bytearray resolves to two candidates, bytes and
 		# bytearray). Reuses the same tag/data/v_<member> machinery match
 		# statements use (UnionStorage.get) - branches are tried in
 		# priority order, falling through to `default` (no test needed -
-		# it's whatever's left once every more specific branch is excluded)
+		# it's whatever's left once every more specific branch is excluded).
+		# `receiver` is the SAME instance operand for every branch (an
+		# Overload group is either entirely bound methods sharing one
+		# receiver, or entirely receiver-less free functions/statics - never
+		# a mix) - already scheduled/move-tracked by _lower_call before ever
+		# reaching here, so it's just threaded through unchanged into each
+		# branch's own ir.Call, same as `args`/`kwargs` already are.
 		self.lowering._ensure_resolved( default )
 		for branch in branches:
 			self.lowering._ensure_resolved( branch.function )
@@ -11376,10 +11539,10 @@ class FunctionLowering:
 		for branch in branches:
 			next_label = self._new_label( 'dispatch_next' )
 			self._lower_dispatch_tests( node, branch.function, branch.conditions, args, kwargs, next_label )
-			self._emit_dispatch_call( branch.function, args, kwargs, dest, want_result )
+			self._emit_dispatch_call( branch.function, receiver, args, kwargs, dest, want_result )
 			self._emit( ir.Jump( target = end_label ))
 			self._emit( ir.Label( name = next_label ))
-		self._emit_dispatch_call( default, args, kwargs, dest, want_result )
+		self._emit_dispatch_call( default, receiver, args, kwargs, dest, want_result )
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
@@ -11413,7 +11576,7 @@ class FunctionLowering:
 			self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] ) ))
 			self._emit( ir.JumpIfFalse( cond = cmp_dest, target = next_label ))
 
-	def _emit_dispatch_call( self, target: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], dest: ir.Temp|None, want_result: bool ) -> None:
+	def _emit_dispatch_call( self, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], dest: ir.Temp|None, want_result: bool ) -> None:
 		params = target.parameters or []
 		unwrapped_args = [ self._maybe_unwrap_union_arg( a, p.type ) for a, p in zip( args, params ) ]
 		unwrapped_kwargs = {
@@ -11423,7 +11586,7 @@ class FunctionLowering:
 		self.lowering.schedule( target.return_type )
 		for p in params:
 			self.lowering.schedule( p.type )
-		self._emit( ir.Call( dest = dest if want_result else None, target = target, receiver = None, args = unwrapped_args, kwargs = unwrapped_kwargs ))
+		self._emit( ir.Call( dest = dest if want_result else None, target = target, receiver = receiver, args = unwrapped_args, kwargs = unwrapped_kwargs ))
 
 	def _maybe_unwrap_union_arg( self, operand: ir.Operand, target_type: Type|None ) -> ir.Operand:
 		# a union-typed call-site argument (copy_from: bytes|bytearray)

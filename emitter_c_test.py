@@ -1738,6 +1738,83 @@ def main() -> i32:
 ''' ),
 		] )
 
+class VolatileLocalTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for `Volatile[T]` local declarations - the
+	fix for a --release micro-benchmark loop (`for i in range(N): pass`)
+	being dead-code-eliminated by the C compiler under -O2/-O3 (no
+	observable side effects, statically-known trip count). Confirms both
+	that the qualifier actually lands in the generated C, and that a
+	Volatile[T] local otherwise behaves exactly like a plain T everywhere
+	(arithmetic, comparisons, reuse as a for-loop target). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact shape the benchmark needs: pre-declare `i: Volatile[
+			# usize]` before a `for i in range(...)` - _bind_loop_target's
+			# existing "reuse a same-named pre-declared local" path (the
+			# same one str.concat's own `i: usize = 0` uses) picks it up
+			# with no lowering changes of its own, so the loop's induction
+			# variable keeps its is_volatile flag through every iteration
+			( 'volatile_loop_counter_reused_as_for_target', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: Volatile[usize] = 0
+		for i in range( 1000 ):
+			pass
+		if i != 1000:
+			return 1
+		return 0
+''' ),
+			# ordinary arithmetic/comparisons on a Volatile[T] local work
+			# exactly like a plain T - it's a storage qualifier on the
+			# binding, not a distinct type (unlike move[T]/copy[T])
+			( 'volatile_local_arithmetic_and_comparison', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: Volatile[i32] = 10
+		x += 5
+		if x != 15:
+			return 1
+		if not ( x > 10 ):
+			return 2
+		y: i32 = x + 1
+		if y != 16:
+			return 3
+		return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_declaration_is_qualified_volatile_in_generated_c( self ) -> None:
+		self.compiler.import_code( '''
+def main() -> None:
+	i: Volatile[usize] = 0
+	return
+''', Path( '__main__.py' ), scope = None )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+		self.assertIn( 'volatile uintptr_t i', c_source )
+
+	def test_volatile_of_refcounted_type_is_rejected( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+class Box:
+	v: i32 = 0
+
+def main() -> None:
+	b: Volatile[Box] = Box()
+	return
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertTrue( any( 'Volatile[...] does not support refcounted types' in e for e in discovery.errors.errors ))
+
+
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -4987,6 +5064,72 @@ def main() -> i32:
 		return 2
 	if classify( 3 ) != 999:
 		return 3
+	return 0
+''' ),
+		] )
+
+
+class GenericMatchTypeMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for type_resolver.py's _try_fold_match_type -
+	`match type(<Name>): case ConcreteClass(binding): ... case _: ...` over a
+	generic function's own type-parameter-typed parameter, folded to exactly
+	one arm's own statements at monomorphization time (no runtime branch left
+	behind at all - see the rewrite's own docstring, and PLAN_MATCH_TYPE_
+	MONOMORPHIZATION.md for the full design). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'match_type_selects_a_different_arm_per_instantiation', '''
+class Foo:
+	pass
+
+def describe[T]( x: T ) -> i32:
+	match type( x ):
+		case i32( n ):
+			with compiler.wrap_arithmetic:
+				return n + 100
+		case Foo( f ):
+			return 200
+		case _:
+			return 300
+
+def main() -> i32:
+	a: i32 = 5
+	if describe( a ) != 105:
+		return 1
+	if describe( Foo() ) != 200:
+		return 2
+	b: bool = True
+	if describe( b ) != 300:
+		return 3
+	return 0
+''' ),
+			( 'match_type_same_name_capture_skips_the_synthesized_rebind', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def identity[T]( other: T ) -> T:
+	match type( other ):
+		case Box( other ):
+			return other
+		case _:
+			return other
+
+def main() -> i32:
+	b: Box = Box( 42 )
+	r: Box = identity( b )
+	if r.v != 42:
+		return 1
+	x: i32 = 7
+	n: i32 = identity( x )
+	if n != 7:
+		return 2
 	return 0
 ''' ),
 		] )
@@ -9591,6 +9734,64 @@ def main() -> i32:
 	n: i32 = 42
 	if b.get( n ) != 'generic':
 		return 2
+	return 0
+''' ),
+			# a generic `[T]` candidate as one branch (or the trailing
+			# default) of a runtime-dispatched Overload call - a UNION-typed
+			# argument (unlike the concrete-argument case above) can force
+			# overload_resolution.resolve_call to return a real
+			# ConditionalDispatch, whose branches _lower_conditional_dispatch
+			# schedules as concrete, callable C symbols. Two real gaps fixed
+			# together here: (1) whichever single leaf still reaches a
+			# generic branch/default at compile time (only i32 can ever
+			# reach get[T] once str is claimed by the concrete overload) is
+			# now monomorphized in place instead of being rejected outright
+			# (see lowering.py's _monomorphize_dispatch_target) - a call
+			# whose argument is CONCRETE already worked (the case just
+			# above); this is the same feature for a UNION-typed argument.
+			# (2) _lower_conditional_dispatch/_emit_dispatch_call always
+			# hardcoded receiver=None, silently dropping `self` for any
+			# runtime-dispatched METHOD call (every prior real-compile
+			# exercise of this machinery - see OverloadGenericSubstitution
+			# MatchingRealCompileTests - only ever used receiver-less free
+			# functions, so this was never caught): confirmed via a real
+			# repro, the C compiler itself rejected the generated call
+			# ("too few arguments to function call") before this fix.
+			# Exercises the generic candidate landing as BOTH the trailing
+			# default (str|i32 - str claimed, i32 falls through) and a
+			# proper conditioned branch (i32|str - order flipped).
+			( 'generic_typevar_fallback_through_runtime_dispatch', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick_str_first( flag: bool ) -> str|i32:
+	if flag:
+		return 'hi'
+	return 42
+
+def pick_i32_first( flag: bool ) -> i32|str:
+	if flag:
+		return 42
+	return 'hi'
+
+def main() -> i32:
+	b: Box = Box()
+	u1: str|i32 = pick_str_first( True )
+	u2: str|i32 = pick_str_first( False )
+	if b.get( u1 ) != 'hi':
+		return 1
+	if b.get( u2 ) != 'generic':
+		return 2
+	u3: i32|str = pick_i32_first( True )
+	u4: i32|str = pick_i32_first( False )
+	if b.get( u3 ) != 'generic':
+		return 3
+	if b.get( u4 ) != 'hi':
+		return 4
 	return 0
 ''' ),
 		] )

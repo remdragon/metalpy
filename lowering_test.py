@@ -116,6 +116,38 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_annassign_volatile_sets_flag_and_strips_type( self ) -> None:
+		# Volatile[T] resolves transparently to plain T (discovery.py's
+		# visit_Subscript) - the Variable itself carries is_volatile=True,
+		# not a wrapper type, so it keeps behaving as an ordinary usize
+		# everywhere else (see the Volatile[T] design note in _stmt_AnnAssign)
+		code = '\n'.join([
+			'def main() -> None:',
+			'	i: Volatile[usize] = 0',
+			'	return',
+		])
+		usize = self.discovery.get_intrinsics()['usize']
+		none_type = self.discovery.get_none_type()
+		i = Variable( stem = 'i', qualname = 'main.i', file = Path( '__test__.py' ), line = 2, type = usize, is_volatile = True )
+		self._test_ir( code, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = i, src = ir.Const( type = usize, value = 0 )),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_annassign_volatile_rejects_rc_type( self ) -> None:
+		code = '\n'.join([
+			'class Box:',
+			'	v: i32 = 0',
+			'def main() -> None:',
+			'	b: Volatile[Box] = Box()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( any( 'Volatile[...] does not support refcounted types' in e for e in self.discovery.errors.errors ))
+
 	def test_augassign_desugars_to_binop_and_assign( self ) -> None:
 		# x += 1 lowers exactly like a hand-written x = x + 1 would - same
 		# AddWrap/Assign shape, honoring the active arithmetic mode
@@ -2722,6 +2754,72 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
 		self.assertIs( assigns['x'].value, True )
+
+	# --- match type(<Name>): case ConcreteClass(...): ... (generic monomorphization fold) ---
+	# type_resolver.py's _try_fold_match_type - compile-time arm selection,
+	# once a generic function's own type-parameter-typed value is
+	# monomorphized to a concrete, non-union type. See PLAN_MATCH_TYPE_
+	# MONOMORPHIZATION.md for the design this implements.
+
+	def test_match_type_folds_to_the_matching_arm_with_no_runtime_branch_left( self ) -> None:
+		code = '\n'.join([
+			'def describe[T]( x: T ) -> i32:',
+			'	match type( x ):',
+			'		case i32( n ):',
+			'			return n',
+			'		case _:',
+			'			return -1',
+			'',
+			'def main() -> i32:',
+			'	a: i32 = 5',
+			'	return describe( a )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.compiler._drain() # describe(a)'s own Specialization is only SCHEDULED while lowering main - draining is what actually resolves+lowers its own body
+		self.assertEqual( self.discovery.errors.errors, [] )
+		described = next( lf for lf in self.compiler.functions if 'describe' in lf.function.qualname )
+		# a real compile-time arm selection, not a runtime tag check - no
+		# comparison/branch instruction of any kind should be left behind
+		self.assertFalse( any( isinstance( i, ( ir.Cmp, ir.JumpIfTrue, ir.JumpIfFalse )) for i in described.instructions ) )
+
+	def test_match_type_falls_back_to_wildcard_for_an_uncovered_concrete_type( self ) -> None:
+		code = '\n'.join([
+			'def describe[T]( x: T ) -> i32:',
+			'	match type( x ):',
+			'		case i32( n ):',
+			'			return n',
+			'		case _:',
+			'			return -1',
+			'',
+			'def main() -> i32:',
+			'	b: bool = True',
+			'	return describe( b )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.compiler._drain()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		described = next( lf for lf in self.compiler.functions if 'describe' in lf.function.qualname )
+		returns = [ i for i in described.instructions if isinstance( i, ir.Return ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( returns[0].value.value, -1 ) # only the wildcard arm's own body survived - the i32 arm was pruned entirely for this (bool) instantiation
+
+	def test_match_type_no_covering_arm_and_no_wildcard_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def describe[T]( x: T ) -> i32:',
+			'	match type( x ):',
+			'		case i32( n ):',
+			'			return n',
+			'',
+			'def main() -> i32:',
+			'	f: f64 = 1.0',
+			'	return describe( f )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.compiler._drain()
+		self.assertTrue( any( 'no arm covers' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
 
 	# --- compiler.refcount(x) ---------------------------------------------------
 
@@ -9590,8 +9688,13 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 	FIRST fix alone still crashed the emitter with a bare TypeVar parameter
 	- see _lower_overload_generic_call/_finish_generic_call). A call whose
 	argument is CONCRETE (not itself union-typed) always resolves to a
-	single, statically-known branch at compile time either way - see the
-	next test for the one shape still rejected. '''
+	single, statically-known branch at compile time either way. A UNION-
+	typed argument can force a real runtime ConditionalDispatch instead - a
+	generic branch/default there is now ALSO supported as long as whatever
+	leaf(s) still reach it are pinned to exactly one at compile time (see
+	_monomorphize_dispatch_target); only a generic branch that would itself
+	need to span 2+ distinct runtime leaves is still rejected (the last
+	test below - genuine per-tag monomorphization dispatch, out of scope). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -9622,17 +9725,20 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 		self.compiler._lower( self.discovery.main )
 		self.assertEqual( self.discovery.errors.errors, [] )
 
-	def test_runtime_dispatched_union_argument_with_generic_branch_is_rejected( self ) -> None:
-		# unlike a concrete argument (always statically resolved - see
-		# above), a UNION-typed argument can force overload_resolution.
-		# resolve_call to return a real runtime ConditionalDispatch, whose
-		# branches (including the trailing default) _lower_conditional_
-		# dispatch always schedules as concrete, callable C symbols - a
-		# generic branch has no single such symbol (this compiler has no
-		# runtime-polymorphic dispatch), so it's rejected with a clean
-		# compile error rather than reaching the emitter with a still-bare
-		# TypeVar parameter (confirmed via a real repro before this guard
-		# existed: emitter_c.py's c_type() raised NotImplementedError)
+	def test_runtime_dispatched_union_argument_with_generic_branch_resolving_one_leaf_compiles( self ) -> None:
+		# a UNION-typed argument can force overload_resolution.resolve_call
+		# to return a real runtime ConditionalDispatch, whose branches
+		# (including the trailing default) _lower_conditional_dispatch
+		# always schedules as concrete, callable C symbols - a generic
+		# branch has no single such symbol UNLESS whatever leaf(s) still
+		# reach it are already pinned down to exactly one at compile time
+		# (here: the union has exactly 2 leaves, str claimed by the concrete
+		# overload, so only i32 can ever reach the generic default) - see
+		# _monomorphize_dispatch_target. This used to be rejected outright
+		# (same blanket rejection the next test still exercises for the
+		# genuinely harder shape) until a real repro showed it doesn't
+		# actually need runtime-polymorphic dispatch: T is statically
+		# knowable here, same as any other generic call.
 		code = '\n'.join([
 			'class Box:',
 			'	def get( self, x: str ) -> str:',
@@ -9649,6 +9755,42 @@ class GenericOverloadDispatchTests( unittest.TestCase ):
 			'def main() -> None:',
 			'	b: Box = Box()',
 			'	u: str|i32 = pick( True )',
+			'	b.get( u )',
+			'	return',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_runtime_dispatched_union_argument_with_multi_leaf_generic_branch_is_rejected( self ) -> None:
+		# the genuinely harder shape the previous test's fix does NOT cover:
+		# a 3-leaf union where only ONE leaf has a concrete overload, so TWO
+		# distinct leaves (i32 and bool) both fall through to the SAME
+		# generic default - each would need its own distinct
+		# monomorphization chosen by a runtime tag no single Call target can
+		# express (this compiler has no vtable/runtime-polymorphic dispatch
+		# concept anywhere). Still rejected cleanly rather than reaching the
+		# emitter with a still-bare TypeVar parameter (confirmed via a real
+		# repro before either guard existed: emitter_c.py's c_type() raised
+		# NotImplementedError).
+		code = '\n'.join([
+			'class Box:',
+			'	def get( self, x: str ) -> str:',
+			'		return x',
+			'',
+			'	def get[T]( self, x: T ) -> str:',
+			'		return "generic"',
+			'',
+			'def pick( flag: i32 ) -> str|i32|bool:',
+			'	if flag == 0:',
+			'		return "hi"',
+			'	if flag == 1:',
+			'		return 42',
+			'	return True',
+			'',
+			'def main() -> None:',
+			'	b: Box = Box()',
+			'	u: str|i32|bool = pick( 1 )',
 			'	b.get( u )',
 			'	return',
 		])

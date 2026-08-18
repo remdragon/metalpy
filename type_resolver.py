@@ -5017,7 +5017,130 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return False
 		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
 
+	def _try_fold_match_type( self, node: ast.Match ) -> list[ast.stmt]|None:
+		''' rewrite: `match type(<Name>): case ConcreteClass(binding): ...
+		case _: ...` - compile-time ARM SELECTION for a bare-Name subject
+		whose own static type is concrete (most usefully, a generic
+		method's own type-parameter-typed parameter/local, once
+		monomorphization has bound it to a concrete type) - same "declines
+		on the still-abstract body, folds once T is concrete" discipline
+		as _try_fold_is_rc_if (this pass runs once against the shared,
+		abstract body, where a generic T is still its own unbound TypeVar
+		and this correctly declines, and again against the monomorphized
+		copy's own deep-copied body once T is bound - see
+		resolve_function_body's own docstring), just for `match` instead
+		of `if`. This is a DIFFERENT rewrite from _rewrite_type_is_
+		comparison/visit_Match's own ordinary handling below: those require
+		the subject's static type to already be a TaggedUnion (a real,
+		tagged runtime value); this one is for the OPPOSITE case, a
+		non-union concrete type, where there is nothing to check at
+		runtime at all - the whole match collapses to exactly one arm's
+		own statements at compile time, no `ast.If`/Cmp left behind.
+
+		Two DIFFERENT kinds of "not yet" have to be told apart here, unlike
+		_try_fold_is_rc_if (whose own decline just lets visit_If's ordinary
+		machinery harmlessly re-visit compiler.is_rc(T) as a plain,
+		unrecognized Call - a no-op, never an error, since nothing else in
+		this class attaches any meaning to is_rc outside the fold):
+		visit_Match's own ordinary (TaggedUnion-only) handling below is
+		NOT that forgiving - the moment it can't determine the subject's
+		type, or determines it isn't a union, it calls discovery.fail()
+		OUTRIGHT (a real, PERMANENT error), because rewrite 2 (ordinary
+		match desugaring) is documented as substitution-INDEPENDENT and
+		was never meant to be retried on a second pass. So when the
+		subject genuinely IS `type(<Name>)` and Name's type is still an
+		unbound TypeVar - the one case that's certain to resolve cleanly
+		once monomorphization binds it - this returns the node COMPLETELY
+		UNTOUCHED (`[node]`, not None) rather than falling through, so
+		none of visit_Match's ordinary machinery ever sees it on this
+		pass at all. That's safe for the exact same reason _try_fold_is_
+		rc_if's own second pass is (see resolve_function_body's own
+		docstring): a monomorphized copy's body is independently deep-
+		copied, so the held, unvisited node here is simply revisited fresh
+		- and this time foldable - against THAT copy.
+		Every OTHER kind of doubt (not a `type(Name)` subject at all,
+		Name's type genuinely undeterminable for some unrelated reason,
+		Name's type IS a TaggedUnion, or any single arm shaped other than
+		a plain single-capture class pattern or a bare `case _:`) declines
+		with a plain None instead - these reproduce exactly the SAME
+		"cannot determine the match subject's type"/"is not a union type"
+		errors visit_Match's ordinary handling already gives `match
+		type(...)` today (never a supported shape before this rewrite
+		either), not a new regression. Once the shape is confirmed to
+		apply on a genuinely concrete, non-union type, though, this IS
+		authoritative - a concrete type with no covering arm is a real,
+		reported error (see the no-wildcard branch below), not a silent
+		no-op. '''
+		subject_expr = self._type_call_subject( node.subject )
+		if subject_expr is None or not isinstance( subject_expr, ast.Name ):
+			return None
+		subj_type = self._type_of_expr( subject_expr )
+		if isinstance( subj_type, TypeVar ):
+			return [ node ] # still abstract - hold unvisited for the monomorphized copy's own second pass, see docstring
+		if subj_type is None:
+			return None # genuinely undeterminable for some other reason - not this rewrite's doubt to resolve
+		spec = self.resolver._as_specialization( subj_type )
+		base = spec.base if spec is not None else subj_type
+		if isinstance( base, TaggedUnion ):
+			return None # `match type(x):` for a real union isn't a shape anything supports, before or after this rewrite - decline to the same pre-existing error
+		winning_stmts: list[ast.stmt]|None = None
+		winning_bind: str|None = None
+		for case in node.cases:
+			pattern = case.pattern
+			if isinstance( pattern, ast.MatchAs ) and pattern.pattern is None and pattern.name is None:
+				# a true, UNNAMED wildcard (case _:) - always matches. A
+				# NAMED bare pattern (case leftover:) is deliberately NOT
+				# treated as a wildcard here: it would mean binding the
+				# whole `type(other)` VALUE, and this compiler has no
+				# runtime type-object value to bind it to (see
+				# type_resolver.py's own "no runtime reflection/RTTI"
+				# comment, ~line 4090) - decline the whole fold instead of
+				# guessing what that should mean
+				winning_stmts = case.body
+				break
+			if not (
+				isinstance( pattern, ast.MatchClass ) and not pattern.kwd_patterns and not pattern.kwd_attrs
+				and len( pattern.patterns ) == 1 and isinstance( pattern.patterns[0], ast.MatchAs ) and pattern.patterns[0].pattern is None
+			):
+				return None # not a plain single-capture class pattern (or a named wildcard, handled above) - decline entirely, don't partially fold
+			leaf_type = self._try_resolve_callable_namespace( pattern.cls )
+			if leaf_type is None:
+				return None
+			if self.resolver._same_type( leaf_type, subj_type ):
+				winning_stmts = case.body
+				winning_bind = pattern.patterns[0].name
+				break
+		if winning_stmts is None:
+			self.discovery.fail( f'match type(...): no arm covers {getattr( subj_type, "qualname", subj_type )} for this instantiation: {ast.unparse(node)}', node )
+			return []
+		folded: list[ast.stmt] = []
+		if winning_bind is not None and winning_bind != subject_expr.id:
+			# subject already IS exactly the matched concrete type - no
+			# payload to extract (unlike a real TaggedUnion match's own
+			# .data.v_<member> unwrap), just a plain rebind. Skipped
+			# entirely when the capture reuses the subject's OWN name
+			# (`case str(other):` against `match type(other):`) - not just
+			# an optimization: synthesizing `other = other` for an RC-
+			# tracked type would self-alias-assign, and nothing else in
+			# this rewrite needs that statement to exist at all when the
+			# name already denotes the right value with the right type
+			rebind = ast.Assign( targets = [ ast.Name( id = winning_bind, ctx = ast.Store() ) ], value = subject_expr )
+			ast.copy_location( rebind, node )
+			folded.append( rebind )
+		if winning_bind is not None:
+			self.locals[winning_bind] = subj_type
+		for stmt in winning_stmts:
+			result = self.visit( stmt )
+			if isinstance( result, list ):
+				folded.extend( result )
+			elif result is not None:
+				folded.append( result )
+		return folded
+
 	def visit_Match( self, node: ast.Match ) -> list[ast.stmt]:
+		folded = self._try_fold_match_type( node )
+		if folded is not None:
+			return folded
 		unique = self._label_id
 		self._label_id += 1
 		subj_name = f'__match_subj_{unique}'
