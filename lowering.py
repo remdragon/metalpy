@@ -5826,8 +5826,12 @@ class FunctionLowering:
 		# blindly typing the Const as the whole union here would be wrong
 		# (a literal is never itself union-shaped at the C level), and
 		# _lower_expr's own post-hoc coercion (see its comment) is what
-		# actually wraps this natural-typed Const into the union afterward
-		if expected_type is None or isinstance( expected_type, TaggedUnion ):
+		# actually wraps this natural-typed Const into the union afterward.
+		# A bare, still-unbound TypeVar is treated the same way, matching
+		# the validation exemption above - the literal's own natural type
+		# is what UNIFIES to solve T, so tagging the Const with the bare
+		# TypeVar itself (leaving it unsubstituted downstream) is wrong.
+		if expected_type is None or isinstance( expected_type, TaggedUnion ) or isinstance( expected_type, TypeVar ):
 			if isinstance( node.value, bool ):
 				expected_type = self.lowering.discovery.get_intrinsics()['bool']
 			elif isinstance( node.value, float ):
