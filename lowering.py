@@ -3671,6 +3671,36 @@ class FunctionLowering:
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.addrof(...) takes exactly one argument: {ast.unparse(node)}', node )
 		arg_node = node.args[0]
+		if isinstance( arg_node, ast.Subscript ) and isinstance( arg_node.value, ast.Attribute ):
+			# compiler.addrof(x.field[i]) where field is a FixedArrayType ->
+			# Ptr[ElemType] at element i specifically (unlike the bare
+			# compiler.addrof(x.field) case above, which only ever gives
+			# element 0 via array-to-pointer decay). Same root-must-be-a-
+			# bare-local safety requirement as every other addrof shape
+			# here, checked explicitly since _fixed_array_index_target
+			# itself doesn't enforce it (by design - GetAttrIndex/
+			# SetAttrIndex's own callers only ever need a VALUE, which
+			# doesn't share addrof's dangling-pointer concern about the
+			# root's lifetime).
+			attr_node = arg_node.value
+			if not isinstance( attr_node.value, ast.Name ):
+				self.lowering.discovery.fail(
+					f'compiler.addrof(...) indexed field-access argument must be rooted at a bare local variable, '
+					f'not {ast.unparse(node)} (only one level of field access is supported)',
+					node,
+				)
+			fixed = self._fixed_array_index_target( attr_node, arg_node.slice )
+			if fixed is None:
+				self.lowering.discovery.fail(
+					f'compiler.addrof(...) subscript argument must index a fixed-size array field: {ast.unparse(node)}',
+					node,
+				)
+			root, attr, array_type, index = fixed
+			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+			elem_ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ array_type.elem_type ] )
+			dest = self._new_temp( elem_ptr_type )
+			self._emit( ir.AddrOfArrayIndex( dest = dest, obj = root, attr = attr, index = index ))
+			return dest
 		if isinstance( arg_node, ast.Attribute ):
 			if not isinstance( arg_node.value, ast.Name ):
 				self.lowering.discovery.fail(

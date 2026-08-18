@@ -607,6 +607,24 @@ class ArrayFieldPtr( Instruction ):
 	def test_repr( self ) -> str:
 		return f'ArrayFieldPtr( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r} )'
 
+@dataclass( kw_only = True )
+class AddrOfArrayIndex( Instruction ):
+	# compiler.addrof(x.field[i]) where field is a FixedArrayType - yields
+	# Ptr[ElemType] pointing at element i specifically (not the array's
+	# start the way ArrayFieldPtr does), e.g. `dest = &(x.field[i]);` /
+	# `dest = &(x->field[i]);`. A real, well-defined C operation (indexing
+	# then &-ing gives ElemType* directly, no decay-vs-pointer-to-array
+	# ambiguity the way ArrayFieldPtr's own bare-array-decay case has).
+	# Same "obj is always the ROOT object" shape as AddrOfField/
+	# ArrayFieldPtr/GetAttrIndex/SetAttrIndex.
+	dest: Temp
+	obj: Operand
+	attr: str
+	index: Operand
+
+	def test_repr( self ) -> str:
+		return f'AddrOfArrayIndex( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r}, index={self.index!r} )'
+
 class AtomicRMWOp( Enum ): # compiler.atomic_add/atomic_sub/atomic_exchange - fetch-and-op, dest gets the value BEFORE the op
 	ADD = 'add'
 	SUB = 'sub'

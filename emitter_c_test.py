@@ -13298,7 +13298,18 @@ class AddrofFieldAccessRealCompileTests( test_support.RealCompileMixin, Compiler
 	(ElemType*) - a real C type mismatch against the declared
 	Ptr[ElemType] destination even though the address value is identical.
 	ArrayFieldPtr instead emits the bare `(obj)OP field` decay expression,
-	relying on C's own array-to-pointer decay. '''
+	relying on C's own array-to-pointer decay.
+
+	Widened once more for a SPECIFIC element (`compiler.addrof(x.arr[i])`,
+	as opposed to `compiler.addrof(x.arr)`'s always-element-0 decay) - a
+	real, well-defined C operation with no decay ambiguity (indexing then
+	&-ing gives ElemType* directly). Fixed via a new ir.AddrOfArrayIndex
+	instruction, reusing lowering.py's existing `_fixed_array_index_target`
+	helper (already used by ordinary f.arr[i] read/write) for field
+	resolution and literal-index bounds checking - the same root-must-be-
+	a-bare-local safety check as every other addrof shape here is applied
+	explicitly, since that helper's own callers (GetAttrIndex/SetAttrIndex)
+	don't need that guarantee the way addrof does. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -13431,6 +13442,89 @@ def main() -> i32:
 	return 0
 ''' ),
 		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_array_field_indexed_addrof_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# compiler.addrof(x.field[i]) - a SPECIFIC element's address, not
+			# just element 0 the way bare compiler.addrof(x.field) gives.
+			# Confirms both directions through the pointer, and that
+			# neighboring elements are untouched (same "real storage, not a
+			# copy or wrong offset" proof as the whole-array case above)
+			( 'indexed_array_field_addrof_plain_value_receiver_writes_through', '''
+@cstruct
+class Foo:
+	arr: u16[4] = 0
+
+def main() -> i32:
+	f = Foo()
+	f.arr[1] = 11
+	p: Ptr[u16] = compiler.addrof( f.arr[2] )
+	if p[0] != 0:
+		return 1
+	p[0] = 99
+	if f.arr[2] != 99:
+		return 2
+	if f.arr[1] != 11:
+		return 3
+	if f.arr[0] != 0 or f.arr[3] != 0:
+		return 4
+	return 0
+''' ),
+			# same, through a Ptr[Struct] receiver - the shape lib/windows/
+			# time.py's get_local_timezone_name() would use if it ever
+			# needed one specific slot rather than a whole-array decode
+			( 'indexed_array_field_addrof_pointer_receiver_writes_through', '''
+import sys
+
+@cstruct
+class Foo:
+	arr: u16[4] = 0
+
+def main() -> i32:
+	raw: Ptr[u8] = sys.alloc[u8]( compiler.sizeof( Foo ))
+	sys.memzero( raw, compiler.sizeof( Foo ))
+	pf = compiler.cast( Ptr[Foo], raw )
+	p: Ptr[u16] = compiler.addrof( pf.arr[3] )
+	p[0] = 55
+	if pf.arr[3] != 55:
+		return 1
+	if pf.arr[0] != 0 or pf.arr[1] != 0 or pf.arr[2] != 0:
+		return 2
+	sys.free( raw )
+	return 0
+''' ),
+		] )
+
+	def test_indexed_addrof_rejects_literal_index_out_of_range( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	arr: u16[4] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	compiler.addrof( f.arr[10] )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	def test_indexed_addrof_rejects_call_rooted_field_access( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	arr: u16[4] = 0',
+			'',
+			'def make() -> Foo:',
+			'	return Foo()',
+			'',
+			'def main() -> None:',
+			'	compiler.addrof( make().arr[1] )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'must be rooted at a bare local variable', self.discovery.errors.errors[0] )
 
 	def test_addrof_rejects_multi_level_field_chain( self ) -> None:
 		self._run( '\n'.join([
