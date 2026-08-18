@@ -2778,6 +2778,12 @@ _BUILTINS_STR_FIXTURE = '\n'.join([
 	'class str:',
 	'	__data: ConstPtr[u8]',
 	'	__byte_size: usize',
+	# mirrors real builtins.str's __char_count/__index fields (lib/builtins/
+	# __init__.py) - _emit_one_string_literal (emitter_c.py) unconditionally
+	# bakes both into every str literal it emits, so this fixture needs the
+	# same shape even though nothing in these tests reads either field.
+	'	__char_count: usize',
+	'	__index: Ptr[usize]',
 	'',
 	'	def get_data( self ) -> ConstPtr[u8]:',
 	'		return self.__data',
@@ -5855,6 +5861,133 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+
+class StrLenGetitemIndexTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' O(1) str.__len__() (__char_count) and the new codepoint-indexed
+	str.__getitem__() (sparse __index, one entry per 256 codepoints) - both
+	computed for free during _from_owned_cstr's existing mandatory UTF-8
+	validation scan (lib/builtins/__init__.py). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'empty_string', '''
+def main() -> i32:
+	s: str = ''
+	if len( s ) != 0:
+		return 1
+	r: Result[str,IndexError] = s.__getitem__( 0 )
+	if r.is_ok():
+		return 2
+	return 0
+''' ),
+			( 'single_ascii_char', '''
+def main() -> i32:
+	s: str = 'x'
+	if len( s ) != 1:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'x':
+		return 2
+	r: Result[str,IndexError] = s.__getitem__( 1 )
+	if r.is_ok():
+		return 3
+	return 0
+''' ),
+			( 'exactly_256_codepoints', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	s: str = run_of_a( 256 )
+	if len( s ) != 256:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'a':
+		return 2
+	if s.__getitem__( 255 ).unwrap( 'x' ) != 'a':
+		return 3
+	r: Result[str,IndexError] = s.__getitem__( 256 )
+	if r.is_ok():
+		return 4
+	return 0
+''' ),
+			( '257_codepoints_crosses_index_boundary', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	s: str = run_of_a( 256 ) + 'b'
+	if len( s ) != 257:
+		return 1
+	if s.__getitem__( 255 ).unwrap( 'x' ) != 'a':
+		return 2
+	if s.__getitem__( 256 ).unwrap( 'x' ) != 'b':
+		return 3
+	return 0
+''' ),
+			( 'multibyte_codepoint_index_ne_byte_offset', '''
+def main() -> i32:
+	s: str = 'héllo'
+	if len( s ) != 5:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'h':
+		return 2
+	if s.__getitem__( 1 ).unwrap( 'x' ) != 'é':
+		return 3
+	if s.__getitem__( 2 ).unwrap( 'x' ) != 'l':
+		return 4
+	if s.__getitem__( 4 ).unwrap( 'x' ) != 'o':
+		return 5
+	if s.byte_len() != 6: # 4 ascii + 2-byte 'é'
+		return 6
+	return 0
+''' ),
+			( 'out_of_range_index_is_err', '''
+def main() -> i32:
+	s: str = 'abc'
+	r: Result[str,IndexError] = s.__getitem__( 3 )
+	if r.is_ok():
+		return 1
+	r2: Result[str,IndexError] = s.__getitem__( 1000000 )
+	if r2.is_ok():
+		return 2
+	return 0
+''' ),
+			( 'group_boundary_string_still_readable_after_construction', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	original: str = run_of_a( 256 ) + 'zb'
+	if original.__getitem__( 256 ).unwrap( 'x' ) != 'z':
+		return 1
+	if len( original ) != 258:
+		return 2
+	return 0
+''' ),
+		])
 
 
 class StrPhase2PaddingTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -11383,14 +11516,30 @@ class IfExpTempLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
 		# reasoning for why a bare single-shot check isn't enough to catch
 		# a leak (as opposed to the double-free, which a single shot alone
 		# already reliably reproduced).
+		# dash/plus + '' (not bare '-'.lstrip()/'+'.lstrip() directly in the
+		# ternary): a BARE method-call receiver on a str LITERAL, used as
+		# BOTH ternary branches, was found (while adapting this test off the
+		# now-removed str copy-constructor) to hit a SEPARATE, still-open
+		# double-free in _expr_IfExp - confirmed independent of this fix's
+		# own __char_count/__index change (repros identically with plain
+		# int(1) if cond else int(2)-shaped construct calls being FINE, but
+		# two fresh ORDINARY METHOD calls merged via a ternary crashing
+		# under MSVC's debug heap regardless of receiver - literal or a
+		# bound local - every time; task flagged separately, not fixed
+		# here). dash/plus + '' still produces two genuinely fresh,
+		# independently-owned allocations each iteration (str.__add__ always
+		# allocates - see __init__.py), it just does it via a BinOp instead
+		# of a bare method Call, which doesn't hit the open bug.
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		i: i32 = 0
 		cond: bool = True
+		dash: str = '-'
+		plus: str = '+'
 		while i < 1000:
-			x: str = str( '-' ) if cond else str( '+' )
-			expected: str = str( '-' ) if cond else str( '+' )
+			x: str = ( dash + '' ) if cond else ( plus + '' )
+			expected: str = ( dash + '' ) if cond else ( plus + '' )
 			if x != expected:
 				return 1
 			if compiler.refcount( x ) != 1:
@@ -11412,17 +11561,17 @@ def main() -> i32:
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		a: str = str( 'A' )
-		b: str = str( 'B' )
+		a: str = 'A'.lstrip()
+		b: str = 'B'.lstrip()
 		cond: bool = True
 		z: str = a if cond else b
-		if z != str( 'A' ):
+		if z != 'A':
 			return 1
 		if compiler.refcount( a ) != 2:
 			return 2
 		if compiler.refcount( z ) != 2:
 			return 3
-		if a != str( 'A' ) or b != str( 'B' ):
+		if a != 'A' or b != 'B':
 			return 4
 		return 0
 ''' )
@@ -11437,16 +11586,16 @@ def main() -> i32:
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		existing: str = str( 'lower' )
+		existing: str = 'lower'.lstrip()
 		cond: bool = False
 		result: str = existing.upper() if cond else existing
-		if result != str( 'lower' ):
+		if result != 'lower':
 			return 1
 		if compiler.refcount( existing ) != 2:
 			return 2
 		cond2: bool = True
 		result2: str = existing.upper() if cond2 else existing
-		if result2 != str( 'LOWER' ):
+		if result2 != 'LOWER':
 			return 3
 		if compiler.refcount( result2 ) != 1:
 			return 4
