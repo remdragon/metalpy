@@ -5069,6 +5069,72 @@ def main() -> i32:
 		] )
 
 
+class GenericMatchTypeMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for type_resolver.py's _try_fold_match_type -
+	`match type(<Name>): case ConcreteClass(binding): ... case _: ...` over a
+	generic function's own type-parameter-typed parameter, folded to exactly
+	one arm's own statements at monomorphization time (no runtime branch left
+	behind at all - see the rewrite's own docstring, and PLAN_MATCH_TYPE_
+	MONOMORPHIZATION.md for the full design). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'match_type_selects_a_different_arm_per_instantiation', '''
+class Foo:
+	pass
+
+def describe[T]( x: T ) -> i32:
+	match type( x ):
+		case i32( n ):
+			with compiler.wrap_arithmetic:
+				return n + 100
+		case Foo( f ):
+			return 200
+		case _:
+			return 300
+
+def main() -> i32:
+	a: i32 = 5
+	if describe( a ) != 105:
+		return 1
+	if describe( Foo() ) != 200:
+		return 2
+	b: bool = True
+	if describe( b ) != 300:
+		return 3
+	return 0
+''' ),
+			( 'match_type_same_name_capture_skips_the_synthesized_rebind', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def identity[T]( other: T ) -> T:
+	match type( other ):
+		case Box( other ):
+			return other
+		case _:
+			return other
+
+def main() -> i32:
+	b: Box = Box( 42 )
+	r: Box = identity( b )
+	if r.v != 42:
+		return 1
+	x: i32 = 7
+	n: i32 = identity( x )
+	if n != 7:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class CEnumReturnCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for _stmt_Return's own CEnum<->underlying-
 	scalar coercion - "a CEnum has exactly the same runtime representation as

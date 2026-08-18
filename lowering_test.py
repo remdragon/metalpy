@@ -2737,6 +2737,72 @@ class Tests( unittest.TestCase ):
 		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
 		self.assertIs( assigns['x'].value, True )
 
+	# --- match type(<Name>): case ConcreteClass(...): ... (generic monomorphization fold) ---
+	# type_resolver.py's _try_fold_match_type - compile-time arm selection,
+	# once a generic function's own type-parameter-typed value is
+	# monomorphized to a concrete, non-union type. See PLAN_MATCH_TYPE_
+	# MONOMORPHIZATION.md for the design this implements.
+
+	def test_match_type_folds_to_the_matching_arm_with_no_runtime_branch_left( self ) -> None:
+		code = '\n'.join([
+			'def describe[T]( x: T ) -> i32:',
+			'	match type( x ):',
+			'		case i32( n ):',
+			'			return n',
+			'		case _:',
+			'			return -1',
+			'',
+			'def main() -> i32:',
+			'	a: i32 = 5',
+			'	return describe( a )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.compiler._drain() # describe(a)'s own Specialization is only SCHEDULED while lowering main - draining is what actually resolves+lowers its own body
+		self.assertEqual( self.discovery.errors.errors, [] )
+		described = next( lf for lf in self.compiler.functions if 'describe' in lf.function.qualname )
+		# a real compile-time arm selection, not a runtime tag check - no
+		# comparison/branch instruction of any kind should be left behind
+		self.assertFalse( any( isinstance( i, ( ir.Cmp, ir.JumpIfTrue, ir.JumpIfFalse )) for i in described.instructions ) )
+
+	def test_match_type_falls_back_to_wildcard_for_an_uncovered_concrete_type( self ) -> None:
+		code = '\n'.join([
+			'def describe[T]( x: T ) -> i32:',
+			'	match type( x ):',
+			'		case i32( n ):',
+			'			return n',
+			'		case _:',
+			'			return -1',
+			'',
+			'def main() -> i32:',
+			'	b: bool = True',
+			'	return describe( b )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.compiler._drain()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		described = next( lf for lf in self.compiler.functions if 'describe' in lf.function.qualname )
+		returns = [ i for i in described.instructions if isinstance( i, ir.Return ) ]
+		self.assertEqual( len( returns ), 1 )
+		self.assertEqual( returns[0].value.value, -1 ) # only the wildcard arm's own body survived - the i32 arm was pruned entirely for this (bool) instantiation
+
+	def test_match_type_no_covering_arm_and_no_wildcard_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def describe[T]( x: T ) -> i32:',
+			'	match type( x ):',
+			'		case i32( n ):',
+			'			return n',
+			'',
+			'def main() -> i32:',
+			'	f: f64 = 1.0',
+			'	return describe( f )',
+		])
+		self._import( code )
+		self._lower_main()
+		self.compiler._drain()
+		self.assertTrue( any( 'no arm covers' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
 	# --- compiler.refcount(x) ---------------------------------------------------
 
 	def test_compiler_refcount_emits_refcount_instruction( self ) -> None:
