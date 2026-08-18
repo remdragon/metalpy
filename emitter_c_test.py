@@ -9581,6 +9581,64 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# a generic `[T]` candidate as one branch (or the trailing
+			# default) of a runtime-dispatched Overload call - a UNION-typed
+			# argument (unlike the concrete-argument case above) can force
+			# overload_resolution.resolve_call to return a real
+			# ConditionalDispatch, whose branches _lower_conditional_dispatch
+			# schedules as concrete, callable C symbols. Two real gaps fixed
+			# together here: (1) whichever single leaf still reaches a
+			# generic branch/default at compile time (only i32 can ever
+			# reach get[T] once str is claimed by the concrete overload) is
+			# now monomorphized in place instead of being rejected outright
+			# (see lowering.py's _monomorphize_dispatch_target) - a call
+			# whose argument is CONCRETE already worked (the case just
+			# above); this is the same feature for a UNION-typed argument.
+			# (2) _lower_conditional_dispatch/_emit_dispatch_call always
+			# hardcoded receiver=None, silently dropping `self` for any
+			# runtime-dispatched METHOD call (every prior real-compile
+			# exercise of this machinery - see OverloadGenericSubstitution
+			# MatchingRealCompileTests - only ever used receiver-less free
+			# functions, so this was never caught): confirmed via a real
+			# repro, the C compiler itself rejected the generated call
+			# ("too few arguments to function call") before this fix.
+			# Exercises the generic candidate landing as BOTH the trailing
+			# default (str|i32 - str claimed, i32 falls through) and a
+			# proper conditioned branch (i32|str - order flipped).
+			( 'generic_typevar_fallback_through_runtime_dispatch', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick_str_first( flag: bool ) -> str|i32:
+	if flag:
+		return 'hi'
+	return 42
+
+def pick_i32_first( flag: bool ) -> i32|str:
+	if flag:
+		return 42
+	return 'hi'
+
+def main() -> i32:
+	b: Box = Box()
+	u1: str|i32 = pick_str_first( True )
+	u2: str|i32 = pick_str_first( False )
+	if b.get( u1 ) != 'hi':
+		return 1
+	if b.get( u2 ) != 'generic':
+		return 2
+	u3: i32|str = pick_i32_first( True )
+	u4: i32|str = pick_i32_first( False )
+	if b.get( u3 ) != 'generic':
+		return 3
+	if b.get( u4 ) != 'hi':
+		return 4
+	return 0
+''' ),
 		] )
 
 
