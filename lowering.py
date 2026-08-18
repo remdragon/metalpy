@@ -68,6 +68,8 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.BitOr: '__or__',
 	ast.BitAnd: '__and__',
 	ast.BitXor: '__xor__',
+	ast.LShift: '__lshift__',
+	ast.RShift: '__rshift__',
 }
 
 # forward binop dunder name -> its REFLECTED counterpart, mirroring Python's
@@ -119,6 +121,7 @@ _CHECKED_BINOP_OPCODES: dict[tuple[str,str],type] = {
 	( 'mul', 'checked' ): ir.MulCheck, ( 'mul', 'wrapped' ): ir.MulWrap, ( 'mul', 'saturated' ): ir.MulSaturate,
 	( 'floordiv', 'checked' ): ir.Div, ( 'floordiv', 'wrapped' ): ir.DivWrap, ( 'floordiv', 'saturated' ): ir.DivSaturate,
 	( 'mod', 'checked' ): ir.Mod, ( 'mod', 'wrapped' ): ir.ModWrap, ( 'mod', 'saturated' ): ir.ModSaturate,
+	( 'shl', 'checked' ): ir.ShlCheck, ( 'shl', 'wrapped' ): ir.ShlWrap, ( 'shl', 'saturated' ): ir.ShlSaturate,
 }
 
 # same idea for FLOAT operands - wrap/saturate raw-IEEE add/sub/mul reuse the
@@ -1302,6 +1305,34 @@ class Lowering:
 		(what every existing caller already does) as if the name were
 		never registered at all. '''
 		return self._monomorphized_function( found ) if isinstance( found, Specialization ) else found
+
+	def _resolve_receiver_generic_dunder( self, found: Name|None, owner_type: Type|None ) -> Name|None:
+		''' Ptr[T]/ConstPtr[T]'s own dunders (Ptr.__add__ = ptr_add_checked,
+		see lib/builtins/__ptr_arith.py) are registered as a BARE generic
+		Function (`found` here, still carrying its own unbound type param) -
+		unlike an ordinary scalar dunder (i32.__add__ = i_add_checked[i32]),
+		there's no concrete pointee type to specialize against AT
+		REGISTRATION time, since Ptr's own `.names` dict is shared across
+		every Ptr[X] (Specialization.names passes through to .base - see
+		mpy_types.py). The pointee type only becomes known at the CALL
+		SITE, from the receiver's own owner_type (Ptr[i32], say) - so
+		unlike _resolve_scalar_name's Specialization-already-known case,
+		this composes the specialization here instead, binding the
+		function's own type param to owner_type's pointee arg, then
+		monomorphizes it exactly like any other generic instantiation.
+		Confirmed via a real spike that skipping this step reaches the
+		emitter with a bare, unbound TypeVar and crashes
+		(NotImplementedError: c_type: unsupported type <TypeVar ...>) -
+		this is not optional defensive padding, it's required for Ptr/
+		ConstPtr dunder dispatch to work at all. '''
+		if (
+			isinstance( found, Function ) and found.type_params
+			and isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar )
+			and owner_type.base.stem in ( 'Ptr', 'ConstPtr' )
+		):
+			spec = self.discovery._get_or_create_specialization( found, list( owner_type.args ))
+			return self._monomorphized_function( spec )
+		return found
 
 	def monomorphize_class( self, spec: Specialization ) -> ClassLike:
 		return self._monomorphizer.monomorphize_class( spec )
@@ -3709,6 +3740,121 @@ class FunctionLowering:
 		check_dest = self._new_temp( check_type )
 		self._emit( ir.ConvertCheck( dest = check_dest, operand = operand ))
 		return check_dest
+
+	# (kind, mode) -> opcode for Ptr[T]/ConstPtr[T] +/- usize -> Ptr[T].
+	# Deliberately reuses the SAME AddCheck/AddWrap/SubCheck/SubWrap opcodes
+	# _CHECKED_BINOP_OPCODES already uses for plain scalar add/sub - both
+	# _emit_check_arith and _emit_wrap_arith (emitter_c.py) already branch
+	# on a POINTER-typed dest_type correctly (byte-offset uintptr_t round-
+	# trip, never sizeof(T)-scaled) - confirmed via Spike B, this already
+	# works today via the (about-to-be-retired) fallback path, just needs
+	# wiring through dunders now. No 'saturated' entry - saturating pointer
+	# arithmetic is a clean compile-time rejection instead (confirmed with
+	# the user: an address isn't a bounded numeric range the way an int is,
+	# "clamp to min/max" has no coherent meaning) - see
+	# _lower_compiler_ptr_binop's own handling of that mode.
+	_PTR_BINOP_OPCODES: dict[tuple[str,str],type] = {
+		( 'add', 'checked' ): ir.AddCheck, ( 'add', 'wrapped' ): ir.AddWrap,
+		( 'sub', 'checked' ): ir.SubCheck, ( 'sub', 'wrapped' ): ir.SubWrap,
+	}
+
+	def _lower_compiler_ptr_binop( self, node: ast.Call, intrinsic_name: str, kind: str, mode: str, expected_type: Type|None ) -> ir.Operand:
+		# compiler.checked_ptr_add(p, offset)/wrapped_ptr_add(...)/
+		# saturated_ptr_add(...)/checked_ptr_sub(...)/wrapped_ptr_sub(...)/
+		# saturated_ptr_sub(...) - the fixed-mode intrinsics behind Ptr[T]/
+		# ConstPtr[T]'s own __add__/__sub__ dunders (lib/builtins/
+		# __ptr_arith.py) for the Ptr[T] +/- usize -> Ptr[T] shape (pointer
+		# MINUS pointer, yielding a distance, is a separate shape/dunder -
+		# see compiler.ptr_sub_dist). Parallel to, not sharing code with,
+		# _lower_compiler_checked_binop - that method hard-requires
+		# left.type is right.type, but here the two operand types genuinely
+		# differ (Ptr[T], usize).
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		if not self.lowering._type_resolver._is_ptr_specialization( left.type ):
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) first argument must be a Ptr[T]/ConstPtr[T]: {ast.unparse(node)}', node,
+			)
+		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+		if right.type is not usize_cls:
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) second argument must be usize, got '
+				f'{right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		if mode == 'saturated':
+			self.lowering.discovery.fail(
+				f'saturating pointer arithmetic is not supported (an address is not a bounded numeric range - '
+				f'use checked or wrap mode instead): {ast.unparse(node)}',
+				node,
+			)
+		opcode = self._PTR_BINOP_OPCODES[( kind, mode )]
+		result_type = left.type
+		if not opcode.checked_errors:
+			return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		error_type, _alternatives = self._resolve_checked_error( node, opcode, result_type )
+		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ result_type, error_type ] )
+		self.lowering.schedule( check_type )
+		check_dest = self._new_temp( check_type )
+		self._emit( opcode( dest = check_dest, left = left, right = right ))
+		return check_dest
+
+	def _lower_compiler_ptr_diff( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.ptr_sub_dist(a, b) - Ptr[T]/ConstPtr[T] - Ptr[T]/ConstPtr[T]
+		# -> isize, the fixed-opcode intrinsic behind Ptr[T]/ConstPtr[T]'s own
+		# __sub__ dunder for the pointer-MINUS-pointer shape (ptr_sub_dist[T]
+		# in lib/builtins/__ptr_arith.py) - distinct from the Ptr[T]-usize ->
+		# Ptr[T] offset-subtraction shape _lower_compiler_ptr_binop handles
+		# above (same __sub__ name, disambiguated at the dunder-lookup level
+		# by _find_dunder_for_arg's arg-type matching, not here). Infallible,
+		# single opcode - see ir.PtrDiff's own comment for why there's no
+		# wrap/check/saturate split for a pointer distance.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.ptr_sub_dist(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		if not self.lowering._type_resolver._is_ptr_specialization( left.type ) or left.type is not right.type:
+			self.lowering.discovery.fail(
+				f'compiler.ptr_sub_dist(...) arguments must both be the same Ptr[T]/ConstPtr[T] type - got '
+				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		isize_cls = self.lowering.discovery.get_intrinsics()['isize']
+		return self._lower_arithmetic_op( node, ir.PtrDiff, None, isize_cls, { 'left': left, 'right': right }, 'binary' )
+
+	# ir.Shr (>>) joins these deliberately: right-shift by a valid amount is
+	# always well-defined (this compiler doesn't check shift-amount-exceeds-
+	# width for either direction - a separate, pre-existing, out-of-scope
+	# concern), so it's single-opcode/infallible exactly like the bitwise
+	# ops - unlike << (Shl), which DOES have real Wrap/Check/Saturate
+	# variants (shifting bits out the top is a real, already-modeled
+	# concern) and flows through _lower_compiler_checked_binop instead,
+	# parallel to add/sub/mul.
+	_BITWISE_OPCODES: dict[str,type] = { 'bitand': ir.BitAnd, 'bitor': ir.BitOr, 'bitxor': ir.BitXor, 'rshift': ir.Shr }
+
+	def _lower_compiler_bitwise( self, node: ast.Call, intrinsic_name: str, expected_type: Type|None ) -> ir.Operand:
+		# compiler.bitand/bitor/bitxor/rshift(a, b) - the fixed-opcode
+		# intrinsics behind every scalar __and__/__or__/__xor__/__rshift__
+		# dunder (lib/builtins/__scalar_arith.py). Unlike checked_add/etc,
+		# there is only ONE variant each - ir.BitAnd/BitOr/BitXor/Shr have
+		# no Wrap/Check/Saturate forms at all - always infallible, plain
+		# T-returning, no Result involved.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		opcode = self._BITWISE_OPCODES[intrinsic_name]
+		if not isinstance( left.type, Scalar ) or left.type is not right.type or _is_float_scalar( left.type ):
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) arguments must both be the same integer scalar type - got '
+				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		result_type = expected_type if expected_type is not None and isinstance( expected_type, Scalar ) else left.type
+		return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
 
 	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
@@ -7147,15 +7293,20 @@ class FunctionLowering:
 					if reflected_method is not None:
 						return self._emit_binop_dunder_call( node, reflected_method, right, left, expected_type )
 
-		# a float on EITHER side takes the GetFloatBinOp path (plain IEEE, or
-		# inf/nan-checked, depending on the active mode) rather than the integer
-		# overflow machinery. Strict same-type: both sides must already be the
-		# SAME float type (a bare literal on either side has already been hinted
-		# to the other's type by _lower_binary_operands, so `f + 1.5`/`f + 1`
-		# still work; only a float mixed with an int VARIABLE, or two different
-		# float widths, reaches this error). NOTE an int VARIABLE combined with a
-		# bare float LITERAL (`i + 1.5`) is not caught here - the literal is
-		# hinted to the int's type and truncated, an accepted first-pass edge)
+		# a float on EITHER side gets two float-specific rejections dunder
+		# dispatch above can't produce itself (it only ever MISSES silently,
+		# never explains why): strict same-type (a bare literal on either
+		# side has already been hinted to the other's type by _lower_binary_
+		# operands, so `f + 1.5`/`f + 1` still work; only a float mixed with
+		# an int VARIABLE, or two different float widths, reaches this error.
+		# NOTE an int VARIABLE combined with a bare float LITERAL (`i + 1.5`)
+		# is not caught here - the literal is hinted to the int's type and
+		# truncated, an accepted first-pass edge), and bitwise/shift/floordiv/
+		# mod, which have no floating-point meaning and no dunder at all.
+		# Every remaining same-type float shape (+-*/`/`) already has a real
+		# dunder (lib/builtins/__scalar_arith.py's f_*_checked/wrapped/
+		# saturated, __truediv__) and dispatched through it above - nothing
+		# legitimate reaches past these two checks.
 		if _is_float_scalar( left.type ) or _is_float_scalar( right.type ):
 			if left.type is not right.type:
 				float_type = left.type if _is_float_scalar( left.type ) else right.type
@@ -7168,14 +7319,13 @@ class FunctionLowering:
 			bad = _FLOAT_UNSUPPORTED_BINOPS.get( type( node.op ))
 			if bad is not None:
 				self.lowering.discovery.fail( f'operator {bad!r} is not supported on floating-point values: {ast.unparse(node)}', node )
-			result_type = expected_type if _is_float_scalar( expected_type ) else left.type
-			opcode, extra = self._arithmetic_mode[-1].GetFloatBinOp( node )
-			return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
 
-		result_type = expected_type or left.type
-
-		opcode, extra = self._arithmetic_mode[-1].GetBinOp( node )
-		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
+		# every operator this language actually supports has a dunder mapping
+		# in _BINOP_DUNDER above (dispatched through it, or through the float
+		# checks just above, before ever reaching here) - what's left is a
+		# genuinely unsupported operator (`/` on an int - only `//` exists;
+		# `**`/`@`, never mapped to anything at all)
+		self.lowering.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
 
 	def _mode_qualified_dunder_names( self, base_name: str ) -> list[str]:
 		# see _MODE_DUNDER_PREFIX's own module-level comment for the full
@@ -7883,8 +8033,26 @@ class FunctionLowering:
 			# unannotated local first (`c = a + b; return Result.Ok(c)`),
 			# never returning the binop expression directly.
 			arg_index = 1 if impl.cls is None else 0
-			if len( params ) == arg_index + 1 and self.lowering._type_resolver._same_type( params[arg_index].type, arg_type ):
-				return impl
+			if len( params ) != arg_index + 1:
+				continue
+			param_type = params[arg_index].type
+			# either an exact match (the ordinary case - e.g. usize against
+			# a `other: usize` param), or a wildcard match against a still-
+			# generic candidate's OWN type-param-typed parameter (e.g.
+			# ptr_sub_dist[T]'s `other: Ptr[T]` against a concrete Ptr[i32]
+			# arg_type - _same_type can't structurally match an unbound
+			# TypeVar, so this is a separate, narrower check: same base,
+			# and the param's own type arg is one of impl's own type_params -
+			# any Ptr[whatever] arg_type counts, since T gets bound from the
+			# RECEIVER below via _resolve_receiver_generic_dunder anyway,
+			# which is what actually pins this parameter's concrete type).
+			is_wildcard = (
+				isinstance( param_type, Specialization ) and isinstance( arg_type, Specialization )
+				and param_type.base is arg_type.base
+				and any( isinstance( a, TypeVar ) and any( a is tv for tv in impl.type_params or [] ) for a in param_type.args )
+			)
+			if is_wildcard or self.lowering._type_resolver._same_type( param_type, arg_type ):
+				return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
 		return None
 
 	def _lower_eq_or_ne( self, node: ast.Compare, left: ir.Operand, expected_type: Type|None, negate: bool ) -> ir.Operand:
@@ -10945,7 +11113,8 @@ class FunctionLowering:
 
 			case 'checked_add' | 'wrapped_add' | 'saturated_add' | 'checked_sub' | 'wrapped_sub' | 'saturated_sub' | \
 				'checked_mul' | 'wrapped_mul' | 'saturated_mul' | 'checked_floordiv' | 'wrapped_floordiv' | 'saturated_floordiv' | \
-				'checked_mod' | 'wrapped_mod' | 'saturated_mod' | 'checked_truediv' | 'wrapped_truediv':
+				'checked_mod' | 'wrapped_mod' | 'saturated_mod' | 'checked_truediv' | 'wrapped_truediv' | \
+				'checked_shl' | 'wrapped_shl' | 'saturated_shl':
 				# every compiler.<mode>_<kind>(a, b) intrinsic shares one
 				# lowering - see _lower_compiler_checked_binop and
 				# _CHECKED_BINOP_OPCODES/_CHECKED_FLOAT_BINOP_OPCODES for how
@@ -10961,6 +11130,22 @@ class FunctionLowering:
 
 			case 'checked_convert':
 				result = self._lower_compiler_checked_convert( node, expected_type )
+				return result if want_result else None
+
+			case 'bitand' | 'bitor' | 'bitxor' | 'rshift':
+				result = self._lower_compiler_bitwise( node, self.lowering._is_compiler_call( node ), expected_type )
+				return result if want_result else None
+
+			case 'checked_ptr_add' | 'wrapped_ptr_add' | 'saturated_ptr_add' | \
+				'checked_ptr_sub' | 'wrapped_ptr_sub' | 'saturated_ptr_sub':
+				name = self.lowering._is_compiler_call( node )
+				mode, _sep, rest = name.partition( '_' )
+				kind = 'add' if rest == 'ptr_add' else 'sub'
+				result = self._lower_compiler_ptr_binop( node, name, kind, mode, expected_type )
+				return result if want_result else None
+
+			case 'ptr_sub_dist':
+				result = self._lower_compiler_ptr_diff( node, expected_type )
 				return result if want_result else None
 
 			case '__raw_alloc__':

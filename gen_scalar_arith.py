@@ -155,6 +155,49 @@ emit( '\treturn compiler.wrapped_truediv( value, other )' )
 emit()
 
 # ============================================================================
+# generic bodies - bitwise &/|/^ (int types only - no float meaning). Single
+# variant each: ir.BitAnd/BitOr/BitXor have no Wrap/Check/Saturate forms at
+# all (bitwise ops can't overflow), so there's nothing for ambient
+# arithmetic mode to disambiguate - always infallible, plain T-returning.
+# ============================================================================
+
+for kind, intrinsic in ( ( 'and', 'bitand' ), ( 'or', 'bitor' ), ( 'xor', 'bitxor' ) ):
+	emit( '@inline' )
+	emit( f'def i_{kind}[T]( value: T, other: T ) -> T:' )
+	emit( f'\treturn compiler.{intrinsic}( value, other )' )
+	emit()
+
+# ============================================================================
+# generic bodies - shifts. << (shl) has real Wrap/Check/Saturate variants
+# (ir.ShlWrap/ShlCheck/ShlSaturate - shifting bits out the top is a real,
+# already-modeled concern), same 3-variant shape as add/sub/mul. >> (rshift)
+# has no such concept (this compiler doesn't check shift-amount-exceeds-
+# width for either direction), single-variant infallible like the bitwise
+# ops above.
+# ============================================================================
+
+emit( '@fallible_arithmetic' )
+emit( '@inline' )
+emit( 'def i_shl_checked[T]( value: T, other: T ) -> Result[T,OverflowError]:' )
+emit( '\treturn compiler.checked_shl( value, other )' )
+emit()
+
+emit( '@inline' )
+emit( 'def i_shl_wrapped[T]( value: T, other: T ) -> T:' )
+emit( '\treturn compiler.wrapped_shl( value, other )' )
+emit()
+
+emit( '@inline' )
+emit( 'def i_shl_saturated[T]( value: T, other: T ) -> T:' )
+emit( '\treturn compiler.saturated_shl( value, other )' )
+emit()
+
+emit( '@inline' )
+emit( 'def i_rshift[T]( value: T, other: T ) -> T:' )
+emit( '\treturn compiler.rshift( value, other )' )
+emit()
+
+# ============================================================================
 # registrations - one line per (type, dunder name), specializing the
 # matching generic body above
 # ============================================================================
@@ -197,6 +240,28 @@ for t in FLOAT_TYPES:
 	emit( f'{t}.{dunder} = f_truediv_checked[{t}]' )
 	emit( f'{t}.{mode_dunder( dunder, "wrapped" )} = f_truediv_wrapped[{t}]' )
 	emit( f'{t}.{mode_dunder( dunder, "saturated" )} = f_truediv_saturated[{t}]' )
+emit()
+
+emit( '# --- int/bool bitwise (&/|/^) - single variant, no mode qualification -' )
+emit()
+# bool is scalar (a valid compiler.bitand/bitor/bitxor operand type just like
+# any int), and & / | / ^ on bool has real, well-defined boolean-algebra
+# meaning (unlike shift, which bool has no sensible meaning for and never
+# type-checks in this language to begin with) - genuinely was reaching this
+# old fallback tail (unlike every int type, bool had NO dunder registered at
+# all here before), a real gap this rollout would otherwise have left behind
+for t in ( *INT_TYPES, 'bool' ):
+	for kind, dunder in ( ( 'and', '__and__' ), ( 'or', '__or__' ), ( 'xor', '__xor__' ) ):
+		emit( f'{t}.{dunder} = i_{kind}[{t}]' )
+emit()
+
+emit( '# --- int shifts (<< checked/wrapped/saturated, >> single variant) ---' )
+emit()
+for t in INT_TYPES:
+	emit( f'{t}.__lshift__ = i_shl_checked[{t}]' )
+	emit( f'{t}.{mode_dunder( "__lshift__", "wrapped" )} = i_shl_wrapped[{t}]' )
+	emit( f'{t}.{mode_dunder( "__lshift__", "saturated" )} = i_shl_saturated[{t}]' )
+	emit( f'{t}.__rshift__ = i_rshift[{t}]' )
 emit()
 
 # ============================================================================

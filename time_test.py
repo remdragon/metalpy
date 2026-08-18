@@ -27,7 +27,7 @@ import time
 def main() -> i32:
 	start: f64 = time.monotonic()
 
-	acc: i64 = 0
+	acc: usize = 0
 	with compiler.wrap_arithmetic:
 		for i in range( 5_000_000 ):
 			acc += i

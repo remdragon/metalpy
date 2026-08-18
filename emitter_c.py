@@ -2312,6 +2312,14 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		symbol = _PLAIN_BITWISE_SYMBOL[type(instr)]
 		return [ f'\t{dest} = ({_emit_operand(instr.left)}) {symbol} ({_emit_operand(instr.right)});' ]
 
+	if isinstance( instr, ir.PtrDiff ):
+		# raw byte distance, isize - same uintptr_t round-trip _emit_wrap_arith
+		# already uses for pointer +/-, just signed and with no dest-type cast
+		# back to a pointer type (dest_type is isize here, not Ptr[T])
+		dest = _emit_operand( instr.dest )
+		l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
+		return [ f'\t{dest} = (intptr_t)((uintptr_t)({l}) - (uintptr_t)({r}));' ]
+
 	if isinstance( instr, ir.Invert ):
 		return [ f'\t{_emit_operand(instr.dest)} = ~({_emit_operand(instr.operand)});' ]
 	if isinstance( instr, ir.Not ):

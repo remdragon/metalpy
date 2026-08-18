@@ -150,7 +150,9 @@ class Tests( unittest.TestCase ):
 
 	def test_augassign_desugars_to_binop_and_assign( self ) -> None:
 		# x += 1 lowers exactly like a hand-written x = x + 1 would - same
-		# AddWrap/Assign shape, honoring the active arithmetic mode
+		# AddWrap/Assign shape (via i32.__wrapped_add__'s inline-spliced
+		# body), honoring the active arithmetic mode
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	x: i32 = 1',
@@ -161,12 +163,20 @@ class Tests( unittest.TestCase ):
 		i32 = self.discovery.get_intrinsics()['i32']
 		none_type = self.discovery.get_none_type()
 		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 2, type = i32 )
+		add_i32_fn = i32.names['__wrapped_add__']
+		if add_i32_fn.resolve is not None:
+			add_i32_fn.resolve()
+		inline_other = Variable(
+			stem = '$inline0$other', qualname = f'{add_i32_fn.qualname}$$inline0$other',
+			file = add_i32_fn.file, line = add_i32_fn.line, type = i32,
+		)
 		t0 = ir.Temp( type = i32, id = 0 )
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = x, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = inline_other, src = ir.Const( type = i32, value = 2 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.AddWrap( dest = t0, left = x, right = ir.Const( type = i32, value = 2 )),
+			ir.AddWrap( dest = t0, left = x, right = inline_other ),
 			ir.Assign( dest = x, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
 			ir.Return( value = None ),
@@ -201,6 +211,7 @@ class Tests( unittest.TestCase ):
 			'		f.x += 2',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' )
 		mod = self._import( code )
 		i32 = self.discovery.get_intrinsics()['i32']
 		none_type = self.discovery.get_none_type()
@@ -210,6 +221,20 @@ class Tests( unittest.TestCase ):
 		if self.discovery.main.resolve is not None:
 			self.discovery.main.resolve()
 		f = self.discovery.main.parameters[0]
+		add_i32_fn = i32.names['__wrapped_add__']
+		if add_i32_fn.resolve is not None:
+			add_i32_fn.resolve()
+		# the receiver here is t0 (a GetAttr's Temp, not already a bare
+		# Variable) so it ALSO needs splicing into its own synthesized local,
+		# not just the literal `other` operand - shifting other to $inline1$
+		inline_value = Variable(
+			stem = '$inline0$value', qualname = f'{add_i32_fn.qualname}$$inline0$value',
+			file = add_i32_fn.file, line = add_i32_fn.line, type = i32,
+		)
+		inline_other = Variable(
+			stem = '$inline1$other', qualname = f'{add_i32_fn.qualname}$$inline1$other',
+			file = add_i32_fn.file, line = add_i32_fn.line, type = i32,
+		)
 		t0 = ir.Temp( type = i32, id = 0 )
 		t1 = ir.Temp( type = i32, id = 1 )
 
@@ -219,8 +244,10 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = 'main', params = [ f ], return_type = none_type ),
 			ir.DeclareTemp( temp = t0 ),
 			ir.GetAttr( dest = t0, obj = f, attr = 'x' ),
+			ir.Assign( dest = inline_value, src = t0 ),
+			ir.Assign( dest = inline_other, src = ir.Const( type = i32, value = 2 )),
 			ir.DeclareTemp( temp = t1 ),
-			ir.AddWrap( dest = t1, left = t0, right = ir.Const( type = i32, value = 2 )),
+			ir.AddWrap( dest = t1, left = inline_value, right = inline_other ),
 			ir.SetAttr( obj = f, attr = 'x', value = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
@@ -247,6 +274,7 @@ class Tests( unittest.TestCase ):
 			'		get_obj().x += 1',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -271,6 +299,7 @@ class Tests( unittest.TestCase ):
 			'	sys.free( p )',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -299,6 +328,7 @@ class Tests( unittest.TestCase ):
 			'		b[0] += 5',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -460,31 +490,40 @@ class Tests( unittest.TestCase ):
 		# arithmetic defaults to Check mode (Result[T,OverflowError]) - see
 		# the Lowering class docstring - and main() returns None, which can't
 		# propagate that error, so plain `a + 1` here is a compile error
-		# rather than silently falling back to wrapping
+		# rather than silently falling back to wrapping. `a + 1` now
+		# dispatches through i32.__add__ (a real dunder, needing real
+		# builtins.Result/OverflowError - no more hand-rolled local stand-ins
+		# for those), whose own generic _FALLIBLE_METHOD_ALTERNATIVES message
+		# only names panic_arithmetic (not wrap/saturate_arithmetic - it
+		# doesn't know it's specifically backing an arithmetic opcode, unlike
+		# the old fallback's own opcode-specific _ALTERNATIVES_BY_ERROR)
 		code = '\n'.join([
-			'class OverflowError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	pass',
-			'',
 			'def main() -> None:',
 			'	a: i32 = 1',
 			'	b: i32 = a + 1',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self._lower_main()
-		self.assertIn( 'wrap_arithmetic', self.discovery.errors.errors[0] )
+		self.assertIn( 'panic_arithmetic', self.discovery.errors.errors[0] )
 		# lower_function's per-statement recovery boundary skips just the
-		# failing statement - b is never assigned, everything else is fine
+		# failing statement - b is never assigned. Unlike the old fallback
+		# (which validated Result-coverage BEFORE emitting anything), the
+		# dunder path's own check only runs at the final Result-consumption
+		# step, after the inline splice has already emitted its own
+		# instructions - those leak into the recovered function body (dead,
+		# since nothing ever reads t0/inline_other, but present)
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Assign', 'DeclareTemp', 'AddCheck', 'Return', 'FuncEnd' ] )
 
 	def test_binop_wrap_arithmetic_context( self ) -> None:
 		# with compiler.wrap_arithmetic: switches Add/Sub/Mult back to the
-		# plain Wrap opcodes, no Result/OrReturn involved - the with
-		# statement itself contributes no instructions of its own
+		# plain Wrap opcodes (via i32.__wrapped_add__/__wrapped_sub__/
+		# __wrapped_mul__'s inline-spliced bodies), no Result/OrReturn
+		# involved - the with statement itself contributes no instructions
+		# of its own
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
@@ -500,6 +539,17 @@ class Tests( unittest.TestCase ):
 		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
 		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 5, type = i32 )
 		d = Variable( stem = 'd', qualname = 'main.d', file = Path( '__test__.py' ), line = 6, type = i32 )
+		# the $inlineN$ splice counter is shared across every inline call
+		# spliced into THIS function body (main), not reset per callee - the
+		# three ops here get inline0/1/2 in source order
+		def inline_other( fn_name: str, n: int ) -> Variable:
+			fn = i32.names[fn_name]
+			if fn.resolve is not None:
+				fn.resolve()
+			return Variable( stem = f'$inline{n}$other', qualname = f'{fn.qualname}$$inline{n}$other', file = fn.file, line = fn.line, type = i32 )
+		add_other = inline_other( '__wrapped_add__', 0 )
+		sub_other = inline_other( '__wrapped_sub__', 1 )
+		mul_other = inline_other( '__wrapped_mul__', 2 )
 		# temp numbering is per-function (not per-statement), so each new
 		# statement's temp continues where the last one left off
 		t0 = ir.Temp( type = i32, id = 0 )
@@ -508,16 +558,19 @@ class Tests( unittest.TestCase ):
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = add_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.AddWrap( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.AddWrap( dest = t0, left = a, right = add_other ),
 			ir.Assign( dest = b, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.Assign( dest = sub_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t1 ),
-			ir.SubWrap( dest = t1, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.SubWrap( dest = t1, left = a, right = sub_other ),
 			ir.Assign( dest = c, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
+			ir.Assign( dest = mul_other, src = ir.Const( type = i32, value = 2 )),
 			ir.DeclareTemp( temp = t2 ),
-			ir.MulWrap( dest = t2, left = a, right = ir.Const( type = i32, value = 2 )),
+			ir.MulWrap( dest = t2, left = a, right = mul_other ),
 			ir.Assign( dest = d, src = t2 ),
 			ir.DeleteTemp( temp = t2 ),
 			ir.Return( value = None ),
@@ -529,13 +582,16 @@ class Tests( unittest.TestCase ):
 		# takes no arguments to be called with the error) that returns
 		# Result[None,OverflowError] - every Check op is immediately followed
 		# by an OrReturn (Result.or_return()'s own semantics), consuming the
-		# Result and continuing with the unwrapped i32 value
+		# Result and continuing with the unwrapped i32 value. The dunder
+		# path's error type is the REAL builtins.OverflowError (i32.__add__'s
+		# own, fixed at __scalar_arith.py's own import time) - checked()'s
+		# own return annotation must reference that SAME class for
+		# _require_result_return's coverage check to pass, so this imports
+		# the real builtins.Result/OverflowError rather than hand-rolling
+		# local stand-ins the way pre-dunder tests used to
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
-			'class OverflowError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	pass',
+			'from builtins import Result, OverflowError',
 			'',
 			'def checked() -> Result[None,OverflowError]:',
 			'	a: i32 = 1',
@@ -549,16 +605,28 @@ class Tests( unittest.TestCase ):
 		checked_fn = mod.get_local( 'checked' )
 		if checked_fn.resolve is not None:
 			checked_fn.resolve()
-		overflow_cls = mod.get_local( 'OverflowError' )
-		result_cls = mod.get_local( 'Result' )
+		builtins_mod = self.discovery.modules['builtins']
+		overflow_cls = builtins_mod.get_local( 'OverflowError' )
+		result_cls = builtins_mod.get_local( 'Result' )
 		if result_cls.resolve is not None:
 			result_cls.resolve()
 		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
 
-		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 8, type = i32 )
-		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 9, type = i32 )
-		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 10, type = i32 )
-		d = Variable( stem = 'd', qualname = '__test__.checked.d', file = Path( '__test__.py' ), line = 11, type = i32 )
+		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 4, type = i32 )
+		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 5, type = i32 )
+		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 6, type = i32 )
+		d = Variable( stem = 'd', qualname = '__test__.checked.d', file = Path( '__test__.py' ), line = 7, type = i32 )
+
+		# each op's literal `other` operand is spliced into its own
+		# synthesized local - counter shared across the whole function body
+		def inline_other( fn_name: str, n: int ) -> Variable:
+			fn = i32.names[fn_name]
+			if fn.resolve is not None:
+				fn.resolve()
+			return Variable( stem = f'$inline{n}$other', qualname = f'{fn.qualname}$$inline{n}$other', file = fn.file, line = fn.line, type = i32 )
+		add_other = inline_other( '__add__', 0 )
+		sub_other = inline_other( '__sub__', 1 )
+		mul_other = inline_other( '__mul__', 2 )
 
 		t0 = ir.Temp( type = result_i32_overflow, id = 0 ) # AddCheck's Result
 		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via OrReturn
@@ -571,22 +639,25 @@ class Tests( unittest.TestCase ):
 		self._assert_ir( fn, [
 			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = add_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.AddCheck( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.AddCheck( dest = t0, left = a, right = add_other ),
 			ir.DeclareTemp( temp = t1 ),
 			ir.OrReturn( dest = t1, value = t0 ),
 			ir.Assign( dest = b, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.Assign( dest = sub_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t2 ),
-			ir.SubCheck( dest = t2, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.SubCheck( dest = t2, left = a, right = sub_other ),
 			ir.DeclareTemp( temp = t3 ),
 			ir.OrReturn( dest = t3, value = t2 ),
 			ir.Assign( dest = c, src = t3 ),
 			ir.DeleteTemp( temp = t3 ),
 			ir.DeleteTemp( temp = t2 ),
+			ir.Assign( dest = mul_other, src = ir.Const( type = i32, value = 2 )),
 			ir.DeclareTemp( temp = t4 ),
-			ir.MulCheck( dest = t4, left = a, right = ir.Const( type = i32, value = 2 )),
+			ir.MulCheck( dest = t4, left = a, right = mul_other ),
 			ir.DeclareTemp( temp = t5 ),
 			ir.OrReturn( dest = t5, value = t4 ),
 			ir.Assign( dest = d, src = t5 ),
@@ -772,8 +843,10 @@ class Tests( unittest.TestCase ):
 
 	def test_binop_saturate_arithmetic_context( self ) -> None:
 		# with compiler.saturate_arithmetic: - same shape as wrap_arithmetic,
-		# just the *Saturate opcodes instead - no Result/OrReturn involved
-		# either, so this works fine inside main() too
+		# just the *Saturate opcodes (via i32.__saturated_add__/_sub__/_mul__)
+		# instead - no Result/OrReturn involved either, so this works fine
+		# inside main() too
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
@@ -789,22 +862,33 @@ class Tests( unittest.TestCase ):
 		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
 		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 5, type = i32 )
 		d = Variable( stem = 'd', qualname = 'main.d', file = Path( '__test__.py' ), line = 6, type = i32 )
+		def inline_other( fn_name: str, n: int ) -> Variable:
+			fn = i32.names[fn_name]
+			if fn.resolve is not None:
+				fn.resolve()
+			return Variable( stem = f'$inline{n}$other', qualname = f'{fn.qualname}$$inline{n}$other', file = fn.file, line = fn.line, type = i32 )
+		add_other = inline_other( '__saturated_add__', 0 )
+		sub_other = inline_other( '__saturated_sub__', 1 )
+		mul_other = inline_other( '__saturated_mul__', 2 )
 		t0 = ir.Temp( type = i32, id = 0 )
 		t1 = ir.Temp( type = i32, id = 1 )
 		t2 = ir.Temp( type = i32, id = 2 )
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = add_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.AddSaturate( dest = t0, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.AddSaturate( dest = t0, left = a, right = add_other ),
 			ir.Assign( dest = b, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.Assign( dest = sub_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t1 ),
-			ir.SubSaturate( dest = t1, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.SubSaturate( dest = t1, left = a, right = sub_other ),
 			ir.Assign( dest = c, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
+			ir.Assign( dest = mul_other, src = ir.Const( type = i32, value = 2 )),
 			ir.DeclareTemp( temp = t2 ),
-			ir.MulSaturate( dest = t2, left = a, right = ir.Const( type = i32, value = 2 )),
+			ir.MulSaturate( dest = t2, left = a, right = mul_other ),
 			ir.Assign( dest = d, src = t2 ),
 			ir.DeleteTemp( temp = t2 ),
 			ir.Return( value = None ),
@@ -883,6 +967,7 @@ class Tests( unittest.TestCase ):
 		# expected type flows from whichever side is NOT the bare literal -
 		# wrapped in wrap_arithmetic just to sidestep the Check-mode/Result
 		# requirement, unrelated to what this test actually checks
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
@@ -894,12 +979,23 @@ class Tests( unittest.TestCase ):
 		none_type = self.discovery.get_none_type()
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
 		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		add_i32_fn = i32.names['__wrapped_add__']
+		if add_i32_fn.resolve is not None:
+			add_i32_fn.resolve()
+		# the receiver here is the literal `1` (not already a Variable), so
+		# IT is what gets spliced into a synthesized local - `a` (already a
+		# Variable) passes straight through as `other`
+		inline_value = Variable(
+			stem = '$inline0$value', qualname = f'{add_i32_fn.qualname}$$inline0$value',
+			file = add_i32_fn.file, line = add_i32_fn.line, type = i32,
+		)
 		t0 = ir.Temp( type = i32, id = 0 )
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = inline_value, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.AddWrap( dest = t0, left = ir.Const( type = i32, value = 1 ), right = a ),
+			ir.AddWrap( dest = t0, left = inline_value, right = a ),
 			ir.Assign( dest = b, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
 			ir.Return( value = None ),
@@ -907,9 +1003,11 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_binop_bitwise_ops_are_unconditional( self ) -> None:
-		# no overflow concept for &/|/^/>> - always a single opcode,
-		# independent of arithmetic mode (works fine in main() with no
-		# wrap/check/saturate context at all, unlike +/-/*)
+		# no overflow concept for &/|/^/>> - always a single, mode-independent
+		# dunder (i32.__and__/__or__/__xor__/__rshift__ - no __wrapped_*__/
+		# __saturated_*__ variants), works fine in main() with no wrap/check/
+		# saturate context at all, unlike +/-/*
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 6',
@@ -926,6 +1024,15 @@ class Tests( unittest.TestCase ):
 		c = Variable( stem = 'c', qualname = 'main.c', file = Path( '__test__.py' ), line = 4, type = i32 )
 		d = Variable( stem = 'd', qualname = 'main.d', file = Path( '__test__.py' ), line = 5, type = i32 )
 		e = Variable( stem = 'e', qualname = 'main.e', file = Path( '__test__.py' ), line = 6, type = i32 )
+		def inline_other( fn_name: str, n: int ) -> Variable:
+			fn = i32.names[fn_name]
+			if fn.resolve is not None:
+				fn.resolve()
+			return Variable( stem = f'$inline{n}$other', qualname = f'{fn.qualname}$$inline{n}$other', file = fn.file, line = fn.line, type = i32 )
+		and_other = inline_other( '__and__', 0 )
+		or_other = inline_other( '__or__', 1 )
+		xor_other = inline_other( '__xor__', 2 )
+		rshift_other = inline_other( '__rshift__', 3 )
 		t0 = ir.Temp( type = i32, id = 0 )
 		t1 = ir.Temp( type = i32, id = 1 )
 		t2 = ir.Temp( type = i32, id = 2 )
@@ -933,20 +1040,24 @@ class Tests( unittest.TestCase ):
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 6 )),
+			ir.Assign( dest = and_other, src = ir.Const( type = i32, value = 3 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.BitAnd( dest = t0, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.BitAnd( dest = t0, left = a, right = and_other ),
 			ir.Assign( dest = b, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.Assign( dest = or_other, src = ir.Const( type = i32, value = 3 )),
 			ir.DeclareTemp( temp = t1 ),
-			ir.BitOr( dest = t1, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.BitOr( dest = t1, left = a, right = or_other ),
 			ir.Assign( dest = c, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
+			ir.Assign( dest = xor_other, src = ir.Const( type = i32, value = 3 )),
 			ir.DeclareTemp( temp = t2 ),
-			ir.BitXor( dest = t2, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.BitXor( dest = t2, left = a, right = xor_other ),
 			ir.Assign( dest = d, src = t2 ),
 			ir.DeleteTemp( temp = t2 ),
+			ir.Assign( dest = rshift_other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t3 ),
-			ir.Shr( dest = t3, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.Shr( dest = t3, left = a, right = rshift_other ),
 			ir.Assign( dest = e, src = t3 ),
 			ir.DeleteTemp( temp = t3 ),
 			ir.Return( value = None ),
@@ -958,6 +1069,7 @@ class Tests( unittest.TestCase ):
 		# overflow, unlike the other bitwise ops) - wrap_arithmetic here just
 		# sidesteps the Check-mode/Result requirement, same as
 		# test_binop_literal_on_left
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
@@ -969,12 +1081,20 @@ class Tests( unittest.TestCase ):
 		none_type = self.discovery.get_none_type()
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
 		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 4, type = i32 )
+		shl_i32_fn = i32.names['__wrapped_lshift__']
+		if shl_i32_fn.resolve is not None:
+			shl_i32_fn.resolve()
+		inline_other = Variable(
+			stem = '$inline0$other', qualname = f'{shl_i32_fn.qualname}$$inline0$other',
+			file = shl_i32_fn.file, line = shl_i32_fn.line, type = i32,
+		)
 		t0 = ir.Temp( type = i32, id = 0 )
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = inline_other, src = ir.Const( type = i32, value = 2 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.ShlWrap( dest = t0, left = a, right = ir.Const( type = i32, value = 2 )),
+			ir.ShlWrap( dest = t0, left = a, right = inline_other ),
 			ir.Assign( dest = b, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
 			ir.Return( value = None ),
@@ -986,14 +1106,13 @@ class Tests( unittest.TestCase ):
 		# SIGNED checked division can raise EITHER ZeroDivisionError (divisor 0)
 		# OR OverflowError (INT_MIN/-1), so its Result error type is the union
 		# ZeroDivisionError|OverflowError - the enclosing function must return a
-		# Result whose error covers both
+		# Result whose error covers both. `//`/`%` dispatch through i32's real
+		# __floordiv__/__mod__ dunders now, needing the REAL builtins Result/
+		# ZeroDivisionError/OverflowError (see test_binop_check_mode_emits_or_
+		# return's own comment on why a hand-rolled local stand-in no longer works)
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
-			'class ZeroDivisionError: pass',
-			'class OverflowError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	pass',
+			'from builtins import Result, ZeroDivisionError, OverflowError',
 			'',
 			'def checked() -> Result[None,ZeroDivisionError | OverflowError]:',
 			'	a: i32 = 10',
@@ -1006,17 +1125,26 @@ class Tests( unittest.TestCase ):
 		checked_fn = mod.get_local( 'checked' )
 		if checked_fn.resolve is not None:
 			checked_fn.resolve()
-		zerodiv_cls = mod.get_local( 'ZeroDivisionError' )
-		overflow_cls = mod.get_local( 'OverflowError' )
-		result_cls = mod.get_local( 'Result' )
+		builtins_mod = self.discovery.modules['builtins']
+		zerodiv_cls = builtins_mod.get_local( 'ZeroDivisionError' )
+		overflow_cls = builtins_mod.get_local( 'OverflowError' )
+		result_cls = builtins_mod.get_local( 'Result' )
 		if result_cls.resolve is not None:
 			result_cls.resolve()
 		error_union = self.discovery._get_or_create_union( [ zerodiv_cls, overflow_cls ] )
 		result_i32_err = self.discovery._get_or_create_specialization( result_cls, [ i32, error_union ] )
 
-		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 9, type = i32 )
-		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 10, type = i32 )
-		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 11, type = i32 )
+		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 4, type = i32 )
+		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 5, type = i32 )
+		c = Variable( stem = 'c', qualname = '__test__.checked.c', file = Path( '__test__.py' ), line = 6, type = i32 )
+
+		def inline_other( fn_name: str, n: int ) -> Variable:
+			fn = i32.names[fn_name]
+			if fn.resolve is not None:
+				fn.resolve()
+			return Variable( stem = f'$inline{n}$other', qualname = f'{fn.qualname}$$inline{n}$other', file = fn.file, line = fn.line, type = i32 )
+		floordiv_other = inline_other( '__floordiv__', 0 )
+		mod_other = inline_other( '__mod__', 1 )
 
 		t0 = ir.Temp( type = result_i32_err, id = 0 ) # Div's Result
 		t1 = ir.Temp( type = i32, id = 1 )            # unwrapped via OrReturn
@@ -1027,15 +1155,17 @@ class Tests( unittest.TestCase ):
 		self._assert_ir( fn, [
 			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 10 )),
+			ir.Assign( dest = floordiv_other, src = ir.Const( type = i32, value = 3 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.Div( dest = t0, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.Div( dest = t0, left = a, right = floordiv_other ),
 			ir.DeclareTemp( temp = t1 ),
 			ir.OrReturn( dest = t1, value = t0 ),
 			ir.Assign( dest = b, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.Assign( dest = mod_other, src = ir.Const( type = i32, value = 3 )),
 			ir.DeclareTemp( temp = t2 ),
-			ir.Mod( dest = t2, left = a, right = ir.Const( type = i32, value = 3 )),
+			ir.Mod( dest = t2, left = a, right = mod_other ),
 			ir.DeclareTemp( temp = t3 ),
 			ir.OrReturn( dest = t3, value = t2 ),
 			ir.Assign( dest = c, src = t3 ),
@@ -1045,14 +1175,8 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_binop_floordiv_without_zerodivision_result_is_a_compile_error( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
-			'class ZeroDivisionError: pass',
-			'class OverflowError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	pass',
-			'',
 			'def main() -> None:',
 			'	a: i32 = 1',
 			'	b: i32 = a // 1',
@@ -1064,8 +1188,12 @@ class Tests( unittest.TestCase ):
 		# OverflowError (INT_MIN/-1), so the required error type is their union
 		self.assertIn( 'Result[_,OverflowError | ZeroDivisionError]', self.discovery.errors.errors[0] )
 		self.assertIn( 'panic_arithmetic', self.discovery.errors.errors[0] )
+		# see test_binop_without_arithmetic_context_is_a_compile_error's own
+		# comment - the dunder path's Result-coverage check runs only at the
+		# final consumption step, after the inline splice has already
+		# emitted its own (dead, unread) instructions
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Assign', 'DeclareTemp', 'Div', 'Return', 'FuncEnd' ] )
 
 	def test_binop_floordiv_inside_wrap_arithmetic_still_requires_result_and_uses_or_return( self ) -> None:
 		# there's no wrapped/saturated division - being inside
@@ -1079,12 +1207,9 @@ class Tests( unittest.TestCase ):
 		# for the rejection case, and the panic case is covered by
 		# test_binop_floordiv_and_mod_check_mode_emits_or_return's sibling
 		# panic_arithmetic tests elsewhere in this class)
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
-			'class ZeroDivisionError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	pass',
+			'from builtins import Result, ZeroDivisionError',
 			'',
 			'def checked() -> Result[None,ZeroDivisionError]:',
 			'	a: i32 = 10',
@@ -1115,12 +1240,6 @@ class Tests( unittest.TestCase ):
 		for context in ( 'compiler.wrap_arithmetic', 'compiler.saturate_arithmetic' ):
 			with self.subTest( context = context ):
 				code = '\n'.join([
-					'class ZeroDivisionError: pass',
-					'',
-					'@cstruct',
-					'class Result[T,E]:',
-					'	pass',
-					'',
 					'def main() -> None:', # -> None, not Result[_,ZeroDivisionError]
 					'	a: i32 = 1',
 					f'	with {context}:',
@@ -1128,13 +1247,17 @@ class Tests( unittest.TestCase ):
 					'	return',
 				])
 				disco = Discovery( import_builtins = False )
+				disco.import_name( 'builtins' )
 				comp = Compiler( disco )
 				comp.import_code( code, filename = Path( '__test__.py' ))
 				fn = comp._lower( disco.main )
 				self.assertIn( 'Result[_,ZeroDivisionError]', disco.errors.errors[0] )
 				self.assertIn( 'panic_arithmetic', disco.errors.errors[0] )
+				# see test_binop_without_arithmetic_context_is_a_compile_error's
+				# own comment - partial (dead) inline-splice instructions leak
+				# into the recovered function body
 				kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-				self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+				self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Assign', 'DeclareTemp', 'DivWrap' if context == 'compiler.wrap_arithmetic' else 'DivSaturate', 'Return', 'FuncEnd' ] )
 
 	def test_binop_true_div_remains_unsupported( self ) -> None:
 		# '/' (ast.Div) is deliberately not mapped to anything - there's no
@@ -5668,14 +5791,13 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_errdefer_with_checked_arithmetic_emits_or_jump( self ) -> None:
+		# real builtins.Result already has its own is_err() - see
+		# test_binop_check_mode_emits_or_return's comment on why `a + 1`'s
+		# own Result/OverflowError must be the REAL builtins ones, not a
+		# hand-rolled local stand-in
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
-			'class bool: pass',
-			'class OverflowError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	def is_err( self ) -> bool:',
-			'		pass',
+			'from builtins import Result, OverflowError',
 			'',
 			'def checked() -> Result[None,OverflowError]:',
 			'	with errdefer:',
@@ -5799,12 +5921,9 @@ class Tests( unittest.TestCase ):
 	def test_no_defer_still_uses_plain_return_and_or_return( self ) -> None:
 		# regression check - a function with no defer/errdefer at all still
 		# gets the pre-epilogue shape exactly as before, no Jump/Label anywhere
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
-			'class OverflowError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	pass',
+			'from builtins import Result, OverflowError',
 			'',
 			'def checked() -> Result[None,OverflowError]:',
 			'	a: i32 = 1',
@@ -7163,9 +7282,16 @@ class Tests( unittest.TestCase ):
 		# actual shared choke point), with an ast node now threaded through
 		# _emit_checked_op/_consume_checked_result from their real callers
 		# for discovery.fail()'s own location
-		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+		# uses the REAL builtins.Result (not _RESULT_FIXTURE's local one) -
+		# a + b's own dunder needs checked()'s return type to cover the REAL
+		# builtins.OverflowError (see test_binop_check_mode_emits_or_return's
+		# comment); builtins.Result already has is_ok()/Ok(), so there's no
+		# need for a separate local Result just for r's own discard-check shape
+		self.discovery.import_name( 'builtins' )
+		code = '\n'.join([
+			'from builtins import Result, OverflowError',
+			'',
 			'class MyError: pass',
-			'class OverflowError: pass',
 			'',
 			'def get() -> Result[i32,MyError]:',
 			'	pass',
@@ -7627,6 +7753,7 @@ class InlineMultiStatementTests( unittest.TestCase ):
 			'	with compiler.wrap_arithmetic:',
 			'		return tmp + result',
 		])
+		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )

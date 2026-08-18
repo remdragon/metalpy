@@ -382,6 +382,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 
 class EmitArithmeticTests( CompilerTestCase ):
 	def test_wrap_arithmetic_smoke_test( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -394,7 +395,14 @@ def main() -> i32:
 		self.assertNotIn( '__builtin', src ) # wrap mode must NOT use the overflow builtins
 
 	def test_default_check_mode_uses_result_and_or_return( self ) -> None:
-		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+		# real builtins.Result/OverflowError, not _RESULT_FIXTURE's local
+		# stand-in - x + 1 dispatches through i32.__add__ now, whose own
+		# Result[T,OverflowError] is always the REAL builtins one (see
+		# lowering_test.py's test_binop_check_mode_emits_or_return)
+		self.discovery.import_name( 'builtins' )
+		self._run( '\n'.join([
+			'from builtins import Result, OverflowError',
+			'',
 			'def main() -> Result[i32,OverflowError]:',
 			'	x: i32 = 1',
 			'	y: i32 = x + 1',
@@ -422,6 +430,7 @@ _POINT_FIXTURE = '\n'.join([
 
 class EmitCStructConstructTests( CompilerTestCase ):
 	def test_construct_and_read_back( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		self._run( _POINT_FIXTURE + '\n' + '\n'.join([
 			'def main() -> i32:',
 			'	p: Point = Point.make( 1, 2 )',
@@ -472,6 +481,7 @@ _UNION_FIXTURE = '\n'.join([
 
 class EmitTaggedUnionTests( CompilerTestCase ):
 	def test_construct_and_match_round_trip( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		# mirrors lowering_test.py's own test_match_union_construction_and_
 		# extraction_round_trip - construct with one member, match takes
 		# that arm, extracts the value. No new control-flow ops needed here
@@ -487,7 +497,14 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 			'			return x',
 			'		case Foo.Baz( z ):',
 			'			with compiler.wrap_arithmetic:',
-			'				return z + 1',
+			# z: usize (Baz's own payload type) - z + 1 is usize, needs an
+			# explicit narrowing cast back to i32 for main's own return type.
+			# The dunder path types this correctly as usize (left.type, the
+			# receiver's real type) - the pre-dunder fallback used to
+			# silently mistype the AddWrap op itself as i32 (result_type =
+			# expected_type or left.type, picking the OUTER expected_type
+			# instead), masking this exact mismatch
+			'				return i32( z + 1 )',
 			'	return 0',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -1864,6 +1881,7 @@ def main() -> None:
 	def test_wrap_arithmetic_smoke_test_compiles( self ) -> None:
 		# Phase 1 milestone (a): the first real smoke test, sidesteps
 		# Result plumbing entirely
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -1926,7 +1944,13 @@ def main() -> i32:
 		# program never declares main() -> Result[...] (that wouldn't even
 		# make sense given main always returns int), so the Result-
 		# returning function under test is a separate, ordinary helper
-		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+		# real builtins.Result/OverflowError, not _RESULT_FIXTURE's local
+		# stand-in - see EmitArithmeticTests.test_default_check_mode_uses_
+		# result_and_or_return's own comment
+		self.discovery.import_name( 'builtins' )
+		self._run( '\n'.join([
+			'from builtins import Result, OverflowError',
+			'',
 			'def foo() -> Result[i32,OverflowError]:',
 			'	x: i32 = 1',
 			'	y: i32 = x + 1',
@@ -1963,6 +1987,7 @@ def main() -> i32:
 		self._assert_compiles( harness )
 
 	def test_cstruct_construct_and_read_back_compiles( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		self._run( _POINT_FIXTURE + '\n' + '\n'.join([
 			'def main() -> i32:',
 			'	p: Point = Point.make( 1, 2 )',
@@ -1986,6 +2011,7 @@ def main() -> None:
 
 	def test_union_construct_and_match_compiles( self ) -> None:
 		# Phase 5 milestone (a): synthetic @union construct/match round trip
+		self.discovery.import_name( 'builtins' )
 		self._run( _UNION_FIXTURE + '\n' + '\n'.join([
 			'def main() -> i32:',
 			'	f: Foo = Foo.Bar( 5 )',
@@ -1994,7 +2020,14 @@ def main() -> None:
 			'			return x',
 			'		case Foo.Baz( z ):',
 			'			with compiler.wrap_arithmetic:',
-			'				return z + 1',
+			# z: usize (Baz's own payload type) - z + 1 is usize, needs an
+			# explicit narrowing cast back to i32 for main's own return type.
+			# The dunder path types this correctly as usize (left.type, the
+			# receiver's real type) - the pre-dunder fallback used to
+			# silently mistype the AddWrap op itself as i32 (result_type =
+			# expected_type or left.type, picking the OUTER expected_type
+			# instead), masking this exact mismatch
+			'				return i32( z + 1 )',
 			'	return 0',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
@@ -2092,7 +2125,13 @@ def main() -> None:
 		#     own bare TypeVar instead of the concrete specialization,
 		#     corrupting the Result[T,OverflowError] the arithmetic itself
 		#     needs to build into a bogus, unsubstituted one.
-		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+		# real builtins.Result/OverflowError, not _RESULT_FIXTURE's local
+		# stand-in - see EmitArithmeticTests.test_default_check_mode_uses_
+		# result_and_or_return's own comment
+		self.discovery.import_name( 'builtins' )
+		self._run( '\n'.join([
+			'from builtins import Result, OverflowError',
+			'',
 			'@union',
 			'class Box[T]:',
 			'\tFull: T',
