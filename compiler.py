@@ -92,6 +92,16 @@ class Compiler:
 		# directories on a real machine, in general) and deliberately not
 		# auto-derived from scanning a DLL's own import table.
 		self.extern_dlls: set[str] = set()
+		# 3rd-party license notice identifiers declared via
+		# @extern(..., notice='<name>'|[...]) - same reachability-gated
+		# collection point as extern_libs/extern_dlls above. A short
+		# identifier (e.g. 'TCL', 'ZLIB'), not a path - mpy.py's post-link
+		# step resolves each against licenses/<name>.txt and combines them
+		# into one dist/THIRD-PARTY-LICENSES file. Deliberately independent
+		# of extern_dlls (see mpy_types.Function.extern_notices's own
+		# comment): a notice can be shared across multiple, otherwise
+		# unrelated DLL dependencies.
+		self.extern_notices: set[str] = set()
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
 		# pass the entry module's own eventual qualname through as `package` so
@@ -326,6 +336,7 @@ class Compiler:
 			if unit.extern_lib is not None:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
 				self.extern_dlls.update( unit.extern_dlls )
+				self.extern_notices.update( unit.extern_notices )
 			lf = LoweredFunction( function = unit, instructions = instructions )
 			self.functions.append( lf )
 			self._lowered_functions[ id( unit ) ] = lf
