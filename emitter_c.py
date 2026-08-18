@@ -887,6 +887,24 @@ def _field_type_spelling( t: Type ) -> str:
 		return _NONE_PLACEHOLDER_TYPE
 	return c_type( t )
 
+def _mark_used_if_none( operand: ir.Operand ) -> list[str]:
+	''' MetalpyNone (see _NONE_PLACEHOLDER_TYPE) carries no real
+	information - assigning one is a structurally-required IR shape (e.g.
+	`ok: T = self.data.v_Ok` inside Result[T,E].unwrap()'s own generic
+	body when T=NoneType, or .or_return()'s own dest when used as a bare
+	statement, its value never actually consumed), not necessarily a value
+	any caller goes on to read. A genuinely-unused NoneType local was never
+	actionable dead code to begin with (there's nothing in it to act on),
+	so marking it read here - always AFTER its real assignment, never
+	before (an earlier read would be a genuine uninitialized-value bug,
+	not just a spurious warning) - is safe in every case and silences
+	-Wunused-variable/-Wunused-but-set-variable/C4189 on every such
+	monomorphization without risking a false negative on a real,
+	non-placeholder type. '''
+	if isinstance( operand.type, Scalar ) and operand.type.stem == 'NoneType':
+		return [ f'\t(void){_emit_operand(operand)};' ]
+	return []
+
 def _field_name( name: str ) -> str:
 	# a REAL struct/class field (x: i32) is already a plain identifier, so
 	# mangle_qualname is a no-op there - but a TaggedUnion payload's
@@ -2176,11 +2194,11 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			name = _c_local_name( instr.dest.stem )
 			if name not in declared:
 				declared.add( name )
-				return [ f'\t{_declarator( instr.dest.type, name, volatile = instr.dest.is_volatile )} = {src};' ]
-			return [ f'\t{name} = {src};' ]
+				return [ f'\t{_declarator( instr.dest.type, name, volatile = instr.dest.is_volatile )} = {src};' ] + _mark_used_if_none( instr.dest )
+			return [ f'\t{name} = {src};' ] + _mark_used_if_none( instr.dest )
 		# a global Variable is declared separately at file scope (Phase 7 -
 		# emit_global) - never re-declared here, only assigned
-		return [ f'\t{_emit_operand(instr.dest)} = {src};' ]
+		return [ f'\t{_emit_operand(instr.dest)} = {src};' ] + _mark_used_if_none( instr.dest )
 
 	if type( instr ) in _ARITH_BINOP_INFO:
 		kind, mode = _ARITH_BINOP_INFO[type(instr)]
@@ -2577,11 +2595,11 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			f'\t\t{panic_name}( {_emit_operand(instr.errmsg)} );',
 			'\t}',
 			f'\t{_emit_operand(instr.dest)} = ({value}).{data_f}.{ok_f};',
-		]
+		] + _mark_used_if_none( instr.dest )
 	if isinstance( instr, ir.UnwrapOr ):
 		value = _emit_operand( instr.value )
 		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.value.type )
-		return [ f'\t{_emit_operand(instr.dest)} = ( ({value}).{tag_f} == 1 ) ? {_emit_operand(instr.default)} : ({value}).{data_f}.{ok_f};' ]
+		return [ f'\t{_emit_operand(instr.dest)} = ( ({value}).{tag_f} == 1 ) ? {_emit_operand(instr.default)} : ({value}).{data_f}.{ok_f};' ] + _mark_used_if_none( instr.dest )
 
 	raise NotImplementedError( f'_emit_instruction: unsupported instruction {instr!r} (later-phase work)' )
 
@@ -2643,7 +2661,7 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 			f'\t\tgoto {_c_label(merge_label)};',
 			'\t}',
 			f'\t{dest} = ({value}).{data_f}.{ok_f};',
-		]
+		] + _mark_used_if_none( instr.dest )
 	return [
 		f'\tif ( ({value}).{tag_f} == 1 ) {{',
 		f'\t\t{ret_ctype} __err;',
@@ -2653,7 +2671,7 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 		'\t\treturn __err;',
 		'\t}',
 		f'\t{dest} = ({value}).{data_f}.{ok_f};',
-	]
+	] + _mark_used_if_none( instr.dest )
 
 def _emit_widen_result( instr: ir.WidenResult ) -> list[str]:
 	# a bare `return x` widening x's own Result[T,NarrowE] into dest's wider
@@ -2702,6 +2720,7 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 	lines.append( f'\t\tgoto {_c_label(instr.target)};' )
 	lines.append( '\t}' )
 	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
+	lines.extend( _mark_used_if_none( instr.dest ))
 	return lines
 
 # --- classes / globals -----------------------------------------------------

@@ -1280,17 +1280,25 @@ class CFGState:
 	) -> list[ir.Instruction]:
 		''' the shared unwind sequence every return that used
 		current_epilogue_label() (and the function's own fall-off-the-end)
-		jumps into - one Label + that entry's own still-live replay per
-		pending entry (RC Decref, or a flag-guarded defer/errdefer replay -
-		see _replay()), deepest (most-recently-pushed) first, each falling
-		straight through into the next with no Jump needed. Cancelled
-		entries still get their own Label (current_epilogue_label() can
-		still point straight at one - see its own comment), just no
-		instructions. Callers append their own final ir.Return - cfg.py has
-		no notion of a function's return type or return-value slot. '''
+		jumps into - one Label (only when entry.captured - see below) +
+		that entry's own still-live replay per pending entry (RC Decref, or
+		a flag-guarded defer/errdefer replay - see _replay()), deepest
+		(most-recently-pushed) first, each falling straight through into
+		the next with no Jump needed. Cancelled entries still get their own
+		Label whenever captured (current_epilogue_label() can still point
+		straight at one - see its own comment), just no instructions. An
+		entry current_epilogue_label() never actually handed out as a live
+		jump target (entry.captured stays False - no return anywhere in the
+		function needed to unwind from exactly that depth) gets NO Label
+		either: every OTHER rung still reaches it purely by falling
+		through from the one above, so a Label with nothing branching to it
+		would be a real, always-on -Wunused-label/C4102 on every compiler.
+		Callers append their own final ir.Return - cfg.py has no notion of
+		a function's return type or return-value slot. '''
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack ):
-			instructions.append( ir.Label( name = entry.name ))
+			if entry.captured: # see this method's own docstring
+				instructions.append( ir.Label( name = entry.name ))
 			if not entry.cancelled:
 				instructions += self._replay( entry, get_is_err_check )
 		return instructions
@@ -1318,7 +1326,9 @@ class CFGState:
 		scope = self._inline_scope_stack[-1]
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack[scope.boundary_depth:] ):
-			instructions.append( ir.Label( name = entry.name ))
+			# see build_epilogue_ladder()'s own identical comment
+			if entry.captured:
+				instructions.append( ir.Label( name = entry.name ))
 			if not entry.cancelled:
 				instructions += self._replay( entry, get_is_err_check )
 		del self._epilogue_stack[scope.boundary_depth:]

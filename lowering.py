@@ -1546,6 +1546,25 @@ class Lowering:
 		self.discovery.fail( f'{target.qualname}: cannot locate the call-site argument for parameter {param.stem!r}', node )
 
 
+@dataclass
+class _LoopContext:
+	''' one entry of FunctionLowering._loop_labels - a for/while loop
+	currently being lowered. continue_captured tracks whether a `continue`
+	anywhere in the body actually emitted a Jump into continue_label - a
+	for-loop's continue_label is a synthesized fallthrough point (the
+	increment/back-edge code), not something the loop's own control flow
+	ever jumps to on its own, so if no `continue` ever captured it, the
+	label itself must be omitted rather than emitted-then-unused (a bare
+	`goto`-less C label triggers -Wunused-label/C4102 on every compiler).
+	A while-loop's continue_label is start_label instead, always already
+	captured by the loop's own back edge, so this only matters for the
+	three for-loop lowerers. '''
+	continue_label: str
+	break_label: str
+	loop_snapshot: object
+	continue_captured: bool = False
+
+
 class FunctionLowering:
 	'''
 	Everything Lowering.lower_function/lower_global need that's scoped to ONE
@@ -1577,7 +1596,7 @@ class FunctionLowering:
 		self._current_fn = fn
 		self._arithmetic_mode: list[arithmetic_mode.ArithmeticMode] = [ arithmetic_mode.ArithmeticChecked() ]
 		self._loop_depth = 0
-		self._loop_labels: list[tuple[str,str]] = []
+		self._loop_labels: list[_LoopContext] = []
 		self._in_deferred_body = False
 		# set (briefly, restored in a finally) only around _lower_scalar_cast's
 		# own literal-argument branch - an EXPLICIT cast on a literal
@@ -4386,7 +4405,10 @@ class FunctionLowering:
 		test = self._lower_expr( node.test, bool_cls )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		# continue_captured unused here - start_label (this loop's own
+		# continue target) is always jumped to by the back edge below
+		# regardless of whether the body itself ever uses `continue`
+		break_narrowed, break_live, _ = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4425,9 +4447,10 @@ class FunctionLowering:
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
-	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> tuple[list[dict[str,list[Variable]]],list[set[str]]]:
+	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> tuple[list[dict[str,list[Variable]]],list[set[str]],bool]:
 		self._loop_depth += 1
-		self._loop_labels.append(( continue_label, break_label, loop_snapshot ))
+		ctx = _LoopContext( continue_label = continue_label, break_label = break_label, loop_snapshot = loop_snapshot )
+		self._loop_labels.append( ctx )
 		# see cfg.py's CFGState.enter_loop's own docstring: lets
 		# current_epilogue_label() recognize an RC entry pushed while
 		# lowering THIS body as loop-confined (restore(), called once this
@@ -4453,7 +4476,7 @@ class FunctionLowering:
 			break_narrowed, break_live = self._cfg.exit_loop()
 			self._loop_labels.pop()
 			self._loop_depth -= 1
-		return break_narrowed, break_live
+		return break_narrowed, break_live, ctx.continue_captured
 
 	def _check_loop_exit_unchecked_results( self, loop_snapshot: object, node: ast.AST ) -> None:
 		try:
@@ -4464,7 +4487,8 @@ class FunctionLowering:
 	def _stmt_Break( self, node: ast.Break ) -> None:
 		if not self._loop_labels:
 			self.lowering.discovery.fail( 'break outside a loop', node )
-		_, break_label, loop_snapshot = self._loop_labels[-1]
+		ctx = self._loop_labels[-1]
+		break_label, loop_snapshot = ctx.break_label, ctx.loop_snapshot
 		self._check_loop_exit_unchecked_results( loop_snapshot, node )
 		# Phase 8: capture whatever's narrowed RIGHT HERE, at the exact
 		# point this break fires - cfg.py's record_break_narrowed() files
@@ -4484,7 +4508,9 @@ class FunctionLowering:
 	def _stmt_Continue( self, node: ast.Continue ) -> None:
 		if not self._loop_labels:
 			self.lowering.discovery.fail( 'continue outside a loop', node )
-		continue_label, _, loop_snapshot = self._loop_labels[-1]
+		ctx = self._loop_labels[-1]
+		continue_label, loop_snapshot = ctx.continue_label, ctx.loop_snapshot
+		ctx.continue_captured = True
 		self._check_loop_exit_unchecked_results( loop_snapshot, node )
 		for instr in self._cfg.unwind_to( loop_snapshot ):
 			self._emit( instr )
@@ -4608,7 +4634,7 @@ class FunctionLowering:
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4624,7 +4650,11 @@ class FunctionLowering:
 		# used by _stmt_While
 		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
-		self._emit( ir.Label( name = continue_label ))
+		# continue_label is purely a fallthrough landing (the increment
+		# below) unless some `continue` in the body actually jumped to it -
+		# an un-goto'd label triggers -Wunused-label/C4102
+		if continue_captured:
+			self._emit( ir.Label( name = continue_label ))
 		# the increment is a compiler-synthesized implementation detail of
 		# the loop, not user-written arithmetic - it's structurally
 		# guaranteed safe (target_var < stop_var strictly before every
@@ -4693,7 +4723,7 @@ class FunctionLowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4704,7 +4734,9 @@ class FunctionLowering:
 		# Phase 8 - see _lower_for_range's own identical call/comment
 		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
-		self._emit( ir.Label( name = continue_label ))
+		# see _lower_for_range's own identical comment on continue_captured
+		if continue_captured:
+			self._emit( ir.Label( name = continue_label ))
 		incr = self._new_temp( usize_cls )
 		self._emit( ir.AddWrap( dest = incr, left = index_var, right = ir.Const( type = usize_cls, value = 1 ) ))
 		self._emit( ir.Assign( dest = index_var, src = incr ))
@@ -4794,7 +4826,7 @@ class FunctionLowering:
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
 
-		break_narrowed, break_live = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
+		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
 			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
 		except CompileError as e:
@@ -4805,7 +4837,9 @@ class FunctionLowering:
 		# Phase 8 - see _lower_for_range's own identical call/comment
 		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
-		self._emit( ir.Label( name = continue_label ))
+		# see _lower_for_range's own identical comment on continue_captured
+		if continue_captured:
+			self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
