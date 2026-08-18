@@ -10124,6 +10124,55 @@ class DefiniteAssignmentTests( unittest.TestCase ):
 		]))
 		self.assertTrue( any( "'x' is not initialized on all code branches" in e for e in errors ) )
 
+	def test_nested_if_else_both_terminating_does_not_wipe_liveness_of_unrelated_param( self ) -> None:
+		# real bug: _stmt_diverges only recognized a LITERAL Return/Break/
+		# Continue as its own last statement, never a nested if/else whose
+		# OWN two branches both terminate - so an outer if-branch ending in
+		# such a nested if/else was wrongly treated as falling through to
+		# the join point. merge_if's ordinary (non-terminating) path then
+		# intersected that branch's genuinely-empty post-terminator live
+		# set against the other (implicit, no-else) branch's full live set,
+		# wiping out even ordinary, always-bound parameters read afterward.
+		errors = self._errors( '\n'.join([
+			'def main( cond: bool, other: bool ) -> None:',
+			'	if cond:',
+			'		if other:',
+			'			return',
+			'		else:',
+			'			return',
+			'	if other:',
+			'		return',
+			'	return',
+		]))
+		self.assertEqual( errors, [] )
+
+	def test_match_with_all_arms_returning_inside_if_does_not_wipe_liveness_of_unrelated_param( self ) -> None:
+		# the shape this was actually found in (lib/http/client.py's
+		# _encode_body): an exhaustive `match` (every arm returns) as the
+		# last statement of an `if`-branch, desugared by type_resolver.py's
+		# visit_Match into a chained ast.If (not a literal Return) - same
+		# root cause as the plain nested-if case above, via the identical
+		# _stmt_diverges blind spot.
+		errors = self._errors( '\n'.join([
+			'def parse( s: str ) -> Result[str,str]:',
+			'	return Result.Ok( s )',
+			'',
+			'def main( data: str|None, form: str|None, json_value: str|None ) -> str:',
+			'	if json_value is not None:',
+			'		jv: str = json_value',
+			'		match parse( jv ):',
+			'			case Result.Ok( text ):',
+			'				return text',
+			'			case Result.Err( _ ):',
+			'				return "err"',
+			'	if form is not None:',
+			'		return form',
+			'	if data is not None:',
+			'		return data',
+			'	return "none"',
+		]))
+		self.assertEqual( errors, [] )
+
 
 if __name__ == '__main__':
 	logging.basicConfig( level = logging.DEBUG )
