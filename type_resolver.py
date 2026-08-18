@@ -186,6 +186,7 @@ class TypeResolver:
 		# once, lazily, the first time an RCClass actually needs one
 		self._sys_free_scheduled: bool = False
 		self._destructors_synthesized: set[int] = set()
+		self._constructors_synthesized: set[int] = set() # id(RCClass) -> $$__new__ already synthesized - see _synthesize_rcclass_constructor
 		self._dtor_label_id = 0
 		self._sys_functions: dict[str,Function] = {}
 		# re-entrancy guard for _schedule_uniontype_storage: union_storage.
@@ -2400,6 +2401,237 @@ class TypeResolver:
 		)
 		fn.add_name( 'self', self_param )
 		self.schedule( fn )
+
+	def _synthesize_rcclass_constructor( self, cls: RCClass, init: Function ) -> None:
+		''' build an AST Function for $$__new__ - a per-class constructor
+		mirroring _synthesize_rcclass_destructor: allocate a raw,
+		uninitialized instance (compiler.__raw_alloc__) and call the
+		class's own __init__ on it, so every Foo(...) call site
+		(lowering.py's _try_lower_construct_call) can call this ONE
+		function instead of inlining alloc+header-init+__init__-call
+		machinery at every construction site. Unlike the destructor, this
+		is called DIRECTLY BY NAME - construction always knows its concrete
+		class statically, never dispatched through a vtable - so it needs
+		no emitter special-casing at all, ordinary Function emission
+		handles it.
+
+		Called ONLY eagerly from _try_lower_construct_call itself, never
+		from compiler._lower's own class-registration trigger the way the
+		destructor is: unlike the destructor (needed for every RCClass,
+		since any instance, however constructed, might need releasing),
+		$$__new__ is only ever needed by an actual `Foo(...)` construction
+		call site, which already synthesizes it eagerly itself, at the
+		exact moment it needs the live Function object (schedule() is a
+		deferred queue that can't guarantee that timing). Synthesizing it
+		unconditionally for every REGISTERED class too, regardless of
+		whether anything ever actually constructs it, was tried and
+		reverted: it forced a vtable reference (the header.vtable
+		assignment inside $$__new__'s own body) for classes never meant to
+		be constructed at all - a real regression, confirmed by a test
+		asserting an abstract base class, only ever used polymorphically
+		through a subclass, never gets its own vtable INSTANCE emitted.
+
+		`init` is used AS-IS instead of being re-derived via
+		cls.get_local('__init__') - required for a monomorphized generic
+		class: _try_lower_construct_call's own eager call already holds
+		the correctly-monomorphized __init__ (T substituted to the real
+		concrete type) as a local (_lower_generic_construction_args' own
+		monomorphized_init) - re-deriving it here via a fresh
+		cls.get_local('__init__') lookup instead is NOT reliably the same
+		object (confirmed by a real repro: Box(7) with T inferred purely
+		from the argument, no surrounding annotation - the fresh lookup
+		here produced an __init__ whose own parameter type was still the
+		bare, unsubstituted TypeVar T, crashing the emitter outright once
+		it tried to mangle a TypeVar into a C type). '''
+		if cls.type_params:
+			return  # only concrete RCClasses get a constructor
+		if id( cls ) in self._constructors_synthesized:
+			return
+		self._constructors_synthesized.add( id( cls ))
+
+		if cls.resolve is not None:
+			cls.resolve()
+		if not isinstance( init, Function ):
+			return  # an Overload - lowering.py's _try_lower_construct_call already rejects this case with its own error message
+		if init.resolve is not None:
+			init.resolve()
+		if any( p.is_vararg or p.is_kwarg or p.is_move or p.is_copy for p in ( init.parameters or [] )):
+			# no real __init__ in this codebase declares any of these -
+			# forwarding them correctly (re-spelling *args/**kwargs
+			# unpacking, or the explicit move(x)/copy(x) call-site marker
+			# move[T]/copy[T] params require) through a synthesized AST
+			# body is unsupported for now rather than silently miscompiled
+			self.discovery.fail(
+				f'{init.qualname}: *args/**kwargs/move[T]/copy[T] parameters are not supported yet for construction',
+				init.node,
+			)
+
+		none_type = self.discovery.get_none_type()
+		# fallibility check mirrors lowering.py's own Lowering._init_
+		# fallibility exactly (duplicated, not shared - that one lives on
+		# Lowering, not TypeResolver). _result_shape/find_name_or_none
+		# resolve 'Result' relative to discovery.module_stack[-1] - safe
+		# when this method runs eagerly (mid-lowering of some real
+		# function, module_stack already correctly populated), but
+		# module_stack can be genuinely EMPTY when reached from compiler.
+		# py's own class-registration trigger instead (confirmed by a real
+		# crash: IndexError in find_name_or_none, from a merged-executable
+		# test where no eager construction call site ever ran first) -
+		# push cls's own declaring module explicitly, same as
+		# resolve_function_body's own module_context push, so this is
+		# correct regardless of which trigger reached it first
+		with self.discovery.module_context( self._find_module_for( cls )):
+			if init.return_type is none_type:
+				fallible = False
+				error_cls = None
+				result_cls = None
+			else:
+				shape = self._result_shape( init.return_type )
+				if shape is None or shape[0] is not none_type:
+					self.discovery.fail(
+						f'{init.qualname} must return None or Result[None,_], got '
+						f'{init.return_type.qualname if init.return_type else None}',
+						init.node,
+					)
+				fallible = True
+				error_cls = shape[1]
+				result_cls = self.discovery.find_name_or_none( 'Result' )
+
+		qualname = f'{cls.qualname}$$__new__'
+		new_params: list[Parameter] = []
+		for p in ( init.parameters or [] ):
+			new_params.append( Parameter(
+				stem = p.stem, qualname = f'{qualname}.{p.stem}',
+				file = cls.file, line = cls.line, type = p.type,
+				is_posonly = p.is_posonly, is_kwonly = p.is_kwonly,
+			))
+
+		# self = compiler.__raw_alloc__(<cls>) - <cls> handed over directly
+		# via the resolved_type escape hatch (no natural source-level
+		# spelling for a monomorphized generic class - same technique the
+		# destructor's own <sys.free.ptr> node above uses)
+		class_ref = ast.Name( id = '<$$__new__.cls>', ctx = ast.Load() )
+		class_ref.resolved_type = cls
+		self_assign = ast.Assign(
+			targets = [ ast.Name( id = 'self', ctx = ast.Store() ) ],
+			value = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = '__raw_alloc__', ctx = ast.Load() ),
+				args = [ class_ref ], keywords = [],
+			),
+		)
+
+		# self.__init__(<forward every param>) - kwonly params must be
+		# forwarded as keywords (Python calling convention), everything
+		# else positionally; new_params' own stems/order are a direct 1:1
+		# copy of init.parameters, so this is always a valid, complete call
+		init_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__init__', ctx = ast.Load() ),
+			args = [ ast.Name( id = p.stem, ctx = ast.Load() ) for p in new_params if not p.is_kwonly ],
+			keywords = [ ast.keyword( arg = p.stem, value = ast.Name( id = p.stem, ctx = ast.Load() ) ) for p in new_params if p.is_kwonly ],
+		)
+
+		body: list[ast.stmt] = [ self_assign ]
+		if not fallible:
+			body.append( ast.Expr( init_call ))
+			body.append( ast.Return( value = ast.Name( id = 'self', ctx = ast.Load() )))
+			return_type: Type = cls
+		else:
+			body.append( ast.Assign( targets = [ ast.Name( id = 'result', ctx = ast.Store() ) ], value = init_call ))
+			is_err_call = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'result', ctx = ast.Load() ), attr = 'is_err', ctx = ast.Load() ),
+				args = [], keywords = [],
+			)
+			# Result.Err(result.data.v_Err) - same union-payload shape
+			# _emit_fallible_construction's own former Err branch used
+			err_expr = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+				args = [ ast.Attribute(
+					value = ast.Attribute( value = ast.Name( id = 'result', ctx = ast.Load() ), attr = 'data', ctx = ast.Load() ),
+					attr = 'v_Err', ctx = ast.Load(),
+				) ], keywords = [],
+			)
+			raw_free_stmt = ast.Expr( ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = '__raw_free__', ctx = ast.Load() ),
+				args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+			))
+			body.append( ast.If(
+				test = is_err_call,
+				body = [ raw_free_stmt, ast.Return( value = err_expr ) ],
+				orelse = [],
+			))
+			# self is fully constructed here. Result.Ok(self)'s own
+			# construction takes an INDEPENDENT incref'd copy of self for
+			# the payload it builds (confirmed empirically: returning
+			# Result.Ok(self) directly, relying on self's own scope-exit
+			# epilogue to release its original reference, leaked one ref
+			# per successful construction - the returned expression is
+			# Result.Ok(self)'s OWN result, not self itself, so the "return
+			# your own local directly, skip its release" fast path the
+			# plain non-fallible branch above relies on never applies here)
+			# - self's own original reference is a SEPARATE unit that still
+			# needs its own explicit release, same as the old raw-IR
+			# _emit_fallible_construction's own Ok branch had to do by hand.
+			#
+			# The intermediate `ok` local needs an explicit Result[cls,
+			# error_cls] annotation - Result.Ok(value)'s own E type param
+			# can never be inferred from `value: T` alone (SYNTAX.md/
+			# _lower_generic_construction_args's own comment on this), so a
+			# bare, un-annotated `ok = Result.Ok(self)` fails to infer E.
+			# For a MONOMORPHIZED GENERIC cls specifically, a by-name
+			# annotation (Result[Box, error_cls], built from cls.stem)
+			# would be actively WRONG, not just unspellable: cls.stem is
+			# still the ABSTRACT template's own bare name ('Box'), so
+			# ordinary scope lookup resolves the annotation's own T slot to
+			# the wrong (abstract) class - which then conflicts with T
+			# ALSO being inferred, correctly, as the concrete Box[i32] from
+			# self's own argument type, a genuine "T inferred as both X and
+			# Y" compile error (confirmed by a real repro: RCClassConstruct
+			# Tests' own generic-init-construction fallible-wrapping tests,
+			# which construct exactly this shape). Uses discovery.py's own
+			# node.resolved_type escape hatch instead (this session's own
+			# addition to visit_Name, mirroring the identical, already-
+			# established lowering.py-side convention _lower_compiler_cast/
+			# _lower_compiler_raw_alloc's own arguments already use) -
+			# tags a single Name node with the already-built, concrete
+			# Result[cls,error_cls] Specialization object directly
+			return_type = self.discovery._get_or_create_specialization( result_cls, [ cls, error_cls ])
+			ok_expr = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+				args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+			)
+			ok_annotation = ast.Name( id = '<$$__new__.result_type>', ctx = ast.Load() )
+			ok_annotation.resolved_type = return_type
+			decref_self_stmt = ast.Expr( ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+				args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
+			))
+			body.append( ast.AnnAssign( target = ast.Name( id = 'ok', ctx = ast.Store() ), annotation = ok_annotation, value = ok_expr, simple = 1 ))
+			body.append( decref_self_stmt )
+			body.append( ast.Return( value = ast.Name( id = 'ok', ctx = ast.Load() )))
+
+		node = ast.FunctionDef(
+			name = '$$__new__',
+			args = ast.arguments(
+				posonlyargs = [], args = [], vararg = None,
+				kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [],
+			),
+			body = body, decorator_list = [], returns = None, type_params = [],
+			lineno = cls.line or 1, col_offset = 0,
+			end_lineno = cls.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( node )
+
+		fn = Function(
+			stem = '$$__new__', qualname = qualname,
+			file = cls.file, line = cls.line,
+			cls = cls, node = node,
+			parameters = new_params, return_type = return_type,
+			is_static = True, resolve = None,
+		)
+		for p in new_params:
+			fn.add_name( p.stem, p )
+		self.schedule( fn )
+		cls.add_name( '$$__new__', fn )
 
 	def _build_field_teardown_ast( self, field_expr: ast.Attribute, field_type: Type ) -> list[ast.stmt]:
 		''' recursively build AST statements to decref every RC leaf

@@ -2434,7 +2434,7 @@ class FunctionLowering:
 		# used to fall back to the generic per-class destructor's
 		# unconditional field cascade, independently releasing the same
 		# attribute again; that fallback is gone now (see
-		# _emit_fallible_construction's own comment on why it had to be
+		# _lower_compiler_raw_free's own comment (used by the synthesized $$__new__'s Err branch) on why it had to be
 		# removed - it also unconditionally touched attributes that were
 		# NEVER assigned at all, reading uninitialized memory), so this
 		# construction's own inline unwind is now the ONLY place whichever
@@ -3327,6 +3327,9 @@ class FunctionLowering:
 		if self.lowering._is_compiler_call( node.value ) == 'decref_dynamic':
 			self._lower_compiler_decref_dynamic( node.value )
 			return
+		if self.lowering._is_compiler_call( node.value ) == '__raw_free__':
+			self._lower_compiler_raw_free( node.value )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.lowering.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -3862,6 +3865,36 @@ class FunctionLowering:
 			opcode, extra = self._arithmetic_mode[-1].GetCast()
 		return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
 
+	def _lower_compiler_raw_alloc( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.__raw_alloc__(T) - allocate a fresh RCClass instance with
+		# every field left UNINITIALIZED: no field validation, no __init__
+		# call. This is the exact alloc _try_lower_construct_call used to
+		# emit inline (dest = new temp, schedule sys.alloc[T], ir.Allocate
+		# with an empty fields dict) - factored out here so a synthesized
+		# $$__new__ body (type_resolver.py's
+		# _synthesize_rcclass_constructor) can spell "allocate self, THEN
+		# call __init__ myself" as ordinary AST rather than raw IR. Not
+		# meant for ordinary user code (there's no field-completeness check
+		# at all - the caller is on the hook for calling __init__ or
+		# compiler.__raw_free__'ing it before it ever escapes), same
+		# internal-only posture as compiler.decref_dynamic.
+		#
+		# node.args[0].resolved_type, like compiler.cast's first argument,
+		# lets compiler-synthesized AST hand over a concrete RCClass object
+		# directly (including a monomorphized generic with no user-
+		# spellable name), bypassing ordinary namespace resolution.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__raw_alloc__(...) takes exactly one argument: {ast.unparse(node)}', node )
+		target_type = getattr( node.args[0], 'resolved_type', None )
+		if target_type is None:
+			target_type = self.lowering._try_resolve_namespace( node.args[0] )
+		if not isinstance( target_type, RCClass ):
+			self.lowering.discovery.fail( f'compiler.__raw_alloc__(...) argument must be a concrete RCClass: {ast.unparse(node)}', node )
+		dest = self._new_temp( target_type )
+		self.lowering._schedule_rcclass_construction( target_type, dest.type )
+		self._emit( ir.Allocate( dest = dest, cls = target_type, fields = {} ))
+		return dest
+
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.cast(T, x) - T is a TYPE reference (resolved via
 		# _try_resolve_namespace, same as compiler.sizeof's argument, not
@@ -4036,6 +4069,41 @@ class FunctionLowering:
 			f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
 			node,
 		)
+
+	def _lower_compiler_raw_free( self, node: ast.Call ) -> None:
+		# compiler.__raw_free__(x) - free a raw, not-yet-fully-alive RCClass
+		# allocation (compiler.__raw_alloc__'s own product, once __init__
+		# has failed) WITHOUT running the class's real destructor. An
+		# ordinary decref-to-zero would call the synthesized
+		# $$__destructor__, which reads every field as though __init__ had
+		# already populated them - on a raw, not-yet-initialized alloc
+		# that's still garbage, a real heap-corruption bug (see
+		# type_resolver.py's _synthesize_rcclass_constructor, fallible
+		# body, and _emit_fallible_construction's own former Err branch,
+		# whose logic this generalizes). Frees the backing storage directly
+		# via sys.free - the same thing _synthesize_rcclass_destructor's
+		# own step 3 does, skipping its __del__/field-cascade steps 1/2
+		# entirely - then cancels x's pending automatic scope-exit release
+		# via manually_decreffed, the same pairing compiler.decref(x) uses
+		# just above, minus the real Decref that precedes it there.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__raw_free__(...) takes exactly one argument: {ast.unparse(node)}', node )
+		operand = self._lower_expr( node.args[0], None )
+		if not isinstance( operand.type, RCClass ):
+			self.lowering.discovery.fail(
+				f'compiler.__raw_free__(...) argument must be a bare RCClass value, not '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		sys_module = self.lowering.discovery.modules['sys']
+		free_overload = sys_module.get_local( 'free' )
+		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
+		self.lowering._ensure_resolved( free_fn )
+		cast_dest = self._new_temp( free_fn.parameters[0].type )
+		self._emit( ir.CastWrap( dest = cast_dest, operand = operand ))
+		self._emit( ir.Call( dest = None, target = free_fn, receiver = None, args = [ cast_dest ], kwargs = {} ))
+		for instr in self._cfg.manually_decreffed( operand ):
+			self._emit( instr )
 
 	def _lower_compiler_incref( self, node: ast.Call ) -> None:
 		# compiler.incref(x) — emit the real Incref sequence for x, via
@@ -9181,26 +9249,41 @@ class FunctionLowering:
 				self_type = target_cls
 				args, kwargs = self._lower_call_args( init, node )
 
-		# self_temp.type is self_type - already scheduled above (schedule
-		# (target_cls) for the plain case, _ensure_resolved(cls_spec) for the
-		# generic case), so no separate schedule() call is needed here.
-		# ir.Allocate's own `cls`, unlike self_temp.type, is always the
-		# ABSTRACT target_cls - the emitter only uses it for an RCClass-vs-not
-		# check, never field layout (values are in `fields`, and the mangled
-		# alloc name comes from dest.type, not cls - see emitter_c.py's own
-		# ir.Allocate handling)
-		self_temp = self._new_temp( self_type )
-		self.lowering._schedule_rcclass_construction( target_cls, self_temp.type )
-		self._emit( ir.Allocate( dest = self_temp, cls = target_cls, fields = {} ))
-
+		# self_type is either already concrete (plain/resolved_construction
+		# branches) or a generic-class Specialization (_lower_generic_
+		# construction_args' own cls_spec) - _ensure_resolved is a no-op-
+		# ish pass-through for an already-concrete class (same as
+		# elsewhere in this file), so this one line handles both uniformly
 		self.lowering.schedule( init.return_type )
 		for param in init.parameters or []:
 			self.lowering.schedule( param.type )
-
-		if not self.lowering._init_fallibility( init ):
-			self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
-			return self_temp
-		return self._emit_fallible_construction( node, self_type, init, self_temp, args, kwargs, expected_type )
+		if isinstance( self_type, Specialization ):
+			# self_type was already resolved above (either by this method's
+			# own earlier branches - target.schedule/_ensure_resolved(cls_spec)
+			# in _lower_generic_construction_args - or by resolved_construction's
+			# own pre-resolution) - re-calling _ensure_resolved would just
+			# redundantly re-schedule() the same Specialization a second
+			# time for no benefit (schedule()'s own id-based _seen dedup
+			# makes it harmless, just wasted work) - .monomorphized is the
+			# same cache Monomorphizer.monomorphize_class itself reads
+			# (mpy_types.py's Specialization), a plain, side-effect-free
+			# read of what's already there
+			concrete_cls = self_type.monomorphized if self_type.monomorphized is not None else self.lowering._ensure_resolved( self_type )
+		else:
+			concrete_cls = self_type
+		assert isinstance( concrete_cls, RCClass ), f'internal compiler error: {self_type=} did not resolve to a concrete RCClass'
+		# synthesize (idempotent, memoized) rather than rely solely on the
+		# compiler.py class-registration trigger - schedule() is a
+		# deferred queue, so THIS call site needs $$__new__'s live Function
+		# object available right now, not whenever it eventually gets
+		# dequeued (see _synthesize_rcclass_constructor's own docstring)
+		self.lowering._type_resolver._synthesize_rcclass_constructor( concrete_cls, init )
+		new_fn = concrete_cls.get_local( '$$__new__' )
+		assert isinstance( new_fn, Function ), f'internal compiler error: {concrete_cls.qualname} has no synthesized $$__new__'
+		self.lowering.schedule( new_fn.return_type )
+		dest = self._new_temp( new_fn.return_type )
+		self._emit( ir.Call( dest = dest, target = new_fn, receiver = None, args = args, kwargs = kwargs ))
+		return dest
 
 	def _lower_and_infer_call_args(
 		self, node: ast.Call, callee: Function, type_params: list[TypeVar], bindings: dict[int,Type], qualname: str,
@@ -9292,257 +9375,6 @@ class FunctionLowering:
 		self.lowering._ensure_resolved( cls_spec ) # also populates init_spec.monomorphized as a side effect - same (init, concrete_args) key monomorphize_class's own method-substitution loop uses
 		monomorphized_init = self.lowering._ensure_resolved( init_spec )
 		return cls_spec, monomorphized_init, args, kwargs
-
-	def _emit_fallible_construction(
-		self, node: ast.Call, concrete_cls: RCClass|Specialization, init: Function, self_temp: ir.Temp,
-		args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None,
-	) -> ir.Operand:
-		# __init__ is fallible (Result[None,E]) - Foo(...) becomes
-		# Result[Foo,E] (SYNTAX.md). The actual Ok/Err wrapping reuses REAL
-		# Result.Ok/Result.Err call-lowering (via synthesized AST
-		# referencing hidden locals - _declare_hidden_local, the same
-		# technique the for-loop scaffolding already uses) rather than
-		# hand-building ResultPayload's own internal shape here - only the
-		# branch structure itself (and self_temp's own decref on Err, not
-		# expressible as source syntax) is raw IR, mirroring
-		# _lower_conditional_dispatch's own style
-		init_result = self._new_temp( init.return_type )
-		self._emit( ir.Call( dest = init_result, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
-
-		# track_result=False throughout this method's own hidden locals -
-		# result_var/dest_var are compiler-internal Result-typed scaffolding
-		# (see cfg.assign()'s own comment): result_var's is_err-ness is
-		# already unconditionally checked right below by the synthesized
-		# branch itself (that's the whole point of this method), and
-		# dest_var is just a relay for whichever of ok_value/err_value wins -
-		# the REAL obligation lands on whatever binding the OUTER `Foo(...)`
-		# expression's own result gets assigned into, tracked normally there
-		unique = self._label_id
-		self_var = self._declare_hidden_local( f'__ctor_self_{unique}', concrete_cls, node )
-		for instr in self._cfg_assign( self_var, self_temp, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = self_var, src = self_temp ))
-
-		result_var = self._declare_hidden_local( f'__ctor_result_{unique}', init.return_type, node )
-		for instr in self._cfg_assign( result_var, init_result, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = result_var, src = init_result ))
-
-		# _result_shape, not init.return_type.args[1] directly -
-		# init.return_type may already be the real, monomorphized Result
-		# object itself (not a Specialization wrapper) - see Monomorphizer.
-		# origin_of's own docstring. Guaranteed to succeed here: the only
-		# caller (_try_lower_construct_call) already confirmed init is
-		# fallible (Result[None,_]-shaped) via _init_fallibility before
-		# ever reaching this method
-		error_cls = self.lowering._type_resolver._result_shape( init.return_type )[1]
-		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		outer_result_type = expected_type or self.lowering.discovery._get_or_create_specialization( result_cls, [ concrete_cls, error_cls ] )
-		dest_var = self._declare_hidden_local( f'__ctor_dest_{unique}', outer_result_type, node )
-
-		is_err_fn = self.lowering._attr_lookup_callable( init.return_type, 'is_err', node )
-		self.lowering._ensure_resolved( is_err_fn )
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		is_err_temp = self._new_temp( bool_cls )
-		self._emit( ir.Call( dest = is_err_temp, target = is_err_fn, receiver = result_var, args = [], kwargs = {} ))
-
-		err_label = self._new_label( 'ctor_err' )
-		end_label = self._new_label( 'ctor_end' )
-		# JumpIfTrue, not JumpIfFalse - is_err_temp holds is_err()'s own
-		# result, so a jump-to-err has to fire when it's TRUE (a bug found
-		# while prototyping Phase 2's fallible super().__init__() chaining -
-		# JumpIfFalse here meant "not an error -> jump to the error branch",
-		# inverted, for EVERY fallible RCClass __init__ in the language, not
-		# just a subclassed one - confirmed on a clean checkout before any
-		# RCClass-subclassing work, so unrelated to it beyond being how it
-		# was found)
-		self._emit( ir.JumpIfTrue( cond = is_err_temp, target = err_label ))
-
-		# Ok branch: self is fully constructed - hand it off. Result.Ok(...)'s
-		# own construction (field_value(), called from inside its body) takes
-		# an independent Incref'd copy of self_var for the Ok payload it
-		# builds - self_var's OWN original reference is a SEPARATE unit that
-		# still needs its own release, exactly once, on every path. Dropped
-		# right here (self_var's ownership "moves" into the Ok payload,
-		# leaving exactly the one Ok-owned reference alive) via cfg.decref()+
-		# manually_decreffed() - the same pair _lower_compiler_decref uses
-		# for compiler.decref(x) - rather than left to cfg's own automatic
-		# scope-exit release: self_var is pushed as one single, branch-
-		# unaware OWNED entry (this method never calls enter_branch()/
-		# restore() around the Ok/Err split below - it's raw Jump/Label IR,
-		# invisible to that reconciliation machinery), so a compile-time
-		# entry.cancelled=True in only ONE of the two branches would wrongly
-		# suppress the automatic release on the OTHER, still-live path too
-		# (confirmed by a real regression while fixing the Err-branch bug
-		# below: cancelling self_var's entry only in the Err branch's own
-		# lowering code silently deleted its release from the Ok/success
-		# path as well, since cfg tracks one flat sequence, not per-branch
-		# state - a leak, compiler.refcount() reading 3 instead of 1 after
-		# an otherwise-correct unwrap()). Explicitly decref'ing (and
-		# cancelling) self_var in BOTH branches, symmetrically, keeps cfg's
-		# single cancelled flag valid no matter which one actually runs -
-		# each runtime path already contains its own manual release before
-		# the shared epilogue is ever reached
-		ok_expr = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
-			args = [ ast.Name( id = self_var.stem, ctx = ast.Load() ) ], keywords = [],
-		)
-		ast.copy_location( ok_expr, node )
-		ok_value = self._lower_expr( ok_expr, outer_result_type )
-		for instr in self._cfg.decref( concrete_cls, self_var ):
-			self._emit( instr )
-		for instr in self._cfg.manually_decreffed( self_var ):
-			self._emit( instr )
-		for instr in self._cfg_assign( dest_var, ok_value, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = dest_var, src = ok_value ))
-		self._emit( ir.Jump( target = end_label ))
-
-		# Err branch: self never became valid - free its own storage (but
-		# __del__ is never invoked on it - SYNTAX.md), propagate the same
-		# error, re-wrapped for THIS construction's own Result[Foo,E].
-		#
-		# Deliberately NOT self._cfg.decref(concrete_cls, self_var) (an
-		# ordinary release_object() call, the same one used to destroy any
-		# fully-valid instance of concrete_cls): that goes through the
-		# class's single, shared vtable destructor (type_resolver.py's
-		# _synthesize_rcclass_destructor), which unconditionally (1) calls
-		# self.__del__() if declared - forbidden here by SYNTAX.md - and (2)
-		# decrefs EVERY RC-typed attribute, including ones this __init__
-		# never reached an assignment for on the path that actually failed.
-		# self is only PARTIALLY constructed here - an attribute release_
-		# object's destructor reads is whatever raw bytes sys.alloc's
-		# allocator happened to return, not a valid reference - releasing it
-		# is a real, confirmed STATUS_HEAP_CORRUPTION (0xC0000374), reading/
-		# decrementing a refcount through a garbage pointer. __init__'s own
-		# Err-path return_() unwind (_stmt_Return's construction_err_path
-		# special case - see its own comment) already released whichever RC
-		# attributes IT assigned, using its own precise, path-sensitive CFG
-		# state; self's underlying allocation just needs freeing now, exactly
-		# like _synthesize_rcclass_destructor's own step 3 (sys.free(self)),
-		# skipping its steps 1 (__del__) and 2 (field cascade) entirely -
-		# self_var's own refcount is guaranteed exactly 1 here (fresh from
-		# sys.alloc, never escaped anywhere else - check_self_escape()
-		# forbids passing self out of __init__ before construction completes,
-		# which this failed path never reaches), so there's no other owner to
-		# race with a bare free. manually_decreffed(self_var) still runs
-		# below, same as before - self_var's own epilogue entry (pushed by
-		# the _cfg_assign near this method's own top) still needs neutralizing
-		# regardless of which release mechanism actually ran, or the
-		# function's own scope-exit epilogue would try to release it a SECOND
-		# time on top of this
-		# emitted as raw IR (mirroring init_result's own ir.Call near this
-		# method's own top), NOT as synthesized-AST-plus-_lower_expr the way
-		# ok_expr/err_expr above are - unlike Result.Ok/Err (synthesized
-		# specifically to reuse REAL Result-construction lowering, per this
-		# method's own opening comment), sys.free(ptr) has no sugar worth
-		# reusing, and building it as `ast.Name(id='sys', ...)` was actually
-		# tried first and failed: _lower_expr re-resolves node.func's own
-		# receiver by ordinary namespace lookup before ever consulting node.
-		# resolved_callee, which only short-circuits OVERLOAD selection, not
-		# name resolution - "name 'sys' is not defined" in any file that
-		# never imports sys (confirmed by a real regression: lowering_test.
-		# py's own fallible-init shape test, whose fixture never imports
-		# sys). type_resolver.py's _synthesize_rcclass_destructor gets away
-		# with the identical AST shape only because its own FunctionDef is
-		# scheduled and resolved through the compiler's synthesized-code
-		# path, never through an ordinary file's own import-gated namespace
-		# at all
-		sys_module = self.lowering.discovery.modules['sys']
-		free_overload = sys_module.get_local( 'free' )
-		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
-		self.lowering._ensure_resolved( free_fn )
-		free_ptr_type = free_fn.parameters[0].type
-		# label before the cast - JumpIfTrue above jumps straight here
-		self._emit( ir.Label( name = err_label ))
-		cast_dest = self._new_temp( free_ptr_type )
-		self._emit( ir.CastWrap( dest = cast_dest, operand = self_var ))
-		self._emit( ir.Call( dest = None, target = free_fn, receiver = None, args = [ cast_dest ], kwargs = {} ))
-		for instr in self._cfg.manually_decreffed( self_var ):
-			self._emit( instr )
-		err_expr = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
-			args = [ ast.Attribute(
-				value = ast.Attribute( value = ast.Name( id = result_var.stem, ctx = ast.Load() ), attr = 'data', ctx = ast.Load() ),
-				attr = 'v_Err', ctx = ast.Load(),
-			) ], keywords = [],
-		)
-		ast.copy_location( err_expr, node )
-		err_value = self._lower_expr( err_expr, outer_result_type )
-		# dest_var was ALREADY assigned once above, in the Ok branch - cfg
-		# saw that assignment first (this method never calls enter_branch()/
-		# restore() around the Ok/Err split, so cfg's single flat pass has
-		# no notion that the two are mutually exclusive) and is therefore
-		# convinced dest_var is currently a live, OWNED Result value. Its
-		# own cfg_assign() below would "helpfully" emit a decref releasing
-		# dest_var's CURRENT value before overwriting it with err_value -
-		# correct for a genuine reassignment, but WRONG here: at runtime,
-		# whichever branch actually reaches this point, the Ok branch's own
-		# assignment never ran, so dest_var's storage is uninitialized
-		# garbage - releasing it is a real, confirmed crash (illegal
-		# instruction / access violation), found by a regression test that
-		# loops a failing fallible construction: the very FIRST failure at
-		# any given call site hits this, no loop required, just never
-		# exercised by any existing test since none of them construct a
-		# class whose __init__ can actually fail. cfg.move() here discards
-		# the Ok branch's own binding as a pure cancellation (no Incref/
-		# Decref - exactly like abandoning a value that was never really
-		# there) rather than a release, so the reassignment below sees
-		# dest_var as un-owned and skips the bogus stale-value decref;
-		# move() also collapses both branches onto the SAME epilogue entry
-		# (reused, not duplicated) so whichever value dest_var ends up
-		# holding still gets released exactly once downstream
-		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
-			self._emit( instr )
-		for instr in self._cfg_assign( dest_var, err_value, is_alias = False, node = node, track_result = False ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = dest_var, src = err_value ))
-		self._emit( ir.Label( name = end_label ))
-		# dest_var is a persistent hidden-local Variable (needed above so the
-		# synthesized Result.Ok/Err ast.Call machinery has a real Name to
-		# reference), not an ir.Temp - but every OTHER Call in this file
-		# returns a genuine ir.Temp, and callers rely on that: _is_aliasing_
-		# expr treats `Foo(...)` (an ast.Call node) as always-fresh (is_alias
-		# =False, no Incref needed to store it into a new binding) on the
-		# assumption - stated in its own docstring - that "a well-behaved
-		# callee already accounts for that on its own side", i.e. hands back
-		# a value whose ownership transfers cleanly with a bare pointer copy.
-		# Returning dest_var directly broke that assumption: cfg.assign()'s
-		# own "ownership transfers into dest, untrack the momentary Temp"
-		# branch (see its own docstring) only ever fires for isinstance(src,
-		# ir.Temp), so `r = Foo(...)` left dest_var independently OWNED in
-		# cfg's own bookkeeping AT THE SAME TIME r became its own independent
-		# owner of the identical value - two tracked owners, one real
-		# reference, decref'd twice at scope exit. Confirmed by a real,
-		# repeated compile-and-run crash (segfault): two fallible
-		# constructions of the same class in one function, or a single one
-		# whose Result is retained/queried (.is_ok()) rather than immediately
-		# consumed, both over-released the constructed object.
-		#
-		# Moving dest_var's value into a genuine fresh Temp here (registered
-		# via fresh_temp(), exactly like every Call/Allocate dest already is
-		# in _emit()) restores that contract: cfg.move() cancels dest_var's
-		# own pending epilogue decref (ownership transfers out, no Incref/
-		# Decref of its own), and the Temp then gets the SAME automatic
-		# handling as any other fresh Call result - untracked cleanly if
-		# consumed into a new binding (`r = Foo(...)`), or self-released by
-		# its own DeleteTemp at the end of this statement if merely used as
-		# a transient receiver (`Foo(...).unwrap(...)`) and never bound at
-		# all. The naive alternative (just cfg.move()-ing dest_var and
-		# returning it as-is, tried first) fixed the crash above but broke
-		# the OTHER direction instead - a real, confirmed LEAK: dest_var's
-		# own release is what balances Result.Ok's own retain_object() when
-		# nothing else ever claims independent ownership of that reference
-		# (e.g. a receiver never stored into a named binding), and simply
-		# cancelling it with nothing left to release it lost that reference
-		# forever. compiler.refcount() on the unwrapped value read 3 (should
-		# have been 1) before this Temp indirection was added.
-		for instr in self._cfg.move( dest_var, target_qualname = concrete_cls.qualname, param_stem = dest_var.stem ):
-			self._emit( instr )
-		final = self._new_temp( outer_result_type )
-		self._emit( ir.Assign( dest = final, src = dest_var ))
-		self._cfg.fresh_temp( final, outer_result_type )
-		return final
 
 	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
 		# ScalarName(x) - Python's own int(x)/float(x)-style constructor-as-
@@ -10760,6 +10592,10 @@ class FunctionLowering:
 
 			case 'cast':
 				result = self._lower_compiler_cast( node, expected_type )
+				return result if want_result else None
+
+			case '__raw_alloc__':
+				result = self._lower_compiler_raw_alloc( node, expected_type )
 				return result if want_result else None
 
 			case 'addrof':
