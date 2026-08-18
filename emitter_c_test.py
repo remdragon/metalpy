@@ -12696,6 +12696,218 @@ def main() -> i32:
 		] )
 
 
+class BytesByteArrayFindSplitStartswithEndswithTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' find()/split()/startswith()/endswith() for bytes and bytearray
+	(lib/builtins/__init__.py) - missing gap surfaced by hand-writing an
+	HTTP request-line parser against raw socket-received bytes (there was
+	no way to find(b'\\r\\n')/split(b' ')/startswith(b'GET') on bytes at
+	all before this). Mirrors str's own find()/split()/startswith()/
+	endswith(), with the corrected isize/-1-sentinel find() convention
+	from the start (bytes has no Result-returning history to fix). bytes
+	has no __eq__, so content checks decode() to str first.
+
+	needle/prefix/suffix/sep parameters are bytes|bytearray, and bare
+	literal receivers/arguments are used directly throughout - both now
+	work because _expr_Constant's literal self-typing chain gained a
+	bytes branch (previously bytes literals could not infer their type
+	either as a union member or as a bare method-call receiver; see
+	[[bytes_literal_type_inference_gaps_fixed]]). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'bytes_find_found_and_not_found', '''
+def main() -> i32:
+	data: bytes = b'deadbeef-dead-beef-dead-beefdeadbeef'
+	if data.find( b'-' ) != isize( 8 ):
+		return 1
+	if data.find( b'zzz' ) != isize( -1 ):
+		return 2
+	if data.find( b'' ) != isize( 0 ):
+		return 3
+	# explicit start offset - resumes past the first match
+	if data.find( b'-', 9 ) != isize( 13 ):
+		return 4
+	if data.find( b'toolongtoolongtoolongtoolongtoolongtoolong' ) != isize( -1 ):
+		return 5
+	return 0
+''' ),
+			( 'bytes_split_http_request_line', '''
+def main() -> i32:
+	line: bytes = b'GET / HTTP/1.1'
+	parts: list[bytes] = line.split( b' ' )
+	if parts.__len__() != 3:
+		return 1
+	p0: bytes = parts.__getitem__( 0 ).unwrap( 'x' )
+	p1: bytes = parts.__getitem__( 1 ).unwrap( 'x' )
+	p2: bytes = parts.__getitem__( 2 ).unwrap( 'x' )
+	if p0.decode().unwrap( 'x' ) != 'GET':
+		return 2
+	if p1.decode().unwrap( 'x' ) != '/':
+		return 3
+	if p2.decode().unwrap( 'x' ) != 'HTTP/1.1':
+		return 4
+	return 0
+''' ),
+			# a bare bytes literal receiver throughout - no typed-local
+			# workaround needed now that literal receivers self-type
+			( 'bytes_split_edge_cases', '''
+def main() -> i32:
+	empty: list[bytes] = b''.split( b',' )
+	if empty.__len__() != 1:
+		return 1
+	e0: bytes = empty.__getitem__( 0 ).unwrap( 'x' )
+	if e0.decode().unwrap( 'x' ) != '':
+		return 2
+
+	leading: list[bytes] = b',a,b'.split( b',' )
+	if leading.__len__() != 3:
+		return 3
+	l0: bytes = leading.__getitem__( 0 ).unwrap( 'x' )
+	if l0.decode().unwrap( 'x' ) != '':
+		return 4
+
+	no_sep: list[bytes] = b'abc'.split( b',' )
+	if no_sep.__len__() != 1:
+		return 5
+	n0: bytes = no_sep.__getitem__( 0 ).unwrap( 'x' )
+	if n0.decode().unwrap( 'x' ) != 'abc':
+		return 6
+
+	consecutive: list[bytes] = b'a,,b'.split( b',' )
+	if consecutive.__len__() != 3:
+		return 7
+	c1: bytes = consecutive.__getitem__( 1 ).unwrap( 'x' )
+	if c1.decode().unwrap( 'x' ) != '':
+		return 8
+	return 0
+''' ),
+			( 'bytes_startswith_endswith', '''
+def main() -> i32:
+	data: bytes = b'GET / HTTP/1.1'
+	if not data.startswith( b'GET' ):
+		return 1
+	if data.startswith( b'POST' ):
+		return 2
+	if not data.endswith( b'HTTP/1.1' ):
+		return 3
+	if data.endswith( b'GET' ):
+		return 4
+	if not data.startswith( b'' ):
+		return 5
+	if not data.endswith( b'' ):
+		return 6
+	if data.startswith( b'toolongtoolongtoolongtoolongtoolongtoolong' ):
+		return 7
+	# explicit start offset
+	if not data.startswith( b'/', 4 ):
+		return 8
+	return 0
+''' ),
+			( 'bytearray_find_split_startswith_endswith', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 5 )
+	buf[0] = 104 # h
+	buf[1] = 101 # e
+	buf[2] = 108 # l
+	buf[3] = 108 # l
+	buf[4] = 111 # o
+	if buf.find( b'llo' ) != isize( 2 ):
+		return 1
+	if buf.find( b'zzz' ) != isize( -1 ):
+		return 2
+	if not buf.startswith( b'he' ):
+		return 3
+	if not buf.endswith( b'llo' ):
+		return 4
+
+	parts: list[bytearray] = buf.split( b'l' )
+	if parts.__len__() != 3:
+		return 5
+	p0: bytearray = parts.__getitem__( 0 ).unwrap( 'x' )
+	p2: bytearray = parts.__getitem__( 2 ).unwrap( 'x' )
+	if p0.decode().unwrap( 'x' ) != 'he':
+		return 6
+	if p2.decode().unwrap( 'x' ) != 'o':
+		return 7
+	# each split piece is independently owned - mutating one must not
+	# affect the source buffer or its siblings
+	p0[0] = 90 # 'Z' - was 'h'
+	if buf.__getitem__( 0 ).unwrap( 'x' ) != 104:
+		return 8
+	if p2.decode().unwrap( 'x' ) != 'o':
+		return 9
+	return 0
+''' ),
+			# find()/startswith()/endswith()/split()'s needle/sep parameter
+			# is bytes|bytearray - a bytearray needle now works directly
+			# against a bytes haystack, and vice versa, with no bytes(...)/
+			# bytearray(...) conversion needed on either side
+			( 'bytes_bytearray_cross_type_needle_haystack', '''
+def main() -> i32:
+	needle_ba: bytearray = bytearray( 5 )
+	needle_ba[0] = 119 # w
+	needle_ba[1] = 111 # o
+	needle_ba[2] = 114 # r
+	needle_ba[3] = 108 # l
+	needle_ba[4] = 100 # d
+	haystack: bytes = b'hello world'
+	if haystack.find( needle_ba ) != isize( 6 ):
+		return 1
+	if not haystack.endswith( needle_ba ):
+		return 2
+
+	haystack_ba: bytearray = bytearray( 11 )
+	src: bytes = b'hello world'
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 11:
+			haystack_ba[i] = src.get_const_ptr()[i]
+			i += 1
+	# bare bytes literal needle directly against a bytearray haystack
+	if haystack_ba.find( b'world' ) != isize( 6 ):
+		return 3
+	if not haystack_ba.startswith( b'hello' ):
+		return 4
+	return 0
+''' ),
+			# the actual data[:received]-then-parse shape a hand-rolled HTTP
+			# server needs: bytearray slicing (already supported) combined
+			# with find()/split()/startswith() on the trimmed result
+			( 'bytearray_slice_then_parse_request_line', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	src: bytes = b'GET /hello HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n'
+	received: usize = src.__len__()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < received:
+			buf[i] = src.get_const_ptr()[i]
+			i += 1
+	trimmed: bytearray = buf[:received]
+	line_end: isize = trimmed.find( b'\\r\\n' )
+	if line_end == isize( -1 ):
+		return 1
+	with compiler.panic_arithmetic( 'bounded by trimmed length' ):
+		line_end_u: usize = usize( line_end )
+	line: bytearray = trimmed[:line_end_u]
+	if not line.startswith( b'GET' ):
+		return 2
+	parts: list[bytearray] = line.split( b' ' )
+	if parts.__len__() != 3:
+		return 3
+	path: bytearray = parts.__getitem__( 1 ).unwrap( 'x' )
+	if path.decode().unwrap( 'x' ) != '/hello':
+		return 4
+	return 0
+''' ),
+		] )
+
+
 class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression coverage for a real, confirmed silent-data-corruption bug:
 	an `@extern` function declared with a `T|None` return type where T is a

@@ -162,11 +162,72 @@ class slice[T]:
 		return self.get_unchecked( index )
 
 
+# shared byte-level helpers for bytes.find()/bytearray.find() (etc.) - pure
+# sys.memcmp over an explicit length, unlike str.find()'s UTF-8-aware
+# reasoning: bytes/bytearray carry no UTF-8-validity or null-terminator
+# guarantee, so nothing here infers where a match "safely" lands, length is
+# always explicit. Free functions (not methods on either class) so the
+# actual scan logic isn't duplicated between bytes and bytearray - mirrors
+# how Codec.decode (lib/codecs/utf8.py) already operates generically over a
+# bytes|bytearray union via the public len()/get_const_ptr() accessors.
+# Same -1-means-not-found convention as str.find() (see str.find() below).
+def _bytes_find_at( haystack: bytes|bytearray, needle: bytes|bytearray, start: usize ) -> isize:
+	self_len: usize = len( haystack )
+	sub_len: usize = len( needle )
+	if start > self_len:
+		return isize( -1 )
+	if sub_len == 0:
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			return isize( start )
+	with compiler.wrap_arithmetic: # start <= self_len, just checked above
+		remaining: usize = self_len - start
+	if sub_len > remaining:
+		return isize( -1 )
+	with compiler.wrap_arithmetic: # sub_len <= self_len, just checked above
+		last_start: usize = self_len - sub_len
+	haystack_ptr: ConstPtr[u8] = haystack.get_const_ptr()
+	needle_ptr: ConstPtr[u8] = needle.get_const_ptr()
+	i: usize = start
+	with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+		while i <= last_start:
+			if sys.memcmp( haystack_ptr + i, needle_ptr, sub_len ) == 0:
+				return isize( i )
+			i += 1
+	return isize( -1 )
+
+def _bytes_startswith_at( haystack: bytes|bytearray, prefix: bytes|bytearray, start: usize ) -> bool:
+	self_len: usize = len( haystack )
+	prefix_len: usize = len( prefix )
+	if start > self_len:
+		return False
+	if prefix_len == 0:
+		return True
+	with compiler.wrap_arithmetic: # start <= self_len, just checked above
+		remaining: usize = self_len - start
+	if prefix_len > remaining:
+		return False
+	with compiler.wrap_arithmetic: # start bounded by self_len above
+		candidate: ConstPtr[u8] = haystack.get_const_ptr() + start
+	return sys.memcmp( candidate, prefix.get_const_ptr(), prefix_len ) == 0
+
+def _bytes_endswith( haystack: bytes|bytearray, suffix: bytes|bytearray ) -> bool:
+	self_len: usize = len( haystack )
+	suffix_len: usize = len( suffix )
+	if suffix_len == 0:
+		return True
+	if suffix_len > self_len:
+		return False
+	with compiler.wrap_arithmetic: # suffix_len <= self_len, just checked above
+		offset: usize = self_len - suffix_len
+		candidate: ConstPtr[u8] = haystack.get_const_ptr() + offset
+	return sys.memcmp( candidate, suffix.get_const_ptr(), suffix_len ) == 0
+
+
 class bytes:
 	__data: ConstPtr[u8]
-	
+
 	__len: usize
-	
+
 	def __init__( self, copy_from: bytes|bytearray ) -> None:
 		self.__len = len( copy_from )
 		data = sys.alloc[u8]( self.__len )
@@ -193,9 +254,55 @@ class bytes:
 	
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
-	
+
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		return utf8.decode( self )
+
+	def find( self, sub: bytes|bytearray, start: usize = 0 ) -> isize:
+		return _bytes_find_at( self, sub, start )
+
+	def startswith( self, prefix: bytes|bytearray, start: usize = 0 ) -> bool:
+		return _bytes_startswith_at( self, prefix, start )
+
+	def endswith( self, suffix: bytes|bytearray ) -> bool:
+		return _bytes_endswith( self, suffix )
+
+	@private
+	def _byte_slice( self, start: usize, end: usize ) -> bytes:
+		''' bytes [start, end) of self, as a new, independently-owned bytes -
+		the bytes-side counterpart to bytearray._byte_slice below. bytes has
+		no size-only public constructor (unlike bytearray), so this goes
+		through __allocate__ directly, the same way from_bytearray above
+		does. '''
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			piece_len: usize = end - start
+		new_data: Ptr[u8] = sys.alloc[u8]( piece_len )
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			src: ConstPtr[u8] = self.__data + start
+		sys.memcpy( new_data, src, piece_len )
+		return bytes.__allocate__( __data = new_data, __len = piece_len )
+
+	def split( self, sep: bytes|bytearray ) -> list[bytes]:
+		''' splits self on every occurrence of sep - same semantics as
+		str.split() (lib/builtins/__init__.py), built on find()/_byte_slice
+		above rather than its own scanning logic. sep must not be empty. '''
+		if len( sep ) == 0:
+			sys.panic( 'bytes.split(...): separator must not be empty' )
+		result: list[bytes] = list[bytes]()
+		self_len: usize = self.__len__()
+		sep_len: usize = len( sep )
+		start: usize = 0
+		while True:
+			found: isize = self.find( sep, start )
+			if found == isize( -1 ):
+				result.append( self._byte_slice( start, self_len )).unwrap( 'bytes.split: append failed' )
+				break
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				match_start: usize = usize( found )
+			result.append( self._byte_slice( start, match_start )).unwrap( 'bytes.split: append failed' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				start = match_start + sep_len
+		return result
 
 BYTEARRAY_INVALID: Ptr[u8] = 0 # this is a sentinel to indicate a bytearray was released - matches lib/windows/kernel32.py's own INVALID_HANDLE_VALUE convention (a literal assigned directly to its real pointer type, not a same-width integer alias needing its own cast at every comparison site)
 
@@ -224,6 +331,21 @@ class bytearray:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.get_const_ptr() called after release()'
 		return self.__data
+
+	def find( self, sub: bytes|bytearray, start: usize = 0 ) -> isize:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.find() called after release()'
+		return _bytes_find_at( self, sub, start )
+
+	def startswith( self, prefix: bytes|bytearray, start: usize = 0 ) -> bool:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.startswith() called after release()'
+		return _bytes_startswith_at( self, prefix, start )
+
+	def endswith( self, suffix: bytes|bytearray ) -> bool:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.endswith() called after release()'
+		return _bytes_endswith( self, suffix )
 
 	def __getitem__( self, index: usize ) -> Result[u8,IndexError]:
 		if compiler.target.debug:
@@ -272,6 +394,33 @@ class bytearray:
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			src: ConstPtr[u8] = self.__data + start
 		sys.memcpy( result.__data, src, piece_len )
+		return result
+
+	def split( self, sep: bytes|bytearray ) -> list[bytearray]:
+		''' splits self on every occurrence of sep - same semantics as
+		bytes.split()/str.split() above. Each returned piece is an
+		independently-owned, freshly-allocated bytearray (_byte_slice
+		always allocates+copies, never aliases self's own buffer), so
+		mutating one piece afterward cannot affect self or its siblings.
+		sep must not be empty. '''
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.split() called after release()'
+		if len( sep ) == 0:
+			sys.panic( 'bytearray.split(...): separator must not be empty' )
+		result: list[bytearray] = list[bytearray]()
+		self_len: usize = self.__len__()
+		sep_len: usize = len( sep )
+		start: usize = 0
+		while True:
+			found: isize = self.find( sep, start )
+			if found == isize( -1 ):
+				result.append( self._byte_slice( start, self_len )).unwrap( 'bytearray.split: append failed' )
+				break
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				match_start: usize = usize( found )
+			result.append( self._byte_slice( start, match_start )).unwrap( 'bytearray.split: append failed' )
+			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+				start = match_start + sep_len
 		return result
 
 class str:
