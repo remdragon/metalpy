@@ -18,6 +18,7 @@ The compiler pipeline:
 import argparse
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 
@@ -238,6 +239,24 @@ def main() -> None:
 			sys.exit( 1 )
 
 		print( f'mpy: built {exe_path}' )
+
+		# --- bundle runtime DLL dependencies declared via @extern(..., dll=...) -
+		# driven entirely by compiler.extern_dlls (populated only from functions
+		# actually reached/lowered, same reachability gate as extern_libs), never
+		# anything hardcoded to a particular library here. Best-effort: a missing
+		# DLL warns but doesn't fail the build - the exe already linked fine. ---
+		for dll_name in sorted( compiler.extern_dlls ):
+			found = linker_c.find_dll( dll_name )
+			if found is None:
+				print( f'mpy: warning: could not locate {dll_name} on PATH to bundle into '
+					f'{exe_path.parent} - the built exe may not run without it available at runtime', file = sys.stderr )
+				continue
+			dest = exe_path.parent / dll_name
+			try:
+				shutil.copy2( found, dest )
+				print( f'mpy: bundled {dest}' )
+			except OSError as e:
+				print( f'mpy: warning: could not bundle {found} to {dest}: {e}', file = sys.stderr )
 
 if __name__ == '__main__':
 	main()

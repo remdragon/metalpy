@@ -407,7 +407,22 @@ def malloc( size: usize ) -> Ptr[u8]:
 @extern( 'kernel32', 'HeapAlloc' )
 def HeapAlloc( hHeap: HANDLE, dwFlags: u32, dwBytes: usize ) -> Ptr[u8]:
 	...
+
+# Vendored/3rd-party DLL FFI, with a runtime bundling hint:
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
 ```
+
+`dll=` is optional and independent from the `lib` argument: `lib` ('tcl86t' above) is the
+import library linked against at build time, while `dll=` names the bare runtime DLL
+filename that must be loadable when the built program actually runs - the two can live in
+different directories on the build machine (e.g. a vendored library's `.lib` and `.dll`
+shipped separately). When a function declaring `dll=` is actually reached and compiled into
+the program, `mpy`'s build step locates that DLL on `PATH` and copies it next to the built
+executable automatically; a function that's declared but never called contributes nothing,
+and system DLLs (`kernel32`, `user32`, `ntdll`, ...) simply never declare `dll=` since
+they're always present on the target machine already.
 
 ### Target Platform Conditioning (`@compiler.target` & `compiler.target`)
 

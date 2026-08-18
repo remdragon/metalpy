@@ -504,6 +504,35 @@ def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool =
 	return f'{lib}.lib' if cc.name == 'cl' else f'-l{lib}'
 
 
+def find_dll( name: str ) -> Path|None:
+	'''
+	Locates a runtime DLL by bare filename (e.g. 'tcl86t.dll') for
+	bundling into a build's output directory - see mpy.py's post-link
+	step, driven by compiler.extern_dlls (populated from
+	@extern(..., dll=...) declarations on functions actually reached).
+
+	Searches PATH, in order - the same place a real Windows process
+	resolves an unqualified DLL import from, so "found here" is a direct
+	stand-in for "the exe would find this DLL too, if PATH weren't
+	different at run time" (e.g. on a machine without this build's own
+	dev tools installed). Not a general library search (no LIB/
+	LIBRARY_PATH, no system directories) - those are for the .lib import
+	library at link time, a different file that can live somewhere else
+	entirely (see mpy_types.Function.extern_dll's own comment).
+
+	Returns None (best-effort) if not found anywhere on PATH - mpy.py
+	warns and continues rather than failing the build over a bundling
+	step; the exe already linked successfully.
+	'''
+	for entry in os.environ.get( 'PATH', '' ).split( os.pathsep ):
+		if not entry:
+			continue
+		candidate = Path( entry ) / name
+		if candidate.is_file():
+			return candidate
+	return None
+
+
 def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
 	'''
 	Locates the static runtime library providing GCC/Clang's own float<->

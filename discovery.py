@@ -1971,28 +1971,45 @@ class Discovery( ast.NodeVisitor ):
 		available = linker_c.has_symbol( cc, lib, symbol )
 		return available != negate
 
-	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None]:
-		# @extern('lib', 'symbol') or @extern('lib', 'symbol', header='<name>')
+	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,str|None]:
+		# @extern('lib', 'symbol') or @extern('lib', 'symbol', header='<name>', dll='<name>')
 		# 'lib' is the .lib/.so name to link against, except the literal
 		# 'c' which means the platform C runtime rather than a real file on
 		# disk - that distinction is a future emitter/linker's job to act
-		# on, not this parse step's
+		# on, not this parse step's. 'dll' is an unrelated, independent
+		# concern from 'lib': the bare filename of a RUNTIME dll this
+		# symbol needs loadable (e.g. 'tcl86t.dll') - not necessarily
+		# findable in the same directory as the .lib/.so 'lib' names (a
+		# vendored/3rd-party library's import lib and its runtime DLL can
+		# live in entirely different directories, e.g. a Python install's
+		# tcl86t.lib under .../tcl/ vs tcl86t.dll under .../DLLs/). Declared
+		# per-function (same granularity as 'lib'/'header') so the compiler
+		# never has to guess which libs need bundling - system DLLs like
+		# kernel32/user32 never declare one, only genuinely-vendored ones
+		# do - see mpy.py's post-link bundling step, which copies exactly
+		# the dll names collected from functions that were actually reached
+		# (compiler.extern_dlls), nothing hardcoded to any particular lib.
 		if not isinstance( decorator, ast.Call ) or len( decorator.args ) < 2 or len( decorator.args ) > 3:
-			self.fail( f'@extern(lib, symbol[, header=...]) requires 2 or 3 positional arguments: {ast.unparse(decorator)}', node )
+			self.fail( f"@extern(lib, symbol[, header=...][, dll=...]) requires 2 or 3 positional arguments: {ast.unparse(decorator)}", node )
 		lib_arg, symbol_arg = decorator.args[0], decorator.args[1]
 		if not ( isinstance( lib_arg, ast.Constant ) and isinstance( lib_arg.value, str )):
 			self.fail( f'@extern(...) lib name must be a string literal: {ast.unparse(decorator)}', node )
 		if not ( isinstance( symbol_arg, ast.Constant ) and isinstance( symbol_arg.value, str )):
 			self.fail( f'@extern(...) symbol name must be a string literal: {ast.unparse(decorator)}', node )
 		header: str|None = None
+		dll: str|None = None
 		for kw in decorator.keywords:
 			if kw.arg == 'header':
 				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
 					self.fail( f'@extern(...) header= must be a string literal: {ast.unparse(decorator)}', node )
 				header = kw.value.value
+			elif kw.arg == 'dll':
+				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
+					self.fail( f'@extern(...) dll= must be a string literal: {ast.unparse(decorator)}', node )
+				dll = kw.value.value
 			else:
 				self.fail( f'@extern(...) unexpected keyword argument {kw.arg!r}: {ast.unparse(decorator)}', node )
-		return lib_arg.value, symbol_arg.value, header
+		return lib_arg.value, symbol_arg.value, header, dll
 
 	def _parse_function(
 		self,
@@ -2037,6 +2054,7 @@ class Discovery( ast.NodeVisitor ):
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
+		extern_dll: str|None = None
 		for decorator in node.decorator_list or []:
 			if self._is_compiler_target_call( decorator ):
 				if not self._matches_active_target( decorator ):
@@ -2065,7 +2083,7 @@ class Discovery( ast.NodeVisitor ):
 				case 'fallible_arithmetic':
 					is_fallible_arithmetic = True
 				case 'extern':
-					extern_lib, extern_symbol, extern_header = self._parse_extern_decorator( decorator, node, qualname )
+					extern_lib, extern_symbol, extern_header, extern_dll = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
 					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
 
@@ -2221,6 +2239,7 @@ class Discovery( ast.NodeVisitor ):
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,
+			extern_dll = extern_dll,
 		)
 		if extern_header is not None:
 			self.required_headers.add( extern_header )

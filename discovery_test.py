@@ -2953,6 +2953,26 @@ def malloc( size: usize ) -> Ptr[u8]:
 		fn.resolve()
 		self.assertEqual( fn.extern_lib, 'c' )
 		self.assertEqual( fn.extern_symbol, 'malloc' )
+		self.assertIsNone( fn.extern_dll )
+
+	def test_extern_dll_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertEqual( fn.extern_lib, 'tcl86t' )
+		self.assertEqual( fn.extern_dll, 'tcl86t.dll' )
+
+	def test_extern_dll_non_string_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 123 )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		self.assertTrue( any( 'dll= must be a string literal' in e for e in disco.errors.errors ))
 
 	def test_ordinary_function_has_no_extern_fields( self ) -> None:
 		disco, mod = self._import( '''

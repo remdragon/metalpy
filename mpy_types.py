@@ -929,6 +929,7 @@ class Function( Type, ScopeMixin ):
 	extern_lib: str|None = None
 	extern_symbol: str|None = None
 	extern_header: str|None = None # optional header that declares this @extern function; when included via require_header, the emitter skips the prototype
+	extern_dll: str|None = None # optional runtime DLL (bare filename, e.g. 'tcl86t.dll') this @extern function needs loadable at runtime - not the same as extern_lib (the .lib/.so linked against at build time, which can live in a different directory than the .dll). See compiler.py's extern_dlls collection and mpy.py's post-link bundling step.
 
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
