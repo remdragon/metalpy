@@ -134,6 +134,18 @@ def f_truediv_wrapped[T]( value: T, other: T ) -> T:
 def f_truediv_saturated[T]( value: T, other: T ) -> T:
 	return compiler.wrapped_truediv( value, other )
 
+@inline
+def i_and[T]( value: T, other: T ) -> T:
+	return compiler.bitand( value, other )
+
+@inline
+def i_or[T]( value: T, other: T ) -> T:
+	return compiler.bitor( value, other )
+
+@inline
+def i_xor[T]( value: T, other: T ) -> T:
+	return compiler.bitxor( value, other )
+
 # --- int add/sub/mul -----------------------------------------------
 
 i8.__add__ = i_add_checked[i8]
@@ -372,6 +384,45 @@ f32.__saturated_truediv__ = f_truediv_saturated[f32]
 f64.__truediv__ = f_truediv_checked[f64]
 f64.__wrapped_truediv__ = f_truediv_wrapped[f64]
 f64.__saturated_truediv__ = f_truediv_saturated[f64]
+
+# --- int bitwise (&/|/^) - single variant, no mode qualification -----
+
+i8.__and__ = i_and[i8]
+i8.__or__ = i_or[i8]
+i8.__xor__ = i_xor[i8]
+i16.__and__ = i_and[i16]
+i16.__or__ = i_or[i16]
+i16.__xor__ = i_xor[i16]
+i32.__and__ = i_and[i32]
+i32.__or__ = i_or[i32]
+i32.__xor__ = i_xor[i32]
+i64.__and__ = i_and[i64]
+i64.__or__ = i_or[i64]
+i64.__xor__ = i_xor[i64]
+i128.__and__ = i_and[i128]
+i128.__or__ = i_or[i128]
+i128.__xor__ = i_xor[i128]
+isize.__and__ = i_and[isize]
+isize.__or__ = i_or[isize]
+isize.__xor__ = i_xor[isize]
+u8.__and__ = i_and[u8]
+u8.__or__ = i_or[u8]
+u8.__xor__ = i_xor[u8]
+u16.__and__ = i_and[u16]
+u16.__or__ = i_or[u16]
+u16.__xor__ = i_xor[u16]
+u32.__and__ = i_and[u32]
+u32.__or__ = i_or[u32]
+u32.__xor__ = i_xor[u32]
+u64.__and__ = i_and[u64]
+u64.__or__ = i_or[u64]
+u64.__xor__ = i_xor[u64]
+u128.__and__ = i_and[u128]
+u128.__or__ = i_or[u128]
+u128.__xor__ = i_xor[u128]
+usize.__and__ = i_and[usize]
+usize.__or__ = i_or[usize]
+usize.__xor__ = i_xor[usize]
 
 @fallible_arithmetic
 @inline

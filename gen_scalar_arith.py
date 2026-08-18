@@ -155,6 +155,19 @@ emit( '\treturn compiler.wrapped_truediv( value, other )' )
 emit()
 
 # ============================================================================
+# generic bodies - bitwise &/|/^ (int types only - no float meaning). Single
+# variant each: ir.BitAnd/BitOr/BitXor have no Wrap/Check/Saturate forms at
+# all (bitwise ops can't overflow), so there's nothing for ambient
+# arithmetic mode to disambiguate - always infallible, plain T-returning.
+# ============================================================================
+
+for kind, intrinsic in ( ( 'and', 'bitand' ), ( 'or', 'bitor' ), ( 'xor', 'bitxor' ) ):
+	emit( '@inline' )
+	emit( f'def i_{kind}[T]( value: T, other: T ) -> T:' )
+	emit( f'\treturn compiler.{intrinsic}( value, other )' )
+	emit()
+
+# ============================================================================
 # registrations - one line per (type, dunder name), specializing the
 # matching generic body above
 # ============================================================================
@@ -197,6 +210,13 @@ for t in FLOAT_TYPES:
 	emit( f'{t}.{dunder} = f_truediv_checked[{t}]' )
 	emit( f'{t}.{mode_dunder( dunder, "wrapped" )} = f_truediv_wrapped[{t}]' )
 	emit( f'{t}.{mode_dunder( dunder, "saturated" )} = f_truediv_saturated[{t}]' )
+emit()
+
+emit( '# --- int bitwise (&/|/^) - single variant, no mode qualification -----' )
+emit()
+for t in INT_TYPES:
+	for kind, dunder in ( ( 'and', '__and__' ), ( 'or', '__or__' ), ( 'xor', '__xor__' ) ):
+		emit( f'{t}.{dunder} = i_{kind}[{t}]' )
 emit()
 
 # ============================================================================

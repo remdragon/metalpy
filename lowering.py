@@ -3646,6 +3646,30 @@ class FunctionLowering:
 		self._emit( ir.ConvertCheck( dest = check_dest, operand = operand ))
 		return check_dest
 
+	_BITWISE_OPCODES: dict[str,type] = { 'bitand': ir.BitAnd, 'bitor': ir.BitOr, 'bitxor': ir.BitXor }
+
+	def _lower_compiler_bitwise( self, node: ast.Call, intrinsic_name: str, expected_type: Type|None ) -> ir.Operand:
+		# compiler.bitand/bitor/bitxor(a, b) - the fixed-opcode intrinsics
+		# behind every scalar __and__/__or__/__xor__ dunder (lib/builtins/
+		# __scalar_arith.py). Unlike checked_add/etc, there is only ONE
+		# variant each - ir.BitAnd/BitOr/BitXor have no Wrap/Check/Saturate
+		# forms at all (bitwise ops can't overflow, so there's nothing for
+		# ambient arithmetic mode to ever have ambiguity about) - always
+		# infallible, plain T-returning, no Result involved.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		opcode = self._BITWISE_OPCODES[intrinsic_name]
+		if not isinstance( left.type, Scalar ) or left.type is not right.type or _is_float_scalar( left.type ):
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) arguments must both be the same integer scalar type - got '
+				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		result_type = expected_type if expected_type is not None and isinstance( expected_type, Scalar ) else left.type
+		return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
+
 	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
 		# must be a bare local variable/parameter name (matches SYNTAX.md's
@@ -10833,6 +10857,10 @@ class FunctionLowering:
 
 			case 'checked_convert':
 				result = self._lower_compiler_checked_convert( node, expected_type )
+				return result if want_result else None
+
+			case 'bitand' | 'bitor' | 'bitxor':
+				result = self._lower_compiler_bitwise( node, self.lowering._is_compiler_call( node ), expected_type )
 				return result if want_result else None
 
 			case '__raw_alloc__':
