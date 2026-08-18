@@ -27,52 +27,25 @@ class SYSTEMTIME:
 	wMilliseconds: u16 = 0
 
 
-# DYNAMIC_TIME_ZONE_INFORMATION (timezoneapi.h) - verified field-for-field
-# against Microsoft's own docs this session (learn.microsoft.com/.../
-# ns-timezoneapi-dynamic_time_zone_information): Bias:LONG, StandardName:
+# DYNAMIC_TIME_ZONE_INFORMATION (timezoneapi.h): Bias:LONG, StandardName:
 # WCHAR[32], StandardDate:SYSTEMTIME, StandardBias:LONG, DaylightName:
 # WCHAR[32], DaylightDate:SYSTEMTIME, DaylightBias:LONG, TimeZoneKeyName:
-# WCHAR[128] (NOT 32 - the previous version of this struct wrongly reused
-# _TZNAME_SIZE here, a 3x undersized buffer that GetDynamicTimeZoneInformation/
-# EnumDynamicTimeZoneInformation would have written past),
-# DynamicDaylightTimeDisabled:BOOLEAN.
-#
-# Each WCHAR array is a real u16[N] fixed-size inline array field now that
-# this compiler supports declaring + zero-filling one (this struct used to
-# decompose every WCHAR array into individually-numbered u16 fields -
-# lib/guid.py's GUID.Data4 hit the same original gap for a smaller case).
-# Every field still gets a "= 0" default (matching posix/time.py's own
-# timespec precedent) so DynamicTimeZoneInformation() can be constructed
-# with no args.
-#
-# StandardDate/DaylightDate nest SYSTEMTIME by value directly - a small
-# cstruct nested by value inside a large cross-module cstruct used to hit a
-# real emitter bug here (a by-value-embedded field type reachable only
-# through the containing struct never got scheduled for compilation at all -
-# confirmed directly via a real clang "incomplete type" error, worked around
-# at the time by inlining SYSTEMTIME's 8 fields by hand; fixed upstream
-# since - task_421ed8be).
+# WCHAR[128], DynamicDaylightTimeDisabled:BOOLEAN. Every field gets a "= 0"
+# default so DynamicTimeZoneInformation() can be constructed with no args.
 #
 # StandardName/DaylightName's own content is never read anywhere in this
-# codebase (only TimeZoneKeyName is) - they're still real fields (not a
-# collapsed/reinterpreted filler region) purely to hold TimeZoneKeyName at
-# the correct byte offset.
+# codebase (only TimeZoneKeyName is) - kept as real fields purely to hold
+# TimeZoneKeyName at the correct byte offset.
 #
-# TimeZoneKeyName is read as a whole null-terminated string (up to
-# _TZKEYNAME_SIZE UTF-16 code units), not one element at a time - element-
-# level indexed access (f.arr[i]) now works, but there's still no way to get
-# a raw Ptr[u16] at an array field's start (compiler.addrof(struct.arr) is
-# its own, separate, still-unimplemented gap: "u16[128] fields have no
-# addrof support yet", confirmed directly). windows/zoneinfo_rules.py's
-# helpers instead take compiler.addrof() of the WHOLE struct (a bare local
-# IS allowed), cast to Ptr[u8], and advance by _TZKEYNAME_OFFSET bytes - the
-# sum of every field's size up to (not including) TimeZoneKeyName: Bias(4) +
-# StandardName(32*2=64) + StandardDate(8*2=16) + StandardBias(4) +
-# DaylightName(64) + DaylightDate(16) + DaylightBias(4) = 172, unchanged by
-# the u16[N] migration (a real C array field occupies exactly the same
-# N*sizeof(elem) bytes the old individually-numbered fields did, with no
-# extra padding). No struct field is ever reordered/renamed above without
-# updating this constant to match.
+# TimeZoneKeyName is read as a whole null-terminated string, not one
+# element at a time, and compiler.addrof() doesn't support array fields -
+# so windows/zoneinfo_rules.py's helpers instead take compiler.addrof() of
+# the WHOLE struct (a bare local), cast to Ptr[u8], and advance by
+# _TZKEYNAME_OFFSET bytes - the sum of every field's size up to (not
+# including) TimeZoneKeyName: Bias(4) + StandardName(32*2=64) +
+# StandardDate(8*2=16) + StandardBias(4) + DaylightName(64) +
+# DaylightDate(16) + DaylightBias(4) = 172. No struct field is ever
+# reordered/renamed above without updating this constant to match.
 @cstruct
 class DynamicTimeZoneInformation:
 	Bias: i32 = 0
