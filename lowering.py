@@ -1479,6 +1479,7 @@ class Lowering:
 			self.schedule( del_fn )
 
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
+	_FALLIBLE_METHOD_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST, context_qualname: str ) -> None:
@@ -1846,7 +1847,33 @@ class FunctionLowering:
 					except CompileError as e:
 						self.lowering.discovery.fail( str( e ), fn.node )
 
-					if self._cfg.current_epilogue_label() is not None or self._cfg.used_shared_epilogue_label() or self._cfg.cancel_flags():
+					# current_epilogue_label() (called with no operand below) is
+					# only a real question when the body can actually fall off
+					# the end into this closing brace (_body_may_fall_off_the_
+					# end() - False whenever the last top-level statement is
+					# already a literal `return`, which always terminates).
+					# Calling it unconditionally is self-fulfilling: merely
+					# asking it "is anything still live" captures whatever
+					# entry it finds (current_epilogue_label()'s own captured=
+					# True/_any_shared_label_used side effect) and manufactures
+					# a label for a fall-through that can never happen - e.g. a
+					# function whose sole `return x` returns its own live local
+					# directly (label=None, return_()'s inline unwind already
+					# handled everything, per _stmt_Return) left that local's
+					# entry on the stack uncancelled, and this check alone used
+					# to conjure a dead "L__epilogue__: release(x); return
+					# __return_value;" block after the real, unconditional
+					# `return x;` - confirmed via $$__new__ and any ordinary
+					# `def f() -> SomeRC: x = SomeRC(...); return x`.
+					# used_shared_epilogue_label()/cancel_flags() still catch
+					# every case that genuinely needs the ladder built (an
+					# EARLIER return already committed a goto into it, or a
+					# defer/errdefer flag needs its init spliced in) regardless
+					# of whether the body can fall off the end.
+					if (
+						( self.lowering._body_may_fall_off_the_end( fn.node.body ) and self._cfg.current_epilogue_label() is not None )
+						or self._cfg.used_shared_epilogue_label() or self._cfg.cancel_flags()
+					):
 						# some return (or OrJump) already jumped into the
 						# shared epilogue ladder (_stmt_Return/_consume_checked_
 						# result, via current_epilogue_label()), or nothing did
@@ -3492,6 +3519,24 @@ class FunctionLowering:
 			dest = self._new_temp( expected_type or usize_cls )
 			self._emit( ir.SizeOf( dest = dest, type = target_type ))
 			return dest
+
+		# a FixedArrayType field (u8[N]/u16[N]-style) - folds to a compile-
+		# time constant the same way a plain Scalar's sizeof already does,
+		# PROVIDED the element type itself has a plain-int sizeof (true for
+		# every real element type this compiler's FixedArrayType is
+		# actually exercised with today - u8/u16/etc). An element type
+		# without one (a real class-like type, e.g. a hypothetical
+		# SomeStruct[N] field) would need the C compiler's own sizeof(...)
+		# to size correctly, same as any other class-like type below - not
+		# attempted here since no real FixedArrayType field with a non-
+		# scalar element type exists anywhere in this codebase yet; falls
+		# through to the same "not supported yet" error below rather than
+		# silently computing a wrong Python-int size for a type with no
+		# sizeof of its own.
+		if isinstance( target_type, FixedArrayType ):
+			elem_sizeof = getattr( target_type.elem_type, 'sizeof', None )
+			if elem_sizeof is not None:
+				return ir.Const( type = expected_type or usize_cls, value = elem_sizeof * target_type.count )
 
 		# a real class-like type (RCClass/CStruct/CUnion/TaggedUnion, or a
 		# concrete Specialization of one) - no field-layout algorithm exists
@@ -5930,8 +5975,12 @@ class FunctionLowering:
 		# blindly typing the Const as the whole union here would be wrong
 		# (a literal is never itself union-shaped at the C level), and
 		# _lower_expr's own post-hoc coercion (see its comment) is what
-		# actually wraps this natural-typed Const into the union afterward
-		if expected_type is None or isinstance( expected_type, TaggedUnion ):
+		# actually wraps this natural-typed Const into the union afterward.
+		# A bare, still-unbound TypeVar is treated the same way, matching
+		# the validation exemption above - the literal's own natural type
+		# is what UNIFIES to solve T, so tagging the Const with the bare
+		# TypeVar itself (leaving it unsubstituted downstream) is wrong.
+		if expected_type is None or isinstance( expected_type, TaggedUnion ) or isinstance( expected_type, TypeVar ):
 			if isinstance( node.value, bool ):
 				expected_type = self.lowering.discovery.get_intrinsics()['bool']
 			elif isinstance( node.value, float ):
@@ -7270,8 +7319,22 @@ class FunctionLowering:
 		shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
 		assert shape is not None and len( shape[1] ) == 2, f'@fallible_arithmetic {method.qualname} must declare a Result[T,E] return type'
 		success_type = shape[1][0].type
+		error_type = shape[1][1].type
 		mode = self._arithmetic_mode[-1]
 		extra = mode.extra if isinstance( mode, arithmetic_mode.ArithmeticPanic ) else None
+		if extra is None:
+			# same requirement _lower_arithmetic_op's own Check-mode opcodes
+			# already enforce before emitting OrReturn/OrJump - missing here
+			# let an @fallible_arithmetic dunder call (int.__floordiv__/
+			# __mod__ via `//`/`%`, or a Scalar-registered arithmetic dunder)
+			# silently emit an OrReturn/OrJump into a function whose return
+			# type can't represent the error at all, crashing at C emission
+			# time instead of failing to compile cleanly - confirmed via a
+			# real repro (`r: int = a // b` inside a function declared -> i32)
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			self.lowering._type_resolver._require_result_return(
+				node, result_cls, error_type, self.lowering._FALLIBLE_METHOD_ALTERNATIVES, fn = self._current_fn,
+			)
 		return self._consume_checked_result( node, result, success_type, extra )
 
 	def _lower_arithmetic_op( self, node: ast.AST, opcode: type|None, extra: ir.Operand|None, result_type: Type, operand_kwargs: dict, kind: str ) -> ir.Operand:
@@ -11544,29 +11607,28 @@ class FunctionLowering:
 					kwargs[param.stem] = default_operand
 		else:
 			self.lowering._resolve_call_target( target )
+			# a Scalar-registered method's receiver isn't threaded through
+			# call.args at all - _match_call_args's own
+			# receiver_fills_first_param excludes target's first positional
+			# parameter from call-site matching accordingly (see its own
+			# comment); the receiver is spliced back in as an ordinary
+			# leading positional argument just below.
 			receiver_fills_first_param = receiver is not None and isinstance( target, Function ) and target.cls is None
 			args, kwargs = self._lower_call_args( target, node, receiver_fills_first_param = receiver_fills_first_param )
 
 		if receiver is not None and isinstance( target, Function ) and target.cls is None:
-			# a Scalar-registered method (`SomeScalar.method = some_free_
-			# function` - discovery.py's visit_Assign, e.g. lib/builtins/
-			# __float.py's `f64.__str__ = _f64_str`) is a genuine free
-			# Function, unlike a real CStruct/RCClass method - discovery
-			# never strips a "self" off its .parameters the way
-			# _make_function_resolver does for an actual class body (there
-			# IS no class body here), so ir.Call's own receiver field
-			# (meant for real bound-method calls only) would make
-			# emitter_c.py's own _emit_call_args (which walks
-			# target.parameters assuming it already excludes the receiver)
-			# double-count the receiver against the first declared
-			# parameter - confirmed by a real KeyError crash on ordinary
-			# `f.__str__()` call syntax. _lower_method_call above (used by
-			# f-string dunder-dispatch/format-spec call sites) already
-			# carries this exact fix for its own narrower set of callers;
-			# this is the same fix for the general call-lowering path every
-			# other Scalar-attached-method call site (including ordinary
-			# user-written `receiver.method()` syntax) actually goes
-			# through.
+			# ir.Call's own receiver field is for real bound-method calls
+			# only (an RCClass/CStruct method with "self" already excluded
+			# from .parameters) - a Scalar-attached free function (see the
+			# comment above) takes the receiver as an ordinary LEADING
+			# positional argument instead, confirmed by a real KeyError
+			# crash on ordinary `f.__str__()` call syntax before this fix.
+			# _lower_method_call above (used by f-string dunder-dispatch/
+			# format-spec call sites) already carries this exact fix for
+			# its own narrower set of callers; this is the same fix for the
+			# general call-lowering path every other Scalar-attached-method
+			# call site (including ordinary user-written `receiver.method()`
+			# syntax) actually goes through.
 			args = [ receiver ] + args
 			receiver = None
 

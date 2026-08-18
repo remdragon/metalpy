@@ -9,8 +9,11 @@
 # compiled - splicing only). Uses the shared test_support.RealCompileMixin
 # harness (no copy-pasted compile+link+run).
 
+from pathlib import Path
 import unittest
 
+from compiler import Compiler
+from discovery import Discovery
 import emitter_c
 import test_support
 from test_support import RealCompileMixin
@@ -93,6 +96,51 @@ class CheckedDunderBehaviorTests( RealCompileMixin, unittest.TestCase ):
 		compiler = self._compile_source( _I32_ADD_PANIC_BEHAVIOR )
 		c_source = emitter_c.emit_c( compiler )
 		self._assert_compiles_and_runs( c_source, expected_exit = 1, compiler = compiler )
+
+
+# _emit_binop_dunder_call/_emit_fallible_method_call (the @fallible_arithmetic
+# dispatch path for a real class's own dunder - e.g. int.__floordiv__/__mod__
+# via `//`/`%`, or a Scalar-registered dunder like i32.__add__) used to skip
+# the _require_result_return validation _lower_arithmetic_op's own plain
+# scalar Check-mode opcodes already perform. That let a program whose checked
+# arithmetic error can't propagate anywhere (the enclosing function doesn't
+# return a covering Result[_,_]) reach emitter_c.py with an invalid OrReturn/
+# OrJump - a Python AssertionError (_result_error_type: "not a Result[T,E]")
+# instead of a clean compile error. Confirmed via a real repro: `r: int = a
+# // b` inside a function declared `-> i32` crashed mpy.py entirely.
+class FallibleArithmeticBinopValidationTests( unittest.TestCase ):
+	def test_checked_floordiv_without_result_return_fails_cleanly_not_a_crash( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '\n'.join([
+			'def main() -> i32:',
+			'	a: int = int( 10 )',
+			'	b: int = int( 3 )',
+			'	r: int = a // b',
+			'	return 0',
+		]), Path( '__main__.py' ), scope = None )
+		compiler.run() # must not raise (the crash this guards against was a real, uncaught AssertionError)
+		self.assertTrue(
+			any( 'requires the enclosing function to return Result' in e for e in discovery.errors.errors ),
+			f'expected a clean compile error, got: {discovery.errors.errors}',
+		)
+
+	def test_checked_floordiv_with_result_return_still_compiles( self ) -> None:
+		# the valid counterpart - guards against an overzealous fix rejecting
+		# the exact shape it's meant to keep accepting
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '\n'.join([
+			'def divide( a: int, b: int ) -> Result[i32, IntError | ZeroDivisionError]:',
+			'	q: int = a // b',
+			'	return Result.Ok( 0 )',
+			'',
+			'def main() -> i32:',
+			'	r = divide( int( 10 ), int( 3 ))',
+			'	return 1 if r.is_err() else 0',
+		]), Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [], f'unexpected compile errors: {discovery.errors.errors}' )
 
 
 if __name__ == '__main__':

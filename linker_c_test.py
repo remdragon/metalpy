@@ -220,3 +220,45 @@ class NtdllImportLibTests( unittest.TestCase ):
 		flag = linker_c.resolve_lib_ldflag( _CC, 'kernel32', { 'GetLastError' } )
 		expected = 'kernel32.lib' if _CC.name == 'cl' else '-lkernel32'
 		self.assertEqual( flag, expected )
+
+
+class FindDllTests( unittest.TestCase ):
+	''' linker_c.find_dll() - PATH-order lookup by bare filename, feeding
+	mpy.py's post-link bundling step for @extern(..., dll=...)
+	dependencies (see compiler.extern_dlls). Uses a scratch PATH (mocked
+	os.environ, not the real one) so this doesn't depend on what happens
+	to be installed on the machine running the tests. '''
+
+	def test_finds_a_real_file_on_path( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			dll_path = Path( tmp ) / 'fake_dep.dll'
+			dll_path.write_bytes( b'not a real PE, just needs to exist' )
+			with patch.dict( os.environ, { 'PATH': tmp } ):
+				found = linker_c.find_dll( 'fake_dep.dll' )
+			self.assertEqual( found, dll_path )
+
+	def test_searches_path_entries_in_order( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			first_dir = Path( tmp ) / 'first'
+			second_dir = Path( tmp ) / 'second'
+			first_dir.mkdir()
+			second_dir.mkdir()
+			( second_dir / 'fake_dep.dll' ).write_bytes( b'second' )
+			( first_dir / 'fake_dep.dll' ).write_bytes( b'first' )
+			with patch.dict( os.environ, { 'PATH': os.pathsep.join([ str( first_dir ), str( second_dir ) ]) } ):
+				found = linker_c.find_dll( 'fake_dep.dll' )
+			self.assertEqual( found, first_dir / 'fake_dep.dll' )
+
+	def test_returns_none_when_not_found_anywhere_on_path( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			with patch.dict( os.environ, { 'PATH': tmp } ):
+				found = linker_c.find_dll( 'does_not_exist_987.dll' )
+			self.assertIsNone( found )
+
+	def test_ignores_empty_path_entries( self ) -> None:
+		# a PATH like "C:\foo;;C:\bar" (empty segment from a trailing/
+		# doubled separator) must not be treated as "search cwd" via a bare
+		# Path('') / name - real Windows PATH values sometimes have these
+		with patch.dict( os.environ, { 'PATH': os.pathsep.join([ '', '' ]) } ):
+			found = linker_c.find_dll( 'kernel32.dll' )
+		self.assertIsNone( found )

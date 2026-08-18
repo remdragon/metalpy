@@ -510,7 +510,12 @@ class TypeResolutionTests( unittest.TestCase ):
 	def test_implicit_generic_call_tags_resolved_callee_per_argument_type( self ) -> None:
 		# the exact shape from ARCHITECTURE's own generic-function example -
 		# foo('hello') and foo(42) each get their own monomorphized foo,
-		# distinguished by argument type alone (no explicit foo[T])
+		# distinguished by argument type alone (no explicit foo[T]). foo(42)
+		# infers intrinsics.i32 - a bare int literal's own natural type
+		# (matching what Lowering._expr_Constant will actually tag it as),
+		# NOT this module's own locally-defined `int` class (a literal
+		# argument's inferred type must never depend on what name happens to
+		# be bound to 'int' in scope - see _natural_literal_type)
 		mod = self._import( '\n'.join([
 			'class str: pass',
 			'class int: pass',
@@ -528,7 +533,7 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertIsNotNone( str_callee )
 		self.assertIsNotNone( int_callee )
 		self.assertEqual( str_callee.qualname, '__test__.foo[__test__.str]' )
-		self.assertEqual( int_callee.qualname, '__test__.foo[__test__.int]' )
+		self.assertEqual( int_callee.qualname, '__test__.foo[intrinsics.i32]' )
 		self.assertIsNot( str_callee, int_callee )
 		self.assertIsNot( str_callee.node, int_callee.node ) # independent, deep-copied bodies - not the shared abstract one
 

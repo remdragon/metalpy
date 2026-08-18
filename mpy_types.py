@@ -929,6 +929,26 @@ class Function( Type, ScopeMixin ):
 	extern_lib: str|None = None
 	extern_symbol: str|None = None
 	extern_header: str|None = None # optional header that declares this @extern function; when included via require_header, the emitter skips the prototype
+	# optional runtime DLL(s) (bare filenames, e.g. 'tcl86t.dll') this
+	# @extern function needs loadable at runtime - not the same as
+	# extern_lib (the .lib/.so linked against at build time, which can
+	# live in a different directory than the .dll, or not exist as a
+	# separate file at all for a header-only/forwarded symbol). Written as
+	# dll='name.dll' or dll=['name.dll', 'other.dll'] - deliberately a
+	# fixed, author-supplied list rather than something the compiler
+	# derives by scanning a DLL's own import table: the transitive
+	# dependency set of a real DLL includes both genuinely-needed vendored
+	# files (e.g. tcl86t.dll needs zlib1.dll) AND system components
+	# (kernel32.dll, the api-ms-win-crt-*.dll forwarders, ...) that must
+	# NEVER be bundled - reliably telling those apart automatically would
+	# need either a maintained system-DLL blacklist (a maintenance
+	# nightmare, explicitly rejected) or heuristics prone to bundling the
+	# wrong thing. An explicit, per-declaration list sidesteps the
+	# question entirely: the author decides exactly what ships, including
+	# deliberately leaving out something like VCRUNTIME140.dll if it's
+	# assumed already present on target machines. See compiler.py's
+	# extern_dlls collection and mpy.py's post-link bundling step.
+	extern_dlls: tuple[str,...] = ()
 
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)

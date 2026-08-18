@@ -13037,7 +13037,20 @@ class FixedSizeArrayFieldTests( test_support.RealCompileMixin, CompilerTestCase 
 	is rooted at a plain Name/Attribute chain (lowering.py's
 	_static_field_type_or_none) - a deeper/Call-rooted root (e.g.
 	`make().arr[i]`) simply isn't recognized and falls through to the
-	ordinary whole-value-read rejection above, unchanged. '''
+	ordinary whole-value-read rejection above, unchanged.
+
+	compiler.sizeof(x.arr) also now folds to the field's own real byte
+	size (elem_type.sizeof * count) when the element type has a plain-int
+	sizeof (every real FixedArrayType field in this codebase - a
+	hypothetical non-scalar element type, e.g. a struct[N] field, falls
+	through to the ordinary "not supported yet" error every other
+	unsupported compiler.sizeof(...) target already gets, not a crash).
+	Lets a caller derive an array field's element count as
+	compiler.sizeof(x.arr) // compiler.sizeof(ElemType) instead of hand-
+	copying it into a separate constant that could drift out of sync with
+	the field's own declared count - see lib/windows/kernel32.py's
+	_TZNAME_SIZE/_TZKEYNAME_SIZE, now computed this way instead of
+	hardcoded. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -13153,6 +13166,32 @@ def main() -> i32:
 			j = j + usize( 1 )
 	return 0
 ''' ),
+			# compiler.sizeof(x.arr) - the field's own real byte size
+			# (elem_type.sizeof * count), not the whole containing struct's
+			# size. Also confirms the classic sizeof(arr)//sizeof(elem)
+			# element-count idiom works, since neither piece is hardcoded -
+			# this is what a caller needing "how many elements does this
+			# array field have" (e.g. a bounded string-decode scan length)
+			# should compute instead of a hand-copied constant.
+			( 'sizeof_of_fixed_array_field_is_its_own_byte_size', '''
+@cstruct
+class Foo:
+	a: u32 = 0
+	arr: u16[32] = 0
+	small: u8[8] = 0
+
+def main() -> i32:
+	f = Foo()
+	if compiler.sizeof( f.arr ) != usize( 64 ):
+		return 1
+	if compiler.sizeof( f.small ) != usize( 8 ):
+		return 2
+	with compiler.panic_arithmetic( 'compile-time constants, never zero divisor' ):
+		count: usize = compiler.sizeof( f.arr ) // compiler.sizeof( u16 )
+	if count != usize( 32 ):
+		return 3
+	return 0
+''' ),
 		] )
 
 	def test_fixed_array_indexed_write_literal_index_out_of_range_is_rejected_at_compile_time( self ) -> None:
@@ -13255,6 +13294,35 @@ def main() -> i32:
 		]))
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'cannot be read as a whole value', self.discovery.errors.errors[0] )
+
+	def test_sizeof_of_fixed_array_field_with_non_scalar_element_type_still_rejected( self ) -> None:
+		# compiler.sizeof(x.arr) only folds to a compile-time constant when
+		# the element type itself has a plain-int sizeof (every real
+		# FixedArrayType field in this codebase - u8[N]/u16[N]/etc). A
+		# hypothetical array-of-struct field falls through to the same
+		# "not supported yet" error class-like types already get, rather
+		# than crashing or silently computing a wrong size.
+		self._run( '\n'.join([
+			'import sys',
+			'@cstruct',
+			'class Inner:',
+			'	x: u32 = 0',
+			'',
+			'@cstruct',
+			'class Foo:',
+			'	arr: Inner[3]',
+			'',
+			'def main() -> None:',
+			# a raw pointer cast - no construction attempted at all, since
+			# Inner[3] has no "= 0" zero-fill sugar (that only applies to
+			# scalar element types) - the point here is purely whether
+			# compiler.sizeof(f.arr) itself is rejected cleanly
+			'	f = compiler.cast( Ptr[Foo], sys.alloc[u8]( 64 ))',
+			'	compiler.sizeof( f.arr )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'is not supported yet', self.discovery.errors.errors[0] )
 
 
 class AddrofFieldAccessRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):

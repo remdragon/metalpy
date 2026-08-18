@@ -16,14 +16,17 @@ get/post/put/patch/delete/head/options/request - module-level Session convenienc
 
 host may be a real hostname now - lib/socket.py's Socket.connect() resolves it
 via getaddrinfo internally (commit f794edb). https:// URLs aren't supported yet
-(no TLS - see PLAN_HTTP_CLIENT.md's Phase 4).
+(no TLS - see PLAN_HTTP_CLIENT.md's Phase 4). URL parsing/query encoding is
+built on lib/urllib/parse.py (urlsplit/urlencode/parse_qsl/urljoin) rather
+than hand-rolled here - redirect Location headers may now be relative,
+resolved against the request URL via urljoin().
 '''
 
 import sys
 import compiler
 import base64
 from socket import Socket
-from urllib.parse import quote
+from urllib.parse import urlencode, parse_qsl, urlsplit, urljoin, SplitResult
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -685,22 +688,26 @@ class HTTPConnection:
 		return Result.Ok( Response( parsed_status[1], parsed_status[2], headers, content, '' ))
 
 # ---------------------------------------------------------------------------
-# URL parsing - minimal, http:// only (no TLS - see PLAN_HTTP_CLIENT.md's
-# Phase 4), absolute URLs only (no relative-URL resolution, needed for
-# redirect Location headers below - a relative Location is an error for v1).
+# URL parsing - http:// only (no TLS - see PLAN_HTTP_CLIENT.md's Phase 4),
+# built on lib/urllib/parse.py's urlsplit() rather than this file's own
+# hand-rolled scheme/host/port/path splitter (see PLAN_HTTP_CLIENT.md for
+# the migration - urlsplit() lands host/port splitting and query handling on
+# a real, separately-tested general-purpose module instead).
 # ---------------------------------------------------------------------------
 
 class ParsedURL:
 	scheme: str
 	host: str
 	port: u16
-	path: str # path + query, e.g. "/foo?bar=1" - everything after host[:port]
+	path: str  # path only, no query - see _build_request_path for query merging
+	query: str # raw query string, no leading '?'
 
-	def __init__( self, scheme: str, host: str, port: u16, path: str ) -> None:
+	def __init__( self, scheme: str, host: str, port: u16, path: str, query: str ) -> None:
 		self.scheme = scheme
 		self.host = host
 		self.port = port
 		self.path = path
+		self.query = query
 
 def _u16_from_str( s: str ) -> Result[u16, HTTPError]:
 	n: usize = _usize_from_str( s ).or_return()
@@ -710,24 +717,15 @@ def _u16_from_str( s: str ) -> Result[u16, HTTPError]:
 		return Result.Ok( u16( n ))
 
 def _parse_url( url: str ) -> Result[ParsedURL, HTTPError]:
-	scheme_split: tuple[str,str,str] = url.partition( '://' )
-	if scheme_split[1].byte_len() == 0:
+	split: SplitResult = urlsplit( url )
+	if split.scheme != 'http':
+		# https:// (or anything else, including a missing scheme) isn't
+		# reachable without TLS support
 		return Result.Err( HTTPError.InvalidURL( None ))
-	scheme: str = scheme_split[0].lower()
-	if scheme != 'http':
-		# https:// (or anything else) isn't reachable without TLS support
-		return Result.Err( HTTPError.InvalidURL( None ))
-	rest: str = scheme_split[2]
-	if rest.byte_len() == 0:
+	if split.netloc.byte_len() == 0:
 		return Result.Err( HTTPError.InvalidURL( None ))
 
-	path_split: tuple[str,str,str] = rest.partition( '/' )
-	hostport: str = path_split[0]
-	path: str = '/'
-	if path_split[1].byte_len() != 0:
-		path = '/' + path_split[2]
-
-	hp_split: tuple[str,str,str] = hostport.partition( ':' )
+	hp_split: tuple[str,str,str] = split.netloc.partition( ':' )
 	host: str = hp_split[0]
 	if host.byte_len() == 0:
 		return Result.Err( HTTPError.InvalidURL( None ))
@@ -735,42 +733,55 @@ def _parse_url( url: str ) -> Result[ParsedURL, HTTPError]:
 	if hp_split[1].byte_len() != 0:
 		port = _u16_from_str( hp_split[2] ).or_return()
 
-	return Result.Ok( ParsedURL( scheme, host, port, path ))
+	path: str = split.path
+	if path.byte_len() == 0:
+		path = '/'
+
+	return Result.Ok( ParsedURL( split.scheme, host, port, path, split.query ))
 
 # ---------------------------------------------------------------------------
 # query-string / form encoding - dict[str,str] iterated via key_at/value_at
-# (lib/builtins/__init__.py's dict[K,V] positional accessors), percent-
-# encoded via urllib.parse's quote().
+# (lib/builtins/__init__.py's dict[K,V] positional accessors) into
+# list[tuple[str,str]] pairs, then urllib.parse's parse_qsl()/urlencode() do
+# the actual percent-encoding (quote_plus - space becomes '+', matching
+# application/x-www-form-urlencoded and requests' own params=/data= dict
+# encoding, both built on Python's own urlencode()).
 # ---------------------------------------------------------------------------
 
-def _merge_query_params( path: str, params: dict[str,str]|None ) -> str:
-	if params is None:
-		return path
-	p: dict[str,str] = params
-	n: usize = p.__len__()
-	if n == 0:
-		return path
-	parts: list[str] = list[str]()
+def _dict_to_pairs( d: dict[str,str] ) -> list[tuple[str,str]]:
+	pairs: list[tuple[str,str]] = list[tuple[str,str]]()
+	n: usize = d.__len__()
 	i: usize = 0
 	for i in range( n ):
-		key: str = p.key_at( i ).unwrap( '_merge_query_params: index in bounds by construction' )
-		value: str = p.value_at( i ).unwrap( '_merge_query_params: index in bounds by construction' )
-		parts.append( quote( key ) + '=' + quote( value ) ).unwrap( '_merge_query_params: append failed' )
-	sep: str = '&'
-	found: isize = path.find( '?' )
-	if found == isize( -1 ):
-		sep = '?'
-	return path + sep + '&'.join( parts )
+		key: str = d.key_at( i ).unwrap( '_dict_to_pairs: index in bounds by construction' )
+		value: str = d.value_at( i ).unwrap( '_dict_to_pairs: index in bounds by construction' )
+		pairs.append( ( key, value )).unwrap( '_dict_to_pairs: append failed' )
+	return pairs
+
+def _build_request_path( parsed: ParsedURL, params: dict[str,str]|None ) -> Result[str, HTTPError]:
+	''' parsed.path, plus parsed's own query merged with params= (params=
+	appended after whatever query the URL already carried, matching
+	requests' own params= behavior). '''
+	pairs: list[tuple[str,str]] = list[tuple[str,str]]()
+	if parsed.query.byte_len() != 0:
+		match parse_qsl( parsed.query ):
+			case Result.Ok( existing ):
+				pairs = existing
+			case Result.Err( _ ):
+				return Result.Err( HTTPError.InvalidURL( None ))
+	if params is not None:
+		p: dict[str,str] = params
+		extra: list[tuple[str,str]] = _dict_to_pairs( p )
+		en: usize = extra.__len__()
+		ei: usize = 0
+		for ei in range( en ):
+			pairs.append( extra.__getitem__( ei ).unwrap( '_build_request_path: index in bounds by construction' )).unwrap( '_build_request_path: append failed' )
+	if pairs.__len__() == 0:
+		return Result.Ok( parsed.path )
+	return Result.Ok( parsed.path + '?' + urlencode( pairs ))
 
 def _form_encode( data: dict[str,str] ) -> str:
-	n: usize = data.__len__()
-	parts: list[str] = list[str]()
-	i: usize = 0
-	for i in range( n ):
-		key: str = data.key_at( i ).unwrap( '_form_encode: index in bounds by construction' )
-		value: str = data.value_at( i ).unwrap( '_form_encode: index in bounds by construction' )
-		parts.append( quote( key ) + '=' + quote( value ) ).unwrap( '_form_encode: append failed' )
-	return '&'.join( parts )
+	return urlencode( _dict_to_pairs( data ))
 
 def _copy_headers( h: HTTPHeaders ) -> HTTPHeaders:
 	out: HTTPHeaders = HTTPHeaders()
@@ -852,14 +863,17 @@ def _build_request_headers( session_headers: HTTPHeaders, content_type: str|None
 		request_headers.set( 'Authorization', 'Basic ' + base64_encode( cred_bytes ))
 	return request_headers
 
-def _next_redirect_url( response: Response, allow_redirects: bool ) -> str:
+def _next_redirect_url( response: Response, allow_redirects: bool, current_url: str ) -> str:
 	''' the URL to redirect to, or '' if this response isn't a redirect that
 	should be followed - an empty-string sentinel rather than str|None so
 	Session.request()'s own while loop never needs to narrow an Optional
-	(see its own comment on why that doesn't work inside that loop). Only
-	absolute http:// Location values are followed - a relative Location
-	needs URL-resolution-against-the-original this pass doesn't implement,
-	so it's treated as "don't redirect" rather than an error. '''
+	(see its own comment on why that doesn't work inside that loop). A
+	relative Location is resolved against current_url via lib/urllib/parse.py
+	's urljoin() (RFC 3986 5.3) - previously only an absolute http://
+	Location was followed, treating a relative one as "don't redirect"; that
+	restriction is gone now that urljoin() exists. Still only ever returns
+	an http:// result - a Location resolving to https:// (or anything else)
+	isn't reachable without TLS support, so that's still "don't redirect". '''
 	if not allow_redirects:
 		return ''
 	if not _is_redirect_status( response.status_code ):
@@ -867,8 +881,9 @@ def _next_redirect_url( response: Response, allow_redirects: bool ) -> str:
 	location: str|None = response.headers.get( 'Location' )
 	if location is not None:
 		loc: str = location
-		if loc.startswith( 'http://' ):
-			return loc
+		resolved: str = urljoin( current_url, loc )
+		if resolved.startswith( 'http://' ):
+			return resolved
 	return ''
 
 class Session:
@@ -936,7 +951,7 @@ class Session:
 		with compiler.panic_arithmetic( 'bounded by _MAX_REDIRECTS, cannot overflow' ):
 			while True:
 				parsed: ParsedURL = _parse_url( current_url ).or_return()
-				full_path: str = _merge_query_params( parsed.path, params )
+				full_path: str = _build_request_path( parsed, params ).or_return()
 				# `x is not None` narrowing doesn't hold up inside a `while
 				# True:` loop body here (confirmed by several real compiles:
 				# every one of content_type/headers/cookie_header/auth/
@@ -960,7 +975,7 @@ class Session:
 
 				# '' is a "don't redirect" sentinel, not Optional - see
 				# _next_redirect_url's own comment for why
-				next_url: str = _next_redirect_url( response, allow_redirects )
+				next_url: str = _next_redirect_url( response, allow_redirects, current_url )
 				if next_url.byte_len() == 0:
 					return Result.Ok( response )
 

@@ -105,7 +105,7 @@ def _find_zone_by_key_name( win_name: str ) -> Ptr[u8]:
 	reusing the same scratch buffer across iterations until a match is
 	found, so only one allocation is made regardless of how many entries are
 	scanned. '''
-	from windows.kernel32 import DynamicTimeZoneInformation, _TZKEYNAME_SIZE
+	from windows.kernel32 import DynamicTimeZoneInformation
 	from windows.advapi32 import EnumDynamicTimeZoneInformation, ERROR_SUCCESS, ERROR_NO_MORE_ITEMS
 
 	struct_size: usize = compiler.sizeof( DynamicTimeZoneInformation )
@@ -127,7 +127,11 @@ def _find_zone_by_key_name( win_name: str ) -> Ptr[u8]:
 			sys.panic( 'zoneinfo: EnumDynamicTimeZoneInformation failed' )
 
 		key_ptr: Ptr[u16] = compiler.addrof( dtzi_ptr.TimeZoneKeyName )
-		candidate: str = _decode_ascii_utf16z( key_ptr, _TZKEYNAME_SIZE )
+		# element count derived from the field's own declared size, not a
+		# hand-copied constant - see windows/time.py's identical pattern
+		with compiler.panic_arithmetic( 'field size and element size are both compile-time constants, never zero' ):
+			keyname_len: usize = compiler.sizeof( dtzi_ptr.TimeZoneKeyName ) // compiler.sizeof( u16 )
+		candidate: str = _decode_ascii_utf16z( key_ptr, keyname_len )
 		if candidate == win_name:
 			return raw
 

@@ -472,9 +472,9 @@ class RedirectServer:
 						recv_total1 += n1
 						attempts1 += 1
 						req1 = buf1.decode().unwrap( 'server: decode 1' )
-						if req1.find( '/search?q=hello%20world' ) != isize( -1 ) or n1 == 0:
+						if req1.find( '/search?q=hello+world' ) != isize( -1 ) or n1 == 0:
 							break
-				if req1.find( '/search?q=hello%20world' ) != isize( -1 ):
+				if req1.find( '/search?q=hello+world' ) != isize( -1 ):
 					self.saw_query.store( True )
 				resp1: str = 'HTTP/1.1 302 Found\\r\\nLocation: http://127.0.0.1:18771/final\\r\\nContent-Length: 0\\r\\n\\r\\n'
 				rb1: bytes = resp1.encode().unwrap( 'server: encode 1' )
@@ -517,6 +517,73 @@ def main() -> i32:
 		return 3
 	if r.url != 'http://127.0.0.1:18771/final':
 		return 4
+	return 0
+''' ),
+			( 'session_follows_relative_redirect', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response
+
+class RelativeRedirectServer:
+	port: u16
+	ready: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 2 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+
+		match listener.accept():
+			case Result.Ok( pair1 ):
+				conn1: Socket = pair1[0]
+				buf1: bytearray = bytearray( 4096 )
+				conn1.recv( buf1.get_ptr(), 4096 ).unwrap( 'server: recv 1' )
+				# a RELATIVE Location - resolved against the request URL via
+				# urllib.parse.urljoin() now, previously "don't redirect"
+				resp1: str = 'HTTP/1.1 302 Found\\r\\nLocation: /final\\r\\nContent-Length: 0\\r\\n\\r\\n'
+				rb1: bytes = resp1.encode().unwrap( 'server: encode 1' )
+				conn1.send( rb1.get_const_ptr(), rb1.__len__() ).unwrap( 'server: send 1' )
+				conn1.close()
+			case Result.Err( _ ):
+				pass
+
+		match listener.accept():
+			case Result.Ok( pair2 ):
+				conn2: Socket = pair2[0]
+				buf2: bytearray = bytearray( 4096 )
+				conn2.recv( buf2.get_ptr(), 4096 ).unwrap( 'server: recv 2' )
+				resp2: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 5\\r\\n\\r\\nfinal'
+				rb2: bytes = resp2.encode().unwrap( 'server: encode 2' )
+				conn2.send( rb2.get_const_ptr(), rb2.__len__() ).unwrap( 'server: send 2' )
+				conn2.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: RelativeRedirectServer = RelativeRedirectServer( u16( 18773 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	r: Response = s.get( 'http://127.0.0.1:18773/start' ).unwrap( 'client request' )
+	t.join()
+
+	if r.status_code != 200:
+		return 1
+	body: str = r.text().unwrap( 'text' )
+	if body != 'final':
+		return 2
+	if r.url != 'http://127.0.0.1:18773/final':
+		return 3
 	return 0
 ''' ),
 			( 'session_form_post_and_basic_auth', '''

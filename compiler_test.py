@@ -514,5 +514,73 @@ def main() -> None:
 ''' )
 		self.assertEqual( self._extern_libs(), {} )
 
+class ExternDllDependencyTests( CompilerTestCase ):
+	''' compiler.extern_dlls - populated only from @extern(..., dll=...)
+	declarations on functions actually reached/lowered, the same
+	reachability gate ExternLibraryDependencyTests above verifies for
+	extern_libs (see compiler.py's Function-lowering branch: both are
+	registered together, from the same `if unit.extern_lib is not None:`
+	check). Drives mpy.py's post-link DLL-bundling step. '''
+
+	def test_called_extern_function_registers_its_dll( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll' } )
+
+	def test_declared_but_uncalled_extern_function_does_not_register_its_dll( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	pass
+''' )
+		self.assertEqual( self.compiler.extern_dlls, set() )
+
+	def test_extern_without_dll_leaves_the_registry_empty( self ) -> None:
+		self._run( '''
+@extern( 'c', 'malloc' )
+def malloc( size: usize ) -> Ptr[u8]:
+	...
+
+def main() -> None:
+	malloc( 4 )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, set() )
+
+	def test_dll_list_registers_every_entry( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'zlib1.dll' } )
+
+	def test_dlls_union_across_multiple_reached_functions( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tk86t', 'Tk_Init', dll = 'tk86t.dll' )
+def Tk_Init( interp: Ptr[None] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tk_Init( None )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'tk86t.dll' } )
+
 if __name__ == '__main__':
 	unittest.main()
