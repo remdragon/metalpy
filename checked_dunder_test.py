@@ -77,9 +77,15 @@ class CheckedDunderBehaviorTests( RealCompileMixin, unittest.TestCase ):
 		compiler = self._compile_source( _I32_ADD_MODES_BEHAVIOR )
 		c_source = emitter_c.emit_c( compiler )
 		self._assert_compiles_and_runs( c_source, expected_exit = 0, compiler = compiler )
+		# i32.__add__/__wrapped_add__/__saturated_add__ are now specializations
+		# of shared generic bodies (i_add_checked[T]/i_add_wrapped[T]/
+		# i_add_saturated[T] - lib/builtins/__scalar_arith.py), not per-type
+		# functions named i32__add__i32 anymore - check for the GENERIC
+		# stem instead, so this assertion still means something (checking
+		# for the old, now-nonexistent name would trivially always pass)
 		qualnames = { lf.function.qualname for lf in compiler.functions }
 		self.assertFalse(
-			any( 'i32__add__i32' in q or 'i32__wrapped_add__i32' in q or 'i32__saturated_add__i32' in q for q in qualnames ),
+			any( 'i_add_checked' in q or 'i_add_wrapped' in q or 'i_add_saturated' in q for q in qualnames ),
 			f'a real i32 dunder-add function was compiled, @inline should have spliced it instead: {sorted(qualnames)}',
 		)
 
