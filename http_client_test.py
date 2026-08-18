@@ -1,7 +1,8 @@
 # Real-compile-and-run tests for lib/http/client.py's Phase 0 pieces (see
 # PLAN_HTTP_CLIENT.md): the zero-prerequisite pure wire-format functions -
-# HTTPHeaders, status-line/header-line parsing, percent-encoding, base64
-# encoding, and chunked-transfer decoding. None of this depends on the
+# HTTPHeaders, status-line/header-line parsing, base64 encoding, and
+# chunked-transfer decoding (percent-encoding moved to urllib.parse - see
+# urllib_parse_test.py). None of this depends on the
 # socket library (still unimplemented - see the plan), so it's tested here
 # entirely against in-memory strings/bytes, the same way lib/codecs/*.py's
 # own encode/decode round trips are tested.
@@ -114,19 +115,6 @@ def main() -> i32:
 				return 5
 	if hdrs.__len__() != 2:
 		return 6
-	return 0
-''' ),
-			( 'percent_encode_reserved_and_unreserved', '''
-from http.client import percent_encode
-
-def main() -> i32:
-	if percent_encode( 'hello world!' ) != 'hello%20world%21':
-		return 1
-	# every RFC 3986 unreserved character must pass through unchanged
-	if percent_encode( 'abc-._~XYZ019' ) != 'abc-._~XYZ019':
-		return 2
-	if percent_encode( '' ) != '':
-		return 3
 	return 0
 ''' ),
 			( 'base64_encode_known_vectors', '''

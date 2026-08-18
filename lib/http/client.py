@@ -7,7 +7,6 @@ HTTPHeaders     - ordered, case-insensitive multimap for request/response header
 parse_status_line  - "HTTP/1.1 200 OK" -> (version, status_code, reason)
 parse_header_line  - "Name: value" -> (name, value)
 parse_headers      - a raw CRLF-joined header block -> HTTPHeaders
-percent_encode     - RFC 3986 percent-encoding of a str's UTF-8 bytes
 base64_encode      - standard (padded) base64 encoding of bytes, for auth=
 decode_chunked     - decodes an already-fully-buffered chunked-transfer body
 HTTPConnection     - connect/request/getresponse/close over one TCP connection
@@ -24,6 +23,7 @@ import sys
 import compiler
 import base64
 from socket import Socket
+from urllib.parse import quote
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -190,63 +190,6 @@ def parse_headers( raw_block: str ) -> Result[HTTPHeaders, HTTPError]:
 		parsed: tuple[str,str] = parse_header_line( line ).or_return()
 		headers.add( parsed[0], parsed[1] )
 	return Result.Ok( headers )
-
-# ---------------------------------------------------------------------------
-# percent-encoding (RFC 3986) - needed by params=/form-encoded data=
-# ---------------------------------------------------------------------------
-
-def _is_unreserved_byte( b: u8 ) -> bool:
-	if b >= 0x41 and b <= 0x5A: # A-Z
-		return True
-	if b >= 0x61 and b <= 0x7A: # a-z
-		return True
-	if b >= 0x30 and b <= 0x39: # 0-9
-		return True
-	if b == 0x2D or b == 0x5F or b == 0x2E or b == 0x7E: # - _ . ~
-		return True
-	return False
-
-_HEX_UPPER: str = '0123456789ABCDEF'
-_PERCENT: u8 = 0x25 # '%'
-
-def percent_encode( s: str ) -> str:
-	''' RFC 3986 percent-encoding, applied to s's own UTF-8 bytes (percent-
-	encoding is a byte-level transform, not a codepoint-level one - a
-	multi-byte UTF-8 codepoint becomes multiple %XX triplets, matching
-	Python's urllib.parse.quote() on a UTF-8-encoded str). '''
-	data: ConstPtr[u8] = s.get_const_ptr()
-	n: usize = s.byte_len()
-	hex_ptr: ConstPtr[u8] = _HEX_UPPER.get_const_ptr()
-
-	out_len: usize = 0
-	i: usize = 0
-	with compiler.panic_arithmetic( 'irrational string length' ):
-		while i < n:
-			if _is_unreserved_byte( data[i] ):
-				out_len += 1
-			else:
-				out_len += 3
-			i += 1
-		buf_size: usize = out_len + 1 # zero terminator
-
-	out: bytearray = bytearray( buf_size )
-	out_ptr: Ptr[u8] = out.get_ptr()
-	o: usize = 0
-	i = 0
-	with compiler.wrap_arithmetic:
-		while i < n:
-			b: u8 = data[i]
-			if _is_unreserved_byte( b ):
-				out_ptr[o] = b
-				o += 1
-			else:
-				out_ptr[o] = _PERCENT
-				out_ptr[o+1] = hex_ptr[ usize( b >> 4 ) ]
-				out_ptr[o+2] = hex_ptr[ usize( b & 0x0F ) ]
-				o += 3
-			i += 1
-
-	return str.from_cstr( move( out )).unwrap( 'percent_encode: invalid UTF-8 (unreachable - output is pure ASCII)' )
 
 # ---------------------------------------------------------------------------
 # base64 (encode only - v1 only needs it for auth= -> Basic auth header)
@@ -493,7 +436,7 @@ class _GrowableBuffer:
 		# bytearray(n+1) is zero-filled by construction (see lib/builtins/
 		# __init__.py's bytearray.__init__) and never written at its own
 		# last index below, so it's null-terminated by construction instead -
-		# same approach percent_encode/base64_encode above already use.
+		# same approach quote()/base64_encode above already use.
 		with compiler.panic_arithmetic( 'bounded by len, cannot overflow' ):
 			n: usize = end - start
 			src: ConstPtr[u8] = self.__data + start
@@ -797,7 +740,7 @@ def _parse_url( url: str ) -> Result[ParsedURL, HTTPError]:
 # ---------------------------------------------------------------------------
 # query-string / form encoding - dict[str,str] iterated via key_at/value_at
 # (lib/builtins/__init__.py's dict[K,V] positional accessors), percent-
-# encoded via Phase 0's percent_encode.
+# encoded via urllib.parse's quote().
 # ---------------------------------------------------------------------------
 
 def _merge_query_params( path: str, params: dict[str,str]|None ) -> str:
@@ -812,7 +755,7 @@ def _merge_query_params( path: str, params: dict[str,str]|None ) -> str:
 	for i in range( n ):
 		key: str = p.key_at( i ).unwrap( '_merge_query_params: index in bounds by construction' )
 		value: str = p.value_at( i ).unwrap( '_merge_query_params: index in bounds by construction' )
-		parts.append( percent_encode( key ) + '=' + percent_encode( value ) ).unwrap( '_merge_query_params: append failed' )
+		parts.append( quote( key ) + '=' + quote( value ) ).unwrap( '_merge_query_params: append failed' )
 	sep: str = '&'
 	found: isize = path.find( '?' )
 	if found == isize( -1 ):
@@ -826,7 +769,7 @@ def _form_encode( data: dict[str,str] ) -> str:
 	for i in range( n ):
 		key: str = data.key_at( i ).unwrap( '_form_encode: index in bounds by construction' )
 		value: str = data.value_at( i ).unwrap( '_form_encode: index in bounds by construction' )
-		parts.append( percent_encode( key ) + '=' + percent_encode( value ) ).unwrap( '_form_encode: append failed' )
+		parts.append( quote( key ) + '=' + quote( value ) ).unwrap( '_form_encode: append failed' )
 	return '&'.join( parts )
 
 def _copy_headers( h: HTTPHeaders ) -> HTTPHeaders:
