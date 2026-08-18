@@ -11647,11 +11647,11 @@ def main() -> i32:
 		# for nested JSON keys via exactly this ternary shape.
 		self._run( '''
 def build_path( prefix: str, k: str ) -> str:
-	return k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
+	return k if prefix.byte_len() == 0 else prefix + '.' + k
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		p1: str = build_path( str( '' ), 'a' )
+		p1: str = build_path( '', 'a' )
 		if p1 != 'a':
 			return 1
 		p2: str = build_path( 'a', 'b' )
@@ -11669,11 +11669,11 @@ def main() -> i32:
 		# accidentally specific to which branch runs the chained __add__s
 		self._run( '''
 def build_path( prefix: str, k: str ) -> str:
-	return prefix + str( '.' ) + k if prefix.byte_len() != 0 else k
+	return prefix + '.' + k if prefix.byte_len() != 0 else k
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		p1: str = build_path( str( '' ), 'a' )
+		p1: str = build_path( '', 'a' )
 		if p1 != 'a':
 			return 1
 		p2: str = build_path( 'a', 'b' )
@@ -11690,11 +11690,11 @@ def main() -> i32:
 		# each branch's own intermediate temps must be flushed independently
 		self._run( '''
 def build_path( prefix: str, k: str ) -> str:
-	return ( prefix + str( '!' )) if prefix.byte_len() == 0 else ( prefix + str( '.' ) + k )
+	return ( prefix + '!' ) if prefix.byte_len() == 0 else ( prefix + '.' + k )
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		p1: str = build_path( str( '' ), 'a' )
+		p1: str = build_path( '', 'a' )
 		if p1 != '!':
 			return 1
 		p2: str = build_path( 'a', 'b' )
@@ -11712,12 +11712,12 @@ def main() -> i32:
 		# confirmed not specific to a bare `return <ternary>`
 		self._run( '''
 def build_path( prefix: str, k: str ) -> str:
-	result: str = k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
+	result: str = k if prefix.byte_len() == 0 else prefix + '.' + k
 	return result
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		p1: str = build_path( str( '' ), 'a' )
+		p1: str = build_path( '', 'a' )
 		if p1 != 'a':
 			return 1
 		p2: str = build_path( 'a', 'b' )
