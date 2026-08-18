@@ -135,6 +135,7 @@ class _Snapshot:
 	stack_depth: int
 	results: set[str]
 	narrowed: dict[str,Variable]
+	live: set[str]
 
 class CFGState:
 	''' one instance per function being lowered. `bindings` is public and
@@ -176,7 +177,9 @@ class CFGState:
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
+		self._break_live_stack: list[list[set[str]]] = [] # the definite-assignment analogue of _break_narrowed_stack above - one set[str] snapshot per break, see record_break_live()
 		self.bindings: Bindings = {}
+		self._live: set[str] = set() # names of locals DEFINITELY ASSIGNED on the current path - independent of RC tracking above (unlike bindings/rc_leaves, tracks EVERY local regardless of type - see assign()/is_live()/_expr_Name's own liveness gate). Parameters/self are always live from entry (seeded below/in enter_self()); a bare AnnAssign's own name is added to fn.names but NOT here until its first real assignment
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._narrowed: dict[str,list[Variable]] = {} # name -> the non-empty set of the UNION's own members it could still be (each .type the narrowed leaf, .stem the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead", and ONLY when the set has collapsed to exactly one member - see narrowed_member(). A single narrow() call always starts as a one-element list; merge_if's own soft-merge can grow it (two disagreeing-but-both-still-possible branches union together rather than discarding the fact) or drop it (a name narrowed on only SOME surviving paths)
 		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
@@ -194,6 +197,7 @@ class CFGState:
 		# down to T, recording the ownership fact on is_move/is_copy
 		# instead - see Parameter's own docstring) - only the OWNERSHIP
 		# STATE this prologue sets up differs by which flag is set
+		self._live.add( param.stem ) # every parameter is definitely assigned from function entry, RC or not
 		if param.is_move:
 			# the callee now fully owns the incoming reference - MOVED is
 			# the CALLER's state at the call site, not the callee's own
@@ -221,6 +225,7 @@ class CFGState:
 		because __del__ already guards the double-free via the
 		BYTEARRAY_INVALID sentinel, unrelated to this). Otherwise BORROWED,
 		like any other plain parameter - self is never copy[T]. '''
+		self._live.add( self_param.stem ) # self is definitely assigned from entry, RC or not - unlike the rc_leaves early-return below, this must run unconditionally
 		if not rc_leaves( self_param.type ):
 			return
 		if is_move:
@@ -306,7 +311,7 @@ class CFGState:
 	def snapshot( self ) -> _Snapshot:
 		return _Snapshot(
 			bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ),
-			narrowed = dict( self._narrowed ),
+			narrowed = dict( self._narrowed ), live = set( self._live ),
 		)
 
 	def restore( self, snap: _Snapshot ) -> None:
@@ -328,10 +333,18 @@ class CFGState:
 		above, and (v1 scope, see TODO.txt's own "union disambiguation"
 		section) narrowing never survives past its own branch regardless of
 		whether that branch could only have been entered when it's true -
-		no cross-branch/post-if narrowing tracking is attempted yet. '''
+		no cross-branch/post-if narrowing tracking is attempted yet.
+
+		_live reverts the same unconditional way, for the identical reason:
+		a name only definitely-assigned INSIDE a branch/loop body is never
+		assumed definitely-assigned once back outside it - merge_if()/
+		merge_loop_exits() are what let a name's liveness survive past the
+		construct, via their own explicit reconciliation, same split of
+		responsibility as bindings/narrowed above. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
+		self._live = set( snap.live )
 		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
@@ -358,18 +371,21 @@ class CFGState:
 		empty collection list onto _break_narrowed_stack (Phase 8) - every
 		`break` reached while lowering THIS loop's own body records a
 		narrowed-state snapshot into it, consumed by exit_loop()'s own
-		return value once this loop's body is fully lowered. '''
+		return value once this loop's body is fully lowered. _break_live_
+		stack is the definite-assignment analogue, pushed/popped in lockstep
+		- see record_break_live()/merge_loop_exits(). '''
 		self._confinement_depths.append( stack_depth )
 		self._break_narrowed_stack.append( [] )
+		self._break_live_stack.append( [] )
 
-	def exit_loop( self ) -> list[dict[str,list[Variable]]]:
-		''' pops and returns every narrowed-state snapshot record_break_
-		narrowed() collected while lowering this loop's own body (Phase 8)
-		- the caller (lowering.py's _stmt_While/for-loop lowerers) merges
-		these together with whatever the loop's own natural exit implies
-		via merge_loop_exits(). '''
+	def exit_loop( self ) -> tuple[list[dict[str,list[Variable]]],list[set[str]]]:
+		''' pops and returns every narrowed-state/live-state snapshot
+		record_break_narrowed()/record_break_live() collected while lowering
+		this loop's own body (Phase 8) - the caller (lowering.py's
+		_stmt_While/for-loop lowerers) merges these together with whatever
+		the loop's own natural exit implies via merge_loop_exits(). '''
 		self._confinement_depths.pop()
-		return self._break_narrowed_stack.pop()
+		return self._break_narrowed_stack.pop(), self._break_live_stack.pop()
 
 	def record_break_narrowed( self ) -> None:
 		''' called by lowering.py's _stmt_Break, BEFORE its own unwind_to()
@@ -386,7 +402,21 @@ class CFGState:
 		if self._break_narrowed_stack:
 			self._break_narrowed_stack[-1].append( dict( self._narrowed ))
 
-	def merge_loop_exits( self, natural_exit_narrowed: dict[str,list[Variable]] | None, break_narrowed: list[dict[str,list[Variable]]] ) -> None:
+	def record_break_live( self ) -> None:
+		''' the definite-assignment analogue of record_break_narrowed() -
+		called from the same _stmt_Break call site, alongside it. Captures
+		the CURRENT _live state at the exact point this break fires, into
+		the innermost currently-lowering loop's own collection list -
+		consumed by merge_loop_exits() below. Same "not for continue/return"
+		reasoning as record_break_narrowed(). '''
+		if self._break_live_stack:
+			self._break_live_stack[-1].append( set( self._live ))
+
+	def merge_loop_exits(
+		self,
+		natural_exit_narrowed: dict[str,list[Variable]] | None, break_narrowed: list[dict[str,list[Variable]]],
+		natural_exit_live: set[str] | None = None, break_live: list[set[str]] = (),
+	) -> None:
 		''' called once a loop's own body has been fully lowered (after
 		its own restore() back to the loop's entry snapshot) - reconciles
 		every way execution can actually reach the code AFTER this loop:
@@ -400,26 +430,45 @@ class CFGState:
 		value is the UNION (dedup by identity) of what each one narrowed
 		it to - not just an identical-only intersection. No candidates at
 		all (an unconditional `while True:` with no break) means nothing
-		reaches past the loop - empty is correct (dead code follows). '''
+		reaches past the loop - empty is correct (dead code follows).
+
+		natural_exit_live/break_live are the definite-assignment analogue,
+		reconciled by plain set INTERSECTION across every candidate (same
+		"AND, never an error here" rule as _merge_live_soft) rather than
+		narrowed's union-of-possible-members - a name is live past the loop
+		only if EVERY way of reaching here leaves it definitely assigned. No
+		candidates at all means nothing reaches past the loop, so liveness
+		is moot there too - empty is the safe/correct choice, matching
+		narrowed's own handling directly above. '''
 		candidates = list( break_narrowed )
 		if natural_exit_narrowed is not None:
 			candidates.append( natural_exit_narrowed )
 		if not candidates:
 			self._narrowed = {}
-			return
-		merged: dict[str,list[Variable]] = dict( candidates[0] )
-		for other in candidates[1:]:
-			next_merged: dict[str,list[Variable]] = {}
-			for name, members in merged.items():
-				if name not in other:
-					continue
-				combined = list( members )
-				for m in other[name]:
-					if not any( m is existing for existing in combined ):
-						combined.append( m )
-				next_merged[name] = combined
-			merged = next_merged
-		self._narrowed = merged
+		else:
+			merged: dict[str,list[Variable]] = dict( candidates[0] )
+			for other in candidates[1:]:
+				next_merged: dict[str,list[Variable]] = {}
+				for name, members in merged.items():
+					if name not in other:
+						continue
+					combined = list( members )
+					for m in other[name]:
+						if not any( m is existing for existing in combined ):
+							combined.append( m )
+					next_merged[name] = combined
+				merged = next_merged
+			self._narrowed = merged
+		live_candidates = list( break_live )
+		if natural_exit_live is not None:
+			live_candidates.append( natural_exit_live )
+		if not live_candidates:
+			self._live = set()
+		else:
+			live_merged = set( live_candidates[0] )
+			for other_live in live_candidates[1:]:
+				live_merged &= other_live
+			self._live = live_merged
 
 	def enter_branch( self, stack_depth: int ) -> None:
 		''' called by lowering.py's own _stmt_If, bracketing one if/elif/
@@ -482,6 +531,60 @@ class CFGState:
 		own true_end_narrowed/false_end_narrowed params) - mirrors
 		unchecked_results()'s own identical purpose. '''
 		return dict( self._narrowed )
+
+	# --- definite-assignment ("liveness") tracking -------------------------
+
+	def live_snapshot( self ) -> set[str]:
+		''' a defensive copy for lowering.py to capture alongside bindings/
+		narrowed/unchecked_results() around if/loop orchestration (see
+		merge_if()'s own true_end_live/false_end_live params) - mirrors
+		narrowed_snapshot()'s own identical purpose. '''
+		return set( self._live )
+
+	def is_live( self, name: str ) -> bool:
+		''' True if `name` is definitely assigned on the CURRENT path -
+		called from lowering.py's _expr_Name (every Name read) and
+		_stmt_Delete, the two places a local's value is actually consumed.
+		Type-independent, unlike self.bindings (RC-only) - a plain scalar/
+		struct/enum local is tracked here even though it has no entry in
+		bindings at all. '''
+		return name in self._live
+
+	def mark_live( self, name: str ) -> None:
+		''' marks `name` live directly, bypassing assign()'s own RC/Result
+		bookkeeping - for lowering.py plumbing that legitimately bypasses
+		_cfg_assign by design (compiler-synthesized loop scaffolding via
+		_declare_hidden_local/_bind_loop_target; @inline's own parameter/
+		self binding, which is deliberately untracked by cfg.py at all -
+		see _lower_inline_call's own "no _cfg_assign/incref here,
+		deliberately" comment) but is still unconditionally bound at
+		exactly the point this is called - same reasoning as parameters/
+		self being seeded live from function entry in __init__/enter_self. '''
+		self._live.add( name )
+
+	def unmark_live( self, name: str ) -> None:
+		''' the inverse of mark_live() - lets a caller that temporarily
+		marks a name live (inline parameter binding, which shadows-and-
+		restores fn.names the same way) put the name's liveness back
+		exactly as found afterward, rather than leaking a permanent
+		liveness fact for a name that wasn't actually live before the
+		splice (e.g. an outer local that happens to share a spliced
+		function's own parameter name). '''
+		self._live.discard( name )
+
+	def set_live( self, live: set[str] ) -> None:
+		''' overwrites the ENTIRE live set wholesale - used by @inline's
+		own multi-statement splice (lowering.py's _lower_inline_call) to
+		fully revert whatever liveness the splice's own pre-return
+		statements produced, once the whole splice returns. Safe as a
+		blunt full-revert (unlike merge_if/merge_loop_exits' own precise
+		reconciliation) because every name the splice's body could mark
+		live is either alpha-renamed to a name unique to that one splice
+		(never referenced again by the caller) or a self/parameter binding
+		that's deliberately reverted rather than leaking past the call -
+		mirrors the provisional Function itself being single-use and
+		discarded once the splice returns. '''
+		self._live = set( live )
 
 	# --- unchecked Result tracking ----------------------------------------
 
@@ -559,6 +662,7 @@ class CFGState:
 		entry_results: set[str] = frozenset(), true_end_results: set[str] = frozenset(), false_end_results: set[str] = frozenset(),
 		true_terminates: bool = False, false_terminates: bool = False,
 		true_end_narrowed: dict[str,list[Variable]] | None = None, false_end_narrowed: dict[str,list[Variable]] | None = None,
+		true_end_live: set[str] = frozenset(), false_end_live: set[str] = frozenset(),
 	) -> tuple[list[ir.Instruction],list[ir.Instruction],list[str]]:
 		''' called after lowering.py has already restore()'d back to the
 		if's own entry snapshot (so self.bindings/self._epilogue_stack are
@@ -636,7 +740,21 @@ class CFGState:
 		is needed - unlike bindings (which needs entry state to distinguish
 		"already live" from "needs a fresh push") or results (whose own
 		error path checks entry_results), a narrowed fact's survival past
-		the join depends only on the two end-states. '''
+		the join depends only on the two end-states.
+
+		true_end_live/false_end_live are the definite-assignment analogue -
+		captured by lowering.py via live_snapshot() at the same points it
+		captures narrowed_snapshot() - reconciled the same soft way narrowing
+		is (see _merge_live_soft), except by INTERSECTION rather than union:
+		a name survives only if BOTH branches leave it definitely assigned,
+		since ANY disagreement means a later read could hit the not-assigned
+		path. Unlike bindings' own hard "exists on only one branch" error
+		above, disagreement here is never a CompileError at the merge point -
+		it's deferred to the actual read/del (_expr_Name/_stmt_Delete), which
+		is where the user-facing "not initialized on all code branches"
+		message belongs. This is deliberately independent of Bindings/
+		rc_leaves - it covers every local, RC or not (see assign()'s own
+		unconditional self._live.add()). '''
 		true_instructions: list[ir.Instruction] = []
 		false_instructions: list[ir.Instruction] = []
 		removed: list[str] = []
@@ -654,14 +772,17 @@ class CFGState:
 			survivor = None
 			survivor_results = None
 			survivor_narrowed = None
+			survivor_live = None
 			if true_terminates and not false_terminates:
 				survivor = false_end
 				survivor_results = false_end_results
 				survivor_narrowed = false_end_narrowed
+				survivor_live = false_end_live
 			elif false_terminates and not true_terminates:
 				survivor = true_end
 				survivor_results = true_end_results
 				survivor_narrowed = true_end_narrowed
+				survivor_live = true_end_live
 			if survivor is not None:
 				for name, binding in survivor.items():
 					prior = entry_bindings.get( name )
@@ -670,9 +791,10 @@ class CFGState:
 			# both terminate -> nothing reaches the join at all (dead code
 			# past here, same reasoning as the RC side above) - empty is the
 			# safe choice; one terminates -> only the survivor's own results/
-			# narrowed state can possibly reach the join
+			# narrowed/live state can possibly reach the join
 			self._unchecked_results = set( survivor_results ) if survivor_results is not None else set()
 			self._narrowed = dict( survivor_narrowed ) if survivor_narrowed is not None else {}
+			self._live = set( survivor_live ) if survivor_live is not None else set()
 			return true_instructions, false_instructions, removed
 		for name in set( true_end ) | set( false_end ):
 			in_true = name in true_end
@@ -746,6 +868,7 @@ class CFGState:
 			removed.append( name )
 		self._merge_results( entry_results, true_end_results, false_end_results, ctx )
 		self._merge_narrowed_soft( true_end_narrowed, false_end_narrowed )
+		self._merge_live_soft( true_end_live, false_end_live )
 		return true_instructions, false_instructions, removed
 
 	def _merge_narrowed_soft( self, true_end_narrowed: dict[str,list[Variable]] | None, false_end_narrowed: dict[str,list[Variable]] | None ) -> None:
@@ -781,6 +904,19 @@ class CFGState:
 					combined.append( m )
 			merged[name] = combined
 		self._narrowed = merged
+
+	def _merge_live_soft( self, true_end_live: set[str], false_end_live: set[str] ) -> None:
+		''' the definite-assignment analogue of _merge_narrowed_soft, for the
+		neither-branch-terminates case (the terminates case is handled
+		directly in merge_if() - only the survivor's own live state matters
+		there). Unlike narrowing (union) or bindings (hard error),
+		disagreement here is a plain, silent INTERSECTION: a name survives
+		as live past the join only if BOTH branches leave it definitely
+		assigned - live on only one branch means a path exists where it
+		isn't, so it can't be trusted past the join, but that's never an
+		error HERE, only at the eventual read/del (see merge_if()'s own
+		docstring on true_end_live/false_end_live). '''
+		self._live = true_end_live & false_end_live
 
 	def _merge_results( self, entry_results: set[str], true_end_results: set[str], false_end_results: set[str], ctx: str ) -> None:
 		''' the unchecked-Result analogue of merge_if()'s own binding
@@ -1369,6 +1505,7 @@ class CFGState:
 		of the ORIGINAL still nets it to zero eventually) but inflated every
 		compiler.refcount() read taken inside a match arm by one, and every
 		match execution paid for a wholly unneeded retain/release pair. '''
+		self._live.add( dest.stem ) # unconditional, before every early-return below (borrow/rc_leaves) - liveness is type-independent, unlike bindings/rc_leaves themselves
 		if dest.stem in self._unchecked_results:
 			raise CompileError(
 				f"Result value {dest.stem!r} is discarded - it was never inspected: "
@@ -1669,19 +1806,34 @@ class CFGState:
 
 	# --- del x -------------------------------------------------------------
 
-	def deleted( self, variable: Variable ) -> list[ir.Instruction]:
+	def deleted( self, variable: Variable, ctx: str ) -> list[ir.Instruction]:
 		''' called for `del x` (see lowering.py's _stmt_Delete) - returns
 		the Decref to emit right there (if x was OWNED/COPY), and
 		neutralizes its epilogue entry so it's never decref'd again.
 		Independent-of-RC unchecked-Result check first, same reasoning as
 		assign()'s own early check - del'ing a still-unchecked Result is
 		exactly the "discarded via del" table entry, regardless of whether
-		its type has any RC leaves at all. '''
+		its type has any RC leaves at all.
+
+		Liveness check next, same reasoning again - `del` reads/consumes the
+		binding before removing it, so it needs the identical definite-
+		assignment gate _expr_Name applies to an ordinary read (this is the
+		"__del__ a variable that's not provably alive" half of that gate -
+		see is_live()'s own docstring). Checked before self.bindings.pop()
+		below so an already-live-but-never-RC-bound (scalar/struct/enum)
+		variable.stem still gets a real error instead of deleted() silently
+		no-op'ing (there was never a self.bindings entry to pop for those in
+		the first place). self._live is updated unconditionally afterward,
+		error or not - a name that WAS live is no longer live once del'd
+		either way (mirrors fn.names' own removal in lowering.py). '''
 		if variable.stem in self._unchecked_results:
 			raise CompileError(
 				f"Result value {variable.stem!r} is discarded via del - it was never inspected: "
 				f"use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
 			)
+		if variable.stem not in self._live:
+			raise CompileError( f"{ctx}: {variable.stem!r} is not initialized on all code branches" )
+		self._live.discard( variable.stem )
 		binding = self.bindings.pop( variable.stem, None )
 		if binding is None or binding.entry is None:
 			return []

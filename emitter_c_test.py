@@ -297,8 +297,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef get( self ) -> T:',
 			'\t\treturn self.v',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]',
+			'def main( b: Box[i32] ) -> None:', # a parameter, not a bare local - definitely assigned from entry, and (unlike a real Box[i32](...) construction) doesn't pull lib/sys.py's own str/builtins dependency into this import_builtins=False test
 			'\tx = b.get()',
 			'\treturn',
 		]))
@@ -331,8 +330,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef set( self, x: T ) -> None:',
 			'\t\tself.v = x',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]|Box[u32]',
+			'def main( b: Box[i32]|Box[u32] ) -> None:', # a parameter, not a bare local - see the identical comment in test_generic_rcclass_method_call_through_concrete_receiver_is_substituted
 			'\tx: i32 = 5',
 			'\tb.set( x )',
 			'\treturn',
@@ -365,8 +363,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef set( self, x: T ) -> None:',
 			'\t\tself.v = x',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]|Box[i64]',
+			'def main( b: Box[i32]|Box[i64] ) -> None:', # a parameter, not a bare local - see the identical comment in test_generic_rcclass_method_call_through_concrete_receiver_is_substituted
 			'\tx: i32 = 5',
 			'\tb.set( x )',
 			'\treturn',

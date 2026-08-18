@@ -337,9 +337,7 @@ def len( x: Foo ) -> usize:
 def len( x: Bar ) -> usize:
 	return x.__len__()
 
-def main() -> None:
-	f: Foo
-	b: Bar
+def main( f: Foo, b: Bar ) -> None:
 	x: usize = len( f )
 	y: usize = len( b )
 ''' )
@@ -373,8 +371,7 @@ def foo( x: int|None = None ) -> None:
 def foo( x: str ) -> None:
 	pass
 
-def main() -> None:
-	x: int
+def main( x: int ) -> None:
 	foo( x )
 ''' )
 		names = self._function_names()
@@ -419,8 +416,7 @@ def foo( x: int ) -> None:
 def foo( x: str ) -> None:
 	pass
 
-def main() -> None:
-	x: int|str
+def main( x: int|str ) -> None:
 	foo( x )
 ''', Path( '__main__.py' ), scope = None )
 		self.compiler.run()

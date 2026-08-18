@@ -354,7 +354,7 @@ def foo( x: Foo ) -> None:
 	def test_del_owned_decrefs_and_removes( self ) -> None:
 		x = Variable( stem = 'y', qualname = 'foo.y', file = None, line = None, type = self.foo_cls )
 		self.state.assign( x, self._new_temp( self.foo_cls ), is_alias = False )
-		instrs = self.state.deleted( x )
+		instrs = self.state.deleted( x, 'foo' )
 		self.assertEqual( self._kinds( instrs ), ['Decref'] )
 		self.assertIs( instrs[0].value, x )
 		self.assertNotIn( 'y', self.state.bindings )
@@ -362,9 +362,20 @@ def foo( x: Foo ) -> None:
 
 	def test_del_borrowed_is_a_noop( self ) -> None:
 		param = self._fn( 'foo' ).parameters[0]
-		instrs = self.state.deleted( param )
+		instrs = self.state.deleted( param, 'foo' )
 		self.assertEqual( instrs, [] )
 		self.assertNotIn( 'x', self.state.bindings )
+
+	def test_del_never_live_raises_not_initialized( self ) -> None:
+		# the "__del__ a variable that's not provably alive" half of the
+		# new definite-assignment gate - a name that was never assign()'d
+		# (so never marked live) can't be del'd either, same as reading it
+		x = Variable( stem = 'y', qualname = 'foo.y', file = None, line = None, type = self.foo_cls )
+		with self.assertRaises( CompileError ) as ctx:
+			self.state.deleted( x, 'foo' )
+		self.assertIn( "'y' is not initialized on all code branches", str( ctx.exception ))
+		# unaffected by the error - nothing was ever pushed to pop
+		self.assertNotIn( 'y', self.state.bindings )
 
 # --- IF/ELSE/ENDIF -----------------------------------------------------------
 
@@ -444,7 +455,7 @@ def foo() -> None:
 		s = self._local( 's' )
 		self.state.assign( s, self._new_temp( self.foo_cls ), is_alias = False )
 		entry = self.state.snapshot()
-		self.state.deleted( s )
+		self.state.deleted( s, 'foo' )
 		true_end = dict( self.state.bindings )
 		false_end = dict( entry.bindings ) # s still alive here
 		with self.assertRaises( CompileError ) as ctx:
@@ -469,6 +480,52 @@ def foo() -> None:
 		self.assertEqual( removed, [] )
 		self.assertEqual( len( self.state._epilogue_stack ), 1 ) # still exactly one entry, not two
 		self.assertIs( self.state.bindings['y'].entry, entry.bindings['y'].entry )
+
+	def test_live_on_only_one_branch_does_not_survive_the_merge_no_error( self ) -> None:
+		# _merge_live_soft's own intersection rule - unlike the RC bindings
+		# comparison in this same merge_if() call (which would treat 'x'
+		# here as fresh-and-confined, torn down with no error, since x was
+		# never in entry_bindings at all), liveness disagreement is its own
+		# INDEPENDENT, separately-reconciled fact: live on exactly one
+		# branch never survives past the join, but - unlike bindings -
+		# this is never a CompileError at the merge point itself, only at
+		# the actual later read/del (see merge_if()'s own docstring)
+		entry = self.state.snapshot()
+		true_instrs, false_instrs, removed = self.state.merge_if(
+			entry.bindings, {}, {}, 'foo', true_end_live = { 'x' }, false_end_live = set(),
+		)
+		self.assertEqual( true_instrs, [] )
+		self.assertEqual( false_instrs, [] )
+		self.assertEqual( removed, [] )
+		self.assertFalse( self.state.is_live( 'x' ))
+
+	def test_live_on_both_branches_survives_the_merge( self ) -> None:
+		entry = self.state.snapshot()
+		self.state.merge_if(
+			entry.bindings, {}, {}, 'foo', true_end_live = { 'x' }, false_end_live = { 'x' },
+		)
+		self.assertTrue( self.state.is_live( 'x' ))
+
+	def test_one_terminates_survivor_live_wins( self ) -> None:
+		# mirrors test_true_terminates_false_survives_no_comparison_needed's
+		# own reasoning, for liveness - only the non-terminating branch's
+		# own live state can possibly reach the join
+		entry = self.state.snapshot()
+		self.state.merge_if(
+			entry.bindings, {}, {}, 'foo', true_terminates = True,
+			true_end_live = set(), false_end_live = { 'x' },
+		)
+		self.assertTrue( self.state.is_live( 'x' ))
+
+	def test_both_terminate_resets_live_to_empty( self ) -> None:
+		entry = self.state.snapshot()
+		self.state._live.add( 'already_live' )
+		self.state.merge_if(
+			entry.bindings, {}, {}, 'foo', true_terminates = True, false_terminates = True,
+			true_end_live = { 'x' }, false_end_live = { 'y' },
+		)
+		self.assertFalse( self.state.is_live( 'x' ))
+		self.assertFalse( self.state.is_live( 'y' ))
 
 	def test_true_terminates_false_survives_no_comparison_needed( self ) -> None:
 		# if cond: takeown(move(s)); return  (no else) - s is MOVED on the
