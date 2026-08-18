@@ -437,49 +437,19 @@ class str:
 	                     # codepoint takes >= 1 byte, so char_count <= byte_len <=
 	                     # byte_size, and idx >> 8 < entries for any valid idx.
 
-	# str is immutable, so there is no reason to ever deep-copy one - every
-	# call site that used to write str(existing_str) to hand back "a copy"
-	# now just returns/reuses that existing_str directly, picking up its own
-	# incref for free via the compiler's aliasing-return convention (see
-	# _stmt_Return / _expr_Tuple's field_value, the same mechanism
-	# _insert_thousands_sep's own comment already documents). Left commented
-	# out, not deleted, as the historical copy-constructor shape in case a
-	# real deep-copy need ever comes back.
-	# def __init__( self, copy_from: str ) -> None:
-	# 	self.__byte_size = copy_from.__byte_size
-	# 	data: Ptr[u8] = sys.alloc[u8]( self.__byte_size )
-	# 	sys.memcpy( data, copy_from.__data, self.__byte_size )
-	# 	self.__data = data
-	# 	self.__char_count = copy_from.__char_count
-	# 	with compiler.panic_arithmetic( 'index sizing bounded by byte_size, cannot overflow' ):
-	# 		entries: usize = ( self.__byte_size >> 8 ) + 1
-	# 	new_index: Ptr[usize] = sys.alloc[usize]( entries )
-	# 	sys.memcpy( new_index, copy_from.__index, entries * compiler.sizeof( usize ) )
-	# 	self.__index = new_index
-
 	def __del__( self ) -> None:
 		sys.free( self.__data )
 		sys.free( self.__index )
 
-	@staticmethod
-	def __call__( x: str ) -> str:
-		# str is immutable - str(x) is always just x itself, no copy. The
-		# returned borrowed param aliases+increfs automatically (the same
-		# _stmt_Return aliasing-return convention every other str method
-		# that hands back one of its own arguments unchanged already
-		# relies on).
-		return x
+	def __str__( self ) -> str:
+		# str is immutable - str(x) is always just x itself, no copy.
+		return self
 
 	@staticmethod
 	def __call__[T]( x: T ) -> str:
-		# fallback for str(x) on anything that isn't already a str -
-		# defers to x's own __str__() the same way Python's str() does.
-		# Resolves per call site: overload_resolution.py's wildcard
-		# matching picks this only when the concrete str(x: str) overload
-		# above doesn't apply, then lowering.py monomorphizes T from the
-		# real argument type. Fails to compile (not a runtime error - this
-		# compiler has no such thing) for a T with no __str__ of its own,
-		# e.g. a bare i32 literal - use int(x).__str__() for that.
+		# str(x) isn't a request to create a new str, but to convert
+		# an object into a str, but it requires that object to implement
+		# __str__() since we have no way to know how to do that from here.
 		return x.__str__()
 
 	def __add__( self, other: str ) -> str:
