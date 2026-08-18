@@ -6535,18 +6535,26 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( '-1 is out of range for intrinsics.u128', self.discovery.errors.errors[0] )
 
-	def test_explicit_cast_still_exempt_from_range_check( self ) -> None:
-		# the exact shape the fix must NOT break - u8(300) is exactly as
-		# deliberate a bit-reinterpretation as u32(-11) (test_negative_
-		# literal_cast_is_a_bare_const above), just overflowing the OTHER
-		# direction (positive, above MAX, instead of negative, below MIN)
+	def test_narrowing_literal_cast_is_range_checked( self ) -> None:
+		# a NARROWING literal cast (u8's target width is narrower than a
+		# bare literal's own natural i32 width - unlike u32(-11)'s same-
+		# width case above, which stays a pure, unconditional bit-
+		# reinterpretation) is no longer exempt from the ordinary range
+		# check every other literal-into-scalar-type context already
+		# enforces - confirmed with the user: even for an explicit cast,
+		# a literal magnitude that can't actually fit the target's real
+		# value range is worth catching as a compile error rather than
+		# silently reinterpreting (e.g. i8(128), once used to construct
+		# i8::MIN via bit-reinterpretation of a "one past max" literal,
+		# is exactly the class of bug this is meant to catch - see
+		# float_test.py's test_int_min_div_* for the idiom this replaced).
 		code = '\n'.join([
 			'def main() -> None:',
 			'	x: u8 = u8( 300 )',
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIn( '300 is out of range for intrinsics.u8 (0..255)', self.discovery.errors.errors[0] )
 
 	def test_boundary_values_signed_and_unsigned( self ) -> None:
 		code = '\n'.join([

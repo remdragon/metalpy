@@ -3874,15 +3874,22 @@ class FunctionLowering:
 	def _lower_scalar_cast( self, target_type: Scalar, source: ast.expr|ir.Operand, node: ast.AST ) -> ir.Operand:
 		# shared by compiler.cast(T, x) and T(x) construction-sugar - the
 		# one place the actual Scalar-to-Scalar conversion logic lives.
-		# `source` is EITHER an unlowered ast.expr (a bare literal - always
-		# succeeds via bit-reinterpretation, decided at compile time, no
-		# Result involved - -11 reinterpreted as u32 is exactly the
-		# well-defined two's-complement value real WinAPI constants like
-		# STD_OUTPUT_HANDLE rely on) OR an already-lowered ir.Operand (a
-		# real runtime value, where "does this fit" is a genuine runtime
-		# question - respects self._arithmetic_mode exactly like +/-/*
-		# already do, reusing the same Check/Wrap/Saturate/panic_arithmetic
-		# machinery, not a separate concept)
+		# `source` is EITHER an unlowered ast.expr (a bare literal) OR an
+		# already-lowered ir.Operand (a real runtime value). For a pure
+		# int<->int conversion (float involved is handled separately below,
+		# unchanged), the rule is purely a bit-width question, identical for
+		# a literal and a runtime value alike (see the width comparison
+		# below and its own comment): same-width or widening ALWAYS
+		# succeeds, unconditionally, in every arithmetic mode (a pure bit-
+		# reinterpretation - -1 reinterpreted as u32 is exactly the well-
+		# defined two's-complement value real WinAPI constants like
+		# STD_OUTPUT_HANDLE rely on); only a genuinely NARROWING conversion
+		# can ever fail, and that stays mode-aware (respects self.
+		# _arithmetic_mode exactly like +/-/* already do, reusing the same
+		# Check/Wrap/Saturate/panic_arithmetic machinery) - see SYNTAX.md's
+		# own T(x) section for the full rationale, including why this is
+		# deliberately a DIFFERENT, narrower rule than x.to_T() (a value-
+		# range check, independent of width - see compiler.checked_convert).
 		if isinstance( source, ast.expr ):
 			# an EXPLICIT float-literal cast to a non-float scalar (i32(1.5),
 			# compiler.cast(u8, 3.9)) truncates toward zero at compile time -
@@ -3893,12 +3900,29 @@ class FunctionLowering:
 			# (float value preserved, or int bit-reinterpretation via _lower_expr)
 			if isinstance( source, ast.Constant ) and isinstance( source.value, float ) and not _is_float_scalar( target_type ):
 				return ir.Const( type = target_type, value = int( source.value ) )
-			# a literal argument to an EXPLICIT cast is intentional bit-
-			# reinterpretation (see this method's own docstring above) -
-			# exempt from _expr_Constant's own range check, unlike a plain
-			# literal flowing into a type via assignment/argument/return
+			# a bare int literal's own natural type is i32 (_expr_Constant's
+			# own "a literal's OWN Python type always determines its natural
+			# type" rule, used whenever no expected_type applies) - applying
+			# the SAME same-width/widening-vs-narrowing rule the runtime
+			# branch below uses, relative to THAT natural i32 width, is what
+			# makes a literal and an equivalent runtime i32 argument behave
+			# IDENTICALLY through T(x) - closing the exact inconsistency
+			# this whole mechanism exists for (previously: u32(-1) always
+			# succeeded via a blanket exemption, but u32(some_i32_var
+			# holding -1) went through the real, then still mode-aware,
+			# checked-cast path - now both are simply never fallible in the
+			# first place, since i32->u32 is same-width). Only a genuinely
+			# NARROWING literal (target narrower than i32) still needs
+			# range-checking - e.g. u8(-10000) is still a hard, mode-
+			# independent compile-time error, matching how `x: u8 = -10000`
+			# already behaves everywhere else literals flow into a
+			# concrete integer type.
+			allow_bit_reinterpret = True
+			if isinstance( source, ast.Constant ) and type( source.value ) is int and not _is_float_scalar( target_type ):
+				i32 = self.lowering.discovery.get_intrinsics()['i32']
+				allow_bit_reinterpret = target_type.sizeof >= i32.sizeof
 			prev_allow_bit_reinterpret = self._allow_literal_bit_reinterpret
-			self._allow_literal_bit_reinterpret = True
+			self._allow_literal_bit_reinterpret = allow_bit_reinterpret
 			try:
 				return self._lower_expr( source, target_type )
 			finally:
@@ -3913,8 +3937,19 @@ class FunctionLowering:
 		source_is_float = _is_float_scalar( operand.type )
 		if target_is_float or source_is_float:
 			opcode, extra = self._arithmetic_mode[-1].GetFloatCast( target_is_float = target_is_float, source_is_float = source_is_float )
-		else:
-			opcode, extra = self._arithmetic_mode[-1].GetCast()
+			return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
+		if target_type.sizeof >= operand.type.sizeof:
+			# same-width or widening int<->int - always succeeds, in every
+			# mode, no Result involved: matches CastWrap's own bare-C-cast
+			# emitter code (a plain `(ctype)(operand)`), just no longer
+			# gated behind wrap-mode specifically. A real, deliberate
+			# behavior change from this conversion's own prior semantics
+			# (confirmed via a real repro: u32(some_i32_holding_a_negative_
+			# value) previously REQUIRED an enclosing Result under checked/
+			# panic mode, only wrap mode was unconditional) - see this
+			# function's own top-of-method comment and SYNTAX.md.
+			return self._lower_arithmetic_op( node, ir.CastWrap, None, target_type, { 'operand': operand }, 'cast' )
+		opcode, extra = self._arithmetic_mode[-1].GetCast()
 		return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
 
 	def _lower_compiler_cast( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
