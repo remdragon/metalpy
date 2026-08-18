@@ -824,24 +824,6 @@ def _copy_headers( h: HTTPHeaders ) -> HTTPHeaders:
 
 _MAX_REDIRECTS: usize = 10
 
-def _encode_json_body( json_value: JSONValue ) -> Result[tuple[bytes|None, str|None], HTTPError]:
-	''' split out of _encode_body() itself - a nested match (each arm
-	returning) directly inside `if json_value is not None:`, immediately
-	followed by another `if form is not None:` check on a DIFFERENT
-	parameter, hit a real compiler diagnostic bug ("'form' is not
-	initialized on all code branches" - form is an ordinary parameter,
-	always bound - confirmed via a real compile). A single-return-statement
-	call site sidesteps it entirely, matching this file's own established
-	"extract into a plain non-looping helper" pattern used elsewhere (see
-	_build_request_headers/_next_redirect_url's own comments). '''
-	match dumps( json_value ):
-		case Result.Ok( text ):
-			body: bytes = text.encode().unwrap( '_encode_json_body: json.dumps() output is always valid UTF-8' )
-			result: tuple[bytes|None, str|None] = ( body, 'application/json' )
-			return Result.Ok( result )
-		case Result.Err( _ ):
-			return Result.Err( HTTPError.InvalidJSON( None ))
-
 def _encode_body( data: bytes|str|None, form: dict[str,str]|None, json_value: JSONValue|None ) -> Result[tuple[bytes|None, str|None], HTTPError]:
 	''' -> (body bytes, Content-Type to set if not already present). json_value,
 	form, and data are mutually exclusive (checked in that priority order if
@@ -860,7 +842,13 @@ def _encode_body( data: bytes|str|None, form: dict[str,str]|None, json_value: JS
 	dumps() rejects a non-finite float anywhere in the value. '''
 	if json_value is not None:
 		jv: JSONValue = json_value
-		return _encode_json_body( jv )
+		match dumps( jv ):
+			case Result.Ok( text ):
+				body: bytes = text.encode().unwrap( '_encode_body: json.dumps() output is always valid UTF-8' )
+				result: tuple[bytes|None, str|None] = ( body, 'application/json' )
+				return Result.Ok( result )
+			case Result.Err( _ ):
+				return Result.Err( HTTPError.InvalidJSON( None ))
 	if form is not None:
 		f: dict[str,str] = form
 		encoded: str = _form_encode( f )

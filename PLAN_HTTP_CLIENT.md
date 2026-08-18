@@ -429,10 +429,10 @@ Compiler gaps found while landing Phase 4a
    "'form' is not initialized on all code branches", where `form` is an
    ordinary always-bound parameter never touched by the preceding block.
    Worked around by extracting the nested-match branch into its own small
-   single-return-statement helper function (_encode_json_body) - matches
-   this file's own established "extract into a plain helper" pattern for
-   narrowing-related compiler gaps (_build_request_headers/_next_redirect_url).
-   Flagged as task_ccb9f3d6.
+   single-return-statement helper function (_encode_json_body). Fixed for
+   real by c20b4d1 (_stmt_diverges now recognizes a terminating nested
+   if/else, including the if-chain a match desugars into); the helper was
+   re-inlined into _encode_body once that landed. Flagged as task_ccb9f3d6.
 
 3. (Not a compiler bug - a real bug in this file, found and fixed the same
    way): a match-arm capture bound to the name `text` inside Response.json()
