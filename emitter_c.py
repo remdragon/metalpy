@@ -1899,6 +1899,74 @@ def _emit_cast( instr ) -> list[str]:
 		'\t}',
 	]
 
+def _emit_convert_check( instr: 'ir.ConvertCheck' ) -> list[str]:
+	# compiler.checked_convert(T, x) - value-preserving numeric conversion:
+	# succeeds iff operand's VALUE fits in target's own [MIN,MAX], entirely
+	# independent of bit width. Deliberately NOT the same code path as
+	# CastCheck (T(x)/compiler.cast(T,x)'s own check opcode, reached only
+	# for a NARROWING conversion - see _lower_scalar_cast's width
+	# comparison) - see ir.ConvertCheck's own comment for why these are two
+	# separate opcodes despite needing near-identical comparison math. This
+	# is a deliberate, close adaptation of _emit_cast's own check-mode
+	# branch (same u128/wideint/wideuint/MSVC-fallback edge cases apply
+	# here identically - see that function's own extensive comments for
+	# the full rationale of each), kept as an independent function rather
+	# than a shared helper so the two opcodes' emitters stay independently
+	# readable/modifiable.
+	target_type = instr.dest.type.args[0]
+	operand = _emit_operand( instr.operand )
+	stem = target_type.stem if isinstance( target_type, Scalar ) else None
+	ctype = c_type( target_type )
+	min_c, max_c = _int_min_max_bit_pattern( stem )
+	source_stem = instr.operand.type.stem if isinstance( instr.operand.type, Scalar ) else None
+	dest = _temp_name( instr.dest.id )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+	err_ctype = c_type( _result_error_type( instr.dest.type ))
+
+	if stem == 'u128' and source_stem != 'u128':
+		out_of_range = None if source_stem is not None and _is_unsigned_stem( source_stem ) else f'( ({operand}) < 0 )'
+		if out_of_range is None:
+			return [ f'\t{dest}.{tag_f} = 0;', f'\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});' ]
+		return [
+			'\t{',
+			f'\t\tbool __overflow = {out_of_range};',
+			'\t\tif ( __overflow ) {',
+			f'\t\t\t{dest}.{tag_f} = 1;',
+			f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
+			'\t\t} else {',
+			f'\t\t\t{dest}.{tag_f} = 0;',
+			f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+			'\t\t}',
+			'\t}',
+		]
+
+	wide_ctype = '__metalpy_wideuint' if source_stem is not None and _is_unsigned_stem( source_stem ) else '__metalpy_wideint'
+	wide_decl = f'{wide_ctype} __wide = ({wide_ctype})({operand});'
+	upper_needs_unsigned_domain = wide_ctype == '__metalpy_wideint' and stem in ( 'u64', 'usize' )
+	upper_bound = (
+		f'( (__metalpy_wideuint)(__wide) > (__metalpy_wideuint)({max_c}) )'
+		if upper_needs_unsigned_domain else
+		f'( __wide > ({wide_ctype})({max_c}) )'
+	)
+	overflow = (
+		upper_bound
+		if wide_ctype == '__metalpy_wideuint' else
+		f'( __wide < ({wide_ctype})({min_c}) ) || {upper_bound}'
+	)
+	return [
+		'\t{',
+		f'\t\t{wide_decl}',
+		f'\t\tbool __overflow = {overflow};',
+		'\t\tif ( __overflow ) {',
+		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
+		'\t\t} else {',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+		'\t\t}',
+		'\t}',
+	]
+
 # --- comparisons / control flow / calls / member access -----------------------
 
 _CMP_SYMBOLS = {
@@ -2165,6 +2233,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return _emit_neg( instr )
 	if type( instr ) in _CAST_MODE:
 		return _emit_cast( instr )
+	if isinstance( instr, ir.ConvertCheck ):
+		return _emit_convert_check( instr )
 
 	if isinstance( instr, ir.Cmp ):
 		symbol = _CMP_SYMBOLS[instr.op]

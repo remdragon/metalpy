@@ -291,6 +291,17 @@ class CastWrap( UnaryOp ): pass
 class CastCheck( UnaryOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class CastSaturate( UnaryOp ): pass
 
+# compiler.checked_convert(T, x) - deliberately separate from CastCheck, not
+# a reuse: CastCheck's own range check only applies to a WIDTH-CHANGING
+# (narrowing) conversion - same-width/widening always succeed unconditionally
+# (T(x) construct-cast syntax, see _lower_scalar_cast). ConvertCheck's own
+# check is a genuine VALUE-range comparison against the target type's own
+# [MIN,MAX], independent of width - it can fail even for a same-width,
+# cross-signedness conversion (i8(-1).to_u8() must fail; u8(i8(-1)) via
+# construct-cast syntax never does). See SYNTAX.md's own T(x)-vs-.to_T()
+# section for the full rationale.
+class ConvertCheck( UnaryOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
+
 # float-involving scalar casts (see the float-arithmetic note above). Unary `-`
 # on a float always reuses the plain NegWrap opcode (negation never introduces
 # inf/nan, so there's nothing to check), so no float negate opcode is needed.

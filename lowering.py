@@ -3599,6 +3599,48 @@ class FunctionLowering:
 		self._emit( opcode( dest = check_dest, left = left, right = right ))
 		return check_dest
 
+	def _lower_compiler_checked_convert( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.checked_convert(T, x) - the single fixed-mode intrinsic
+		# behind every scalar .to_T() conversion method (lib/builtins/
+		# __scalar_arith.py) - a genuine numeric VALUE-range check against
+		# T's own [MIN,MAX], independent of bit width (unlike compiler.
+		# cast(T,x)/T(x) construct-cast syntax, which only range-checks a
+		# NARROWING conversion - see _lower_scalar_cast). Always fallible
+		# (ir.ConvertCheck), unlike checked_add/etc's wrapped_*/saturated_*
+		# siblings - there's no "wrapped"/"saturated" variant of a value-
+		# range check that means anything different, so .to_T() only ever
+		# needs this one intrinsic (see mode-consumption at the DISPATCH
+		# site - ambient mode still governs how the Result gets consumed,
+		# same as any other @fallible_arithmetic method, just never changes
+		# the check itself).
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.checked_convert(...) takes exactly two arguments (target type, value): {ast.unparse(node)}', node )
+		target_type = getattr( node.args[0], 'resolved_type', None )
+		if target_type is None:
+			target_type = self.lowering._try_resolve_namespace( node.args[0] )
+		if not isinstance( target_type, Scalar ) or target_type.stem in ( 'f32', 'f64' ):
+			self.lowering.discovery.fail(
+				f'compiler.checked_convert(...) first argument must be an integer scalar type: {ast.unparse(node)}', node,
+			)
+		operand = self._lower_expr( node.args[1], None )
+		if not isinstance( operand.type, Scalar ) or operand.type.stem in ( 'f32', 'f64' ):
+			self.lowering.discovery.fail(
+				f'compiler.checked_convert(...) second argument must be an integer scalar value, got '
+				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		overflow_cls = self.lowering.discovery.find_name( 'OverflowError', node )
+		# NOT monomorphized - same reasoning as _lower_compiler_checked_binop's
+		# own check_dest above: _emit_convert_check (emitter_c.py) needs
+		# this temp's type to stay a Specialization (reads .args[0] for the
+		# target type)
+		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ target_type, overflow_cls ] )
+		self.lowering.schedule( check_type )
+		check_dest = self._new_temp( check_type )
+		self._emit( ir.ConvertCheck( dest = check_dest, operand = operand ))
+		return check_dest
+
 	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
 		# must be a bare local variable/parameter name (matches SYNTAX.md's
@@ -10804,6 +10846,10 @@ class FunctionLowering:
 
 			case 'cast':
 				result = self._lower_compiler_cast( node, expected_type )
+				return result if want_result else None
+
+			case 'checked_convert':
+				result = self._lower_compiler_checked_convert( node, expected_type )
 				return result if want_result else None
 
 			case 'addrof':
