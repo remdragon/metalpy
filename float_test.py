@@ -892,6 +892,97 @@ def main() -> i32:
 	return 0
 ''', [ 'format_value(f64) via .__str__() == "2.0"' ] )
 
+	def test_f32_string_formatting_entry_points( self ) -> None:
+		# lib/builtins/__float.py's f32-side functions all widen to f64 and
+		# delegate (_f32_str( value ) -> f64( value ).__str__(), etc). The
+		# f64( value ) widening conversion is a checked-mode float cast by
+		# default (arithmetic_mode.py's GetFloatCast makes no widening-vs-
+		# narrowing distinction - every to-float direction is treated as
+		# "could produce a non-finite result", which is only actually true
+		# when the SOURCE is already NaN/Infinity), so every one of these
+		# functions used to fail to compile outright with "f64(value)
+		# requires the enclosing function to return Result[_,
+		# FloatingPointError]" - none of them return a Result (they're all
+		# plain `-> str`), and panicking on a merely-non-finite INPUT would
+		# make it impossible to ever print/format such a value. Confirmed
+		# unconditional (present even via the plain f-string path, which
+		# has nothing to do with the SEPARATE Scalar-attached-method-call
+		# crash fixed just above) and apparently never caught before -
+		# nothing in this suite had ever compiled these specific function
+		# bodies. Fixed by wrapping each f64( value ) conversion in `with
+		# compiler.wrap_arithmetic:` - per arithmetic_mode.py's own
+		# _raw_float_cast, wrap-mode float widening lowers to a single
+		# plain C cast (`(double)(value)`), the literal always-correct,
+		# lossless widening operation for THIS direction specifically, not
+		# a "silently wrong on overflow" shortcut the way integer wrap is.
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	f: f32 = 3.5
+	if f.__str__() != '3.5':
+		return 1
+	if f.__repr__() != '3.5':
+		return 2
+	if f'{f}' != '3.5':
+		return 3
+	if f'{f:.1f}' != '3.5':
+		return 4
+	return 0
+''', [
+			'f32.__str__() == "3.5"',
+			'f32.__repr__() == "3.5"',
+			'bare f-string interpolation of an f32 == "3.5"',
+			"format-spec'd f-string interpolation of an f32 == \"3.5\"",
+		] )
+
+	def test_f32_string_formatting_of_non_finite_values( self ) -> None:
+		# the whole reason `with compiler.wrap_arithmetic:` (not panic_
+		# arithmetic) is the right choice above: these functions need to be
+		# able to render a NaN/Infinity f32 as text too, matching f64's own
+		# confirmed str()/repr() behavior on non-finite input - panicking
+		# on a merely non-finite INPUT (as opposed to an operation that
+		# PRODUCES one) would make this impossible.
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		zero: f32 = 0.0
+		nan: f32 = zero / zero
+		pos_inf: f32 = 1.0 / zero
+	if nan.__str__() != 'nan':
+		return 1
+	if pos_inf.__str__() != 'inf':
+		return 2
+	return 0
+''', [ 'f32 NaN.__str__() == "nan"', 'f32 +Infinity.__str__() == "inf"' ] )
+
+	def test_scalar_attached_method_call_with_explicit_argument_beyond_receiver( self ) -> None:
+		# a SEPARATE gap in the fix just above (test_f64_str_and_repr_
+		# direct_call): _lower_call's own receiver-prepend only patches
+		# `args` AFTER _match_call_args/_lower_call_args has already
+		# matched the call site's own EXPLICIT arguments against target.
+		# parameters from index 0, with no idea a receiver will later
+		# occupy slot 0. For a receiver-taking call with ZERO explicit
+		# arguments (f.__str__()) this degenerates harmlessly (nothing to
+		# mismatch), which is why that fix alone looked complete - but any
+		# Scalar-attached method taking one or more EXPLICIT arguments
+		# beyond the receiver (f64._sign_prefix(mode), reached via lib/
+		# builtins/__float.py's own f32->f64 format-spec delegation above)
+		# had every explicit argument matched one parameter slot too EARLY
+		# (mode checked against value's own f64-typed slot), confirmed by a
+		# real type error the first time such a call was ever actually
+		# compiled. Fixed by matching the call site's own arguments against
+		# a parameter list with the receiver's slot already excluded.
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	f: f64 = 5.0
+	got: str = f._sign_prefix( '+' )
+	if got != '+':
+		return 1
+	got2: str = f._sign_prefix( '-' )
+	if got2 != '':
+		return 2
+	return 0
+''', [ "f64._sign_prefix('+') on a non-negative value == \"+\"", "f64._sign_prefix('-') on a non-negative value == \"\"" ] )
+
 
 if __name__ == '__main__':
 	unittest.main()

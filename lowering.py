@@ -11470,29 +11470,28 @@ class FunctionLowering:
 					kwargs[param.stem] = default_operand
 		else:
 			self.lowering._resolve_call_target( target )
+			# a Scalar-registered method's receiver isn't threaded through
+			# call.args at all - _match_call_args's own
+			# receiver_fills_first_param excludes target's first positional
+			# parameter from call-site matching accordingly (see its own
+			# comment); the receiver is spliced back in as an ordinary
+			# leading positional argument just below.
 			receiver_fills_first_param = receiver is not None and isinstance( target, Function ) and target.cls is None
 			args, kwargs = self._lower_call_args( target, node, receiver_fills_first_param = receiver_fills_first_param )
 
 		if receiver is not None and isinstance( target, Function ) and target.cls is None:
-			# a Scalar-registered method (`SomeScalar.method = some_free_
-			# function` - discovery.py's visit_Assign, e.g. lib/builtins/
-			# __float.py's `f64.__str__ = _f64_str`) is a genuine free
-			# Function, unlike a real CStruct/RCClass method - discovery
-			# never strips a "self" off its .parameters the way
-			# _make_function_resolver does for an actual class body (there
-			# IS no class body here), so ir.Call's own receiver field
-			# (meant for real bound-method calls only) would make
-			# emitter_c.py's own _emit_call_args (which walks
-			# target.parameters assuming it already excludes the receiver)
-			# double-count the receiver against the first declared
-			# parameter - confirmed by a real KeyError crash on ordinary
-			# `f.__str__()` call syntax. _lower_method_call above (used by
-			# f-string dunder-dispatch/format-spec call sites) already
-			# carries this exact fix for its own narrower set of callers;
-			# this is the same fix for the general call-lowering path every
-			# other Scalar-attached-method call site (including ordinary
-			# user-written `receiver.method()` syntax) actually goes
-			# through.
+			# ir.Call's own receiver field is for real bound-method calls
+			# only (an RCClass/CStruct method with "self" already excluded
+			# from .parameters) - a Scalar-attached free function (see the
+			# comment above) takes the receiver as an ordinary LEADING
+			# positional argument instead, confirmed by a real KeyError
+			# crash on ordinary `f.__str__()` call syntax before this fix.
+			# _lower_method_call above (used by f-string dunder-dispatch/
+			# format-spec call sites) already carries this exact fix for
+			# its own narrower set of callers; this is the same fix for the
+			# general call-lowering path every other Scalar-attached-method
+			# call site (including ordinary user-written `receiver.method()`
+			# syntax) actually goes through.
 			args = [ receiver ] + args
 			receiver = None
 
