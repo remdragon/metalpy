@@ -6567,9 +6567,26 @@ class FunctionLowering:
 		# genuine arity mismatch is a real type error better left to
 		# whatever assignment/return-type check already reports it
 		# clearly, not guessed at here.
+		#
+		# expected_type isn't always the bare TupleType itself - a generic
+		# call's own type-param inference (monomorphize.py's substitute_
+		# type_params) eagerly resolves a TupleType bound to a TypeVar into
+		# its backing RCClass before handing it down as an expected-type
+		# hint (Result.Ok((a, b)) against a declared Result[tuple[T1|None,
+		# T2|None],E] return type reaches here with expected_type already
+		# the tuple's backing RCClass, not the bare TupleType) - falling
+		# back to tuple_type_for's reverse lookup recovers the original
+		# elem_types (with their union members) in that case too, instead
+		# of silently skipping per-element coercion and inferring the
+		# tuple's own NATURAL (non-union) type, which then disagrees with
+		# the outer expected type and fails generic inference.
+		expected_tuple_type = (
+			expected_type if isinstance( expected_type, TupleType )
+			else self.lowering._tuple_storage.tuple_type_for( expected_type )
+		)
 		expected_elem_types: list[Type]|None = (
-			expected_type.elem_types
-			if isinstance( expected_type, TupleType ) and len( expected_type.elem_types ) == len( node.elts )
+			expected_tuple_type.elem_types
+			if expected_tuple_type is not None and len( expected_tuple_type.elem_types ) == len( node.elts )
 			else None
 		)
 		operands: list[ir.Operand] = []

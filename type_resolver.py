@@ -2322,17 +2322,32 @@ class TypeResolver:
 		while node_ref is not None:
 			chain.append( node_ref )
 			node_ref = node_ref.base
-		for base_cls in reversed( chain ):
-			for attr in base_cls.attributes:
-				if attr.resolve is not None:
-					attr.resolve()
-				body.extend( self._build_field_teardown_ast(
-					ast.Attribute(
-						value = ast.Name( id = 'self', ctx = ast.Load() ),
-						attr = attr.stem, ctx = ast.Load(),
-					),
-					attr.type,
-				))
+		# _build_field_teardown_ast may need to synthesize a union member
+		# constructor for the FIRST time (a field typed as an anonymous
+		# X|Y never otherwise touched, e.g. a tuple[X|None,...] element
+		# reached here as a queued RCClass before anything else ever
+		# constructs a real value of that tuple type) - UnionStorage.get() stamps
+		# that constructor's own file from "whichever module is currently
+		# active" (module_stack[-1]), which is otherwise NOT the case here:
+		# compiler._lower's RCClass branch calls this method directly,
+		# with no module_context of its own (unlike resolve_function_body,
+		# which always pushes one first - see this class's own identical
+		# _find_module_for pattern there). Without this, the synthesized
+		# constructor's file stays None and a later _find_module_for on IT
+		# fails outright ("no module found owning ...") the first time
+		# anything actually needs to lower/call it.
+		with self.discovery.module_context( self._find_module_for( cls )):
+			for base_cls in reversed( chain ):
+				for attr in base_cls.attributes:
+					if attr.resolve is not None:
+						attr.resolve()
+					body.extend( self._build_field_teardown_ast(
+						ast.Attribute(
+							value = ast.Name( id = 'self', ctx = ast.Load() ),
+							attr = attr.stem, ctx = ast.Load(),
+						),
+						attr.type,
+					))
 
 		# 3. sys.free(self) — resolve the callee and tag it so lowering
 		# skips overload resolution (sys.free is an Overload group,

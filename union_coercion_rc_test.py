@@ -163,6 +163,51 @@ def main() -> i32:
 	return 0
 '''
 
+# bug (4): a tuple LITERAL passed directly as a generic call's own argument
+# (Result.Ok((a, b)), not merely a return value/AnnAssign RHS already fixed
+# by 98c2010 "tuple: coerce elements into their declared union types during
+# construction") against a declared Result[tuple[T1|None,T2|None],E] return
+# type used to fail generic inference outright: "type parameter 'T' is
+# inferred as both tuple[str|None,str|None] and tuple[str,str]". Root cause:
+# monomorphize.py's substitute_type_params eagerly resolves a TupleType bound
+# to a TypeVar into its backing RCClass before handing it down the call's own
+# argument-lowering as an expected-type hint (needed so the emitter, which
+# has no ensure_resolved of its own, never sees a bare unresolved TupleType -
+# see that function's own comment) - but _expr_Tuple's own per-element
+# union-coercion only recognized a BARE TupleType, not its already-resolved
+# backing RCClass, so it silently skipped coercing the tuple's own elements
+# into their declared union types, inferring the tuple's plain NATURAL type
+# instead - which then disagreed with the return type's own binding.
+# _expr_Tuple now falls back to TupleStorage's own reverse lookup (backing
+# RCClass -> the TupleType it backs) to recover the original elem_types
+# (with their union members) in that case too.
+_RESULT_OK_TUPLE_LITERAL_UNION_ELEMENTS = '''
+@union
+class SomeErr:
+	Bad: None
+
+def f( a: str, b: str|None ) -> Result[tuple[str|None,str|None], SomeErr]:
+	return Result.Ok(( a, b ))
+
+def main() -> i32:
+	r = f( 'hello', None )
+	if r.is_err():
+		return 1
+	t: tuple[str|None,str|None] = r.unwrap( 'f: expected Ok' )
+	match t[0]:
+		case str( s ):
+			if s != 'hello':
+				return 2
+		case None:
+			return 3
+	match t[1]:
+		case str( s ):
+			return 4
+		case None:
+			pass
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
 class UnionCoercionRCTests( RealCompileMixin, unittest.TestCase ):
@@ -171,6 +216,11 @@ class UnionCoercionRCTests( RealCompileMixin, unittest.TestCase ):
 			( 'return_borrowed_through_union', _RETURN_BORROWED_THROUGH_UNION ),
 			( 'union_coerce_field_read', _UNION_COERCE_FIELD_READ ),
 			( 'union_coerce_tracked_local', _UNION_COERCE_TRACKED_LOCAL ),
+		])
+
+	def test_tuple_literal_union_elements_via_generic_call( self ) -> None:
+		self.assert_programs_run([
+			( 'result_ok_tuple_literal_union_elements', _RESULT_OK_TUPLE_LITERAL_UNION_ELEMENTS ),
 		])
 
 
