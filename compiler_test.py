@@ -52,6 +52,11 @@ class ArchitectureExampleTests( CompilerTestCase ):
 	''' hand-verifies ARCHITECTURE.md's own shape: FuncStart, DeclareTemp, AddWrap, Call, DeleteTemp, Return, FuncEnd '''
 
 	def test_foo_sequence_and_schedule_order( self ) -> None:
+		# x + 1 dispatches through i32.__wrapped_add__ now - the literal `1`
+		# isn't already a Variable, so it's spliced into a synthesized local
+		# (an extra Assign) before AddWrap, same as lowering_test.py's own
+		# migrated arithmetic tests
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def main() -> None:
 	foo( 3 )
@@ -68,13 +73,14 @@ def echo( x: i32 ) -> None:
 
 		instructions = self._instructions_for( '__main__.foo' )
 		kinds = [ type( instr ) for instr in instructions ]
-		self.assertEqual( kinds, [ ir.FuncStart, ir.DeclareTemp, ir.AddWrap, ir.Call, ir.DeleteTemp, ir.Return, ir.FuncEnd ] )
+		self.assertEqual( kinds, [ ir.FuncStart, ir.Assign, ir.DeclareTemp, ir.AddWrap, ir.Call, ir.DeleteTemp, ir.Return, ir.FuncEnd ] )
 
-		add_wrap = instructions[2]
+		add_wrap = instructions[3]
 		self.assertIsInstance( add_wrap, ir.AddWrap )
-		self.assertEqual( add_wrap.right, ir.Const( type = add_wrap.left.type, value = 1 ))
+		self.assertEqual( add_wrap.right, instructions[1].dest ) # the spliced $inline0$other local
+		self.assertEqual( instructions[1].src, ir.Const( type = add_wrap.left.type, value = 1 ))
 
-		call = instructions[3]
+		call = instructions[4]
 		self.assertIsInstance( call, ir.Call )
 		self.assertEqual( call.target.qualname, '__main__.echo' )
 		self.assertIsNone( call.dest )
@@ -430,6 +436,7 @@ def main( x: int|str ) -> None:
 		# alloc[u32](...) must compile exactly one function - the
 		# monomorphized alloc[u32] - never the shared, unspecialized alloc
 		# itself (T never gets bound there, so it can't actually compile)
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def alloc[T]( count: usize ) -> usize:
 	with compiler.wrap_arithmetic:

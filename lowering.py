@@ -7228,15 +7228,20 @@ class FunctionLowering:
 					if reflected_method is not None:
 						return self._emit_binop_dunder_call( node, reflected_method, right, left, expected_type )
 
-		# a float on EITHER side takes the GetFloatBinOp path (plain IEEE, or
-		# inf/nan-checked, depending on the active mode) rather than the integer
-		# overflow machinery. Strict same-type: both sides must already be the
-		# SAME float type (a bare literal on either side has already been hinted
-		# to the other's type by _lower_binary_operands, so `f + 1.5`/`f + 1`
-		# still work; only a float mixed with an int VARIABLE, or two different
-		# float widths, reaches this error). NOTE an int VARIABLE combined with a
-		# bare float LITERAL (`i + 1.5`) is not caught here - the literal is
-		# hinted to the int's type and truncated, an accepted first-pass edge)
+		# a float on EITHER side gets two float-specific rejections dunder
+		# dispatch above can't produce itself (it only ever MISSES silently,
+		# never explains why): strict same-type (a bare literal on either
+		# side has already been hinted to the other's type by _lower_binary_
+		# operands, so `f + 1.5`/`f + 1` still work; only a float mixed with
+		# an int VARIABLE, or two different float widths, reaches this error.
+		# NOTE an int VARIABLE combined with a bare float LITERAL (`i + 1.5`)
+		# is not caught here - the literal is hinted to the int's type and
+		# truncated, an accepted first-pass edge), and bitwise/shift/floordiv/
+		# mod, which have no floating-point meaning and no dunder at all.
+		# Every remaining same-type float shape (+-*/`/`) already has a real
+		# dunder (lib/builtins/__scalar_arith.py's f_*_checked/wrapped/
+		# saturated, __truediv__) and dispatched through it above - nothing
+		# legitimate reaches past these two checks.
 		if _is_float_scalar( left.type ) or _is_float_scalar( right.type ):
 			if left.type is not right.type:
 				float_type = left.type if _is_float_scalar( left.type ) else right.type
@@ -7249,14 +7254,13 @@ class FunctionLowering:
 			bad = _FLOAT_UNSUPPORTED_BINOPS.get( type( node.op ))
 			if bad is not None:
 				self.lowering.discovery.fail( f'operator {bad!r} is not supported on floating-point values: {ast.unparse(node)}', node )
-			result_type = expected_type if _is_float_scalar( expected_type ) else left.type
-			opcode, extra = self._arithmetic_mode[-1].GetFloatBinOp( node )
-			return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
 
-		result_type = expected_type or left.type
-
-		opcode, extra = self._arithmetic_mode[-1].GetBinOp( node )
-		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'left': left, 'right': right }, 'binary' )
+		# every operator this language actually supports has a dunder mapping
+		# in _BINOP_DUNDER above (dispatched through it, or through the float
+		# checks just above, before ever reaching here) - what's left is a
+		# genuinely unsupported operator (`/` on an int - only `//` exists;
+		# `**`/`@`, never mapped to anything at all)
+		self.lowering.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
 
 	def _mode_qualified_dunder_names( self, base_name: str ) -> list[str]:
 		# see _MODE_DUNDER_PREFIX's own module-level comment for the full
