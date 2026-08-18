@@ -577,6 +577,25 @@ class AddrOfField( Instruction ):
 	def test_repr( self ) -> str:
 		return f'AddrOfField( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r} )'
 
+@dataclass( kw_only = True )
+class ArrayFieldPtr( Instruction ):
+	# compiler.addrof(x.field) where field is a FixedArrayType (mpy_types.
+	# FixedArrayType, `u8[8]`-style inline C array) - yields Ptr[ElemType]
+	# pointing at the array's first element via C's own array-to-pointer
+	# decay, e.g. `dest = (x.field);` / `dest = (x->field);` - deliberately
+	# NOT `dest = &(x.field);` (that would be AddrOfField's own emission,
+	# giving a DIFFERENT C type, ElemType(*)[N] - pointer-TO-array, not
+	# pointer-to-element - a real type mismatch against the declared
+	# Ptr[ElemType] destination, even though the underlying address value
+	# is identical). Same "obj is always the ROOT object" shape as
+	# AddrOfField/GetAttrIndex/SetAttrIndex, for the same reason.
+	dest: Temp
+	obj: Operand
+	attr: str
+
+	def test_repr( self ) -> str:
+		return f'ArrayFieldPtr( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r} )'
+
 class AtomicRMWOp( Enum ): # compiler.atomic_add/atomic_sub/atomic_exchange - fetch-and-op, dest gets the value BEFORE the op
 	ADD = 'add'
 	SUB = 'sub'

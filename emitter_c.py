@@ -2289,6 +2289,15 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		op = _member_access_operator( instr.obj.type )
 		return [ f'\t{_emit_operand(instr.dest)} = &({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
 
+	if isinstance( instr, ir.ArrayFieldPtr ):
+		# compiler.addrof(x.field) where field is a FixedArrayType - one
+		# flat C expression, (obj)OP field, deliberately with NO leading &
+		# (see ArrayFieldPtr's own docstring: a real C array member decays
+		# to a pointer to its first element on use - &-ing it would give a
+		# pointer-TO-array instead, a different, mismatched C type)
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
+
 	if isinstance( instr, ir.GetAttrIndex ):
 		# f.arr[i] - one flat C expression, (obj)OP field[index] - see
 		# GetAttrIndex's own docstring for why this targets the field

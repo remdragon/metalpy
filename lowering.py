@@ -3622,19 +3622,23 @@ class FunctionLowering:
 				)
 			root = self._lower_expr( arg_node.value, None )
 			attr_var = self.lowering._attr_lookup( root.type, arg_node.attr, arg_node )
-			if isinstance( attr_var.type, FixedArrayType ):
-				# same restriction _expr_Attribute's own GetAttr guard
-				# enforces for an ordinary read - see FixedArrayType's own
-				# docstring (no element-level access exists yet either, so
-				# there's nothing meaningful to take the address of beyond
-				# the whole array, which C already lets an ordinary bare-
-				# array-field expression decay to on its own without &)
-				self.lowering.discovery.fail(
-					f'{ast.unparse(node)}: {attr_var.type.qualname} fields have no addrof support yet '
-					f'(no element-level array access is implemented)',
-					node,
-				)
 			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+			if isinstance( attr_var.type, FixedArrayType ):
+				# compiler.addrof(x.field) where field is ElemType[N] ->
+				# Ptr[ElemType], via C's own array-to-pointer decay - NOT
+				# &(x.field), which would be a pointer TO the array
+				# (ElemType(*)[N]), a different C type than the declared
+				# Ptr[ElemType] destination even though the address value
+				# is identical. Safe for the same reason ordinary field
+				# addrof is: `obj` is a real, stable-lifetime lvalue (a
+				# bare local, or one level of field access rooted at one),
+				# and a fixed-size array member of a stable object is
+				# itself just as stable. See ir.ArrayFieldPtr's own
+				# docstring for the emission this builds.
+				elem_ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ attr_var.type.elem_type ] )
+				dest = self._new_temp( elem_ptr_type )
+				self._emit( ir.ArrayFieldPtr( dest = dest, obj = root, attr = arg_node.attr ))
+				return dest
 			pointee = attr_var.type
 			# same RC-pointee-depth rule the bare-Name path below applies -
 			# see its own comment for why (Ptr[Foo] already spells `Foo*`,

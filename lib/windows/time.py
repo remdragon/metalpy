@@ -27,35 +27,12 @@ def _decode_ascii_utf16z( ptr: Ptr[u16], max_len: usize ) -> str:
 	return str._from_owned_cstr( buf, buf_size ).unwrap( 'windows zone name: unexpectedly non-ASCII' )
 
 
-def _field_ptr_u16( struct_ptr: Ptr[None], byte_offset: usize ) -> Ptr[u16]:
-	''' compiler.addrof(...) doesn't support a FixedArrayType field yet
-	(e.g. compiler.addrof(tz_info.TimeZoneKeyName) fails with "u16[128]
-	fields have no addrof support yet" - verified directly this session),
-	so there is no direct way to get a Ptr[u16] at the START of
-	DynamicTimeZoneInformation's TimeZoneKeyName array for a bulk/
-	multi-element decode (element-level indexed access, f.arr[i], DOES
-	work now, but only for one element at a time - not what a null-
-	terminated-string scan needs). Callers instead already hold a
-	Ptr[None] to the whole struct (see get_local_timezone_name's own
-	tz_info, which is heap-allocated rather than a bare local for an
-	unrelated reason - see its own comment) - this just advances it by
-	byte_offset. See kernel32.py's own _TZNAME_OFFSET/_TZKEYNAME_OFFSET
-	comment for how each offset is derived and kept in sync with the
-	struct. '''
-	raw: Ptr[u8] = compiler.cast( Ptr[u8], struct_ptr )
-	with compiler.wrap_arithmetic:
-		field_bytes: Ptr[u8] = raw + byte_offset
-	return compiler.cast( Ptr[u16], field_bytes )
-
-
 def get_local_timezone_name() -> str:
 	from windows.kernel32 import (
 		DynamicTimeZoneInformation,
 		GetDynamicTimeZoneInformation,
 		_TZNAME_SIZE,
-		_TZNAME_OFFSET,
 		_TZKEYNAME_SIZE,
-		_TZKEYNAME_OFFSET,
 	)
 
 	# DynamicTimeZoneInformation is large (432 bytes, decomposed from three
@@ -86,9 +63,8 @@ def get_local_timezone_name() -> str:
 
 	result: str = 'UTC'
 	if status != 0xFFFFFFFF:
-		opaque_ptr: Ptr[None] = compiler.cast( Ptr[None], tz_info )
 		if tz_info.TimeZoneKeyName[0] != 0:
-			key_ptr: Ptr[u16] = _field_ptr_u16( opaque_ptr, _TZKEYNAME_OFFSET )
+			key_ptr: Ptr[u16] = compiler.addrof( tz_info.TimeZoneKeyName )
 			win_name: str = _decode_ascii_utf16z( key_ptr, _TZKEYNAME_SIZE )
 			# windows_zones.to_iana() was always meant to back this lookup
 			# (see lib/windows_zones.py) - opt-in: a program that never
@@ -103,7 +79,7 @@ def get_local_timezone_name() -> str:
 			else:
 				result = win_name
 		else:
-			name_ptr: Ptr[u16] = _field_ptr_u16( opaque_ptr, _TZNAME_OFFSET )
+			name_ptr: Ptr[u16] = compiler.addrof( tz_info.StandardName )
 			result = _decode_ascii_utf16z( name_ptr, _TZNAME_SIZE )
 
 	sys.free( raw )

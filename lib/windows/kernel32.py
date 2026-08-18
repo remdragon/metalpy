@@ -37,15 +37,9 @@ class SYSTEMTIME:
 # codebase (only TimeZoneKeyName is) - kept as real fields purely to hold
 # TimeZoneKeyName at the correct byte offset.
 #
-# TimeZoneKeyName is read as a whole null-terminated string, not one
-# element at a time, and compiler.addrof() doesn't support array fields -
-# so windows/zoneinfo_rules.py's helpers instead take compiler.addrof() of
-# the WHOLE struct (a bare local), cast to Ptr[u8], and advance by
-# _TZKEYNAME_OFFSET bytes - the sum of every field's size up to (not
-# including) TimeZoneKeyName: Bias(4) + StandardName(32*2=64) +
-# StandardDate(8*2=16) + StandardBias(4) + DaylightName(64) +
-# DaylightDate(16) + DaylightBias(4) = 172. No struct field is ever
-# reordered/renamed above without updating this constant to match.
+# TimeZoneKeyName/StandardName are read as a whole null-terminated string
+# via compiler.addrof(x.field) (Ptr[u16] at the array's own start, C array-
+# to-pointer decay), not one element at a time.
 @cstruct
 class DynamicTimeZoneInformation:
 	Bias: i32 = 0
@@ -59,19 +53,16 @@ class DynamicTimeZoneInformation:
 	DynamicDaylightTimeDisabled: u8 = 0
 	_pad: u8[3] = 0
 
-_TZNAME_OFFSET: usize = 4       # StandardName starts right after Bias's 4 bytes
-_TZKEYNAME_OFFSET: usize = 172  # see DynamicTimeZoneInformation's own comment
-
 
 # TIME_ZONE_INFORMATION (timezoneapi.h) - same leading layout as
 # DynamicTimeZoneInformation above, just without TimeZoneKeyName/
 # DynamicDaylightTimeDisabled. This is GetTimeZoneInformationForYear's own
 # [out] parameter type - StandardDate/DaylightDate are read directly as
-# ordinary nested-struct field access (tzi.StandardDate.wMonth, etc.) - no
-# addrof/offset trick needed there, unlike TimeZoneKeyName above, since
-# these are real scalar reads, not "get a contiguous buffer" reads. See
-# windows/zoneinfo_rules.py for how the recurring-rule encoding in these two
-# fields becomes a concrete UTC transition instant for a given year.
+# ordinary nested-struct field access (tzi.StandardDate.wMonth, etc.), real
+# scalar reads rather than TimeZoneKeyName's own "get a pointer to a whole
+# array" case above. See windows/zoneinfo_rules.py for how the recurring-
+# rule encoding in these two fields becomes a concrete UTC transition
+# instant for a given year.
 @cstruct
 class TIME_ZONE_INFORMATION:
 	Bias: i32 = 0

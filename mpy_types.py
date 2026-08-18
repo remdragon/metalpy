@@ -459,20 +459,18 @@ class FixedArrayType( Type ):
 	syntax is discontinuous ("TYPE NAME[N]", not a plain prefix type the
 	way every other field is spelled) and a bare C array is not assignable
 	via `=` at all (only a WHOLE containing struct/union is, or an explicit
-	memcpy) - unlike every other Type kind here, a value of this type is
-	only ever legitimately produced two ways: (1) the class-body compound-
-	literal construction path this fix wires up (a `= 0` field default or
-	an explicit `ClassName(field=0)` argument, both meaning "zero-fill the
-	whole array" - the one shape a C designated initializer `.field = {0}`
-	can express), or (2) reading/writing it back out is NOT implemented
-	(discovery.py/lowering.py explicitly reject a FixedArrayType field
-	anywhere else - parameter/return/local-variable annotations, and
-	reading the field back out via ordinary attribute access) rather than
-	silently emit C that fails to compile (`x = arr;`) or is outright
-	invalid (`dest->field = arr;`). Element-level indexed read/write is a
-	separate, real, currently-unimplemented follow-up (would need its own
-	__getitem__/__setitem__-style lowering, the same gap this repo's own
-	bytearray has today), not attempted here. '''
+	memcpy). A value of this type is never read/written as a whole (`x =
+	arr` / `dest->field = arr` are both rejected, matching real C, rather
+	than silently emitting invalid C) - only three real operations exist:
+	(1) the class-body compound-literal construction path (a `= 0` field
+	default or an explicit `ClassName(field=0)` argument, meaning "zero-
+	fill the whole array" - the one shape a C designated initializer
+	`.field = {0}` can express), (2) element-level indexed read/write
+	(`f.arr[i]`, both directions - ir.GetAttrIndex/ir.SetAttrIndex), and
+	(3) compiler.addrof(x.arr) -> Ptr[ElemType] at the array's own start,
+	via C's own array-to-pointer decay (ir.ArrayFieldPtr). Parameter/
+	return/local-variable annotations of this type are rejected outright -
+	only a @cstruct/@cunion field. '''
 	elem_type: Type
 	count: int
 
