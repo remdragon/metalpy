@@ -173,6 +173,146 @@ def pair( a: str, b: str ) -> None:
 		self.assertEqual( target_ids, { id( p_ii ), id( p_is ), id( p_si ), id( p_ss ) })
 
 
+class GenericWildcardCandidateTests( unittest.TestCase ):
+	''' a candidate whose declared parameter type is a bare TypeVar (e.g.
+	`x: T` on a generic `def foo[T](x: T)`) used to be structurally
+	unmatchable against any real argument type: _build_candidates' own
+	`required` tuple was built from Type.leaves(), which for a TypeVar
+	returns [itself] - and _contains' identity-based same_type check can
+	never equate that TypeVar object with a real, concrete argument type.
+	A generic candidate sharing a name with one or more concrete overloads
+	therefore always lost to "no matching overload"/ambiguity, regardless
+	of which concrete candidates existed alongside it. Fixed by treating a
+	bare-TypeVar-typed slot as a wildcard (_Candidate.wildcard) that always
+	matches, at lowest priority - see this module's own _sweep/resolve_call
+	comments. lowering.py separately handles actually MONOMORPHIZING the
+	winning generic candidate - out of scope for this pure-types module. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def _resolve( self, group, args, kwargs ):
+		return OR.resolve_call( group.stubs, group.implementations, args, kwargs, qualname = group.qualname )
+
+	def test_plain_implementations_concrete_beats_generic( self ) -> None:
+		mod = self._import( '''
+class str: pass
+class i32: pass
+
+def get( x: str ) -> str:
+	pass
+
+def get[T]( x: T ) -> str:
+	pass
+''' )
+		group = mod.get_local( 'get' )
+		concrete_impl, generic_impl = group.implementations
+		str_cls = mod.get_local( 'str' )
+		i32_cls = mod.get_local( 'i32' )
+
+		branches, default = self._resolve( group, [ str_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, concrete_impl )
+
+	def test_plain_implementations_generic_is_fallback_for_everything_else( self ) -> None:
+		mod = self._import( '''
+class str: pass
+class i32: pass
+
+def get( x: str ) -> str:
+	pass
+
+def get[T]( x: T ) -> str:
+	pass
+''' )
+		group = mod.get_local( 'get' )
+		concrete_impl, generic_impl = group.implementations
+		i32_cls = mod.get_local( 'i32' )
+
+		branches, default = self._resolve( group, [ i32_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, generic_impl )
+
+	def test_plain_implementations_dispatch_is_source_order_independent( self ) -> None:
+		# the generic candidate declared FIRST in source must not shadow the
+		# concrete one declared after it - wildcard priority is a property
+		# of the candidate's own shape, not declaration order
+		mod = self._import( '''
+class str: pass
+class i32: pass
+
+def get[T]( x: T ) -> str:
+	pass
+
+def get( x: str ) -> str:
+	pass
+''' )
+		group = mod.get_local( 'get' )
+		generic_impl, concrete_impl = group.implementations
+		str_cls = mod.get_local( 'str' )
+		i32_cls = mod.get_local( 'i32' )
+
+		branches, default = self._resolve( group, [ str_cls ], {} )
+		self.assertIs( default, concrete_impl )
+		branches, default = self._resolve( group, [ i32_cls ], {} )
+		self.assertIs( default, generic_impl )
+
+	def test_overload_sweep_concrete_beats_generic_fallback( self ) -> None:
+		# same wildcard-priority behavior, but through the @overload
+		# box-subtraction sweep path (overload_candidates) rather than the
+		# plain-implementation combo-resolution path exercised above
+		mod = self._import( '''
+class str: pass
+class i32: pass
+
+@overload
+def get( x: str ) -> str:
+	pass
+
+@overload
+def get[T]( x: T ) -> str:
+	pass
+''' )
+		group = mod.get_local( 'get' )
+		concrete_impl, generic_impl = group.implementations
+		str_cls = mod.get_local( 'str' )
+		i32_cls = mod.get_local( 'i32' )
+
+		branches, default = self._resolve( group, [ str_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, concrete_impl )
+
+		branches, default = self._resolve( group, [ i32_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, generic_impl )
+
+	def test_overload_sweep_generic_declared_first_still_yields_to_concrete( self ) -> None:
+		mod = self._import( '''
+class str: pass
+class i32: pass
+
+@overload
+def get[T]( x: T ) -> str:
+	pass
+
+@overload
+def get( x: str ) -> str:
+	pass
+''' )
+		group = mod.get_local( 'get' )
+		generic_impl, concrete_impl = group.implementations
+		str_cls = mod.get_local( 'str' )
+		i32_cls = mod.get_local( 'i32' )
+
+		branches, default = self._resolve( group, [ str_cls ], {} )
+		self.assertIs( default, concrete_impl )
+		branches, default = self._resolve( group, [ i32_cls ], {} )
+		self.assertIs( default, generic_impl )
+
+
 class TodoWorkedExampleTests( unittest.TestCase ):
 	''' TODO.txt's own worked-through examples (the design this module implements) - each @overload-decorated with a real body (metalpy's own flexibility beyond Python's @overload convention: multiple real-bodied @overload members are allowed, priority-ordered by declaration, no shared single implementation required) '''
 

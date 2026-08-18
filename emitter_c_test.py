@@ -9286,6 +9286,36 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# a concrete overload sharing a name with a generic `[T]` one -
+			# real gap: overload_resolution.py's own box-subtraction matching
+			# treated a TypeVar-typed candidate's required leaves ([itself],
+			# per Type.leaves()' own base case) as structurally unmatchable
+			# against any real argument type, so the generic candidate could
+			# never be selected at all ("no matching overload" for the
+			# non-str call below). Fixed via _Candidate.wildcard (a bare-
+			# TypeVar slot matches everything, at lowest priority regardless
+			# of declaration order) plus lowering.py's _lower_overload_
+			# generic_call/_finish_generic_call (monomorphizing the winning
+			# generic candidate the same way a bare generic-function call
+			# already does - the emitter crashed on the still-abstract
+			# TypeVar parameter before that existed).
+			( 'concrete_overload_beats_generic_typevar_fallback', '''
+class Box:
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+	def get( self, x: str ) -> str:
+		return x
+
+def main() -> i32:
+	b: Box = Box()
+	if b.get( 'hi' ) != 'hi':
+		return 1
+	n: i32 = 42
+	if b.get( n ) != 'generic':
+		return 2
+	return 0
+''' ),
 		] )
 
 
