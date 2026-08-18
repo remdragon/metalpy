@@ -274,8 +274,39 @@ def main() -> None:
 				print( f'mpy: bundled {dest}' )
 			except OSError as e:
 				bundle_errors.append( f'{dll_name}: {e}' )
+
+		# --- combine 3rd-party license notices declared via
+		# @extern(..., notice=...) into one dist/THIRD-PARTY-LICENSES.txt -
+		# driven entirely by compiler.extern_notices (same reachability
+		# gate as extern_dlls above, same "explicit, author-listed, fails
+		# the build if unresolvable" philosophy). Each identifier resolves
+		# to licenses/<NAME>.txt next to this script - a fixed metalpy-
+		# installation-relative directory (Path(__file__).parent), the
+		# same anchor discovery.py's own Discovery.__init__ uses to find
+		# lib/ (licenses/ is source material shipped with metalpy itself,
+		# not build output - unlike dist/, which is CWD-relative because
+		# it belongs wherever the caller is building). Deliberately
+		# separate from extern_dlls: one notice (e.g. 'ZLIB') can cover
+		# several otherwise-unrelated DLL dependencies across different
+		# libraries, so a program bundling zlib1.dll for a reason unrelated
+		# to Tcl/Tk would reference the same file rather than a duplicate
+		# copy. ---
+		if compiler.extern_notices:
+			licenses_dir = Path( __file__ ).parent / 'licenses'
+			notice_blocks: list[str] = []
+			for name in sorted( compiler.extern_notices ):
+				notice_path = licenses_dir / f'{name}.txt'
+				try:
+					notice_blocks.append( f'{"=" * 20} {name} {"=" * 20}\n{notice_path.read_text( encoding = "utf-8" )}' )
+				except OSError:
+					bundle_errors.append( f'{name}: license notice not found at {notice_path}' )
+			if notice_blocks:
+				notices_dest = exe_path.parent / 'THIRD-PARTY-LICENSES.txt'
+				notices_dest.write_text( '\n\n'.join( notice_blocks ), encoding = 'utf-8' )
+				print( f'mpy: wrote {notices_dest}' )
+
 		if bundle_errors:
-			print( 'mpy: error: failed to bundle required runtime DLL(s):', file = sys.stderr )
+			print( 'mpy: error: failed to bundle required runtime DLL(s)/license notice(s):', file = sys.stderr )
 			for err in bundle_errors:
 				print( f'  {err}', file = sys.stderr )
 			sys.exit( 1 )

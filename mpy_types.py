@@ -949,6 +949,23 @@ class Function( Type, ScopeMixin ):
 	# assumed already present on target machines. See compiler.py's
 	# extern_dlls collection and mpy.py's post-link bundling step.
 	extern_dlls: tuple[str,...] = ()
+	# optional 3rd-party license notice identifier(s) required when this
+	# @extern function (and, transitively, whatever it bundles via
+	# extern_dlls) ships in a built program's dist/ output. Written as
+	# notice='NAME' or notice=['NAME', 'OTHER'] - each NAME resolves to
+	# licenses/NAME.txt relative to the metalpy installation itself (see
+	# mpy.py's own resolution). Deliberately a separate declaration from
+	# extern_dlls, not auto-derived from it: a notice can be shared across
+	# unrelated libraries (e.g. 'ZLIB' applies to anything that happens to
+	# bundle zlib1.dll, not just Tcl/Tk), so collapsing the two ideas would
+	# either duplicate the same license text under every DLL that happens
+	# to depend on it, or require guessing which dll= entries share a
+	# notice. Same reachability-gated collection as extern_dlls (see
+	# compiler.py) and same "explicit author list, fails the build if
+	# unresolvable" philosophy - see mpy.py's post-link step, which
+	# combines every referenced notice into one dist/THIRD-PARTY-LICENSES
+	# file.
+	extern_notices: tuple[str,...] = ()
 
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)

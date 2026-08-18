@@ -582,5 +582,84 @@ def main() -> None:
 ''' )
 		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'tk86t.dll' } )
 
+class ExternNoticeDependencyTests( CompilerTestCase ):
+	''' compiler.extern_notices - populated only from
+	@extern(..., notice=...) declarations on functions actually
+	reached/lowered, same reachability gate and same registration point as
+	extern_dlls above. Drives mpy.py's post-link THIRD-PARTY-LICENSES
+	combination step. Deliberately independent of extern_dlls (see
+	mpy_types.Function.extern_notices's own comment) - covered explicitly
+	below, not assumed. '''
+
+	def test_called_extern_function_registers_its_notice( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 'TCL' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL' } )
+
+	def test_declared_but_uncalled_extern_function_does_not_register_its_notice( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 'TCL' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	pass
+''' )
+		self.assertEqual( self.compiler.extern_notices, set() )
+
+	def test_notice_list_registers_every_entry( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = [ 'TCL', 'ZLIB' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL', 'ZLIB' } )
+
+	def test_notice_independent_of_dll( self ) -> None:
+		''' a notice can be declared with no dll= at all (e.g. a header-only
+		or statically-linked dependency that still needs attribution), and
+		a dll= with no notice= (the author's call) - the two registries
+		never imply each other. '''
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tk86t', 'Tk_Init', notice = 'TCL' )
+def Tk_Init( interp: Ptr[None] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tk_Init( None )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll' } )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL' } )
+
+	def test_notices_union_across_multiple_reached_functions( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 'TCL' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tcl86t', 'Tcl_Eval', notice = [ 'TCL', 'ZLIB' ] )
+def Tcl_Eval( interp: Ptr[None], script: ConstPtr[u8] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tcl_Eval( None, None )
+''' )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL', 'ZLIB' } )
+
 if __name__ == '__main__':
 	unittest.main()

@@ -410,8 +410,9 @@ def HeapAlloc( hHeap: HANDLE, dwFlags: u32, dwBytes: usize ) -> Ptr[u8]:
 
 # Vendored/3rd-party DLL FFI, with a runtime bundling hint (single DLL,
 # or a list when the vendored library has its own further DLL
-# dependencies that also need to ship):
-@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+# dependencies that also need to ship) and a 3rd-party license notice
+# hint (same single-or-list shape):
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_CreateInterp() -> Ptr[None]:
 	...
 ```
@@ -433,6 +434,17 @@ compiled into the program, `mpy`'s build step locates each named DLL on `PATH` a
 next to the built executable; a function that's declared but never called contributes
 nothing, and a declared DLL that can't be found anywhere on `PATH` fails the build. System
 DLLs simply never declare `dll=` in the first place.
+
+`notice=` is likewise optional and independent - both from `lib` and from `dll=`. Each
+identifier (`'TCL'`, `'ZLIB'` above) resolves to a `licenses/<NAME>.txt` file at the metalpy
+installation root, containing that dependency's actual license text. It's a separate
+declaration from `dll=` on purpose: a notice can apply to several otherwise-unrelated DLL
+dependencies (e.g. `'ZLIB'` covers `zlib1.dll` regardless of which library happens to bundle
+it, not just Tcl/Tk), so collapsing the two ideas would either duplicate license text per
+dependency or force guessing which `dll=` entries share a notice. When a function declaring
+`notice=` is actually reached and compiled in, `mpy`'s build step combines every referenced
+notice file into one `dist/THIRD-PARTY-LICENSES.txt` alongside the bundled DLLs; a notice
+that can't be found fails the build, the same as a missing `dll=` entry.
 
 ### Target Platform Conditioning (`@compiler.target` & `compiler.target`)
 

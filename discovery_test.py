@@ -3002,6 +3002,45 @@ def Tcl_CreateInterp() -> Ptr[None]:
 ''' )
 		self.assertTrue( any( 'dll= must be a string literal or a list/tuple of string literals' in e for e in disco.errors.errors ))
 
+	def test_extern_notice_single_string_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 'TCL' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertEqual( fn.extern_notices, ( 'TCL', ) )
+
+	def test_extern_notice_list_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = [ 'TCL', 'ZLIB' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertEqual( fn.extern_notices, ( 'TCL', 'ZLIB' ) )
+
+	def test_extern_dll_and_notice_combine_independently( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertEqual( fn.extern_dlls, ( 'tcl86t.dll', 'zlib1.dll' ) )
+		self.assertEqual( fn.extern_notices, ( 'TCL', 'ZLIB' ) )
+
+	def test_extern_notice_non_string_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 123 )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		self.assertTrue( any( 'notice= must be a string literal or a list/tuple of string literals' in e for e in disco.errors.errors ))
+
 	def test_ordinary_function_has_no_extern_fields( self ) -> None:
 		disco, mod = self._import( '''
 def foo() -> None:

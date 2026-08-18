@@ -1971,8 +1971,9 @@ class Discovery( ast.NodeVisitor ):
 		available = linker_c.has_symbol( cc, lib, symbol )
 		return available != negate
 
-	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,tuple[str,...]]:
-		# @extern('lib', 'symbol') or @extern('lib', 'symbol', header='<name>', dll='<name>'|['<name>', ...])
+	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,tuple[str,...],tuple[str,...]]:
+		# @extern('lib', 'symbol') or
+		# @extern('lib', 'symbol', header='<name>', dll='<name>'|[...], notice='<name>'|[...])
 		# 'lib' is the .lib/.so name to link against, except the literal
 		# 'c' which means the platform C runtime rather than a real file on
 		# disk - that distinction is a future emitter/linker's job to act
@@ -1999,31 +2000,38 @@ class Discovery( ast.NodeVisitor ):
 		# bundling step, which copies exactly the dll names collected from
 		# functions that were actually reached (compiler.extern_dlls).
 		if not isinstance( decorator, ast.Call ) or len( decorator.args ) < 2 or len( decorator.args ) > 3:
-			self.fail( f"@extern(lib, symbol[, header=...][, dll=...]) requires 2 or 3 positional arguments: {ast.unparse(decorator)}", node )
+			self.fail( f"@extern(lib, symbol[, header=...][, dll=...][, notice=...]) requires 2 or 3 positional arguments: {ast.unparse(decorator)}", node )
 		lib_arg, symbol_arg = decorator.args[0], decorator.args[1]
 		if not ( isinstance( lib_arg, ast.Constant ) and isinstance( lib_arg.value, str )):
 			self.fail( f'@extern(...) lib name must be a string literal: {ast.unparse(decorator)}', node )
 		if not ( isinstance( symbol_arg, ast.Constant ) and isinstance( symbol_arg.value, str )):
 			self.fail( f'@extern(...) symbol name must be a string literal: {ast.unparse(decorator)}', node )
+
+		def _parse_str_or_str_list( kw_value: ast.expr, kw_name: str ) -> tuple[str,...]:
+			if isinstance( kw_value, ast.Constant ) and isinstance( kw_value.value, str ):
+				return ( kw_value.value, )
+			if isinstance( kw_value, ( ast.List, ast.Tuple ) ) and all(
+				isinstance( elt, ast.Constant ) and isinstance( elt.value, str ) for elt in kw_value.elts
+			):
+				return tuple( elt.value for elt in kw_value.elts )
+			self.fail( f"@extern(...) {kw_name}= must be a string literal or a list/tuple of string literals: {ast.unparse(decorator)}", node )
+			return () # unreachable - self.fail raises, but keeps this a total function for the type checker
+
 		header: str|None = None
 		dlls: tuple[str,...] = ()
+		notices: tuple[str,...] = ()
 		for kw in decorator.keywords:
 			if kw.arg == 'header':
 				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
 					self.fail( f'@extern(...) header= must be a string literal: {ast.unparse(decorator)}', node )
 				header = kw.value.value
 			elif kw.arg == 'dll':
-				if isinstance( kw.value, ast.Constant ) and isinstance( kw.value.value, str ):
-					dlls = ( kw.value.value, )
-				elif isinstance( kw.value, ( ast.List, ast.Tuple ) ) and all(
-					isinstance( elt, ast.Constant ) and isinstance( elt.value, str ) for elt in kw.value.elts
-				):
-					dlls = tuple( elt.value for elt in kw.value.elts )
-				else:
-					self.fail( f"@extern(...) dll= must be a string literal or a list/tuple of string literals: {ast.unparse(decorator)}", node )
+				dlls = _parse_str_or_str_list( kw.value, 'dll' )
+			elif kw.arg == 'notice':
+				notices = _parse_str_or_str_list( kw.value, 'notice' )
 			else:
 				self.fail( f'@extern(...) unexpected keyword argument {kw.arg!r}: {ast.unparse(decorator)}', node )
-		return lib_arg.value, symbol_arg.value, header, dlls
+		return lib_arg.value, symbol_arg.value, header, dlls, notices
 
 	def _parse_function(
 		self,
@@ -2069,6 +2077,7 @@ class Discovery( ast.NodeVisitor ):
 		extern_symbol: str|None = None
 		extern_header: str|None = None
 		extern_dlls: tuple[str,...] = ()
+		extern_notices: tuple[str,...] = ()
 		for decorator in node.decorator_list or []:
 			if self._is_compiler_target_call( decorator ):
 				if not self._matches_active_target( decorator ):
@@ -2097,7 +2106,7 @@ class Discovery( ast.NodeVisitor ):
 				case 'fallible_arithmetic':
 					is_fallible_arithmetic = True
 				case 'extern':
-					extern_lib, extern_symbol, extern_header, extern_dlls = self._parse_extern_decorator( decorator, node, qualname )
+					extern_lib, extern_symbol, extern_header, extern_dlls, extern_notices = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
 					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
 
@@ -2254,6 +2263,7 @@ class Discovery( ast.NodeVisitor ):
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,
 			extern_dlls = extern_dlls,
+			extern_notices = extern_notices,
 		)
 		if extern_header is not None:
 			self.required_headers.add( extern_header )

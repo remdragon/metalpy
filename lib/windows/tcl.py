@@ -35,6 +35,15 @@
 # api-ms-win-crt-*.dll forwarders), so its own functions list only
 # 'tk86t.dll' itself.
 #
+# Every function's dll= is paired with a notice= declaration (@extern's
+# notice= mechanism - see SYNTAX.md §6) referencing licenses/TCL.txt and/or
+# licenses/ZLIB.txt at the metalpy repo root - the exact license.terms /
+# zlib.h license text for the Tcl/Tk and zlib builds actually bundled (see
+# each file's own provenance note). mpy's build step combines whichever are
+# actually reached into one dist/THIRD-PARTY-LICENSES.txt alongside the
+# bundled DLLs. 'TCL' covers both Tcl and Tk - they ship under one shared
+# license.terms document upstream, not two separate ones.
+#
 # Still not auto-discovered or bundled: TCL_LIBRARY/TK_LIBRARY environment
 # variables pointing at the Tcl/Tk script library (the tcl8.6/tk8.6
 # directories of .tcl scripts Tcl_Init()/Tk_Init() load at runtime) - a
@@ -53,23 +62,23 @@ TCL_OK: i32 = 0
 TCL_DONT_WAIT: i32 = 2
 TCL_ALL_EVENTS: i32 = -3
 
-@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_CreateInterp() -> Tcl_Interp:
 	...
 
-@extern( 'tcl86t', 'Tcl_Init', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+@extern( 'tcl86t', 'Tcl_Init', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_Init( interp: Tcl_Interp ) -> i32:
 	...
 
-@extern( 'tk86t', 'Tk_Init', dll = 'tk86t.dll' )
+@extern( 'tk86t', 'Tk_Init', dll = 'tk86t.dll', notice = 'TCL' )
 def Tk_Init( interp: Tcl_Interp ) -> i32:
 	...
 
-@extern( 'tcl86t', 'Tcl_Eval', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+@extern( 'tcl86t', 'Tcl_Eval', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_Eval( interp: Tcl_Interp, script: ConstPtr[u8] ) -> i32:
 	...
 
-@extern( 'tcl86t', 'Tcl_GetStringResult', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+@extern( 'tcl86t', 'Tcl_GetStringResult', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_GetStringResult( interp: Tcl_Interp ) -> ConstPtr[u8]:
 	...
 
@@ -77,7 +86,7 @@ def Tcl_GetStringResult( interp: Tcl_Interp ) -> ConstPtr[u8]:
 # -> int, the classic (pre-Tcl_Obj) Tcl_CmdProc shape - the simplest command
 # callback signature Tcl_CreateCommand accepts, sufficient for a fixed
 # trampoline that doesn't need to inspect its arguments.
-@extern( 'tcl86t', 'Tcl_CreateCommand', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+@extern( 'tcl86t', 'Tcl_CreateCommand', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_CreateCommand(
 	interp: Tcl_Interp,
 	cmdName: ConstPtr[u8],
@@ -87,17 +96,17 @@ def Tcl_CreateCommand(
 ) -> Ptr[None]:
 	...
 
-@extern( 'tcl86t', 'Tcl_DoOneEvent', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+@extern( 'tcl86t', 'Tcl_DoOneEvent', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_DoOneEvent( flags: i32 ) -> i32:
 	...
 
-@extern( 'tcl86t', 'Tcl_DeleteInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+@extern( 'tcl86t', 'Tcl_DeleteInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ], notice = [ 'TCL', 'ZLIB' ] )
 def Tcl_DeleteInterp( interp: Tcl_Interp ) -> None:
 	...
 
 # Number of toplevel windows still open - a real Tk_MainLoop-shaped
 # mainloop (below, in lib/tkinter.py) runs until this reaches 0, i.e. until
 # the user closes the last window, same as real tkinter's mainloop().
-@extern( 'tk86t', 'Tk_GetNumMainWindows', dll = 'tk86t.dll' )
+@extern( 'tk86t', 'Tk_GetNumMainWindows', dll = 'tk86t.dll', notice = 'TCL' )
 def Tk_GetNumMainWindows() -> i32:
 	...
