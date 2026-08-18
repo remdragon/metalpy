@@ -325,6 +325,71 @@ def adjust_volume( vol: u8, delta: i8 ) -> u8:
 		return vol + delta  # Translates to vol.saturating_add( delta )
 ```
 
+### Scalar Conversions: `T(x)` vs. `x.to_T()`
+
+Converting between scalar types has two spellings with **different
+semantics** — they are not interchangeable, and are not two names for the
+same operation.
+
+**`T(x)` (constructor-call syntax, also `compiler.cast(T, x)`)** is a
+bit-width operation: it succeeds unconditionally whenever the target is the
+same width or wider than the source — same-width is a pure bit
+reinterpretation, widening sign/zero-extends — in **every** arithmetic
+context, including the default checked context. Only a genuinely
+*narrowing* conversion (target bit-width smaller than the source's) can
+fail, and that stays context-aware exactly like `+`/`-`/`*`:
+
+```metalpy
+def widen_and_reinterpret() -> None:
+	x: i32 = -1
+	y: u32 = u32( x )      # same-width: always 4294967295, every arithmetic context
+	z: i32 = i32( y )      # same-width: round-trips back to -1
+
+	small: u8 = 200
+	w: i32 = i32( small )  # widening: always succeeds, every context
+
+def narrow_it( big: i32 ) -> Result[u8, OverflowError]:
+	return u8( big )       # narrowing: checked, propagates/panics/wraps/clamps like +/-/*
+```
+
+A literal argument is checked the same way, using its own natural type
+(`i32` for an int literal — the type an unannotated literal always has
+elsewhere in the language) as the source width: `u32(-1)` succeeds
+(same width as `i32`), but `u8(300)`/`u8(-10000)` are compile-time errors
+(narrowing, out of `u8`'s real value range) — even inside an explicit cast.
+This is deliberate: an out-of-range literal is treated as a caught bug, not
+a silent truncation. If you need a specific narrower bit pattern a literal
+can't spell directly, compose two casts — `i8(u8(128))` first fits `128`
+into `u8` (in range), then reinterprets that same-width value as `i8`,
+giving `i8::MIN`.
+
+**`x.to_T()`** is a value-preserving numeric conversion: it succeeds **iff
+the source's mathematical value fits within `T`'s own `[MIN, MAX]`**,
+independent of bit width. This is a genuinely different check from `T(x)` —
+it can fail for a same-width conversion `T(x)` never fails for, and succeed
+for a narrowing conversion whose value happens to fit:
+
+```metalpy
+def compare_the_two() -> None:
+	neg: i8 = -1
+	a: u8 = u8( neg )         # T(x): same-width, always succeeds -> 255
+	b = neg.to_u8()           # .to_T(): -1 isn't a valid u8 VALUE -> Err(OverflowError)
+
+	fits: i32 = 200
+	c = fits.to_u8()          # .to_T(): narrowing, but 200 fits u8's range -> Ok(200)
+```
+
+`.to_T()` returns `Result[T, OverflowError]`, consumed by ambient
+arithmetic context exactly like any other `Result`-returning arithmetic
+expression (auto-propagate under the default/wrap/saturate contexts,
+`.unwrap()`/panic under `panic_arithmetic`) — but unlike `+`/`-`/`*`, the
+check itself never varies by context: there's no meaningful "wrapped" or
+"saturated" value-range check, the same way `int`'s own `.__floordiv__()`
+only ever has one divide-by-zero check regardless of context. Currently
+implemented for integer-to-integer conversions only (`i8`/`i16`/`i32`/
+`i64`/`i128`/`isize`/`u8`/`u16`/`u32`/`u64`/`u128`/`usize`, every ordered
+pair plus self-conversion) — float conversions are a planned follow-up.
+
 ---
 
 ## 6. Foreign Function Interface (FFI) & Target Conditioning
