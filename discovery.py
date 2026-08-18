@@ -649,28 +649,41 @@ class Discovery( ast.NodeVisitor ):
 	# and inspects whatever comes back.
 
 	def visit_Expr( self, node: ast.Expr ) -> None:
-		# module-level compiler directives like
+		# module-level (or class-body) compiler directives like
 		# `compiler.require_header('pthread.h')` — recognized textually
 		# (same pattern as _is_compiler_target_call), not by actually
 		# resolving the `compiler` module
-		if isinstance( node.value, ast.Call ):
+		if (
+			isinstance( node.value, ast.Call )
+			and isinstance( node.value.func, ast.Attribute )
+			and isinstance( node.value.func.value, ast.Name )
+			and node.value.func.value.id == 'compiler'
+			and node.value.func.attr == 'require_header'
+		):
 			call = node.value
-			if (
-				isinstance( call.func, ast.Attribute )
-				and isinstance( call.func.value, ast.Name )
-				and call.func.value.id == 'compiler'
-			):
-				if call.func.attr == 'require_header':
-					if len( call.args ) != 1 or call.keywords:
-						self.fail( f'compiler.require_header(...) takes exactly one argument: {ast.unparse(node)}', node )
-					arg = call.args[0]
-					if not ( isinstance( arg, ast.Constant ) and isinstance( arg.value, str )):
-						self.fail( f'compiler.require_header(...) argument must be a string literal: {ast.unparse(node)}', node )
-					self.required_headers.add( arg.value )
-				return
-		# otherwise: a bare expression statement at module level that isn't a
-		# compiler directive — silently ignore (same as generic_visit, which
-		# would recurse into child nodes but find nothing useful this pass needs)
+			if len( call.args ) != 1 or call.keywords:
+				self.fail( f'compiler.require_header(...) takes exactly one argument: {ast.unparse(node)}', node )
+			arg = call.args[0]
+			if not ( isinstance( arg, ast.Constant ) and isinstance( arg.value, str )):
+				self.fail( f'compiler.require_header(...) argument must be a string literal: {ast.unparse(node)}', node )
+			self.required_headers.add( arg.value )
+			return
+		if isinstance( node.value, ast.Constant ):
+			# a bare literal (a module/class docstring, or a `...` stub
+			# placeholder) has no side effect either way it's read - silently
+			# ignoring it matches ordinary Python, where evaluating a lone
+			# literal statement is a no-op
+			return
+		# neither a recognized directive nor an inert literal: this compiler
+		# never executes a module/class body as code (main() is the only
+		# real entry point - see ARCHITECTURE.md), so a bare expression
+		# statement here - `print(...)`, `some_call()`, `x.y` - can never
+		# run. This used to fall through silently (same as generic_visit),
+		# so a call like this would compile clean and then vanish from the
+		# generated program with zero diagnostic. Reject it instead, same as
+		# every other statement kind this scan already rejects for being
+		# unreachable/meaningless here (AugAssign, loops, ...)
+		self.fail( f'unsupported statement here: {ast.unparse(node)}', node )
 
 	def visit_Name( self, node: ast.Name ) -> Name:
 		assert isinstance( node.ctx, ast.Load ), f'invalid context on {node=}' # internal invariant - Load is the only context an expression-position Name can have

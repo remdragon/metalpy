@@ -208,6 +208,61 @@ class Foo:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self.assertIsNotNone( mod.get_local( 'Foo' ))
 
+	def test_bare_call_expression_at_module_level_is_a_clean_compile_error( self ) -> None:
+		# the real bug this covers: ast.Expr IS in _SUPPORTED_BODY_STATEMENTS
+		# (unlike AugAssign/for above), so a bare call statement with no
+		# assignment target used to sail through this scan with zero errors
+		# and then simply never reach any IR/emission path - it vanished
+		# from the compiled program silently. visit_Expr now rejects
+		# anything that's neither a recognized compiler.* directive nor an
+		# inert literal
+		self._import( '''
+some_undefined_function()
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'unsupported statement', self.discovery.errors.errors[0] )
+
+	def test_bare_call_expression_in_class_body_is_a_clean_compile_error( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	some_undefined_function()
+	x: i32
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve() # class bodies are scanned lazily - see ShallowScanTests
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'unsupported statement', self.discovery.errors.errors[0] )
+
+	def test_module_docstring_is_still_silently_accepted( self ) -> None:
+		# a bare literal statement (a docstring, or a `...` stub) has no
+		# side effect to lose either way - this is the single most common
+		# bare-expression-statement idiom in real Python and must keep
+		# working
+		mod = self._import( '''
+"""a module docstring"""
+x: i32 = 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIsNotNone( mod.get_local( 'x' ))
+
+	def test_class_docstring_is_still_silently_accepted( self ) -> None:
+		mod = self._import( '''
+class Foo:
+	"""a class docstring"""
+	x: i32
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIsNotNone( foo.get_local( 'x' ))
+
+	def test_require_header_directive_still_works( self ) -> None:
+		self._import( '''
+compiler.require_header( 'pthread.h' )
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'pthread.h', self.discovery.required_headers )
+
 
 class ShallowScanTests( unittest.TestCase ):
 	'''
