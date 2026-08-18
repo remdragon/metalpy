@@ -440,7 +440,7 @@ class Result[T, E]:
 
 ### Module-Level (Top-Level) Execution Rules
 
-At module scope, `import`/`from...import`, `class`/`def` definitions (including `@compiler.target`-decorated ones), `pass`, and global variable declarations/initializations are allowed. A **non**-constant `if`/`match`, loops, and `AugAssign` (`x += 1`) are all compile errors at module scope ("unsupported statement here"). A compile-time-constant `if`/`match` is folded down to just its taken branch's statements before anything else runs, so it's effectively allowed too.
+At module scope, `import`/`from...import`, `class`/`def` definitions (including `@compiler.target`-decorated ones), `pass`, and global variable declarations/initializations are allowed. A **non**-constant `if`/`match`, loops, `AugAssign` (`x += 1`), and any bare expression-statement that isn't a literal (a call with no assignment target, e.g. a top-level `print('hi')` line) are all compile errors at module scope ("unsupported statement here") — a bare call like that can never actually run, so it's rejected rather than silently compiled away. A compile-time-constant `if`/`match` is folded down to just its taken branch's statements before anything else runs, so it's effectively allowed too.
 
 A global variable's initializer is **not** restricted to a compile-time constant — it can call ordinary functions at real program-startup time; the compiler synthesizes a `__metalpy_init_<name>()` function per initializer, called before `main()` runs.
 
@@ -458,11 +458,11 @@ class WindowsSpecific:
 	pass
 ```
 
-**A bare expression-statement at module scope (a function call with no assignment, e.g. a bare `print('hi')` line) is NOT rejected — but it's also never emitted or executed. It's silently dropped, with no compile error and no runtime effect.** This is a confirmed, real compiler gap (not a documented/intentional restriction) — avoid this shape entirely; there is no working idiom for "run this one statement at module scope" today outside of a global initializer's own evaluation.
+A bare literal statement (a module/class docstring, or a `...` stub placeholder) is still silently accepted and is a genuine no-op, same as ordinary Python. There is still no working idiom for "run this one statement at module scope" — the only way to run code at program-startup time (before `main()`) is a global variable's own initializer, above.
 
 ### `main()` Entry Point
 
-The program entry point is a function named `main`. Its return type must be `None` or a scalar integer type (`i32`, `u8`, `u32`, etc.) — never `Result[...]` or any other shape. `main` compiles directly to C's real `int main(...)` — the OS/CRT invokes it exactly like any C program's `main`, with **no** metalpy-level driver call needed (a top-level `sys.exit(main())`-style statement is not part of this codebase's actual convention, and per the module-scope rule just above, a bare one would be silently inert anyway). A `None`-returning `main()` synthesizes `return 0;`; any other declared return type has its `Return`'s operand emitted as the C `int main`'s return value directly. The return-type restriction isn't (yet) enforced as a dedicated, friendly compiler diagnostic — declaring `main() -> Result[...]` compiles cleanly through this compiler's own IR and only fails once the *generated C* is compiled, with a much less friendly C-level type error.
+The program entry point is a function named `main`. Its return type must be `None` or a scalar integer type (`i32`, `u8`, `u32`, etc.) — never `Result[...]` or any other shape. `main` compiles directly to C's real `int main(...)` — the OS/CRT invokes it exactly like any C program's `main`, with **no** metalpy-level driver call needed (a top-level `sys.exit(main())`-style statement is not part of this codebase's actual convention, and per the module-scope rule just above, a bare one would be a compile error anyway). A `None`-returning `main()` synthesizes `return 0;`; any other declared return type has its `Return`'s operand emitted as the C `int main`'s return value directly. The return-type restriction isn't (yet) enforced as a dedicated, friendly compiler diagnostic — declaring `main() -> Result[...]` compiles cleanly through this compiler's own IR and only fails once the *generated C* is compiled, with a much less friendly C-level type error.
 
 ```metalpy
 def main() -> i32:
