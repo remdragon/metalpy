@@ -8874,6 +8874,38 @@ class FunctionLowering:
 		if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 			target_cls = self.lowering._ensure_resolved( target_cls )
 
+		# T(...) where T defines a static __call__ dispatches to
+		# T.__call__(...) instead of construction - rewrite node.func to
+		# Attribute(T, '__call__') in place and bail out (returning None
+		# here just makes this recognizer decline, same as any other
+		# shape mismatch): the remaining recognizers below in _lower_call's
+		# own tuple all safely no-op against an Attribute ending in
+		# '__call__' (none matches that shape), and _resolve_callee's
+		# existing ClassName.static_method(...) path (already used by
+		# int.from_str(...)) picks the rewritten node.func up unchanged
+		# once the recognizer loop falls through - no new call-resolution
+		# logic needed downstream. Reuses target_cls (already resolved just
+		# above, including the generic-Specialization case) rather than a
+		# second _try_resolve_namespace call - same reasoning as this
+		# whole check's own placement, right after that resolution and
+		# before the CEnum branch: no-op for the overwhelming common case
+		# (target_cls isn't ClassLike, or has no local __call__), so every
+		# OTHER class's construction stays byte-for-byte unchanged.
+		if isinstance( target_cls, ClassLike ):
+			call_member = target_cls.get_local( '__call__' )
+			if call_member is not None:
+				members = call_member.implementations if isinstance( call_member, Overload ) else [ call_member ]
+				if not all( isinstance( m, Function ) and m.is_static for m in members ):
+					self.lowering.discovery.fail(
+						f'{target_cls.qualname}.__call__ must be declared @staticmethod to be used as {target_cls.qualname}(...): {ast.unparse(node)}',
+						node,
+					)
+					return None
+				new_func = ast.Attribute( value = node.func, attr = '__call__', ctx = ast.Load() )
+				ast.copy_location( new_func, node.func )
+				node.func = new_func
+				return None
+
 		# CEnum construction: EnumName(value) is a plain cast to the
 		# enum's underlying type — no allocation, no refcounting, just
 		# reinterpret the raw integer as the enum type. e.g. OSError(ENOENT)

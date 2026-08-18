@@ -460,7 +460,16 @@ class str:
 	def __del__( self ) -> None:
 		sys.free( self.__data )
 		sys.free( self.__index )
-	
+
+	@staticmethod
+	def __call__( x: str ) -> str:
+		# str is immutable - str(x) is always just x itself, no copy. The
+		# returned borrowed param aliases+increfs automatically (the same
+		# _stmt_Return aliasing-return convention every other str method
+		# that hands back one of its own arguments unchanged already
+		# relies on).
+		return x
+
 	def __add__( self, other: str ) -> str:
 		if compiler.target.debug:
 			assert self.__byte_size > 0, 'invalid str instance (byte_size must be >0)'
