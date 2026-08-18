@@ -3970,6 +3970,29 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			pairs.append(( param, kw.value ))
 		return pairs
 
+	def _natural_literal_type( self, node: ast.Constant ) -> Type|None:
+		''' a literal's own no-context default type, exactly mirroring
+		Lowering._expr_Constant's expected_type-is-None branch - deliberately
+		NOT the same mapping _type_of_expr's Constant branch uses (that one
+		means what an ANNOTATION spelling would: `int` the arbitrary-precision
+		class, `float` an alias for f32). Only for _infer_generic_args' own
+		trust_literals path below, where the question is what type the
+		argument literal will actually be lowered as. '''
+		intrinsics = self.discovery.get_intrinsics()
+		if node.value is None:
+			return self.discovery.get_none_type()
+		if isinstance( node.value, bool ):
+			return intrinsics['bool']
+		if isinstance( node.value, int ):
+			return intrinsics['i32']
+		if isinstance( node.value, float ):
+			return intrinsics['f64']
+		if isinstance( node.value, str ):
+			return self.discovery.find_name_or_none( 'str' )
+		if isinstance( node.value, bytes ):
+			return self.discovery.find_name_or_none( 'bytes' )
+		return None
+
 	def _infer_generic_args(
 		self, node: ast.Call, target: Function, type_params: list[TypeVar], *, trust_literals: bool = True,
 	) -> list[Type]|None:
@@ -4008,9 +4031,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return None
 		bindings: dict[int,Type] = {} # id(TypeVar) -> the concrete Type it was inferred as
 		for param, expr in pairs:
-			if not trust_literals and isinstance( expr, ast.Constant ):
-				continue
-			actual = self._type_of_expr( expr )
+			if isinstance( expr, ast.Constant ):
+				if not trust_literals:
+					continue
+				# a literal argument's inferred type must match what Lowering.
+				# _expr_Constant will ACTUALLY tag it as once this pass's
+				# binding turns the type param concrete (i32/f64/bool/str/
+				# bytes/NoneType) - NOT _type_of_expr's Constant mapping, which
+				# deliberately means the same thing an ANNOTATION would (42's
+				# `int` is the arbitrary-precision class, 3.14's `float` is an
+				# alias for f32). Using that mapping here bound T to the
+				# annotation-int/float type instead, so the literal then failed
+				# lowering's own compatible-stems check against its own
+				# concrete (non-scalar, or narrower-float) parameter type
+				actual = self._natural_literal_type( expr )
+			else:
+				actual = self._type_of_expr( expr )
 			if actual is None or isinstance( actual, TypeVar ):
 				continue # can't determine this one - not an error here, just doesn't contribute a binding (see the "missing" check below)
 			if not self._unify_type_param( type_params, param.type, actual, bindings ):
