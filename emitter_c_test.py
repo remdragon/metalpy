@@ -11902,7 +11902,7 @@ def main() -> i32:
 		# each branch's own intermediate temps must be flushed independently
 		self._run( '''
 def build_path( prefix: str, k: str ) -> str:
-	return ( prefix + '!') if prefix.byte_len() == 0 else ( prefix + '.' + k )
+	return ( prefix + '!' ) if prefix.byte_len() == 0 else ( prefix + '.' + k )
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:

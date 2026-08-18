@@ -241,13 +241,21 @@ class RowParser:
 # ---------------------------------------------------------------------------
 
 def _format_field( field: str, delimiter: str, quotechar: str ) -> str:
-	# deliberately if/elif, NOT one `or`-chained boolean expression: a chain
-	# of 3+ `field.find(...) != isize(-1)` comparisons joined by `or`
-	# crashes at runtime under MSVC specifically (STATUS_BREAKPOINT, heap-
-	# corruption-flavored - confirmed via a minimal repro isolated down to
-	# exactly this shape; 2-deep `or` chains are fine). Real compiler bug
-	# in short-circuit-chain temporary cleanup, not something csv.py can
-	# fix - this is the workaround.
+	# deliberately if/elif, NOT one `or`-chained boolean expression:
+	# `field.find(...).is_ok()` calls joined by `or`, once the first one
+	# short-circuits, crashed at runtime under MSVC specifically
+	# (STATUS_BREAKPOINT, heap-corruption-flavored) - a real compiler bug
+	# in _expr_BoolOp (lowering.py), fixed 2026-08-18: a short-circuited
+	# operand's own Result temp (str.find()'s return, an RC-leaf @union)
+	# still got its enclosing statement's unconditional end-of-statement
+	# cleanup, reading a garbage tag/pointer off the never-executed
+	# operand's uninitialized C local. Confirmed via direct investigation
+	# that even a 2-deep chain crashed (not just 3+, as originally
+	# believed when this comment was first written) whenever the first
+	# operand short-circuited - the depth wasn't the trigger, the
+	# short-circuit was. Kept as if/elif regardless of the fix landing -
+	# no reason to reintroduce the `or`-chain now that it happens to work
+	# again.
 	needs_quote: bool = False
 	if field.find( delimiter ) != isize( -1 ):
 		needs_quote = True

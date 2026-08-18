@@ -7221,66 +7221,51 @@ class FunctionLowering:
 			opcode, extra = self._arithmetic_mode[-1].GetUnaryOp( node )
 		return self._lower_arithmetic_op( node, opcode, extra, result_type, { 'operand': operand }, 'unary' )
 
-	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:
-		# short-circuit and/or: evaluate operands left to right, each into
-		# the same dest temp, stopping early (jump to end) as soon as the
-		# result is already decided - `and` stops on the first falsy
-		# operand, `or` stops on the first truthy one. Needed by match's
-		# nested pattern tests (an outer tag check AND, only if that
-		# passes, an inner tag check on the payload - reading the payload
-		# before confirming the outer tag would be reading the wrong
-		# union member's storage)
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		is_and = isinstance( node.op, ast.And )
-		end_label = self._new_label( 'booland' if is_and else 'boolor' )
-		dest = self._new_temp( bool_cls )
-		for i, value_node in enumerate( node.values ):
-			operand = self._lower_expr( value_node, bool_cls )
-			self._emit( ir.Assign( dest = dest, src = operand ))
-			if i < len( node.values ) - 1:
-				jump_opcode = ir.JumpIfFalse if is_and else ir.JumpIfTrue
-				self._emit( jump_opcode( cond = dest, target = end_label ))
-		self._emit( ir.Label( name = end_label ))
-		return dest
-
-	def _flush_ifexp_branch_temps( self, start_idx: int, *keep: ir.Operand ) -> None:
-		# a ternary branch can lower an arbitrarily deep sub-expression (e.g.
-		# `prefix + str('.') + k`, two chained str.__add__ Calls) that
-		# DeclareTemp's its own intermediate temps (the '.'  literal-wrap
-		# temp, and the first __add__'s own result, consumed as the second
-		# __add__'s receiver) via the ordinary self._new_temp() path - every
-		# one of those lands in self._pending_temps exactly like any other
-		# temp. _expr_IfExp only ever untrack_temp()'s/increfs the branch's
-		# OWN final value (`true_val`/`false_val` below) - it never touches
-		# these purely-intermediate temps, so left alone they'd survive in
+	def _flush_branch_temps( self, start_idx: int, *keep: ir.Operand ) -> None:
+		# shared by _expr_BoolOp and _expr_IfExp: both lower a SEQUENCE of
+		# conditionally-skippable sub-expressions (BoolOp operands after a
+		# short-circuit jump; the IfExp branch that didn't run) into the
+		# same straight-line instruction stream. A sub-expression that
+		# chains multiple calls (e.g. `field.find(x)` receiver consumed by
+		# `.is_ok()`, or `prefix + str('.') + k`'s two chained __add__s)
+		# DeclareTemp's its own intermediate temps via the ordinary
+		# self._new_temp() path - every one of those lands in
+		# self._pending_temps exactly like any other temp. Neither method
+		# ever touches these purely-intermediate temps itself (only the
+		# construct's own final value - `operand`/`true_val`/`false_val` -
+		# gets special handling), so left alone they'd survive in
 		# _pending_temps all the way to the ENCLOSING STATEMENT's own
 		# _flush_pending_temps() (e.g. _stmt_Return's, called once after
-		# BOTH branches have already merged at end_label) - which then
-		# decref's them UNCONDITIONALLY, including in whichever branch did
-		# NOT run and therefore never assigned into that temp's C variable
-		# at all, releasing raw stack garbage. Confirmed as a real,
-		# reproducible stack-overflow crash (not just a leak/UAF): the
-		# garbage pointer's own "vtable" field is whatever happened to be on
-		# the stack, so release_object's vtable->destroy call jumps
-		# somewhere essentially random.
+		# every operand/branch has already merged at end_label) - which
+		# then decref's them UNCONDITIONALLY, including for whichever
+		# operand/branch never actually ran (skipped by an earlier
+		# operand's short-circuit jump, or the branch not taken), reading
+		# tag/payload data off an uninitialized C local. Confirmed as a
+		# real, reproducible crash in both shapes - not just a leak/UAF:
+		# _expr_IfExp's case releases a garbage object pointer through a
+		# garbage vtable (a stack-overflow crash); _expr_BoolOp's case
+		# reads a garbage union tag and, whenever it happens to look like
+		# the RC leaf, releases a garbage pointer straight from the stack
+		# (a STATUS_BREAKPOINT crash under MSVC - confirmed with as few as
+		# 2 chained `field.find(x).is_ok() or field.find(y).is_ok()`
+		# operands, whenever the first one short-circuits).
 		#
-		# The fix: flush each branch's OWN intermediate temps (added to
-		# _pending_temps since `start_idx`, i.e. everything DeclareTemp'd
-		# while lowering just THIS branch) right here, inside the branch,
-		# before the Jump to end_label - exactly mirroring how the already-
-		# correct if/else STATEMENT form gets this right for free (each
-		# branch is its own statement, so _lower_stmt's per-statement
-		# pending_temps save/flush/restore already scopes it correctly).
-		# `keep` (the branch's own dest/final-value temps) is excluded -
-		# their ownership is already fully resolved by the incref/
-		# untrack_temp() decision made just above each call site, and dest
-		# in particular is still actively in use afterward (assigned into,
-		# then read again once both branches merge) so it must not be
-		# DeleteTemp'd here even though the actual decref side would
-		# already be a safe no-op for it (cfg.fresh_temp() only registers
-		# dest AFTER both branches, so cfg.delete_temp(dest) can't fire a
-		# real release yet regardless - this is about not emitting a
-		# spurious "this temp is done" marker on a temp that visibly isn't).
+		# The fix: flush each operand/branch's OWN intermediate temps
+		# (added to _pending_temps since `start_idx`, i.e. everything
+		# DeclareTemp'd while lowering just this one) right here, before
+		# moving on to the next operand or the branch's own Jump/merge -
+		# exactly mirroring how the already-correct if/else STATEMENT form
+		# gets this right for free (each branch is its own statement, so
+		# _lower_stmt's per-statement pending_temps save/flush/restore
+		# already scopes it correctly). `keep` (the construct's own
+		# dest/final-value temps) is excluded - their ownership is already
+		# fully resolved by the incref/untrack_temp() decision made just
+		# above each call site (IfExp) or is simply never RC to begin with
+		# (BoolOp's `operand` is always bool), and dest in particular is
+		# still actively in use afterward (assigned into, then read again
+		# once every operand/branch merges) so it must not be DeleteTemp'd
+		# here even though the actual decref side would already be a safe
+		# no-op for it.
 		branch_temps = self._pending_temps[ start_idx: ]
 		self._pending_temps = self._pending_temps[ : start_idx ]
 		keep_ids = { k.id for k in keep if isinstance( k, ir.Temp ) }
@@ -7290,6 +7275,37 @@ class FunctionLowering:
 			for instr in self._cfg.delete_temp( t ):
 				self._emit( instr )
 			self._emit( ir.DeleteTemp( temp = t ))
+
+	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:
+		# short-circuit and/or: evaluate operands left to right, each into
+		# the same dest temp, stopping early (jump to end) as soon as the
+		# result is already decided - `and` stops on the first falsy
+		# operand, `or` stops on the first truthy one. Needed by match's
+		# nested pattern tests (an outer tag check AND, only if that
+		# passes, an inner tag check on the payload - reading the payload
+		# before confirming the outer tag would be reading the wrong
+		# union member's storage)
+		#
+		# Each operand's own intermediate temps (e.g. `field.find(x)`'s
+		# Result temp, consumed as `.is_ok()`'s receiver) are flushed via
+		# _flush_branch_temps right after that operand's own code runs,
+		# before any later operand's short-circuit jump could skip past a
+		# temp this operand already finished with - see that method's own
+		# comment for the confirmed crash this fixes.
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		is_and = isinstance( node.op, ast.And )
+		end_label = self._new_label( 'booland' if is_and else 'boolor' )
+		dest = self._new_temp( bool_cls )
+		for i, value_node in enumerate( node.values ):
+			operand_start = len( self._pending_temps )
+			operand = self._lower_expr( value_node, bool_cls )
+			self._emit( ir.Assign( dest = dest, src = operand ))
+			self._flush_branch_temps( operand_start, dest, operand )
+			if i < len( node.values ) - 1:
+				jump_opcode = ir.JumpIfFalse if is_and else ir.JumpIfTrue
+				self._emit( jump_opcode( cond = dest, target = end_label ))
+		self._emit( ir.Label( name = end_label ))
+		return dest
 
 	def _expr_IfExp( self, node: ast.IfExp, expected_type: Type|None ) -> ir.Operand:
 		# ternary `x if cond else y` — both branches assign to the same
@@ -7316,8 +7332,8 @@ class FunctionLowering:
 		# Each branch's own PURELY INTERMEDIATE temps (e.g. every temp a
 		# chained `prefix + str('.') + k` concatenation DeclareTemp's along
 		# the way, none of which is `true_val`/`false_val` itself) are
-		# flushed inside that branch via _flush_ifexp_branch_temps - see its
-		# own comment for why: left to the enclosing statement's normal
+		# flushed inside that branch via _flush_branch_temps - see its own
+		# comment for why: left to the enclosing statement's normal
 		# end-of-statement flush, they leak past end_label and get
 		# unconditionally decref'd even in the branch that never ran,
 		# releasing an uninitialized C local - a real, reproducible stack-
@@ -7339,7 +7355,7 @@ class FunctionLowering:
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( true_val )
-		self._flush_ifexp_branch_temps( true_branch_start, dest, true_val )
+		self._flush_branch_temps( true_branch_start, dest, true_val )
 		self._emit( ir.Assign( dest = dest, src = true_val ))
 		self._emit( ir.Jump( target = end_label ))
 		# false branch
@@ -7351,7 +7367,7 @@ class FunctionLowering:
 				self._emit( instr )
 		else:
 			self._cfg.untrack_temp( false_val )
-		self._flush_ifexp_branch_temps( false_branch_start, dest, false_val )
+		self._flush_branch_temps( false_branch_start, dest, false_val )
 		self._emit( ir.Assign( dest = dest, src = false_val ))
 		self._emit( ir.Label( name = end_label ))
 		self._cfg.fresh_temp( dest, dest.type )
