@@ -178,23 +178,27 @@ class _LeafPairBinop:
 	type, right leaf type) grid cell for a union-involving +-*//%|&^ - see
 	that method's own docstring for the full per-kind rule. `success_type`
 	is None only for 'error' (no valid operation for this leaf pair at
-	all); `error_type` is None whenever this cell CAN'T fail (infallible
-	scalar arithmetic under the current mode, or a dunder whose own
-	declared return type isn't itself Result[T,E]) - a cell can carry both
-	(a fallible scalar op, or a dunder returning Result[T,E]) or neither.
-	`opcode`/`extra` are 'scalar' only (mirrors _lower_arithmetic_op's own
-	two parameters of the same name - `extra` is the lowered panic-mode
-	message operand, or None for every other mode). `method`/`reflected`
-	are 'dunder' only, same meaning as _LeafPairEq's own pair - `reflected
-	= True` means this was found via right_type's own REFLECTED,
-	DIFFERENTLY-NAMED method (__radd__ etc, not __eq__/__ne__'s
-	same-name-swapped-roles reflection - see _REFLECTED_BINOP_DUNDER's own
-	comment on why binops need the different convention). '''
-	kind: str   # 'scalar' | 'dunder' | 'error'
+	all); `error_type` is None whenever this cell CAN'T fail as far as the
+	OUTER aggregate is concerned - either the dunder's own return type
+	isn't Result[T,E] at all, or it IS but `method.is_fallible_arithmetic`
+	(a scalar-registered arithmetic dunder, or int.__floordiv__/__mod__)
+	means its Result gets auto-consumed via the ambient arithmetic mode
+	instead, exactly like the non-union path already does - see
+	_emit_binop_cell's own handling. `method`/`reflected`, same meaning as
+	_LeafPairEq's own pair - `reflected = True` means this was found via
+	right_type's own REFLECTED, DIFFERENTLY-NAMED method (__radd__ etc,
+	not __eq__/__ne__'s same-name-swapped-roles reflection - see
+	_REFLECTED_BINOP_DUNDER's own comment on why binops need the
+	different convention). No separate 'scalar' kind anymore - a Scalar
+	operand's own arithmetic is just another dunder lookup now
+	(i32.__add__ = ..., see lib/builtins/__scalar_arith.py), found via the
+	exact same _find_dunder_for_arg/_mode_qualified_dunder_names machinery
+	the non-union path already uses - one source of truth for "how do I
+	resolve a mode-qualified arithmetic dunder", not a second, independent
+	reimplementation of GetBinOp/_resolve_checked_error. '''
+	kind: str   # 'dunder' | 'error'
 	success_type: Type|None = None
 	error_type: Type|None = None
-	opcode: type|None = None
-	extra: ir.Operand|None = None
 	method: Function|None = None
 	reflected: bool = False
 
@@ -8548,36 +8552,55 @@ class FunctionLowering:
 
 	def _classify_leaf_pair_binop( self, node: 'ast.BinOp|ast.AugAssign', method_name: str|None, reflected_name: str|None, left_type: Type, right_type: Type ) -> _LeafPairBinop:
 		''' one grid cell of _lower_binop_dispatch's own classification -
-		see that method's docstring for the full rule. A leaf pair that
-		can't type-check at all (mismatched float types, an operator with
-		no floating-point meaning, or neither side has a usable dunder)
-		becomes an 'error' cell (contributing TypeError) rather than an
-		immediate compile failure - mirrors _classify_leaf_pair_eq's own
-		identical choice: a single bad pairing doesn't reject the WHOLE
-		union expression, it becomes one runtime-checkable branch of it. '''
+		see that method's docstring for the full rule. Dunder lookup only,
+		mode-qualified exactly like the non-union path's own forward/
+		reflected loop in _lower_binop_values - no isinstance(Scalar)
+		branch at all: a Scalar operand's own arithmetic is registered as
+		a real (if @inline, zero-overhead) dunder now (see lib/builtins/
+		__scalar_arith.py), found via _find_dunder_for_arg identically to
+		any class's own method. A leaf pair that can't type-check at all
+		(mismatched float types - no matching dunder is ever registered
+		for that pairing, so lookup just misses; an operator with no
+		dunder mapping; or neither side has a usable method) becomes an
+		'error' cell (contributing TypeError) rather than an immediate
+		compile failure - mirrors _classify_leaf_pair_eq's own identical
+		choice: a single bad pairing doesn't reject the WHOLE union
+		expression, it becomes one runtime-checkable branch of it. '''
 		type_error_cls = self.lowering.discovery.find_name( 'TypeError', node )
-		if isinstance( left_type, Scalar ) and isinstance( right_type, Scalar ):
-			is_float = _is_float_scalar( left_type ) or _is_float_scalar( right_type )
-			if is_float and ( left_type is not right_type or _FLOAT_UNSUPPORTED_BINOPS.get( type( node.op )) is not None ):
-				return _LeafPairBinop( 'error', error_type = type_error_cls )
-			opcode, extra = ( self._arithmetic_mode[-1].GetFloatBinOp( node ) if is_float else self._arithmetic_mode[-1].GetBinOp( node ))
-			if opcode is None:
-				return _LeafPairBinop( 'error', error_type = type_error_cls )
-			error_type = None
-			if opcode.checked_errors and extra is None:
-				error_type, _alternatives = self._resolve_checked_error( node, opcode, left_type )
-			return _LeafPairBinop( 'scalar', success_type = left_type, error_type = error_type, opcode = opcode, extra = extra )
-		method = self._find_dunder_for_arg( left_type, method_name, right_type ) if method_name is not None and not isinstance( left_type, Scalar ) else None
+		method: Function|None = None
 		reflected = False
-		if method is None and reflected_name is not None and not isinstance( right_type, Scalar ):
-			method = self._find_dunder_for_arg( right_type, reflected_name, left_type )
-			reflected = method is not None
+		if method_name is not None:
+			for candidate in self._mode_qualified_dunder_names( method_name ):
+				method = self._find_dunder_for_arg( left_type, candidate, right_type )
+				if method is not None:
+					break
+			if method is None and reflected_name is not None:
+				for candidate in self._mode_qualified_dunder_names( reflected_name ):
+					method = self._find_dunder_for_arg( right_type, candidate, left_type )
+					if method is not None:
+						reflected = True
+						break
 		if method is None:
 			return _LeafPairBinop( 'error', error_type = type_error_cls )
-		self.lowering._ensure_resolved( method )
+		# _resolve_call_target, not _ensure_resolved - the latter
+		# unconditionally schedules its target as a real compile unit,
+		# which for an @inline scalar-arithmetic dunder means compiling
+		# it as real, dead, never-called code - same gotcha
+		# _emit_fallible_method_call's own comment documents, needed
+		# again here since classification resolves the method before
+		# codegen ever reaches that shared call site
+		self.lowering._resolve_call_target( method )
 		self.lowering.schedule( method.return_type )
 		for p in ( method.parameters or [] ):
 			self.lowering.schedule( p.type )
+		if method.is_fallible_arithmetic:
+			# consumed via the ambient arithmetic mode at emission time
+			# (_emit_binop_cell), exactly like this SAME dunder already
+			# behaves reached from the non-union path - never folds into
+			# this expression's own aggregate error union
+			shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
+			assert shape is not None and len( shape[1] ) == 2, f'@fallible_arithmetic {method.qualname} must declare a Result[T,E] return type'
+			return _LeafPairBinop( 'dunder', success_type = shape[1][0].type, method = method, reflected = reflected )
 		if cfg.is_result_type( method.return_type ):
 			shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
 			assert shape is not None and len( shape[1] ) == 2
@@ -8664,39 +8687,36 @@ class FunctionLowering:
 		cell: _LeafPairBinop, dest: ir.Temp, success_type: Type, error_type: Type|None, result_union: TaggedUnion|None, end_label: str,
 	) -> None:
 		''' one grid cell's codegen - see _lower_binop_dispatch's own
-		docstring for what each kind means. A cell with its own
-		error_type set needs the extra Ok/Err decomposition
-		(_emit_binop_fallible_split); every other cell just produces one
-		plain value directly. '''
+		docstring for what each kind means. An 'error' cell needs a fresh
+		TypeError() instance; a 'dunder' cell is emitted via the SAME
+		_emit_fallible_method_call the non-union path uses (one source of
+		truth for "resolve+schedule, splice-or-Call, consume via ambient
+		mode if @fallible_arithmetic") - passing expected_type=None always,
+		since a non-fallible-arithmetic dunder's raw return value is what
+		THIS dispatch's own _coerce_binop_value/_emit_binop_fallible_split
+		need to see, never pre-coerced at the call site. For an
+		is_fallible_arithmetic method, _emit_fallible_method_call has
+		ALREADY consumed its Result via the ambient mode by the time it
+		returns here (cell.error_type is None in that case, by
+		construction - see _classify_leaf_pair_binop) - so `value` is
+		simply the cell's own final success value either way; only a
+		cell with error_type set (a REGULAR dunder whose own declared
+		return type is Result[T,E], e.g. int.__add__/Vector.__add__)
+		still needs the extra Ok/Err decomposition. '''
 		if cell.kind == 'error':
 			error_instance = self._build_type_error_instance( node )
 			assert error_type is not None and result_union is not None   # an 'error' cell always contributes TypeError, so the whole expression is always fallible whenever one exists
 			value = self._coerce_binop_value( error_instance, error_type, result_union, node )
 			self._finish_binop_result_branch( error_instance, value, dest, end_label )
 			return
-		if cell.kind == 'scalar':
-			if cell.error_type is None:
-				value = self._lower_arithmetic_op( node, cell.opcode, cell.extra, cell.success_type, { 'left': narrowed_left, 'right': narrowed_right }, 'binary' )
-				value = self._coerce_binop_value( value, success_type, result_union, node )
-				self._finish_binop_cell( dest, value, end_label )
-				return
-			result_cls = self.lowering.discovery.find_name( 'Result', node )
-			check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ cell.success_type, cell.error_type ] )
-			self.lowering.schedule( check_type )
-			check_dest = self._new_temp( check_type )
-			self._emit( cell.opcode( dest = check_dest, left = narrowed_left, right = narrowed_right ))
-			self._emit_binop_fallible_split( node, check_dest, dest, success_type, error_type, result_union, end_label )
-			return
 		assert cell.kind == 'dunder' and cell.method is not None
 		receiver, arg = ( narrowed_right, narrowed_left ) if cell.reflected else ( narrowed_left, narrowed_right )
-		self.lowering.schedule( cell.method.return_type )
-		call_dest = self._new_temp( cell.method.return_type )
-		self._emit( ir.Call( dest = call_dest, target = cell.method, receiver = receiver, args = [ arg ], kwargs = {} ))
+		value = self._emit_fallible_method_call( node, cell.method, receiver, [ arg ], None )
 		if cell.error_type is None:
-			value = self._coerce_binop_value( call_dest, success_type, result_union, node )
+			value = self._coerce_binop_value( value, success_type, result_union, node )
 			self._finish_binop_cell( dest, value, end_label )
 			return
-		self._emit_binop_fallible_split( node, call_dest, dest, success_type, error_type, result_union, end_label )
+		self._emit_binop_fallible_split( node, value, dest, success_type, error_type, result_union, end_label )
 
 	def _coerce_binop_value( self, value: ir.Operand, axis_type: Type, result_union: TaggedUnion|None, node: ast.AST ) -> ir.Operand:
 		''' two-step coercion for ONE axis (success or error) of the
