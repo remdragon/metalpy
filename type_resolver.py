@@ -3793,6 +3793,25 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			base = self._try_resolve_callable_namespace( node.value )
 			if base is None:
 				return None
+			# resolve() alone (populating base's own member table) is cheap
+			# and side-effect-free from this pass's point of view - it's
+			# ensure_resolved's OTHER half, schedule() (queuing base, and
+			# everything it transitively calls, for real compilation), that
+			# must stay gated on node.attr actually being a real member.
+			# Checking membership BEFORE scheduling is what makes this
+			# method's own "silent probe, no side effects on a miss"
+			# docstring true - a bare Name lookup above can easily land on
+			# the wrong, unrelated base (a local variable shadowing a
+			# same-named module-level function/class - fn.names isn't
+			# populated yet at this pre-lowering pass, see this method's own
+			# docstring), and unconditionally scheduling that wrong guess
+			# used to pull in everything IT calls even on a confirmed miss
+			resolve = getattr( base, 'resolve', None )
+			if resolve is not None:
+				resolve()
+			names = getattr( base, 'names', None )
+			if not isinstance( names, dict ) or node.attr not in names:
+				return None
 			base = self.resolver.ensure_resolved( base )
 			if isinstance( base, TaggedUnion ):
 				self.resolver.union_storage.get( base )
