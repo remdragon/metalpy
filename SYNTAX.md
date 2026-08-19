@@ -96,16 +96,16 @@ match s.index( 'beef' ):          # index() returns a real Result instead
 
 ### `str()` vs. f-strings — converting values to text
 
-`str` is fully immutable and has **no public constructor at all** — not even a copy constructor. `str(some_str)`, `str(42)`, and `str(some_bytes)` all do **not** compile; there is no `str(...)` conversion path for anything. Since `str` never needs deep-copying (nothing can mutate it), a function that used to "return a copy" of an existing `str` just returns/reuses that same value directly.
+`str` is fully immutable and has no public constructor of its own — not even a copy constructor (`str` never needs deep-copying, since nothing can mutate it; a function that used to "return a copy" of an existing `str` just returns/reuses that same value directly). `str(x)` still works for any `x` with a `__str__` method, though — it's ordinary generic dispatch (`str.__call__[T](x: T) -> str: return x.__str__()`), not a copy constructor.
 
-F-string interpolation (`f"{x}"`) is the real stringification mechanism: with no format spec (or `!s`), it calls `x.__str__()`; with `!r`/`!a`, `x.__repr__()`; a `str` value is used as-is. This currently only works when `x` is already `str`, the boxed arbitrary-precision `int`, or another class that defines its own `__str__`/`__repr__` — **fixed-width scalar types (`i32`, `u16`, `usize`, `f32`, `f64`, `bool`, ...) have no `__str__`/`__repr__` of their own**, so `f"{n}"` for a bare `u16` port number, for example, does not compile today. Converting a fixed-width integer to text currently requires hand-rolled digit conversion (see `lib/http/client.py`'s own `_usize_to_str` for the established idiom), or boxing it through the arbitrary-precision `int` type first where the width allows it (`int(i32(x))`).
+F-string interpolation (`f"{x}"`) is the more common stringification mechanism: with no format spec (or `!s`), it calls `x.__str__()`; with `!r`/`!a`, `x.__repr__()`; a `str` value is used as-is. Every scalar type has its own `__str__`/`__repr__` except `bool` — fixed-width ints (`i8`/`u8`/`i16`/`u16`/`i32`/`u32`/`i64`/`u64`/`i128`/`u128`/`isize`/`usize`) and `f32`/`f64` all support it directly, alongside the boxed arbitrary-precision `int` and any other class that defines its own `__str__`/`__repr__`.
 
 ```metalpy
 n: int = int( 42 )
 msg: str = f'count: {n}'          # OK - int has __str__
 
 port: u16 = 8080
-# msg2: str = f'port: {port}'     # does NOT compile - u16 has no __str__
+msg2: str = f'port: {port}'       # OK - u16 has __str__ too
 ```
 
 ### Structs, Unions & Monomorphization

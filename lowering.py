@@ -64,7 +64,7 @@ _BINOP_DUNDER: dict[type,str] = {
 	ast.Mult: '__mul__',
 	ast.FloorDiv: '__floordiv__',
 	ast.Mod: '__mod__',
-	ast.Div: '__truediv__', # float-only in practice (see lib/builtins/__scalar_arith.py) - int has no `/`, only `//`
+	ast.Div: '__truediv__', # float-only in practice (see lib/builtins/__scalar_dunders.py) - int has no `/`, only `//`
 	ast.BitOr: '__or__',
 	ast.BitAnd: '__and__',
 	ast.BitXor: '__xor__',
@@ -131,7 +131,7 @@ _CHECKED_BINOP_OPCODES: dict[tuple[str,str],type] = {
 # delegates to _raw_float_binop, identically to ArithmeticWrap) - the
 # library-level saturated_add/etc dunders for f32/f64 call compiler.
 # wrapped_add directly instead of a separate saturated intrinsic (see
-# lib/builtins/__scalar_arith.py), so 'saturated' is deliberately absent
+# lib/builtins/__scalar_dunders.py), so 'saturated' is deliberately absent
 # here. No 'floordiv'/'mod' entries either - float has no // or % in this
 # language's arithmetic-mode system (arithmetic_mode.py's GetFloatBinOp has
 # no case for either).
@@ -191,7 +191,7 @@ class _LeafPairBinop:
 	_REFLECTED_BINOP_DUNDER's own comment on why binops need the
 	different convention). No separate 'scalar' kind anymore - a Scalar
 	operand's own arithmetic is just another dunder lookup now
-	(i32.__add__ = ..., see lib/builtins/__scalar_arith.py), found via the
+	(i32.__add__ = ..., see lib/builtins/__scalar_dunders.py), found via the
 	exact same _find_dunder_for_arg/_mode_qualified_dunder_names machinery
 	the non-union path already uses - one source of truth for "how do I
 	resolve a mode-qualified arithmetic dunder", not a second, independent
@@ -3929,7 +3929,7 @@ class FunctionLowering:
 		# but which one is picked never depends on ambient arithmetic mode).
 		# Intended body for a scalar-registered, @inline'd `__add__`/
 		# `__wrapped_add__`/`__saturated_add__`/etc (see lib/builtins/
-		# __scalar_arith.py) - which opcode a given SOURCE `+`/`//`/etc
+		# __scalar_dunders.py) - which opcode a given SOURCE `+`/`//`/etc
 		# actually gets still comes from ambient mode picking which of
 		# these dunders binop dispatch resolves to (mode-qualified name
 		# lookup in _lower_binop_values), not from anything read here.
@@ -3985,7 +3985,7 @@ class FunctionLowering:
 	def _lower_compiler_checked_convert( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.checked_convert(T, x) - the single fixed-mode intrinsic
 		# behind every scalar .to_T() conversion method (lib/builtins/
-		# __scalar_arith.py) - a genuine numeric VALUE-range check against
+		# __scalar_dunders.py) - a genuine numeric VALUE-range check against
 		# T's own [MIN,MAX], independent of bit width (unlike compiler.
 		# cast(T,x)/T(x) construct-cast syntax, which only range-checks a
 		# NARROWING conversion - see _lower_scalar_cast). Always fallible
@@ -4121,7 +4121,7 @@ class FunctionLowering:
 	def _lower_compiler_bitwise( self, node: ast.Call, intrinsic_name: str, expected_type: Type|None ) -> ir.Operand:
 		# compiler.bitand/bitor/bitxor/rshift(a, b) - the fixed-opcode
 		# intrinsics behind every scalar __and__/__or__/__xor__/__rshift__
-		# dunder (lib/builtins/__scalar_arith.py). Unlike checked_add/etc,
+		# dunder (lib/builtins/__scalar_dunders.py). Unlike checked_add/etc,
 		# there is only ONE variant each - ir.BitAnd/BitOr/BitXor/Shr have
 		# no Wrap/Check/Saturate forms at all - always infallible, plain
 		# T-returning, no Result involved.
@@ -6470,11 +6470,13 @@ class FunctionLowering:
 		# Python's real ascii(): str has no __repr__() of its own here for
 		# !a to match the quoting behavior of either, so !a just escapes
 		# whatever !r's own resolution already produces) both want
-		# __repr__; -1 (none) and 115 ('!s') want __str__ - matches
-		# print()'s own existing "no implicit stringification" convention:
-		# a scalar (i32, bool, ...) has no __str__ of its own, only the
-		# boxed classes do (int.__str__) - deliberately not auto-boxed
-		# here, same reasoning PLAN_FSTRINGS.md's own scope section gives
+		# __repr__; -1 (none) and 115 ('!s') want __str__ - just an ordinary
+		# method lookup, same as any other type: every fixed-width int
+		# scalar (i8/u8/.../isize/usize) has a real __str__/__repr__
+		# (lib/builtins/__scalar_dunders.py's i_str_signed/i_str_unsigned),
+		# same mechanism f64/f32's own __str__/__repr__ use (__float.py) -
+		# a scalar WITHOUT one (bool, currently) still fails cleanly here
+		# with a plain "method not found" error rather than being auto-boxed
 		if operand.type is str_type:
 			value_as_str = operand
 		else:
@@ -7620,7 +7622,7 @@ class FunctionLowering:
 		# truncated, an accepted first-pass edge), and bitwise/shift/floordiv/
 		# mod, which have no floating-point meaning and no dunder at all.
 		# Every remaining same-type float shape (+-*/`/`) already has a real
-		# dunder (lib/builtins/__scalar_arith.py's f_*_checked/wrapped/
+		# dunder (lib/builtins/__scalar_dunders.py's f_*_checked/wrapped/
 		# saturated, __truediv__) and dispatched through it above - nothing
 		# legitimate reaches past these two checks.
 		if _is_float_scalar( left.type ) or _is_float_scalar( right.type ):
@@ -8947,7 +8949,7 @@ class FunctionLowering:
 		reflected loop in _lower_binop_values - no isinstance(Scalar)
 		branch at all: a Scalar operand's own arithmetic is registered as
 		a real (if @inline, zero-overhead) dunder now (see lib/builtins/
-		__scalar_arith.py), found via _find_dunder_for_arg identically to
+		__scalar_dunders.py), found via _find_dunder_for_arg identically to
 		any class's own method. A leaf pair that can't type-check at all
 		(mismatched float types - no matching dunder is ever registered
 		for that pairing, so lookup just misses; an operator with no

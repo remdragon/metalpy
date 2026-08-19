@@ -7,7 +7,7 @@ from .__errors import OSError
 from .__fastlist import FastList
 from .__float import _f64_sign_prefix, _f64_fixed_digits
 from .__int import int, IntError
-from .__scalar_arith import i_add_checked
+from .__scalar_dunders import i_add_checked
 from .__ptr_arith import ptr_add_checked
 from .__list import list, UnsafeList
 from .__RawDict import RawDict, RawEntry
