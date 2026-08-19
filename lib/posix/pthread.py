@@ -70,3 +70,45 @@ def pthread_join(
 	retval: Ptr[None],
 ) -> i32:
 	...
+
+
+# ---------------------------------------------------------------------------
+# ucontext — user-level context switching (glibc, part of libc itself, no
+# separate link library - 'c' matches socket.py's own no-extra-library
+# externs). ucontext_t is opaque/platform-specific (its layout differs by
+# libc/arch) - modelled the same way as pthread_t above via compiler.c_type,
+# only ever touched through Ptr[ucontext_t]. Field access (uc_stack.ss_sp/
+# ss_size, uc_link) has no mechanism in this compiler (CType exposes no
+# field lowering) - fiber_poc_test.py's own shim fills those fields in real
+# hand-written C on our behalf; see its comment for why.
+# ---------------------------------------------------------------------------
+
+ucontext_t = compiler.c_type( 'ucontext_t', header = 'ucontext.h' )
+
+@extern('c', 'getcontext', header='ucontext.h')
+def getcontext(
+	ucp: Ptr[ucontext_t],
+) -> i32:
+	...
+
+# void makecontext(ucontext_t *ucp, void (*func)(), int argc, ...) - the
+# real prototype is variadic (extra int args forwarded to func at resume).
+# This POC only ever calls it with argc=0 (zero-arg top-level entry
+# functions - see fiber_poc_test.py) - no variadic argument-passing is
+# bound here. A real feature built on this would need that; deliberately
+# out of scope for this feasibility POC (no variadic @extern precedent
+# exists anywhere in this codebase).
+@extern('c', 'makecontext', header='ucontext.h')
+def makecontext(
+	ucp: Ptr[ucontext_t],
+	func: Ptr[Callable[[], None]],
+	argc: i32,
+) -> None:
+	...
+
+@extern('c', 'swapcontext', header='ucontext.h')
+def swapcontext(
+	oucp: Ptr[ucontext_t],
+	ucp: Ptr[ucontext_t],
+) -> i32:
+	...

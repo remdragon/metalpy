@@ -15,17 +15,20 @@ Session            - cookie jar + redirect-following requests.Session-style laye
 get/post/put/patch/delete/head/options/request - module-level Session convenience
 
 host may be a real hostname now - lib/socket.py's Socket.connect() resolves it
-via getaddrinfo internally (commit f794edb). https:// URLs aren't supported yet
-(no TLS - see PLAN_HTTP_CLIENT.md's Phase 4). URL parsing/query encoding is
-built on lib/urllib/parse.py (urlsplit/urlencode/parse_qsl/urljoin) rather
-than hand-rolled here - redirect Location headers may now be relative,
-resolved against the request URL via urljoin(). json= (on post/put/patch)
-and Response.json() are built on lib/json.py.
+via getaddrinfo internally (commit f794edb). https:// URLs work too, via
+lib/ssl.py (PLAN_SSL.md) - HTTPConnection.connect()/HTTPSConnection.connect()
+pick the transport, and Session.request() dispatches on the parsed URL's own
+scheme. URL parsing/query encoding is built on lib/urllib/parse.py
+(urlsplit/urlencode/parse_qsl/urljoin) rather than hand-rolled here - redirect
+Location headers may now be relative, resolved against the request URL via
+urljoin(). json= (on post/put/patch) and Response.json() are built on
+lib/json.py.
 '''
 
 import sys
 import compiler
 import base64
+import ssl
 from socket import Socket
 from urllib.parse import urlencode, parse_qsl, urlsplit, urljoin, SplitResult
 from json import loads, dumps, JSONValue
@@ -50,6 +53,7 @@ class HTTPError:
 	BadStatus: None
 	NameResolutionFailed: None
 	InvalidJSON: None
+	TLSError: None
 	Other: None
 
 # ---------------------------------------------------------------------------
@@ -359,7 +363,90 @@ def _usize_from_str( s: str ) -> Result[usize, HTTPError]:
 	return Result.Ok( value )
 
 # ---------------------------------------------------------------------------
-# _GrowableBuffer - accumulates bytes read off a Socket across multiple
+# _Transport - either a plain Socket or a TLS-wrapped ssl.SSLSocket, so
+# HTTPConnection/_GrowableBuffer/the request-sending helpers below have one
+# thing to call send()/recv()/close() on regardless of http:// vs https://.
+# A @union (not a base class HTTPConnection subclasses per scheme) because
+# MetalPy's RCClass subclassing rules forbid a subclass shadowing a base
+# class's own field with a different type (see PLAN_SUBCLASSING_VTABLES_COM.md)
+# - HTTPConnection.__transport genuinely needs to hold either a Socket or an
+# SSLSocket depending on how it was connected, which a single concrete field
+# type can't express, but a tagged union can (same idiom sys.OwnershipError
+# already uses to carry a real object payload per variant, not just None).
+# ---------------------------------------------------------------------------
+
+@union
+class _Transport:
+	Plain:  Socket
+	Secure: ssl.SSLSocket
+
+def _transport_send( transport: _Transport, ptr: ConstPtr[u8], length: usize ) -> Result[usize, HTTPError]:
+	match transport:
+		case _Transport.Plain( sock ):
+			match sock.send( ptr, length ):
+				case Result.Ok( n ):
+					return Result.Ok( n )
+				case Result.Err( _ ):
+					return Result.Err( HTTPError.Other( None ))
+		case _Transport.Secure( tls ):
+			match tls.send( ptr, length ):
+				case Result.Ok( n ):
+					return Result.Ok( n )
+				case Result.Err( _ ):
+					return Result.Err( HTTPError.TLSError( None ))
+
+def _transport_recv( transport: _Transport, buf: Ptr[u8], count: usize ) -> Result[usize, HTTPError]:
+	match transport:
+		case _Transport.Plain( sock ):
+			match sock.recv( buf, count ):
+				case Result.Ok( n ):
+					return Result.Ok( n )
+				case Result.Err( _ ):
+					return Result.Err( HTTPError.Other( None ))
+		case _Transport.Secure( tls ):
+			match tls.recv( buf, count ):
+				case Result.Ok( n ):
+					return Result.Ok( n )
+				case Result.Err( _ ):
+					return Result.Err( HTTPError.TLSError( None ))
+
+def _transport_close( transport: _Transport ) -> None:
+	match transport:
+		case _Transport.Plain( sock ):
+			sock.close()
+		case _Transport.Secure( tls ):
+			tls.close()
+
+def _connect_transport( scheme: str, host: str, port: u16 ) -> Result[_Transport, HTTPError]:
+	''' TCP-connects (shared with the plain-http path via _connect_or_http_err
+	below), then TLS-wraps the socket when scheme is 'https'. A TLS handshake
+	failure (including a certificate problem - lib/ssl.py's create_default_
+	context() already turns on peer verification, matching this file's own
+	"secure by default" posture elsewhere) collapses to HTTPError.TLSError,
+	same treatment every other lib/ssl.py-facing error gets here (see
+	_transport_send/_transport_recv above) - a caller wanting the specific
+	ssl.SSLError reason would need to use lib/ssl.py directly. '''
+	sock: Socket = _connect_or_http_err( host, port ).or_return()
+	if scheme == 'https':
+		match ssl.SSLContext.create_default_context():
+			case Result.Ok( ctx ):
+				match ssl.SSLSocket.wrap_socket( ctx, sock, host ):
+					case Result.Ok( tls ):
+						return Result.Ok( _Transport.Secure( tls ))
+					case Result.Err( _ ):
+						return Result.Err( HTTPError.TLSError( None ))
+			case Result.Err( _ ):
+				return Result.Err( HTTPError.TLSError( None ))
+	return Result.Ok( _Transport.Plain( sock ))
+
+def _connect_for_scheme( scheme: str, host: str, port: u16 ) -> Result[HTTPConnection, HTTPError]:
+	''' shared by HTTPConnection.connect()/HTTPSConnection.connect() (fixed
+	scheme each) and Session.request() (scheme comes from the parsed URL). '''
+	transport: _Transport = _connect_transport( scheme, host, port ).or_return()
+	return Result.Ok( HTTPConnection._from_transport( transport, host, port ))
+
+# ---------------------------------------------------------------------------
+# _GrowableBuffer - accumulates bytes read off a _Transport across multiple
 # recv() calls. bytearray() itself is fixed-size at construction (see lib/
 # builtins/__init__.py) with no append/extend, so this is a small hand-
 # rolled doubling buffer, the same "count/allocate-exact/fill" discipline
@@ -399,14 +486,14 @@ class _GrowableBuffer:
 		self.__data = new_data
 		self.__cap = new_cap
 
-	def fill_from( self, sock: Socket ) -> Result[usize, OSError]:
+	def fill_from( self, transport: _Transport ) -> Result[usize, HTTPError]:
 		''' one recv() call, appended to the buffer. Returns the number of
 		bytes read - 0 means the peer closed the connection. '''
 		self._grow( 4096 )
 		with compiler.wrap_arithmetic:
 			dest: Ptr[u8] = self.__data + self.__len
 			room: usize = self.__cap - self.__len
-		n: usize = sock.recv( dest, room ).or_return()
+		n: usize = _transport_recv( transport, dest, room ).or_return()
 		with compiler.wrap_arithmetic:
 			self.__len += n
 		return Result.Ok( n )
@@ -505,25 +592,11 @@ def _connect_or_http_err( host: str, port: u16 ) -> Result[Socket, HTTPError]:
 		case Result.Err( _ ):
 			return Result.Err( HTTPError.Other( None ))
 
-def _send_or_http_err( sock: Socket, ptr: ConstPtr[u8], length: usize ) -> Result[usize, HTTPError]:
-	match sock.send( ptr, length ):
-		case Result.Ok( n ):
-			return Result.Ok( n )
-		case Result.Err( _ ):
-			return Result.Err( HTTPError.Other( None ))
-
-def _fill_or_http_err( buf: _GrowableBuffer, sock: Socket ) -> Result[usize, HTTPError]:
-	match buf.fill_from( sock ):
-		case Result.Ok( n ):
-			return Result.Ok( n )
-		case Result.Err( _ ):
-			return Result.Err( HTTPError.Other( None ))
-
-def _send_all( sock: Socket, ptr: ConstPtr[u8], length: usize ) -> Result[None, HTTPError]:
+def _send_all( transport: _Transport, ptr: ConstPtr[u8], length: usize ) -> Result[None, HTTPError]:
 	sent: usize = 0
 	with compiler.panic_arithmetic( 'bounded by length, cannot overflow' ):
 		while sent < length:
-			n: usize = _send_or_http_err( sock, ptr + sent, length - sent ).or_return()
+			n: usize = _transport_send( transport, ptr + sent, length - sent ).or_return()
 			if n == 0:
 				return Result.Err( HTTPError.UnexpectedEOF( None ))
 			sent += n
@@ -583,7 +656,7 @@ class Response:
 # nested `while True: ... break` didn't hold up under a real compile.
 # ---------------------------------------------------------------------------
 
-def _read_chunked_body( sock: Socket, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
+def _read_chunked_body( transport: _Transport, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
 	with compiler.panic_arithmetic( 'a real chunked body fits well within usize' ):
 		while True:
 			body_bytes: bytes = buf.slice_bytes( body_start, buf.len() )
@@ -594,28 +667,28 @@ def _read_chunked_body( sock: Socket, buf: _GrowableBuffer, body_start: usize ) 
 					return Result.Err( HTTPError.ChunkSizeInvalid( None ))
 				case Result.Err( _ ):
 					pass # UnexpectedEOF - not a full chunked body yet, keep reading
-			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			n: usize = buf.fill_from( transport ).or_return()
 			if n == 0:
 				return Result.Err( HTTPError.UnexpectedEOF( None ))
 
-def _read_content_length_body( sock: Socket, buf: _GrowableBuffer, body_start: usize, content_length: usize ) -> Result[bytes, HTTPError]:
+def _read_content_length_body( transport: _Transport, buf: _GrowableBuffer, body_start: usize, content_length: usize ) -> Result[bytes, HTTPError]:
 	with compiler.panic_arithmetic( 'a real Content-Length body fits well within usize' ):
 		while True:
 			with compiler.panic_arithmetic( 'bounded by buf.len(), cannot overflow' ):
 				have: usize = buf.len() - body_start
 			if have >= content_length:
 				break
-			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			n: usize = buf.fill_from( transport ).or_return()
 			if n == 0:
 				return Result.Err( HTTPError.UnexpectedEOF( None ))
 	with compiler.wrap_arithmetic:
 		body_end: usize = body_start + content_length
 	return Result.Ok( buf.slice_bytes( body_start, body_end ))
 
-def _read_until_close_body( sock: Socket, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
+def _read_until_close_body( transport: _Transport, buf: _GrowableBuffer, body_start: usize ) -> Result[bytes, HTTPError]:
 	with compiler.panic_arithmetic( 'a real response body fits well within usize' ):
 		while True:
-			n: usize = _fill_or_http_err( buf, sock ).or_return()
+			n: usize = buf.fill_from( transport ).or_return()
 			if n == 0:
 				break
 	return Result.Ok( buf.slice_bytes( body_start, buf.len() ))
@@ -623,33 +696,44 @@ def _read_until_close_body( sock: Socket, buf: _GrowableBuffer, body_start: usiz
 # ---------------------------------------------------------------------------
 # HTTPConnection - one TCP connection, one request/response at a time.
 # Mirrors lib/builtins/__File.py's handle shape: an owned resource field (a
-# Socket, itself already RC-managed with its own auto-closing __del__ - no
-# HTTPConnection.__del__ needed, the field's own teardown cascades), a
+# _Transport, itself already RC-managed with its own auto-closing __del__ -
+# no HTTPConnection.__del__ needed, the field's own teardown cascades), a
 # private constructor, ordinary Result-returning methods.
+#
+# HTTPSConnection (below) is NOT a subclass of this - see _Transport's own
+# header comment for why (field-shadowing is disallowed) - it's a separate,
+# minimal class whose connect() returns this same HTTPConnection type,
+# already carrying whichever transport it was given. Matches CPython's
+# http.client naming (HTTPConnection/HTTPSConnection) without needing real
+# subtype polymorphism, which nothing here actually requires.
 # ---------------------------------------------------------------------------
 
 class HTTPConnection:
-	__sock: Socket
+	__transport: _Transport
 	__host: str
 	__port: u16
 
 	def close( self ) -> None:
-		self.__sock.close()
+		_transport_close( self.__transport )
+
+	@private
+	@staticmethod
+	def _from_transport( transport: _Transport, host: str, port: u16 ) -> HTTPConnection:
+		return HTTPConnection.__allocate__( __transport = transport, __host = host, __port = port )
 
 	@staticmethod
 	def connect( host: str, port: u16 = 80 ) -> Result[HTTPConnection, HTTPError]:
 		''' host may be a real hostname - lib/socket.py's own Socket.connect()
 		resolves it via getaddrinfo internally. '''
-		sock: Socket = _connect_or_http_err( host, port ).or_return()
-		return Result.Ok( HTTPConnection.__allocate__( __sock = sock, __host = host, __port = port ))
+		return _connect_for_scheme( 'http', host, port )
 
 	def request( self, method: str, path: str, headers: HTTPHeaders|None = None, body: bytes|None = None ) -> Result[None, HTTPError]:
 		head: str = _build_request_head( method, path, self.__host, headers, body )
 		head_bytes: bytes = head.encode().unwrap( '_build_request_head: unreachable - pure ASCII output' )
-		_send_all( self.__sock, head_bytes.get_const_ptr(), head_bytes.__len__() ).or_return()
+		_send_all( self.__transport, head_bytes.get_const_ptr(), head_bytes.__len__() ).or_return()
 		if body is not None:
 			content: bytes = body
-			_send_all( self.__sock, content.get_const_ptr(), content.__len__() ).or_return()
+			_send_all( self.__transport, content.get_const_ptr(), content.__len__() ).or_return()
 		return Result.Ok( None )
 
 	def getresponse( self ) -> Result[Response, HTTPError]:
@@ -666,7 +750,7 @@ class HTTPConnection:
 						break
 					case Result.Err( _ ):
 						pass
-				n: usize = _fill_or_http_err( buf, self.__sock ).or_return()
+				n: usize = buf.fill_from( self.__transport ).or_return()
 				if n == 0:
 					return Result.Err( HTTPError.UnexpectedEOF( None ))
 
@@ -690,16 +774,16 @@ class HTTPConnection:
 
 		content: bytes = bytes.from_bytearray( move( bytearray( 0 )))
 		if is_chunked:
-			content = _read_chunked_body( self.__sock, buf, body_start ).or_return()
+			content = _read_chunked_body( self.__transport, buf, body_start ).or_return()
 		else:
 			content_length_str: str|None = headers.get( 'Content-Length' )
 			if content_length_str is not None:
 				cl: str = content_length_str
 				content_length: usize = _usize_from_str( cl ).or_return()
-				content = _read_content_length_body( self.__sock, buf, body_start, content_length ).or_return()
+				content = _read_content_length_body( self.__transport, buf, body_start, content_length ).or_return()
 			else:
 				# no Content-Length, not chunked - read until the peer closes
-				content = _read_until_close_body( self.__sock, buf, body_start ).or_return()
+				content = _read_until_close_body( self.__transport, buf, body_start ).or_return()
 
 		# url left blank here - HTTPConnection only knows host/port/path, not
 		# the scheme a caller reached it through; Session.request() (the only
@@ -707,12 +791,22 @@ class HTTPConnection:
 		# right after getresponse() returns.
 		return Result.Ok( Response( parsed_status[1], parsed_status[2], headers, content, '' ))
 
+class HTTPSConnection:
+	''' TLS entry point for HTTPConnection - see that class's own header
+	comment for why this isn't a subclass. connect()'s returned HTTPConnection
+	already carries an _Transport.Secure(...) (an ssl.SSLSocket - see
+	PLAN_SSL.md), so request()/getresponse()/close() all work unmodified. '''
+
+	@staticmethod
+	def connect( host: str, port: u16 = 443 ) -> Result[HTTPConnection, HTTPError]:
+		return _connect_for_scheme( 'https', host, port )
+
 # ---------------------------------------------------------------------------
-# URL parsing - http:// only (no TLS - see PLAN_HTTP_CLIENT.md's Phase 4),
-# built on lib/urllib/parse.py's urlsplit() rather than this file's own
-# hand-rolled scheme/host/port/path splitter (see PLAN_HTTP_CLIENT.md for
-# the migration - urlsplit() lands host/port splitting and query handling on
-# a real, separately-tested general-purpose module instead).
+# URL parsing - http:// and https://, built on lib/urllib/parse.py's
+# urlsplit() rather than this file's own hand-rolled scheme/host/port/path
+# splitter (see PLAN_HTTP_CLIENT.md for the migration - urlsplit() lands
+# host/port splitting and query handling on a real, separately-tested
+# general-purpose module instead).
 # ---------------------------------------------------------------------------
 
 class ParsedURL:
@@ -738,9 +832,7 @@ def _u16_from_str( s: str ) -> Result[u16, HTTPError]:
 
 def _parse_url( url: str ) -> Result[ParsedURL, HTTPError]:
 	split: SplitResult = urlsplit( url )
-	if split.scheme != 'http':
-		# https:// (or anything else, including a missing scheme) isn't
-		# reachable without TLS support
+	if split.scheme != 'http' and split.scheme != 'https':
 		return Result.Err( HTTPError.InvalidURL( None ))
 	if split.netloc.byte_len() == 0:
 		return Result.Err( HTTPError.InvalidURL( None ))
@@ -749,7 +841,7 @@ def _parse_url( url: str ) -> Result[ParsedURL, HTTPError]:
 	host: str = hp_split[0]
 	if host.byte_len() == 0:
 		return Result.Err( HTTPError.InvalidURL( None ))
-	port: u16 = 80
+	port: u16 = 443 if split.scheme == 'https' else 80
 	if hp_split[1].byte_len() != 0:
 		port = _u16_from_str( hp_split[2] ).or_return()
 
@@ -906,9 +998,10 @@ def _next_redirect_url( response: Response, allow_redirects: bool, current_url: 
 	relative Location is resolved against current_url via lib/urllib/parse.py
 	's urljoin() (RFC 3986 5.3) - previously only an absolute http://
 	Location was followed, treating a relative one as "don't redirect"; that
-	restriction is gone now that urljoin() exists. Still only ever returns
-	an http:// result - a Location resolving to https:// (or anything else)
-	isn't reachable without TLS support, so that's still "don't redirect". '''
+	restriction is gone now that urljoin() exists. Both http:// and https://
+	results are followed now that lib/ssl.py makes https:// reachable too
+	(including a redirect that crosses schemes, e.g. http:// -> https://,
+	which requests() itself also follows transparently). '''
 	if not allow_redirects:
 		return ''
 	if not _is_redirect_status( response.status_code ):
@@ -917,7 +1010,7 @@ def _next_redirect_url( response: Response, allow_redirects: bool, current_url: 
 	if location is not None:
 		loc: str = location
 		resolved: str = urljoin( current_url, loc )
-		if resolved.startswith( 'http://' ):
+		if resolved.startswith( 'http://' ) or resolved.startswith( 'https://' ):
 			return resolved
 	return ''
 
@@ -1002,7 +1095,7 @@ class Session:
 				cookie_header: str|None = self._build_cookie_header( cookies )
 				request_headers: HTTPHeaders = _build_request_headers( self.headers, content_type, headers, cookie_header, auth )
 
-				conn: HTTPConnection = HTTPConnection.connect( parsed.host, parsed.port ).or_return()
+				conn: HTTPConnection = _connect_for_scheme( parsed.scheme, parsed.host, parsed.port ).or_return()
 				conn.request( current_method, full_path, request_headers, current_body ).or_return()
 				response: Response = conn.getresponse().or_return()
 				conn.close()

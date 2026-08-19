@@ -368,3 +368,57 @@ def GetStringTypeW(
 	lpCharType: Ptr[u16],
 ) -> bool:
 	...
+
+
+# ---------------------------------------------------------------------------
+# Fibers — cooperative, OS-scheduled stack-switching on one real OS thread.
+# lpFiber return/params are LPVOID (a direct pointer to the fiber's own
+# bookkeeping, not a kernel HANDLE), so these are typed as bare Ptr[None]
+# rather than reusing HANDLE above. dwStackSize behaves like a thread's
+# stack size (reserve dwStackSize, commit an initial slice, guard-page the
+# rest) - CreateFiber gives no way to hand it caller-supplied stack memory.
+# ---------------------------------------------------------------------------
+
+# LPVOID WINAPI CreateFiber(SIZE_T dwStackSize, LPFIBER_START_ROUTINE
+# lpStartAddress, LPVOID lpParameter) - VOID CALLBACK FiberProc(LPVOID) is
+# the fixed fiber-entry shape, same Ptr[Callable[...]] pattern as
+# CreateThread's lpStartAddress above (just void-returning, not u32).
+@extern('kernel32', 'CreateFiber')
+def CreateFiber(
+	dwStackSize: usize,
+	lpStartAddress: Ptr[Callable[[Ptr[None]], None]],
+	lpParameter: Ptr[None],
+) -> Ptr[None]:
+	...
+
+@extern('kernel32', 'ConvertThreadToFiber')
+def ConvertThreadToFiber(
+	lpParameter: Ptr[None],
+) -> Ptr[None]:
+	...
+
+@extern('kernel32', 'SwitchToFiber')
+def SwitchToFiber(
+	lpFiber: Ptr[None],
+) -> None:
+	...
+
+@extern('kernel32', 'DeleteFiber')
+def DeleteFiber(
+	lpFiber: Ptr[None],
+) -> None:
+	...
+
+# UINT WINAPI SetErrorMode(UINT uMode) - called before deliberately driving
+# a process into an unhandled SEH exception (e.g. a stack-overflow-into-
+# guard-page test), so the crash exits promptly with its NTSTATUS as the
+# process exit code instead of popping a blocking Windows Error Reporting
+# dialog that would otherwise hang the caller until it times out.
+SEM_FAILCRITICALERRORS: u32 = 0x0001
+SEM_NOGPFAULTERRORBOX:  u32 = 0x0002
+
+@extern('kernel32', 'SetErrorMode')
+def SetErrorMode(
+	uMode: u32,
+) -> u32:
+	...
