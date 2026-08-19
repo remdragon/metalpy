@@ -191,7 +191,7 @@ def main() -> None:
 		return
 
 	# --- stage 5: emit C ---
-	no_crt = 'c' not in compiler.extern_libs
+	no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
 	if args.crt:
 		no_crt = False
 	no_crt = linker_c.resolve_no_crt( no_crt, args.asan )

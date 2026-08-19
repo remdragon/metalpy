@@ -1028,6 +1028,19 @@ class Function( Type, ScopeMixin ):
 	# isn't resolved yet at parse time (see .resolve).
 	is_fallible_arithmetic: bool = False
 
+	# @requires_crt - marks a function whose mere reachability (not any
+	# @extern('c', ...) call it makes itself) means the whole build must
+	# link the real CRT rather than the freestanding Windows entry point -
+	# e.g. a library that runs user code on a small/foreign stack and can't
+	# rule out that code needing MSVC's __chkstk, which a no_crt build has
+	# no way to supply (see msvc_no_crt_missing_chkstk). No effect on
+	# non-Windows targets, where there's no freestanding/no_crt distinction
+	# to override. compiler.py's Compiler._lower sets self.requires_crt
+	# on the Compiler instance the same way it already does for
+	# extern_lib/compiler.extern_libs - only when THIS function is actually
+	# lowered (reachable from main()), never merely discovered.
+	requires_crt: bool = False
+
 def _leaf_is_accepted( leaf: Type, declared: Type ) -> bool:
 	# identity-based deliberately, not `==` - Type dataclasses have structural
 	# equality (comparing every field, including mutable dicts/lists), which is

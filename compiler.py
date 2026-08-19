@@ -103,6 +103,13 @@ class Compiler:
 		# comment): a notice can be shared across multiple, otherwise
 		# unrelated DLL dependencies.
 		self.extern_notices: set[str] = set()
+		# @requires_crt - set True the moment ANY reachable/lowered function
+		# carries the flag (see mpy_types.Function.requires_crt's own
+		# comment) - same reachability-gated shape as extern_libs above,
+		# just a bare bool instead of a dict, since "does this build need
+		# the CRT at all" is all any caller (mpy.py, Compiler.run's own
+		# no_crt computation below) ever asks of it.
+		self.requires_crt: bool = False
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
 		# pass the entry module's own eventual qualname through as `package` so
@@ -172,15 +179,16 @@ class Compiler:
 		self._enqueue( self.disco.main )
 		self._drain()
 		if self.disco.active_target['os'] == 'windows':
-			# 'c' not in self.extern_libs mirrors mpy.py's own no_crt
-			# computation ('c' not in compiler.extern_libs) - captured HERE,
-			# right after the user's own program has fully drained (above),
-			# before any of the forcing below runs, so it reflects exactly
-			# what the user's own program needs. Neither force_reachable
-			# call below ever touches the 'c' extern either way (Windows
-			# console-codepage/exit both live in kernel32), so this doesn't
-			# need to be recomputed between them.
-			no_crt = 'c' not in self.extern_libs
+			# mirrors mpy.py's own no_crt computation ('c' not in
+			# compiler.extern_libs and not compiler.requires_crt) - captured
+			# HERE, right after the user's own program has fully drained
+			# (above), before any of the forcing below runs, so it reflects
+			# exactly what the user's own program needs. Neither
+			# force_reachable call below ever touches the 'c' extern or
+			# requires_crt either way (Windows console-codepage/exit both
+			# live in kernel32), so this doesn't need to be recomputed
+			# between them.
+			no_crt = 'c' not in self.extern_libs and not self.requires_crt
 			# force windows._console's _console_init global to be reachable on
 			# EVERY Windows build - nothing in the user's own program
 			# necessarily references it, but its own initializer
@@ -376,6 +384,8 @@ class Compiler:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
 				self.extern_dlls.update( unit.extern_dlls )
 				self.extern_notices.update( unit.extern_notices )
+			if unit.requires_crt:
+				self.requires_crt = True
 			lf = LoweredFunction( function = unit, instructions = instructions )
 			self.functions.append( lf )
 			self._lowered_functions[ id( unit ) ] = lf

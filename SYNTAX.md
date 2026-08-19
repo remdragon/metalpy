@@ -446,6 +446,29 @@ dependency or force guessing which `dll=` entries share a notice. When a functio
 notice file into one `dist/THIRD-PARTY-LICENSES.txt` alongside the bundled DLLs; a notice
 that can't be found fails the build, the same as a missing `dll=` entry.
 
+### Forcing CRT Linking (`@requires_crt`)
+On Windows, a build with no reachable `@extern('c', ...)` call links freestanding by default
+(no CRT, a hand-rolled entry point - see `mpy.py`'s `--crt` flag to override this from the
+command line). `@requires_crt` lets a library function force CRT linking for the whole build
+from *inside* the language instead, whenever that function is itself actually reachable -
+useful for something whose need for the CRT isn't expressed as an ordinary `@extern('c', ...)`
+call at all (e.g. MSVC's `__chkstk` stack-probing support routine, silently required by any
+function with a large enough local stack frame, which a freestanding MSVC build has no way to
+supply):
+
+```metalpy
+@requires_crt
+def uses_a_large_stack_frame() -> i32:
+	...
+```
+
+Reachability-gated the same way `@extern`'s own `lib`/`dll`/`notice` declarations are: a
+`@requires_crt` function that's never called from anything reachable from `main()` has no
+effect. Not supported on an `@inline` function - it's spliced directly into each call site
+and never becomes its own reachable unit, so the flag would never actually fire. No effect on
+non-Windows targets, which have no freestanding/no-CRT build mode to override in the first
+place.
+
 ### Target Platform Conditioning (`@compiler.target` & `compiler.target`)
 
 Target conditioning supports fine-grained keyword filters at the function level, as well as compile-time property queries inside function scopes.

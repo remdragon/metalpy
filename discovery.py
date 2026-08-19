@@ -2116,6 +2116,7 @@ class Discovery( ast.NodeVisitor ):
 		is_inline = False
 		is_property = False
 		is_fallible_arithmetic = False
+		is_requires_crt = False
 		extern_lib: str|None = None
 		extern_symbol: str|None = None
 		extern_header: str|None = None
@@ -2148,6 +2149,8 @@ class Discovery( ast.NodeVisitor ):
 					is_property = True
 				case 'fallible_arithmetic':
 					is_fallible_arithmetic = True
+				case 'requires_crt':
+					is_requires_crt = True
 				case 'extern':
 					extern_lib, extern_symbol, extern_header, extern_dlls, extern_notices = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
@@ -2247,6 +2250,14 @@ class Discovery( ast.NodeVisitor ):
 				self.fail( f'@inline {qualname} cannot also be @virtual - not supported', node )
 			if extern_lib is not None:
 				self.fail( f'@inline {qualname} cannot also be @extern - no real body to splice', node )
+			if is_requires_crt:
+				# @inline never becomes a standalone lowered Function unit
+				# (its body is spliced at each call site instead - see
+				# compiler.py/lowering.py), so it never passes through the
+				# reachability check that would actually set
+				# compiler.requires_crt - silently ineffective rather than
+				# a real error, reject instead
+				self.fail( f'@inline {qualname} cannot also be @requires_crt - inlined functions never become their own reachable unit, so this would silently do nothing', node )
 			if is_classmethod:
 				self.fail( f'@inline {qualname} cannot also be @classmethod - not supported', node )
 			if is_move:
@@ -2302,6 +2313,7 @@ class Discovery( ast.NodeVisitor ):
 			is_inline = is_inline,
 			is_property = is_property,
 			is_fallible_arithmetic = is_fallible_arithmetic,
+			requires_crt = is_requires_crt,
 			extern_lib = extern_lib,
 			extern_symbol = extern_symbol,
 			extern_header = extern_header,

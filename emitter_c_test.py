@@ -3333,6 +3333,114 @@ def main() -> i32:
 		return compute( 10 ) - 10
 ''', expected_exit = 0 )
 
+class RequiresCrtDecoratorTests( unittest.TestCase ):
+	# @requires_crt (see mpy_types.Function.requires_crt/compiler.py's
+	# Compiler.requires_crt) - a library function marks itself, and if it's
+	# actually reachable/lowered, the whole build must link the real CRT
+	# rather than the freestanding Windows entry point (e.g. so MSVC's
+	# __chkstk is available - see msvc_no_crt_missing_chkstk memory), even
+	# though the function itself never calls a real @extern('c', ...).
+	def _compile( self, source: str ) -> tuple[Compiler, Discovery]:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		return compiler, discovery
+
+	def test_reachable_requires_crt_function_forces_no_crt_off( self ) -> None:
+		compiler, discovery = self._compile( '''
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	return needs_crt()
+''' )
+		self.assertEqual( discovery.errors.errors, [] )
+		self.assertTrue( compiler.requires_crt )
+		self.assertNotIn( 'c', compiler.extern_libs ) # no real @extern('c', ...) call anywhere - requires_crt alone is doing this
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		self.assertFalse( no_crt )
+
+	def test_unreachable_requires_crt_function_does_not_force_it( self ) -> None:
+		# same decorated function, never called from main() - reachability-
+		# gated the same way extern_lib/compiler.extern_libs already is,
+		# not "declared anywhere in an imported module"
+		compiler, discovery = self._compile( '''
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	return 0
+''' )
+		self.assertEqual( discovery.errors.errors, [] )
+		self.assertFalse( compiler.requires_crt )
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		self.assertTrue( no_crt )
+
+	def test_inline_plus_requires_crt_rejected( self ) -> None:
+		# @inline splices the body at each call site and never becomes its
+		# own lowered unit, so @requires_crt on an @inline function would
+		# silently never fire - rejected outright rather than shipping a
+		# no-op combination
+		compiler, discovery = self._compile( '''
+@inline
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	return needs_crt()
+''' )
+		self.assertTrue( any( 'cannot also be @requires_crt' in str( e ) for e in discovery.errors.errors ), discovery.errors.errors )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+@unittest.skipUnless( os.name == 'nt', 'no_crt is a Windows-only concept in this codebase (see NoCrtLocalArrayStructRealCompileTests above) - @requires_crt has no observable C-level effect on Linux, where the compiler always links glibc regardless' )
+class RequiresCrtDecoratorRealCompileTests( unittest.TestCase ):
+	def _compile_and_run( self, source: str, expected_exit: int ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, expected_exit, f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
+
+	def test_requires_crt_function_compiles_links_and_runs_crt_linked( self ) -> None:
+		self._compile_and_run( '''
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return needs_crt() - 42
+''', expected_exit = 0 )
+
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
 	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:
