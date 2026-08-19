@@ -6435,8 +6435,22 @@ class FunctionLowering:
 		# shared _find_method + resolve/schedule + emit Call boilerplate -
 		# every f-string dunder-dispatch/format-spec call site below uses
 		# this same shape (receiver already lowered, method looked up by
-		# plain name, no generics involved - str/int are never generic)
-		method = self.lowering._find_method( receiver.type, method_name )
+		# plain name). str/int/f32/f64 are never generic, so this comment
+		# used to end there - but Ptr[T]/ConstPtr[T]'s own __str__/__repr__
+		# (lib/builtins/__ptr_arith.py) ARE bare generic Functions with an
+		# unbound type param T (same registration shape as their __add__/
+		# __sub__/comparison dunders - see _resolve_receiver_generic_dunder's
+		# own docstring), so _find_method alone isn't enough here anymore:
+		# without also resolving T from the receiver's own concrete pointee
+		# type, `method` still carries the bare TypeVar, and emitter_c.py's
+		# c_type crashes on it at prototype-emission time (confirmed via a
+		# real repro building f'{some_ptr}'/some_ptr.__str__()) - same fix
+		# _find_dunder_for_arg's own tail already applies for operator-
+		# dispatched Ptr dunders, just needed here too for this SEPARATE,
+		# plain-method-name dispatch path.
+		method = self.lowering._resolve_receiver_generic_dunder(
+			self.lowering._find_method( receiver.type, method_name ), receiver.type,
+		)
 		if method is None:
 			type_name = receiver.type.qualname if receiver.type is not None else '?'
 			self.lowering.discovery.fail( f'f-string requires {type_name}.{method_name}() to be available: {ast.unparse(node)}', node )

@@ -2921,8 +2921,24 @@ class TypeResolver:
 		owner_type = self.ensure_resolved( owner_type )
 		if isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar ) and owner_type.base.stem in ( 'Ptr', 'ConstPtr' ):
 			# dot-operator on a raw pointer means arrow - see lowering.py's
-			# _attr_lookup's identical redirect for the non-callable case
-			owner_type = self.ensure_resolved( owner_type.args[0] )
+			# _attr_lookup's identical redirect for the non-callable case -
+			# EXCEPT for a dunder Ptr[T]/ConstPtr[T] registers on ITSELF
+			# (__str__/__repr__/__eq__/etc - lib/builtins/__ptr_arith.py):
+			# those are the pointer's OWN protocol methods, not something
+			# meant to be reached by dereferencing first (same precedent
+			# Python itself follows - len(x) always calls type(x).__len__(x),
+			# never something found by chasing through x's own contents).
+			# Confirmed via a real repro: str(some_ptr) (builtins.str.
+			# __call__'s own generic `return x.__str__()` body, ordinary
+			# dot-call syntax) used to redirect through the arrow rule and
+			# find the POINTEE's own __str__ instead (e.g. u8's, for
+			# Ptr[u8]), then pass the raw pointer where a plain scalar
+			# value was expected - a real type-confusion crash at C emission
+			# time, not just the wrong answer.
+			is_dunder = attr.startswith( '__' ) and attr.endswith( '__' )
+			own_dunder = owner_type.base.names.get( attr ) if is_dunder else None
+			if own_dunder is None:
+				owner_type = self.ensure_resolved( owner_type.args[0] )
 		if isinstance( owner_type, ( CStruct, RCClass )):
 			found = owner_type.chain_lookup( attr )
 		else:
@@ -2930,6 +2946,21 @@ class TypeResolver:
 			if not isinstance( names, dict ):
 				self.discovery.fail( f'{owner_type!r} has no members, cannot look up {attr!r} ({ast.unparse(ctx)})', ctx )
 			found = names.get( attr )
+		if (
+			isinstance( found, Function ) and found.type_params
+			and isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar )
+			and owner_type.base.stem in ( 'Ptr', 'ConstPtr' )
+		):
+			# the own-dunder case just above found a bare generic Function
+			# (Ptr[T]'s own dunders are registered unspecialized - T is only
+			# ever bound from the receiver's own concrete pointee type at
+			# the call site, never at registration time - see lowering.py's
+			# _resolve_receiver_generic_dunder, the identical fix for the
+			# operator-dispatch path) - same binding needed here, otherwise
+			# `found` still carries the unbound TypeVar T and crashes
+			# emitter_c.py's c_type at prototype-emission time.
+			spec = self.discovery._get_or_create_specialization( found, list( owner_type.args ))
+			found = self.monomorphizer.monomorphized_function( spec )
 		if isinstance( found, Specialization ):
 			# a Scalar-registered generic method (`i32.to_u32 = i__to__i[i32,u32]`)
 			# - discovery.py's visit_Assign stores the raw Specialization,
