@@ -9678,7 +9678,33 @@ class FunctionLowering:
 			if not isinstance( direct, ( Function, Overload )):
 				return self.lowering._type_resolver._resolve_union_receiver_members( base, members, func_node.attr, func_node ), receiver
 		target = self.lowering._type_resolver._attr_lookup_callable( receiver.type, func_node.attr, func_node )
-		return target, receiver
+		return target, self._maybe_deref_arrow_receiver( receiver, target )
+
+	def _maybe_deref_arrow_receiver( self, receiver: ir.Operand, target: Function|Overload|Specialization|_ReceiverDispatch ) -> ir.Operand:
+		''' `p.method()` where p: Ptr[T]/ConstPtr[T] is arrow-sugar -
+		_attr_lookup_callable already redirected the NAME LOOKUP to T's own
+		method, but `receiver` above is still evaluated against p's own,
+		un-redirected Ptr[T] type. A plain (non-interface) CStruct or an
+		RCClass method's self expects a real T value (T's own by-value
+		struct, or the RCClass's own bare pointer respectively - see
+		lower_function's own self_param construction), not the raw Ptr[T] -
+		dereference it here, the same ir.GetItem the ordinary `p[0]`
+		subscript uses (Ptr[T]/ConstPtr[T]'s own dereference convention).
+		An @interface CStruct's self is ALWAYS Ptr[T] itself though - there
+		the pointer already IS what self expects, so this leaves receiver
+		untouched (confirmed: dereferencing there produced invalid C -
+		passing a by-value struct where the generated prototype declares a
+		pointer). '''
+		if not self.lowering._type_resolver._is_ptr_specialization( receiver.type ):
+			return receiver
+		target_cls = getattr( target, 'cls', None )
+		if target_cls is None or ( isinstance( target_cls, CStruct ) and target_cls.is_interface ):
+			return receiver
+		index_type = self.lowering.discovery.get_intrinsics()['usize']
+		index = ir.Const( type = index_type, value = 0 )
+		dest = self._new_temp( receiver.type.args[0] )
+		self._emit( ir.GetItem( dest = dest, obj = receiver, index = index ))
+		return dest
 
 	def _apply_move_hook( self, param: Parameter, operand: ir.Operand, target_qualname: str ) -> None:
 		# the semantic half of move[T] - _check_move_argument (run earlier,
