@@ -5850,6 +5850,37 @@ def main() -> i32:
 		return 5
 	return 0
 ''' ),
+			# regression test for the SAME bug as CallableTests.test_optional_
+			# callable_narrowed_by_is_not_none_is_callable, hitting
+			# _try_lower_closure_call's own copy of the check instead of
+			# _try_lower_indirect_call's: a Closure[...]|None parameter,
+			# narrowed to non-None via `if x is not None:`, used to still
+			# read as the union type (name.type, ignoring cfg.py's
+			# narrowed_member()) and fail with "cannot call c"
+			( 'optional_closure_narrowed_by_is_not_none_is_callable', '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def get( self ) -> i32:
+		return self.x
+
+def maybe_call( c: Closure[[], i32]|None = None ) -> i32:
+	if c is not None:
+		return c()
+	return -1
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	c: Closure[[], i32] = w.get
+	result: i32 = maybe_call( c )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' ),
 		] )
 
 
@@ -12989,6 +13020,135 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_optional_callable_field_storage( self ) -> None:
+		# regression test: a Ptr[Callable[...]]|None-typed parameter (needed
+		# by lib/bisect.py's own key= parameter, and lib/http/client.py's
+		# logging sink) forces the union payload machinery to store a real
+		# Ptr[Callable[...]] member - emitter_c.py's _struct_or_union_body
+		# used to call _field_type_spelling/c_type on the bare CallableType
+		# unwrapped from Ptr[...], which has no c_type() branch at all
+		# (NotImplementedError: c_type: unsupported type <CallableType ...>).
+		# Fixed by routing struct/union field emission through the SAME
+		# _declarator helper parameter/local declarations already use, which
+		# special-cases Ptr[Callable[...]]'s function-pointer declarator
+		# shape. This alone (no call through the narrowed value) is enough to
+		# trigger emission of the TaggedUnion's own backing CUnion - see
+		# test_optional_callable_narrowed_by_is_not_none_is_callable below
+		# for the companion "narrowed value can actually be called" bug.
+		self._run( '''
+def sink( text: str ) -> None:
+	pass
+
+def maybe_log( text: str, log: Ptr[Callable[[str],None]]|None = None ) -> None:
+	pass
+
+def main() -> i32:
+	f: Ptr[Callable[[str],None]] = sink
+	maybe_log( 'hello', f )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_optional_callable_narrowed_by_is_not_none_is_callable( self ) -> None:
+		# regression test: lowering.py's _try_lower_indirect_call checked the
+		# callee Name's raw DECLARED type (name.type) for a Ptr[Callable[...]]
+		# shape, ignoring cfg.py's narrowed_member() - so a Ptr[Callable[...]]
+		# |None parameter, narrowed to non-None via `if x is not None:`,
+		# still read as the union type and failed to match, falling through
+		# to _resolve_callee's generic path with a hard "cannot call log"
+		# compile error even though the identical non-Optional shape (log:
+		# Ptr[Callable[[str],None]] with no |None) always worked. Fixed via
+		# a shared _narrowed_type_of_name helper mirroring _expr_Name's own
+		# narrowed_member lookup.
+		self._run( '''
+class Recorder:
+	got: str
+
+recorder: Recorder = Recorder( got = '' )
+
+def sink( text: str ) -> None:
+	recorder.got = text
+
+def maybe_log( text: str, log: Ptr[Callable[[str],None]]|None = None ) -> None:
+	if log is not None:
+		log( text )
+
+def main() -> i32:
+	f: Ptr[Callable[[str],None]] = sink
+	maybe_log( 'hello', f )
+	if recorder.got != 'hello':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_optional_callable_narrowed_by_match_is_callable( self ) -> None:
+		# same bug/fix as test_optional_callable_narrowed_by_is_not_none_is_
+		# callable above, narrowed via `match`/`case _:` instead of `if x is
+		# not None:` - the original bug report tried both narrowing
+		# mechanisms and got the identical "cannot call log" failure from
+		# both, so both get their own regression coverage.
+		self._run( '''
+class Recorder:
+	got: str
+
+recorder: Recorder = Recorder( got = '' )
+
+def sink( text: str ) -> None:
+	recorder.got = text
+
+def maybe_log( text: str, log: Ptr[Callable[[str],None]]|None = None ) -> None:
+	match log:
+		case None:
+			pass
+		case _:
+			log( text )
+
+def main() -> i32:
+	f: Ptr[Callable[[str],None]] = sink
+	maybe_log( 'hello', f )
+	if recorder.got != 'hello':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_optional_callable_narrowed_and_called( self ) -> None:
+		# same bug as the two tests above, exercised through a GENERIC
+		# function - the exact shape lib/bisect.py's own bisect_right/
+		# bisect_left[T,K](key: Ptr[Callable[[T],K]]|None = None) uses, which
+		# per PLAN_COMPILER_BUG_SWEEP.md-style history is exactly where a
+		# Specialization-vs-monomorphized-type gap would most likely hide (a
+		# generic parameter's declared type stays an unresolved
+		# Specialization until substituted) - confirmed working end to end
+		# with a real substituted i32/i32 call.
+		self._run( '''
+def apply_or_default[T,K]( x: T, key: Ptr[Callable[[T],K]]|None, default: K ) -> K:
+	if key is not None:
+		return key( x )
+	return default
+
+def double( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x * 2
+
+def main() -> i32:
+	k: Ptr[Callable[[i32],i32]] = double
+	result: i32 = apply_or_default( 21, k, 0 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
 class NestedFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):

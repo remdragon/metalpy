@@ -937,14 +937,13 @@ def _function_pointer_c_type( fn_type: CallableType ) -> tuple[str,list[str]]:
 	return ret, params
 
 def _declarator( t: Type|None, name: str, *, volatile: bool = False ) -> str:
-	''' "TYPE NAME" for an ordinary parameter/local-variable declaration -
-	except when t is Ptr[Callable[...]], where C's function-pointer syntax
-	is the one declarator shape that ISN'T "prefix type, then name": the
-	name goes INSIDE the parens (RetType (*name)(ParamTypes)), so plain
-	string concatenation of c_type(t) and name can't express it. Scoped to
-	parameter/local declarations only (see PLAN_CALLABLE.md) - not struct
-	fields (nothing needs that yet). `volatile` is for Volatile[T] locals
-	(_stmt_AnnAssign) only - never set for a function-pointer declarator. '''
+	''' "TYPE NAME" for an ordinary parameter/local-variable/struct-or-union-
+	field declaration - except when t is Ptr[Callable[...]], where C's
+	function-pointer syntax is the one declarator shape that ISN'T "prefix
+	type, then name": the name goes INSIDE the parens (RetType (*name)
+	(ParamTypes)), so plain string concatenation of c_type(t) and name can't
+	express it. `volatile` is for Volatile[T] locals (_stmt_AnnAssign) only -
+	never set for a function-pointer declarator or a field. '''
 	fn_type = _callable_ptr_type( t )
 	prefix = 'volatile ' if volatile else ''
 	if fn_type is None:
@@ -971,11 +970,6 @@ def _value_spelling( t: Type ) -> str:
 	if isinstance( t, CType ):
 		return t.c_name
 	return c_type( t ) # scalars/CEnum - value and reference spelling are identical
-
-def _field_type_spelling( t: Type ) -> str:
-	if isinstance( t, Scalar ) and t.stem == 'NoneType':
-		return _NONE_PLACEHOLDER_TYPE
-	return c_type( t )
 
 def _mark_used_if_none( operand: ir.Operand ) -> list[str]:
 	''' MetalpyNone (see _NONE_PLACEHOLDER_TYPE) carries no real
@@ -1150,11 +1144,11 @@ def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]]
 				# C's array declarator is discontinuous ("TYPE NAME[N];", not
 				# a plain prefix type followed by the name - see
 				# FixedArrayType's own docstring and _declarator's identical
-				# function-pointer special case) - _field_type_spelling's
-				# plain "TYPE NAME" concatenation can't express this
+				# function-pointer special case) - _declarator's plain
+				# "TYPE NAME" concatenation can't express this
 				lines.append( f'\t{c_type(field_type.elem_type)} {_field_name(field_name)}[{field_type.count}];' )
 			else:
-				lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+				lines.append( f'\t{_declarator(field_type, _field_name(field_name))};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 
@@ -2956,7 +2950,7 @@ def emit_rcclass( cls: RCClass ) -> str:
 	name = mangle_type( cls )
 	lines = [ f'struct {name} {{', '\tObjectHeader $header;' ]
 	for field_name, field_type in attrs:
-		lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+		lines.append( f'\t{_declarator(field_type, _field_name(field_name))};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 
@@ -3394,7 +3388,7 @@ def emit_cstruct( cls: CStruct ) -> str:
 		vtbl_name = _interface_vtbl_name( cls )
 		lines = [ f'struct {mangle_type(cls)} {{', f'\tconst {vtbl_name}* $vtable;' ]
 		for field_name, field_type in own_attrs:
-			lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+			lines.append( f'\t{_declarator(field_type, _field_name(field_name))};' )
 		lines.append( '};' )
 		return '\n'.join( lines )
 	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]
