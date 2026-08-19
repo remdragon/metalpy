@@ -570,14 +570,14 @@ class Lowering:
 		import os
 		import tempfile
 		from pathlib import Path
+		import linker_c
 		# cache key derived from (expr, header) — deterministic, so the
 		# same expression always hits the same cached value regardless
 		# of which compilation or project it appears in
 		key = hashlib.sha256( f'{expr}\0{header}'.encode() ).hexdigest()[:16]
 		cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'cexpr'
-		cache_dir.mkdir( parents = True, exist_ok = True )
 		cache_file = cache_dir / key
-		if cache_file.is_file():
+		if linker_c.ensure_cache_dir( cache_dir ) and cache_file.is_file():
 			# a torn/half-written entry parses as ValueError, not as a wrong
 			# answer - treat it as a miss and re-probe rather than crashing
 			# the whole compile (see linker_c.atomic_write_cache). OSError
@@ -590,7 +590,6 @@ class Lowering:
 				pass
 
 		# no cached value — compile and run a tiny C program
-		import linker_c
 		cc = linker_c.detect_cc()
 		if cc is None:
 			self.discovery.fail(
@@ -634,8 +633,7 @@ class Lowering:
 					node,
 				)
 			value = int( run_result.stdout.strip() )
-		import linker_c as _linker_c
-		_linker_c.atomic_write_cache( cache_file, str( value ))
+		linker_c.atomic_write_cache( cache_file, str( value ))
 		return value
 
 	_UNICODE_DATA_URL = 'https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt'
@@ -664,10 +662,10 @@ class Lowering:
 				)
 			return local_path.read_bytes()
 
+		import linker_c
 		cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'case_folding'
-		cache_dir.mkdir( parents = True, exist_ok = True )
 		cache_file = cache_dir / 'UnicodeData.txt'
-		if cache_file.is_file():
+		if linker_c.ensure_cache_dir( cache_dir ) and cache_file.is_file():
 			# an empty file is a torn write, never a real (multi-MB) table -
 			# re-download instead of building casing tables from nothing.
 			# Deliberately NOT trying to detect a PARTIAL-but-non-empty file:
@@ -698,8 +696,7 @@ class Lowering:
 				f'set METALPY_UNICODE_DATA_DIR to a local directory containing UnicodeData.txt to avoid the network entirely',
 				node,
 			)
-		import linker_c as _linker_c
-		_linker_c.atomic_write_cache( cache_file, data )
+		linker_c.atomic_write_cache( cache_file, data )
 		return data
 
 	def _build_unicode_simple_table( self, data: bytes, which: str, node: ast.AST ) -> bytes:
@@ -792,10 +789,10 @@ class Lowering:
 				)
 			return local_path.read_bytes()
 
+		import linker_c
 		cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'windows_zones'
-		cache_dir.mkdir( parents = True, exist_ok = True )
 		cache_file = cache_dir / 'windowsZones.xml'
-		if cache_file.is_file():
+		if linker_c.ensure_cache_dir( cache_dir ) and cache_file.is_file():
 			# same "empty file is a torn write, re-download" posture as
 			# _fetch_unicode_data_txt - see its own comment
 			try:
@@ -817,8 +814,7 @@ class Lowering:
 				f'set METALPY_WINDOWS_ZONES_DIR to a local directory containing windowsZones.xml to avoid the network entirely',
 				node,
 			)
-		import linker_c as _linker_c
-		_linker_c.atomic_write_cache( cache_file, data )
+		linker_c.atomic_write_cache( cache_file, data )
 		return data
 
 	def _build_windows_zones_table( self, data: bytes, node: ast.AST ) -> bytes:

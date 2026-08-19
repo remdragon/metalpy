@@ -39,7 +39,49 @@ def resolve_no_crt( no_crt: bool, asan: bool ) -> bool:
 	return no_crt
 
 
-def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
+def ensure_cache_dir( cache_dir: Path ) -> bool:
+	''' best-effort mkdir for one of this codebase's %TEMP%/metalpy/<category>
+	disk-cache directories - shared by every cache call site (atomic_write_
+	cache below, and each cache_dir.mkdir(...) that gates a read attempt
+	before ever reaching it: lowering._eval_cexpr, has_symbol,
+	ntdll_import_lib, wide_int_runtime_lib). A cache directory being
+	unavailable - most commonly a DIFFERENT user's earlier process having
+	left one behind at a restrictive mode (confirmed: root-owned, 0o755,
+	blocking every non-root user from creating anything inside it) - must
+	never fail the compile the caller actually asked for; it only means
+	this call, and every other process sharing the directory, pays the real
+	cost the cache exists to avoid. Warns via stderr (NOT silent - unlike
+	atomic_write_cache's own publish-race retries, this is a standing
+	environment problem worth a human noticing, not a routine microseconds-
+	wide contention window) and returns False so the caller skips the
+	read/write attempt entirely instead of tripping over a directory that
+	still doesn't actually exist.
+
+	On POSIX, ALSO chmods cache_dir and its immediate parent (the shared
+	.../metalpy directory itself, but never higher - tempfile.gettempdir()
+	is a real system directory, e.g. /tmp, this code must never touch) to
+	0o777 whenever it can, regardless of whether THIS call just created
+	them: Path.mkdir(mode=...) is filtered through the process umask, so
+	passing a permissive mode there is not reliable, and re-asserting 0o777
+	on a directory this process (or a past run of this same fixed code)
+	already owns is a harmless, self-healing no-op. A directory owned by a
+	different user simply raises EPERM here, silently ignored - not ours to
+	fix, that's exactly the "unavailable, fall through" case above. '''
+	try:
+		cache_dir.mkdir( parents = True, exist_ok = True )
+	except OSError as e:
+		print( f'WARNING - metalpy: cache directory {cache_dir} is unavailable ({e}) - continuing without caching', file = sys.stderr )
+		return False
+	if os.name == 'posix':
+		for d in ( cache_dir, cache_dir.parent ):
+			try:
+				os.chmod( d, 0o777 )
+			except OSError:
+				pass
+	return True
+
+
+def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> bool:
 	''' publish a disk-cache entry so a concurrent reader sees either the
 	complete previous state or the complete new one, never a half-written file.
 
@@ -68,12 +110,19 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 	Readers should ALSO treat empty/unparseable content as a miss - this fixes
 	new writes, but cannot repair a corrupt file some earlier run left behind.
 
-	PUBLISHING IS BEST-EFFORT, deliberately. On Windows os.replace fails with
-	PermissionError (WinError 5) when the destination is currently OPEN - which
-	a concurrent reader doing cache_file.read_text() briefly makes it. The first
-	version of this raised, which turned the original rare silent-wrong-answer
-	into a rare hard crash that aborted the compile - strictly worse, and caught
-	by the same test that motivated the fix in the first place.
+	PUBLISHING IS BEST-EFFORT, deliberately - returns whether it actually
+	succeeded (True) or gave up (False), but NEVER raises. On Windows
+	os.replace fails with PermissionError (WinError 5) when the destination
+	is currently OPEN - which a concurrent reader doing cache_file.
+	read_text() briefly makes it. The first version of this raised, which
+	turned the original rare silent-wrong-answer into a rare hard crash
+	that aborted the compile - strictly worse, and caught by the same test
+	that motivated the fix in the first place. The SAME posture now also
+	covers the write itself (tmp.write_bytes/write_text) and the directory
+	creation (ensure_cache_dir) - a different user's earlier process having
+	left the cache directory at a mode this process can't write into hits
+	PermissionError right there, before os.replace is even reached, and
+	needs the identical "don't crash the caller's compile" treatment.
 
 	Losing that race is harmless: this cache is IDEMPOTENT, every writer for a
 	given key computes the same value from the same (lib, symbol, compiler) or
@@ -81,26 +130,40 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 	caller already has its own correct value in hand and returns it either way;
 	all that's lost is the chance to save the NEXT process a re-probe. A few
 	tight retries first, since a reader's handle is only open for microseconds
-	and retrying usually wins immediately - but never at the cost of failing. '''
-	cache_file.parent.mkdir( parents = True, exist_ok = True )
+	and retrying usually wins immediately.
+
+	A give-up IS reported (stderr WARNING, not silent - see ensure_cache_dir's
+	own identical reasoning): losing one publish is harmless noise, but a
+	caller like ntdll_import_lib whose own contract needs the file to actually
+	land on disk checks this return value and needs to know why it came back
+	False, and a standing "this directory is unusable" environment problem is
+	worth a human noticing even where the immediate caller doesn't care. '''
+	if not ensure_cache_dir( cache_file.parent ):
+		return False
 	tmp = cache_file.with_name( f'{cache_file.name}.{os.getpid()}.tmp' )
 	try:
-		if isinstance( data, bytes ):
-			tmp.write_bytes( data )
-		else:
-			tmp.write_text( data, encoding = 'utf-8' )
+		try:
+			if isinstance( data, bytes ):
+				tmp.write_bytes( data )
+			else:
+				tmp.write_text( data, encoding = 'utf-8' )
+		except OSError as e:
+			print( f'WARNING - metalpy: cannot write cache file {cache_file} ({e}) - continuing without caching', file = sys.stderr )
+			return False
+		if os.name == 'posix':
+			try:
+				os.chmod( tmp, 0o666 )
+			except OSError:
+				pass
 		for attempt in range( 3 ):
 			try:
 				os.replace( tmp, cache_file )
-				return
-			except OSError:
+				return True
+			except OSError as e:
 				if attempt == 2:
-					# give up publishing - see "best-effort" above. NOT an error
-					# to report: a failed publish costs a future re-probe, never
-					# correctness, and the cache lives in %TEMP% where a full
-					# disk / locked file is the user's environment, not a bug in
-					# the compile they asked for.
-					break
+					# give up publishing - see "best-effort" above
+					print( f'WARNING - metalpy: cannot publish cache file {cache_file} ({e}) - continuing without caching', file = sys.stderr )
+					return False
 	finally:
 		# never leave a stray .tmp behind - on the give-up path above, and on
 		# any exception from the writes themselves. Nothing reaps %TEMP%/metalpy
@@ -296,9 +359,8 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 
 	key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
 	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'has_symbol'
-	cache_dir.mkdir( parents = True, exist_ok = True )
 	cache_file = cache_dir / key
-	if cache_file.is_file():
+	if ensure_cache_dir( cache_dir ) and cache_file.is_file():
 		# an empty/unrecognized body is a TORN or half-written entry, not a
 		# real answer - fall through and re-probe rather than reporting "not
 		# available" for something that is (see atomic_write_cache). Cheap:
@@ -454,9 +516,8 @@ def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False
 
 	key = hashlib.sha256( f'{cc.name}\0{",".join( sorted( symbols ))}'.encode() ).hexdigest()[:16]
 	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'ntdll_import_lib'
-	cache_dir.mkdir( parents = True, exist_ok = True )
 	lib_path = cache_dir / f'{key}.lib'
-	if lib_path.is_file():
+	if ensure_cache_dir( cache_dir ) and lib_path.is_file():
 		# cache hit - skip both the export-table probe and the lib.exe/
 		# llvm-lib build below entirely, same spirit as has_symbol()'s own
 		# cache (this is the whole point of caching: a cache hit must not
@@ -486,8 +547,20 @@ def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False
 		result = subprocess.run( cmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, text = True )
 		if result.returncode != 0 or not out_path.is_file():
 			raise RuntimeError( f'failed to build a custom ntdll import library:\n{result.stdout}' )
-		atomic_write_cache( lib_path, out_path.read_bytes() )
-	return lib_path
+		data = out_path.read_bytes()
+		if atomic_write_cache( lib_path, data ):
+			return lib_path
+		# the shared cache directory is unavailable this run (atomic_write_
+		# cache already warned why) - out_path is about to be deleted along
+		# with this TemporaryDirectory, but this function's own contract is
+		# a real, on-disk .lib path regardless of whether caching it
+		# actually worked, so fall back to a private, uncached copy outside
+		# the shared tree rather than returning a path that was just
+		# confirmed not to exist
+		fallback_fd, fallback_name = tempfile.mkstemp( suffix = '.lib', prefix = 'metalpy_ntdll_' )
+		with os.fdopen( fallback_fd, 'wb' ) as f:
+			f.write( data )
+		return Path( fallback_name )
 
 
 def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool = False ) -> str:
@@ -561,10 +634,14 @@ def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
 
 	key = hashlib.sha256( f'{cc.name}\0{cc.path}'.encode() ).hexdigest()[:16]
 	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'wide_int_runtime_lib'
-	cache_dir.mkdir( parents = True, exist_ok = True )
 	cache_file = cache_dir / key
-	if cache_file.is_file():
-		return cache_file.read_text( encoding = 'utf-8' ).strip() or None
+	if ensure_cache_dir( cache_dir ) and cache_file.is_file():
+		# best-effort read, same reasoning as has_symbol's identical guard -
+		# a torn/mid-replace read costs one re-probe, never correctness
+		try:
+			return cache_file.read_text( encoding = 'utf-8' ).strip() or None
+		except OSError:
+			pass
 
 	found: str|None = None
 	if cc.name == 'clang':
@@ -593,7 +670,7 @@ def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
 		if result.returncode == 0 and path is not None and path.is_file():
 			found = str( path )
 
-	cache_file.write_text( found or '', encoding = 'utf-8' )
+	atomic_write_cache( cache_file, found or '' )
 	return found
 
 

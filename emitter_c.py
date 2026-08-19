@@ -378,13 +378,25 @@ static inline bool __metalpy_isinf_f64( double x ) {
 #endif
 '''
 
-# only needed where an ir.FormatFloat/ir.ParseFloat is actually emitted (see
-# emit_c) - i.e. a program that formats/parses a float as text (str(f),
-# f-string float formatting, float(s)). Kept as one unit (not split further
-# per-function) - both halves share the Windows branch's GetModuleHandleA/
-# LoadLibraryA/GetProcAddress declarations and msvcrt resolution, and the
-# common case uses both anyway (see lib/builtins/__float.py's repr search).
-_PROLOGUE_FLOAT_CONV = '''\
+# _PROLOGUE_FLOAT_FORMAT/_PROLOGUE_FLOAT_PARSE - only needed where an
+# ir.FormatFloat/ir.ParseFloat is actually emitted (see emit_c), i.e. a
+# program that formats a float as text (str(f), f-string float formatting)
+# or parses one (float(s)) respectively. Split into two independently-gated
+# parts (NOT kept as one combined unit, despite sharing the Windows branch's
+# GetModuleHandleA/LoadLibraryA/GetProcAddress declarations and msvcrt
+# resolution) so a program using only one direction doesn't pull in a
+# genuinely unused static inline function for the other - confirmed via a
+# real repro: an f-string-only program (formats, never parses) still showed
+# -Wunused-function on __metalpy_parse_f64 when this was one unit. The common
+# case (lib/builtins/__float.py's shortest-round-trip repr search) uses both
+# anyway, so both parts land together there - this only matters for a
+# program that formats-only or parses-only. The 3 extern prototypes are
+# duplicated verbatim into BOTH Windows branches rather than factored into a
+# shared third part: a repeated, IDENTICAL extern declaration is legal,
+# warning-free C on every one of clang/gcc/MSVC, and keeping each part fully
+# self-contained is simpler than threading a third always-emitted-if-either-
+# part-is dependency through emit_c().
+_PROLOGUE_FLOAT_FORMAT = '''\
 // backs compiler.format_f64(buf, size, precision, type_char, alt, value)
 // (lowering.py's _lower_compiler_format_f64 / ir.FormatFloat) - writes
 // value's fixed-precision decimal digits into buf via a dynamically-built
@@ -469,6 +481,9 @@ static inline void __metalpy_fixup_msvcrt_exponent( char* buf, int* n ) {
 		break; // at most one exponent in a real float conversion
 	}
 }
+// see this module's own _PROLOGUE_FLOAT_FORMAT/_PROLOGUE_FLOAT_PARSE
+// comment on why these 3 are duplicated into _PROLOGUE_FLOAT_PARSE too
+// rather than factored into a shared part
 void* __stdcall GetModuleHandleA( const char* lpModuleName );
 void* __stdcall LoadLibraryA( const char* lpLibFileName );
 void* __stdcall GetProcAddress( void* hModule, const char* lpProcName );
@@ -505,6 +520,23 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 	if ( n > 0 ) __metalpy_fixup_msvcrt_exponent( buf, &n );
 	return n;
 }
+#else
+#include <stdio.h>
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
+	char fmt[6];
+	int fi = 0;
+	fmt[fi++] = '%';
+	if ( alt ) fmt[fi++] = '#';
+	fmt[fi++] = '.';
+	fmt[fi++] = '*';
+	fmt[fi++] = (char)type_char;
+	fmt[fi] = 0;
+	return snprintf( buf, size, fmt, precision, value );
+}
+#endif
+'''
+
+_PROLOGUE_FLOAT_PARSE = '''\
 // backs compiler.parse_f64(buf) - the inverse of compiler.format_f64, needed
 // for the shortest-round-trip repr search (lib/builtins/__float.py's
 // _f64_repr_digits_raw). msvcrt.dll's own strtod was verified correct
@@ -515,7 +547,14 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 // exactly. strtod is an ordinary (non-variadic) function - no ABI hazard
 // like _snprintf has - but resolved the same dynamic way regardless, since
 // a plain @extern('c', ...) binding would still wrongly flip the no-crt
-// Windows build (same reasoning __metalpy_format_f64 above documents).
+// Windows build (same reasoning _PROLOGUE_FLOAT_FORMAT's own
+// __metalpy_format_f64 comment documents).
+#ifdef _WIN32
+// see _PROLOGUE_FLOAT_FORMAT's own identical comment on why these 3 are
+// duplicated here rather than factored into a shared part
+void* __stdcall GetModuleHandleA( const char* lpModuleName );
+void* __stdcall LoadLibraryA( const char* lpLibFileName );
+void* __stdcall GetProcAddress( void* hModule, const char* lpProcName );
 typedef double ( __cdecl *__metalpy_strtod_fn )( const char*, char** );
 static inline double __metalpy_parse_f64( const char* text ) {
 	static __metalpy_strtod_fn fn = 0;
@@ -528,19 +567,7 @@ static inline double __metalpy_parse_f64( const char* text ) {
 	return fn( text, 0 );
 }
 #else
-#include <stdio.h>
 #include <stdlib.h>
-static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
-	char fmt[6];
-	int fi = 0;
-	fmt[fi++] = '%';
-	if ( alt ) fmt[fi++] = '#';
-	fmt[fi++] = '.';
-	fmt[fi++] = '*';
-	fmt[fi++] = (char)type_char;
-	fmt[fi] = 0;
-	return snprintf( buf, size, fmt, precision, value );
-}
 static inline double __metalpy_parse_f64( const char* text ) {
 	return strtod( text, 0 );
 }
@@ -551,7 +578,7 @@ static inline double __metalpy_parse_f64( const char* text ) {
 # PROLOGUE helper regardless of whether a specific program needs it (e.g.
 # emitter_c_test.py's own release_object test). emit_c() itself assembles
 # the pieces above selectively instead of using this directly.
-PROLOGUE = _PROLOGUE_HEADER + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_CONV
+PROLOGUE = _PROLOGUE_HEADER + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE
 
 
 
@@ -3633,21 +3660,22 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# tag would be pure bookkeeping noise, not a needed flag - and, unlike
 	# Windows, adding it would incorrectly flip no_crt for any caller that
 	# reads compiler.extern_libs before emit_c().
-	uses_float_conv = any(
-		isinstance( instr, ( ir.FormatFloat, ir.ParseFloat ) ) for lf in compiler.functions for instr in lf.instructions
-	)
-	if compiler.disco.active_target['os'] == 'windows' and uses_float_conv:
+	uses_format_conv = any( isinstance( instr, ir.FormatFloat ) for lf in compiler.functions for instr in lf.instructions )
+	uses_parse_conv = any( isinstance( instr, ir.ParseFloat ) for lf in compiler.functions for instr in lf.instructions )
+	if compiler.disco.active_target['os'] == 'windows' and ( uses_format_conv or uses_parse_conv ):
 		compiler.extern_libs.setdefault( 'kernel32', set() ).add( 'GetProcAddress' )
 
 	# selective PROLOGUE assembly - _PROLOGUE_HEADER/_PROLOGUE_ARITH are
 	# always needed (ObjectHeader/vtable typedefs, arithmetic intrinsics),
-	# but retain_object/release_object/the format_f64+parse_f64 pair are
-	# real "static inline" FUNCTIONS that trigger -Wunused-function (clang;
-	# gcc doesn't warn on unused static inline, MSVC doesn't warn on unused
-	# static at all) whenever a program doesn't happen to need them - most
-	# commonly a trivial program with no RCClass traffic and no float
-	# formatting/parsing at all. Only emitting what's actually referenced
-	# avoids that instead of suppressing the warning after the fact.
+	# but retain_object/release_object/format_f64/parse_f64 are real "static
+	# inline" FUNCTIONS that trigger -Wunused-function (clang; gcc doesn't
+	# warn on unused static inline, MSVC doesn't warn on unused static at
+	# all) whenever a program doesn't happen to need them - most commonly a
+	# trivial program with no RCClass traffic and no float formatting/
+	# parsing at all, or (format_f64/parse_f64 specifically - see their own
+	# comment) a program using only one of the two directions. Only
+	# emitting what's actually referenced avoids that instead of
+	# suppressing the warning after the fact.
 	uses_incref = any( isinstance( instr, ir.Incref ) for lf in compiler.functions for instr in lf.instructions )
 	uses_decref = any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for lf in compiler.functions for instr in lf.instructions )
 	parts: list[str] = [ _PROLOGUE_HEADER ]
@@ -3656,8 +3684,10 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	if uses_decref:
 		parts.append( _PROLOGUE_RELEASE )
 	parts.append( _PROLOGUE_ARITH )
-	if uses_float_conv:
-		parts.append( _PROLOGUE_FLOAT_CONV )
+	if uses_format_conv:
+		parts.append( _PROLOGUE_FLOAT_FORMAT )
+	if uses_parse_conv:
+		parts.append( _PROLOGUE_FLOAT_PARSE )
 
 	# collect #include requirements from all modules whose symbols are
 	# compiled into this translation unit
