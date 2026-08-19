@@ -208,6 +208,42 @@ def main() -> i32:
 	return 0
 '''
 
+_UNARY_OP_INTO_UNION = '''
+def maybe_neg( i: i32 ) -> i32|None:
+	with compiler.wrap_arithmetic:
+		return -i
+
+def maybe_invert( i: i32 ) -> i32|None:
+	with compiler.wrap_arithmetic:
+		return ~i
+
+def maybe_not( flag: bool ) -> bool|None:
+	return not flag
+
+def yield_neg( i: i32 ) -> Iterator[i32]:
+	with compiler.wrap_arithmetic:
+		yield -i
+
+def main() -> i32:
+	a = maybe_neg( 5 )
+	if a is None or a != -5:
+		return 1
+	b = maybe_invert( 5 )
+	if b is None or b != -6:
+		return 2
+	c = maybe_not( True )
+	if c is None or c != False:
+		return 3
+	d = maybe_not( False )
+	if d is None or d != True:
+		return 4
+	g = yield_neg( 7 )
+	e = g.__next__()
+	if e is None or e != -7:
+		return 5
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
 class UnionCoercionRCTests( RealCompileMixin, unittest.TestCase ):
@@ -221,6 +257,22 @@ class UnionCoercionRCTests( RealCompileMixin, unittest.TestCase ):
 	def test_tuple_literal_union_elements_via_generic_call( self ) -> None:
 		self.assert_programs_run([
 			( 'result_ok_tuple_literal_union_elements', _RESULT_OK_TUPLE_LITERAL_UNION_ELEMENTS ),
+		])
+
+	def test_unary_op_coerces_into_union_correctly( self ) -> None:
+		# the scalar (non-RC) analog of this file's own bug class: a UnaryOp
+		# (-x/~x/not x) whose OUTER context expects a union return/yield type
+		# (e.g. `return -i` from a function declared -> i32|None) used to hint
+		# node.operand's own lowering with that union type DIRECTLY, silently
+		# wrapping the operand into Some(i) BEFORE the operator ever ran, and
+		# (the `not` case specifically) forcing the RESULT temp itself to be
+		# union-typed too - both produced invalid C (assigning a bare
+		# int/bool straight into a union struct), confirmed via a real
+		# compile failure, not just reasoning. Found while rebuilding
+		# generator Phase F (`yield -i` hit the identical bug) - see
+		# _expr_UnaryOp's own operand_hint/dest comments for the fix.
+		self.assert_programs_run([
+			( 'unary_op_into_union', _UNARY_OP_INTO_UNION ),
 		])
 
 
