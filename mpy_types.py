@@ -970,6 +970,16 @@ class Function( Type, ScopeMixin ):
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
 	is_destructor: bool = False # synthesized $$__destructor__ body — emitter uses void(void*) signature + cast prologue
+	# PLAN_GENERATORS.md Phase F - synthesized $$__next__ body (a
+	# generator's backing class method) - lowering.py gates its own
+	# state-check dispatch prologue on this, mirroring is_destructor's
+	# identical "synthesized method, special lowering-time treatment"
+	# precedent. node.generator_yield_states (a list[tuple[int,str]] tag
+	# set once by type_resolver.py's _build_generator_next_function, not
+	# a dataclass field - same convention as this file's other AST-level
+	# generator tags) carries the (state, resume_label) pairs the
+	# prologue dispatches on.
+	is_generator_next: bool = False
 
 	# implementations only (never set on a stub - stubs are never scheduled
 	# as real compile units, so they never need a C symbol of their own) -

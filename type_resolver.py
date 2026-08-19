@@ -311,17 +311,14 @@ class TypeResolver:
 	def _validate_generator_defer_sites( self, fn: Function ) -> None:
 		''' PLAN_GENERATORS.md's defer/errdefer-in-generators phase - a
 		`with defer:`/`with errdefer:`/`defer(...)`/`errdefer(...)` site is
-		only allowed as a DIRECT TOP-LEVEL statement of the generator's own
-		body: `fn.node.body` is exactly what _split_generator_segments
-		groups into (preamble, unit) pairs (every non-unit top-level
-		statement becomes part of some preamble or the trailing tail), so
-		"top-level" here already means "preamble or tail" - no separate
-		unit-membership check needed. Nested one level further in - a
-		while-unit's own loop body, an if-unit's own branch, or any other
-		ordinary nested if/for/while/with - is rejected: same "start
-		narrow, no obviously-correct place to run a resumable loop's own
-		per-iteration arming/replay yet" posture _validate_while_yield_unit
-		already takes for break/continue inside a yield-containing loop. '''
+		only allowed as a DIRECT TOP-LEVEL statement of `fn.node.body`
+		itself (this stays true post-Phase F even though ordinary yield
+		nesting/multiplicity restrictions were lifted - a deliberate,
+		independent scope decision, not related to yield dispatch at
+		all). Nested one level further in - a while/if/for/with's own
+		body/branch - is rejected: "start narrow, no obviously-correct
+		place to run a resumable loop's own per-iteration arming/replay
+		yet" posture. '''
 		top_level_ids = { id( s ) for s in fn.node.body }
 		for node in self._walk_generator_body( fn.node.body ):
 			kind = self._generator_defer_site_kind( node )
@@ -613,71 +610,6 @@ class TypeResolver:
 			result.append( stmt )
 		return result
 
-	def _while_yield_nodes( self, node: ast.While ) -> list[ast.expr]:
-		return [ n for n in self._walk_generator_body( node.body ) if isinstance( n, ( ast.Yield, ast.YieldFrom )) ]
-
-	def _validate_while_yield_unit( self, fn: Function, node: ast.While ) -> None:
-		''' Phase 2, PLAN_GENERATORS.md - a top-level `while` loop containing
-		yield is only supported in the exact shape the plan's own motivating
-		range()-style example needs: exactly one yield, a DIRECT statement of
-		the loop's own body (not nested one level further in if/for/while/
-		with/try inside it), no while/else, no break/continue anywhere in the
-		loop body (both are rejected outright for now - see
-		_build_while_unit_guard's own docstring for why break/continue would
-		need real design work, not just a bigger table). '''
-		if node.orelse:
-			self.discovery.fail( f'{fn.qualname}: while/else is not supported inside a generator body', node )
-		direct_yields = [ s for s in node.body if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) ]
-		all_yields = self._while_yield_nodes( node )
-		if len( direct_yields ) != 1 or len( all_yields ) != 1:
-			self.discovery.fail(
-				f'{fn.qualname}: a while loop containing yield must have exactly one yield, as a direct '
-				f'statement of the loop body (not nested in if/for/while/with/try) - see PLAN_GENERATORS.md',
-				node,
-			)
-		for n in self._walk_generator_body( node.body ):
-			if isinstance( n, ( ast.Break, ast.Continue )) and not getattr( n, 'compiler_synthesized_break', False ):
-				# the exemption is for THIS pass's own synthesized `case
-				# None: break` (PLAN_GENERATORS.md Phase 1's
-				# _desugar_iterator_for, the "was __next__() exhausted"
-				# check) - a genuinely USER-written break/continue inside
-				# the for-loop's own body (which becomes part of node.body
-				# here too) still hits the real, unsolved ambiguity this
-				# check exists for, and stays rejected
-				self.discovery.fail( f'{fn.qualname}: break/continue are not supported inside a yield-containing while/for loop yet - see PLAN_GENERATORS.md', n )
-
-	def _if_yield_nodes( self, node: ast.If ) -> list[ast.expr]:
-		return [ n for n in self._walk_generator_body( node.body + node.orelse ) if isinstance( n, ( ast.Yield, ast.YieldFrom )) ]
-
-	def _validate_if_yield_unit( self, fn: Function, node: ast.If ) -> None:
-		''' PLAN_GENERATORS.md Phase 2 - a top-level `if`/`if-else`
-		containing yield: at most one yield PER BRANCH, each a direct
-		statement of its OWN branch (not nested one level further in if/
-		for/while/with/try inside it), at least one branch actually
-		having one (an if/else with a yield in NEITHER branch would never
-		have been recognized as a unit in the first place - see
-		_collect_generator_units's own caller). elif chains (`orelse`
-		being a single nested `ast.If` - how Python itself represents
-		`elif`) are rejected outright for now: the branch-stable-condition
-		resume trick this unit's own guard-building relies on (see
-		_build_if_unit_guard's own docstring) generalizes to a chain in
-		principle, but hasn't been worked through/tested here - a
-		deliberate, narrower first cut, not an oversight. '''
-		if len( node.orelse ) == 1 and isinstance( node.orelse[0], ast.If ):
-			self.discovery.fail( f'{fn.qualname}: elif chains inside a generator body are not supported yet - see PLAN_GENERATORS.md', node )
-		body_yields = [ s for s in node.body if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) ]
-		orelse_yields = [ s for s in node.orelse if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) ]
-		all_yields = self._if_yield_nodes( node )
-		if len( body_yields ) > 1 or len( orelse_yields ) > 1 or ( len( body_yields ) + len( orelse_yields )) != len( all_yields ):
-			self.discovery.fail(
-				f'{fn.qualname}: an if/else containing yield must have at most one yield per branch, each a '
-				f'direct statement of its own branch (not nested in if/for/while/with/try) - see PLAN_GENERATORS.md',
-				node,
-			)
-		for n in self._walk_generator_body( node.body + node.orelse ):
-			if isinstance( n, ( ast.Break, ast.Continue )):
-				self.discovery.fail( f'{fn.qualname}: break/continue are not supported inside a yield-containing if/else yet - see PLAN_GENERATORS.md', n )
-
 	def _is_generator_range_call( self, node: ast.expr ) -> bool:
 		# textual recognition, same shape as lowering.py's own
 		# _is_range_call (deliberately duplicated rather than reached
@@ -692,51 +624,6 @@ class TypeResolver:
 		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range':
 			return True
 		return False
-
-	def _arithmetic_mode_with_kind( self, node: ast.expr ) -> str|None:
-		# textual recognition, mirrors lowering.py's own _stmt_With
-		# (compiler.wrap_arithmetic / compiler.saturate_arithmetic /
-		# compiler.panic_arithmetic(...)) - duplicated rather than reached
-		# across the TypeResolver/Lowering boundary, same reasoning as
-		# this file's other textual recognizers (_is_generator_range_call
-		# etc.). defer/errdefer with-blocks are deliberately NOT
-		# recognized here - PLAN_GENERATORS.md rejects those inside a
-		# generator body outright (_reject_generator_defer), unrelated to
-		# this Phase 2 arithmetic-mode-only allowance
-		if isinstance( node, ast.Attribute ) and isinstance( node.value, ast.Name ) and node.value.id == 'compiler':
-			if node.attr in ( 'wrap_arithmetic', 'saturate_arithmetic' ):
-				return node.attr
-			return None
-		if (
-			isinstance( node, ast.Call ) and isinstance( node.func, ast.Attribute )
-			and isinstance( node.func.value, ast.Name ) and node.func.value.id == 'compiler'
-			and node.func.attr == 'panic_arithmetic'
-		):
-			return 'panic_arithmetic'
-		return None
-
-	def _yield_with_wrapper( self, node: ast.stmt ) -> ast.With|None:
-		''' PLAN_GENERATORS.md Phase 2 - is `node` a `with compiler.
-		wrap_arithmetic/saturate_arithmetic/panic_arithmetic(...): yield
-		expr` statement (a bare yield, alone, as the with-block's ENTIRE
-		body)? These with-blocks are pure lowering-time bookkeeping (push/
-		pop an arithmetic mode - lowering.py's own _stmt_With), no real
-		runtime branching at all, so a yield directly inside one is safe
-		to treat as an ordinary bare-yield unit (_build_yield_unit_guard),
-		just with the same with-wrapper preserved around the synthesized
-		state-assign+return so the arithmetic mode is still correctly
-		active while the yielded value's own expression gets lowered.
-		Returns `node` itself (not just a bool) so callers can use it
-		directly as the unit's own stmt. '''
-		if not isinstance( node, ast.With ):
-			return None
-		if len( node.items ) != 1 or node.items[0].optional_vars is not None:
-			return None
-		if self._arithmetic_mode_with_kind( node.items[0].context_expr ) is None:
-			return None
-		if len( node.body ) != 1 or not ( isinstance( node.body[0], ast.Expr ) and isinstance( node.body[0].value, ast.Yield )):
-			return None
-		return node
 
 	def _probe_method( self, owner_type: Type|None, name: str ) -> Function|None:
 		''' PLAN_GENERATORS.md Phase 1 - non-failing probe (unlike
@@ -1154,80 +1041,51 @@ class TypeResolver:
 		ast.fix_missing_locations( target_init )
 		return [ target_init, while_node ]
 
-	def _collect_generator_units( self, fn: Function ) -> list[tuple]:
-		''' walks fn.node.body's own top-level statements, recognizing four
-		yield-bearing shapes: a bare `yield expr` statement (v1), the same
-		wrapped in an arithmetic-mode `with` block (Phase 2 -
-		_yield_with_wrapper), a `while` loop whose own body contains
-		exactly one yield as a direct statement (Phase 2/4 - PLAN_
-		GENERATORS.md's own motivating range() example: `while i < count:
-		yield i; i += 1`, or the equivalent `for i in range(count): yield
-		i`, already desugared to this same shape by _desugar_generator_
-		for_loops before this ever runs), and an `if`/`if-else` with at
-		most one yield per branch (Phase 2 - _validate_if_yield_unit).
-		Anything else containing a yield (nested in for-non-range/try,
-		elif chains, multiple yields in one loop/branch, yield nested two
-		levels deep, `yield from`) is rejected - enforced by cross-
-		checking against the TOTAL yield count found anywhere in the
-		body, so nothing containing a yield can silently slip through
-		unrecognized. Returns an ordered list of ('yield', stmt) /
-		('while', while_stmt) / ('if', if_stmt) tuples - ordinary non-
-		yield-bearing statements (including an ordinary while/for/if with
-		no yield in it at all) aren't units, they're picked up as segment
-		preamble by _split_generator_segments below. '''
-		all_yields = self._find_all_yield_nodes( fn )
-		if any( isinstance( y, ast.YieldFrom ) for y in all_yields ):
-			self.discovery.fail( f'{fn.qualname}: yield from is not supported yet - see PLAN_GENERATORS.md', fn.node )
+	def _reject_generator_yield_from( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md Phase F - `yield from` is A.4a follow-up
+		scope, not attempted here; still a clean rejection rather than a
+		silent miscompile (ast.YieldFrom never gets a dispatch state
+		assigned below, so reaching lowering.py unrejected would hit an
+		unsupported-statement failure with a far less useful message). '''
+		for n in self._walk_generator_body( fn.node.body ):
+			if isinstance( n, ast.YieldFrom ):
+				self.discovery.fail( f'{fn.qualname}: yield from is not supported yet - see PLAN_GENERATORS.md', n )
 
-		units: list[tuple] = []
-		accounted = 0
-		for stmt in fn.node.body:
-			if isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Yield ):
-				units.append( ( 'yield', stmt ) )
-				accounted += 1
-			elif self._yield_with_wrapper( stmt ) is not None:
-				units.append( ( 'yield', stmt ) )
-				accounted += 1
-			elif isinstance( stmt, ast.While ) and self._while_yield_nodes( stmt ):
-				self._validate_while_yield_unit( fn, stmt )
-				units.append( ( 'while', stmt ) )
-				accounted += 1
-			elif isinstance( stmt, ast.If ) and self._if_yield_nodes( stmt ):
-				self._validate_if_yield_unit( fn, stmt )
-				units.append( ( 'if', stmt ) )
-				accounted += len( self._if_yield_nodes( stmt ))
-
-		if accounted != len( all_yields ):
-			self.discovery.fail(
-				f'{fn.qualname}: yield must be a direct top-level statement of the generator function body '
-				f'(optionally wrapped in an arithmetic-mode with-block), or the single yield inside a direct '
-				f'top-level while/for loop, or at most one yield per branch of a direct top-level if/else '
-				f'(Phases 1/2/4/5 - see PLAN_GENERATORS.md); yield inside try, a for loop nested inside '
-				f'something else, an elif chain, multiple yields in one loop/branch, or yield nested more '
-				f'than one level deep is not supported yet',
-				fn.node,
-			)
-		return units
-
-	def _split_generator_segments( self, fn: Function, units: list[tuple] ) -> tuple[list[tuple[list[ast.stmt],tuple]],list[ast.stmt]]:
-		''' regroups fn.node.body's own top-level statements into
-		(preamble, unit) pairs in program order - preamble is the ordinary
-		statements immediately preceding this unit (run once, only the
-		first time this unit's own state range is entered - see
-		_build_while_unit_guard's own first-entry guard for why that
-		matters for a while-unit specifically). Returns (segments, tail) -
-		tail is whatever trails the LAST unit (may be empty). '''
-		unit_by_stmt_id = { id( u[1] ): u for u in units }
-		segments: list[tuple[list[ast.stmt],tuple]] = []
-		preamble: list[ast.stmt] = []
-		for stmt in fn.node.body:
-			unit = unit_by_stmt_id.get( id( stmt ))
-			if unit is not None:
-				segments.append( ( preamble, unit ))
-				preamble = []
-			else:
-				preamble.append( stmt )
-		return segments, preamble
+	def _assign_generator_yield_dispatch( self, fn: Function ) -> list[tuple[int,str]]:
+		''' PLAN_GENERATORS.md Phase F - replaces the old AST-synthesis
+		unit-matcher (_collect_generator_units/_split_generator_segments/
+		_build_yield_unit_guard/_build_while_unit_guard/_build_if_unit_
+		guard, all deleted) with a real IR-level dispatch: every ast.Yield
+		reachable anywhere in the body (arbitrary depth - if-in-while,
+		while-in-if, elif chains, multiple yields per loop/branch, all of
+		which the old unit model rejected outright) gets a unique
+		sequential dispatch state (starting at 1 - state 0 means "not yet
+		started") and a fresh resume label, tagged directly onto the node
+		(`generator_yield_state`/`generator_resume_label`) so lowering.py's
+		ordinary statement/expression pipeline can build `ir.Yield`
+		in-place once it reaches each one, and so
+		FunctionLowering._emit_generator_dispatch_prologue (built from the
+		returned list, cached on the FunctionDef itself as `.
+		generator_yield_states`) knows every resume target up front,
+		before the body it jumps INTO has been lowered at all - safe
+		because ir.Jump/ir.Label targets are plain string labels, resolved
+		at emission time, not requiring the target to already exist.
+		Walks fn.node.body in the SAME program-order _walk_generator_body
+		every other generator pass already relies on, so two yields at
+		the same nesting depth still get states in textual left-to-right/
+		outer-to-inner order (not that dispatch correctness depends on
+		ORDER - each state is independently unique - but a stable,
+		predictable order keeps a dumped instruction stream readable). '''
+		states: list[tuple[int,str]] = []
+		state = 0
+		for n in self._walk_generator_body( fn.node.body ):
+			if isinstance( n, ast.Yield ):
+				state += 1
+				label = f'__gen_resume_{state}'
+				n.generator_yield_state = state
+				n.generator_resume_label = label
+				states.append( ( state, label ) )
+		return states
 
 	def _collect_generator_locals( self, fn: Function ) -> dict[str,Type]:
 		''' every local assigned anywhere in the body becomes a field - see
@@ -1397,31 +1255,59 @@ class TypeResolver:
 		is still evaluated exactly once.
 
 		rc_local_stems is empty for a generator with no RC-typed promoted
-		locals at all - a no-op then, identical to the old bare rename. '''
+		locals at all - a no-op then, identical to the old bare rename.
+
+		PLAN_GENERATORS.md Phase F - `stmts` is now the WHOLE (or a whole
+		nested if/while/for/with block's) statement list, not just one
+		unit's own flat pre/post-yield slice, so the live-flag-guard step
+		is applied via a SEPARATE recursive pass (_apply_live_flag_
+		guards, below) over the already-fully-renamed tree, rather than
+		inline here - renamer.visit(s) on a compound statement already
+		renames its ENTIRE subtree in one call (ast.NodeTransformer's
+		default generic_visit recurses), so re-visiting a child with
+		renamer again here would be redundant; the live-flag-guard
+		transform, by contrast, has to run AFTER renaming (it matches on
+		the RENAMED self.<stem>=... shape) and has to recurse independently
+		to reach an RC-reassignment buried inside a nested block. '''
+		renamed = [ renamer.visit( s ) for s in stmts ]
 		if not rc_local_stems:
-			return [ renamer.visit( s ) for s in stmts ]
+			return renamed
+		return self._apply_live_flag_guards( renamed, rc_local_stems )
+
+	def _apply_live_flag_guards( self, stmts: list[ast.stmt], rc_local_stems: set ) -> list[ast.stmt]:
+		''' PLAN_GENERATORS.md Phase F - the live-flag-guard half of
+		_rename_and_track_liveness's own old docstring (see above),
+		generalized to recurse into nested if/while/for/with bodies -
+		same "_recurse_*_wrap" shape PLAN_GENERATORS.md's own Phase F/A.4a
+		write-up describes reusing for defer-tagging/bare-return-rewriting/
+		for-loop-desugaring elsewhere in this file. Operates on an
+		ALREADY-RENAMED tree (never calls renamer itself) - see caller. '''
 		result: list[ast.stmt] = []
 		for s in stmts:
-			renamed = renamer.visit( s )
-			stem = self._assigned_self_attr_stem( renamed )
+			stem = self._assigned_self_attr_stem( s )
 			if stem is not None and stem in rc_local_stems:
-				already_live = renamed
-				first_time = copy.deepcopy( renamed )
+				already_live = s
+				first_time = copy.deepcopy( s )
 				first_time.generator_first_rc_assign = True
 				flag_assign = ast.Assign(
-					targets = [ self._self_attr( self._live_flag_stem( stem ), renamed ) ],
+					targets = [ self._self_attr( self._live_flag_stem( stem ), s ) ],
 					value = ast.Constant( value = True ),
 				)
-				ast.copy_location( flag_assign, renamed )
+				ast.copy_location( flag_assign, s )
 				guard = ast.If(
-					test = self._self_attr( self._live_flag_stem( stem ), renamed ),
+					test = self._self_attr( self._live_flag_stem( stem ), s ),
 					body = [ already_live ],
 					orelse = [ first_time, flag_assign ],
 				)
-				ast.copy_location( guard, renamed )
+				ast.copy_location( guard, s )
 				result.append( guard )
-			else:
-				result.append( renamed )
+				continue
+			if isinstance( s, ( ast.If, ast.While, ast.For ) ):
+				s.body = self._apply_live_flag_guards( s.body, rc_local_stems )
+				s.orelse = self._apply_live_flag_guards( s.orelse, rc_local_stems )
+			elif isinstance( s, ast.With ):
+				s.body = self._apply_live_flag_guards( s.body, rc_local_stems )
+			result.append( s )
 		return result
 
 	# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) used to route every
@@ -1445,335 +1331,99 @@ class TypeResolver:
 	# it) was removed once that was confirmed - yield sites below just
 	# return the renamed value straight through.
 
-	def _pessimistic_done_prefix( self, stmts: list[ast.stmt], node: ast.AST, pending_done_assigns: 'list[ast.Assign]|None', defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> list[ast.stmt]:
-		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
-		generator's __next__ needs "permanently done" set BEFORE any block
-		of user code that might contain an or_return()/checked-arithmetic
-		early return, not after: OrReturn's own error exit returns directly
-		out of __next__ WITHOUT running whatever would normally advance
-		self.__state afterward, so without this, self.__state stays at
-		whatever it was BEFORE the failing statement - a later .__next__()
-		call would re-enter the SAME guard and re-run the SAME (partially-
-		applied, possibly already-consumed-a-moved-value) code from
-		scratch. Pessimistically setting state to "done" FIRST, then
-		letting the unit's own normal success path overwrite it with the
-		real next-state value right before its own yield/fall-through,
-		means an early return anywhere in between is automatically correct
-		with zero new IR/lowering machinery - purely a reordering of
-		existing AST.
-
-		pending_done_assigns is None for an infallible (Iterator[T])
-		generator - a no-op, `stmts` returned unchanged (nothing can fail,
-		nothing to guard against). For a fallible one, it's the SAME list
-		object threaded through every call site across all three guard
-		builders for one __next__ build - the real "done" value isn't
-		known yet at guard-building time (it depends on the FINAL state
-		count, computed only after every unit is built), so each inserted
-		Assign's own placeholder value gets recorded here and patched to
-		the real done_state by _build_generator_next_function once that's
-		known, rather than sharing one mutable Constant node across every
-		insertion point.
-
-		PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - when
-		`defer_sites` is non-empty, ALSO tags every statement in `stmts`
-		with the "currently armed" prefix of defer_sites (see _tag_armed_
-		defer_sites) before returning - every call site here is exactly
-		the granularity ("a block of user code that might fail") Mechanism
-		2 needs to know the armed set for too, so this is the natural
-		place to piggyback the tagging pass rather than a separate walk. '''
-		if pending_done_assigns is None:
-			return stmts
-		if defer_sites:
-			assert armed_count is not None
-			self._tag_armed_defer_sites( stmts, defer_sites, armed_count )
-		assign = ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = 0 ) )
-		ast.copy_location( assign, node )
-		pending_done_assigns.append( assign )
-		return [ assign ] + stmts
-
-	def _build_yield_unit_guard( self, pre: list[ast.stmt], stmt: 'ast.Expr|ast.With', start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> tuple[ast.If,int]:
-		''' a bare top-level `yield expr` (v1), or the SAME shape wrapped
-		in `with compiler.wrap_arithmetic/saturate_arithmetic/
-		panic_arithmetic(...):` (Phase 2 - see _yield_with_wrapper's own
-		docstring for why this is safe to treat as the same unit kind),
-		occupies exactly ONE state (start_state) - there's no separate
-		"resuming" state to distinguish the way a while/if-unit needs (see
-		_build_while_unit_guard/_build_if_unit_guard), so `pre` (the
-		ordinary statements immediately before this yield) can run
-		unguarded: this guard only ever fires when __state == start_state
-		exactly (every smaller state was already caught and returned by an
-		earlier guard). pending_done_assigns: see _pessimistic_done_prefix -
-		non-None only for a fallible (Generator[T,E]) generator. '''
-		if isinstance( stmt, ast.With ):
-			yield_stmt = stmt.body[0]
-			assert isinstance( yield_stmt, ast.Expr )
-			yield_node = yield_stmt.value
-		else:
-			yield_node = stmt.value
-		assert isinstance( yield_node, ast.Yield )
-		seg_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems or set() ), stmt, pending_done_assigns, defer_sites, armed_count )
-		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-		yield_stmts: list[ast.stmt] = [
-			ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = start_state + 1 ) ),
-			ast.Return( value = yielded ),
-		]
-		if isinstance( stmt, ast.With ):
-			# keep the arithmetic-mode wrapper around the state-assign+
-			# return, not just the yielded expression itself - lowering.py's
-			# own _stmt_With pushes/pops the arithmetic mode around
-			# whatever's textually inside the with-block, so this is what
-			# keeps the yielded value's own expression lowering under the
-			# right mode once it's embedded here
-			context_expr = renamer.visit( stmt.items[0].context_expr )
-			wrapped = ast.With( items = [ ast.withitem( context_expr = context_expr, optional_vars = None ) ], body = yield_stmts )
-			ast.copy_location( wrapped, stmt )
-			yield_stmts = [ wrapped ]
-		body = seg_stmts + yield_stmts
-		guard = ast.If(
-			test = ast.Compare( left = self._self_attr( '__state', stmt ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = body, orelse = [],
-		)
-		return guard, start_state + 1
-
-	def _build_while_unit_guard( self, pre: list[ast.stmt], node: ast.While, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> tuple[ast.If,int]:
-		''' a `while cond: PRE_ITER; yield V; POST_ITER` loop occupies TWO
-		states: start_state ("not yet entered") and start_state+1
-		("paused mid-loop, resuming"). Restructured as the standard
-		resumable-loop idiom (real technique behind hand-written C
-		coroutines/protothreads, e.g. Duff's device/Simon Tatham's
-		coroutines - here expressed in plain structured AST, no goto
-		needed): `while True: [on resume only: run POST_ITER once]; if not
-		cond: break; PRE_ITER; state = start_state+1; return V`. On the
-		very first call, POST_ITER is skipped (there's nothing to finish
-		yet); on every later call the loop is genuinely re-entered fresh
-		(a brand new C stack frame - see PLAN_GENERATORS.md), so POST_ITER
-		has to run explicitly, once, before the condition is re-checked -
-		exactly what a resumed loop iteration would have done next. `pre`
-		(statements before the while loop itself) is guarded to run ONLY
-		on the very first entry (state == start_state, never true again
-		once state advances) - unlike a bare yield-unit's own `pre`, this
-		one spans TWO states, so it needs its own explicit guard to avoid
-		re-running (e.g. resetting a loop counter back to 0) on resume.
-		When the loop's own condition finally goes false, state advances
-		to start_state+2 and execution FALLS THROUGH (no return here) into
-		whatever the next unit/tail's own guard covers - correct, since
-		Python's own generator semantics don't pause between a loop ending
-		and the code that follows it (no yield boundary there).
-		break/continue inside the user's own loop body are rejected before
-		this ever runs (_validate_while_yield_unit) - break would still be
-		correct by construction (breaks the same synthesized `while True:`
-		this builds around the user's own condition, which IS the correct
-		exit), but continue's real Python semantics ("skip the rest of
-		THIS iteration, re-check cond") don't have an obviously correct
-		place in this restructuring when it can appear before OR after the
-		yield, so it's left rejected rather than guessed at. '''
-		yield_index = next( i for i, s in enumerate( node.body ) if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield ) )
-		rc_local_stems = rc_local_stems or set()
-		pre_iter_stmts = self._rename_and_track_liveness( node.body[:yield_index], renamer, rc_local_stems )
-		yield_node = node.body[ yield_index ].value
-		assert isinstance( yield_node, ast.Yield )
-		yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-		post_iter_stmts = self._rename_and_track_liveness( node.body[ yield_index + 1: ], renamer, rc_local_stems )
-		cond = renamer.visit( node.test )
-
-		resume_var = f'__gen_resuming_{start_state}' # unique per while-unit (keyed by its own start_state) - an ordinary $$__next__-scoped local, never a field: only needs to survive within ONE call
-		first_entry_guard = ast.If(
-			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count ) or [ ast.Pass() ],
-			orelse = [],
-		)
-		resuming_init = ast.Assign(
-			targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ],
-			value = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
-		)
-		resume_body = self._pessimistic_done_prefix( post_iter_stmts, node, pending_done_assigns, defer_sites, armed_count ) + [
-			ast.Assign( targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ], value = ast.Constant( value = False ) ),
-		]
-		inner_if = ast.If( test = ast.Name( id = resume_var, ctx = ast.Load() ), body = resume_body, orelse = [] )
-		break_if = ast.If( test = ast.UnaryOp( op = ast.Not(), operand = cond ), body = [ ast.Break() ], orelse = [] )
-		yield_stmts = self._pessimistic_done_prefix( pre_iter_stmts, node, pending_done_assigns, defer_sites, armed_count ) + [
-			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
-			ast.Return( value = yielded ),
-		]
-		while_true = ast.While( test = ast.Constant( value = True ), body = [ inner_if, break_if ] + yield_stmts, orelse = [] )
-
-		end_state = start_state + 2
-		body = [
-			first_entry_guard,
-			resuming_init,
-			while_true,
-			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = end_state ) ),
-		]
-		guard = ast.If(
-			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
-			body = body, orelse = [],
-		)
-		return guard, end_state
-
-	def _build_if_unit_guard( self, pre: list[ast.stmt], node: ast.If, start_state: int, renamer: '_GeneratorNameRenamer', pending_done_assigns: 'list[ast.Assign]|None' = None, rc_local_stems: 'set|None' = None, defer_sites: 'list[tuple[str,bool,list[ast.stmt]]]|None' = None, armed_count: 'list[int]|None' = None ) -> tuple[ast.If,int]:
-		''' `if cond: [...yield...] else: [...yield...]` (at most one
-		yield per branch, at least one branch having one - see
-		_validate_if_yield_unit) occupies TWO states, same as a while-unit
-		(not-yet-entered / resuming), for the identical reason: it's
-		possible to suspend mid-branch and need to finish that branch's
-		own post-yield code on the next call. Unlike a while-unit, there's
-		no LOOPING - the if/else runs exactly once per __next__() call,
-		so resuming never re-runs a branch's own pre-yield code, only
-		whatever comes after the yield, then falls straight through to
-		whatever follows the if/else entirely (state = end_state, no
-		return - same "no pause between this construct ending and the
-		code after it" reasoning _build_while_unit_guard's own docstring
-		already gives for a loop's natural exit).
-
-		Resuming safely lands back in the SAME branch that yielded by
-		simply RE-EVALUATING `cond` on every call, first-entry or resume:
-		cond's own underlying values are fields, untouched between
-		__next__() calls (nothing else runs during a suspension), so it's
-		guaranteed stable - no separate per-branch resume state needed,
-		one shared `resuming` flag covers whichever branch actually used
-		it. A branch with NO yield at all needs no resume handling of its
-		own - it can only ever be reached on the first entry (a branch
-		that never yields can't be the one execution suspended in), so its
-		own statements just run unconditionally and fall through. '''
-		cond = renamer.visit( node.test )
-		resume_var = f'__gen_if_resuming_{start_state}'
-		rc_local_stems = rc_local_stems or set()
-
-		def build_branch( branch_stmts: list[ast.stmt] ) -> list[ast.stmt]:
-			yield_index = next(
-				( i for i, s in enumerate( branch_stmts ) if isinstance( s, ast.Expr ) and isinstance( s.value, ast.Yield )),
-				None,
-			)
-			if yield_index is None:
-				# a non-yielding branch only ever runs on the FIRST entry
-				# (state == start_state - see this method's own docstring),
-				# but its own code can still fail partway through, so it
-				# needs the same pessimistic-done guarding as any other
-				# fallible block, same reasoning as first_entry_guard below
-				return self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts, renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count )
-			pre_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[:yield_index], renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count )
-			yield_node = branch_stmts[ yield_index ].value
-			assert isinstance( yield_node, ast.Yield )
-			yielded = renamer.visit( yield_node.value ) if yield_node.value is not None else ast.Constant( value = None )
-			post_stmts = self._pessimistic_done_prefix( self._rename_and_track_liveness( branch_stmts[ yield_index + 1: ], renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count )
-			resuming_branch = post_stmts or [ ast.Pass() ]
-			fresh_branch = pre_stmts + [
-				ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = start_state + 1 ) ),
-				ast.Return( value = yielded ),
-			]
-			return [ ast.If( test = ast.Name( id = resume_var, ctx = ast.Load() ), body = resuming_branch, orelse = fresh_branch ) ]
-
-		first_entry_guard = ast.If(
-			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state ) ] ),
-			body = self._pessimistic_done_prefix( self._rename_and_track_liveness( pre, renamer, rc_local_stems ), node, pending_done_assigns, defer_sites, armed_count ) or [ ast.Pass() ],
-			orelse = [],
-		)
-		resuming_init = ast.Assign(
-			targets = [ ast.Name( id = resume_var, ctx = ast.Store() ) ],
-			value = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
-		)
-		if_body = build_branch( node.body )
-		else_body = build_branch( node.orelse ) if node.orelse else []
-		outer_if = ast.If( test = cond, body = if_body, orelse = else_body )
-
-		end_state = start_state + 2
-		body = [
-			first_entry_guard,
-			resuming_init,
-			outer_if,
-			ast.Assign( targets = [ self._self_attr( '__state', node ) ], value = ast.Constant( value = end_state ) ),
-		]
-		guard = ast.If(
-			test = ast.Compare( left = self._self_attr( '__state', node ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = start_state + 1 ) ] ),
-			body = body, orelse = [],
-		)
-		return guard, end_state
-
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, units: list[tuple], locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> Function:
-		''' builds $$__next__: self.__state == DONE short-circuits to `return
-		None`, then a flat sequence of per-unit guards (_build_yield_unit_
-		guard/_build_while_unit_guard/_build_if_unit_guard - a bare yield
-		occupies one state, a while/if-unit occupies two), plus a final
-		tail guard (the statements after the last unit, ending `self.
-		__state = DONE; return None`). Every YIELD unit's own branch
-		unconditionally returns; a WHILE/IF unit's branch falls through
-		once its own construct naturally finishes (correct - see each
-		builder's own docstring) into whatever guard covers the state it
-		just advanced to - no elif/goto/switch needed anywhere (see this
-		section's own top docstring).
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> Function:
+		''' PLAN_GENERATORS.md Phase F - builds $$__next__: self.__state ==
+		DONE short-circuits to `return None`, then the generator's own
+		body, lowered essentially AS-IS (structurally intact - no more
+		per-shape unit guards; the earlier AST-synthesis unit-matcher this
+		replaced is gone, see this section's own top-of-file docstring),
+		then a tail (natural-exhaustion exit: armed plain-`defer` replay +
+		self.__state = DONE; return None). Every ast.Yield reachable
+		anywhere in the body already carries its own dispatch state/resume
+		label by the time this runs (_assign_generator_yield_dispatch,
+		below) - lowering.py's ordinary statement pipeline turns each one
+		into a real `ir.Yield` in place (arbitrary nesting depth composes
+		for free, no CFG/merge_if changes needed - a yield doesn't unwind
+		or fork anything, see ir.Yield's own docstring), and
+		FunctionLowering._emit_generator_dispatch_prologue builds the
+		real state-check-and-goto dispatch AT LOWERING TIME from node.
+		generator_yield_states (tagged onto the FunctionDef below) - a
+		real goto/switch has no AST spelling in Python, so that piece
+		can't be synthesized here the way everything else in this method
+		still is.
 
 		next_return_type/error_type: PLAN_GENERATORS.md Phase 4 (roadmap
 		Phase 4) - error_type is None for an infallible Iterator[T]
-		generator (next_return_type is just result_union, unchanged from
-		before this phase) or set for a fallible Generator[T,E] one
-		(next_return_type is Result[result_union,error_type]). When
-		fallible: every guard builder gets a SHARED pending_done_assigns
-		list to record a pessimistic "self.__state = <placeholder>"
-		inserted immediately before every block of user code that might
-		contain an or_return()/checked-arithmetic early return (see
-		_pessimistic_done_prefix's own docstring for why this needs to run
-		BEFORE, not after) - the real done_state value isn't known until
-		AFTER every unit is built, so every placeholder gets patched to it
-		here, once, right below. Every ast.Return in the assembled body
-		(including this DONE short-circuit's own, and the tail's) then
-		gets its value wrapped in Result.Ok(...) - or_return()'s own Err
-		return is untouched (it's an IR-level OrReturn, built later during
-		real lowering, never a literal ast.Return node this pass ever
-		sees). '''
+		generator (next_return_type is just result_union) or set for a
+		fallible Generator[T,E] one (Result[result_union,error_type]).
+		The old AST-level pessimistic-done pre-write this method used to
+		orchestrate per-unit (_pessimistic_done_prefix) is gone too - Phase
+		F re-derives it at the LOWERING level instead (lowering.py's
+		_consume_checked_result appends a SetAttr(self.__state,done_state)
+		into every OrReturn's own epilogue whenever self._current_fn.
+		is_generator_next, reusing the exact hook Mechanism 2's own
+		error-defer replay already established there), so this method
+		doesn't need to know or care where a fallible operation might be
+		reached from anymore. Every ast.Return AND ast.Yield in the
+		assembled body then gets its value wrapped in Result.Ok(...) - see
+		_wrap_generator_next_returns_in_ok. '''
 		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() ) | set( extra_fields.keys() )
 		renamer = _GeneratorNameRenamer( rename_targets )
+
+		is_fallible = error_type is not None
+		rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
 
 		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - a
 		# SEPARATE, already-renamed copy of defer_sites, used ONLY for
 		# tagging (_tag_armed_defer_sites, below) - lowering.py's own
 		# Mechanism 2 hook (_build_generator_error_defer_replay) has no
-		# access to this file's _GeneratorNameRenamer/_rename_and_track_
-		# liveness, so unlike Mechanism 1's own _build_defer_replay_guards
-		# (which embeds the RAW body and relies on a later renamer.visit(
-		# ...) call to cover it - see that method's own docstring), the
-		# tag itself has to already carry self.<field>-qualified
-		# statements. Rendered ONCE here (not per insertion site - a
-		# single canonical copy is enough for tagging; lowering.py's own
-		# hook deep-copies its own fresh instance per OrReturn site that
-		# actually consumes it, same reasoning as Mechanism 1's per-site
-		# copies).
+		# access to this file's _GeneratorNameRenamer, so unlike
+		# Mechanism 1's own _build_defer_replay_guards (which embeds the
+		# RAW body and relies on a LATER renamer.visit(...)/_rename_and_
+		# track_liveness call to cover it - see that method's own
+		# docstring), the tag itself has to already carry self.<field>-
+		# qualified statements. Rendered ONCE here (not per insertion
+		# site - a single canonical copy is enough for tagging;
+		# lowering.py's own hook deep-copies its own fresh instance per
+		# OrReturn site that actually consumes it).
 		rendered_defer_sites: list[tuple[str,bool,list[ast.stmt]]] = [
 			( flag_stem, is_errdefer, [ renamer.visit( copy.deepcopy( s )) for s in body_stmts ] )
 			for flag_stem, is_errdefer, body_stmts in defer_sites
 		]
 
-		segments, tail = self._split_generator_segments( fn, units )
-		is_fallible = error_type is not None
-		pending_done_assigns: 'list[ast.Assign]|None' = [] if is_fallible else None
-		# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - which promoted
-		# locals need the live-flag treatment at all (see
-		# _rename_and_track_liveness/_build_generator_destructor) -
-		# scalar/non-RC locals need nothing, same posture as before this
-		# phase
-		rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
-
-		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - a single
-		# shared mutable cell, advanced in program order as each guard
-		# builder crosses one of defer_sites' own arm-assigns (see
-		# _tag_armed_defer_sites) - tags every fallible-eligible statement
-		# it's handed with "the prefix of defer_sites armed by this point"
+		# tag the WHOLE original (un-renamed - the tag values themselves
+		# are the pre-rendered copy above, but the NODES being tagged are
+		# still the raw body, walked in its own natural program order)
+		# body in ONE pass now: Phase F removed the unit/segment split
+		# that used to make "top-level" mean "this particular preamble/
+		# tail slice" - it now means exactly what _validate_generator_
+		# defer_sites already always meant by it, fn.node.body's own
+		# direct children (see _tag_armed_defer_sites' own docstring:
+		# tagging only the top-level statement of a slice is sufficient,
+		# lowering.py's own push/pop keeps it active for that whole
+		# statement's recursive lowering - unaffected by this
+		# generalization from many small slices to one whole-body slice)
 		armed_count: list[int] = [ 0 ]
-		guards: list[ast.If] = []
-		state = 0
-		for preamble, ( kind, stmt ) in segments:
-			if kind == 'yield':
-				guard, state = self._build_yield_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, rendered_defer_sites, armed_count )
-			elif kind == 'if':
-				guard, state = self._build_if_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, rendered_defer_sites, armed_count )
-			else:
-				guard, state = self._build_while_unit_guard( preamble, stmt, state, renamer, pending_done_assigns, rc_local_stems, rendered_defer_sites, armed_count )
-			guards.append( guard )
-		done_state = state + 1
-		if pending_done_assigns is not None:
-			for pending in pending_done_assigns:
-				pending.value = ast.Constant( value = done_state )
+		if defer_sites:
+			self._tag_armed_defer_sites( fn.node.body, rendered_defer_sites, armed_count )
+
+		yield_states = self._assign_generator_yield_dispatch( fn )
+		done_state = len( yield_states ) + 1
 		for pending in pending_bare_return_assigns:
 			pending.value = ast.Constant( value = done_state )
+
+		body_stmts = self._rename_and_track_liveness( fn.node.body, renamer, rc_local_stems )
+
+		anchor = fn.node.body[-1] if fn.node.body else fn.node
+		# PLAN_GENERATORS.md's defer/errdefer phase - natural exhaustion is
+		# a real generator-ending exit like any other, so every currently-
+		# armed plain `defer` site replays here too (LIFO), right before
+		# the state gets pinned to done
+		defer_replay = self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, anchor ), renamer, rc_local_stems )
+		tail_body: list[ast.stmt] = defer_replay + [
+			ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) ),
+			ast.Return( value = ast.Constant( value = None ) ),
+		]
 
 		next_body: list[ast.stmt] = [
 			ast.If(
@@ -1782,37 +1432,8 @@ class TypeResolver:
 				orelse = [],
 			),
 		]
-		next_body.extend( guards )
-
-		anchor = tail[0] if tail else fn.node
-		tail_stmts = self._rename_and_track_liveness( tail, renamer, rc_local_stems )
-		if is_fallible:
-			# the real done_state is already known here (unlike each unit's
-			# own placeholder above) - tail_stmts is ordinary user code
-			# (whatever follows the last unit) and can fail just like any
-			# other block, so it needs the same pessimistic guarding
-			if defer_sites:
-				self._tag_armed_defer_sites( tail_stmts, rendered_defer_sites, armed_count )
-			pessimistic = ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) )
-			ast.copy_location( pessimistic, anchor )
-			tail_stmts = [ pessimistic ] + tail_stmts
-		# PLAN_GENERATORS.md's defer/errdefer phase - the tail's own
-		# natural-exhaustion exit is a real generator-ending exit like any
-		# other, so every currently-armed plain `defer` site replays here
-		# too (LIFO), right before the state gets pinned to done. Unlike
-		# the bare-return call site (which embeds these raw and relies on
-		# a LATER bulk rename), this one renames explicitly right now -
-		# renamer/rc_local_stems are already in hand here
-		defer_replay = self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, anchor ), renamer, rc_local_stems )
-		tail_body = tail_stmts + defer_replay + [
-			ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) ),
-			ast.Return( value = ast.Constant( value = None ) ),
-		]
-		next_body.append( ast.If(
-			test = ast.Compare( left = self._self_attr( '__state', anchor ), ops = [ ast.LtE() ], comparators = [ ast.Constant( value = state ) ] ),
-			body = tail_body, orelse = [],
-		))
-		next_body.append( ast.Return( value = ast.Constant( value = None ) )) # unreachable safety net - every path above already returns
+		next_body.extend( body_stmts )
+		next_body.extend( tail_body )
 
 		if is_fallible:
 			self._wrap_generator_next_returns_in_ok( next_body )
@@ -1824,13 +1445,28 @@ class TypeResolver:
 			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
 		)
 		ast.fix_missing_locations( node )
+		node.generator_yield_states = yield_states
 
 		next_fn = Function(
 			stem = '__next__', qualname = f'{backing_cls.qualname}.__next__', file = fn.file, line = fn.line,
 			cls = backing_cls, node = node,
 			parameters = [], return_type = next_return_type,
 			is_static = False, resolve = None,
+			is_generator_next = True,
 		)
+		# PLAN_GENERATORS.md Phase F - unlike the old unit-matcher (which
+		# rewrote every ast.Yield into a plain ast.Return before this
+		# point, so $$__next__'s own assembled body never contained one),
+		# next_fn.node.body now embeds the REAL ast.Yield nodes directly -
+		# _function_contains_yield would otherwise see them and treat
+		# $$__next__ itself as an unrelated generator needing its OWN
+		# synthesis (confirmed via a real repro: "a generator method is
+		# not supported yet", ensure_generator_synthesized reached with
+		# fn.cls already set). Pre-marking id(next_fn) here, the same way
+		# id(fn) itself gets marked at the top of ensure_generator_
+		# synthesized, makes that check a no-op the moment anything
+		# (lowering.py's own safety-net call, in particular) reaches it.
+		self._generators_synthesized.add( id( next_fn ))
 		backing_cls.methods.append( next_fn )
 		backing_cls.names[ next_fn.stem ] = next_fn
 		return next_fn
@@ -1839,24 +1475,29 @@ class TypeResolver:
 		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
 		Generator[T,E]'s $$__next__ declares -> Result[elem_type|None,E],
 		so every `return <value>` built anywhere above (the DONE short-
-		circuit's `return None`, every yield-unit's `return <yielded>`,
-		the tail's/safety-net's `return None`) needs to become `return
-		Result.Ok(<value>)` instead. Run once, after the WHOLE body is
-		assembled, rather than threading Result-wrapping through every
-		individual guard builder - simpler, and correct because $$__next__
-		can never contain a nested def/lambda (generator bodies already
-		reject those), so a plain ast.walk (no "don't recurse into a
-		nested scope" concern, unlike _walk_generator_body elsewhere in
-		this file) safely reaches every ast.Return belonging to THIS
-		function. Result.Ok(...)'s own payload argument is coerced the
-		ordinary way (same _lower_expr(arg,expected_type) machinery any
-		other call argument gets, confirmed via a real repro: a bare
-		elem_type value OR a bare None constant both coerce into the
-		declared elem_type|None payload with no extra wrapping needed
-		here) - so this never needs to know what shape `value` already is. '''
+		circuit's `return None`, the tail's/safety-net's `return None`)
+		AND every `yield <value>` reachable anywhere in the body (PLAN_
+		GENERATORS.md Phase F - lowering.py's own yield-lowering coerces
+		ast.Yield.value against self._current_fn.return_type exactly like
+		_stmt_Return already coerces its own value, so wrapping it here,
+		the SAME uniform way, needs zero special-casing there) needs to
+		become `Result.Ok(<value>)` instead. Run once, after the WHOLE
+		body is assembled, rather than threading Result-wrapping through
+		individual construction sites - simpler, and correct because
+		$$__next__ can never contain a nested def/lambda (generator
+		bodies already reject those), so a plain ast.walk (no "don't
+		recurse into a nested scope" concern, unlike _walk_generator_body
+		elsewhere in this file) safely reaches every ast.Return/ast.Yield
+		belonging to THIS function. Result.Ok(...)'s own payload argument
+		is coerced the ordinary way (same _lower_expr(arg,expected_type)
+		machinery any other call argument gets, confirmed via a real
+		repro: a bare elem_type value OR a bare None constant both coerce
+		into the declared elem_type|None payload with no extra wrapping
+		needed here) - so this never needs to know what shape `value`
+		already is. '''
 		for stmt in next_body:
 			for n in ast.walk( stmt ):
-				if isinstance( n, ast.Return ):
+				if isinstance( n, ( ast.Return, ast.Yield )):
 					value = n.value if n.value is not None else ast.Constant( value = None )
 					ok_call = ast.Call(
 						func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
@@ -2166,7 +1807,7 @@ class TypeResolver:
 			self.schedule( elem_type )
 
 			extra_fields = self._desugar_generator_for_loops( fn )
-			units = self._collect_generator_units( fn )
+			self._reject_generator_yield_from( fn )
 			self._validate_generator_defer_sites( fn )
 			defer_sites = self._desugar_generator_defer_sites( fn )
 			self._reject_generator_value_return( fn )
@@ -2195,7 +1836,7 @@ class TypeResolver:
 				next_return_type = result_union
 
 			backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
-			self._build_generator_next_function( fn, backing_cls, units, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
+			self._build_generator_next_function( fn, backing_cls, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
 			# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 			# backing_cls is ever scheduled below, so its own pre-mark of
 			# id(backing_cls) in self._destructors_synthesized (see its own

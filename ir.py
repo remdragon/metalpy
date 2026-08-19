@@ -727,6 +727,34 @@ class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no fi
 @dataclass( kw_only = True )
 class Return( Instruction ):
 	value: Operand|None
-	
+
 	def test_repr( self ) -> str:
 		return f'Return( value={self.value!r} )'
+
+@dataclass( kw_only = True )
+class Yield( Instruction ):
+	''' PLAN_GENERATORS.md Phase F - a real `yield` suspend point inside a
+	generator's $$__next__ body (Function.is_generator_next). Codegen
+	(emitter_c.py) is deliberately trivial - `return value;`, the exact
+	same shape ir.Return's own non-void/non-entry-point branch already
+	emits ($$__next__ always has a concrete, non-void return type, and is
+	never the program's entry point) - the state store (self.__state =
+	state) is an ordinary, separate ir.SetAttr emitted immediately BEFORE
+	this instruction, and the resume point is an ordinary, separate
+	ir.Label(name=resume_label) emitted immediately AFTER it
+	(lowering.py's own yield-lowering emits all three, back to back) -
+	both already-proven, unmodified machinery, reused as-is rather than
+	reimplemented inside this instruction's own codegen. A LATER call,
+	dispatched via the function's own state-check prologue jumping
+	straight to that label, resumes execution there. state/resume_label
+	are carried here anyway (not read back by codegen at all) purely so a
+	dumped/test_repr'd instruction stream is self-describing - state is
+	this yield's own dispatch discriminant (unique per textual yield
+	site, assigned by TypeResolver._assign_generator_yield_dispatch,
+	starting at 1 - state 0 means "not yet started"). '''
+	value: Operand # already coerced/wrapped to match the function's own declared return type (elem_type|None, or Result[elem_type|None,error_type] when fallible) - same convention ir.Return's own `value` field expects
+	state: int
+	resume_label: str
+
+	def test_repr( self ) -> str:
+		return f'Yield( value={self.value!r}, state={self.state}, resume_label={self.resume_label!r} )'

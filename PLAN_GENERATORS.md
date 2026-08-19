@@ -1,31 +1,47 @@
 Generator functions (`yield`, state-machine transform)
 
-> **Note (2026-08-19): this STATUS section describes design work that is
-> NOT reflected in the current code.** Phase F (real IR-level `ir.Yield`
-> dispatch, replacing the old AST-synthesis unit-matcher), Phase B, Phase
-> C (`.send()`), and the A.4a follow-up (`yield from`/nested for-loop
-> consumption) below were fully implemented, tested, and merged to master
-> (commit a4a1d5d). The very next merge (1a89a86, "Merge branch
-> 'worktree-lib-logging'") resolved a conflict by keeping the OLDER,
-> pre-Phase-F versions of `ir.py`/`lowering.py`/`type_resolver.py`/
-> `cfg.py`/`discovery.py`/`emitter_c.py`/`emitter_c_test.py` instead of
-> the just-merged ones, silently discarding the implementation while this
-> doc (mostly) survived. By the time this was noticed, master had
-> diverged from a4a1d5d by 150+ commits touching exactly the substrate
-> Phase F depended on (RC/liveness tracking, generic overload dispatch,
-> scalar/union dunder dispatch), so reapplying the old branch as a patch
-> is not viable - recovering the real Phase F/B/C/A.4a implementation
-> means re-deriving it against current master, using commits
-> `b881707..cc84341` (tip `fd36ed3`, merged via `a4a1d5d`) as a design
-> reference. This section is restored here as that reference/spec, kept
-> in its original "landed" phrasing since it describes what WAS true at
-> `a4a1d5d` - do not read it as describing current master. Current
-> master's generator support stops at the "defer/errdefer" paragraph
-> below (v1 through Phase 9 + the defer/errdefer mini-plan); everything
-> from "Past THAT, a second major rebuild..." onward, and the "Phase F
-> design"/"Phase B design"/"Phase C design"/A.4a sections further down,
-> describe code that does not exist on master today. A rebuild has not
-> been scheduled.
+> **Note (2026-08-19): Phase F has been REIMPLEMENTED and is real again as
+> of this note - Phase C/A.4a below are still NOT.** History recap: Phase
+> F/B/C/A.4a were originally built, merged to master (a4a1d5d), then
+> silently discarded by the next merge (1a89a86) before anyone noticed.
+> By the time that was caught, master had diverged too far (150+ commits
+> touching the exact substrate Phase F depends on) for the old branch to
+> be reapplied as a patch, so Phase F was rebuilt FRESH against current
+> master (worktree `generator-phase-f-rebuild`) using the sections below
+> as a design reference, not as a diff. The new implementation reaches
+> the same destination (real `ir.Yield` + `self.__state` goto/label
+> dispatch, built at lowering time; arbitrary yield nesting/multiplicity,
+> `elif` chains, `break`/`continue` in a yield-containing loop all now
+> ordinary compile-and-run cases) but its own internal names differ from
+> what "Phase F design" below describes - see `type_resolver.py`'s
+> `_assign_generator_yield_dispatch`/`_build_generator_next_function` and
+> `lowering.py`'s `_lower_generator_yield`/`_emit_generator_dispatch_
+> prologue` for the ACTUAL current mechanism; the design section is kept
+> for its reasoning, not as a literal function-by-function map anymore.
+> Phase B's own nesting/multiplicity verification is covered by
+> `emitter_c_test.py`'s `test_previously_rejected_shapes_now_compile_and_
+> run`. Three real, generator-unrelated bugs were found (and fixed) while
+> rebuilding this, via real compile-and-run testing exactly like the
+> original build: (1) a yield reached outside a successfully-synthesized
+> generator needs a graceful `discovery.fail()`, not a raw crash, when an
+> earlier, unrelated error left synthesis only partially done; (2)
+> `cfg.py`'s `merge_loop_exits()` wiped `self._live` to empty (rather
+> than preserving the loop's own entry snapshot) whenever a `while True:`
+> loop had no `break` at all - harmless for genuinely dead code in an
+> ordinary function, but wrong the moment code after such a loop is
+> actually reachable (a generator's own synthesized tail, in particular);
+> (3) `_lower_generator_yield` needed the same `_cfg.untrack_temp(value)`
+> call `_stmt_Return` already makes before its own temp flush, or the
+> flush immediately decrefs the very value a union-coercion's own
+> constructor just increfed, silently cancelling it out - confirmed via a
+> real `compiler.refcount()` repro (a captured RC parameter yielded back
+> through a match arm read one lower than expected). **Phase C
+> (`.send()`) and the A.4a follow-up (`yield from`) are NOT implemented**
+> on current master - the "Phase C design"/A.4a sections further down
+> describe a design that was real once (on the original, now-superseded
+> branch) and could still guide a future implementation, but nothing
+> below "Phase F: defer/errdefer under real nested lowering" reflects
+> current code. A `.send()`/`yield from` rebuild has not been scheduled.
 
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
@@ -57,28 +73,33 @@ part of the numbered sequence above - see "defer/errdefer phase design"
 below), including a prerequisite fix (a bare `return` inside a generator
 body now correctly ends iteration permanently, not just once).
 
-Past THAT, a second major rebuild has landed: **Phase F** replaced the
-entire AST-synthesis dispatch mechanism (`_collect_generator_units` and
-its three per-shape guard builders - the flat-unit-recognition machinery
-every phase above this point was built on top of) with a real IR-level
+Past THAT, a second major rebuild has landed (reimplemented from scratch
+2026-08-19, after the original build was lost to a merge conflict - see
+this doc's own top-of-file note): **Phase F** replaced the entire AST-
+synthesis dispatch mechanism (the old `_collect_generator_units` and its
+per-shape guard builders - the flat-unit-recognition machinery every
+phase above this point was built on top of) with a real IR-level
 `ir.Yield` + `self.__state` goto/label dispatch, built directly by
 lowering.py instead of hand-assembled AST. This is what finally lifted
 the structural restrictions every phase above inherited from the unit
 model: multiple yields per loop/branch, yield nested at ARBITRARY depth
 (if-in-while, while-in-if, three-plus levels), `elif` chains containing
 yield, and `break`/`continue` inside a yield-containing loop are all now
-ordinary compile-and-run cases, not compile errors - see "Phase F
-design" below. **Phase B** (real repro tests filling out the
-nesting/multiplicity matrix Phase F unlocked) and **Phase C** (`.send()`
-- a new 3-arg `Generator[T,SendType,E]` form, yield used as a captured
-EXPRESSION, backing-class `__send_slot`/`__send_ready` fields, and the
-`$$__resume__`/`__next__`/`send()` method split) landed alongside it -
-see "Phase B design"/"Phase C design" below. The **A.4a follow-up**
-(`yield from`, and an ordinary for-loop-with-yield, at non-top-level
-positions - previously top-level-only) also landed as part of this same
-pass, with one newly-discovered, deliberately-scoped-out restriction
-(nested inside a while/for loop that could re-enter it - see its own
-write-up below for why).
+ordinary compile-and-run cases, not compile errors - real-compile-and-run
+verified via `emitter_c_test.py`'s `test_previously_rejected_shapes_now_
+compile_and_run` (the **Phase B** nesting/multiplicity verification bar),
+all 3 compilers. See "Phase F design" below for the ORIGINAL build's own
+reasoning (still broadly accurate) - its literal internal names describe
+the original, now-superseded implementation; see this doc's own top note
+for where the CURRENT mechanism actually lives.
+
+**Phase C (`.send()`) and the A.4a follow-up (`yield from`) did NOT come
+back with this rebuild** - only Phase F/B did. `Iterator[T]`/`Generator[
+T,E]` stay 1-/2-type-param forms with no `SendType`; `yield from` is
+still a clean, explicit rejection (`TypeResolver._reject_generator_yield_
+from`). The "Phase C design"/A.4a sections below describe what the
+ORIGINAL branch built, kept as a design reference for whoever picks this
+back up, not as a description of anything currently compilable.
 
 PLAN_GENERATORS.md's own motivating example now compiles and runs in its
 most natural, idiomatic spelling: `for i in range(count): yield i`,
