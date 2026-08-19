@@ -3199,6 +3199,107 @@ def main() -> i32:
 			self.assertEqual( result.returncode, 42, f'exe exited {result.returncode}, expected 42 (stderr: {result.stderr})' )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+@unittest.skipUnless( os.name == 'nt', 'no_crt is a Windows-only concept in this codebase - on Linux the compiler always targets the host platform (see wsl_gcc_real_posix_target_testing memory) and always links glibc regardless, so this fixture legitimately pulls in libc there (no_crt is never True) rather than exercising the gap this class tests' )
+class NoCrtLocalArrayStructRealCompileTests( unittest.TestCase ):
+	# clang/gcc's own -O0 codegen lowers a local @cstruct's zero-init (any
+	# array-bearing field, regardless of size - confirmed down to 8 bytes)
+	# to a real `call memset`, and a by-value struct copy above a small
+	# size threshold to `call memcpy` - neither is a call this module's own
+	# extern-tracking machinery ever sees (inserted directly by the C
+	# compiler's backend, not lowered from any ir.Call emitter_c itself
+	# emits), so `no_crt = 'c' not in compiler.extern_libs` can't catch it
+	# the way an explicit crt.memset()/crt.memcpy() call would (that always
+	# flips no_crt off). Confirmed via a real LNK2019 "unresolved external
+	# symbol memset" building this exact shape before emit_c() started
+	# providing freestanding stand-ins for both symbols under no_crt.
+	def _compile_and_run( self, source: str, expected_exit: int ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, expected_exit, f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
+
+	def test_local_array_bearing_cstruct_zero_init( self ) -> None:
+		self._compile_and_run( '''
+@cstruct
+class Buf8:
+	items: i32[8] = 0
+
+def compute( x: i32 ) -> i32:
+	buf: Buf8 = Buf8()
+	with compiler.wrap_arithmetic:
+		i: usize = usize( 0 )
+		while i < usize( 8 ):
+			buf.items[i] = x + i32( i )
+			i += usize( 1 )
+	return buf.items[usize(0)]
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return compute( 10 ) - 10
+''', expected_exit = 0 )
+
+	def test_local_array_bearing_cstruct_by_value_copy( self ) -> None:
+		# large enough (512 bytes) to push clang past whatever inline-store
+		# threshold it uses at -O0 and actually emit `call memcpy` for the
+		# by-value struct copy (confirmed via a real compile with this fix
+		# reverted) - too small to also trip the SEPARATE, still-open
+		# __chkstk large-stack-frame gap under MSVC (see
+		# msvc_no_crt_missing_chkstk memory), which this test deliberately
+		# doesn't exercise (confirmed empirically: compute()'s own frame -
+		# its own BufMed local PLUS the by-value outgoing argument copy for
+		# touch(src) - trips __chkstk at 256 elements/1KB already, well
+		# below the single-local 4KB threshold that gap's own memory notes)
+		self._compile_and_run( '''
+@cstruct
+class BufMed:
+	items: i32[128] = 0
+
+def touch( b: BufMed ) -> i32:
+	buf: BufMed = b
+	return buf.items[0]
+
+def compute( x: i32 ) -> i32:
+	src: BufMed = BufMed()
+	with compiler.wrap_arithmetic:
+		i: usize = usize( 0 )
+		while i < usize( 128 ):
+			src.items[i] = x + i32( i )
+			i += usize( 1 )
+	return touch( src )
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return compute( 10 ) - 10
+''', expected_exit = 0 )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
 	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:
 		# PLAN_GLOBAL_INIT.md flags TRUE cross-global dependency ordering

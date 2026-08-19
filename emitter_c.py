@@ -3937,4 +3937,39 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			'int _fltused = 0x9875;\n'
 			'#endif'
 		)
+		# clang/gcc's own -O0 codegen lowers ANY nontrivial local zero-init
+		# (a bare `struct Foo x = {0};`-shaped compound literal, regardless
+		# of struct/array size - confirmed even an 8-byte i32[2] field) to a
+		# real `call memset`, and a by-value struct copy above a small size
+		# threshold to `call memcpy` - neither is a call MetalPy's own
+		# extern-tracking machinery ever sees (it's inserted directly by the
+		# C compiler's backend, not lowered from any ir.Call this module
+		# emits), so the `no_crt = 'c' not in compiler.extern_libs`
+		# auto-detection in mpy.py can never catch it the way an explicit
+		# crt.memset()/crt.memcpy() call would (that always flips no_crt
+		# off). Confirmed via a real LNK2019 "unresolved external symbol
+		# memset" building a @cstruct with an i32[8] field as a plain local.
+		# MSVC's own /Od codegen never referenced either symbol in testing
+		# (up to a 2KB by-value struct copy, before hitting the separate,
+		# still-open __chkstk gap - see msvc_no_crt_missing_chkstk memory) -
+		# defined unconditionally here anyway since an unreferenced extern
+		# definition is harmless, and cheaper than special-casing per
+		# compiler. Volatile-pointer stores, not plain ones: defeats loop-
+		# idiom recognition folding this very definition back into a call to
+		# itself under a --release (-O2) no_crt build.
+		parts.append(
+			'#ifdef _WIN32\n'
+			'void* memset( void* dst, int value, size_t n ) {\n'
+			'\tvolatile unsigned char* p = (volatile unsigned char*)dst;\n'
+			'\tfor ( size_t i = 0; i < n; i++ ) p[i] = (unsigned char)value;\n'
+			'\treturn dst;\n'
+			'}\n'
+			'void* memcpy( void* dst, const void* src, size_t n ) {\n'
+			'\tvolatile unsigned char* d = (volatile unsigned char*)dst;\n'
+			'\tconst unsigned char* s = (const unsigned char*)src;\n'
+			'\tfor ( size_t i = 0; i < n; i++ ) d[i] = s[i];\n'
+			'\treturn dst;\n'
+			'}\n'
+			'#endif'
+		)
 	return '\n\n'.join( part for part in parts if part ) + '\n'
