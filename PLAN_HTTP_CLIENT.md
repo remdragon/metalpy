@@ -611,15 +611,47 @@ Remaining backlog / future work
   the list survives across sessions - this is expected to take a while to
   work through, not a next-session todo.
 
-  1. Request/response logging with secret redaction (user-requested feature,
-     not yet started). Originally recorded as blocked on lib/logging.py
-     maturing - NO LONGER the case now that the integration point is
-     settled as a plain Callable[[str],None] sink, not a Logger (see
-     below) - that needs no lib/logging.py machinery at all. Not
-     specifically blocked on anything else in http.client either; mostly
-     just not started yet.
+  1. Request/response logging with secret redaction - LANDED. `log:
+     Ptr[Callable[[str],None]] = _no_op_sink` and `sensitive_values:
+     list[str]|None = None` threaded through Session.request()/get/post/
+     put/patch/delete/head/options and the matching module-level
+     convenience functions. Verified for real, not just compiled:
+     http_client_test.py's session_log_with_secret_redaction spins up a
+     loopback server, makes a real request with a secret header value and
+     a real sink function, and confirms both the request line and the
+     response status line reached the sink, the secret itself never
+     appears in the captured text, and the '***CENSORED***' placeholder
+     does (proving substitution happened, not that the header was silently
+     dropped). Full suite green on all three local compilers (MSVC, clang,
+     gcc via WSL - 1408 tests each).
 
-     Design settled by studying a working real-world reference the user
+     One real compiler bug found landing this, workaround shipped, real
+     fix flagged as task_92b90a9a: `Ptr[Callable[...]]|None` (or
+     `Closure[...]|None`) compiles as a parameter type (matches
+     lib/bisect.py's own pre-existing `key: Callable[[T],K]|None`
+     signature) but calling THROUGH it after narrowing (`is not None` or
+     `match`, doesn't matter which) fails with "cannot call log" even
+     though calling the exact same type unwrapped (non-Optional) works
+     fine - and routing the narrowed value into a separate non-Optional-
+     typed helper function (the usual workaround for narrowing that
+     doesn't survive some other context in this codebase) dodges that only
+     to hit a DEEPER emitter crash instead ("NotImplementedError: c_type:
+     unsupported type CallableType(...)" - a Callable/Closure has
+     apparently never been exercised as a union payload's storage type
+     before). Worked around by never constructing the union at all: `log`
+     defaults to a real no-op function (`_no_op_sink`) instead of `None`,
+     so it's always safely callable with no narrowing anywhere. Costs one
+     extra indirect call per request when a caller doesn't pass `log=`;
+     negligible.
+
+     Deliberate v1 simplification, not a gap: a binary (non-UTF-8) request/
+     response body logs as a `<N bytes, not valid UTF-8>` placeholder
+     rather than an escaped byte-for-byte rendering (CPython's
+     backslashreplace equivalent) - this stdlib has no codec support for
+     that yet, and it wasn't worth blocking the feature on it.
+
+     Design was settled (before implementation) by studying a working
+     real-world reference the user
      already relies on day to day: C:\cvs\itas\incpy\demands.py (a Python/
      `requests`-based wrapper the user built for the same job). Conclusions
      to carry over into http.client's own version, not open questions:
@@ -675,11 +707,12 @@ Remaining backlog / future work
          something interactively. This means the lib/logging.py maturity
          blocker applies to essentially none of this feature - a sink
          parameter needs no Logger machinery at all, only a working
-         Closure[[str],None] type (MetalPy generic closures - unrelated to
-         logging.py's own readiness). Re-confirm Closure[[str],None]
-         actually compiles cleanly through this call shape when picked
-         back up, but there's no longer a reason to wait on logging.py
-         maturing before starting this.
+         callable-parameter type - unrelated to logging.py's own
+         readiness. Confirmed correct: ended up using `Ptr[Callable[[str],
+         None]]`, not `Closure[[str],None]` (Closure turned out to be
+         specifically for bound-method values like `w.get`, not a general
+         callable slot - see the "LANDED" note above for the real shape
+         used and the compiler bug hit getting there).
 
   2. `files=` multipart/form-data uploads. Deferred since the original
      scoping pass - even the PHP fetch() reference this project mirrors

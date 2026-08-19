@@ -1010,6 +1010,103 @@ def _next_redirect_url( response: Response, allow_redirects: bool, current_url: 
 			return resolved
 	return ''
 
+# ---------------------------------------------------------------------------
+# request/response logging with secret redaction (PLAN_HTTP_CLIENT.md's
+# "Remaining backlog" item 1) - design lifted from a working real-world
+# reference (the user's own C:\cvs\itas\incpy\demands.py): redact by VALUE
+# (caller-supplied secret strings), not by header name; censor the whole
+# serialized wire message in one pass; redact before ever handing text to
+# the sink; sink is a plain callable, not a Logger, so each call site can
+# log in its own context (or nowhere - print, a bound logger.info method,
+# whatever the caller wants).
+#
+# log's default is a real no-op function, NOT `None` - a `Ptr[Callable[...]]
+# |None` parameter compiles (bisect.py's own key: Callable[[T],K]|None has
+# the identical shape) but calling THROUGH it after `is not None`/match
+# narrowing crashes ("cannot call log"), and storing one as a union payload
+# crashes emitter_c.py's c_type() outright ("unsupported type
+# CallableType(...)") - both confirmed via minimal repro, neither specific
+# to this file. Flagged as task_92b90a9a; the no-op-default shape below sidesteps
+# both entirely (no union, always safely callable) and costs nothing more
+# than one indirect call per request when the caller doesn't pass log=.
+# ---------------------------------------------------------------------------
+
+def _no_op_sink( s: str ) -> None:
+	pass
+
+def _redact( text: str, sensitive_values: list[str]|None ) -> str:
+	''' replaces every occurrence of every string in sensitive_values with
+	'***CENSORED***', longest value first so a short secret that happens to
+	be a substring of a longer one doesn't leave a mangled partial redaction
+	behind. A plain str.replace() chain, not a regex - every value here is a
+	literal to match verbatim, never a pattern, so a regex library buys
+	nothing (per the user directly). list[T] has no sort() yet, hence the
+	manual selection sort - fine at the size this ever runs at (a handful of
+	caller-supplied secrets per request, not a bulk data path). Copies
+	sensitive_values into a local list first rather than sorting it in
+	place, so a caller's own list isn't silently reordered as a side effect. '''
+	if sensitive_values is None:
+		return text
+	source: list[str] = sensitive_values
+	n: usize = source.__len__()
+	values: list[str] = list[str]()
+	i: usize = 0
+	for i in range( n ):
+		v: str = source.__getitem__( i ).unwrap( '_redact: index in bounds by construction' )
+		values.append( v ).unwrap( '_redact: append failed' )
+
+	with compiler.panic_arithmetic( 'n bounded by a real caller-supplied list, cannot overflow' ):
+		for i in range( n ):
+			longest: usize = i
+			j: usize = i + 1
+			for j in range( i + 1, n ):
+				a: str = values.__getitem__( j ).unwrap( '_redact: index in bounds by construction' )
+				b: str = values.__getitem__( longest ).unwrap( '_redact: index in bounds by construction' )
+				if a.__len__() > b.__len__():
+					longest = j
+			if longest != i:
+				vi: str = values.__getitem__( i ).unwrap( '_redact: index in bounds by construction' )
+				vl: str = values.__getitem__( longest ).unwrap( '_redact: index in bounds by construction' )
+				values.__setitem__( i, vl ).unwrap( '_redact: index in bounds by construction' )
+				values.__setitem__( longest, vi ).unwrap( '_redact: index in bounds by construction' )
+
+	redacted: str = text
+	for i in range( n ):
+		secret: str = values.__getitem__( i ).unwrap( '_redact: index in bounds by construction' )
+		if secret.__len__() > 0:
+			redacted = redacted.replace( secret, '***CENSORED***' )
+	return redacted
+
+def _body_text_for_log( content: bytes ) -> str:
+	''' best-effort text rendering of a body for logging - invalid UTF-8
+	(a binary body) collapses to a placeholder rather than attempting a
+	byte-level escape (CPython's backslashreplace equivalent) that this
+	stdlib has no codec support for yet. '''
+	if content.__len__() == 0:
+		return ''
+	match content.decode():
+		case Result.Ok( s ):
+			return s
+		case Result.Err( _ ):
+			return '<' + content.__len__().__str__() + ' bytes, not valid UTF-8>'
+
+def _build_request_text( method: str, path: str, host: str, headers: HTTPHeaders, body: bytes|None ) -> str:
+	head: str = _build_request_head( method, path, host, headers, body )
+	if body is None:
+		return head
+	b: bytes = body
+	return head + _body_text_for_log( b )
+
+def _build_response_text( response: Response ) -> str:
+	head: str = 'HTTP/1.1 ' + response.status_code.__str__() + ' ' + response.reason + '\r\n'
+	n: usize = response.headers.__len__()
+	i: usize = 0
+	for i in range( n ):
+		name: str = response.headers.name_at( i ).unwrap( '_build_response_text: index in bounds by construction' )
+		value: str = response.headers.value_at( i ).unwrap( '_build_response_text: index in bounds by construction' )
+		head = head + name + ': ' + value + '\r\n'
+	return head + '\r\n' + _body_text_for_log( response.content )
+
 class Session:
 	headers: HTTPHeaders
 	__cookies: dict[str,str]
@@ -1066,6 +1163,8 @@ class Session:
 		auth: tuple[str,str]|None = None,
 		allow_redirects: bool = True,
 		verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink,
+		sensitive_values: list[str]|None = None,
 	) -> Result[Response, HTTPError]:
 		current_method: str = method
 		current_url: str = url
@@ -1092,8 +1191,11 @@ class Session:
 				cookie_header: str|None = self._build_cookie_header( cookies )
 				request_headers: HTTPHeaders = _build_request_headers( self.headers, content_type, headers, cookie_header, auth )
 
+				log( _redact( _build_request_text( current_method, full_path, parsed.host, request_headers, current_body ), sensitive_values ))
+
 				response: Response = _perform_request_for_scheme( parsed.scheme, parsed.host, parsed.port, current_method, full_path, request_headers, current_body, verify ).or_return()
 				response.url = current_url
+				log( _redact( _build_response_text( response ), sensitive_values ))
 				self._harvest_cookies( response.headers )
 
 				# '' is a "don't redirect" sentinel, not Optional - see
@@ -1113,32 +1215,39 @@ class Session:
 				current_url = next_url
 
 	def get( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'GET', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+		return self.request( 'GET', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 	def post( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'POST', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+		return self.request( 'POST', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 	def put( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'PUT', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+		return self.request( 'PUT', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 	def patch( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'PATCH', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+		return self.request( 'PATCH', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 	def delete( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'DELETE', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+		return self.request( 'DELETE', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 	def head( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False, verify: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'HEAD', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False, verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+		return self.request( 'HEAD', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 	def options( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'OPTIONS', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+		log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+		return self.request( 'OPTIONS', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 # ---------------------------------------------------------------------------
 # module-level convenience - each a one-off Session() underneath, matching
@@ -1147,29 +1256,36 @@ class Session:
 # ---------------------------------------------------------------------------
 
 def get( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-	return Session().get( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+	log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+	return Session().get( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 def post( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-	return Session().post( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+	log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+	return Session().post( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 def put( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-	return Session().put( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+	log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+	return Session().put( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 def patch( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-	return Session().patch( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+	log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+	return Session().patch( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 def delete( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-	return Session().delete( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+	log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+	return Session().delete( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 def head( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False, verify: bool = True ) -> Result[Response, HTTPError]:
-	return Session().head( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False, verify: bool = True,
+	log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+	return Session().head( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
 
 def options( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
-	return Session().options( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True,
+	log: Ptr[Callable[[str],None]] = _no_op_sink, sensitive_values: list[str]|None = None ) -> Result[Response, HTTPError]:
+	return Session().options( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify, log = log, sensitive_values = sensitive_values )
