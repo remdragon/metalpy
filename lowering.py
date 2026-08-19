@@ -457,9 +457,9 @@ class Lowering:
 		# when it takes that path, rather than have this function re-
 		# inspect/re-resolve node.value's own type to tell the two
 		# Subscript shapes apart (the same "risk re-resolving and double-
-		# evaluating the receiver" ast.Attribute's own ClosureType check
-		# below avoids by taking the callee's already-lowered operand
-		# instead). Missing this (confirmed by a real, repeated-real-
+		# evaluating the receiver" problem ast.Attribute's own is_bound_
+		# method_closure tag below avoids the same way). Missing this
+		# (confirmed by a real, repeated-real-
 		# compile-and-run-verified use-after-free, not just reasoning):
 		# reassigning an existing local to another tuple element read
 		# (`x = some_tuple[0]`, x already bound) skipped the Incref an
@@ -472,10 +472,20 @@ class Lowering:
 		# but `worker.run` (a bound-method reference) CONSTRUCTS a fresh
 		# closure (an Allocate underneath, via _lower_bound_method_closure)
 		# - same "fresh owned handoff" shape as a Call, not a read.
-		# Re-inspecting node itself can't tell these apart without
-		# re-resolving (and risking double-evaluating) the receiver, so
-		# callers instead pass the operand they ALREADY lowered from node -
-		# its type alone settles it cheaply and exactly, no re-lowering.
+		# _lower_bound_method_closure tags ITS OWN node (node.
+		# is_bound_method_closure) the same way _expr_Subscript tags
+		# is_tuple_element_read below - checking the OPERAND's type alone
+		# (as this used to) is NOT enough: an ordinary field read whose
+		# DECLARED type happens to be ClosureType (e.g. a union payload
+		# access like `self.data.v_Ok` for a Result[Closure[...],E], or any
+		# user field typed Closure[...]) produces the same ClosureType
+		# operand while genuinely aliasing an EXISTING closure, not
+		# constructing a fresh one - confirmed by a real heap-use-after-free:
+		# `list[Closure[...]]` silently under-referenced every element
+		# popped back out, because Result.unwrap()'s `ok: T = self.data.
+		# v_Ok` was wrongly treated as fresh (skipping the Incref an
+		# aliasing capture-into-local needs) whenever T happened to be a
+		# Closure.
 		# Scoped to ast.Attribute specifically, NOT every ClosureType
 		# operand - `d = c` (a bare Name reading an EXISTING closure local)
 		# is an ordinary aliasing read like any other RC-typed Name, and
@@ -516,8 +526,7 @@ class Lowering:
 		# ast.Attribute" to "any node a coercion silently replaced".
 		if getattr( operand, 'is_union_coerce_result', False ):
 			return False
-		operand_type = operand.type if operand is not None else None
-		if isinstance( node, ast.Attribute ) and isinstance( operand_type, ClosureType ):
+		if isinstance( node, ast.Attribute ) and getattr( node, 'is_bound_method_closure', False ):
 			return False
 		if isinstance( node, ast.Subscript ):
 			return getattr( node, 'is_tuple_element_read', False )
@@ -7299,6 +7308,13 @@ class FunctionLowering:
 		# - a compiler-synthesized RCClass (ClosureType), so every existing
 		# RC mechanism (cfg.py's is_rc/rc_leaves/assign/move) applies
 		# completely unchanged from here on, no special-casing needed
+		# is_bound_method_closure tags this SPECIFIC node so
+		# _is_aliasing_expr can tell it apart from an ordinary field read
+		# whose declared type just happens to be ClosureType (e.g.
+		# `self.data.v_Ok` for a Result[Closure[...],E]) - see
+		# _is_aliasing_expr's own comment on why the operand's type alone
+		# isn't enough
+		node.is_bound_method_closure = True
 		self.lowering._ensure_resolved( method )
 		if method.broken:
 			raise RedundantCompilationError() # already reported at the point method's own resolution failed - see Name.broken

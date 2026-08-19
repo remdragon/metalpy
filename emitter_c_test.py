@@ -6015,6 +6015,49 @@ def main() -> i32:
 		diff: i32 = result - 42
 	return diff
 ''' ),
+			# real heap-use-after-free found via list[Closure[[],None]]: a
+			# Closure stored/retrieved through a generic container (list[T])
+			# was silently under-referenced by one - Result.unwrap()'s `ok: T
+			# = self.data.v_Ok` (an ast.Attribute read of an EXISTING union
+			# payload) was misidentified as a FRESH closure construction
+			# (the same node shape `worker.run` uses) purely because its
+			# type happened to be ClosureType, skipping the Incref an
+			# aliasing capture-into-local needs. append()/pop()/unwrap()
+			# all round-trip through exactly this path
+			( 'list_of_closures_round_trips_refcount_correctly', '''
+class Counter:
+	n: i32
+	def __init__( self ) -> None:
+		self.n = 0
+	def bump( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.n = self.n + 1
+
+def main() -> i32:
+	counter = Counter()
+	c: Closure[[], None] = counter.bump
+	rc0: usize = compiler.refcount( c )
+
+	lst = list[Closure[[], None]]()
+	lst.append( c ).unwrap( 'append failed' )
+	rc1: usize = compiler.refcount( c )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+
+	# pop() removes the list's own slot reference but hands back a new
+	# one via its Result.Ok payload - net unchanged from rc1 (c's own
+	# reference is untouched throughout, still live here)
+	popped: Closure[[], None] = lst.pop().unwrap( 'pop failed' )
+	rc2: usize = compiler.refcount( popped )
+	if rc2 != rc1:
+		return 2
+
+	popped()
+	if counter.n != 1:
+		return 3
+	return 0
+''' ),
 		] )
 
 
