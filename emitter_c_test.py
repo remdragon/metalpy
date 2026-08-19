@@ -16657,6 +16657,171 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
 
+	# PLAN_GENERATORS.md Phase C - `.send()`. Generator[T,SendType,E] (3-
+	# arg form) makes `(yield expr)` usable as a captured EXPRESSION,
+	# evaluating to plain SendType, delivered via .send(v) - see this
+	# doc's own "Phase C design" section (describes the ORIGINAL,
+	# now-superseded branch's internals; the real current mechanism is
+	# type_resolver.py's _build_generator_send_wrappers/_hoist_yield_
+	# from_rc_reassignment and lowering.py's _expr_Yield).
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_send_before_first_yield_panics( self ) -> None:
+		# a real panic (sys.panic -> exit(1)) can't share a merged multi-
+		# case binary with assert_programs_run's other cases - it would
+		# abort the WHOLE process before any later case ever ran. Own
+		# standalone compile+run, same pattern as e.g. test_ord_on_empty_
+		# string_panics above.
+		self._run( '''
+@union
+class NoError:
+	Never: None
+
+def gen() -> Generator[i32, i32, NoError]:
+	x: i32 = yield 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		r = g.send( 5 ).unwrap( 'unexpected error' )
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bare_next_at_captured_yield_panics( self ) -> None:
+		self._run( '''
+@union
+class NoError:
+	Never: None
+
+def gen() -> Generator[i32, i32, NoError]:
+	x: i32 = yield 1
+	x2: i32 = yield x
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		r0 = g.__next__().unwrap( 'unexpected error' )
+		r1 = g.__next__().unwrap( 'unexpected error' ) # resumes the captured yield without sending - must panic, not silently deliver garbage
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_send_scalar_and_rc_values( self ) -> None:
+		self.assert_programs_run([
+			( 'send_scalar_accumulator', '''
+@union
+class NoError:
+	Never: None
+
+def accumulator() -> Generator[i32, i32, NoError]:
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			received: i32 = yield total
+			total += received
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = accumulator()
+		r0 = g.__next__().unwrap( 'unexpected error' )
+		if r0 is None or r0 != 0:
+			return 1
+		r1 = g.send( 5 ).unwrap( 'unexpected error' )
+		if r1 is None or r1 != 5:
+			return 2
+		r2 = g.send( 10 ).unwrap( 'unexpected error' )
+		if r2 is None or r2 != 15:
+			return 3
+		return 0
+''' ),
+			( 'send_rc_value_refcount_correct_across_repeated_sends', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+@union
+class NoError:
+	Never: None
+
+def collector() -> Generator[i32, Box, NoError]:
+	i: i32 = 0
+	held: Box = Box( v = 0 )
+	with compiler.wrap_arithmetic:
+		while i < 3:
+			held = yield held.v
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b1 = Box( v = 10 )
+		if compiler.refcount( b1 ) != 1:
+			return 1
+		g = collector()
+		r0 = g.__next__().unwrap( 'e' )
+		if r0 is None or r0 != 0:
+			return 2
+		r1 = g.send( b1 ).unwrap( 'e' )
+		if r1 is None or r1 != 10:
+			return 3
+		# THREE independent owners: the caller's own b1, __send_slot
+		# (never cleared by consumption - only overwritten by a LATER
+		# send), and held (the promoted local __gen_send_capture_N
+		# relayed into)
+		if compiler.refcount( b1 ) != 3:
+			return 4
+		b2 = Box( v = 20 )
+		r2 = g.send( b2 ).unwrap( 'e' )
+		if r2 is None or r2 != 20:
+			return 5
+		if compiler.refcount( b1 ) != 1: # dropped back to just the caller's own binding
+			return 6
+		if compiler.refcount( b2 ) != 3: # caller's own b2 + __send_slot + held now
+			return 7
+		return 0
+''' ),
+			( 'dropping_generator_mid_iteration_releases_send_slot_and_captured_local', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+@union
+class NoError:
+	Never: None
+
+def collector() -> Generator[i32, Box, NoError]:
+	i: i32 = 0
+	held: Box = Box( v = 0 )
+	with compiler.wrap_arithmetic:
+		while i < 3:
+			held = yield held.v
+			i += 1
+
+def make_send_and_drop( b: Box ) -> None:
+	g = collector()
+	r0 = g.__next__().unwrap( 'e' )
+	r1 = g.send( b ).unwrap( 'e' )
+	# g abandoned here mid-iteration - both held and __send_slot still
+	# hold their own reference to b, must both be released by the
+	# generator's own destructor
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 5 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		make_send_and_drop( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
+		])
+
 
 class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' regression test for a real, confirmed bug: Result[T,E].unwrap_or()

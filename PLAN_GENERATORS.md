@@ -1,47 +1,52 @@
 Generator functions (`yield`, state-machine transform)
 
-> **Note (2026-08-19): Phase F has been REIMPLEMENTED and is real again as
-> of this note - Phase C/A.4a below are still NOT.** History recap: Phase
-> F/B/C/A.4a were originally built, merged to master (a4a1d5d), then
-> silently discarded by the next merge (1a89a86) before anyone noticed.
-> By the time that was caught, master had diverged too far (150+ commits
-> touching the exact substrate Phase F depends on) for the old branch to
-> be reapplied as a patch, so Phase F was rebuilt FRESH against current
-> master (worktree `generator-phase-f-rebuild`) using the sections below
-> as a design reference, not as a diff. The new implementation reaches
-> the same destination (real `ir.Yield` + `self.__state` goto/label
-> dispatch, built at lowering time; arbitrary yield nesting/multiplicity,
-> `elif` chains, `break`/`continue` in a yield-containing loop all now
-> ordinary compile-and-run cases) but its own internal names differ from
-> what "Phase F design" below describes - see `type_resolver.py`'s
-> `_assign_generator_yield_dispatch`/`_build_generator_next_function` and
-> `lowering.py`'s `_lower_generator_yield`/`_emit_generator_dispatch_
-> prologue` for the ACTUAL current mechanism; the design section is kept
-> for its reasoning, not as a literal function-by-function map anymore.
-> Phase B's own nesting/multiplicity verification is covered by
-> `emitter_c_test.py`'s `test_previously_rejected_shapes_now_compile_and_
-> run`. Three real, generator-unrelated bugs were found (and fixed) while
-> rebuilding this, via real compile-and-run testing exactly like the
-> original build: (1) a yield reached outside a successfully-synthesized
-> generator needs a graceful `discovery.fail()`, not a raw crash, when an
-> earlier, unrelated error left synthesis only partially done; (2)
-> `cfg.py`'s `merge_loop_exits()` wiped `self._live` to empty (rather
-> than preserving the loop's own entry snapshot) whenever a `while True:`
-> loop had no `break` at all - harmless for genuinely dead code in an
-> ordinary function, but wrong the moment code after such a loop is
-> actually reachable (a generator's own synthesized tail, in particular);
-> (3) `_lower_generator_yield` needed the same `_cfg.untrack_temp(value)`
-> call `_stmt_Return` already makes before its own temp flush, or the
-> flush immediately decrefs the very value a union-coercion's own
-> constructor just increfed, silently cancelling it out - confirmed via a
-> real `compiler.refcount()` repro (a captured RC parameter yielded back
-> through a match arm read one lower than expected). **Phase C
-> (`.send()`) and the A.4a follow-up (`yield from`) are NOT implemented**
-> on current master - the "Phase C design"/A.4a sections further down
-> describe a design that was real once (on the original, now-superseded
-> branch) and could still guide a future implementation, but nothing
-> below "Phase F: defer/errdefer under real nested lowering" reflects
-> current code. A `.send()`/`yield from` rebuild has not been scheduled.
+> **Note (2026-08-19): Phase F, B, and now C (`.send()`) have all been
+> REIMPLEMENTED against current master - only the A.4a follow-up (`yield
+> from`) has not.** History recap: Phase F/B/C/A.4a were originally
+> built, merged to master (a4a1d5d), then silently discarded by the next
+> merge (1a89a86) before anyone noticed. By the time that was caught,
+> master had diverged too far (150+ commits touching the exact substrate
+> Phase F depends on) for the old branch to be reapplied as a patch, so
+> Phase F/B were rebuilt FRESH first (worktree `generator-phase-f-
+> rebuild`), then Phase C on top of that rebuild (worktree `generator-
+> phase-c-send`, same day) - both using the sections below as a design
+> REFERENCE, not a diff. Both reach the same destination the original
+> branch describes, but internal names differ throughout - see `type_
+> resolver.py`'s `_assign_generator_yield_dispatch`/`_build_generator_
+> next_function`/`_build_generator_send_wrappers`/`_hoist_yield_from_rc_
+> reassignment` and `lowering.py`'s `_lower_generator_yield`/`_expr_
+> Yield`/`_emit_generator_dispatch_prologue` for the ACTUAL current
+> mechanism; the design sections below are kept for their reasoning, not
+> as a literal function-by-function map. Phase B's own nesting/
+> multiplicity verification is covered by `emitter_c_test.py`'s `test_
+> previously_rejected_shapes_now_compile_and_run`; Phase C's own `.send()`
+> tests are `test_send_scalar_and_rc_values`/`test_send_before_first_
+> yield_panics`/`test_bare_next_at_captured_yield_panics`.
+>
+> Four real, generator-unrelated bugs were found (and fixed) across both
+> rebuilds, via real compile-and-run testing exactly like the original
+> build: (1) a yield reached outside a successfully-synthesized generator
+> needs a graceful `discovery.fail()`, not a raw crash, when an earlier,
+> unrelated error left synthesis only partially done; (2) `cfg.py`'s
+> `merge_loop_exits()` wiped `self._live` to empty (rather than
+> preserving the loop's own entry snapshot) whenever a `while True:` loop
+> had no `break` at all - harmless for genuinely dead code in an ordinary
+> function, but wrong the moment code after such a loop is actually
+> reachable (a generator's own synthesized tail, in particular); (3)
+> `_lower_generator_yield`/`_expr_Yield` need the same `_cfg.untrack_
+> temp(value)` call `_stmt_Return` already makes before its own temp
+> flush, or the flush immediately decrefs the very value a union-
+> coercion's own constructor just increfed, silently cancelling it out -
+> confirmed via a real `compiler.refcount()` repro; (4) a separate,
+> unrelated bug found and fixed the same day as the Phase F rebuild:
+> negating a value (`-x`) directly into a union return/yield type
+> produced invalid C - see `_expr_UnaryOp`'s own `operand_hint` comment.
+>
+> **The A.4a follow-up (`yield from`) is still NOT implemented** -
+> `TypeResolver._reject_generator_yield_from` still rejects it cleanly.
+> The A.4a design section further down describes what the original
+> branch built and could still guide a future attempt, but nothing there
+> reflects current code either.
 
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
@@ -93,13 +98,36 @@ reasoning (still broadly accurate) - its literal internal names describe
 the original, now-superseded implementation; see this doc's own top note
 for where the CURRENT mechanism actually lives.
 
-**Phase C (`.send()`) and the A.4a follow-up (`yield from`) did NOT come
-back with this rebuild** - only Phase F/B did. `Iterator[T]`/`Generator[
-T,E]` stay 1-/2-type-param forms with no `SendType`; `yield from` is
-still a clean, explicit rejection (`TypeResolver._reject_generator_yield_
-from`). The "Phase C design"/A.4a sections below describe what the
-ORIGINAL branch built, kept as a design reference for whoever picks this
-back up, not as a description of anything currently compilable.
+**Phase C (`.send()`) has ALSO landed** (reimplemented from scratch,
+same day, on top of the Phase F/B rebuild above): `Generator[T,SendType,
+E]` (3-arg form - `T`/`E` are the existing `elem_type`/`error_type`,
+`SendType` new, inserted in the middle) makes `(yield expr)` usable as
+an EXPRESSION, evaluating to plain `SendType`, delivered via `.send(v)`.
+Backing-class shape and the overall `__next__()`/`send(v)` wrapper split
+over a real `$$__resume__` match the ORIGINAL design almost exactly (see
+"Phase C design" below for the reasoning) - `type_resolver.py`'s
+`_build_generator_send_wrappers` builds the two thin wrappers, and a new
+`_hoist_yield_from_rc_reassignment` pass (this rebuild's own name for
+the original's `_build_liveness_guard` restructuring - see bug #1 in
+"Phase C design") avoids duplicating a captured yield when
+`_apply_live_flag_guards` would otherwise deep-copy it for an RC-typed
+promoted local's own first-assignment branch. Verified via real
+compile-and-run refcount-delta checks matching the original design's own
+bar exactly: an RC-typed `Box` sent through `.send()` into a captured
+`held = yield i` ends up with THREE independent owners (caller, `__
+send_slot`, `held`), a second `.send()` drops the first back to one and
+brings the new one to three, `.send()` before the first yield panics,
+and resuming a captured yield via bare `.__next__()` panics too. Unlike
+the original build, there is no separate 3-arg-vs-2-arg `SendType`-is-
+independent-of-`E` nuance write-up needed here - it carries over
+unchanged (see "Phase C design" below).
+
+**The A.4a follow-up (`yield from`) did NOT come back with either
+rebuild.** `yield from` is still a clean, explicit rejection
+(`TypeResolver._reject_generator_yield_from`). The A.4a section below
+describes what the ORIGINAL branch built, kept as a design reference for
+whoever picks this back up, not as a description of anything currently
+compilable.
 
 PLAN_GENERATORS.md's own motivating example now compiles and runs in its
 most natural, idiomatic spelling: `for i in range(count): yield i`,

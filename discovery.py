@@ -932,11 +932,26 @@ class Discovery( ast.NodeVisitor ):
 		# just two type args instead of one, carried as GeneratorType's own
 		# error_type (None for Iterator[T] means infallible). __next__'s
 		# return type becomes Result[elem_type|None, error_type] instead of
-		# plain elem_type|None once ensure_generator_synthesized sees this
+		# plain elem_type|None once ensure_generator_synthesized sees this.
+		# Generator[T,SendType,E] - PLAN_GENERATORS.md Phase C - the SAME
+		# fallible form with a THIRD type argument inserted in the middle:
+		# SendType, the type `.send(v)` accepts and a captured `(yield
+		# expr)` expression evaluates to. Dispatched on tuple arity (2 vs
+		# 3), not a separate name - `Generator[T,E]` callers are completely
+		# unaffected by this addition.
 		if isinstance( node.value, ast.Name ) and node.value.id == 'Generator':
-			if not isinstance( node.slice, ast.Tuple ) or len( node.slice.elts ) != 2:
-				self.fail( f'Generator[...] takes exactly two type arguments (element, error): {ast.unparse(node)}', node )
+			if not isinstance( node.slice, ast.Tuple ) or len( node.slice.elts ) not in ( 2, 3 ):
+				self.fail( f'Generator[...] takes two type arguments (element, error) or three (element, send, error): {ast.unparse(node)}', node )
 			elem_type = self.visit( node.slice.elts[0] )
+			if len( node.slice.elts ) == 3:
+				send_type = self.visit( node.slice.elts[1] )
+				error_type = self.visit( node.slice.elts[2] )
+				return GeneratorType(
+					stem = f'Generator[{elem_type.qualname},{send_type.qualname},{error_type.qualname}]',
+					qualname = f'Generator[{elem_type.qualname},{send_type.qualname},{error_type.qualname}]',
+					file = elem_type.file, line = elem_type.line,
+					elem_type = elem_type, send_type = send_type, error_type = error_type,
+				)
 			error_type = self.visit( node.slice.elts[1] )
 			return GeneratorType(
 				stem = f'Generator[{elem_type.qualname},{error_type.qualname}]',

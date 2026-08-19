@@ -212,6 +212,11 @@ class TypeResolver:
 		# simplest way to guarantee uniqueness without threading a fresh
 		# counter through every desugaring call site
 		self._for_desugar_counter = 0
+		# PLAN_GENERATORS.md Phase C - unique __gen_send_capture_N suffix
+		# for _hoist_yield_from_rc_reassignment's own synthesized capture
+		# temp, same "global across every generator function, never reset
+		# per-function" reasoning as _for_desugar_counter just above
+		self._gen_send_capture_counter = 0
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -1132,21 +1137,30 @@ class TypeResolver:
 		used for a scalar/non-RC local (nothing to gate - see is_rc). '''
 		return f'__{local_stem}_live'
 
-	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> RCClass:
+	def _build_generator_backing_class( self, fn: Function, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]], send_type: 'Type|None' = None ) -> RCClass:
 		''' the per-function backing RCClass a generator's constructor
-		allocates and its own $$__next__ method operates on - fields:
-		`__state` (resume discriminant) + one per parameter + one per
-		promoted local (_collect_generator_locals) + one per Phase-1 for-
-		loop-desugaring field (extra_fields - e.g. __for_obj_N, the once-
-		evaluated iterated expression a non-range() for-loop needs; see
-		_new_for_obj_field's own docstring for why these are safe to
+		allocates and its own $$__next__/$$__resume__ method operates on -
+		fields: `__state` (resume discriminant) + one per parameter + one
+		per promoted local (_collect_generator_locals) + one per Phase-1
+		for-loop-desugaring field (extra_fields - e.g. __for_obj_N, the
+		once-evaluated iterated expression a non-range() for-loop needs;
+		see _new_for_obj_field's own docstring for why these are safe to
 		decref unconditionally, same as a captured parameter, with no new
 		destructor machinery) + one `__<stem>_live: bool` companion field
 		per RC-typed promoted LOCAL (PLAN_GENERATORS.md Phase 5/roadmap
 		Phase 5 - NOT for parameters/extra_fields, which stay always-valid
 		from construction onward, unchanged) + one `__defer_armed_N: bool`
 		field per defer/errdefer site (PLAN_GENERATORS.md's defer/errdefer
-		phase - see _desugar_generator_defer_sites). resolve=None/every
+		phase - see _desugar_generator_defer_sites) + (PLAN_GENERATORS.md
+		Phase C, send_type not None) `__send_slot: send_type` - treated
+		EXACTLY like an RC-typed promoted local (its own `__send_slot_live`
+		companion field when send_type.is_rc(), same live-flag-guarded
+		reassignment/zero-placeholder-construction/destructor-teardown
+		machinery, no new RC design needed - see _build_generator_send_
+		wrappers) - plus `__send_ready: bool`, a SEPARATE protocol flag
+		(armed by send(), consumed+cleared by the next captured-yield
+		resume - see lowering.py's _expr_Yield) that has nothing to do with
+        whether __send_slot has ever been assigned. resolve=None/every
 		attribute's own resolve=None (mirrors tuple_storage.TupleStorage.
 		get()'s identical "already fully known, nothing to defer" shape).
 		Unlike every other RCClass, this one's own $$__destructor__ is
@@ -1180,7 +1194,13 @@ class TypeResolver:
 			Variable( stem = flag_stem, qualname = f'{qualname}.{flag_stem}', file = fn.file, line = fn.line, type = bool_cls )
 			for flag_stem, _is_errdefer, _body in defer_sites
 		]
-		attributes = [ state_attr ] + param_attrs + local_attrs + live_flag_attrs + extra_attrs + defer_armed_attrs
+		send_attrs: list[Variable] = []
+		if send_type is not None:
+			send_attrs.append( Variable( stem = '__send_slot', qualname = f'{qualname}.__send_slot', file = fn.file, line = fn.line, type = send_type ) )
+			if send_type.is_rc():
+				send_attrs.append( Variable( stem = '__send_slot_live', qualname = f'{qualname}.__send_slot_live', file = fn.file, line = fn.line, type = bool_cls ) )
+			send_attrs.append( Variable( stem = '__send_ready', qualname = f'{qualname}.__send_ready', file = fn.file, line = fn.line, type = bool_cls ) )
+		attributes = [ state_attr ] + param_attrs + local_attrs + live_flag_attrs + extra_attrs + defer_armed_attrs + send_attrs
 		return RCClass(
 			stem = qualname, qualname = qualname, file = fn.file, line = fn.line,
 			base = None, type_params = None,
@@ -1272,7 +1292,77 @@ class TypeResolver:
 		renamed = [ renamer.visit( s ) for s in stmts ]
 		if not rc_local_stems:
 			return renamed
-		return self._apply_live_flag_guards( renamed, rc_local_stems )
+		hoisted = self._hoist_yield_from_rc_reassignment( renamed, rc_local_stems )
+		return self._apply_live_flag_guards( hoisted, rc_local_stems )
+
+	def _hoist_yield_from_rc_reassignment( self, stmts: list[ast.stmt], rc_local_stems: set ) -> list[ast.stmt]:
+		''' PLAN_GENERATORS.md Phase C - _apply_live_flag_guards (below)
+		deep-copies the WHOLE statement for its own "first assignment"
+		branch - safe for an ordinary value expression (only one of the
+		two branches ever actually RUNS per dynamic execution, so a
+		duplicated Call/constructor still only executes once), but NOT
+		for a yield: it's a real suspend point, so duplicating it creates
+		TWO independent (state, resume_label) dispatch targets for what
+		must be ONE textual yield site - confirmed via a real repro
+		("redefinition of label" - a real C compile error, not just a
+		latent correctness gap). Runs BEFORE _apply_live_flag_guards
+		(after _assign_generator_yield_dispatch has already tagged every
+		yield with its own state/resume_label - those tags travel with
+		the node wherever it moves) and recurses the same way that does.
+
+		Scoped to the DIRECT case only - `self.<stem> = (yield expr)`,
+		the entire RHS is the captured yield, exactly what `.send()`
+		naturally looks like (`held: Box = yield i`) - restructured into
+		`__gen_send_capture_N = (yield expr); self.<stem> = __gen_send_
+		capture_N`, so the yield now appears exactly once, textually and
+		state-wise, and _apply_live_flag_guards only ever deep-copies the
+		cheap re-store afterward. The capture assignment is tagged is_
+		match_subject (same "no independent tracked ownership, just
+		borrows the ALREADY-correctly-increfed source" treatment
+		visit_Match's own __match_subj_N relay already gets - see
+		lowering.py's _stmt_Assign) - _expr_Yield's own returned operand
+		needs no incref of its OWN (a plain field read of self.__
+		send_slot), relying entirely on the capture assignment's own
+		is_alias=True (now that _is_aliasing_expr recognizes a captured
+		ast.Yield) to do it; the capture temp then just relays that SAME
+		single reference into the re-store below via an ordinary Name
+		read (aliasing by the general rule, needing no special-casing at
+		all there). A yield embedded deeper inside a LARGER expression
+		assigned to an RC-typed promoted local (`held = (yield i) if
+		flag else other`) is rejected instead of guessed at - same "start
+		narrow" posture PLAN_GENERATORS.md applies elsewhere; no forcing
+		use case for the general form yet. '''
+		result: list[ast.stmt] = []
+		for s in stmts:
+			stem = self._assigned_self_attr_stem( s )
+			value = s.value if isinstance( s, ast.Assign ) else None
+			if stem is not None and stem in rc_local_stems and isinstance( value, ast.Yield ):
+				capture_name = f'__gen_send_capture_{self._gen_send_capture_counter}'
+				self._gen_send_capture_counter += 1
+				capture_assign = ast.Assign( targets = [ ast.Name( id = capture_name, ctx = ast.Store() ) ], value = value )
+				capture_assign.is_match_subject = True
+				ast.copy_location( capture_assign, s )
+				ast.fix_missing_locations( capture_assign )
+				restore_assign = ast.Assign( targets = s.targets, value = ast.Name( id = capture_name, ctx = ast.Load() ) )
+				ast.copy_location( restore_assign, s )
+				ast.fix_missing_locations( restore_assign )
+				result.append( capture_assign )
+				result.append( restore_assign )
+				continue
+			if stem is not None and stem in rc_local_stems and any( isinstance( n, ast.Yield ) for n in ast.walk( value ) if value is not None ):
+				self.discovery.fail(
+					f'a yield embedded inside a larger expression assigned to an RC-typed generator local is not supported yet '
+					f'(`{stem} = yield expr` directly is fine) - see PLAN_GENERATORS.md',
+					s,
+				)
+				continue
+			if isinstance( s, ( ast.If, ast.While, ast.For ) ):
+				s.body = self._hoist_yield_from_rc_reassignment( s.body, rc_local_stems )
+				s.orelse = self._hoist_yield_from_rc_reassignment( s.orelse, rc_local_stems )
+			elif isinstance( s, ast.With ):
+				s.body = self._hoist_yield_from_rc_reassignment( s.body, rc_local_stems )
+			result.append( s )
+		return result
 
 	def _apply_live_flag_guards( self, stmts: list[ast.stmt], rc_local_stems: set ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase F - the live-flag-guard half of
@@ -1331,7 +1421,7 @@ class TypeResolver:
 	# it) was removed once that was confirmed - yield sites below just
 	# return the renamed value straight through.
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]], send_type: 'Type|None' = None ) -> Function:
 		''' PLAN_GENERATORS.md Phase F - builds $$__next__: self.__state ==
 		DONE short-circuits to `return None`, then the generator's own
 		body, lowered essentially AS-IS (structurally intact - no more
@@ -1438,17 +1528,33 @@ class TypeResolver:
 		if is_fallible:
 			self._wrap_generator_next_returns_in_ok( next_body )
 
+		# PLAN_GENERATORS.md Phase C - when SendType is declared
+		# (Generator[T,SendType,E]), the real body-bearing method is
+		# renamed $$__resume__ (double-dollar, same "never user-callable
+		# through ordinary name resolution" convention $$__destructor__
+		# already uses) - __next__() and send(v) become thin wrappers
+		# over it instead (_build_generator_send_wrappers, called from
+		# ensure_generator_synthesized once this returns). Iterator[T]/
+		# the 2-arg Generator[T,E] form are completely unaffected -
+		# __next__ stays the one real method, exactly as every phase
+		# before this one built it.
+		method_stem = '$$__resume__' if send_type is not None else '__next__'
 		node = ast.FunctionDef(
-			name = '$$__next__',
+			name = method_stem,
 			args = ast.arguments( posonlyargs = [], args = [], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
 			body = next_body, decorator_list = [], returns = None, type_params = [],
 			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
 		)
 		ast.fix_missing_locations( node )
 		node.generator_yield_states = yield_states
+		# PLAN_GENERATORS.md Phase C - lowering.py's _expr_Yield reads this
+		# back (via self._current_fn.node) to know whether a captured
+		# `(yield expr)` is even legal here at all (only when SendType is
+		# declared) and, if so, what type to deliver it as
+		node.generator_send_type = send_type
 
 		next_fn = Function(
-			stem = '__next__', qualname = f'{backing_cls.qualname}.__next__', file = fn.file, line = fn.line,
+			stem = method_stem, qualname = f'{backing_cls.qualname}.{method_stem}', file = fn.file, line = fn.line,
 			cls = backing_cls, node = node,
 			parameters = [], return_type = next_return_type,
 			is_static = False, resolve = None,
@@ -1470,6 +1576,86 @@ class TypeResolver:
 		backing_cls.methods.append( next_fn )
 		backing_cls.names[ next_fn.stem ] = next_fn
 		return next_fn
+
+	def _build_generator_send_wrappers( self, fn: Function, backing_cls: RCClass, resume_fn: Function, send_type: Type, next_return_type: Type ) -> None:
+		''' PLAN_GENERATORS.md Phase C - two thin public wrappers delegating
+		into $$__resume__ (built separately, see _build_generator_next_
+		function's own docstring): `__next__()` (leaves __send_ready
+		untouched - a captured yield resumed this way sees __send_ready
+		still False and panics, via _expr_Yield, pointing at .send()
+		instead) and `send(v)` (panics via sys.panic() if self.__state ==
+		0, mirroring Python's own TypeError for sending before the first
+		yield; otherwise arms __send_slot/__send_ready, then resumes).
+		Both are ordinary Attribute-call syntax (`self.$$__resume__()`),
+		resolved through the SAME generic _attr_lookup_callable/
+		_find_method machinery any other self.<method>() call already
+		uses - backing_cls.names['$$__resume__'] already has a real entry
+		(the caller already registered it), so this needs no resolved_
+		callee escape hatch at all, unlike sys.free(self)'s own call in
+		_build_generator_destructor (a receiver-less FREE function). '''
+		self_read = lambda attr: ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = attr, ctx = ast.Load() )
+		resume_call = lambda: ast.Call( func = self_read( resume_fn.stem ), args = [], keywords = [] ) # a fresh node per use - see _build_defer_replay_guards' own docstring for why sharing one node object across sites is unsafe (lowering attaches mutable per-occurrence attributes)
+
+		next_node = ast.FunctionDef(
+			name = '__next__',
+			args = ast.arguments( posonlyargs = [], args = [], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
+			body = [ ast.Return( value = resume_call() ) ], decorator_list = [], returns = None, type_params = [],
+			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( next_node )
+		next_fn = Function(
+			stem = '__next__', qualname = f'{backing_cls.qualname}.__next__', file = fn.file, line = fn.line,
+			cls = backing_cls, node = next_node,
+			parameters = [], return_type = next_return_type,
+			is_static = False, resolve = None,
+		)
+		self._generators_synthesized.add( id( next_fn )) # same "never a generator of its own" pre-mark as $$__resume__/$$__next__ - see that call site's own comment
+		backing_cls.methods.append( next_fn )
+		backing_cls.names[ next_fn.stem ] = next_fn
+
+		v_param = Parameter( stem = 'v', qualname = f'{backing_cls.qualname}.send.v', file = fn.file, line = fn.line, type = send_type )
+		panic_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'sys', ctx = ast.Load() ), attr = 'panic', ctx = ast.Load() ),
+			args = [ ast.Constant( value = f'{fn.qualname}: cannot send a value before the first yield' ) ], keywords = [],
+		)
+		not_started_guard = ast.If(
+			test = ast.Compare( left = self_read( '__state' ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = 0 ) ] ),
+			body = [ ast.Expr( panic_call ) ], orelse = [],
+		)
+		v_read = lambda: ast.Name( id = 'v', ctx = ast.Load() ) # fresh node per use, same reasoning as resume_call above
+		if send_type.is_rc():
+			# __send_slot is treated exactly like an RC-typed promoted
+			# local's own first-or-later reassignment - same live-flag-
+			# guard shape _apply_live_flag_guards builds for one, hand-
+			# built here directly since send()'s own body isn't part of
+			# the user's original generator body that pass ever walks
+			already_live = ast.Assign( targets = [ self_read( '__send_slot' ) ], value = v_read() )
+			first_time = ast.Assign( targets = [ self_read( '__send_slot' ) ], value = v_read() )
+			first_time.generator_first_rc_assign = True
+			flag_assign = ast.Assign( targets = [ self_read( '__send_slot_live' ) ], value = ast.Constant( value = True ) )
+			send_slot_assign = [ ast.If( test = self_read( '__send_slot_live' ), body = [ already_live ], orelse = [ first_time, flag_assign ] ) ]
+		else:
+			send_slot_assign = [ ast.Assign( targets = [ self_read( '__send_slot' ) ], value = v_read() ) ]
+		ready_assign = ast.Assign( targets = [ self_read( '__send_ready' ) ], value = ast.Constant( value = True ) )
+		send_body: list[ast.stmt] = [ not_started_guard ] + send_slot_assign + [ ready_assign, ast.Return( value = resume_call() ) ]
+		send_node = ast.FunctionDef(
+			name = 'send',
+			args = ast.arguments( posonlyargs = [], args = [ ast.arg( arg = 'v' ) ], vararg = None, kwonlyargs = [], kw_defaults = [], kwarg = None, defaults = [] ),
+			body = send_body, decorator_list = [], returns = None, type_params = [],
+			lineno = fn.line or 1, col_offset = 0, end_lineno = fn.line or 1, end_col_offset = 0,
+		)
+		ast.fix_missing_locations( send_node )
+		send_fn = Function(
+			stem = 'send', qualname = f'{backing_cls.qualname}.send', file = fn.file, line = fn.line,
+			cls = backing_cls, node = send_node,
+			parameters = [ v_param ],
+			return_type = next_return_type,
+			is_static = False, resolve = None,
+		)
+		send_fn.add_name( 'v', v_param )
+		self._generators_synthesized.add( id( send_fn ))
+		backing_cls.methods.append( send_fn )
+		backing_cls.names[ send_fn.stem ] = send_fn
 
 	def _wrap_generator_next_returns_in_ok( self, next_body: list[ast.stmt] ) -> None:
 		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
@@ -1508,7 +1694,7 @@ class TypeResolver:
 					ast.copy_location( ok_call.func.value, n )
 					n.value = ok_call
 
-	def _build_generator_destructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> None:
+	def _build_generator_destructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]], send_type: 'Type|None' = None ) -> None:
 		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - a generator's
 		backing class does NOT get the ordinary, unconditional
 		$$__destructor__ cascade _synthesize_rcclass_destructor builds
@@ -1600,6 +1786,24 @@ class TypeResolver:
 			)
 			body.append( guard )
 
+		# 2b. PLAN_GENERATORS.md Phase C - __send_slot, treated exactly
+		# like an RC-typed promoted local (see _build_generator_backing_
+		# class's own docstring): gated behind __send_slot_live, NOT
+		# __send_ready (a separate protocol flag that gets cleared as soon
+		# as a captured yield consumes a pending send, while __send_slot
+		# itself keeps its own independent reference regardless - see
+		# lowering.py's _expr_Yield)
+		if send_type is not None and send_type.is_rc():
+			teardown = self._build_field_teardown_ast(
+				ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__send_slot', ctx = ast.Load() ),
+				send_type,
+			)
+			if teardown:
+				body.append( ast.If(
+					test = self._self_attr( '__send_slot_live', fn.node ),
+					body = teardown, orelse = [],
+				))
+
 		# 3. extra_fields (Phase 1's __for_obj_N - the once-evaluated
 		# iterated expression a non-range() for-loop needs) - unconditional,
 		# same reasoning/precedent as a captured parameter (see
@@ -1661,7 +1865,7 @@ class TypeResolver:
 		dtor_fn.add_name( 'self', self_param )
 		self.schedule( dtor_fn )
 
-	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> None:
+	def _rewrite_generator_constructor( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], extra_fields: dict[str,tuple[Type,ast.expr]], defer_sites: list[tuple[str,bool,list[ast.stmt]]], send_type: 'Type|None' = None ) -> None:
 		''' replaces the original generator def's own body with a single
 		`return <allocate the backing class, state=0, fields=args/zeros>` -
 		matches Python's own "calling a generator function doesn't run any
@@ -1709,6 +1913,22 @@ class TypeResolver:
 			keywords.append( ast.keyword( arg = stem, value = expr ) )
 		for flag_stem, _is_errdefer, _body in defer_sites:
 			keywords.append( ast.keyword( arg = flag_stem, value = ast.Constant( value = False ) ) )
+		if send_type is not None:
+			# PLAN_GENERATORS.md Phase C - __send_slot starts exactly like
+			# an RC-typed promoted local's own zero-placeholder (never read
+			# before __send_slot_live gates it True - see _expr_Constant's
+			# generator_zero_rc_field exemption), or an ordinary scalar
+			# zero/False otherwise; __send_ready always starts False (no
+			# pending send at construction time)
+			if send_type.is_rc():
+				send_zero = ast.Constant( value = 0 )
+				send_zero.generator_zero_rc_field = True
+			else:
+				send_zero = ast.Constant( value = False if ( isinstance( send_type, Scalar ) and send_type.stem == 'bool' ) else 0 )
+			keywords.append( ast.keyword( arg = '__send_slot', value = send_zero ) )
+			if send_type.is_rc():
+				keywords.append( ast.keyword( arg = '__send_slot_live', value = ast.Constant( value = False ) ) )
+			keywords.append( ast.keyword( arg = '__send_ready', value = ast.Constant( value = False ) ) )
 		call = ast.Call( func = ast.Name( id = backing_cls.stem, ctx = ast.Load() ), args = [], keywords = keywords )
 		call.generator_backing_cls = backing_cls
 		fn.node.body = [ ast.Return( value = call ) ]
@@ -1804,7 +2024,10 @@ class TypeResolver:
 		with self.discovery.module_context( module ):
 			elem_type = fn.return_type.elem_type
 			error_type = fn.return_type.error_type
+			send_type = fn.return_type.send_type # PLAN_GENERATORS.md Phase C - None unless Generator[T,SendType,E] (3-arg form)
 			self.schedule( elem_type )
+			if send_type is not None:
+				self.schedule( send_type )
 
 			extra_fields = self._desugar_generator_for_loops( fn )
 			self._reject_generator_yield_from( fn )
@@ -1835,8 +2058,14 @@ class TypeResolver:
 			else:
 				next_return_type = result_union
 
-			backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites )
-			self._build_generator_next_function( fn, backing_cls, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites )
+			backing_cls = self._build_generator_backing_class( fn, locals_decl, extra_fields, defer_sites, send_type )
+			resume_fn = self._build_generator_next_function( fn, backing_cls, locals_decl, extra_fields, next_return_type, error_type, pending_bare_return_assigns, defer_sites, send_type )
+			# PLAN_GENERATORS.md Phase C - __next__()/send(v) thin wrappers
+			# over $$__resume__ (built just above) - only when SendType is
+			# declared; Iterator[T]/Generator[T,E] already got their own
+			# real __next__ directly from _build_generator_next_function
+			if send_type is not None:
+				self._build_generator_send_wrappers( fn, backing_cls, resume_fn, send_type, next_return_type )
 			# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - built BEFORE
 			# backing_cls is ever scheduled below, so its own pre-mark of
 			# id(backing_cls) in self._destructors_synthesized (see its own
@@ -1844,13 +2073,15 @@ class TypeResolver:
 			# handling to the punch - that path checks the SAME memo set
 			# before ever building its own (wrong, unconditional-decref)
 			# destructor for this class
-			self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
+			self._build_generator_destructor( fn, backing_cls, locals_decl, extra_fields, defer_sites, send_type )
 
 			self.schedule( backing_cls )
 			self.schedule( backing_cls.get_local_or_raise( '__next__' ))
+			if send_type is not None:
+				self.schedule( backing_cls.get_local_or_raise( 'send' ))
 			self.schedule( result_union )
 
-			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites )
+			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, extra_fields, defer_sites, send_type )
 			fn.return_type = backing_cls
 
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:

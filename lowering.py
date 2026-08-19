@@ -519,7 +519,17 @@ class Lowering:
 			return False
 		if isinstance( node, ast.Subscript ):
 			return getattr( node, 'is_tuple_element_read', False )
-		return isinstance( node, ( ast.Name, ast.Attribute ))
+		# PLAN_GENERATORS.md Phase C - a captured `(yield expr)` reads an
+		# existing field (self.__send_slot, via _expr_Yield) the same way
+		# ast.Attribute already does - self.__send_slot independently
+		# keeps its own reference regardless of who else reads it, so
+		# wherever this value lands needs its own Incref exactly like any
+		# other field read. Without this, a captured yield's own consumer
+		# (`held = yield i`) was wrongly treated as "fresh" (a Call-shaped
+		# handoff needing no Incref of its own) and given its own tracked
+		# ownership that never gets balanced - confirmed via a real
+		# compiler.refcount() repro.
+		return isinstance( node, ( ast.Name, ast.Attribute, ast.Yield ))
 
 	def _is_compiler_attr( self, node: ast.expr ) -> str|None:
 		# textual recognition, same as discovery.py's _is_compiler_target_call -
@@ -3520,6 +3530,55 @@ class FunctionLowering:
         call site. A graceful discovery.fail() here, not a raw crash - a
 		single already-broken generator shouldn't be able to take down
 		the whole compile run. '''
+		self._emit_generator_yield_suspend( node )
+
+	def _emit_generator_yield_suspend( self, node: ast.Yield ) -> None:
+		''' PLAN_GENERATORS.md Phase F/Phase C - the suspend itself, shared
+		by both the discarded (statement-position, `_lower_generator_
+		yield` above) and captured (expression-position, `_expr_Yield`
+		below) cases: `self.__state = state` (an ordinary SetAttr -
+		__state is a scalar usize field, never RC-typed, so this needs
+		none of _stmt_Assign's decref-old-value machinery), the yielded
+		value coerced against this function's own declared return type
+		(mirrors _stmt_Return's identical coercion + _incref_aliasing_
+		return call, deliberately WITHOUT everything else Return does - a
+		yield doesn't unwind or jump to any epilogue; locals persist
+		across a suspend by construction, see type_resolver.py's own
+		live-flag-field mechanism for what actually makes that safe at
+		the value level), then ir.Yield itself, then the resume Label.
+		`_expr_Yield` picks up from here to read back whatever `.send()`
+		delivered - this method itself has no idea whether that's even
+		possible (SendType may not be declared at all), that's entirely
+		its own caller's concern.
+
+		Composes for free with arbitrary nesting (if/while/for/with),
+		unlike the old AST-synthesis unit-matcher this replaced: nothing
+		here touches self._cfg's bindings/live-set at all, so lowering
+		the WHOLE generator body once, in ordinary program order (exactly
+		like any non-generator function's body), already leaves the
+		compiler's own static RC-ownership view exactly where a real
+		fall-through would - regardless of how many times a given
+		textual point is actually reached at RUNTIME via a resume jump.
+		No merge_if-style reconciliation is needed for the dispatch
+		prologue's own jumps either, for the same reason: they're
+		alternate ENTRY points into one linear lowering pass, not a fork
+		requiring two independently-lowered branches to be reconciled.
+
+		state/resume_label can genuinely be missing here (not just a
+		theoretical "should never happen"): a generator whose own
+		ensure_generator_synthesized run aborted partway through, for an
+		unrelated already-reported reason (e.g. a `return` inside a
+		defer/errdefer body - _reject_return_inside_generator_defer_body,
+		called from _desugar_generator_defer_sites, BEFORE _assign_
+		generator_yield_dispatch ever runs), leaves fn.node.body's own
+		yields untagged AND fn.return_type never rewritten to the
+		synthesized backing class - id(fn) is already memoized as
+		"synthesized" by then (see ensure_generator_synthesized's own
+		top), so nothing retries it, and the original, still-yield-
+		bearing body can still reach real lowering via a later, unrelated
+        call site. A graceful discovery.fail() here, not a raw crash - a
+		single already-broken generator shouldn't be able to take down
+		the whole compile run. '''
 		state = getattr( node, 'generator_yield_state', None )
 		resume_label = getattr( node, 'generator_resume_label', None )
 		if state is None or resume_label is None:
@@ -3559,6 +3618,96 @@ class FunctionLowering:
 		self._flush_pending_temps()
 		self._emit( ir.Yield( value = value, state = state, resume_label = resume_label ))
 		self._emit( ir.Label( name = resume_label ))
+
+	def _expr_Yield( self, node: ast.Yield, expected_type: Type|None ) -> ir.Operand:
+		''' PLAN_GENERATORS.md Phase C - `(yield expr)` used as an
+		EXPRESSION: the suspend itself is identical to the ordinary
+		statement-position case (_emit_generator_yield_suspend, shared) -
+		what's new is what happens AFTER resuming. Only legal inside a
+		generator that declared a SendType (Generator[T,SendType,E]);
+		Iterator[T]/the 2-arg Generator[T,E] form have no SendType to
+		ever deliver a captured yield's own value through, so this fails
+		clearly instead of reaching lowering with nothing to read back
+		(mirrors the pre-Phase-C behavior exactly - _lower_expr's own
+		getattr-based dispatch already rejected any expression-position
+		yield as "unsupported expression" before this method existed at
+		all, just with a much less specific message).
+
+		Reads back self.__send_ready: True means send(v) armed __send_
+		slot since this exact suspend point - clears the flag (consumed,
+		one-shot) and reads __send_slot as this expression's own value; a
+		PLAIN field read, no incref of its own - _is_aliasing_expr now
+		recognizes a captured ast.Yield as aliasing (same category
+		ast.Attribute already is - it reads an existing field, self.
+		__send_slot's own reference, independent of whatever __send_slot
+		itself keeps), so wherever this operand ultimately lands (`held =
+		yield i`, an argument, ...) gets its own Incref through the SAME
+		ordinary consumption-time machinery any other field read already
+		relies on - no special-casing needed here beyond that one
+		recognition fix. False means this resume came from a bare
+		__next__()/for-loop consumption instead (send_ready never armed) -
+		panics with a message pointing at .send(), mirroring Python's own
+		runtime behavior for resuming a captured yield without sending a
+		value. Composes for FREE with anything wrapping the yield (`x =
+		yield v`, `x = (yield v).or_return()`, ...) since this is ordinary
+		expression lowering - no special-casing needed for nesting, same
+		reason Phase F's own dispatch mechanism generalized nesting/
+		multiplicity for free. '''
+		send_type = getattr( self._current_fn.node, 'generator_send_type', None )
+		if send_type is None:
+			self.lowering.discovery.fail(
+				f'{self._current_fn.qualname}: yield can only be used as an expression inside a generator that declares a '
+				f'SendType (Generator[T,SendType,E]) - a bare `yield expr` statement is still supported everywhere else - '
+				f'see PLAN_GENERATORS.md',
+				node,
+			)
+			send_type = self._current_fn.return_type # keep going with SOME type so the rest of this method still produces a well-typed (if meaningless) operand, same "don't cascade into confusing follow-on errors" posture the rest of this file uses after a reported failure
+
+		self._emit_generator_yield_suspend( node )
+
+		self_name = ast.Name( id = 'self', ctx = ast.Load() )
+		ast.copy_location( self_name, node )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		ready_read = ast.Attribute( value = self_name, attr = '__send_ready', ctx = ast.Load() )
+		ast.copy_location( ready_read, node )
+		ready = self._lower_expr( ready_read, bool_cls )
+
+		panic_label = self._new_label( 'gen_send_required' )
+		end_label = self._new_label( 'gen_send_end' )
+		self._emit( ir.JumpIfFalse( cond = ready, target = panic_label ))
+
+		# true branch: a pending send exists - consume it (clear the flag,
+		# one-shot) and deliver __send_slot as this expression's value
+		self_obj, writeback = self._lower_attr_target_obj( self_name )
+		self._emit( ir.SetAttr( obj = self_obj, attr = '__send_ready', value = ir.Const( type = bool_cls, value = False )))
+		if writeback is not None:
+			writeback( self_obj )
+		slot_read = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__send_slot', ctx = ast.Load() )
+		ast.copy_location( slot_read, node )
+		ast.copy_location( slot_read.value, node )
+		slot_val = self._lower_expr( slot_read, send_type, strict = False )
+		dest = self._new_temp( send_type )
+		self._emit( ir.Assign( dest = dest, src = slot_val ))
+		self._emit( ir.Jump( target = end_label ))
+
+		# false branch: resumed via __next__()/for-loop consumption
+		# instead of .send() - panic, same statement-position AST-
+		# synthesis + swap-buffer technique _build_generator_error_defer_
+		# replay/_build_generator_pessimistic_done_pin already use to
+		# reuse ordinary _lower_call/_lower_stmt machinery for a call this
+		# file has no other reason to hand-build IR for directly
+		self._emit( ir.Label( name = panic_label ))
+		panic_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = 'sys', ctx = ast.Load() ), attr = 'panic', ctx = ast.Load() ),
+			args = [ ast.Constant( value = f'{self._current_fn.qualname}: resumed via __next__()/for-loop consumption at a captured yield - use .send() instead' ) ],
+			keywords = [],
+		)
+		panic_stmt = ast.Expr( value = panic_call )
+		ast.copy_location( panic_call, node ); ast.copy_location( panic_stmt, node )
+		ast.fix_missing_locations( panic_stmt )
+		self._lower_stmt( panic_stmt )
+		self._emit( ir.Label( name = end_label ))
+		return dest
 
 	def _stmt_With( self, node: ast.With ) -> None:
 		if len( node.items ) != 1 or node.items[0].optional_vars is not None:
