@@ -12,6 +12,8 @@
 # decodes a failure back to the offending case name and sub-code.
 
 # stdlib imports:
+import os
+import sys
 import unittest
 
 # local imports:
@@ -743,6 +745,76 @@ def main() -> i32:
 	return 0
 ''' ),
 		])
+
+
+_NETWORK_OK = os.environ.get( 'METALPY_TEST_NETWORK', '1' ) not in ( '0', 'false', 'False' )
+_HAS_TLS_BACKEND = os.name == 'nt' or sys.platform.startswith( 'linux' )
+
+
+@unittest.skipUnless( _HAS_TLS_BACKEND, 'lib/ssl.py only has Windows/Linux backends so far - see PLAN_SSL.md' )
+@unittest.skipUnless( _NETWORK_OK, 'set METALPY_TEST_NETWORK=0 to acknowledge - these tests dial out to example.com' )
+class HTTPSClientTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' HTTPConnection/HTTPSConnection/Session over real https:// - same
+	network-dependent departure ssl_test.py's own handshake tests already
+	are (there's no loopback TLS server here either, for the same reason:
+	lib/ssl.py is client-only - see PLAN_SSL.md). Exercises the actual
+	wiring in lib/http/client.py (_Transport, _connect_transport,
+	_parse_url's https:// support, HTTPSConnection) against a real server,
+	not just that it compiles. '''
+
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'session_get_https', '''
+from http.client import get
+
+def main() -> i32:
+	r = get( 'https://example.com/' ).unwrap( 'https get' )
+	if r.status_code != 200:
+		return 1
+	body: str = r.text().unwrap( 'decode body' )
+	if not body.startswith( '<!doctype html>' ):
+		return 2
+	return 0
+''' ),
+			( 'httpsconnection_direct', '''
+from http.client import HTTPSConnection, Response, HTTPHeaders
+
+def main() -> i32:
+	conn = HTTPSConnection.connect( 'example.com' ).unwrap( 'https connect' )
+	conn.request( 'GET', '/', None, None ).unwrap( 'request' )
+	resp: Response = conn.getresponse().unwrap( 'getresponse' )
+	conn.close()
+	if resp.status_code != 200:
+		return 1
+	# staged into a local first, NOT resp.headers.get(...) is None directly -
+	# a real, pre-existing (unrelated to TLS) compiler gap: `X.field.method()
+	# is None` fails to compile ("built-in operator '==' cannot be applied"
+	# to the str|None union) where the equivalent `local.method() is None`
+	# compiles fine. Flagged as its own follow-up, not fixed here.
+	h: HTTPHeaders = resp.headers
+	if h.get( 'Content-Type' ) is None:
+		return 2
+	return 0
+''' ),
+			( 'https_certificate_failure_surfaces_as_tlserror', '''
+from http.client import get, HTTPError
+
+def main() -> i32:
+	match get( 'https://expired.badssl.com/' ):
+		case Result.Ok( _ ):
+			return 1  # unexpected - badssl.com's cert should never validate
+		case Result.Err( HTTPError.TLSError( _ )):
+			return 0
+		case Result.Err( _ ):
+			return 2  # wrong HTTPError variant
+''' ),
+		], timeout = 60.0 )  # three real external TLS handshakes - generous margin for network jitter
 
 
 if __name__ == '__main__':

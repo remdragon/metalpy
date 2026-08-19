@@ -403,9 +403,50 @@ this codebase was hitting the same walls before these fixes landed).
     gaps found while landing this - see "Compiler gaps found while landing
     Phase 4a" below.
 
-  Phase 4b (deferred/future plan doc) — HTTPSConnection/TLS (no TLS library
-    exists at all yet - a large separate undertaking), multipart `files=`,
-    connection reuse/keep-alive.
+  Phase 4b — landed: HTTPSConnection/TLS, once lib/ssl.py's Windows and Linux
+    backends existed (see PLAN_SSL.md - a large separate undertaking of its
+    own, scoped and landed in its own parallel plan/session rather than
+    inline here). _parse_url now accepts https:// (default port 443, same
+    ParsedURL.scheme field that already existed but was previously checked
+    against 'http' only); a new _Transport @union (Socket | ssl.SSLSocket)
+    replaces HTTPConnection's old concrete `__sock: Socket` field so the same
+    request()/getresponse()/close() code path works over either transport
+    unmodified (see lib/http/client.py's own comment on why this is a union
+    and not a real HTTPSConnection(HTTPConnection) subclass - MetalPy's
+    RCClass subclassing rules forbid a subclass shadowing a base field with a
+    different type, which a plain-vs-TLS transport field would need).
+    HTTPSConnection itself is a small standalone class (not a subclass)
+    whose connect() returns the same HTTPConnection type, already carrying
+    whichever transport it was given - CPython-shaped naming without needing
+    real subtype polymorphism, which nothing here actually requires.
+    HTTPError gained one new member, TLSError (a plain None-payload variant,
+    matching every other member's shape - a caller wanting the specific
+    ssl.SSLError reason would need to use lib/ssl.py directly).
+    _next_redirect_url now follows a Location resolving to either http:// or
+    https:// (previously only http:// - the https:// restriction existed
+    only because nothing could reach it yet). Covered by http_client_test.py's
+    new HTTPSClientTests: a real Session.get('https://...'), a direct
+    HTTPSConnection.connect() round trip, and a certificate-failure path
+    (expired.badssl.com) confirmed to surface as HTTPError.TLSError - same
+    "dial out to a real public host, no loopback TLS server" departure
+    ssl_test.py's own handshake tests already are, for the same reason
+    (lib/ssl.py is client-only). Verified on all three toolchains this
+    project supports (MSVC, clang on Windows; gcc on Linux via WSL).
+
+    One real, pre-existing compiler gap found while landing this (unrelated
+    to TLS/HTTP specifically - see PLAN_SSL.md's own note, and the task
+    flagged for it): `expr.field.method() is None` fails to compile
+    ("built-in operator '==' cannot be applied" to the str|None union)
+    where the equivalent staged through a local (`local.method() is None`)
+    compiles fine. Worked around at the one call site that hit it
+    (HTTPSClientTests.httpsconnection_direct stages resp.headers into a
+    local first) rather than blocking this work on a compiler fix, matching
+    this file's own established practice for compiler gaps found while
+    landing a phase - see "Compiler gaps found while landing Phase 4a" below
+    for the precedent.
+
+  Phase 4c (deferred/future plan doc) — multipart `files=` uploads,
+    connection reuse/keep-alive, HTTP/2.
 
 Compiler gaps found while landing Phase 4a
 

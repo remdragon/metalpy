@@ -246,10 +246,9 @@ module and PLAN_HTTP_CLIENT.md's own Response/Session sketch.
       # __del__ auto-closes, same idiom as BinaryReader/BinaryWriter in
       # lib/builtins/__File.py and socket.Socket itself
 
-This is what makes PLAN_HTTP_CLIENT.md's reserved verify=True kwarg and its
-deferred HTTPSConnection real, once wired up (still a follow-up) — HTTPSConnection
-becomes a thin wrapper: connect a raw socket.Socket, then SSLSocket.wrap_socket()
-it before handing the result to the existing request/response read/write path.
+This is what makes lib/http/client.py's HTTPSConnection real - wired up as
+Phase 4 below: connect a raw socket.Socket, then SSLSocket.wrap_socket() it
+before handing the result to the existing request/response read/write path.
 
 Remaining phased roadmap
 
@@ -259,10 +258,12 @@ Remaining phased roadmap
     verify against - do the binding/struct work but hold off calling it done
     without a real handshake test, same discipline Phase 1/2 were held to.
 
-  Phase 4 (deferred/future plan doc) — wire into lib/http/client.py's reserved
-    verify=/HTTPSConnection path. Also: client-certificate auth
-    (load_cert_chain), session resumption/ticket caching, ALPN (relevant for a
-    future HTTP/2 story PLAN_HTTP_CLIENT.md already marked out of scope).
+  Phase 4 — landed: wired into lib/http/client.py as HTTPSConnection (see
+    PLAN_HTTP_CLIENT.md's own "Phase 4b — landed" entry for the details -
+    _Transport union, HTTPError.TLSError, https:// URL support). Still
+    deferred: client-certificate auth (load_cert_chain), session
+    resumption/ticket caching, ALPN (relevant for a future HTTP/2 story
+    PLAN_HTTP_CLIENT.md already marked out of scope).
 
 Testing approach
 
