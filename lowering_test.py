@@ -4633,6 +4633,37 @@ class Tests( unittest.TestCase ):
 		self.assertIsInstance( allocate_instr.dest.type, Specialization )
 		self.assertIs( allocate_instr.dest.type.base, foo_cls )
 
+	def test_allocate_accepts_explicit_self_subscript_of_own_type_param( self ) -> None:
+		# a generic class's own method re-applying its OWN type parameter
+		# explicitly - Foo[T].__allocate__(...) - rather than the bare
+		# Foo.__allocate__(...) spelling used everywhere above. Both should
+		# resolve identically (redundant [T] carries no new information over
+		# the in-scope T lookup the bare form already does); previously
+		# Foo[T] in this call-target position was lowered as a VALUE
+		# expression instead of a type reference, failing with "'Foo' is
+		# not a value, cannot use it as an expression"
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo[T]:',
+			'	x: T',
+			'',
+			'	@staticmethod',
+			'	def make( v: T ) -> Foo[T]:',
+			'		res: Foo[T] = Foo[T].__allocate__( x = v )',
+			'		return res',
+		])
+		mod = self._import( code )
+		foo_cls = mod.get_local( 'Foo' )
+		foo_cls.resolve()
+		make_fn = foo_cls.get_local( 'make' )
+		if make_fn.resolve is not None:
+			make_fn.resolve()
+		fn = self.compiler._lower( make_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocate_instr = next( i for i in fn.instructions if isinstance( i, ir.Allocate ))
+		self.assertIsInstance( allocate_instr.dest.type, Specialization )
+		self.assertIs( allocate_instr.dest.type.base, foo_cls )
+
 	def test_bare_construct_infers_type_args_from_field_values_with_no_expected_type( self ) -> None:
 		# the bug report's own repro shape (also PLAN_RETURN_INFERENCE.md's
 		# "Also found and worked around, NOT fixed" note): a generic
