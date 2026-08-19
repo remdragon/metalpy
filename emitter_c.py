@@ -2324,6 +2324,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{_emit_operand(instr.dest)} = ~({_emit_operand(instr.operand)});' ]
 	if isinstance( instr, ir.Not ):
 		return [ f'\t{_emit_operand(instr.dest)} = !({_emit_operand(instr.operand)});' ]
+	if isinstance( instr, ir.MarkUsed ):
+		return [ f'\t(void){_emit_operand(instr.operand)};' ]
 	if type( instr ) in _NEG_MODE:
 		return _emit_neg( instr )
 	if type( instr ) in _CAST_MODE:

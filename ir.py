@@ -328,6 +328,25 @@ class Not( Instruction ): # boolean negation: dest = !operand
 	def test_repr( self ) -> str:
 		return f'Not( dest={self.dest!r}, operand={self.operand!r} )'
 
+@dataclass( kw_only = True )
+class MarkUsed( Instruction ):
+	''' no runtime effect - marks operand as read without actually reading
+	it, purely to keep the C compiler from flagging its already-completed
+	definition as dead (-Wunused-variable/-Wunused-but-set-variable/
+	C4189). Emitted only where lowering.py already knows operand's real
+	definition happened and won't be read again through any other path -
+	e.g. compiler.decref(x)/compiler.incref(x) silently no-op for a non-RC
+	x inside a monomorphized generic-class method (_in_generic_class_
+	method) rather than failing, so x can end up with no other reader at
+	all in that specific instantiation (list[i32].__del__'s `val`, never
+	RC, only ever passed to decref). NEVER emit this before operand's real
+	definition - that would silence a genuine uninitialized-value bug
+	instead of a spurious warning. '''
+	operand: Operand
+
+	def test_repr( self ) -> str:
+		return f'MarkUsed( operand={self.operand!r} )'
+
 # Result-consuming ops - Check-mode arithmetic and Div/Mod hand back a
 # Result[T,OverflowError] rather than panicking inline. These mirror the real
 # methods already defined on builtins.Result (or_return, unwrap, unwrap_or in

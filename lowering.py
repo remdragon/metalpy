@@ -4403,6 +4403,12 @@ class FunctionLowering:
 				self._emit( instr )
 			return
 		if operand.type is not None and self._in_generic_class_method():
+			# a genuine no-op for THIS monomorphization (see the comment
+			# above), but operand may have no other reader at all in that
+			# case (e.g. list[i32].__del__'s `val`, only ever passed to
+			# decref) - mark it read so the no-op doesn't turn its own
+			# already-emitted definition into -Wunused-variable/C4189
+			self._emit( ir.MarkUsed( operand = operand ))
 			return
 		self.lowering.discovery.fail(
 			f'compiler.decref(...) argument must be a reference-counted value, not '
@@ -4458,6 +4464,8 @@ class FunctionLowering:
 				self._emit( instr )
 			return
 		if operand.type is not None and self._in_generic_class_method():
+			# see _lower_compiler_decref's own identical comment
+			self._emit( ir.MarkUsed( operand = operand ))
 			return
 		self.lowering.discovery.fail(
 			f'compiler.incref(...) argument must be a reference-counted value, not '
