@@ -520,8 +520,29 @@ this codebase was hitting the same walls before these fixes landed).
   this was genuinely new territory, not a previously-exercised path.
   Flagged as task_3abe3f4f.
 
+  verify=False landed — a `verify: bool = True` parameter threaded through
+  Session.request()/get/post/put/patch/delete/head/options, the matching
+  module-level convenience functions, and HTTPSConnection.connect(), down
+  to _connect_tls_or_http_err(). verify=False switches to a new
+  ssl.SSLContext.create_unverified_context() sibling factory (added on both
+  the Windows/Schannel and Linux/OpenSSL backends - Windows via
+  SCH_CRED_MANUAL_CRED_VALIDATION instead of SCH_CRED_AUTO_CRED_VALIDATION,
+  Linux via SSL_CTX_set_verify(..., SSL_VERIFY_NONE, ...) instead of
+  SSL_VERIFY_PEER - both purely additive, existing create_default_context()
+  untouched). macOS's poison-pill SSLContext stub got a matching
+  create_unverified_context() stub too, for API symmetry. Proven for real,
+  not just compiled: a new test (https_verify_false_accepts_expired_cert)
+  hits the same expired.badssl.com endpoint the existing certificate-
+  failure test already dials (which correctly still rejects with
+  verify=True/default), and confirms verify=False's handshake succeeds
+  anyway. Run across all three local compilers (MSVC and clang on Windows -
+  Schannel backend, gcc via WSL - OpenSSL backend) - full suite green on
+  all three (1401 tests).
+
   Phase 4c (deferred/future plan doc) — multipart `files=` uploads,
-    connection reuse/keep-alive, HTTP/2.
+    connection reuse/keep-alive, HTTP/2. timeout_ms= is also still
+    deferred, but no longer blocked here specifically - a separate session
+    is adding non-blocking I/O (incl. timeout support) to lib/socket.py.
 
 Compiler gaps found while landing Phase 4a
 

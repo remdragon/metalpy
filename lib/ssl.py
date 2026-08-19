@@ -50,9 +50,10 @@ if compiler.target.os == 'windows':
 	# hardcoded rather than compiler.cexpr'd, matching
 	# lib/windows/com/__init__.py's own precedent for winerror.h HRESULTs) ---
 
-	SCHANNEL_CRED_VERSION:         u32 = 4
-	SCH_CRED_NO_DEFAULT_CREDS:     u32 = 0x00000010
-	SCH_CRED_AUTO_CRED_VALIDATION: u32 = 0x00000020
+	SCHANNEL_CRED_VERSION:           u32 = 4
+	SCH_CRED_NO_DEFAULT_CREDS:       u32 = 0x00000010
+	SCH_CRED_AUTO_CRED_VALIDATION:   u32 = 0x00000020
+	SCH_CRED_MANUAL_CRED_VALIDATION: u32 = 0x00000008
 
 	SECPKG_CRED_OUTBOUND: u32 = 0x00000002
 
@@ -101,6 +102,7 @@ elif compiler.target.os != 'macos':
 	# result's and SSL_ctrl's `long` parameters/returns are i64 here, not i32.
 
 	SSL_VERIFY_PEER: i32 = 0x01
+	SSL_VERIFY_NONE: i32 = 0x00
 
 	SSL_ERROR_NONE:        i32 = 0
 	SSL_ERROR_SSL:         i32 = 1
@@ -430,6 +432,32 @@ class SSLContext:
 		cred_data: SCHANNEL_CRED = SCHANNEL_CRED(
 			dwVersion = SCHANNEL_CRED_VERSION,
 			dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_AUTO_CRED_VALIDATION,
+		)
+		hcred: SecHandle = SecHandle()
+		expiry: TimeStamp = TimeStamp( 0 )
+		status: SECURITY_STATUS = AcquireCredentialsHandleA(
+			None, pkg.get_cstr(), SECPKG_CRED_OUTBOUND, None,
+			compiler.cast( Ptr[None], compiler.addrof( cred_data )),
+			None, None,
+			compiler.addrof( hcred ), compiler.addrof( expiry ),
+		)
+		if status != SEC_E_OK:
+			return Result.Err( SSLError.Other )
+		return Result.Ok( SSLContext._from_cred( hcred ))
+
+	@staticmethod
+	def create_unverified_context() -> Result[SSLContext, SSLError]:
+		''' like create_default_context(), but SCH_CRED_MANUAL_CRED_VALIDATION
+		instead of SCH_CRED_AUTO_CRED_VALIDATION - Schannel skips certificate
+		chain validation entirely (expired/self-signed/hostname-mismatch all
+		succeed) since nothing here ever calls the manual validation API a
+		real "manual" caller would use to opt back in. Mirrors CPython's
+		ssl._create_unverified_context() - for talking to a self-signed/dev
+		server only, never for a real endpoint. '''
+		pkg: str = "Microsoft Unified Security Protocol Provider"
+		cred_data: SCHANNEL_CRED = SCHANNEL_CRED(
+			dwVersion = SCHANNEL_CRED_VERSION,
+			dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION,
 		)
 		hcred: SecHandle = SecHandle()
 		expiry: TimeStamp = TimeStamp( 0 )
@@ -937,6 +965,22 @@ class SSLContext:
 			return Result.Err( SSLError.Other )
 		return Result.Ok( SSLContext._from_ctx( ctx ))
 
+	@staticmethod
+	def create_unverified_context() -> Result[SSLContext, SSLError]:
+		''' like create_default_context(), but SSL_VERIFY_NONE instead of
+		SSL_VERIFY_PEER - the handshake succeeds regardless of the peer's
+		certificate (expired/self-signed/hostname-mismatch all succeed).
+		Skips loading the system trust store too, since nothing here needs
+		it with verification off. Mirrors CPython's
+		ssl._create_unverified_context() - for talking to a self-signed/dev
+		server only, never for a real endpoint. '''
+		method: Ptr[None] = TLS_client_method()
+		ctx: Ptr[None] = SSL_CTX_new( method )
+		if ctx is None:
+			return Result.Err( SSLError.Other )
+		SSL_CTX_set_verify( ctx, SSL_VERIFY_NONE, None )
+		return Result.Ok( SSLContext._from_ctx( ctx ))
+
 
 @compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
 class SSLSocket:
@@ -1072,6 +1116,10 @@ class SSLSocket:
 class SSLContext:
 	@staticmethod
 	def create_default_context() -> Result[SSLContext, SSLError]:
+		return _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()
+
+	@staticmethod
+	def create_unverified_context() -> Result[SSLContext, SSLError]:
 		return _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()
 
 @compiler.target( os = 'macos' )
