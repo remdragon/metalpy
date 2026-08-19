@@ -17153,10 +17153,23 @@ def main() -> i32:
 ''' ),
 		])
 
-	def test_yield_from_nested_inside_while_is_rejected( self ) -> None:
-		self._run( '''
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_yield_from_nested_inside_reenterable_loop_forwards_correctly( self ) -> None:
+		# PLAN_GENERATORS.md's own A.4a note - this shape used to be a
+		# compile-time rejection: __for_obj_N (the iterated expression a
+		# for-loop-with-yield/yield-from needs) was constructed exactly
+		# once, eagerly, at the OUTER generator's own construction time -
+		# reusing the same already-exhausted object on every re-entry
+		# instead of freshly reconstructing it, a silent WRONG-OUTPUT bug,
+		# not a merely-unsupported restriction. Fixed by making __for_obj_N
+		# an ordinary, re-derived-per-loop-entry promoted local instead
+		# (_new_for_obj_field) - real, compile-and-run verified behavior
+		# now, not just "no longer rejected."
+		self.assert_programs_run([
+			( 'yield_from_nested_inside_while_forwards_fresh_values_each_pass', '''
 def inner() -> Iterator[i32]:
 	yield 1
+	yield 2
 
 def outer( count: usize ) -> Iterator[i32]:
 	i: usize = 0
@@ -17165,14 +17178,27 @@ def outer( count: usize ) -> Iterator[i32]:
 		with compiler.wrap_arithmetic:
 			i += 1
 
-def main() -> None:
+def main() -> i32:
 	g = outer( 3 )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'could re-enter it', str( self.discovery.errors.errors[0] ))
-
-	def test_yield_from_nested_inside_for_is_rejected( self ) -> None:
-		self._run( '''
+	total: i32 = 0
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			v = g.__next__()
+			if v is None:
+				break
+			total += v
+			count += 1
+	# 3 outer passes, each forwarding inner()'s own 2 values (1, 2) - a
+	# stale, already-exhausted inner() reused across passes would only
+	# ever produce the FIRST pass's own values (count=2, total=3)
+	if count != 6:
+		return 1
+	if total != 9:
+		return 2
+	return 0
+''' ),
+			( 'yield_from_nested_inside_for_forwards_fresh_values_each_element', '''
 def inner() -> Iterator[i32]:
 	yield 1
 
@@ -17180,11 +17206,53 @@ def outer( xs: list[i32] ) -> Iterator[i32]:
 	for _x in xs:
 		yield from inner()
 
-def main() -> None:
-	g = outer( [1, 2, 3] )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'could re-enter it', str( self.discovery.errors.errors[0] ))
+def main() -> i32:
+	g = outer( [10, 20, 30] )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			v = g.__next__()
+			if v is None:
+				break
+			count += 1
+	if count != 3:
+		return 1
+	return 0
+''' ),
+			( 'for_loop_with_yield_directly_nested_inside_another_forwards_correctly', '''
+def inner() -> Iterator[i32]:
+	yield 1
+
+def outer( xs: list[i32] ) -> Iterator[i32]:
+	for _x in xs:
+		for y in inner():
+			yield y
+
+def main() -> i32:
+	g = outer( [10, 20, 30] )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			v = g.__next__()
+			if v is None:
+				break
+			count += 1
+	# _desugar_indexable_for's own generated while-loop splices the
+	# original for-loop's body in verbatim, WITHOUT re-scanning it for a
+	# further nested for-loop-with-yield of its own - confirmed via a
+	# real repro to leave the inner one un-desugared, falling through to
+	# lowering.py's ordinary (non-generator-aware) for-loop lowering
+	# instead: compiled clean, but crashed at runtime under MSVC (debug:
+	# heap-corruption breakpoint; release: access violation) - clang/gcc's
+	# own codegen happened not to visibly corrupt anything for the same
+	# wrong IR, masking it completely. _recurse_desugar_for_loops now
+	# recurses into a for-loop-with-yield's own desugared output too, not
+	# just plain if/while/for/with bodies.
+	if count != 3:
+		return 1
+	return 0
+''' ),
+		])
 
 	def test_yield_wrong_element_type_is_rejected( self ) -> None:
 		# found while testing A.4a's own yield-from forwarding, but
