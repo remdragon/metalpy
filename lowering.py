@@ -4108,6 +4108,107 @@ class FunctionLowering:
 		self._emit( ir.AddrOf( dest = dest, value = value ))
 		return dest
 
+	def _c_field_name_literal( self, name_node: ast.expr, fn_name: str, node: ast.Call ) -> str:
+		# one level of field access ONLY, same restriction compiler.addrof's
+		# own field-access shape already has (see its own comment) - a
+		# dotted path ('uc_stack.ss_sp') can't reuse GetAttr/SetAttr/
+		# AddrOfField's existing 'attr: str' emission unchanged
+		# (mangle_qualname corrupts a literal '.' into '$', producing wrong
+		# C) - reaching a second-level opaque field means composing two
+		# single-level compiler.c_field*() calls instead (see
+		# _lower_compiler_c_field_addr's own comment)
+		if not ( isinstance( name_node, ast.Constant ) and isinstance( name_node.value, str ) and name_node.value.isidentifier() ):
+			self.lowering.discovery.fail(
+				f'compiler.{fn_name}(...) field name must be a plain identifier string literal '
+				f'(one level of field access, no dots): {ast.unparse(node)}',
+				node,
+			)
+		return name_node.value
+
+	def _require_c_type_pointer( self, ptr_type: Type|None, fn_name: str, node: ast.Call ) -> None:
+		if not (
+			isinstance( ptr_type, Specialization )
+			and isinstance( ptr_type.base, Scalar )
+			and ptr_type.base.stem in ( 'Ptr', 'ConstPtr' )
+			and isinstance( ptr_type.args[0], CType )
+		):
+			self.lowering.discovery.fail(
+				f'compiler.{fn_name}(...) first argument must be Ptr[T]/ConstPtr[T] where T is a '
+				f'compiler.c_type(...): {ast.unparse(node)}',
+				node,
+			)
+
+	def _lower_compiler_c_field( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.c_field(ptr, 'field_name', T) -> T - reads a field of an
+		# OPAQUE compiler.c_type(...) struct through ptr (Ptr[SomeCType]/
+		# ConstPtr[SomeCType]), trusting the caller's asserted type T the
+		# same way compiler.cexpr's/compiler.sizeof's own type arguments are
+		# trusted - nothing here verifies field_name or T against the real
+		# header's actual layout; a mismatch is caught by the C compiler
+		# once it sees the real struct definition, exactly like an
+		# @extern(header=...) signature mismatch already is. See
+		# lib/posix/pthread.py's own comment on why ucontext_t needs this:
+		# CType has no known field layout at all (unlike a @cstruct/
+		# @interface), so ordinary x.field access has nowhere to look the
+		# field up (_attr_lookup requires chain_lookup or a .names dict,
+		# neither of which CType has).
+		if len( node.args ) != 3 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.c_field(ptr, field_name, type) takes exactly 3 positional arguments: {ast.unparse(node)}', node )
+		ptr_node, name_node, type_node = node.args
+		ptr = self._lower_expr( ptr_node, None )
+		field_name = self._c_field_name_literal( name_node, 'c_field', node )
+		self._require_c_type_pointer( ptr.type, 'c_field', node )
+		field_type = self.lowering._try_resolve_namespace( type_node )
+		if not isinstance( field_type, Type ):
+			self.lowering.discovery.fail( f'compiler.c_field(...) third argument must be a type: {ast.unparse(node)}', node )
+		dest = self._new_temp( field_type )
+		self._emit( ir.GetAttr( dest = dest, obj = ptr, attr = field_name ))
+		return dest
+
+	def _lower_compiler_c_field_set( self, node: ast.Call, expected_type: Type|None ) -> None:
+		# compiler.c_field_set(ptr, 'field_name', value) - writes a field of
+		# an opaque compiler.c_type(...) struct through ptr. Same trust
+		# model as compiler.c_field's own read side (see its comment) -
+		# value's own type is whatever it already lowers to, unchecked
+		# against the real field's type beyond what the C compiler itself
+		# catches.
+		if len( node.args ) != 3 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.c_field_set(ptr, field_name, value) takes exactly 3 positional arguments: {ast.unparse(node)}', node )
+		ptr_node, name_node, value_node = node.args
+		ptr = self._lower_expr( ptr_node, None )
+		field_name = self._c_field_name_literal( name_node, 'c_field_set', node )
+		self._require_c_type_pointer( ptr.type, 'c_field_set', node )
+		value = self._lower_expr( value_node, None )
+		self._emit( ir.SetAttr( obj = ptr, attr = field_name, value = value ))
+		return None
+
+	def _lower_compiler_c_field_addr( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.c_field_addr(ptr, 'field_name', Ptr[T]) -> Ptr[T] -
+		# address of a NESTED value-typed field of an opaque c_type struct
+		# (e.g. ucontext_t's uc_stack, itself a stack_t VALUE, not a
+		# pointer) - lets a second-level opaque type (stack_t, its own
+		# compiler.c_type(...)) be reached by composing two single-level
+		# accesses (this, then compiler.c_field/c_field_set on the result)
+		# rather than needing a dotted field path - see
+		# _c_field_name_literal's own comment for why dotted paths aren't
+		# supported directly. Third argument is the FULL result type
+		# (Ptr[T], not just T) - unlike compiler.addrof, which computes the
+		# pointer level itself from a known operand type, everything here is
+		# already caller-asserted, so there's no "known type" to compute a
+		# level from.
+		if len( node.args ) != 3 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.c_field_addr(ptr, field_name, type) takes exactly 3 positional arguments: {ast.unparse(node)}', node )
+		ptr_node, name_node, type_node = node.args
+		ptr = self._lower_expr( ptr_node, None )
+		field_name = self._c_field_name_literal( name_node, 'c_field_addr', node )
+		self._require_c_type_pointer( ptr.type, 'c_field_addr', node )
+		result_type = self.lowering._try_resolve_namespace( type_node )
+		if not isinstance( result_type, Type ):
+			self.lowering.discovery.fail( f'compiler.c_field_addr(...) third argument must be a type: {ast.unparse(node)}', node )
+		dest = self._new_temp( result_type )
+		self._emit( ir.AddrOfField( dest = dest, obj = ptr, attr = field_name ))
+		return dest
+
 	def _lower_compiler_atomic_load( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.atomic_load(...) takes exactly one argument: {ast.unparse(node)}', node )
@@ -11439,6 +11540,18 @@ class FunctionLowering:
 
 			case 'cexpr':
 				result = self.lowering._lower_compiler_cexpr( node, expected_type )
+				return result if want_result else None
+
+			case 'c_field':
+				result = self._lower_compiler_c_field( node, expected_type )
+				return result if want_result else None
+
+			case 'c_field_set':
+				self._lower_compiler_c_field_set( node, expected_type )
+				return None
+
+			case 'c_field_addr':
+				result = self._lower_compiler_c_field_addr( node, expected_type )
 				return result if want_result else None
 
 			case 'fetch_unicode_table':

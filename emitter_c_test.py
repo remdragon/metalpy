@@ -134,6 +134,95 @@ class CompilerTestCase( unittest.TestCase ):
 		self.compiler.import_code( code, Path( '__main__.py' ), scope = None )
 		self.compiler.run()
 
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class CFieldTests( CompilerTestCase, test_support.RealCompileMixin ):
+	''' compiler.c_field/c_field_set/c_field_addr - field access on an OPAQUE
+	compiler.c_type(...), needed for structs like POSIX's ucontext_t whose
+	layout this compiler can't know. Uses struct tm/<time.h> as the opaque
+	target since its int fields (tm_year, tm_mon) are portable across all 3
+	toolchains (MSVC ucrt, glibc, clang) without pulling in anything
+	platform-specific. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_get_set_roundtrip_on_opaque_c_type( self ) -> None:
+		self._run( '''
+import compiler
+import sys
+
+tm_t = compiler.c_type( 'struct tm', header = 'time.h' )
+
+def main() -> i32:
+	t: Ptr[tm_t] = sys.alloc[tm_t]( 1 )
+	compiler.c_field_set( t, 'tm_year', i32( 2024 ))
+	compiler.c_field_set( t, 'tm_mon', i32( 5 ))
+	y: i32 = compiler.c_field( t, 'tm_year', i32 )
+	m: i32 = compiler.c_field( t, 'tm_mon', i32 )
+	sys.free( compiler.cast( Ptr[None], t ))
+	if y == 2024 and m == 5:
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_c_field_addr_reaches_a_nested_value_field( self ) -> None:
+		# struct tm has no nested-struct field to test c_field_addr against
+		# directly, so this composes it artificially: get the address of
+		# tm_year itself (an int field, not a struct) as a Ptr[i32] via
+		# c_field_addr, then write through THAT pointer with an ordinary
+		# store - proves the address is real, not a copy, the same
+		# distinction AddrOfField's own docstring draws against GetAttr.
+		self._run( '''
+import compiler
+import sys
+
+tm_t = compiler.c_type( 'struct tm', header = 'time.h' )
+
+def main() -> i32:
+	t: Ptr[tm_t] = sys.alloc[tm_t]( 1 )
+	compiler.c_field_set( t, 'tm_year', i32( 1 ))
+	year_ptr: Ptr[i32] = compiler.c_field_addr( t, 'tm_year', Ptr[i32] )
+	year_ptr[0] = i32( 2024 )
+	y: i32 = compiler.c_field( t, 'tm_year', i32 )
+	sys.free( compiler.cast( Ptr[None], t ))
+	if y == 2024:
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_rejects_dotted_field_name( self ) -> None:
+		self._run( '''
+import compiler
+
+tm_t = compiler.c_type( 'struct tm', header = 'time.h' )
+
+def main() -> i32:
+	dummy: i32 = 0
+	t: Ptr[tm_t] = compiler.cast( Ptr[tm_t], compiler.addrof( dummy ))
+	x: i32 = compiler.c_field( t, 'a.b', i32 )
+	return 0
+''' )
+		self.assertTrue( any( 'one level of field access' in str( e ) for e in self.discovery.errors.errors ),
+			f'expected a one-level-of-field-access error, got: {self.discovery.errors.errors}' )
+
+	def test_rejects_non_c_type_pointer( self ) -> None:
+		self._run( '''
+import compiler
+
+def main() -> i32:
+	x: i32 = 5
+	p: Ptr[i32] = compiler.addrof( x )
+	y: i32 = compiler.c_field( p, 'whatever', i32 )
+	return 0
+''' )
+		self.assertTrue( any( 'compiler.c_type(...)' in str( e ) for e in self.discovery.errors.errors ),
+			f'expected a Ptr[T]-where-T-is-a-c_type error, got: {self.discovery.errors.errors}' )
+
 class EmitFunctionTests( CompilerTestCase ):
 	def test_empty_function_prototype_and_body( self ) -> None:
 		self._run( '''
