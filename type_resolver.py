@@ -1021,54 +1021,120 @@ class TypeResolver:
 		ast.fix_missing_locations( len_init ); ast.fix_missing_locations( index_init )
 		return [ obj_init, len_init, index_init, while_node ]
 
+	def _type_annotation_ast( self, t: Type, node: ast.AST ) -> ast.expr:
+		''' builds a fresh annotation-position AST expression resolving
+		back to `t` via discovery.py's own visit(...) machinery - a bare
+		ast.Name(id=t.stem) for a plain type (the pattern this file already
+		uses throughout for elem_type_name etc.), or a chain of `A | B | C`
+		BinOps rebuilt from t.leaves() for an anonymous union (t.stem
+		itself, e.g. "A|B", is not a valid Python identifier and wouldn't
+		resolve via ordinary name lookup - has to be spelled out textually,
+		the same shape a user writing it by hand would, which discovery.
+		py's own visit_BinOp/_flatten_union/_get_or_create_union already
+		knows how to resolve back to the identical interned union). A
+		NOMINAL @union (t.file is not None, e.g. a user's own MyError)
+		stays a bare Name - its own stem IS a valid identifier, and it
+		must NOT be decomposed into its own variants (matches _atomic_
+		leaves' identical distinction elsewhere in this file). Needed by
+		_desugar_iterator_for's own StopIteration-stripped remaining-error
+		type, which can legitimately be a fresh multi-member union. '''
+		if t is self.discovery.get_none_type():
+			result: ast.expr = ast.Constant( value = None )
+			ast.copy_location( result, node )
+			return result
+		if isinstance( t, TaggedUnion ) and t.file is None:
+			leaves = t.leaves()
+			expr = self._type_annotation_ast( leaves[0], node )
+			for leaf in leaves[1:]:
+				expr = ast.BinOp( left = expr, op = ast.BitOr(), right = self._type_annotation_ast( leaf, node ) )
+				ast.copy_location( expr, node )
+			return expr
+		result = ast.Name( id = t.stem, ctx = ast.Load() )
+		ast.copy_location( result, node )
+		return result
+
 	def _desugar_iterator_for( self, fn: Function, node: ast.For, obj_type: Type, next_fn: Function, extra_locals: dict[str,Type] ) -> list[ast.stmt]:
-		''' `for x in <expr>: BODY` where <expr> has __next__() -> T|None
-		(most commonly: another generator). Extracting the non-None
-		payload needs real narrowing, and the only working mechanism is
-		`match subject: case T(subject): ...` reusing the subject's own
-		name (cfg.py's narrow()/narrowed_member(), same as lowering.py's
-		own _lower_for_over_iterator uses at the IR level) - and that
-		narrowing does NOT survive past the branch that established it,
-		so the extraction has to happen INSIDE the match's own case arm,
-		writing directly into x (an ordinary field by then, no narrowing
-		concern once written). BODY itself (containing the yield) stays a
-		SIBLING of the match statement, not nested inside it - keeping
-		yield at the exact nesting depth _validate_while_yield_unit
-		already requires, with zero changes to that validator. x's own
-		element type was restricted to scalar when this was written -
-		PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) lifted that (x is an
-		ordinary promoted local like any other now - _collect_generator_
-		locals no longer scalar-gates it, and an RC-typed one gets the
-		same live-flag-gated destructor treatment as any other RC-typed
-		promoted local), verified via a real for-loop-over-list[RCClass]-
-		inside-a-generator repro. '''
+		''' `for x in <expr>: BODY` where <expr> has __next__() ->
+		Result[T,E] (E always includes StopIteration - PLAN_GENERATORS.md's
+		StopIteration reversal; most commonly: another generator).
+		Extracting the payload needs real narrowing, and the only working
+		mechanism is `match subject: case T(subject): ...` reusing the
+		subject's own name (cfg.py's narrow()/narrowed_member(), same as
+		lowering.py's own _lower_for_over_iterator uses at the IR level) -
+		and that narrowing does NOT survive past the branch that
+		established it, so the extraction has to happen INSIDE the match's
+		own case arm, writing directly into x (an ordinary field by then,
+		no narrowing concern once written). BODY itself (containing the
+		yield) stays a SIBLING of the match statement, not nested inside
+		it - keeping yield at the exact nesting depth _validate_while_
+		yield_unit already requires, with zero changes to that validator.
+
+		x's own binding shape (confirmed directly with the user): if E is
+		JUST StopIteration (no other error), x binds to plain T - the loop
+		itself handles StopIteration as ordinary termination, never
+		surfaced to the loop body. If E has any OTHER error alongside
+		StopIteration, x binds to Result[T,E'] with StopIteration already
+		stripped out of E' - the caller handles the real error explicitly
+		inside the loop body (match/.is_err()/.or_return()/.unwrap()), the
+		loop does NOT auto-propagate it (deliberately different from
+		_maybe_consume_result's own auto-propagate idiom for __len__/
+		__getitem__ elsewhere in this file - don't conflate the two).
+		Narrowing `e`'s own type down to E' inside the wildcard arm after
+		one explicit `case StopIteration(_):` arm reuses visit_Match's own
+		existing wildcard-narrows-to-the-union's-remaining-members
+		mechanism (Phase 6) - confirmed via a real repro, no bespoke
+		per-leaf rewrap machinery needed. `yield from` (_desugar_generator_
+		yield_from, below) requires an EXACT match between the inner and
+		outer generator's own Result[T,E] shapes instead of going through
+		this general binding - see its own docstring. '''
 		self.ensure_resolved( next_fn )
-		elem_type = next_fn.return_type
-		none_type = self.discovery.get_none_type()
-		if not (
-			isinstance( elem_type, TaggedUnion ) and len( elem_type.attributes ) == 2
-			and any( a.type is none_type for a in elem_type.attributes )
-		):
+		shape = self._result_shape( next_fn.return_type )
+		if shape is None:
 			self.discovery.fail(
-				f'{fn.qualname}: for loop needs __next__() to return exactly T|None on '
+				f'{fn.qualname}: for loop needs __next__() to return Result[T,E] on '
 				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
 				node,
 			)
-		result_type = elem_type
-		elem_type = next( a.type for a in result_type.attributes if a.type is not none_type )
+		elem_type, full_error_type = shape
+		stop_iteration_cls = self.discovery.find_name_or_none( 'StopIteration' )
+		if stop_iteration_cls is None or stop_iteration_cls not in self._atomic_leaves( full_error_type ):
+			self.discovery.fail(
+				f'{fn.qualname}: for loop needs __next__()\'s own error type to include StopIteration on '
+				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		remaining_leaves = [ leaf for leaf in self._atomic_leaves( full_error_type ) if leaf is not stop_iteration_cls ]
+		if not remaining_leaves:
+			remaining_error_type: Type|None = None
+		elif len( remaining_leaves ) == 1:
+			remaining_error_type = remaining_leaves[0]
+		else:
+			remaining_error_type = self.discovery._get_or_create_union( remaining_leaves )
 
 		obj_name, obj_init = self._new_for_obj_field( node, obj_type, extra_locals )
 		unique = self._for_desugar_counter
 		self._for_desugar_counter += 1
 		next_name = f'__for_next_{unique}'
 
-		elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() ) if elem_type is not None else ast.Name( id = '?', ctx = ast.Load() )
-		ast.copy_location( elem_type_name, node )
-		if isinstance( elem_type, Scalar ) and elem_type.stem == 'bool':
+		if remaining_error_type is None:
+			x_type: Type|None = elem_type
+			x_annotation = self._type_annotation_ast( elem_type, node )
+		else:
+			result_cls = self.discovery.find_name_or_none( 'Result' )
+			assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for a for-loop-with-yield but was not found'
+			x_type = self.discovery._get_or_create_specialization( result_cls, [ elem_type, remaining_error_type ] )
+			x_annotation = ast.Subscript(
+				value = ast.Name( id = 'Result', ctx = ast.Load() ),
+				slice = ast.Tuple( elts = [ self._type_annotation_ast( elem_type, node ), self._type_annotation_ast( remaining_error_type, node ) ], ctx = ast.Load() ),
+				ctx = ast.Load(),
+			)
+			ast.copy_location( x_annotation, node )
+			ast.copy_location( x_annotation.slice, node )
+		if isinstance( x_type, Scalar ) and x_type.stem == 'bool':
 			target_zero = ast.Constant( value = False )
 		else:
 			target_zero = ast.Constant( value = 0 )
-			if elem_type is not None and elem_type.is_rc():
+			if x_type is not None and x_type.is_rc():
 				# same exemption _rewrite_generator_constructor's own RC-
 				# typed field zero-placeholders already use (_expr_
 				# Constant's generator_zero_rc_field) - this loop target
@@ -1083,10 +1149,15 @@ class TypeResolver:
 				# Box is expected") - found via A.4a's own `yield from`
 				# (a natural way to forward an RC-typed inner generator's
 				# values), but reproduces identically with an ordinary
-				# user-written for-loop, no yield-from involved
+				# user-written for-loop, no yield-from involved. Checked
+				# against x_type (bare elem_type, OR Result[elem_type,
+				# remaining_error_type] once StopIteration is stripped
+				# out) rather than elem_type alone - a Result wrapping is
+				# RC whenever EITHER side is, so a scalar elem_type paired
+				# with an RC-carrying remaining error still needs this.
 				target_zero.generator_zero_rc_field = True
 		target_init = ast.AnnAssign(
-			target = ast.Name( id = node.target.id, ctx = ast.Store() ), annotation = elem_type_name,
+			target = ast.Name( id = node.target.id, ctx = ast.Store() ), annotation = x_annotation,
 			value = target_zero, simple = 1,
 		)
 		ast.copy_location( target_init, node )
@@ -1111,31 +1182,24 @@ class TypeResolver:
 		# Fix: give it the SAME ordinary promoted-local treatment as any
 		# user-written one (an AnnAssign, so _collect_generator_locals picks
 		# it up and _apply_live_flag_guards gives it the standard live-flag-
-		# guarded reassignment/destructor teardown) instead of opting it out
-		# - safe even though its type is a union (elem_type|None): Type.
-		# is_rc() already recurses into union leaves, so an RC elem_type
-		# still gets the live-flag companion field it needs.
-		# only an RC-typed elem_type actually needs any of the special
-		# handling below - a scalar/non-RC one has no ownership to track,
-		# so the ORIGINAL "recomputed fresh every resume, never crosses
-		# one" assumption (this method's own docstring) is still exactly
-		# true for it even when BODY contains a yield: nothing here needs
-		# tearing down, so nothing needs promoting. Confirmed via a real
-		# regression this branch used to trip on body_has_yield alone
-		# (an ordinary `for x in some_gen_of_usize(): yield x`, x scalar):
-		# the constructor's own zero-placeholder for a promoted __for_
-		# next_N has no exemption path for a NON-RC union target either
-		# (generator_zero_rc_field, just below in lowering.py, is gated on
-		# is_rc() same as everywhere else) - "expected NoneType|usize, got
-		# i32" on a case this method never needed to change in the first
-		# place.
+		# guarded reassignment/destructor teardown) instead of opting it out.
+		# Unlike the pre-StopIteration-reversal version of this method,
+		# needs_promotion no longer needs its own RC check - __for_next_N's
+		# own type, Result[elem_type,full_error_type], is now ALWAYS RC
+		# (full_error_type always includes StopIteration, itself a real,
+		# always-RC class like every other class in this language, even
+		# with zero fields of its own), so body_has_yield alone already
+		# implies it.
 		body_has_yield = any( isinstance( n, ast.Yield ) for n in self._walk_generator_body( node.body ) )
-		needs_promotion = body_has_yield and elem_type is not None and elem_type.is_rc()
+		needs_promotion = body_has_yield
 		if needs_promotion:
-			next_elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() ) if elem_type is not None else ast.Name( id = '?', ctx = ast.Load() )
-			ast.copy_location( next_elem_type_name, node )
-			next_annotation = ast.BinOp( left = next_elem_type_name, op = ast.BitOr(), right = ast.Constant( value = None ) )
+			next_annotation = ast.Subscript(
+				value = ast.Name( id = 'Result', ctx = ast.Load() ),
+				slice = ast.Tuple( elts = [ self._type_annotation_ast( elem_type, node ), self._type_annotation_ast( full_error_type, node ) ], ctx = ast.Load() ),
+				ctx = ast.Load(),
+			)
 			ast.copy_location( next_annotation, node )
+			ast.copy_location( next_annotation.slice, node )
 			next_assign = ast.AnnAssign(
 				target = ast.Name( id = next_name, ctx = ast.Store() ), annotation = next_annotation,
 				value = next_call, simple = 1,
@@ -1156,80 +1220,143 @@ class TypeResolver:
 
 		exhausted_break = ast.Break()
 		exhausted_break.compiler_synthesized_break = True # exempted from _validate_while_yield_unit's own break/continue rejection - see its own comment
-		none_case = ast.match_case(
-			pattern = ast.MatchSingleton( value = None ), guard = None,
-			body = [ exhausted_break ],
-		)
-		# the match arm's own bound extraction name: reuses next_name (the
-		# "narrowing bind, reuses the subject's own name" shape - see
-		# visit_Match's own original_subject_name) when the raw next()
-		# result stays a plain local - that mechanism can't apply once it's
-		# promoted instead (needs_promotion above): _GeneratorNameRenamer
-		# rewrites every ast.Name(id=next_name) it finds (including the
-		# match SUBJECT below) into self.<next_name>, but a MatchAs
-		# pattern's own `.name` is a plain str, never touched by that
-		# renamer (it only visits ast.Name nodes), and visit_Match's own
-		# "reuses the subject's own name" recognition requires the subject
-		# to still be a bare ast.Name to begin with - a self-attr subject
-		# never qualifies. A fresh, distinct name is needed either way, so
-		# use one (__for_elem_N) whenever needs_promotion -
-		# binding directly into node.target.id instead was tried first and
-		# is WRONG, not just for RC reasons: _match_pattern (below) always
-		# synthesizes a bind into a bare ast.Name, resolved via its own
-		# fresh self.locals[...] entry, never routed through self.<attr> -
-		# for A.4a's own yield-from desugaring node.target.id IS the
-		# promoted field's own stem (__yield_from_N), so that bind silently
-		# created a SECOND, same-named plain local shadowing the real
-		# field, which then never actually received the extracted value at
-		# all (confirmed via a real repro: the yielded value came back
-		# wrapped around a null pointer instead of the real one, while the
-		# shadow local's own extra reference just leaked, coincidentally
-		# still landing on a "plausible" refcount).
-		elem_bind_name = next_name if not needs_promotion else f'__for_elem_{unique}'
-		elem_case_body: list[ast.stmt] = [
-			ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = ast.Name( id = elem_bind_name, ctx = ast.Load() ) ),
-		]
-		if needs_promotion:
-			# elem_bind_name stays a PLAIN, non-promoted local here on
-			# purpose (tried promoting it via extra_locals first - wrong:
-			# _match_pattern, below, ALWAYS synthesizes its bind as a bare
+
+		def bind_name( base: str ) -> str:
+			return base if not needs_promotion else f'__for_{base}_{unique}'
+
+		# same reasoning next_name's own "reuses next_name whenever it stays
+		# a plain local" comment further down gives: a bind name only needs
+		# to be distinct from any promoted field's own stem once needs_
+		# promotion means everything here is renamed to self.<stem> -
+		# _GeneratorNameRenamer only ever touches ast.Name nodes, never a
+		# MatchAs pattern's own raw string .name, so reusing an ALREADY-
+		# promoted stem here would silently bind a second, disjoint plain
+		# local instead (see A.4a's own historical bug on this exact point,
+		# _for_elem_N's original docstring, still accurate about WHY, just
+		# renamed here since this method's own binding shape changed).
+		ok_bind_name = bind_name( 'ok' )
+		ok_case_body: list[ast.stmt] = []
+		if remaining_error_type is None:
+			ok_case_body.append( ast.Assign(
+				targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = ast.Name( id = ok_bind_name, ctx = ast.Load() ),
+			))
+		else:
+			rewrap = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+				args = [ ast.Name( id = ok_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			ast.copy_location( rewrap, node ); ast.copy_location( rewrap.func, node ); ast.copy_location( rewrap.func.value, node )
+			ok_case_body.append( ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = rewrap ))
+		if needs_promotion and elem_type is not None and elem_type.is_rc():
+			# ok_bind_name stays a PLAIN, non-promoted local here on
+			# purpose (tried promoting it via extra_locals first, for the
+			# original single-level version of this shape - wrong:
+			# _match_pattern always synthesizes its bind as a bare
 			# ast.Assign into a bare ast.Name, built fresh at visit_Match
 			# time - well AFTER _GeneratorNameRenamer has already run over
 			# this whole body during _build_generator_next_function, so a
-			# promoted elem_bind_name would just create a second, disjoint
+			# promoted bind name would just create a second, disjoint
 			# storage location: the bind writes a genuinely fresh plain
 			# local, while the re-store above - built here, so it DOES go
-			# through the renamer - reads self.<elem_bind_name> instead,
-			# the STILL-UNINITIALIZED field. Confirmed via a real repro:
-			# `x` came back None instead of the real extracted value).
+			# through the renamer - reads self.<bind_name> instead, the
+			# STILL-UNINITIALIZED field. Confirmed via a real repro on the
+			# original single-level shape: `x` came back None instead of
+			# the real extracted value.
 			#
 			# Kept plain, this temp's own extraction incref (the ordinary
-			# aliasing-read cost of pulling an RC payload out of the union)
-			# still needs a real decref, and cfg.py's own loop_back_edge()
-			# - which would ordinarily supply that automatically, for any
-			# plain Name binding confined to the loop - schedules it for
-			# the loop's own back edge, past the yield a few statements
-			# below, in a separate $$__resume__ call with a fresh stack
-			# frame (confirmed via a real repro: release_object() on a
-			# never-initialized local). So: decref it explicitly, right
-			# here, immediately after the re-store has taken its own
-			# independent reference - manually_decreffed (cfg.py, reached
-			# via compiler.decref's own lowering) marks it consumed, so the
-			# loop's own back-edge reconciliation no longer tries to a
-			# second time.
-			elem_case_body.append( _expr_stmt( ast.Call(
+			# aliasing-read cost of pulling a payload out of the union,
+			# doubled here since the re-wrap into Result.Ok(...)/Result.
+			# Err(...) above ALSO increfs its own argument) still needs a
+			# real decref, and cfg.py's own loop_back_edge() - which would
+			# ordinarily supply that automatically, for any plain Name
+			# binding confined to the loop - schedules it for the loop's
+			# own back edge, past the yield a few statements below, in a
+			# separate $$__resume__ call with a fresh stack frame
+			# (confirmed via a real repro on the original single-level
+			# shape: release_object() on a never-initialized local). So:
+			# decref it explicitly, right here, immediately after the
+			# re-store has taken its own independent reference - manually_
+			# decreffed (cfg.py, reached via compiler.decref's own
+			# lowering) marks it consumed, so the loop's own back-edge
+			# reconciliation no longer tries a second time.
+			ok_case_body.append( _expr_stmt( ast.Call(
 				func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
-				args = [ ast.Name( id = elem_bind_name, ctx = ast.Load() ) ], keywords = [],
+				args = [ ast.Name( id = ok_bind_name, ctx = ast.Load() ) ], keywords = [],
 			)))
-		elem_case = ast.match_case(
+		elem_type_name = self._type_annotation_ast( elem_type, node )
+		ok_case = ast.match_case(
 			pattern = ast.MatchClass(
-				cls = elem_type_name, patterns = [ ast.MatchAs( name = elem_bind_name ) ],
-				kwd_attrs = [], kwd_patterns = [],
+				cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+				patterns = [ ast.MatchAs( name = ok_bind_name ) ], kwd_attrs = [], kwd_patterns = [],
 			),
 			guard = None,
-			body = elem_case_body,
+			body = ok_case_body,
 		)
-		match_stmt = ast.Match( subject = ast.Name( id = next_name, ctx = ast.Load() ), cases = [ none_case, elem_case ] )
+
+		if remaining_error_type is None:
+			# E is JUST StopIteration - Result[T,StopIteration].Err(_) can
+			# only ever BE StopIteration, no inner match needed at all
+			err_case = ast.match_case(
+				pattern = ast.MatchClass(
+					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+				),
+				guard = None,
+				body = [ exhausted_break ],
+			)
+		else:
+			err_bind_name = bind_name( 'err' )
+			rewrap = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+				args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			ast.copy_location( rewrap, node ); ast.copy_location( rewrap.func, node ); ast.copy_location( rewrap.func.value, node )
+			remaining_case_body: list[ast.stmt] = [
+				ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = rewrap ),
+			]
+			if needs_promotion and remaining_error_type is not None and remaining_error_type.is_rc():
+				remaining_case_body.append( _expr_stmt( ast.Call(
+					func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+					args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+				)))
+			inner_stop_iteration_break = ast.Break()
+			inner_stop_iteration_break.compiler_synthesized_break = True
+			inner_match = ast.Match(
+				subject = ast.Name( id = err_bind_name, ctx = ast.Load() ),
+				cases = [
+					ast.match_case(
+						pattern = ast.MatchClass(
+							cls = ast.Name( id = 'StopIteration', ctx = ast.Load() ),
+							patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+						),
+						guard = None,
+						body = [ inner_stop_iteration_break ],
+					),
+					# wildcard, reached only once StopIteration's own tag is
+					# already ruled out by the sibling case above - visit_
+					# Match's own Phase 6 wildcard-narrowing (a wildcard
+					# arm's OWN subject read gets narrowed to whatever
+					# union members every prior sibling case hasn't already
+					# claimed) types err_bind_name here as remaining_error_
+					# type directly, not the wider full_error_type - no
+					# per-leaf rewrap machinery needed, confirmed via a
+					# real repro.
+					ast.match_case(
+						pattern = ast.MatchAs( name = None, pattern = None ), guard = None,
+						body = remaining_case_body,
+					),
+				],
+			)
+			ast.copy_location( inner_match, node )
+			err_case = ast.match_case(
+				pattern = ast.MatchClass(
+					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = err_bind_name ) ], kwd_attrs = [], kwd_patterns = [],
+				),
+				guard = None,
+				body = [ inner_match ],
+			)
+		match_stmt = ast.Match( subject = ast.Name( id = next_name, ctx = ast.Load() ), cases = [ err_case, ok_case ] )
 		ast.copy_location( match_stmt, node )
 
 		while_node = ast.While(
@@ -1242,55 +1369,212 @@ class TypeResolver:
 		ast.fix_missing_locations( target_init )
 		return [ obj_init, target_init, while_node ]
 
-	def _desugar_generator_yield_from( self, fn: Function ) -> None:
-		''' PLAN_GENERATORS.md A.4a follow-up - `yield from <expr>`
-		desugars into `for __yield_from_N in <expr>: yield __yield_from_
-		N`, run BEFORE _desugar_generator_for_loops so the synthesized
-		for-loop gets picked up by that pass's own existing machinery
-		exactly like an ordinary user-written for-loop-with-yield - no
-		separate forwarding mechanism needed (and, like every other for-
-		loop-with-yield, restricted to an INFALLIBLE T|None-shaped
-		__next__() - see _desugar_iterator_for - so `yield from` over a
-		fallible Generator[T,E]/Generator[T,SendType,E] isn't supported
-		either, same pre-existing boundary as an ordinary `for x in
-		fallible_gen():` outside a generator body). Recurses into nested
-		if/while/for/with bodies (same "_recurse_*_wrap" shape used
-		elsewhere in this file) - a `yield from` reachable through a
-		while/for that could re-enter it used to be rejected here (a
-		nesting validator ran before this point); lifted once __for_obj_N
-		stopped needing eager, construction-time-only evaluation to be
-		RC-safe - see _new_for_obj_field's own docstring. '''
-		fn.node.body = self._recurse_desugar_yield_from( fn, fn.node.body )
+	def _desugar_generator_yield_from( self, fn: Function, elem_type: Type, error_type: Type ) -> dict[str,Type]:
+		''' PLAN_GENERATORS.md's StopIteration reversal - `yield from
+		<expr>` requires <expr>'s own __next__() to return EXACTLY
+		Result[elem_type,error_type] (this generator's own declared
+		shape, identity-compared - every Result[T,E] specialization is
+		interned, same posture _require_result_return's own leaves-
+		containment check already relies on) - confirmed directly with
+		the user: no covering/widening check, no auto-propagation, every
+		value (Ok AND Err alike) forwarded untouched except Err(
+		StopIteration) specifically, which terminates yield-from's own
+		loop (falls through to whatever follows the statement) rather
+		than being forwarded as this generator's own exhaustion. A
+		narrower/wider mismatch is a clear compile error directing the
+		user to write an explicit `for` loop instead (which has its own,
+		more permissive binding rule - see _desugar_iterator_for) - NOT
+		silently downgraded to that shared path, which would double-wrap
+		(the shared for-loop path always yields the UNWRAPPED bare-T/
+		Result[T,E'] binding, auto-Ok-wrapped afterward by _wrap_
+		generator_next_returns_in_ok same as any other yield - forwarding
+		an ALREADY Result[elem_type,error_type]-shaped raw next() value
+		through that same auto-wrap would produce Ok(Result[...]), not
+		Result[...] itself).
 
-	def _recurse_desugar_yield_from( self, fn: Function, stmts: list[ast.stmt] ) -> list[ast.stmt]:
+		Run BEFORE _desugar_generator_for_loops - unlike A.4a's original
+		version, no longer reuses that shared machinery at all for this
+		exact-match case, so ordering no longer matters for THAT reason,
+		but still runs first to keep both desugaring passes' own
+		responsibilities cleanly separated (this handles yield-from
+		expressions specifically; that handles for statements, which
+		still includes any ordinary `for` loop the user wrote by hand to
+		work around a yield-from mismatch this method rejects). Recurses
+		into nested if/while/for/with bodies (same "_recurse_*_wrap"
+		shape used elsewhere in this file) - a `yield from` reachable
+		through a while/for that could re-enter it used to be rejected
+		here (a nesting validator ran before this point); lifted once
+		__for_obj_N-style locals stopped needing eager, construction-time-
+		only evaluation to be RC-safe - see _new_for_obj_field's own
+		docstring (this method's own __yield_from_obj_N field follows the
+		identical lazy-per-entry-reconstruction posture).
+
+		Returns extra_locals (name -> type) for every promoted local this
+		desugaring itself needs beyond what _collect_generator_locals's
+		own AnnAssign scan can discover - __yield_from_obj_N (the
+		iterated expression, an ordinary Assign not a real annotation,
+		same reason _new_for_obj_field's own __for_obj_N needs this) -
+		merged by the caller into _desugar_generator_for_loops's own
+		return value, same convention that method already establishes. '''
+		extra_locals: dict[str,Type] = {}
+		fn.node.body = self._recurse_desugar_yield_from( fn, fn.node.body, elem_type, error_type, extra_locals )
+		return extra_locals
+
+	def _recurse_desugar_yield_from( self, fn: Function, stmts: list[ast.stmt], elem_type: Type, error_type: Type, extra_locals: dict[str,Type] ) -> list[ast.stmt]:
 		result: list[ast.stmt] = []
 		for s in stmts:
 			if isinstance( s, ast.Expr ) and isinstance( s.value, ast.YieldFrom ):
-				unique = self._for_desugar_counter
-				self._for_desugar_counter += 1
-				target_name = f'__yield_from_{unique}'
-				yielded_name = ast.Name( id = target_name, ctx = ast.Load() )
-				ast.copy_location( yielded_name, s )
-				yield_stmt = ast.Expr( value = ast.Yield( value = yielded_name ))
-				ast.copy_location( yield_stmt, s )
-				ast.copy_location( yield_stmt.value, s )
-				for_node = ast.For(
-					target = ast.Name( id = target_name, ctx = ast.Store() ),
-					iter = s.value.value,
-					body = [ yield_stmt ], orelse = [],
-				)
-				ast.copy_location( for_node, s )
-				ast.copy_location( for_node.target, s )
-				ast.fix_missing_locations( for_node )
-				result.append( for_node )
+				result.extend( self._desugar_one_yield_from( fn, s, elem_type, error_type, extra_locals ))
 				continue
 			if isinstance( s, ( ast.If, ast.While, ast.For )):
-				s.body = self._recurse_desugar_yield_from( fn, s.body )
-				s.orelse = self._recurse_desugar_yield_from( fn, s.orelse )
+				s.body = self._recurse_desugar_yield_from( fn, s.body, elem_type, error_type, extra_locals )
+				s.orelse = self._recurse_desugar_yield_from( fn, s.orelse, elem_type, error_type, extra_locals )
 			elif isinstance( s, ast.With ):
-				s.body = self._recurse_desugar_yield_from( fn, s.body )
+				s.body = self._recurse_desugar_yield_from( fn, s.body, elem_type, error_type, extra_locals )
 			result.append( s )
 		return result
+
+	def _desugar_one_yield_from( self, fn: Function, s: ast.Expr, elem_type: Type, error_type: Type, extra_locals: dict[str,Type] ) -> list[ast.stmt]:
+		iter_expr = s.value.value
+		assert isinstance( s.value, ast.YieldFrom )
+		obj_type = self._resolve_expr_type_for_desugar( fn, iter_expr )
+		if obj_type is None:
+			self.discovery.fail(
+				f'{fn.qualname}: cannot determine the type of {ast.unparse(iter_expr)} to desugar this yield from '
+				f'- its type needs to be resolvable without lowering (a parameter, an already-declared local, or a '
+				f'simple attribute/call chain) - see PLAN_GENERATORS.md',
+				s,
+			)
+		next_fn = self._probe_method( obj_type, '__next__' )
+		if next_fn is None:
+			self.discovery.fail( f'{fn.qualname}: yield from needs __next__() on {obj_type.qualname if obj_type else "?"}: {ast.unparse(s)}', s )
+		self.ensure_resolved( next_fn )
+		shape = self._result_shape( next_fn.return_type )
+		stop_iteration_cls = self.discovery.find_name_or_none( 'StopIteration' )
+		if shape is None or stop_iteration_cls is None or stop_iteration_cls not in self._atomic_leaves( shape[1] ):
+			self.discovery.fail(
+				f'{fn.qualname}: yield from needs __next__() to return Result[T,E] (E including StopIteration) on '
+				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(s)}',
+				s,
+			)
+		inner_elem_type, inner_error_type = shape
+		if inner_elem_type is not elem_type or inner_error_type is not error_type:
+			self.discovery.fail(
+				f'{fn.qualname}: yield from requires an EXACT match between the consumed Result[T,E] '
+				f'(Result[{inner_elem_type.qualname},{inner_error_type.qualname}]) and this generator\'s own '
+				f'declared Result[T,E] (Result[{elem_type.qualname},{error_type.qualname}]) - write an explicit '
+				f'for loop instead to handle the difference: {ast.unparse(s)}',
+				s,
+			)
+
+		unique = self._for_desugar_counter
+		self._for_desugar_counter += 1
+		obj_name = f'__yield_from_obj_{unique}'
+		extra_locals[obj_name] = obj_type
+		obj_init = ast.Assign( targets = [ ast.Name( id = obj_name, ctx = ast.Store() ) ], value = iter_expr )
+		ast.copy_location( obj_init, s )
+		obj_init.compiler_synthesized_for_loop_temp = True
+
+		next_name = f'__yield_from_next_{unique}'
+		next_call = ast.Call(
+			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__next__', ctx = ast.Load() ),
+			args = [], keywords = [],
+		)
+		next_annotation = ast.Subscript(
+			value = ast.Name( id = 'Result', ctx = ast.Load() ),
+			slice = ast.Tuple( elts = [ self._type_annotation_ast( elem_type, s ), self._type_annotation_ast( error_type, s ) ], ctx = ast.Load() ),
+			ctx = ast.Load(),
+		)
+		ast.copy_location( next_annotation, s )
+		ast.copy_location( next_annotation.slice, s )
+		# always promoted - a yield-from loop unconditionally yields on
+		# every iteration (that's the whole point), so __yield_from_next_N
+		# always crosses a yield, unlike a general for-loop's __for_next_N
+		# which only needs promotion when its own BODY happens to yield
+		next_assign = ast.AnnAssign(
+			target = ast.Name( id = next_name, ctx = ast.Store() ), annotation = next_annotation,
+			value = next_call, simple = 1,
+		)
+		ast.copy_location( next_assign, s )
+
+		def forward_yield() -> ast.stmt:
+			# forwards __yield_from_next_N UNCHANGED as this generator's own
+			# $$__next__ return - already exactly Result[elem_type,error_
+			# type]-shaped (the exact-match check above guarantees it), so
+			# _wrap_generator_next_returns_in_ok must NOT auto-Ok-wrap it
+			# like an ordinary yielded value - generator_already_result_
+			# shaped tells it to leave this node's value untouched
+			yield_expr = ast.Yield( value = ast.Name( id = next_name, ctx = ast.Load() ))
+			ast.copy_location( yield_expr, s )
+			yield_expr.generator_already_result_shaped = True
+			stmt = ast.Expr( value = yield_expr )
+			ast.copy_location( stmt, s )
+			return stmt
+
+		ok_case = ast.match_case(
+			pattern = ast.MatchClass(
+				cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+				patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+			),
+			guard = None,
+			body = [ forward_yield() ],
+		)
+
+		err_bind_name = f'__yield_from_err_{unique}'
+		exhausted_break = ast.Break()
+		exhausted_break.compiler_synthesized_break = True
+		forward_body: list[ast.stmt] = []
+		if error_type.is_rc():
+			# err_bind_name's own extraction (below) is an aliasing-read
+			# incref - it's never consumed by anything (forward_yield
+			# forwards __yield_from_next_N itself, not err_bind_name), so
+			# unlike this file's other match-extracted temps it has no
+			# re-store to hand its reference off to; same "explicit decref,
+			# right where the value stops being needed" treatment _desugar_
+			# iterator_for's own remaining_case_body uses, and for the same
+			# reason - loop_back_edge() would otherwise schedule it for the
+			# loop's own back edge, past forward_yield's own suspend, in a
+			# separate $$__resume__ call where this plain local no longer
+			# exists
+			forward_body.append( _expr_stmt( ast.Call(
+				func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+				args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)))
+		forward_body.append( forward_yield() )
+		inner_match = ast.Match(
+			subject = ast.Name( id = err_bind_name, ctx = ast.Load() ),
+			cases = [
+				ast.match_case(
+					pattern = ast.MatchClass(
+						cls = ast.Name( id = 'StopIteration', ctx = ast.Load() ),
+						patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+					),
+					guard = None,
+					body = [ exhausted_break ],
+				),
+				ast.match_case(
+					pattern = ast.MatchAs( name = None, pattern = None ), guard = None,
+					body = forward_body,
+				),
+			],
+		)
+		ast.copy_location( inner_match, s )
+		err_case = ast.match_case(
+			pattern = ast.MatchClass(
+				cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+				patterns = [ ast.MatchAs( name = err_bind_name ) ], kwd_attrs = [], kwd_patterns = [],
+			),
+			guard = None,
+			body = [ inner_match ],
+		)
+		match_stmt = ast.Match( subject = ast.Name( id = next_name, ctx = ast.Load() ), cases = [ err_case, ok_case ] )
+		ast.copy_location( match_stmt, s )
+
+		while_node = ast.While( test = ast.Constant( value = True ), body = [ next_assign, match_stmt ], orelse = [] )
+		ast.copy_location( while_node, s )
+		ast.fix_missing_locations( while_node )
+		ast.fix_missing_locations( obj_init )
+		return [ obj_init, while_node ]
 
 	def _assign_generator_yield_dispatch( self, fn: Function ) -> list[tuple[int,str]]:
 		''' PLAN_GENERATORS.md Phase F - replaces the old AST-synthesis
@@ -1926,6 +2210,13 @@ class TypeResolver:
 		for stmt in next_body:
 			for n in ast.walk( stmt ):
 				if isinstance( n, ( ast.Return, ast.Yield )):
+					if getattr( n, 'generator_already_result_shaped', False ):
+						# _desugar_one_yield_from's own forwarding yield -
+						# already exactly Result[elem_type,error_type]-shaped
+						# (the exact-match check there guarantees it), so
+						# wrapping it in ANOTHER Ok(...) here would produce
+						# Ok(Result[...]) instead of Result[...] itself
+						continue
 					if getattr( n, 'generator_exhaustion_return', False ):
 						assert n.value is not None and isinstance( n.value, ast.Constant ) and n.value.value is None, (
 							f'exhaustion-tagged node with an unexpected non-None value: {ast.dump(n)}'
@@ -2313,8 +2604,9 @@ class TypeResolver:
 			# same as a real Python generator's own lazy per-entry
 			# construction - see that method's own docstring for the real
 			# bug this used to paper over.
-			self._desugar_generator_yield_from( fn )
+			yield_from_extra_locals = self._desugar_generator_yield_from( fn, elem_type, error_type )
 			extra_locals = self._desugar_generator_for_loops( fn )
+			extra_locals.update( yield_from_extra_locals )
 			self._validate_generator_defer_sites( fn )
 			defer_sites = self._desugar_generator_defer_sites( fn )
 			self._reject_generator_value_return( fn )
