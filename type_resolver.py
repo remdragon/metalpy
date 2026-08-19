@@ -1306,47 +1306,69 @@ class TypeResolver:
 			)
 		else:
 			err_bind_name = bind_name( 'err' )
-			rewrap = ast.Call(
-				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
-				args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
-			)
-			ast.copy_location( rewrap, node ); ast.copy_location( rewrap.func, node ); ast.copy_location( rewrap.func.value, node )
-			remaining_case_body: list[ast.stmt] = [
-				ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = rewrap ),
-			]
-			if needs_promotion and remaining_error_type is not None and remaining_error_type.is_rc():
-				remaining_case_body.append( _expr_stmt( ast.Call(
-					func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
-					args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
-				)))
+			# ONE explicit case per remaining leaf - NOT a single trailing
+			# wildcard covering all of them at once. A wildcard arm's own
+			# subject read only narrows to a SINGLE concrete member when
+			# EXACTLY one candidate remains after every sibling case
+			# (cfg.py's narrowed_member() - see its own comment: a multi-
+			# element narrowed set, the case with 2+ remaining leaves,
+			# never collapses to one, so err_bind_name would stay typed
+			# as the WHOLE full_error_type there, not remaining_error_
+			# type) - confirmed via a real repro with 2 remaining leaves:
+			# Result.Err(err_bind_name)'s own T/E inference disagreed
+			# between the assignment target's declared Result[_,
+			# remaining_error_type] and err_bind_name's own un-narrowed
+			# full_error_type. Each leaf's own EXPLICIT case, by
+			# contrast, always narrows to exactly that one leaf (same
+			# mechanism the StopIteration(_) case below already uses),
+			# giving err_bind_name a concrete single-class type that
+			# widens cleanly into remaining_error_type.
+			def build_leaf_case( leaf: Type, rebind: str|None, body: list[ast.stmt] ) -> ast.match_case:
+				# a bare `case Leaf(_):` (rebind=None) tests the tag without
+				# narrowing err_bind_name's own STATIC type for later reads -
+				# only a trailing WILDCARD arm gets that treatment (visit_
+				# Match's own Phase 6 "narrows to whatever remains"), confirmed
+				# via a real repro (Result.Err(err_bind_name)'s own T/E
+				# inference still saw the WIDE full_error_type inside a plain
+				# `case Leaf(_):` arm). Binding a name directly into the
+				# class's own single positional slot instead - same mechanism
+				# `case Result.Err(err_bind_name):` already uses at the OUTER
+				# level - narrows correctly even for a zero-field marker class
+				# like StopIteration/MyError (the slot represents "the whole
+				# matched value" then, not a real field) and even nested one
+				# match deep - confirmed via a standalone repro
+				# (zero_field_bind_check.py); a wrapping `as` pattern was tried
+				# first and rejected ("unsupported match pattern") specifically
+				# when nested inside another match's own case body - a real,
+				# general pre-existing gap, sidestepped here rather than fixed.
+				pattern = ast.MatchClass(
+					cls = ast.Name( id = leaf.stem, ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = rebind, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+				)
+				ast.copy_location( pattern, node )
+				case = ast.match_case( pattern = pattern, guard = None, body = body )
+				return case
+
 			inner_stop_iteration_break = ast.Break()
 			inner_stop_iteration_break.compiler_synthesized_break = True
-			inner_match = ast.Match(
-				subject = ast.Name( id = err_bind_name, ctx = ast.Load() ),
-				cases = [
-					ast.match_case(
-						pattern = ast.MatchClass(
-							cls = ast.Name( id = 'StopIteration', ctx = ast.Load() ),
-							patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
-						),
-						guard = None,
-						body = [ inner_stop_iteration_break ],
-					),
-					# wildcard, reached only once StopIteration's own tag is
-					# already ruled out by the sibling case above - visit_
-					# Match's own Phase 6 wildcard-narrowing (a wildcard
-					# arm's OWN subject read gets narrowed to whatever
-					# union members every prior sibling case hasn't already
-					# claimed) types err_bind_name here as remaining_error_
-					# type directly, not the wider full_error_type - no
-					# per-leaf rewrap machinery needed, confirmed via a
-					# real repro.
-					ast.match_case(
-						pattern = ast.MatchAs( name = None, pattern = None ), guard = None,
-						body = remaining_case_body,
-					),
-				],
-			)
+			inner_cases = [ build_leaf_case( stop_iteration_cls, None, [ inner_stop_iteration_break ] ) ]
+			for leaf in remaining_leaves:
+				narrowed_name = bind_name( f'err_{leaf.stem}' )
+				rewrap = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+					args = [ ast.Name( id = narrowed_name, ctx = ast.Load() ) ], keywords = [],
+				)
+				ast.copy_location( rewrap, node ); ast.copy_location( rewrap.func, node ); ast.copy_location( rewrap.func.value, node )
+				leaf_body: list[ast.stmt] = [
+					ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = rewrap ),
+				]
+				if needs_promotion and leaf.is_rc():
+					leaf_body.append( _expr_stmt( ast.Call(
+						func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+						args = [ ast.Name( id = narrowed_name, ctx = ast.Load() ) ], keywords = [],
+					)))
+				inner_cases.append( build_leaf_case( leaf, narrowed_name, leaf_body ))
+			inner_match = ast.Match( subject = ast.Name( id = err_bind_name, ctx = ast.Load() ), cases = inner_cases )
 			ast.copy_location( inner_match, node )
 			err_case = ast.match_case(
 				pattern = ast.MatchClass(
@@ -1520,53 +1542,72 @@ class TypeResolver:
 			body = [ forward_yield() ],
 		)
 
-		err_bind_name = f'__yield_from_err_{unique}'
 		exhausted_break = ast.Break()
 		exhausted_break.compiler_synthesized_break = True
-		forward_body: list[ast.stmt] = []
-		if error_type.is_rc():
-			# err_bind_name's own extraction (below) is an aliasing-read
-			# incref - it's never consumed by anything (forward_yield
-			# forwards __yield_from_next_N itself, not err_bind_name), so
-			# unlike this file's other match-extracted temps it has no
-			# re-store to hand its reference off to; same "explicit decref,
-			# right where the value stops being needed" treatment _desugar_
-			# iterator_for's own remaining_case_body uses, and for the same
-			# reason - loop_back_edge() would otherwise schedule it for the
-			# loop's own back edge, past forward_yield's own suspend, in a
-			# separate $$__resume__ call where this plain local no longer
-			# exists
-			forward_body.append( _expr_stmt( ast.Call(
-				func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
-				args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
-			)))
-		forward_body.append( forward_yield() )
-		inner_match = ast.Match(
-			subject = ast.Name( id = err_bind_name, ctx = ast.Load() ),
-			cases = [
-				ast.match_case(
-					pattern = ast.MatchClass(
-						cls = ast.Name( id = 'StopIteration', ctx = ast.Load() ),
-						patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+		if self._atomic_leaves( error_type ) == [ stop_iteration_cls ]:
+			# error_type is BARE StopIteration - nothing else it could ever
+			# be, so Result[elem_type,error_type].Err(_) is unconditionally
+			# exhaustion - no inner match needed at all (mirrors _desugar_
+			# iterator_for's own identical remaining_error_type-is-None
+			# special case). Matching `case StopIteration(_): ... case _:
+			# ...` against a subject whose OWN static type isn't a union at
+			# all (nothing to distinguish) is rejected outright ("match
+			# subject is not a union type") - confirmed via a real repro
+			# (yield_from_rc.py, Iterator[Result[Box,StopIteration]])
+			err_case = ast.match_case(
+				pattern = ast.MatchClass(
+					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+				),
+				guard = None,
+				body = [ exhausted_break ],
+			)
+		else:
+			err_bind_name = f'__yield_from_err_{unique}'
+			forward_body: list[ast.stmt] = []
+			if error_type.is_rc():
+				# err_bind_name's own extraction (below) is an aliasing-read
+				# incref - it's never consumed by anything (forward_yield
+				# forwards __yield_from_next_N itself, not err_bind_name), so
+				# unlike this file's other match-extracted temps it has no
+				# re-store to hand its reference off to; same "explicit decref,
+				# right where the value stops being needed" treatment _desugar_
+				# iterator_for's own remaining_case_body uses, and for the same
+				# reason - loop_back_edge() would otherwise schedule it for the
+				# loop's own back edge, past forward_yield's own suspend, in a
+				# separate $$__resume__ call where this plain local no longer
+				# exists
+				forward_body.append( _expr_stmt( ast.Call(
+					func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+					args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+				)))
+			forward_body.append( forward_yield() )
+			inner_match = ast.Match(
+				subject = ast.Name( id = err_bind_name, ctx = ast.Load() ),
+				cases = [
+					ast.match_case(
+						pattern = ast.MatchClass(
+							cls = ast.Name( id = 'StopIteration', ctx = ast.Load() ),
+							patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+						),
+						guard = None,
+						body = [ exhausted_break ],
 					),
-					guard = None,
-					body = [ exhausted_break ],
+					ast.match_case(
+						pattern = ast.MatchAs( name = None, pattern = None ), guard = None,
+						body = forward_body,
+					),
+				],
+			)
+			ast.copy_location( inner_match, s )
+			err_case = ast.match_case(
+				pattern = ast.MatchClass(
+					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = err_bind_name ) ], kwd_attrs = [], kwd_patterns = [],
 				),
-				ast.match_case(
-					pattern = ast.MatchAs( name = None, pattern = None ), guard = None,
-					body = forward_body,
-				),
-			],
-		)
-		ast.copy_location( inner_match, s )
-		err_case = ast.match_case(
-			pattern = ast.MatchClass(
-				cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
-				patterns = [ ast.MatchAs( name = err_bind_name ) ], kwd_attrs = [], kwd_patterns = [],
-			),
-			guard = None,
-			body = [ inner_match ],
-		)
+				guard = None,
+				body = [ inner_match ],
+			)
 		match_stmt = ast.Match( subject = ast.Name( id = next_name, ctx = ast.Load() ), cases = [ err_case, ok_case ] )
 		ast.copy_location( match_stmt, s )
 
