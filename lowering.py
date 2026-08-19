@@ -1815,6 +1815,8 @@ class FunctionLowering:
 						self._emit( instr )
 					if self._construction_self is not None:
 						self._emit_construction_defaults( self_cls, self_param, module )
+					if fn.is_generator_next:
+						self._emit_generator_dispatch_prologue( fn )
 					body_start = len( self._instructions )
 					# a subclass's own __init__ must open with
 					# super().__init__(...) as its literal first statement
@@ -1935,6 +1937,42 @@ class FunctionLowering:
 					self._emit( ir.FuncEnd( name = fn.qualname ))
 
 		return self._instructions
+
+	def _emit_generator_dispatch_prologue( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md Phase F - a real state-check-and-goto
+		dispatch, built directly as IR rather than synthesized AST like
+		everything else in a generator's assembled $$__next__ body still
+		is (see type_resolver.py's _build_generator_next_function's own
+		docstring for why: Python's ast module has no goto statement to
+		spell this with). For every (state, resume_label) TypeResolver.
+		_assign_generator_yield_dispatch tagged onto fn.node (cached as
+		node.generator_yield_states): `if self.__state == state: goto
+		resume_label`. Reuses ordinary comparison lowering (a synthesized
+		ast.Compare fed through _lower_expr) rather than hand-building
+		the GetAttr/comparison IR directly - the exact same "borrow the
+		real expression-lowering pipeline for a tiny synthesized
+		snippet" trick this file's other generator hooks already use
+		(_build_generator_error_defer_replay, etc.).
+
+		State 0 ("not yet started") and the DONE sentinel (checked
+		separately, by the assembled body's own leading ast.If - see
+		_build_generator_next_function) both simply fail every check
+		here and fall through into the body's own ordinary top, exactly
+		as intended - this only ever needs to actively dispatch on a
+		real mid-body suspend state. '''
+		states = getattr( fn.node, 'generator_yield_states', None )
+		if not states:
+			return
+		bool_cls = self.lowering.discovery.get_intrinsics()['bool']
+		for state, resume_label in states:
+			self_attr = ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__state', ctx = ast.Load() )
+			compare = ast.Compare( left = self_attr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = state ) ] )
+			ast.fix_missing_locations( ast.copy_location( compare, fn.node ) )
+			cond = self._lower_expr( compare, bool_cls )
+			skip_label = self._new_label( 'gen_dispatch_skip' )
+			self._emit( ir.JumpIfFalse( cond = cond, target = skip_label ))
+			self._emit( ir.Jump( target = resume_label ))
+			self._emit( ir.Label( name = skip_label ))
 
 	def run_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self.lowering._find_module_for( var )
@@ -3422,9 +3460,98 @@ class FunctionLowering:
 		if self.lowering._is_compiler_call( node.value ) == '__raw_free__':
 			self._lower_compiler_raw_free( node.value )
 			return
+		if isinstance( node.value, ast.Yield ):
+			# PLAN_GENERATORS.md Phase F - a bare (statement-position)
+			# `yield expr` inside a generator's $$__next__ body
+			# (type_resolver.py only ever emits ast.Yield in a
+			# is_generator_next function - see ensure_generator_
+			# synthesized's own top-of-file docstring)
+			self._lower_generator_yield( node.value )
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.lowering.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
+
+	def _lower_generator_yield( self, node: ast.Yield ) -> None:
+		''' PLAN_GENERATORS.md Phase F - a real `yield` suspend point:
+		`self.__state = state` (an ordinary SetAttr - __state is a scalar
+		usize field, never RC-typed, so this needs none of _stmt_Assign's
+		decref-old-value machinery), the yielded value coerced against
+		this function's own declared return type (mirrors _stmt_Return's
+		identical coercion + _incref_aliasing_return call, deliberately
+		WITHOUT everything else Return does - a yield doesn't unwind or
+		jump to any epilogue; locals persist across a suspend by
+		construction, see type_resolver.py's own live-flag-field
+		mechanism for what actually makes that safe at the value level),
+		then ir.Yield itself, then the resume Label.
+
+		Composes for free with arbitrary nesting (if/while/for/with),
+		unlike the old AST-synthesis unit-matcher this replaced: nothing
+		here touches self._cfg's bindings/live-set at all, so lowering
+		the WHOLE generator body once, in ordinary program order (exactly
+		like any non-generator function's body), already leaves the
+		compiler's own static RC-ownership view exactly where a real
+		fall-through would - regardless of how many times a given
+		textual point is actually reached at RUNTIME via a resume jump.
+		No merge_if-style reconciliation is needed for the dispatch
+		prologue's own jumps either, for the same reason: they're
+		alternate ENTRY points into one linear lowering pass, not a fork
+		requiring two independently-lowered branches to be reconciled.
+
+		state/resume_label can genuinely be missing here (not just a
+		theoretical "should never happen"): a generator whose own
+		ensure_generator_synthesized run aborted partway through, for an
+		unrelated already-reported reason (e.g. a `return` inside a
+		defer/errdefer body - _reject_return_inside_generator_defer_body,
+		called from _desugar_generator_defer_sites, BEFORE _assign_
+		generator_yield_dispatch ever runs), leaves fn.node.body's own
+		yields untagged AND fn.return_type never rewritten to the
+		synthesized backing class - id(fn) is already memoized as
+		"synthesized" by then (see ensure_generator_synthesized's own
+		top), so nothing retries it, and the original, still-yield-
+		bearing body can still reach real lowering via a later, unrelated
+        call site. A graceful discovery.fail() here, not a raw crash - a
+		single already-broken generator shouldn't be able to take down
+		the whole compile run. '''
+		state = getattr( node, 'generator_yield_state', None )
+		resume_label = getattr( node, 'generator_resume_label', None )
+		if state is None or resume_label is None:
+			self.lowering.discovery.fail(
+				f'{self._current_fn.qualname}: yield reached outside a successfully-synthesized generator '
+				f'(an earlier, already-reported error left this generator only partially built) - see PLAN_GENERATORS.md',
+				node,
+			)
+			return
+
+		self_name = ast.Name( id = 'self', ctx = ast.Load() )
+		ast.copy_location( self_name, node )
+		self_obj, writeback = self._lower_attr_target_obj( self_name )
+		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+		self._emit( ir.SetAttr( obj = self_obj, attr = '__state', value = ir.Const( type = usize_cls, value = state )))
+		if writeback is not None:
+			writeback( self_obj )
+
+		value_node = node.value if node.value is not None else ast.Constant( value = None )
+		value = self._lower_expr( value_node, self._current_fn.return_type, strict = False )
+		self._incref_aliasing_return( value_node, value )
+		# mirrors _stmt_Return's own identical call (its simpler, no-
+		# shared-epilogue-label branch - a yield needs none of that
+		# branch's OTHER machinery, cfg.return_()'s own epilogue-style
+		# unwind of every other still-live local, since a yield's own
+		# suspend must NOT decref anything else - locals persist across
+		# it by construction): `value`'s own ownership is about to
+		# transfer into ir.Yield below (a bare temp, if the yielded
+		# expression needed coercing into this function's own union
+		# return type - `yield self.<field>`, the common case). Without
+		# this, _flush_pending_temps right after ALSO decrefs it,
+		# silently cancelling out the coercion's own incref (confirmed
+		# via a real refcount() repro: a captured RC parameter yielded
+		# back through a match arm read compiler.refcount() one lower
+		# than expected).
+		self._cfg.untrack_temp( value )
+		self._flush_pending_temps()
+		self._emit( ir.Yield( value = value, state = state, resume_label = resume_label ))
+		self._emit( ir.Label( name = resume_label ))
 
 	def _stmt_With( self, node: ast.With ) -> None:
 		if len( node.items ) != 1 or node.items[0].optional_vars is not None:
@@ -7612,6 +7739,49 @@ class FunctionLowering:
 			self._generator_armed_defer_sites = outer_armed
 		return instructions
 
+	def _build_generator_pessimistic_done_pin( self ) -> list[ir.Instruction]:
+		''' PLAN_GENERATORS.md Phase 4/Phase F - a fallible generator's
+		$$__next__ needs "permanently done" set on ANY early error exit
+		(or_return()'s own Err branch, or checked-arithmetic under Check
+		mode consumed the same way) - OrReturn's own error exit returns
+		directly out of $$__next__ WITHOUT running whatever would
+		normally advance self.__state afterward, so without this, self.
+		__state stays at whatever it was BEFORE the failing statement,
+		and a later .__next__() call would wrongly re-enter and re-run
+		the same (possibly already-consumed-a-moved-value) code from
+		scratch.
+
+		Phase F re-derives this at the LOWERING level (this hook,
+		spliced into ir.OrReturn's own epilogue right alongside
+		Mechanism 2's error-defer replay - see this method's one call
+		site) instead of the old AST-level pre-write (_pessimistic_
+		done_prefix, inserted ahead of every block of user code that
+		MIGHT fail, deleted along with the rest of the unit-matcher):
+		reaching this exact point during lowering already means an
+		early Err-branch exit is really happening, so the pin only ever
+		needs building once per OrReturn site, not speculatively ahead
+		of every fallible-eligible block regardless of whether it's
+		even generator code. A no-op outside a generator
+		(self._current_fn.is_generator_next False for every ordinary
+		function) - correct, since only a generator's own $$__next__
+		has a self.__state field to pin at all. '''
+		if not self._current_fn.is_generator_next:
+			return []
+		done_state = len( self._current_fn.node.generator_yield_states ) + 1
+		pin = ast.Assign(
+			targets = [ ast.Attribute( value = ast.Name( id = 'self', ctx = ast.Load() ), attr = '__state', ctx = ast.Store() ) ],
+			value = ast.Constant( value = done_state ),
+		)
+		ast.fix_missing_locations( ast.copy_location( pin, self._current_fn.node ) )
+		outer_instructions = self._instructions
+		self._instructions = []
+		try:
+			self._lower_stmt( pin )
+		finally:
+			captured = self._instructions
+			self._instructions = outer_instructions
+		return captured
+
 	def _consume_checked_result( self, node: ast.AST, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
 		# shared by both binop (AddCheck/.../Div/Mod) and unary (NegCheck)
 		# Check-mode ops, _maybe_consume_result's __len__/__getitem__ auto-
@@ -7710,7 +7880,11 @@ class FunctionLowering:
 				# operation's own position just get appended here, no extra
 				# guard needed. See _build_generator_error_defer_replay's
 				# own docstring for why this is a no-op outside a generator.
-				replay = replay + self._build_generator_error_defer_replay()
+				# The pessimistic-done pin runs FIRST, ahead of any defer/
+				# errdefer replay - both are no-ops outside a generator,
+				# order between them doesn't affect correctness inside one
+				# (see _build_generator_pessimistic_done_pin's own docstring)
+				replay = replay + self._build_generator_pessimistic_done_pin() + self._build_generator_error_defer_replay()
 				if inline_scope is not None:
 					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay, inline_exit = inline_scope ))
 				else:

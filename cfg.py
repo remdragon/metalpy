@@ -436,10 +436,30 @@ class CFGState:
 		reconciled by plain set INTERSECTION across every candidate (same
 		"AND, never an error here" rule as _merge_live_soft) rather than
 		narrowed's union-of-possible-members - a name is live past the loop
-		only if EVERY way of reaching here leaves it definitely assigned. No
-		candidates at all means nothing reaches past the loop, so liveness
-		is moot there too - empty is the safe/correct choice, matching
-		narrowed's own handling directly above. '''
+		only if EVERY way of reaching here leaves it definitely assigned.
+
+		No candidates at all (dead code follows) is handled differently
+		here than for narrowed, on purpose: narrowed information can only
+		ever cause an over-eager ACCEPT if kept, so wiping it is the safe
+		default; but self._live gates whether a read is accepted AT ALL -
+		wiping it to empty would make every single name in that dead code
+		look uninitialized, including parameters/self (live from function
+		entry, unconditionally). This compiler doesn't strip unreachable
+		statements - they still get lowered structurally, same as any
+		other statement (confirmed by a real repro: `while True: pass`
+		with no break, followed by an ordinary `return <a parameter>`,
+		fails "not initialized on all code branches" even though the
+		parameter obviously IS - PLAN_GENERATORS.md's own generator
+		rebuild hit this for real: its $$__next__ body always has more
+		code after a user's own while-True-with-no-break loop, namely the
+		generator's own tail). Leaving self._live untouched here (already
+		restore()'d to the loop's own entry snapshot by every caller
+		before this runs) is a safe over-approximation either way: if the
+		code really is dead, an over-generous live set just lets reads
+		that never execute through harmlessly; if it isn't (a resumable
+		generator jumping back in), the loop's own entry liveness is
+		exactly the right starting point, since nothing between loop
+		entry and here could have invalidated it. '''
 		candidates = list( break_narrowed )
 		if natural_exit_narrowed is not None:
 			candidates.append( natural_exit_narrowed )
@@ -463,7 +483,7 @@ class CFGState:
 		if natural_exit_live is not None:
 			live_candidates.append( natural_exit_live )
 		if not live_candidates:
-			self._live = set()
+			pass # dead code follows - leave self._live exactly as restore() already set it (the loop's own entry snapshot), see this method's own docstring for why that's the safe choice here, unlike self._narrowed above
 		else:
 			live_merged = set( live_candidates[0] )
 			for other_live in live_candidates[1:]:

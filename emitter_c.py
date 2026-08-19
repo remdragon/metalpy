@@ -2271,6 +2271,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			return [ '\treturn;' ]
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
+	if isinstance( instr, ir.Yield ):
+		# PLAN_GENERATORS.md Phase F - see ir.Yield's own docstring: a
+		# generator's $$__next__ is never void, never the entry point, so
+		# this is unconditionally the same shape as ir.Return's own
+		# simplest branch - no need to replicate its other special cases
+		return [ f'\treturn {_emit_operand(instr.value)};' ]
+
 	if isinstance( instr, ir.DeclareTemp ):
 		return [ f'\t{_declarator( instr.temp.type, _temp_name( instr.temp.id ) )};' ]
 	if isinstance( instr, ir.DeleteTemp ):
