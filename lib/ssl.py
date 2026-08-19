@@ -1021,3 +1021,78 @@ class SSLSocket:
 			return Result.Err( _map_ssl_error( self.__ssl, err ))
 		with compiler.wrap_arithmetic:
 			return Result.Ok( usize( rc ))
+
+
+# ---------------------------------------------------------------------------
+# macOS — deliberately NOT implemented (see PLAN_SSL.md: Secure Transport /
+# Network.framework, blocked on having a real Mac to verify a handshake
+# against - "do the binding/struct work but hold off calling it done without
+# a real handshake test" was the standing rule for Windows/Linux too, and
+# there's no way to honor that here yet).
+#
+# This is a real class (not just an absent one) for a concrete reason found
+# by testing this exact scenario against a simulated macos compiler target
+# (Discovery(active_target={'os': 'macos', ...})): lib/http/client.py's
+# _Transport @union declares `Secure: ssl.SSLSocket` as a field type
+# UNCONDITIONALLY (a union needs one concrete type per variant, not a
+# per-target one) - if ssl.SSLSocket didn't exist at all on macOS,
+# type_resolver.py's RC-class destructor synthesis crashes outright
+# (AttributeError: 'NoneType' object has no attribute 'is_rc_pointer', deep
+# in _build_field_teardown_ast) the moment ANY program merely imports
+# lib/http/client.py on a macOS target - even one that only ever uses
+# plain http://, never touches TLS. So SSLContext/SSLSocket need to exist
+# as real, structurally valid types on every target lib/http/client.py
+# might compile for, whether or not that target's TLS backend is finished.
+#
+# Given that, every method that would need to actually DO something routes
+# through _MACOS_SSL_NOT_YET_IMPLEMENTED - a deliberately undefined name, not
+# a typo. MetalPy has no compiler.error(...)/compiler.static_assert(...)
+# intrinsic to raise a custom compile-time message (confirmed absent from
+# discovery.py/compile_time_transformer.py), so this is the mechanism that
+# exists: referencing an undefined name inside a function body only gets
+# type-checked once something actually reaches/calls that function (stage 2
+# - "walk the tree from main and determine everything touched by main" per
+# ARCHITECTURE.md). A program that merely `import ssl` and never touches TLS
+# compiles clean. lib/http/client.py itself is a different story, NOT because
+# of anything specific to this file: its _transport_send/_transport_recv/
+# _transport_close each pattern-match both _Transport variants in one shared
+# function body, and a function's whole body - every match arm, not just the
+# one actually taken - is what gets compiled, so those three functions reach
+# SSLSocket.send/recv/close whenever THEY are reached, regardless of whether
+# a given call is plain http:// or https:// - meaning any http.client usage
+# at all currently hits this pill on macOS, same as it already hit the
+# pre-poison-pill crash described above for the identical structural reason
+# (see PLAN_SSL.md's own "macOS poison pill" section for the full trade-off).
+# Either way, compilation fails with a loud, self-explanatory error instead
+# of silently miscompiling or crashing the compiler itself:
+#   name '_MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD' is not defined
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'macos' )
+class SSLContext:
+	@staticmethod
+	def create_default_context() -> Result[SSLContext, SSLError]:
+		return _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()
+
+@compiler.target( os = 'macos' )
+class SSLSocket:
+	# a real field (not zero fields) so this stays a structurally ordinary
+	# RC class matching the Windows/Linux backends' own shape - never
+	# actually populated, since wrap_socket() below never returns Ok(...).
+	__unused: bool
+
+	@staticmethod
+	def wrap_socket( ctx: SSLContext, sock: socket.Socket, server_hostname: str ) -> Result[SSLSocket, SSLError]:
+		return _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()
+
+	def send( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, SSLError]:
+		return _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()
+
+	def send_all( self, buf: ConstPtr[u8], count: usize ) -> Result[None, SSLError]:
+		return _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()
+
+	def recv( self, buf: Ptr[u8], count: usize ) -> Result[usize, SSLError]:
+		return _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()
+
+	def close( self ) -> None:
+		_MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD()

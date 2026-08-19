@@ -204,6 +204,8 @@ In scope (now landed for Windows and Linux):
 Out of scope (still deferred):
   - macOS (Secure Transport/Network.framework) backend - see "Backend
     strategy" above; no macOS machine available to verify against right now.
+    A deliberate poison pill stands in its place instead of either a silent
+    gap or a blind implementation - see "macOS poison pill" below.
   - Client-certificate authentication (load_cert_chain) - stretch goal, same
     treatment PLAN_HTTP_CLIENT.md gave multipart files= uploads.
   - Wiring into lib/http/client.py's reserved verify=/HTTPSConnection path -
@@ -257,6 +259,71 @@ Remaining phased roadmap
     before committing to bindings). Blocked on access to a macOS machine to
     verify against - do the binding/struct work but hold off calling it done
     without a real handshake test, same discipline Phase 1/2 were held to.
+    NOT started - user explicitly decided against implementing this blind
+    (no way to verify a real handshake), and asked for a poison pill instead
+    (see "macOS poison pill" below) so the gap is loud, not silent.
+
+macOS poison pill (in lieu of Phase 3)
+
+  Rather than an absent SSLContext/SSLSocket on macOS (which was the default,
+  do-nothing state before this), lib/ssl.py now defines both as REAL classes
+  under @compiler.target(os='macos'), with every method that would need to
+  actually do something routing through a single deliberately-undefined name,
+  _MACOS_SSL_NOT_YET_IMPLEMENTED__SEE_PLAN_SSL_MD. MetalPy has no
+  compiler.error(...)/compiler.static_assert(...) intrinsic for a custom
+  compile-time message (confirmed absent from discovery.py/compile_time_
+  transformer.py) - referencing an undefined name is the only mechanism that
+  exists, so this leans on it deliberately rather than inventing something.
+
+  Why real classes, not just an absent module member: tested directly
+  against a simulated macOS compile (Discovery(active_target={'os': 'macos',
+  ...}) - not a real Mac, but enough to exercise discovery/type resolution).
+  Two things were confirmed, not assumed:
+
+    - With NO macOS definition at all (the prior state), referencing
+      ssl.SSLContext from a MetalPy program produces a confusing, target-
+      agnostic error ('ssl' is not a value, cannot use it as an expression)
+      that gives no hint this is a known, deliberate gap.
+    - Worse: lib/http/client.py's own _Transport @union declares
+      `Secure: ssl.SSLSocket` as a field type UNCONDITIONALLY (a union needs
+      one concrete type per variant, not a per-target one) - with ssl.
+      SSLSocket entirely absent, type_resolver.py's RC-class destructor
+      synthesis CRASHES outright (AttributeError: 'NoneType' object has no
+      attribute 'is_rc_pointer', in _build_field_teardown_ast) the moment
+      ANY program merely imports lib/http/client.py on macOS - even one that
+      only ever uses plain http://, never touches TLS. So SSLContext/
+      SSLSocket need to exist as real, structurally valid types on every
+      target lib/http/client.py might compile for, whether or not that
+      target's TLS backend is finished - not optional polish.
+
+  A program that merely imports ssl (or http.client) without ever calling
+  into TLS compiles clean on macOS - the undefined-name reference only gets
+  type-checked once something actually reaches/calls that method (MetalPy
+  compiles from main() outward, per ARCHITECTURE.md's stage 2). Confirmed
+  directly: `import ssl` alone, and `from http.client import get` alone
+  (unused), both produce zero errors under the simulated macOS target.
+
+  One real, broader consequence worth being explicit about, also confirmed
+  directly rather than assumed: because lib/http/client.py's _transport_send/
+  _transport_recv/_transport_close each pattern-match BOTH _Transport
+  variants in one shared function body (`case _Transport.Secure(tls):
+  tls.send(...)`), and a function's full body - every match arm, not just the
+  ones a given call's runtime value takes - gets compiled as a unit, the
+  poison pill fires for ANY http.client usage on macOS, including plain
+  http:// with no TLS involved at all. This is NOT a regression this poison
+  pill introduces - the crash described above already blocked plain http://
+  on macOS before this change, for the identical structural reason (_Transport
+  needing ssl.SSLSocket to be a real type regardless of which variant a
+  specific call site uses). The poison pill turns that crash into a clear,
+  self-explanatory compile error instead - it doesn't narrow the blast radius,
+  because narrowing it would need decoupling HTTPConnection's shared
+  transport-dispatch helpers per scheme, a real lib/http/client.py redesign
+  question, not a "make ssl.py fail loudly" one - out of scope here.
+
+  Verified: full lib/ssl.py + http_client_test.py test suites (Windows -
+  MSVC and clang; Linux - gcc via WSL) plus a full tests.py run on both
+  platforms all stayed green after adding this - the macOS-only class
+  definitions are inert everywhere else.
 
   Phase 4 — landed: wired into lib/http/client.py as HTTPSConnection (see
     PLAN_HTTP_CLIENT.md's own "Phase 4b — landed" entry for the details -
