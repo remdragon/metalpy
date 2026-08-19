@@ -8392,6 +8392,44 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			# `expr.field.method(...) is None`/`is not None` - the receiver of
+			# the union-returning call is a chained field access (Attribute of
+			# an Attribute), not a bare local. type_resolver.py's _type_of_expr
+			# ast.Attribute branch resolved the OWNER class (via
+			# ensure_resolved) but then read the found field Variable's .type
+			# straight off without forcing ITS OWN separate .resolve first - a
+			# field's type is populated lazily exactly like a global's (see
+			# the ast.Name branch's own established fix for that), so
+			# `o.inner`'s type came back None here, `_type_of_expr` gave up on
+			# the whole `o.inner.get(...)` call, and `_is_none_narrowing_shape`
+			# silently declined the tag-check rewrite - falling through to
+			# _lower_is_comparison's flat Cmp, which cannot compare a
+			# TaggedUnion struct against None. Staging `o.inner` into a named
+			# local first used to be the only way to dodge this, since a
+			# local's type is always eagerly resolved by the time it lands in
+			# self.locals.
+			( 'chained_field_access_call_is_none_narrowing_without_a_local', '''
+class Inner:
+	stored: str|None
+	def get( self, key: str ) -> str|None:
+		if key == 'present':
+			return self.stored
+		return None
+
+class Outer:
+	inner: Inner
+
+def main() -> i32:
+	o: Outer = Outer( inner = Inner( stored = "hi" ) )
+	if o.inner.get( 'present' ) is None:
+		return 1
+	if o.inner.get( 'missing' ) is not None:
+		return 2
+	o2: Outer = Outer( inner = Inner( stored = None ) )
+	if o2.inner.get( 'present' ) is not None:
+		return 3
+	return 0
+''' ),
 			# `union_val == leaf` / `!=` - comparing a still-union-typed value
 			# directly against a leaf, with no match-based extraction needed
 			# first. Used to fall through to the plain dunder-or-flat-Cmp path,
