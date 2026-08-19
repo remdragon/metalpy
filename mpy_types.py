@@ -539,6 +539,7 @@ class GeneratorType( Type ):
 	to that one Function, not to this type). '''
 	elem_type: Type
 	error_type: 'Type|None' = None # None: Iterator[T] (infallible); set: Generator[T,error_type] - __next__ returns Result[elem_type|None, error_type] instead of plain elem_type|None
+	send_type: 'Type|None' = None # None: no .send() support; set (PLAN_GENERATORS.md Phase C, Generator[T,SendType,E] - 3 type args): (yield expr) is usable as an EXPRESSION evaluating to plain SendType, delivered via .send(v) - the backing method becomes $$__resume__ instead of $$__next__, with thin __next__()/send(v) wrappers over it
 	backing: 'RCClass|None' = None
 
 # a class's own body scan (revealing its attribute/method *names*) is
