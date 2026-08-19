@@ -9881,6 +9881,29 @@ class FunctionLowering:
 		if not ( isinstance( node.func, ast.Attribute ) and node.func.attr == '__allocate__' ):
 			return None
 		target_cls = self.lowering._try_resolve_namespace( node.func.value )
+		# explicit generic-class subscript - ClassName[T].__allocate__(...),
+		# including a generic class's own method re-applying its OWN type
+		# parameter to itself (the bare ClassName.__allocate__(...) spelling
+		# already resolves this correctly via in-scope T lookup - this is
+		# the same call, just reached through an explicit, redundant [T]).
+		# Without this, _try_resolve_namespace's own Subscript branch
+		# already correctly resolves ClassName[T] to a Specialization, but
+		# this recognizer only accepted a real ClassLike, declining
+		# (returning None) and falling through to ordinary receiver-based
+		# call resolution - which lowers ClassName[T] as a VALUE expression
+		# instead of a type reference, and ClassName (a class, not a
+		# Variable/Function) fails there with "'ClassName' is not a value,
+		# cannot use it as an expression".
+		# Unwrap to .base (the abstract template) rather than monomorphizing
+		# to the concrete specialization - _lower_allocate_fields's own
+		# comment just below documents that target_cls must always be the
+		# ABSTRACT class (it separately substitutes field types against
+		# self._current_fn.cls, the concrete specialization, when one's
+		# available); handing it an already-monomorphized target_cls here
+		# instead breaks that substitution AND in_private_scope's identical
+		# "self is always the abstract template" contract just below
+		if isinstance( target_cls, Specialization ):
+			target_cls = target_cls.base
 		if not isinstance( target_cls, ClassLike ):
 			return None
 
