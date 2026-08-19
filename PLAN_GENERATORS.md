@@ -51,13 +51,44 @@ Generator functions (`yield`, state-machine transform)
 > generator(): yield x` already went through - so this landed BOTH
 > `yield from` itself AND, for free, general support for an ordinary for-
 > loop-with-yield forwarding another generator's values (previously only
-> exercised over `list[T]`/`range()`). `_reject_generator_for_or_yield_
-> from_nested_inside_loop` replaces the old blanket `_reject_generator_
-> yield_from` rejection, narrowing it to just the one genuinely unsafe
-> shape: nested inside a while/for that could re-enter it (nested inside
-> if/with is fine, at any depth) - see its own docstring for the
-> `_new_for_obj_field` "evaluate once, at construction" invariant this
-> protects.
+> exercised over `list[T]`/`range()`).
+>
+> **A follow-up same-day fix (worktree `generator-for-obj-lazy-init`)
+> then LIFTED the nesting restriction entirely**, rather than leaving it
+> as a permanent compile-time rejection: a for-loop-with-yield (or
+> `yield from`) reachable through a while/for that could re-enter it used
+> to be rejected outright, because `__for_obj_N` (the iterated
+> expression) was constructed exactly once, EAGERLY, in the generator's
+> own constructor - reusing the same already-exhausted object on every
+> re-entry instead of freshly reconstructing it, a real silent wrong-
+> output bug (confirmed via a repro: `while j < count: yield from
+> inner(); j += 1` only forwarded `inner()`'s own values on the outer
+> loop's first pass). `_new_for_obj_field` now builds `__for_obj_N` as an
+> ordinary, live-flag-guarded promoted local instead - re-derived from
+> its real expression every time program execution reaches the loop, the
+> same as a real Python generator's own lazy per-entry construction, not
+> merely a safe approximation of it. `_reject_generator_for_or_yield_
+> from_nested_inside_loop` and its helper walker are gone entirely, not
+> just relaxed.
+>
+> That same fix also found and fixed a SEPARATE, pre-existing bug this
+> newly-unblocked nesting shape exposed for the first time:
+> `_recurse_desugar_for_loops` never recursed into a for-loop-with-
+> yield's OWN body after desugaring it - so a for-loop-with-yield
+> DIRECTLY nested inside another one (`for x in xs: for y in gen(): yield
+> y`) silently fell through to lowering.py's ordinary, non-generator-
+> aware for-loop lowering for the inner one instead of ever getting its
+> own while-unit desugaring. This shape was always broken, just
+> unreachable before this fix (the blanket rejection blocked ANY for-
+> loop-with-yield nested inside another while/for, regardless of which
+> one was outer). Confirmed via a real repro: compiled clean, but crashed
+> at runtime under MSVC (debug build: heap-corruption breakpoint;
+> release build: access violation) - clang/gcc's own codegen happened not
+> to visibly corrupt anything for the same wrong IR, masking it
+> completely until tested on MSVC specifically (re-verified clean under
+> AddressSanitizer too, not just "didn't crash this time"). Fixed by
+> having `_recurse_desugar_for_loops` recurse into a for-loop-with-
+> yield's own desugared output, not just plain if/while/for/with bodies.
 >
 > Three real, pre-existing bugs were found and fixed while building this
 > (none specific to `yield from` itself - all three are general gaps
@@ -104,9 +135,11 @@ Generator functions (`yield`, state-machine transform)
 > mid-iteration (abandonment) still releases every field it was holding,
 > via the ordinary state/flag-gated destructor cascade, no new machinery
 > needed there. See `emitter_c_test.py`'s `test_yield_from_basic_and_
-> nesting`/`test_yield_from_nested_inside_while_is_rejected`/`test_yield_
-> from_nested_inside_for_is_rejected`/`test_yield_wrong_element_type_is_
-> rejected`.
+> nesting`/`test_yield_wrong_element_type_is_rejected`/`test_yield_from_
+> nested_inside_reenterable_loop_forwards_correctly` (covers both the
+> lazy-reconstruction fix and the doubly-nested-for-loop recursion fix).
+> Full test suite green on all 3 compilers (clang/MSVC/WSL gcc) for both
+> fixes.
 
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
@@ -1271,23 +1304,28 @@ nesting depth, not just the top level.
 A real, deeper bug surfaced along the way, not just the narrow "nested
 positions are unreachable" gap this started as: `_new_for_obj_field`'s
 own "evaluate the iterated expression once, at construction" design
-(Phase 1, still unchanged) is silently WRONG once the for-loop is
-reachable through a while/for loop that can re-enter it - the same
-already-exhausted iterated object gets reused on every re-entry instead
-of being freshly reconstructed, confirmed via a real repro (`while j <
-count: yield from inner(); j += 1` only ever forwarded `inner()`'s own
-values during the outer loop's FIRST pass - every later pass silently
-forwarded nothing at all). Rather than the larger fix (re-deriving `__
-for_obj_N` to re-initialize per loop entry, not just once ever - real
-work, no forcing use case yet), landed a new explicit pre-desugar
-validator (`_reject_generator_for_or_yield_from_nested_inside_loop`,
-run against the ORIGINAL undesugared body, before either desugar pass)
-that rejects this specific shape with a clear message: nested inside
-`if`/`with` is fine and works; nested inside `while`/`for` (at ANY
-depth reachable through one - tracked via a simple `in_loop` flag
-propagated through the walk, set once entering any loop and never
-cleared by an intervening `if`/`with`) stays a compile error instead of
-a silent miscompile.
+(Phase 1, still unchanged at the time) is silently WRONG once the for-
+loop is reachable through a while/for loop that can re-enter it - the
+same already-exhausted iterated object gets reused on every re-entry
+instead of being freshly reconstructed, confirmed via a real repro
+(`while j < count: yield from inner(); j += 1` only ever forwarded
+`inner()`'s own values during the outer loop's FIRST pass - every later
+pass silently forwarded nothing at all). This turn landed only a stopgap
+for it: an explicit pre-desugar validator
+(`_reject_generator_for_or_yield_from_nested_inside_loop`) that rejected
+the shape outright with a clear message rather than shipping the silent
+miscompile - nested inside `if`/`with` still worked fine; nested inside
+`while`/`for` (at ANY depth reachable through one) was a compile error.
+**Superseded the same day, in a follow-up turn** (worktree `generator-
+for-obj-lazy-init`) that did the larger fix instead: `__for_obj_N` re-
+derives from its real expression every time the loop is actually
+reached, via the same live-flag-guarded promoted-local machinery A.4a
+had already built for `__for_next_N` - so the validator (and its helper
+walker) were removed entirely rather than left as a permanent
+restriction. See this doc's own top-of-file note for the full writeup,
+including a second, unrelated pre-existing bug (`_recurse_desugar_for_
+loops` never recursed into a for-loop-with-yield's own body) that this
+newly-unblocked nesting shape exposed and that turn also fixed.
 
 Phase F: defer/errdefer under real nested lowering
 
