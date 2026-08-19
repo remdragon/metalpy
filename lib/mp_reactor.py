@@ -60,42 +60,20 @@ import threading
 import fiber
 
 class Worker:
-	# __pending_tasks is list[Ptr[None]], NOT list[Closure[[],None]] -
-	# deliberately type-erased. Confirmed via a minimal real compile+run
-	# probe (isolated from everything else in this file - no Fiber, no
-	# incref, just list.append(closure)/pop()/unwrap()) that list[T]'s
-	# generic RC storage/retrieval is ITSELF broken for T=Closure today -
-	# real heap corruption, not just a missing incref (that was the
-	# original diagnosis; too narrow - the actual gap goes deeper than one
-	# accessor). Root cause is the same known, already-flagged Closure/
-	# Capture RC gap another session is rebuilding at its source (see
-	# fiber.py's own __pending field, which already worked around this
-	# exact class of problem the same way - Ptr[None] isn't RC-tracked at
-	# all, so it never touches list[T]'s broken Closure-specific path).
-	# schedule()/run_until_idle() below own the incref/cast/decref manually
-	# instead, mirroring Fiber.start()/_run_loop's already-verified-working
-	# pattern exactly.
-	__pending_tasks: list[Ptr[None]]
+	__pending_tasks: list[Closure[[], None]]
 	__ready_to_unpark: list[fiber.Fiber]
 	__idle_pool: list[fiber.Fiber]
 
 	def __init__( self ) -> None:
-		self.__pending_tasks = list[Ptr[None]]()
+		self.__pending_tasks = list[Closure[[], None]]()
 		self.__ready_to_unpark = list[fiber.Fiber]()
 		self.__idle_pool = list[fiber.Fiber]()
 
 	def schedule( self, task: Closure[[], None] ) -> None:
 		''' enqueue a fresh task - picked up by whichever thread next calls
 		run_until_idle() on this Worker (may be a different thread than
-		the caller, e.g. Reactor.spawn() called from outside any worker).
-		Increfs before stashing the type-erased pointer - see __pending_tasks'
-		own comment for why this doesn't just store `task` directly - so the
-		queue holds its own genuinely-owned reference, released back into a
-		real Closure local (no extra incref needed there) when popped in
-		run_until_idle(). '''
-		compiler.incref( task )
-		raw: Ptr[None] = compiler.cast( Ptr[None], task )
-		self.__pending_tasks.append( raw ).unwrap( 'Worker.schedule: queue overflow' )
+		the caller, e.g. Reactor.spawn() called from outside any worker). '''
+		self.__pending_tasks.append( task ).unwrap( 'Worker.schedule: queue overflow' )
 
 	def __take_idle_fiber( self ) -> fiber.Fiber:
 		match self.__idle_pool.pop():
@@ -145,25 +123,16 @@ class Worker:
 					pass
 			with compiler.wrap_arithmetic:
 				to_unpark = to_unpark - 1
-		# __pending_tasks is list[Ptr[None]] (type-erased) - see its own
-		# field comment. Ptr[None] isn't RC-tracked, so this pop()/unwrap()
-		# is ordinary, uneventful pointer plumbing; the ONLY real reference
-		# involved is the one schedule() minted with its own compiler.incref
-		# before storing, which the compiler.cast() below reclaims into
-		# `task` as this local's own genuinely-owned copy (consumed by
-		# `task`'s own scope-exit decref at the end of this loop iteration,
-		# same as any other compiler.cast()-derived local in this codebase -
-		# see fiber.py's _run_loop for the identical pattern).
 		to_start: usize = self.__pending_tasks.__len__()
 		while to_start > 0:
-			next_raw: Result[Ptr[None], IndexError] = self.__pending_tasks.pop()
-			if next_raw.is_ok():
-				raw: Ptr[None] = next_raw.unwrap( 'Worker.run_until_idle: just checked is_ok' )
-				task: Closure[[], None] = compiler.cast( Closure[[], None], raw )
-				f: fiber.Fiber = self.__take_idle_fiber()
-				f.start( task )
-				self.__requeue_by_state( f )
-				progressed = True
+			match self.__pending_tasks.pop():
+				case Result.Ok( task ):
+					f: fiber.Fiber = self.__take_idle_fiber()
+					f.start( task )
+					self.__requeue_by_state( f )
+					progressed = True
+				case Result.Err( _ ):
+					pass
 			with compiler.wrap_arithmetic:
 				to_start = to_start - 1
 		return progressed
