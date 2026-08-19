@@ -3985,4 +3985,44 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			'int _fltused = 0x9875;\n'
 			'#endif'
 		)
+		# clang/gcc's own -O0 codegen lowers ANY nontrivial local zero-init
+		# (a bare `struct Foo x = {0};`-shaped compound literal, regardless
+		# of struct/array size - confirmed even an 8-byte i32[2] field) to a
+		# real `call memset`, and a by-value struct copy above a small size
+		# threshold to `call memcpy` - neither is a call MetalPy's own
+		# extern-tracking machinery ever sees (it's inserted directly by the
+		# C compiler's backend, not lowered from any ir.Call this module
+		# emits), so the `no_crt = 'c' not in compiler.extern_libs`
+		# auto-detection in mpy.py can never catch it the way an explicit
+		# crt.memset()/crt.memcpy() call would (that always flips no_crt
+		# off). Confirmed via a real LNK2019 "unresolved external symbol
+		# memset" building a @cstruct with an i32[8] field as a plain local.
+		# MSVC's own /Od codegen never referenced either symbol in testing
+		# (up to a 2KB by-value struct copy, before hitting the separate,
+		# still-open __chkstk gap - see msvc_no_crt_missing_chkstk memory) -
+		# defined unconditionally here anyway since an unreferenced extern
+		# definition is harmless, and cheaper than special-casing per
+		# compiler. Thin wrappers around sys.memset/sys.memcpy (lib/sys.py's
+		# Windows target already routes both through ntdll's RtlFillMemory/
+		# RtlCopyMemory - genuinely no_crt-safe, no CRT dependency) rather
+		# than a hand-rolled byte loop: reuses an already-vetted primitive
+		# instead of duplicating it, and - unlike a hand-rolled loop - has
+		# no risk of loop-idiom recognition folding this very definition
+		# back into a self-recursive call to itself under a --release (-O2)
+		# no_crt build, since there's no loop in the call chain at all
+		# (RtlFillMemory/RtlCopyMemory are opaque extern calls). compiler.py's
+		# Compiler.run() force-enqueues sys.memset/sys.memcpy whenever
+		# no_crt, mirroring its existing sys.exit force_reachable - so
+		# sys$memset/sys$memcpy always resolve here, same guarantee
+		# mainCRTStartup's own sys$exit call already relies on.
+		parts.append(
+			'#ifdef _WIN32\n'
+			f'void* memset( void* dst, int value, size_t n ) {{\n'
+			f'\treturn {mangle_qualname( "sys.memset" )}( (uint8_t*)dst, (uint8_t)value, n );\n'
+			'}\n'
+			f'void* memcpy( void* dst, const void* src, size_t n ) {{\n'
+			f'\treturn {mangle_qualname( "sys.memcpy" )}( (uint8_t*)dst, (const uint8_t*)src, n );\n'
+			'}\n'
+			'#endif'
+		)
 	return '\n\n'.join( part for part in parts if part ) + '\n'

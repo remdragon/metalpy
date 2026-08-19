@@ -20,6 +20,7 @@ class CompilerTestCase( unittest.TestCase ):
 	_CONSOLE_INIT_QUALNAMES = frozenset({
 		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
 		'sys.exit', 'windows.kernel32.ExitProcess',
+		'sys.memset', 'sys.memcpy', 'windows.ntdll.RtlFillMemory', 'windows.ntdll.RtlCopyMemory',
 	})
 
 	def setUp( self ) -> None:
@@ -40,6 +41,11 @@ class CompilerTestCase( unittest.TestCase ):
 			libs['kernel32'].discard( 'ExitProcess' )
 			if not libs['kernel32']:
 				del libs['kernel32']
+		if 'ntdll' in libs:
+			libs['ntdll'].discard( 'RtlFillMemory' )
+			libs['ntdll'].discard( 'RtlCopyMemory' )
+			if not libs['ntdll']:
+				del libs['ntdll']
 		return libs
 
 	def _instructions_for( self, qualname: str ) -> list[ir.Instruction]:
