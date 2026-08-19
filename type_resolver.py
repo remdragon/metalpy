@@ -3650,7 +3650,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if not isinstance( names, dict ):
 				return None
 			found = names.get( node.attr )
-			return found.type if isinstance( found, Variable ) else None
+			if not isinstance( found, Variable ):
+				return None
+			# a field Variable's .type is populated lazily too, exactly like a
+			# global's (see the ast.Name branch's own comment above) - the
+			# class's OWN resolve() (just forced via ensure_resolved above)
+			# only runs its body_fn far enough to register each field's
+			# Variable in .names, via _make_annotation_resolver's own separate
+			# lazy .resolve; it does NOT force that resolver too. Confirmed by
+			# a real repro: `resp.headers.get(...) is None` (a chained
+			# field-access receiver, `resp.headers` a still-unresolved
+			# HTTPHeaders-typed field) silently declined this whole rewrite -
+			# found.type was still None - and fell through to lowering.py's
+			# flat Cmp, which doesn't know how to compare a TaggedUnion
+			# struct against None at all
+			self.resolver.ensure_resolved( found )
+			return found.type
 		if isinstance( node, ast.Subscript ):
 			# tuple[...]'s own constant-index element access ONLY (t[0]) -
 			# mirrors lowering.py's _expr_Subscript tuple branch exactly
