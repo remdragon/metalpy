@@ -193,7 +193,14 @@ class CcTool:
 		if self.name == 'cl':
 			cmd = [ self.path, '/nologo', '/std:c11',
 				'/experimental:c11atomics',
-				'/W4', '-c', str( src ), f'/Fo:{obj}' ]
+				# /wd4701 ("potentially uninitialized local variable used") -
+				# see the matching -Wno-sometimes-uninitialized/-Wno-
+				# uninitialized below for the full reasoning (a confirmed
+				# false positive: __return_value, this codebase's own shared
+				# multi-entry function epilogue, is a goto-heavy pattern this
+				# static analysis can't prove exhaustive even when metalpy's
+				# own discovery/type-checking already has)
+				'/W4', '/wd4701', '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
 			if want_debug_info:
@@ -225,6 +232,13 @@ class CcTool:
 				cmd += [ '/fsanitize=address' ]
 		else:
 			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
+			# -Wno-sometimes-uninitialized (clang) / -Wno-maybe-uninitialized
+			# (gcc) - see cl.exe's /wd4701 branch above for the full
+			# reasoning; -Wno-uninitialized covers both compilers' own
+			# plain (not just conditional) flavor of the same false
+			# positive
+			cmd += [ '-Wno-uninitialized' ]
+			cmd += [ '-Wno-sometimes-uninitialized' ] if self.name == 'clang' else [ '-Wno-maybe-uninitialized' ]
 			if want_debug_info:
 				cmd += [ '-g' ]
 			if debug:

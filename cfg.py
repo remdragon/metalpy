@@ -1123,7 +1123,7 @@ class CFGState:
 			not entry.cancelled and entry.operand is operand for entry in self._epilogue_stack
 		)
 
-	def current_epilogue_label( self, returned_operand: ir.Operand | None = None ) -> str | None:
+	def current_epilogue_label( self, returned_operand: ir.Operand | None = None, *, mark_captured: bool = True ) -> str | None:
 		''' the label a `return` (or the function's own fall-off-the-end)
 		should jump to instead of unwinding inline via return_() - the
 		topmost still-active entry's own name (skipping only cancelled ones -
@@ -1179,7 +1179,21 @@ class CFGState:
 		the stack the same way they'd apply to a real function's - see
 		return_()'s own matching comment for why THOSE cases still need a
 		self-contained inline unwind rather than the shared label even
-		inside a splice. '''
+		inside a splice.
+
+		mark_captured=False: the caller only wants to know WHETHER there's
+		still something pending (is not None), not to actually commit a
+		`goto` using the returned name - e.g. lower_function's own "does
+		the fall-off-the-end path need build_epilogue_ladder() at all"
+		probe, which relies on placing the ladder immediately after the
+		function's own body (pure fallthrough is already correct there, no
+		goto needed). The normal call already marks entry.captured=True
+		unconditionally on the assumption its caller is about to emit a
+		real jump to entry.name; a probe that never does that would
+		otherwise spuriously mark an entry captured with no goto anywhere
+		actually referencing it - a real, confirmed -Wunused-label/C4102
+		(build_epilogue_ladder() gates the Label itself on entry.captured -
+		see its own docstring). '''
 		if returned_operand is not None and any(
 			not entry.cancelled and entry.operand is returned_operand
 			for entry in self._epilogue_stack
@@ -1227,14 +1241,15 @@ class CFGState:
 			# (confirmed via a real regression: an @inline splice's own
 			# internal early return/.or_return() must never manufacture a
 			# second real ir.Return in the CALLER).
-			if inline_scope is None:
-				self._any_shared_label_used = True
-			# this jump is now committed to entry.name regardless of what
-			# happens to `entry` afterward - a LATER manually_decreffed()/
-			# deleted()/move() on this same entry must not silently turn this
-			# already-emitted goto into a no-op landing (see their shared
-			# _neutralize() helper)
-			entry.captured = True
+			if mark_captured:
+				if inline_scope is None:
+					self._any_shared_label_used = True
+				# this jump is now committed to entry.name regardless of what
+				# happens to `entry` afterward - a LATER manually_decreffed()/
+				# deleted()/move() on this same entry must not silently turn
+				# this already-emitted goto into a no-op landing (see their
+				# shared _neutralize() helper)
+				entry.captured = True
 			return entry.name
 		if inline_scope is not None:
 			return inline_scope.label

@@ -1834,6 +1834,18 @@ def main() -> None:
 
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
+		# unlike test_support.RealCompileMixin's _compile_source (which
+		# always asserts this itself), this class's own _run() doesn't -
+		# a caller that emits+compiles C from a Discovery run that already
+		# has real errors gets whatever half-lowered C the compiler managed
+		# to produce before bailing, which can trigger arbitrary downstream
+		# C-compiler warnings/behavior that have nothing to do with real
+		# codegen quality (confirmed: 5 tests in this file were silently
+		# doing exactly this - see git history). Assert it here, once, so
+		# nothing "passes" by compiling C for a program that was never
+		# actually valid metalpy in the first place.
+		self.assertEqual( self.discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in self.discovery.errors.errors ) )
 		with tempfile.TemporaryDirectory() as tmp:
 			src_path = Path( tmp ) / 'generated.c'
 			obj_path = Path( tmp ) / 'generated.o'
@@ -1957,8 +1969,9 @@ def main() -> i32:
 			'	return Result.Ok( y )',
 			'',
 			'def main() -> None:',
-			'	foo()',
+			"	foo().unwrap( 'foo failed' )",
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_cenum_typedef_and_member_reference_compiles( self ) -> None:
@@ -1978,7 +1991,11 @@ def main() -> i32:
 		color.values = { 0: 'Red', 1: 'Green' }
 		harness = '\n'.join([
 			'#include <stdint.h>',
-			'#define __metalpy_maybe_unused', # real compiles get this from PROLOGUE - see its own comment
+			'#if defined(_MSC_VER) && !defined(__clang__)', # mirrors the real PROLOGUE's own conditional definition exactly - see its own comment
+			'#define __metalpy_maybe_unused',
+			'#else',
+			'#define __metalpy_maybe_unused __attribute__((unused))',
+			'#endif',
 			emitter_c.emit_cenum( color ),
 			'int main( void ) {',
 			'\treturn (int)__main__$Color$Red;',
@@ -2005,8 +2022,11 @@ def main() -> None:
 	p: Ptr[u8] = compiler.addrof( x )
 	p[i] = seven
 	y: u8 = p[i]
+	if y != seven:
+		return
 	return
 ''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_union_construct_and_match_compiles( self ) -> None:
@@ -2035,17 +2055,23 @@ def main() -> None:
 	def test_ptr_or_none_return_and_is_none_check_compiles( self ) -> None:
 		# Phase 5 milestone (b): mirrors the real, load-bearing shape every
 		# allocation in the language ultimately runs through - lib/sys.py's
-		# own _alloc(size: usize) -> Ptr[u8]|None, consumed via `if ptr is
-		# None:`. A synthetic extern stands in for the real HeapAlloc/malloc
-		# call (same posture as every other fixture in this file - no real
-		# lib/ dependency needed to exercise this shape)
+		# own _alloc/HeapAlloc/malloc are plain @extern bindings returning a
+		# bare (possibly-null) Ptr[u8] - a union can't cross the @extern
+		# boundary at all (only a plain C value type can), so the synthetic
+		# extern here mirrors that exact shape too, not Ptr[u8]|None
+		# directly. alloc_or_none is the ordinary (non-extern) wrapper that
+		# turns the raw nullable Ptr into a real Ptr[u8]|None union return,
+		# consumed via `if p is None:` - same posture as every other
+		# fixture in this file, no real lib/ dependency needed
 		self._run( '\n'.join([
 			"@extern( 'c', '_metalpy_test_maybe_alloc' )",
-			'def _test_maybe_alloc( size: usize ) -> Ptr[u8]|None:',
+			'def _test_maybe_alloc( size: usize ) -> Ptr[u8]:',
 			'	...',
 			'',
 			'def alloc_or_none( size: usize ) -> Ptr[u8]|None:',
 			'	ptr = _test_maybe_alloc( size )',
+			'	if ptr is None:',
+			'		return None',
 			'	return ptr',
 			'',
 			'def main() -> i32:',
@@ -2054,6 +2080,7 @@ def main() -> None:
 			'		return 0',
 			'	return 1',
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_scalar_casts_in_every_arithmetic_mode_compile( self ) -> None:
@@ -2067,11 +2094,14 @@ def main() -> None:
 			'	with compiler.saturate_arithmetic:',
 			'		y: u8 = u8( x )', # narrowing, out of range - clamps to 255
 			'	z: u32 = compiler.cast( u32, x )', # default Check mode
+			'	if y == 0:', # dead in practice (300 saturates to 255, never 0) - just keeps y a real, referenced value
+			'		z = 0',
 			'	return Result.Ok( z )',
 			'',
 			'def main() -> None:',
-			'	foo()',
+			'	foo().is_ok()',
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_defer_compiles( self ) -> None:
@@ -2101,9 +2131,10 @@ def main() -> None:
 			'	return Result.Ok( 5 )',
 			'',
 			'def main() -> None:',
-			'	checked()',
+			'	checked().is_ok()',
 			'	return',
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_generic_union_method_and_construction_arg_use_substituted_types( self ) -> None:
@@ -2148,8 +2179,9 @@ def main() -> None:
 			'def main() -> None:',
 			'\tb = make_full( 10 )',
 			'\tv = b.unwrap_ok()',
-			'\tr = add_one( v )',
+			"\tadd_one( v ).unwrap( 'add_one failed' )",
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_generic_specialization_naming_compiles( self ) -> None:
@@ -2190,7 +2222,9 @@ def main() -> None:
 			'	def get_or( self, default: T ) -> T:',
 			'		...',
 			'	def get_or( self, default: T ) -> T:',
-			'		return self.data.v_Some',
+			'		if self.tag == 0:',
+			'			return self.data.v_Some',
+			'		return default',
 			'',
 			'def main() -> i32:',
 			'	b: Box[i32] = Box.Some( 5 )',
