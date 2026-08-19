@@ -625,24 +625,23 @@ Remaining backlog / future work
      dropped). Full suite green on all three local compilers (MSVC, clang,
      gcc via WSL - 1408 tests each).
 
-     One real compiler bug found landing this, workaround shipped, real
-     fix flagged as task_92b90a9a: `Ptr[Callable[...]]|None` (or
-     `Closure[...]|None`) compiles as a parameter type (matches
-     lib/bisect.py's own pre-existing `key: Callable[[T],K]|None`
-     signature) but calling THROUGH it after narrowing (`is not None` or
-     `match`, doesn't matter which) fails with "cannot call log" even
-     though calling the exact same type unwrapped (non-Optional) works
-     fine - and routing the narrowed value into a separate non-Optional-
-     typed helper function (the usual workaround for narrowing that
-     doesn't survive some other context in this codebase) dodges that only
-     to hit a DEEPER emitter crash instead ("NotImplementedError: c_type:
-     unsupported type CallableType(...)" - a Callable/Closure has
-     apparently never been exercised as a union payload's storage type
-     before). Worked around by never constructing the union at all: `log`
-     defaults to a real no-op function (`_no_op_sink`) instead of `None`,
-     so it's always safely callable with no narrowing anywhere. Costs one
-     extra indirect call per request when a caller doesn't pass `log=`;
-     negligible.
+     One real compiler bug found landing this, WORKAROUND NOW REVERTED - the
+     real fix landed (7e0703e, task_92b90a9a): `Ptr[Callable[...]]|None`
+     compiles as a parameter type (matches lib/bisect.py's own pre-existing
+     `key: Callable[[T],K]|None` signature) but used to fail calling
+     THROUGH it after narrowing ("cannot call log"), and a deeper emitter
+     crash storing one as a union payload ("NotImplementedError: c_type:
+     unsupported type CallableType(...)"). `log` briefly shipped defaulting
+     to a real no-op function instead of `None` to sidestep both (no union
+     ever constructed) - reverted back to the plain, obvious
+     `Ptr[Callable[[str],None]]|None = None` shape once the real fix
+     landed, verified again on all three compilers. The narrowing itself
+     goes through a small helper (_log_if_present), not inlined
+     `if log is not None:` at each call site - Session.request()'s own
+     while-True loop still doesn't let `is not None` narrowing survive a
+     loop back-edge (a separate, older, still-present limitation - see that
+     loop's own comment), same reason every other Optional it touches
+     already goes through a small non-looping helper.
 
      Deliberate v1 simplification, not a gap: a binary (non-UTF-8) request/
      response body logs as a `<N bytes, not valid UTF-8>` placeholder
