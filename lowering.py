@@ -7919,6 +7919,23 @@ class FunctionLowering:
 		return unwrapped
 
 	def _expr_UnaryOp( self, node: ast.UnaryOp, expected_type: Type|None ) -> ir.Operand:
+		# expected_type is the OUTER expression's own target (e.g. `return
+		# -i` from a function declared -> i32|None) - hinting node.operand's
+		# own lowering with it directly is wrong whenever expected_type is a
+		# union: _lower_expr's own union-wrap coercion would silently wrap
+		# the OPERAND into Some(i) BEFORE the unary operator ever runs,
+		# leaving `-`/`~`/`not` trying to operate on a union value instead
+		# of the scalar it actually needs - confirmed via a real repro
+		# (`return -i` from a function declared -> i32|None generated
+		# invalid C, assigning a bare int into the union struct directly;
+		# NegWrap's own dest/operand had both silently become union-typed).
+		# Same fix _lower_binary_operands' own operand_hint already applies
+		# for +-*/etc - None here lets node.operand infer its own natural
+		# type instead, exactly as if no hint had been given at all; the
+		# unary operator's own RESULT still gets coerced into expected_type
+		# normally, by the ordinary _lower_expr call that invoked this
+		# method in the first place.
+		operand_hint = expected_type if self.lowering._type_resolver._tagged_union_shape( expected_type ) is None else None
 		if isinstance( node.op, ast.Not ):
 			# strict=False: `not x` applies C-style truthiness to WHATEVER
 			# scalar x already is (ir.Not/emitter_c.py's own `!operand` C
@@ -7926,11 +7943,25 @@ class FunctionLowering:
 			# here is only ever a hint for the RARE case node.operand itself
 			# still needs inference (an untyped literal/generic call), never a
 			# real requirement that x must already BE expected_type's own type
-			operand = self._lower_expr( node.operand, expected_type, strict = False )
-			dest = self._new_temp( expected_type or operand.type )
+			operand = self._lower_expr( node.operand, operand_hint, strict = False )
+			# `not x`'s own result is ALWAYS bool, never expected_type itself
+			# (which, same reasoning as operand_hint above, might be a union
+			# wrapping bool - `return not flag` from a function declared ->
+			# bool|None) - dest must stay plain bool here so ir.Not's own
+			# `dest = !(operand);` codegen matches its declared C type; the
+			# post-dispatch _coerce_or_check_operand tail (_lower_expr's own,
+			# back in the caller) is what wraps this plain bool into the
+			# union afterward, same as every other _expr_X method relies on
+			# it to. Confirmed via a real repro: using expected_type directly
+			# here made dest itself union-typed, which _coerce_or_check_
+			# operand's own "operand.type is expected_type already" identity
+			# check then wrongly treated as "nothing to coerce", leaving a
+			# bare `!(flag)` assigned straight into a union struct in C
+			bool_cls = self.lowering.discovery.find_name( 'bool', node )
+			dest = self._new_temp( bool_cls )
 			self._emit( ir.Not( dest = dest, operand = operand ))
 			return dest
-		operand = self._lower_expr( node.operand, expected_type )
+		operand = self._lower_expr( node.operand, operand_hint )
 
 		# non-scalar operand — try the dunder method (int.__neg__, ...),
 		# mirroring _expr_BinOp/_expr_Compare's identical dispatch
