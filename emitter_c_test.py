@@ -6018,6 +6018,216 @@ def main() -> i32:
 		] )
 
 
+class CapturingClosureRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for CAPTURING closures - a lambda or
+	nested def that references a local/parameter of its own enclosing
+	function, generalizing ClosureRealCompileTests' bound-method-only
+	Closure[...] to a synthesized captured-env RCClass (see the closures
+	plan). Confirms the generated code actually reads the right captured
+	value AND manages the captured RC value's refcount correctly - the
+	same posture ClosureRealCompileTests' own
+	refcount_incremented_once_on_construction_and_calls_are_neutral takes,
+	applied here to a captured local instead of a bound-method receiver. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'nested_def_capturing_scalar_local_and_called_directly', '''
+def make_adder( n: i32 ) -> i32:
+	def add( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + n
+	return add( 10 )
+
+def main() -> i32:
+	result: i32 = make_adder( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 15
+	return diff
+''' ),
+			( 'lambda_capturing_scalar_local_passed_to_a_closure_parameter', '''
+def call_it( f: Closure[[i32],i32], v: i32 ) -> i32:
+	return f( v )
+
+def outer( y: i32 ) -> i32:
+	return call_it( lambda x: y, 5 )
+
+def main() -> i32:
+	result: i32 = outer( 41 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 41
+	return diff
+''' ),
+			# mixed scalar + RC capture - correct per-field decref (via
+			# type_resolver.py's own _synthesize_rcclass_destructor/
+			# _build_field_teardown_ast, unmodified) on the env's own
+			# teardown, no leak/double-free. A second, unrelated Box instance
+			# untouched by the closure confirms nothing else's refcount moved
+			( 'nested_def_capturing_mixed_scalar_and_rc_locals', '''
+class Box:
+	v: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Box:
+		return Box.__allocate__( v = v )
+
+def outer( n: i32, b: Box ) -> i32:
+	def combine() -> i32:
+		with compiler.wrap_arithmetic:
+			return n + b.v
+	return combine()
+
+def main() -> i32:
+	b: Box = Box.make( 100 )
+	other: Box = Box.make( 999 )
+	rc0: usize = compiler.refcount( b )
+	other_rc0: usize = compiler.refcount( other )
+	result: i32 = outer( 41, b )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 141
+	if diff != 0:
+		return 1
+	rc1: usize = compiler.refcount( b )
+	if rc1 != rc0:
+		return 2
+	other_rc1: usize = compiler.refcount( other )
+	if other_rc1 != other_rc0:
+		return 3
+	return 0
+''' ),
+			# construction increfs the captured RC local exactly once, 200
+			# repeated calls through the closure touch its refcount not at
+			# all, teardown releases exactly that one reference - direct
+			# analogue of ClosureRealCompileTests' own bound-method version,
+			# defending the AST-rewrite's inline-cast-per-occurrence design
+			# (never a prologue-materialized local) against reintroducing
+			# per-call refcount churn
+			( 'refcount_incremented_once_on_capture_and_calls_are_neutral', '''
+class Box:
+	v: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Box:
+		return Box.__allocate__( v = v )
+
+def outer( b: Box, n: i32 ) -> i32:
+	rc0: usize = compiler.refcount( b )
+
+	def inner( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + n + b.v
+
+	rc1: usize = compiler.refcount( b )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+
+	i: i32 = 0
+	result: i32 = 0
+	with compiler.wrap_arithmetic:
+		while i < 200:
+			result = inner( 1 )
+			i += 1
+
+	rc_after_calls: usize = compiler.refcount( b )
+	if rc_after_calls != rc1:
+		return 2
+
+	with compiler.wrap_arithmetic:
+		expected: i32 = n + 1 + b.v
+	if result != expected:
+		return 3
+
+	return 0
+
+def main() -> i32:
+	b: Box = Box.make( 100 )
+	rc_before: usize = compiler.refcount( b )
+	code: i32 = outer( b, 41 )
+	if code != 0:
+		return code
+	rc_after: usize = compiler.refcount( b )
+	if rc_after != rc_before:
+		return 10
+	return 0
+''' ),
+			# `d = c` aliasing an EXISTING capturing closure increfs the
+			# CLOSURE object itself once, not the captured value again -
+			# direct analogue of ClosureRealCompileTests' own
+			# shared_closure_across_multiple_owners
+			( 'shared_capturing_closure_across_multiple_owners', '''
+class Box:
+	v: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Box:
+		return Box.__allocate__( v = v )
+
+def outer( b: Box ) -> i32:
+	rc0: usize = compiler.refcount( b )
+
+	def get() -> i32:
+		return b.v
+
+	rc1: usize = compiler.refcount( b )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+
+	other: Closure[[], i32] = get
+	closure_rc: usize = compiler.refcount( get )
+	if closure_rc != 2:
+		return 2
+	if get() != 100 or other() != 100:
+		return 3
+
+	compiler.decref( get )
+	rc_mid: usize = compiler.refcount( b )
+	if rc_mid != rc1:
+		return 4
+	compiler.decref( other )
+	rc2: usize = compiler.refcount( b )
+	if rc2 != rc0:
+		return 5
+	return 0
+
+def main() -> i32:
+	b: Box = Box.make( 100 )
+	return outer( b )
+''' ),
+			# a nested def inside a LOOP correctly rebuilds a fresh env +
+			# closure each iteration ("closure creation happens when the def
+			# statement executes", matching Python's own semantics) - each
+			# closure independently captures its own loop-iteration value,
+			# not a shared/aliased one
+			( 'nested_def_capturing_inside_loop_rebuilds_per_iteration', '''
+def make_closures_summed( n: i32 ) -> i32:
+	total: i32 = 0
+	i: i32 = 0
+	with compiler.wrap_arithmetic:
+		while i < n:
+			def get_i() -> i32:
+				return i
+			total += get_i()
+			i += 1
+	return total
+
+def main() -> i32:
+	result: i32 = make_closures_summed( 5 ) # 0+1+2+3+4
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 10
+	return diff
+''' ),
+		] )
+
+
 class PropertyRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for @property (lowering.py's _expr_
 	Attribute is_property branch) - unlike the IR-shape assertions in
@@ -6178,6 +6388,42 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			i += 1
 	if c.n.load() != 8000:
+		return 1
+	return 0
+''' ),
+			# the direct end-to-end proof a REAL capturing closure (not a
+			# bound method) survives the exact same foreign-C-callback round
+			# trip Thread already proves for bound methods: incref -> cast
+			# to Ptr[None] -> CreateThread/pthread_create's own userdata
+			# slot -> _thread_entry casts back -> call(). Needs ZERO new
+			# compiler code to pass (per the closures plan's own "Precedent
+			# reused" section) - Thread/_thread_entry only ever treat
+			# Closure[[],None] as opaque, regardless of what it captures.
+			# write_captured captures TWO locals of different kinds (r: an
+			# RC receiver used to hand a result back across the thread
+			# boundary, and n: a plain scalar) - the spawned thread reading
+			# back the correct scalar CONFIRMS the env's own field read
+			# survived the round trip, not just that SOME thread ran
+			( 'capturing_closure_survives_thread_round_trip', '''
+import threading
+
+class Result:
+	value: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Result:
+		return Result.__allocate__( value = v )
+
+def main() -> i32:
+	r: Result = Result.make( 0 )
+	n: i32 = 777
+
+	def write_captured() -> None:
+		r.value = n
+
+	t: threading.Thread = threading.Thread( write_captured )
+	t.join()
+	if r.value != 777:
 		return 1
 	return 0
 ''' ),

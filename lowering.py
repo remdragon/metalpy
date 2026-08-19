@@ -1152,6 +1152,50 @@ class Lowering:
 		self._closure_trampolines[key] = trampoline
 		return trampoline
 
+	def _build_closure_env_class( self, captures: list[tuple[str,Type]], qualname: str, file: object, line: int|None ) -> RCClass:
+		''' the backing RCClass for one capturing lambda/nested-def's captured
+		environment - real, un-erased Variable attributes (unlike ClosureType's
+		own fn/self, both always Ptr[None]), built exactly like tuple_storage.py's
+		TupleStorage.get() builds a tuple's own backing class from nothing: no
+		parsed source, no AST body, no __init__ (a construction site builds one
+		directly via ir.Allocate's field=value shape, same as a tuple literal
+		does). Every existing RC mechanism (cfg.py's is_rc/rc_leaves,
+		type_resolver.py's _synthesize_rcclass_destructor/_build_field_teardown_
+		ast, emitter_c.py's emit_rcclass) applies to it completely unchanged -
+		real typed fields are exactly what makes the automatic, per-field-
+		correct (RC pointer/nested CStruct/tag-gated union/nothing) destructor
+		synthesis "just work" here with zero new code.
+
+		Deliberately NOT memoized/interned the way TupleStorage.get() is: a
+		tuple's backing class is reached from many independent call sites
+		across a whole compile run (any annotation spelling the same element
+		types), but a lambda/nested-def's own AST node is visited exactly once
+		by the ordinary top-to-bottom lowering walk (the same reason
+		_lambda_counter is a plain incrementing counter, not a cache key) - a
+		cache here would be written once and never read. Two occurrences that
+		happen to capture same-typed locals still get two independent classes
+		(GeneratorType's "fresh per occurrence" posture, not TupleType's
+		cross-occurrence interning - see mpy_types.py's own comment on the
+		difference). This is only safe because a nested def/lambda inside a
+		generic enclosing function is rejected outright elsewhere
+		(_reject_generic_enclosing_scope) - if that restriction is ever lifted,
+		a generic function's own capturing closure would be lowered once per
+		monomorphization and WOULD need its env class memoized per
+		specialization, not built fresh-and-unmemoized like this. '''
+		attributes = [
+			Variable( stem = name, qualname = f'{qualname}.{name}', file = file, line = line, type = t )
+			for name, t in captures
+		]
+		env_cls = RCClass(
+			stem = qualname, qualname = qualname, file = file, line = line,
+			base = None, type_params = None,
+			attributes = attributes, methods = [],
+			names = { a.stem: a for a in attributes },
+			resolve = None,
+		)
+		self.schedule( env_cls )
+		return env_cls
+
 	def find_name_recursive( self, node: ast.Attribute ) -> tuple[object,str]|None:
 		''' Resolve a dotted ast.Attribute expression (builtins.OSError.
 		FileNotFoundError) to the terminal scope object and the final
@@ -6116,21 +6160,37 @@ class FunctionLowering:
 		self._emit( ir.Assign( dest = var, src = operand ))
 		return var
 
-	def _reject_free_variables( self, roots: list[ast.AST], param_names: set[str], node: ast.AST ) -> None:
-		# a nested def/lambda may only reference its own parameters/locally
-		# -assigned names, module-level names, and builtins - referencing
-		# anything from the immediately enclosing function's own scope is a
-		# capture, deliberately unsupported for now (see PLAN_LAMBDA.md's
-		# own "deferred" list - no representation decision made yet for a
-		# captured environment). `roots` is the def's own body (a list of
-		# statements) or a lambda's own body wrapped in a single-element
-		# list (a bare expression - lambda syntax forbids assignment
-		# statements, but NOT ast.NamedExpr/walrus, which also binds via
-		# Name(Store) - the same walk covers both shapes uniformly without
-		# special-casing). Doesn't recurse into a FURTHER nested def/
-		# lambda's own body - that one gets its own independent check when
-		# IT gets synthesized (only its OWN name, if it's a def, becomes a
-		# local binding at THIS level, same as an ordinary assignment would)
+	def _collect_free_variables( self, roots: list[ast.AST], param_names: set[str], node: ast.AST ) -> list[tuple[str,Variable]]:
+		# a nested def/lambda's own parameters/locally-assigned names,
+		# module-level names, and builtins resolve normally; anything else
+		# reaching into the immediately enclosing function's own scope is a
+		# CAPTURE - collected and returned here (as (name, Variable) pairs,
+		# ready for _build_closure_env_class/the AST rewrite - see the
+		# capturing-closures plan) rather than rejected, now that a
+		# representation decision has been made (real closures - see
+		# ClosureType/PLAN_CALLABLE.md's own bound-method precedent,
+		# generalized). `roots` is the def's own body (a list of statements)
+		# or a lambda's own body wrapped in a single-element list (a bare
+		# expression - lambda syntax forbids assignment statements, but NOT
+		# ast.NamedExpr/walrus, which also binds via Name(Store) - the same
+		# walk covers both shapes uniformly without special-casing).
+		# Doesn't recurse into a FURTHER nested def/lambda's own body - that
+		# one gets its own independent capture collection when IT gets
+		# synthesized (only its OWN name, if it's a def, becomes a local
+		# binding at THIS level, same as an ordinary assignment would); this
+		# is also the reason a closure capturing another closure's own
+		# capture isn't supported yet (see the plan's "Deferred" section) -
+		# by the time an inner nested def/lambda's own free-variable walk
+		# runs, THIS level's own rewrite has already turned any name it
+		# captured into an Attribute expression, never a resolvable name.
+		#
+		# `x = x + 1` inside the body never reaches `free` at all: any
+		# ast.Store anywhere in the body makes that name local for the
+		# WHOLE body (mirroring real Python's own hoisting rule), so this
+		# is also what makes captures strictly immutable snapshots (no
+		# nonlocal write-back) - a captured-and-reassigned name is simply a
+		# local read of its own not-yet-assigned local, not a capture,
+		# enforced with no extra checking needed here.
 		local_names = set( param_names )
 		class _BindingCollector( ast.NodeVisitor ):
 			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
@@ -6159,15 +6219,67 @@ class FunctionLowering:
 
 		enclosing_fn = self._current_fn
 		if enclosing_fn is None:
-			return
+			return []
+		captures: list[tuple[str,Variable]] = []
+		seen: set[str] = set()
 		for free_name in free:
-			if free_name.id in enclosing_fn.names:
+			if free_name.id in seen:
+				continue
+			resolved = enclosing_fn.names.get( free_name.id )
+			if resolved is None:
+				continue # genuinely undefined - falls through to the ordinary "not defined" error once the (rewritten) body is actually lowered
+			if not isinstance( resolved, Variable ):
 				self.lowering.discovery.fail(
-					f"{ast.unparse(node)}: captures {free_name.id!r} from the enclosing function - nested "
-					f"functions/lambdas can only reference their own parameters, module-level names, and "
-					f"builtins (no captured variables yet)",
+					f"{ast.unparse(node)}: cannot capture {free_name.id!r} - only local variables and "
+					f"parameters can be captured, not {type(resolved).__name__.lower()}s",
 					node,
 				)
+			seen.add( free_name.id )
+			captures.append( ( free_name.id, resolved ) )
+		return captures
+
+	def _rewrite_captures_into_env_reads( self, roots: list[ast.AST], env_cls: RCClass, erased_param: str, captured_names: set[str] ) -> list[ast.AST]:
+		''' replaces every captured-name ast.Name(Load) reference inside
+		`roots` with an inline, never-named env-field read:
+		compiler.cast(<env>, erased_param).name - mirrors
+		_get_or_create_closure_trampoline's own inline compiler.cast(
+		<closure_owner>, erased_self) receiver expression, for the
+		identical reason: binding the cast to a named local first would
+		make _is_aliasing_expr treat it as a fresh, owned value needing its
+		own scope-exit decref, over-releasing the env object this is only
+		ever a BORROWED reinterpretation of (the closure's own `self`
+		field already owns it - see _construct_capturing_closure). Doesn't
+		recurse into a FURTHER nested def/lambda's own body - same posture
+		_collect_free_variables's own walk takes, for the same reason (see
+		its own comment on why multi-level capture-of-a-capture isn't
+		supported yet). Mutates/replaces in place - each occurrence's own
+		AST is synthesized and lowered exactly once, never reused for
+		anything else afterward, so there's no aliasing hazard in doing so. '''
+		def env_field_read( name: str, line: int, col: int ) -> ast.Attribute:
+			env_type_ref = ast.Name( id = '<closure_env>', ctx = ast.Load(), lineno = line, col_offset = col )
+			env_type_ref.resolved_type = env_cls
+			cast_call = ast.Call(
+				func = ast.Attribute(
+					value = ast.Name( id = 'compiler', ctx = ast.Load(), lineno = line, col_offset = col ),
+					attr = 'cast', ctx = ast.Load(), lineno = line, col_offset = col,
+				),
+				args = [ env_type_ref, ast.Name( id = erased_param, ctx = ast.Load(), lineno = line, col_offset = col ) ],
+				keywords = [], lineno = line, col_offset = col,
+			)
+			return ast.Attribute( value = cast_call, attr = name, ctx = ast.Load(), lineno = line, col_offset = col )
+
+		class _CaptureRewriter( ast.NodeTransformer ):
+			def visit_FunctionDef( self, fd: ast.FunctionDef ) -> ast.FunctionDef:
+				return fd # don't recurse into a further nested def's own body
+			def visit_Lambda( self, lam: ast.Lambda ) -> ast.Lambda:
+				return lam # ditto for a further nested lambda
+			def visit_Name( self, n: ast.Name ) -> ast.AST:
+				if isinstance( n.ctx, ast.Load ) and n.id in captured_names:
+					return env_field_read( n.id, n.lineno, n.col_offset )
+				return n
+
+		rewriter = _CaptureRewriter()
+		return [ rewriter.visit( root ) for root in roots ]
 
 	def _lower_function_ref( self, fn: Function, node: ast.AST ) -> ir.Operand:
 		# a bare reference to a function used AS A VALUE, not called - see
@@ -6280,20 +6392,74 @@ class FunctionLowering:
 		else:
 			synthetic.return_type = self.lowering.discovery.get_none_type()
 
-		self._reject_free_variables( node.body, { p.stem for p in parameters }, node )
+		captures = self._collect_free_variables( node.body, { p.stem for p in parameters }, node )
 
-		enclosing.add_name( node.name, synthetic )
-		self.lowering.schedule( synthetic )
+		if not captures:
+			# the common, zero-cost case: nothing to capture, so `node.name`
+			# resolves straight to a real Function - callers reach it via
+			# _lower_function_ref (a bare reference) or ordinary Call
+			# resolution, exactly as before this feature existed
+			enclosing.add_name( node.name, synthetic )
+			self.lowering.schedule( synthetic )
+			return
+
+		# a CAPTURING nested def - unlike the non-capturing case above, this
+		# genuinely emits IR at the def statement's own position (this IS
+		# "closure creation time" for a nested def, the same point Python
+		# itself creates the function object each time the statement
+		# executes - so one inside a loop correctly rebuilds a fresh env +
+		# closure every iteration). `node.name` can no longer resolve to a
+		# bare Function: calling it must route through _try_lower_closure_
+		# call, which only matches a Variable of ClosureType - see the
+		# closures plan
+		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		none_type = self.lowering.discovery.get_none_type()
+		ptr_none_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ none_type ] )
+
+		env_cls = self.lowering._build_closure_env_class(
+			[ ( name, resolved.type ) for name, resolved in captures ], f'{qualname}$$env', enclosing.file, node.lineno,
+		)
+		captured_names = { name for name, _ in captures }
+		node.body = self._rewrite_captures_into_env_reads( node.body, env_cls, 'erased_env', captured_names )
+
+		erased_env_param = Parameter( stem = 'erased_env', qualname = f'{qualname}.erased_env', file = enclosing.file, line = node.lineno, type = ptr_none_type )
+		synthetic.parameters = [ erased_env_param, *parameters ]
+		synthetic.add_name( 'erased_env', erased_env_param )
+
+		operand = self._construct_capturing_closure( captures, env_cls, synthetic, node )
+
+		# bind node.name as a real Variable (not a Function) - the same
+		# "first assignment to a name with no prior declaration" tail
+		# _stmt_Assign's own no-prior-declaration branch uses, minus
+		# _declare_local's callback-based lowering (operand is already
+		# lowered above). is_alias=False: operand is a fresh Allocate
+		# result, same as any other first-time construction
+		var = Variable( stem = node.name, qualname = f'{enclosing.qualname}.{node.name}', file = enclosing.file, line = node.lineno, type = operand.type )
+		enclosing.add_name( var.stem, var )
+		self.lowering.schedule( var.type )
+		for instr in self._cfg_assign( var, operand, is_alias = False, node = node ):
+			self._emit( instr )
+		self._emit( ir.Assign( dest = var, src = operand ))
 
 	def _expr_Lambda( self, node: ast.Lambda, expected_type: Type|None ) -> ir.Operand:
-		# a non-capturing lambda expression - see PLAN_LAMBDA.md. Lambda
-		# syntax carries no type annotations at all, so parameter types are
-		# inferred entirely from expected_type (must already be a
-		# Ptr[Callable[[ArgTypes],Ret]] shape flowing in from the
-		# surrounding context - e.g. a `key: Callable[[T],K]` parameter's
-		# own declared type, while lowering the argument expression at a
-		# call site)
+		# a lambda expression, capturing or not - see PLAN_LAMBDA.md/the
+		# closures plan. Lambda syntax carries no type annotations at all,
+		# so parameter types are inferred entirely from expected_type -
+		# either a Ptr[Callable[[ArgTypes],Ret]] shape (the non-capturing
+		# case's own established route - e.g. a `key: Callable[[T],K]`
+		# parameter's own declared type) or, now, a bare ClosureType (a
+		# capturing lambda's own actual result type - `c: Closure[[Args],
+		# Ret] = lambda ...: ...`, the natural way to write one). ClosureType
+		# already exposes the identical arg_types/return_type shape
+		# CallableType does (see its own docstring), so no wrapper object is
+		# needed - just falling back to expected_type itself when it's
+		# already the right shape. Deliberately NOT folded into
+		# TypeResolver._callable_type_of itself - that function's other
+		# callers (_try_lower_indirect_call in particular) mean specifically
+		# "a bare function-pointer value", not "anything callable"
 		fn_type = self.lowering._type_resolver._callable_type_of( expected_type )
+		if fn_type is None and isinstance( expected_type, ClosureType ):
+			fn_type = expected_type
 		if fn_type is None:
 			self.lowering.discovery.fail(
 				f'cannot infer lambda parameter types - no expected Callable[...] context: {ast.unparse(node)}',
@@ -6365,7 +6531,28 @@ class FunctionLowering:
 			synthetic.add_name( param.stem, param )
 		synthetic.parameters = parameters
 
-		self._reject_free_variables( [ node.body ], { p.arg for p in positional }, node )
+		captures = self._collect_free_variables( [ node.body ], { p.arg for p in positional }, node )
+
+		env_cls: RCClass|None = None
+		if captures:
+			# a capturing lambda - build the env class and rewrite the body
+			# BEFORE any eager lowering below, so a still-unbound return
+			# type is inferred from the ALREADY-REWRITTEN (fully closed, no
+			# free names left) body - see the closures plan's own note on
+			# why this ordering is one-directional
+			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+			none_type = self.lowering.discovery.get_none_type()
+			ptr_none_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ none_type ] )
+
+			env_cls = self.lowering._build_closure_env_class(
+				[ ( cap_name, resolved.type ) for cap_name, resolved in captures ], f'{qualname}$$env', enclosing.file, node.lineno,
+			)
+			captured_names = { cap_name for cap_name, _ in captures }
+			synthetic_node.body = self._rewrite_captures_into_env_reads( synthetic_node.body, env_cls, 'erased_env', captured_names )
+
+			erased_env_param = Parameter( stem = 'erased_env', qualname = f'{qualname}.erased_env', file = enclosing.file, line = node.lineno, type = ptr_none_type )
+			synthetic.parameters = [ erased_env_param, *parameters ]
+			synthetic.add_name( 'erased_env', erased_env_param )
 
 		if return_type_provisional:
 			# lower the body RIGHT NOW, synchronously, instead of only ever
@@ -6379,15 +6566,24 @@ class FunctionLowering:
 			# lower_function itself builds a brand-new FunctionLowering
 			# instance for this nested call, so there's no shared mutable
 			# state with the lowering already in progress for `enclosing` to
-			# save/restore around at all
+			# save/restore around at all. Post-rewrite (if capturing), the
+			# body is already fully closed (every capture is now an
+			# ordinary attribute-chain expression rooted at erased_env) -
+			# eager lowering genuinely cannot tell a capturing lambda from a
+			# hand-written one at this point, so nothing here needs to change
 			lowered = self.lowering._compile_now( synthetic )
 			return_instr = next( instr for instr in lowered.instructions if isinstance( instr, ir.Return ))
 			synthetic.return_type = (
 				return_instr.value.type if return_instr.value is not None
 				else self.lowering.discovery.get_none_type()
 			)
-		else:
+		elif not captures:
 			self.lowering.schedule( synthetic )
+
+		if captures:
+			# _construct_capturing_closure schedules `synthetic` itself
+			# (see its own comment) - not done separately here
+			return self._construct_capturing_closure( captures, env_cls, synthetic, node, expected_type )
 		return self.lowering._function_ref_operand( synthetic )
 
 	def _expr_Constant( self, node: ast.Constant, expected_type: Type|None ) -> ir.Operand:
@@ -7142,6 +7338,90 @@ class FunctionLowering:
 
 		dest = self._new_temp( expected_type or closure_type )
 		self._emit( ir.Allocate( dest = dest, cls = closure_type, fields = { 'fn': fn_erased, 'self': self_erased } ))
+		return dest
+
+	def _construct_capturing_closure(
+		self, captures: list[tuple[str,Variable]], env_cls: RCClass, synthetic: Function,
+		node: ast.AST, expected_type: Type|None = None,
+	) -> ir.Operand:
+		''' builds a real, capturing Closure[[Args],Ret] value - the general
+		case of _lower_bound_method_closure just above, generalized from one
+		erased receiver field to N real captured fields collapsed behind one
+		erased env pointer. Shared by _stmt_FunctionDef (a capturing nested
+		def) and _expr_Lambda (a capturing lambda) - see the closures plan.
+		`synthetic` IS the trampoline here (unlike the bound-method case's
+		separate, shared, memoized-per-(method,owner) trampoline function) -
+		a lambda/nested-def's own synthesized body is never called any other
+		way than through its own closure's fn field, and never shared across
+		construction sites, so there's no benefit to a second indirection
+		layer; its own first parameter is already `erased_env: Ptr[None]`. '''
+		arg_types = [ p.type for p in synthetic.parameters[1:] ] # skip erased_env
+		self.lowering.schedule( synthetic.return_type )
+		for t in arg_types:
+			self.lowering.schedule( t )
+
+		closure_type = self.lowering.discovery._get_or_create_closure_type( arg_types, synthetic.return_type )
+		self.lowering._ensure_resolved( closure_type )
+		self.lowering._schedule_rcclass_construction( closure_type, closure_type )
+		self.lowering._schedule_rcclass_construction( env_cls, env_cls ) # the env is a real, constructed RCClass too - needs its own sys.alloc/__del__ scheduled, same as any other constructed class
+
+		# each capture's CURRENT value, read in the ENCLOSING function's own
+		# scope (an ordinary ast.Name read) - field_value() is the same
+		# generic per-field embedding every ordinary SomeClass(field=value)
+		# construction already uses (cfg.py, shared by _lower_allocate_fields):
+		# an aliasing Name read gets exactly one Incref if its type is RC,
+		# nothing otherwise - no hand-rolled ir.Incref needed here, unlike
+		# the bound-method case above, precisely BECAUSE these fields keep
+		# their real declared types instead of erasing to Ptr[None]
+		fields: dict[str,ir.Operand] = {}
+		for name, resolved in captures:
+			name_node = ast.Name( id = name, ctx = ast.Load(), lineno = node.lineno, col_offset = node.col_offset )
+			value = self._lower_expr( name_node, resolved.type )
+			is_alias = self.lowering._is_aliasing_expr( name_node, value )
+			for instr in self._cfg.field_value( value.type, value, is_alias = is_alias ):
+				self._emit( instr )
+			fields[name] = value
+
+		env_dest = self._new_temp( env_cls )
+		self._emit( ir.Allocate( dest = env_dest, cls = env_cls, fields = fields ))
+
+		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		none_type = self.lowering.discovery.get_none_type()
+		ptr_none_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ none_type ] )
+
+		env_erased = self._new_temp( ptr_none_type )
+		self._emit( ir.CastWrap( dest = env_erased, operand = env_dest ))
+		# env_dest is a fresh ir.Allocate result, so it's fresh_temp()-
+		# tracked as a pending obligation for THIS statement's own cleanup
+		# (see _emit) - erasing it via CastWrap doesn't transfer that
+		# tracking (a CastWrap's own dest is never fresh_temp()-registered,
+		# but its OPERAND's existing tracking is untouched), so without this
+		# the per-statement pending-temp flush would decref env_dest right
+		# out from under the closure that's about to become its only real
+		# owner - a real, confirmed premature free (heap corruption at
+		# runtime, not just reasoning). untrack_temp mirrors exactly what
+		# cfg.field_value's own is_alias=False branch already does for any
+		# other fresh value handed into a new field - ownership transfers
+		# into the closure's own `self` field, so the original temp needs
+		# no independent decref of its own
+		self._cfg.untrack_temp( env_dest )
+
+		trampoline_callable_type = self.lowering.discovery._get_or_create_callable_type(
+			[ p.type for p in synthetic.parameters ], synthetic.return_type,
+		)
+		trampoline_ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ trampoline_callable_type ] )
+		fn_ref = ir.FunctionRef( type = trampoline_ptr_type, fn = synthetic )
+		fn_erased = self._new_temp( ptr_none_type )
+		self._emit( ir.CastWrap( dest = fn_erased, operand = fn_ref ))
+		# unlike the bound-method trampoline (scheduled inside _get_or_create_
+		# closure_trampoline, which BUILDS it), `synthetic` here is built by
+		# the caller (_stmt_FunctionDef/_expr_Lambda) - this is the one place
+		# both paths funnel through, so scheduling it here (not at either
+		# call site) is what actually makes it a real, emitted function
+		self.lowering.schedule( synthetic )
+
+		dest = self._new_temp( expected_type or closure_type )
+		self._emit( ir.Allocate( dest = dest, cls = closure_type, fields = { 'fn': fn_erased, 'self': env_erased } ))
 		return dest
 
 	def _expr_Attribute( self, node: ast.Attribute, expected_type: Type|None ) -> ir.Operand:

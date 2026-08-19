@@ -4306,7 +4306,43 @@ class Tests( unittest.TestCase ):
 		self.assertIsInstance( assign.src, ir.FunctionRef )
 		self.assertEqual( assign.src.fn.qualname, '__test__.outer$$nested_inner' )
 
-	def test_nested_def_capturing_enclosing_local_is_rejected( self ) -> None:
+	# --- capturing nested function defs (real closures) -----------------------
+
+	def test_nested_def_capturing_scalar_local_builds_env_then_closure_allocate( self ) -> None:
+		code = '\n'.join([
+			'def outer( y: i32 ) -> i32:',
+			'	def inner( x: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return x + y',
+			'	return inner( 5 )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocates = [ i for i in lf.instructions if isinstance( i, ir.Allocate ) ]
+		self.assertEqual( len( allocates ), 2 )
+		env_alloc, closure_alloc = allocates
+		self.assertIsInstance( closure_alloc.cls, ClosureType )
+		self.assertNotIsInstance( env_alloc.cls, ClosureType )
+		self.assertIn( 'fn', closure_alloc.fields )
+		self.assertIn( 'self', closure_alloc.fields )
+		# env class's own field keeps the REAL captured type (i32), not
+		# erased to Ptr[None] the way ClosureType's own fn/self fields are -
+		# this is what lets the env's own destructor be synthesized for free
+		self.assertIn( 'y', env_alloc.fields )
+		y_attr = next( a for a in env_alloc.cls.attributes if a.stem == 'y' )
+		self.assertEqual( y_attr.type.stem, 'i32' )
+		# no Incref at all for a scalar capture
+		self.assertFalse( any( isinstance( i, ir.Incref ) for i in lf.instructions ))
+
+	def test_nested_def_capturing_binds_closure_typed_variable_not_a_function( self ) -> None:
+		# unlike the non-capturing case (test_nested_def_bare_reference_
+		# lowers_to_function_ref above), a capturing nested def's own name
+		# must resolve to a real Variable of ClosureType - _try_lower_
+		# closure_call only ever matches a Variable, never a bare Function
 		code = '\n'.join([
 			'def outer( y: i32 ) -> i32:',
 			'	def inner( x: i32 ) -> i32:',
@@ -4319,7 +4355,123 @@ class Tests( unittest.TestCase ):
 		if outer_fn.resolve is not None:
 			outer_fn.resolve()
 		self.compiler._lower( outer_fn )
-		self.assertIn( "captures 'y' from the enclosing function", self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		bound = outer_fn.names['inner']
+		self.assertIsInstance( bound, Variable )
+		self.assertNotIsInstance( bound, Function )
+		self.assertIsInstance( bound.type, ClosureType )
+
+	def test_nested_def_capturing_called_directly_emits_callindirect( self ) -> None:
+		code = '\n'.join([
+			'def outer( y: i32 ) -> i32:',
+			'	def inner( x: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return x + y',
+			'	return inner( 5 )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertFalse( any( isinstance( i, ir.Call ) for i in lf.instructions ))
+		call_indirects = [ i for i in lf.instructions if isinstance( i, ir.CallIndirect ) ]
+		self.assertEqual( len( call_indirects ), 1 )
+
+	def test_nested_def_capturing_rc_typed_local_increfs_env_field_once( self ) -> None:
+		code = '\n'.join([
+			'class Box:',
+			'	v: i32',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Box:',
+			'		return Box.__allocate__( v = v )',
+			'',
+			'def outer( b: Box ) -> i32:',
+			'	def inner() -> i32:',
+			'		return b.v',
+			'	return inner()',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		increfs = [ i for i in lf.instructions if isinstance( i, ir.Incref ) ]
+		self.assertEqual( len( increfs ), 1 )
+		allocates = [ i for i in lf.instructions if isinstance( i, ir.Allocate ) ]
+		env_alloc = next( a for a in allocates if not isinstance( a.cls, ClosureType ))
+		# the capture's own Incref happens before the env is allocated (the
+		# same "aliasing read gets its own Incref before being embedded"
+		# ordering cfg.field_value/_lower_allocate_fields already use
+		# everywhere else)
+		self.assertLess( lf.instructions.index( increfs[0] ), lf.instructions.index( env_alloc ))
+
+	def test_two_nested_def_occurrences_get_independent_env_classes( self ) -> None:
+		# each closure called independently, not combined via `+` - this
+		# test file's own Discovery(import_builtins=False) setup has no
+		# real scalar arithmetic dunder dispatch available (unrelated to
+		# closures - confirmed: even a plain `a + 1` fails identically here)
+		code = '\n'.join([
+			'def outer( a: i32, b: i32 ) -> i32:',
+			'	def first() -> i32:',
+			'		return a',
+			'	def second() -> i32:',
+			'		return b',
+			'	first()',
+			'	return second()',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		env_allocs = [ i for i in lf.instructions if isinstance( i, ir.Allocate ) and not isinstance( i.cls, ClosureType ) ]
+		self.assertEqual( len( env_allocs ), 2 )
+		self.assertIsNot( env_allocs[0].cls, env_allocs[1].cls )
+
+	def test_reassigned_captured_name_is_local_not_captured( self ) -> None:
+		# `x = x + 1`-shaped body: any ast.Store anywhere in the body makes
+		# that name local for the WHOLE body (mirrors real Python's own
+		# hoisting rule) - x is never collected as a capture, so this
+		# compiles as an ordinary (here: use-before-first-assignment) error,
+		# not a capture of the enclosing y
+		code = '\n'.join([
+			'def outer( y: i32 ) -> i32:',
+			'	def inner() -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			y = y + 1',
+			'		return y',
+			'	return inner()',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		self.compiler._lower( outer_fn )
+		self.compiler._drain() # inner's own body (and its own errors) is only lowered once dequeued - _stmt_FunctionDef merely schedule()s it
+		# NOT a "captures 'y'" error - y is treated as inner's own local,
+		# read before it's ever assigned
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertNotIn( "captures 'y'", self.discovery.errors.errors[0] )
+
+	def test_nested_def_capturing_undefined_name_fails_not_defined( self ) -> None:
+		code = '\n'.join([
+			'def outer( y: i32 ) -> i32:',
+			'	def inner() -> i32:',
+			'		return totally_undefined_name',
+			'	return inner()',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		self.compiler._lower( outer_fn )
+		self.compiler._drain() # inner's own body is only lowered once dequeued - see the previous test's identical comment
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'not defined', self.discovery.errors.errors[0] )
 
 	def test_nested_def_inside_generic_function_is_rejected( self ) -> None:
 		code = '\n'.join([
@@ -4382,9 +4534,15 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'lambda takes 1 argument(s)', self.discovery.errors.errors[0] )
 
-	def test_lambda_capturing_enclosing_local_is_rejected( self ) -> None:
+	def test_lambda_capturing_enclosing_local_builds_closure( self ) -> None:
+		# unlike a non-capturing lambda (always Ptr[Callable[...]]), a
+		# capturing lambda's own result is a ClosureType - so it can only be
+		# written where a Closure[...]-shaped context (not Ptr[Callable[...]])
+		# is available to infer its parameter types from; ClosureType
+		# duck-types the same arg_types/return_type shape CallableType does
+		# for exactly this reason (see _expr_Lambda's own comment)
 		code = '\n'.join([
-			'def call_it( f: Ptr[Callable[[i32],i32]], v: i32 ) -> i32:',
+			'def call_it( f: Closure[[i32],i32], v: i32 ) -> i32:',
 			'	return f( v )',
 			'',
 			'def outer( y: i32 ) -> i32:',
@@ -4397,8 +4555,111 @@ class Tests( unittest.TestCase ):
 		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
 		if outer_fn.resolve is not None:
 			outer_fn.resolve()
-		self.compiler._lower( outer_fn )
-		self.assertIn( "captures 'y' from the enclosing function", self.discovery.errors.errors[0] )
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocates = [ i for i in lf.instructions if isinstance( i, ir.Allocate ) ]
+		self.assertEqual( len( allocates ), 2 )
+		self.assertIsInstance( allocates[1].cls, ClosureType )
+		self.assertNotIsInstance( allocates[0].cls, ClosureType )
+
+	def test_lambda_capturing_no_incref_for_scalar_capture( self ) -> None:
+		code = '\n'.join([
+			'def call_it( f: Closure[[i32],i32], v: i32 ) -> i32:',
+			'	return f( v )',
+			'',
+			'def outer( y: i32 ) -> i32:',
+			'	return call_it( lambda x: y, 5 )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertFalse( any( isinstance( i, ir.Incref ) for i in lf.instructions ))
+
+	def test_two_lambda_occurrences_get_independent_env_classes( self ) -> None:
+		code = '\n'.join([
+			'def call_it( f: Closure[[i32],i32], v: i32 ) -> i32:',
+			'	return f( v )',
+			'',
+			'def outer( a: i32, b: i32 ) -> i32:',
+			'	call_it( lambda x: a, 1 )',
+			'	return call_it( lambda x: b, 2 )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		env_allocs = [ i for i in lf.instructions if isinstance( i, ir.Allocate ) and not isinstance( i.cls, ClosureType ) ]
+		self.assertEqual( len( env_allocs ), 2 )
+		self.assertIsNot( env_allocs[0].cls, env_allocs[1].cls )
+
+	def test_lambda_capturing_inside_generic_function_is_rejected( self ) -> None:
+		# same restriction as a capturing nested def (test_nested_def_
+		# inside_generic_function_is_rejected) - _reject_generic_enclosing_
+		# scope runs before capture collection either way
+		code = '\n'.join([
+			'def outer[T]( y: T, f: Closure[[],T] ) -> None:',
+			'	g: Closure[[],T] = lambda: y',
+			'	return',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		spec = self.discovery._get_or_create_specialization( outer_fn, [ self.discovery.get_intrinsics()['i32'] ] )
+		self.compiler._lower( spec )
+		self.assertIn( 'lambdas are not supported inside a generic function', self.discovery.errors.errors[0] )
+
+	def test_lambda_eager_return_type_inference_with_capture( self ) -> None:
+		# the eager-lowering path (PLAN_LAMBDA.md's own "Follow-up done") -
+		# key's own K is still a bare TypeVar until the lambda's body is
+		# lowered - composed here with a capture (y). Per the closures
+		# plan's own note on ordering: capture collection/env-build/rewrite
+		# happens BEFORE _compile_now, so eager lowering sees an already-
+		# closed body and infers the real return type correctly regardless.
+		# NOTE: checked at the LOWERING level only (never calls emitter_c.
+		# emit_c()) - the outer generic apply[T,K]'s own return type
+		# substitution through a Closure[...]-shaped parameter has a
+		# separate, PRE-EXISTING gap unrelated to captures (confirmed
+		# reproducible with a plain bound-method closure argument too, no
+		# lambda/capture involved) that only surfaces at C emission time;
+		# not fixed here, out of scope - this test only verifies what this
+		# pass is actually responsible for: the closure's OWN return type is
+		# correctly, eagerly inferred despite capturing.
+		code = '\n'.join([
+			'def apply[T,K]( x: T, key: Closure[[T],K] ) -> K:',
+			'	return key( x )',
+			'',
+			'def outer( y: i32 ) -> i32:',
+			'	return apply( 5, key = lambda v: y )',
+		])
+		self._import( code )
+		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
+		if outer_fn.resolve is not None:
+			outer_fn.resolve()
+		lf = self.compiler._lower( outer_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		closure_allocs = [ i for i in lf.instructions if isinstance( i, ir.Allocate ) and isinstance( i.cls, ClosureType ) ]
+		self.assertEqual( len( closure_allocs ), 1 )
+		self.assertEqual( closure_allocs[0].cls.return_type.stem, 'i32' )
+
+	# NOTE: a capturing lambda written where the context expects
+	# Ptr[Callable[...]] instead of Closure[...] (e.g. the OLD, pre-capture
+	# shape of the test above) is NOT caught as a clean type-mismatch error
+	# at lowering time - it silently produces a ClosureType-shaped operand
+	# in a Ptr[Callable[...]]-declared slot, which later crashes the
+	# EMITTER with an internal AssertionError (emitter_c.py's own
+	# `assert isinstance(concrete_cls, RCClass)`) instead of a real compile
+	# error. Confirmed pre-existing and NOT specific to capturing closures -
+	# the identical crash reproduces with today's already-shipped bound-
+	# method closures (`w.get` passed where Ptr[Callable[...]] is
+	# expected). Out of scope here (a _lower_call_args/argument type-
+	# checking gap, unrelated to closure construction itself) - flagged for
+	# a follow-up, not fixed in this pass.
 
 	# --- Closure[[...],...] bound-method values -------------------------------
 
