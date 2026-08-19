@@ -1,5 +1,6 @@
 # stdlib imports:
 import ast
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
@@ -175,30 +176,49 @@ class UnionStorage:
 		cached = self._cache.get( id( union ) )
 		if cached is not None:
 			return cached
-		self._ensure_resolved( union )
-		for attr in union.attributes:
-			self._ensure_resolved( attr )
-			# scheduling `attr` itself (the union's own member Variable) is
-			# NOT enough to get its LEAF TYPE emitted: schedule()'s own
-			# guard only enqueues a Function/ClassLike/global Variable, and
-			# a union member's own attribute Variable is none of those (not
-			# global - it's a class-attribute-shaped Variable, same as an
-			# RCClass's own field) - scheduling it is a silent no-op. This
-			# left a real, confirmed gap: a union member whose own leaf type
-			# (e.g. an RCClass like str) is otherwise NEVER constructed
-			# anywhere reachable in the program - only ever flowing through
-			# as this union's own unconstructed variant - never got its full
-			# struct emitted, even though the union's own generic tag-gated
-			# Incref/Decref codegen (cfg.py's _tag_gated_refcount_
-			# instructions) always needs to reference EVERY RC-bearing
-			# member's full layout, unconditionally, regardless of whether
-			# this program ever actually constructs one (confirmed via a
-			# real repro: emit_c() emits `release_object(&($t5)->$header)`
-			# against a leaf type that was only ever forward-declared,
-			# `struct builtins$str` with no member definitions - clang
-			# fails with "incomplete definition of type"). Explicitly
-			# scheduling attr.type here closes that gap.
-			self._ensure_resolved( attr.type )
+		# get() is reachable from almost anywhere (schedule()'s own eager
+		# class-registration dispatch, monomorphize_class, an ordinary
+		# construction/match site, ...) with no guarantee of an active
+		# module_context - but a MEMBER's own leaf type, resolved just
+		# below, can itself be a fresh anonymous union whose OWN member
+		# constructors need one (UnionStorage.get() stamps a synthesized
+		# constructor's file from module_stack[-1] - see fn_file below).
+		# A NAMED union (union.file is real, by definition never anonymous)
+		# pushes its own file here so that fallback has something to work
+		# with even when nothing else already established a context;
+		# skipped for an anonymous union itself (file=None - nothing
+		# sensible to push, so this just falls through to whatever's
+		# already active, same as before this existed).
+		module_ctx = nullcontext()
+		if union.file is not None:
+			module = next( ( m for m in self.discovery.modules.values() if m.file == union.file ), None )
+			if module is not None:
+				module_ctx = self.discovery.module_context( module )
+		with module_ctx:
+			self._ensure_resolved( union )
+			for attr in union.attributes:
+				self._ensure_resolved( attr )
+				# scheduling `attr` itself (the union's own member Variable) is
+				# NOT enough to get its LEAF TYPE emitted: schedule()'s own
+				# guard only enqueues a Function/ClassLike/global Variable, and
+				# a union member's own attribute Variable is none of those (not
+				# global - it's a class-attribute-shaped Variable, same as an
+				# RCClass's own field) - scheduling it is a silent no-op. This
+				# left a real, confirmed gap: a union member whose own leaf type
+				# (e.g. an RCClass like str) is otherwise NEVER constructed
+				# anywhere reachable in the program - only ever flowing through
+				# as this union's own unconstructed variant - never got its full
+				# struct emitted, even though the union's own generic tag-gated
+				# Incref/Decref codegen (cfg.py's _tag_gated_refcount_
+				# instructions) always needs to reference EVERY RC-bearing
+				# member's full layout, unconditionally, regardless of whether
+				# this program ever actually constructs one (confirmed via a
+				# real repro: emit_c() emits `release_object(&($t5)->$header)`
+				# against a leaf type that was only ever forward-declared,
+				# `struct builtins$str` with no member definitions - clang
+				# fails with "incomplete definition of type"). Explicitly
+				# scheduling attr.type here closes that gap.
+				self._ensure_resolved( attr.type )
 		# a monomorphized CONCRETE specialization's own .names starts as a
 		# shallow copy of its abstract base's .names (Monomorphizer.
 		# monomorphize_class calls union_storage.get(base) before building

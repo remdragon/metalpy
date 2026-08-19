@@ -668,5 +668,87 @@ def main() -> None:
 ''' )
 		self.assertEqual( self.compiler.extern_notices, { 'TCL', 'ZLIB' } )
 
+class ColdQueueDrainModuleContextTests( unittest.TestCase ):
+	''' compiler._lower's own class-registration branches (RCClass/CStruct/
+	CUnion/TaggedUnion, both bare and Specialization-wrapped) can need to
+	synthesize a fresh anonymous union's member constructor for a field's
+	own type, touched here for the FIRST time - UnionStorage.get() stamps
+	that constructor's own .file from "whichever module is currently
+	active" (discovery.module_stack[-1]) - but unlike an ordinary function
+	body (FunctionLowering.run always pushes its own module_context first)
+	or a global's own initializer (TypeResolver.resolve_global_init does
+	the same), nothing established one by the time these branches run
+	reached directly off the work queue. Normally masked by scheduling
+	order (whatever first REFERENCES the class already touched its fields
+	with valid context, from inside its own module_context, before the
+	class's own turn on the queue) - not always: see worktree-fix-result-
+	ok-tuple-union-infer's own bug #2, where a tuple[T|None,...]'s own
+	backing RCClass (built via monomorphize.py's substitute_type_params as
+	a side effect of generic type-parameter inference) reached this
+	completely decoupled from any real construction expression.
+
+	Pre-enqueuing the class directly, before compiler.run() ever pushes any
+	module context at all, forces the same "first touch happens cold"
+	condition deterministically instead of depending on a scheduling-order
+	coincidence - every case below reliably crashed ("no module found
+	owning ...") before compiler.py's own module_context wraps (mirroring
+	_synthesize_rcclass_destructor's own, earlier fix) and UnionStorage.
+	get()'s own (the root cause: reachable from schedule()'s eager class-
+	registration dispatch with no context guarantee at all, not just from
+	compiler._lower()'s cold branches). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _run_with_precocious_enqueue( self, code: str, class_name: str ) -> None:
+		self.compiler.import_code( code, Path( '__main__.py' ), scope = None )
+		cls = self.discovery.modules['__main__'].get_local( class_name )
+		self.compiler._enqueue( cls )
+		self.compiler.run()
+
+	def test_rcclass_field_typed_as_anonymous_union( self ) -> None:
+		self._run_with_precocious_enqueue( '''
+class Box:
+	v: i32|None
+	def __init__( self, v: i32|None ) -> None:
+		self.v = v
+
+def main() -> i32:
+	b: Box = Box( 5 )
+	return 0
+''', 'Box' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_cstruct_field_typed_as_anonymous_union( self ) -> None:
+		self._run_with_precocious_enqueue( '''
+@cstruct
+class Holder:
+	r: i32|None
+
+def g() -> i32|None:
+	return 5
+
+def main() -> i32:
+	v: i32|None = g()
+	return 0
+''', 'Holder' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_union_variant_payload_typed_as_anonymous_union( self ) -> None:
+		self._run_with_precocious_enqueue( '''
+@union
+class Foo:
+	A: i32|None
+
+def g() -> i32|None:
+	return 5
+
+def main() -> i32:
+	v: i32|None = g()
+	return 0
+''', 'Foo' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 if __name__ == '__main__':
 	unittest.main()
