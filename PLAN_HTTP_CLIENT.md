@@ -460,20 +460,55 @@ this codebase was hitting the same walls before these fixes landed).
   unavoidable, since it doesn't know the scheme until the URL is parsed -
   with everything downstream of that one branch fully generic/dispatch-free.
 
-  What this bought, and what it didn't (tested, not assumed): the runtime
-  tag-dispatch `match` code that used to be sprinkled through every I/O
-  call site (_send_all/_GrowableBuffer.fill_from/_read_*_body) is gone, and
-  each _Connection[T] is sized exactly for whichever transport it holds
-  rather than the union's own tag + larger-payload layout. It is NOT a
-  binary-size/linkage win, despite first appearances - compiled .exe size
-  and extern_libs were tested directly (HTTPConnection-only program vs.
-  HTTPSConnection-only program) and came out byte-identical, both linking
-  secur32 either way, because importing http.client schedules the WHOLE
-  MODULE for compilation in this compiler's model, not just the specific
-  names a program references - HTTPSConnection sits in the same file as
-  HTTPConnection regardless of transport representation. Making ssl.py
-  genuinely opt-in would need HTTPSConnection split into its own separately
-  -imported module, a different, not-yet-done change.
+  What this bought (tested, not assumed): the runtime tag-dispatch `match`
+  code that used to be sprinkled through every I/O call site (_send_all/
+  _GrowableBuffer.fill_from/_read_*_body) is gone, and each _Connection[T]
+  is sized exactly for whichever transport it holds rather than the union's
+  own tag + larger-payload layout. It IS also a binary-size/linkage win, as
+  the user originally expected - my first measurement of this (HTTPConnection
+  -only .exe vs. HTTPSConnection-only .exe, byte-identical, both linking
+  secur32) was correct as a measurement but wrong in its conclusion. I
+  originally attributed the identical linkage to "importing http.client
+  schedules the whole module regardless of usage" - the user pushed back
+  ("I think you have uncovered a bug in the compiler. The ssl library
+  should not have been brought in for an unused generic parameter") and
+  asked for a `--dep-report`/`type_resolver.triggered_by()` trace instead of
+  a hand-wave. That trace found the real cause: a LOCAL VARIABLE in
+  _Connection.request() was named `head`, colliding with this module's own
+  top-level `head()` convenience function. type_resolver.py's
+  _try_resolve_callable_namespace (a "silent probe" run at every call site
+  to detect generic-function calls, e.g. `x.method(...)`) resolves a bare
+  Name via `discovery.find_name_or_none(...)` BEFORE local variables are
+  registered in the function's own namespace, so a local named the same as
+  a module-level function is genuinely indistinguishable from that function
+  at this pre-lowering pass - the probe's own docstring already acknowledges
+  this. The bug is that even though the probe is documented to have NO
+  side effects on a miss (returns None, lowering.py resolves the real call
+  normally afterward), it calls `self.resolver.ensure_resolved(base)` on
+  whatever it finds before confirming the guess was right - and
+  ensure_resolved() unconditionally hands its argument to schedule(),
+  which queues it for compilation. So `head.encode()` inside
+  _Connection.request() spuriously scheduled http.client.head() (and
+  everything IT transitively calls: Session, Session.request,
+  _perform_request_for_scheme, and the whole ssl.py surface) even in a
+  program that never calls head()/Session/HTTPSConnection at all. Confirmed
+  with a minimal repro outside this file (a local var named the same as an
+  unrelated top-level function, `.dotted()`-called) - reproduces identically
+  on a plain non-generic class, so this is a general local-variable name-
+  shadowing bug, NOT specific to generics or unions; the old @union-based
+  code would have shown the exact same false linkage had its own local
+  variable happened to collide the same way. Worked around here by renaming
+  the local variable (head -> request_head) in _Connection.request(); after
+  the rename, --dep-report for an HTTPConnection-only program shows zero
+  ssl.* references (153 functions scheduled, was 653), while an
+  HTTPSConnection-only program still correctly pulls in ssl.py (102 ssl.*
+  references). Flagged as task_6e15ed96 for a real compiler-side fix
+  (defer scheduling until the probe's guess is confirmed, or run local-name
+  resolution before this probe). Until that lands, EVERY MetalPy stdlib
+  module should avoid naming a local variable the same as one of that
+  module's own top-level function/class names if a method gets called on
+  it - the collision silently drags in that function's whole dependency
+  graph with no compile error to flag it.
 
   One real compiler gap found while landing this: inside a generic class's
   OWN method body, self-construction must use the bare class name with

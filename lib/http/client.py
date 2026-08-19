@@ -729,8 +729,15 @@ class _Connection[T]:
 		return _Connection.__allocate__( __transport = transport, __host = host, __port = port )
 
 	def request( self, method: str, path: str, headers: HTTPHeaders|None = None, body: bytes|None = None ) -> Result[None, HTTPError]:
-		head: str = _build_request_head( method, path, self.__host, headers, body )
-		head_bytes: bytes = head.encode().unwrap( '_build_request_head: unreachable - pure ASCII output' )
+		# NOT named `head` - a local variable shadowing a module-level
+		# function of the same name (this module has one, http.client.head())
+		# spuriously schedules that function (and everything it transitively
+		# calls) for compilation, see type_resolver.py's
+		# _try_resolve_callable_namespace/ensure_resolved (task pending, see
+		# PLAN_HTTP_CLIENT.md). Confirmed independent of generics/unions -
+		# a plain name collision bug.
+		request_head: str = _build_request_head( method, path, self.__host, headers, body )
+		head_bytes: bytes = request_head.encode().unwrap( '_build_request_head: unreachable - pure ASCII output' )
 		_send_all( self.__transport, head_bytes.get_const_ptr(), head_bytes.__len__() ).or_return()
 		if body is not None:
 			content: bytes = body
