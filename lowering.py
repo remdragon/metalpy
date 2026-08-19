@@ -3485,6 +3485,25 @@ class FunctionLowering:
 			# synthesized's own top-of-file docstring)
 			self._lower_generator_yield( node.value )
 			return
+		if isinstance( node.value, ast.YieldFrom ):
+			# PLAN_GENERATORS.md A.4a follow-up - type_resolver.py's
+			# _desugar_generator_yield_from always rewrites a real `yield
+			# from` into an ordinary for-loop before lowering ever runs,
+			# so reaching HERE means the SAME "generator whose own
+			# ensure_generator_synthesized run aborted partway through,
+			# for an unrelated already-reported reason" situation _lower_
+			# generator_yield's own identical check handles - see its
+			# docstring for the full explanation. A graceful discovery.
+			# fail() here too, instead of falling through to the generic
+			# "unsupported expression statement" message below (which is
+			# technically correct but confusingly generic for what's
+			# really a cascading secondary error, not a new one).
+			self.lowering.discovery.fail(
+				f'{self._current_fn.qualname}: yield from reached outside a successfully-synthesized generator '
+				f'(an earlier, already-reported error left this generator only partially built) - see PLAN_GENERATORS.md',
+				node,
+			)
+			return
 		if not isinstance( node.value, ast.Call ):
 			self.lowering.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
 		self._lower_call( node.value, None, want_result = False )
@@ -3599,6 +3618,42 @@ class FunctionLowering:
 
 		value_node = node.value if node.value is not None else ast.Constant( value = None )
 		value = self._lower_expr( value_node, self._current_fn.return_type, strict = False )
+		# strict=False (mirrors _stmt_Return's own identical call) skips
+		# _lower_expr's own built-in final rejection - so, same as _stmt_
+		# Return, this needs its OWN explicit check afterward: _lower_
+		# expr already applies every coercion it legitimately can (union-
+		# leaf-wrap via _coerce_into_union, RCClass base-upcast); if
+		# value.type STILL doesn't match this function's own declared
+		# return type, that's a genuine, uncaught mismatch that would
+		# otherwise silently emit a `return` of the wrong C type - a
+		# scoped-down version of _stmt_Return's own check (no CEnum
+		# bidirectional exemption, no Result-error widening - neither
+		# realistically arises for a generator's own elem_type|None/
+		# Result[elem_type|None,error_type] return shape), confirmed via
+		# a real repro: `for x in range(n): yield x * 10` inside an
+		# Iterator[i32] generator (range()'s own loop counter is usize,
+		# not i32) compiled with zero errors and produced C a real
+		# compiler rejects outright (`return $tN;` returning a bare
+		# uintptr_t where the union struct is expected) - found while
+		# testing A.4a's own nested-for-loop generalization, but
+		# reproduces identically with no nesting involved at all.
+		if value.type is not None and self._current_fn.return_type is not None:
+			fn_type = self._current_fn.return_type
+			expected_concrete = fn_type
+			if isinstance( fn_type, Specialization ) and isinstance( fn_type.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				expected_concrete = self.lowering.monomorphize_class( fn_type )
+			value_concrete = value.type
+			if isinstance( value.type, Specialization ) and isinstance( value.type.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				value_concrete = self.lowering.monomorphize_class( value.type )
+			if (
+				value.type is not fn_type and value.type is not expected_concrete
+				and value_concrete is not fn_type and value_concrete is not expected_concrete
+			):
+				self.lowering.discovery.fail(
+					f'{ast.unparse(node)}: yield produces {fn_type.qualname if fn_type else "None"}, '
+					f'not {value.type.qualname if value.type else "?"}',
+					node,
+				)
 		self._incref_aliasing_return( value_node, value )
 		# mirrors _stmt_Return's own identical call (its simpler, no-
 		# shared-epilogue-label branch - a yield needs none of that

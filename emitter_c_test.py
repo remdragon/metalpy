@@ -17031,6 +17031,178 @@ def main() -> i32:
 ''' ),
 		])
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_yield_from_basic_and_nesting( self ) -> None:
+		# PLAN_GENERATORS.md A.4a - `yield from <expr>` desugars into `for
+		# __yield_from_N in <expr>: yield __yield_from_N`, sharing the same
+		# for-loop-over-iterator desugaring (_desugar_iterator_for) any
+		# user-written `for x in some_generator(): yield x` already goes
+		# through
+		self.assert_programs_run([
+			( 'yield_from_top_level_forwards_every_value_in_order', '''
+def inner() -> Iterator[i32]:
+	yield 1
+	yield 2
+	yield 3
+
+def outer() -> Iterator[i32]:
+	yield from inner()
+
+def main() -> i32:
+	g = outer()
+	r0 = g.__next__()
+	r1 = g.__next__()
+	r2 = g.__next__()
+	r3 = g.__next__()
+	if r0 is None or r0 != 1:
+		return 1
+	if r1 is None or r1 != 2:
+		return 2
+	if r2 is None or r2 != 3:
+		return 3
+	if r3 is not None:
+		return 4
+	return 0
+''' ),
+			( 'yield_from_nested_in_if_still_forwards_correctly', '''
+def inner() -> Iterator[i32]:
+	yield 10
+	yield 20
+
+def outer( flag: bool ) -> Iterator[i32]:
+	if flag:
+		yield from inner()
+	else:
+		yield 99
+
+def main() -> i32:
+	g = outer( True )
+	r0 = g.__next__()
+	r1 = g.__next__()
+	if r0 is None or r0 != 10:
+		return 1
+	if r1 is None or r1 != 20:
+		return 2
+	g2 = outer( False )
+	r2 = g2.__next__()
+	if r2 is None or r2 != 99:
+		return 3
+	return 0
+''' ),
+			( 'yield_from_forwards_rc_values_with_correct_refcounts', '''
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+def inner( b1: Box, b2: Box ) -> Iterator[Box]:
+	yield b1
+	yield b2
+
+def outer( b1: Box, b2: Box ) -> Iterator[Box]:
+	yield from inner( b1, b2 )
+
+def consume_fully( b1: Box, b2: Box ) -> None:
+	g = outer( b1, b2 )
+	x = g.__next__()
+	y = g.__next__()
+	z = g.__next__()
+
+def main() -> i32:
+	b1 = Box( n = 1 )
+	b2 = Box( n = 2 )
+	consume_fully( b1, b2 )
+	# every intermediate owner (g.b1/b2, inner_gen.b1/b2, the promoted
+	# __for_next_N/__yield_from_N fields, x/y/z) has gone out of scope by
+	# here - only the caller's own b1/b2 bindings remain
+	if compiler.refcount( b1 ) != 1:
+		return 1
+	if compiler.refcount( b2 ) != 1:
+		return 2
+	return 0
+''' ),
+			( 'yield_from_dropped_mid_iteration_releases_every_forwarded_reference', '''
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+def inner( b1: Box, b2: Box ) -> Iterator[Box]:
+	yield b1
+	yield b2
+
+def outer( b1: Box, b2: Box ) -> Iterator[Box]:
+	yield from inner( b1, b2 )
+
+def make_and_abandon( b1: Box, b2: Box ) -> None:
+	g = outer( b1, b2 )
+	first = g.__next__()
+	# g (and first, and inner's own generator) all go out of scope here,
+	# still mid-iteration on b1 - the generator's own destructor must
+	# still release every live promoted field it's holding
+
+def main() -> i32:
+	b1 = Box( n = 1 )
+	b2 = Box( n = 2 )
+	make_and_abandon( b1, b2 )
+	if compiler.refcount( b1 ) != 1:
+		return 1
+	if compiler.refcount( b2 ) != 1:
+		return 2
+	return 0
+''' ),
+		])
+
+	def test_yield_from_nested_inside_while_is_rejected( self ) -> None:
+		self._run( '''
+def inner() -> Iterator[i32]:
+	yield 1
+
+def outer( count: usize ) -> Iterator[i32]:
+	i: usize = 0
+	while i < count:
+		yield from inner()
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> None:
+	g = outer( 3 )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'could re-enter it', str( self.discovery.errors.errors[0] ))
+
+	def test_yield_from_nested_inside_for_is_rejected( self ) -> None:
+		self._run( '''
+def inner() -> Iterator[i32]:
+	yield 1
+
+def outer( xs: list[i32] ) -> Iterator[i32]:
+	for _x in xs:
+		yield from inner()
+
+def main() -> None:
+	g = outer( [1, 2, 3] )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'could re-enter it', str( self.discovery.errors.errors[0] ))
+
+	def test_yield_wrong_element_type_is_rejected( self ) -> None:
+		# found while testing A.4a's own yield-from forwarding, but
+		# generator-unrelated and pre-existing: _emit_generator_yield_
+		# suspend's strict=False coercion had no follow-up type check, so
+		# `yield <usize>` into a declared Iterator[i32] silently produced
+		# invalid C instead of a clean compile error
+		self._run( '''
+def gen() -> Iterator[i32]:
+	x: usize = 10
+	yield x
+
+def main() -> None:
+	g = gen()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'yield produces', str( self.discovery.errors.errors[0] ))
+
 
 class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' regression test for a real, confirmed bug: Result[T,E].unwrap_or()
