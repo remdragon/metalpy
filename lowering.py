@@ -10458,6 +10458,17 @@ class FunctionLowering:
 		self._emit( ir.Call( dest = dest, target = dunder, receiver = operand, args = [], kwargs = {} ))
 		return dest
 
+	def _narrowed_type_of_name( self, var_id: str, declared_type: Type ) -> Type:
+		''' declared_type, unless var_id is currently narrowed (cfg.py's
+		narrow(), e.g. inside an `if x is not None:`/`match x: case _:` arm) -
+		then the narrowed member's own type instead. Shared by
+		_try_lower_indirect_call/_try_lower_closure_call so a Ptr[Callable[...]]
+		|None or Closure[...]|None parameter is recognized as callable once
+		narrowed to its non-None leaf, not just when declared bare - mirrors
+		_static_type_of_value_expr's identical narrowed_member lookup. '''
+		member = self._cfg.narrowed_member( var_id )
+		return member.type if member is not None else declared_type
+
 	def _try_lower_indirect_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
 		# eq_fn(a, b) where eq_fn: Ptr[Callable[[A,B],R]] - a call THROUGH a
 		# function-pointer VALUE, not a named Function/method lookup at all
@@ -10477,7 +10488,8 @@ class FunctionLowering:
 		if not isinstance( name, Variable ):
 			return None
 		self.lowering._ensure_resolved( name )
-		fn_type = self.lowering._type_resolver._callable_type_of( name.type )
+		effective_type = self._narrowed_type_of_name( node.func.id, name.type )
+		fn_type = self.lowering._type_resolver._callable_type_of( effective_type )
 		if fn_type is None:
 			return None
 		if any( isinstance( a, ast.Starred ) for a in node.args ):
@@ -10526,7 +10538,7 @@ class FunctionLowering:
 		if not isinstance( name, Variable ):
 			return None
 		self.lowering._ensure_resolved( name )
-		closure_type = name.type
+		closure_type = self._narrowed_type_of_name( node.func.id, name.type )
 		if not isinstance( closure_type, ClosureType ):
 			return None
 		self.lowering._ensure_resolved( closure_type )

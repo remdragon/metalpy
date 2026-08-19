@@ -1,7 +1,7 @@
 def bisect_right[T,K](
 	arr: slice[T],
 	x: K,
-	key: Callable[[T],K]|None = None,
+	key: Ptr[Callable[[T],K]]|None = None,
 ) -> usize:
 	lo: usize = 0
 	hi: usize = len( arr )
@@ -27,7 +27,7 @@ def bisect_right[T,K](
 def bisect_left[T,K](
 	arr: slice[T],
 	x: K,
-	key: Callable[[T],K]|None = None,
+	key: Ptr[Callable[[T],K]]|None = None,
 ) -> usize:
 	lo: usize = 0
 	hi: usize = len( arr )
