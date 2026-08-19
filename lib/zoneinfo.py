@@ -52,13 +52,18 @@ class ZoneInfo:
 	def get_ttinfo( self, timestamp: i64 ) -> TTInfo:
 		# hand-rolled binary search over transition_times (list[i64]), NOT
 		# lib/bisect.py's bisect_right - bisect_right takes arr: slice[T],
-		# and slice[T] has no real construction path from ordinary metalpy
-		# source anywhere in this codebase yet (see str.join's own comment
-		# in lib/builtins/__init__.py, which made this exact same call for
-		# this exact same reason). Separately, a generic key=lambda call
-		# here would also hit PLAN_LAMBDA.md's documented "not attempted
-		# end to end" gap - this sidesteps both at once, at the cost of a
-		# few duplicated lines instead of a shared helper.
+		# and slice[T] IS constructible now (UnsafeList[T].as_slice(), see
+		# BisectTests/RawDict._lower_bound), but transition_times is a
+		# locked list[T] specifically, not UnsafeList[T] - list[T]
+		# deliberately has no as_slice()/get_ptr() (see __list.py's own
+		# header comment: a raw buffer view isn't safe to hold once the
+		# lock that made it valid has been released), so this would still
+		# need transition_times to become UnsafeList[T] (a real behavior
+		# change - whether ZoneInfo is ever shared cross-thread wasn't
+		# checked) before switching this over. Separately, a generic
+		# key=lambda call here would also hit PLAN_LAMBDA.md's documented
+		# "not attempted end to end" gap - this sidesteps both at once, at
+		# the cost of a few duplicated lines instead of a shared helper.
 		# arr[i] bracket sugar desugars to .__getitem__(i).or_return() (only
 		# type-checks inside a function that itself returns a compatible
 		# Result - see lowering.py's own _expr_Subscript comment), but

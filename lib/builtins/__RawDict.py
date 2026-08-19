@@ -23,6 +23,7 @@
 # stored in __indices need fixing up after a removal (see
 # _fixup_indices_after_removal).
 
+import bisect
 import compiler
 
 KeyEqFn: TypeAlias = Ptr[Callable[[Ptr[None],Ptr[None]],bool]]
@@ -37,6 +38,9 @@ class RawEntry:
 class RawIndex:
 	hash: u64
 	entry_idx: usize
+
+def _raw_index_hash( node: RawIndex ) -> u64:
+	return node.hash
 
 class RawDict:
 	# UnsafeList[T], not list[T]: RawDict's own storage is private and never
@@ -55,23 +59,14 @@ class RawDict:
 		return len( self.__entries )
 
 	# first position in __indices whose hash is >= target (lower_bound) -
-	# plain manual binary search, not bisect.bisect_left: bisect.py's own
-	# key= parameter needs Callable/lambda support this compiler doesn't
-	# have yet (see PLAN_CALLABLE.md's own "deferred" list), and RawIndex's
-	# .hash field is known statically here anyway - no need for a key
-	# extractor at all
+	# bisect_left_by_key over a borrowed slice[RawIndex] view of __indices
+	# (UnsafeList.as_slice(), no copy) keyed on .hash. Used to be a plain
+	# manual binary search (see git history) written before Callable[...]
+	# existed to make bisect.py's own key= usable at all - now the first
+	# real caller of bisect.py anywhere in this codebase.
 	def _lower_bound( self, target_hash: u64 ) -> usize:
-		lo: usize = 0
-		hi: usize = len( self.__indices )
-		with compiler.panic_arithmetic( 'RawDict _lower_bound: overflow' ):
-			while lo < hi:
-				mid: usize = ( lo + hi ) // 2
-				mid_hash: u64 = self.__indices.__getitem__( mid ).unwrap( 'RawDict: index out of bounds' ).hash
-				if mid_hash < target_hash:
-					lo = mid + 1
-				else:
-					hi = mid
-		return lo
+		key: Ptr[Callable[[RawIndex],u64]] = _raw_index_hash
+		return bisect.bisect_left_by_key( self.__indices.as_slice(), target_hash, key )
 
 	# the __entries index of the live entry matching (hash, key_ptr) via
 	# key_eq_fn, scanning every __indices position with the same hash
