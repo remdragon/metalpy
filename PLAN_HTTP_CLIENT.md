@@ -612,12 +612,12 @@ Remaining backlog / future work
   work through, not a next-session todo.
 
   1. Request/response logging with secret redaction (user-requested feature,
-     not yet started - BLOCKED on lib/logging.py maturing further, per the
-     user directly; not blocked on anything in http.client itself).
-     lib/logging.py already exists today (Logger/Handler/Formatter/levels/
-     FileHandler - see that file's own header comment) but per the user
-     isn't mature enough yet for this; revisit once it is, rather than
-     guessing at what specifically is missing.
+     not yet started). Originally recorded as blocked on lib/logging.py
+     maturing - NO LONGER the case now that the integration point is
+     settled as a plain Callable[[str],None] sink, not a Logger (see
+     below) - that needs no lib/logging.py machinery at all. Not
+     specifically blocked on anything else in http.client either; mostly
+     just not started yet.
 
      Design settled by studying a working real-world reference the user
      already relies on day to day: C:\cvs\itas\incpy\demands.py (a Python/
@@ -655,18 +655,24 @@ Remaining backlog / future work
          about to be logged, never passes the raw string to the log
          callback and redacts after. Confirms the principle already
          written into this doc above.
-       - Don't require a full Logger object as the integration point for a
-         v1 - the reference's `demand()` takes a plain `log:
-         Callable[[str],None]|None` sink (works with `print`, a bound
-         `logger.info`, anything). A per-Session `Callable[[str],None]|
-         None` (MetalPy's Closure[[str],None]) sink parameter is a much
-         lighter dependency than plumbing a real lib/logging.py Logger
-         through, and doesn't need to wait on lib/logging.py at all - only
-         the STDLIB-PROVIDED convenience of wiring it up to a real Logger
-         by default needs logging.py to mature. Worth reconsidering
-         whether the lib/logging.py blocker applies to the whole feature,
-         or only to a nicer default integration on top of a sink-based v1 -
-         raise this with the user when picked back up rather than assuming.
+       - SETTLED (confirmed directly with the user, not just a v1
+         placeholder): the integration point is a plain `Callable[[str],
+         None]|None` sink (MetalPy's Closure[[str],None]) - NOT a
+         lib/logging.py Logger, permanently, not just until logging.py
+         matures. Two concrete reasons the user gave: (1) a fixed Logger
+         would funnel every request through the same logging context,
+         where a caller-supplied callable lets each call site log in ITS
+         OWN context instead (e.g. tagging which higher-level operation a
+         given request belongs to); (2) sometimes the destination isn't a
+         logging target at all - e.g. a bare `print()` while investigating
+         something interactively. This means the lib/logging.py maturity
+         blocker applies to essentially none of this feature - a sink
+         parameter needs no Logger machinery at all, only a working
+         Closure[[str],None] type (MetalPy generic closures - unrelated to
+         logging.py's own readiness). Re-confirm Closure[[str],None]
+         actually compiles cleanly through this call shape when picked
+         back up, but there's no longer a reason to wait on logging.py
+         maturing before starting this.
 
   2. `files=` multipart/form-data uploads. Deferred since the original
      scoping pass - even the PHP fetch() reference this project mirrors
