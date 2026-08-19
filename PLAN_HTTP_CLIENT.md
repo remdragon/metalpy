@@ -613,40 +613,60 @@ Remaining backlog / future work
 
   1. Request/response logging with secret redaction (user-requested feature,
      not yet started - BLOCKED on lib/logging.py maturing further, per the
-     user directly; not blocked on anything in http.client itself). The
-     idea: an opt-in way to log the full wire-level request (request line +
-     headers + body) and response (status line + headers + body) for a
-     Session/request(), through lib/logging.py's Logger, with sensitive
-     values redacted before anything is ever formatted or handed to a
-     Handler - never log-then-redact, since that risks a real secret
-     reaching a Handler.emit() (and therefore disk/network) if redaction is
-     skipped or fails downstream of logging. lib/logging.py already exists
-     today (Logger/Handler/Formatter/levels/FileHandler - see that file's
-     own header comment) but per the user isn't mature enough yet for this;
-     revisit once it is, rather than guessing at what specifically is
-     missing here.
+     user directly; not blocked on anything in http.client itself).
+     lib/logging.py already exists today (Logger/Handler/Formatter/levels/
+     FileHandler - see that file's own header comment) but per the user
+     isn't mature enough yet for this; revisit once it is, rather than
+     guessing at what specifically is missing.
 
-     Known design questions to resolve when this is picked up (not decided
-     yet - flagging what to think about, not prescribing answers):
-       - What counts as a secret by default: Authorization (Basic/Bearer
-         credentials), Cookie/Set-Cookie (session tokens), and any
-         caller-supplied auth= tuple are the obvious ones. Should redaction
-         be a fixed header-name blocklist, a caller-supplied one, or both
-         (fixed defaults + caller additions)?
-       - json=/form= bodies can carry secrets in arbitrary field names
-         (password, token, api_key, ...) that a header-name blocklist can't
-         catch - is body redaction in scope for v1, or headers-only with
-         body redaction as a stretch goal?
-       - Where does this plug in - a `logger: Logger|None` parameter on
-         Session (mirrors requests' own logging.getLogger('urllib3')
-         integration point) vs. a global module-level logger similar to how
-         CPython's http.client module has one? A per-Session logger fits
-         this file's existing Session-holds-its-own-state posture
-         (cookie jar, default headers) better than a module global.
-       - Redacted value rendering - drop the header/field entirely, or keep
-         the name and replace the value with a fixed placeholder (e.g.
-         'Authorization: [REDACTED]')? The latter is more useful for
-         debugging (confirms the header WAS sent) without leaking it.
+     Design settled by studying a working real-world reference the user
+     already relies on day to day: C:\cvs\itas\incpy\demands.py (a Python/
+     `requests`-based wrapper the user built for the same job). Conclusions
+     to carry over into http.client's own version, not open questions:
+
+       - Redact by VALUE, not by header name. The reference takes a
+         `sensitive_values: list[str]` - the actual secret strings (an API
+         key, a password, a bearer token, ...) - not a set of header names
+         to blank out. It builds one alternation regex over all of them
+         (`re.escape`d, sorted LONGEST-first so a shorter secret that
+         happens to be a substring of a longer one doesn't partially
+         redact it) and substitutes '***CENSORED***' for every match.
+         This is strictly more robust than a header-name blocklist
+         (Authorization/Cookie/...): it catches a secret anywhere it shows
+         up - a header, the body, even a query string - without having to
+         predict every place a secret could leak into. http.client's
+         version should take the same shape: a caller-supplied
+         list[str]|None of the exact secret values in play for that
+         request (the password half of auth=, an API key the caller is
+         about to put in a custom header, etc.) - NOT an attempt to
+         auto-detect "this looks like a secret".
+       - Redact the WHOLE serialized message in one pass, not header-by-
+         header. The reference builds one flat string for the full wire
+         message first (method+url, then headers, then a blank line, then
+         body for the request; status-line, headers, blank line, body for
+         the response - i.e. exactly what HTTPHeaders/Response already
+         hold in this file) and applies the substitution once over that
+         whole blob, then splits on line breaks for line-prefixed output
+         (the reference uses 'C>'/'S>' prefixes per line). http.client
+         already has everything needed to build that flat string - see
+         _build_request_head for the request side.
+       - Redact BEFORE anything is handed to a log sink - never log-then-
+         redact. The reference censors the string at the exact point it's
+         about to be logged, never passes the raw string to the log
+         callback and redacts after. Confirms the principle already
+         written into this doc above.
+       - Don't require a full Logger object as the integration point for a
+         v1 - the reference's `demand()` takes a plain `log:
+         Callable[[str],None]|None` sink (works with `print`, a bound
+         `logger.info`, anything). A per-Session `Callable[[str],None]|
+         None` (MetalPy's Closure[[str],None]) sink parameter is a much
+         lighter dependency than plumbing a real lib/logging.py Logger
+         through, and doesn't need to wait on lib/logging.py at all - only
+         the STDLIB-PROVIDED convenience of wiring it up to a real Logger
+         by default needs logging.py to mature. Worth reconsidering
+         whether the lib/logging.py blocker applies to the whole feature,
+         or only to a nicer default integration on top of a sink-based v1 -
+         raise this with the user when picked back up rather than assuming.
 
   2. `files=` multipart/form-data uploads. Deferred since the original
      scoping pass - even the PHP fetch() reference this project mirrors
