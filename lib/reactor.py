@@ -1,15 +1,16 @@
-# lib/mp_reactor.py — Worker/Reactor scaffolding on top of fiber.Fiber.
+# lib/reactor.py — Worker/Reactor scaffolding on top of fiber.Fiber.
 #
-# NAMED mp_reactor, NOT reactor: confirmed via real compile+run testing that
-# naming this module "reactor" (identical content, only the filename/import
-# name differed) reliably produces a real crash (use-after-free/heap
-# corruption) that "mp_reactor" and every other name tried does not. Ruled
-# out: Python-level name collision (no "reactor" module/package installed),
-# every known content-hash-keyed compiler cache (%TEMP%/metalpy/cexpr etc -
-# none are module-name-keyed). Root cause NOT found within this session's
-# time budget - flagged clearly rather than silently worked around. If a
-# future session renames this back to reactor.py, re-verify this isn't
-# still an issue first.
+# Was named mp_reactor.py for a while - naming this module "reactor" once
+# reliably crashed (real use-after-free/heap corruption) for reasons never
+# root-caused at the time. Re-investigated later and confirmed RESOLVED:
+# the crash traced to two real, independent UAFs that existed the same day
+# this module was first written (Fiber.start()'s missing incref, and a
+# list[Closure[...]] aliasing-check bug in lowering.py - see
+# list_closure_uaf_fixed in memory) and just happened to manifest under
+# the specific memory layout the name "reactor" produced that day - nothing
+# about the name itself. Both are long since fixed on master; renamed back
+# once that was verified (full suite + repeated real compile/run passes on
+# all 3 compilers, debug/--release/--asan, no recurrence).
 #
 # A Worker owns a pool of fibers and two work queues: __pending_tasks (fresh
 # work, needs an idle fiber and a start()) and __ready_to_unpark (fibers that

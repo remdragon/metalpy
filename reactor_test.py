@@ -1,4 +1,4 @@
-# mp_reactor_test.py — real compile+link+run coverage for lib/mp_reactor.py.
+# reactor_test.py — real compile+link+run coverage for lib/reactor.py.
 
 import unittest
 from pathlib import Path
@@ -20,7 +20,7 @@ class ReactorTests( test_support.RealCompileMixin, unittest.TestCase ):
 	def test_worker_runs_a_simple_task( self ) -> None:
 		self._run( '''
 import compiler
-import mp_reactor
+import reactor
 import fiber
 
 class Counter:
@@ -38,7 +38,7 @@ class SimpleTask:
 
 def main() -> i32:
 	fiber.enable_current_thread()
-	w = mp_reactor.Worker()
+	w = reactor.Worker()
 	counter = Counter()
 	a = SimpleTask( counter )
 	w.schedule( a.run )
@@ -53,7 +53,7 @@ def main() -> i32:
 	def test_worker_parks_and_requeues_across_two_drains( self ) -> None:
 		self._run( '''
 import compiler
-import mp_reactor
+import reactor
 import fiber
 
 class Counter:
@@ -82,7 +82,7 @@ class ParkingTask:
 
 def main() -> i32:
 	fiber.enable_current_thread()
-	w = mp_reactor.Worker()
+	w = reactor.Worker()
 	counter = Counter()
 	a = SimpleTask( counter )
 	b = ParkingTask( counter )
@@ -112,7 +112,7 @@ def main() -> i32:
 		# this particular test."
 		self._run( '''
 import compiler
-import mp_reactor
+import reactor
 import atomic
 
 class CountingTask:
@@ -124,7 +124,7 @@ class CountingTask:
 
 def main() -> i32:
 	counter = atomic.Atomic[i32]( 0 )
-	r = mp_reactor.Reactor( 1 )
+	r = reactor.Reactor( 1 )
 	i: usize = 0
 	while i < 20:
 		t = CountingTask( counter )
