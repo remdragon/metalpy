@@ -745,6 +745,78 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			( 'session_log_with_secret_redaction', '''
+import compiler
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response, HTTPHeaders
+
+class EchoOkServer:
+	port: u16
+	ready: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				conn.recv( buf.get_ptr(), 4096 ).unwrap( 'server: recv' )
+				resp: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'
+				rb: bytes = resp.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+_captured: str = ''
+
+def _capture( s: str ) -> None:
+	global _captured
+	_captured = _captured + s + '\\n---\\n'
+
+def main() -> i32:
+	server: EchoOkServer = EchoOkServer( u16( 18775 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	req_headers: HTTPHeaders = HTTPHeaders()
+	req_headers.set( 'X-Api-Key', 'sw0rdfish' )
+	secrets: list[str] = list[str]()
+	secrets.append( 'sw0rdfish' ).unwrap( 'append' )
+	r: Response = s.get( 'http://127.0.0.1:18775/', headers = req_headers, log = _capture, sensitive_values = secrets ).unwrap( 'client request' )
+	t.join()
+
+	if r.status_code != 200:
+		return 1
+
+	# request line + response status line both made it into the log
+	if _captured.find( 'GET / HTTP/1.1' ) == isize( -1 ):
+		return 2
+	if _captured.find( 'HTTP/1.1 200 OK' ) == isize( -1 ):
+		return 3
+	# the secret itself never appears in cleartext...
+	if _captured.find( 'sw0rdfish' ) != isize( -1 ):
+		return 4
+	# ...but the redaction placeholder does, proving it was actually swapped
+	# in rather than the header simply being dropped
+	if _captured.find( '***CENSORED***' ) == isize( -1 ):
+		return 5
+	return 0
+''' ),
 		])
 
 
