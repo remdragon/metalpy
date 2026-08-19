@@ -316,7 +316,7 @@ def main() -> i32:
 	# behavior belongs to x.to_u128() now instead (the value-RANGE-checked
 	# conversion, independent of width - see compiler.checked_convert/
 	# ir.ConvertCheck), not to T(x) (a pure width/bit-pattern operation).
-	# TODO once lib/builtins/__scalar_arith.py's .to_T() methods land
+	# TODO once lib/builtins/__scalar_dunders.py's .to_T() methods land
 	# (Part 2 of the same rollout): add x.to_u128() coverage here for the
 	# "negative can't go into unsigned" case this test used to check via
 	# T(x) - to_u128() is a fixed, single check (no wrapped/saturated

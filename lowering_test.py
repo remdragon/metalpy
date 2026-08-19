@@ -584,7 +584,7 @@ class Tests( unittest.TestCase ):
 		# by an OrReturn (Result.or_return()'s own semantics), consuming the
 		# Result and continuing with the unwrapped i32 value. The dunder
 		# path's error type is the REAL builtins.OverflowError (i32.__add__'s
-		# own, fixed at __scalar_arith.py's own import time) - checked()'s
+		# own, fixed at __scalar_dunders.py's own import time) - checked()'s
 		# own return annotation must reference that SAME class for
 		# _require_result_return's coverage check to pass, so this imports
 		# the real builtins.Result/OverflowError rather than hand-rolling
@@ -930,13 +930,13 @@ class Tests( unittest.TestCase ):
 		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via Unwrap
 
 		# `a + 1` dispatches through i32.__add__ (a real, @inline dunder -
-		# see lib/builtins/__scalar_arith.py), NOT a bare AddCheck directly
+		# see lib/builtins/__scalar_dunders.py), NOT a bare AddCheck directly
 		# against the literal: the literal `1` isn't already a Variable, so
 		# _lower_inline_call's splice synthesizes a fresh local to bind the
 		# dunder's own `other` parameter to (same "only a genuinely computed
 		# operand needs the synthesized-local fallback" rule that applies to
 		# every @inline call, not special to this dunder) - looked up
-		# dynamically here (rather than hardcoding __scalar_arith.py's own
+		# dynamically here (rather than hardcoding __scalar_dunders.py's own
 		# file/line) so this test doesn't break if that file moves/changes
 		add_i32_fn = i32.names['__add__']
 		if add_i32_fn.resolve is not None:

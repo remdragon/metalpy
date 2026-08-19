@@ -373,14 +373,14 @@ Deferred items
 
 6. Implicit scalar-to-str boxing - f"{i}" for i: i32
 
-   Still a discretionary design choice, not a technical gap. Deliberately
-   requires explicit `int(i)`/`float(f)` conversion today, matching
-   print()'s own existing no-implicit-stringification convention
-   (lowering.py:3735-3739's operand.type is str_type / else __str__/
-   __repr__ dispatch only ever fires against a boxed value - a bare scalar
-   has no __str__ of its own to find, so _find_method just fails with "f-
-   string requires <type>.__str__() to be available"). Revisit only if
-   this stops feeling like the right default.
+   RESOLVED for every fixed-width int scalar (i8/u8/i16/u16/i32/u32/i64/
+   u64/i128/u128/isize/usize) and f32/f64: each has a real __str__/
+   __repr__ now (lib/builtins/__scalar_dunders.py's i_str_signed/
+   i_str_unsigned; __float.py's own for f32/f64) - bare f"{x}"/str(x) just
+   works via ordinary method dispatch, no auto-boxing involved (the
+   dunder IS the value's own type's method, same as any class). `bool` is
+   the one remaining scalar with no __str__ of its own - still fails
+   cleanly with "method not found" rather than being silently boxed.
 
 7. `c` (int-as-codepoint) and `n` (locale-aware) type chars
 

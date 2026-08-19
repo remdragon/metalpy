@@ -9308,7 +9308,7 @@ class UnionBinopDispatchTests( test_support.RealCompileMixin, CompilerTestCase )
 	No separate "scalar" classification anymore - a Scalar operand's own
 	arithmetic is just another dunder lookup now (mode-qualified, exactly
 	like the non-union path: i32.__add__/__wrapped_add__/__saturated_add__,
-	see lib/builtins/__scalar_arith.py), found via the SAME
+	see lib/builtins/__scalar_dunders.py), found via the SAME
 	_find_dunder_for_arg/_mode_qualified_dunder_names machinery - one
 	source of truth, not two independent reimplementations (see
 	[[binop_fallback_eliminated]]/[[fallible_arithmetic_decorator_and_int_division_fix]]

@@ -1308,10 +1308,45 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 		# is applied to the whole CAST expression afterward, never baked into
 		# the literal token itself - this also sidesteps INT64_MIN's own
 		# classic "positive magnitude doesn't fit a signed 64-bit literal"
-		# problem, since the magnitude is always spelled as unsigned
+		# problem, since the magnitude is always spelled as unsigned. The
+		# negation itself happens in UNSIGNED arithmetic (well-defined modular
+		# wraparound in C), with the cast to the signed ctype applied last -
+		# NOT `-((ctype)magnitude)`, which is real signed-overflow UB for the
+		# exact MIN magnitude of any width (e.g. i64: `-((int64_t)
+		# 9223372036854775808ULL)` casts an out-of-range unsigned magnitude to
+		# a negative int64_t - implementation-defined but two's-complement in
+		# practice, giving INT64_MIN already - then negates THAT, overflowing
+		# signed 64-bit a second time). Confirmed via a real crash: `e: i64 =
+		# -9223372036854775808` compiled clean but crashed with SIGILL at
+		# runtime (a hardware trap from the resulting UB), caught while
+		# building fixed-width int __str__ support and needing to construct
+		# MIN literals for test coverage - a real, independent, pre-existing
+		# bug, not caused by that work. The unsigned intermediate must be
+		# stem's OWN same-width unsigned counterpart (_SIGNED_TO_UNSIGNED), not
+		# a fixed 64-bit type - i128's ctype is 128-bit __metalpy_wideint, and
+		# negating in a narrower 64-bit `unsigned long long` first then
+		# widening the cast produces a WRONG positive value (a same-signedness
+		# 64->128 widen zero-extends instead of reinterpreting bits) - caught
+		# by a real test regression (wide_int_test's own
+		# test_saturating_negate_i128) while first drafting this fix.
+		#
+		# Only SIGNED stems need this uctype detour: a negative `value`
+		# reaching here for an UNSIGNED stem (e.g. -1 encoding USIZE_MAX as a
+		# two's-complement bit pattern) negates directly in ctype itself,
+		# which is already well-defined modular arithmetic with no signed-
+		# overflow UB possible - the double-negation bug this fix targets is
+		# specific to signed types. _SIGNED_TO_UNSIGNED has no 'usize' (etc.)
+		# entry, so routing unsigned stems through it too is a plain KeyError,
+		# not just unnecessary - caught by a real regression (socket_test/
+		# ssl_test both embed a negative-encoded usize global) while
+		# broadening this fix beyond the signed case it was first written for.
 		magnitude = abs( value )
-		cast_expr = f'(({ctype}){magnitude}ULL)'
-		return f'(-{cast_expr})' if value < 0 else cast_expr
+		if value < 0:
+			if stem in _SIGNED_TO_UNSIGNED:
+				uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
+				return f'(({ctype})(-({uctype}){magnitude}ULL))'
+			return f'(-(({ctype}){magnitude}ULL))'
+		return f'(({ctype}){magnitude}ULL)'
 	magnitude = abs( value )
 	hi, lo = magnitude >> 64, magnitude & 0xFFFFFFFFFFFFFFFF
 	# the shift amount is derived from __metalpy_wideuint's own real C width
@@ -1327,8 +1362,16 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << ( sizeof(__metalpy_wideuint)*8 - 64 ) ) | (__metalpy_wideuint){lo}ULL )'
 	if _is_unsigned_stem( stem ):
 		return unsigned_expr
-	signed_expr = f'(__metalpy_wideint){unsigned_expr}'
-	return f'(-{signed_expr})' if value < 0 else signed_expr
+	# same unsigned-negate-then-cast fix as the <=64-bit branch above (see its
+	# own comment) - i128::MIN is exactly the same double-negation UB, just at
+	# 128 bits: `-((__metalpy_wideint)unsigned_expr)` casts the 2**127 bit
+	# pattern to a negative __int128 first (already the correct MIN, same
+	# implementation-defined-but-relied-upon two's-complement reinterpret this
+	# whole function already uses), then negates THAT, overflowing signed
+	# __int128 - confirmed via the same real SIGILL crash as i64::MIN above.
+	if value < 0:
+		return f'(__metalpy_wideint)(-{unsigned_expr})'
+	return f'(__metalpy_wideint){unsigned_expr}'
 
 def _emit_const( c: ir.Const ) -> str:
 	if isinstance( c.type, FixedArrayType ):

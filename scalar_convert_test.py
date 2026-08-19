@@ -1,5 +1,5 @@
 # Real-compile-and-run behavioral test for x.to_T() scalar conversions
-# (lib/builtins/__scalar_arith.py's i_to_i[S,T]/i_to_i_identity[T], backed
+# (lib/builtins/__scalar_dunders.py's i_to_i[S,T]/i_to_i_identity[T], backed
 # by compiler.checked_convert/ir.ConvertCheck - see emitter_c.py's
 # _emit_convert_check). Proves .to_T() is a genuinely different operation
 # from T(x) construct-cast syntax: a value-range check against the target's

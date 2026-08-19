@@ -1,5 +1,5 @@
 # Ptr[T]/ConstPtr[T] arithmetic dunders - Phase 3 of eliminating lowering.py's
-# legacy direct-opcode fallback (see gen_scalar_arith.py's own header comment
+# legacy direct-opcode fallback (see gen_scalar_dunders.py's own header comment
 # for the overall design, ARCHITECTURE.md's "design decision" sections for
 # the full rationale). Hand-written, not generator-produced - pointer
 # arithmetic is always raw BYTE-offset (never sizeof(T)-scaled, confirmed via
