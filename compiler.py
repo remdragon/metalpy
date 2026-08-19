@@ -1,4 +1,5 @@
 # stdlib imports:
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 import queue
@@ -246,6 +247,19 @@ class Compiler:
 			except CompileError:
 				continue
 
+	def _module_context_for( self, unit: ClassLike ):
+		# a synthesized anonymous union's own payload CUnion (UnionStorage's
+		# $data CUnion) inherits the union's own file=None (by design - see
+		# union_storage.py's build_member_constructor docstring) - there is
+		# no real module to attribute it to, and its own attributes are
+		# never themselves a FRESH by-value dependency needing union member
+		# synthesis, so module_context is simply unneeded here; falling
+		# back to _find_module_for would hard-fail on the very file=None
+		# this method exists to route around
+		if unit.file is None:
+			return nullcontext()
+		return self.disco.module_context( self.lowering._find_module_for( unit ))
+
 	def _lower( self, unit: CompileUnit ) -> CompiledUnit:
 		if isinstance( unit, Specialization ) and isinstance( unit.base, Function ):
 			if unit.base.resolve is not None:
@@ -282,7 +296,19 @@ class Compiler:
 			self._lowered_functions[ id( monomorphized ) ] = lf
 			return lf
 		elif isinstance( unit, Specialization ) and isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
-			monomorphized = self.lowering.monomorphize_class( unit )
+			# monomorphize_class (and, for an RCClass, _synthesize_rcclass_
+			# destructor below) can need to synthesize a union member
+			# constructor for a field type touched here for the FIRST time
+			# (e.g. a by-value-embedded anonymous union) - UnionStorage.get()
+			# stamps that constructor's own file from "whichever module is
+			# currently active" (module_stack[-1]), which is otherwise NOT
+			# the case here: this branch is reached directly from the work
+			# queue, with no module_context of its own (unlike an ordinary
+			# function body - FunctionLowering.run always pushes one first).
+			# unit.base (the abstract, generic template) always has a real
+			# file, whether or not unit itself does.
+			with self.disco.module_context( self.lowering._find_module_for( unit.base )):
+				monomorphized = self.lowering.monomorphize_class( unit )
 			if isinstance( monomorphized, RCClass ):
 				if monomorphized.base is not None:
 					self._enqueue( monomorphized.base )
@@ -360,24 +386,32 @@ class Compiler:
 		elif isinstance( unit, CStruct ):
 			if unit.resolve is not None:
 				unit.resolve()
-			for attr in unit.attributes:
-				self.lowering._ensure_resolved( attr )
-				# a by-value-embedded field (e.g. SYSTEMTIME nested inside a
-				# larger cstruct) is only reachable THROUGH this attribute -
-				# unlike a Function/global Variable, merely resolving attr's
-				# own .type never schedules attr.type itself (schedule()
-				# ignores class-attribute Variables, is_global=False - see its
-				# own comment), so a field type referenced ONLY as another
-				# struct's own member, never independently constructed/sized/
-				# pointed-to anywhere else in the reachable program, would
-				# otherwise never land in compiler.cstructs/cunions/
-				# tagged_unions at all. _emit_value_type_bodies's topological
-				# sort then has nothing to order it against - not a wrong
-				# order, a MISSING definition entirely (confirmed directly: a
-				# real clang "field has incomplete type" error, task_421ed8be)
-				dep = by_value_dependency( attr.type )
-				if dep is not None:
-					self.lowering._ensure_resolved( attr.type )
+			# module_context: a by-value dependency touched for the first
+			# time below (e.g. a field typed as an anonymous X|Y never
+			# otherwise constructed) can need UnionStorage.get() to
+			# synthesize a fresh union member constructor, which stamps
+			# that constructor's own file from module_stack[-1] - see the
+			# identical reasoning on the Specialization+ClassLike branch
+			# above.
+			with self._module_context_for( unit ):
+				for attr in unit.attributes:
+					self.lowering._ensure_resolved( attr )
+					# a by-value-embedded field (e.g. SYSTEMTIME nested inside a
+					# larger cstruct) is only reachable THROUGH this attribute -
+					# unlike a Function/global Variable, merely resolving attr's
+					# own .type never schedules attr.type itself (schedule()
+					# ignores class-attribute Variables, is_global=False - see its
+					# own comment), so a field type referenced ONLY as another
+					# struct's own member, never independently constructed/sized/
+					# pointed-to anywhere else in the reachable program, would
+					# otherwise never land in compiler.cstructs/cunions/
+					# tagged_unions at all. _emit_value_type_bodies's topological
+					# sort then has nothing to order it against - not a wrong
+					# order, a MISSING definition entirely (confirmed directly: a
+					# real clang "field has incomplete type" error, task_421ed8be)
+					dep = by_value_dependency( attr.type )
+					if dep is not None:
+						self.lowering._ensure_resolved( attr.type )
 			if unit.base is not None: # @interface subclass - base interface needs to be a real compile unit too (its Vtbl type is what $vtable actually points to), same as RCClass.base above
 				self._enqueue( unit.base )
 			if unit.is_interface:
@@ -389,22 +423,24 @@ class Compiler:
 		elif isinstance( unit, CUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
-			for attr in unit.attributes:
-				self.lowering._ensure_resolved( attr )
-				dep = by_value_dependency( attr.type ) # see the identical CStruct branch above for why this is needed
-				if dep is not None:
-					self.lowering._ensure_resolved( attr.type )
+			with self._module_context_for( unit ): # see the identical CStruct branch above for why this is needed
+				for attr in unit.attributes:
+					self.lowering._ensure_resolved( attr )
+					dep = by_value_dependency( attr.type )
+					if dep is not None:
+						self.lowering._ensure_resolved( attr.type )
 			if unit not in self.cunions:
 				self.cunions.append( unit )
 			return unit
 		elif isinstance( unit, TaggedUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
-			for attr in unit.attributes:
-				self.lowering._ensure_resolved( attr )
-				dep = by_value_dependency( attr.type ) # see the identical CStruct branch above for why this is needed
-				if dep is not None:
-					self.lowering._ensure_resolved( attr.type )
+			with self._module_context_for( unit ): # see the identical CStruct branch above for why this is needed
+				for attr in unit.attributes:
+					self.lowering._ensure_resolved( attr )
+					dep = by_value_dependency( attr.type )
+					if dep is not None:
+						self.lowering._ensure_resolved( attr.type )
 			if unit not in self.tagged_unions:
 				self.tagged_unions.append( unit )
 			return unit
