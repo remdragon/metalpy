@@ -1408,6 +1408,15 @@ class Tests( unittest.TestCase ):
 	# --- comparisons ---------------------------------------------------------
 
 	def test_compare_eq_emits_cmp( self ) -> None:
+		# a == 1 dispatches through i32.__eq__ (a real, @inline dunder - see
+		# lib/builtins/__scalar_dunders.py's scalar_eq[T]), NOT a bare Cmp
+		# directly against the literal - same "receiver/literal-arg splice"
+		# shape test_binop_wrap_arithmetic_context already documents for
+		# arithmetic; comparisons dropped their own isinstance(Scalar)
+		# special-casing to reach parity with that same dunder-dispatch
+		# mechanism (see binop_fallback_eliminated), so a bare `==` now
+		# needs builtins imported here too, exactly like `+` already did
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
@@ -1419,12 +1428,17 @@ class Tests( unittest.TestCase ):
 		none_type = self.discovery.get_none_type()
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
 		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = bool_cls )
+		fn = i32.names['__eq__']
+		if fn.resolve is not None:
+			fn.resolve()
+		other = Variable( stem = '$inline0$other', qualname = f'{fn.qualname}$$inline0$other', file = fn.file, line = fn.line, type = i32 )
 		t0 = ir.Temp( type = bool_cls, id = 0 )
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = other, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.Cmp( dest = t0, op = ir.CmpOp.EQ, left = a, right = ir.Const( type = i32, value = 1 )),
+			ir.Cmp( dest = t0, op = ir.CmpOp.EQ, left = a, right = other ),
 			ir.Assign( dest = b, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
 			ir.Return( value = None ),
@@ -1445,6 +1459,7 @@ class Tests( unittest.TestCase ):
 		for py_op, expected_cmpop in cases:
 			with self.subTest( op = py_op ):
 				disco = Discovery( import_builtins = False )
+				disco.import_name( 'builtins' )
 				comp = Compiler( disco )
 				comp.import_code( '\n'.join([
 					'def main() -> None:',
@@ -1453,12 +1468,24 @@ class Tests( unittest.TestCase ):
 					'	return',
 				]), filename = Path( '__test__.py' ))
 				fn = comp._lower( disco.main )
+				# each op's own dunder is spliced (@inline), but the spliced
+				# body still bottoms out in exactly one real ir.Cmp with the
+				# right op (compiler.cmp_eq/etc - see lowering.py's
+				# _lower_compiler_cmp) - same assertion as before the dunder
+				# migration, just reached one layer deeper
 				cmp_instr = next( i for i in fn.instructions if isinstance( i, ir.Cmp ))
 				self.assertEqual( cmp_instr.op, expected_cmpop )
 
 	def test_compare_literal_on_left( self ) -> None:
 		# expected type flows from whichever side is NOT the bare literal -
-		# mirrors test_binop_literal_on_left
+		# mirrors test_binop_literal_on_left. The literal `1` becomes the
+		# dunder's own RECEIVER (i32.__lt__'s `value` parameter) - it's not
+		# already a Variable, so the inline splice synthesizes a fresh local
+		# for it ($inline0$value); `a` (already a Variable) passes straight
+		# through as `other` with no synthesized local needed - same "only a
+		# genuinely computed operand needs the synthesized-local fallback"
+		# rule as any other @inline splice
+		self.discovery.import_name( 'builtins' )
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
@@ -1470,12 +1497,17 @@ class Tests( unittest.TestCase ):
 		none_type = self.discovery.get_none_type()
 		a = Variable( stem = 'a', qualname = 'main.a', file = Path( '__test__.py' ), line = 2, type = i32 )
 		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = bool_cls )
+		fn = i32.names['__lt__']
+		if fn.resolve is not None:
+			fn.resolve()
+		value = Variable( stem = '$inline0$value', qualname = f'{fn.qualname}$$inline0$value', file = fn.file, line = fn.line, type = i32 )
 		t0 = ir.Temp( type = bool_cls, id = 0 )
 		self._test_ir( code, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.Assign( dest = a, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = value, src = ir.Const( type = i32, value = 1 )),
 			ir.DeclareTemp( temp = t0 ),
-			ir.Cmp( dest = t0, op = ir.CmpOp.LT, left = ir.Const( type = i32, value = 1 ), right = a ),
+			ir.Cmp( dest = t0, op = ir.CmpOp.LT, left = value, right = a ),
 			ir.Assign( dest = b, src = t0 ),
 			ir.DeleteTemp( temp = t0 ),
 			ir.Return( value = None ),
@@ -1553,21 +1585,35 @@ class Tests( unittest.TestCase ):
 			'	x: Maybe[A] = Maybe.Some( A() )',
 			'	b: bool = x is None',
 		])
+		self.discovery.import_name( 'builtins' ) # the tag check is now an ordinary u8.__eq__ dunder call
 		mod = self._import( code )
 		lowered = self.compiler._lower( mod.get_local( 'main' ))
 		self.assertEqual( self.discovery.errors.errors, [] )
 		get_attr = next( i for i in lowered.instructions if isinstance( i, ir.GetAttr ) and i.attr == 'tag' )
 		x_var = mod.get_local( 'main' ).names['x']
 		self.assertIs( get_attr.obj, x_var )
-		# filtered to the Cmp fed by THIS GetAttr, not just "the only Cmp in
+		# get_attr.dest (a Temp, not a Variable) feeds the dunder call's own
+		# RECEIVER slot, which the @inline splice copies into a fresh local
+		# first (only an already-Variable operand passes straight through
+		# unsynthesized - see _lower_inline_call's own "only a genuinely
+		# computed operand needs the synthesized-local fallback" rule), so
+		# the Cmp's own `left` is that synthesized copy, not get_attr.dest
+		# directly - find it via the Assign feeding straight from get_attr.dest
+		copy_assign = next( i for i in lowered.instructions if isinstance( i, ir.Assign ) and i.src is get_attr.dest )
+		# filtered to the Cmp fed by THIS copy, not just "the only Cmp in
 		# the function" - x now holds a real Some(A()) value (definite-
 		# assignment requires a real initializer), so the RC leaf inside it
 		# also needs its own runtime tag check at scope-exit cleanup, which
 		# emits an unrelated second Cmp of its own
-		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) and i.left is get_attr.dest ]
+		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) and i.left is copy_assign.dest ]
 		self.assertEqual( len( cmp_instrs ), 1 )
 		self.assertEqual( cmp_instrs[0].op, ir.CmpOp.EQ )
-		self.assertEqual( cmp_instrs[0].right.value, 1 ) # Nothing is member ordinal 1 (Some is 0)
+		# the ordinal `1` (a bare literal at the dunder call site) is ALSO
+		# synthesized into its own local by the same splice, same reasoning
+		# as the receiver above - trace it back to its own feeding Assign
+		# rather than expecting a raw ir.Const on the Cmp's own right operand
+		right_assign = next( i for i in lowered.instructions if isinstance( i, ir.Assign ) and i.dest is cmp_instrs[0].right )
+		self.assertEqual( right_assign.src.value, 1 ) # Nothing is member ordinal 1 (Some is 0)
 
 	def test_compare_is_not_none_on_tagged_union_uses_ne( self ) -> None:
 		code = '\n'.join([
@@ -1580,6 +1626,7 @@ class Tests( unittest.TestCase ):
 			'	x = get()',
 			'	b: bool = x is not None',
 		])
+		self.discovery.import_name( 'builtins' ) # the tag check is now an ordinary u8.__ne__ dunder call
 		mod = self._import( code )
 		lowered = self.compiler._lower( mod.get_local( 'main' ))
 		cmp_instrs = [ i for i in lowered.instructions if isinstance( i, ir.Cmp ) ]
@@ -1831,6 +1878,7 @@ class Tests( unittest.TestCase ):
 			'			w: usize = z',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # match-arm tag dispatch is now an ordinary u8.__eq__ dunder call - see test_construct_and_match_round_trip (emitter_c_test.py)
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -1898,6 +1946,7 @@ class Tests( unittest.TestCase ):
 			'			x: i32 = v',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # non-exhaustive match's own tag check is now an ordinary u8.__eq__ dunder call
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -2754,6 +2803,7 @@ class Tests( unittest.TestCase ):
 			'			pass',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # the match-arm tag dispatch is now an ordinary u8.__eq__ dunder call
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -3310,6 +3360,7 @@ class Tests( unittest.TestCase ):
 			'		x: usize = i',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # range()'s own hidden bound check (i < count) is now an ordinary usize.__lt__ dunder call
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -3332,6 +3383,7 @@ class Tests( unittest.TestCase ):
 			'		pass',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # range()'s own hidden bound check is now an ordinary usize.__lt__ dunder call
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -3374,6 +3426,7 @@ class Tests( unittest.TestCase ):
 			'		x: i32 = v',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # the desugared while's own hidden bound check is now an ordinary usize.__lt__ dunder call
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -5552,6 +5605,7 @@ class Tests( unittest.TestCase ):
 			'		defer( cleanup() )',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # range()'s own hidden bound check is now an ordinary i32.__lt__ dunder call
 		self._import( code )
 		self._lower_main()
 		self.assertTrue( any( 'not allowed inside a loop' in e for e in self.discovery.errors.errors ))
@@ -5807,6 +5861,7 @@ class Tests( unittest.TestCase ):
 			'def main() -> None:',
 			'	foo( usize( 0 ), usize( 0 ))',
 		])
+		self.discovery.import_name( 'builtins' ) # n > 10/20 is now an ordinary usize.__gt__ dunder call
 		mod = self._import( code )
 		foo = mod.get_local( 'foo' )
 		lfoo = self.compiler._lower( foo )
@@ -7165,7 +7220,25 @@ class Tests( unittest.TestCase ):
 		# obligation nothing ever clears, AND the original r would never
 		# get cleared either (ordinary aliasing assignment doesn't propagate
 		# a clear back to its source)
-		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
+		# NOT _RESULT_FIXTURE as-is: its own `class bool: pass` shadow (kept
+		# for other, builtins-less callers of that shared fixture) conflicts
+		# with builtins' own real intrinsics.bool now that self.tag == 0/1
+		# (is_ok/is_err) and the match's own tag dispatch go through a real
+		# u8.__eq__ dunder call - that dunder's own return type is always
+		# the real bool, so this test needs the real one too
+		self.discovery.import_name( 'builtins' )
+		code = '\n'.join([
+			'@union',
+			'class Result[T,E]:',
+			'	Ok: T',
+			'	Err: E',
+			'',
+			'	def is_ok( self ) -> bool:',
+			'		return self.tag == 0',
+			'',
+			'	def is_err( self ) -> bool:',
+			'		return self.tag == 1',
+			'',
 			'class MyError: pass',
 			'',
 			'def get() -> Result[i32,MyError]:',
@@ -7704,6 +7777,7 @@ class InlineTests( unittest.TestCase ):
 			'	r = checked()',
 			'	return r.is_ok()',
 		])
+		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
 		self._import( code )
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -7855,6 +7929,7 @@ class InlineMultiStatementTests( unittest.TestCase ):
 			'		return w.doubled()',
 			'	return 0',
 		])
+		self.discovery.import_name( 'builtins' ) # tmp == 0 is now an ordinary usize.__eq__ dunder call
 		self._import( code )
 		self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -7882,6 +7957,7 @@ class InlineMultiStatementTests( unittest.TestCase ):
 			'def main( w: Widget ) -> i32:',
 			'	return w.resolve_choice()',
 		])
+		self.discovery.import_name( 'builtins' ) # the match's own tag dispatch is now an ordinary u8.__eq__ dunder call
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -7965,6 +8041,7 @@ class InlineMultiStatementTests( unittest.TestCase ):
 			'	y: i32 = x',
 			'	return y',
 		])
+		self.discovery.import_name( 'builtins' ) # self.y < 0 is now an ordinary i32.__lt__ dunder call
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -8157,6 +8234,7 @@ class ReturnOnlyTypeParamInferenceTests( unittest.TestCase ):
 			'def main( w: Widget ) -> bool:',
 			'	return make( w )',
 		])
+		self.discovery.import_name( 'builtins' ) # self.y != 0 / extra == 1 are now ordinary i32.__ne__/__eq__ dunder calls
 		self._import( code )
 		self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -9732,7 +9810,13 @@ class IfIsNotNoneNarrowingTests( unittest.TestCase ):
 		# own (larger) union size. An un-narrowed compiler.sizeof(u) isn't
 		# necessarily a Const at all (a TaggedUnion's own size isn't always
 		# foldable the same way a scalar leaf's is) - either shape here
-		# just means "not narrowed", which is all the negative tests need
+		# just means "not narrowed", which is all the negative tests need.
+		# `is`/`is not None` against a TaggedUnion is rewritten into a plain
+		# tag Eq/NotEq ast.Compare before lowering ever sees it (type_
+		# resolver.py's _ReferenceResolver) - now an ordinary u8.__eq__/
+		# __ne__ dunder call like any other scalar comparison, so needs
+		# builtins imported
+		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self.compiler._lower( self.discovery.main )
 		self.assertEqual( self.discovery.errors.errors, [] )

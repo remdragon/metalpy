@@ -1684,6 +1684,43 @@ class Discovery( ast.NodeVisitor ):
 				class_obj.file, class_obj.line,
 			)
 
+	# ast.FunctionDef.name -> the compiler.cmp_* intrinsic backing its
+	# auto-synthesized CEnum body (see _synthesize_cenum_comparison_methods) -
+	# same 6 comparison dunders every Scalar/Ptr[T]/ConstPtr[T] gets
+	# (gen_scalar_dunders.py/lib/builtins/__ptr_arith.py), same fixed-opcode
+	# intrinsic (lowering.py's _lower_compiler_cmp)
+	_CENUM_COMPARISON_INTRINSICS: dict[str,str] = {
+		'__eq__': 'cmp_eq', '__ne__': 'cmp_ne',
+		'__lt__': 'cmp_lt', '__le__': 'cmp_le',
+		'__gt__': 'cmp_gt', '__ge__': 'cmp_ge',
+	}
+
+	def _synthesize_cenum_comparison_methods( self, class_name: str, node: ast.ClassDef ) -> list[ast.FunctionDef]:
+		''' one `def __op__( self, other: <class_name> ) -> bool: return
+		compiler.cmp_op( self, other )` per comparison dunder, parsed from a
+		small synthetic source snippet rather than hand-built AST (far less
+		error-prone than constructing ast.FunctionDef/ast.arguments/etc field
+		by field) - same underlying compiler.cmp_eq/etc intrinsic a Scalar's
+		own __eq__/etc delegates to (CEnum lowers to a plain C typedef'd int,
+		comparing exactly the same native way - see _lower_compiler_cmp's own
+		comment). Only called when the user defined NONE of these 6
+		themselves (see this method's own caller) - confirmed with the user:
+		auto-synthesize only when nothing would be overridden; a single
+		user-declared comparison dunder opts the whole class out of every
+		auto-synthesized one, not just that one name. Line numbers are
+		shifted to land near the real class (ast.increment_lineno) so a
+		hypothetical future error here wouldn't point at a nonexistent
+		synthetic file, even though these bodies are simple and deterministic
+		enough that none is expected in practice. '''
+		source = '\n'.join(
+			f'def {name}( self, other: {class_name} ) -> bool:\n\treturn compiler.{intrinsic}( self, other )\n'
+			for name, intrinsic in self._CENUM_COMPARISON_INTRINSICS.items()
+		)
+		synthesized = ast.parse( source ).body
+		for stmt in synthesized:
+			ast.increment_lineno( stmt, node.lineno - 1 )
+		return synthesized
+
 	def _parse_ClassDef_CEnum( self, node: ast.ClassDef, qualname: str, value_type: Scalar ) -> CEnum:
 		module = self.module_stack[-1]
 		class_obj = CEnum(
@@ -1701,8 +1738,16 @@ class Discovery( ast.NodeVisitor ):
 		scope = self.scope_stack[-1]
 		scope.add_name( class_obj.stem, class_obj )
 
+		body = node.body
+		user_defined_comparison = any(
+			isinstance( stmt, ast.FunctionDef ) and stmt.name in self._CENUM_COMPARISON_INTRINSICS
+			for stmt in body
+		)
+		if not user_defined_comparison:
+			body = body + self._synthesize_cenum_comparison_methods( node.name, node )
+
 		try:
-			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+			unresolved = self._shallow_class_body_scan( class_obj, body )
 		except CompileError:
 			# scope.add_name already ran above, so class_obj.resolve would
 			# otherwise be left at its dataclass default of None here - the

@@ -142,9 +142,11 @@ _CHECKED_FLOAT_BINOP_OPCODES: dict[tuple[str,str],type] = {
 	( 'truediv', 'checked' ): ir.FloatDivCheck, ( 'truediv', 'wrapped' ): ir.FloatDiv,
 }
 
-# ast comparison operator -> the dunder method name to dispatch to for a
-# non-scalar left operand (str.__eq__, etc.). Scalar operands go through
-# flat ir.Cmp instead.
+# ast comparison operator -> the dunder method name to dispatch to
+# (str.__eq__, i32.__lt__, etc. - lib/builtins/__scalar_dunders.py registers
+# these for every scalar type too, so this isn't gated on left operand
+# scalar-ness anymore). A type with nothing registered under the name (a
+# class that never defined it, or NoneType) falls through to flat ir.Cmp.
 _COMP_DUNDER: dict[type,str] = {
 	ast.Eq: '__eq__',
 	ast.NotEq: '__ne__',
@@ -4194,6 +4196,54 @@ class FunctionLowering:
 		result_type = expected_type if expected_type is not None and isinstance( expected_type, Scalar ) else left.type
 		return self._lower_arithmetic_op( node, opcode, None, result_type, { 'left': left, 'right': right }, 'binary' )
 
+	# comparison never overflows - single variant each, same "always
+	# infallible, plain bool-returning" shape as the bitwise ops above, no
+	# ambient arithmetic mode to disambiguate. Backs every scalar comparison
+	# dunder (lib/builtins/__scalar_dunders.py's scalar_eq/scalar_ne/
+	# scalar_lt/scalar_le/scalar_gt/scalar_ge) - the same fixed-opcode-
+	# intrinsic pattern _BITWISE_OPCODES/_lower_compiler_bitwise already use,
+	# letting ordinary comparison dispatch (_expr_Compare/_lower_eq_or_ne/
+	# _lower_operand_compare/_classify_leaf_pair_eq) find a real dunder for
+	# Scalar operands too, instead of hardcoding a flat ir.Cmp as the only
+	# possible outcome for a Scalar left operand.
+	_CMP_INTRINSIC_OPCODES: dict[str,'ir.CmpOp'] = {
+		'cmp_eq': ir.CmpOp.EQ, 'cmp_ne': ir.CmpOp.NE,
+		'cmp_lt': ir.CmpOp.LT, 'cmp_le': ir.CmpOp.LE,
+		'cmp_gt': ir.CmpOp.GT, 'cmp_ge': ir.CmpOp.GE,
+	}
+
+	def _lower_compiler_cmp( self, node: ast.Call, intrinsic_name: str, expected_type: Type|None ) -> ir.Operand:
+		# compiler.cmp_eq/cmp_ne/cmp_lt/cmp_le/cmp_gt/cmp_ge(a, b) -> bool -
+		# emits the exact same ir.Cmp _expr_Compare's own flat-Cmp fallback
+		# does (see its own docstring), just reachable as a real callable
+		# intrinsic so a Scalar-, Ptr[T]/ConstPtr[T]-, or CEnum-registered
+		# dunder body can delegate to it. Ptr[T]/ConstPtr[T] (a Specialization
+		# wrapping a Scalar base, not itself `isinstance(_, Scalar)` - see
+		# _is_ptr_specialization) needs the same plain address comparison a
+		# bare scalar gets (a C pointer compares natively with ==/!=/</etc,
+		# same ir.Cmp opcode, no different codegen) - backs Ptr.__eq__/etc
+		# (lib/builtins/__ptr_arith.py). CEnum lowers to a plain C
+		# typedef'd int (emitter_c.py's c_type - never struct/union-
+		# prefixed), so it compares exactly the same native way too - backs
+		# the auto-synthesized CEnum __eq__/etc (type_resolver.py's
+		# _synthesize_cenum_comparisons).
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic_name}(...) takes exactly two positional arguments: {ast.unparse(node)}', node )
+		left = self._lower_expr( node.args[0], None )
+		right = self._lower_expr( node.args[1], None )
+		is_ptr = self.lowering._type_resolver._is_ptr_specialization( left.type )
+		if not ( isinstance( left.type, ( Scalar, CEnum ) ) or is_ptr ) or left.type is not right.type:
+			self.lowering.discovery.fail(
+				f'compiler.{intrinsic_name}(...) arguments must both be the same scalar, Ptr[T]/ConstPtr[T], or CEnum type - got '
+				f'{left.type.qualname if left.type else "?"} and {right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
+		cmp_op = self._CMP_INTRINSIC_OPCODES[intrinsic_name]
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		dest = self._new_temp( bool_cls )
+		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
+		return dest
+
 	def _lower_compiler_addrof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.addrof(x) -> Ptr[T], translating directly to C's &x - x
 		# must be a bare local variable/parameter name (matches SYNTAX.md's
@@ -6541,8 +6591,22 @@ class FunctionLowering:
 		# shared _find_method + resolve/schedule + emit Call boilerplate -
 		# every f-string dunder-dispatch/format-spec call site below uses
 		# this same shape (receiver already lowered, method looked up by
-		# plain name, no generics involved - str/int are never generic)
-		method = self.lowering._find_method( receiver.type, method_name )
+		# plain name). str/int/f32/f64 are never generic, so this comment
+		# used to end there - but Ptr[T]/ConstPtr[T]'s own __str__/__repr__
+		# (lib/builtins/__ptr_arith.py) ARE bare generic Functions with an
+		# unbound type param T (same registration shape as their __add__/
+		# __sub__/comparison dunders - see _resolve_receiver_generic_dunder's
+		# own docstring), so _find_method alone isn't enough here anymore:
+		# without also resolving T from the receiver's own concrete pointee
+		# type, `method` still carries the bare TypeVar, and emitter_c.py's
+		# c_type crashes on it at prototype-emission time (confirmed via a
+		# real repro building f'{some_ptr}'/some_ptr.__str__()) - same fix
+		# _find_dunder_for_arg's own tail already applies for operator-
+		# dispatched Ptr dunders, just needed here too for this SEPARATE,
+		# plain-method-name dispatch path.
+		method = self.lowering._resolve_receiver_generic_dunder(
+			self.lowering._find_method( receiver.type, method_name ), receiver.type,
+		)
 		if method is None:
 			type_name = receiver.type.qualname if receiver.type is not None else '?'
 			self.lowering.discovery.fail( f'f-string requires {type_name}.{method_name}() to be available: {ast.unparse(node)}', node )
@@ -8477,36 +8541,55 @@ class FunctionLowering:
 			# Scalar.
 			return self._lower_eq_or_ne( node, left, expected_type, negate = isinstance( node.ops[0], ast.NotEq ))
 
-		# non-scalar left operand — try the dunder method (<, >, <=, >=, ...)
-		if not isinstance( left.type, Scalar ):
-			method_name = _COMP_DUNDER.get( type( node.ops[0] ))
-			if method_name is not None:
-				# _find_dunder_for_arg, not the plain _find_method - see
-				# its own docstring: right, lowered with strict=True just
-				# below, is already guaranteed to end up exactly left.type
-				# (coerced or rejected) before this dunder lookup even
-				# matters, so the wanted implementation is whichever one
-				# declares its own parameter as exactly left.type - same
-				# "caller already knows the wanted arg type" shape as
-				# _lower_eq_or_ne's own same-type fast path
-				method = self._find_dunder_for_arg( left.type, method_name, left.type )
-				if method is not None:
-					right = self._lower_expr( node.comparators[0], left.type )
-					self.lowering._ensure_resolved( method )
-					self.lowering.schedule( method.return_type )
-					for p in ( method.parameters or [] ):
-						self.lowering.schedule( p.type )
-					dest = self._new_temp( expected_type or method.return_type )
-					self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
-					return dest
-			# non-scalar without a matching dunder — fall through to
-			# flat Cmp (pointer comparison), same pre-dunder behavior
-
-		# scalar left operand — flat ir.Cmp
+		# try the dunder method (<, >, <=, >=, ...) - NOT gated on
+		# isinstance(left.type, Scalar) anymore: _find_dunder_for_arg
+		# already resolves a Scalar-registered dunder (i32.__lt__ = ...;
+		# see lib/builtins/__scalar_dunders.py) identically to a real
+		# class's own method (both just read .names). A Scalar with
+		# nothing registered under this name (NoneType, in practice) just
+		# misses, exactly like a class that doesn't define the dunder at
+		# all - falls through to flat Cmp below either way, same
+		# precedent as _lower_binop_values' own arithmetic dispatch
+		method_name = _COMP_DUNDER.get( type( node.ops[0] ))
+		if method_name is not None:
+			# _find_dunder_for_arg, not the plain _find_method - see
+			# its own docstring: right, lowered with strict=True just
+			# below, is already guaranteed to end up exactly left.type
+			# (coerced or rejected) before this dunder lookup even
+			# matters, so the wanted implementation is whichever one
+			# declares its own parameter as exactly left.type - same
+			# "caller already knows the wanted arg type" shape as
+			# _lower_eq_or_ne's own same-type fast path
+			method = self._find_dunder_for_arg( left.type, method_name, left.type )
+			if method is not None:
+				right = self._lower_expr( node.comparators[0], left.type )
+				# _emit_fallible_method_call, not a hand-rolled ir.Call -
+				# a Scalar-registered dunder (method.cls is None) needs its
+				# receiver threaded as a plain leading positional arg
+				# instead of ir.Call.receiver (discovery.py never strips
+				# "self" off a free function's own parameter list the way
+				# it does for a real class method - same fix _lower_call/
+				# _lower_method_call/_emit_binop_dunder_call already apply)
+				return self._emit_fallible_method_call( node, method, left, [ right ], expected_type )
+		# no matching dunder - a hard compile error, not a silent flat-Cmp
+		# fallback (pointer identity comparison, or a plain scalar compare):
+		# confirmed with the user - there's no sensible default for
+		# comparing two arbitrary values (an RCClass's own == is meaningless
+		# unless the class defines it), so every comparable type needs a
+		# real dunder now, no exceptions. Scalars/Ptr[T]/ConstPtr[T]/CEnum
+		# all have one (gen_scalar_dunders.py, lib/builtins/__ptr_arith.py,
+		# discovery.py's _synthesize_cenum_comparison_methods) - this is
+		# reached only by a genuine RCClass/CStruct/CUnion/TaggedUnion (or a
+		# leftover corner) with no __<op>__ of its own.
 		right = self._lower_expr( node.comparators[0], left.type )
 		cmp_op = self.lowering._CMP_OPCODES.get( type( node.ops[0] ))
 		if cmp_op is None:
 			self.lowering.discovery.fail( f'unsupported comparison operator: {ast.unparse(node)}', node )
+		type_name = left.type.qualname if left.type is not None else '?'
+		self.lowering.discovery.fail(
+			f'{type_name} has no {method_name}() defined - comparison requires an explicit dunder: {ast.unparse(node)}',
+			node,
+		)
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
@@ -8654,8 +8737,15 @@ class FunctionLowering:
 		# see _find_dunder_for_arg's own docstring for why a plain
 		# _find_method silently breaks this once a class ever declares a
 		# SECOND __eq__/__ne__ overload (e.g. int.__eq__(other: i32)
-		# alongside the pre-existing int.__eq__(other: int))
-		method = self._find_dunder_for_arg( left.type, method_name, left.type ) if not isinstance( left.type, Scalar ) else None
+		# alongside the pre-existing int.__eq__(other: int)). NOT gated on
+		# isinstance(left.type, Scalar) anymore - a Scalar-registered
+		# __eq__/__ne__ (i32.__eq__ = ...; see lib/builtins/
+		# __scalar_dunders.py) resolves identically here, same precedent
+		# as _lower_binop_values' own arithmetic dispatch. NoneType (also
+		# Scalar) has none registered, so `None == x` below still misses
+		# and falls through to the union-recognition/flat-Cmp tail exactly
+		# as before.
+		method = self._find_dunder_for_arg( left.type, method_name, left.type )
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		# the hint handed to the comparator's own lowering below: left.type,
 		# EXCEPT when left.type is ITSELF a union - hinting a plain leaf
@@ -8688,13 +8778,10 @@ class FunctionLowering:
 				right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
 				return self._lower_eq_dispatch( node, left, left_shape, right, right_shape, negate )
 		if method is not None:
-			self.lowering._ensure_resolved( method )
-			self.lowering.schedule( method.return_type )
-			for p in ( method.parameters or [] ):
-				self.lowering.schedule( p.type )
-			dest = self._new_temp( expected_type or method.return_type )
-			self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
-			return dest
+			# _emit_fallible_method_call, not a hand-rolled ir.Call - see
+			# _expr_Compare's own identical comment on why (Scalar-
+			# registered dunder receiver threading)
+			return self._emit_fallible_method_call( node, method, left, [ right ], expected_type )
 		if left_shape is not None:
 			# right.type IS left.type (the fast-path check above), and both
 			# are the exact SAME union - genuinely no dunder of its own was
@@ -8704,6 +8791,15 @@ class FunctionLowering:
 			# dispatch instead of assuming "same type -> flat Cmp is safe",
 			# which only holds for scalars/pointers, never for a TaggedUnion
 			return self._lower_eq_dispatch( node, left, left_shape, right, left_shape, negate )
+		# no matching dunder - a hard compile error, not a silent flat-Cmp
+		# fallback - see _expr_Compare's own identical comment for the full
+		# rationale (confirmed with the user: no sensible default exists for
+		# comparing two arbitrary values)
+		type_name = left.type.qualname if left.type is not None else '?'
+		self.lowering.discovery.fail(
+			f'{type_name} has no {method_name}() defined - comparison requires an explicit dunder: {ast.unparse(node)}',
+			node,
+		)
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = ir.CmpOp.NE if negate else ir.CmpOp.EQ, left = left, right = right ))
@@ -8822,11 +8918,18 @@ class FunctionLowering:
 		# (other: i32) alongside int.__eq__(other: int)) registers as a
 		# real Overload, which a bare _find_method silently treats as "no
 		# such method" - the exact shape this whole 'cross_dunder' branch
-		# exists to use
-		method = self._find_dunder_for_arg( left_type, method_name, right_type ) if not isinstance( left_type, Scalar ) else None
+		# exists to use. NOT gated on isinstance(Scalar) anymore - same
+		# precedent as everywhere else this file's comparison/binop
+		# dispatch dropped that gate; in practice this cross-type branch
+		# still never matches for two DIFFERENT Scalar types today (no
+		# cross-type scalar comparison dunders are registered, only same-
+		# type ones - see lib/builtins/__scalar_dunders.py), so dropping
+		# the gate is a no-op for Scalar pairs right now, not a behavior
+		# change - just no longer special-cased for no reason.
+		method = self._find_dunder_for_arg( left_type, method_name, right_type )
 		if method is not None:
 			return _LeafPairEq( 'cross_dunder', method = method, reflected = False )
-		reflected_method = self._find_dunder_for_arg( right_type, method_name, left_type ) if not isinstance( right_type, Scalar ) else None
+		reflected_method = self._find_dunder_for_arg( right_type, method_name, left_type )
 		if reflected_method is not None:
 			return _LeafPairEq( 'cross_dunder', method = reflected_method, reflected = True )
 		return _LeafPairEq( 'error' )
@@ -9451,21 +9554,30 @@ class FunctionLowering:
 		own to re-dispatch through (mirrors _coerce_or_check_operand's
 		identical "no node to re-evaluate" posture). '''
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		if not isinstance( left.type, Scalar ):
-			method_name = '__ne__' if negate else '__eq__'
-			# _find_dunder_for_arg, not the plain _find_method - both
-			# operands are already known to share the SAME type (this
-			# method's own docstring), so the wanted implementation is
-			# whichever one declares its own parameter as exactly left.type
-			method = self._find_dunder_for_arg( left.type, method_name, left.type )
-			if method is not None:
-				self.lowering._ensure_resolved( method )
-				self.lowering.schedule( method.return_type )
-				for p in ( method.parameters or [] ):
-					self.lowering.schedule( p.type )
-				dest = self._new_temp( method.return_type )
-				self._emit( ir.Call( dest = dest, target = method, receiver = left, args = [ right ], kwargs = {} ))
-				return dest
+		method_name = '__ne__' if negate else '__eq__'
+		# _find_dunder_for_arg, not the plain _find_method - both
+		# operands are already known to share the SAME type (this
+		# method's own docstring), so the wanted implementation is
+		# whichever one declares its own parameter as exactly left.type.
+		# NOT gated on isinstance(left.type, Scalar) anymore - a Scalar-
+		# registered __eq__/__ne__ resolves identically here (see lib/
+		# builtins/__scalar_dunders.py), same precedent as everywhere else
+		# this file's comparison dispatch dropped that gate.
+		method = self._find_dunder_for_arg( left.type, method_name, left.type )
+		if method is not None:
+			# _emit_fallible_method_call, not a hand-rolled ir.Call - see
+			# _expr_Compare's own identical comment on why (Scalar-
+			# registered dunder receiver threading)
+			return self._emit_fallible_method_call( node, method, left, [ right ], None )
+		# no matching dunder - a hard compile error, not a silent flat-Cmp
+		# fallback - see _expr_Compare's own identical comment for the full
+		# rationale (confirmed with the user: no sensible default exists for
+		# comparing two arbitrary values). No source AST node for this
+		# specific comparison (this method's own docstring - a narrowed
+		# union-leaf payload has none of its own), so `node` here is
+		# whatever the caller passed for error-reporting purposes only.
+		type_name = left.type.qualname if left.type is not None else '?'
+		self.lowering.discovery.fail( f'{type_name} has no {method_name}() defined - comparison requires an explicit dunder', node )
 		dest = self._new_temp( bool_cls )
 		self._emit( ir.Cmp( dest = dest, op = ir.CmpOp.NE if negate else ir.CmpOp.EQ, left = left, right = right ))
 		return dest
@@ -11737,6 +11849,10 @@ class FunctionLowering:
 
 			case 'bitand' | 'bitor' | 'bitxor' | 'rshift':
 				result = self._lower_compiler_bitwise( node, self.lowering._is_compiler_call( node ), expected_type )
+				return result if want_result else None
+
+			case 'cmp_eq' | 'cmp_ne' | 'cmp_lt' | 'cmp_le' | 'cmp_gt' | 'cmp_ge':
+				result = self._lower_compiler_cmp( node, self.lowering._is_compiler_call( node ), expected_type )
 				return result if want_result else None
 
 			case 'checked_ptr_add' | 'wrapped_ptr_add' | 'saturated_ptr_add' | \

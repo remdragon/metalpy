@@ -882,6 +882,7 @@ class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	next_auto: int = 0
 	members: dict[str,int] = field( default_factory = dict )
 	values: dict[int,str] = field( default_factory = dict )
+	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 

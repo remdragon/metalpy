@@ -495,6 +495,137 @@ usize.__wrapped_lshift__ = i_shl_wrapped[usize]
 usize.__saturated_lshift__ = i_shl_saturated[usize]
 usize.__rshift__ = i_rshift[usize]
 
+@inline
+def scalar_eq[T]( value: T, other: T ) -> bool:
+	return compiler.cmp_eq( value, other )
+
+@inline
+def scalar_ne[T]( value: T, other: T ) -> bool:
+	return compiler.cmp_ne( value, other )
+
+@inline
+def scalar_lt[T]( value: T, other: T ) -> bool:
+	return compiler.cmp_lt( value, other )
+
+@inline
+def scalar_le[T]( value: T, other: T ) -> bool:
+	return compiler.cmp_le( value, other )
+
+@inline
+def scalar_gt[T]( value: T, other: T ) -> bool:
+	return compiler.cmp_gt( value, other )
+
+@inline
+def scalar_ge[T]( value: T, other: T ) -> bool:
+	return compiler.cmp_ge( value, other )
+
+# --- comparisons (==, !=, <, <=, >, >=) -------------------------------
+
+i8.__eq__ = scalar_eq[i8]
+i8.__ne__ = scalar_ne[i8]
+i8.__lt__ = scalar_lt[i8]
+i8.__le__ = scalar_le[i8]
+i8.__gt__ = scalar_gt[i8]
+i8.__ge__ = scalar_ge[i8]
+
+i16.__eq__ = scalar_eq[i16]
+i16.__ne__ = scalar_ne[i16]
+i16.__lt__ = scalar_lt[i16]
+i16.__le__ = scalar_le[i16]
+i16.__gt__ = scalar_gt[i16]
+i16.__ge__ = scalar_ge[i16]
+
+i32.__eq__ = scalar_eq[i32]
+i32.__ne__ = scalar_ne[i32]
+i32.__lt__ = scalar_lt[i32]
+i32.__le__ = scalar_le[i32]
+i32.__gt__ = scalar_gt[i32]
+i32.__ge__ = scalar_ge[i32]
+
+i64.__eq__ = scalar_eq[i64]
+i64.__ne__ = scalar_ne[i64]
+i64.__lt__ = scalar_lt[i64]
+i64.__le__ = scalar_le[i64]
+i64.__gt__ = scalar_gt[i64]
+i64.__ge__ = scalar_ge[i64]
+
+i128.__eq__ = scalar_eq[i128]
+i128.__ne__ = scalar_ne[i128]
+i128.__lt__ = scalar_lt[i128]
+i128.__le__ = scalar_le[i128]
+i128.__gt__ = scalar_gt[i128]
+i128.__ge__ = scalar_ge[i128]
+
+isize.__eq__ = scalar_eq[isize]
+isize.__ne__ = scalar_ne[isize]
+isize.__lt__ = scalar_lt[isize]
+isize.__le__ = scalar_le[isize]
+isize.__gt__ = scalar_gt[isize]
+isize.__ge__ = scalar_ge[isize]
+
+u8.__eq__ = scalar_eq[u8]
+u8.__ne__ = scalar_ne[u8]
+u8.__lt__ = scalar_lt[u8]
+u8.__le__ = scalar_le[u8]
+u8.__gt__ = scalar_gt[u8]
+u8.__ge__ = scalar_ge[u8]
+
+u16.__eq__ = scalar_eq[u16]
+u16.__ne__ = scalar_ne[u16]
+u16.__lt__ = scalar_lt[u16]
+u16.__le__ = scalar_le[u16]
+u16.__gt__ = scalar_gt[u16]
+u16.__ge__ = scalar_ge[u16]
+
+u32.__eq__ = scalar_eq[u32]
+u32.__ne__ = scalar_ne[u32]
+u32.__lt__ = scalar_lt[u32]
+u32.__le__ = scalar_le[u32]
+u32.__gt__ = scalar_gt[u32]
+u32.__ge__ = scalar_ge[u32]
+
+u64.__eq__ = scalar_eq[u64]
+u64.__ne__ = scalar_ne[u64]
+u64.__lt__ = scalar_lt[u64]
+u64.__le__ = scalar_le[u64]
+u64.__gt__ = scalar_gt[u64]
+u64.__ge__ = scalar_ge[u64]
+
+u128.__eq__ = scalar_eq[u128]
+u128.__ne__ = scalar_ne[u128]
+u128.__lt__ = scalar_lt[u128]
+u128.__le__ = scalar_le[u128]
+u128.__gt__ = scalar_gt[u128]
+u128.__ge__ = scalar_ge[u128]
+
+usize.__eq__ = scalar_eq[usize]
+usize.__ne__ = scalar_ne[usize]
+usize.__lt__ = scalar_lt[usize]
+usize.__le__ = scalar_le[usize]
+usize.__gt__ = scalar_gt[usize]
+usize.__ge__ = scalar_ge[usize]
+
+f32.__eq__ = scalar_eq[f32]
+f32.__ne__ = scalar_ne[f32]
+f32.__lt__ = scalar_lt[f32]
+f32.__le__ = scalar_le[f32]
+f32.__gt__ = scalar_gt[f32]
+f32.__ge__ = scalar_ge[f32]
+
+f64.__eq__ = scalar_eq[f64]
+f64.__ne__ = scalar_ne[f64]
+f64.__lt__ = scalar_lt[f64]
+f64.__le__ = scalar_le[f64]
+f64.__gt__ = scalar_gt[f64]
+f64.__ge__ = scalar_ge[f64]
+
+bool.__eq__ = scalar_eq[bool]
+bool.__ne__ = scalar_ne[bool]
+bool.__lt__ = scalar_lt[bool]
+bool.__le__ = scalar_le[bool]
+bool.__gt__ = scalar_gt[bool]
+bool.__ge__ = scalar_ge[bool]
+
 @fallible_arithmetic
 @inline
 def i_to_i[S,T]( value: S ) -> Result[T,OverflowError]:
