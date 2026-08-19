@@ -5486,6 +5486,78 @@ def main() -> i32:
 		] )
 
 
+class MatchNestedUnionMemberRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for a fixed bug in type_resolver.py's
+	_match_pattern: `case SomeUnion.Variant(x):` resolves SomeUnion PURELY
+	from the pattern's own text, with no regard for what the match
+	subject's actual type is - correct when the subject genuinely IS
+	SomeUnion directly (the common case), but SomeUnion can also be nested
+	OPAQUELY as one member of a WIDER union that's the subject's real type
+	(e.g. `e: MyError | SomeOtherType`) - the code this used to build
+	tested SomeUnion's own INTERNAL tag position (Variant's position within
+	SomeUnion) directly against the subject, which is really the OUTER
+	union's own, entirely different tag space. Confirmed via a real repro:
+	silently WRONG generated code (not a crash, not a compile error) -
+	`case MyError.Bad(_):` only matched correctly by COINCIDENCE, whenever
+	MyError happened to sort first in the outer union's own canonicalized
+	member order. Found while building PLAN_GENERATORS.md's StopIteration
+	reversal (every generator error type now includes StopIteration, which
+	- living in builtins - sorts ahead of almost any user error type,
+	making this the COMMON case for generator error handling going
+	forward, not a rare edge case) but is completely general and pre-
+	existing, unrelated to generators specifically. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'nested_union_member_sorted_first_already_worked', '''
+class ZzzMarker:
+	pass
+
+@union
+class MyError:
+	Bad: None
+
+def make( which: i32 ) -> MyError | ZzzMarker:
+	if which == 0:
+		return MyError.Bad( None )
+	return ZzzMarker()
+
+def main() -> i32:
+	v = make( 0 )
+	match v:
+		case MyError.Bad( _ ):
+			return 0
+		case _:
+			return 1
+''' ),
+			( 'nested_union_member_sorted_second_was_the_real_bug', '''
+class AaaMarker:
+	pass
+
+@union
+class MyError:
+	Bad: None
+
+def make( which: i32 ) -> AaaMarker | MyError:
+	if which == 0:
+		return MyError.Bad( None )
+	return AaaMarker()
+
+def main() -> i32:
+	v = make( 0 )
+	match v:
+		case MyError.Bad( _ ):
+			return 0
+		case _:
+			return 1
+''' ),
+		] )
+
+
 class GenericMatchTypeMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for type_resolver.py's _try_fold_match_type -
 	`match type(<Name>): case ConcreteClass(binding): ... case _: ...` over a

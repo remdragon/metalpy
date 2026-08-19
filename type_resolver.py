@@ -576,6 +576,13 @@ class TypeResolver:
 		result: list[ast.stmt] = []
 		for stmt in stmts:
 			if isinstance( stmt, ast.Return ) and ( stmt.value is None or ( isinstance( stmt.value, ast.Constant ) and stmt.value.value is None )):
+				# PLAN_GENERATORS.md's StopIteration reversal - a user-
+				# written `return`/`return None` is a real generator-ending
+				# exit, same as the tail's own natural exhaustion and the
+				# DONE short-circuit above - tag it the same way so
+				# _wrap_generator_next_returns_in_ok wraps its value in
+				# Result.Err(StopIteration()) instead of Result.Ok(None)
+				stmt.generator_exhaustion_return = True
 				assign = ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = 0 ) )
 				ast.copy_location( assign, stmt )
 				pending.append( assign )
@@ -1645,7 +1652,7 @@ class TypeResolver:
 	# it) was removed once that was confirmed - yield sites below just
 	# return the renamed value straight through.
 
-	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], next_return_type: Type, error_type: 'Type|None', pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]], send_type: 'Type|None' = None ) -> Function:
+	def _build_generator_next_function( self, fn: Function, backing_cls: RCClass, locals_decl: dict[str,Type], next_return_type: Type, pending_bare_return_assigns: 'list[ast.Assign]', defer_sites: list[tuple[str,bool,list[ast.stmt]]], send_type: 'Type|None' = None ) -> Function:
 		''' PLAN_GENERATORS.md Phase F - builds $$__next__: self.__state ==
 		DONE short-circuits to `return None`, then the generator's own
 		body, lowered essentially AS-IS (structurally intact - no more
@@ -1666,10 +1673,11 @@ class TypeResolver:
 		can't be synthesized here the way everything else in this method
 		still is.
 
-		next_return_type/error_type: PLAN_GENERATORS.md Phase 4 (roadmap
-		Phase 4) - error_type is None for an infallible Iterator[T]
-		generator (next_return_type is just result_union) or set for a
-		fallible Generator[T,E] one (Result[result_union,error_type]).
+		next_return_type: PLAN_GENERATORS.md's StopIteration reversal -
+		every generator is unconditionally fallible now (its own error_type
+		always includes StopIteration, never None - see discovery.py's
+		visit_Subscript), so next_return_type is always Result[elem_type,
+		error_type], never a bare elem_type|None union.
 		The old AST-level pessimistic-done pre-write this method used to
 		orchestrate per-unit (_pessimistic_done_prefix) is gone too - Phase
 		F re-derives it at the LOWERING level instead (lowering.py's
@@ -1679,12 +1687,13 @@ class TypeResolver:
 		error-defer replay already established there), so this method
 		doesn't need to know or care where a fallible operation might be
 		reached from anymore. Every ast.Return AND ast.Yield in the
-		assembled body then gets its value wrapped in Result.Ok(...) - see
-		_wrap_generator_next_returns_in_ok. '''
+		assembled body then gets its value wrapped in Result.Ok(...) - EXCEPT
+		a tagged synthesized exhaustion return, which wraps into
+		Result.Err(StopIteration()) instead - see _wrap_generator_next_
+		returns_in_ok. '''
 		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() )
 		renamer = _GeneratorNameRenamer( rename_targets )
 
-		is_fallible = error_type is not None
 		rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
 
 		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - a
@@ -1734,23 +1743,29 @@ class TypeResolver:
 		# armed plain `defer` site replays here too (LIFO), right before
 		# the state gets pinned to done
 		defer_replay = self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, anchor ), renamer, rc_local_stems )
+		tail_exhaustion_return = ast.Return( value = ast.Constant( value = None ) )
+		tail_exhaustion_return.generator_exhaustion_return = True
 		tail_body: list[ast.stmt] = defer_replay + [
 			ast.Assign( targets = [ self._self_attr( '__state', anchor ) ], value = ast.Constant( value = done_state ) ),
-			ast.Return( value = ast.Constant( value = None ) ),
+			tail_exhaustion_return,
 		]
 
+		done_short_circuit_return = ast.Return( value = ast.Constant( value = None ) )
+		done_short_circuit_return.generator_exhaustion_return = True
 		next_body: list[ast.stmt] = [
 			ast.If(
 				test = ast.Compare( left = self._self_attr( '__state', fn.node ), ops = [ ast.Eq() ], comparators = [ ast.Constant( value = done_state ) ] ),
-				body = [ ast.Return( value = ast.Constant( value = None ) ) ],
+				body = [ done_short_circuit_return ],
 				orelse = [],
 			),
 		]
 		next_body.extend( body_stmts )
 		next_body.extend( tail_body )
 
-		if is_fallible:
-			self._wrap_generator_next_returns_in_ok( next_body )
+		# PLAN_GENERATORS.md's StopIteration reversal - always run now (every
+		# generator is unconditionally fallible, see this method's own
+		# docstring)
+		self._wrap_generator_next_returns_in_ok( next_body )
 
 		# PLAN_GENERATORS.md Phase C - when SendType is declared
 		# (Generator[T,SendType,E]), the real body-bearing method is
@@ -1882,32 +1897,50 @@ class TypeResolver:
 		backing_cls.names[ send_fn.stem ] = send_fn
 
 	def _wrap_generator_next_returns_in_ok( self, next_body: list[ast.stmt] ) -> None:
-		''' PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - a fallible
-		Generator[T,E]'s $$__next__ declares -> Result[elem_type|None,E],
-		so every `return <value>` built anywhere above (the DONE short-
-		circuit's `return None`, the tail's/safety-net's `return None`)
-		AND every `yield <value>` reachable anywhere in the body (PLAN_
+		''' PLAN_GENERATORS.md's StopIteration reversal - $$__next__ always
+		declares -> Result[elem_type,error_type] now, so every `return
+		<value>`/`yield <value>` reachable anywhere in the body (PLAN_
 		GENERATORS.md Phase F - lowering.py's own yield-lowering coerces
 		ast.Yield.value against self._current_fn.return_type exactly like
 		_stmt_Return already coerces its own value, so wrapping it here,
 		the SAME uniform way, needs zero special-casing there) needs to
-		become `Result.Ok(<value>)` instead. Run once, after the WHOLE
+		become `Result.Ok(<value>)` - EXCEPT a node tagged generator_
+		exhaustion_return (the DONE short-circuit, the tail's own natural
+		exhaustion, and a user-written bare `return`/`return None` - see
+		_build_generator_next_function/_rewrite_bare_return_stmts, the
+		three sites that set this tag), which becomes `Result.Err(
+		StopIteration())` instead: reaching the end of the generator is no
+		longer a nullable None bundled into the success channel, it's a
+		real Err in the existing error channel. Run once, after the WHOLE
 		body is assembled, rather than threading Result-wrapping through
 		individual construction sites - simpler, and correct because
 		$$__next__ can never contain a nested def/lambda (generator
 		bodies already reject those), so a plain ast.walk (no "don't
 		recurse into a nested scope" concern, unlike _walk_generator_body
 		elsewhere in this file) safely reaches every ast.Return/ast.Yield
-		belonging to THIS function. Result.Ok(...)'s own payload argument
-		is coerced the ordinary way (same _lower_expr(arg,expected_type)
-		machinery any other call argument gets, confirmed via a real
-		repro: a bare elem_type value OR a bare None constant both coerce
-		into the declared elem_type|None payload with no extra wrapping
-		needed here) - so this never needs to know what shape `value`
-		already is. '''
+		belonging to THIS function. Result.Ok(...)/Result.Err(...)'s own
+		payload argument is coerced the ordinary way (same _lower_expr(arg,
+		expected_type) machinery any other call argument gets) - so this
+		never needs to know what shape a non-exhaustion `value` already
+		is. '''
 		for stmt in next_body:
 			for n in ast.walk( stmt ):
 				if isinstance( n, ( ast.Return, ast.Yield )):
+					if getattr( n, 'generator_exhaustion_return', False ):
+						assert n.value is not None and isinstance( n.value, ast.Constant ) and n.value.value is None, (
+							f'exhaustion-tagged node with an unexpected non-None value: {ast.dump(n)}'
+						)
+						err_call = ast.Call(
+							func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+							args = [ ast.Call( func = ast.Name( id = 'StopIteration', ctx = ast.Load() ), args = [], keywords = [] ) ],
+							keywords = [],
+						)
+						ast.copy_location( err_call, n )
+						ast.copy_location( err_call.func, n )
+						ast.copy_location( err_call.func.value, n )
+						ast.copy_location( err_call.args[0], n )
+						n.value = err_call
+						continue
 					value = n.value if n.value is not None else ast.Constant( value = None )
 					ok_call = ast.Call(
 						func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
@@ -2289,29 +2322,29 @@ class TypeResolver:
 			locals_decl = self._collect_generator_locals( fn )
 			locals_decl.update( extra_locals )
 
-			none_type = self.discovery.get_none_type()
-			result_union = self.discovery._get_or_create_union([ elem_type, none_type ])
-
-			# PLAN_GENERATORS.md Phase 4 (roadmap Phase 4) - Generator[T,E]
-			# (error_type set) makes __next__ fallible: it returns
-			# Result[elem_type|None, error_type] instead of the bare union, so
+			# PLAN_GENERATORS.md's StopIteration reversal - error_type is
+			# never None for a legally-constructed GeneratorType (discovery.py's
+			# visit_Subscript requires it to already include StopIteration
+			# among its own leaves), so __next__ is unconditionally fallible:
+			# it returns Result[elem_type, error_type], never a bare nullable
+			# elem_type|None. Reaching the end of the generator produces
+			# Err(StopIteration()) (see _wrap_generator_next_returns_in_ok's
+			# own exhaustion-tag handling below), not Ok(None) - there is no
+			# more "the success channel is itself nullable" case to build.
 			# or_return()/checked-arithmetic inside the body engage the
 			# existing _require_result_return machinery for free (no special
 			# generator-side flag needed - it's purely a consequence of
 			# __next__'s own declared return type, exactly like any other
-			# fallible function). Iterator[T] (error_type None) is unaffected -
-			# next_return_type stays the bare union, same as before this phase.
-			if error_type is not None:
-				self.schedule( error_type )
-				result_cls = self.discovery.find_name_or_none( 'Result' )
-				assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for Generator[T,E] but was not found'
-				next_return_type = self.discovery._get_or_create_specialization( result_cls, [ result_union, error_type ] )
-				self.schedule( next_return_type )
-			else:
-				next_return_type = result_union
+			# fallible function).
+			assert error_type is not None, 'GeneratorType.error_type is never None for a legally-constructed generator (see discovery.py)'
+			self.schedule( error_type )
+			result_cls = self.discovery.find_name_or_none( 'Result' )
+			assert isinstance( result_cls, ClassLike ), 'builtins.Result is required for a generator\'s own __next__ but was not found'
+			next_return_type = self.discovery._get_or_create_specialization( result_cls, [ elem_type, error_type ] )
+			self.schedule( next_return_type )
 
 			backing_cls = self._build_generator_backing_class( fn, locals_decl, defer_sites, send_type )
-			resume_fn = self._build_generator_next_function( fn, backing_cls, locals_decl, next_return_type, error_type, pending_bare_return_assigns, defer_sites, send_type )
+			resume_fn = self._build_generator_next_function( fn, backing_cls, locals_decl, next_return_type, pending_bare_return_assigns, defer_sites, send_type )
 			# PLAN_GENERATORS.md Phase C - __next__()/send(v) thin wrappers
 			# over $$__resume__ (built just above) - only when SendType is
 			# declared; Iterator[T]/Generator[T,E] already got their own
@@ -2331,7 +2364,6 @@ class TypeResolver:
 			self.schedule( backing_cls.get_local_or_raise( '__next__' ))
 			if send_type is not None:
 				self.schedule( backing_cls.get_local_or_raise( 'send' ))
-			self.schedule( result_union )
 
 			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, defer_sites, send_type )
 			fn.return_type = backing_cls
@@ -6029,6 +6061,9 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# case Result.Ok(x): - the class path directly NAMES the union
 			# (Result) and the member (Ok) as text - the union comes from
 			# the PATTERN, the subject's own static type is never consulted
+			# for THIS resolution step (finding owner/member by name) - only
+			# below, to detect the nested-opaque-member case a bare name
+			# lookup can't see on its own.
 			owner = self._try_resolve_namespace( pattern.cls.value )
 			if not isinstance( owner, TaggedUnion ):
 				self.discovery.fail( f'unsupported match pattern class: {ast.unparse(pattern)}', node )
@@ -6036,6 +6071,51 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			member = next( ( attr for attr in owner.attributes if attr.stem == pattern.cls.attr ), None )
 			if member is None:
 				self.discovery.fail( f'{owner.qualname} has no member {pattern.cls.attr!r}: {ast.unparse(pattern)}', node )
+			# a real, confirmed bug (not hypothetical): `owner` above is
+			# resolved PURELY from the pattern's own text, with zero regard
+			# for what the SUBJECT's own actual type is. That's correct
+			# when the subject genuinely IS owner's own type directly (the
+			# overwhelmingly common case, `match r: case Result.Ok(x):`
+			# where r: Result[...]) - but when `owner` (a nominal union,
+			# e.g. MyError) is instead nested OPAQUELY as one member of a
+			# WIDER union that's the subject's real type (e.g. `e: MyError
+			# | StopIteration`, `case MyError.Bad(_):`), the code built
+			# below tests MyError's OWN internal tag position (Bad's
+			# position within MyError) directly against the SUBJECT - which
+			# is really the OUTER union's own tag storage, an entirely
+			# different tag space. Confirmed via a real repro: silently
+			# WRONG generated code (not a crash, not a compile error) -
+			# `case MyError.Bad(_):` matched whenever the outer union's own
+			# tag happened to equal Bad's position within MyError, which is
+			# only ever correct by coincidence (MyError sorting first in
+			# the outer union's own canonicalized member order). Every
+			# `Generator[T,E]`'s error type now includes StopIteration
+			# (PLAN_GENERATORS.md's StopIteration reversal) - since
+			# `StopIteration` lives in builtins, it sorts ahead of almost
+			# any user error type, so this shape is now the COMMON case for
+			# generator error handling, not a rare edge case.
+			#
+			# Fixed by detecting the nested-opaque case here and building
+			# the outer union's own match_union_member step FIRST, handing
+			# it this SAME pattern node as its own inner_pattern - the
+			# resulting recursive _match_pattern call re-enters this exact
+			# branch, but against payload_expr (self.<data>.v_<owner's own
+			# stem>), whose type genuinely IS `owner` directly, so the
+			# ordinary (already-correct) case handles it from there with
+			# zero further special-casing.
+			subj_type = self._type_of_expr( subj_expr )
+			subj_spec = self.resolver._as_specialization( subj_type ) if subj_type is not None else None
+			subj_base = subj_spec.base if subj_spec is not None else subj_type
+			if isinstance( subj_base, TaggedUnion ) and subj_base is not owner:
+				outer_members = self._resolved_union_members( subj_type, subj_base )
+				outer_member = next( ( attr for attr in outer_members if attr.type is owner ), None )
+				if outer_member is not None:
+					return self._match_union_member( subj_expr, subj_base, outer_member, pattern, node, original_subject_name )
+				self.discovery.fail(
+					f'{owner.qualname} is not {subj_base.qualname} and is not one of its members - match pattern '
+					f'names a union unrelated to the subject\'s own type: {ast.unparse(pattern)}',
+					node,
+				)
 			return self._match_union_member( subj_expr, owner, member, pattern.patterns[0], node, original_subject_name )
 
 		if isinstance( pattern.cls, ast.Name ):
