@@ -956,27 +956,22 @@ def _encode_body( data: bytes|str|None, form: dict[str,str]|None, json_value: JS
 		match dumps( jv ):
 			case Result.Ok( text ):
 				body: bytes = text.encode().unwrap( '_encode_body: json.dumps() output is always valid UTF-8' )
-				result: tuple[bytes|None, str|None] = ( body, 'application/json' )
-				return Result.Ok( result )
+				return Result.Ok(( body, 'application/json' ))
 			case Result.Err( _ ):
 				return Result.Err( HTTPError.InvalidJSON( None ))
 	if form is not None:
 		f: dict[str,str] = form
 		encoded: str = _form_encode( f )
 		form_body: bytes = encoded.encode().unwrap( '_encode_body: form encoding is always ASCII' )
-		form_result: tuple[bytes|None, str|None] = ( form_body, 'application/x-www-form-urlencoded' )
-		return Result.Ok( form_result )
+		return Result.Ok(( form_body, 'application/x-www-form-urlencoded' ))
 	if data is not None:
 		match data:
 			case bytes( b ):
-				bytes_result: tuple[bytes|None, str|None] = ( b, None )
-				return Result.Ok( bytes_result )
+				return Result.Ok(( b, None ))
 			case str( s ):
 				sb: bytes = s.encode().unwrap( '_encode_body: request body string must be valid UTF-8' )
-				str_result: tuple[bytes|None, str|None] = ( sb, None )
-				return Result.Ok( str_result )
-	empty_result: tuple[bytes|None, str|None] = ( None, None )
-	return Result.Ok( empty_result )
+				return Result.Ok(( sb, None ))
+	return Result.Ok(( None, None ))
 
 def _is_redirect_status( status_code: u16 ) -> bool:
 	return status_code == 301 or status_code == 302 or status_code == 303 or status_code == 307 or status_code == 308

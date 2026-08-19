@@ -529,15 +529,22 @@ Compiler gaps found while landing Phase 4a
    the enclosing function's declared return type wraps a tuple with union
    element types (Result[tuple[bytes|None,str|None], HTTPError] here), left
    T ambiguous - "inferred as both tuple[bytes|None,str|None] and
-   tuple[bytes,str]" (a real compile error). This is a narrower case than
-   task_34251c9f (a union AS a tuple's own element - fixed by 98c2010): here
-   the tuple/union shape itself is fine on its own (it's exactly what
-   task_34251c9f fixed), the NEW gap is specifically Result.Ok(...) inferring
-   its own T from a bare tuple-literal argument rather than the function's
-   declared return type. Worked around by staging every such tuple literal
-   through an explicitly `tuple[bytes|None,str|None]`-typed local first, then
-   passing THAT to Result.Ok() - see _encode_body's own comment. Flagged as
-   task_ffb0bdb5.
+   tuple[bytes,str]" (a real compile error). Worked around at the time by
+   staging every such tuple literal through an explicitly-typed local first,
+   then passing THAT to Result.Ok(). Flagged as task_ffb0bdb5. FIXED - turned
+   out to already be resolved on master by the time this was revisited: the
+   same root cause as union_coercion_rc_test.py's "bug (4)"
+   (monomorphize.py's substitute_type_params eagerly resolving a TupleType
+   bound to a TypeVar into its backing RCClass before _expr_Tuple's own
+   union-coercion pass saw it, so a bare TupleType-shaped hint went
+   unrecognized and the tuple's NATURAL element types got inferred instead,
+   disagreeing with the declared return type) - that fix already covered
+   this shape too, nobody had circled back to remove the workaround.
+   Re-verified directly (bytes|None+str|None asymmetric pair, 3-element
+   tuples, non-Optional union members i32|str, and Result.Err(...) instead
+   of Result.Ok(...) - all compile clean now) before removing the staging
+   locals from _encode_body and re-running the full http_client_test.py +
+   tests.py suites (1401 tests, all green).
 
 2. A nested `match` (every arm returning) directly inside an `if x is not
    None:` block, immediately followed by a plain `if` checking a DIFFERENT
