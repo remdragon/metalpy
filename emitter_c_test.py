@@ -4276,6 +4276,36 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ptr_dot_operator_method_call_on_plain_cstruct( self ) -> None:
+		# a plain (non-interface) CStruct's self is a real by-value T, unlike
+		# an @interface CStruct's (always Ptr[T]) - calling p.method() through
+		# p: Ptr[T] used to pass the raw pointer straight through as self,
+		# producing a C compile error (passing struct T* to a parameter
+		# declared struct T). _resolve_callee's own receiver (still evaluated
+		# against p's un-redirected Ptr[T] type) now gets dereferenced first,
+		# the same GetItem `p[0]` itself uses.
+		self._run( '''
+@cstruct
+class Widget:
+	y: i32
+	def double_y( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.y * 2
+
+def main() -> i32:
+	w: Widget = Widget( y = 21 )
+	p: Ptr[Widget] = compiler.addrof( w )
+	r: i32 = p.double_y()
+	if r != 42:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( '(p)[((uintptr_t)0ULL)]', src ) # real dereference before the by-value call, not the raw pointer
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_virtual_dispatch_calls_the_override_not_the_stub( self ) -> None:
 		# real vtable dispatch, not a direct call - IFoo's own get_value is
 		# an unfulfilled stub (never emitted as a real C function - see
