@@ -520,8 +520,29 @@ this codebase was hitting the same walls before these fixes landed).
   this was genuinely new territory, not a previously-exercised path.
   Flagged as task_3abe3f4f.
 
+  verify=False landed — a `verify: bool = True` parameter threaded through
+  Session.request()/get/post/put/patch/delete/head/options, the matching
+  module-level convenience functions, and HTTPSConnection.connect(), down
+  to _connect_tls_or_http_err(). verify=False switches to a new
+  ssl.SSLContext.create_unverified_context() sibling factory (added on both
+  the Windows/Schannel and Linux/OpenSSL backends - Windows via
+  SCH_CRED_MANUAL_CRED_VALIDATION instead of SCH_CRED_AUTO_CRED_VALIDATION,
+  Linux via SSL_CTX_set_verify(..., SSL_VERIFY_NONE, ...) instead of
+  SSL_VERIFY_PEER - both purely additive, existing create_default_context()
+  untouched). macOS's poison-pill SSLContext stub got a matching
+  create_unverified_context() stub too, for API symmetry. Proven for real,
+  not just compiled: a new test (https_verify_false_accepts_expired_cert)
+  hits the same expired.badssl.com endpoint the existing certificate-
+  failure test already dials (which correctly still rejects with
+  verify=True/default), and confirms verify=False's handshake succeeds
+  anyway. Run across all three local compilers (MSVC and clang on Windows -
+  Schannel backend, gcc via WSL - OpenSSL backend) - full suite green on
+  all three (1401 tests).
+
   Phase 4c (deferred/future plan doc) — multipart `files=` uploads,
-    connection reuse/keep-alive, HTTP/2.
+    connection reuse/keep-alive, HTTP/2. timeout_ms= is also still
+    deferred, but no longer blocked here specifically - a separate session
+    is adding non-blocking I/O (incl. timeout support) to lib/socket.py.
 
 Compiler gaps found while landing Phase 4a
 
@@ -529,15 +550,22 @@ Compiler gaps found while landing Phase 4a
    the enclosing function's declared return type wraps a tuple with union
    element types (Result[tuple[bytes|None,str|None], HTTPError] here), left
    T ambiguous - "inferred as both tuple[bytes|None,str|None] and
-   tuple[bytes,str]" (a real compile error). This is a narrower case than
-   task_34251c9f (a union AS a tuple's own element - fixed by 98c2010): here
-   the tuple/union shape itself is fine on its own (it's exactly what
-   task_34251c9f fixed), the NEW gap is specifically Result.Ok(...) inferring
-   its own T from a bare tuple-literal argument rather than the function's
-   declared return type. Worked around by staging every such tuple literal
-   through an explicitly `tuple[bytes|None,str|None]`-typed local first, then
-   passing THAT to Result.Ok() - see _encode_body's own comment. Flagged as
-   task_ffb0bdb5.
+   tuple[bytes,str]" (a real compile error). Worked around at the time by
+   staging every such tuple literal through an explicitly-typed local first,
+   then passing THAT to Result.Ok(). Flagged as task_ffb0bdb5. FIXED - turned
+   out to already be resolved on master by the time this was revisited: the
+   same root cause as union_coercion_rc_test.py's "bug (4)"
+   (monomorphize.py's substitute_type_params eagerly resolving a TupleType
+   bound to a TypeVar into its backing RCClass before _expr_Tuple's own
+   union-coercion pass saw it, so a bare TupleType-shaped hint went
+   unrecognized and the tuple's NATURAL element types got inferred instead,
+   disagreeing with the declared return type) - that fix already covered
+   this shape too, nobody had circled back to remove the workaround.
+   Re-verified directly (bytes|None+str|None asymmetric pair, 3-element
+   tuples, non-Optional union members i32|str, and Result.Err(...) instead
+   of Result.Ok(...) - all compile clean now) before removing the staging
+   locals from _encode_body and re-running the full http_client_test.py +
+   tests.py suites (1401 tests, all green).
 
 2. A nested `match` (every arm returning) directly inside an `if x is not
    None:` block, immediately followed by a plain `if` checking a DIFFERENT

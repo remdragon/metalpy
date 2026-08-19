@@ -809,7 +809,19 @@ def main() -> i32:
 		case Result.Err( _ ):
 			return 2  # wrong HTTPError variant
 ''' ),
-		], timeout = 60.0 )  # three real external TLS handshakes - generous margin for network jitter
+			( 'https_verify_false_accepts_expired_cert', '''
+from http.client import get
+
+def main() -> i32:
+	# same expired-cert endpoint as https_certificate_failure_surfaces_as_
+	# tlserror above, but verify=False should skip validation entirely and
+	# let the handshake (and request) succeed anyway
+	r = get( 'https://expired.badssl.com/', verify = False ).unwrap( 'verify=False https get' )
+	if r.status_code != 200:
+		return 1
+	return 0
+''' ),
+		], timeout = 90.0 )  # four real external TLS handshakes - generous margin for network jitter
 
 
 if __name__ == '__main__':

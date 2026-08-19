@@ -394,15 +394,19 @@ def _usize_from_str( s: str ) -> Result[usize, HTTPError]:
 # isn't that, and doesn't claim to be.
 # ---------------------------------------------------------------------------
 
-def _connect_tls_or_http_err( host: str, port: u16 ) -> Result[ssl.SSLSocket, HTTPError]:
+def _connect_tls_or_http_err( host: str, port: u16, verify: bool = True ) -> Result[ssl.SSLSocket, HTTPError]:
 	''' TCP-connects (via _connect_or_http_err below), then TLS-wraps via
 	lib/ssl.py. A handshake failure (including a certificate problem -
 	lib/ssl.py's create_default_context() already turns on peer
 	verification, matching this file's own "secure by default" posture
 	elsewhere) collapses to HTTPError.TLSError - a caller wanting the
-	specific ssl.SSLError reason would need to use lib/ssl.py directly. '''
+	specific ssl.SSLError reason would need to use lib/ssl.py directly.
+	verify=False switches to create_unverified_context() (mirrors requests'
+	verify=False) - for a self-signed/dev server only, never a real
+	endpoint. '''
 	sock: Socket = _connect_or_http_err( host, port ).or_return()
-	match ssl.SSLContext.create_default_context():
+	ctx_result: Result[ssl.SSLContext, ssl.SSLError] = ssl.SSLContext.create_default_context() if verify else ssl.SSLContext.create_unverified_context()
+	match ctx_result:
 		case Result.Ok( ctx ):
 			match ssl.SSLSocket.wrap_socket( ctx, sock, host ):
 				case Result.Ok( tls ):
@@ -424,14 +428,14 @@ def _do_request_response[T]( transport: T, method: str, full_path: str, host: st
 	conn.close()
 	return Result.Ok( response )
 
-def _perform_request_for_scheme( scheme: str, host: str, port: u16, method: str, full_path: str, headers: HTTPHeaders, body: bytes|None ) -> Result[Response, HTTPError]:
+def _perform_request_for_scheme( scheme: str, host: str, port: u16, method: str, full_path: str, headers: HTTPHeaders, body: bytes|None, verify: bool = True ) -> Result[Response, HTTPError]:
 	''' the ONE runtime branch point in this whole file for choosing plain
 	vs TLS. Session.request() doesn't know the scheme until it's parsed the
 	URL, so SOME runtime decision is unavoidable here - but it's confined to
 	exactly this one if/else, not sprinkled through every layer the way the
 	old _Transport union's tag-dispatch was. '''
 	if scheme == 'https':
-		tls: ssl.SSLSocket = _connect_tls_or_http_err( host, port ).or_return()
+		tls: ssl.SSLSocket = _connect_tls_or_http_err( host, port, verify ).or_return()
 		return _do_request_response( tls, method, full_path, host, headers, body )
 	sock: Socket = _connect_or_http_err( host, port ).or_return()
 	return _do_request_response( sock, method, full_path, host, headers, body )
@@ -816,8 +820,8 @@ class HTTPSConnection:
 	carrying that live transport. '''
 
 	@staticmethod
-	def connect( host: str, port: u16 = 443 ) -> Result[_Connection[ssl.SSLSocket], HTTPError]:
-		tls: ssl.SSLSocket = _connect_tls_or_http_err( host, port ).or_return()
+	def connect( host: str, port: u16 = 443, verify: bool = True ) -> Result[_Connection[ssl.SSLSocket], HTTPError]:
+		tls: ssl.SSLSocket = _connect_tls_or_http_err( host, port, verify ).or_return()
 		return Result.Ok( _Connection[ssl.SSLSocket]._from_transport( tls, host, port ))
 
 # ---------------------------------------------------------------------------
@@ -956,27 +960,22 @@ def _encode_body( data: bytes|str|None, form: dict[str,str]|None, json_value: JS
 		match dumps( jv ):
 			case Result.Ok( text ):
 				body: bytes = text.encode().unwrap( '_encode_body: json.dumps() output is always valid UTF-8' )
-				result: tuple[bytes|None, str|None] = ( body, 'application/json' )
-				return Result.Ok( result )
+				return Result.Ok(( body, 'application/json' ))
 			case Result.Err( _ ):
 				return Result.Err( HTTPError.InvalidJSON( None ))
 	if form is not None:
 		f: dict[str,str] = form
 		encoded: str = _form_encode( f )
 		form_body: bytes = encoded.encode().unwrap( '_encode_body: form encoding is always ASCII' )
-		form_result: tuple[bytes|None, str|None] = ( form_body, 'application/x-www-form-urlencoded' )
-		return Result.Ok( form_result )
+		return Result.Ok(( form_body, 'application/x-www-form-urlencoded' ))
 	if data is not None:
 		match data:
 			case bytes( b ):
-				bytes_result: tuple[bytes|None, str|None] = ( b, None )
-				return Result.Ok( bytes_result )
+				return Result.Ok(( b, None ))
 			case str( s ):
 				sb: bytes = s.encode().unwrap( '_encode_body: request body string must be valid UTF-8' )
-				str_result: tuple[bytes|None, str|None] = ( sb, None )
-				return Result.Ok( str_result )
-	empty_result: tuple[bytes|None, str|None] = ( None, None )
-	return Result.Ok( empty_result )
+				return Result.Ok(( sb, None ))
+	return Result.Ok(( None, None ))
 
 def _is_redirect_status( status_code: u16 ) -> bool:
 	return status_code == 301 or status_code == 302 or status_code == 303 or status_code == 307 or status_code == 308
@@ -1088,6 +1087,7 @@ class Session:
 		cookies: dict[str,str]|None = None,
 		auth: tuple[str,str]|None = None,
 		allow_redirects: bool = True,
+		verify: bool = True,
 	) -> Result[Response, HTTPError]:
 		current_method: str = method
 		current_url: str = url
@@ -1114,7 +1114,7 @@ class Session:
 				cookie_header: str|None = self._build_cookie_header( cookies )
 				request_headers: HTTPHeaders = _build_request_headers( self.headers, content_type, headers, cookie_header, auth )
 
-				response: Response = _perform_request_for_scheme( parsed.scheme, parsed.host, parsed.port, current_method, full_path, request_headers, current_body ).or_return()
+				response: Response = _perform_request_for_scheme( parsed.scheme, parsed.host, parsed.port, current_method, full_path, request_headers, current_body, verify ).or_return()
 				response.url = current_url
 				self._harvest_cookies( response.headers )
 
@@ -1135,32 +1135,32 @@ class Session:
 				current_url = next_url
 
 	def get( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'GET', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'GET', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 	def post( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'POST', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'POST', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 	def put( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'PUT', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'PUT', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 	def patch( self, url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'PATCH', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'PATCH', url, params = params, data = data, form = form, json = json, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 	def delete( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'DELETE', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'DELETE', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 	def head( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
-		return self.request( 'HEAD', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False, verify: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'HEAD', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 	def options( self, url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-		return self.request( 'OPTIONS', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+		cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+		return self.request( 'OPTIONS', url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 # ---------------------------------------------------------------------------
 # module-level convenience - each a one-off Session() underneath, matching
@@ -1169,29 +1169,29 @@ class Session:
 # ---------------------------------------------------------------------------
 
 def get( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().get( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+	return Session().get( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 def post( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().post( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+	return Session().post( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 def put( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().put( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+	return Session().put( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 def patch( url: str, data: bytes|str|None = None, form: dict[str,str]|None = None, json: JSONValue|None = None, params: dict[str,str]|None = None,
-	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().patch( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	headers: HTTPHeaders|None = None, cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+	return Session().patch( url, data = data, form = form, json = json, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 def delete( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().delete( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+	return Session().delete( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 def head( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False ) -> Result[Response, HTTPError]:
-	return Session().head( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = False, verify: bool = True ) -> Result[Response, HTTPError]:
+	return Session().head( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
 
 def options( url: str, params: dict[str,str]|None = None, headers: HTTPHeaders|None = None,
-	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True ) -> Result[Response, HTTPError]:
-	return Session().options( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects )
+	cookies: dict[str,str]|None = None, auth: tuple[str,str]|None = None, allow_redirects: bool = True, verify: bool = True ) -> Result[Response, HTTPError]:
+	return Session().options( url, params = params, headers = headers, cookies = cookies, auth = auth, allow_redirects = allow_redirects, verify = verify )
