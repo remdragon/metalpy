@@ -143,18 +143,14 @@ def memcmp( a: ConstPtr[u8], b: ConstPtr[u8], count: usize ) -> i32:
 	return _crt_memcmp( a, b, count )
 
 @compiler.target( os = 'windows' )
-def exit( code: u32 ) -> NoReturn:
+def exit( code: i32 ) -> NoReturn:
 	from windows.kernel32 import ExitProcess
-	ExitProcess( code )
+	ExitProcess( u32( code ))
 
 @compiler.target( os = not 'windows' )
-def exit( code: u32 ) -> NoReturn:
+def exit( code: i32 ) -> NoReturn:
 	from crt import _exit
-	# POSIX _exit(int status) takes a signed int - code is u32 (matches
-	# Windows' own u32 exit-code convention, see the sibling branch above),
-	# an explicit narrowing/sign-changing cast either way
-	with compiler.wrap_arithmetic:
-		_exit( i32( code ) )
+	_exit( code )
 
 def panic( message: str ) -> NoReturn:
 	# TODO: route through a real `stderr` stream once IO interfaces exist (see
