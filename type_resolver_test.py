@@ -478,6 +478,32 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertIsNone( myerr.resolve )
 		self.assertEqual( myerr.members, { 'FileNotFound': 2, 'Other': 3 } )
 
+	def test_local_shadowing_global_function_is_not_scheduled( self ) -> None:
+		# _try_resolve_callable_namespace's bare Name lookup can land on an
+		# unrelated module-level function sharing a name with a plain local
+		# variable (fn.names isn't populated until lowering runs - see that
+		# method's own docstring). Calling a method on such a local used to
+		# unconditionally schedule the wrongly-guessed function - and
+		# everything IT calls - as a side effect of a probe that ultimately,
+		# correctly, found nothing.
+		mod = self._import( '\n'.join([
+			'def heavy_dep() -> i32:',
+			'	return 999',
+			'',
+			'def head( x: i32 ) -> i32:', # unrelated top-level fn, same name as the local below
+			'	return heavy_dep()',
+			'',
+			'def main() -> str:',
+			'	head: str = "hi"',
+			'	return head.upper()',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		head_fn = mod.get_local( 'head' )
+		heavy_dep_fn = mod.get_local( 'heavy_dep' )
+		self.assertNotIn( id( head_fn ), self.resolver._seen )
+		self.assertNotIn( id( heavy_dep_fn ), self.resolver._seen )
+
 	# --- idempotency --------------------------------------------------------
 
 	def test_resolve_function_body_is_idempotent( self ) -> None:
