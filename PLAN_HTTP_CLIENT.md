@@ -639,7 +639,14 @@ Remaining backlog / future work
          list[str]|None of the exact secret values in play for that
          request (the password half of auth=, an API key the caller is
          about to put in a custom header, etc.) - NOT an attempt to
-         auto-detect "this looks like a secret".
+         auto-detect "this looks like a secret". Per the user directly:
+         don't use a regex library for this in MetalPy - every value being
+         matched is a literal string, not a pattern, so there's nothing
+         regex buys here. A chain of str.replace(secret, '***CENSORED***')
+         calls (one per sensitive value, sorted LONGEST-first for the same
+         substring-safety reason the reference sorts its regex
+         alternatives) gets the identical result with no `re`-equivalent
+         library dependency at all.
        - Redact the WHOLE serialized message in one pass, not header-by-
          header. The reference builds one flat string for the full wire
          message first (method+url, then headers, then a blank line, then
