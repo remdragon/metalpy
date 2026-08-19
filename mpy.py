@@ -57,6 +57,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'strip symbols / fold identical code for a smaller binary' )
 	p.add_argument( '--asan', action = 'store_true',
 		help = 'build with AddressSanitizer (requires the C runtime - forces CRT linking for a program that would otherwise build freestanding/no-CRT)' )
+	p.add_argument( '--crt', action = 'store_true',
+		help = 'force CRT linking even if the program itself never uses a \'c\' extern (normally: no_crt = \'c\' not in compiler.extern_libs) - e.g. to get __chkstk/other CRT-only support routines without adding a throwaway extern call' )
 	p.add_argument( '--show-warnings', action = 'store_true',
 		help = 'print compiler warnings even on a successful build (off by default - the shared builtins runtime currently emits pre-existing warnings on every build)' )
 	return p.parse_args()
@@ -190,6 +192,8 @@ def main() -> None:
 
 	# --- stage 5: emit C ---
 	no_crt = 'c' not in compiler.extern_libs
+	if args.crt:
+		no_crt = False
 	no_crt = linker_c.resolve_no_crt( no_crt, args.asan )
 	c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
 
