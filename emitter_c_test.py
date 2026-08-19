@@ -8124,6 +8124,128 @@ def main() -> i32:
 		], timeout = 30 )
 
 
+class BisectTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' lib/bisect.py's bisect_left/bisect_right (direct T-vs-T comparison)
+	and bisect_left_by_key/bisect_right_by_key (key: Ptr[Callable[[T],K]]
+	extractor, T and K allowed to differ) - and UnsafeList[T].as_slice(),
+	the slice[T] view bridge these need arr: slice[T] parameters from.
+	Never compiled/run anywhere before this - lib/builtins/__RawDict.py used
+	to hand-roll its own binary search specifically because bisect.py's
+	key= couldn't be made to work (no Callable[...] support, then no
+	slice[T] construction path); RawDict._lower_bound now calls
+	bisect_left_by_key for real (see DictTests). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'as_slice_over_value_typed_elements', '''
+def main() -> i32:
+	arr: UnsafeList[i32] = UnsafeList[i32]()
+	arr.append( 10 ).unwrap( 'append' )
+	arr.append( 20 ).unwrap( 'append' )
+	arr.append( 30 ).unwrap( 'append' )
+	s: slice[i32] = arr.as_slice()
+	if len( s ) != 3:
+		return 1
+	if s.get_unchecked( 0 ) != 10 or s.get_unchecked( 1 ) != 20 or s.get_unchecked( 2 ) != 30:
+		return 2
+	return 0
+''' ),
+			# as_slice() over an EMPTY list - _slot_ptr(0) is deliberately not
+			# bounds-checked against __len for exactly this case (see its own
+			# docstring); a zero-length slice must still be constructible and
+			# safe (nothing can read through it - every real read goes
+			# through an index < len() check first)
+			( 'as_slice_over_empty_list', '''
+def main() -> i32:
+	arr: UnsafeList[i32] = UnsafeList[i32]()
+	s: slice[i32] = arr.as_slice()
+	if len( s ) != 0:
+		return 1
+	return 0
+''' ),
+			# as_slice() over an RC element type (str) - slice[T]'s own _ptr is
+			# untyped (ConstPtr[None]) and get_unchecked already does the
+			# compiler.is_rc(T) handle-vs-value branch, unlike UnsafeList.
+			# get_ptr (documented value-typed-T-only) - confirms the two
+			# containers' buffer layouts genuinely agree for RC T too
+			( 'as_slice_over_rc_elements', '''
+def main() -> i32:
+	arr: UnsafeList[str] = UnsafeList[str]()
+	arr.append( 'apple' ).unwrap( 'append' )
+	arr.append( 'banana' ).unwrap( 'append' )
+	arr.append( 'cherry' ).unwrap( 'append' )
+	s: slice[str] = arr.as_slice()
+	if s.get_unchecked( 0 ) != 'apple':
+		return 1
+	if s.get_unchecked( 1 ) != 'banana':
+		return 2
+	if s.get_unchecked( 2 ) != 'cherry':
+		return 3
+	return 0
+''' ),
+			( 'bisect_left_and_right_direct_comparison', '''
+import bisect
+
+def main() -> i32:
+	arr: UnsafeList[i32] = UnsafeList[i32]()
+	arr.append( 1 ).unwrap( 'append' )
+	arr.append( 3 ).unwrap( 'append' )
+	arr.append( 3 ).unwrap( 'append' )
+	arr.append( 5 ).unwrap( 'append' )
+	arr.append( 7 ).unwrap( 'append' )
+	s: slice[i32] = arr.as_slice()
+	if bisect.bisect_left( s, 3 ) != 1:
+		return 1
+	if bisect.bisect_right( s, 3 ) != 3:
+		return 2
+	if bisect.bisect_left( s, 0 ) != 0:
+		return 3
+	if bisect.bisect_right( s, 100 ) != 5:
+		return 4
+	empty: UnsafeList[i32] = UnsafeList[i32]()
+	if bisect.bisect_left( empty.as_slice(), 5 ) != 0:
+		return 5
+	return 0
+''' ),
+			# T != K: the exact shape a plain Optional key= parameter can't
+			# support (see lib/bisect.py's own module docstring) - a struct
+			# array searched by one numeric field, RawDict's own real usage
+			( 'bisect_by_key_with_differing_element_and_key_types', '''
+import bisect
+
+@cstruct
+class Node:
+	hash: u64
+	payload: usize
+
+def hash_of( n: Node ) -> u64:
+	return n.hash
+
+def main() -> i32:
+	arr: UnsafeList[Node] = UnsafeList[Node]()
+	arr.append( Node( hash = 1, payload = 0 )).unwrap( 'append' )
+	arr.append( Node( hash = 3, payload = 1 )).unwrap( 'append' )
+	arr.append( Node( hash = 3, payload = 2 )).unwrap( 'append' )
+	arr.append( Node( hash = 5, payload = 3 )).unwrap( 'append' )
+	key: Ptr[Callable[[Node],u64]] = hash_of
+	s: slice[Node] = arr.as_slice()
+	if bisect.bisect_left_by_key( s, u64( 3 ), key ) != 1:
+		return 1
+	if bisect.bisect_right_by_key( s, u64( 3 ), key ) != 3:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class TupleTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' tuple[T0, T1, ...] (tuple_storage.py's TupleStorage, discovery.py's
 	tuple[...] recognition, lowering.py's _expr_Tuple/_expr_Subscript) end-

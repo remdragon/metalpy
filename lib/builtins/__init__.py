@@ -153,7 +153,7 @@ class slice[T]:
 
 	def __getitem__( self, index: usize ) -> Result[T,IndexError]:
 		if index >= self.__len:
-			return Result.Err( IndexError )
+			return Result.Err( IndexError() )
 
 		return Result.Ok( self.get_unchecked( index ))
 
@@ -924,11 +924,13 @@ class str:
 		''' self inserted between each element of parts - str.concat's own
 		two-pass shape, plus self's own bytes between consecutive parts.
 		Takes list[str] rather than slice[str] (str.concat's own parameter
-		type) - slice[T] has no real construction path from ordinary
-		metalpy source anywhere in this codebase yet (no array-literal
-		syntax - see CaseFolding's own upper_table comment), while
-		list[str] is the container every caller already has a piece of
-		text collection in (e.g. split()'s own return type). '''
+		type) - list[str] is the container every caller already has a
+		piece of text collection in (e.g. split()'s own return type), and
+		list[T] (unlike UnsafeList[T], see its own as_slice()) deliberately
+		has no slice[T] view to hand over (a raw buffer view isn't safe to
+		hold once the lock that made it valid has been released - see
+		__list.py's own header comment), so bridging to str.concat would
+		still need an explicit copy either way. '''
 		count: usize = parts.__len__()
 		if count == 0:
 			return ''

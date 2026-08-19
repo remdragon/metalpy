@@ -279,6 +279,19 @@ class UnsafeList[T]:
 		ptr: Ptr[T] = compiler.cast( Ptr[T], self.__raw._ptr_at( idx ).or_return())
 		return Result.Ok( ptr )
 
+	# A borrowed slice[T] view over the WHOLE buffer - same "don't outlive
+	# the next mutation" borrow contract as get_ptr, but unlike get_ptr this
+	# is safe for an RC element type too: slice[T]'s own _ptr is untyped
+	# (ConstPtr[None]), and slice.get_unchecked/_element_size already do the
+	# same compiler.is_rc(T) handle-vs-value branch UnsafeList's own
+	# _read_element does - the two containers' buffer layouts always agree.
+	# _slot_ptr(0), not get_ptr(0)/_ptr_at(0) - those are bounds-checked
+	# against __len and would fail on an empty list; a zero-length slice is
+	# still well-formed (nothing can dereference through it, since every
+	# real read goes through an index < len() check first).
+	def as_slice( self ) -> slice[T]:
+		return slice[T]( _ptr = compiler.cast( ConstPtr[None], self.__raw._slot_ptr( 0 )), __len = self.__raw.len() )
+
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
 	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
