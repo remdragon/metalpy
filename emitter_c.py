@@ -3954,21 +3954,26 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		# still-open __chkstk gap - see msvc_no_crt_missing_chkstk memory) -
 		# defined unconditionally here anyway since an unreferenced extern
 		# definition is harmless, and cheaper than special-casing per
-		# compiler. Volatile-pointer stores, not plain ones: defeats loop-
-		# idiom recognition folding this very definition back into a call to
-		# itself under a --release (-O2) no_crt build.
+		# compiler. Thin wrappers around sys.memset/sys.memcpy (lib/sys.py's
+		# Windows target already routes both through ntdll's RtlFillMemory/
+		# RtlCopyMemory - genuinely no_crt-safe, no CRT dependency) rather
+		# than a hand-rolled byte loop: reuses an already-vetted primitive
+		# instead of duplicating it, and - unlike a hand-rolled loop - has
+		# no risk of loop-idiom recognition folding this very definition
+		# back into a self-recursive call to itself under a --release (-O2)
+		# no_crt build, since there's no loop in the call chain at all
+		# (RtlFillMemory/RtlCopyMemory are opaque extern calls). compiler.py's
+		# Compiler.run() force-enqueues sys.memset/sys.memcpy whenever
+		# no_crt, mirroring its existing sys.exit force_reachable - so
+		# sys$memset/sys$memcpy always resolve here, same guarantee
+		# mainCRTStartup's own sys$exit call already relies on.
 		parts.append(
 			'#ifdef _WIN32\n'
-			'void* memset( void* dst, int value, size_t n ) {\n'
-			'\tvolatile unsigned char* p = (volatile unsigned char*)dst;\n'
-			'\tfor ( size_t i = 0; i < n; i++ ) p[i] = (unsigned char)value;\n'
-			'\treturn dst;\n'
+			f'void* memset( void* dst, int value, size_t n ) {{\n'
+			f'\treturn {mangle_qualname( "sys.memset" )}( (uint8_t*)dst, (uint8_t)value, n );\n'
 			'}\n'
-			'void* memcpy( void* dst, const void* src, size_t n ) {\n'
-			'\tvolatile unsigned char* d = (volatile unsigned char*)dst;\n'
-			'\tconst unsigned char* s = (const unsigned char*)src;\n'
-			'\tfor ( size_t i = 0; i < n; i++ ) d[i] = s[i];\n'
-			'\treturn dst;\n'
+			f'void* memcpy( void* dst, const void* src, size_t n ) {{\n'
+			f'\treturn {mangle_qualname( "sys.memcpy" )}( (uint8_t*)dst, (const uint8_t*)src, n );\n'
 			'}\n'
 			'#endif'
 		)

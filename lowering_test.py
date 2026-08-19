@@ -7433,6 +7433,7 @@ class InlineTests( unittest.TestCase ):
 	_CONSOLE_INIT_QUALNAMES = frozenset({
 		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
 		'sys.exit', 'windows.kernel32.ExitProcess',
+		'sys.memset', 'sys.memcpy', 'windows.ntdll.RtlFillMemory', 'windows.ntdll.RtlCopyMemory',
 	})
 
 	def _function_qualnames( self ) -> set[str]:
@@ -7705,6 +7706,7 @@ class InlineMultiStatementTests( unittest.TestCase ):
 	_CONSOLE_INIT_QUALNAMES = frozenset({
 		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
 		'sys.exit', 'windows.kernel32.ExitProcess',
+		'sys.memset', 'sys.memcpy', 'windows.ntdll.RtlFillMemory', 'windows.ntdll.RtlCopyMemory',
 	})
 
 	def _function_qualnames( self ) -> set[str]:

@@ -205,6 +205,19 @@ class Compiler:
 				# all), so it's gated separately rather than being forced
 				# unconditionally on every Windows target.
 				self.force_reachable( 'sys', 'exit' )
+				# clang/gcc's own -O0 codegen implicitly calls the raw libc
+				# memset()/memcpy() symbols for local struct zero-init and
+				# by-value struct copies, regardless of whether the user's
+				# own program ever calls either - see emitter_c.py's own
+				# no_crt memset/memcpy PROLOGUE stand-ins (local_cstruct_
+				# array_zero_init_memset_bug memory). Those stand-ins are
+				# thin wrappers around sys.memset/sys.memcpy (Windows'
+				# RtlFillMemory/RtlCopyMemory - no CRT dependency, and no
+				# hand-rolled loop for a compiler to fold back into a
+				# self-recursive memset/memcpy call), so those two must be
+				# forced reachable here too, same as sys.exit above.
+				self.force_reachable( 'sys', 'memset' )
+				self.force_reachable( 'sys', 'memcpy' )
 
 	def force_reachable( self, module_qualname: str, attr_name: str ) -> None:
 		''' resolves module_qualname.attr_name (a Function or global
