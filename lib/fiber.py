@@ -159,6 +159,15 @@ class Fiber:
 		munmap( self.__base, self.__guard_and_stack )
 		sys.free( compiler.cast( Ptr[None], self.__handle ))
 
+	def state( self ) -> FiberState:
+		''' lets a driver (e.g. a Worker's scheduling loop) tell what to do
+		with this fiber once control returns to it: IDLE means the task
+		ran to completion (safe to pool/reuse for a fresh start()), PARKED
+		means it called park() mid-task (needs a later unpark(), not a new
+		task). Never observes RUNNING from outside - that's only ever this
+		fiber's own view of itself while switched in. '''
+		return self.__state
+
 	def start( self, task: Closure[[], None] ) -> None:
 		''' switch control into this IDLE fiber to run a NEW `task` from
 		scratch. Returns once the fiber parks (mid-task, via the free
@@ -171,6 +180,20 @@ class Fiber:
 		only correct way to continue it. '''
 		if self.__state != FiberState.IDLE:
 			sys.panic( 'Fiber.start: fiber is not idle (RUNNING, or PARKED - use unpark() instead)' )
+		# incref before stashing into the type-erased __pending field:
+		# _run_loop's `task: Closure[[],None] = compiler.cast(...)` re-derives
+		# its own Closure-typed local from that raw pointer, and (like every
+		# compiler.cast() result in this compiler - see list.py's
+		# _read_element comment) gets its own phantom scope-exit decref, not
+		# recognized as merely aliasing this same reference. Without this
+		# incref, `task`'s caller-side owned reference AND _run_loop's own
+		# local both decref the same object once each - one too many, a real
+		# heap-use-after-free confirmed via ASAN once a fiber runs a second
+		# task (task 1's phantom decref lands, mid-suspension, only once
+		# task 2 resumes the loop - so it takes 2 uses to manifest, and only
+		# reliably crashes visibly once something (like a spawned pthread's
+		# own exit) actually surfaces the resulting heap corruption).
+		compiler.incref( task )
 		self.__pending = compiler.cast( Ptr[None], task )
 		self.__state = FiberState.RUNNING
 		self.__switch_in()
