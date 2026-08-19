@@ -434,16 +434,56 @@ this codebase was hitting the same walls before these fixes landed).
     project supports (MSVC, clang on Windows; gcc on Linux via WSL).
 
     One real, pre-existing compiler gap found while landing this (unrelated
-    to TLS/HTTP specifically - see PLAN_SSL.md's own note, and the task
-    flagged for it): `expr.field.method() is None` fails to compile
-    ("built-in operator '==' cannot be applied" to the str|None union)
-    where the equivalent staged through a local (`local.method() is None`)
-    compiles fine. Worked around at the one call site that hit it
-    (HTTPSClientTests.httpsconnection_direct stages resp.headers into a
-    local first) rather than blocking this work on a compiler fix, matching
-    this file's own established practice for compiler gaps found while
-    landing a phase - see "Compiler gaps found while landing Phase 4a" below
-    for the precedent.
+    to TLS/HTTP specifically - see PLAN_SSL.md's own note): `expr.field.
+    method() is None` failed to compile where the equivalent staged through
+    a local (`local.method() is None`) compiled fine. Fixed for real since
+    (commits 38c6df1/9bdd36b - see MEMORY.md's own chained_field_is_none_
+    narrowing_bug_fixed note) - the http_client_test.py workaround was
+    already reverted back to the plain chained form once that landed, same
+    as every other compiler gap this plan has tracked.
+
+  Transport redesign (_Transport union -> generic _Connection[T]) — the
+  original Phase 4b landing used a `@union class _Transport: Plain: Socket;
+  Secure: ssl.SSLSocket` field on HTTPConnection so request()/getresponse()/
+  close() had one thing to call send()/recv()/close() on regardless of
+  scheme. Per explicit user feedback (also captured in this session's
+  memory), replaced with a GENERIC `_Connection[T]` (T=Socket or
+  T=ssl.SSLSocket, monomorphized separately) instead - HTTPConnection/
+  HTTPSConnection are now thin non-generic entry-point classes whose
+  connect() returns a specific instantiation. Confirmed via real compile
+  spikes before committing to the design: a generic free function/method
+  can call a NAMED method directly on a bare type parameter with no shared
+  base class/interface (`transport.send(...)`), and this works even nested
+  two levels deep (_do_request_response[T] -> _Connection[T]._from_transport
+  -> generic methods calling transport.send/recv/close). Session.request()
+  keeps exactly ONE runtime scheme branch (_perform_request_for_scheme) -
+  unavoidable, since it doesn't know the scheme until the URL is parsed -
+  with everything downstream of that one branch fully generic/dispatch-free.
+
+  What this bought, and what it didn't (tested, not assumed): the runtime
+  tag-dispatch `match` code that used to be sprinkled through every I/O
+  call site (_send_all/_GrowableBuffer.fill_from/_read_*_body) is gone, and
+  each _Connection[T] is sized exactly for whichever transport it holds
+  rather than the union's own tag + larger-payload layout. It is NOT a
+  binary-size/linkage win, despite first appearances - compiled .exe size
+  and extern_libs were tested directly (HTTPConnection-only program vs.
+  HTTPSConnection-only program) and came out byte-identical, both linking
+  secur32 either way, because importing http.client schedules the WHOLE
+  MODULE for compilation in this compiler's model, not just the specific
+  names a program references - HTTPSConnection sits in the same file as
+  HTTPConnection regardless of transport representation. Making ssl.py
+  genuinely opt-in would need HTTPSConnection split into its own separately
+  -imported module, a different, not-yet-done change.
+
+  One real compiler gap found while landing this: inside a generic class's
+  OWN method body, self-construction must use the bare class name with
+  `.__allocate__(...)` (`_Connection.__allocate__(...)`), not the name
+  re-parametrized with its own type argument (`_Connection[T].__allocate__
+  (...)` fails: "'_Connection' is not a value, cannot use it as an
+  expression"). Worked around by using the bare name - every other
+  .__allocate__() factory in this codebase is on a non-generic class, so
+  this was genuinely new territory, not a previously-exercised path.
+  Flagged as task_3abe3f4f.
 
   Phase 4c (deferred/future plan doc) — multipart `files=` uploads,
     connection reuse/keep-alive, HTTP/2.
