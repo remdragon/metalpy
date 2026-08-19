@@ -4017,6 +4017,18 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		# mainCRTStartup's own sys$exit call already relies on.
 		parts.append(
 			'#ifdef _WIN32\n'
+			# MSVC recognizes memset/memcpy as compiler intrinsics under
+			# optimization (a --release/-O2 build) and refuses to let a
+			# TU define a function with that exact name/signature
+			# ("error C2169: 'memset': intrinsic function, cannot be
+			# defined") - #pragma function is MSVC's own documented way
+			# to say "compile a real call here instead", same idiom
+			# freestanding/kernel-mode Windows C code already uses for
+			# this. Debug (-Od) builds never hit this, which is why it
+			# wasn't caught immediately. clang has no such restriction.
+			'#if defined(_MSC_VER) && !defined(__clang__)\n'
+			'#pragma function(memset, memcpy)\n'
+			'#endif\n'
 			f'void* memset( void* dst, int value, size_t n ) {{\n'
 			f'\treturn {mangle_qualname( "sys.memset" )}( (uint8_t*)dst, (uint8_t)value, n );\n'
 			'}\n'
