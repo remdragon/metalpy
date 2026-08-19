@@ -604,3 +604,76 @@ Testing approach
   A manual smoke test (compile a small program that GETs a local fixture and prints
   status_code/text) is worth running by hand once Phase 3 lands, per this project's
   existing practice of verifying compiled programs via print()/exit codes.
+
+Remaining backlog / future work
+
+  Everything below is scoped but NOT started. Recorded here (2026-08-19) so
+  the list survives across sessions - this is expected to take a while to
+  work through, not a next-session todo.
+
+  1. Request/response logging with secret redaction (user-requested feature,
+     not yet started - BLOCKED on lib/logging.py maturing further, per the
+     user directly; not blocked on anything in http.client itself). The
+     idea: an opt-in way to log the full wire-level request (request line +
+     headers + body) and response (status line + headers + body) for a
+     Session/request(), through lib/logging.py's Logger, with sensitive
+     values redacted before anything is ever formatted or handed to a
+     Handler - never log-then-redact, since that risks a real secret
+     reaching a Handler.emit() (and therefore disk/network) if redaction is
+     skipped or fails downstream of logging. lib/logging.py already exists
+     today (Logger/Handler/Formatter/levels/FileHandler - see that file's
+     own header comment) but per the user isn't mature enough yet for this;
+     revisit once it is, rather than guessing at what specifically is
+     missing here.
+
+     Known design questions to resolve when this is picked up (not decided
+     yet - flagging what to think about, not prescribing answers):
+       - What counts as a secret by default: Authorization (Basic/Bearer
+         credentials), Cookie/Set-Cookie (session tokens), and any
+         caller-supplied auth= tuple are the obvious ones. Should redaction
+         be a fixed header-name blocklist, a caller-supplied one, or both
+         (fixed defaults + caller additions)?
+       - json=/form= bodies can carry secrets in arbitrary field names
+         (password, token, api_key, ...) that a header-name blocklist can't
+         catch - is body redaction in scope for v1, or headers-only with
+         body redaction as a stretch goal?
+       - Where does this plug in - a `logger: Logger|None` parameter on
+         Session (mirrors requests' own logging.getLogger('urllib3')
+         integration point) vs. a global module-level logger similar to how
+         CPython's http.client module has one? A per-Session logger fits
+         this file's existing Session-holds-its-own-state posture
+         (cookie jar, default headers) better than a module global.
+       - Redacted value rendering - drop the header/field entirely, or keep
+         the name and replace the value with a fixed placeholder (e.g.
+         'Authorization: [REDACTED]')? The latter is more useful for
+         debugging (confirms the header WAS sent) without leaking it.
+
+  2. `files=` multipart/form-data uploads. Deferred since the original
+     scoping pass - even the PHP fetch() reference this project mirrors
+     just delegates multipart encoding to curl rather than hand-rolling it.
+     MetalPy would need to hand-roll RFC 7578 multipart encoding (boundary
+     generation, Content-Disposition per part, binary-safe body assembly)
+     from scratch - no existing precedent anywhere in lib/ to build on.
+
+  3. Connection pooling / keep-alive reuse across requests, HTTP/2, proxies.
+     Every request today opens a fresh TCP (+ TLS, for https://) connection
+     and closes it (_do_request_response's own close() call) - correct but
+     wasteful for a Session issuing several requests to the same host.
+     Keep-alive reuse would need _Connection[T] instances to outlive a
+     single request() call, keyed by (scheme, host, port) on the Session,
+     with real lifecycle rules (Connection: close from either side, idle
+     timeout, max-requests-per-connection) - a real chunk of design work on
+     its own, not a small addition. HTTP/2 and proxy support are further
+     out still and not scoped in any detail yet.
+
+  4. `timeout_ms=` (connect/read timeouts). Deferred since the original
+     scoping pass - lib/socket.py has never had any timeout support to
+     build on (blocking-only sockets). No longer specifically blocked here:
+     a separate, already-in-progress session is adding non-blocking I/O
+     (including timeout support) to lib/socket.py. Once that lands, this
+     needs a `timeout_ms: u32|None = None` parameter threaded through the
+     same call chain verify= just went through (Session.request()/
+     convenience methods/module-level functions down to
+     _connect_or_http_err/_connect_tls_or_http_err and the read loops in
+     getresponse()), plus deciding how a timeout surfaces as an HTTPError
+     variant.
