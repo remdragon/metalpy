@@ -247,6 +247,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 	unreachable and removed). '''
 
 	def test_is_ok_on_concrete_result_receiver_is_monomorphized_once( self ) -> None:
+		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def get() -> Result[i32,OverflowError]:',
 			'\treturn Result.Ok( 1 )',
@@ -529,7 +530,15 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		src = emitter_c.emit_function( main_lf )
 		self.assertIn( ').tag;', src ) # the match's case Foo.Bar(...) tag read, compared against the ordinal separately
-		self.assertIn( '== (0)', src )
+		# the tag comparison is synthesized as an ordinary ast.Compare (see
+		# discovery.py's own match-arm lowering), so it now goes through the
+		# same u8.__eq__ dunder dispatch as any other scalar `==` (see
+		# gen_scalar_dunders.py's scalar_eq[T]/__eq__ rollout) - @inline
+		# splices it rather than emitting a bare `== (0)` literal comparison
+		# the way the pre-dunder flat-Cmp fallback used to, so this checks
+		# for the spliced shape's own ordinal assignment instead
+		self.assertIn( '= 0;', src )
+		self.assertIn( ') == (', src )
 
 _CC = linker_c.detect_cc()
 
@@ -1916,6 +1925,7 @@ def main() -> i32:
 		# clearly in-range value like 11 to spuriously "overflow". Found by
 		# str.upper()'s own real end-to-end test (see StrUpperLowerTests)
 		# panicking on ordinary short ASCII input.
+		self.discovery.import_name( 'builtins' ) # y != 11 is now an ordinary usize.__ne__ dunder call
 		self._run( '''
 def main() -> i32:
 	x: i32 = 11
@@ -2014,6 +2024,7 @@ def main() -> i32:
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_addrof_getitem_setitem_compiles( self ) -> None:
+		self.discovery.import_name( 'builtins' ) # y != seven is now an ordinary u8.__ne__ dunder call
 		self._run( '''
 def main() -> None:
 	x: u8 = 5
@@ -2063,6 +2074,7 @@ def main() -> None:
 		# turns the raw nullable Ptr into a real Ptr[u8]|None union return,
 		# consumed via `if p is None:` - same posture as every other
 		# fixture in this file, no real lib/ dependency needed
+		self.discovery.import_name( 'builtins' ) # `is None` on a TaggedUnion rewrites to an ordinary u8.__eq__ dunder call
 		self._run( '\n'.join([
 			"@extern( 'c', '_metalpy_test_maybe_alloc' )",
 			'def _test_maybe_alloc( size: usize ) -> Ptr[u8]:',
@@ -2088,6 +2100,7 @@ def main() -> None:
 		# CastWrap is already exercised end to end by the Phase 6 milestone
 		# (RealCompileTests further down), this covers the other two modes
 		# directly
+		self.discovery.import_name( 'builtins' ) # self.tag == 0/y == 0 are now ordinary u8.__eq__ dunder calls
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def foo() -> Result[u32,OverflowError]:',
 			'	x: usize = 300',
@@ -2122,6 +2135,7 @@ def main() -> None:
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_errdefer_compiles( self ) -> None:
+		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def cleanup() -> None:',
 			'	return',
@@ -2213,6 +2227,7 @@ def main() -> None:
 		# plain ClassName(...) has its own, separate, unrelated gap (its
 		# __init__ never gets monomorphized when reached this way), not
 		# what this test is checking.
+		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
 		self._run( '\n'.join([
 			'@union',
 			'class Box[T]:',

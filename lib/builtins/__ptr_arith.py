@@ -91,6 +91,64 @@ def const_ptr_sub_offset_saturated[T]( value: ConstPtr[T], offset: usize ) -> Co
 def const_ptr_sub_dist[T]( value: ConstPtr[T], other: ConstPtr[T] ) -> isize:
 	return compiler.ptr_sub_dist( value, other )
 
+# comparisons (==, !=, <, <=, >, >=) - plain address comparison, same
+# infallible/no-mode-qualification shape as the scalar comparisons this
+# mirrors (gen_scalar_dunders.py's scalar_eq/etc) - a C pointer compares
+# natively with the same ir.Cmp opcode a scalar does (see
+# _lower_compiler_cmp's own comment), so there's no pointer-specific
+# codegen needed here either, just the dunder registration itself. <, <=,
+# >, >= on a pointer are a real, meaningful (if less common) operation in
+# C - ordering two addresses within the same allocation/array is
+# well-defined - included for the same completeness reasons scalars got
+# all 6, not just eq/ne.
+@inline
+def ptr_eq[T]( value: Ptr[T], other: Ptr[T] ) -> bool:
+	return compiler.cmp_eq( value, other )
+
+@inline
+def ptr_ne[T]( value: Ptr[T], other: Ptr[T] ) -> bool:
+	return compiler.cmp_ne( value, other )
+
+@inline
+def ptr_lt[T]( value: Ptr[T], other: Ptr[T] ) -> bool:
+	return compiler.cmp_lt( value, other )
+
+@inline
+def ptr_le[T]( value: Ptr[T], other: Ptr[T] ) -> bool:
+	return compiler.cmp_le( value, other )
+
+@inline
+def ptr_gt[T]( value: Ptr[T], other: Ptr[T] ) -> bool:
+	return compiler.cmp_gt( value, other )
+
+@inline
+def ptr_ge[T]( value: Ptr[T], other: Ptr[T] ) -> bool:
+	return compiler.cmp_ge( value, other )
+
+@inline
+def const_ptr_eq[T]( value: ConstPtr[T], other: ConstPtr[T] ) -> bool:
+	return compiler.cmp_eq( value, other )
+
+@inline
+def const_ptr_ne[T]( value: ConstPtr[T], other: ConstPtr[T] ) -> bool:
+	return compiler.cmp_ne( value, other )
+
+@inline
+def const_ptr_lt[T]( value: ConstPtr[T], other: ConstPtr[T] ) -> bool:
+	return compiler.cmp_lt( value, other )
+
+@inline
+def const_ptr_le[T]( value: ConstPtr[T], other: ConstPtr[T] ) -> bool:
+	return compiler.cmp_le( value, other )
+
+@inline
+def const_ptr_gt[T]( value: ConstPtr[T], other: ConstPtr[T] ) -> bool:
+	return compiler.cmp_gt( value, other )
+
+@inline
+def const_ptr_ge[T]( value: ConstPtr[T], other: ConstPtr[T] ) -> bool:
+	return compiler.cmp_ge( value, other )
+
 Ptr.__add__ = ptr_add_checked
 Ptr.__radd__ = ptr_add_checked          # usize + Ptr[T] - usize.__add__ already misses (arg-type mismatch), falls to reflected
 Ptr.__wrapped_add__ = ptr_add_wrapped
@@ -120,3 +178,17 @@ ConstPtr.__sub__ = const_ptr_sub_offset_checked
 ConstPtr.__sub__ = const_ptr_sub_dist    # ConstPtr[T]-ConstPtr[T]->isize - see Ptr.__sub__ above
 ConstPtr.__wrapped_sub__ = const_ptr_sub_offset_wrapped
 ConstPtr.__saturated_sub__ = const_ptr_sub_offset_saturated
+
+Ptr.__eq__ = ptr_eq
+Ptr.__ne__ = ptr_ne
+Ptr.__lt__ = ptr_lt
+Ptr.__le__ = ptr_le
+Ptr.__gt__ = ptr_gt
+Ptr.__ge__ = ptr_ge
+
+ConstPtr.__eq__ = const_ptr_eq
+ConstPtr.__ne__ = const_ptr_ne
+ConstPtr.__lt__ = const_ptr_lt
+ConstPtr.__le__ = const_ptr_le
+ConstPtr.__gt__ = const_ptr_gt
+ConstPtr.__ge__ = const_ptr_ge

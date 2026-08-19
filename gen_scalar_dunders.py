@@ -1,9 +1,9 @@
 # Generates lib/builtins/__scalar_dunders.py - not itself part of the compiler,
 # a one-off codegen tool (run manually, output checked into the repo like any
 # other source file). Registers checked/wrapped/saturated arithmetic dunders,
-# plus __str__/__repr__, for every scalar type via the `Scalar.method = fn`
-# sigil (discovery.py's visit_Assign) - the same mechanism __float.py's own
-# f32/f64 __str__/__repr__ use.
+# comparisons (==/!=/</<=/>/>=), and __str__/__repr__, for every scalar type
+# via the `Scalar.method = fn` sigil (discovery.py's visit_Assign) - the same
+# mechanism __float.py's own f32/f64 __str__/__repr__ use.
 #
 # Unlike the file this replaces, the FUNCTION BODIES below are no longer
 # generated per concrete type - there is exactly ONE real generic function
@@ -264,6 +264,43 @@ for t in INT_TYPES:
 	emit( f'{t}.{mode_dunder( "__lshift__", "saturated" )} = i_shl_saturated[{t}]' )
 	emit( f'{t}.__rshift__ = i_rshift[{t}]' )
 emit()
+
+# ============================================================================
+# comparisons (==, !=, <, <=, >, >=) - single variant each, no Wrap/Check/
+# Saturate mode to disambiguate (comparison never overflows, same "always
+# infallible, plain bool-returning" shape as the bitwise ops above). One
+# generic body per op, shared by every int type, float type, AND bool alike
+# (unlike floordiv/mod, comparison has no signedness- or kind-dependent
+# split) - backed by compiler.cmp_eq/cmp_ne/cmp_lt/cmp_le/cmp_gt/cmp_ge
+# (lowering.py's _lower_compiler_cmp), the same fixed-opcode-intrinsic
+# pattern compiler.bitand/etc already use for the bitwise ops. Registering
+# these lets ordinary comparison dispatch (lowering.py's _expr_Compare/
+# _lower_eq_or_ne/_lower_operand_compare/_classify_leaf_pair_eq) find a real
+# dunder for a Scalar operand too, eliminating the isinstance(Scalar)
+# special-casing those methods used to gate dunder lookup on entirely -
+# _find_dunder_for_arg already treats a Scalar-registered dunder identically
+# to a real class's own method (both just read .names), so a Scalar with
+# nothing registered under a given name still just misses cleanly and falls
+# through to the pre-existing flat-Cmp fallback, exactly like a class that
+# never defined the dunder at all - same precedent as arithmetic's own
+# binop_fallback_eliminated rollout. NoneType (also Scalar) deliberately
+# gets none of these - it never reaches ordinary dunder lookup at all (see
+# _lower_eq_or_ne's own docstring on `None == x`), so registering comparison
+# dunders for it would be dead code, never actually looked up.
+# ============================================================================
+
+for kind, intrinsic in ( ( 'eq', 'cmp_eq' ), ( 'ne', 'cmp_ne' ), ( 'lt', 'cmp_lt' ), ( 'le', 'cmp_le' ), ( 'gt', 'cmp_gt' ), ( 'ge', 'cmp_ge' ) ):
+	emit( '@inline' )
+	emit( f'def scalar_{kind}[T]( value: T, other: T ) -> bool:' )
+	emit( f'\treturn compiler.{intrinsic}( value, other )' )
+	emit()
+
+emit( '# --- comparisons (==, !=, <, <=, >, >=) -------------------------------' )
+emit()
+for t in ( *INT_TYPES, *FLOAT_TYPES, 'bool' ):
+	for kind, dunder in ( ( 'eq', '__eq__' ), ( 'ne', '__ne__' ), ( 'lt', '__lt__' ), ( 'le', '__le__' ), ( 'gt', '__gt__' ), ( 'ge', '__ge__' ) ):
+		emit( f'{t}.{dunder} = scalar_{kind}[{t}]' )
+	emit()
 
 # ============================================================================
 # .to_T() - value-preserving numeric conversion, int<->int only this pass
