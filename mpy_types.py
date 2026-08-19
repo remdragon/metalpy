@@ -525,12 +525,14 @@ class TupleType( Type ):
 
 @dataclass( kw_only = True, repr = False )
 class GeneratorType( Type ):
-	''' `Iterator[T]` (infallible) or `Generator[T,E]` (fallible,
-	PLAN_GENERATORS.md Phase 4/roadmap Phase 4) in a function's own return
-	annotation. Recognized textually in visit_Subscript, same posture as
+	''' `Iterator[Result[T,E]]` or `Generator[T,E]` (E always includes
+	StopIteration - PLAN_GENERATORS.md's StopIteration reversal) in a
+	function's own return annotation - both spellings build the exact same
+	GeneratorType from here on, they're purely syntactic alternatives (see
+	discovery.py's visit_Subscript). Recognized textually, same posture as
 	CallableType/TupleType above. Deliberately NOT interned/shared the way
-	those are: two unrelated generator functions both declaring `->
-	Iterator[i32]` still need two independent backing RCClasses (each
+	those are: two unrelated generator functions both declaring the same
+	elem_type/error_type still need two independent backing RCClasses (each
 	function's own, private state machine/fields) - unifying them by
 	elem_type alone would wrongly conflate two functions' unrelated local
 	state. A fresh GeneratorType is built for every annotation occurrence;
@@ -538,7 +540,13 @@ class GeneratorType( Type ):
 	actually contains a `yield` and synthesizes its backing class (keyed
 	to that one Function, not to this type). '''
 	elem_type: Type
-	error_type: 'Type|None' = None # None: Iterator[T] (infallible); set: Generator[T,error_type] - __next__ returns Result[elem_type|None, error_type] instead of plain elem_type|None
+	# error_type is never actually None for any LEGALLY constructed
+	# GeneratorType (discovery.py's visit_Subscript requires StopIteration
+	# among its leaves unconditionally) - the field keeps its Optional type/
+	# default purely so nothing else in this dataclass's own construction
+	# needs simultaneous updating; __next__ always returns
+	# Result[elem_type, error_type], never a bare nullable elem_type|None
+	error_type: 'Type|None' = None
 	send_type: 'Type|None' = None # None: no .send() support; set (PLAN_GENERATORS.md Phase C, Generator[T,SendType,E] - 3 type args): (yield expr) is usable as an EXPRESSION evaluating to plain SendType, delivered via .send(v) - the backing method becomes $$__resume__ instead of $$__next__, with thin __next__()/send(v) wrappers over it
 	backing: 'RCClass|None' = None
 
