@@ -783,7 +783,7 @@ def main() -> i32:
 	return 0
 ''' ),
 			( 'httpsconnection_direct', '''
-from http.client import HTTPSConnection, Response, HTTPHeaders
+from http.client import HTTPSConnection, Response
 
 def main() -> i32:
 	conn = HTTPSConnection.connect( 'example.com' ).unwrap( 'https connect' )
@@ -792,13 +792,7 @@ def main() -> i32:
 	conn.close()
 	if resp.status_code != 200:
 		return 1
-	# staged into a local first, NOT resp.headers.get(...) is None directly -
-	# a real, pre-existing (unrelated to TLS) compiler gap: `X.field.method()
-	# is None` fails to compile ("built-in operator '==' cannot be applied"
-	# to the str|None union) where the equivalent `local.method() is None`
-	# compiles fine. Flagged as its own follow-up, not fixed here.
-	h: HTTPHeaders = resp.headers
-	if h.get( 'Content-Type' ) is None:
+	if resp.headers.get( 'Content-Type' ) is None:
 		return 2
 	return 0
 ''' ),
