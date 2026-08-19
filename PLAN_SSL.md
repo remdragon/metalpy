@@ -9,8 +9,9 @@ deferred to its own future plan doc," and speculated without committing that the
 approach would be "schannel on Windows / some TLS lib on POSIX."
 
 This started as a scoping/roadmap-only pass (mirroring PLAN_HTTP_CLIENT.md's own
-early scoping session), written before lib/socket.py existed. Phase 0 and Phase 1
-(Windows/Schannel) have since landed for real - see "What actually landed" below.
+early scoping session), written before lib/socket.py existed. Phase 0, Phase 1
+(Windows/Schannel), and Phase 2 (Linux/OpenSSL) have since landed for real - see
+"What actually landed" below.
 
 Backend strategy — native OS TLS, not a bundled OpenSSL
 
@@ -39,7 +40,8 @@ assumption. They confirmed the recommended, codebase-consistent direction:
     not verify current API shape or deprecation status, and Network.framework's
     async-callback design may not map cleanly onto the blocking synchronous
     socket contract lib/socket.py actually shipped with. Treat this plan's macOS
-    section as provisional, not final. NOT STARTED.
+    section as provisional, not final. NOT STARTED - no macOS machine available
+    to this session; deferred until one is.
 
   - Linux: no OS-native TLS API exists, so link against the system's own
     OpenSSL via the existing @compiler.target(has_library=('ssl', 'SSL_new'))
@@ -48,7 +50,7 @@ assumption. They confirmed the recommended, codebase-consistent direction:
     has_library tests, linker_c.py's has_symbol). SSL_CTX_new, SSL_new,
     SSL_set_fd, SSL_connect, SSL_read, SSL_write, SSL_get_error, SSL_shutdown,
     SSL_free, SSL_CTX_free. This genuinely requires libssl-dev on the build
-    machine. NOT STARTED.
+    machine. LANDED - see below.
 
   - Linking against system OpenSSL uniformly on all three platforms (skipping
     Schannel/Secure Transport) was considered and rejected: unlike Linux,
@@ -59,7 +61,7 @@ What actually landed (lib/ssl.py, ssl_test.py)
 
 Phase 0 and Phase 1 (Windows/Schannel) landed together, once lib/socket.py
 (commit 863bfc8 and its follow-ups) made a real client possible to build and
-test end-to-end.
+test end-to-end. Phase 2 (Linux/OpenSSL) landed in a follow-up session.
 
   Phase 0 — SSLError, a single portable @enum (HandshakeFailed,
     CertificateVerifyFailed, CertificateExpired, HostnameMismatch,
@@ -125,21 +127,87 @@ test end-to-end.
     `__inout` (and their `_opt`-suffixed and `_In_`/`_Out_`-style SAL 2.0
     cousins) are unsafe field/parameter names on Windows targets.
 
+  Phase 2 — the Linux OpenSSL backend, same SSLContext/SSLSocket public shape
+    as Windows (SSLSocket.wrap_socket()/send()/send_all()/recv()/close()) but
+    a completely different internal shape: every OpenSSL type touched here
+    (SSL_CTX*, SSL*, SSL_METHOD*) is fully opaque from MetalPy's side - no
+    struct layouts to derive at all, only function signatures and integer
+    constants, both cross-checked against the real openssl/ssl.h and
+    openssl/x509_vfy.h (OpenSSL 3.5, Debian 13 trixie, via WSL) rather than
+    guessed. The same "validate with a standalone C client first" discipline
+    applied here too: a real TCP connection, a real OpenSSL handshake with
+    peer verification actually turned on (SSL_CTX_set_verify(...,
+    SSL_VERIFY_PEER, ...) - OFF by default in raw OpenSSL, a well-known
+    footgun this wrapper doesn't expose), and a real decrypted HTTP response
+    against example.com, plus the same three badssl.com fixtures, before any
+    of it was transcribed into MetalPy.
+
+    One real OpenSSL-specific gotcha worth recording: SSL_get_error() alone
+    does NOT distinguish which certificate problem occurred - it returns the
+    same generic SSL_ERROR_SSL (1) for all three badssl.com failures
+    (confirmed empirically with the C reference, not assumed from docs). The
+    actual reason lives in a SEPARATE call, SSL_get_verify_result(), which
+    returns a real X509_V_ERR_* code (X509_V_ERR_CERT_HAS_EXPIRED = 10,
+    X509_V_ERR_HOSTNAME_MISMATCH = 62, and a third value for the self-signed
+    case that isn't either of those - hence _map_ssl_error()'s trailing
+    catch-all to CertificateVerifyFailed rather than a third named check).
+
+    SSL_set_tlsext_host_name (SNI) is a macro in real OpenSSL headers, not an
+    exported symbol - it expands to SSL_ctrl(ssl, 55, 0, name) (confirmed
+    against openssl/tls1.h) - so lib/ssl.py calls SSL_ctrl directly with
+    those constants rather than @extern'ing a symbol that doesn't exist.
+
+    A real, load-bearing infrastructure bug was found and fixed while
+    landing this (not part of lib/ssl.py itself): linker_c.py's CcTool.link()
+    placed ldflags (e.g. `-lssl`) BEFORE the object files being linked on the
+    gcc/clang command line. GNU ld only pulls a symbol from a `-l<name>`
+    library if there's already a pending undefined reference for it AT THE
+    POINT ld reaches that flag - a library listed before the object that
+    needs it is silently a no-op, so every @compiler.target(has_library=(lib,
+    symbol))-gated def/class in a program that genuinely CALLED that symbol
+    would just never resolve, even though has_symbol()'s own probe (compile +
+    link, with the same broken ordering) consistently and self-consistently
+    reported the symbol as unavailable. This was invisible until now because
+    every prior has_library/extern_libs use on Linux was libc ('c'), which
+    every compiler driver links implicitly regardless of -l position - lib/
+    ssl.py's has_library=('ssl', 'SSL_new') is the first real non-libc shared
+    library dependency this mechanism has ever been exercised against on
+    Linux. Fixed by moving `extra` (ldflags) after `obj_args` in link()'s
+    argument list; verified with linker_c_test.py's full suite plus this
+    project's whole test suite (tests.py) on both Windows (MSVC and clang)
+    and Linux (gcc, via WSL) - all green, no regressions from the reorder.
+
+    lib/socket.py also gained one small, purely additive method:
+    Socket.fileno() -> SOCKET, returning the raw OS handle (POSIX fd / Windows
+    SOCKET) - needed because SSL_set_fd() drives its own socket I/O directly
+    against the raw fd rather than going through Socket.send()/recv() the way
+    the Windows Schannel backend does (Schannel only ever needs byte buffers
+    handed through the existing Socket API; OpenSSL's SSL_set_fd() approach
+    is the standard, simplest way to use it and is what the validated C
+    reference does too).
+
+    Covered by ssl_test.py's SSLLinuxHandshakeTests - the exact same MetalPy
+    source (_HANDSHAKE_ROUND_TRIP / _CERTIFICATE_FAILURE_MAPPING) that
+    SSLWindowsHandshakeTests runs, just compiled against a different backend
+    per host OS. Verified for real via WSL (Debian 13, gcc, real libssl-dev).
+
 Scope for this pass
 
-In scope (now landed for Windows):
-  - lib/ssl.py's SSLError, SSLContext, SSLSocket (Windows/Schannel backend).
-  - ssl_test.py covering both Phase 0 (pure) and Phase 1 (real network).
+In scope (now landed for Windows and Linux):
+  - lib/ssl.py's SSLError, SSLContext, SSLSocket (Schannel backend on
+    Windows, OpenSSL backend on Linux).
+  - lib/socket.py's new Socket.fileno() accessor.
+  - The linker_c.py ldflags-ordering fix (infrastructure, not ssl.py-specific,
+    but found and required by this work).
+  - ssl_test.py covering Phase 0 (pure) and both real-network backend classes.
 
 Out of scope (still deferred):
-  - Linux (has_library-gated OpenSSL) and macOS (Secure Transport/
-    Network.framework) backends - see "Backend strategy" above.
+  - macOS (Secure Transport/Network.framework) backend - see "Backend
+    strategy" above; no macOS machine available to verify against right now.
   - Client-certificate authentication (load_cert_chain) - stretch goal, same
     treatment PLAN_HTTP_CLIENT.md gave multipart files= uploads.
   - Wiring into lib/http/client.py's reserved verify=/HTTPSConnection path -
     a separate follow-up once this is stable.
-  - Any change to the compiler/linker pipeline - has_library/has_symbol already
-    do everything Linux support will need; nothing new required there.
 
 Draft API (as implemented)
 
@@ -160,7 +228,8 @@ module and PLAN_HTTP_CLIENT.md's own Response/Session sketch.
       @staticmethod
       def create_default_context() -> Result[SSLContext, SSLError]: ...
       # loads the platform trust store implicitly (Windows: system cert store
-      # via Schannel's own automatic validation)
+      # via Schannel's own automatic validation; Linux: OpenSSL's default CA
+      # bundle/directory search, with peer verification explicitly turned on)
 
   class SSLSocket:
       @staticmethod
@@ -184,13 +253,11 @@ it before handing the result to the existing request/response read/write path.
 
 Remaining phased roadmap
 
-  Phase 2 — Linux backend: has_library-gated OpenSSL extern bindings
-    (SSL_CTX_new/SSL_new/SSL_set_fd/SSL_connect/SSL_read/SSL_write/
-    SSL_get_error/SSL_shutdown/SSL_free/SSL_CTX_free).
-
   Phase 3 — macOS backend, prefixed by the research spike flagged above
     (confirm Secure Transport vs Network.framework's actual current shape
-    before committing to bindings).
+    before committing to bindings). Blocked on access to a macOS machine to
+    verify against - do the binding/struct work but hold off calling it done
+    without a real handshake test, same discipline Phase 1/2 were held to.
 
   Phase 4 (deferred/future plan doc) — wire into lib/http/client.py's reserved
     verify=/HTTPSConnection path. Also: client-certificate auth
@@ -206,10 +273,23 @@ Testing approach
   Phase 0 needed no network dependency, same as any other pure-data test in
   this codebase.
 
-  Phase 1's tests are a deliberate departure from every other *_test.py here:
-  they dial out to real public hosts (example.com, badssl.com) rather than
-  looping back locally, because there's no local TLS server to loop back
-  against without implementing server-side Schannel too (out of scope for a
-  client-only library). Gated behind METALPY_TEST_NETWORK=0 for environments
-  without network egress. Future Linux/macOS backend tests should follow the
-  same pattern.
+  Phase 1/2's tests (SSLWindowsHandshakeTests / SSLLinuxHandshakeTests) are a
+  deliberate departure from every other *_test.py here: they dial out to real
+  public hosts (example.com, badssl.com) rather than looping back locally,
+  because there's no local TLS server to loop back against without
+  implementing server-side Schannel/OpenSSL too (out of scope for a
+  client-only library). Both classes run the identical MetalPy source -
+  only the compiled backend differs by host OS (os.name=='nt' vs
+  sys.platform.startswith('linux')). Gated behind METALPY_TEST_NETWORK=0 for
+  environments without network egress. A future macOS backend's tests should
+  follow the same pattern - a third class, same shared source, gated on
+  sys.platform=='darwin'.
+
+  This phase's Linux work was verified end-to-end via WSL (Debian 13 trixie,
+  gcc, real libssl-dev) rather than a native Linux machine - both the
+  standalone C reference client and the final ssl_test.py suite were compiled
+  and run there for real, including a full tests.py run (1387 tests, 0
+  failures) to confirm the linker_c.py fix didn't regress anything else. This
+  is a reasonable stand-in for "a real Linux machine" (same kernel/libc/ld
+  family, same libssl-dev package), not a shortcut - every claim in this doc
+  about what works on Linux is backed by an actual run, not an assumption.

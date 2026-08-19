@@ -1,23 +1,27 @@
 # Real-compile-and-run tests for lib/ssl.py (see PLAN_SSL.md).
 #
-# Two classes:
+# Three classes:
 #   SSLPhase0Tests - the SSLError enum, zero prerequisites, no I/O. Runs
 #     everywhere a C compiler is available, same as every other Phase 0 test
 #     in this codebase.
-#   SSLWindowsHandshakeTests - the real Schannel/SSPI backend (Windows only -
-#     lib/ssl.py has no other backend yet, see PLAN_SSL.md). Unlike every
-#     other *_test.py in this codebase, this genuinely dials out over the
-#     network: there is no local TLS server to loop back against without
-#     first implementing TLS *server*-side Schannel (out of scope - lib/ssl.py
-#     is client-only), so this drives the compiled MetalPy program against
-#     real public endpoints instead - example.com for the success path, and
-#     badssl.com's expired/wrong-host/self-signed fixtures (a public service
-#     that exists specifically for this kind of TLS client testing) for the
-#     three certificate-failure paths. Requires network egress; set
-#     METALPY_TEST_NETWORK=0 to skip if that's not available.
+#   SSLWindowsHandshakeTests / SSLLinuxHandshakeTests - the real Schannel/SSPI
+#     and OpenSSL backends respectively (lib/ssl.py has no macOS backend yet,
+#     see PLAN_SSL.md). Unlike every other *_test.py in this codebase, these
+#     genuinely dial out over the network: there is no local TLS server to
+#     loop back against without also implementing TLS *server*-side
+#     Schannel/OpenSSL (out of scope - lib/ssl.py is client-only), so these
+#     drive the compiled MetalPy program against real public endpoints
+#     instead - example.com for the success path, and badssl.com's
+#     expired/wrong-host/self-signed fixtures (a public service that exists
+#     specifically for this kind of TLS client testing) for the three
+#     certificate-failure paths. Both classes run the SAME MetalPy source
+#     (_HANDSHAKE_ROUND_TRIP / _CERTIFICATE_FAILURE_MAPPING below) - only the
+#     backend actually compiled differs, per host OS. Requires network
+#     egress; set METALPY_TEST_NETWORK=0 to skip if that's not available.
 
 # stdlib imports:
 import os
+import sys
 import unittest
 
 # local imports:
@@ -78,30 +82,11 @@ def main() -> i32:
 
 _NETWORK_OK = os.environ.get( 'METALPY_TEST_NETWORK', '1' ) not in ( '0', 'false', 'False' )
 
+# Shared MetalPy source for both native backends (Windows/Schannel, Linux/
+# OpenSSL) - same source, same expected behavior; only which backend
+# actually gets compiled differs per host OS (compiler.target.os).
 
-@unittest.skipUnless( os.name == 'nt', 'lib/ssl.py only has a Windows (Schannel) backend so far - see PLAN_SSL.md' )
-@unittest.skipUnless( _NETWORK_OK, 'set METALPY_TEST_NETWORK=0 to acknowledge - these tests dial out to example.com/badssl.com' )
-class SSLWindowsHandshakeTests( test_support.RealCompileMixin, unittest.TestCase ):
-	''' Drives the real Schannel backend against real public TLS endpoints -
-	both struct layouts (SecBuffer/SecBufferDesc/SCHANNEL_CRED/SecHandle/
-	SecPkgContext_StreamSizes) and the full handshake/encrypt/decrypt call
-	sequence were independently validated against the real Windows SDK
-	headers and a standalone C client before being ported here (see
-	PLAN_SSL.md and lib/ssl.py's own header comment) - these tests exercise
-	the MetalPy port of that same, already-proven sequence. Kept in its own
-	assert_programs_run cluster, separate from SSLPhase0Tests, since these
-	do real network I/O rather than pure in-memory checks (same reasoning as
-	http_client_test.py's HTTPConnectionLoopbackTests). '''
-
-	def setUp( self ) -> None:
-		from discovery import Discovery
-		from compiler import Compiler
-		self.discovery = Discovery( import_builtins = True )
-		self.compiler = Compiler( self.discovery )
-
-	def test_programs_compile_and_run( self ) -> None:
-		self.assert_programs_run([
-			( 'handshake_and_encrypted_round_trip', '''
+_HANDSHAKE_ROUND_TRIP = '''
 import socket
 import ssl
 
@@ -142,8 +127,9 @@ def main() -> i32:
 	if not saw_ok_status:
 		return 3
 	return 0
-''' ),
-			( 'certificate_failure_mapping', '''
+'''
+
+_CERTIFICATE_FAILURE_MAPPING = '''
 import socket
 import ssl
 
@@ -165,5 +151,59 @@ def main() -> i32:
 	if try_host( "self-signed.badssl.com" ) != ssl.SSLError.CertificateVerifyFailed:
 		return 3
 	return 0
-''' ),
+'''
+
+
+@unittest.skipUnless( os.name == 'nt', 'lib/ssl.py only has Windows/Linux backends so far - see PLAN_SSL.md' )
+@unittest.skipUnless( _NETWORK_OK, 'set METALPY_TEST_NETWORK=0 to acknowledge - these tests dial out to example.com/badssl.com' )
+class SSLWindowsHandshakeTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' Drives the real Schannel backend against real public TLS endpoints -
+	both struct layouts (SecBuffer/SecBufferDesc/SCHANNEL_CRED/SecHandle/
+	SecPkgContext_StreamSizes) and the full handshake/encrypt/decrypt call
+	sequence were independently validated against the real Windows SDK
+	headers and a standalone C client before being ported here (see
+	PLAN_SSL.md and lib/ssl.py's own header comment) - these tests exercise
+	the MetalPy port of that same, already-proven sequence. Kept in its own
+	assert_programs_run cluster, separate from SSLPhase0Tests, since these
+	do real network I/O rather than pure in-memory checks (same reasoning as
+	http_client_test.py's HTTPConnectionLoopbackTests). '''
+
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'handshake_and_encrypted_round_trip', _HANDSHAKE_ROUND_TRIP ),
+			( 'certificate_failure_mapping', _CERTIFICATE_FAILURE_MAPPING ),
+		], timeout = 60.0 )  # four real external TLS handshakes in one run - generous margin for network jitter
+
+
+@unittest.skipUnless( sys.platform.startswith( 'linux' ), 'lib/ssl.py only has Windows/Linux backends so far - see PLAN_SSL.md' )
+@unittest.skipUnless( _NETWORK_OK, 'set METALPY_TEST_NETWORK=0 to acknowledge - these tests dial out to example.com/badssl.com' )
+class SSLLinuxHandshakeTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' Same idea as SSLWindowsHandshakeTests, driving the real Linux/OpenSSL
+	backend instead (has_library=('ssl', 'SSL_new') - requires libssl-dev on
+	the build machine, skipped entirely if compiler.has_library() rules the
+	backend out, in which case the underlying MetalPy program itself would
+	fail to compile with "ssl has no member SSLContext" - this class assumes
+	libssl-dev IS present, same assumption PLAN_SSL.md documents). Every
+	extern signature and the full connect/verify/read/write sequence were
+	independently validated against the real openssl/ssl.h headers and a
+	standalone C client (including this exact set of badssl.com fixtures)
+	before being ported here - see PLAN_SSL.md and lib/ssl.py's own Linux
+	section comment. '''
+
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'handshake_and_encrypted_round_trip', _HANDSHAKE_ROUND_TRIP ),
+			( 'certificate_failure_mapping', _CERTIFICATE_FAILURE_MAPPING ),
 		], timeout = 60.0 )  # four real external TLS handshakes in one run - generous margin for network jitter

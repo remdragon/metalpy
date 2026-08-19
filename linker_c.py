@@ -239,8 +239,20 @@ class CcTool:
 			# linker input. Harmless to add even when unused - a static
 			# archive only pulls in symbols something else in the link
 			# actually references
+			#
+			# extra (ldflags, e.g. -lssl) MUST come after obj_args, not
+			# before - GNU ld resolves a -l<name> against whatever undefined
+			# references are ALREADY pending when it reaches that flag on the
+			# command line; a library placed before the objects that need it
+			# is a no-op (confirmed by a real repro: `gcc -lssl generated.o`
+			# silently fails to resolve SSL_new, `gcc generated.o -lssl`
+			# resolves it fine). This was invisible until lib/ssl.py's Linux
+			# backend (has_library=('ssl', 'SSL_new')) - every prior has_
+			# library/extern_libs use on Linux was libc ('c'), which every
+			# compiler driver links implicitly regardless of -l ordering, so
+			# the bug never affected a real -l<name> flag before.
 			wide_int_lib = _find_wide_int_runtime_lib( self )
-			cmd = [ self.path ] + extra + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + [ '-o', str( exe ) ]
+			cmd = [ self.path ] + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + extra + [ '-o', str( exe ) ]
 			if asan:
 				# clang/gcc's own driver acts as the linker frontend even for
 				# an objects-only link, and only links the ASan runtime when

@@ -922,6 +922,14 @@ class Socket:
 	def set_reuseaddr( self, enable: bool ) -> Result[None, OSError]:
 		return _set_reuseaddr_raw( self.__sock, enable )
 
+	def fileno( self ) -> SOCKET:
+		''' the raw OS socket handle - POSIX fd (i32) or Windows SOCKET
+		(usize), matching this module's own SOCKET type alias per platform.
+		Needed by TLS backends (lib/ssl.py's Linux/OpenSSL backend) that hand
+		this off directly to a native library rather than driving I/O
+		through send()/recv() themselves. '''
+		return self.__sock
+
 	def getsockname( self ) -> Result[SocketAddr, OSError]:
 		if self.__family == AF_INET6:
 			addr: SockAddrIn6 = SockAddrIn6()

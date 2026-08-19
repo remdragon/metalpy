@@ -1,10 +1,11 @@
 # lib/ssl.py — TLS/SSL client sockets. See PLAN_SSL.md for the backend-
 # strategy decision (native OS TLS, no bundled OpenSSL) and phased roadmap.
 #
-# v1 scope: Windows only (Schannel via SSPI, secur32.dll) - client-side only
-# (wrap an already-connected socket.Socket in a TLS session; no server side).
-# Linux (has_library-gated system OpenSSL) and macOS (Secure Transport /
-# Network.framework) are later phases - see PLAN_SSL.md.
+# Client-side only (wrap an already-connected socket.Socket in a TLS
+# session; no server side). Two backends so far: Windows (Schannel via
+# SSPI, secur32.dll) and Linux (system OpenSSL via libssl, has_library-
+# gated - requires libssl-dev on the build machine). macOS (Secure
+# Transport / Network.framework) is still a later phase - see PLAN_SSL.md.
 
 import compiler
 import sys
@@ -88,6 +89,38 @@ if compiler.target.os == 'windows':
 	SEC_E_BUFFER_TOO_SMALL:   SECURITY_STATUS = SECURITY_STATUS( 0x80090321 )
 	SEC_E_ALGORITHM_MISMATCH: SECURITY_STATUS = SECURITY_STATUS( 0x80090331 )
 	SEC_E_INVALID_TOKEN:      SECURITY_STATUS = SECURITY_STATUS( 0x80090308 )
+
+elif compiler.target.os != 'macos':
+	# Linux (and any other non-Windows, non-macOS target) - system OpenSSL.
+	# Constants below (SSL_ERROR_*, X509_V_*, SSL_CTRL_SET_TLSEXT_HOSTNAME,
+	# TLSEXT_NAMETYPE_host_name) are hardcoded from the real
+	# openssl/ssl.h + openssl/x509_vfy.h (OpenSSL 3.5, Debian 13) - verified
+	# against the actual headers via grep, not guessed, same bar as the
+	# Windows constants above. `long` is 8 bytes on Linux x86_64 (LP64,
+	# unlike Windows' LLP64 where `long` stays 4 bytes) - SSL_get_verify_
+	# result's and SSL_ctrl's `long` parameters/returns are i64 here, not i32.
+
+	SSL_VERIFY_PEER: i32 = 0x01
+
+	SSL_ERROR_NONE:        i32 = 0
+	SSL_ERROR_SSL:         i32 = 1
+	SSL_ERROR_WANT_READ:   i32 = 2
+	SSL_ERROR_WANT_WRITE:  i32 = 3
+	SSL_ERROR_SYSCALL:     i32 = 5
+	SSL_ERROR_ZERO_RETURN: i32 = 6
+
+	# SSL_set_tlsext_host_name(s, name) is a macro in real openssl headers,
+	# not an exported symbol - it expands to
+	# SSL_ctrl(s, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, name)
+	# (confirmed against openssl/tls1.h) - so this file calls SSL_ctrl
+	# directly with these two constants rather than @extern'ing a symbol
+	# that doesn't exist.
+	SSL_CTRL_SET_TLSEXT_HOSTNAME: i32 = 55
+	TLSEXT_NAMETYPE_host_name:    i64 = 0
+
+	X509_V_OK:                     i64 = 0
+	X509_V_ERR_CERT_HAS_EXPIRED:   i64 = 10
+	X509_V_ERR_HOSTNAME_MISMATCH:  i64 = 62
 
 
 # SecHandle - real C typedefs CredHandle/CtxtHandle to this exact same
@@ -732,3 +765,259 @@ class SSLSocket:
 		with compiler.wrap_arithmetic:
 			self.__plain_pos += take2
 		return Result.Ok( take2 )
+
+
+# ---------------------------------------------------------------------------
+# Linux backend — system OpenSSL (libssl, via @compiler.target(has_library=
+# (...))). Every extern signature below was cross-checked against the real
+# openssl/ssl.h (OpenSSL 3.5, Debian 13 trixie) rather than hand-derived from
+# memory, and the full connect/verify/read/write sequence was validated
+# end-to-end with a standalone C client (real TCP + real OpenSSL handshake
+# against example.com, and the same three badssl.com cert-failure paths the
+# Windows backend was checked against) before being transcribed here - same
+# bar as the Windows backend above. Unlike Schannel, every OpenSSL type used
+# here (SSL_CTX*, SSL*, SSL_METHOD*) is fully opaque from this side - we
+# never allocate or read a single field of any of them, only pass the
+# pointers back to libssl - so there are no struct layouts to get wrong here,
+# just function signatures and integer constants.
+#
+# @compiler.target(os=..., has_library=...) - a single decorator combining
+# both conditions - is deliberately used for every def/class below (matching
+# lib/crt.py's own decorator-per-extern style) rather than nesting a second
+# `if compiler.has_library(...)` inside the module-level `elif` above that
+# already holds this backend's constants: only TypeAlias/const bindings are
+# confirmed to work inside a bare module-level if/else (see this file's
+# Windows section comment); nesting a second conditional block inside that
+# one, specifically to hold @extern defs, is untested territory this file
+# doesn't need to risk when the decorator form already proves both
+# conditions compose (discovery.py's _matches_active_target checks every
+# keyword given, has_library included).
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'TLS_client_method' )
+def TLS_client_method() -> Ptr[None]:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_CTX_new' )
+def SSL_CTX_new( method: Ptr[None] ) -> Ptr[None]:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_CTX_free' )
+def SSL_CTX_free( ctx: Ptr[None] ) -> None:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_CTX_set_verify' )
+def SSL_CTX_set_verify( ctx: Ptr[None], mode: i32, callback: Ptr[None] ) -> None:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_CTX_set_default_verify_paths' )
+def SSL_CTX_set_default_verify_paths( ctx: Ptr[None] ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_new' )
+def SSL_new( ctx: Ptr[None] ) -> Ptr[None]:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_free' )
+def SSL_free( ssl: Ptr[None] ) -> None:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_set_fd' )
+def SSL_set_fd( ssl: Ptr[None], fd: i32 ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_set1_host' )
+def SSL_set1_host( ssl: Ptr[None], host: ConstPtr[u8] ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_ctrl' )
+def SSL_ctrl( ssl: Ptr[None], cmd: i32, larg: i64, parg: Ptr[None] ) -> i64:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_connect' )
+def SSL_connect( ssl: Ptr[None] ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_read' )
+def SSL_read( ssl: Ptr[None], buf: Ptr[None], num: i32 ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_write' )
+def SSL_write( ssl: Ptr[None], buf: Ptr[None], num: i32 ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_get_error' )
+def SSL_get_error( ssl: Ptr[None], ret_code: i32 ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_shutdown' )
+def SSL_shutdown( ssl: Ptr[None] ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+@extern( 'ssl', 'SSL_get_verify_result' )
+def SSL_get_verify_result( ssl: Ptr[None] ) -> i64:
+	...
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+def _map_ssl_error( ssl: Ptr[None], err: i32 ) -> SSLError:
+	''' SSL_get_error() alone only distinguishes SSL_ERROR_SSL (a generic
+	"the library/protocol rejected something") from the transport-level
+	codes - the specific certificate-failure reason lives in a SEPARATE call,
+	SSL_get_verify_result(), which is only meaningful once SSL_ERROR_SSL is
+	confirmed (real OpenSSL behavior, not an assumption - confirmed by the
+	same standalone C client this was ported from: SSL_get_error() returned
+	1 (SSL_ERROR_SSL) uniformly for all three badssl.com failures, and only
+	SSL_get_verify_result() distinguished expired (10) / wrong-host (62) /
+	self-signed (an X509_V_ERR_* other than those two, hence the trailing
+	catch-all) from each other. '''
+	if err == SSL_ERROR_ZERO_RETURN:
+		return SSLError.Closed
+	if err == SSL_ERROR_SYSCALL:
+		return SSLError.Other
+	if err != SSL_ERROR_SSL:
+		return SSLError.HandshakeFailed
+	vr: i64 = SSL_get_verify_result( ssl )
+	if vr == X509_V_ERR_CERT_HAS_EXPIRED:
+		return SSLError.CertificateExpired
+	if vr == X509_V_ERR_HOSTNAME_MISMATCH:
+		return SSLError.HostnameMismatch
+	if vr != X509_V_OK:
+		return SSLError.CertificateVerifyFailed
+	return SSLError.HandshakeFailed
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+class SSLContext:
+	__ctx: Ptr[None]  # SSL_CTX*
+
+	def __del__( self ) -> None:
+		SSL_CTX_free( self.__ctx )
+
+	@private
+	def _ctx( self ) -> Ptr[None]:
+		return self.__ctx
+
+	@private
+	@staticmethod
+	def _from_ctx( ctx: Ptr[None] ) -> SSLContext:
+		return SSLContext.__allocate__( __ctx = ctx )
+
+	@staticmethod
+	def create_default_context() -> Result[SSLContext, SSLError]:
+		''' loads the system trust store implicitly
+		(SSL_CTX_set_default_verify_paths - OpenSSL's own default CA bundle/
+		directory search, same spirit as Schannel's automatic system-store
+		validation on Windows) and turns on peer certificate verification
+		(SSL_CTX_set_verify(..., SSL_VERIFY_PEER, ...) - OFF by default in
+		raw OpenSSL, a well-known footgun this wrapper doesn't expose). '''
+		method: Ptr[None] = TLS_client_method()
+		ctx: Ptr[None] = SSL_CTX_new( method )
+		if ctx is None:
+			return Result.Err( SSLError.Other )
+		SSL_CTX_set_verify( ctx, SSL_VERIFY_PEER, None )
+		if SSL_CTX_set_default_verify_paths( ctx ) != 1:
+			SSL_CTX_free( ctx )
+			return Result.Err( SSLError.Other )
+		return Result.Ok( SSLContext._from_ctx( ctx ))
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), has_library = ( 'ssl', 'SSL_new' ) )
+class SSLSocket:
+	__ssl:    Ptr[None]  # SSL*
+	__sock:   socket.Socket
+	__closed: bool
+
+	def __del__( self ) -> None:
+		self.close()
+
+	def close( self ) -> None:
+		if not self.__closed:
+			SSL_shutdown( self.__ssl )
+			SSL_free( self.__ssl )
+			self.__closed = True
+
+	@staticmethod
+	def wrap_socket( ctx: SSLContext, sock: socket.Socket, server_hostname: str ) -> Result[SSLSocket, SSLError]:
+		ssl: Ptr[None] = SSL_new( ctx._ctx() )
+		if ssl is None:
+			return Result.Err( SSLError.Other )
+
+		fd: i32 = sock.fileno()
+		if SSL_set_fd( ssl, fd ) != 1:
+			SSL_free( ssl )
+			return Result.Err( SSLError.Other )
+
+		host_cstr: ConstPtr[u8] = server_hostname.get_cstr()
+		# SNI - see this section's own header comment on why this calls
+		# SSL_ctrl directly instead of a nonexistent SSL_set_tlsext_host_name
+		# symbol. Return value intentionally unchecked, matching the
+		# validated C reference (a failed SNI call still lets the handshake
+		# proceed - it just means the server can't select a cert by name).
+		SSL_ctrl( ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, compiler.cast( Ptr[None], host_cstr ))
+		if SSL_set1_host( ssl, host_cstr ) != 1:
+			SSL_free( ssl )
+			return Result.Err( SSLError.Other )
+
+		rc: i32 = SSL_connect( ssl )
+		if rc != 1:
+			err: i32 = SSL_get_error( ssl, rc )
+			mapped: SSLError = _map_ssl_error( ssl, err )
+			SSL_free( ssl )
+			return Result.Err( mapped )
+
+		return Result.Ok( SSLSocket.__allocate__( __ssl = ssl, __sock = sock, __closed = False ))
+
+	def send( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, SSLError]:
+		with compiler.saturate_arithmetic:
+			n: i32 = i32( count )
+		rc: i32 = SSL_write( self.__ssl, compiler.cast( Ptr[None], buf ), n )
+		if rc <= 0:
+			err: i32 = SSL_get_error( self.__ssl, rc )
+			return Result.Err( _map_ssl_error( self.__ssl, err ))
+		with compiler.wrap_arithmetic:
+			return Result.Ok( usize( rc ))
+
+	def send_all( self, buf: ConstPtr[u8], count: usize ) -> Result[None, SSLError]:
+		sent: usize = 0
+		with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
+			while sent < count:
+				n: usize = self.send( buf + sent, count - sent ).or_return()
+				if n == 0:
+					return Result.Err( SSLError.Closed )
+				sent += n
+		return Result.Ok( None )
+
+	def recv( self, buf: Ptr[u8], count: usize ) -> Result[usize, SSLError]:
+		with compiler.saturate_arithmetic:
+			n: i32 = i32( count )
+		rc: i32 = SSL_read( self.__ssl, compiler.cast( Ptr[None], buf ), n )
+		if rc <= 0:
+			err: i32 = SSL_get_error( self.__ssl, rc )
+			if err == SSL_ERROR_ZERO_RETURN:
+				return Result.Ok( 0 )
+			# a clean EOF without a close_notify alert (SSL_ERROR_SYSCALL
+			# with rc == 0) is common in practice - consistent with
+			# Socket.recv()'s own "0 means peer closed" convention, treated
+			# as a normal close rather than a hard error.
+			if err == SSL_ERROR_SYSCALL and rc == 0:
+				return Result.Ok( 0 )
+			return Result.Err( _map_ssl_error( self.__ssl, err ))
+		with compiler.wrap_arithmetic:
+			return Result.Ok( usize( rc ))
