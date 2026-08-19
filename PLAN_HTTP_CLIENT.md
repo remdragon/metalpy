@@ -604,3 +604,96 @@ Testing approach
   A manual smoke test (compile a small program that GETs a local fixture and prints
   status_code/text) is worth running by hand once Phase 3 lands, per this project's
   existing practice of verifying compiled programs via print()/exit codes.
+
+Remaining backlog / future work
+
+  Everything below is scoped but NOT started. Recorded here (2026-08-19) so
+  the list survives across sessions - this is expected to take a while to
+  work through, not a next-session todo.
+
+  1. Request/response logging with secret redaction (user-requested feature,
+     not yet started - BLOCKED on lib/logging.py maturing further, per the
+     user directly; not blocked on anything in http.client itself).
+     lib/logging.py already exists today (Logger/Handler/Formatter/levels/
+     FileHandler - see that file's own header comment) but per the user
+     isn't mature enough yet for this; revisit once it is, rather than
+     guessing at what specifically is missing.
+
+     Design settled by studying a working real-world reference the user
+     already relies on day to day: C:\cvs\itas\incpy\demands.py (a Python/
+     `requests`-based wrapper the user built for the same job). Conclusions
+     to carry over into http.client's own version, not open questions:
+
+       - Redact by VALUE, not by header name. The reference takes a
+         `sensitive_values: list[str]` - the actual secret strings (an API
+         key, a password, a bearer token, ...) - not a set of header names
+         to blank out. It builds one alternation regex over all of them
+         (`re.escape`d, sorted LONGEST-first so a shorter secret that
+         happens to be a substring of a longer one doesn't partially
+         redact it) and substitutes '***CENSORED***' for every match.
+         This is strictly more robust than a header-name blocklist
+         (Authorization/Cookie/...): it catches a secret anywhere it shows
+         up - a header, the body, even a query string - without having to
+         predict every place a secret could leak into. http.client's
+         version should take the same shape: a caller-supplied
+         list[str]|None of the exact secret values in play for that
+         request (the password half of auth=, an API key the caller is
+         about to put in a custom header, etc.) - NOT an attempt to
+         auto-detect "this looks like a secret".
+       - Redact the WHOLE serialized message in one pass, not header-by-
+         header. The reference builds one flat string for the full wire
+         message first (method+url, then headers, then a blank line, then
+         body for the request; status-line, headers, blank line, body for
+         the response - i.e. exactly what HTTPHeaders/Response already
+         hold in this file) and applies the substitution once over that
+         whole blob, then splits on line breaks for line-prefixed output
+         (the reference uses 'C>'/'S>' prefixes per line). http.client
+         already has everything needed to build that flat string - see
+         _build_request_head for the request side.
+       - Redact BEFORE anything is handed to a log sink - never log-then-
+         redact. The reference censors the string at the exact point it's
+         about to be logged, never passes the raw string to the log
+         callback and redacts after. Confirms the principle already
+         written into this doc above.
+       - Don't require a full Logger object as the integration point for a
+         v1 - the reference's `demand()` takes a plain `log:
+         Callable[[str],None]|None` sink (works with `print`, a bound
+         `logger.info`, anything). A per-Session `Callable[[str],None]|
+         None` (MetalPy's Closure[[str],None]) sink parameter is a much
+         lighter dependency than plumbing a real lib/logging.py Logger
+         through, and doesn't need to wait on lib/logging.py at all - only
+         the STDLIB-PROVIDED convenience of wiring it up to a real Logger
+         by default needs logging.py to mature. Worth reconsidering
+         whether the lib/logging.py blocker applies to the whole feature,
+         or only to a nicer default integration on top of a sink-based v1 -
+         raise this with the user when picked back up rather than assuming.
+
+  2. `files=` multipart/form-data uploads. Deferred since the original
+     scoping pass - even the PHP fetch() reference this project mirrors
+     just delegates multipart encoding to curl rather than hand-rolling it.
+     MetalPy would need to hand-roll RFC 7578 multipart encoding (boundary
+     generation, Content-Disposition per part, binary-safe body assembly)
+     from scratch - no existing precedent anywhere in lib/ to build on.
+
+  3. Connection pooling / keep-alive reuse across requests, HTTP/2, proxies.
+     Every request today opens a fresh TCP (+ TLS, for https://) connection
+     and closes it (_do_request_response's own close() call) - correct but
+     wasteful for a Session issuing several requests to the same host.
+     Keep-alive reuse would need _Connection[T] instances to outlive a
+     single request() call, keyed by (scheme, host, port) on the Session,
+     with real lifecycle rules (Connection: close from either side, idle
+     timeout, max-requests-per-connection) - a real chunk of design work on
+     its own, not a small addition. HTTP/2 and proxy support are further
+     out still and not scoped in any detail yet.
+
+  4. `timeout_ms=` (connect/read timeouts). Deferred since the original
+     scoping pass - lib/socket.py has never had any timeout support to
+     build on (blocking-only sockets). No longer specifically blocked here:
+     a separate, already-in-progress session is adding non-blocking I/O
+     (including timeout support) to lib/socket.py. Once that lands, this
+     needs a `timeout_ms: u32|None = None` parameter threaded through the
+     same call chain verify= just went through (Session.request()/
+     convenience methods/module-level functions down to
+     _connect_or_http_err/_connect_tls_or_http_err and the read loops in
+     getresponse()), plus deciding how a timeout surfaces as an HTTPError
+     variant.
