@@ -313,8 +313,8 @@ def decode_chunked( data: bytes ) -> Result[bytes, HTTPError]:
 	return Result.Ok( bytes.from_bytearray( move( out )))
 
 # ---------------------------------------------------------------------------
-# small integer <-> str helpers - int (the boxed arbitrary-precision type)
-# only converts from/to i32 (lib/builtins/__int.py), not usize, and a
+# small integer <-> str helper - int (the boxed arbitrary-precision type)
+# only converts from i32 (lib/builtins/__int.py), not usize, and a
 # Content-Length can legitimately need the full usize range - spelled out
 # directly rather than routed through int, matching this codebase's own
 # established "ASCII digits by hand" idiom (see lib/builtins/__int.py's own
@@ -323,28 +323,6 @@ def decode_chunked( data: bytes ) -> Result[bytes, HTTPError]:
 
 _ASCII_ZERO: u8 = 0x30
 _ASCII_NINE: u8 = 0x39
-
-def _usize_to_str( n: usize ) -> str:
-	if n == 0:
-		return '0'
-	digits: bytearray = bytearray( 20 ) # a u64 fits in at most 20 decimal digits
-	d_ptr: Ptr[u8] = digits.get_ptr()
-	count: usize = 0
-	v: usize = n
-	with compiler.panic_arithmetic( 'usize has at most 20 decimal digits, divisor is a nonzero literal' ):
-		while v > 0:
-			d_ptr[count] = u8( v % 10 ) + _ASCII_ZERO
-			v = v // 10
-			count += 1
-	with compiler.panic_arithmetic( 'count is bounded by 20, cannot overflow' ):
-		out: bytearray = bytearray( count + 1 ) # +1 zero terminator
-	out_ptr: Ptr[u8] = out.get_ptr()
-	i: usize = 0
-	with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
-		while i < count:
-			out_ptr[i] = d_ptr[ count - 1 - i ] # digits were built least-significant-first
-			i += 1
-	return str.from_cstr( move( out )).unwrap( '_usize_to_str: unreachable - pure ASCII digits' )
 
 def _usize_from_str( s: str ) -> Result[usize, HTTPError]:
 	if s.byte_len() == 0:
@@ -553,7 +531,7 @@ def _build_request_head( method: str, path: str, host: str, headers: HTTPHeaders
 			value: str = headers.value_at( i ).unwrap( '_build_request_head: index in bounds by construction' )
 			head = head + name + ': ' + value + '\r\n'
 	if body is not None:
-		head = head + 'Content-Length: ' + _usize_to_str( body.__len__() ) + '\r\n'
+		head = head + 'Content-Length: ' + body.__len__().__str__() + '\r\n'
 	return head + '\r\n'
 
 # Every socket-facing call in this file is funneled through one of the
