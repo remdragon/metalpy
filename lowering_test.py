@@ -5674,8 +5674,12 @@ class Tests( unittest.TestCase ):
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
 			# falls off the end of the body (no explicit return) straight
-			# into the epilogue - no Jump needed, it's placed right after
-			ir.Label( name = '__epilogue_0__' ),
+			# into the epilogue - no Jump needed, it's placed right after.
+			# No Label either: nothing else in this function ever needs to
+			# goto this exact depth, so build_epilogue_ladder() correctly
+			# omits it (a Label with nothing branching to it is a real
+			# -Wunused-label/C4102 on every C compiler) - see cfg.py's own
+			# comment on entry.captured
 			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_1__' ),
 			ir.Call( dest = None, target = cleanup_fn, args = [], kwargs = {} ),
 			ir.Label( name = '__defer_skip_1__' ),
@@ -5726,7 +5730,10 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
-			ir.Label( name = '__epilogue_0__' ),
+			# no Label here - see test_noreturn_function_epilogue_has_no_
+			# return_value_var's identical comment; nothing else in this
+			# function needs to goto this depth, only the fall-off-the-end
+			# path reaches it, via pure fallthrough
 			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_1__' ),
 			# the is_err() check is computed fresh, INSIDE the flag guard -
 			# with per-Epilogue labels a check computed once up front
@@ -5785,7 +5792,10 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( got, [
 			ir.Return( value = None ), # straight return, no epilogue yet
 			ir.Jump( target = '__epilogue_1__' ), # jumps straight to b's own cleanup, skipping c's (not alive yet on this path)
-			ir.Label( name = '__epilogue_3__' ), # clean up c
+			# no Label for c's own rung (__epilogue_3__) - nothing ever
+			# jumps there (only the fall-off-the-end path reaches it, via
+			# pure fallthrough from the Jump target above), so it's
+			# correctly omitted - see cfg.py's entry.captured
 			ir.Label( name = '__epilogue_1__' ), # clean up b - shared with the early return above
 			ir.Return( value = None ), # the function's one real Return, reached by fall-off-the-end
 		])

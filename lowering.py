@@ -1892,7 +1892,14 @@ class FunctionLowering:
 					# defer/errdefer flag needs its init spliced in) regardless
 					# of whether the body can fall off the end.
 					if (
-						( self.lowering._body_may_fall_off_the_end( fn.node.body ) and self._cfg.current_epilogue_label() is not None )
+						# mark_captured=False: this is a pure existence probe -
+						# the label itself is discarded, never used to emit a
+						# goto (the fall-off-the-end path relies on
+						# build_epilogue_ladder() being placed immediately
+						# after the body, pure fallthrough, no jump needed) -
+						# see current_epilogue_label()'s own comment on why
+						# marking it captured here would be spurious
+						( self.lowering._body_may_fall_off_the_end( fn.node.body ) and self._cfg.current_epilogue_label( mark_captured = False ) is not None )
 						or self._cfg.used_shared_epilogue_label() or self._cfg.cancel_flags()
 					):
 						# some return (or OrJump) already jumped into the

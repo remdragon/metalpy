@@ -821,7 +821,18 @@ def c_type( t: Type|None ) -> str:
 				inner = 'void'
 			else:
 				inner = _value_spelling( inner_type )
-			return f'{inner}*' if base.stem == 'Ptr' else f'const {inner}*'
+			if base.stem == 'Ptr':
+				return f'{inner}*'
+			# a flat, single leading const covers the whole pointer chain
+			# in this codebase's model (never a per-level const, e.g. real
+			# C's `const T* const*`) - inner_type itself being Ptr[U]/
+			# ConstPtr[U] (ConstPtr[ConstPtr[T]] etc) means the recursive
+			# _value_spelling/c_type call above already produced that
+			# single leading const, so just add this level's own pointer
+			# star; re-adding 'const ' here too would double it ("const
+			# const T**") - a real, confirmed -Wduplicate-decl-specifier
+			# on clang, not just cosmetic pickiness
+			return f'{inner}*' if inner.startswith( 'const ' ) else f'const {inner}*'
 		if t.is_rc_pointer():
 			return f'struct {mangle_type(t)}*'
 		if isinstance( base, ( CStruct, CUnion, TaggedUnion )):
@@ -2213,21 +2224,53 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# popped) stack, and a dead "fall off the end" epilogue can exist with
 	# no OrJump anywhere in the function at all (a while-True loop whose
 	# only exits are return/break, e.g. str.split() below). So this checks
-	# for EITHER shape, not just one: any OrJump with a return_slot, OR
-	# any Label at all whose name starts with 'epilogue' (cfg.py's
-	# Epilogue.name is always 'epilogue_N', from _new_label('epilogue') -
-	# a reliable proxy for "an Epilogue entry existed, so build_epilogue_
-	# ladder() ran" without replicating cfg.py's own push/cancel
-	# bookkeeping here). `declared` then makes any actual ir.Assign to it
-	# (from the function's own `return <expr>`) just an ordinary
-	# re-assignment, not a second declaration
+	# for any of THREE shapes: any OrJump with a return_slot; the shared
+	# epilogue ladder's own final `ir.Return(value=<__return_value>)`
+	# (_emit_epilogue's unconditional tail - the direct, unambiguous
+	# signal, not a proxy); OR (kept as a belt-and-suspenders fallback,
+	# cheaper to check and still correct whenever it fires) any Label at
+	# all whose name starts with 'epilogue' (cfg.py's Epilogue.name is
+	# always 'epilogue_N', from _new_label('epilogue')). The Label check
+	# ALONE is no longer sufficient on its own - build_epilogue_ladder()
+	# now omits an uncaptured entry's own Label entirely (see its own
+	# docstring), so a function whose only epilogue entry is reached
+	# purely by the fall-off-the-end path with no OTHER return capturing
+	# it can have _emit_epilogue() genuinely run (referencing __return_
+	# value) while NO Label with 'epilogue' in its name survives anywhere
+	# in fn.instructions - confirmed by a real repro (a plain "use of
+	# undeclared identifier '__return_value'" compile error) once the
+	# Label-omission fix shipped without this. `declared` then makes any
+	# actual ir.Assign to it (from the function's own `return <expr>`)
+	# just an ordinary re-assignment, not a second declaration
 	needs_return_value = any(
 		( isinstance( instr, ir.OrJump ) and instr.return_slot is not None )
+		or ( isinstance( instr, ir.Return ) and isinstance( instr.value, Variable ) and instr.value.stem == '__return_value' )
 		or ( isinstance( instr, ir.Label ) and 'epilogue' in instr.name ) # _new_label('epilogue') -> '__epilogue_N__', not a bare prefix
 		for instr in fn.instructions
 	)
 	if needs_return_value and not _returns_void_in_c( function.return_type ):
 		name = _c_local_name( '__return_value' )
+		# deliberately NOT zero-initialized (`= {0}`) despite a branch
+		# chain compiled from a match/if-elif over every variant of a
+		# union (or similarly exhaustive-at-the-metalpy-level shape) being
+		# only PROVABLY exhaustive to this compiler's own discovery/type-
+		# checking - the emitted C is ordinary if/else-if with no final
+		# catch-all else, so clang/MSVC's own (more conservative, per-
+		# branch) dataflow analysis can't see that every REACHABLE path
+		# already assigned this before the shared "fall off the end"
+		# `return __return_value;` ever reads it, and flags -Wsometimes-
+		# uninitialized/C4701 - a confirmed false positive (every test in
+		# the suite that hits this shape produces the correct, non-zero
+		# result). `= {0}` was tried here first and reverted: for a large
+		# enough struct/union return type it lowers to a real, CALLED
+		# memset() (confirmed via a real link failure - int.__add__'s own
+		# Result[i32,OverflowError] triggered it), bypassing this
+		# compiler's own extern_libs/no_crt bookkeeping entirely (the C
+		# compiler inserts the call on its own, invisibly, well after
+		# metalpy's own emission), so a no-CRT build (no memset available
+		# at all) fails to link. See CcTool.compile()'s own
+		# -Wno-sometimes-uninitialized/-Wno-uninitialized/wd4701 for the
+		# actual (diagnostic-suppression, zero behavior-risk) fix instead
 		lines.append( f'\t{_declarator( function.return_type, name )};' )
 		declared.add( name )
 	for instr in fn.instructions:
@@ -2267,8 +2310,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# real `return <T-typed-expr>;` in its own body (e.g. Result
 			# [None,E].unwrap()'s `return self.data.v_Ok`), which would
 			# otherwise emit `return $t2;` from a function declared void -
-			# see _returns_void_in_c's own comment
-			return [ '\treturn;' ]
+			# see _returns_void_in_c's own comment. instr.value's own
+			# defining instruction (DeclareTemp+GetAttr/Call/whatever, not
+			# necessarily an ir.Assign - _mark_used_if_none's other call
+			# sites don't cover every shape) already ran; mark it read here
+			# so discarding it doesn't turn that already-emitted definition
+			# into -Wunused-variable/-Wunused-but-set-variable
+			return _mark_used_if_none( instr.value ) + [ '\treturn;' ]
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
 	if isinstance( instr, ir.Yield ):
