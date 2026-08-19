@@ -1,8 +1,8 @@
 Generator functions (`yield`, state-machine transform)
 
-> **Note (2026-08-19): Phase F, B, and now C (`.send()`) have all been
-> REIMPLEMENTED against current master - only the A.4a follow-up (`yield
-> from`) has not.** History recap: Phase F/B/C/A.4a were originally
+> **Note (2026-08-19): Phase F, B, C (`.send()`), and now the A.4a
+> follow-up (`yield from`) have all been REIMPLEMENTED against current
+> master.** History recap: Phase F/B/C/A.4a were originally
 > built, merged to master (a4a1d5d), then silently discarded by the next
 > merge (1a89a86) before anyone noticed. By the time that was caught,
 > master had diverged too far (150+ commits touching the exact substrate
@@ -42,11 +42,71 @@ Generator functions (`yield`, state-machine transform)
 > negating a value (`-x`) directly into a union return/yield type
 > produced invalid C - see `_expr_UnaryOp`'s own `operand_hint` comment.
 >
-> **The A.4a follow-up (`yield from`) is still NOT implemented** -
-> `TypeResolver._reject_generator_yield_from` still rejects it cleanly.
-> The A.4a design section further down describes what the original
-> branch built and could still guide a future attempt, but nothing there
-> reflects current code either.
+> **The A.4a follow-up (`yield from`) has ALSO now been REIMPLEMENTED**
+> (worktree `generator-a4a-yield-from`, 2026-08-19), on top of the Phase
+> F/B/C rebuild above: `yield from <expr>` desugars into `for __yield_
+> from_N in <expr>: yield __yield_from_N` (`TypeResolver._desugar_
+> generator_yield_from`), sharing the same for-loop-over-iterator
+> desugaring (`_desugar_iterator_for`) any user-written `for x in some_
+> generator(): yield x` already went through - so this landed BOTH
+> `yield from` itself AND, for free, general support for an ordinary for-
+> loop-with-yield forwarding another generator's values (previously only
+> exercised over `list[T]`/`range()`). `_reject_generator_for_or_yield_
+> from_nested_inside_loop` replaces the old blanket `_reject_generator_
+> yield_from` rejection, narrowing it to just the one genuinely unsafe
+> shape: nested inside a while/for that could re-enter it (nested inside
+> if/with is fine, at any depth) - see its own docstring for the
+> `_new_for_obj_field` "evaluate once, at construction" invariant this
+> protects.
+>
+> Three real, pre-existing bugs were found and fixed while building this
+> (none specific to `yield from` itself - all three are general gaps
+> this was just the first thing to actually exercise): (1) `yield <expr>`
+> whose type didn't match the generator's own declared element type
+> silently produced invalid C instead of a clean error - `_emit_
+> generator_yield_suspend`'s `strict=False` coercion had no follow-up
+> type check (now added, mirroring `_stmt_Return`'s own); (2) a for-
+> loop's synthesized loop-target zero-placeholder (`_desugar_iterator_
+> for`'s `target_zero`) didn't tag itself `generator_zero_rc_field` for
+> an RC-typed `elem_type`, so ANY for-loop-with-yield consuming an RC-
+> typed generator/iterable failed to compile at all ("an int literal
+> cannot be used where Box is expected") - never previously exercised
+> since every existing for-loop-with-yield test used a scalar element
+> type; (3) **the significant one**: forwarding an RC-typed value through
+> `yield from`/a for-loop-with-yield leaked exactly one reference per
+> forwarded value. Root cause: `_desugar_iterator_for` builds a while
+> loop whose body is `__for_next_N = obj.__next__(); match __for_next_N:
+> ...; yield <extracted>` - a genuine yield/suspend sits INSIDE that
+> loop's own body, so any CFG-tracked plain-local binding introduced
+> there (the raw `.__next__()` result, and the match arm's own extracted-
+> payload temp) has its `cfg.py` `loop_back_edge()`-scheduled teardown
+> land on the FAR SIDE of the yield - a separate `$$__resume__` call with
+> a fresh stack frame, where that plain local's storage no longer exists
+> (confirmed via a real repro: `release_object()` on garbage/uninitialized
+> memory). Fixed two different ways for the two different temps: `__for_
+> next_N` gets promoted to an ordinary live-flag-guarded field exactly
+> like any user-written RC-typed local (an `AnnAssign` instead of a bare
+> `Assign`, so `_collect_generator_locals`'s existing scan picks it up
+> for free) whenever `elem_type.is_rc()` and BODY contains a yield; the
+> match arm's own extraction temp can't use the same trick (`_match_
+> pattern` always binds via a bare, un-renamed `ast.Name`, so a promoted
+> name there just creates a SECOND, disjoint plain local shadowing the
+> real field - confirmed via a real repro where the yielded value came
+> back wrapped around a null pointer) - kept as a plain local instead,
+> with an explicit `compiler.decref(...)` call synthesized right after
+> its one real use, the same established idiom `list.__del__`/`dict`'s
+> own `_release_key`/`_release_value` already use for tearing down a
+> value read out of a container (`cfg.py`'s `manually_decreffed` stops
+> the loop's own back-edge reconciliation from trying a second time).
+> Verified via real compile-and-run refcount checks: forwarding two RC
+> values through a full `yield from` cycle and fully consuming both
+> leaves refcounts exactly back to baseline; dropping the outer generator
+> mid-iteration (abandonment) still releases every field it was holding,
+> via the ordinary state/flag-gated destructor cascade, no new machinery
+> needed there. See `emitter_c_test.py`'s `test_yield_from_basic_and_
+> nesting`/`test_yield_from_nested_inside_while_is_rejected`/`test_yield_
+> from_nested_inside_for_is_rejected`/`test_yield_wrong_element_type_is_
+> rejected`.
 
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
@@ -122,12 +182,13 @@ the original build, there is no separate 3-arg-vs-2-arg `SendType`-is-
 independent-of-`E` nuance write-up needed here - it carries over
 unchanged (see "Phase C design" below).
 
-**The A.4a follow-up (`yield from`) did NOT come back with either
-rebuild.** `yield from` is still a clean, explicit rejection
-(`TypeResolver._reject_generator_yield_from`). The A.4a section below
-describes what the ORIGINAL branch built, kept as a design reference for
-whoever picks this back up, not as a description of anything currently
-compilable.
+**The A.4a follow-up (`yield from`) has ALSO now been reimplemented**,
+on top of the Phase F/B/C rebuild above - see this doc's own top-of-file
+note for the current mechanism and the three bugs found building it. The
+A.4a section further down still describes the ORIGINAL branch's own
+design/reasoning (kept as reference - internal names differ from the
+current rebuild, same posture as every other phase's own design section
+in this doc).
 
 PLAN_GENERATORS.md's own motivating example now compiles and runs in its
 most natural, idiomatic spelling: `for i in range(count): yield i`,

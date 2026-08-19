@@ -766,10 +766,32 @@ class TypeResolver:
 		the constructor, rather than lazily on first __next__() call.
 
 		A for-loop with no yield in it at all is left completely alone
-		(ordinary preamble/body content, not this pass's concern). '''
+		(ordinary preamble/body content, not this pass's concern).
+
+		PLAN_GENERATORS.md A.4a follow-up - generalized from top-level-
+		only to recursing into nested if/while/for/with bodies (same
+		"_recurse_*_wrap" shape used elsewhere in this file - see
+		_recurse_desugar_for_loops) - a for-loop-with-yield reachable
+		through if/with now desugars correctly at any nesting depth, not
+		just the top level. _reject_generator_for_or_yield_from_nested_
+		inside_loop, run before this (and before _desugar_generator_
+		yield_from, which this always runs after - see their shared
+		caller), has already rejected the one nesting shape this can't
+		handle safely (nested inside a while/for that could re-enter
+		it) - a for-loop-with-yield reachable ONLY through if/with can
+		never itself contain a FURTHER nested for-loop-with-yield/yield-
+		from needing its OWN desugaring (that combination is always
+		rejected too, regardless of what's between them), so this never
+		needs to recurse into a for-loop-with-yield's own body once it's
+		matched - see that validator's own docstring for the full
+		invariant this relies on. '''
 		extra_fields: dict[str,tuple[Type,ast.expr]] = {}
+		fn.node.body = self._recurse_desugar_for_loops( fn, fn.node.body, extra_fields )
+		return extra_fields
+
+	def _recurse_desugar_for_loops( self, fn: Function, stmts: list[ast.stmt], extra_fields: dict[str,tuple[Type,ast.expr]] ) -> list[ast.stmt]:
 		new_body: list[ast.stmt] = []
-		for stmt in fn.node.body:
+		for stmt in stmts:
 			if isinstance( stmt, ast.For ) and any(
 				isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( stmt.body )
 			):
@@ -777,10 +799,14 @@ class TypeResolver:
 					new_body.extend( self._desugar_range_for( fn, stmt ))
 				else:
 					new_body.extend( self._desugar_general_for( fn, stmt, extra_fields ))
-			else:
-				new_body.append( stmt )
-		fn.node.body = new_body
-		return extra_fields
+				continue
+			if isinstance( stmt, ( ast.If, ast.While, ast.For )):
+				stmt.body = self._recurse_desugar_for_loops( fn, stmt.body, extra_fields )
+				stmt.orelse = self._recurse_desugar_for_loops( fn, stmt.orelse, extra_fields )
+			elif isinstance( stmt, ast.With ):
+				stmt.body = self._recurse_desugar_for_loops( fn, stmt.body, extra_fields )
+			new_body.append( stmt )
+		return new_body
 
 	def _desugar_general_for( self, fn: Function, node: ast.For, extra_fields: dict[str,tuple[Type,ast.expr]] ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 1 - `for x in <expr>: BODY` where
@@ -996,7 +1022,27 @@ class TypeResolver:
 
 		elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() ) if elem_type is not None else ast.Name( id = '?', ctx = ast.Load() )
 		ast.copy_location( elem_type_name, node )
-		target_zero = ast.Constant( value = False ) if ( isinstance( elem_type, Scalar ) and elem_type.stem == 'bool' ) else ast.Constant( value = 0 )
+		if isinstance( elem_type, Scalar ) and elem_type.stem == 'bool':
+			target_zero = ast.Constant( value = False )
+		else:
+			target_zero = ast.Constant( value = 0 )
+			if elem_type is not None and elem_type.is_rc():
+				# same exemption _rewrite_generator_constructor's own RC-
+				# typed field zero-placeholders already use (_expr_
+				# Constant's generator_zero_rc_field) - this loop target
+				# is about to be immediately overwritten by the match arm
+				# just below (never actually READ as this placeholder
+				# value), but it's still a real, ordinary promoted local
+				# needing SOME initial value satisfying its own RC-typed
+				# declared annotation - confirmed via a real repro: a for-
+				# loop consuming another generator whose elem_type is
+				# RC-typed (e.g. `for x in some_gen_of_boxes():`) failed
+				# to compile at all ("an int literal cannot be used where
+				# Box is expected") - found via A.4a's own `yield from`
+				# (a natural way to forward an RC-typed inner generator's
+				# values), but reproduces identically with an ordinary
+				# user-written for-loop, no yield-from involved
+				target_zero.generator_zero_rc_field = True
 		target_init = ast.AnnAssign(
 			target = ast.Name( id = node.target.id, ctx = ast.Store() ), annotation = elem_type_name,
 			value = target_zero, simple = 1,
@@ -1007,17 +1053,64 @@ class TypeResolver:
 			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__next__', ctx = ast.Load() ),
 			args = [], keywords = [],
 		)
-		next_assign = ast.Assign( targets = [ ast.Name( id = next_name, ctx = ast.Store() ) ], value = next_call )
+		# A.4a: when BODY itself contains a yield (the for-x-in-generator-
+		# forwarding shape yield-from always desugars into), __for_next_N's
+		# own raw __next__() result is alive ACROSS that yield's suspend -
+		# the very next statement after it (the match extracting the
+		# narrowed payload) only runs on the FOLLOWING resume, a genuinely
+		# separate C function call with a fresh stack frame. The docstring
+		# above ("recomputed fresh every resume, never crosses one") is only
+		# true when BODY has no yield of its own - confirmed by a real
+		# nested-generator yield-from repro that leaked one whole reference
+		# per forwarded RC value: __for_next_N stayed a bare stack local, so
+		# the value it captured from inner's own yield-wrap incref was
+		# silently abandoned (never released) once the outer loop's own
+		# match arm copied it onward into the promoted __yield_from_N field.
+		# Fix: give it the SAME ordinary promoted-local treatment as any
+		# user-written one (an AnnAssign, so _collect_generator_locals picks
+		# it up and _apply_live_flag_guards gives it the standard live-flag-
+		# guarded reassignment/destructor teardown) instead of opting it out
+		# - safe even though its type is a union (elem_type|None): Type.
+		# is_rc() already recurses into union leaves, so an RC elem_type
+		# still gets the live-flag companion field it needs.
+		# only an RC-typed elem_type actually needs any of the special
+		# handling below - a scalar/non-RC one has no ownership to track,
+		# so the ORIGINAL "recomputed fresh every resume, never crosses
+		# one" assumption (this method's own docstring) is still exactly
+		# true for it even when BODY contains a yield: nothing here needs
+		# tearing down, so nothing needs promoting. Confirmed via a real
+		# regression this branch used to trip on body_has_yield alone
+		# (an ordinary `for x in some_gen_of_usize(): yield x`, x scalar):
+		# the constructor's own zero-placeholder for a promoted __for_
+		# next_N has no exemption path for a NON-RC union target either
+		# (generator_zero_rc_field, just below in lowering.py, is gated on
+		# is_rc() same as everywhere else) - "expected NoneType|usize, got
+		# i32" on a case this method never needed to change in the first
+		# place.
+		body_has_yield = any( isinstance( n, ast.Yield ) for n in self._walk_generator_body( node.body ) )
+		needs_promotion = body_has_yield and elem_type is not None and elem_type.is_rc()
+		if needs_promotion:
+			next_elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() ) if elem_type is not None else ast.Name( id = '?', ctx = ast.Load() )
+			ast.copy_location( next_elem_type_name, node )
+			next_annotation = ast.BinOp( left = next_elem_type_name, op = ast.BitOr(), right = ast.Constant( value = None ) )
+			ast.copy_location( next_annotation, node )
+			next_assign = ast.AnnAssign(
+				target = ast.Name( id = next_name, ctx = ast.Store() ), annotation = next_annotation,
+				value = next_call, simple = 1,
+			)
+		else:
+			next_assign = ast.Assign( targets = [ ast.Name( id = next_name, ctx = ast.Store() ) ], value = next_call )
 		ast.copy_location( next_assign, node )
-		# exempted from _collect_generator_locals's own "must be declared
-		# with an explicit annotation" check - __for_next_N is deliberately
-		# an ordinary $$__next__-scoped local (recomputed fresh every
-		# resume, never crosses one - see this method's own docstring),
-		# same posture as _build_while_unit_guard's own __gen_resuming_N,
-		# just built one stage earlier (during desugaring, before locals
-		# collection ever runs) so it needs an explicit opt-out here
-		# instead of simply never being visible to that scan at all
-		next_assign.compiler_synthesized_for_loop_temp = True
+		if not needs_promotion:
+			# exempted from _collect_generator_locals's own "must be declared
+			# with an explicit annotation" check - __for_next_N is deliberately
+			# an ordinary $$__next__-scoped local (recomputed fresh every
+			# resume, never crosses one - see this method's own docstring),
+			# same posture as _build_while_unit_guard's own __gen_resuming_N,
+			# just built one stage earlier (during desugaring, before locals
+			# collection ever runs) so it needs an explicit opt-out here
+			# instead of simply never being visible to that scan at all
+			next_assign.compiler_synthesized_for_loop_temp = True
 
 		exhausted_break = ast.Break()
 		exhausted_break.compiler_synthesized_break = True # exempted from _validate_while_yield_unit's own break/continue rejection - see its own comment
@@ -1025,13 +1118,74 @@ class TypeResolver:
 			pattern = ast.MatchSingleton( value = None ), guard = None,
 			body = [ exhausted_break ],
 		)
+		# the match arm's own bound extraction name: reuses next_name (the
+		# "narrowing bind, reuses the subject's own name" shape - see
+		# visit_Match's own original_subject_name) when the raw next()
+		# result stays a plain local - that mechanism can't apply once it's
+		# promoted instead (needs_promotion above): _GeneratorNameRenamer
+		# rewrites every ast.Name(id=next_name) it finds (including the
+		# match SUBJECT below) into self.<next_name>, but a MatchAs
+		# pattern's own `.name` is a plain str, never touched by that
+		# renamer (it only visits ast.Name nodes), and visit_Match's own
+		# "reuses the subject's own name" recognition requires the subject
+		# to still be a bare ast.Name to begin with - a self-attr subject
+		# never qualifies. A fresh, distinct name is needed either way, so
+		# use one (__for_elem_N) whenever needs_promotion -
+		# binding directly into node.target.id instead was tried first and
+		# is WRONG, not just for RC reasons: _match_pattern (below) always
+		# synthesizes a bind into a bare ast.Name, resolved via its own
+		# fresh self.locals[...] entry, never routed through self.<attr> -
+		# for A.4a's own yield-from desugaring node.target.id IS the
+		# promoted field's own stem (__yield_from_N), so that bind silently
+		# created a SECOND, same-named plain local shadowing the real
+		# field, which then never actually received the extracted value at
+		# all (confirmed via a real repro: the yielded value came back
+		# wrapped around a null pointer instead of the real one, while the
+		# shadow local's own extra reference just leaked, coincidentally
+		# still landing on a "plausible" refcount).
+		elem_bind_name = next_name if not needs_promotion else f'__for_elem_{unique}'
+		elem_case_body: list[ast.stmt] = [
+			ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = ast.Name( id = elem_bind_name, ctx = ast.Load() ) ),
+		]
+		if needs_promotion:
+			# elem_bind_name stays a PLAIN, non-promoted local here on
+			# purpose (tried promoting it via extra_locals first - wrong:
+			# _match_pattern, below, ALWAYS synthesizes its bind as a bare
+			# ast.Assign into a bare ast.Name, built fresh at visit_Match
+			# time - well AFTER _GeneratorNameRenamer has already run over
+			# this whole body during _build_generator_next_function, so a
+			# promoted elem_bind_name would just create a second, disjoint
+			# storage location: the bind writes a genuinely fresh plain
+			# local, while the re-store above - built here, so it DOES go
+			# through the renamer - reads self.<elem_bind_name> instead,
+			# the STILL-UNINITIALIZED field. Confirmed via a real repro:
+			# `x` came back None instead of the real extracted value).
+			#
+			# Kept plain, this temp's own extraction incref (the ordinary
+			# aliasing-read cost of pulling an RC payload out of the union)
+			# still needs a real decref, and cfg.py's own loop_back_edge()
+			# - which would ordinarily supply that automatically, for any
+			# plain Name binding confined to the loop - schedules it for
+			# the loop's own back edge, past the yield a few statements
+			# below, in a separate $$__resume__ call with a fresh stack
+			# frame (confirmed via a real repro: release_object() on a
+			# never-initialized local). So: decref it explicitly, right
+			# here, immediately after the re-store has taken its own
+			# independent reference - manually_decreffed (cfg.py, reached
+			# via compiler.decref's own lowering) marks it consumed, so the
+			# loop's own back-edge reconciliation no longer tries to a
+			# second time.
+			elem_case_body.append( _expr_stmt( ast.Call(
+				func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+				args = [ ast.Name( id = elem_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)))
 		elem_case = ast.match_case(
 			pattern = ast.MatchClass(
-				cls = elem_type_name, patterns = [ ast.MatchAs( name = next_name ) ],
+				cls = elem_type_name, patterns = [ ast.MatchAs( name = elem_bind_name ) ],
 				kwd_attrs = [], kwd_patterns = [],
 			),
 			guard = None,
-			body = [ ast.Assign( targets = [ ast.Name( id = node.target.id, ctx = ast.Store() ) ], value = ast.Name( id = next_name, ctx = ast.Load() ) ) ],
+			body = elem_case_body,
 		)
 		match_stmt = ast.Match( subject = ast.Name( id = next_name, ctx = ast.Load() ), cases = [ none_case, elem_case ] )
 		ast.copy_location( match_stmt, node )
@@ -1046,15 +1200,104 @@ class TypeResolver:
 		ast.fix_missing_locations( target_init )
 		return [ target_init, while_node ]
 
-	def _reject_generator_yield_from( self, fn: Function ) -> None:
-		''' PLAN_GENERATORS.md Phase F - `yield from` is A.4a follow-up
-		scope, not attempted here; still a clean rejection rather than a
-		silent miscompile (ast.YieldFrom never gets a dispatch state
-		assigned below, so reaching lowering.py unrejected would hit an
-		unsupported-statement failure with a far less useful message). '''
-		for n in self._walk_generator_body( fn.node.body ):
-			if isinstance( n, ast.YieldFrom ):
-				self.discovery.fail( f'{fn.qualname}: yield from is not supported yet - see PLAN_GENERATORS.md', n )
+	def _reject_generator_for_or_yield_from_nested_inside_loop( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md A.4a follow-up - _new_for_obj_field's own
+		"evaluate the iterated expression once, at construction" design
+		(Phase 1, unchanged) is silently WRONG once a for-loop-with-yield
+		(or `yield from`, which desugars into one - see _desugar_
+		generator_yield_from) is reachable through a while/for loop that
+		could re-enter it: the same already-exhausted iterated object
+		gets reused on every re-entry instead of being freshly
+		reconstructed (confirmed via a real repro: `while j < count:
+		yield from inner(); j += 1` only ever forwarded inner()'s own
+		values during the outer loop's FIRST pass - every later pass
+		silently forwarded nothing at all). Rather than the larger fix
+		(re-deriving __for_obj_N to re-initialize per loop entry - real
+		work, no forcing use case yet), this rejects the specific shape
+		instead: nested inside if/with is fine (both _desugar_generator_
+		for_loops/_desugar_generator_yield_from generalize/desugar
+		correctly there); nested inside while/for, at ANY depth reachable
+		through one, stays a compile error, not a silent miscompile.
+		Runs against the ORIGINAL, undesugared body, BEFORE either
+		desugar pass - a for-loop/yield-from already rewritten away
+		wouldn't be recognizable as such anymore. '''
+		self._walk_for_loop_nesting( fn, fn.node.body, in_loop = False )
+
+	def _walk_for_loop_nesting( self, fn: Function, stmts: list[ast.stmt], in_loop: bool ) -> None:
+		''' helper for _reject_generator_for_or_yield_from_nested_inside_
+		loop - see its own docstring. `in_loop` is a plain bool, not a
+		mutable/shared cell: propagated by VALUE into every recursive
+		call, set once entering ANY while/for (never cleared by an
+		intervening if/with, only by genuinely being outside that loop's
+		own body on this walk) - simple because this is a real recursive
+		tree walk, not a flat scan needing its own stack. '''
+		for s in stmts:
+			is_loop = isinstance( s, ( ast.While, ast.For ))
+			is_yield_from = isinstance( s, ast.Expr ) and isinstance( s.value, ast.YieldFrom )
+			is_for_with_yield = isinstance( s, ast.For ) and any(
+				isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( s.body )
+			)
+			if in_loop and ( is_yield_from or is_for_with_yield ):
+				kind = 'yield from' if is_yield_from else 'a for loop containing yield'
+				self.discovery.fail(
+					f'{fn.qualname}: {kind} nested inside a while/for loop that could re-enter it is not '
+					f'supported yet (nested inside if/with is fine) - see PLAN_GENERATORS.md',
+					s,
+				)
+			if isinstance( s, ( ast.If, ast.While, ast.For )):
+				self._walk_for_loop_nesting( fn, s.body, in_loop or is_loop )
+				self._walk_for_loop_nesting( fn, s.orelse, in_loop or is_loop )
+			elif isinstance( s, ast.With ):
+				self._walk_for_loop_nesting( fn, s.body, in_loop )
+
+	def _desugar_generator_yield_from( self, fn: Function ) -> None:
+		''' PLAN_GENERATORS.md A.4a follow-up - `yield from <expr>`
+		desugars into `for __yield_from_N in <expr>: yield __yield_from_
+		N`, run BEFORE _desugar_generator_for_loops so the synthesized
+		for-loop gets picked up by that pass's own existing machinery
+		exactly like an ordinary user-written for-loop-with-yield - no
+		separate forwarding mechanism needed (and, like every other for-
+		loop-with-yield, restricted to an INFALLIBLE T|None-shaped
+		__next__() - see _desugar_iterator_for - so `yield from` over a
+		fallible Generator[T,E]/Generator[T,SendType,E] isn't supported
+		either, same pre-existing boundary as an ordinary `for x in
+		fallible_gen():` outside a generator body). Recurses into nested
+		if/while/for/with bodies (same "_recurse_*_wrap" shape used
+		elsewhere in this file) - _reject_generator_for_or_yield_from_
+		nested_inside_loop, run just before this, has already rejected
+		the one placement this can't desugar safely (nested inside a
+		while/for that could re-enter it). '''
+		fn.node.body = self._recurse_desugar_yield_from( fn, fn.node.body )
+
+	def _recurse_desugar_yield_from( self, fn: Function, stmts: list[ast.stmt] ) -> list[ast.stmt]:
+		result: list[ast.stmt] = []
+		for s in stmts:
+			if isinstance( s, ast.Expr ) and isinstance( s.value, ast.YieldFrom ):
+				unique = self._for_desugar_counter
+				self._for_desugar_counter += 1
+				target_name = f'__yield_from_{unique}'
+				yielded_name = ast.Name( id = target_name, ctx = ast.Load() )
+				ast.copy_location( yielded_name, s )
+				yield_stmt = ast.Expr( value = ast.Yield( value = yielded_name ))
+				ast.copy_location( yield_stmt, s )
+				ast.copy_location( yield_stmt.value, s )
+				for_node = ast.For(
+					target = ast.Name( id = target_name, ctx = ast.Store() ),
+					iter = s.value.value,
+					body = [ yield_stmt ], orelse = [],
+				)
+				ast.copy_location( for_node, s )
+				ast.copy_location( for_node.target, s )
+				ast.fix_missing_locations( for_node )
+				result.append( for_node )
+				continue
+			if isinstance( s, ( ast.If, ast.While, ast.For )):
+				s.body = self._recurse_desugar_yield_from( fn, s.body )
+				s.orelse = self._recurse_desugar_yield_from( fn, s.orelse )
+			elif isinstance( s, ast.With ):
+				s.body = self._recurse_desugar_yield_from( fn, s.body )
+			result.append( s )
+		return result
 
 	def _assign_generator_yield_dispatch( self, fn: Function ) -> list[tuple[int,str]]:
 		''' PLAN_GENERATORS.md Phase F - replaces the old AST-synthesis
@@ -1890,6 +2133,7 @@ class TypeResolver:
 		here already does. This is the ONE place that expression is ever
 		evaluated - see _new_for_obj_field's own docstring for why eager,
 		construction-time evaluation was chosen over lazy. '''
+		none_type = self.discovery.get_none_type()
 		keywords = [ ast.keyword( arg = '__state', value = ast.Constant( value = 0 ) ) ]
 		for p in fn.parameters or []:
 			name_node = ast.Name( id = p.stem, ctx = ast.Load() )
@@ -1897,13 +2141,33 @@ class TypeResolver:
 			keywords.append( ast.keyword( arg = p.stem, value = name_node ) )
 		for stem, t in locals_decl.items():
 			if t.is_rc():
-				# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - never read
-				# before its own first real assignment (gated by the
-				# companion live-flag field below, checked by the
-				# generator's own state/flag-gated destructor) - see
-				# _expr_Constant's own generator_zero_rc_field exemption
-				zero = ast.Constant( value = 0 )
-				zero.generator_zero_rc_field = True
+				t_base = t.base if isinstance( t, Specialization ) else t
+				if isinstance( t_base, TaggedUnion ) and any( a.type is none_type for a in t_base.attributes ):
+					# a T|None promoted local (e.g. A.4a's own __for_next_N,
+					# holding a for-loop-desugared iterator's raw .__next__()
+					# result across a yield) has an obvious, always-valid
+					# "not assigned yet" placeholder already: None itself -
+					# a real member of its own declared type, needing no
+					# generator_zero_rc_field exemption (that exemption is
+					# TaggedUnion-excluded below in lowering.py's
+					# _check_assignable - a bare `0` was never a meaningful
+					# stand-in for an arbitrary union's tag+data shape the
+					# way it is for a plain RCClass pointer)
+					zero = ast.Constant( value = None )
+				else:
+					# PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - never
+					# read before its own first real assignment (gated by
+					# the companion live-flag field below, checked by the
+					# generator's own state/flag-gated destructor) - see
+					# _expr_Constant's own generator_zero_rc_field exemption.
+					# NOTE: doesn't cover a promoted local typed as an RC
+					# union WITHOUT a None member (e.g. `held: A|B = ...`) -
+					# no zero-cost placeholder exists for that shape either,
+					# unexercised by anything built so far (every generator-
+					# yield_from/for-loop-forwarding site produces T|None by
+					# construction)
+					zero = ast.Constant( value = 0 )
+					zero.generator_zero_rc_field = True
 			else:
 				zero = ast.Constant( value = False if ( isinstance( t, Scalar ) and t.stem == 'bool' ) else 0 )
 			keywords.append( ast.keyword( arg = stem, value = zero ) )
@@ -2029,8 +2293,16 @@ class TypeResolver:
 			if send_type is not None:
 				self.schedule( send_type )
 
+			# PLAN_GENERATORS.md A.4a follow-up - order matters: the
+			# nesting validator runs first, against the ORIGINAL
+			# undesugared body (a for-loop/yield-from already rewritten
+			# away wouldn't be recognizable as such anymore); yield-from
+			# desugars into an ordinary for-loop next, so the for-loop
+			# desugaring pass right after picks up both user-written AND
+			# synthesized for-loops uniformly, with zero special-casing
+			self._reject_generator_for_or_yield_from_nested_inside_loop( fn )
+			self._desugar_generator_yield_from( fn )
 			extra_fields = self._desugar_generator_for_loops( fn )
-			self._reject_generator_yield_from( fn )
 			self._validate_generator_defer_sites( fn )
 			defer_sites = self._desugar_generator_defer_sites( fn )
 			self._reject_generator_value_return( fn )
