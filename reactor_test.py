@@ -342,6 +342,131 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
 
+	def test_spawn_wakes_a_genuinely_blocked_worker( self ) -> None:
+		# the crux of the whole blocking-drain_fully() design: a single
+		# worker parks Task1 on a signal that's deliberately withheld, so
+		# its queues drain to nothing else and it genuinely BLOCKS inside
+		# run_until_idle(-1)'s own poller.wait() - real Reactor.run(), not
+		# manual ticking. From a SEPARATE thread, after a bounded busy
+		# delay (no sleep() primitive exists - see busy_delay()) gives the
+		# worker a head start to actually reach that blocking call,
+		# Reactor.spawn() enqueues Task2 - if Worker.schedule()'s own
+		# wake-pair poke didn't exist (or were broken), Task2 would sit in
+		# __pending_tasks completely unprocessed until Task1's own signal
+		# ALSO happens to fire (queued work never gets lost, just
+		# arbitrarily delayed) - which would make this test pass anyway on
+		# a broken implementation via that "eventual, not prompt" path,
+		# proving nothing. To rule that out, the driving (main) thread
+		# busy-polls counter.load() for Task2's own completion BEFORE ever
+		# satisfying Task1's signal - if the wake mechanism genuinely
+		# works, this observes counter==1 well before the poll's own
+		# bound, while Task1's own signal is still deliberately
+		# unsatisfied. Sanity-checked directly during development:
+		# temporarily removing Worker.schedule()'s own wake-pair write
+		# made this exact test correctly fail (exit code 1, not a silent
+		# pass or a hang) - confirms it actually discriminates.
+		self._run( '''
+import compiler
+import socket
+import poller
+import reactor
+import atomic
+import threading
+
+def busy_delay() -> None:
+	i: usize = 0
+	while i < usize( 200000000 ):
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+class Task1:
+	fd: poller.SOCKET
+	counter: atomic.Atomic[i32]
+	def __init__( self, fd: poller.SOCKET, counter: atomic.Atomic[i32] ) -> None:
+		self.fd = fd
+		self.counter = counter
+	def run( self ) -> None:
+		sig = reactor.Signal( self.fd, True, False )
+		reactor.wait_for_signal( sig )
+		self.counter.fetch_add( 100 )
+
+class Task2:
+	counter: atomic.Atomic[i32]
+	def __init__( self, counter: atomic.Atomic[i32] ) -> None:
+		self.counter = counter
+	def run( self ) -> None:
+		self.counter.fetch_add( 1 )
+
+class LateWork:
+	r: reactor.Reactor
+	counter: atomic.Atomic[i32]
+	def __init__( self, r: reactor.Reactor, counter: atomic.Atomic[i32] ) -> None:
+		self.r = r
+		self.counter = counter
+	def run( self ) -> None:
+		busy_delay()
+		t2 = Task2( self.counter )
+		self.r.spawn( t2.run )
+
+class ReactorRunner:
+	r: reactor.Reactor
+	def __init__( self, r: reactor.Reactor ) -> None:
+		self.r = r
+	def run( self ) -> None:
+		self.r.run()
+
+def run() -> Result[i32, OSError]:
+	server = socket.Socket.tcp().or_return()
+	server.bind( '127.0.0.1', u16( 0 )).or_return()
+	server.listen().or_return()
+	bound = server.getsockname().or_return()
+	client = socket.Socket.tcp().or_return()
+	client.connect( '127.0.0.1', bound.port() ).or_return()
+	( conn, _addr ) = server.accept().or_return()
+	poller.set_nonblocking( conn.fileno() ).or_return()
+
+	counter = atomic.Atomic[i32]( 0 )
+	r = reactor.Reactor( 1 )
+	t1 = Task1( conn.fileno(), counter )
+	r.spawn( t1.run )
+
+	runner = ReactorRunner( r )
+	t_run = threading.Thread( runner.run )
+
+	late = LateWork( r, counter )
+	t_late = threading.Thread( late.run )
+
+	i: usize = 0
+	saw_task2: bool = False
+	while i < usize( 400000000 ):
+		if counter.load() == 1:
+			saw_task2 = True
+			break
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+	msg: bytes = b'go'
+	client.send_all( msg.get_const_ptr(), usize( 2 )).or_return()
+
+	t_run.join()
+	t_late.join()
+
+	if not saw_task2:
+		return Result.Ok( 1 )
+	if counter.load() != 101:
+		return Result.Ok( 2 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match run():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 3
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
+
 def _emit( compiler: Compiler ) -> str:
 	import emitter_c
 	return emitter_c.emit_c( compiler )
