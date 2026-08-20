@@ -73,6 +73,44 @@ def pthread_join(
 
 
 # ---------------------------------------------------------------------------
+# TLS (thread-local storage) - lib/threading.py's own ThreadLocal[T]. pthread_key_t
+# is opaque/platform-specific (an unsigned int on glibc), modelled the same
+# way as pthread_t above.
+# ---------------------------------------------------------------------------
+
+pthread_key_t = compiler.c_type( 'pthread_key_t', header = 'pthread.h' )
+
+# int pthread_key_create(pthread_key_t *key, void (*destructor)(void*)) -
+# destructor is always passed NULL here (Ptr[None]) - see ThreadLocal's own
+# docstring for why automatic per-thread cleanup isn't attempted
+@extern('pthread', 'pthread_key_create', header='pthread.h')
+def pthread_key_create(
+	key: Ptr[pthread_key_t],
+	destructor: Ptr[None],
+) -> i32:
+	...
+
+@extern('pthread', 'pthread_key_delete', header='pthread.h')
+def pthread_key_delete(
+	key: pthread_key_t,
+) -> i32:
+	...
+
+@extern('pthread', 'pthread_getspecific', header='pthread.h')
+def pthread_getspecific(
+	key: pthread_key_t,
+) -> Ptr[None]:
+	...
+
+@extern('pthread', 'pthread_setspecific', header='pthread.h')
+def pthread_setspecific(
+	key: pthread_key_t,
+	value: Ptr[None],
+) -> i32:
+	...
+
+
+# ---------------------------------------------------------------------------
 # ucontext — user-level context switching (glibc, part of libc itself, no
 # separate link library - 'c' matches socket.py's own no-extra-library
 # externs). ucontext_t is opaque/platform-specific (its layout differs by
