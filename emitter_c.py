@@ -1212,6 +1212,21 @@ def _function_prototype( function: Function ) -> str:
 		params.append( _declarator( p.type, _c_local_name( p.stem )))
 	params_str = ', '.join( params ) if params else 'void'
 	if _is_entry_point( function ):
+		# the real OS/CRT entry point always calls main with (argc, argv,
+		# envp) on the actual calling convention regardless of which
+		# prototype the source declares (a plain C fact, not something
+		# unique to this compiler) - so declaring the C-level signature as
+		# `int main(int argc, char** argv)` costs nothing and lets sys.argv
+		# (lib/sys.py) read real values, via emit_c()'s own argc/argv
+		# capture injected as the first statement of this function's body.
+		# Only for the ordinary, zero-parameter `def main() -> i32:` shape;
+		# a handful of lowering-only test fixtures declare a function
+		# LITERALLY named main with its own parameter for unrelated reasons
+		# (generic dispatch tests, never actually emitted through this path
+		# for real) - preserve the old behavior there rather than silently
+		# dropping a declared parameter from the C signature.
+		if not params:
+			return 'int main( int argc, char** argv )'
 		return f'int main( {params_str} )'
 	noreturn = '_Noreturn ' if _is_noreturn( function.return_type ) else ''
 	# NoneType/NoReturn are value-less in C — return void, not MetalpyNone
@@ -4087,23 +4102,48 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
 	)
+	# sys._raw_argc/_raw_argv only actually get DECLARED (see the globals
+	# loop above) when compiler.py's Compiler.run() successfully force-
+	# reaches sys.argv - which no-ops for a deliberately minimal, fixture-
+	# only Discovery whose own paths= doesn't include a real lib/sys.py
+	# (see force_reachable's own docstring; several *_test.py files use
+	# exactly this shape). Emitting the capture assignment unconditionally
+	# would then reference an undeclared identifier for those - gate on
+	# whether the global is actually present in THIS program.
+	has_argv_globals = any( g.variable.qualname == 'sys._raw_argc' for g in compiler.globals )
 	for lf in compiler.functions:
 		# @extern functions have no body (only a ; declaration in pass 1)
 		if lf.function.extern_lib is None:
 			src = emit_function( lf )
-			# prepend __metalpy_init() to main() on every target - not just
-			# Windows anymore, since it now also runs global initializers
-			# (PLAN_GLOBAL_INIT.md), needed everywhere, not only the
-			# Windows-specific console-codepage setup. EXCEPT when no_crt on
-			# Windows: there, mainCRTStartup (below) is the REAL entry point
-			# and already calls __metalpy_init() before calling main() itself -
-			# prepending here too would run it (and now every global
-			# initializer) TWICE. Harmless back when this only ever did
-			# SetConsoleOutputCP (idempotent); a real double-construction bug
-			# now that it also builds RCClass globals.
+			# EXCEPT when no_crt on Windows: there, mainCRTStartup (below) is
+			# the REAL entry point and already calls __metalpy_init() before
+			# calling main() itself - prepending it here too would run it
+			# (and now every global initializer) TWICE. Harmless back when
+			# this only ever did SetConsoleOutputCP (idempotent); a real
+			# double-construction bug now that it also builds RCClass globals.
 			windows_no_crt = no_crt and compiler.disco.active_target['os'] == 'windows'
-			if _is_entry_point( lf.function ) and not windows_no_crt:
-				src = src.replace( '{\n', '{\n\t__metalpy_init();\n', 1 )
+			if _is_entry_point( lf.function ):
+				prelude = ''
+				if not lf.function.parameters and has_argv_globals:
+					# captures the real OS-provided argc/argv for sys.argv
+					# (lib/sys.py) - BEFORE __metalpy_init() below, since
+					# that's what actually builds sys.argv itself from these.
+					# Always injected, even for windows_no_crt: harmless
+					# there (mainCRTStartup calls main(0, NULL), so this just
+					# captures the same already-empty defaults).
+					prelude += (
+						f'\t{mangle_qualname( "sys._raw_argc" )} = argc;\n'
+						f'\t{mangle_qualname( "sys._raw_argv" )} = (uint8_t**)argv;\n'
+					)
+				# prepend __metalpy_init() to main() on every target - not just
+				# Windows anymore, since it now also runs global initializers
+				# (PLAN_GLOBAL_INIT.md), needed everywhere, not only the
+				# Windows-specific console-codepage setup - except
+				# windows_no_crt, per this block's own comment above.
+				if not windows_no_crt:
+					prelude += '\t__metalpy_init();\n'
+				if prelude:
+					src = src.replace( '{\n', '{\n' + prelude, 1 )
 			parts.append( src )
 
 	# custom entry point when CRT is not linked - the linker expects
@@ -4120,7 +4160,12 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			'#ifdef _WIN32\n'
 			'void mainCRTStartup( void ) {\n'
 			'\t__metalpy_init();\n'
-			'\tint __result = main();\n'
+			# no real argc/argv at a freestanding entry point (the OS loader
+			# never hands them to WinMainCRTStartup-shaped entries the way
+			# it does the UCRT's own main()) - sys.argv (lib/sys.py) just
+			# stays empty here, a known, accepted limitation of no_crt
+			# builds specifically, not a bug.
+			'\tint __result = main( 0, (char**)0 );\n'
 			f'\t{mangle_qualname( "sys.exit" )}( (uint32_t)__result );\n'
 			'}\n'
 			'#endif'

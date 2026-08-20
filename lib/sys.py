@@ -202,3 +202,55 @@ def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:
 def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:
 	from crt import write
 	write( 2, msg, length ) # STDERR_FILENO is 2
+
+# ---------------------------------------------------------------------------
+# argv: command-line arguments (argv[0] included, matching real Python)
+#
+# _raw_argc/_raw_argv are written DIRECTLY (raw C assignment, not through
+# any metalpy-level Assign) by emit_c()'s own entry-point prelude, as the
+# very first statements of main() - before __metalpy_init() (which is what
+# actually calls _build_argv() below, via this file's own `argv: list[str]
+# = _build_argv()` global) ever runs. Real argc/argv are only available at
+# a normal CRT-linked entry; a no_crt/freestanding build has no OS-provided
+# values to capture (mainCRTStartup calls main(0, NULL)), so argv is just
+# empty there - an accepted limitation, not a bug (GetCommandLineA()+manual
+# parsing would be the way to add it later if that's ever needed).
+# ---------------------------------------------------------------------------
+
+_raw_argc: i32 = 0
+_raw_argv: Ptr[Ptr[u8]] = None
+
+def _argv_cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
+	# a local byte-scanning strlen instead of this file's own cstrlen()
+	# above: cstrlen's Windows branch calls windows.ntdll.strnlen, and
+	# linking BOTH that and ucrt (the normal, non-no_crt case - exactly the
+	# case where argv is populated at all) makes clang/MSVC reject the
+	# build with "strnlen already defined" (ntdll.dll and ucrt each export
+	# an unrelated function that happens to share that name) - a real,
+	# separately-tracked linker bug (task_51bbb0d2), not something to route
+	# around here by masking it; this just avoids the one shared call path
+	# that trips it, so sys.argv itself isn't blocked on that fix landing.
+	i: usize = 0
+	with compiler.panic_arithmetic( 'bounded by max_length, cannot overflow' ):
+		while i < max_length and ptr[i] != 0:
+			i += 1
+	return i
+
+def _build_argv() -> list[str]:
+	result: list[str] = list[str]()
+	if _raw_argc <= 0:
+		return result
+	with compiler.panic_arithmetic( 'argc is never negative once positive-checked above' ):
+		count: usize = usize( _raw_argc )
+	i: usize = 0
+	with compiler.panic_arithmetic( 'bounded by count/cstrlen, cannot overflow' ):
+		while i < count:
+			raw: ConstPtr[u8] = compiler.cast( ConstPtr[u8], _raw_argv[i] )
+			n: usize = _argv_cstrlen( raw, 1_000_000 )
+			size: usize = n + 1
+			s: str = str.from_cstr( raw, size ).unwrap( 'sys.argv: invalid UTF-8 in argument' )
+			result.append( s ).unwrap( 'sys.argv: too many arguments' )
+			i += 1
+	return result
+
+argv: list[str] = _build_argv()
