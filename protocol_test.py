@@ -64,6 +64,155 @@ def main() -> i32:
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 		self.assertIn( 'is ambiguous', str( self.discovery.errors.errors[0] ) )
 
+	def test_bound_violation_bare_generic_call_is_a_compile_error( self ) -> None:
+		self._run( '''
+@protocol
+class Greeter:
+	def greet( self ) -> i32:
+		...
+
+class Talker( Greeter ):
+	def greet( self ) -> i32:
+		return 7
+
+class Mute:
+	pass
+
+def call_greet[T: Greeter]( x: T ) -> i32:
+	return x.greet()
+
+def main() -> i32:
+	m = Mute()
+	call_greet( m )
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		message = str( self.discovery.errors.errors[0] )
+		self.assertIn( '__main__.Mute', message )
+		self.assertIn( '__main__.Greeter', message )
+		self.assertIn( 'does not implement protocol', message )
+
+	def test_bound_violation_bare_generic_call_accepts_conforming_type( self ) -> None:
+		self._run( '''
+@protocol
+class Greeter:
+	def greet( self ) -> i32:
+		...
+
+class Talker( Greeter ):
+	def greet( self ) -> i32:
+		return 7
+
+def call_greet[T: Greeter]( x: T ) -> i32:
+	return x.greet()
+
+def main() -> i32:
+	t = Talker()
+	call_greet( t )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_bound_violation_explicit_subscript_call_is_a_compile_error( self ) -> None:
+		self._run( '''
+@protocol
+class Greeter:
+	def greet( self ) -> i32:
+		...
+
+class Talker( Greeter ):
+	def greet( self ) -> i32:
+		return 7
+
+class Mute:
+	pass
+
+def make_greeting[T: Greeter]() -> i32:
+	return 5
+
+def main() -> i32:
+	make_greeting[Mute]()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		message = str( self.discovery.errors.errors[0] )
+		self.assertIn( '__main__.Mute', message )
+		self.assertIn( '__main__.Greeter', message )
+		self.assertIn( 'does not implement protocol', message )
+
+	def test_bound_violation_explicit_subscript_call_accepts_conforming_type( self ) -> None:
+		self._run( '''
+@protocol
+class Greeter:
+	def greet( self ) -> i32:
+		...
+
+class Talker( Greeter ):
+	def greet( self ) -> i32:
+		return 7
+
+def make_greeting[T: Greeter]() -> i32:
+	return 5
+
+def main() -> i32:
+	make_greeting[Talker]()
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_bound_violation_generic_construction_is_a_compile_error( self ) -> None:
+		self._run( '''
+@protocol
+class Greeter:
+	def greet( self ) -> i32:
+		...
+
+class Talker( Greeter ):
+	def greet( self ) -> i32:
+		return 7
+
+class Mute:
+	pass
+
+class Box[T: Greeter]:
+	value: T
+	def __init__( self, value: T ) -> None:
+		self.value = value
+
+def main() -> i32:
+	m = Mute()
+	b = Box( m )
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		message = str( self.discovery.errors.errors[0] )
+		self.assertIn( '__main__.Mute', message )
+		self.assertIn( '__main__.Greeter', message )
+		self.assertIn( 'does not implement protocol', message )
+
+	def test_bound_violation_generic_construction_accepts_conforming_type( self ) -> None:
+		self._run( '''
+@protocol
+class Greeter:
+	def greet( self ) -> i32:
+		...
+
+class Talker( Greeter ):
+	def greet( self ) -> i32:
+		return 7
+
+class Box[T: Greeter]:
+	value: T
+	def __init__( self, value: T ) -> None:
+		self.value = value
+
+def main() -> i32:
+	t = Talker()
+	b = Box( t )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_protocol_base_routes_to_protocols_not_base( self ) -> None:
 		# a class declaring @protocol conformance is NOT a subclass - the
 		# protocol entry must land in .protocols, and the one real RCClass
@@ -170,14 +319,11 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( compiler ), expected_exit = 0, compiler = compiler )
 
 	def test_generic_typevar_bound_to_protocol( self ) -> None:
-		# NOTE: this only proves TypeVar(bound=SomeProtocol) is accepted and
-		# a conforming T monomorphizes/dispatches correctly through it - it
-		# does NOT prove a NON-conforming T gets rejected. That enforcement
-		# (checking the concrete T's own .protocols at generic instantiation
-		# time - see discovery.py's _get_or_create_specialization, the right
-		# cache/builder to hook, but shared by many unrelated call sites with
-		# no AST node/error-location available there) is a deliberate,
-		# flagged gap, not yet implemented - see task tracking.
+		# proves TypeVar(bound=SomeProtocol) is accepted and a conforming T
+		# monomorphizes/dispatches correctly through it, end to end. The
+		# REJECTION side (a non-conforming T) is compile-error-only - see
+		# ProtocolCompileErrorTests' test_bound_violation_* cases above,
+		# which don't need a real C compiler to verify.
 		compiler = self._compile_source( '''
 @protocol
 class Greeter:
