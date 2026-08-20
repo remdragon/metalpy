@@ -38,13 +38,22 @@
 # a real blocking-wait-for-work mechanism once real I/O exists; not
 # attempted here.
 #
-# current_worker()-style ambient lookup (so code running INSIDE a fiber can
-# find which Worker owns it) is DELIBERATELY NOT built yet - nothing here
-# needs it yet (no I/O registration to do). ThreadLocal[T] now exists
-# (lib/threading.py) and fiber.py's own _current/_thread_fiber_handle have
-# already been converted to use it (real per-OS-thread TLS, not plain
-# globals) - build current_worker() the same way once real I/O wiring
-# needs it.
+# current_worker() - an ambient lookup so code running INSIDE a fiber (e.g.
+# a future NonBlockingIO read()/wait_for()) can find which Worker owns it,
+# without needing a Worker threaded through every call - mirrors fiber.py's
+# own current(), built the same way (a ThreadLocal[Worker] slot, set by
+# whichever thread is driving a Worker's own run_until_idle() loop). Set
+# UNCONDITIONALLY on every run_until_idle() call (not idempotently, unlike
+# fiber.enable_current_thread()'s one-time OS-level side effect) - cheap,
+# and correctly reflects whichever Worker most recently drove this thread
+# in the (test-only, not the real pinned-per-worker Reactor.run() case)
+# scenario of one thread sequentially driving more than one Worker. Safe
+# to store without an extra incref (unlike fiber.py's own _thread_fiber_
+# handle box, which needed one - see that fix's own comment): a Worker
+# handed to run_until_idle() is ALWAYS kept alive by some other real owner
+# for the whole call already (a Reactor's own __workers list, or a test's
+# bare local) - current_worker() is a bookmark, not a second owner, same
+# as fiber.py's own _current.
 #
 # Reactor with more than ONE worker is now SAFE at the fiber-switching
 # level: fiber.py's own _current/_thread_fiber_handle are real
@@ -64,6 +73,16 @@ import compiler
 import sys
 import threading
 import fiber
+
+_current_worker: threading.ThreadLocal[Worker] = threading.ThreadLocal[Worker]()
+
+def current_worker() -> Worker|None:
+	''' the Worker driving fibers on THIS OS thread right now, or None if
+	this thread isn't currently (or has never been) inside a Worker's own
+	run_until_idle() - e.g. the thread that just calls Reactor.spawn()
+	from outside any worker. See this module's own header comment for the
+	full ownership reasoning. '''
+	return _current_worker.get()
 
 class Worker:
 	__pending_tasks: list[Closure[[], None]]
@@ -115,8 +134,11 @@ class Worker:
 		point. Calls fiber.enable_current_thread() itself (idempotent) -
 		Reactor.run() invokes this on a freshly-spawned OS thread that's
 		never been fiber-enabled, and Windows' SwitchToFiber requires that
-		before it'll accept the thread as a switch target. '''
+		before it'll accept the thread as a switch target. Also sets this
+		thread's own current_worker() to self - see this module's header
+		comment for why that's unconditional, not idempotent. '''
 		fiber.enable_current_thread()
+		_current_worker.set( self )
 		progressed: bool = False
 		to_unpark: usize = self.__ready_to_unpark.__len__()
 		while to_unpark > 0:
