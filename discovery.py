@@ -2296,18 +2296,15 @@ class Discovery( ast.NodeVisitor ):
 			# swap rather than pay a module lookup for the common case
 			self._parse_function( copied_node, class_obj )
 			return
-		protocol_module = next(
-			( mod for mod in self.modules.values() if mod.file == default_fn.file ),
-			None,
-		)
+		protocol_module = default_fn.module
 		if protocol_module is None:
-			# every protocol default's Function.file is set to its owning
-			# module's .file at parse time (_parse_function) - the module
-			# itself must already be registered in self.modules by the time
-			# any conformer references it (an unimported module can't have
-			# contributed a protocol to class_obj.protocols in the first
-			# place), so this should be unreachable; fail loudly rather than
-			# silently resolving the copied body against the wrong module
+			# every protocol default's Function.module is set at parse time
+			# (_parse_function, alongside .file) - the module itself must
+			# already be registered in self.modules by the time any conformer
+			# references it (an unimported module can't have contributed a
+			# protocol to class_obj.protocols in the first place), so this
+			# should be unreachable; fail loudly rather than silently
+			# resolving the copied body against the wrong module
 			self.fail_loc(
 				f'internal error: no module found owning {default_fn.qualname} (file={default_fn.file})',
 				class_obj.file, class_obj.line,
@@ -2719,6 +2716,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = qualname,
 			cls = class_obj,
 			node = node,
+			module = module,
 			file = module.file,
 			line = node.lineno,
 			is_static = is_static,

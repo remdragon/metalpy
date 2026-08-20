@@ -1066,6 +1066,14 @@ ClassLike = Union[ RCClass, CStruct, CUnion, TaggedUnion, CEnum ]
 class Function( Type, ScopeMixin ):
 	cls: ClassLike|None
 	node: ast.FunctionDef # whole def - node.args/.returns resolved lazily, node.body untouched until IR generation
+	# the module this function was DEFINED in (set from Discovery.module_stack
+	# at parse time, once, alongside .file - never reassigned afterward).
+	# Lets a caller go straight from a Function to its owning Module without
+	# a self.modules.values() scan-by-file - see discovery.py's
+	# _splice_protocol_default, the motivating caller: a @protocol default
+	# method's free/qualified names must resolve against the PROTOCOL's own
+	# module, not whichever module happens to be conforming to it.
+	module: 'Module|None' = None
 	type_params: list[TypeVar]|None = None # if not None, this is a generic function (e.g. def alloc[T](...))
 	parameters: list[Parameter]|None = None
 	return_type: Type|None = None
