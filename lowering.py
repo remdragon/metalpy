@@ -1710,6 +1710,10 @@ class FunctionLowering:
 		# $$__next__ - nothing else ever sets the tag this reads
 		self._generator_armed_defer_sites: list[tuple[str,bool,list[ast.stmt]]] = []
 		self._return_value_var = None
+		# `with EXPR [as NAME]: BODY` (general context-manager form, see
+		# _lower_with_context_manager) - unique per with-statement in this
+		# function, only for the synthesized ctx-holding local's own stem
+		self._with_ctx_id = 0
 		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
 		# _inlining_stack (by id(target)) is the reentrancy guard - a target
 		# already present means direct or mutual @inline recursion, rejected
@@ -3866,41 +3870,247 @@ class FunctionLowering:
 		return dest
 
 	def _stmt_With( self, node: ast.With ) -> None:
-		if len( node.items ) != 1 or node.items[0].optional_vars is not None:
+		if len( node.items ) != 1:
 			self.lowering.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
-		context_expr = node.items[0].context_expr
+		item = node.items[0]
+		context_expr = item.context_expr
 
-		defer_kind = self.lowering._defer_kind_of_with( context_expr )
-		if defer_kind is not None:
-			self._register_defer_block( is_err_only = ( defer_kind == 'errdefer' ), body = node.body, node = node )
-			return
+		if item.optional_vars is None:
+			defer_kind = self.lowering._defer_kind_of_with( context_expr )
+			if defer_kind is not None:
+				self._register_defer_block( is_err_only = ( defer_kind == 'errdefer' ), body = node.body, node = node )
+				return
 
-		attr = self.lowering._is_compiler_attr( context_expr )
-		if attr == 'wrap_arithmetic':
-			mode: arithmetic_mode.ArithmeticMode = arithmetic_mode.ArithmeticWrap()
-		elif attr == 'saturate_arithmetic':
-			mode = arithmetic_mode.ArithmeticSaturate()
-		elif self.lowering._is_compiler_call( context_expr ) == 'panic_arithmetic':
-			if len( context_expr.args ) != 1 or context_expr.keywords:
-				self.lowering.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(node)}', node )
-			str_cls = self.lowering.discovery.find_name( 'str', node )
-			errmsg = self._lower_expr( context_expr.args[0], str_cls )
-			mode = arithmetic_mode.ArithmeticPanic( errmsg )
-		else:
-			self.lowering.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
+			attr = self.lowering._is_compiler_attr( context_expr )
+			mode: arithmetic_mode.ArithmeticMode|None = None
+			if attr == 'wrap_arithmetic':
+				mode = arithmetic_mode.ArithmeticWrap()
+			elif attr == 'saturate_arithmetic':
+				mode = arithmetic_mode.ArithmeticSaturate()
+			elif self.lowering._is_compiler_call( context_expr ) == 'panic_arithmetic':
+				if len( context_expr.args ) != 1 or context_expr.keywords:
+					self.lowering.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(node)}', node )
+				str_cls = self.lowering.discovery.find_name( 'str', node )
+				errmsg = self._lower_expr( context_expr.args[0], str_cls )
+				mode = arithmetic_mode.ArithmeticPanic( errmsg )
 
-		self._arithmetic_mode.append( mode )
-		try:
-			for stmt in node.body:
-				# same per-statement recovery boundary as the top-level loop
-				# in lower_function - one bad statement inside the with-block
-				# doesn't stop the rest of it from being lowered
+			if mode is not None:
+				self._arithmetic_mode.append( mode )
 				try:
-					self._lower_stmt( stmt )
-				except CompileError:
-					continue
-		finally:
-			self._arithmetic_mode.pop()
+					for stmt in node.body:
+						# same per-statement recovery boundary as the top-level loop
+						# in lower_function - one bad statement inside the with-block
+						# doesn't stop the rest of it from being lowered
+						try:
+							self._lower_stmt( stmt )
+						except CompileError:
+							continue
+				finally:
+					self._arithmetic_mode.pop()
+				return
+
+		# general context-manager form: with EXPR [as NAME]: BODY - EXPR's
+		# type supplies __enter__(self)/__exit__(self), neither of the
+		# special-cased shapes above (defer/errdefer, compiler.*_arithmetic)
+		self._lower_with_context_manager( node, item )
+
+	def _lower_with_context_manager( self, node: ast.With, item: ast.withitem ) -> None:
+		''' `with EXPR [as NAME]: BODY` for a user-defined context manager -
+		EXPR's type must supply __enter__(self)->T and __exit__(self)->None.
+		Desugars to (as plain AST, fed back through the ordinary statement
+		pipeline, same idiom type_resolver.py's own desugaring passes use):
+			__with_ctx_N = EXPR
+			[NAME = ]__with_ctx_N.__enter__()
+			with defer: __with_ctx_N.__exit__()
+			BODY
+		reusing _register_defer_block for the guaranteed-once-per-entry,
+		runs-on-every-exit-path contract - same "not allowed inside a loop"
+		restriction defer/errdefer already have (see the check below), and
+		the same "not inside a generator's own body" restriction (Mechanism
+		2's defer-replay is a SEPARATE, generator-specific path this doesn't
+		integrate with yet - a clean rejection, not attempted here). Real
+		per-iteration loop scoping (`with timeout(...): read(...)` inside a
+		request loop, PLAN_NON_BLOCKING_IO's own motivating case) is real,
+		separate future work, same as it would be for defer/errdefer.
+		__exit__ always runs unconditionally on every exit path - this
+		compiler has no Python-style exception propagation for __exit__ to
+		observe or suppress, so there's no exc_type/exc_value/traceback
+		parameter, unlike Python's own protocol; a Result-returning
+		__enter__/__exit__ works the same as any other bare/bound call
+		(the ordinary "an unconsumed Result is a compile error" rule
+		applies exactly as it would to hand-written code, nothing special
+		here consumes or requires one).
+
+		__with_ctx_N (and NAME, if `as NAME` is used) must NOT survive past
+		this with-statement's own end the way an ordinary local declared at
+		this level would (self.lowering.discovery still knows the NAME for
+		the rest of the function - see cfg.py's own "no block scoping"
+		module docstring - but the underlying VALUE must actually be
+		released here, not linger until the enclosing function eventually
+		returns: confirmed via a real compile+run refcount repro, the
+		context manager's own fields/the __enter__-returned value stayed
+		one refcount too high for the rest of the function otherwise).
+		Reuses _stmt_If's own branch-confinement machinery
+		(cfg.snapshot/enter_branch/exit_branch/merge_if) to get that -
+		exactly the same mechanism an ordinary `if True: ctx = ...` would
+		get for free, just without ever emitting a real runtime test/jump,
+		since this "branch" is unconditionally taken. merge_if only compares
+		STATE DICTIONARIES (bindings/results/narrowed/live before vs. after),
+		not actual control flow, so treating this like _stmt_If's own
+		else-less case (false_end/false_captured mirror the entry snapshot
+		verbatim, as if the condition were simply never true) reconciles
+		correctly with zero new CFG logic. '''
+		if self._loop_depth > 0:
+			self.lowering.discovery.fail(
+				'with-statement (context manager) is not allowed inside a loop - call another function and use the '
+				f'with-statement inside that instead: {ast.unparse(node)}', node,
+			)
+		if self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'with-statement (context manager) is not supported inside a generator body yet: {ast.unparse(node)}', node,
+			)
+
+		index = self._with_ctx_id
+		self._with_ctx_id += 1
+		ctx_name = f'__with_ctx_{index}'
+
+		entry_snapshot = self._cfg.snapshot()
+		outer_instructions = self._instructions
+		self._instructions = []
+		self._cfg.enter_branch( entry_snapshot.stack_depth )
+		try:
+			self._lower_with_context_manager_body( node, item, ctx_name )
+		except CompileError:
+			# unlike _stmt_If's own per-statement try/except-continue loop,
+			# ctx_assign/the enter call/the __enter__+__exit__ presence
+			# check above aren't individually guarded - a failure anywhere
+			# in there must still leave self._instructions/self._cfg
+			# exactly as this with-statement found them before propagating,
+			# or every statement lowered AFTER this one (still inside the
+			# SAME function) would silently keep appending into this
+			# with-statement's own abandoned, never-spliced-back
+			# instruction list instead of the real one
+			self._cfg.exit_branch()
+			self._cfg.restore( entry_snapshot )
+			self._instructions = outer_instructions
+			raise
+		self._cfg.exit_branch()
+		true_captured = self._instructions
+		true_end = dict( self._cfg.bindings )
+		true_end_results = self._cfg.unchecked_results()
+		true_end_narrowed = self._cfg.narrowed_snapshot()
+		true_end_live = self._cfg.live_snapshot()
+		true_terminates = bool( node.body ) and self._stmt_diverges( node.body[-1] )
+
+		self._cfg.restore( entry_snapshot )
+		self._instructions = outer_instructions
+		false_end = dict( entry_snapshot.bindings )
+		false_end_results = set( entry_snapshot.results )
+		false_end_narrowed = dict( entry_snapshot.narrowed )
+		false_end_live = set( entry_snapshot.live )
+		try:
+			true_extra, false_extra, removed = self._cfg.merge_if(
+				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
+				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
+				true_terminates = true_terminates, false_terminates = False,
+				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
+				true_end_live = true_end_live, false_end_live = false_end_live,
+			)
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+
+		for instr in true_captured:
+			self._emit_captured( instr )
+		for instr in true_extra:
+			self._emit( instr )
+		# false_extra: merge_if's own "false path" reconciliation, always
+		# run - see _stmt_If's own else-less tail for why this can be
+		# non-empty even with no real orelse (ownership-disagreement flag
+		# disarming)
+		for instr in false_extra:
+			self._emit( instr )
+
+	def _lower_with_context_manager_body( self, node: ast.With, item: ast.withitem, ctx_name: str ) -> None:
+		''' the actual ctx/__enter__/__exit__/BODY sequence, run inside the
+		branch-confinement window _lower_with_context_manager sets up
+		around this call - see that method's own docstring. '''
+		context_expr = item.context_expr
+		ctx_assign = ast.Assign( targets = [ ast.Name( id = ctx_name, ctx = ast.Store() ) ], value = context_expr )
+		ast.fix_missing_locations( ast.copy_location( ctx_assign, node ))
+		self._lower_stmt( ctx_assign )
+
+		ctx_var = self._existing_local_or_none( ctx_name, node, 'with-statement context expression' )
+		assert ctx_var is not None # just declared immediately above - _lower_stmt would have raised on failure
+		ctx_type = ctx_var.type
+
+		if self.lowering._find_method( ctx_type, '__enter__' ) is None or self.lowering._find_method( ctx_type, '__exit__' ) is None:
+			type_name = ctx_type.qualname if ctx_type is not None else '?'
+			self.lowering.discovery.fail(
+				f'with-statement requires {type_name} to define both __enter__(self) and __exit__(self): {ast.unparse(node)}', node,
+			)
+
+		def _ctx_read() -> ast.Name:
+			n = ast.Name( id = ctx_name, ctx = ast.Load() )
+			ast.fix_missing_locations( ast.copy_location( n, node ))
+			return n
+
+		enter_call = ast.Call( func = ast.Attribute( value = _ctx_read(), attr = '__enter__', ctx = ast.Load() ), args = [], keywords = [] )
+		ast.fix_missing_locations( ast.copy_location( enter_call, node ))
+		enter_stmt: ast.stmt
+		if item.optional_vars is not None:
+			assert isinstance( item.optional_vars, ast.Name )
+			enter_stmt = ast.Assign( targets = [ ast.Name( id = item.optional_vars.id, ctx = ast.Store() ) ], value = enter_call )
+		else:
+			enter_stmt = ast.Expr( value = enter_call )
+		ast.fix_missing_locations( ast.copy_location( enter_stmt, node ))
+		self._lower_stmt( enter_stmt )
+
+		def _make_exit_stmt() -> ast.stmt:
+			# a FRESH node every call, never reused across the two sites
+			# below - lowering attaches mutable per-occurrence attributes to
+			# a node as it processes it (same reason _build_defer_replay_
+			# guards' own resume_call lambda in type_resolver.py rebuilds
+			# fresh each time, not once and shared)
+			call = ast.Call( func = ast.Attribute( value = _ctx_read(), attr = '__exit__', ctx = ast.Load() ), args = [], keywords = [] )
+			ast.fix_missing_locations( ast.copy_location( call, node ))
+			stmt = ast.Expr( value = call )
+			ast.fix_missing_locations( ast.copy_location( stmt, node ))
+			return stmt
+
+		# _register_defer_block gives FUNCTION-scoped semantics (runs once,
+		# from here to wherever the function actually ends, regardless of
+		# what code follows this with-statement) - exactly right for an
+		# early return/break/continue reached from INSIDE this with-block's
+		# own body, but too broad on its own: a with-statement's __exit__
+		# must run when THIS BLOCK is left, not merely "sometime before the
+		# function ends". So: register it as a defer (covers every early-
+		# exit path from inside the body below), then - only if the body
+		# can actually fall through to its own natural end (_stmt_diverges:
+		# false unless every path through the body already returns/breaks/
+		# continues) - explicitly DISARM that defer's flag and call
+		# __exit__() directly, right here, matching the block's real
+		# lexical extent. Without the disarm, a with-statement followed by
+		# more code in the same function would see __exit__ fire twice:
+		# once here (if this were a plain second call with no disarm) AND
+		# again later at the function's own eventual exit - confirmed via a
+		# real compile+run repro (list.append() call counts, __exit__'s own
+		# side effects observably running at the wrong point in the
+		# program's actual output order, not just "eventually").
+		self._register_defer_block( is_err_only = False, body = [ _make_exit_stmt() ], node = node )
+		exit_flag = self._defer_flags[-1] # the one push_defer above just armed
+
+		for stmt in node.body:
+			# same per-statement recovery boundary as the arithmetic-mode/
+			# defer-body cases above
+			try:
+				self._lower_stmt( stmt )
+			except CompileError:
+				continue
+
+		if not node.body or not self._stmt_diverges( node.body[-1] ):
+			bool_cls = self.lowering.discovery.find_name( 'bool', node )
+			self._emit( ir.Assign( dest = exit_flag, src = ir.Const( type = bool_cls, value = False )))
+			self._lower_stmt( _make_exit_stmt() )
 
 	def _static_type_of_value_expr( self, node: ast.expr ) -> Type|None:
 		# compile-time-only: the static type of a value-shaped expression

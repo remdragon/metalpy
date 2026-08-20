@@ -18438,5 +18438,379 @@ def main() -> i32:
 ''' ),
 		] )
 
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class WithStatementContextManagerTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `with EXPR [as NAME]: BODY` for a user-defined context manager (a
+	type supplying __enter__(self)/__exit__(self)) - previously always a
+	clean "unsupported with statement" rejection; only the special-cased
+	defer/errdefer/compiler.*_arithmetic shapes worked. See lowering.py's
+	_lower_with_context_manager for the full design writeup - summary:
+	desugars to `ctx = EXPR; [NAME =] ctx.__enter__(); <registers ctx.
+	__exit__() as a defer, for early-return/break/continue from inside
+	BODY>; BODY`, then - only if BODY can actually fall through to its own
+	natural end - explicitly disarms that defer and calls __exit__()
+	directly right there, so __exit__ runs exactly where THIS BLOCK ends,
+	not "whenever the function eventually returns" (defer's own, much
+	broader contract). ctx/NAME are also scoped to just this block via the
+	same branch-confinement machinery _stmt_If already uses (cfg.py's
+	merge_if) - confirmed via a real refcount repro that without this,
+	both leaked one reference for the rest of the enclosing function. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_basic_as_binding_and_enter_exit_ordering( self ) -> None:
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> i32:
+		self.log.append( 1 ).unwrap( 'overflow' )
+		return 42
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t as v:
+		log.append( v ).unwrap( 'overflow' )
+	if log.__len__() != 3:
+		return 1
+	if log.__getitem__( 0 ).unwrap( 'idx' ) != 1:
+		return 2
+	if log.__getitem__( 1 ).unwrap( 'idx' ) != 42:
+		return 3
+	if log.__getitem__( 2 ).unwrap( 'idx' ) != 2:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_no_as_binding( self ) -> None:
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t:
+		log.append( 99 ).unwrap( 'overflow' )
+	if log.__len__() != 3:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_exit_runs_on_early_return_from_inside_body( self ) -> None:
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		self.log.append( 7 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t:
+		log.append( 1 ).unwrap( 'overflow' )
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_exit_does_not_run_twice_on_natural_fallthrough( self ) -> None:
+		# regression test for the FIRST implementation attempt: reusing
+		# _register_defer_block's own function-scoped replay unmodified
+		# made __exit__ fire once at the with-block's own natural end (via
+		# an explicit call) AND a second time later, wherever the function
+		# actually returned - confirmed via a real compile+run repro
+		# (list.append() call counts, and __exit__'s own side effects
+		# observably running out of order relative to code textually AFTER
+		# the with-block). The fix disarms the deferred replay once the
+		# direct, natural-fallthrough call has already happened.
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t:
+		log.append( 99 ).unwrap( 'overflow' )
+	log.append( 3 ).unwrap( 'overflow' )
+	if log.__len__() != 4:
+		return 1
+	if log.__getitem__( 3 ).unwrap( 'idx' ) != 3:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_ctx_and_bound_value_refcounts_correct( self ) -> None:
+		# regression test for the SECOND implementation attempt: ctx/NAME
+		# declared as ordinary (unscoped) locals at the with-statement's own
+		# level leaked one reference each for the rest of the enclosing
+		# function, since this compiler ties RC teardown to lexical block
+		# extent, not just to a name going out of scope. Fixed by reusing
+		# _stmt_If's own branch-confinement bookkeeping (cfg.py's
+		# enter_branch/exit_branch/merge_if) around an unconditionally-taken
+		# "branch" - no real runtime test needed, merge_if only compares
+		# state snapshots.
+		self._run( '''
+import compiler
+
+class Payload:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+class Ctx:
+	payload: Payload
+	def __init__( self, payload: Payload ) -> None:
+		self.payload = payload
+	def __enter__( self ) -> Payload:
+		return self.payload
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	payload = Payload( 7 )
+	c = Ctx( payload )
+	rc_before: usize = compiler.refcount( payload )
+	with c as bound:
+		rc_inside: usize = compiler.refcount( payload )
+		with compiler.wrap_arithmetic:
+			if rc_inside != rc_before + 1:
+				return 1
+		if bound.n != 7:
+			return 2
+	rc_after: usize = compiler.refcount( payload )
+	if rc_after != rc_before:
+		return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_ctx_itself_freed_exactly_once( self ) -> None:
+		self._run( '''
+import compiler
+
+class Counter:
+	n: i32
+	def __init__( self ) -> None:
+		self.n = 0
+
+class Ctx:
+	counter: Counter
+	def __init__( self, counter: Counter ) -> None:
+		self.counter = counter
+	def __enter__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.counter.n = self.counter.n + 1
+	def __exit__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.counter.n = self.counter.n + 10
+
+def main() -> i32:
+	counter = Counter()
+	with Ctx( counter ):
+		with compiler.wrap_arithmetic:
+			counter.n = counter.n + 100
+	if counter.n != 111:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_nested_with_statements( self ) -> None:
+		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	tag: i32
+	def __init__( self, log: list[i32], tag: i32 ) -> None:
+		self.log = log
+		self.tag = tag
+	def __enter__( self ) -> None:
+		self.log.append( self.tag ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.log.append( self.tag + 100 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	with Trace( log, 1 ):
+		with Trace( log, 2 ):
+			log.append( 0 ).unwrap( 'overflow' )
+	if log.__len__() != 5:
+		return 1
+	expected: list[i32] = [ 1, 2, 0, 102, 101 ]
+	i: usize = 0
+	while i < 5:
+		got = log.__getitem__( i ).unwrap( 'idx' )
+		want = expected.__getitem__( i ).unwrap( 'idx' )
+		if got != want:
+			return 2
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_only_true_branch_of_if_runs_exit_once( self ) -> None:
+		# a with-statement nested inside an if-branch that's only sometimes
+		# taken - no interaction between the with-statement's OWN internal
+		# branch-confinement bookkeeping and the enclosing if's
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	flag = True
+	if flag:
+		with Trace( log ):
+			pass
+	if log.__len__() != 1:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_unsupported_type_is_a_clean_rejection( self ) -> None:
+		self._run( '''
+class NotAContextManager:
+	pass
+
+def main() -> i32:
+	with NotAContextManager():
+		pass
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'define both __enter__(self) and __exit__(self)', str( self.discovery.errors.errors[0] ))
+
+	def test_rejected_inside_a_loop( self ) -> None:
+		self._run( '''
+class Trace:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	i: usize = 0
+	while i < 3:
+		with Trace():
+			pass
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'not allowed inside a loop', str( self.discovery.errors.errors[0] ))
+
+	def test_with_after_a_loop_not_inside_it_is_allowed( self ) -> None:
+		# the with-statement itself is NOT inside the loop (comes after it,
+		# same function, loop_depth back to 0 by the time it's lowered)
+		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 99 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	log = list[i32]()
+	i: usize = 0
+	while i < 3:
+		with compiler.wrap_arithmetic:
+			log.append( i32( i )).unwrap( 'overflow' )
+			i = i + 1
+	with Trace( log ):
+		pass
+	if log.__len__() != 4:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_bound_value_not_usable_after_with_block( self ) -> None:
+		# cfg.py's own liveness gate, not a crash - ctx/NAME are torn down
+		# (real Decref) at the with-block's own end; reading NAME
+		# afterward must be a clean "not initialized" compile error.
+		self._run( '''
+class Ctx:
+	def __enter__( self ) -> i32:
+		return 1
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with Ctx() as bound:
+		pass
+	return bound
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'not initialized', str( self.discovery.errors.errors[0] ))
+
+	def test_broken_context_expression_does_not_corrupt_later_lowering( self ) -> None:
+		# a failure while lowering the with-statement itself (unresolvable
+		# context expression) must leave self._instructions/self._cfg
+		# exactly as found, so lowering can still proceed correctly for
+		# the rest of the function - regression test for an exception-
+		# safety gap in the first version of the branch-confinement fix
+		# (see _lower_with_context_manager's own except CompileError:
+		# restore-then-reraise block).
+		self._run( '''
+def main() -> i32:
+	with this_name_does_not_exist():
+		pass
+	x: i32 = 5
+	return x
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'this_name_does_not_exist' is not defined", str( self.discovery.errors.errors[0] ))
+
 if __name__ == '__main__':
 	unittest.main()
