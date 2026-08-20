@@ -99,6 +99,41 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
 
+	def test_current_worker_identifies_the_driving_worker( self ) -> None:
+		# None on a thread that hasn't driven any Worker yet; the exact
+		# SAME Worker instance (not just "some Worker") once inside a task
+		# it's driving - the whole point of current_worker() being an
+		# ambient lookup rather than just a bool "am I inside a worker".
+		self._run( '''
+import reactor
+import sys
+
+class IdentityTask:
+	worker: reactor.Worker
+	saw_self: bool
+	def __init__( self, worker: reactor.Worker ) -> None:
+		self.worker = worker
+		self.saw_self = False
+	def run( self ) -> None:
+		cw = reactor.current_worker()
+		if cw is None:
+			sys.panic( 'current_worker() returned None inside a running task' )
+		self.saw_self = cw is self.worker
+
+def main() -> i32:
+	if reactor.current_worker() is not None:
+		return 1
+	w = reactor.Worker()
+	t = IdentityTask( w )
+	w.schedule( t.run )
+	w.run_until_idle()
+	if not t.saw_self:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
+
 	def test_reactor_spawns_on_its_own_worker_thread( self ) -> None:
 		# single-worker: Reactor.run() DOES put this Worker on its own
 		# freshly-spawned thread (a real cross-thread handoff, exercising
