@@ -39,15 +39,20 @@ class ScalarCmpDunderBehaviorTests( RealCompileMixin, unittest.TestCase ):
 		compiler = self._compile_source( '''
 def main() -> i32:
 	a: i32 = 5
+	a2: i32 = 5 # same value as a, distinct variable - exercises the reflexive
+	# (==/!=/<=/>=) cases below without a literal `a == a`-style self-
+	# comparison, which is a real, confirmed -Wtautological-compare on the
+	# generated C (correctly flagging a tautology - the compiler isn't
+	# wrong, this test just needed two equal-but-distinct operands instead)
 	b: i32 = 7
-	if not ( a == a ): return 1
+	if not ( a == a2 ): return 1
 	if a == b: return 2
 	if not ( a != b ): return 3
-	if a != a: return 4
+	if a2 != a: return 4
 	if not ( a < b ): return 5
-	if not ( a <= a ): return 6
+	if not ( a <= a2 ): return 6
 	if not ( b > a ): return 7
-	if not ( a >= a ): return 8
+	if not ( a >= a2 ): return 8
 	f: f64 = 1.5
 	g: f64 = 2.5
 	if not ( f < g ): return 9
