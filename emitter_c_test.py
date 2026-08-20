@@ -14228,6 +14228,45 @@ def main() -> i32:
 		diff: i32 = result - 5
 	return diff
 ''' ),
+			# regression test: a MODULE-LEVEL Ptr[Callable[...]] global used to
+			# crash emit_c() entirely (NotImplementedError: c_type: unsupported
+			# type <CallableType ...>) - _emit_global_declaration spelled the
+			# global's declaration as a plain c_type(...)-prefixed "TYPE NAME"
+			# string instead of routing through _declarator (which every
+			# parameter/local/field declaration already does), and C's
+			# function-pointer declarator syntax puts the name INSIDE the
+			# parens, not after a type prefix. This exercises the non-trivial
+			# ({0} + separate init-function-call) declaration path: the
+			# initializer is a real function reference, not a constant.
+			( 'module_level_function_pointer_global_assigned_function_reference', '''
+def double( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x * 2
+
+_dispatch: Ptr[Callable[[i32],i32]] = double
+
+def main() -> i32:
+	result: i32 = _dispatch( 21 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' ),
+			# same underlying gap as the test above, but through the OTHER
+			# _emit_global_declaration branch: a trivial bare-Const initializer
+			# (the exact `_SIG_DFL: Ptr[Callable[...]] = 0` null-sentinel shape
+			# that motivated this - see lib/signal.py). This also exercises a
+			# companion gap in _emit_const, which cast pointer-typed constants
+			# via a bare c_type(...) call that likewise can't spell a function-
+			# pointer type. Mirrors EmitGlobalTests' own STD_OUTPUT_HANDLE
+			# convention: read the global into a local to prove it's really
+			# emitted and readable, not just that emit_c() doesn't crash.
+			( 'module_level_function_pointer_global_null_sentinel', '''
+_sig_dfl: Ptr[Callable[[i32],i32]] = 0
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = _sig_dfl
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )

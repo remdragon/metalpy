@@ -1480,7 +1480,16 @@ def _emit_const( c: ir.Const ) -> str:
 		text = repr( value )
 		return text + 'f' if is_f32 else text
 	if isinstance( c.value, int ):
-		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast
+		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast.
+		# Ptr[Callable[...]] is a special case within that: c_type() can't
+		# spell a bare function-pointer TYPE at all (see _declarator's own
+		# comment - the name goes inside the parens, so it's not an
+		# ordinary "prefix type" spelling) - needed for e.g. a null-
+		# function-pointer sentinel (`handler: Ptr[Callable[[i32],None]] = 0`)
+		fn_type = _callable_ptr_type( c.type )
+		if fn_type is not None:
+			ret, params = _function_pointer_c_type( fn_type )
+			return f'({_fn_ptr_cast_type(ret, params)}){c.value}'
 		if isinstance( c.type, Specialization ):
 			base = c.type.base
 			if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
@@ -3784,10 +3793,16 @@ def _topologically_sort_globals( compiler: Compiler ) -> list[LoweredGlobal]:
 
 def _emit_global_declaration( g: LoweredGlobal ) -> str:
 	name = mangle_qualname( g.variable.qualname )
-	ctype = c_type( g.variable.type )
+	# _declarator, not a plain c_type(...) prefix - a Ptr[Callable[...]]
+	# global's name goes INSIDE the C function-pointer declarator's parens
+	# (RetType (*name)(ParamTypes)), not after a "TYPE NAME"-shaped prefix
+	# (see _declarator's own docstring); c_type() itself doesn't even try
+	# to spell a bare CallableType, so a plain f'{c_type(...)} {name}' here
+	# hits its NotImplementedError for any function-pointer-typed global.
+	declarator = _declarator( g.variable.type, name )
 	if _is_trivial_global_init( g.instructions ):
 		value = _emit_operand( g.instructions[0].src )
-		return f'{ctype} {name} = {value};'
+		return f'{declarator} = {value};'
 	# a {0} zero initializer either way for a non-trivial global - a valid
 	# C11 initializer for ANY type alike (ISO C11 6.7.9p11: a scalar
 	# initializer may be "optionally enclosed in braces"), matching the same
@@ -3795,7 +3810,7 @@ def _emit_global_declaration( g: LoweredGlobal ) -> str:
 	# _global_init_is_all_zero_value_type case (see emit_global) needs
 	# nothing MORE than this - its own init function is skipped entirely,
 	# not just left uncalled.
-	return f'{ctype} {name} = {{0}};'
+	return f'{declarator} = {{0}};'
 
 def _emit_global_init_fn( g: LoweredGlobal ) -> str|None:
 	''' the private `static void __metalpy_init_<name>(void) { ... }` body
