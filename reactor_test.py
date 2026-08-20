@@ -217,6 +217,131 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
 
+	def test_signal_wait_resumes_only_after_real_readiness( self ) -> None:
+		# real TCP loopback pair - a task parks on reactor.wait_for_signal()
+		# for the accepted connection's own fd, must NOT resume before any
+		# data is written (first run_until_idle() call only starts+parks
+		# it), and must resume within a bounded number of further ticks
+		# once the other end sends real data (the first of those ticks
+		# notices readiness via Worker.__check_signals's own non-blocking
+		# poller peek and moves the fiber to __ready_to_unpark; the NEXT
+		# tick actually unparks it - see run_until_idle()'s own docstring
+		# on why that's two ticks, not one).
+		self._run( '''
+import socket
+import poller
+import reactor
+
+class WaitTask:
+	fd: poller.SOCKET
+	resumed: bool
+	def __init__( self, fd: poller.SOCKET ) -> None:
+		self.fd = fd
+		self.resumed = False
+	def run( self ) -> None:
+		sig = reactor.Signal( self.fd, True, False )
+		reactor.wait_for_signal( sig )
+		self.resumed = True
+
+def run() -> Result[i32, OSError]:
+	server = socket.Socket.tcp().or_return()
+	server.bind( '127.0.0.1', u16( 0 )).or_return()
+	server.listen().or_return()
+	bound = server.getsockname().or_return()
+
+	client = socket.Socket.tcp().or_return()
+	client.connect( '127.0.0.1', bound.port() ).or_return()
+	( conn, _addr ) = server.accept().or_return()
+
+	poller.set_nonblocking( conn.fileno() ).or_return()
+
+	w = reactor.Worker()
+	t = WaitTask( conn.fileno() )
+	w.schedule( t.run )
+	w.run_until_idle()
+	if t.resumed:
+		return Result.Ok( 1 )
+
+	msg: bytes = b'hi'
+	client.send_all( msg.get_const_ptr(), usize( 2 )).or_return()
+
+	i: usize = 0
+	while i < 20:
+		w.run_until_idle()
+		if t.resumed:
+			return Result.Ok( 0 )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	return Result.Ok( 2 )
+
+def main() -> i32:
+	match run():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 3
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
+
+	def test_wait_for_signal_blocks_without_a_reactor( self ) -> None:
+		# no Worker driving this thread at all - wait_for_signal() must
+		# fall back to a real, standalone blocking wait (own throwaway
+		# Poller) rather than trying to park a fiber into nothing. A
+		# background thread writes to the connection's peer; the main
+		# thread's wait_for_signal() call is expected to actually block
+		# until that real write lands, then return (both epoll and
+		# WSAPoll are level-triggered - already-ready-when-registered and
+		# becomes-ready-while-waiting are indistinguishable and both
+		# correct here, so this is inherently race-free regardless of
+		# which side of that the writer thread happens to land on).
+		self._run( '''
+import socket
+import poller
+import reactor
+import threading
+
+class Writer:
+	sock: socket.Socket
+	def __init__( self, sock: socket.Socket ) -> None:
+		self.sock = sock
+	def run( self ) -> None:
+		msg: bytes = b'hi'
+		self.sock.send_all( msg.get_const_ptr(), usize( 2 )).unwrap( 'writer send failed' )
+
+def run() -> Result[i32, OSError]:
+	server = socket.Socket.tcp().or_return()
+	server.bind( '127.0.0.1', u16( 0 )).or_return()
+	server.listen().or_return()
+	bound = server.getsockname().or_return()
+
+	client = socket.Socket.tcp().or_return()
+	client.connect( '127.0.0.1', bound.port() ).or_return()
+	( conn, _addr ) = server.accept().or_return()
+
+	poller.set_nonblocking( conn.fileno() ).or_return()
+
+	if reactor.current_worker() is not None:
+		return Result.Ok( 1 )
+
+	w = Writer( client )
+	t = threading.Thread( w.run )   # constructing already launches it
+
+	sig = reactor.Signal( conn.fileno(), True, False )
+	reactor.wait_for_signal( sig )
+	t.join()
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match run():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 2
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
+
 def _emit( compiler: Compiler ) -> str:
 	import emitter_c
 	return emitter_c.emit_c( compiler )
