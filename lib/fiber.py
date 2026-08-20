@@ -66,14 +66,33 @@ class FiberError:
 # reactor plan's own current_worker() design), NOT yet thread-local. Safe
 # for a single OS thread driving fibers (what this module is tested against
 # today); becomes a real bug the moment more than one OS thread resumes
-# fibers concurrently - MUST become a ThreadLocal[Fiber|None] before the
-# multi-worker Reactor is built on top of this. Tracked, not forgotten.
+# fibers concurrently - MUST become a ThreadLocal[Fiber|None] (lib/
+# threading.py, shipped) before the multi-worker Reactor is built on top
+# of this. Tracked, not forgotten. (current()'s own RC-ownership contract
+# is fixed as of this comment - see its own docstring - independent of
+# this still-open thread-safety gap.)
 # ---------------------------------------------------------------------------
 
 _current: Fiber|None = None
 
 def current() -> Fiber|None:
-	return _current
+	# incref before returning - _current itself does NOT own a reference
+	# (it's a bare bookmark, same as this whole module's docstring already
+	# says: the actual Fiber is owned by whichever Worker queue/pool holds
+	# it), but ANY call's result is unconditionally treated as a fresh,
+	# owned value the instant it's bound to a local, regardless of what the
+	# callee's own return statement did (this compiler's own universal
+	# convention - see lib/threading.py's ThreadLocal.get(), fixed for the
+	# identical reason: a real heap-use-after-free/RC under-count,
+	# confirmed via compiler.refcount(), the moment a caller's own local
+	# AND current()'s returned value are both live at once - e.g. `f =
+	# current(); ...; f.something()` decrefs the SAME fiber an extra time
+	# in f's own scope-exit epilogue, with nothing having incremented it to
+	# balance that release).
+	fiber = _current
+	if fiber is not None:
+		compiler.incref( fiber )
+	return fiber
 
 
 @enum( i32 )
@@ -302,12 +321,25 @@ def _fiber_trampoline() -> None:
 	# no argument on POSIX (makecontext's own zero-arg restriction - see
 	# lib/posix/pthread.py's comment) - `current()` already correctly
 	# points at this fiber by the time we get here, since start()'s own
-	# __switch_in sets it BEFORE swapcontext ever jumps here
+	# __switch_in sets it BEFORE swapcontext ever jumps here.
+	#
+	# Deliberately calls _run_loop() through the NARROWED `started` itself,
+	# not a separately-bound `fiber: Fiber = started` local - that extra
+	# binding would ALSO capture its own independent Incref (same
+	# "capturing into a local increfs" contract current() itself now needs
+	# - see its own docstring), stacked on top of current()'s own. Since
+	# _run_loop() never returns, NEITHER capture's own phantom epilogue
+	# decref would ever fire - permanently DOUBLING the trampoline's own
+	# already-intentional "self is held forever, released only via
+	# DeleteFiber" leak (confirmed via a real generated-C inspection: two
+	# separate, both-unreached release_object calls after _run_loop, one
+	# per capture). Calling through the narrowed `started` directly keeps
+	# this at the ONE held reference this already leaked before current()
+	# started increfing - not introducing a second one.
 	started: Fiber|None = current()
 	if started is None:
 		sys.panic( 'Fiber trampoline: started with no current fiber set' )
-	fiber: Fiber = started
-	fiber._run_loop()
+	started._run_loop()
 
 
 # ---------------------------------------------------------------------------

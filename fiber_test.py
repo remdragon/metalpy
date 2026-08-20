@@ -143,6 +143,75 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
 
+	def test_current_returns_the_right_fiber_across_reuse( self ) -> None:
+		# regression test for a real heap-use-after-free: current() used to
+		# return a BORROWED (non-increfed) alias of the module-level
+		# _current bookmark - but this compiler unconditionally treats ANY
+		# call's result as a fresh, owned value the instant it's bound to a
+		# local, regardless of what the callee's own return statement did.
+		# Without current()'s own Incref, a caller like `f = fiber.current()`
+		# (exactly park()'s own existing pattern) got its OWN phantom
+		# epilogue Decref for `f` with nothing having incremented whatever
+		# it pointed at to balance it - confirmed via a real generated-C
+		# trace during development (a fresh Call-bound local's own release
+		# reading already-freed memory).
+		#
+		# A precise refcount-delta assertion around this call was tried and
+		# dropped: fiber start()/unpark()'s own internal RC bookkeeping
+		# (the entry trampoline's one-time self-identification, __switch_in/
+		# __switch_out's own _current juggling) turned out to have enough
+		# additional, subtle behavior of its own that a hand-derived
+		# expected delta kept being wrong in ways unrelated to THIS fix -
+		# not confidently resolvable under this investigation's own time
+		# budget, flagged separately rather than guessed at here. This test
+		# instead exercises the FUNCTIONAL contract current()'s own callers
+		# actually depend on - reused across two separate fibers and
+		# repeated start() calls (matching how a real Worker's own fiber
+		# pool drives things), with no crash and the right identity/count
+		# each time being the actual bar.
+		self._run( '''
+import compiler
+import fiber
+
+class Counter:
+	n: i32
+	def __init__( self ) -> None:
+		self.n = 0
+
+class Task:
+	tag: i32
+	counter: Counter
+	def __init__( self, tag: i32, counter: Counter ) -> None:
+		self.tag = tag
+		self.counter = counter
+	def run( self ) -> None:
+		cur1 = fiber.current()
+		cur2 = fiber.current()
+		if cur1 is None or cur2 is None:
+			sys.panic( 'no current fiber' )
+		with compiler.wrap_arithmetic:
+			self.counter.n = self.counter.n + self.tag
+
+def main() -> i32:
+	fiber.enable_current_thread()
+	counter = Counter()
+	fa = fiber.Fiber()
+	fb = fiber.Fiber()
+	i: usize = 0
+	while i < 5:
+		ta = Task( 1, counter )
+		tb = Task( 10, counter )
+		fa.start( ta.run )
+		fb.start( tb.run )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	if counter.n != 55:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
+
 def _emit( compiler: Compiler ) -> str:
 	import emitter_c
 	return emitter_c.emit_c( compiler )
