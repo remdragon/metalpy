@@ -100,6 +100,7 @@ class Epilogue:
 	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
 	captured: bool = False # current_epilogue_label() has handed this entry's own .name out as a live jump target at least once - see manually_decreffed()/deleted()/move()'s shared _neutralize() helper for why this matters: a plain compile-time `cancelled = True` is only correct for an entry NO earlier return has already committed a goto into, since build_epilogue_ladder() bakes the entry's FINAL cancelled state into every jump site that shares it, not the state at each individual jump's own time
+	is_construction_attr: bool = False # a self.<attr> entry pushed by attr_assign()/complete_base_construction() during a fallible __init__ - see current_epilogue_label_for_construction_err()'s own docstring for why these can never share a label the way a defer/errdefer or plain local entry can
 
 	@property
 	def is_flag_guarded( self ) -> bool:
@@ -279,8 +280,8 @@ class CFGState:
 		# the bug complete_base_construction's own comment describes).
 		self._construction_required = list( required )
 
-	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None ) -> Epilogue:
-		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref )
+	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None, is_construction_attr: bool = False ) -> Epilogue:
+		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref, is_construction_attr = is_construction_attr )
 		self._epilogue_stack.append( entry )
 		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
@@ -1324,6 +1325,100 @@ class CFGState:
 			return inline_scope.label
 		return None
 
+	def current_epilogue_label_for_construction_err(
+		self, returned_operand: ir.Operand | None,
+	) -> tuple[str | None, list[ir.Instruction]]:
+		''' current_epilogue_label()'s counterpart for a fallible __init__'s
+		own Err-path return (lowering.py's _stmt_Return, construction_err_
+		path) - a self.<attr> entry (attr_assign()/complete_base_
+		construction(), entry.is_construction_attr) can never be handed out
+		as a shared label's own JUMP TARGET: complete_construction() cancels
+		every required attribute WITHOUT a per-jump-site record (Epilogue.
+		cancelled is one mutable flag, not a snapshot - see its own
+		docstring), and an attribute has no runtime flag of its own the way
+		defer/errdefer does, so treating an attribute's OWN rung as
+		reachable via `goto` is only sound for returns strictly AFTER its
+		assignment - never provably true once more than one Err return
+		exists (this class's own fix #3, the ORIGINAL regression this whole
+		construction_err_path mechanism exists to prevent). Every live
+		attribute entry is therefore always decref'd INLINE, right here,
+		regardless of where it sits in the stack.
+
+		Everything else pending (defer/errdefer, or a plain non-attribute
+		RC local) is never touched by complete_construction() at all -
+		exactly as safe to route through the ordinary shared epilogue
+		label as in a non-__init__ function, and safe to let an
+		attribute's own (labelless, unreachable-via-goto) rung sit ABOVE
+		OR BELOW it in the stack: build_epilogue_ladder()/build_inline_
+		scope_ladder() unconditionally skip replaying is_construction_attr
+		entries (see their own comments) - never just because .cancelled
+		happens to be set by ladder-build time (relying on that would
+		reintroduce a narrower version of the exact same hazard for a
+		fallible __init__ with no textual success-shaped return at all,
+		where complete_construction() never runs and an attribute would
+		stay .cancelled=False forever) - so an attribute's rung is a
+		guaranteed no-op wherever a shared jump happens to fall through
+		it, and this method never needs to inspect stack ORDER at all,
+		only liveness. Returns (label, inline instructions to emit before
+		jumping to it) - label is None when nothing needs a shared jump
+		(caller falls back to a plain Return), or when current_epilogue_
+		label()'s own bail-outs apply (returned_operand aliasing a live
+		entry anywhere in the stack, or a confined loop/branch entry -
+		both rare enough in a constructor to not warrant a partial-inline
+		treatment here); the caller then falls back to plain return_() for
+		the WHOLE stack, exactly as before this method existed - the
+		returned instruction list is always [] alongside a None label,
+		nothing to double-emit.
+
+		Pure classification first (which indices need an inline decref, and
+		whether a shared label is even reachable), THEN - only once that's
+		fully decided - a second pass that actually calls _decref_
+		instructions() for just the entries being kept. Not merged into one
+		pass: _decref_instructions() can mint fresh temps/labels for a
+		union-typed attribute (_extract_payload()'s own tag-gated path),
+		which land as real DeclareTemp instructions in the CURRENT
+		instruction stream as an unconditional side effect the moment
+		they're minted (lowering.py's own _new_temp(), passed in as this
+		class's new_temp callback) - calling it speculatively for an
+		attribute later discarded by a bail-out below would leak a stray,
+		never-populated temp declaration into the emitted C even though
+		this method's own contract is "never emits anything by itself". '''
+		if returned_operand is not None and any(
+			not entry.cancelled and entry.operand is returned_operand for entry in self._epilogue_stack
+		):
+			return None, []
+		confinement_floor = min( self._confinement_depths ) if self._confinement_depths else None
+		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
+		floor = inline_scope.boundary_depth if inline_scope is not None else 0
+		attr_indices: list[int] = []
+		candidate_index: int | None = None
+		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
+			if i < floor:
+				break
+			if entry.cancelled:
+				continue
+			if confinement_floor is not None and not entry.is_flag_guarded and i >= confinement_floor:
+				return None, []
+			if entry.is_construction_attr:
+				attr_indices.append( i )
+				continue
+			if candidate_index is None:
+				candidate_index = i
+		inline_instructions: list[ir.Instruction] = []
+		for i in attr_indices:
+			entry = self._epilogue_stack[i]
+			inline_instructions += self._decref_instructions( entry.type, entry.operand )
+		if candidate_index is None:
+			if inline_scope is not None:
+				inline_scope.captured = True
+				return inline_scope.label, inline_instructions
+			return None, inline_instructions
+		entry = self._epilogue_stack[candidate_index]
+		if inline_scope is None:
+			self._any_shared_label_used = True
+		entry.captured = True
+		return entry.name, inline_instructions
+
 	def used_shared_epilogue_label( self ) -> bool:
 		''' whether some ALREADY-LOWERED return/OrJump actually committed a
 		jump into one of this function's own shared epilogue labels (i.e.
@@ -1378,12 +1473,28 @@ class CFGState:
 		through from the one above, so a Label with nothing branching to it
 		would be a real, always-on -Wunused-label/C4102 on every compiler.
 		Callers append their own final ir.Return - cfg.py has no notion of
-		a function's return type or return-value slot. '''
+		a function's return type or return-value slot.
+
+		entry.is_construction_attr is skipped UNCONDITIONALLY here (never
+		just because .cancelled happens to be set) - a self.<attr> entry
+		is NEVER a valid ladder rung, full stop: current_epilogue_label_
+		for_construction_err() never hands one out as a jump target, so its
+		own rung only exists as fallthrough scenery for some OTHER entry's
+		jump, and it was already decref'd inline, right at whichever Err
+		return actually needed it, by that same method. Gating this on
+		.cancelled instead (relying on complete_construction() having
+		already flipped it by the time this ladder is built) would still
+		be correct for the common case, but not for a fallible __init__
+		with no textual success-shaped return at all: complete_
+		construction() then never runs, .cancelled stays False forever,
+		and this same rung - reached by an unrelated entry's shared jump
+		simply falling through it - would double-decref an attribute
+		some earlier Err return already handled. '''
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack ):
 			if entry.captured: # see this method's own docstring
 				instructions.append( ir.Label( name = entry.name ))
-			if not entry.cancelled:
+			if not entry.cancelled and not entry.is_construction_attr:
 				instructions += self._replay( entry, get_is_err_check )
 		return instructions
 
@@ -1410,10 +1521,11 @@ class CFGState:
 		scope = self._inline_scope_stack[-1]
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack[scope.boundary_depth:] ):
-			# see build_epilogue_ladder()'s own identical comment
+			# see build_epilogue_ladder()'s own identical comment, including
+			# on why is_construction_attr is skipped unconditionally
 			if entry.captured:
 				instructions.append( ir.Label( name = entry.name ))
-			if not entry.cancelled:
+			if not entry.cancelled and not entry.is_construction_attr:
 				instructions += self._replay( entry, get_is_err_check )
 		del self._epilogue_stack[scope.boundary_depth:]
 		return instructions
@@ -1691,7 +1803,7 @@ class CFGState:
 			existing.entry.cancelled = False
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = existing.entry )
 		elif is_rc:
-			self._push( attr, attr.type, OwnState.OWNED, key = key )
+			self._push( attr, attr.type, OwnState.OWNED, key = key, is_construction_attr = True )
 		else:
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
 		return instructions
@@ -2092,7 +2204,7 @@ class CFGState:
 			)
 			key = f'self.{attr.stem}'
 			if rc_leaves( attr.type ):
-				self._push( attr, attr.type, OwnState.OWNED, key = key )
+				self._push( attr, attr.type, OwnState.OWNED, key = key, is_construction_attr = True )
 			else:
 				self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
 			# complete_construction()'s own success-path cancellation loop
