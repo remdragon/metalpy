@@ -1291,23 +1291,33 @@ def _function_prototype( function: Function ) -> str:
 			return 'int main( int argc, char** argv )'
 		return f'int main( {params_str} )'
 	noreturn = '_Noreturn ' if _is_noreturn( function.return_type ) else ''
-	# NoneType/NoReturn are value-less in C — return void, not MetalpyNone
-	if _returns_void_in_c( function.return_type ):
-		ret = 'void'
-	else:
-		ret = c_type( function.return_type )
 	# @extern(lib, symbol) functions are declared with their raw C symbol
 	# name, not the metalpy-qualified name — the linker resolves the raw
 	# symbol from the foreign library, not from this translation unit
-	if function.extern_lib is not None:
-		name = function.extern_symbol
-		# generic @extern monomorphized to different pointer types
-		# share the same C symbol — use void* for all object pointers
-		# to avoid conflicting prototypes for the same symbol
-		if isinstance( ret, str ) and ret.endswith( '*' ):
-			ret = 'void*' if not ret.startswith( 'const' ) else 'const void*'
-	else:
-		name = mangle_function_qualname( function )
+	name = function.extern_symbol if function.extern_lib is not None else mangle_function_qualname( function )
+	# NoneType/NoReturn are value-less in C — return void, not MetalpyNone
+	if _returns_void_in_c( function.return_type ):
+		return f'{noreturn}void {name}( {params_str} )'
+	fn_ret_type = _callable_ptr_type( function.return_type )
+	if fn_ret_type is not None:
+		# a function RETURNING a function pointer is C's gnarliest
+		# declarator shape - RetType (*name(Params))(InnerParams) - the one
+		# case where the OUTER function's own name+params nest INSIDE the
+		# return type's own declarator, rather than the ordinary "prefix
+		# type, then name" order every other return type uses (see
+		# _declarator's own doc for the analogous parameter/local case).
+		# Reuses _declarator as-is: passing "name( params )" as ITS OWN
+		# `name` argument makes the two declarator layers nest correctly
+		# with no separate logic needed - _declarator wraps whatever string
+		# it's given in `(*...)`, and a call expression is a valid thing to
+		# wrap.
+		return f'{noreturn}{_declarator( function.return_type, f"{name}( {params_str} )" )}'
+	ret = c_type( function.return_type )
+	# generic @extern monomorphized to different pointer types share the
+	# same C symbol — use void* for all object pointers to avoid
+	# conflicting prototypes for the same symbol
+	if function.extern_lib is not None and ret.endswith( '*' ):
+		ret = 'void*' if not ret.startswith( 'const' ) else 'const void*'
 	return f'{noreturn}{ret} {name}( {params_str} )'
 
 def _emit_operand( op: ir.Operand ) -> str:
