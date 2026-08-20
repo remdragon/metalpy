@@ -2270,15 +2270,52 @@ class Discovery( ast.NodeVisitor ):
 		directly in class_obj's own body. This is what makes the splice
 		"just work" with no new dispatch machinery: self.foo()/self.x
 		references inside the copied body resolve against class_obj's own
-		scope (chain_lookup, attributes, etc.), not the protocol's, since
-		class_obj is what's on scope_stack/module_stack when this runs (see
-		_validate_protocol_conformance's own caller, body_fn) - no renaming
-		pass needed (unlike e.g. type_resolver.py's generator-backing-
-		function synthesis, which has to rename because IT weaves a new
-		body out of pieces; this is a straight copy of an already-complete,
-		already-valid method body). '''
+		scope (chain_lookup, attributes, etc.), since class_obj is passed
+		straight through to _parse_function - no renaming pass needed
+		(unlike e.g. type_resolver.py's generator-backing-function synthesis,
+		which has to rename because IT weaves a new body out of pieces; this
+		is a straight copy of an already-complete, already-valid method
+		body).
+
+		Free/global names (not self.-prefixed) are a different story: a
+		default body's own qualified references (e.g. `fs.SEEK_CUR`) were
+		written against the PROTOCOL's own module - lexical Python scoping
+		means they must resolve there too, never against whichever module
+		class_obj happens to live in (a conforming class in a different
+		module than its protocol may not even import the same names at all -
+		see the class_obj.file != default_fn.file case below). class_obj
+		itself still has to be the innermost scope (for self/attribute
+		binding), so this pushes [protocol's own module, class_obj] rather
+		than reusing body_fn's ambient [class_obj's module, class_obj] -
+		module_context's own scope_stack reset makes that a clean swap, not
+		a merge of the two modules' names. '''
 		copied_node = copy.deepcopy( default_fn.node )
-		self._parse_function( copied_node, class_obj )
+		if default_fn.file == class_obj.file:
+			# same module - the ambient module_stack/scope_stack (already
+			# class_obj's own, from body_fn) is already correct; skip the
+			# swap rather than pay a module lookup for the common case
+			self._parse_function( copied_node, class_obj )
+			return
+		protocol_module = next(
+			( mod for mod in self.modules.values() if mod.file == default_fn.file ),
+			None,
+		)
+		if protocol_module is None:
+			# every protocol default's Function.file is set to its owning
+			# module's .file at parse time (_parse_function) - the module
+			# itself must already be registered in self.modules by the time
+			# any conformer references it (an unimported module can't have
+			# contributed a protocol to class_obj.protocols in the first
+			# place), so this should be unreachable; fail loudly rather than
+			# silently resolving the copied body against the wrong module
+			self.fail_loc(
+				f'internal error: no module found owning {default_fn.qualname} (file={default_fn.file})',
+				class_obj.file, class_obj.line,
+			)
+			return
+		with self.module_context( protocol_module ):
+			with self.scope_context( class_obj ):
+				self._parse_function( copied_node, class_obj )
 
 	# --- functions ----------------------------------------------------------
 

@@ -9,6 +9,7 @@
 # gets spliced directly into the conforming class's dispatch table, so
 # ordinary calls need no new runtime dispatch mechanism at all.
 
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -345,3 +346,60 @@ def main() -> i32:
 ''' )
 		import emitter_c
 		self._assert_compiles_and_runs( emitter_c.emit_c( compiler ), expected_exit = 0, compiler = compiler )
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class ProtocolCrossModuleSpliceTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' regression coverage for a real bug: a protocol default method's body
+	referencing a qualified name from its OWN module's imports (e.g.
+	`fs.SEEK_CUR`) failed to resolve ('name X is not defined') once spliced
+	into a conformer declared in a DIFFERENT module - _splice_protocol_default
+	was parsing the copied body against the CONFORMER's ambient module_stack
+	instead of the protocol's own defining module (lexical scoping: a
+	function's free/global names resolve against where it was written, not
+	where it's spliced to - only self.-prefixed names are meant to rebind).
+	Reproduces with two entirely ordinary modules - not specific to lib/
+	builtins/ - see lib/io.py's Seekable.tell()/lib/builtins/__File.py's
+	BinaryReader for the original real-world trigger. '''
+
+	def test_default_method_qualified_name_resolves_against_protocol_module( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'xconst.py' ).write_text( 'ANSWER: i32 = 42\n' )
+			( root / 'xproto.py' ).write_text( '''
+import xconst
+
+@protocol
+class Answerable:
+	def raw( self ) -> i32:
+		...
+
+	def answer( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.raw() + xconst.ANSWER
+''' )
+			( root / 'xconform.py' ).write_text( '''
+import compiler
+from xproto import Answerable
+
+class Thing( Answerable ):
+	def raw( self ) -> i32:
+		return 0
+''' )
+			discovery = Discovery( paths = [ root, Path( 'lib' ).resolve() ], import_builtins = True )
+			compiler = Compiler( discovery )
+			compiler.import_code( '''
+import compiler
+from xconform import Thing
+
+def main() -> i32:
+	t = Thing()
+	if t.answer() == 42:
+		return 0
+	return 1
+''', Path( '__main__.py' ), scope = None )
+			compiler.run()
+			self.assertEqual( discovery.errors.errors, [],
+				'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ) )
+			import emitter_c
+			self._assert_compiles_and_runs( emitter_c.emit_c( compiler ), expected_exit = 0, compiler = compiler )
