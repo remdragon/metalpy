@@ -2776,6 +2776,31 @@ class TypeResolver:
 		after the class body is resolved, never from within schedule(). '''
 		if cls.type_params:
 			return  # only concrete RCClasses get a destructor
+		# an RCClass with any unfulfilled @abstractmethod slot anywhere in
+		# its own chain can never be directly constructed (same is_abstract
+		# walk lowering.py's _check_rcclass_fully_implemented/emitter_c.py's
+		# _rcclass_fulfilled_slot_impls already use - all three have to
+		# agree on exactly which classes are "complete"). Its OWN
+		# destructor is then unreachable dead code, unconditionally, in
+		# EVERY program that ever uses it purely as a base: nothing ever
+		# calls it directly, and emit_rcclass_vtable_instance already skips
+		# building a vtable instance for an abstract class (the only thing
+		# that would ever reference $$__destructor__'s own address) - a
+		# real, confirmed -Wunused-function suite-wide (codecs.Codec,
+		# logging.Handler, ...), not a hypothetical. A concrete subclass's
+		# own destructor tears down the FULL inherited field set directly
+		# (base-first, via _build_field_teardown_ast below) - it never
+		# calls into an ancestor's own separately-synthesized destructor -
+		# so skipping synthesis entirely here removes nothing anything else
+		# depends on.
+		for slot in cls.virtual_slots():
+			impl = cls.chain_lookup( slot.stem )
+			if not isinstance( impl, Function ):
+				return
+			if impl.resolve is not None:
+				impl.resolve()
+			if impl.is_abstract:
+				return
 		sys_module = self.discovery.modules.get( 'sys' )
 		if sys_module is None:
 			return  # sys.free must be available

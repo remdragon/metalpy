@@ -3190,6 +3190,33 @@ def _interface_vtbl_name( cls: CStruct ) -> str:
 	# FooImplVtbl for an ordinary implementation)
 	return f'{mangle_type(cls.vtbl_owner())}Vtbl'
 
+def _vtable_slot_referenced_classlikes( owner: RCClass|CStruct ) -> list[ClassLike]:
+	''' every RCClass/CStruct/CUnion/TaggedUnion referenced (as a return or
+	parameter type, unwrapping a Specialization to its own .base) by any of
+	owner's own virtual_slots() signatures - in encounter order, deduped.
+	Even a still-unfulfilled slot (@abstractmethod, never gets a real
+	vtable INSTANCE of its own) still contributes its OWN declared
+	signature to owner's shared Vtbl STRUCT TYPE, which is unconditional -
+	needed by any future concrete override's own real instance regardless
+	of whether one exists yet. A type reachable ONLY through such a slot,
+	with no concrete override ever actually compiled anywhere in THIS
+	particular program, can otherwise go completely unscheduled - a real,
+	confirmed -Wvisibility ("will not be visible outside of this
+	function"), since nothing else ever independently forward-tags it
+	(compiler.rcclasses/cstructs/cunions/tagged_unions, each unconditionally
+	forward-tagged in emit_c's own pass 1, only ever contain types that got
+	SCHEDULED as a real compile unit somewhere - a type ONLY ever named in
+	an abstract slot's signature never does). '''
+	found: list[ClassLike] = []
+	for slot in owner.virtual_slots():
+		if slot.resolve is not None:
+			slot.resolve()
+		for t in [ slot.return_type ] + [ p.type for p in ( slot.parameters or [] ) ]:
+			base = t.base if isinstance( t, Specialization ) else t
+			if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion )) and base not in found:
+				found.append( base )
+	return found
+
 def _vtable_slot_c_type( owner: RCClass|CStruct, slot: Function ) -> tuple[str,list[str]]:
 	''' the function-pointer type for one vtable slot in `owner`'s own
 	Vtbl struct - self is Ptr[owner] UNIFORMLY for every slot in that one
@@ -3890,13 +3917,13 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# own (every class below it that adds nothing new reuses that same
 	# type unchanged - see CStruct.vtbl_owner) - dict used as an
 	# insertion-ordered dedup set, same convention as elsewhere in this
-	# module.
+	# module. Computed here (rather than immediately before its own
+	# emission loop below) so _vtable_slot_referenced_classlikes can walk
+	# it for the extra forward-tag pass just below.
 	vtbl_owners: dict[str,CStruct] = {}
 	for cls in compiler.cstructs:
 		if cls.is_interface and not cls.type_params:
 			vtbl_owners[ _interface_vtbl_name( cls ) ] = cls.vtbl_owner()
-	for owner in vtbl_owners.values():
-		parts.append( emit_interface_vtbl_struct( owner ))
 	# RCClass analog (RCClass-subclassing plan, Phase 4) - only classes
 	# that actually introduce a REAL @virtual slot need their own
 	# synthesized type at all (own_new_virtual_slots() non-empty, via
@@ -3909,6 +3936,30 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	for cls in compiler.rcclasses:
 		if not cls.type_params and cls.virtual_slots():
 			rcclass_vtbl_owners[ mangle_type( cls.vtbl_owner() )] = cls.vtbl_owner()
+	# a type reachable ONLY through a vtable slot's own signature (see
+	# _vtable_slot_referenced_classlikes) isn't guaranteed to appear in any
+	# of the four unconditional tag loops just above - typically an
+	# abstract slot whose concrete override never happens to get compiled
+	# anywhere in THIS particular program (e.g. logging.Handler.emit's own
+	# `record: LogRecord` when no concrete Handler subclass is ever
+	# constructed). Forward-tag anything the vtable owners below still
+	# reference that isn't already covered - same "cheap and always safe"
+	# reasoning the four loops above already use.
+	already_tagged = {
+		mangle_type( c )
+		for cls_list in ( compiler.rcclasses, compiler.cstructs, compiler.cunions, compiler.tagged_unions )
+		for c in cls_list if not c.type_params
+	}
+	for owner in list( vtbl_owners.values() ) + list( rcclass_vtbl_owners.values() ):
+		for referenced in _vtable_slot_referenced_classlikes( owner ):
+			name = mangle_type( referenced )
+			if name in already_tagged:
+				continue
+			already_tagged.add( name )
+			keyword = 'union' if isinstance( referenced, CUnion ) else 'struct'
+			parts.append( f'{keyword} {name};' )
+	for owner in vtbl_owners.values():
+		parts.append( emit_interface_vtbl_struct( owner ))
 	for owner in rcclass_vtbl_owners.values():
 		parts.append( emit_rcclass_vtbl_struct( owner ))
 	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
