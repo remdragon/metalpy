@@ -11747,6 +11747,7 @@ def helper( r: Result[str,MyError], r2: Result[str,MyError] ) -> i32:
 					junk = x.byte_len()
 				case Result.Err( e ):
 					junk = 0
+			if junk != usize( 0 ): pass
 			with compiler.wrap_arithmetic:
 				outcome = i32( r.byte_len() )
 		case Result.Err( e ):

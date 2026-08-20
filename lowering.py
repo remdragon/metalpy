@@ -9637,8 +9637,17 @@ class FunctionLowering:
 					match = self._new_temp( bool_cls )
 					self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = left_tag_attr.type, value = left_tags[lm.stem] )))
 					self._emit( ir.JumpIfFalse( cond = match, target = next_left_label ))
-				if lm.type is none_type:
-					narrowed_left = left   # never read - every cell using this row has left leaf type NoneType, handled without touching the operand at all
+				# _emit_leaf_pair_eq_value only ever reads narrowed_left/
+				# narrowed_right for a 'same_type'/'cross_dunder' cell - an
+				# 'error' cell builds a TypeError instance instead, and a
+				# 'none_true'/'none_false' cell returns a bare Const, neither
+				# ever touching the operand at all. Extracting the payload
+				# regardless is dead code (a real -Wunused-but-set-variable,
+				# confirmed suite-wide). Skip it whenever NO cell in this row
+				# can ever read it.
+				row_has_reader_cell = any( c.kind in ( 'same_type', 'cross_dunder' ) for c in grid[i] )
+				if lm.type is none_type or not row_has_reader_cell:
+					narrowed_left = left   # never read
 				else:
 					narrowed_left = self._extract_union_payload( left, left_data_attr, left_payload_cls, lm )
 			else:
@@ -9655,7 +9664,9 @@ class FunctionLowering:
 						match2 = self._new_temp( bool_cls )
 						self._emit( ir.Cmp( dest = match2, op = ir.CmpOp.EQ, left = tag_dest2, right = ir.Const( type = right_tag_attr.type, value = right_tags[rm.stem] )))
 						self._emit( ir.JumpIfFalse( cond = match2, target = next_right_label ))
-					if rm.type is none_type:
+					# same reasoning as narrowed_left above, but per-cell: this
+					# one cell (i,j) is the ONLY reader of narrowed_right
+					if rm.type is none_type or grid[i][j].kind not in ( 'same_type', 'cross_dunder' ):
 						narrowed_right = right
 					else:
 						narrowed_right = self._extract_union_payload( right, right_data_attr, right_payload_cls, rm )
@@ -9963,7 +9974,14 @@ class FunctionLowering:
 					match = self._new_temp( bool_cls )
 					self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = left_tag_attr.type, value = left_tags[lm.stem] )))
 					self._emit( ir.JumpIfFalse( cond = match, target = next_left_label ))
-				narrowed_left = left if lm.type is none_type else self._extract_union_payload( left, left_data_attr, left_payload_cls, lm )
+				# an 'error' cell's own codegen (_emit_binop_cell) never reads
+				# narrowed_left/narrowed_right - only a TypeError instance is
+				# built. Extracting the payload anyway is dead code (a real
+				# -Wunused-but-set-variable, confirmed suite-wide): skip it
+				# whenever NO cell in this row can ever read it, i.e. every
+				# right-side pairing for this left leaf is itself 'error'.
+				row_has_dunder_cell = any( c.kind != 'error' for c in grid[i] )
+				narrowed_left = left if lm.type is none_type or not row_has_dunder_cell else self._extract_union_payload( left, left_data_attr, left_payload_cls, lm )
 			else:
 				narrowed_left = left
 
@@ -9978,7 +9996,10 @@ class FunctionLowering:
 						match2 = self._new_temp( bool_cls )
 						self._emit( ir.Cmp( dest = match2, op = ir.CmpOp.EQ, left = tag_dest2, right = ir.Const( type = right_tag_attr.type, value = right_tags[rm.stem] )))
 						self._emit( ir.JumpIfFalse( cond = match2, target = next_right_label ))
-					narrowed_right = right if rm.type is none_type else self._extract_union_payload( right, right_data_attr, right_payload_cls, rm )
+					# same reasoning as narrowed_left above, but per-cell: this
+					# one cell (i,j) is the ONLY reader of narrowed_right, so
+					# an 'error' cell alone is enough to skip it
+					narrowed_right = right if rm.type is none_type or grid[i][j].kind == 'error' else self._extract_union_payload( right, right_data_attr, right_payload_cls, rm )
 				else:
 					narrowed_right = right
 
@@ -11402,7 +11423,18 @@ class FunctionLowering:
 		# arithmetic's own identical OrReturn/OrJump early-exit - see its
 		# own comment
 		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None )
-		return unwrapped if want_result else None
+		if not want_result:
+			# unwrapped's own extraction is bundled into OrReturn/OrJump's IR
+			# shape (see _consume_checked_result) - can't be skipped even
+			# though a bare `expr.or_return()` statement (validate-only,
+			# error propagation is the only wanted effect) never reads it.
+			# Non-RC-leaf receivers (e.g. Result[u8,E]) get no decref of their
+			# own either, leaving a real -Wunused-but-set-variable - confirmed
+			# suite-wide (lib/urllib/parse.py's own _unquote_impl first-pass
+			# validation scan).
+			self._emit( ir.MarkUsed( operand = unwrapped ))
+			return None
+		return unwrapped
 
 	def _lower_call_args( self, target: Function, node: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
 		# shared by the plain call path (_lower_call's own else branch) and
