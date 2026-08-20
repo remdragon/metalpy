@@ -1931,6 +1931,80 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# the shape that actually matters in real code, and the one the
+			# fix above's first draft still couldn't handle: a self.<attr>
+			# entry assigned BEFORE the defer() (real-world __init__s
+			# routinely stash a caller-owned reference first, then allocate/
+			# defer-cleanup scratch state afterward - unlike mmap.py's own
+			# shape, which happens to assign no attribute until the very
+			# end). That first draft only inline-decref'd an attribute found
+			# ABOVE its chosen shared-label candidate, bailing to the old
+			# full-inline behavior otherwise - correct, but needlessly
+			# conservative: an attribute's own rung is never reachable via
+			# `goto` regardless of stack position (current_epilogue_label_
+			# for_construction_err() never hands one out as a jump target),
+			# and build_epilogue_ladder()/build_inline_scope_ladder() now
+			# skip is_construction_attr entries UNCONDITIONALLY rather than
+			# only once .cancelled happens to be set - so this works
+			# regardless of push order. Checks exact refcount (not just "no
+			# crash"), same convention as fallible_construction_assigned_
+			# rc_field_before_later_err_no_leak above - a leak or a double-
+			# free both survive a single iteration undetected
+			( 'fallible_construction_attr_before_defer_shared_label_no_leak', '''
+class MyError:
+	pass
+
+class Holder:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class DeferAfterAttr:
+	held: Holder
+
+	@compiler.target( os = 'windows' )
+	def __init__( self, held: Holder, v: i32 ) -> Result[None, MyError]:
+		self.held = held
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( buf ))
+		if v < 0:
+			return Result.Err( MyError() )
+		return Result.Ok( None )
+
+	@compiler.target( os = not 'windows' )
+	def __init__( self, held: Holder, v: i32 ) -> Result[None, MyError]:
+		self.held = held
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		if v < 0:
+			return Result.Err( MyError() )
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		h: Holder = Holder( 9 )
+		before: usize = compiler.refcount( h )
+		i: i32 = 0
+		while i < 500:
+			r: Result[DeferAfterAttr, MyError] = DeferAfterAttr( h, -1 )
+			if not r.is_err():
+				return 1
+			i += 1
+		after_err: usize = compiler.refcount( h )
+		if before != after_err:
+			return compiler.cast( i32, 2 + after_err )
+		good: Result[DeferAfterAttr, MyError] = DeferAfterAttr( h, 3 )
+		if good.is_err():
+			return 10
+		after_ok: usize = compiler.refcount( h )
+		if after_ok != before + 1:
+			return compiler.cast( i32, 20 + after_ok )
+		return 0
+''' ),
 		] )
 
 class RCClassSubclassingPhase4Tests( test_support.RealCompileMixin, CompilerTestCase ):
