@@ -5440,14 +5440,36 @@ class FunctionLowering:
 		self._emit( ir.Label( name = end_label ))
 
 	def _lower_for_over_iterator( self, node: ast.For, obj: ir.Operand, next_fn: Function ) -> None:
-		''' PLAN_GENERATORS.md Phase 3 - `for x in <expr with a __next__()
-		returning T|None>:`. Structurally the same shape as
-		_lower_for_over_indexable (once-evaluated iterable, start/continue/
-		end labels, snapshot-bind-lower_loop_body-back_edge-restore-merge),
-		except the "is there another element" test is __next__()'s own
-		T|None result rather than an index/length comparison, and the
-		element binding needs the union's payload extracted rather than a
-		plain __getitem__ call.
+		''' PLAN_GENERATORS.md's StopIteration reversal - `for x in <expr
+		with a __next__() returning Result[T,E]>:` (E always including
+		StopIteration). Structurally the same shape as _lower_for_over_
+		indexable (once-evaluated iterable, start/continue/end labels,
+		snapshot-bind-lower_loop_body-back_edge-restore-merge), except the
+		"is there another element" test is __next__()'s own Result[T,E]
+		tag rather than an index/length comparison, and the element
+		binding needs the union's payload extracted rather than a plain
+		__getitem__ call.
+
+		Binding rule (matches type_resolver.py's own _desugar_iterator_for,
+		the in-generator-body mirror of this method - see its own docstring
+		for the full reasoning, confirmed directly with the user): if E is
+		JUST StopIteration, x binds to plain T. If E has any OTHER error,
+		x should bind to Result[T,E'] (E' = E minus StopIteration) - NOT
+		YET IMPLEMENTED here (a discovery.fail() below instead): unlike the
+		in-generator-body desugaring (which builds fresh AST processed by
+		a later type-checking/desugaring pass with its own narrowing
+		machinery), this method lowers directly to IR, where constructing
+		a NARROWER Result[T,E'] value from a payload read out of the WIDER
+		Result[T,E] requires either a real N-way tag dispatch per E' leaf
+		(cfg.py's narrow() only yields a concrete single type when exactly
+		one candidate remains) or reusing _stmt_If's own branch-merge
+		machinery by hand - real, substantial new code with no existing
+		caller to verify it against (every for-loop-over-a-generator this
+		codebase actually has - lib/re.py's finditer included - is
+		StopIteration-only). Deferred rather than risking a strong claim on
+		under-tested CFG-merge code, matching the "known v1 limitation,
+		clear error not silent wrongness" posture this codebase uses
+		elsewhere (e.g. finditer's own module-level-only restriction).
 
 		The payload extraction reuses cfg.py's REAL narrowing mechanism
 		(narrow()/narrowed_member(), the same machinery a `match x: case
@@ -5456,40 +5478,53 @@ class FunctionLowering:
 		None: ... else: ...`-narrowed read does NOT currently work anywhere
 		in this compiler, generator-unrelated - see PLAN_GENERATORS.md's own
 		STATUS section) directly at the IR level: __next__()'s result is
-		bound into a hidden local, narrow()'d to the union's own non-None
-		leaf, then read back through node.target's own ordinary _stmt_Assign
-		- _expr_Name's existing narrowed-read branch does the rest (extracts
+		bound into a hidden local, narrow()'d to the union's own Ok leaf,
+		then read back through node.target's own ordinary _stmt_Assign -
+		_expr_Name's existing narrowed-read branch does the rest (extracts
 		through GetAttr(data)/GetAttr(v_<leaf>) automatically), no new
 		extraction code needed here at all.
 
-		The "was this None" test can't be spelled `x is None` in the
-		synthesized AST the way user source would: that spelling only works
-		via type_resolver.py's own _ReferenceResolver.visit_Compare rewrite
-		(is/is-not-None against a TaggedUnion -> a direct .tag comparison),
-		which runs ONCE, early, over each REAL function body - never over
-		AST built here, mid-lowering (confirmed via a real repro:
-		ast.Compare(ops=[ast.Is()]) against a union operand falls through
-		to plain scalar `==`, comparing the whole union struct against a
-		bare 0 - a C compile error). So the same tag comparison that
-		rewrite produces is built directly, by hand, below. '''
-		none_type = self.lowering.discovery.get_none_type()
-
+		The "was this an error" test can't be spelled `x.is_err()` in the
+		synthesized AST the way user source would (that's a real method
+		call, more machinery than needed) - the same direct .tag comparison
+		this method has always built by hand (see its own historical
+		docstring on why is/is-not-None doesn't work here either - the same
+		reasoning applies to any comparison against a TaggedUnion tag). '''
 		self.lowering._ensure_resolved( next_fn )
 		result_type = next_fn.return_type
-		if not (
-			isinstance( result_type, TaggedUnion )
-			and len( result_type.attributes ) == 2
-			and any( a.type is none_type for a in result_type.attributes )
-		):
+		shape = self.lowering._type_resolver._result_shape( result_type )
+		stop_iteration_cls = self.lowering.discovery.find_name_or_none( 'StopIteration' )
+		if shape is None or stop_iteration_cls is None or stop_iteration_cls not in self.lowering._type_resolver._atomic_leaves( shape[1] ):
 			self.lowering.discovery.fail(
-				f'for loop needs __next__() to return exactly T|None on '
+				f'for loop needs __next__() to return Result[T,E] (E including StopIteration) on '
 				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
 				node,
 			)
+		elem_type, full_error_type = shape
+		remaining_leaves = [ leaf for leaf in self.lowering._type_resolver._atomic_leaves( full_error_type ) if leaf is not stop_iteration_cls ]
+		if remaining_leaves:
+			self.lowering.discovery.fail(
+				f'for loop over a generator whose error type has more than just StopIteration '
+				f'({full_error_type.qualname}) is not supported yet outside a generator body - consume it via '
+				f'.__next__() and match directly instead: {ast.unparse(node)}',
+				node,
+			)
 		self.lowering.schedule( result_type )
-		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( result_type )
-		none_member = next( a for a in result_type.attributes if a.type is none_type )
-		elem_member = next( a for a in result_type.attributes if a.type is not none_type )
+		# result_type is routinely a Result[T,E] SPECIALIZATION, not a bare
+		# TaggedUnion - _tagged_union_shape gives back the abstract base's
+		# own member list (substituted for THIS instantiation), and _union_
+		# storage.get needs a monomorphized concrete union (the abstract
+		# Result class's own payload union has no real C definition, bare
+		# unsubstituted T/E TypeVars) - same "monomorphize_class if
+		# Specialization else itself" pattern _emit_binop_fallible_check's
+		# own identical situation already uses (see its own comment)
+		tagged_shape = self.lowering._type_resolver._tagged_union_shape( result_type )
+		assert tagged_shape is not None
+		_result_base, result_members = tagged_shape
+		err_member = next( a for a in result_members if a.stem == 'Err' )
+		ok_member = next( a for a in result_members if a.stem == 'Ok' )
+		concrete_result_union = self.lowering.monomorphize_class( result_type ) if isinstance( result_type, Specialization ) else result_type
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( concrete_result_union )
 
 		unique = self._label_id
 		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
@@ -5507,17 +5542,17 @@ class FunctionLowering:
 
 		tag_expr = ast.Attribute( value = self.lowering._synth_name( next_var.stem, node ), attr = tag_attr.stem, ctx = ast.Load() )
 		ast.copy_location( tag_expr, node )
-		is_none_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ none_member.stem ] ) ] )
-		ast.copy_location( is_none_test, node )
+		is_err_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ err_member.stem ] ) ] )
+		ast.copy_location( is_err_test, node )
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		is_none_cond = self._lower_expr( is_none_test, bool_cls )
-		self._emit( ir.JumpIfTrue( cond = is_none_cond, target = end_label ))
+		is_err_cond = self._lower_expr( is_err_test, bool_cls )
+		self._emit( ir.JumpIfTrue( cond = is_err_cond, target = end_label ))
 
 		# snapshot BEFORE the loop target's own binding - same reasoning
 		# _lower_for_over_indexable's identical comment gives (the binding
 		# happens fresh every iteration, not confined-and-torn-down)
 		loop_snapshot = self._cfg.snapshot()
-		self._cfg.narrow( next_var.stem, elem_member )
+		self._cfg.narrow( next_var.stem, ok_member )
 		bind = ast.Assign( targets = [ node.target ], value = self.lowering._synth_name( next_var.stem, node ))
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )

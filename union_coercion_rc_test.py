@@ -220,7 +220,7 @@ def maybe_invert( i: i32 ) -> i32|None:
 def maybe_not( flag: bool ) -> bool|None:
 	return not flag
 
-def yield_neg( i: i32 ) -> Iterator[i32]:
+def yield_neg( i: i32 ) -> Iterator[Result[i32, StopIteration]]:
 	with compiler.wrap_arithmetic:
 		yield -i
 
@@ -238,9 +238,13 @@ def main() -> i32:
 	if d is None or d != True:
 		return 4
 	g = yield_neg( 7 )
-	e = g.__next__()
-	if e is None or e != -7:
-		return 5
+	r = g.__next__()
+	match r:
+		case Result.Err( _ ):
+			return 5
+		case Result.Ok( e ):
+			if e != -7:
+				return 5
 	return 0
 '''
 

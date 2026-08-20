@@ -5486,6 +5486,78 @@ def main() -> i32:
 		] )
 
 
+class MatchNestedUnionMemberRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for a fixed bug in type_resolver.py's
+	_match_pattern: `case SomeUnion.Variant(x):` resolves SomeUnion PURELY
+	from the pattern's own text, with no regard for what the match
+	subject's actual type is - correct when the subject genuinely IS
+	SomeUnion directly (the common case), but SomeUnion can also be nested
+	OPAQUELY as one member of a WIDER union that's the subject's real type
+	(e.g. `e: MyError | SomeOtherType`) - the code this used to build
+	tested SomeUnion's own INTERNAL tag position (Variant's position within
+	SomeUnion) directly against the subject, which is really the OUTER
+	union's own, entirely different tag space. Confirmed via a real repro:
+	silently WRONG generated code (not a crash, not a compile error) -
+	`case MyError.Bad(_):` only matched correctly by COINCIDENCE, whenever
+	MyError happened to sort first in the outer union's own canonicalized
+	member order. Found while building PLAN_GENERATORS.md's StopIteration
+	reversal (every generator error type now includes StopIteration, which
+	- living in builtins - sorts ahead of almost any user error type,
+	making this the COMMON case for generator error handling going
+	forward, not a rare edge case) but is completely general and pre-
+	existing, unrelated to generators specifically. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'nested_union_member_sorted_first_already_worked', '''
+class ZzzMarker:
+	pass
+
+@union
+class MyError:
+	Bad: None
+
+def make( which: i32 ) -> MyError | ZzzMarker:
+	if which == 0:
+		return MyError.Bad( None )
+	return ZzzMarker()
+
+def main() -> i32:
+	v = make( 0 )
+	match v:
+		case MyError.Bad( _ ):
+			return 0
+		case _:
+			return 1
+''' ),
+			( 'nested_union_member_sorted_second_was_the_real_bug', '''
+class AaaMarker:
+	pass
+
+@union
+class MyError:
+	Bad: None
+
+def make( which: i32 ) -> AaaMarker | MyError:
+	if which == 0:
+		return MyError.Bad( None )
+	return AaaMarker()
+
+def main() -> i32:
+	v = make( 0 )
+	match v:
+		case MyError.Bad( _ ):
+			return 0
+		case _:
+			return 1
+''' ),
+		] )
+
+
 class GenericMatchTypeMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for type_resolver.py's _try_fold_match_type -
 	`match type(<Name>): case ConcreteClass(binding): ... case _: ...` over a
@@ -16026,7 +16098,7 @@ class GeneratorFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	def test_programs_compile_and_run( self ) -> None:
 		self.assert_programs_run([
 			( 'multi_yield_state_transitions_and_exhaustion', '''
-def counter() -> Iterator[i32]:
+def counter() -> Iterator[Result[i32, StopIteration]]:
 	x: i32 = 1
 	yield x
 	x = 2
@@ -16038,21 +16110,33 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter()
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'calling_the_generator_function_runs_no_body_code', '''
-def only_yields_if_called() -> Iterator[i32]:
+def only_yields_if_called() -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 
 def main() -> i32:
@@ -16066,13 +16150,13 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[i32]:
+def gen( b: Box ) -> Iterator[Result[i32, StopIteration]]:
 	yield b.v
 	yield b.v
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
-	first = g.__next__() # only one of the two yields is ever consumed
+	first = g.__next__().is_ok() # only one of the two yields is ever consumed
 	# g goes out of scope here, still mid-iteration - PLAN_GENERATORS.md's
 	# own point: dropping it must still decref its captured Box parameter,
 	# via the ordinary, unmodified $$__destructor__ cascade every other
@@ -16097,7 +16181,7 @@ def main() -> i32:
 			# _is_range_call). See _build_while_unit_guard's own docstring
 			# for the resumable-loop restructuring this compiles down to.
 			( 'while_loop_resumable_across_next_calls', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield i
@@ -16108,17 +16192,29 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter( 3 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'while_loop_dropped_mid_iteration_decrefs_captured_parameter', '''
@@ -16127,7 +16223,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
@@ -16136,8 +16232,8 @@ def gen( b: Box ) -> Iterator[usize]:
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
-	first = g.__next__()
-	second = g.__next__() # b.v is 10 - only 2 of 10 iterations consumed
+	first = g.__next__().is_ok()
+	second = g.__next__().is_ok() # b.v is 10 - only 2 of 10 iterations consumed
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -16150,7 +16246,7 @@ def main() -> i32:
 		return 0
 ''' ),
 			( 'bare_yield_and_while_unit_mixed_in_one_generator', '''
-def mixed( count: usize ) -> Iterator[usize]:
+def mixed( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	hundred: usize = 100
 	yield hundred
 	i: usize = 0
@@ -16165,20 +16261,35 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = mixed( 2 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		e = g.__next__()
-		if e is not None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 5
 		return 0
 ''' ),
 			# --- Phase 3: `for x in <generator call>:` consumption
@@ -16192,7 +16303,7 @@ def main() -> i32:
 			# just "is None" correct (see PLAN_GENERATORS.md's own STATUS
 			# section on why this couldn't be checked directly until now).
 			( 'for_loop_consumes_a_while_unit_generator', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield i
@@ -16218,7 +16329,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
@@ -16250,7 +16361,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
@@ -16282,7 +16393,7 @@ def main() -> i32:
 			# (same $t-numbered instructions, same __gen_resuming_0 local)
 			# by inspecting the emitted C directly during development.
 			( 'for_loop_over_range_containing_yield', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	for i in range( count ):
 		yield i
 
@@ -16290,23 +16401,41 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter( 5 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		e = g.__next__()
-		if e is None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				return 5
+			case Result.Ok( _ ):
+				pass
 		f = g.__next__()
-		if f is not None:
-			return 6
+		match f:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 6
 		return 0
 ''' ),
 			( 'for_loop_over_range_composes_with_for_loop_consumption', '''
@@ -16315,7 +16444,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	for i in range( b.v ):
 		yield i
 
@@ -16338,13 +16467,13 @@ def main() -> i32:
 			# --- Phase 1: `for x in <expr>:` inside a generator body, over
 			# a non-range() iterable - both the indexable shape (__len__/
 			# __getitem__, e.g. list[T]) and the iterator shape (__next__()
-			# -> T|None, i.e. one generator consuming another). Unblocked by
+			# -> Result[T,E], i.e. one generator consuming another). Unblocked by
 			# type_resolver.py's _resolve_expr_type_for_desugar, reusing
 			# _ReferenceResolver._type_of_expr (already proven for match-
 			# statement subjects) to resolve the iterated expression's type
 			# entirely from AST, before any real lowering exists.
 			( 'for_loop_over_list_inside_generator', '''
-def double_all( xs: list[i32] ) -> Iterator[i32]:
+def double_all( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 	for x in xs:
 		doubled: i32 = 0
 		with compiler.wrap_arithmetic:
@@ -16359,21 +16488,33 @@ def main() -> i32:
 		xs.append( 3 ).unwrap( 'append failed' )
 		g = double_all( xs )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'for_loop_over_list_releases_it_and_its_captured_parameter', '''
-def double_all( xs: list[i32] ) -> Iterator[i32]:
+def double_all( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 	for x in xs:
 		doubled: i32 = 0
 		with compiler.wrap_arithmetic:
@@ -16382,7 +16523,7 @@ def double_all( xs: list[i32] ) -> Iterator[i32]:
 
 def make_and_partially_consume( xs: list[i32] ) -> None:
 	g = double_all( xs )
-	first = g.__next__()
+	first = g.__next__().is_ok()
 	# g goes out of scope here, mid-iteration - g's own __for_obj_N field
 	# holds a SEPARATE reference to xs, must also be released
 
@@ -16400,14 +16541,14 @@ def main() -> i32:
 		return 0
 ''' ),
 			( 'for_loop_consumes_another_generator_inside_a_generator', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield i
 		with compiler.wrap_arithmetic:
 			i += 1
 
-def doubled( count: usize ) -> Iterator[usize]:
+def doubled( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	for x in counter( count ):
 		y: usize = 0
 		with compiler.wrap_arithmetic:
@@ -16418,17 +16559,29 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = doubled( 3 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'for_loop_over_nested_generator_releases_both_levels', '''
@@ -16437,14 +16590,14 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def counter( b: Box ) -> Iterator[usize]:
+def counter( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
 		with compiler.wrap_arithmetic:
 			i += 1
 
-def doubled( b: Box ) -> Iterator[usize]:
+def doubled( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	for x in counter( b ):
 		y: usize = 0
 		with compiler.wrap_arithmetic:
@@ -16453,7 +16606,7 @@ def doubled( b: Box ) -> Iterator[usize]:
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = doubled( b )
-	first = g.__next__()
+	first = g.__next__().is_ok()
 	# g's own __for_obj_N field holds the inner counter(b) generator,
 	# which ITSELF holds b as its own captured parameter - both levels
 	# must release correctly when g is dropped mid-iteration
@@ -16479,7 +16632,7 @@ def main() -> i32:
 		# in the yielding branch (the `resuming` flag's own body),
 		# falling through to a shared tail unit after the if/else.
 		( 'if_else_yield_resumes_correct_branch_and_falls_through', '''
-def alternator( flag: bool ) -> Iterator[i32]:
+def alternator( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	if flag:
 		one: i32 = 1
 		yield one
@@ -16496,25 +16649,43 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = alternator( True )
 		a = g.__next__() # if-branch
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__() # resumes if-branch post-yield code, falls through to tail
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__() # exhausted
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 
 		g2 = alternator( False )
 		d = g2.__next__() # else-branch
-		if d is None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		e = g2.__next__() # falls through to tail
-		if e is None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				return 5
+			case Result.Ok( _ ):
+				pass
 		f = g2.__next__() # exhausted
-		if f is not None:
-			return 6
+		match f:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 6
 		return 0
 ''' ),
 		# --- Phase 2b: `with compiler.wrap_arithmetic/saturate_arithmetic/
@@ -16523,7 +16694,7 @@ def main() -> i32:
 		# (_yield_with_wrapper), no new unit kind. Confirms the mode
 		# is still correctly scoped when the segment is lowered.
 		( 'with_wrapped_yield_units', '''
-def counter( start: i32 ) -> Iterator[i32]:
+def counter( start: i32 ) -> Iterator[Result[i32, StopIteration]]:
 	x: i32 = start
 	with compiler.wrap_arithmetic:
 		yield x
@@ -16536,18 +16707,27 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter( 10 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 		return 0
 ''' ),
 		# --- Phase 3: generic generator functions (`def gen[T](x: T) ->
-		# Iterator[T]:`) - both an explicit instantiation (`gen[i32](...)`)
+		# Iterator[Result[T, StopIteration]]:`) - both an explicit instantiation (`gen[i32](...)`)
 		# and an inferred one (`gen(seven)`, T inferred from the
 		# argument's own static type - a bare int LITERAL argument hits a
 		# pre-existing, generator-unrelated inference gap in this
@@ -16564,48 +16744,66 @@ def main() -> i32:
 		# generic function's ABSTRACT base, never the concrete copy - see
 		# each fix's own comment for the specific gap it closes).
 		( 'generic_generator_explicit_and_inferred_instantiation', '''
-def gen[T]( x: T ) -> Iterator[T]:
+def gen[T]( x: T ) -> Iterator[Result[T, StopIteration]]:
 	yield x
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g1 = gen[i32]( 5 ) # explicit instantiation
 		a = g1.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g1.__next__()
-		if b is not None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 2
 
 		seven: i32 = 7
 		g2 = gen( seven ) # inferred instantiation
 		c = g2.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g2.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 		( 'generic_generator_two_instantiations_coexist_independently', '''
-def gen[T]( x: T ) -> Iterator[T]:
+def gen[T]( x: T ) -> Iterator[Result[T, StopIteration]]:
 	yield x
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g1 = gen[i32]( 5 )
 		a = g1.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 
 		g2 = gen[usize]( 9 ) # a DIFFERENT instantiation - independent backing class
 		b = g2.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		return 0
 ''' ),
 		( 'generic_generator_consumed_via_for_loop', '''
-def gen[T]( x: T, count: usize ) -> Iterator[T]:
+def gen[T]( x: T, count: usize ) -> Iterator[Result[T, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield x
@@ -16625,9 +16823,10 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
-		# --- Phase 4: fallible generators (`Generator[T,E]`, TODO.txt's
-		# original open question). __next__ returns Result[elem_type|None,
-		# E] instead of the bare union - or_return() inside the body
+		# --- Phase 4: fallible generators (`Generator[T, E | StopIteration]`, TODO.txt's
+		# original open question). __next__ returns Result[elem_type,E]
+		# unconditionally (StopIteration reversal - see PLAN_GENERATORS.md)
+		# - or_return() inside the body
 		# engages the EXISTING checked-arithmetic/_require_result_return
 		# machinery for free (no special generator-side flag - purely a
 		# consequence of __next__'s own declared return type, same as any
@@ -16649,7 +16848,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def counter( limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def counter( limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	i: usize = 0
 	while i < limit:
 		v: usize = maybe_bad( i, boom_at ).or_return()
@@ -16681,18 +16880,26 @@ def main() -> i32:
 				return 3
 		if not errored:
 			return 4
-		r3 = g.__next__() # permanently done - Ok(None), not a re-run of the failing code
+		r3 = g.__next__() # permanently done - Err(StopIteration()), not a re-run of the failing code
 		match r3:
 			case Result.Err( e ):
-				return 5
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 5
 			case Result.Ok( d ):
-				pass
+				return 5
 		r4 = g.__next__() # still permanently done, still no crash
 		match r4:
 			case Result.Err( e ):
-				return 6
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 6
 			case Result.Ok( f ):
-				pass
+				return 6
 		return 0
 ''' ),
 		( 'fallible_generator_or_return_error_releases_captured_parameter', '''
@@ -16710,7 +16917,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	i: usize = 0
 	while i < limit:
 		v: usize = maybe_bad( i, boom_at ).or_return()
@@ -16767,7 +16974,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def make_boxes( count: usize ) -> Iterator[Box]:
+def make_boxes( count: usize ) -> Iterator[Result[Box, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		b: Box = Box( v = 100 )
@@ -16780,14 +16987,14 @@ def consume_fully( count: usize ) -> None:
 		n: usize = 0
 		while True:
 			match make_boxes( count ).__next__():
-				case Box( x ):
+				case Result.Ok( x ):
 					if x.v != 100:
 						return
 					n += 1
-				case None:
+				case Result.Err( _ ):
 					break
 
-def gen_from_box( b: Box, count: usize ) -> Iterator[Box]:
+def gen_from_box( b: Box, count: usize ) -> Iterator[Result[Box, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield b
@@ -16797,9 +17004,9 @@ def gen_from_box( b: Box, count: usize ) -> Iterator[Box]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen_from_box( b, 5 )
 	match g.__next__():
-		case Box( first ):
+		case Result.Ok( first ):
 			pass
-		case None:
+		case Result.Err( _ ):
 			pass
 	# g goes out of scope here, still mid-iteration (only 1 of 5 yields
 	# consumed) - dropping it must decref the captured parameter b,
@@ -16824,7 +17031,7 @@ def main() -> i32:
 		# 048af0f regression guard: a yielded RC value now returns straight
 		# through with no intermediate temp routing (see the comment above
 		# this section's own list) - `yield b` compiles to a bare `return
-		# self.b` against __next__'s own elem_type|None return type,
+		# self.b` against __next__'s own Result[elem_type,error_type] return type,
 		# exactly the shape union_coercion_rc_test.py's own
 		# _UNION_COERCE_FIELD_READ proves increfs exactly once for a plain
 		# (non-generator) field read. Mirrors that test's own before/after-
@@ -16841,7 +17048,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def yield_param_directly( b: Box ) -> Iterator[Box]:
+def yield_param_directly( b: Box ) -> Iterator[Result[Box, StopIteration]]:
 	yield b
 
 def main() -> i32:
@@ -16850,15 +17057,16 @@ def main() -> i32:
 		g1 = yield_param_directly( p )
 		before: usize = compiler.refcount( p ) # p itself + g1's own captured field
 		r = g1.__next__()
+		r.is_ok() # satisfies the must-inspect check on the early-return path below too - the real value check is the match further down
 		after: usize = compiler.refcount( p )
 		if after != before + 1:
 			return 1
 		del g1
 		match r:
-			case Box( got ):
+			case Result.Ok( got ):
 				if got.v != 1:
 					return 2
-			case None:
+			case Result.Err( _ ):
 				return 3
 		return 0
 ''' ),
@@ -16868,7 +17076,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def double_all( xs: list[Box] ) -> Iterator[Box]:
+def double_all( xs: list[Box] ) -> Iterator[Result[Box, StopIteration]]:
 	for x in xs:
 		yield x
 
@@ -16902,7 +17110,7 @@ def main() -> i32:
 			# previously-untested gap (_reject_generator_value_return only ever
 			# rejected a VALUE return, nothing rewrote a bare one)
 			( 'bare_return_nested_in_while_unit_loop_body_ends_iteration_permanently', '''
-def gen( limit: i32 ) -> Iterator[i32]:
+def gen( limit: i32 ) -> Iterator[Result[i32, StopIteration]]:
 	x: i32 = 0
 	while x < limit:
 		if x == 2:
@@ -16915,24 +17123,39 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen( 5 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__() # x becomes 2 here, hits the bare `return` before yielding again
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 		d = g.__next__() # must stay permanently None, not resume mid-loop
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		e = g.__next__()
-		if e is not None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 5
 		return 0
 ''' ),
 			( 'bare_return_in_tail_after_yield_ends_iteration_permanently', '''
-def gen( flag: bool ) -> Iterator[i32]:
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 	if flag:
 		return
@@ -16942,14 +17165,23 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen( True )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__() # the tail's `if flag: return` fires here
-		if b is not None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 2
 		c = g.__next__() # must stay None - not fall through to the second yield
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 		return 0
 ''' ),
 			# --- defer/errdefer in generators (PLAN_GENERATORS.md) - Mechanism
@@ -16967,7 +17199,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -16983,21 +17215,33 @@ def main() -> i32:
 		if compiler.refcount( b ) != 2: # caller + generator's own captured param
 			return 1
 		a = g.__next__()
-		if a is None:
-			return 2
+		match a:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		if compiler.refcount( b ) != 2: # defer must not have fired yet
 			return 3
 		c = g.__next__()
-		if c is None:
-			return 4
+		match c:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__() # exhausts here - tail's own exit replays the armed defer
-		if d is not None:
-			return 5
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 5
 		if compiler.refcount( b ) != 3: # defer fired exactly once
 			return 6
 		e = g.__next__() # already done - must not re-fire
-		if e is not None:
-			return 7
+		match e:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 7
 		if compiler.refcount( b ) != 3:
 			return 8
 		return 0
@@ -17008,7 +17252,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, limit: usize ) -> Iterator[usize]:
+def gen( b: Box, limit: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -17026,13 +17270,19 @@ def main() -> i32:
 		if compiler.refcount( b ) != 2:
 			return 1
 		a = g.__next__() # i=0, yields 0
-		if a is None:
-			return 2
+		match a:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		if compiler.refcount( b ) != 2: # defer must not have fired yet
 			return 3
 		c = g.__next__() # i becomes 1, hits the bare `return` inside the loop - defer fires
-		if c is not None:
-			return 4
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		if compiler.refcount( b ) != 3:
 			return 5
 		return 0
@@ -17043,7 +17293,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -17054,7 +17304,7 @@ def gen( b: Box, count: usize ) -> Iterator[usize]:
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b, 5 )
-	first = g.__next__() # only 1 of 5 iterations consumed
+	first = g.__next__().is_ok() # only 1 of 5 iterations consumed
 	# g goes out of scope here, still mid-iteration - abandonment must still
 	# replay the armed defer, via the destructor, before its own ordinary
 	# captured-parameter teardown
@@ -17075,7 +17325,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, c: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, c: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -17092,11 +17342,17 @@ def main() -> i32:
 		c = Box( v = 2 )
 		g = gen( b, c, 1 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__() # exhausts - both defers replay LIFO: c's own first, then b's
-		if d is not None:
-			return 2
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 2
 		if compiler.refcount( b ) != 3: # captured param + b's own armed defer
 			return 3
 		if compiler.refcount( c ) != 3: # captured param + c's own armed defer
@@ -17124,7 +17380,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	with errdefer:
 		compiler.incref( b )
 	i: usize = 0
@@ -17162,12 +17418,16 @@ def main() -> i32:
 				return 5
 		if compiler.refcount( b ) != 3: # errdefer fired exactly once
 			return 6
-		r3 = g.__next__() # permanently done - Ok(None), errdefer must not re-fire
+		r3 = g.__next__() # permanently done - Err(StopIteration()), errdefer must not re-fire
 		match r3:
 			case Result.Err( e ):
-				return 7
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 7
 			case Result.Ok( a ):
-				pass
+				return 7
 		if compiler.refcount( b ) != 3:
 			return 9
 		return 0
@@ -17187,7 +17447,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def gen( b: Box, c: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def gen( b: Box, c: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	with defer:
 		compiler.incref( b )
 	with errdefer:
@@ -17228,7 +17488,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -17241,10 +17501,10 @@ def drain_fully( b: Box, count: usize ) -> None:
 	g = gen( b, count )
 	i: usize = 0
 	while i < count:
-		v = g.__next__()
+		v = g.__next__().is_ok()
 		with compiler.wrap_arithmetic:
 			i += 1
-	last = g.__next__() # natural exhaustion - tail replay fires the defer, unsets its own flag
+	last = g.__next__().is_ok() # natural exhaustion - tail replay fires the defer, unsets its own flag
 	# g goes out of scope HERE - $$__destructor__ must see the flag already
 	# unset and must NOT replay the same defer body a second time
 
@@ -17268,7 +17528,7 @@ def main() -> i32:
 class NotIterable:
 	pass
 
-def gen( x: NotIterable ) -> Iterator[i32]:
+def gen( x: NotIterable ) -> Iterator[Result[i32, StopIteration]]:
 	for y in x:
 		yield 1
 
@@ -17279,11 +17539,11 @@ def main() -> None:
 		self.assertIn( '__len__', str( self.discovery.errors.errors[0] ))
 
 	def test_for_loop_over_bad_next_shape_is_rejected( self ) -> None:
-		# a __next__() that returns something other than T|None - real, not
-		# a generator's own (compiler-synthesized __next__ always has the
-		# right shape) - must be a clear compile error, not a miscompile.
-		# Not generator-specific: any user class implementing __next__ by
-		# hand hits the same check.
+		# a __next__() that returns something other than Result[T,E] (E
+		# including StopIteration) - real, not a generator's own (compiler-
+		# synthesized __next__ always has the right shape) - must be a
+		# clear compile error, not a miscompile. Not generator-specific:
+		# any user class implementing __next__ by hand hits the same check.
 		self._run( '''
 class NotReallyAnIterator:
 	def __next__( self ) -> i32:
@@ -17295,7 +17555,7 @@ def main() -> None:
 		pass
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'T|None', str( self.discovery.errors.errors[0] ))
+		self.assertIn( 'Result[T,E]', str( self.discovery.errors.errors[0] ))
 
 	# PLAN_GENERATORS.md Phase F - the AST-synthesis unit-matcher these five
 	# rejection tests originally covered is gone; the real IR-level yield
@@ -17307,7 +17567,7 @@ def main() -> None:
 	def test_previously_rejected_shapes_now_compile_and_run( self ) -> None:
 		self.assert_programs_run([
 			( 'yield_nested_in_if_inside_while_true', '''
-def gen( flag: bool ) -> Iterator[i32]:
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	while True:
 		if flag:
 			yield 1
@@ -17317,19 +17577,30 @@ def gen( flag: bool ) -> Iterator[i32]:
 def main() -> i32:
 	g = gen( True )
 	a = g.__next__()
-	if a is None or a != 1:
-		return 1
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 1:
+				return 1
 	b = g.__next__()
-	if b is None or b != 1:
-		return 2
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 1:
+				return 2
 	g2 = gen( False )
 	c = g2.__next__()
-	if c is not None:
-		return 3
+	match c:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 3
 	return 0
 ''' ),
 			( 'while_loop_with_two_yields', '''
-def gen() -> Iterator[i32]:
+def gen() -> Iterator[Result[i32, StopIteration]]:
 	i: i32 = 0
 	with compiler.wrap_arithmetic:
 		while i < 3:
@@ -17343,8 +17614,11 @@ def main() -> i32:
 		idx: usize = 0
 		while idx < 6:
 			v = g.__next__()
-			if v is None:
-				return i32( 1 + idx )
+			match v:
+				case Result.Err( _ ):
+					return i32( 1 + idx )
+				case Result.Ok( v ):
+					pass
 			e: i32 = 0
 			if idx == 0: e = 0
 			elif idx == 1: e = 100
@@ -17356,12 +17630,15 @@ def main() -> i32:
 				return i32( 10 + idx )
 			idx += 1
 		last = g.__next__()
-		if last is not None:
-			return 20
+		match last:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 20
 		return 0
 ''' ),
 			( 'break_inside_yielding_while_loop', '''
-def gen() -> Iterator[i32]:
+def gen() -> Iterator[Result[i32, StopIteration]]:
 	i: i32 = 0
 	with compiler.wrap_arithmetic:
 		while True:
@@ -17373,21 +17650,36 @@ def gen() -> Iterator[i32]:
 def main() -> i32:
 	g = gen()
 	a = g.__next__()
-	if a is None or a != 0:
-		return 1
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 0:
+				return 1
 	b = g.__next__()
-	if b is None or b != 1:
-		return 2
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 1:
+				return 2
 	c = g.__next__()
-	if c is None or c != 2:
-		return 3
+	match c:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( c ):
+			if c != 2:
+				return 3
 	d = g.__next__()
-	if d is not None:
-		return 4
+	match d:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 4
 	return 0
 ''' ),
 			( 'if_elif_chain_with_yield', '''
-def gen( flag: i32 ) -> Iterator[i32]:
+def gen( flag: i32 ) -> Iterator[Result[i32, StopIteration]]:
 	if flag == 0:
 		yield 1
 	elif flag == 1:
@@ -17398,20 +17690,32 @@ def gen( flag: i32 ) -> Iterator[i32]:
 def main() -> i32:
 	g0 = gen( 0 )
 	a = g0.__next__()
-	if a is None or a != 1:
-		return 1
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 1:
+				return 1
 	g1 = gen( 1 )
 	b = g1.__next__()
-	if b is None or b != 2:
-		return 2
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 2:
+				return 2
 	g2 = gen( 2 )
 	c = g2.__next__()
-	if c is None or c != 3:
-		return 3
+	match c:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( c ):
+			if c != 3:
+				return 3
 	return 0
 ''' ),
 			( 'if_else_with_two_yields_in_one_branch', '''
-def gen( flag: bool ) -> Iterator[i32]:
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	if flag:
 		yield 1
 		yield 2
@@ -17421,21 +17725,39 @@ def gen( flag: bool ) -> Iterator[i32]:
 def main() -> i32:
 	g0 = gen( True )
 	a = g0.__next__()
-	if a is None or a != 1:
-		return 1
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 1:
+				return 1
 	b = g0.__next__()
-	if b is None or b != 2:
-		return 2
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 2:
+				return 2
 	c = g0.__next__()
-	if c is not None:
-		return 3
+	match c:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 3
 	g1 = gen( False )
 	d = g1.__next__()
-	if d is None or d != 3:
-		return 4
+	match d:
+		case Result.Err( _ ):
+			return 4
+		case Result.Ok( d ):
+			if d != 3:
+				return 4
 	e = g1.__next__()
-	if e is not None:
-		return 5
+	match e:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 5
 	return 0
 ''' ),
 		])
@@ -17445,7 +17767,7 @@ def main() -> i32:
 		# level statement (preamble/tail) is supported for now, same start-
 		# narrow posture as break/continue inside a yield-containing loop
 		self._run( '''
-def gen( count: usize ) -> Iterator[usize]:
+def gen( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		with defer:
@@ -17462,7 +17784,7 @@ def main() -> None:
 
 	def test_errdefer_inside_if_unit_branch_is_rejected( self ) -> None:
 		self._run( '''
-def gen( flag: bool ) -> Generator[i32,str]:
+def gen( flag: bool ) -> Generator[i32, str | StopIteration]:
 	if flag:
 		with errdefer:
 			pass
@@ -17486,7 +17808,7 @@ def main() -> None:
 		# never fires here since a generator's own defer body never routes
 		# through _register_defer_block at all
 		self._run( '''
-def gen( count: usize ) -> Iterator[usize]:
+def gen( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		return
@@ -17506,7 +17828,7 @@ def main() -> None:
 		# level deeper (inside an if) - confirms the whole-body walk
 		# catches a nested return too, not just a direct top-level one
 		self._run( '''
-def gen( flag: bool ) -> Generator[i32,str]:
+def gen( flag: bool ) -> Generator[i32, str | StopIteration]:
 	with errdefer:
 		if flag:
 			return
@@ -17532,7 +17854,7 @@ def main() -> None:
 def identity[T]( v: T ) -> T:
 	return v
 
-def gen[T]( x: T ) -> Iterator[T]:
+def gen[T]( x: T ) -> Iterator[Result[T, StopIteration]]:
 	y: T = identity( x )
 	yield y
 
@@ -17544,13 +17866,17 @@ def main() -> None:
 
 	def test_or_return_inside_infallible_iterator_is_rejected( self ) -> None:
 		# Phase 4 (roadmap Phase 4) - or_return() stays rejected inside a
-		# plain Iterator[T] (infallible) generator, exactly as before this
-		# phase - unchanged, since it's purely a consequence of __next__'s
-		# own declared return type (elem_type|None, not Result-shaped),
-		# same _require_result_return check every other non-Result-
-		# returning function already hits. Generator[T,E] is what lifts
-		# this - see test_programs_compile_and_run's own fallible_generator_
-		# ... test cases.
+		# plain Iterator[Result[T,StopIteration]] ("infallible" beyond
+		# exhaustion) generator: __next__'s own declared error type
+		# (StopIteration alone) doesn't COVER BoomError, same
+		# _require_result_return leaves-containment check every other
+		# fallible propagation site already hits - purely a consequence of
+		# the declared error type, same as before the StopIteration
+		# reversal, just with a real Result-shaped (not bare T|None)
+		# __next__ underneath now. Generator[T, E|StopIteration] (E
+		# actually covering BoomError) is what lifts this - see
+		# test_programs_compile_and_run's own fallible_generator_... test
+		# cases.
 		self._run( '''
 @union
 class BoomError:
@@ -17561,7 +17887,7 @@ def maybe_bad( flag: bool ) -> Result[i32, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( 1 )
 
-def gen( flag: bool ) -> Iterator[i32]:
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	v: i32 = maybe_bad( flag ).or_return()
 	yield v
 
@@ -17571,7 +17897,7 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
 
-	# PLAN_GENERATORS.md Phase C - `.send()`. Generator[T,SendType,E] (3-
+	# PLAN_GENERATORS.md Phase C - `.send()`. Generator[T, SendType, E | StopIteration] (3-
 	# arg form) makes `(yield expr)` usable as a captured EXPRESSION,
 	# evaluating to plain SendType, delivered via .send(v) - see this
 	# doc's own "Phase C design" section (describes the ORIGINAL,
@@ -17590,7 +17916,7 @@ def main() -> None:
 class NoError:
 	Never: None
 
-def gen() -> Generator[i32, i32, NoError]:
+def gen() -> Generator[i32, i32, NoError | StopIteration]:
 	x: i32 = yield 1
 
 def main() -> i32:
@@ -17609,7 +17935,7 @@ def main() -> i32:
 class NoError:
 	Never: None
 
-def gen() -> Generator[i32, i32, NoError]:
+def gen() -> Generator[i32, i32, NoError | StopIteration]:
 	x: i32 = yield 1
 	x2: i32 = yield x
 
@@ -17631,7 +17957,7 @@ def main() -> i32:
 class NoError:
 	Never: None
 
-def accumulator() -> Generator[i32, i32, NoError]:
+def accumulator() -> Generator[i32, i32, NoError | StopIteration]:
 	total: i32 = 0
 	with compiler.wrap_arithmetic:
 		while True:
@@ -17642,13 +17968,13 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = accumulator()
 		r0 = g.__next__().unwrap( 'unexpected error' )
-		if r0 is None or r0 != 0:
+		if r0 != 0:
 			return 1
 		r1 = g.send( 5 ).unwrap( 'unexpected error' )
-		if r1 is None or r1 != 5:
+		if r1 != 5:
 			return 2
 		r2 = g.send( 10 ).unwrap( 'unexpected error' )
-		if r2 is None or r2 != 15:
+		if r2 != 15:
 			return 3
 		return 0
 ''' ),
@@ -17662,7 +17988,7 @@ class Box:
 class NoError:
 	Never: None
 
-def collector() -> Generator[i32, Box, NoError]:
+def collector() -> Generator[i32, Box, NoError | StopIteration]:
 	i: i32 = 0
 	held: Box = Box( v = 0 )
 	with compiler.wrap_arithmetic:
@@ -17677,10 +18003,10 @@ def main() -> i32:
 			return 1
 		g = collector()
 		r0 = g.__next__().unwrap( 'e' )
-		if r0 is None or r0 != 0:
+		if r0 != 0:
 			return 2
 		r1 = g.send( b1 ).unwrap( 'e' )
-		if r1 is None or r1 != 10:
+		if r1 != 10:
 			return 3
 		# THREE independent owners: the caller's own b1, __send_slot
 		# (never cleared by consumption - only overwritten by a LATER
@@ -17690,7 +18016,7 @@ def main() -> i32:
 			return 4
 		b2 = Box( v = 20 )
 		r2 = g.send( b2 ).unwrap( 'e' )
-		if r2 is None or r2 != 20:
+		if r2 != 20:
 			return 5
 		if compiler.refcount( b1 ) != 1: # dropped back to just the caller's own binding
 			return 6
@@ -17708,7 +18034,7 @@ class Box:
 class NoError:
 	Never: None
 
-def collector() -> Generator[i32, Box, NoError]:
+def collector() -> Generator[i32, Box, NoError | StopIteration]:
 	i: i32 = 0
 	held: Box = Box( v = 0 )
 	with compiler.wrap_arithmetic:
@@ -17745,36 +18071,51 @@ def main() -> i32:
 		# through
 		self.assert_programs_run([
 			( 'yield_from_top_level_forwards_every_value_in_order', '''
-def inner() -> Iterator[i32]:
+def inner() -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 	yield 2
 	yield 3
 
-def outer() -> Iterator[i32]:
+def outer() -> Iterator[Result[i32, StopIteration]]:
 	yield from inner()
 
 def main() -> i32:
 	g = outer()
 	r0 = g.__next__()
+	match r0:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( r0 ):
+			if r0 != 1:
+				return 1
 	r1 = g.__next__()
+	match r1:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( r1 ):
+			if r1 != 2:
+				return 2
 	r2 = g.__next__()
+	match r2:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( r2 ):
+			if r2 != 3:
+				return 3
 	r3 = g.__next__()
-	if r0 is None or r0 != 1:
-		return 1
-	if r1 is None or r1 != 2:
-		return 2
-	if r2 is None or r2 != 3:
-		return 3
-	if r3 is not None:
-		return 4
+	match r3:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 4
 	return 0
 ''' ),
 			( 'yield_from_nested_in_if_still_forwards_correctly', '''
-def inner() -> Iterator[i32]:
+def inner() -> Iterator[Result[i32, StopIteration]]:
 	yield 10
 	yield 20
 
-def outer( flag: bool ) -> Iterator[i32]:
+def outer( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	if flag:
 		yield from inner()
 	else:
@@ -17783,15 +18124,27 @@ def outer( flag: bool ) -> Iterator[i32]:
 def main() -> i32:
 	g = outer( True )
 	r0 = g.__next__()
+	match r0:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( r0 ):
+			if r0 != 10:
+				return 1
 	r1 = g.__next__()
-	if r0 is None or r0 != 10:
-		return 1
-	if r1 is None or r1 != 20:
-		return 2
+	match r1:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( r1 ):
+			if r1 != 20:
+				return 2
 	g2 = outer( False )
 	r2 = g2.__next__()
-	if r2 is None or r2 != 99:
-		return 3
+	match r2:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( r2 ):
+			if r2 != 99:
+				return 3
 	return 0
 ''' ),
 			( 'yield_from_forwards_rc_values_with_correct_refcounts', '''
@@ -17800,18 +18153,18 @@ class Box:
 	def __init__( self, n: i32 ) -> None:
 		self.n = n
 
-def inner( b1: Box, b2: Box ) -> Iterator[Box]:
+def inner( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
 	yield b1
 	yield b2
 
-def outer( b1: Box, b2: Box ) -> Iterator[Box]:
+def outer( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
 	yield from inner( b1, b2 )
 
 def consume_fully( b1: Box, b2: Box ) -> None:
 	g = outer( b1, b2 )
-	x = g.__next__()
-	y = g.__next__()
-	z = g.__next__()
+	x = g.__next__().is_ok()
+	y = g.__next__().is_ok()
+	z = g.__next__().is_ok()
 
 def main() -> i32:
 	b1 = Box( n = 1 )
@@ -17832,16 +18185,16 @@ class Box:
 	def __init__( self, n: i32 ) -> None:
 		self.n = n
 
-def inner( b1: Box, b2: Box ) -> Iterator[Box]:
+def inner( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
 	yield b1
 	yield b2
 
-def outer( b1: Box, b2: Box ) -> Iterator[Box]:
+def outer( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
 	yield from inner( b1, b2 )
 
 def make_and_abandon( b1: Box, b2: Box ) -> None:
 	g = outer( b1, b2 )
-	first = g.__next__()
+	first = g.__next__().is_ok()
 	# g (and first, and inner's own generator) all go out of scope here,
 	# still mid-iteration on b1 - the generator's own destructor must
 	# still release every live promoted field it's holding
@@ -17872,11 +18225,11 @@ def main() -> i32:
 		# now, not just "no longer rejected."
 		self.assert_programs_run([
 			( 'yield_from_nested_inside_while_forwards_fresh_values_each_pass', '''
-def inner() -> Iterator[i32]:
+def inner() -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 	yield 2
 
-def outer( count: usize ) -> Iterator[i32]:
+def outer( count: usize ) -> Iterator[Result[i32, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield from inner()
@@ -17890,8 +18243,11 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		while True:
 			v = g.__next__()
-			if v is None:
-				break
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( v ):
+					pass
 			total += v
 			count += 1
 	# 3 outer passes, each forwarding inner()'s own 2 values (1, 2) - a
@@ -17904,10 +18260,10 @@ def main() -> i32:
 	return 0
 ''' ),
 			( 'yield_from_nested_inside_for_forwards_fresh_values_each_element', '''
-def inner() -> Iterator[i32]:
+def inner() -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 
-def outer( xs: list[i32] ) -> Iterator[i32]:
+def outer( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 	for _x in xs:
 		yield from inner()
 
@@ -17917,18 +18273,21 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		while True:
 			v = g.__next__()
-			if v is None:
-				break
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( _ ):
+					pass
 			count += 1
 	if count != 3:
 		return 1
 	return 0
 ''' ),
 			( 'for_loop_with_yield_directly_nested_inside_another_forwards_correctly', '''
-def inner() -> Iterator[i32]:
+def inner() -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 
-def outer( xs: list[i32] ) -> Iterator[i32]:
+def outer( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 	for _x in xs:
 		for y in inner():
 			yield y
@@ -17939,8 +18298,11 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		while True:
 			v = g.__next__()
-			if v is None:
-				break
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( _ ):
+					pass
 			count += 1
 	# _desugar_indexable_for's own generated while-loop splices the
 	# original for-loop's body in verbatim, WITHOUT re-scanning it for a
@@ -17963,10 +18325,16 @@ def main() -> i32:
 		# found while testing A.4a's own yield-from forwarding, but
 		# generator-unrelated and pre-existing: _emit_generator_yield_
 		# suspend's strict=False coercion had no follow-up type check, so
-		# `yield <usize>` into a declared Iterator[i32] silently produced
-		# invalid C instead of a clean compile error
+		# `yield <usize>` into a declared Iterator[Result[i32,StopIteration]]
+		# silently produced invalid C instead of a clean compile error.
+		# Since the StopIteration reversal, _wrap_generator_next_returns_
+		# in_ok wraps every yielded value in Result.Ok(...) uniformly - the
+		# type mismatch is now caught there, as an ordinary generic-
+		# inference disagreement (T inferred as both the declared elem_type
+		# and the yielded value's own actual type), rather than by the
+		# original dedicated check.
 		self._run( '''
-def gen() -> Iterator[i32]:
+def gen() -> Iterator[Result[i32, StopIteration]]:
 	x: usize = 10
 	yield x
 
@@ -17974,7 +18342,7 @@ def main() -> None:
 	g = gen()
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'yield produces', str( self.discovery.errors.errors[0] ))
+		self.assertIn( "type parameter 'T' is inferred as both", str( self.discovery.errors.errors[0] ))
 
 
 class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):

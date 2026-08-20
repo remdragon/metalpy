@@ -33,6 +33,12 @@ class KeyError: pass
 # _lower_eq_dispatch/_classify_leaf_pair_eq) produces Result[bool,TypeError]
 # purely as a tag, same empty-marker shape as the others above
 class TypeError: pass
+# not an operation-failure marker like the others above - the generator-
+# exhaustion sentinel every Iterator[Result[T,StopIteration]]/Generator[T,E]
+# (E always includes this) produces in its own Result's error channel once
+# $$__next__ reaches the end of the function, instead of a nullable None
+# bundled into the success channel (see PLAN_GENERATORS.md)
+class StopIteration: pass
 
 # FNV-1a, 64-bit - a plain, fast, deterministic byte hash. Shared by
 # str.__hash__ (below) and dict[K,V]'s own _hash_key (see __init__.py's

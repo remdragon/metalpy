@@ -1707,7 +1707,7 @@ def _require_next_match( pattern: Pattern, s: str, pos: usize, slen: usize, max_
 	return m
 
 
-def finditer( pattern: Pattern, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Iterator[Match]:
+def finditer( pattern: Pattern, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Iterator[Result[Match, StopIteration]]:
 	''' yields each successive non-overlapping match, scanning forward
 	from the end of the previous one (or by one codepoint, for a
 	zero-width match). Externally consumable via a real for-loop as of

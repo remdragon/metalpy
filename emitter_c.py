@@ -1408,6 +1408,25 @@ def _emit_const( c: ir.Const ) -> str:
 			base = c.type.base
 			if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
 				return f'({c_type(c.type)}){c.value}'
+		union_base = c.type.base if isinstance( c.type, Specialization ) else c.type
+		if c.value == 0 and isinstance( union_base, TaggedUnion ):
+			# PLAN_GENERATORS.md - type_resolver.py's generator_zero_rc_field
+			# placeholder (a promoted local/field "not assigned yet", never
+			# read before its own live-flag gates it) used to only ever
+			# target a plain RCClass pointer (0 is a valid null-pointer bit
+			# pattern there) or a T|None union (a real `None` Const used
+			# instead, see _rewrite_generator_constructor). Result[T,E] broke
+			# that: a TaggedUnion with NO None member (tag+data struct, no
+			# pointer-shaped representation) assigned a bare `0` - valid to
+			# the type checker (lowering.py's _check_assignable exempts every
+			# TaggedUnion target from the strict literal-compatibility check
+			# generally) but not valid C (assigning to 'struct ...' from
+			# incompatible type 'int'). A zero-initialized compound literal
+			# is valid C in assignment-RHS position (unlike the
+			# FixedArrayType '{0}' above, which is brace-initializer-only)
+			# and needs no real tag/payload - this placeholder is never read
+			# before being overwritten.
+			return f'({c_type(c.type)}){{0}}'
 		stem = c.type.stem if isinstance( c.type, Scalar ) else None
 		if stem in _WIDE_INT_STEMS:
 			return _emit_wide_int_const( c.value, stem )

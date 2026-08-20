@@ -916,25 +916,50 @@ class Discovery( ast.NodeVisitor ):
 		# until lowering.py actually finds a `yield` in the function body
 		# this annotates). Deliberately NOT interned (see GeneratorType's
 		# own docstring) - a fresh instance every occurrence.
+		#
+		# StopIteration reversal (PLAN_GENERATORS.md) - every generator's
+		# __next__() now genuinely returns Result[elem_type,error_type],
+		# with exhaustion signaled as Err(StopIteration()) instead of a
+		# nullable None bundled into the success channel. Deliberately NO
+		# implicit "Iterator[T] means Iterator[Result[T,StopIteration]]"
+		# magic (confirmed with the user - same posture as requiring an
+		# explicit `with compiler.panic_arithmetic(...):` rather than
+		# silently picking an arithmetic mode): the single type argument
+		# must already BE Result[T,E] with StopIteration somewhere in E's
+		# own leaves, spelled out by the caller. This makes Iterator[...]
+		# and Generator[...] two spellings of the exact same GeneratorType
+		# construction from here on - the only thing that differs is which
+		# textual shape the caller writes.
 		if isinstance( node.value, ast.Name ) and node.value.id == 'Iterator':
 			if isinstance( node.slice, ast.Tuple ):
 				self.fail( f'Iterator[...] takes exactly one type argument: {ast.unparse(node)}', node )
-			elem_type = self.visit( node.slice )
+			result_arg = self.visit( node.slice )
+			shape = self._result_shape_or_none( result_arg )
+			if shape is None:
+				self.fail(
+					f'Iterator[...] requires a Result[T,E] type argument (E must include StopIteration - '
+					f'reaching the end of the generator produces Err(StopIteration()) instead of a nullable '
+					f'None), got {result_arg.qualname}: {ast.unparse(node)}',
+					node,
+				)
+			elem_type, error_type = shape
+			self._require_stop_iteration_leaf( error_type, node )
 			return GeneratorType(
-				stem = f'Iterator[{elem_type.qualname}]',
-				qualname = f'Iterator[{elem_type.qualname}]',
+				stem = f'Iterator[{result_arg.qualname}]',
+				qualname = f'Iterator[{result_arg.qualname}]',
 				file = elem_type.file, line = elem_type.line,
-				elem_type = elem_type,
+				elem_type = elem_type, error_type = error_type,
 			)
 
-		# Generator[T,E] - PLAN_GENERATORS.md Phase 4 (roadmap Phase 4), the
-		# FALLIBLE sibling of Iterator[T] above - same textual recognition,
-		# just two type args instead of one, carried as GeneratorType's own
-		# error_type (None for Iterator[T] means infallible). __next__'s
-		# return type becomes Result[elem_type|None, error_type] instead of
-		# plain elem_type|None once ensure_generator_synthesized sees this.
+		# Generator[T,E] - PLAN_GENERATORS.md Phase 4 (roadmap Phase 4).
+		# Same textual recognition as Iterator[...] above, just spelled
+		# with the element and error types as two separate slots instead
+		# of one Result[T,E] argument - GeneratorType.error_type must
+		# still include StopIteration among its own leaves (same "no
+		# magic, spell it out" rule as Iterator[...] - E does NOT get
+		# StopIteration silently unioned in here either).
 		# Generator[T,SendType,E] - PLAN_GENERATORS.md Phase C - the SAME
-		# fallible form with a THIRD type argument inserted in the middle:
+		# form with a THIRD type argument inserted in the middle:
 		# SendType, the type `.send(v)` accepts and a captured `(yield
 		# expr)` expression evaluates to. Dispatched on tuple arity (2 vs
 		# 3), not a separate name - `Generator[T,E]` callers are completely
@@ -946,6 +971,7 @@ class Discovery( ast.NodeVisitor ):
 			if len( node.slice.elts ) == 3:
 				send_type = self.visit( node.slice.elts[1] )
 				error_type = self.visit( node.slice.elts[2] )
+				self._require_stop_iteration_leaf( error_type, node )
 				return GeneratorType(
 					stem = f'Generator[{elem_type.qualname},{send_type.qualname},{error_type.qualname}]',
 					qualname = f'Generator[{elem_type.qualname},{send_type.qualname},{error_type.qualname}]',
@@ -953,6 +979,7 @@ class Discovery( ast.NodeVisitor ):
 					elem_type = elem_type, send_type = send_type, error_type = error_type,
 				)
 			error_type = self.visit( node.slice.elts[1] )
+			self._require_stop_iteration_leaf( error_type, node )
 			return GeneratorType(
 				stem = f'Generator[{elem_type.qualname},{error_type.qualname}]',
 				qualname = f'Generator[{elem_type.qualname},{error_type.qualname}]',
@@ -993,6 +1020,38 @@ class Discovery( ast.NodeVisitor ):
 
 		args = [ self.visit( arg_node ) for arg_node in arg_nodes ]
 		return self._get_or_create_specialization( base, args )
+
+	def _result_shape_or_none( self, t: Type ) -> 'tuple[Type,Type]|None':
+		''' (T, E) if `t` is Result[T,E] (a Specialization of the real
+		builtins.Result class with exactly 2 args), else None. A small,
+		discovery-time-only duplicate of type_resolver.py's own identical
+		_result_shape - that one additionally resolves through Monomorphizer.
+		origin_of to handle an ALREADY-monomorphized Specialization, a
+		concern that doesn't exist here: this only ever runs on a type
+		freshly built by visit()-ing an annotation expression a few lines
+		above, never on something that could already be an eagerly-
+		monomorphized target. Used only by Iterator[...]'s own StopIteration
+		reversal check (see visit_Subscript) - PLAN_GENERATORS.md. '''
+		result_cls = self.find_name_or_none( 'Result' )
+		if result_cls is None or not ( isinstance( t, Specialization ) and t.base is result_cls and len( t.args ) == 2 ):
+			return None
+		return t.args[0], t.args[1]
+
+	def _require_stop_iteration_leaf( self, error_type: Type, node: ast.AST ) -> None:
+		''' PLAN_GENERATORS.md - every generator's declared error type must
+		include StopIteration among its own leaves (Type.leaves() - a plain,
+		non-union error_type is trivially its own only leaf) - deliberately
+		no implicit unioning it in for the caller: same "no magic" posture
+		as Iterator[...]'s own Result[T,E]-required check just above (see
+		its own comment for the panic_arithmetic precedent this mirrors). '''
+		stop_iteration_cls = self.find_name_or_none( 'StopIteration' )
+		if stop_iteration_cls is None or stop_iteration_cls not in error_type.leaves():
+			self.fail(
+				f'{error_type.qualname}: a generator\'s error type must include StopIteration (reaching the '
+				f'end of the generator produces Err(StopIteration()) instead of a nullable None) - write it '
+				f'explicitly, e.g. {error_type.qualname}|StopIteration: {ast.unparse(node)}',
+				node,
+			)
 
 	def _get_or_create_move( self, inner: Type ) -> Move:
 		key = f'move[{inner.qualname}]'
