@@ -14162,13 +14162,6 @@ def main() -> i32:
 			# the exact shape dict[K,V]'s own comparator/hasher helpers will
 			# use: a @staticmethod referenced bare from a sibling method of the
 			# same class, stored in a local, called indirectly from there.
-			# NOTE: deliberately does NOT return the Ptr[Callable[...]] value
-			# from a function - that's a real, separate gap (a function
-			# RETURNING a function pointer is C's gnarliest declarator shape,
-			# `RetType (*name(Params))(InnerParams)` - _declarator only covers
-			# parameter/local declarations, per PLAN_CALLABLE.md's own scope).
-			# Not needed here: dict[K,V] only ever passes a callback as a
-			# parameter, never returns one.
 			( 'staticmethod_reference_called_indirectly', '''
 class Ops:
 	@staticmethod
@@ -14266,6 +14259,72 @@ _sig_dfl: Ptr[Callable[[i32],i32]] = 0
 def main() -> i32:
 	f: Ptr[Callable[[i32],i32]] = _sig_dfl
 	return 0
+''' ),
+			# regression test: a function RETURNING a Ptr[Callable[...]] value
+			# used to crash emit_c() (NotImplementedError: c_type: unsupported
+			# type <CallableType ...>) - flagged as an explicit, deferred gap
+			# by PLAN_CALLABLE.md ("not needed by dict[K,V] - it only ever
+			# passes a callback as a parameter, never returns one") since a
+			# function returning a function pointer is C's gnarliest
+			# declarator shape: `RetType (*name(Params))(InnerParams)` - the
+			# one case where even the OUTER function's own name+params nest
+			# INSIDE the return type's own declarator. Fixed by reusing
+			# _declarator exactly as-is: passing "name( params )" as ITS OWN
+			# `name` argument makes the two declarator layers nest correctly.
+			( 'function_returning_function_pointer_called_indirectly', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def get_handler() -> Ptr[Callable[[i32],i32]]:
+	return add_one
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = get_handler()
+	result: i32 = f( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# same gap, through a METHOD (self is always the FIRST outer
+			# parameter, ahead of the return type's own declarator nesting -
+			# confirmed this doesn't disturb the self/params ordering).
+			( 'method_returning_function_pointer_called_indirectly', '''
+class Ops:
+	@staticmethod
+	def double( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x * 2
+
+	def get_op( self, v: i32 ) -> Ptr[Callable[[i32],i32]]:
+		return double
+
+def main() -> i32:
+	o: Ops = Ops()
+	f: Ptr[Callable[[i32],i32]] = o.get_op( 0 )
+	result: i32 = f( 21 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' ),
+			# same gap, through a GENERIC function monomorphized with
+			# K = Ptr[Callable[[i32],i32]] - confirms the declarator fix
+			# applies after substitute_type_params resolves K, not just to a
+			# return type spelled directly in source.
+			( 'generic_function_returning_function_pointer', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def identity[T]( x: T ) -> T:
+	return x
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = identity( add_one )
+	result: i32 = f( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
 ''' ),
 		] )
 

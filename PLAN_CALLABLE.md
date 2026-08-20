@@ -22,13 +22,9 @@ In scope:
    @staticmethod (no bound receiver) lowers to a Ptr[Callable[...]]-typed
    value.
 3. Calling through a Ptr[Callable[...]]-typed value (an indirect call).
-4. Using Ptr[Callable[...]] as a function parameter type and a local
-   variable type - not yet as a struct field, not deeply nested, and NOT
-   as a function's own return type (confirmed: crashes today - a function
-   RETURNING a function pointer is C's gnarliest declarator shape,
-   `RetType (*name(Params))(InnerParams)`, genuinely different from every
-   other declarator _declarator handles. Not needed by dict[K,V] - it only
-   ever passes a callback as a parameter, never returns one).
+4. Using Ptr[Callable[...]] as a function parameter type, a local
+   variable type, and (closed in a later pass - see below) a function's
+   own return type. Not yet as a struct field, not deeply nested.
 
 Deferred (flagged, not attempted this pass):
 - Lambda expressions / nested function defs - needed for zoneinfo.py's
@@ -103,3 +99,16 @@ Verification
 - dict[K,V] real compile-and-run coverage once rebuilt: dict[str,i32] and
   dict[i32,str] (RC and non-RC key) - insert, overwrite-existing-key,
   lookup-miss (KeyError), destruction without leak/double-free.
+
+Status update: a function returning Ptr[Callable[...]] (item 4's original
+exclusion, above) turned out to need no new machinery at all -
+_function_prototype's own "TYPE NAME" spelling had the exact same bug
+_emit_global_declaration independently hit for module-level Ptr[Callable[...]]
+globals (see git history around commit 32a5c90): a bare c_type(...) prefix
+can't express C's function-pointer declarator, which puts the name INSIDE
+the parens. Fixed by reusing _declarator as-is - passing "name( params )" as
+its own `name` argument nests the two declarator layers correctly
+(`RetType (*name(Params))(InnerParams)`), with no separate code path needed.
+Verified: free function, method (self ordering unaffected), and a generic
+function monomorphized to K = Ptr[Callable[...]] - real compile-and-run,
+MSVC/clang/WSL-gcc all green.
