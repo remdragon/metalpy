@@ -229,6 +229,12 @@ def int_stem_range( t: Scalar ) -> tuple[int,int]:
 @dataclass( kw_only = True, repr = False )
 class TypeVar( Type ):
 	''' a placeholder for one of a generic's type parameters, e.g. T in class Result[T,E] '''
+	# TypeVar(bound=SomeProtocol) - the only bound kind supported (discovery.py's
+	# _parse_type_params rejects anything else). Checked at generic
+	# instantiation time: the concrete type substituted for this TypeVar must
+	# carry `bound` in its own RCClass.protocols - see discovery.py's
+	# _get_or_create_specialization.
+	bound: 'Protocol|None' = None
 
 @dataclass( kw_only = True, repr = False )
 class Specialization( Type ):
@@ -722,6 +728,31 @@ class InheritanceChainMixin:
 		return attrs
 
 @dataclass( kw_only = True, repr = False )
+class Protocol( Type, ScopeMixin ): # @protocol class Foo:
+	''' A structural interface contract (SYNTAX.md's `@protocol`). Never
+	instantiated, never RC-managed, has no vtable - purely a compile-time
+	conformance contract. A conforming class declares "I implement this"
+	via ordinary base-class syntax (`class Bar(Foo):`) even though Foo isn't
+	a real base - see discovery.py's _parse_ClassDef_RCClass, which routes a
+	Protocol-typed entry in node.bases into RCClass.protocols below instead
+	of RCClass.base (no vtable/chain_lookup participation at all). Declaring
+	this makes it a compile error, right there at Bar's own definition, if
+	Bar doesn't fit the contract - see discovery.py's
+	_validate_protocol_conformance, which also splices any method the
+	protocol supplies a real (non-stub) default body for directly into the
+	conforming class's own dispatch table, so ordinary method lookup/dispatch
+	needs no new runtime fallback mechanism at all - ITS conformance is
+	settled once, at declaration time, not re-checked or scanned per-call. '''
+	methods: list['Function|Overload'] = field( default_factory = list )
+	names: dict[str,Name] = field( default_factory = dict )
+	resolve: Callable[[],None]|None = None
+
+	def is_rc( self ) -> bool: return False
+	def is_rc_pointer( self ) -> bool: return False
+	def has_object_header( self ) -> bool: return False
+	def has_vtable( self ) -> bool: return False
+
+@dataclass( kw_only = True, repr = False )
 class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted class
 	# base is resolved eagerly at class-creation time, same as type_params -
 	# Python itself requires a base class to already exist when the `class
@@ -729,6 +760,13 @@ class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted c
 	# defer here. Multiple inheritance is a compile error (see discovery.py),
 	# so this is a single pointer, not a list/MRO.
 	base: 'RCClass|None' = None
+	# @protocol types this class has explicitly declared conformance to
+	# (base-class-list syntax - see Protocol's own docstring). Small and
+	# per-class by construction - NOT a global registry, and NOT involved in
+	# chain_lookup/vtable at all. discovery.py's _validate_protocol_
+	# conformance checks and splices against this list once, at this class's
+	# own definition.
+	protocols: list[Protocol] = field( default_factory = list )
 	type_params: list[TypeVar]|None = None # if not None, this is a generic class
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
