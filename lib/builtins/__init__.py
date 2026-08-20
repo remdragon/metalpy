@@ -28,6 +28,11 @@ class ZeroDivisionError: pass
 class FloatingPointError: pass
 class IndexError: pass
 class KeyError: pass
+# list[T].append/insert/erase_at/pop refuse to mutate while a borrow_slice()
+# view is outstanding (see __list.py's own borrow_slice() comment) - the
+# same "an outstanding export blocks a resize" contract Python's own
+# memoryview/buffer protocol enforces over bytearray
+class BorrowError: pass
 # structural `==`/`!=` between two operands where at least one (left, right)
 # leaf-type pairing has no valid comparison (see lowering.py's
 # _lower_eq_dispatch/_classify_leaf_pair_eq) produces Result[bool,TypeError]

@@ -5138,9 +5138,9 @@ class ListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'list_i32_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
 	if x.__len__() != 3:
@@ -5194,7 +5194,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,OverflowError] = x.append( compiler.cast( i32, i ))
+			ar: Result[None,OverflowError|BorrowError] = x.append( compiler.cast( i32, i ))
 			if ar.is_err():
 				return 9
 			i += 1
@@ -5221,14 +5221,14 @@ def main() -> i32:
 			( 'erase_at_preserves_positional_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
-	r3: Result[None,OverflowError] = x.append( 40 )
-	r4: Result[None,OverflowError] = x.append( 50 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
+	r3: Result[None,OverflowError|BorrowError] = x.append( 40 )
+	r4: Result[None,OverflowError|BorrowError] = x.append( 50 )
 	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
 		return 9
-	er: Result[None,IndexError] = x.erase_at( 2 )
+	er: Result[None,IndexError|BorrowError] = x.erase_at( 2 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 4:
@@ -5253,12 +5253,12 @@ def main() -> i32:
 			( 'insert_shifts_tail_right_and_preserves_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
-	ir: Result[None,OverflowError] = x.insert( 1, 99 )
+	ir: Result[None,OverflowError|BorrowError] = x.insert( 1, 99 )
 	if ir.is_err():
 		return 8
 	if x.__len__() != 4:
@@ -5282,11 +5282,11 @@ def main() -> i32:
 			( 'insert_past_end_clamps_to_append', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
 	if r0.is_err() or r1.is_err():
 		return 9
-	ir: Result[None,OverflowError] = x.insert( 100, 30 )
+	ir: Result[None,OverflowError|BorrowError] = x.insert( 100, 30 )
 	if ir.is_err():
 		return 8
 	if x.__len__() != 3:
@@ -5310,9 +5310,9 @@ def set_it( x: list[i32] ) -> Result[None,IndexError]:
 
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
 	sr: Result[None,IndexError] = set_it( x )
@@ -5334,8 +5334,8 @@ def main() -> i32:
 			( 'list_str_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,OverflowError] = x.append( 'hello' )
-	r1: Result[None,OverflowError] = x.append( 'world' )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 'hello' )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 'world' )
 	if r0.is_err() or r1.is_err():
 		return 9
 	if x.__len__() != 2:
@@ -5356,7 +5356,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,OverflowError] = x.append( 'item' )
+			ar: Result[None,OverflowError|BorrowError] = x.append( 'item' )
 			if ar.is_err():
 				return 9
 			i += 1
@@ -5397,7 +5397,7 @@ class Holder:
 		self.items = list[i32]()
 
 	def add( self, v: i32 ) -> None:
-		r: Result[None,OverflowError] = self.items.append( v )
+		r: Result[None,OverflowError|BorrowError] = self.items.append( v )
 		if r.is_err():
 			sys.panic( 'append failed' )
 
@@ -5454,7 +5454,7 @@ class Triple:
 
 def main() -> i32:
 	xs: list[Triple] = list[Triple]()
-	r1: Result[None,OverflowError] = xs.append( Triple( 5 ))
+	r1: Result[None,OverflowError|BorrowError] = xs.append( Triple( 5 ))
 	if r1.is_err():
 		return 1
 	g1: Result[Triple,IndexError] = xs.__getitem__( 0 )
@@ -5506,12 +5506,12 @@ def main() -> i32:
 			( 'list_str_erase_at_preserves_order_and_refcounts', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,OverflowError] = x.append( 'a' )
-	r1: Result[None,OverflowError] = x.append( 'b' )
-	r2: Result[None,OverflowError] = x.append( 'c' )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 'a' )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 'b' )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 'c' )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
-	er: Result[None,IndexError] = x.erase_at( 1 )
+	er: Result[None,IndexError|BorrowError] = x.erase_at( 1 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 2:
@@ -5563,10 +5563,7 @@ class UnsafeListGenericTests( CompilerTestCase ):
 				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_construct_append_getitem_get_ptr_erase( self ) -> None:
-		# get_ptr() specifically - list[T] itself no longer exposes it (a
-		# borrowed pointer is incompatible with a type whose whole point is
-		# "safe to hand to another thread"), but UnsafeList[T] still does
+	def test_construct_append_getitem_erase( self ) -> None:
 		self._run( '''
 def main() -> i32:
 	x: UnsafeList[i32] = UnsafeList[i32]()
@@ -5578,15 +5575,12 @@ def main() -> i32:
 	v: i32 = x.__getitem__( 1 ).unwrap( 'getitem failed' )
 	if v != 2:
 		return 2
-	p: Ptr[i32] = x.get_ptr( 0 ).unwrap( 'get_ptr failed' )
-	if p[0] != 1:
-		return 3
 	x.erase_at( 0 ).unwrap( 'erase_at failed' )
 	if x.__len__() != 2:
-		return 4
+		return 3
 	v = x.__getitem__( 0 ).unwrap( 'getitem failed' )
 	if v != 2:
-		return 5
+		return 4
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -5697,7 +5691,7 @@ class Consumer:
 
 	def run( self ) -> None:
 		while self.popped < 8000:
-			r: Result[i32, IndexError] = self.source.pop()
+			r: Result[i32, IndexError|BorrowError] = self.source.pop()
 			if r.is_ok():
 				v: i32 = r.unwrap( 'checked is_ok' )
 				with compiler.wrap_arithmetic:
@@ -5912,6 +5906,86 @@ def main() -> i32:
 		return 1
 	if result_b.load() != 222:
 		return 2
+	return 0
+''' ),
+			# real cross-thread stress test for list[T].borrow_slice()/
+			# release_borrow(): N threads hammer append() on a list while the
+			# MAIN thread holds a borrow_slice() view, then releases it - a
+			# closed-form accounting check (every attempt is EITHER blocked
+			# with BorrowError OR succeeds, counted separately, and the two
+			# counts plus the list's own final length must all agree exactly)
+			# proves the borrow genuinely serializes against real concurrent
+			# mutation attempts, not just single-threaded reasoning. The
+			# busy-wait on `started` (same pattern independent_per_thread_
+			# slots above already uses) maximizes the chance every hammering
+			# thread has actually begun racing before the main thread
+			# releases the borrow - without it, a slow thread start could let
+			# every attempt land AFTER release, proving nothing.
+			( 'borrow_slice_blocks_concurrent_mutation_from_other_threads', '''
+import threading
+import atomic
+
+class Hammerer:
+	target:  list[i32]
+	started: atomic.Atomic[i32]
+	blocked: atomic.Atomic[i32]
+	ok:      atomic.Atomic[i32]
+
+	@staticmethod
+	def make( target: list[i32], started: atomic.Atomic[i32], blocked: atomic.Atomic[i32], ok: atomic.Atomic[i32] ) -> Hammerer:
+		return Hammerer.__allocate__( target = target, started = started, blocked = blocked, ok = ok )
+
+	def run( self ) -> None:
+		self.started.fetch_add( 1 )
+		i: i32 = 0
+		while i < 500:
+			if self.target.append( 1 ).is_ok():
+				self.ok.fetch_add( 1 )
+			else:
+				self.blocked.fetch_add( 1 )
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	l: list[i32] = list[i32]()
+	started = atomic.Atomic[i32]( 0 )
+	blocked = atomic.Atomic[i32]( 0 )
+	ok      = atomic.Atomic[i32]( 0 )
+
+	view: slice[i32] = l.borrow_slice()
+
+	threads: list[threading.Thread] = list[threading.Thread]()
+	t: i32 = 0
+	while t < 4:
+		h: Hammerer = Hammerer.make( l, started, blocked, ok )
+		threads.append( threading.Thread( h.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+
+	while started.load() < 4:
+		pass
+
+	l.release_borrow()
+
+	i: usize = 0
+	while i < 4:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+
+	if len( view ) != 0:
+		return 1
+	if blocked.load() == 0:
+		return 2
+	if ok.load() == 0:
+		return 3
+	with compiler.wrap_arithmetic:
+		total: i32 = blocked.load() + ok.load()
+	if total != 2000:
+		return 4
+	if l.__len__() != usize( ok.load() ):
+		return 5
 	return 0
 ''' ),
 		], timeout = 30 )
@@ -9325,8 +9399,7 @@ def main() -> i32:
 ''' ),
 			# as_slice() over an RC element type (str) - slice[T]'s own _ptr is
 			# untyped (ConstPtr[None]) and get_unchecked already does the
-			# compiler.is_rc(T) handle-vs-value branch, unlike UnsafeList.
-			# get_ptr (documented value-typed-T-only) - confirms the two
+			# compiler.is_rc(T) handle-vs-value branch - confirms the two
 			# containers' buffer layouts genuinely agree for RC T too
 			( 'as_slice_over_rc_elements', '''
 def main() -> i32:
@@ -16881,7 +16954,7 @@ def main() -> i32:
 ''' ),
 			# runs the N-part runtime path many times over - a real stress
 			# check for the UnsafeList[str] scratch buffer's own lifecycle
-			# (construction, N appends, get_ptr, destruction) - matches this
+			# (construction, N appends, destruction) - matches this
 			# codebase's own "repeat-run stress test, not just reasoning"
 			# verification convention (see ListThreadSafetyTests)
 			( 'repeated_fstring_construction_does_not_leak_or_double_free', '''

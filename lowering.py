@@ -3271,7 +3271,26 @@ class FunctionLowering:
 			existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 			if existing is not None:
 				self._cfg.unnarrow( target.id ) # a real reassignment invalidates whatever this name was previously narrowed to - see cfg.py's own comment
-				operand = self._lower_expr( node.value, existing.type )
+				# every local (including a `case T(name):` match-arm binding -
+				# see is_match_binding below) is function-scoped, no per-arm/
+				# per-match scoping at all - reusing a binding name across two
+				# SEPARATE, unrelated match statements is exactly as ordinary
+				# as reusing a loop counter across two separate loops, and
+				# works fine here whenever both sides happen to agree on the
+				# payload type (an everyday reassignment, same as `x = 5`
+				# then `x = 6`). Only a genuine type MISMATCH on such a reuse
+				# needs a real diagnostic - and match_binding's own gets a
+				# context naming the REAL cause instead of the bare "expected
+				# X, got Y" ordinary reassignment already produces on its
+				# own, which never explains where X even came from (nothing
+				# in THIS statement's own source mentions it - it's a
+				# leftover from wherever `target.id` was first bound).
+				is_match_binding = getattr( node, 'is_match_binding', False )
+				context = (
+					f'{target.id!r} is already declared earlier in this function (e.g. by another match '
+					f"arm's own binding) with an incompatible type"
+				) if is_match_binding else None
+				operand = self._lower_expr( node.value, existing.type, context = context )
 				for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = existing, src = operand ))
@@ -6355,7 +6374,7 @@ class FunctionLowering:
 
 	# --- expressions -----------------------------------------------------------
 
-	def _lower_expr( self, node: ast.expr, expected_type: Type|None, *, strict: bool = True ) -> ir.Operand:
+	def _lower_expr( self, node: ast.expr, expected_type: Type|None, *, strict: bool = True, context: str|None = None ) -> ir.Operand:
 		''' `strict=False` (default True): `expected_type` here is a HINT for
 		inference (e.g. _lower_binary_operands passing the left operand's own
 		type down to help type an untyped literal, or to help a nested
@@ -6365,12 +6384,21 @@ class FunctionLowering:
 		their own comments below), but still applies the pre-existing,
 		unconditionally-safe TaggedUnion/RCClass-upcast/pointer-cast
 		coercions. Every ordinary call site (assignment, call argument,
-		return, ...) leaves this at its default True. '''
+		return, ...) leaves this at its default True.
+		`context`, passed straight through to _coerce_or_check_operand/
+		_check_assignable, only affects a real MISMATCH's own failure
+		message (see _check_assignable's own doc) - every legitimate
+		coercion still applies exactly the same either way. Almost every
+		caller leaves this at its default None (a bare "expected X, got Y");
+		_stmt_Assign's own match-arm-binding reassignment is the one caller
+		that needs it, to name the REAL cause (a reused binding name, not an
+		ordinary value mismatch) instead of a message that never explains
+		where the "expected" type even came from. '''
 		method = getattr( self, f'_expr_{node.__class__.__name__}', None )
 		if method is None:
 			self.lowering.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
 		operand = method( node, expected_type )
-		return self._coerce_or_check_operand( operand, expected_type, node, strict = strict )
+		return self._coerce_or_check_operand( operand, expected_type, node, strict = strict, context = context )
 
 	def _coerce_or_check_operand( self, operand: ir.Operand, expected_type: Type|None, node: ast.AST, *, strict: bool = True, context: str|None = None ) -> ir.Operand:
 		''' the shared post-dispatch tail: given an operand (freshly produced
@@ -7727,15 +7755,15 @@ class FunctionLowering:
 		self, result: ir.Operand, errmsg: str, payload_type: Type, error_type: Type, str_type: Type, node: ast.AST, *, want_result: bool = True,
 	) -> ir.Operand|None:
 		# unwrap()s a Result[T,E] this pass itself just produced (an
-		# UnsafeList[str].append()/.get_ptr() call, below). (payload_type,
-		# error_type) are passed in explicitly by the caller rather than
-		# read back off result.type, since substitute_type_params leaves
-		# two visibly different shapes there depending on whether the
-		# Result's own structure mentions T (get_ptr's Result[Ptr[T],
-		# IndexError] arrives as an already-monomorphized TaggedUnion;
-		# append's Result[None,OverflowError], fully concrete already in
-		# the abstract declaration, stays a plain Specialization) - the
-		# caller already knows both types unambiguously either way.
+		# UnsafeList[str].append() call, below). (payload_type, error_type)
+		# are passed in explicitly by the caller rather than read back off
+		# result.type, since substitute_type_params can leave two visibly
+		# different shapes there depending on whether the Result's own
+		# structure mentions a type param the caller substituted (an
+		# already-monomorphized TaggedUnion) or was fully concrete already
+		# in the abstract declaration (a plain Specialization, e.g. append's
+		# own Result[None,OverflowError]) - the caller already knows both
+		# types unambiguously either way.
 		#
 		# Resolves the CONCRETE Result[payload_type,error_type] CLASS
 		# first (_get_or_create_specialization + _ensure_resolved), then
@@ -7790,25 +7818,6 @@ class FunctionLowering:
 			return None
 		dest = self._new_temp( unwrap.return_type )
 		self._emit( ir.Call( dest = dest, target = unwrap, receiver = result, args = [ errmsg_const ], kwargs = {} ))
-		return dest
-
-	def _lower_slice_view( self, ptr: ir.Operand, length: ir.Operand, elem_type: Type, node: ast.AST ) -> ir.Operand:
-		# builds a slice[elem_type] value directly via ir.Allocate - the one
-		# construction shape in this pass with no prior source-level call
-		# site to copy (slice[T] has no user-spellable constructor - see
-		# lib/builtins/__init__.py's join() comment, "no array-literal
-		# syntax"). Safe precisely because slice is a plain @cstruct, not
-		# an RCClass: emitter_c.py's own Allocate handling already treats a
-		# plain CStruct as "stack value construction, no header" (same
-		# posture _lower_bound_method_closure's own direct Allocate below
-		# uses for a ClosureType nothing in source can spell either) - no
-		# _schedule_rcclass_construction needed, this isn't heap-allocated
-		# or refcounted at all.
-		slice_cls = self.lowering.discovery.find_name( 'slice', node )
-		slice_spec = self.lowering.discovery._get_or_create_specialization( slice_cls, [ elem_type ])
-		concrete_slice_cls = self.lowering._ensure_resolved( slice_spec ) # the real, monomorphized slice[elem_type] - see _expr_JoinedStr's own comment on why the concrete class (not the abstract generic one) is what downstream code needs
-		dest = self._new_temp( slice_spec )
-		self._emit( ir.Allocate( dest = dest, cls = concrete_slice_cls, fields = { '_ptr': ptr, '__len': length } ))
 		return dest
 
 	def _expr_JoinedStr( self, node: ast.JoinedStr, expected_type: Type|None ) -> ir.Operand:
@@ -7890,34 +7899,25 @@ class FunctionLowering:
 				none_type, overflow_error_cls, str_type, node, want_result = False,
 			)
 
-		const_ptr_cls = self.lowering.discovery.get_intrinsics()['ConstPtr']
-		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
-		ptr_str_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ str_type ])
-		index_error_cls = self.lowering.discovery.find_name( 'IndexError', node )
-		get_ptr = concrete_cls.get_local_or_raise( 'get_ptr' )
-		self.lowering._ensure_resolved( get_ptr ) # see init's own comment on why this is needed
-		self.lowering.schedule( get_ptr.return_type )
-		for p in ( get_ptr.parameters or [] ):
+		# UnsafeList[str].as_slice() - a real slice[str] view over the WHOLE
+		# buffer, exactly n elements (the buffer is pre-sized to exactly
+		# len(node.values) and never appended to more than that many times -
+		# same "provably always Ok" reasoning append's own unwrap above
+		# relies on). Used to be a hand-rolled get_ptr(0)+CastWrap+direct
+		# ir.Allocate sequence, written before as_slice() existed at all
+		# (as_slice() was added later, for lib/bisect.py's own wiring, and
+		# nobody circled back to simplify this) - as_slice() already does
+		# the identical thing (buf.__raw._slot_ptr(0), cast to ConstPtr
+		# [None], wrapped in a slice[T]) as one real library call, the same
+		# "look up method by name, emit one ir.Call" pattern init/append
+		# above already use, not a special one-off.
+		as_slice = concrete_cls.get_local_or_raise( 'as_slice' )
+		self.lowering._ensure_resolved( as_slice ) # see init's own comment on why this is needed
+		self.lowering.schedule( as_slice.return_type )
+		for p in ( as_slice.parameters or [] ):
 			self.lowering.schedule( p.type )
-		zero_const = ir.Const( type = usize_cls, value = 0 )
-		get_ptr_result = self._new_temp( get_ptr.return_type )
-		self._emit( ir.Call( dest = get_ptr_result, target = get_ptr, receiver = buf, args = [ zero_const ], kwargs = {} ))
-		ptr = self._lower_unwrap_result(
-			get_ptr_result, 'f-string: internal index failed (unreachable - buffer is non-empty by construction)',
-			ptr_str_type, index_error_cls, str_type, node,
-		)
-
-		# CastWrap to ConstPtr[None] - a raw, untyped view into the buffer,
-		# not ConstPtr[str] - matches slice[T]'s own redesigned _ptr field
-		# (see its own comment on why: Ptr[str]/ConstPtr[str] compiles to
-		# the exact same C type as a bare str handle, one star, wrong for
-		# "array of handles")
-		none_type_ptr_target = self.lowering.discovery.get_none_type()
-		const_ptr_none = self.lowering.discovery._get_or_create_specialization( const_ptr_cls, [ none_type_ptr_target ])
-		const_ptr = self._new_temp( const_ptr_none )
-		self._emit( ir.CastWrap( dest = const_ptr, operand = ptr ))
-
-		view = self._lower_slice_view( const_ptr, n_const, str_type, node )
+		view = self._new_temp( as_slice.return_type )
+		self._emit( ir.Call( dest = view, target = as_slice, receiver = buf, args = [], kwargs = {} ))
 
 		concat = self.lowering._find_method( str_type, 'concat' )
 		self.lowering._ensure_resolved( concat )

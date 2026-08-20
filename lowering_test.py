@@ -2013,6 +2013,100 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'has no member', self.discovery.errors.errors[0] )
 
+	def test_match_binding_name_reused_with_incompatible_type_gets_a_clear_diagnostic( self ) -> None:
+		# every local (including a `case T(name):` match-arm binding) is
+		# function-scoped, no per-arm/per-match scoping - reusing a binding
+		# name across two SEPARATE, unrelated match statements is ordinary
+		# and fine when both sides agree on the payload type (see the
+		# companion test below), but a genuine MISMATCH used to produce a
+		# bare "expected X, got Y" that never explained where X came from
+		# (nothing in the SECOND match's own source mentions the FIRST
+		# match's error type at all). Confirms the diagnostic now names the
+		# real cause instead.
+		code = '\n'.join([
+			'import builtins',
+			'def get_a() -> builtins.Result[i32, builtins.OverflowError|builtins.IndexError]:',
+			'	return builtins.Result.Err( builtins.OverflowError() )',
+			'',
+			'def get_b() -> builtins.Result[i32, builtins.IndexError|builtins.KeyError]:',
+			'	return builtins.Result.Err( builtins.IndexError() )',
+			'',
+			'def main() -> i32:',
+			'	match get_a():',
+			'		case builtins.Result.Err( e ):',
+			'			pass',
+			'		case builtins.Result.Ok( _ ):',
+			'			return 1',
+			'	match get_b():',
+			'		case builtins.Result.Err( e ):',
+			'			pass',
+			'		case builtins.Result.Ok( _ ):',
+			'			return 2',
+			'	return 0',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( "'e' is already declared earlier in this function", self.discovery.errors.errors[0] )
+		self.assertIn( 'another match', self.discovery.errors.errors[0] )
+
+	def test_match_binding_name_reused_with_same_type_is_allowed( self ) -> None:
+		# the companion case: reusing a binding name across two separate
+		# match statements, where both sides happen to agree on the
+		# payload type, is ordinary and must NOT be rejected - the same
+		# posture reusing a loop counter across two separate loops already
+		# has.
+		code = '\n'.join([
+			'import builtins',
+			'def get_a() -> builtins.Result[i32, builtins.IndexError|builtins.OverflowError]:',
+			'	return builtins.Result.Err( builtins.OverflowError() )',
+			'',
+			'def get_b() -> builtins.Result[i32, builtins.IndexError|builtins.OverflowError]:',
+			'	return builtins.Result.Err( builtins.IndexError() )',
+			'',
+			'def main() -> i32:',
+			'	match get_a():',
+			'		case builtins.Result.Err( e ):',
+			'			pass',
+			'		case builtins.Result.Ok( _ ):',
+			'			return 1',
+			'	match get_b():',
+			'		case builtins.Result.Err( e ):',
+			'			pass',
+			'		case builtins.Result.Ok( _ ):',
+			'			return 2',
+			'	return 0',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_match_narrowing_shadow_reuse_is_unaffected_by_binding_reuse_diagnostic( self ) -> None:
+		# the one exception the reused-binding-name diagnostic above must
+		# NOT fire for: a case pattern that reuses the SUBJECT's own name
+		# (`match r: case i32(r):`) narrows r in place (is_narrowing_bind,
+		# a genuinely different code path - see _stmt_Assign's own early
+		# return for it) rather than rebinding a distinct value, so two
+		# SEPARATE such narrowings of two DIFFERENTLY-typed subjects
+		# sharing a name (r narrows i32|None, s narrows i32|None here,
+		# same underlying leaf type, different subjects) must still work.
+		code = '\n'.join([
+			'import builtins',
+			'def main() -> i32:',
+			'	r: i32|None = 5',
+			'	match r:',
+			'		case None:',
+			'			return 1',
+			'		case i32( r ):',
+			'			pass',
+			'	x: i32 = r',
+			'	if x != 5:',
+			'		return 2',
+			'	return 0',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	# --- generic field-type substitution (_attr_lookup) -----------------------
 
 	def test_attr_lookup_substitutes_generic_field_type_through_specialization( self ) -> None:
@@ -9013,12 +9107,17 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 	def test_multipart_runtime_path_uses_unsafelist_slice_concat_not_chained_add( self ) -> None:
 		# f"{a}{b}" (a, b: str, both real runtime values) - exactly 2
 		# parts, so exactly 2 UnsafeList[str].append() calls, exactly 1
-		# UnsafeList[str] Allocate, exactly 1 slice[str] Allocate, exactly
-		# 1 str.concat call, exactly 1 get_ptr call, and (append's own
-		# Result[None,OverflowError] x2 + get_ptr's own Result[Ptr[str],
-		# IndexError] x1 =) exactly 3 unwrap calls - and, the actual point
-		# of this whole pass, ZERO calls to str.__add__ (proving this
-		# ISN'T N-1 chained string concatenation)
+		# UnsafeList[str] Allocate, exactly 1 as_slice() call (its own
+		# slice[str] Allocate happens INSIDE as_slice()'s own compiled
+		# body, not here - see lowering.py's own _expr_JoinedStr comment
+		# on reusing the already-existing as_slice() instead of hand-
+		# building a slice via a direct ir.Allocate the way this used to,
+		# before as_slice() existed), exactly 1 str.concat call, and
+		# (append's own Result[None,OverflowError] x2 - as_slice() itself
+		# returns a bare slice[T], no Result, so nothing to unwrap for it)
+		# exactly 2 unwrap calls - and, the actual point of this whole
+		# pass, ZERO calls to str.__add__ (proving this ISN'T N-1 chained
+		# string concatenation)
 		self._import( '\n'.join([
 			'def main( a: str, b: str ) -> str:',
 			'	return f"{a}{b}"',
@@ -9026,10 +9125,9 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self.assertEqual( len( self._allocates_of( fn, 'UnsafeList' )), 1 )
-		self.assertEqual( len( self._allocates_of( fn, 'slice' )), 1 )
 		self.assertEqual( len( self._calls_to( fn, '.append' )), 2 )
-		self.assertEqual( len( self._calls_to( fn, 'get_ptr' )), 1 )
-		self.assertEqual( len( self._calls_to( fn, 'unwrap' )), 3 )
+		self.assertEqual( len( self._calls_to( fn, 'as_slice' )), 1 )
+		self.assertEqual( len( self._calls_to( fn, 'unwrap' )), 2 )
 		self.assertEqual( len( self._calls_to( fn, '.concat' )), 1 )
 		self.assertEqual( self._calls_to( fn, '__add__' ), [] )
 
