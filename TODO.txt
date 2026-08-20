@@ -545,18 +545,9 @@ emitter:
 			attempts: a missing sys.alloc[T] forward declaration, Result[_,
 			ZeroDivisionError] not being scheduled for panic-wrapped division,
 			and a missing argument in lib/sys.py's WriteFile call.
-		- overload resolution: a narrowing @overload stub's own declared
-			return type (T) and the underlying plain implementation actually
-			called (whose real declared return type is the wider T|None, e.g.
-			builtins.Result[T,E].unwrap_or) can disagree, and nothing
-			reconciles a call site's own dest type against the real target's
-			return type in that case. Confirmed unrelated to candidate
-			matching itself (reproduces with the stub/impl declaring the
-			exact same return type removed from the picture).
 		- a generic class's own __init__ is never monomorphized when reached
 			through plain ClassName(...) construction inside a helper
-			function (confirmed via a non-Result generic RCClass repro,
-			separate from the overload-resolution gap above).
+			function (confirmed via a non-Result generic RCClass repro).
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml

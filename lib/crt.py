@@ -16,6 +16,23 @@ def _exit(
 ) -> NoReturn:
 	...
 
+# the size of a live malloc'd block, for sys.free()'s own debug-only
+# mempoison-before-free - glibc/Linux and macOS expose this under two
+# different names (macOS's <malloc/malloc.h> malloc_size vs glibc's
+# malloc_usable_size), same os split as __error/__errno_location above.
+# Both may return a genuinely LARGER size than what was originally
+# requested (allocator rounding) - fine here, poisoning a few extra
+# trailing bytes inside the same live block is harmless.
+@compiler.target( os = not ( 'windows', 'macos' ))
+@extern( 'c', 'malloc_usable_size' )
+def malloc_usable_size( ptr: ConstPtr[None] ) -> usize:
+	...
+
+@compiler.target( os = 'macos' )
+@extern( 'c', 'malloc_size' )
+def malloc_usable_size( ptr: ConstPtr[None] ) -> usize:
+	...
+
 @extern( 'c', 'free' )
 def free(
 	ptr: Ptr[None],

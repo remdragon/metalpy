@@ -70,6 +70,16 @@
 # a "function returns ..." internal type mismatch, a "passing 'int' to
 # parameter of incompatible type" C error, or a "too few arguments"/missing-
 # receiver C error from a spurious conditional dispatch).
+#
+# test_unwrap_or_explicit_default_on_rc_t below covers the identical shape
+# for an RC-typed T (str) instead of a scalar - a real gap in coverage (no
+# call site anywhere in lib/ used unwrap_or(explicit_default) with an RC T
+# before this test) that turned out to hide a genuine, separate bug: the
+# narrowed str result was a USE-AFTER-FREE, not visible under every build
+# (only reproduces when the executable is CRT-linked - test_support.py's
+# own default - not under mpy.py's default freestanding/no_crt build,
+# which is presumably why it went unnoticed). Root cause and fix are in
+# _maybe_unwrap_union_arg (lowering.py) - see its own `owning` parameter.
 
 import unittest
 
@@ -114,6 +124,46 @@ def main() -> i32:
 	return 0
 '''
 
+_UNWRAP_OR_EXPLICIT_DEFAULT_ON_RC_T = '''
+def main() -> i32:
+	norm: str = 'C:\\\\foo'
+
+	# explicit-default form on the Ok path, T = str (an RC type, unlike the
+	# scalar i32 case above) - narrowed result (str, not str|None) never
+	# needs an is-None check to use directly, and the returned value must be
+	# a genuinely owned reference (not a borrow/garbage payload)
+	drive: str = norm.__getitem__( 0 ).unwrap_or( '' )
+	if drive != 'C':
+		return 1
+
+	# same call, compared against the unrelated, definitely-correct unwrap()
+	# accessor for the same index - catches a payload-corruption regression
+	# even if a stale/garbage `drive` happened to still compare != to 'C'
+	via_unwrap: str = norm.__getitem__( 0 ).unwrap( 'idx' )
+	if drive != via_unwrap:
+		return 2
+
+	# using the returned value in a further str operation (concatenation)
+	# exercises its refcount/UTF-8 validity for real, not just equality
+	combined: str = drive + ':\\\\'
+	if combined != 'C:\\\\':
+		return 3
+
+	# explicit-default form on the Err path - falls back to the given
+	# default, still narrowed to str (not str|None)
+	missing: str = norm.__getitem__( 999 ).unwrap_or( '' )
+	if missing != '':
+		return 4
+
+	# zero-arg form still works alongside the explicit-default form above,
+	# for the SAME Result[str,IndexError] specialization - the impl's own
+	# wide str|None return type
+	zero_arg: str|None = norm.__getitem__( 0 ).unwrap_or()
+	if zero_arg is None or zero_arg != 'C':
+		return 5
+	return 0
+'''
+
 _UNWRAP_OR_BOX_SAME_TYPE_STUB_AND_IMPL = '''
 @union
 class Box[T]:
@@ -142,6 +192,9 @@ class UnwrapOrGeneralNarrowingTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_unwrap_or_box_same_type_stub_and_impl( self ) -> None:
 		self.assert_programs_run([ ( 'unwrap_or_box_same_type_stub_and_impl', _UNWRAP_OR_BOX_SAME_TYPE_STUB_AND_IMPL ) ])
+
+	def test_unwrap_or_explicit_default_on_rc_t( self ) -> None:
+		self.assert_programs_run([ ( 'unwrap_or_explicit_default_on_rc_t', _UNWRAP_OR_EXPLICIT_DEFAULT_ON_RC_T ) ])
 
 
 if __name__ == '__main__':

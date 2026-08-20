@@ -13538,7 +13538,7 @@ class FunctionLowering:
 				# call's arguments can never produce the other member)
 				dest = self._new_temp( target_return_type )
 				self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
-				return self._maybe_unwrap_union_arg( dest, narrowed_return_type )
+				return self._maybe_unwrap_union_arg( dest, narrowed_return_type, owning = True )
 			if isinstance( expected_type, TaggedUnion ) and target_return_type is not None and not isinstance( target_return_type_base, ( TaggedUnion, TypeVar )):
 				# a call whose own return type is a plain leaf (e.g. str)
 				# flowing into a T|None-typed slot - dest must be typed as
@@ -13678,7 +13678,7 @@ class FunctionLowering:
 			self.lowering.schedule( p.type )
 		self._emit( ir.Call( dest = dest if want_result else None, target = target, receiver = receiver, args = unwrapped_args, kwargs = unwrapped_kwargs ))
 
-	def _maybe_unwrap_union_arg( self, operand: ir.Operand, target_type: Type|None ) -> ir.Operand:
+	def _maybe_unwrap_union_arg( self, operand: ir.Operand, target_type: Type|None, *, owning: bool = False ) -> ir.Operand:
 		# a union-typed call-site argument (copy_from: bytes|bytearray)
 		# must be unwrapped to the concrete leaf type the chosen branch's
 		# parameter actually declares before it can be passed as a real
@@ -13705,6 +13705,26 @@ class FunctionLowering:
 		self._emit( ir.GetAttr( dest = payload_dest, obj = operand, attr = data_attr.stem ))
 		dest = self._new_temp( target_type )
 		self._emit( ir.GetAttr( dest = dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+		if owning and target_type.is_rc():
+			# unlike the call-ARGUMENT use of this helper (a transient
+			# borrow: `operand`'s own union temp is still alive for the
+			# duration of the call, and gets its own ordinary decref
+			# afterward, which is all the extracted leaf needs), an
+			# `owning=True` caller (the Overload branch's narrowed_return_
+			# type tail) hands this value on as the CALL EXPRESSION's own
+			# result, which outlives `operand` itself - `operand` (the
+			# wide-typed temp holding the real call result) still gets its
+			# own normal tag-checked decref at end-of-expression regardless
+			# of this narrowing, so without a compensating incref here the
+			# extracted leaf and `operand` end up sharing one single
+			# reference between two independent owners, and whichever
+			# decref runs first frees the payload out from under the
+			# other - confirmed via a real repro (Result[str,E].unwrap_or(
+			# explicit_default): the narrowed str result read as
+			# use-after-free garbage the moment anything else allocated
+			# over the freed bytes, invisible under a build that happened
+			# to leave the freed memory untouched)
+			self._emit( ir.Incref( value = dest ))
 		return dest
 
 	def _lower_union_receiver_call( self, node: ast.Call, dispatch: _ReceiverDispatch, receiver: ir.Operand, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
