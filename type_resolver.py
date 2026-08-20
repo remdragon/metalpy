@@ -5583,10 +5583,18 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		member narrowing-marker support exists yet, matching visit_While's
 		identical restriction on top of the equally general _type_is_shape.
 		Post-if survival (narrowing surviving past the WHOLE if-statement
-		when the un-narrowed branch terminates) needs no changes here at
-		all - merge_if/_merge_narrowed_soft (cfg.py) are already fully
-		generic over any branch's own end-of-branch _narrowed snapshot,
-		already exercised today via the type(x) is T -> match desugar path.
+		when the un-narrowed branch terminates) needs no changes for the
+		REAL, lowering-time narrowing - merge_if/_merge_narrowed_soft
+		(cfg.py) are already fully generic over any branch's own end-of-
+		branch _narrowed snapshot, already exercised today via the
+		type(x) is T -> match desugar path. It DOES need an explicit update
+		to this pass's OWN, separate self._narrowed (below, once
+		other_terminates is known) - self._narrowed only drives this same
+		pass's eager, best-effort inference (_type_of_expr, in turn used by
+		_infer_generic_args for a bare generic call like len(x)), and
+		unlike cfg.py's narrowing it does NOT automatically survive past a
+		terminating sibling branch merely because cfg.py's does; the two
+		are entirely separate trackers over separate representations.
 
 		Manually walks node.body/node.orelse itself (not left to
 		generic_visit's own field-list traversal) once a narrowing target
@@ -5675,6 +5683,18 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		other_terminates = bool( other_body ) and isinstance( other_body[-1], ( ast.Return, ast.Break, ast.Continue, ast.Raise ))
 		if not other_terminates and self.locals.get( subject_name ) is narrow_member.type:
 			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_member, node ) ]
+		if other_terminates:
+			# the un-narrowed branch never reaches the join - every path that
+			# DOES (whatever follows this if-statement in the same enclosing
+			# body) provably has subject_name narrowed, same as cfg.py's own
+			# real narrowing already concludes. Persist that into THIS pass's
+			# self._narrowed too (deliberately not restored to case_entry_
+			# narrowed here, unlike narrowed_body's own try/finally above) so
+			# a sibling statement visited after this method returns - e.g. a
+			# bare generic call's own eager inference (_infer_generic_args ->
+			# _type_of_expr) - sees the narrowed type instead of the stale,
+			# still-unioned declared type.
+			self._narrowed[subject_name] = [ narrow_member.type ]
 		if is_not:
 			node.body, node.orelse = narrowed_visited, other_visited
 		else:

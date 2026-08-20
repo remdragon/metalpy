@@ -13443,6 +13443,34 @@ def main() -> i32:
 	use( True )
 	return 0
 ''' ),
+			# len(x) after `if x is None: return` - unlike the byte_len()/
+			# ordinary-method-call cases above (already correct even before
+			# this fix, since lowering.py's own cfg-based narrowing already
+			# handled post-if survival), len(x) is a BARE call to a builtin
+			# GENERIC function (`def len[T](t: T) -> usize: return
+			# t.__len__()`) - T is inferred from the argument's type by an
+			# EARLIER, separate static pass (type_resolver.py's
+			# _try_resolve_generic_call/_infer_generic_args), which has its
+			# own, separate _narrowed tracker that previously did NOT survive
+			# past a terminating if-branch. That eagerly (and wrongly)
+			# monomorphized len[str|None] instead of len[str], crashing while
+			# resolving `t.__len__()` against the union's own None leaf -
+			# confirmed real repro, not just the type_resolver_test.py-level
+			# unit tests (test_generic_call_after_terminating_is_none_branch_
+			# infers_narrowed_type) covering the same root cause
+			( 'len_after_terminating_is_none_branch_infers_narrowed_type', '''
+def describe_len( xs: str|None ) -> usize:
+	if xs is None:
+		return 0
+	return len( xs )
+
+def main() -> i32:
+	if describe_len( "hello" ) != 5:
+		return 1
+	if describe_len( None ) != 0:
+		return 2
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )

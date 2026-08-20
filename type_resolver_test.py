@@ -632,6 +632,63 @@ class TypeResolutionTests( unittest.TestCase ):
 		[ callee ] = self._resolved_callees( fn )
 		self.assertIsNone( callee )
 
+	def test_generic_call_after_terminating_is_none_branch_infers_narrowed_type( self ) -> None:
+		# `if m is None: return` then a bare `mylen(m)` - the ONLY way past
+		# the if is m already being non-None, same "post-if survival" real
+		# lowering (cfg.py) already gives ordinary code (see lowering_test.py's
+		# IfIsNotNoneNarrowingTests). This pass's OWN self._narrowed (driving
+		# _infer_generic_args -> _type_of_expr for a bare generic call like
+		# len(x)) is a separate tracker over the same AST and needs its own
+		# explicit update for this - previously bound T to the WHOLE union
+		# (Maybe, tag included), monomorphizing an incorrect mylen[Maybe] and
+		# in turn making len(x)-after-narrowing crash resolving T's own
+		# dunder methods against the union's None leaf (the reported bug)
+		mod = self._import( '\n'.join([
+			'@union',
+			'class Maybe:',
+			'	Some: i32',
+			'	Nothing: None',
+			'',
+			'def mylen[T]( t: T ) -> i32:',
+			'	return 0',
+			'',
+			'def main( m: Maybe ) -> None:',
+			'	if m is None:',
+			'		return',
+			'	mylen( m )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNotNone( callee )
+		self.assertEqual( callee.qualname, '__test__.mylen[intrinsics.i32]' )
+
+	def test_generic_call_after_non_terminating_if_does_not_narrow( self ) -> None:
+		# neither branch of `if m is not None: pass` terminates, so nothing
+		# proves m is non-None by the time execution reaches the bare
+		# mylen(m) call after it - T must still be inferred as the WHOLE
+		# union, matching lowering_test.py's
+		# test_no_narrowing_survival_when_neither_branch_terminates
+		mod = self._import( '\n'.join([
+			'@union',
+			'class Maybe:',
+			'	Some: i32',
+			'	Nothing: None',
+			'',
+			'def mylen[T]( t: T ) -> i32:',
+			'	return 0',
+			'',
+			'def main( m: Maybe ) -> None:',
+			'	if m is not None:',
+			'		pass',
+			'	mylen( m )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNotNone( callee )
+		self.assertEqual( callee.qualname, '__test__.mylen[__test__.Maybe]' )
+
 	# --- generic construction resolution --------------------------------------
 
 	def test_generic_construction_via_argument_type_tags_resolved_construction( self ) -> None:
