@@ -212,6 +212,53 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
 
+	def test_current_refcount_is_stable_across_repeated_calls( self ) -> None:
+		# precise refcount-delta regression, now that current()'s own
+		# contract is understood directly (see its own docstring): a bare
+		# `return _current` already gets an automatic incref from the same
+		# is_alias mechanism `local = _current` would - an EXPLICIT
+		# compiler.incref() on top of that (tried once, reverted) was a
+		# genuine double-increment. Isolates current() alone (unlike the
+		# reuse test above, which exercises the whole start()/unpark()
+		# machinery and its own separate RC bookkeeping) - calls it 1000
+		# times in a tight loop and checks a SEPARATE, outer-held reference
+		# to the same Fiber has an identical refcount before and after: any
+		# per-call drift (leak OR under-count) fails this immediately.
+		self._run( '''
+import compiler
+import fiber
+
+class Task:
+	held: fiber.Fiber|None
+	def __init__( self ) -> None:
+		self.held = None
+	def run( self ) -> None:
+		self.held = fiber.current()
+		held = self.held
+		if held is None:
+			sys.panic( 'no current fiber' )
+		rc_before = compiler.refcount( held )
+		i: usize = 0
+		while i < 1000:
+			c = fiber.current()
+			if c is None:
+				sys.panic( 'no current fiber' )
+			with compiler.wrap_arithmetic:
+				i = i + 1
+		rc_after = compiler.refcount( held )
+		if rc_before != rc_after:
+			sys.panic( 'fiber.current() refcount drifted across repeated calls' )
+
+def main() -> i32:
+	fiber.enable_current_thread()
+	f = fiber.Fiber()
+	t = Task()
+	f.start( t.run )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
+
 def _emit( compiler: Compiler ) -> str:
 	import emitter_c
 	return emitter_c.emit_c( compiler )

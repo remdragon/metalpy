@@ -76,23 +76,27 @@ class FiberError:
 _current: Fiber|None = None
 
 def current() -> Fiber|None:
-	# incref before returning - _current itself does NOT own a reference
-	# (it's a bare bookmark, same as this whole module's docstring already
-	# says: the actual Fiber is owned by whichever Worker queue/pool holds
-	# it), but ANY call's result is unconditionally treated as a fresh,
-	# owned value the instant it's bound to a local, regardless of what the
-	# callee's own return statement did (this compiler's own universal
-	# convention - see lib/threading.py's ThreadLocal.get(), fixed for the
-	# identical reason: a real heap-use-after-free/RC under-count,
-	# confirmed via compiler.refcount(), the moment a caller's own local
-	# AND current()'s returned value are both live at once - e.g. `f =
-	# current(); ...; f.something()` decrefs the SAME fiber an extra time
-	# in f's own scope-exit epilogue, with nothing having incremented it to
-	# balance that release).
-	fiber = _current
-	if fiber is not None:
-		compiler.incref( fiber )
-	return fiber
+	# bare `return _current` - NO explicit incref needed here, unlike
+	# lib/threading.py's ThreadLocal.get(). _current is an ordinary,
+	# compiler-TRACKED module global (Fiber|None), and `return <a bare
+	# aliasing Name>` already goes through the same is_alias-detected
+	# auto-incref cfg.py gives `local = <a bare aliasing Name>` - confirmed
+	# via a real compiler.refcount() delta check (a bare `return
+	# module_global` from a free function, called and bound at the call
+	# site, showed the callee's own return already produced a correctly-
+	# balanced +1, with no incref written anywhere in its body). An
+	# EXPLICIT compiler.incref() on top of that would be a genuine, self-
+	# inflicted double-increment (a real leak), not a fix - this was tried
+	# once (see git history) on a misdiagnosis of an unrelated, separate
+	# bug (a real raw-memory boundary crossing in a DIFFERENT function,
+	# where compiler.cast(...)'s result - a Call, not an aliasing Name/
+	# Attribute read - genuinely does NOT get an automatic incref, so an
+	# explicit one there is correct and necessary; ThreadLocal.get() is
+	# exactly that case, crossing out of raw TLS storage). _current itself
+	# still does NOT own a reference (it's a bare bookmark - the actual
+	# Fiber is owned by whichever Worker queue/pool holds it), same as
+	# this whole module's docstring already says.
+	return _current
 
 
 @enum( i32 )
@@ -324,18 +328,19 @@ def _fiber_trampoline() -> None:
 	# __switch_in sets it BEFORE swapcontext ever jumps here.
 	#
 	# Deliberately calls _run_loop() through the NARROWED `started` itself,
-	# not a separately-bound `fiber: Fiber = started` local - that extra
-	# binding would ALSO capture its own independent Incref (same
-	# "capturing into a local increfs" contract current() itself now needs
-	# - see its own docstring), stacked on top of current()'s own. Since
-	# _run_loop() never returns, NEITHER capture's own phantom epilogue
+	# not a separately-bound `fiber: Fiber = started` local - `started`
+	# already holds current()'s own correctly-balanced, owned reference
+	# (see current()'s own docstring); a SECOND bind (`fiber = started`)
+	# would alias-bind a bare Name into another local, which ALSO auto-
+	# increfs, stacking a second owned reference on top for no reason.
+	# Since _run_loop() never returns, NEITHER local's own phantom epilogue
 	# decref would ever fire - permanently DOUBLING the trampoline's own
 	# already-intentional "self is held forever, released only via
 	# DeleteFiber" leak (confirmed via a real generated-C inspection: two
 	# separate, both-unreached release_object calls after _run_loop, one
-	# per capture). Calling through the narrowed `started` directly keeps
-	# this at the ONE held reference this already leaked before current()
-	# started increfing - not introducing a second one.
+	# per capture, when the second bind was present). Calling through the
+	# narrowed `started` directly keeps this at the ONE reference this
+	# already, intentionally, leaks - not a second one.
 	started: Fiber|None = current()
 	if started is None:
 		sys.panic( 'Fiber trampoline: started with no current fiber set' )
