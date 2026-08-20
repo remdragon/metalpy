@@ -2766,6 +2766,7 @@ class FunctionLowering:
 				# inline, right above - re-entering it via its own label
 				# would replay the same entries a second time) straight to
 				# where the early-exit-vs-normal-fallthrough merge begins
+				self._cfg.mark_inline_scope_captured()
 				self._emit( ir.Jump( target = merge_label ))
 			else:
 				self._emit( ir.Return( value = return_value ))
@@ -9132,6 +9133,10 @@ class FunctionLowering:
 				# (see _build_generator_pessimistic_done_pin's own docstring)
 				replay = replay + self._build_generator_pessimistic_done_pin() + self._build_generator_error_defer_replay()
 				if inline_scope is not None:
+					# always `goto`s merge_label directly (see emitter_c.py's
+					# own ir.OrReturn.inline_exit handling) - same bypass
+					# shape _stmt_Return's identical branch marks captured for
+					self._cfg.mark_inline_scope_captured()
 					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay, inline_exit = inline_scope ))
 				else:
 					self._emit( ir.OrReturn( dest = unwrapped, value = check_dest, epilogue = replay ))
@@ -12091,11 +12096,20 @@ class FunctionLowering:
 				# call reached during the splice already replayed
 				# everything itself and jumps straight past this, to
 				# merge_label below (see _stmt_Return/_consume_checked_
-				# result's own splice branches)
-				self._emit( ir.Label( name = scope_label ))
+				# result's own splice branches). Neither label is a real
+				# jump target unless the splice body actually contained an
+				# early exit reaching one of those two branches (a plain
+				# multi-statement @inline body with none, e.g. Ptr.__str__,
+				# never goes near either) - gated on InlineScope.captured,
+				# same "don't declare a label nothing goto's" reasoning
+				# build_epilogue_ladder() already uses for a real function's
+				# own shared epilogue (a real, confirmed -Wunused-label
+				# otherwise, suite-wide)
+				if self._cfg.inline_scope_captured():
+					self._emit( ir.Label( name = scope_label ))
 				for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
 					self._emit( instr )
-				self._cfg.pop_inline_scope()
+				was_captured = self._cfg.pop_inline_scope()
 				self._inline_scope_vars.pop()
 
 				# early exit vs normal fallthrough - both converge into ONE
@@ -12110,7 +12124,8 @@ class FunctionLowering:
 				# epilogue/return type, exactly as already tested), while
 				# scope_context(provisional) stays active so it can still
 				# resolve pre-return-declared locals it references
-				self._emit( ir.Label( name = merge_label ))
+				if was_captured:
+					self._emit( ir.Label( name = merge_label ))
 				result = self._new_temp( target.return_type )
 				normal_label = self._new_label( 'inline_normal' )
 				converge_label = self._new_label( 'inline_converge' )

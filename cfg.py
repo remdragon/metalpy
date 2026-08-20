@@ -126,6 +126,26 @@ class InlineScope:
 	that matters. '''
 	boundary_depth: int # len(self._epilogue_stack) at push time - entries below this belong to an outer scope (the caller, or an outer splice) and must never be inspected/replayed from inside this one
 	label: str # this scope's own shared-ladder fallback target - see current_epilogue_label()'s own comment
+	# two INDEPENDENT captured flags, not one shared bit - lowering.py's own
+	# _splice_multi_statement_inline_body builds two labels around this
+	# scope (`label` itself, and a separate merge_label it owns directly,
+	# not stored here), and an early exit only ever reaches ONE of them: an
+	# ordinary .or_return()/checked-arithmetic with nothing else pending
+	# jumps straight to `label` via current_epilogue_label() (captured
+	# below), after which merge_label is reached only by ordinary
+	# fallthrough (from label's own replayed ladder) - NEVER a real goto,
+	# UNLESS some other early exit in the SAME splice took the separate
+	# inline-unwind bypass path instead (mark_inline_scope_captured() below,
+	# called directly by _stmt_Return/_consume_checked_result - see their
+	# own comments), which jumps PAST `label` straight to merge_label.
+	# Conflating the two into one flag is a real, confirmed bug: it makes
+	# merge_label look "used" whenever ANY early exit occurred anywhere in
+	# the splice, even one that only ever captured `label` - still a
+	# genuine -Wunused-label on merge_label specifically, confirmed by a
+	# real repro (a splice with a SINGLE or_return() call, going through
+	# `label`'s own capture path, not the bypass one).
+	captured: bool = False # `label` has been handed out as a live jump target - see current_epilogue_label()
+	merge_captured: bool = False # merge_label has been jumped to DIRECTLY (the inline-unwind bypass) - see mark_inline_scope_captured()
 
 @dataclass
 class _Snapshot:
@@ -296,15 +316,40 @@ class CFGState:
 		self._inline_scope_stack.append( scope )
 		return scope.label
 
-	def pop_inline_scope( self ) -> None:
+	def inline_scope_captured( self ) -> bool:
+		''' whether the innermost active scope's own `label` (NOT its
+		separate merge_label - see InlineScope's own docstring for why the
+		two need independent tracking) has been handed out as a real jump
+		target so far. Peeks without popping, so lowering.py can gate its
+		scope_label ir.Label BEFORE build_inline_scope_ladder() runs (pop_
+		inline_scope() only happens after that, but merge_label's own ir.
+		Label is emitted after the pop - see its own return value instead). '''
+		return self._inline_scope_stack[-1].captured
+
+	def mark_inline_scope_captured( self ) -> None:
+		''' called by lowering.py right before it emits a real jump straight
+		to the innermost active scope's own merge_label, bypassing `label`
+		entirely (the "inline-unwind return_()/.or_return() already
+		replayed everything itself" shape - see _stmt_Return/_consume_
+		checked_result's own inline_exit branches) - current_epilogue_label()
+		only marks `label` captured when IT hands that one out, so this
+		separate bypass path (which never calls it, and targets the OTHER
+		label) needs its own explicit signal. '''
+		self._inline_scope_stack[-1].merge_captured = True
+
+	def pop_inline_scope( self ) -> bool:
 		''' called once the splice's own local ladder has been fully emitted
 		(lowering.py's own responsibility - this just stops
 		current_epilogue_label()/return_() from consulting this scope's
 		boundary any further, restoring the immediately-enclosing scope, if
 		any, to visibility - the caller/outer splice's own entries were never
 		touched while this scope was active, so there's nothing left to
-		reconcile here beyond popping the stack entry itself. '''
-		self._inline_scope_stack.pop()
+		reconcile here beyond popping the stack entry itself. Returns
+		whether the popped scope's own merge_label was ever captured -
+		lowering.py's own merge_label ir.Label is emitted right after this
+		call, gated on it (see inline_scope_captured()'s own docstring for
+		why `label` itself is peeked separately, before this pop, instead). '''
+		return self._inline_scope_stack.pop().merge_captured
 
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
 
@@ -1241,6 +1286,8 @@ class CFGState:
 		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
 		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
 			if inline_scope is not None and i < inline_scope.boundary_depth:
+				if mark_captured:
+					inline_scope.captured = True
 				return inline_scope.label
 			if entry.cancelled:
 				continue
@@ -1272,6 +1319,8 @@ class CFGState:
 				entry.captured = True
 			return entry.name
 		if inline_scope is not None:
+			if mark_captured:
+				inline_scope.captured = True
 			return inline_scope.label
 		return None
 
