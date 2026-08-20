@@ -9688,6 +9688,43 @@ class ListLiteralTests( unittest.TestCase ):
 			'	return',
 		]), needle = 'list literal needs a known list[T] target type' )
 
+	def test_list_literal_into_optional_list_annotation( self ) -> None:
+		# expected_type here is `list[str]|None` (a TaggedUnion), not a bare
+		# list[str] Specialization - _expr_List must narrow through the
+		# union to find its own list[T] member rather than failing outright
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			"	x: list[str]|None = [ 'a', 'b' ]",
+			'	if x is None:',
+			'		return 1',
+			'	return 0',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len([ c for c in calls if c.target.stem == 'append' ]), 2 )
+
+	def test_list_literal_into_optional_list_call_argument( self ) -> None:
+		# the exact reported call shape: a defaulted `list[str]|None`
+		# parameter, list literal passed by keyword at the call site
+		fn = self._assert_accepted( '\n'.join([
+			'def take( xs: list[str]|None = None ) -> i32:',
+			'	if xs is None:',
+			'		return 0',
+			'	return len( xs )',
+			'',
+			'def main() -> i32:',
+			"	return take( xs = [ 'a', 'b' ] )",
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_list_literal_into_ambiguous_union_is_still_rejected( self ) -> None:
+		# two DIFFERENT list[T] members - genuinely ambiguous which one the
+		# literal targets, so this must still fail rather than guess
+		self._assert_rejected( '\n'.join([
+			'def main() -> i32:',
+			"	x: list[str]|list[i32] = [ 'a', 'b' ]",
+			'	return 0',
+		]), needle = 'list literal needs a known list[T] target type' )
+
 
 class SetLiteralTests( unittest.TestCase ):
 	''' _expr_Set (ast.Set, `{a, b, c}`) - mirrors ListLiteralTests above.
@@ -9749,6 +9786,18 @@ class SetLiteralTests( unittest.TestCase ):
 			"	x = { 'a', 'b' }",
 			'	return',
 		]), needle = 'set literal needs a known set[T] target type' )
+
+	def test_set_literal_into_optional_set_annotation( self ) -> None:
+		# mirrors ListLiteralTests.test_list_literal_into_optional_list_annotation
+		fn = self._assert_accepted( '\n'.join([
+			'def main() -> i32:',
+			"	x: set[str]|None = { 'a', 'b' }",
+			'	if x is None:',
+			'		return 1',
+			'	return 0',
+		]))
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( len([ c for c in calls if c.target.stem == 'add' ]), 2 )
 
 
 class MoveParameterTests( unittest.TestCase ):
