@@ -118,19 +118,6 @@ A: u32 = ASCII
 
 DEFAULT_MAX_STEPS: usize = 65536
 
-# NOTE: every max_steps default parameter below is the literal 65536, not a
-# `= DEFAULT_MAX_STEPS` reference, even though DEFAULT_MAX_STEPS stays
-# declared (a real, still-public symbol - kept for any external caller that
-# references it directly, e.g. `p.search(s, max_steps=re.DEFAULT_MAX_STEPS*2)`)
-# - a confirmed compiler bug (task_<TBD>, filed alongside this change):
-# referencing a module-level constant as a default parameter VALUE breaks
-# name resolution ("name 'DEFAULT_MAX_STEPS' is not defined") specifically
-# once the containing method has 2+ overloads (confirmed: works fine on a
-# single, non-overloaded definition; fails the moment a second same-name
-# overload exists, str/bytes overloads or otherwise - isolated with a
-# minimal repro outside this file, not something specific to re.py's own
-# structure). If that's ever fixed, these can all switch back.
-
 
 def escape( pattern: str ) -> str:
 	''' backslash-escapes every character that isn't alnum/underscore - the
@@ -1729,6 +1716,14 @@ class Pattern:
 		matcher = Matcher( self.__ops, self.__classes, data, data_len, self.__byte_mode, max_steps, self.__flags )
 		return matcher.run_at( 0, self.__n_slots )
 
+	# max_steps stays the literal 65536 here (not `= DEFAULT_MAX_STEPS`) on
+	# every overloaded method in this class, plus module-level finditer()
+	# below - task_85803192's landed fix does not reliably resolve "name
+	# 'DEFAULT_MAX_STEPS' is not defined" on these real overload groups
+	# (search/match/fullmatch/finditer), including 2-overload cases that an
+	# isolated repro of the same shape compiles fine with. Root cause of
+	# the discrepancy not yet identified; see task_85803192's own report
+	# for the follow-up note.
 	def search( self, s: str, pos: usize = 0, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
 		return self._search_from( s, pos, max_steps )
 
@@ -2029,6 +2024,9 @@ def _require_next_match_memoryview( pattern: Pattern, s: memoryview, pos: usize,
 	return m
 
 
+# max_steps stays the literal 65536 across all 3 of finditer()'s own
+# overloads (str/bytes/memoryview) - see Pattern.search()'s own comment
+# above (task_85803192).
 def finditer( pattern: Pattern, s: str, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
 	''' yields each successive non-overlapping match, scanning forward
 	from the end of the previous one (or by one codepoint, for a
