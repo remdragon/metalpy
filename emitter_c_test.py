@@ -14297,6 +14297,45 @@ def main() -> i32:
 		diff: i32 = result - 5
 	return diff
 ''' ),
+			# regression test: a MODULE-LEVEL Ptr[Callable[...]] global used to
+			# crash emit_c() entirely (NotImplementedError: c_type: unsupported
+			# type <CallableType ...>) - _emit_global_declaration spelled the
+			# global's declaration as a plain c_type(...)-prefixed "TYPE NAME"
+			# string instead of routing through _declarator (which every
+			# parameter/local/field declaration already does), and C's
+			# function-pointer declarator syntax puts the name INSIDE the
+			# parens, not after a type prefix. This exercises the non-trivial
+			# ({0} + separate init-function-call) declaration path: the
+			# initializer is a real function reference, not a constant.
+			( 'module_level_function_pointer_global_assigned_function_reference', '''
+def double( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x * 2
+
+_dispatch: Ptr[Callable[[i32],i32]] = double
+
+def main() -> i32:
+	result: i32 = _dispatch( 21 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' ),
+			# same underlying gap as the test above, but through the OTHER
+			# _emit_global_declaration branch: a trivial bare-Const initializer
+			# (the exact `_SIG_DFL: Ptr[Callable[...]] = 0` null-sentinel shape
+			# that motivated this - see lib/signal.py). This also exercises a
+			# companion gap in _emit_const, which cast pointer-typed constants
+			# via a bare c_type(...) call that likewise can't spell a function-
+			# pointer type. Mirrors EmitGlobalTests' own STD_OUTPUT_HANDLE
+			# convention: read the global into a local to prove it's really
+			# emitted and readable, not just that emit_c() doesn't crash.
+			( 'module_level_function_pointer_global_null_sentinel', '''
+_sig_dfl: Ptr[Callable[[i32],i32]] = 0
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = _sig_dfl
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -16092,6 +16131,76 @@ def main() -> i32:
 	path: bytearray = parts.__getitem__( 1 ).unwrap( 'x' )
 	if path.decode().unwrap( 'x' ) != '/hello':
 		return 4
+	return 0
+''' ),
+		] )
+
+
+class ByteArrayResizeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' bytearray.resize(n) - grow or shrink in place, zero-filling any
+	newly exposed bytes (matches __init__'s own zero-init convention, even
+	when regrowing within a capacity a prior shrink left behind - see
+	resize()'s own docstring, lib/builtins/__init__.py, for why this is
+	deliberately stricter than CPython's own "may retain stale bytes
+	there" behavior). Missing gap surfaced porting a real-world zip-file
+	search tool (grap.mpy) that reuses one growable buffer across
+	differently-sized zip entries (`if len(buffer) < entry_size:
+	buffer.resize(entry_size)`) rather than reallocating fresh every time. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'grow_past_capacity_reallocates_and_zero_fills', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 1
+	p[1] = 2
+	p[2] = 3
+	b.resize( 6 )
+	if len( b ) != 6:
+		return 1
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[0] != 1 or p2[1] != 2 or p2[2] != 3:
+		return 2
+	if p2[3] != 0 or p2[4] != 0 or p2[5] != 0:
+		return 3
+	return 0
+''' ),
+			( 'shrink_then_regrow_within_capacity_re_zeroes_not_stale', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	b.resize( 6 )  # grow past capacity: __cap becomes 6
+	p: Ptr[u8] = b.get_ptr()
+	p[3] = 9
+	p[4] = 8
+	p[5] = 7
+	b.resize( 3 )  # shrink: __cap stays 6, __len becomes 3
+	if len( b ) != 3:
+		return 1
+	b.resize( 6 )  # regrow within __cap - no reallocation, but re-zeroed
+	if len( b ) != 6:
+		return 2
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[3] != 0 or p2[4] != 0 or p2[5] != 0:
+		return 3
+	return 0
+''' ),
+			( 'resize_to_same_size_is_a_no_op', '''
+def main() -> i32:
+	b: bytearray = bytearray( 4 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 5
+	b.resize( 4 )
+	if len( b ) != 4:
+		return 1
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[0] != 5:
+		return 2
 	return 0
 ''' ),
 		] )

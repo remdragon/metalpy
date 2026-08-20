@@ -6,6 +6,7 @@ import queue
 import threading
 
 # local imports:
+import compile_time_transformer
 from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
@@ -5924,7 +5925,33 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		call.resolved_callee = _assert_fn
 		stmt = ast.Expr( value = call )
 		ast.copy_location( stmt, node )
-		return [ stmt ]
+		# gated on compiler.target.debug, stripped entirely in a release
+		# build - same mechanism sys.alloc's own poison-fill already uses.
+		# The message argument stays mandatory regardless (checked above),
+		# only whether the check RUNS is target-dependent. This node is
+		# synthesized AFTER compile_time_transformer.transform_function_body
+		# already ran over the rest of this function body (_make_function_
+		# resolver's own body() calls it before ever walking statements, see
+		# its own comment) - it will never be visited by that pass, so the
+		# fold has to be applied here, by hand, right now instead.
+		guard = ast.If(
+			test = ast.Attribute(
+				value = ast.Attribute(
+					value = ast.Name( id = 'compiler', ctx = ast.Load() ),
+					attr = 'target',
+					ctx = ast.Load(),
+				),
+				attr = 'debug',
+				ctx = ast.Load(),
+			),
+			body = [ stmt ],
+			orelse = [],
+		)
+		ast.copy_location( guard, node )
+		folded = compile_time_transformer.transform_stmt_list(
+			[ guard ], self.discovery.active_target, self.discovery._detect_cc,
+		)
+		return folded
 
 	# --- rewrite 2: match statements ---
 
