@@ -9662,62 +9662,30 @@ class FunctionLowering:
 				else:
 					narrowed_right = right
 
+				# cell_start brackets this ONE cell's own intermediate temps
+				# (error_instance, and _coerce_into_union's own Call result
+				# for `value` when result_union is set) - this whole per-cell
+				# block is only ONE branch of a larger dispatch tree, and the
+				# enclosing statement's natural end-of-statement flush fires
+				# unconditionally for EVERY temp still tracked regardless of
+				# which cell actually ran at runtime (first found via a real
+				# ASAN SEGV - release_object() on an uninitialized C local
+				# from a cell that was never taken; then a real ASAN LEAK
+				# from an earlier fix that untracked with no decref at all).
+				# _flush_branch_temps below is the general form of the fix
+				# this cell used to apply by hand (see _lower_binary_branch's
+				# own identical use for the same reason) - flushes every
+				# temp created since cell_start, keeping only dest/value
+				cell_start = len( self._pending_temps )
 				cell = grid[i][j]
 				if cell.kind == 'error':
-					error_instance = self._build_type_error_instance( node )
-					value: ir.Operand = error_instance
+					value: ir.Operand = self._build_type_error_instance( node )
 				else:
-					error_instance = None
 					value = self._emit_leaf_pair_eq_value( node, narrowed_left, narrowed_right, cell, negate, bool_cls )
 				if result_union is not None:
 					value = self._coerce_into_union( value, result_union, node )
-					if error_instance is not None:
-						# error_instance is its own fresh, independently
-						# fresh_temp()-tracked ir.Allocate result (see
-						# _build_type_error_instance's own docstring).
-						# _coerce_into_union's synthesized constructor Call
-						# just above already increfs it into the Result's Err
-						# payload (refcount 1 -> 2) - in ORDINARY, single-
-						# path code (a plain `return Result.Err(SomeClass())`
-						# statement), the caller-side temp's own natural
-						# end-of-STATEMENT decref would bring it back down to
-						# 1, leaving the Result as sole owner. That natural
-						# per-statement flush can't be relied on here though:
-						# this whole per-cell block is only ONE branch of a
-						# larger dispatch tree, and the flush fires
-						# unconditionally for EVERY temp still tracked
-						# REGARDLESS of which branch actually executed -
-						# first found via a real ASAN SEGV (release_object()
-						# on an uninitialized C local from a branch that was
-						# never taken when this was left tracked-for-outer-
-						# flush; then a real ASAN LEAK when it was untracked
-						# outright with no decref of its own at all). The
-						# correct fix is the SAME "just do it inline,
-						# unconditionally-but-only-within-this-branch" shape
-						# the whole surrounding dispatch tree already uses -
-						# emit the decref explicitly, right here, then
-						# untrack it so the outer flush doesn't ALSO decref
-						# whatever ends up in this same temp slot on a
-						# DIFFERENT invocation's DIFFERENT branch
-						for instr in self._cfg.decref( error_instance.type, error_instance ):
-							self._emit( instr )
-						self._cfg.untrack_temp( error_instance )
+				self._flush_branch_temps( cell_start, dest, value )
 				self._emit( ir.Assign( dest = dest, src = value ))
-				# value (when RC-carrying - only possible in the fallible/
-				# Result case, since every OTHER branch produces a plain
-				# bool) is its own independently fresh_temp()-tracked temp
-				# (either _coerce_into_union's own Call dest, or - for a
-				# 'same_type'/'cross_dunder' cell whose own value already
-				# happened to need no wrapping - never RC to begin with) -
-				# untrack it here so ITS OWN eventual delete_temp() doesn't
-				# ALSO decref the same object dest now holds too. Mirrors
-				# _expr_IfExp's identical "untrack the fresh branch value,
-				# fresh_temp() the merge dest once instead" split for a
-				# multi-branch-into-one-dest merge - same bug class, same
-				# fix, generalized from 2 branches to N. A no-op whenever
-				# value isn't RC-carrying at all (untrack_temp/fresh_temp
-				# both check rc_leaves/isinstance internally).
-				self._cfg.untrack_temp( value )
 				self._emit( ir.Jump( target = end_label ))
 				if right_shape is not None and not is_last_right:
 					self._emit( ir.Label( name = next_right_label ))
@@ -10011,21 +9979,34 @@ class FunctionLowering:
 		simply the cell's own final success value either way; only a
 		cell with error_type set (a REGULAR dunder whose own declared
 		return type is Result[T,E], e.g. int.__add__/Vector.__add__)
-		still needs the extra Ok/Err decomposition. '''
+		still needs the extra Ok/Err decomposition. branch_start (snapshotted
+		here, at this cell's own entry, before anything below) is threaded
+		through every tail this cell can reach - _finish_binop_cell's own
+		_flush_branch_temps call uses it to release every intermediate this
+		ONE cell created (error_instance, _coerce_binop_value's own
+		`intermediate`), same reasoning _lower_binary_branch's identical
+		snapshot-then-flush already documents. Safe to reuse ONE snapshot
+		across a cell's own Ok/Err/nested-unwrap sub-branches too, even
+		though those are themselves mutually exclusive at runtime -
+		_flush_branch_temps trims self._pending_temps back to the snapshot
+		on every call, so whichever sub-branch's flush actually runs first
+        (in compile-time emission order) only ever sees temps created SO
+        FAR, never a later sub-branch's not-yet-emitted ones. '''
+		branch_start = len( self._pending_temps )
 		if cell.kind == 'error':
 			error_instance = self._build_type_error_instance( node )
 			assert error_type is not None and result_union is not None   # an 'error' cell always contributes TypeError, so the whole expression is always fallible whenever one exists
 			value = self._coerce_binop_value( error_instance, error_type, result_union, node )
-			self._finish_binop_result_branch( error_instance, value, dest, end_label )
+			self._finish_binop_result_branch( branch_start, error_instance, value, dest, end_label )
 			return
 		assert cell.kind == 'dunder' and cell.method is not None
 		receiver, arg = ( narrowed_right, narrowed_left ) if cell.reflected else ( narrowed_left, narrowed_right )
 		value = self._emit_fallible_method_call( node, cell.method, receiver, [ arg ], None )
 		if cell.error_type is None:
 			value = self._coerce_binop_value( value, success_type, result_union, node )
-			self._finish_binop_cell( dest, value, end_label )
+			self._finish_binop_cell( branch_start, dest, value, end_label )
 			return
-		self._emit_binop_fallible_split( node, value, dest, success_type, error_type, result_union, end_label )
+		self._emit_binop_fallible_split( node, branch_start, value, dest, success_type, error_type, result_union, end_label )
 
 	def _coerce_binop_value( self, value: ir.Operand, axis_type: Type, result_union: TaggedUnion|None, node: ast.AST ) -> ir.Operand:
 		''' two-step coercion for ONE axis (success or error) of the
@@ -10052,34 +10033,38 @@ class FunctionLowering:
 		independent embedded reference via its own ctor's incref (a
 		tag-gated copy of whichever member is active, since axis_type is
 		itself RC-carrying whenever this path is taken), so the
-		intermediate's OWN reference is now redundant and needs releasing
-		- same inline decref+untrack pattern _finish_binop_result_branch
-		already uses for raw_temp, for the identical reason (a temp local
-		to only ONE cell/branch of a larger dispatch tree can't rely on
-		the outer per-statement flush). '''
+		intermediate's OWN reference is now redundant. Left tracked and
+		pending here deliberately (no inline decref/untrack) - the caller's
+		own _finish_binop_cell (reached via _finish_binop_result_branch or
+		directly) always flushes everything created since ITS OWN
+		branch_start right before returning, which correctly sweeps this up
+		either way: when result_union is None `intermediate` becomes the
+		return value itself (kept alive - see the `if result_union is None:
+		return intermediate` branch below, matches whatever `value`
+		_finish_binop_cell was called with); when result_union is set,
+		`intermediate` is a genuine throwaway distinct from the SECOND
+		coercion's own result, correctly released by that same flush. '''
 		if isinstance( axis_type, TaggedUnion ) and not self.lowering._type_resolver._same_type( value.type, axis_type ):
 			intermediate = self._coerce_into_union( value, axis_type, node )
 			if result_union is None:
 				return intermediate
 			value = self._coerce_into_union( intermediate, result_union, node )
-			for instr in self._cfg.decref( intermediate.type, intermediate ):
-				self._emit( instr )
-			self._cfg.untrack_temp( intermediate )
 			return value
 		if result_union is not None:
 			value = self._coerce_into_union( value, result_union, node )
 		return value
 
-	def _finish_binop_cell( self, dest: ir.Temp, value: ir.Operand, end_label: str ) -> None:
+	def _finish_binop_cell( self, branch_start: int, dest: ir.Temp, value: ir.Operand, end_label: str ) -> None:
 		# mirrors _emit_eq_dispatch_tree's own identical per-cell tail -
-		# untrack value (a no-op unless it's RC-carrying - both
-		# untrack_temp/fresh_temp check internally) so its own eventual
-		# delete_temp() doesn't ALSO decref the same object dest now holds
-		self._cfg.untrack_temp( value )
+		# flush everything this cell (or cell sub-branch, for the fallible
+		# split path) created since branch_start, keeping dest/value - see
+		# _emit_binop_cell's own docstring for why ONE snapshot correctly
+		# scopes every sub-branch a cell can reach, not just the top level
+		self._flush_branch_temps( branch_start, dest, value )
 		self._emit( ir.Assign( dest = dest, src = value ))
 		self._emit( ir.Jump( target = end_label ))
 
-	def _finish_binop_result_branch( self, raw_temp: ir.Temp, value: ir.Operand, dest: ir.Temp, end_label: str ) -> None:
+	def _finish_binop_result_branch( self, branch_start: int, raw_temp: ir.Temp, value: ir.Operand, dest: ir.Temp, end_label: str ) -> None:
 		''' shared tail for every branch of _emit_binop_fallible_split (and
 		the 'error' cell above, whose own error_instance is the identical
 		shape) - raw_temp is a branch-local, independently fresh_temp()-
@@ -10088,19 +10073,22 @@ class FunctionLowering:
 		OWN payload `value` was just extracted from (via _coerce_into_
 		union, whose synthesized ctor already increfs `value` - see
 		_build_type_error_instance's own docstring for why this specific
-		incref-then-decref pairing is correctly balanced). Since this is
-		only ONE branch of a larger dispatch tree, the outer unconditional
-		per-statement flush can't be relied on for raw_temp (same bug
-		class _emit_eq_dispatch_tree's own two ASAN-confirmed RC fixes
-		already cover) - decref + untrack it here, inline, unconditionally
-		within this branch only. '''
+		incref-then-decref pairing is correctly balanced). raw_temp PRE-
+		DATES branch_start (it's created once, shared across every
+		Ok/Err/nested-unwrap sub-branch reachable from here, released on
+		exactly whichever one actually runs) - _flush_branch_temps' own
+		since-a-checkpoint model can't express "release a value that
+		already existed before the checkpoint", so this stays a dedicated,
+		explicit decref + untrack, unlike everything created AFTER
+		branch_start (which _finish_binop_cell's own flush call, below,
+		handles generically). '''
 		for instr in self._cfg.decref( raw_temp.type, raw_temp ):
 			self._emit( instr )
 		self._cfg.untrack_temp( raw_temp )
-		self._finish_binop_cell( dest, value, end_label )
+		self._finish_binop_cell( branch_start, dest, value, end_label )
 
 	def _emit_binop_fallible_split(
-		self, node: ast.AST, raw_temp: ir.Temp, dest: ir.Temp, success_type: Type, error_type: Type, result_union: TaggedUnion|None, end_label: str,
+		self, node: ast.AST, branch_start: int, raw_temp: ir.Temp, dest: ir.Temp, success_type: Type, error_type: Type, result_union: TaggedUnion|None, end_label: str,
 	) -> None:
 		''' raw_temp is a not-yet-consumed Result[T,E] value (a checked
 		scalar op's own check_dest, or a dunder's own Call result whose
@@ -10148,7 +10136,7 @@ class FunctionLowering:
 		# Ok branch
 		ok_payload = self._extract_union_payload( raw_temp, data_attr, payload_cls, ok_member )
 		ok_value = self._coerce_binop_value( ok_payload, success_type, result_union, node )
-		self._finish_binop_result_branch( raw_temp, ok_value, dest, end_label )
+		self._finish_binop_result_branch( branch_start, raw_temp, ok_value, dest, end_label )
 		self._emit( ir.Label( name = err_label ))
 		# Err branch - err_member's own type might ITSELF be a multi-member
 		# ANONYMOUS union (signed Div/Mod's own ZeroDivisionError|
@@ -10170,13 +10158,13 @@ class FunctionLowering:
 		err_payload = self._extract_union_payload( raw_temp, data_attr, payload_cls, err_member )
 		err_shape = self.lowering._type_resolver._tagged_union_shape( err_payload.type )
 		if err_shape is not None and err_shape[0].file is None and len( err_shape[1] ) > 1:
-			self._emit_nested_error_unwrap( node, err_payload, err_shape, raw_temp, dest, error_type, result_union, end_label )
+			self._emit_nested_error_unwrap( node, branch_start, err_payload, err_shape, raw_temp, dest, error_type, result_union, end_label )
 		else:
 			err_value = self._coerce_binop_value( err_payload, error_type, result_union, node )
-			self._finish_binop_result_branch( raw_temp, err_value, dest, end_label )
+			self._finish_binop_result_branch( branch_start, raw_temp, err_value, dest, end_label )
 
 	def _emit_nested_error_unwrap(
-		self, node: ast.AST, err_union_operand: ir.Operand, err_shape: tuple[TaggedUnion,list[Variable]],
+		self, node: ast.AST, branch_start: int, err_union_operand: ir.Operand, err_shape: tuple[TaggedUnion,list[Variable]],
 		raw_temp: ir.Temp, dest: ir.Temp, error_type: Type, result_union: TaggedUnion, end_label: str,
 	) -> None:
 		''' one leaf pair's own checked error type can itself be a
@@ -10200,7 +10188,7 @@ class FunctionLowering:
 				self._emit( ir.JumpIfFalse( cond = match, target = next_label ))
 			concrete = self._extract_union_payload( err_union_operand, data_attr, payload_cls, member )
 			value = self._coerce_binop_value( concrete, error_type, result_union, node )
-			self._finish_binop_result_branch( raw_temp, value, dest, end_label )
+			self._finish_binop_result_branch( branch_start, raw_temp, value, dest, end_label )
 			if not is_last:
 				self._emit( ir.Label( name = next_label ))
 
@@ -13448,6 +13436,7 @@ class FunctionLowering:
 			# lowered operand (never re-lowering/re-evaluating the original
 			# argument expression, which would double its side effects once
 			# per leaf; see _coerce_or_check_operand's own docstring)
+			leaf_temps_start = len( self._pending_temps )
 			leaf_args = []
 			for ( ref_param, expr ), operand in zip( positional, args ):
 				leaf_param = self._corresponding_leaf_param( reference, fn, ref_param )
@@ -13459,6 +13448,29 @@ class FunctionLowering:
 				context = f'{fn.qualname}(...): parameter {leaf_param.stem!r}'
 				leaf_kwargs[leaf_param.stem] = self._coerce_or_check_operand( kwargs[ref_param.stem], leaf_param.type, expr, context = context )
 			self._emit( ir.Call( dest = dest, target = fn, receiver = narrowed, args = leaf_args, kwargs = leaf_kwargs ))
+			# a leaf whose own parameter type needs real union-widening
+			# coercion (not just a borrowed CastWrap - see _coerce_or_check_
+			# operand's own comment) leaves a fresh, independently
+			# fresh_temp()-tracked wrapped value in leaf_args/leaf_kwargs,
+			# passed to the Call above as an ordinary BORROWED argument (no
+			# ownership transfer, same convention every other call site
+			# uses) - the caller still owns releasing it. In non-branching
+			# code the enclosing statement's own end-of-statement flush does
+			# that correctly; here this whole per-leaf block is only ONE
+			# branch of a larger dispatch tree (skippable via an earlier
+			# leaf's own tag match), so that flush fires unconditionally for
+			# EVERY leaf regardless of which one's Call actually ran -
+			# reading tag/payload data off an uninitialized C local for
+			# whichever leaf never executed. Confirmed via a real repro
+			# (union receiver dispatch, one leaf declaring a plain parameter
+			# type, the other a wider union needing _coerce_into_union) -
+			# same bug class _flush_branch_temps' own docstring documents
+			# for _expr_BoolOp/_expr_IfExp, and _emit_eq_dispatch_tree's/
+			# _coerce_or_check_operand's own hand-rolled decref+untrack
+			# fixes cover elsewhere in this file. dest is excluded (it's
+			# this whole call's own merge point, must survive to the next
+			# leaf/end_label)
+			self._flush_branch_temps( leaf_temps_start, *( [ dest ] if dest is not None else [] ))
 			if not is_last:
 				self._emit( ir.Jump( target = end_label ))
 				self._emit( ir.Label( name = next_label ))
