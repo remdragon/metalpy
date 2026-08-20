@@ -1595,6 +1595,20 @@ class Lowering:
 			self._unify_type_param( type_params, declared.return_type, actual.return_type, bindings, node, context_qualname )
 			return
 
+	def _check_type_param_bounds( self, node: ast.AST, type_params: list[TypeVar], concrete_args: list[Type], context_qualname: str ) -> None:
+		# every call site that finishes substituting a concrete type for each
+		# of type_params (bare inferred call, explicit Name[T](...), generic
+		# construction, class-inherited generic method) funnels through here
+		# once concrete_args is fully known - see TypeVar.bound's own comment
+		# for why this can't live in _get_or_create_specialization instead
+		for tv, concrete in zip( type_params, concrete_args ):
+			if not tv.bound_satisfied_by( concrete ):
+				self.discovery.fail(
+					f'{context_qualname}[...]: {concrete.qualname} does not implement protocol {tv.bound.qualname} '
+					f'required by type parameter {tv.stem!r}: {ast.unparse(node)}',
+					node,
+				)
+
 	def _type_mentions_param( self, t: Type|None, tv: TypeVar ) -> bool:
 		''' PLAN_RETURN_INFERENCE.md - true if the bare TypeVar `tv` occurs
 		anywhere inside `t`, using the SAME structural recursion
@@ -11429,6 +11443,7 @@ class FunctionLowering:
 				node,
 			)
 		concrete_args = [ bindings[id(tv)] for tv in class_type_params ]
+		self.lowering._check_type_param_bounds( node, class_type_params, concrete_args, target_cls.qualname )
 		cls_spec = self.lowering.discovery._get_or_create_specialization( target_cls, concrete_args )
 		init_spec = self.lowering.discovery._get_or_create_specialization( init, concrete_args )
 		self.lowering._ensure_resolved( cls_spec ) # also populates init_spec.monomorphized as a side effect - same (init, concrete_args) key monomorphize_class's own method-substitution loop uses
@@ -12155,6 +12170,9 @@ class FunctionLowering:
 		# args against the MONOMORPHIZED signature (so a literal argument's
 		# expected type is already concrete, e.g. usize for alloc[u8]'s
 		# count - not the abstract, unsubstituted one)
+		# spec.base is always a Function here (see the isinstance dispatch in
+		# _lower_call that routes to this method)
+		self.lowering._check_type_param_bounds( node, spec.base.type_params or [], spec.args, spec.base.qualname )
 		monomorphized = self.lowering._monomorphized_function( spec )
 		args, kwargs = self._lower_call_args( monomorphized, node )
 		if monomorphized.is_inline:
@@ -12274,9 +12292,11 @@ class FunctionLowering:
 				)
 			monomorphized = self._infer_return_only_type_params( node, target, type_params, bindings, return_only_missing )
 			inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
+			self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 			spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 			return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result, already_compiled = True )
 		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
+		self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		monomorphized = self.lowering._monomorphized_function( spec )
 		if monomorphized.is_inline:
@@ -12625,6 +12645,7 @@ class FunctionLowering:
 				node,
 			)
 		full_args = [ bindings[id(tv)] for tv in type_params ]
+		self.lowering._check_type_param_bounds( node, type_params, full_args, target.qualname )
 		real_spec = self.lowering.discovery._get_or_create_specialization( target, full_args )
 		provisional.return_type = self.lowering._substitute_type_params( target.return_type, type_params, full_args )
 		provisional.qualname = real_spec.qualname
@@ -12732,6 +12753,7 @@ class FunctionLowering:
 				node,
 			)
 		cls_args = [ bindings[id(tv)] for tv in class_type_params ]
+		self.lowering._check_type_param_bounds( node, class_type_params, cls_args, cls.qualname if cls else target.qualname )
 		method_spec = self.lowering.discovery._get_or_create_specialization( target, cls_args )
 		monomorphized = self.lowering._monomorphized_function( method_spec )
 		return self._emit_generic_call( node, method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result )

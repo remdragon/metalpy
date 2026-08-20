@@ -1,5 +1,6 @@
 # stdlib imports:
 import ast
+import copy
 from contextlib import contextmanager, nullcontext
 import itertools
 import platform
@@ -11,7 +12,7 @@ import compile_time_transformer
 from errors import CompileError, ErrorCollector, RedundantCompilationError
 from mpy_types import (
 	Name, Type, Scalar, TypeVar, Specialization, Variable, Parameter, Move, Copy, CallableType, ClosureType, TupleType, FixedArrayType, GeneratorType, Function, Overload,
-	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType,
+	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType, Protocol,
 	Module, _is_covered_by, _overlaps, int_stem_range,
 )
 
@@ -349,7 +350,7 @@ class Discovery( ast.NodeVisitor ):
 		if type( node ) not in _SUPPORTED_BODY_STATEMENTS:
 			self.fail( f'unsupported statement here: {ast.unparse( node )}', node )
 
-	def _resolve_guarded( self, target: 'Function|ClassLike|Variable', body: Callable[[],None] ) -> None:
+	def _resolve_guarded( self, target: 'Function|ClassLike|Protocol|Variable', body: Callable[[],None] ) -> None:
 		# the shared recovery boundary every .resolve() closure runs through -
 		# a CompileError raised (and already recorded) anywhere inside body()
 		# is swallowed here so the caller that triggered this resolve() just
@@ -365,7 +366,7 @@ class Discovery( ast.NodeVisitor ):
 			target.resolve = None
 
 	@contextmanager
-	def scope_context( self, scope: Module|ClassLike|Function ) -> Generator[None,None,None]:
+	def scope_context( self, scope: Module|ClassLike|Protocol|Function ) -> Generator[None,None,None]:
 		self.scope_stack.append( scope )
 		try:
 			yield
@@ -1608,7 +1609,7 @@ class Discovery( ast.NodeVisitor ):
 
 	# --- classes ----------------------------------------------------------------
 
-	def visit_ClassDef( self, node: ast.ClassDef ) -> ClassLike|None:
+	def visit_ClassDef( self, node: ast.ClassDef ) -> ClassLike|Protocol|None:
 		qualname = self._get_qualname( node.name )
 
 		for decorator in node.decorator_list or []:
@@ -1635,6 +1636,8 @@ class Discovery( ast.NodeVisitor ):
 					return self._parse_ClassDef_CEnum( node, qualname, value_type )
 				case 'union':
 					return self._parse_ClassDef_TaggedUnion( node, qualname )
+				case 'protocol':
+					return self._parse_ClassDef_Protocol( node, qualname )
 				case _:
 					self.fail( f'unsupported class decorator {ast.unparse(decorator)} in {qualname}', node )
 
@@ -1655,8 +1658,12 @@ class Discovery( ast.NodeVisitor ):
 		for type_param in type_params:
 			if not isinstance( type_param, ast.TypeVar ):
 				self.fail( f'unsupported {type_param=} in {owner.qualname}', type_param )
+			bound: Protocol|None = None
 			if type_param.bound is not None:
-				self.fail( f'TypeVar(bound=not None) not supported in {owner.qualname}', type_param )
+				resolved_bound = self.visit( type_param.bound )
+				if not isinstance( resolved_bound, Protocol ):
+					self.fail( f'TypeVar(bound=...) is only supported with a @protocol type in {owner.qualname}', type_param )
+				bound = resolved_bound
 			if type_param.default_value is not None:
 				self.fail( f'TypeVar(default_value=not None) not supported in {owner.qualname}', type_param )
 			tv = TypeVar(
@@ -1664,12 +1671,13 @@ class Discovery( ast.NodeVisitor ):
 				qualname = f'{owner.qualname}.{type_param.name}',
 				file = owner.file,
 				line = owner.line,
+				bound = bound,
 			)
 			owner.type_params.append( tv )
 			owner.add_name( type_param.name, tv )
 
 	def _shallow_class_body_scan( self,
-		class_obj: ClassLike,
+		class_obj: ClassLike|Protocol,
 		body: list[ast.AST],
 	) -> tuple[list[ast.AST],Callable[[],None]]:
 		# we only do a minimal scan of class bodies for nested inner class definitions
@@ -1688,7 +1696,7 @@ class Discovery( ast.NodeVisitor ):
 					unprocessed.append( node )
 			return unprocessed
 
-	def _make_class_resolver( self, class_obj: ClassLike, body: list[ast.stmt], module: Module ) -> Callable[[],None]:
+	def _make_class_resolver( self, class_obj: ClassLike|Protocol, body: list[ast.stmt], module: Module ) -> Callable[[],None]:
 		def body_fn() -> None:
 			with self.module_context( module ):
 				with self.scope_context( class_obj ):
@@ -1696,6 +1704,11 @@ class Discovery( ast.NodeVisitor ):
 					for node in body:
 						self._check_supported_statement( node )
 						self.visit( node )
+					if isinstance( class_obj, RCClass ) and class_obj.protocols:
+						# needs class_obj still on scope_stack/module on
+						# module_stack - a missing default gets spliced in
+						# via _parse_function, which reads both directly
+						self._validate_protocol_conformance( class_obj )
 			if isinstance( class_obj, RCClass ) and class_obj.base is not None:
 				self._validate_no_attribute_shadowing( class_obj )
 		def resolve() -> None:
@@ -1969,11 +1982,6 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 		)
-		if len( node.bases ) > 1:
-			self.fail(
-				f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})',
-				node,
-			)
 		if node.keywords:
 			self.fail( f'class {qualname} cannot have keywords ({node.keywords!r})', node )
 
@@ -1981,12 +1989,26 @@ class Discovery( ast.NodeVisitor ):
 		scope.add_name( class_obj.stem, class_obj )
 
 		try:
-			if node.bases:
-				# resolved eagerly, in the enclosing scope, exactly like Python
-				# itself requires the base to already exist when this statement runs
-				base = self.visit( node.bases[0] )
+			# resolved eagerly, in the enclosing scope, exactly like Python
+			# itself requires each base to already exist when this statement
+			# runs. At most one entry may be a real RCClass (single
+			# inheritance, same restriction as before) - any number may be
+			# @protocol types instead, which aren't real bases at all (no
+			# vtable/chain_lookup participation - see Protocol's own
+			# docstring) and are collected into class_obj.protocols instead
+			# of class_obj.base.
+			for base_node in node.bases:
+				base = self.visit( base_node )
+				if isinstance( base, Protocol ):
+					class_obj.protocols.append( base )
+					continue
 				if not isinstance( base, RCClass ):
-					self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes support inheritance)', node )
+					self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes or @protocol types are supported here)', node )
+				if class_obj.base is not None:
+					self.fail(
+						f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})',
+						node,
+					)
 				class_obj.base = base
 
 			self._parse_type_params( node.type_params, class_obj )
@@ -2002,6 +2024,117 @@ class Discovery( ast.NodeVisitor ):
 		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
 
 		return class_obj
+
+	def _parse_ClassDef_Protocol( self, node: ast.ClassDef, qualname: str ) -> Protocol:
+		module = self.module_stack[-1]
+		class_obj = Protocol(
+			stem = node.name,
+			qualname = qualname,
+			file = module.file,
+			line = node.lineno,
+		)
+		if node.bases:
+			self.fail( f'@protocol {qualname} cannot have a base classes ({node.bases!r})', node )
+		if node.keywords:
+			self.fail( f'@protocol {qualname} cannot have keywords ({node.keywords!r})', node )
+
+		scope = self.scope_stack[-1]
+		scope.add_name( class_obj.stem, class_obj )
+
+		try:
+			unresolved = self._shallow_class_body_scan( class_obj, node.body )
+		except CompileError:
+			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
+			raise
+
+		class_obj.resolve = self._make_class_resolver( class_obj, unresolved, module )
+
+		return class_obj
+
+	def _validate_protocol_conformance( self, class_obj: RCClass ) -> None:
+		''' Runs once, at class_obj's own definition (from _make_class_
+		resolver's body_fn, right after class_obj's own body has finished
+		parsing - class_obj is still on scope_stack/module_stack there,
+		which _splice_protocol_default below needs). Deliberately only ever
+		scans class_obj.protocols - this class's own short, explicitly-
+		declared list, never every @protocol in the program (see Protocol's
+		own docstring for why that distinction matters).
+
+		For every method name required by ANY declared protocol: class_obj's
+		own chain_lookup (its own methods, plus a real .base's, if any) wins
+		outright if present. Otherwise, exactly one declared protocol may
+		supply a default (non-stub) body for that name - zero is a missing-
+		method compile error, two or more is an ambiguous-default compile
+		error (matching Rust's identical trait-default collision rule) -
+		and that one default gets spliced directly into class_obj's own
+		dispatch table, so no call site ever needs to know a default was
+		involved at all. '''
+		required_names: dict[str,Protocol] = {}
+		for protocol in class_obj.protocols:
+			if protocol.resolve is not None:
+				protocol.resolve()
+			for name, member in protocol.names.items():
+				if isinstance( member, Function ):
+					required_names.setdefault( name, protocol )
+
+		for name in required_names:
+			# NOT class_obj.chain_lookup(name) - class_obj's own .resolve is
+			# still live on the call stack right now (this runs from inside
+			# its own body_fn), and chain_lookup() unconditionally calls
+			# node.resolve() on its very first step whenever that's non-None -
+			# infinite recursion. class_obj's own .names is already fully
+			# populated at this point (the ordinary body-parsing loop just
+			# above already finished), so read it directly; only a REAL,
+			# separate .base object needs the full chain walk.
+			own = class_obj.get_local_or_raise( name )
+			if own is None and class_obj.base is not None:
+				own = class_obj.base.chain_lookup( name )
+			if own is not None:
+				continue
+
+			providing: list[tuple[Protocol,Function]] = []
+			required_by: list[Protocol] = []
+			for protocol in class_obj.protocols:
+				member = protocol.names.get( name )
+				if not isinstance( member, Function ):
+					continue
+				required_by.append( protocol )
+				if not is_stub_body( member.node.body ):
+					providing.append( ( protocol, member ) )
+
+			if not providing:
+				self.fail_loc(
+					f"{class_obj.qualname} does not implement '{name}', required by "
+					f'@protocol {"/".join( p.qualname for p in required_by )}',
+					class_obj.file, class_obj.line,
+				)
+				continue
+			if len( providing ) > 1:
+				self.fail_loc(
+					f"{class_obj.qualname}.{name} is ambiguous - default implementations from "
+					f'{", ".join( p.qualname for p,_ in providing )} all apply; declare {name} explicitly on {class_obj.qualname}',
+					class_obj.file, class_obj.line,
+				)
+				continue
+
+			self._splice_protocol_default( class_obj, providing[0][1] )
+
+	def _splice_protocol_default( self, class_obj: RCClass, default_fn: Function ) -> None:
+		''' Deep-copies the protocol default's own AST FunctionDef and parses
+		it through the ordinary _parse_function pipeline with class_obj as
+		the owning class - exactly as if the user had written this method
+		directly in class_obj's own body. This is what makes the splice
+		"just work" with no new dispatch machinery: self.foo()/self.x
+		references inside the copied body resolve against class_obj's own
+		scope (chain_lookup, attributes, etc.), not the protocol's, since
+		class_obj is what's on scope_stack/module_stack when this runs (see
+		_validate_protocol_conformance's own caller, body_fn) - no renaming
+		pass needed (unlike e.g. type_resolver.py's generator-backing-
+		function synthesis, which has to rename because IT weaves a new
+		body out of pieces; this is a straight copy of an already-complete,
+		already-valid method body). '''
+		copied_node = copy.deepcopy( default_fn.node )
+		self._parse_function( copied_node, class_obj )
 
 	# --- functions ----------------------------------------------------------
 
