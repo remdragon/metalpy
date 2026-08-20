@@ -535,3 +535,46 @@ def SetErrorMode(
 	uMode: u32,
 ) -> u32:
 	...
+
+# --- file-mapping (lib/mmap.py) -------------------------------------------
+
+PAGE_READONLY:  u32 = 0x02
+PAGE_READWRITE: u32 = 0x04
+
+FILE_MAP_READ:  u32 = 0x0004
+FILE_MAP_WRITE: u32 = 0x0002
+FILE_MAP_COPY:  u32 = 0x0001
+
+@extern('kernel32', 'GetFileSizeEx')
+def GetFileSizeEx(
+	hFile: HANDLE,
+	lpFileSize: Ptr[i64],
+) -> bool:
+	...
+
+@extern('kernel32', 'CreateFileMappingA')
+def CreateFileMappingA(
+	hFile: HANDLE,
+	lpFileMappingAttributes: Ptr[None],
+	flProtect: u32,
+	dwMaximumSizeHigh: u32,
+	dwMaximumSizeLow: u32,
+	lpName: ConstPtr[u8],
+) -> HANDLE:
+	...
+
+@extern('kernel32', 'MapViewOfFile')
+def MapViewOfFile(
+	hFileMappingObject: HANDLE,
+	dwDesiredAccess: u32,
+	dwFileOffsetHigh: u32,
+	dwFileOffsetLow: u32,
+	dwNumberOfBytesToMap: usize,
+) -> Ptr[None]:
+	...
+
+@extern('kernel32', 'UnmapViewOfFile')
+def UnmapViewOfFile(
+	lpBaseAddress: ConstPtr[None],
+) -> bool:
+	...

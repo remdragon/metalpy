@@ -18,7 +18,12 @@ PROT_NONE:      i32 = compiler.cexpr( 'PROT_NONE',      'sys/mman.h', i32 )
 PROT_READ:      i32 = compiler.cexpr( 'PROT_READ',      'sys/mman.h', i32 )
 PROT_WRITE:     i32 = compiler.cexpr( 'PROT_WRITE',     'sys/mman.h', i32 )
 MAP_PRIVATE:    i32 = compiler.cexpr( 'MAP_PRIVATE',    'sys/mman.h', i32 )
+MAP_SHARED:     i32 = compiler.cexpr( 'MAP_SHARED',     'sys/mman.h', i32 )
 MAP_ANONYMOUS:  i32 = compiler.cexpr( 'MAP_ANONYMOUS',  'sys/mman.h', i32 )
+
+# mmap()'s own failure sentinel is (void*)-1 (MAP_FAILED), NOT NULL -
+# lib/mmap.py's own POSIX branch must compare against this, never `is None`.
+MAP_FAILED: Ptr[None] = -1
 
 # void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t
 # offset) - offset modelled as i64 (off_t is 64-bit on every 64-bit POSIX

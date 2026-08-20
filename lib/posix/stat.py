@@ -1,7 +1,8 @@
-# lib/posix/stat.py — stat(2) (sys/stat.h), just enough for os.path.isdir():
-# struct stat's own layout is opaque/libc-dependent (varies by platform and
-# even by _FILE_OFFSET_BITS), so this only ever touches st_mode via
-# compiler.c_field, same posture as lib/posix/dirent.py.
+# lib/posix/stat.py — stat(2)/fstat(2) (sys/stat.h), just enough for
+# os.path.isdir() and lib/mmap.py's own "map the whole file when length==0"
+# case. struct stat's own layout is opaque/libc-dependent (varies by
+# platform and even by _FILE_OFFSET_BITS), so this only ever touches
+# st_mode/st_size via compiler.c_field, same posture as lib/posix/dirent.py.
 
 import compiler
 
@@ -16,6 +17,13 @@ def stat(
 	# for why (gcc hard-errors on char*/unsigned-char* mismatches once
 	# header= makes the real prototype visible; void* sidesteps it).
 	path: ConstPtr[None],
+	buf: Ptr[stat_t],
+) -> i32:
+	...
+
+@extern( 'c', 'fstat', header = 'sys/stat.h' )
+def fstat(
+	fd: i32,
 	buf: Ptr[stat_t],
 ) -> i32:
 	...
