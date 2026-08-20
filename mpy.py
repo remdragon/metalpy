@@ -240,7 +240,7 @@ def main() -> None:
 			if lib == 'c':
 				continue
 			if lib not in ldflags:
-				flag = linker_c.resolve_lib_ldflag( cc, lib, compiler.extern_libs[lib], verbose = args.v )
+				flag = linker_c.resolve_lib_ldflag( cc, lib, compiler.extern_libs[lib], verbose = args.v, no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip )
 		if link_result.returncode != 0:

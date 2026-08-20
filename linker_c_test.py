@@ -166,7 +166,14 @@ class NtdllImportLibTests( unittest.TestCase ):
 	ntdll.dll's export table (confirmed missing: strnlen, despite `dumpbin
 	/exports` showing it's a genuine export) - a real, no-CRT Windows build
 	needing such a symbol previously hit LNK2019 at link time despite the
-	DLL actually providing it. '''
+	DLL actually providing it.
+
+	These tests all pass no_crt=True explicitly - the freestanding scenario
+	that motivated this mechanism in the first place - since strnlen is ALSO
+	a symbol a CRT-linked build's own default libraries provide; see
+	NtdllUcrtStrnlenCollisionTests below for that (no_crt=False) side, the
+	one covering the actual duplicate-symbol regression this file's git
+	history is really about. '''
 
 	def setUp( self ) -> None:
 		self._cache_files: list[Path] = []
@@ -186,32 +193,33 @@ class NtdllImportLibTests( unittest.TestCase ):
 		# the SDK's own ntdll.lib stub - the motivating case for this whole
 		# mechanism (see lib/windows/ntdll.py's own note on its binding)
 		self._fresh_cache_file( { 'strnlen' } )
-		lib_path = linker_c.build_ntdll_import_lib( _CC, { 'strnlen' } )
+		lib_path = linker_c.build_ntdll_import_lib( _CC, { 'strnlen' }, no_crt = True )
+		self.assertIsNotNone( lib_path )
 		self.assertTrue( lib_path.is_file() )
 		self.assertGreater( lib_path.stat().st_size, 0 )
 
 	def test_bogus_symbol_raises( self ) -> None:
 		with self.assertRaises( RuntimeError ):
-			linker_c.build_ntdll_import_lib( _CC, { 'ThisSymbolDoesNotExist987' } )
+			linker_c.build_ntdll_import_lib( _CC, { 'ThisSymbolDoesNotExist987' }, no_crt = True )
 
 	def test_result_is_cached_to_disk( self ) -> None:
 		cache_file = self._fresh_cache_file( { 'RtlCopyMemory' } )
 		self.assertFalse( cache_file.is_file() )
-		linker_c.build_ntdll_import_lib( _CC, { 'RtlCopyMemory' } )
+		linker_c.build_ntdll_import_lib( _CC, { 'RtlCopyMemory' }, no_crt = True )
 		self.assertTrue( cache_file.is_file() )
 
 	def test_second_call_hits_the_cache_not_the_toolchain( self ) -> None:
 		self._fresh_cache_file( { 'RtlZeroMemory' } )
-		first = linker_c.build_ntdll_import_lib( _CC, { 'RtlZeroMemory' } )
+		first = linker_c.build_ntdll_import_lib( _CC, { 'RtlZeroMemory' }, no_crt = True )
 		# if the second call actually re-probed ntdll.dll's export table
 		# instead of reading the cache, this patch would make it explode
 		with patch( 'linker_c._real_ntdll_exports', side_effect = AssertionError( 'toolchain invoked - cache was not hit' ) ):
-			second = linker_c.build_ntdll_import_lib( _CC, { 'RtlZeroMemory' } )
+			second = linker_c.build_ntdll_import_lib( _CC, { 'RtlZeroMemory' }, no_crt = True )
 		self.assertEqual( first, second )
 
 	def test_resolve_lib_ldflag_ntdll_returns_generated_lib_path( self ) -> None:
 		self._fresh_cache_file( { 'strnlen' } )
-		flag = linker_c.resolve_lib_ldflag( _CC, 'ntdll', { 'strnlen' } )
+		flag = linker_c.resolve_lib_ldflag( _CC, 'ntdll', { 'strnlen' }, no_crt = True )
 		self.assertTrue( Path( flag ).is_file() )
 
 	def test_resolve_lib_ldflag_other_lib_is_unaffected( self ) -> None:
@@ -220,6 +228,152 @@ class NtdllImportLibTests( unittest.TestCase ):
 		flag = linker_c.resolve_lib_ldflag( _CC, 'kernel32', { 'GetLastError' } )
 		expected = 'kernel32.lib' if _CC.name == 'cl' else '-lkernel32'
 		self.assertEqual( flag, expected )
+
+
+@unittest.skipUnless( _CC is not None and os.name == 'nt', 'ntdll import-lib generation is Windows-only and needs a C compiler' )
+class NtdllUcrtStrnlenCollisionTests( unittest.TestCase ):
+	''' linker_c.build_ntdll_import_lib()/resolve_lib_ldflag() under
+	no_crt=False (a build that DOES link its default C runtime for real) -
+	the actual regression this class covers: ntdll.dll and a CRT-linked
+	build's own default libraries (ucrt.lib under MSVC/clang) both export a
+	real `strnlen` - two unrelated functions sharing a name - so
+	synthesizing an ntdll import entry for it on top of a build that ALSO
+	links ucrt produced a real LNK2005 "already defined" the moment
+	anything actually called sys.cstrlen() on Windows (nothing did, until
+	lib/os.py's own work surfaced it - see CstrlenNtdllUcrtCollisionRealCompileTests
+	below for the true end-to-end repro). '''
+
+	def setUp( self ) -> None:
+		self._cache_files: list[Path] = []
+
+	def tearDown( self ) -> None:
+		for f in self._cache_files:
+			f.unlink( missing_ok = True )
+
+	def _fresh_cache_file( self, symbols: set[str] ) -> Path:
+		f = _ntdll_cache_file( _CC.name, symbols )
+		f.unlink( missing_ok = True )
+		self._cache_files.append( f )
+		return f
+
+	def test_strnlen_alone_needs_no_synthetic_import_lib( self ) -> None:
+		# ucrt.lib already provides it under a real CRT-linked build - no
+		# import library needed at all, not even an empty one
+		self._fresh_cache_file( { 'strnlen' } )
+		lib_path = linker_c.build_ntdll_import_lib( _CC, { 'strnlen' }, no_crt = False )
+		self.assertIsNone( lib_path )
+
+	def test_resolve_lib_ldflag_ntdll_is_empty_when_crt_already_provides_everything( self ) -> None:
+		self._fresh_cache_file( { 'strnlen' } )
+		flag = linker_c.resolve_lib_ldflag( _CC, 'ntdll', { 'strnlen' }, no_crt = False )
+		self.assertEqual( flag, '' )
+
+	def test_mixed_symbols_only_the_crt_provided_one_is_dropped( self ) -> None:
+		# RtlNtStatusToDosError has no CRT-linked equivalent (confirmed: it's
+		# a real ntdll export, but _default_link_provides reports False for
+		# it, unlike strnlen/the Rtl*Memory family below) - a synthetic
+		# import library must still be built for it, scoped to just that one
+		# symbol, even though strnlen (requested alongside it) needs none
+		self._fresh_cache_file( { 'strnlen', 'RtlNtStatusToDosError' } )
+		lib_path = linker_c.build_ntdll_import_lib( _CC, { 'strnlen', 'RtlNtStatusToDosError' }, no_crt = False )
+		self.assertIsNotNone( lib_path )
+		self.assertTrue( lib_path.is_file() )
+
+	def test_all_of_ntdll_pys_rtl_memory_family_are_also_dropped_when_crt_linked( self ) -> None:
+		# not just strnlen: a real CRT-linked build's default libraries
+		# (via the CRT startup chain's own /DEFAULTLIB directives, confirmed
+		# empirically to ultimately resolve through KERNEL32.dll) ALSO
+		# already provide RtlCopyMemory/RtlMoveMemory/RtlFillMemory/
+		# RtlZeroMemory/RtlCompareMemory - lib/windows/ntdll.py's entire
+		# Rtl*Memory family, not just strnlen. See
+		# CstrlenNtdllUcrtCollisionRealCompileTests for end-to-end proof
+		# this is actually safe (real programs using all of these still
+		# link AND run correctly under a CRT-linked build).
+		symbols = { 'strnlen', 'RtlCopyMemory', 'RtlMoveMemory', 'RtlFillMemory', 'RtlZeroMemory', 'RtlCompareMemory' }
+		self._fresh_cache_file( symbols )
+		lib_path = linker_c.build_ntdll_import_lib( _CC, symbols, no_crt = False )
+		self.assertIsNone( lib_path )
+
+	def test_no_crt_true_never_drops_strnlen( self ) -> None:
+		# the filtering only applies to a REAL CRT-linked build - a
+		# genuinely freestanding one never links ucrt at all (MSVC's
+		# explicit /NODEFAULTLIB; clang/gcc's own default CRT libraries
+		# never entering the link because nothing here competes with their
+		# CRT startup object's own mainCRTStartup), so strnlen still needs
+		# its synthetic ntdll entry there, same as any other requested
+		# symbol
+		self._fresh_cache_file( { 'strnlen' } )
+		lib_path = linker_c.build_ntdll_import_lib( _CC, { 'strnlen' }, no_crt = True )
+		self.assertIsNotNone( lib_path )
+		self.assertTrue( lib_path.is_file() )
+
+
+@unittest.skipUnless( _CC is not None and os.name == 'nt', 'ntdll import-lib generation is Windows-only and needs a C compiler' )
+class CstrlenNtdllUcrtCollisionRealCompileTests( unittest.TestCase ):
+	''' end-to-end regression for the real bug: a MetalPy program that calls
+	sys.cstrlen() (lib/sys.py, Windows branch -> windows.ntdll.strnlen)
+	previously failed to LINK - LNK2019 "unresolved external symbol strnlen"
+	under a freestanding build (build_ntdll_import_lib was wrongly probing a
+	plain `int main(void)` shape that doesn't match the real freestanding
+	program's own mainCRTStartup, so it wrongly concluded ucrt already
+	provided strnlen and dropped the synthetic ntdll entry a freestanding
+	build genuinely still needs), and LNK2005 "already defined" under a
+	CRT-linked build (ucrt.lib's own strnlen colliding with a synthetically
+	generated ntdll one for the exact same name) before that. Nothing
+	previously exercised a real call to sys.cstrlen() at all - grep for
+	`cstrlen(` under lib/builtins confirmed only a comment referenced it. '''
+
+	def _compile_and_run( self, no_crt_forced: bool, expected_exit: int ) -> None:
+		code = '\n'.join([
+			'import sys',
+			'',
+			'def main() -> i32:',
+			'	buf: ConstPtr[u8] = "hello".get_cstr()',
+			'	n: usize = sys.cstrlen( buf, 10 )',
+			'	if n != 5:',
+			'		return 1',
+			'	return 0',
+		])
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( code, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		# mirrors mpy.py's own no_crt derivation (see mpy.py's --crt flag) -
+		# forcing CRT linking here is what actually exercises the ucrt/ntdll
+		# strnlen collision; the natural (unforced) no_crt is the OTHER real
+		# bug this class covers (see class docstring)
+		no_crt = ( 'c' not in compiler.extern_libs and not compiler.requires_crt ) and not no_crt_forced
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, expected_exit, f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
+
+	def test_cstrlen_freestanding_build_links_and_runs( self ) -> None:
+		self._compile_and_run( no_crt_forced = False, expected_exit = 0 )
+
+	def test_cstrlen_crt_linked_build_links_and_runs( self ) -> None:
+		self._compile_and_run( no_crt_forced = True, expected_exit = 0 )
 
 
 class FindDllTests( unittest.TestCase ):

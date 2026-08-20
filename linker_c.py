@@ -423,6 +423,75 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 	return available
 
 
+def _default_link_provides( cc: CcTool, symbol: str ) -> bool:
+	'''
+	True if `symbol` resolves through an ORDINARY, CRT-linked build's own
+	default linking alone (the compiler's implicit default libraries - e.g.
+	ucrt.lib under MSVC/clang) - i.e. with no extra -l/.lib flag at all.
+	Distinguishes "ntdll genuinely is the only source of this symbol" from
+	"the default C runtime already provides an identically-named,
+	functionally-equivalent symbol" - see build_ntdll_import_lib's own
+	docstring for why this matters (a synthetic ntdll import entry for a
+	name the default CRT libraries ALSO define, e.g. strnlen via ucrt.lib,
+	produces a real LNK2005 duplicate-symbol error the moment a build links
+	both).
+
+	No no_crt parameter, deliberately: this is only ever meaningful - and
+	only ever called (see build_ntdll_import_lib) - for a build that IS
+	linking its default C runtime (no_crt=False). A genuinely freestanding
+	build never needs it: no_crt=True means /NODEFAULTLIB under MSVC (ucrt.
+	lib is explicitly excluded, full stop), and under clang/gcc it means
+	emitter_c.py emitted the freestanding program's OWN mainCRTStartup -
+	which, confirmed empirically, is what actually keeps the real ucrt/CRT
+	default libraries out of a clang/gcc link in the first place (nothing
+	else in this codebase ever pulls in the CRT's own startup object, which
+	is what would otherwise drag ucrt.lib onto the default library search
+	list at all - clang has no unconditional "-defaultlib:ucrt"-style flag
+	of its own). A bare `int main(void)` probe - the only shape this
+	function could reasonably synthesize - does NOT define its own
+	mainCRTStartup, so probing it under a claimed no_crt=True would silently
+	answer for the WRONG program shape and could wrongly report a symbol as
+	default-linked when the real freestanding build never links it at all.
+
+	Mirrors has_symbol()'s probe shape (compile+link only, no run - see its
+	own docstring), but without an extra lib argument.
+
+	Cached to disk under %TEMP%/metalpy/default_link_symbol/, keyed by
+	(compiler name, symbol) - same spirit as has_symbol()'s own cache.
+	'''
+	import hashlib
+	import tempfile
+
+	key = hashlib.sha256( f'{cc.name}\0{symbol}'.encode() ).hexdigest()[:16]
+	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'default_link_symbol'
+	cache_file = cache_dir / key
+	if ensure_cache_dir( cache_dir ) and cache_file.is_file():
+		# see has_symbol's identical reasoning: a torn/unreadable cache entry
+		# is a miss to re-probe, never a hard error
+		try:
+			cached = cache_file.read_text().strip()
+		except OSError:
+			cached = ''
+		if cached in ( '0', '1' ):
+			return cached == '1'
+
+	c_src = f'char {symbol}();\nint main(void) {{ return {symbol}(); }}\n'
+	with tempfile.TemporaryDirectory() as tmp:
+		src_path = Path( tmp ) / 'probe.c'
+		obj_path = Path( tmp ) / 'probe.o'
+		exe_path = Path( tmp ) / 'probe'
+		src_path.write_text( c_src, encoding = 'utf-8' )
+		compile_result = cc.compile( src_path, obj_path )
+		if compile_result.returncode != 0:
+			available = False
+		else:
+			link_result = cc.link( exe_path, [ obj_path ] )
+			available = link_result.returncode == 0
+
+	atomic_write_cache( cache_file, '1' if available else '0' )
+	return available
+
+
 _NTDLL_PATH = Path( os.environ.get( 'SystemRoot', r'C:\Windows' ) ) / 'System32' / 'ntdll.dll'
 
 
@@ -501,11 +570,40 @@ def _real_ntdll_exports( cc: CcTool ) -> set[str]:
 	return _parse_dumpbin_exports( result.stdout ) if cc.name == 'cl' else _parse_llvm_readobj_exports( result.stdout )
 
 
-def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False ) -> Path:
+def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False, no_crt: bool = False ) -> Path|None:
 	'''
 	Builds (and disk-caches) a small MS-COFF import library exposing exactly
 	`symbols` from the REAL system ntdll.dll, bypassing the Windows SDK's
 	own ntdll.lib import library entirely.
+
+	When `no_crt` is False (this build links its default C runtime for
+	real), symbols the default CRT linking already provides (see
+	_default_link_provides) are dropped from `symbols` FIRST, before
+	anything else below - ntdll.dll and a CRT-linked build's own default
+	libraries (e.g. MSVC/clang's ucrt.lib) both genuinely export a real
+	`strnlen`, two unrelated functions that happen to share a name and, for
+	this exact `size_t(const char*, size_t)` shape, are functionally
+	interchangeable to a caller. Synthesizing an ntdll import entry for one
+	of those names on top of a build that ALSO links the library already
+	providing it produces a real LNK2005 "already defined" - the fix is to
+	simply not manufacture a duplicate, and let the symbol resolve through
+	the normal default link it was already going to resolve through.
+	Returns None (no import library needed at all - `resolve_lib_ldflag`
+	then omits the ldflag entirely) if every requested symbol was dropped
+	this way. A symbol dropped here is NOT re-validated against ntdll's own
+	export table below: the default link already proves it resolves,
+	regardless of whether it happens to also be a genuine ntdll export.
+
+	When `no_crt` is True, this filtering is skipped entirely - a
+	genuinely freestanding build never links the default CRT at all (see
+	_default_link_provides's own docstring for why: MSVC's explicit
+	/NODEFAULTLIB, and clang/gcc's own default-CRT-library pull being
+	conditioned on nothing here ever defining a competing mainCRTStartup),
+	so every requested symbol still genuinely needs its own ntdll import
+	entry, exactly as before this whole default-CRT-overlap check existed.
+	`no_crt` MUST match whatever this same build will actually pass to
+	CcTool.compile()/link() - see resolve_lib_ldflag's own docstring for the
+	two ways getting this wrong is unsafe.
 
 	Why this exists: ntdll.dll's actual export table (confirmed via `dumpbin
 	/exports`) is far larger than what the SDK's ntdll.lib import library
@@ -533,12 +631,20 @@ def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False
 	step for a genuine typo/nonexistent-symbol @extern binding.
 
 	Cached to disk under %TEMP%/metalpy/ntdll_import_lib/, keyed by
-	(compiler name, symbol set) - same spirit as has_symbol()'s own cache -
-	so the dumpbin/llvm-readobj probe and the lib.exe/llvm-lib build are
-	each only ever paid once per distinct (compiler, symbol set).
+	(compiler name, POST-filter symbol set) - same spirit as has_symbol()'s
+	own cache - so the dumpbin/llvm-readobj probe and the lib.exe/llvm-lib
+	build are each only ever paid once per distinct (compiler, symbol set).
+	The no_crt=False default-CRT filtering above always runs first
+	regardless (it has its own, separate cache), since it decides what the
+	effective symbol set even is.
 	'''
 	import hashlib
 	import tempfile
+
+	if not no_crt:
+		symbols = { s for s in symbols if not _default_link_provides( cc, s ) }
+	if not symbols:
+		return None
 
 	key = hashlib.sha256( f'{cc.name}\0{",".join( sorted( symbols ))}'.encode() ).hexdigest()[:16]
 	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'ntdll_import_lib'
@@ -589,7 +695,7 @@ def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False
 		return Path( fallback_name )
 
 
-def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool = False ) -> str:
+def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool = False, no_crt: bool = False ) -> str:
 	'''
 	The linker flag/path for one @extern library dependency, given the set
 	of symbol names this build's program actually references from it.
@@ -597,9 +703,24 @@ def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool =
 	flag, searched against the compiler's own default library path) -
 	ntdll is special-cased because the SDK's own ntdll.lib is missing real
 	exports it should have (see build_ntdll_import_lib's docstring).
+
+	`no_crt` must match whatever this same build will actually pass to
+	CcTool.compile()/link(): build_ntdll_import_lib uses it to decide which
+	requested ntdll symbols are already covered by this build's own default
+	libraries (and so need no synthetic import entry at all) - passing the
+	wrong value here can either wastefully synthesize an entry a no-CRT
+	build didn't need, or - the actually unsafe direction - wrongly skip one
+	a no-CRT build genuinely does need because a *different*, CRT-linked
+	probe found it "already available".
+
+	Returns '' when build_ntdll_import_lib determines no synthetic import
+	library is needed at all (every requested ntdll symbol already resolves
+	through this build's own default linking) - safe to append as an ldflag,
+	same as any other empty/no-op flag.
 	'''
 	if lib == 'ntdll':
-		return str( build_ntdll_import_lib( cc, symbols, verbose = verbose ) )
+		lib_path = build_ntdll_import_lib( cc, symbols, verbose = verbose, no_crt = no_crt )
+		return str( lib_path ) if lib_path is not None else ''
 	return f'{lib}.lib' if cc.name == 'cl' else f'-l{lib}'
 
 

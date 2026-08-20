@@ -62,7 +62,7 @@ class FloatBehaviorTests( unittest.TestCase ):
 			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] )
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
