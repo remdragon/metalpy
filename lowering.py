@@ -3939,14 +3939,21 @@ class FunctionLowering:
 			with defer: __with_ctx_N.__exit__()
 			BODY
 		reusing _register_defer_block for the guaranteed-once-per-entry,
-		runs-on-every-exit-path contract - same "not allowed inside a loop"
-		restriction defer/errdefer already have (see the check below), and
-		the same "not inside a generator's own body" restriction (Mechanism
-		2's defer-replay is a SEPARATE, generator-specific path this doesn't
-		integrate with yet - a clean rejection, not attempted here). Real
-		per-iteration loop scoping (`with timeout(...): read(...)` inside a
-		request loop, PLAN_NON_BLOCKING_IO's own motivating case) is real,
-		separate future work, same as it would be for defer/errdefer.
+		runs-on-every-exit-path contract - UNLIKE defer/errdefer, this is
+		fine inside a loop as long as BODY always falls through to its own
+		natural end: that path disarms the registered defer and calls
+		__exit__() directly, once per iteration, right where written -
+		there's no "runs once, ever" hazard because nothing here waits for
+		the function's own eventual epilogue. The hazard - and the reason
+		defer/errdefer itself bans loops outright (single armed/captured
+		slot, not one per iteration) - only applies when BODY can leave via
+		a Break/Continue that escapes to an enclosing loop (Return is fine -
+		it ends the function outright, so there's no later iteration left to
+		lose track of); see the loop check below and
+		_body_may_break_or_continue_to_enclosing_loop. Also has the same
+		"not inside a generator's own body" restriction (Mechanism 2's defer-replay is a
+		SEPARATE, generator-specific path this doesn't integrate with yet -
+		a clean rejection, not attempted here).
 		__exit__ always runs unconditionally on every exit path - this
 		compiler has no Python-style exception propagation for __exit__ to
 		observe or suppress, so there's no exc_type/exc_value/traceback
@@ -3988,10 +3995,11 @@ class FunctionLowering:
 		design or real Python's own `with` semantics (which also introduces
 		no new scope - NAME/x stay bound and alive for the rest of the
 		enclosing scope there too). '''
-		if self._loop_depth > 0:
+		if self._loop_depth > 0 and self._body_may_break_or_continue_to_enclosing_loop( node.body ):
 			self.lowering.discovery.fail(
-				'with-statement (context manager) is not allowed inside a loop - call another function and use the '
-				f'with-statement inside that instead: {ast.unparse(node)}', node,
+				'with-statement (context manager) is not allowed inside a loop when its body can break/continue out '
+				'of that loop - call another function and use the with-statement inside that instead: '
+				f'{ast.unparse(node)}', node,
 			)
 		if self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
@@ -4064,7 +4072,13 @@ class FunctionLowering:
 		# real compile+run repro (list.append() call counts, __exit__'s own
 		# side effects observably running at the wrong point in the
 		# program's actual output order, not just "eventually").
-		self._register_defer_block( is_err_only = False, body = [ _make_exit_stmt() ], node = node )
+		# allow_inside_loop=True is safe here regardless of _loop_depth: the
+		# rejection above already ran for the one case that would matter (BODY
+		# can exit early and skip the direct disarm-and-call path below) - if
+		# we get here inside a loop, BODY always falls through to its own
+		# natural end, so this registered defer is always disarmed again a few
+		# lines down and never actually replayed at the function's own epilogue
+		self._register_defer_block( is_err_only = False, body = [ _make_exit_stmt() ], node = node, allow_inside_loop = True )
 		exit_flag = self._defer_flags[-1] # the one push_defer above just armed
 
 		for stmt in node.body:
@@ -4079,6 +4093,36 @@ class FunctionLowering:
 			bool_cls = self.lowering.discovery.find_name( 'bool', node )
 			self._emit( ir.Assign( dest = exit_flag, src = ir.Const( type = bool_cls, value = False )))
 			self._lower_stmt( _make_exit_stmt() )
+
+	def _body_may_break_or_continue_to_enclosing_loop( self, body: list[ast.stmt] ) -> bool:
+		''' true if any statement in `body` can leave it via a Break/
+		Continue that targets an ENCLOSING loop rather than one `body`
+		itself introduces - the only shape unsafe for
+		_lower_with_context_manager to place inside a loop (see that
+		function's own loop check for why). Return is deliberately NOT
+		treated as a hazard here, even though it also skips the with-
+		statement's direct disarm-and-call step: Return terminates the
+		whole function immediately, so however many loop iterations already
+		ran, there's no "next iteration" left to lose track of - the
+		registered defer replays exactly once, correctly, against whichever
+		iteration's own ctx is live at that point. That's the real
+		difference from Break/Continue, which don't end the function and so
+		can revisit this with-statement on a later iteration before the
+		function ever truly ends - defer/errdefer's own "single armed slot,
+		replayed once" contract can't represent more than one such visit.
+		match statements are already desugared to chained ast.If by the
+		time lowering.py runs (mirroring _stmt_diverges's own assumption),
+		and this compiler has no try/except, so those aren't handled here. '''
+		return any( self._stmt_may_break_or_continue( stmt, in_nested_loop = False ) for stmt in body )
+
+	def _stmt_may_break_or_continue( self, stmt: ast.stmt, in_nested_loop: bool ) -> bool:
+		if isinstance( stmt, ( ast.Break, ast.Continue )):
+			return not in_nested_loop
+		if isinstance( stmt, ( ast.For, ast.While )):
+			return any( self._stmt_may_break_or_continue( s, in_nested_loop = True ) for s in stmt.body )
+		if isinstance( stmt, ( ast.If, ast.With )):
+			return any( self._stmt_may_break_or_continue( s, in_nested_loop ) for s in stmt.body )
+		return False
 
 	def _static_type_of_value_expr( self, node: ast.expr ) -> Type|None:
 		# compile-time-only: the static type of a value-shaped expression
@@ -5258,9 +5302,15 @@ class FunctionLowering:
 			)
 		self._emit( ir.DecrefDynamic( value = operand ))
 
-	def _register_defer_block( self, is_err_only: bool, body: list[ast.stmt], node: ast.AST ) -> None:
+	def _register_defer_block( self, is_err_only: bool, body: list[ast.stmt], node: ast.AST, *, allow_inside_loop: bool = False ) -> None:
+		''' allow_inside_loop is set only by _lower_with_context_manager,
+		whose own loop-safety is verified by its caller via
+		_body_may_break_or_continue_to_enclosing_loop before this runs - see
+		that check's own comment for why a with-statement's internal defer registration
+		doesn't share defer/errdefer's own "single armed slot" hazard in
+		the case it actually uses this override. '''
 		kind = 'errdefer' if is_err_only else 'defer'
-		if self._loop_depth > 0:
+		if self._loop_depth > 0 and not allow_inside_loop:
 			self.lowering.discovery.fail( f'{kind} is not allowed inside a loop - call another function and {kind} inside that instead', node )
 		if self._in_deferred_body:
 			self.lowering.discovery.fail( f'{kind} cannot be nested inside another defer/errdefer', node )

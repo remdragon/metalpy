@@ -19158,8 +19158,89 @@ def main() -> i32:
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 		self.assertIn( 'define both __enter__(self) and __exit__(self)', str( self.discovery.errors.errors[0] ))
 
-	def test_rejected_inside_a_loop( self ) -> None:
+	def test_allowed_inside_a_loop_when_body_always_falls_through( self ) -> None:
+		# narrower than the original loop-restriction (see lowering.py's
+		# _body_may_exit_early): a with-statement whose body always falls
+		# through to its own natural end calls __exit__() directly, once per
+		# iteration, right where written - no "single armed slot, only ever
+		# replayed once" hazard the way defer/errdefer itself has (see that
+		# restriction's own comment), so this case doesn't need rejecting.
 		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		log = list[i32]()
+		i: usize = 0
+		while i < 3:
+			with Trace( log ):
+				pass
+			i = i + 1
+		if log.__len__() != 6:
+			return 1
+		k: usize = 0
+		while k < 3:
+			if log.__getitem__( k * 2 ).unwrap( 'idx' ) != 1:
+				return 2
+			if log.__getitem__( k * 2 + 1 ).unwrap( 'idx' ) != 2:
+				return 3
+			k = k + 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_allowed_inside_a_loop_when_body_returns( self ) -> None:
+		# unlike break/continue, Return terminates the whole function
+		# immediately - there's no "next iteration" to lose track of, so
+		# this is safe even though __exit__ only runs via the with-
+		# statement's own defer registration here, not the direct call (see
+		# _body_may_exit_early - Return isn't loop-relative the way
+		# Break/Continue are).
+		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		self.log.append( 7 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		log = list[i32]()
+		i: usize = 0
+		while i < 3:
+			with Trace( log ):
+				if i == 1:
+					return 0
+			i = i + 1
+		return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_allowed_when_break_continue_target_a_nested_loop_inside_body( self ) -> None:
+		# the Continue below targets the inner while-loop the with-block's
+		# own BODY introduces, not the outer loop this with-statement sits
+		# inside - _body_may_exit_early tracks that distinction
+		# (in_nested_loop) so this is correctly NOT flagged as an early exit
+		# from the with-block itself.
+		self._run( '''
+import compiler
+
 class Trace:
 	def __enter__( self ) -> None:
 		pass
@@ -19167,13 +19248,68 @@ class Trace:
 		pass
 
 def main() -> i32:
-	i: usize = 0
-	while i < 3:
-		with Trace():
-			pass
-		with compiler.wrap_arithmetic:
+	with compiler.wrap_arithmetic:
+		total: i32 = 0
+		i: usize = 0
+		while i < 2:
+			with Trace():
+				j: usize = 0
+				while j < 3:
+					if j == 1:
+						j = j + 1
+						continue
+					total = total + 1
+					j = j + 1
 			i = i + 1
-	return 0
+		if total != 4:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_rejected_inside_a_loop_when_body_can_continue( self ) -> None:
+		self._run( '''
+import compiler
+
+class Trace:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < 3:
+			with Trace():
+				if i == 1:
+					continue
+			i = i + 1
+		return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'not allowed inside a loop', str( self.discovery.errors.errors[0] ))
+
+	def test_rejected_inside_a_loop_when_body_can_break( self ) -> None:
+		self._run( '''
+import compiler
+
+class Trace:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < 3:
+			with Trace():
+				if i == 1:
+					break
+			i = i + 1
+		return 0
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
 		self.assertIn( 'not allowed inside a loop', str( self.discovery.errors.errors[0] ))
