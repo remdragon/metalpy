@@ -2445,3 +2445,7 @@ class dict[K, V]:
 # name the type in a field/parameter annotation, which an unexported name
 # does not allow from outside lib/builtins.
 from .__File import File, BinaryReader, BinaryWriter, BinaryReadWriter
+
+# same "depends on bytearray already being pre-parsed" reasoning as File
+# above - memoryview.__init__ takes a bytearray by name.
+from .__memoryview import memoryview

@@ -831,6 +831,50 @@ def main() -> i32:
 	return 0
 '''
 
+# Phase 9: Pattern.search(memoryview, pos)/re.finditer(pattern, memoryview) -
+# the exact two calls grap.mpy's own port needs (a Windows console-app
+# grep-like tool that mmaps a file and searches through a memoryview over
+# it - see the plan this was built against). Reuses the same _search_from_
+# raw/byte-mode core as the bytes overloads (lib/re.py's own comment) - a
+# memoryview is just another (ConstPtr[u8], length) source.
+_RE_MEMORYVIEW = '''
+import re
+
+def main() -> i32:
+	buf: bytearray = bytearray( 14 )
+	src: bytes = b'abcXaabcXaaabc'
+	p: Ptr[u8] = buf.get_ptr()
+	sp: ConstPtr[u8] = src.get_const_ptr()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 14:
+			p[i] = sp[i]
+			i += 1
+
+	pat: re.Pattern = re.compile( b'a+bc' ).unwrap( 'bad pattern' )
+	with memoryview( buf ) as mv:
+		# search(memoryview, pos)
+		m: re.Match = pat.search( mv, 0 ).unwrap( 'search' )
+		sp0: tuple[usize,usize] = m.span()
+		if sp0[0] != 0 or sp0[1] != 3:
+			return 1
+		m2: re.Match = pat.search( mv, 4 ).unwrap( 'search2' )
+		sp1: tuple[usize,usize] = m2.span()
+		if sp1[0] != 4 or sp1[1] != 8:
+			return 2
+
+		# finditer(pattern, memoryview) - over a SLICE, matching grap.mpy's
+		# own `mv[search_pos:eol1]` usage exactly
+		line: memoryview = mv[0:14]
+		count: usize = 0
+		with compiler.wrap_arithmetic:
+			for fm in re.finditer( pat, line ):
+				count += 1
+		if count != 3:
+			return 3
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -947,6 +991,17 @@ def main() -> i32:
 		compiler.run()
 		self.assertEqual( discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( compiler ), expected_exit = 1, compiler = compiler )
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase9BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	''' Pattern.search(memoryview, pos)/re.finditer(pattern, memoryview) -
+	see _RE_MEMORYVIEW's own comment for exact scope. '''
+
+	def test_phase9_memoryview( self ) -> None:
+		self.assert_programs_run([
+			( 'memoryview', _RE_MEMORYVIEW ),
+		])
 
 
 if __name__ == '__main__':

@@ -1757,6 +1757,17 @@ class Pattern:
 			case Result.Err( e ):
 				return Result.Err( e )
 
+	def search( self, s: memoryview, pos: usize = 0, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
+		return self._search_from_memoryview( s, pos, max_steps )
+
+	def _search_from_memoryview( self, s: memoryview, start_pos: usize, max_steps: usize ) -> Result[Match, MatchError]:
+		outcome: Result[Frame, MatchError] = self._search_from_raw( s.get_const_ptr(), len( s ), start_pos, max_steps )
+		match outcome:
+			case Result.Ok( frame ):
+				return Result.Ok( Match( None, frame.slot_values, frame.slot_set, self.__group_names, frame.last_group, frame.last_group_set ))
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	def match( self, s: str, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
 		outcome: Result[Frame, MatchError] = self._match_at_zero_raw( s.get_cstr(), s.byte_len(), max_steps )
 		match outcome:
@@ -1994,6 +2005,30 @@ def _require_next_match_bytes( pattern: Pattern, s: bytes, pos: usize, slen: usi
 	return m
 
 
+# --- memoryview siblings, for finditer(memoryview) - _advance_pos_after_
+# match_bytes above is reused as-is (byte_mode's own "one codepoint" step
+# is always 1 byte regardless of which byte-mode input type it came from,
+# so it never actually touches `s`) ---------------------------------------
+
+def _find_next_match_memoryview( pattern: Pattern, s: memoryview, start_pos: usize, slen: usize, max_steps: usize ) -> Match|None:
+	if start_pos > slen:
+		return None
+	attempt: Result[Match, MatchError] = pattern._search_from_memoryview( s, start_pos, max_steps )
+	if attempt.is_ok():
+		return attempt.unwrap( 're: _find_next_match_memoryview: is_ok checked above' )
+	return None
+
+def _has_match_at_or_after_memoryview( pattern: Pattern, s: memoryview, pos: usize, slen: usize, max_steps: usize ) -> bool:
+	m: Match|None = _find_next_match_memoryview( pattern, s, pos, slen, max_steps )
+	return m is not None
+
+def _require_next_match_memoryview( pattern: Pattern, s: memoryview, pos: usize, slen: usize, max_steps: usize ) -> Match:
+	m: Match|None = _find_next_match_memoryview( pattern, s, pos, slen, max_steps )
+	if m is None:
+		sys.panic( 're: _require_next_match_memoryview: unreachable (_has_match_at_or_after_memoryview already confirmed true)' )
+	return m
+
+
 def finditer( pattern: Pattern, s: str, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
 	''' yields each successive non-overlapping match, scanning forward
 	from the end of the previous one (or by one codepoint, for a
@@ -2069,6 +2104,22 @@ def finditer( pattern: Pattern, s: bytes, max_steps: usize = 65536 ) -> Iterator
 		pos = _advance_pos_after_match_bytes( m, slen )
 		yield m
 		has_next = _has_match_at_or_after_bytes( pattern, s, pos, slen, max_steps )
+	return
+
+
+def finditer( pattern: Pattern, s: memoryview, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+	''' memoryview sibling of finditer() above - same generator-shape
+	constraints, same byte-mode Match caveats (see the bytes sibling's own
+	docstring). This is the exact shape grap.mpy's own port needs:
+	`for m in re.finditer(pattern, mv[a:b]):` over a memoryview slice. '''
+	slen: usize = len( s )
+	pos: usize = 0
+	has_next: bool = _has_match_at_or_after_memoryview( pattern, s, pos, slen, max_steps )
+	while has_next:
+		m: Match = _require_next_match_memoryview( pattern, s, pos, slen, max_steps )
+		pos = _advance_pos_after_match_bytes( m, slen )
+		yield m
+		has_next = _has_match_at_or_after_memoryview( pattern, s, pos, slen, max_steps )
 	return
 
 

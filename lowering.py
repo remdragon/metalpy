@@ -8393,11 +8393,13 @@ class FunctionLowering:
 	# docstring - not the byte length _byte_slice's own byte-offset
 	# contract needs; bytearray has no such split, __len__() IS its real
 	# byte length) - not a uniform dunder lookup, so a small fixed table
-	# for the two currently-supported types is the honest shape here,
-	# same posture as the tuple-index/pointer-fallback cases elsewhere in
+	# for the currently-supported types is the honest shape here, same
+	# posture as the tuple-index/pointer-fallback cases elsewhere in
 	# _expr_Subscript already hardcoding per concrete type family rather
-	# than inventing a protocol for two callers
-	_SLICE_LENGTH_METHOD = { 'str': 'byte_len', 'bytearray': '__len__' }
+	# than inventing a protocol for every caller. memoryview's own
+	# __len__() is its real byte length too (lib/builtins/__memoryview.py),
+	# same shape as bytearray.
+	_SLICE_LENGTH_METHOD = { 'str': 'byte_len', 'bytearray': '__len__', 'memoryview': '__len__' }
 
 	def _lower_slice_subscript( self, node: ast.Subscript, obj: ir.Operand ) -> ir.Operand:
 		''' x[a:b] / x[:b] / x[a:] - str/bytearray only (PLAN_POSIX_FEATURE.md's
@@ -8420,7 +8422,7 @@ class FunctionLowering:
 		length_method_name = self._SLICE_LENGTH_METHOD.get( getattr( obj.type, 'stem', None ) )
 		if slice_fn is None or length_method_name is None:
 			self.lowering.discovery.fail(
-				f'slicing is not supported for {obj.type.qualname} (only str and bytearray support slice syntax): {ast.unparse(node)}',
+				f'slicing is not supported for {obj.type.qualname} (only str, bytearray, and memoryview support slice syntax): {ast.unparse(node)}',
 				node,
 			)
 		self.lowering._ensure_resolved( slice_fn )
