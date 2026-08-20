@@ -23,8 +23,10 @@ In scope:
    value.
 3. Calling through a Ptr[Callable[...]]-typed value (an indirect call).
 4. Using Ptr[Callable[...]] as a function parameter type, a local
-   variable type, and (closed in a later pass - see below) a function's
-   own return type. Not yet as a struct field, not deeply nested.
+   variable type, a struct/RCClass field, and (both closed in later
+   passes - see status updates below) a function's own return type and
+   a call directly through a field-access expression. Not yet deeply
+   nested (e.g. inside another container type).
 
 Deferred (flagged, not attempted this pass):
 - Lambda expressions / nested function defs - needed for zoneinfo.py's
@@ -112,3 +114,21 @@ its own `name` argument nests the two declarator layers correctly
 Verified: free function, method (self ordering unaffected), and a generic
 function monomorphized to K = Ptr[Callable[...]] - real compile-and-run,
 MSVC/clang/WSL-gcc all green.
+
+Status update: storing Ptr[Callable[...]] as a plain struct/RCClass field
+(declaration/construction/read into a local) already worked - both
+_struct_or_union_body and emit_rcclass route every field through
+_declarator, same as any parameter/local. The real remaining gap was
+CALLING directly through the field-access expression itself (`o.field(...)`)
+- _try_lower_indirect_call was deliberately scoped to a bare Name callee
+only, per this doc's own original item 4 wording. Closed by extending it to
+also recognize an Attribute callee, using a purely static, non-emitting
+type lookup (_static_type_of_value_expr / a new non-failing _find_field
+probe) to decide the shape applies BEFORE ever lowering the receiver -
+required because _resolve_callee's own Attribute fallback lowers the
+receiver again on any non-match, so lowering it speculatively here first
+would double-evaluate a receiver with side effects. Verified: @cstruct and
+RCClass fields, a nested field chain (outer.inner.handler(...)), and a
+regression guard that an ordinary same-shaped method call (o.method(...))
+still dispatches normally rather than being misrouted - real compile-and-
+run, MSVC/clang/WSL-gcc all green, plus lowering_test.py IR-level coverage.

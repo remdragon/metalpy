@@ -14497,6 +14497,104 @@ def main() -> i32:
 		diff: i32 = result - 6
 	return diff
 ''' ),
+			# regression test: obj.field(...) - a call DIRECTLY through an
+			# attribute-access expression whose FIELD type is Ptr[Callable[...]]
+			# - used to be a clean compile error ("'field' is not callable on
+			# ...") since _try_lower_indirect_call was scoped to a bare Name
+			# callee only (PLAN_CALLABLE.md's own deferred item; reading the
+			# field into a local first and calling THAT already worked, so
+			# this was purely a call-site recognition gap, not a storage or
+			# codegen bug). Fixed by extending _try_lower_indirect_call to
+			# also recognize an Attribute callee, using a purely STATIC type
+			# lookup (_static_type_of_value_expr, no IR emitted) to decide
+			# whether this shape even applies BEFORE ever lowering the
+			# receiver - critical because _resolve_callee's own Attribute
+			# fallback lowers the receiver again on any non-match, so trying
+			# and abandoning a real lowering here would double-evaluate a
+			# receiver with side effects.
+			( 'cstruct_field_called_directly_as_attribute_expression', '''
+@cstruct
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	o: Ops = Ops( handler = add_one )
+	result: i32 = o.handler( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# same fix, through an RCClass field instead of a @cstruct one -
+			# both emit_rcclass and _struct_or_union_body already routed field
+			# DECLARATIONS through _declarator; this confirms the new call-site
+			# recognizer works identically for either field-storage kind.
+			( 'rcclass_field_called_directly_as_attribute_expression', '''
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	o: Ops = Ops( handler = add_one )
+	result: i32 = o.handler( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# a NESTED field chain (outer.inner.handler(...)) - confirms
+			# _static_type_of_value_expr's own recursive Attribute handling
+			# threads through correctly, not just a single obj.field(...) hop.
+			( 'nested_field_chain_called_directly', '''
+@cstruct
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+@cstruct
+class Outer:
+	inner: Ops
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	outer: Outer = Outer( inner = Ops( handler = add_one ))
+	result: i32 = outer.inner.handler( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# regression guard: an ORDINARY method call through the exact same
+			# dotted-attribute callee shape must still dispatch normally, not
+			# get misrouted into the new field-call recognizer (which must
+			# bail via the non-failing _find_method check before ever trying
+			# _find_field).
+			( 'ordinary_method_call_not_misrouted_by_field_call_recognizer', '''
+@cstruct
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+	def real_method( self, x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x * 10
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	o: Ops = Ops( handler = add_one )
+	result: i32 = o.real_method( 3 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 30
+	return diff
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )

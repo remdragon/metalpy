@@ -984,6 +984,28 @@ class Lowering:
 		found = self._resolve_scalar_name( found )
 		return found if isinstance( found, Function ) else None
 
+	def _find_field( self, owner_type: Type|None, name: str ) -> Variable|None:
+		# a non-failing probe, unlike _attr_lookup - "this type has no such
+		# FIELD" (either no such attribute at all, or it names a method
+		# instead) is a normal outcome for a caller trying a shape (e.g.
+		# _try_lower_indirect_call recognizing obj.field(...) as an indirect
+		# call through a Ptr[Callable[...]]-typed field, only once it's
+		# already ruled out a real method of that name via _find_method),
+		# not a real error to report. Same posture/shape as _find_method
+		# above, mirroring _attr_lookup's own lookup logic minus the fail().
+		owner_type = self._ensure_resolved( owner_type )
+		if isinstance( owner_type, Specialization ) and isinstance( owner_type.base, Scalar ) and owner_type.base.stem in ( 'Ptr', 'ConstPtr' ):
+			owner_type = self._ensure_resolved( owner_type.args[0] )
+		if isinstance( owner_type, ( CStruct, RCClass )):
+			found = owner_type.chain_lookup( name )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( name ) if isinstance( names, dict ) else None
+		if not isinstance( found, Variable ):
+			return None
+		self._ensure_resolved( found )
+		return found
+
 	def _find_iterator_next_method( self, owner_type: Type|None ) -> Function|None:
 		# PLAN_GENERATORS.md Phase 3 - a non-failing probe (same posture as
 		# _find_method above): "this type has no __next__" is a normal
@@ -11628,18 +11650,38 @@ class FunctionLowering:
 		# _ReceiverDispatch, never an arbitrary Operand), so it's
 		# recognized here instead, same "try a shape, None means try the
 		# next one" convention as the construction recognizers above.
-		# Scoped to a bare Name callee for now - the only shape dict[K,V]/
-		# RawDict's own generated code needs (a Ptr[Callable[...]]-typed
-		# PARAMETER called directly); a general expression callee (e.g.
-		# some_struct.get_callback()(...)) would need care to evaluate it
-		# exactly once, deferred until something actually needs it
-		if not isinstance( node.func, ast.Name ):
+		#
+		# Two callee shapes: a bare Name (eq_fn(...)) and obj.field(...) -
+		# a Ptr[Callable[...]]-typed FIELD read off obj. Both determine
+		# "is this even callable" via a PURELY STATIC type lookup (no IR
+		# emitted) before ever lowering node.func for real - critical for
+		# the Attribute case specifically: _resolve_callee's own Attribute
+		# path (the fallback once every recognizer here returns None)
+		# lowers node.func.value ITSELF once it takes over, so lowering it
+		# here too and then bailing out on a non-match would double-
+		# evaluate a receiver with side effects (e.g. get_container().
+		# field(...)) - not just redundant codegen, a real correctness bug.
+		# A callee needing a CALL to obtain the callable at all (that exact
+		# get_container().field(...) shape) isn't attempted for the same
+		# reason one level deeper - no forcing use case yet.
+		if isinstance( node.func, ast.Name ):
+			name = self.lowering.discovery.find_name_or_none( node.func.id )
+			if not isinstance( name, Variable ):
+				return None
+			self.lowering._ensure_resolved( name )
+			effective_type = self._narrowed_type_of_name( node.func.id, name.type )
+		elif isinstance( node.func, ast.Attribute ):
+			receiver_type = self._static_type_of_value_expr( node.func.value )
+			if receiver_type is None:
+				return None
+			if self.lowering._find_method( receiver_type, node.func.attr ) is not None:
+				return None # a real method exists with this name - an ordinary method call, not a field call
+			field = self.lowering._find_field( receiver_type, node.func.attr )
+			if field is None:
+				return None # no such field either - let _resolve_callee's own Attribute path give the accurate diagnostic
+			effective_type = field.type
+		else:
 			return None
-		name = self.lowering.discovery.find_name_or_none( node.func.id )
-		if not isinstance( name, Variable ):
-			return None
-		self.lowering._ensure_resolved( name )
-		effective_type = self._narrowed_type_of_name( node.func.id, name.type )
 		fn_type = self.lowering._type_resolver._callable_type_of( effective_type )
 		if fn_type is None:
 			return None
@@ -11649,9 +11691,12 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'a Callable[...] call takes no keyword arguments: {ast.unparse(node)}', node )
 		if len( node.args ) != len( fn_type.arg_types ):
 			self.lowering.discovery.fail(
-				f'{node.func.id}(...) takes {len(fn_type.arg_types)} argument(s), got {len(node.args)}: {ast.unparse(node)}',
+				f'{ast.unparse(node.func)}(...) takes {len(fn_type.arg_types)} argument(s), got {len(node.args)}: {ast.unparse(node)}',
 				node,
 			)
+		# only lowered now that every shape/arity check above has passed -
+		# for the Attribute case this is the first and only time the
+		# receiver is actually evaluated (see the comment above)
 		target = self._lower_expr( node.func, None )
 		args = [ self._lower_expr( arg_node, arg_type ) for arg_node, arg_type in zip( node.args, fn_type.arg_types ) ]
 		return self._emit_call_indirect( target, args, fn_type.return_type, expected_type )
