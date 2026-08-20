@@ -763,11 +763,7 @@ def main() -> i32:
 	# .regs and doesn't move .lastindex
 	p2: re.Pattern = re.compile( b'a(b)?c' ).unwrap( 'bad pattern 2' )
 	m3: re.Match = p2.search( b'ac' ).unwrap( 'search3' )
-	# via a local, not `m3.lastindex is not None` directly - a confirmed
-	# compiler bug (task_c98beffa): "<property returning T|None> is None"
-	# used directly (not through an intermediate local) fails to compile
-	li3: usize|None = m3.lastindex
-	if li3 is not None:
+	if m3.lastindex is not None:
 		return 12
 	regs3: list[tuple[i32,i32]] = m3.regs
 	r3: tuple[i32,i32] = regs3.__getitem__( 1 ).unwrap( 'idx' )
