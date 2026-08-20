@@ -14,20 +14,6 @@ path.join/isdir/splitext/abspath/normpath: built entirely on str's own
 import compiler
 import sys
 
-# a local byte-scanning strlen instead of sys.cstrlen: sys.cstrlen's own
-# Windows branch calls windows.ntdll.strnlen, and linking BOTH that and
-# ucrt (the normal, non-no_crt case) makes clang/MSVC reject the build with
-# "strnlen already defined" (ntdll.dll and ucrt each export an unrelated
-# function that happens to share that name) - a real, separately-tracked
-# linker bug (task_51bbb0d2), not something to route around here by masking
-# it; this just avoids the one shared call path that trips it.
-def _cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
-	i: usize = 0
-	with compiler.panic_arithmetic( 'bounded by max_length, cannot overflow' ):
-		while i < max_length and ptr[i] != 0:
-			i += 1
-	return i
-
 # str.__getitem__(idx).unwrap_or('') instead of a plain '' default: the
 # explicit-default unwrap_or(...) overload (Result[T,E].unwrap_or(default:
 # T), lib/builtins/__init__.py's @overload-marked stub) is currently
@@ -61,7 +47,7 @@ def listdir( dirpath: str ) -> Result[list[str], OSError]:
 	entries: list[str] = list[str]()
 	while True:
 		name_ptr: ConstPtr[u8] = compiler.addrof( data.cFileName )
-		name_len: usize = _cstrlen( name_ptr, 260 )
+		name_len: usize = sys.cstrlen( name_ptr, 260 )
 		with compiler.panic_arithmetic( 'bounded by the 260-byte cFileName buffer, cannot overflow' ):
 			name_size: usize = name_len + 1
 		name: str = str.from_cstr( name_ptr, name_size ).unwrap( 'os.listdir: invalid UTF-8 in filename' )
@@ -88,10 +74,10 @@ def listdir( dirpath: str ) -> Result[list[str], OSError]:
 			break
 		# d_name's real type is `char[N]` - c_field_addr requests Ptr[None]
 		# (not Ptr[u8]) for the same char*-vs-unsigned-char* reason as
-		# opendir/stat above, then casts back to ConstPtr[u8] for _cstrlen/
-		# str.from_cstr below
+		# opendir/stat above, then casts back to ConstPtr[u8] for
+		# sys.cstrlen/str.from_cstr below
 		name_ptr: ConstPtr[u8] = compiler.cast( ConstPtr[u8], compiler.c_field_addr( entry, 'd_name', Ptr[None] ))
-		name_len: usize = _cstrlen( name_ptr, 4096 )
+		name_len: usize = sys.cstrlen( name_ptr, 4096 )
 		with compiler.panic_arithmetic( 'bounded by the 4096-byte cstrlen cap, cannot overflow' ):
 			name_size: usize = name_len + 1
 		name: str = str.from_cstr( name_ptr, name_size ).unwrap( 'os.listdir: invalid UTF-8 in filename' )
@@ -128,7 +114,7 @@ def _getcwd() -> Result[str, OSError]:
 	result: Ptr[u8] = getcwd( buf, buf_size )
 	if result is None:
 		return Result.Err( OSError( get_errno() ))
-	n: usize = _cstrlen( buf, buf_size )
+	n: usize = sys.cstrlen( buf, buf_size )
 	with compiler.panic_arithmetic( 'bounded by cstrlen < buf_size, cannot overflow' ):
 		size: usize = n + 1
 	return Result.Ok( str.from_cstr( compiler.cast( ConstPtr[u8], buf ), size ).unwrap( 'os.path.abspath: invalid UTF-8 in cwd' ))
