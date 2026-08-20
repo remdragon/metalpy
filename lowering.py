@@ -3941,25 +3941,38 @@ class FunctionLowering:
 		applies exactly as it would to hand-written code, nothing special
 		here consumes or requires one).
 
-		__with_ctx_N (and NAME, if `as NAME` is used) must NOT survive past
-		this with-statement's own end the way an ordinary local declared at
-		this level would (self.lowering.discovery still knows the NAME for
-		the rest of the function - see cfg.py's own "no block scoping"
-		module docstring - but the underlying VALUE must actually be
-		released here, not linger until the enclosing function eventually
-		returns: confirmed via a real compile+run refcount repro, the
-		context manager's own fields/the __enter__-returned value stayed
-		one refcount too high for the rest of the function otherwise).
-		Reuses _stmt_If's own branch-confinement machinery
-		(cfg.snapshot/enter_branch/exit_branch/merge_if) to get that -
-		exactly the same mechanism an ordinary `if True: ctx = ...` would
-		get for free, just without ever emitting a real runtime test/jump,
-		since this "branch" is unconditionally taken. merge_if only compares
-		STATE DICTIONARIES (bindings/results/narrowed/live before vs. after),
-		not actual control flow, so treating this like _stmt_If's own
-		else-less case (false_end/false_captured mirror the entry snapshot
-		verbatim, as if the condition were simply never true) reconciles
-		correctly with zero new CFG logic. '''
+		__with_ctx_N/NAME (`as NAME`) are ORDINARY, function-scoped locals,
+		exactly like any other name introduced anywhere in this compiler
+		(cfg.py's own module docstring: no block scoping at all) - NOT torn
+		down early at this with-statement's own textual end. An earlier
+		version of this feature DID scope them (reusing _stmt_If's own
+		branch-confinement machinery, treating the whole with-block as an
+		unconditionally-taken "if branch") - wrong, and reverted: `with`
+		does not introduce a lifetime scope (real Python's own `with EXPR as
+		NAME:` doesn't either - NAME stays bound and alive for the rest of
+		the enclosing function/scope there too), and a with-statement's
+		BODY - unlike an if-branch's body - always executes exactly once
+		when reached, so ANY local BODY itself declares needs to survive
+		past the with-statement's own end the same way it would if the same
+		statements were written with no with-statement wrapping them at
+		all. Confirmed via a real repro: `with Ctx(): x: i32 = 5` followed
+		by `return x` wrongly reported `'x' is not initialized on all code
+		branches` under the branch-confinement version - `merge_if`'s
+		confinement applies to EVERY binding newly introduced inside the
+		window, not just __with_ctx_N/NAME, so there was no way to confine
+		only those two without also breaking every ordinary local BODY
+		declares. `with x:` on an EXISTING object (not a fresh construction)
+		is the other motivating case: __with_ctx_N then aliases x rather
+		than owning a fresh construction, but ordinary aliasing assignment
+		in this language (`ctx = x`, a plain Name read) still takes its own
+		independent Incref - same as any other `y = x` - so it stays
+		correctly balanced by its own (now function-scoped, not block-
+		scoped) eventual release; nothing here needs to special-case that
+		case, it just needs to NOT be forced into an artificial block scope
+		that has no basis in either this language's own "no block scoping"
+		design or real Python's own `with` semantics (which also introduces
+		no new scope - NAME/x stay bound and alive for the rest of the
+		enclosing scope there too). '''
 		if self._loop_depth > 0:
 			self.lowering.discovery.fail(
 				'with-statement (context manager) is not allowed inside a loop - call another function and use the '
@@ -3974,66 +3987,6 @@ class FunctionLowering:
 		self._with_ctx_id += 1
 		ctx_name = f'__with_ctx_{index}'
 
-		entry_snapshot = self._cfg.snapshot()
-		outer_instructions = self._instructions
-		self._instructions = []
-		self._cfg.enter_branch( entry_snapshot.stack_depth )
-		try:
-			self._lower_with_context_manager_body( node, item, ctx_name )
-		except CompileError:
-			# unlike _stmt_If's own per-statement try/except-continue loop,
-			# ctx_assign/the enter call/the __enter__+__exit__ presence
-			# check above aren't individually guarded - a failure anywhere
-			# in there must still leave self._instructions/self._cfg
-			# exactly as this with-statement found them before propagating,
-			# or every statement lowered AFTER this one (still inside the
-			# SAME function) would silently keep appending into this
-			# with-statement's own abandoned, never-spliced-back
-			# instruction list instead of the real one
-			self._cfg.exit_branch()
-			self._cfg.restore( entry_snapshot )
-			self._instructions = outer_instructions
-			raise
-		self._cfg.exit_branch()
-		true_captured = self._instructions
-		true_end = dict( self._cfg.bindings )
-		true_end_results = self._cfg.unchecked_results()
-		true_end_narrowed = self._cfg.narrowed_snapshot()
-		true_end_live = self._cfg.live_snapshot()
-		true_terminates = bool( node.body ) and self._stmt_diverges( node.body[-1] )
-
-		self._cfg.restore( entry_snapshot )
-		self._instructions = outer_instructions
-		false_end = dict( entry_snapshot.bindings )
-		false_end_results = set( entry_snapshot.results )
-		false_end_narrowed = dict( entry_snapshot.narrowed )
-		false_end_live = set( entry_snapshot.live )
-		try:
-			true_extra, false_extra, removed = self._cfg.merge_if(
-				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
-				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
-				true_terminates = true_terminates, false_terminates = False,
-				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
-				true_end_live = true_end_live, false_end_live = false_end_live,
-			)
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-
-		for instr in true_captured:
-			self._emit_captured( instr )
-		for instr in true_extra:
-			self._emit( instr )
-		# false_extra: merge_if's own "false path" reconciliation, always
-		# run - see _stmt_If's own else-less tail for why this can be
-		# non-empty even with no real orelse (ownership-disagreement flag
-		# disarming)
-		for instr in false_extra:
-			self._emit( instr )
-
-	def _lower_with_context_manager_body( self, node: ast.With, item: ast.withitem, ctx_name: str ) -> None:
-		''' the actual ctx/__enter__/__exit__/BODY sequence, run inside the
-		branch-confinement window _lower_with_context_manager sets up
-		around this call - see that method's own docstring. '''
 		context_expr = item.context_expr
 		ctx_assign = ast.Assign( targets = [ ast.Name( id = ctx_name, ctx = ast.Store() ) ], value = context_expr )
 		ast.fix_missing_locations( ast.copy_location( ctx_assign, node ))
