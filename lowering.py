@@ -2292,6 +2292,36 @@ class FunctionLowering:
 
 	# --- temp/instruction bookkeeping ----------------------------------------
 
+	def _emit_captured( self, instr: ir.Instruction ) -> None:
+		# splices ONE instruction from a branch's own true_captured/false_
+		# captured list (_stmt_If/_lower_binary_branch's own "lower this
+		# branch into a SEPARATE instruction list first, decide true_extra/
+		# false_extra via merge_if, THEN splice everything into the real
+		# stream" technique) back into self._instructions - deliberately
+		# NOT through self._emit() below: that instruction was ALREADY
+		# _emit()'d once, when it was first captured (self._instructions
+		# was redirected to the branch's own list at the time, but _emit()
+		# itself ran, including its own fresh_temp() registration) - _emit()
+		# has no way to tell "first time" from "being re-spliced", so
+		# calling it a SECOND time here for the same ir.Call/Allocate
+		# instruction RE-registers its own dest temp into cfg.py's
+		# _temp_states, silently UNDOING whatever untracked it in between
+		# (e.g. cfg.assign()'s own "ownership transferred into a named
+		# binding, untrack the source temp" branch, if the branch's own
+		# body assigned this Call's result into an EXISTING binding, like
+		# `if flag: r = make_ok(b) else: r = make_err()` reassigning a
+		# pre-declared `r`) - confirmed via a real reference leak (refcount
+		# one too high after either branch of exactly that shape ran).
+		# Every OTHER instruction kind is unaffected (self._emit()'s own
+		# registration is gated on isinstance(instr, (Call, Allocate)), and
+		# _check_self_escape_in is idempotent - re-running it on an
+		# already-checked instruction is harmless, just redundant), so
+		# this only needs to skip the ONE non-idempotent side effect,
+		# not reimplement self._emit() from scratch.
+		if self._current_fn is not None:
+			self._check_self_escape_in( instr )
+		self._instructions.append( instr )
+
 	def _emit( self, instr: ir.Instruction ) -> None:
 		# a Call/Allocate's dest is always a genuinely fresh, owned value
 		# from the caller's perspective (same rule _is_aliasing_expr already
@@ -5455,6 +5485,98 @@ class FunctionLowering:
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
+	def _lower_binary_branch( self, cond: ir.Operand, node: ast.AST, true_thunk: 'Callable[[],bool]', false_thunk: 'Callable[[],bool]' ) -> None:
+		''' hand-rolled version of _stmt_If's own branch-then-merge
+		machinery (JumpIfFalse/snapshot/enter_branch/exit_branch/merge_if/
+		splice), for a caller building its own condition and branch bodies
+		directly at the IR level rather than lowering a real ast.If -
+		_lower_for_over_iterator's own Result[T,E]/Err(StopIteration)-vs-
+		real-error dispatch, which has no ast.If to lower (the condition is
+		a synthesized tag comparison, and each branch's own body is a
+		narrow()+bind pair, not user-written statements).
+
+		Each thunk is called with no arguments inside its own branch-
+		confined region (self._cfg.enter_branch/exit_branch, self.
+		_instructions redirected to a captured list - identical setup
+		_stmt_If uses for node.body/node.orelse), expected to emit
+		whatever IR it needs via self._emit/self._cfg directly, and return
+		True if it's a dead end that never reaches the merge point (a raw
+		jump elsewhere - the same "terminates" concept _stmt_If's own
+		true_terminates/false_terminates track for a branch ending in
+		return/break/continue, just decided by the thunk itself instead of
+		_stmt_diverges since there's no real AST statement to inspect). '''
+		else_label = self._new_label( 'branch_else' )
+		self._emit( ir.JumpIfFalse( cond = cond, target = else_label ))
+
+		entry_snapshot = self._cfg.snapshot()
+		outer_instructions = self._instructions
+		self._instructions = []
+		self._cfg.enter_branch( entry_snapshot.stack_depth )
+		true_temps_start = len( self._pending_temps )
+		try:
+			true_terminates = true_thunk()
+		finally:
+			self._cfg.exit_branch()
+		# each thunk's own PURELY INTERMEDIATE temps (e.g. leaf_bind_thunk's
+		# E'-union coercion wrapper, built to pass a narrowed leaf value into
+		# Result.Err(e: E')) must be flushed HERE, still inside this branch's
+		# own captured instruction list - _flush_branch_temps' own comment
+		# documents the exact same crash class this recreates otherwise:
+		# left pending, they'd survive into the ENCLOSING statement's single
+		# unconditional end-of-statement flush (this method builds raw IR,
+		# never routes a thunk's own statements through _lower_stmt, so nothing
+		# else ever flushes them) and get decref'd there even for whichever
+		# branch never ran at runtime - reading tag/payload data off an
+		# uninitialized C local (confirmed via a real crash: multi_leaf-style
+		# two-leaf error dispatch, MSVC access violation)
+		self._flush_branch_temps( true_temps_start )
+		true_captured = self._instructions
+		true_end = dict( self._cfg.bindings )
+		true_end_results = self._cfg.unchecked_results()
+		true_end_narrowed = self._cfg.narrowed_snapshot()
+		true_end_live = self._cfg.live_snapshot()
+
+		self._cfg.restore( entry_snapshot )
+		self._instructions = []
+		self._cfg.enter_branch( entry_snapshot.stack_depth )
+		false_temps_start = len( self._pending_temps )
+		try:
+			false_terminates = false_thunk()
+		finally:
+			self._cfg.exit_branch()
+		self._flush_branch_temps( false_temps_start )
+		false_captured = self._instructions
+		false_end = dict( self._cfg.bindings )
+		false_end_results = self._cfg.unchecked_results()
+		false_end_narrowed = self._cfg.narrowed_snapshot()
+		false_end_live = self._cfg.live_snapshot()
+
+		self._cfg.restore( entry_snapshot )
+		self._instructions = outer_instructions
+		try:
+			true_extra, false_extra, removed = self._cfg.merge_if(
+				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
+				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
+				true_terminates = true_terminates, false_terminates = false_terminates,
+				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
+				true_end_live = true_end_live, false_end_live = false_end_live,
+			)
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+
+		for instr in true_captured:
+			self._emit_captured( instr )
+		for instr in true_extra:
+			self._emit( instr )
+		end_label = self._new_label( 'branch_end' )
+		self._emit( ir.Jump( target = end_label ))
+		self._emit( ir.Label( name = else_label ))
+		for instr in false_captured:
+			self._emit_captured( instr )
+		for instr in false_extra:
+			self._emit( instr )
+		self._emit( ir.Label( name = end_label ))
+
 	def _lower_for_over_iterator( self, node: ast.For, obj: ir.Operand, next_fn: Function ) -> None:
 		''' PLAN_GENERATORS.md's StopIteration reversal - `for x in <expr
 		with a __next__() returning Result[T,E]>:` (E always including
@@ -5470,22 +5592,22 @@ class FunctionLowering:
 		the in-generator-body mirror of this method - see its own docstring
 		for the full reasoning, confirmed directly with the user): if E is
 		JUST StopIteration, x binds to plain T. If E has any OTHER error,
-		x should bind to Result[T,E'] (E' = E minus StopIteration) - NOT
-		YET IMPLEMENTED here (a discovery.fail() below instead): unlike the
-		in-generator-body desugaring (which builds fresh AST processed by
-		a later type-checking/desugaring pass with its own narrowing
-		machinery), this method lowers directly to IR, where constructing
-		a NARROWER Result[T,E'] value from a payload read out of the WIDER
-		Result[T,E] requires either a real N-way tag dispatch per E' leaf
-		(cfg.py's narrow() only yields a concrete single type when exactly
-		one candidate remains) or reusing _stmt_If's own branch-merge
-		machinery by hand - real, substantial new code with no existing
-		caller to verify it against (every for-loop-over-a-generator this
-		codebase actually has - lib/re.py's finditer included - is
-		StopIteration-only). Deferred rather than risking a strong claim on
-		under-tested CFG-merge code, matching the "known v1 limitation,
-		clear error not silent wrongness" posture this codebase uses
-		elsewhere (e.g. finditer's own module-level-only restriction).
+		x binds to Result[T,E'] (E' = E minus StopIteration) - the caller
+		handles the real error explicitly inside the loop body (match/
+		.is_err()/.or_return()/.unwrap()), no auto-propagation. Unlike the
+		in-generator-body desugaring (which builds fresh AST processed by a
+		LATER type-checking/desugaring pass with its own narrowing
+		machinery), this method lowers directly to IR - constructing a
+		NARROWER Result[T,E'] value from a payload read out of the WIDER
+		Result[T,E] needs a genuine N-way tag dispatch per E' leaf (cfg.py's
+		narrow() only yields a concrete single type when exactly one
+		candidate remains - Result.Err(e)'s own generic T/E inference
+		disagrees between the assignment target's declared E' and e's own
+		un-narrowed E otherwise, confirmed via a real repro identical to
+		type_resolver.py's own _desugar_iterator_for hitting the same
+		trap), built here via _lower_binary_branch - a hand-rolled
+		_stmt_If-style branch-then-merge helper for exactly this situation
+		(a condition + branch bodies with no real ast.If to lower).
 
 		The payload extraction reuses cfg.py's REAL narrowing mechanism
 		(narrow()/narrowed_member(), the same machinery a `match x: case
@@ -5518,13 +5640,13 @@ class FunctionLowering:
 			)
 		elem_type, full_error_type = shape
 		remaining_leaves = [ leaf for leaf in self.lowering._type_resolver._atomic_leaves( full_error_type ) if leaf is not stop_iteration_cls ]
-		if remaining_leaves:
-			self.lowering.discovery.fail(
-				f'for loop over a generator whose error type has more than just StopIteration '
-				f'({full_error_type.qualname}) is not supported yet outside a generator body - consume it via '
-				f'.__next__() and match directly instead: {ast.unparse(node)}',
-				node,
-			)
+		remaining_error_type: Type|None
+		if not remaining_leaves:
+			remaining_error_type = None
+		elif len( remaining_leaves ) == 1:
+			remaining_error_type = remaining_leaves[0]
+		else:
+			remaining_error_type = self.lowering.discovery._get_or_create_union( remaining_leaves )
 		self.lowering.schedule( result_type )
 		# result_type is routinely a Result[T,E] SPECIALIZATION, not a bare
 		# TaggedUnion - _tagged_union_shape gives back the abstract base's
@@ -5541,37 +5663,83 @@ class FunctionLowering:
 		ok_member = next( a for a in result_members if a.stem == 'Ok' )
 		concrete_result_union = self.lowering.monomorphize_class( result_type ) if isinstance( result_type, Specialization ) else result_type
 		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( concrete_result_union )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 
 		unique = self._label_id
 		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
 		self._emit( ir.Assign( dest = obj_var, src = obj ))
 		next_var = self._declare_hidden_local( f'__for_next_{unique}', result_type, node )
 
+		if remaining_error_type is not None:
+			# the loop target's own type is now Result[elem_type,
+			# remaining_error_type], not bare elem_type - pre-declared
+			# EXPLICITLY (rather than left to _stmt_Assign's own "first
+			# assignment infers the type from the RHS" path, which the
+			# bare-T case below relies on) because NEITHER Result.Ok(v)
+			# nor Result.Err(e) can infer their own OTHER type parameter
+			# from their single argument alone (Ok's own call never
+			# mentions E at all; Err's never mentions T) - needs an
+			# expected_type to resolve against, which _stmt_Assign only
+			# supplies for an ALREADY-declared target (existing.type) -
+			# confirmed via a real repro otherwise ("type parameter E is
+			# inferred as both remaining_error_type and full_error_type").
+			result_cls = self.lowering.discovery.find_name( 'Result', node )
+			target_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ elem_type, remaining_error_type ] )
+			self._declare_hidden_local( node.target.id, target_type, node )
+
 		start_label = self._new_label( 'for_start' )
 		continue_label = self._new_label( 'for_continue' )
 		end_label = self._new_label( 'for_end' )
 
 		self._emit( ir.Label( name = start_label ))
+		# snapshot at the VERY TOP of the loop, before next_var's own
+		# per-iteration rebind AND before the loop target's own binding -
+		# same reasoning _lower_for_over_indexable's identical comment gives
+		# (both bindings are fresh every iteration, not confined-and-torn-
+		# down across it) - taken here, before ANY of that, so loop_back_
+		# edge()'s later reconciliation sees next_var (like the target) as
+		# absent from entry/present at the back edge and decrefs its stale
+		# value right before jumping back to start_label. A raw ir.Assign
+		# for next_var (the original shape here) would never decref what it
+		# held from the PRIOR iteration before overwriting it - leaking one
+		# reference per iteration for any RC-typed elem_type (confirmed via
+		# a real multi-iteration compiler.refcount() repro). Tried gating
+		# next_var's own decref through a plain cfg.assign() call instead of
+		# loop_snapshot placement first - doesn't work: cfg.assign() only
+		# emits a decref-of-the-old-value when a binding ALREADY exists in
+		# self.bindings, but next_var's assignment here is lowered exactly
+		# ONCE at compile time (this call happens on every RUNTIME
+		# iteration via the goto back-edge, but cfg only ever sees it as the
+		# textually-first assignment) - loop_back_edge() is the mechanism
+		# actually built for "this binding's value is torn down and
+		# replaced every iteration", not a second compile-time assign() call
+		loop_snapshot = self._cfg.snapshot()
 		next_dest = self._new_temp( result_type )
 		self._emit( ir.Call( dest = next_dest, target = next_fn, receiver = obj_var, args = [], kwargs = {} ))
+		# track_result=False: next_var's own Result-ness is scaffolding
+		# inspected via the raw .tag comparison below, not is_ok()/is_err()/
+		# match - same reasoning as the match-subject temp's own call site
+		for instr in self._cfg.assign( next_var, next_dest, is_alias = False, track_result = False ):
+			self._emit( instr )
 		self._emit( ir.Assign( dest = next_var, src = next_dest ))
 
 		tag_expr = ast.Attribute( value = self.lowering._synth_name( next_var.stem, node ), attr = tag_attr.stem, ctx = ast.Load() )
 		ast.copy_location( tag_expr, node )
 		is_err_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ err_member.stem ] ) ] )
 		ast.copy_location( is_err_test, node )
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		is_err_cond = self._lower_expr( is_err_test, bool_cls )
-		self._emit( ir.JumpIfTrue( cond = is_err_cond, target = end_label ))
 
-		# snapshot BEFORE the loop target's own binding - same reasoning
-		# _lower_for_over_indexable's identical comment gives (the binding
-		# happens fresh every iteration, not confined-and-torn-down)
-		loop_snapshot = self._cfg.snapshot()
-		self._cfg.narrow( next_var.stem, ok_member )
-		bind = ast.Assign( targets = [ node.target ], value = self.lowering._synth_name( next_var.stem, node ))
-		ast.copy_location( bind, node )
-		self._stmt_Assign( bind )
+		if remaining_error_type is None:
+			self._emit( ir.JumpIfTrue( cond = is_err_cond, target = end_label ))
+			self._cfg.narrow( next_var.stem, ok_member )
+			bind = ast.Assign( targets = [ node.target ], value = self.lowering._synth_name( next_var.stem, node ))
+			ast.copy_location( bind, node )
+			self._stmt_Assign( bind )
+		else:
+			self._lower_for_over_iterator_fallible_bind(
+				node, next_var, err_member, ok_member, is_err_cond, elem_type, full_error_type,
+				remaining_leaves, remaining_error_type, stop_iteration_cls, end_label, unique,
+			)
 
 		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:
@@ -5589,6 +5757,149 @@ class FunctionLowering:
 			self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
+
+	def _lower_for_over_iterator_fallible_bind(
+		self, node: ast.For, next_var: Variable, err_member: Variable, ok_member: Variable, is_err_cond: ir.Operand,
+		elem_type: Type, full_error_type: Type, remaining_leaves: list[Type], remaining_error_type: Type,
+		stop_iteration_cls: Type, end_label: str, unique: int,
+	) -> None:
+		''' _lower_for_over_iterator's own Result[T,E'] loop-target binding
+		(E' = the generator's declared error type minus StopIteration) -
+		split out into its own method purely for readability, not reused
+		elsewhere. node.target's own type (Result[elem_type,remaining_
+		error_type]) is already pre-declared by the caller before this
+		runs (see its own comment on why - neither Result.Ok(v) nor
+		Result.Err(e) can infer their own OTHER type parameter alone).
+
+		Three-way outcome (Ok / Err-StopIteration / Err-real-error), but
+		StopIteration is a pure early exit (jumps straight to end_label,
+		contributing nothing to the loop body's own entry state) - so this
+		is built as ONE binary branch (Ok vs Err) via _lower_binary_branch,
+		with the Err side recursing into its OWN binary branch (StopIteration-
+		exit vs real-error-bind), and the real-error side recursing into a
+		right-nested CHAIN of one more binary branch PER remaining leaf
+		(dispatch, below) when there's more than one - each arm narrow()s
+		the extracted error to that ONE concrete leaf (cfg.py's narrow()
+		only yields a concrete type when exactly one candidate remains),
+		needed for Result.Err(e)'s own generic inference to resolve E
+		correctly (matches type_resolver.py's own _desugar_iterator_for,
+		which hit the identical trap with a single wildcard arm instead of
+		one explicit arm per leaf - see its own comment). '''
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		if full_error_type.resolve is not None:
+			full_error_type.resolve()
+		for attr in full_error_type.attributes:
+			if attr.resolve is not None:
+				attr.resolve()
+		e_tag_attr, _e_data_attr, _e_payload_cls, e_tags = self.lowering._union_storage.get( full_error_type )
+		# identity-keyed, not by value - Type dataclasses aren't all
+		# hashable (e.g. RCClass), and every leaf here is interned anyway
+		# (the same _atomic_leaves-derived Type object backs both this
+		# union's own member and remaining_leaves/stop_iteration_cls)
+		e_members = { id( m.type ): m for m in full_error_type.attributes }
+
+		def rewrap_bind( ctor_attr: str, bind_name: str, payload_type: Type ) -> None:
+			rewrap = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = ctor_attr, ctx = ast.Load() ),
+				args = [ ast.Name( id = bind_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			ast.copy_location( rewrap, node ); ast.copy_location( rewrap.func, node ); ast.copy_location( rewrap.func.value, node )
+			bind = ast.Assign( targets = [ node.target ], value = rewrap )
+			ast.copy_location( bind, node )
+			self._stmt_Assign( bind )
+			if payload_type.is_rc():
+				# bind_name's own extraction (above) is an aliasing-read
+				# incref, and Result.Ok(...)/Result.Err(...) increfs its own
+				# argument AGAIN when wrapping it - bind_name's own
+				# extracted reference is never otherwise consumed (node.
+				# target holds the REWRAPPED value's own, independent
+				# reference), so without this it's a real per-iteration
+				# leak - confirmed via a real repro, matches type_resolver.
+				# py's _desugar_iterator_for's identical situation (its own
+				# comment has the full reasoning)
+				decref_call = ast.Expr( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					args = [ ast.Name( id = bind_name, ctx = ast.Load() ) ], keywords = [],
+				))
+				ast.copy_location( decref_call, node ); ast.copy_location( decref_call.value, node )
+				ast.copy_location( decref_call.value.func, node ); ast.copy_location( decref_call.value.func.value, node )
+				self._lower_stmt( decref_call )
+
+		def ok_thunk() -> bool:
+			self._cfg.narrow( next_var.stem, ok_member )
+			ok_bind_name = f'__for_ok_{unique}'
+			self._declare_hidden_local( ok_bind_name, elem_type, node )
+			extract = ast.Assign( targets = [ ast.Name( id = ok_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( next_var.stem, node ))
+			ast.copy_location( extract, node )
+			self._stmt_Assign( extract )
+			rewrap_bind( 'Ok', ok_bind_name, elem_type )
+			return False
+
+		def err_thunk() -> bool:
+			self._cfg.narrow( next_var.stem, err_member )
+			err_bind_name = f'__for_err_{unique}'
+			self._declare_hidden_local( err_bind_name, full_error_type, node )
+			extract = ast.Assign( targets = [ ast.Name( id = err_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( next_var.stem, node ))
+			ast.copy_location( extract, node )
+			self._stmt_Assign( extract )
+
+			def leaf_test_cond( leaf_type: Type ) -> ir.Operand:
+				leaf_member = e_members[ id( leaf_type ) ]
+				tag_expr = ast.Attribute( value = self.lowering._synth_name( err_bind_name, node ), attr = e_tag_attr.stem, ctx = ast.Load() )
+				ast.copy_location( tag_expr, node )
+				test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = e_tags[ leaf_member.stem ] ) ] )
+				ast.copy_location( test, node )
+				return self._lower_expr( test, bool_cls )
+
+			def leaf_bind_thunk( leaf_type: Type ) -> bool:
+				# narrow()'d reads of err_bind_name aren't cached - EVERY
+				# ast.Name(id=err_bind_name) read after this narrow() re-
+				# extracts through the payload independently (a fresh
+				# aliasing-read incref each time, same mechanism as any
+				# other narrowed read), unlike an ordinary plain-variable
+				# read which always refers to the SAME already-extracted
+				# value. rewrap_bind reads bind_name TWICE (the rewrap's
+				# own argument, then the decref) - reading err_bind_name
+				# itself directly for both would incref it twice while
+				# only ever decref-ing one of those extractions, leaking
+				# the other - confirmed via a real repro. Extract ONCE
+				# into a fresh, real (non-narrowed) local instead, matching
+				# ok_thunk's own identical pattern - both of rewrap_bind's
+				# own reads then correctly refer to the SAME extraction.
+				leaf_bind_name = f'__for_err_{leaf_type.stem}_{unique}'
+				self._declare_hidden_local( leaf_bind_name, leaf_type, node )
+				self._cfg.narrow( err_bind_name, e_members[ id( leaf_type ) ] )
+				leaf_extract = ast.Assign( targets = [ ast.Name( id = leaf_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( err_bind_name, node ))
+				ast.copy_location( leaf_extract, node )
+				self._stmt_Assign( leaf_extract )
+				rewrap_bind( 'Err', leaf_bind_name, leaf_type )
+				return False
+
+			def dispatch_real_error( leaves: list[Type] ) -> bool:
+				if len( leaves ) == 1:
+					return leaf_bind_thunk( leaves[0] )
+				leaf = leaves[0]
+				cond = leaf_test_cond( leaf )
+				self._lower_binary_branch(
+					cond, node,
+					lambda: leaf_bind_thunk( leaf ),
+					lambda: dispatch_real_error( leaves[1:] ),
+				)
+				return False
+
+			is_stop_iteration_cond = leaf_test_cond( stop_iteration_cls )
+
+			def stop_iteration_thunk() -> bool:
+				self._emit( ir.Jump( target = end_label ))
+				return True
+
+			def real_error_thunk() -> bool:
+				return dispatch_real_error( remaining_leaves )
+
+			self._lower_binary_branch( is_stop_iteration_cond, node, stop_iteration_thunk, real_error_thunk )
+			return False
+
+		self._lower_binary_branch( is_err_cond, node, err_thunk, ok_thunk )
 
 	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
 		''' true if `stmt` never falls through to the statement after it -
@@ -5747,7 +6058,7 @@ class FunctionLowering:
 		# deleting the name out from under a later reference entirely.
 
 		for instr in true_captured:
-			self._emit( instr )
+			self._emit_captured( instr )
 		for instr in true_extra:
 			self._emit( instr )
 		if node.orelse:
@@ -5755,7 +6066,7 @@ class FunctionLowering:
 			self._emit( ir.Jump( target = end_label ))
 			self._emit( ir.Label( name = else_label ))
 			for instr in false_captured:
-				self._emit( instr )
+				self._emit_captured( instr )
 			for instr in false_extra:
 				self._emit( instr )
 			self._emit( ir.Label( name = end_label ))
