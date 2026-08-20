@@ -899,29 +899,49 @@ def c_type( t: Type|None ) -> str:
 def _is_noreturn( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem == 'NoReturn'
 
-def _callable_ptr_type( t: Type|None ) -> CallableType|None:
-	''' t's own CallableType if t is Ptr[Callable[...]] (see
+def _callable_ptr_type( t: Type|None ) -> tuple[CallableType,int]|None:
+	''' (t's own CallableType, indirection depth) if t is N>=1 levels of
+	Ptr[Ptr[...[Callable[...]]...]] wrapping a bare CallableType (see
 	PLAN_CALLABLE.md) - the ptr-vs-bare distinction and the interning both
 	live in discovery.py/type_resolver.py already (see TypeResolver.
 	_callable_type_of); this is emitter_c.py's own copy of the same
 	structural check since this module works on Type objects directly,
-	with no TypeResolver instance around to call. '''
-	if isinstance( t, Specialization ) and isinstance( t.base, Scalar ) and t.base.stem == 'Ptr':
-		inner = t.args[0]
-		if isinstance( inner, CallableType ):
-			return inner
+	with no TypeResolver instance around to call.
+
+	depth is almost always 1 (an ordinary Ptr[Callable[...]] parameter/
+	local/field/return/global), but can be more: Result[Ptr[Callable[...]],
+	E]'s own union-payload storage indirects certain leaf types through an
+	EXTRA pointer (UnionStorage's own representation choice), producing
+	Ptr[Ptr[Callable[...]]] - real and reachable via any Result/Optional
+	whose leaf is itself Ptr[Callable[...]] (e.g. a plain
+	list[Ptr[Callable[...]]].__getitem__'s own Result[_,IndexError] -
+	confirmed via a real NotImplementedError crash, not just reasoning).
+	C's function-pointer declarator generalizes to N indirection levels by
+	adding N stars INSIDE the parens (RetType (**name)(Params) for N=2,
+	etc) - structurally different from an ordinary object pointer chain
+	(T**), which is why every caller below needs the depth, not just a
+	yes/no answer. '''
+	depth = 0
+	cur = t
+	while isinstance( cur, Specialization ) and isinstance( cur.base, Scalar ) and cur.base.stem in ( 'Ptr', 'ConstPtr' ):
+		depth += 1
+		cur = cur.args[0]
+	if depth > 0 and isinstance( cur, CallableType ):
+		return cur, depth
 	return None
 
-def _fn_ptr_cast_type( ret: str, params: list[str] ) -> str:
-	''' the C function-pointer TYPE spelling itself (RetType (*)(ParamTypes),
-	no name) - shared by emit_interface_vtable_instance (casting a concrete
-	implementation's address into a shared vtable slot type) and
+def _fn_ptr_cast_type( ret: str, params: list[str], *, stars: int = 1 ) -> str:
+	''' the C function-pointer TYPE spelling itself (RetType (*)(ParamTypes)
+	for stars=1, RetType (**)(ParamTypes) for stars=2, ...; no name) -
+	shared by emit_interface_vtable_instance (casting a concrete
+	implementation's address into a shared vtable slot type - always
+	stars=1, a vtable slot is never itself indirected) and
 	_emit_operand's own FunctionRef branch (spelling a bare function
 	reference's cast expression), from whichever (ret, params) tuple the
 	caller already has (_vtable_slot_c_type's own self-prepended shape, or
 	_function_pointer_c_type's plain one below). '''
 	params_str = ', '.join( params ) if params else 'void'
-	return f'{ret} (*)( {params_str} )'
+	return f'{ret} ({"*" * stars})( {params_str} )'
 
 def _function_pointer_c_type( fn_type: CallableType ) -> tuple[str,list[str]]:
 	''' (return type spelling, param type spellings) for fn_type's own
@@ -944,13 +964,14 @@ def _declarator( t: Type|None, name: str, *, volatile: bool = False ) -> str:
 	(ParamTypes)), so plain string concatenation of c_type(t) and name can't
 	express it. `volatile` is for Volatile[T] locals (_stmt_AnnAssign) only -
 	never set for a function-pointer declarator or a field. '''
-	fn_type = _callable_ptr_type( t )
+	callable_ptr = _callable_ptr_type( t )
 	prefix = 'volatile ' if volatile else ''
-	if fn_type is None:
+	if callable_ptr is None:
 		return f'{prefix}{c_type(t)} {name}'
+	fn_type, depth = callable_ptr
 	ret, params = _function_pointer_c_type( fn_type )
 	params_str = ', '.join( params ) if params else 'void'
-	return f'{prefix}{ret} (*{name})( {params_str} )'
+	return f'{prefix}{ret} ({"*" * depth}{name})( {params_str} )'
 
 def _value_spelling( t: Type ) -> str:
 	''' the C spelling of T's OWN VALUE representation - unlike c_type(),
@@ -1331,10 +1352,11 @@ def _emit_operand( op: ir.Operand ) -> str:
 		# builds to point a vtable slot at a concrete implementation
 		# (a plain pointer-to-pointer function-pointer cast, safe and free
 		# at runtime, no wrapper needed) - reused via _function_pointer_c_type
-		fn_type = _callable_ptr_type( op.type )
-		assert fn_type is not None, f'_emit_operand: FunctionRef with non-Ptr[Callable] type {op.type!r}'
+		callable_ptr = _callable_ptr_type( op.type )
+		assert callable_ptr is not None, f'_emit_operand: FunctionRef with non-Ptr[Callable] type {op.type!r}'
+		fn_type, depth = callable_ptr
 		ret, params = _function_pointer_c_type( fn_type )
-		return f'({_fn_ptr_cast_type(ret, params)}){mangle_function_qualname(op.fn)}'
+		return f'({_fn_ptr_cast_type(ret, params, stars = depth)}){mangle_function_qualname(op.fn)}'
 	if isinstance( op, Variable ):
 		# locals (parameters, stack locals) use bare stem; globals
 		# need the full mangled qualname (cross-TU visibility)
@@ -1497,10 +1519,11 @@ def _emit_const( c: ir.Const ) -> str:
 		# parens, so it's not an ordinary "prefix type" spelling) -
 		# needed for e.g. a null-function-pointer sentinel like SIG_DFL
 		# (`sig_dfl: Ptr[Callable[[i32],None]] = 0`)
-		fn_type = _callable_ptr_type( c.type )
-		if fn_type is not None:
+		callable_ptr = _callable_ptr_type( c.type )
+		if callable_ptr is not None:
+			fn_type, depth = callable_ptr
 			ret, params = _function_pointer_c_type( fn_type )
-			return f'({_fn_ptr_cast_type(ret, params)}){c.value}'
+			return f'({_fn_ptr_cast_type(ret, params, stars = depth)}){c.value}'
 		if isinstance( c.type, Specialization ):
 			base = c.type.base
 			if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
@@ -2052,10 +2075,11 @@ def _emit_cast( instr ) -> list[str]:
 	# cast-TO-a-function-pointer this emitter ever needed; every existing
 	# Ptr[Callable[...]] value came from ir.FunctionRef directly before,
 	# never through an explicit cast
-	fn_type = _callable_ptr_type( target_type )
-	if fn_type is not None:
+	callable_ptr = _callable_ptr_type( target_type )
+	if callable_ptr is not None:
+		fn_type, depth = callable_ptr
 		ret, params = _function_pointer_c_type( fn_type )
-		ctype = _fn_ptr_cast_type( ret, params )
+		ctype = _fn_ptr_cast_type( ret, params, stars = depth )
 	else:
 		ctype = c_type( target_type )
 	if mode == 'wrap':

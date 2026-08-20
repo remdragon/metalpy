@@ -171,3 +171,28 @@ that a genuinely non-callable call-result still fails with the ordinary
 IR-level coverage (including the generic-call/compiler-intrinsic
 regression tests that caught the Subscript bug), MSVC/clang/WSL-gcc all
 green, full test suite clean on all three.
+
+Status update: the "generic container storing Ptr[Callable[...]]" question
+above turned out to be a REAL, confirmed bug, not just unverified -
+list[Ptr[Callable[...]]] crashed emit_c() with the SAME NotImplementedError
+as every earlier bug in this file, one level deeper.
+list.__getitem__'s own Result[Ptr[Callable[...]],IndexError] return type
+indirects its Ok-leaf through an EXTRA pointer (UnionStorage's own payload
+representation - not something specific to list, any Result/Optional whose
+leaf is itself Ptr[Callable[...]] hits this), producing
+Ptr[Ptr[Callable[...]]] - a shape _callable_ptr_type only ever recognized
+at exactly ONE indirection level. Fixed by generalizing _callable_ptr_type
+to report the indirection DEPTH (not just yes/no) and threading that
+through every one of its 5 call sites' own star count - C's function-
+pointer declarator generalizes to N indirection levels via N stars INSIDE
+the parens (RetType (**name)(Params) for N=2), structurally different from
+an ordinary object pointer chain's trailing stars, which is why this
+couldn't just be "call c_type twice". Confirmed the fix produces exactly
+`int32_t (**v_Ok)( int32_t );` in the real generated C. Verified: real
+compile-and-run of list[Ptr[Callable[...]]] end to end (construct, append,
+Result-checked __getitem__, indirect call through the retrieved value),
+MSVC/clang/WSL-gcc all green, full test suite clean on all three.
+list[T]'s OWN storage array itself was never the problem in this specific
+bug (it's an ordinary Ptr[T]-typed field, always depth 1) - this was
+entirely inside the Result-payload union machinery, reachable through ANY
+Result/Optional wrapping a Ptr[Callable[...]] leaf, not just via list.

@@ -14622,7 +14622,8 @@ def main() -> i32:
 			# custom __getitem__ rather than a generic container specifically
 			# to isolate this call-site fix from whatever separate, unrelated
 			# gaps a generic container's OWN internals might still have
-			# storing a Ptr[Callable[...]] element (never investigated).
+			# storing a Ptr[Callable[...]] element - see the NEXT test for
+			# that other, separate gap (since found and fixed).
 			( 'subscript_result_used_directly_as_callee', '''
 @cstruct
 class Table:
@@ -14639,6 +14640,43 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 6
 	return diff
+''' ),
+			# regression test: a REAL generic container storing
+			# Ptr[Callable[...]] elements (list[Ptr[Callable[...]]], as
+			# opposed to the custom __getitem__ above) used to crash emit_c()
+			# with the SAME NotImplementedError as every earlier bug in this
+			# area, but ONE LEVEL DEEPER - list.__getitem__'s own
+			# Result[Ptr[Callable[...]],IndexError] return type indirects its
+			# Ok-leaf through an EXTRA pointer (UnionStorage's own payload
+			# representation), producing Ptr[Ptr[Callable[...]]] - a shape
+			# _callable_ptr_type only ever recognized at exactly one
+			# indirection level. Fixed by generalizing it to report the
+			# indirection DEPTH (not just yes/no), and threading that through
+			# every caller's own star count - C's function-pointer declarator
+			# generalizes to N levels via N stars INSIDE the parens
+			# (RetType (**name)(Params) for N=2), unlike an ordinary object
+			# pointer chain's trailing stars.
+			( 'generic_container_storing_callable_elements', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def add_two( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 2
+
+def main() -> i32:
+	arr: list[Ptr[Callable[[i32],i32]]] = list[Ptr[Callable[[i32],i32]]]()
+	arr.append( add_one ).unwrap( 'append' )
+	arr.append( add_two ).unwrap( 'append' )
+	f: Ptr[Callable[[i32],i32]] = arr.__getitem__( 0 ).unwrap( 'getitem' )
+	result0: i32 = f( 5 )
+	result1: i32 = arr.__getitem__( 1 ).unwrap( 'getitem' )( 5 )
+	with compiler.wrap_arithmetic:
+		diff0: i32 = result0 - 6
+		diff1: i32 = result1 - 7
+		total: i32 = diff0 + diff1
+	return total
 ''' ),
 		] )
 
