@@ -1,11 +1,15 @@
 # stdlib imports:
 import ast
 from dataclasses import dataclass, field
+from itertools import count
 from pathlib import Path
 from typing import Callable, Union
 
 # local imports:
 from errors import RedundantCompilationError
+
+# backs Variable.uid - see its own comment
+_variable_uid_counter = count()
 
 @dataclass( kw_only = True )
 class Name:
@@ -386,6 +390,36 @@ class Variable( Name ):
 	# PLAN_GLOBAL_INIT.md). String-quoted to avoid a mpy_types<->ir import
 	# cycle (ir.py doesn't need to know about Variable at all).
 	init_instructions: list['ir.Instruction']|None = None
+	# assigned once, at construction, from a process-wide counter - lets
+	# emitter_c.py give an independently-declared local its own C
+	# identifier (stem + '$' + uid) instead of colliding by source name
+	# alone, when it actually needs one (see needs_uid_suffix below).
+	# repr=False/compare=False: lowering_test.py compares IR instructions
+	# both by their exact string repr AND via assertEqual's own structural
+	# dataclass equality - a process-wide counter value has no business
+	# being part of either (order-dependent, not what those tests are
+	# checking; two separately-constructed-but-conceptually-equal Variable
+	# objects would otherwise never compare equal again).
+	uid: int = field( default_factory = lambda: next( _variable_uid_counter ), repr = False, compare = False )
+	# NOT set at construction - mutated in place by emitter_c.py the first
+	# time it sees this Variable declared/assigned, if-and-only-if this
+	# base C name is already occupied by an INCOMPATIBLE (different type
+	# or volatility) prior declaration in the same function (e.g. `del x;
+	# x: T2 = ...` redeclaring x with an incompatible type - see del_
+	# reuse_and_emitter_naming_bug). Deliberately NOT set just because a
+	# Variable is "a local" in the abstract: two independently-declared
+	# Variable objects sharing both a stem AND a compatible type (e.g. the
+	# same `x: u32 = ...` re-declared, once per arm, across a plain if/
+	# elif/else chain - a common, working pattern, see lib/builtins/
+	# __File.py's own `creation` local) are INTENDED to share one piece of
+	# C storage, exactly as they did before this field existed; suffixing
+	# them unconditionally would silently split that one shared C variable
+	# into several, only one of which the merged control flow actually
+	# initializes on any given path. repr=False/compare=False for the same
+	# reasons as uid above (also: this is emission-time-derived, mutated
+	# well after lowering.py hands the IR off, not part of the IR's own
+	# structural identity).
+	needs_uid_suffix: bool = field( default = False, repr = False, compare = False )
 
 @dataclass( kw_only = True )
 class Parameter( Variable ):

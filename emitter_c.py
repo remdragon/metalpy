@@ -603,10 +603,33 @@ _C_KEYWORDS: frozenset[str] = frozenset([
 	'_Static_assert', '_Thread_local',
 ])
 
-def _c_local_name( stem: str ) -> str:
-	''' return a C-safe local variable name. C keywords get a leading
-	underscore; everything else passes through unchanged. '''
-	return f'_{stem}' if stem in _C_KEYWORDS else stem
+def _c_base_name( var: Variable ) -> str:
+	''' the plain, un-disambiguated C spelling of var's own stem - C
+	keywords get a leading underscore, everything else passes through.
+	_c_local_name (below) is almost always what callers actually want;
+	this is exposed separately only for the emitter_c.py-local mismatch
+	bookkeeping in _emit_instruction, which needs the bare name to key
+	`declared_names` by BEFORE it knows whether var.needs_uid_suffix
+	should be set. '''
+	return f'_{var.stem}' if var.stem in _C_KEYWORDS else var.stem
+
+def _c_local_name( var: Variable ) -> str:
+	''' return this local's own C identifier. var.needs_uid_suffix (see
+	its own docstring - set by _emit_instruction below, the moment it
+	detects an actual type/volatility mismatch against whatever else is
+	already occupying this base name in the current function) appends
+	var.uid ('$' can't appear in a source identifier, same reasoning as
+	_temp_name) so two independently-declared, INCOMPATIBLE Variable
+	objects that happen to share a source stem (e.g. `del x; x:
+	DifferentType = ...` - see del_reuse_and_emitter_naming_bug) never
+	collide at the C level. Everything else - parameters, class/struct
+	attribute definitions, __return_value and other compiler-synthesized
+	slots, and two COMPATIBLY-typed Variable objects sharing a stem (e.g.
+	the same `x: u32 = ...` re-declared once per arm of a plain if/elif/
+	else chain - see needs_uid_suffix's own docstring) - keeps its bare
+	stem, exactly as it always did before this suffixing existed. '''
+	base = _c_base_name( var )
+	return f'{base}${var.uid}' if var.needs_uid_suffix else base
 
 def _temp_name( temp_id: int ) -> str:
 	''' the C name for a compiler-synthesized ir.Temp, e.g. for id=5, "$t5" -
@@ -1292,7 +1315,7 @@ def _function_prototype( function: Function ) -> str:
 	if _has_self( function ):
 		params.append( f'{_self_c_type(function.cls)} self' )
 	for p in ( function.parameters or [] ):
-		params.append( _declarator( p.type, _c_local_name( p.stem )))
+		params.append( _declarator( p.type, _c_local_name( p )))
 	params_str = ', '.join( params ) if params else 'void'
 	if _is_entry_point( function ):
 		# the real OS/CRT entry point always calls main with (argc, argv,
@@ -1358,9 +1381,9 @@ def _emit_operand( op: ir.Operand ) -> str:
 		ret, params = _function_pointer_c_type( fn_type )
 		return f'({_fn_ptr_cast_type(ret, params, stars = depth)}){mangle_function_qualname(op.fn)}'
 	if isinstance( op, Variable ):
-		# locals (parameters, stack locals) use bare stem; globals
+		# locals (parameters, stack locals) use _c_local_name; globals
 		# need the full mangled qualname (cross-TU visibility)
-		return _c_local_name( op.stem ) if not op.is_global else mangle_qualname( op.qualname )
+		return _c_local_name( op ) if not op.is_global else mangle_qualname( op.qualname )
 	raise NotImplementedError( f'_emit_operand: unsupported operand {op!r}' )
 
 # stems wider than plain C `int` - a bare, un-cast literal like `1` silently
@@ -2412,12 +2435,28 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# this module synthesizes one inline at each local's first assignment
 	# (see the ir.Assign branch below) - pre-seed with every parameter
 	# (already declared via the signature itself, must never be
-	# re-declared) so only genuine first-time locals trigger it
-	declared: set[str] = set()
+	# re-declared) so only genuine first-time locals trigger it.
+	# declared_names maps a base C name (pre-uid-suffix) to the (type,
+	# is_volatile) signature currently occupying it - _emit_instruction
+	# consults this on every local declaration/first-assignment to decide
+	# whether a NEW Variable object sharing that base name is compatible
+	# (a plain re-declaration across if/elif/else arms, e.g. lib/builtins/
+	# __File.py's own `creation` local - reuses the existing C storage, no
+	# suffix) or a genuine collision (`del x; x: T2 = ...` - see del_
+	# reuse_and_emitter_naming_bug - gets var.needs_uid_suffix = True and
+	# its own fresh declaration instead).
+	declared_names: dict[str, tuple[Type|None,bool]] = {}
 	if _has_self( function ):
-		declared.add( 'self' )
+		# 'self' is never itself an ir.Assign target in valid code, so this
+		# entry is normally never consulted - kept only as defensive
+		# belt-and-suspenders (a sentinel type that can never structurally
+		# equal a real Variable.type, so anything that DID somehow collide
+		# here gets disambiguated rather than silently aliasing self)
+		declared_names['self'] = ( None, False )
+	declared_objects: set[int] = set()
 	for p in ( function.parameters or [] ):
-		declared.add( _c_local_name( p.stem ))
+		declared_names[_c_base_name( p )] = ( p.type, False )
+		declared_objects.add( id( p ))
 	# __return_value (ir.OrJump's own return_slot - see Lowering.
 	# _return_value_var) is referenced two ways neither of which goes
 	# through the ordinary "declare on first Assign" mechanism below: a
@@ -2451,17 +2490,38 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# value) while NO Label with 'epilogue' in its name survives anywhere
 	# in fn.instructions - confirmed by a real repro (a plain "use of
 	# undeclared identifier '__return_value'" compile error) once the
-	# Label-omission fix shipped without this. `declared` then makes any
-	# actual ir.Assign to it (from the function's own `return <expr>`)
+	# Label-omission fix shipped without this. `declared_names` then makes
+	# any actual ir.Assign to it (from the function's own `return <expr>`)
 	# just an ordinary re-assignment, not a second declaration
-	needs_return_value = any(
-		( isinstance( instr, ir.OrJump ) and instr.return_slot is not None )
-		or ( isinstance( instr, ir.Return ) and isinstance( instr.value, Variable ) and instr.value.stem == '__return_value' )
-		or ( isinstance( instr, ir.Label ) and instr.name.startswith( '__epilogue_' ) ) # _new_label('epilogue') -> '__epilogue_N__' - NOT a bare 'epilogue' substring test: _new_label('inline_epilogue') -> '__inline_epilogue_N__' also contains 'epilogue' but is a totally unrelated @inline splice-scope merge label (build_inline_scope_ladder's own, never touches __return_value at all) - a real, confirmed false-positive-triggered -Wunused-variable on a genuinely never-needed __return_value once one of those coexists in the same function with nothing that actually needs the real one
-		for instr in fn.instructions
-	)
+	needs_return_value = False
+	return_value_var: Variable|None = None
+	for instr in fn.instructions:
+		if isinstance( instr, ir.OrJump ) and instr.return_slot is not None:
+			needs_return_value = True
+			return_value_var = instr.return_slot
+		elif isinstance( instr, ir.Return ) and isinstance( instr.value, Variable ) and instr.value.stem == '__return_value':
+			needs_return_value = True
+			return_value_var = instr.value
+		elif isinstance( instr, ir.Label ) and instr.name.startswith( '__epilogue_' ):
+			# _new_label('epilogue') -> '__epilogue_N__' - NOT a bare 'epilogue' substring test: _new_label('inline_epilogue') -> '__inline_epilogue_N__' also contains 'epilogue' but is a totally unrelated @inline splice-scope merge label (build_inline_scope_ladder's own, never touches __return_value at all) - a real, confirmed false-positive-triggered -Wunused-variable on a genuinely never-needed __return_value once one of those coexists in the same function with nothing that actually needs the real one
+			needs_return_value = True
 	if needs_return_value and not _returns_void_in_c( function.return_type ):
-		name = _c_local_name( '__return_value' )
+		# return_value_var is the ACTUAL Variable object every ir.Assign/
+		# ir.Return/ir.OrJump elsewhere in this same function references
+		# (self._return_value_var is a single object reused function-wide,
+		# never re-declared) - EXCEPT in the Label-only fallback case just
+		# above, where no direct reference was found in this scan at all.
+		# Pre-registering its id here (when we have it) is required, not
+		# just an optimization: without it, the FIRST ir.Assign to it in
+		# the main instruction loop below would see an unregistered
+		# object and try to declare it AGAIN, redefining the C variable
+		# this block is about to declare right here - confirmed via a
+		# real repro (clang: "redefinition of '__return_value'"). When
+		# genuinely absent (Label-only case), declared_names alone still
+		# keeps the name correctly reserved under this bare spelling.
+		if return_value_var is not None:
+			declared_objects.add( id( return_value_var ))
+		name = '__return_value'
 		# deliberately NOT zero-initialized (`= {0}`) despite a branch
 		# chain compiled from a match/if-elif over every variant of a
 		# union (or similarly exhaustive-at-the-metalpy-level shape) being
@@ -2484,9 +2544,9 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		# -Wno-sometimes-uninitialized/-Wno-uninitialized/wd4701 for the
 		# actual (diagnostic-suppression, zero behavior-risk) fix instead
 		lines.append( f'\t{_declarator( function.return_type, name )};' )
-		declared.add( name )
+		declared_names[name] = ( function.return_type, False )
 	for instr in fn.instructions:
-		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
+		lines.extend( _emit_instruction( instr, function = function, declared_names = declared_names, declared_objects = declared_objects ))
 	if not function.is_destructor:
 		# a parameter whose body never reads it (self included - e.g.
 		# UnsafeList._read_element, whose is_rc(T) branch only ever touches
@@ -2496,25 +2556,69 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		# function shape per instantiation/overload, and every call site
 		# already passes it uniformly. (void)param silences -Wunused-
 		# parameter without an attribute (MSVC doesn't support
-		# __attribute__ and doesn't warn on this by default anyway) -
-		# _c_local_name() itself never collides with a real local, so this
-		# text search is safe. Destructors are exempted: their only
+		# __attribute__ and doesn't warn on this by default anyway).
+		# `(?!\$)` matters now that a genuine local sharing a parameter's
+		# stem gets a '$uid' suffix (_c_local_name) - without it, a bare
+		# `\bname\b` search would count as "used" merely by matching the
+		# unsuffixed PREFIX of that unrelated local's own suffixed
+		# occurrence (e.g. parameter `x` against a later `del x; x: T2 =
+		# ...`-redeclared local emitted as `x$7` - see del_reuse_and_
+		# emitter_naming_bug). Destructors are exempted: their only
 		# "parameter" is __obj, never named self in the C signature itself
 		# (self is a real local, cast from __obj, just above)
 		body_text = '\n'.join( lines[1:] )
 		void_marks: list[str] = []
-		if _has_self( function ) and not re.search( r'\bself\b', body_text ):
+		if _has_self( function ) and not re.search( r'\bself\b(?!\$)', body_text ):
 			void_marks.append( 'self' )
 		for p in ( function.parameters or [] ):
-			name = _c_local_name( p.stem )
-			if not re.search( rf'\b{re.escape(name)}\b', body_text ):
+			name = _c_local_name( p )
+			if not re.search( rf'\b{re.escape(name)}\b(?!\$)', body_text ):
 				void_marks.append( name )
 		for name in reversed( void_marks ):
 			lines.insert( 1, f'\t(void){name};' )
 	lines.append( '}' )
 	return '\n'.join( lines )
 
-def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declared: set[str] ) -> list[str]:
+def _register_local_declaration( var: Variable, declared_names: dict[str,tuple[Type|None,bool]], declared_objects: set[int] ) -> bool:
+	''' called exactly once per Variable object - the first time
+	emitter_c.py sees IT SPECIFICALLY declared/first-assigned - and never
+	again for that same object (later ir.Assigns to it are recognized via
+	declared_objects, in _emit_instruction below, as ordinary re-
+	assignments instead of routing back through here). Decides, and
+	permanently records via var.needs_uid_suffix, whether var can share C
+	storage with whatever else already occupies its base name (a prior
+	Variable object of the same type/volatility - e.g. the same `x: u32 =
+	...` re-declared once per arm of a plain if/elif/else chain) or needs
+	its own disambiguated identifier (an INCOMPATIBLE prior occupant -
+	e.g. `del x; x: T2 = ...` - see del_reuse_and_emitter_naming_bug).
+	Deliberately does NOT overwrite declared_names[base] in the collision
+	case: the bare name stays associated with whichever Variable(s)
+	legitimately share it, so a LATER, type-compatible-with-the-ORIGINAL
+	redeclaration can still reuse the bare name even after an incompatible
+	one in between peeled off into its own suffix.
+
+	Returns whether the CALLER still needs to emit an actual C declaration
+	for var (True: first-ever sight of this base name, or an incompatible
+	collision that just got its own suffix - either way, no existing C
+	storage to reuse yet) or can just bare-assign into whatever already-
+	declared, compatible storage this base name already has (False - a
+	DIFFERENT Variable object than whichever one first declared it, but
+	same type/volatility, e.g. the if/elif-branch case above). '''
+	declared_objects.add( id( var ))
+	base = _c_base_name( var )
+	prior = declared_names.get( base )
+	if prior is None:
+		declared_names[base] = ( var.type, var.is_volatile )
+		return True
+	if prior == ( var.type, var.is_volatile ):
+		return False
+	var.needs_uid_suffix = True
+	return True
+
+def _emit_instruction(
+	instr: ir.Instruction, *, function: Function|None,
+	declared_names: dict[str,tuple[Type|None,bool]], declared_objects: set[int],
+) -> list[str]:
 	# FuncStart/FuncEnd carry no independent C text of their own - the
 	# surrounding prototype + braces (built from the LoweredFunction.function
 	# object, not these markers) already represent them; see emit_function
@@ -2562,17 +2666,40 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# (guaranteed by lowering.py to be a genuinely flat/unconditional
 		# point - never nested inside one of THIS module's own hand-emitted
 		# C `{ }` blocks)
-		name = _c_local_name( instr.variable.stem )
-		declared.add( name )
-		return [ f'\t{_declarator( instr.variable.type, name, volatile = instr.variable.is_volatile )};' ]
+		var = instr.variable
+		# return value ignored - unlike ir.Assign below, a bare declaration
+		# with no initializer always emits its own declaration line
+		# unconditionally, matching this instruction's own pre-existing
+		# semantics (it was never conditional on `declared` either, before
+		# this dict/suffix machinery existed at all)
+		_register_local_declaration( var, declared_names, declared_objects )
+		name = _c_local_name( var )
+		return [ f'\t{_declarator( var.type, name, volatile = var.is_volatile )};' ]
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
-			name = _c_local_name( instr.dest.stem )
-			if name not in declared:
-				declared.add( name )
-				return [ f'\t{_declarator( instr.dest.type, name, volatile = instr.dest.is_volatile )} = {src};' ] + _mark_used_if_none( instr.dest )
-			return [ f'\t{name} = {src};' ] + _mark_used_if_none( instr.dest )
+			var = instr.dest
+			if id( var ) not in declared_objects:
+				# first sight of THIS object - resolve/record its own
+				# bare-vs-suffixed name. A later Assign to this SAME object
+				# (an ordinary re-assignment) will instead take the branch
+				# below, keyed by identity, not by name/type - so it's
+				# never re-run through collision detection, even though a
+				# DIFFERENT, incompatible Variable object might occupy this
+				# base name again in between (see del_reuse_and_emitter_
+				# naming_bug/needs_uid_suffix's own docstring)
+				needs_decl = _register_local_declaration( var, declared_names, declared_objects )
+				name = _c_local_name( var )
+				if not needs_decl:
+					# a DIFFERENT, but type/volatility-COMPATIBLE Variable
+					# already declared this exact bare name (e.g. the same
+					# `x: u32 = ...` repeated once per arm of a plain if/
+					# elif/else chain - see lib/builtins/__File.py's own
+					# `creation` local) - reuse its existing C storage,
+					# never a second declaration
+					return [ f'\t{name} = {src};' ] + _mark_used_if_none( var )
+				return [ f'\t{_declarator( var.type, name, volatile = var.is_volatile )} = {src};' ] + _mark_used_if_none( var )
+			return [ f'\t{_c_local_name(var)} = {src};' ] + _mark_used_if_none( var )
 		# a global Variable is declared separately at file scope (Phase 7 -
 		# emit_global) - never re-declared here, only assigned
 		return [ f'\t{_emit_operand(instr.dest)} = {src};' ] + _mark_used_if_none( instr.dest )
@@ -2964,7 +3091,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{dest} = ({ctype}){{ {", ".join(field_init_strs)} }};' ]
 
 	if isinstance( instr, ir.OrReturn ):
-		return _emit_or_return( instr, function, declared )
+		return _emit_or_return( instr, function, declared_names, declared_objects )
 	if isinstance( instr, ir.OrJump ):
 		return _emit_or_jump( instr )
 	if isinstance( instr, ir.WidenResult ):
@@ -2990,7 +3117,10 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 
 	raise NotImplementedError( f'_emit_instruction: unsupported instruction {instr!r} (later-phase work)' )
 
-def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] ) -> list[str]:
+def _emit_or_return(
+	instr: ir.OrReturn, function: Function,
+	declared_names: dict[str,tuple[Type|None,bool]], declared_objects: set[int],
+) -> list[str]:
 	# OrReturn's own IR semantics ARE the branch (see ir.py's docstring:
 	# "Err -> return Result::Err(...); Ok -> dest = payload") - this one
 	# instruction expands to real conditional C here, not a pre-branched IR
@@ -3019,7 +3149,7 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 	# tag-gated GetAttr/Cmp/JumpIfFalse/Jump/Label sequences, defer replays)
 	epilogue_lines: list[str] = []
 	for sub in instr.epilogue:
-		epilogue_lines.extend( _emit_instruction( sub, function = function, declared = declared ))
+		epilogue_lines.extend( _emit_instruction( sub, function = function, declared_names = declared_names, declared_objects = declared_objects ))
 	if instr.inline_exit is not None:
 		# PLAN_INLINE.md early-return generalization - this OrReturn is
 		# .or_return()/checked-arithmetic's own inline-unwind path reached
@@ -3382,7 +3512,7 @@ def _vtable_slot_c_type( owner: RCClass|CStruct, slot: Function ) -> tuple[str,l
 	ret = 'void' if _returns_void_in_c( slot.return_type ) else c_type( slot.return_type )
 	params = [ f'{_self_c_type(owner)} self' ]
 	for p in ( slot.parameters or [] ):
-		params.append( _declarator( p.type, _c_local_name( p.stem )))
+		params.append( _declarator( p.type, _c_local_name( p )))
 	return ret, params
 
 def emit_interface_vtbl_struct( owner: CStruct ) -> str:
@@ -3872,9 +4002,10 @@ def _emit_global_init_fn( g: LoweredGlobal ) -> str|None:
 	# after the globals loop below) - see PLAN_GLOBAL_INIT.md.
 	init_name = _global_init_fn_name( g )
 	lines = [ f'static void {init_name}( void ) {{' ]
-	declared: set[str] = set()
+	declared_names: dict[str, tuple[Type|None,bool]] = {}
+	declared_objects: set[int] = set()
 	for instr in g.instructions:
-		lines.extend( _emit_instruction( instr, function = None, declared = declared ))
+		lines.extend( _emit_instruction( instr, function = None, declared_names = declared_names, declared_objects = declared_objects ))
 	lines.append( '}' )
 	return '\n'.join( lines )
 
