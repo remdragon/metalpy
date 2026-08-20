@@ -74,7 +74,7 @@ class Seekable:
 		...
 
 	def tell( self ) -> Result[i64, OSError]:
-		return self.seek( i64( 0 ), i32( 1 )) # SEEK_CUR == 1 on every supported target (fs.SEEK_CUR)
+		return self.seek( i64( 0 ), fs.SEEK_CUR )
 
 
 def read_exact[T: Reader]( src: T, buf: Ptr[u8], count: usize ) -> Result[None, OSError]:
