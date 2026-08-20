@@ -9904,6 +9904,38 @@ class DefaultValueModuleContextTests( unittest.TestCase ):
 			self.assertIn( 'a.py', discovery.errors.errors[0] )
 			self.assertNotIn( '__main__.py', discovery.errors.errors[0] )
 
+	def test_default_value_referencing_module_constant_with_two_overloads( self ) -> None:
+		''' a module-level constant referenced as a default value on a method
+		with 2+ overloads (plain same-name defs, no @overload needed) - a real
+		repro reported as a "name X is not defined" pointing at each
+		overload's own signature line, worked around in lib/re.py by
+		hardcoding every affected `max_steps: usize = 65536` default instead
+		of `= DEFAULT_MAX_STEPS` once search()/match()/etc grew str/bytes/
+		memoryview overloads. Not reproducible against current lowering.py -
+		this pins that down as a regression test rather than leaving the
+		shape unverified. '''
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '\n'.join([
+			'CONST: usize = 65536',
+			'',
+			'class Foo:',
+			'	def match( self, a: str, max_steps: usize = CONST ) -> usize:',
+			'		return max_steps',
+			'',
+			'	def match( self, a: bytes, max_steps: usize = CONST ) -> usize:',
+			'		return max_steps',
+			'',
+			'def main() -> i32:',
+			'	f: Foo = Foo()',
+			'	x: usize = f.match( "hi" )', # x omitted - forces the default to be lowered
+			'	if x != 65536:',
+			'		return 1',
+			'	return 0',
+		]), filename = Path( '__main__.py' ))
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
 
 class DefaultValueConstructionTests( unittest.TestCase ):
 	''' a construction call embedded in a parameter's own default value
