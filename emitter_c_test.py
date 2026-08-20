@@ -1017,6 +1017,166 @@ def main() -> i32:
 ''' ),
 		] )
 
+class RCClassSubclassingNoOwnInitTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for a confirmed, silent-wrong-program bug: a
+	subclass declaring NO __init__ of its own at all (`class Bar(Real):
+	pass`) - unlike RCClassSubclassingPhase2Tests above, which is entirely
+	about a subclass that DOES declare its own __init__ and must chain to
+	its base via super().__init__(...). Two independent root causes, both
+	in lowering.py's _try_lower_construct_call / _lower_allocate_fields:
+
+	1. `target_cls.get_local_or_raise('__init__')` was a FLAT, own-class-
+	   only lookup - finding nothing for Bar, it fell through to the
+	   no-__init__ field=value construction sugar instead of inheriting
+	   and calling Real.__init__ the way Python's own "no override ->
+	   inherit" semantics require. Fixed by making this a chain lookup
+	   (mpy_types.py's InheritanceChainMixin.chain_lookup) instead.
+
+	2. Even accounting for (1), the fallback sugar path itself
+	   (_lower_allocate_fields) computed target_cls.flattened_attributes()
+	   without first resolving the ancestor chain - flattened_attributes()
+	   documents that it resolves nothing it returns, so an unresolved
+	   ancestor (Real's own class body never having run yet) silently
+	   contributed ZERO fields rather than erroring, dropping the
+	   inherited field from the allocation entirely. Confirmed via a real
+	   compile+link+run repro: `class Bar(Real): pass; b = Bar(); return
+	   b.x` returned MSVC's 0xCDCDCDCD uninitialized-heap poison pattern
+	   (3452816845) instead of Real's own `self.x = 5` - discovery.errors
+	   was empty throughout; nothing ever caught this at compile time.
+	   Fixed via InheritanceChainMixin.resolve_chain(), called before
+	   flattened_attributes() in _lower_allocate_fields. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact repro this class exists for: a subclass with NO
+			# body other than `pass` must still call the base's own
+			# __init__ on construction, not silently allocate zero fields
+			( 'bare_subclass_inherits_base_init', '''
+class Real:
+	x: i32
+	def __init__( self ) -> None:
+		self.x = 5
+
+class Bar( Real ):
+	pass
+
+def main() -> i32:
+	b: Bar = Bar()
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# same shape, but the base's __init__ takes real arguments -
+			# confirms the inherited __init__'s own parameter list is used
+			# for argument matching at the SUBCLASS's construction site
+			( 'bare_subclass_inherits_base_init_with_args', '''
+class Real:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Bar( Real ):
+	pass
+
+def main() -> i32:
+	b: Bar = Bar( x = 42 )
+	if b.x != 42:
+		return 1
+	return 0
+''' ),
+			# multi-level: neither Mid nor Leaf declares its own __init__ -
+			# chain_lookup must walk PAST Mid to find Root's __init__, not
+			# just one level up
+			( 'multi_level_chain_finds_ancestor_init', '''
+class Root:
+	a: i32
+	def __init__( self, a: i32 ) -> None:
+		self.a = a
+
+class Mid( Root ):
+	pass
+
+class Leaf( Mid ):
+	pass
+
+def main() -> i32:
+	leaf: Leaf = Leaf( a = 7 )
+	if leaf.a != 7:
+		return 1
+	return 0
+''' ),
+			# the OTHER root cause on its own: no __init__ ANYWHERE in the
+			# chain (genuine field=value construction sugar), but the base
+			# still contributes a real field that must survive - exercises
+			# _lower_allocate_fields's own ancestor-chain resolution
+			# directly, independent of the __init__-lookup fix above
+			( 'no_init_anywhere_field_sugar_includes_inherited_field', '''
+class Real:
+	x: i32
+
+class Bar( Real ):
+	y: i32
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b: Bar = Bar( x = 5, y = 10 )
+		if b.x != 5:
+			return 1
+		if b.y != 10:
+			return 2
+		return 0
+''' ),
+			# a subclass's own __init__ still wins over an inherited one
+			# (chain_lookup checks self before base) - construction must
+			# NOT run both; unaffected by the chain-lookup change
+			( 'own_init_still_takes_priority_over_inherited', '''
+class Real:
+	x: i32
+	def __init__( self ) -> None:
+		self.x = 5
+
+class Bar( Real ):
+	def __init__( self ) -> None:
+		super().__init__()
+		self.x = 99
+
+def main() -> i32:
+	b: Bar = Bar()
+	if b.x != 99:
+		return 1
+	return 0
+''' ),
+			# RC-lifetime stress check under repetition for the inherited-
+			# __init__ path specifically (same rigor as
+			# RCClassSubclassingPhase2Tests.test_rc_lifetime_repeated_
+			# chained_construction_no_leak) - a leak or double-free here
+			# would only show up under repeated construct/teardown, not a
+			# single iteration
+			( 'rc_lifetime_repeated_inherited_init_no_leak', '''
+class Real:
+	s: str
+	def __init__( self, s: str ) -> None:
+		self.s = s
+
+class Bar( Real ):
+	pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			b: Bar = Bar( s = 'hello'.upper() )
+			if b.s.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
+
 class FallibleInitConstructionRCLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression coverage for a real, confirmed double-free in fallible
 	`__init__()` construction (SYNTAX.md's "Fallible __init__() Construction"

@@ -4816,9 +4816,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# discipline as node.resolved_callee above
 			target = self._try_resolve_callable_namespace( node.func )
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
-				if target.resolve is not None:
-					target.resolve()
-				init = target.get_local( '__init__' )
+				if isinstance( target, ( RCClass, CStruct )):
+					# a CHAIN lookup, not target.get_local('__init__') alone -
+					# a subclass with no own __init__ construction-lowers
+					# through its nearest ANCESTOR's __init__ instead (see
+					# lowering.py's own _try_lower_construct_call, which
+					# looks up the exact same way and depends on this pass
+					# having already resolved+scheduled whichever __init__
+					# it's about to find, own or inherited). chain_lookup's
+					# own walk resolves target AND every ancestor as a side
+					# effect, replacing the plain target.resolve() call the
+					# other branch below still needs for itself
+					init = target.chain_lookup( '__init__' )
+				else:
+					if target.resolve is not None:
+						target.resolve()
+					init = target.get_local( '__init__' )
 				if isinstance( init, Function ) and not init.broken:
 					self.resolver._resolve_callable( init )
 				construction = self._try_resolve_generic_construction( node, target, init )

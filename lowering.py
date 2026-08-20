@@ -10761,6 +10761,15 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'**kwargs not supported for {target_cls.qualname}{label}: {ast.unparse(node)}', node )
 
 		self.lowering._ensure_resolved( target_cls )
+		if isinstance( target_cls, ( RCClass, CStruct )):
+			# flattened_attributes() (below) resolves NOTHING it returns
+			# (see its own docstring) - an ancestor whose own body hasn't
+			# been resolved yet contributes ZERO fields to the flattened
+			# list instead of erroring, so a base's own fields silently
+			# vanish from a subclass's no-__init__ construction sugar
+			# unless every ancestor is resolved first. _ensure_resolved
+			# above only resolves target_cls ITSELF, not its base chain.
+			target_cls.resolve_chain()
 		# .attributes alone only ever holds a class's OWN declared fields
 		# (discovery.py never merges a base's own fields into a subclass) -
 		# flattened_attributes() walks the WHOLE single-inheritance chain
@@ -11237,7 +11246,23 @@ class FunctionLowering:
 			self_type = concrete_cls
 			args, kwargs = self._lower_call_args( init, node )
 		else:
-			init = target_cls.get_local_or_raise( '__init__' )
+			# a CHAIN lookup (self, then base, then base.base, ...), not a
+			# flat own-class-only one: `class Bar(Real): pass` with no own
+			# __init__ must find and call Real.__init__ on construction,
+			# exactly like Python's own "no override -> inherit" MRO
+			# semantics, rather than falling through to the no-__init__
+			# field=value sugar below and silently dropping both Real's
+			# fields AND its constructor call. A subclass that DOES declare
+			# its own __init__ still finds THAT one first (chain_lookup
+			# checks self before base) - unaffected, still required to
+			# chain to its own base via super().__init__(...) itself (see
+			# FunctionLowering._lower_super_init_if_required), never both
+			# an inherited AND an own __init__ running for the same call.
+			# Walking the chain also resolves every ancestor along the way
+			# (chain_lookup's own side effect) - load-bearing for the
+			# init-is-None case too, since _lower_allocate_fields's own
+			# flattened_attributes() call needs that same resolution.
+			init = target_cls.chain_lookup( '__init__' ) if isinstance( target_cls, ( RCClass, CStruct )) else target_cls.get_local_or_raise( '__init__' )
 			if isinstance( init, Function ):
 				assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
 			if init is None:
@@ -11250,12 +11275,12 @@ class FunctionLowering:
 				return None
 			if not isinstance( init, Function ):
 				self.lowering.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
-			# a subclass's own __init__ (found here via a FLAT, own-class-
-			# only lookup - deliberate, matches Python's "an override fully
-			# replaces the inherited one, callers never see both" semantics)
-			# is allowed to chain to its base via super().__init__(...) now
-			# (see FunctionLowering._lower_super_init_if_required) - no
-			# rejection needed here anymore (RCClass-subclassing plan Phase 2)
+			# init may be target_cls's OWN __init__ or an INHERITED one
+			# found further up the chain (see the chain_lookup comment
+			# above) - either way it's allowed to chain to ITS OWN base via
+			# super().__init__(...) (see FunctionLowering._lower_super_
+			# init_if_required) - no rejection needed here (RCClass-
+			# subclassing plan Phase 2)
 			self._check_rcclass_fully_implemented( target_cls, node, '(...)' )
 
 			if target_cls.type_params:

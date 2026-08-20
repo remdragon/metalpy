@@ -613,6 +613,22 @@ class InheritanceChainMixin:
 	attributes: list['Variable']
 	resolve: Callable[[],None]|None
 
+	def resolve_chain( self ) -> None:
+		''' resolve self and every ancestor in the single-inheritance chain
+		(self, then .base, then .base.base, ... until None) - needed before
+		trusting any level's .attributes/.names are populated (e.g.
+		flattened_attributes(), whose own docstring warns it resolves
+		nothing it returns) when there's no name being searched for to
+		drive the walk the way chain_lookup's own walk does. Same per-level
+		resolve() call chain_lookup already performs, factored out so a
+		caller that doesn't have (or want) a name to look up can still get
+		the walk's resolving side effect. '''
+		node: 'InheritanceChainMixin|None' = self
+		while node is not None:
+			if node.resolve is not None:
+				node.resolve()
+			node = node.base
+
 	def chain_lookup( self, name: str ) -> Name|None:
 		''' walk this class's own single-inheritance chain (self, then base,
 		then base.base, ... until None) looking for `name` - .names only ever
