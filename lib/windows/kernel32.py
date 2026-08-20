@@ -87,6 +87,19 @@ def HeapFree(
 ) -> bool:
 	...
 
+@extern('kernel32', 'HeapSize')
+def HeapSize(
+	hHeap: HANDLE,
+	dwFlags: u32,
+	lpMem: ConstPtr[u8],
+) -> usize:
+	...
+
+# HeapSize's own failure sentinel ((SIZE_T)-1, per its docs) - distinguishes
+# "couldn't determine the size" from a real, huge allocation, matching
+# INVALID_HANDLE_VALUE's identical bit-pattern-literal convention above
+HEAP_SIZE_FAILED: usize = usize( -1 )
+
 @extern( 'kernel32', 'GetDynamicTimeZoneInformation' )
 def GetDynamicTimeZoneInformation(
 	pTimeZoneInformation: Ptr[DynamicTimeZoneInformation],

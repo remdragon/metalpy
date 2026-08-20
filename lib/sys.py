@@ -70,12 +70,30 @@ def cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
 
 @compiler.target( os = 'windows' )
 def free( ptr: Ptr[u8] ) -> None:
-	from windows.kernel32 import GetProcessHeap, HeapFree
-	HeapFree( GetProcessHeap(), 0, ptr )
+	from windows.kernel32 import GetProcessHeap, HeapFree, HeapSize, HEAP_SIZE_FAILED
+	heap = GetProcessHeap()
+	if compiler.target.debug:
+		# same "0xCD before the real free" idea as alloc[T]'s own mempoison
+		# call above, just on the other end of the block's lifetime - this
+		# is what actually catches a use-after-free (reading/writing
+		# through a stale pointer after this point now reliably sees
+		# poison instead of whatever the allocator happened to leave
+		# behind, on every compiler, not just the ones whose own debug
+		# heap already does this)
+		size: usize = HeapSize( heap, 0, ptr )
+		if size != HEAP_SIZE_FAILED:
+			mempoison( ptr, size )
+	HeapFree( heap, 0, ptr )
 
 @compiler.target( os = not 'windows' )
 def free( ptr: Ptr[None] ) -> None:
-	from crt import free as _crt_free
+	from crt import free as _crt_free, malloc_usable_size as _crt_malloc_usable_size
+	if compiler.target.debug:
+		# see the Windows branch's own comment above - same mempoison-
+		# before-free, via glibc/macOS's own "how big was this block"
+		# query (crt.malloc_usable_size, os-split there)
+		size: usize = _crt_malloc_usable_size( ptr )
+		mempoison( ptr, size )
 	_crt_free(ptr)
 
 @compiler.target( os = 'windows' )
