@@ -397,6 +397,38 @@ def ConvertThreadToFiber(
 ) -> Ptr[None]:
 	...
 
+
+# ---------------------------------------------------------------------------
+# TLS (thread-local storage) - lib/threading.py's own ThreadLocal[T].
+# ---------------------------------------------------------------------------
+
+# TlsAlloc's own documented failure sentinel: (DWORD)0xFFFFFFFF, not 0 -
+# a freshly-allocated index of 0 is a completely ordinary, valid result
+TLS_OUT_OF_INDEXES: u32 = u32( -1 )
+
+@extern('kernel32', 'TlsAlloc')
+def TlsAlloc() -> u32:
+	...
+
+@extern('kernel32', 'TlsGetValue')
+def TlsGetValue(
+	dwTlsIndex: u32,
+) -> Ptr[None]:
+	...
+
+@extern('kernel32', 'TlsSetValue')
+def TlsSetValue(
+	dwTlsIndex: u32,
+	lpTlsValue: Ptr[None],
+) -> bool:
+	...
+
+@extern('kernel32', 'TlsFree')
+def TlsFree(
+	dwTlsIndex: u32,
+) -> bool:
+	...
+
 @extern('kernel32', 'SwitchToFiber')
 def SwitchToFiber(
 	lpFiber: Ptr[None],

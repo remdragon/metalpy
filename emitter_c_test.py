@@ -5176,6 +5176,127 @@ def main() -> i32:
 		], timeout = 30 )
 
 
+class ThreadLocalCompileRunTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' threading.ThreadLocal[T] (lib/threading.py) - one T|None slot per OS
+	thread, built on real TLS (Windows TlsAlloc/TlsGetValue/TlsSetValue/
+	TlsFree, POSIX pthread_key_create/pthread_getspecific/pthread_
+	setspecific). T is constrained to compiler.is_rc(T) - see that class's
+	own module comment for why (get()/set() reuse list[T]'s own handle-only
+	RC-element representation, compiler.cast(T, raw)/compiler.cast(Ptr[None],
+	value)).
+
+	Two real bugs found and fixed while building this (both via a real
+	compile+run repro, one confirmed with AddressSanitizer under gcc/WSL):
+	1. A genuine, general narrowing gap: `x = generic_obj.method()` (or
+	   `GenericClass[T]()` itself) never let `if x is None: ...; x.field`
+	   narrow at all - _type_of_expr (type_resolver.py) had no ast.Subscript
+	   case at all for `_try_resolve_callable_namespace`, so an EXPLICIT
+	   generic specialization's own type (`Holder[Box]`) was never resolved
+	   by this pass, unrelated to ThreadLocal specifically - see
+	   type_resolver.py's own `_try_resolve_generic_construction` docstring,
+	   which already flagged this exact gap ("explicit-subscript
+	   construction isn't even resolvable by name lookup today").
+	2. get() returning a BORROWED (non-increfed) alias of whatever set()
+	   last stored crashes with a real heap-use-after-free the moment BOTH
+	   the original owner's local AND get()'s own return value are still
+	   live at the same time (`b = Box(...); tl.set(b); got = tl.get()` -
+	   confirmed via ASAN: `b` and `got` both alias the same object, and
+	   BOTH get their own independent release_object() call in the
+	   caller's epilogue - this compiler unconditionally treats ANY call's
+	   result as a fresh, owned value the instant it's bound to a local,
+	   regardless of what the callee's own return statement did). Fixed by
+	   having get() incref before returning - same "peek returns a
+	   genuinely new owned reference" contract list.__getitem__ already
+	   has, not specific to TLS/ThreadLocal at all. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'basic_get_set_clear_single_thread', '''
+import threading
+
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+def main() -> i32:
+	tl = threading.ThreadLocal[Box]()
+	before = tl.get()
+	if before is not None:
+		return 1
+	b = Box( 42 )
+	tl.set( b )
+	after = tl.get()
+	if after is None:
+		return 2
+	if after.n != 42:
+		return 3
+	tl.clear()
+	cleared = tl.get()
+	if cleared is not None:
+		return 4
+	return 0
+''' ),
+			# the actual point: two OS threads must see INDEPENDENT slots -
+			# each sets its own value, then both must read back exactly what
+			# THEY set, never the other thread's value. The busy-wait on
+			# `started` maximizes the chance of catching a shared (non-
+			# thread-local) slot - both threads are guaranteed to have set
+			# their own value before either one reads it back.
+			( 'independent_per_thread_slots', '''
+import threading
+import atomic
+
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+tl: threading.ThreadLocal[Box] = threading.ThreadLocal[Box]()
+
+class Worker:
+	value: i32
+	result: atomic.Atomic[i32]
+	started: atomic.Atomic[i32]
+	def __init__( self, value: i32, result: atomic.Atomic[i32], started: atomic.Atomic[i32] ) -> None:
+		self.value = value
+		self.result = result
+		self.started = started
+	def run( self ) -> None:
+		b = Box( self.value )
+		tl.set( b )
+		self.started.fetch_add( 1 )
+		while self.started.load() < 2:
+			pass
+		got = tl.get()
+		if got is None:
+			self.result.store( -1 )
+			return
+		self.result.store( got.n )
+
+def main() -> i32:
+	started = atomic.Atomic[i32]( 0 )
+	result_a = atomic.Atomic[i32]( 0 )
+	result_b = atomic.Atomic[i32]( 0 )
+	wa = Worker( 111, result_a, started )
+	wb = Worker( 222, result_b, started )
+	ta = threading.Thread( wa.run )
+	tb = threading.Thread( wb.run )
+	ta.join()
+	tb.join()
+	if result_a.load() != 111:
+		return 1
+	if result_b.load() != 222:
+		return 2
+	return 0
+''' ),
+		], timeout = 30 )
+
+
 class FastListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' FastList[T] (lib/builtins/__fastlist.py) end-to-end - the ORIGINAL
 	StableIndexVector port: O(1) swap-and-pop erase, stable IDs that

@@ -4384,10 +4384,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return self._overload_call_return_type( target, node )
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				# a plain (non-generic) construction call, Foo(...) - its own
-				# type is just the class itself. A GENERIC construction
-				# (Result(...), inferring its own type params from the call's
-				# arguments) is deliberately not handled here - that's the
-				# classes half of this work, not yet done
+				# type is just the class itself. An IMPLICIT generic
+				# construction (Result(...), inferring its own type params
+				# from the call's arguments with no explicit subscript) is
+				# deliberately not handled here - that's the classes half of
+				# this work, not yet done
+				return target
+			if isinstance( target, Specialization ):
+				# EXPLICIT generic construction, Holder[Box](...) -
+				# _try_resolve_callable_namespace's own ast.Subscript case
+				# (added alongside this) already built the concrete
+				# Specialization; that IS this call's own result type
+				# directly, no further inference needed (unlike the
+				# implicit-construction case above, which this pass still
+				# doesn't attempt). Confirmed via a real repro:
+				# `h = Holder[Box](); if h.val is None: ...` never narrowed
+				# at all without this - h's own tracked type fell through to
+				# None here, same root cause _try_resolve_generic_
+				# construction's own docstring already flagged.
 				return target
 			return None
 		return None
@@ -4518,6 +4532,36 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if not isinstance( names, dict ):
 				return None
 			return names.get( node.attr )
+		if isinstance( node, ast.Subscript ):
+			# Name[T] - a generic FUNCTION, a generic CLASS construction
+			# (explicit Holder[Box](...), matching _try_resolve_namespace's
+			# own identical Subscript case above, just silent-on-any-doubt
+			# instead of raising - this pass's own SILENT-probe discipline
+			# throughout), or an intrinsic generic pointer scalar. Was
+			# entirely unhandled before (this method had no ast.Subscript
+			# case at all) - confirmed via a real repro: `h = Holder[Box]();
+			# if h.val is None: ...` never narrowed at all, since
+			# _type_of_expr(h) fell through to None here for h's own
+			# initializing Call (whose func is exactly this Subscript
+			# shape), same gap _try_resolve_generic_construction's own
+			# docstring already flagged ("explicit-subscript construction
+			# isn't even resolvable by name lookup today").
+			base = self._try_resolve_callable_namespace( node.value )
+			if not isinstance( base, ( Function, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Scalar )) or not getattr( base, 'type_params', None ):
+				return None
+			resolve = getattr( base, 'resolve', None )
+			if resolve is not None:
+				resolve()
+			arg_nodes = node.slice.elts if isinstance( node.slice, ast.Tuple ) else [ node.slice ]
+			if len( arg_nodes ) != len( base.type_params ):
+				return None
+			args: list[Type] = []
+			for a in arg_nodes:
+				resolved = self._try_resolve_callable_namespace( a )
+				if not isinstance( resolved, Type ):
+					return None
+				args.append( resolved )
+			return self.discovery._get_or_create_specialization( base, args )
 		return None
 
 	def _try_resolve_generic_call( self, node: ast.Call ) -> tuple[Function,list[Type]]|None:
