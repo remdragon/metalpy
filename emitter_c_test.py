@@ -233,10 +233,12 @@ def main() -> None:
 		lf = self.compiler.functions[0]
 		# 'main' is reserved by discovery.py for the entry point - bare,
 		# never module-qualified (discovery.py:994-995) - and compiles to
-		# C's own real `int main(void)`, not `void`
+		# C's own real `int main(int argc, char** argv)` (argc/argv so
+		# sys.argv, lib/sys.py, can capture the real ones - see emit_c's
+		# own entry-point prelude), not `void`
 		self.assertEqual( lf.function.qualname, 'main' )
 		src = emitter_c.emit_function( lf )
-		self.assertIn( 'int main( void ) {', src )
+		self.assertIn( 'int main( int argc, char** argv ) {', src )
 		self.assertIn( 'return 0;', src )
 		self.assertTrue( src.rstrip().endswith( '}' ))
 
@@ -247,7 +249,7 @@ def main() -> None:
 ''' )
 		lf = self.compiler.functions[0]
 		src = emitter_c.emit_function( lf, prototype_only = True )
-		self.assertEqual( src, 'int main( void );' )
+		self.assertEqual( src, 'int main( int argc, char** argv );' )
 
 	def test_non_entry_function_keeps_its_declared_return_type( self ) -> None:
 		self._run( '''
@@ -270,8 +272,8 @@ def main() -> None:
 ''' )
 		src = emitter_c.emit_c( self.compiler )
 		self.assertIn( 'ObjectHeader', src )
-		self.assertIn( 'int main( void );', src ) # forward-declared
-		self.assertIn( 'int main( void ) {', src ) # then defined
+		self.assertIn( 'int main( int argc, char** argv );', src ) # forward-declared
+		self.assertIn( 'int main( int argc, char** argv ) {', src ) # then defined
 
 # shared by every test needing Result[T,E] - matches lowering_test.py's own
 # _RESULT_FIXTURE (self-contained snippet, not a real lib/ import -
@@ -4261,7 +4263,7 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		for target in ( self._WINDOWS_TARGET, self._LINUX_TARGET ):
 			with self.subTest( target = target[ 'os' ] ):
 				src = self._compiled_source( target )
-				main_start = src.index( 'int main( void ) {' )
+				main_start = src.index( 'int main( int argc, char** argv ) {' )
 				second_line = src[ main_start: ].split( '\n', 2 )[1]
 				self.assertIn( '__metalpy_init();', second_line )
 
