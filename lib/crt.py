@@ -138,6 +138,15 @@ def ftruncate(
 ) -> i32:
 	...
 
+@extern( 'c', 'getcwd' )
+def getcwd(
+	buf: Ptr[u8],
+	size: usize,
+) -> Ptr[u8]:
+	# NULL on failure (e.g. ERANGE if buf is too small for the real cwd) -
+	# callers must check get_errno() to distinguish the failure reason.
+	...
+
 # ---------------------------------------------------------------------------
 # Unicode-correct case mapping - str.upper()/str.lower() (see PLAN_STR_UPPER_
 # LOWER.md). towupper_l/towlower_l (the explicit-locale, thread-safe POSIX.1-
