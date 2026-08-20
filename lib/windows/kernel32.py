@@ -195,6 +195,74 @@ def CreateThread(
 
 INFINITE: u32 = u32( -1 )
 
+MAX_PATH: usize = 260
+
+# WIN32_FIND_DATAA (fileapi.h) - FindFirstFileA/FindNextFileA's own [out]
+# parameter. A stable, public, documented ABI, so modelled as a real
+# @cstruct rather than an opaque compiler.c_type - same posture as
+# SYSTEMTIME/TIME_ZONE_INFORMATION above. Each FILETIME field is two
+# separate u32s (dwLowDateTime then dwHighDateTime), NOT one u64 - a real
+# FILETIME struct's own alignment is 4 (max of its two DWORD members), but
+# a bare u64 has NATURAL 8-byte alignment on x86-64, so the C compiler
+# would insert 4 bytes of padding before it that the real (unpadded)
+# WIN32_FIND_DATAA doesn't have, shifting every field after
+# dwFileAttributes by 4 bytes - confirmed via a real repro (FindFirstFileA
+# read cFileName 4 bytes into the real name, truncating every result:
+# "alpha.txt" came back as "a.txt"). cFileName is read as a whole null-
+# terminated string via compiler.addrof(data.cFileName), same pattern as
+# TimeZoneKeyName's own comment on DynamicTimeZoneInformation.
+@cstruct
+class WIN32_FIND_DATAA:
+	dwFileAttributes: u32 = 0
+	ftCreationTime_low: u32 = 0
+	ftCreationTime_high: u32 = 0
+	ftLastAccessTime_low: u32 = 0
+	ftLastAccessTime_high: u32 = 0
+	ftLastWriteTime_low: u32 = 0
+	ftLastWriteTime_high: u32 = 0
+	nFileSizeHigh: u32 = 0
+	nFileSizeLow: u32 = 0
+	dwReserved0: u32 = 0
+	dwReserved1: u32 = 0
+	cFileName: u8[260] = 0
+	cAlternateFileName: u8[14] = 0
+
+FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10
+INVALID_FILE_ATTRIBUTES: u32 = u32( -1 )
+
+@extern( 'kernel32', 'FindFirstFileA' )
+def FindFirstFileA(
+	lpFileName: ConstPtr[u8],
+	lpFindFileData: Ptr[WIN32_FIND_DATAA],
+) -> HANDLE:
+	...
+
+@extern( 'kernel32', 'FindNextFileA' )
+def FindNextFileA(
+	hFindFile: HANDLE,
+	lpFindFileData: Ptr[WIN32_FIND_DATAA],
+) -> bool:
+	...
+
+@extern( 'kernel32', 'FindClose' )
+def FindClose(
+	hFindFile: HANDLE,
+) -> bool:
+	...
+
+@extern( 'kernel32', 'GetFileAttributesA' )
+def GetFileAttributesA(
+	lpFileName: ConstPtr[u8],
+) -> u32:
+	...
+
+@extern( 'kernel32', 'GetCurrentDirectoryA' )
+def GetCurrentDirectoryA(
+	nBufferLength: u32,
+	lpBuffer: Ptr[u8],
+) -> u32:
+	...
+
 @extern('kernel32', 'WaitForSingleObject')
 def WaitForSingleObject(
 	hHandle: HANDLE,
