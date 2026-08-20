@@ -864,6 +864,27 @@ class Discovery( ast.NodeVisitor ):
 				self.fail( f'Volatile[...] takes exactly one type argument: {ast.unparse(node)}', node )
 			return self.visit( node.slice )
 
+		# Aligned[N, T] - compiler syntax too, same "resolves transparently
+		# to plain T" posture as Volatile[T] just above (arithmetic/
+		# comparisons/overload-matching all see a bare T). The real
+		# consumer is discovery.py's own _apply_aligned_annotation, which
+		# re-peeks this same raw annotation AST once the owning Variable
+		# exists, to record N as that field's own explicit C alignment
+		# override (only meaningful as a @cstruct/@cunion field - see that
+		# function). N is validated here (shape + power-of-two), since
+		# this is the one place that already sees the raw slice.
+		if isinstance( node.value, ast.Name ) and node.value.id == 'Aligned':
+			if not ( isinstance( node.slice, ast.Tuple ) and len( node.slice.elts ) == 2 ):
+				self.fail( f'Aligned[...] must look like Aligned[N, Type]: {ast.unparse(node)}', node )
+			n_node, type_node = node.slice.elts
+			if not (
+				isinstance( n_node, ast.Constant ) and isinstance( n_node.value, int )
+				and not isinstance( n_node.value, bool ) and n_node.value > 0
+				and ( n_node.value & ( n_node.value - 1 )) == 0
+			):
+				self.fail( f'Aligned[N, ...] - N must be a positive power-of-two integer literal: {ast.unparse(node)}', node )
+			return self.visit( type_node )
+
 		# Callable[[Arg1,Arg2,...], Ret] - also compiler syntax (see
 		# PLAN_CALLABLE.md), recognized the same textual way as move/copy
 		# above rather than resolved as an ordinary generic base: its own
@@ -1365,9 +1386,51 @@ class Discovery( ast.NodeVisitor ):
 					var_obj.type = self.visit( annotation )
 					self._reject_bare_interface_value_type( var_obj.type, annotation, var_obj.qualname )
 					self._reject_fixed_array_outside_struct_field( var_obj.type, scope, annotation, var_obj.qualname )
+					self._apply_aligned_annotation( var_obj, scope, annotation )
 		def resolve() -> None:
 			self._resolve_guarded( var_obj, body )
 		return resolve
+
+	def _is_aligned_annotation( self, node: ast.expr ) -> bool:
+		return isinstance( node, ast.Subscript ) and isinstance( node.value, ast.Name ) and node.value.id == 'Aligned'
+
+	def _reject_aligned_annotation_outside_struct_field( self, node: ast.expr, context: str ) -> None:
+		''' Aligned[N, T] is only ever meaningful as a plain @cstruct/@cunion
+		field (it overrides that ONE field's own position within a real C
+		struct layout) - a function parameter/return type has no such
+		layout to speak of, so unlike _apply_aligned_annotation (which
+		conditionally allows it for a class-body AnnAssign whose scope IS a
+		plain CStruct/CUnion), this call site always rejects it outright.
+		Same restriction class as _reject_fixed_array_outside_struct_field's
+		own parameter/return-type call sites. '''
+		if not self._is_aligned_annotation( node ):
+			return
+		self.fail(
+			f'{context}: Aligned[...] is only allowed as a plain @cstruct/@cunion field, not here: {ast.unparse(node)}',
+			node,
+		)
+
+	def _apply_aligned_annotation( self, var_obj: Variable, scope: 'Module|ClassLike|Function', node: ast.expr ) -> None:
+		''' Aligned[N, T] (compiler syntax, resolves transparently to plain T -
+		see visit_Subscript's own Aligned branch, which already validated N's
+		shape) records N as var_obj.c_align - a plain @cstruct/@cunion field's
+		own explicit C alignment override, independent of the owning struct's
+		CStruct.packed. Same restriction class as
+		_reject_fixed_array_outside_struct_field (plain-value struct field
+		only, not @interface - an @interface CStruct's fields never reach
+		_struct_or_union_body at all, see emit_cstruct). '''
+		if not self._is_aligned_annotation( node ):
+			return
+		assert isinstance( node, ast.Subscript )
+		if not ( isinstance( scope, ( CStruct, CUnion )) and not ( isinstance( scope, CStruct ) and scope.is_interface )):
+			self.fail(
+				f'{var_obj.qualname}: Aligned[...] is only allowed as a plain @cstruct/@cunion field, not here: {ast.unparse(node)}',
+				node,
+			)
+		assert isinstance( node.slice, ast.Tuple ) # already validated by visit_Subscript
+		n_node = node.slice.elts[0]
+		assert isinstance( n_node, ast.Constant ) and isinstance( n_node.value, int ) # already validated by visit_Subscript
+		var_obj.c_align = n_node.value
 
 	def _reject_fixed_array_outside_struct_field( self, t: 'Type|None', scope: 'Module|ClassLike|Function', node: ast.AST, context: str ) -> None:
 		''' a FixedArrayType (`u8[8]`-style fixed-size inline array - see its
@@ -1636,11 +1699,13 @@ class Discovery( ast.NodeVisitor ):
 			decname = self._decorator_name( decorator )
 			match decname:
 				case 'cstruct':
-					return self._parse_ClassDef_CStruct( node, qualname )
+					packed = self._parse_packed_decorator_kwarg( decorator, qualname )
+					return self._parse_ClassDef_CStruct( node, qualname, packed = packed )
 				case 'interface':
 					return self._parse_ClassDef_Interface( node, qualname )
 				case 'cunion':
-					return self._parse_ClassDef_CUnion( node, qualname )
+					packed = self._parse_packed_decorator_kwarg( decorator, qualname )
+					return self._parse_ClassDef_CUnion( node, qualname, packed = packed )
 				case 'enum':
 					if not isinstance( decorator, ast.Call ):
 						self.fail( f'invalid @enum {decorator=}', node )
@@ -1666,6 +1731,27 @@ class Discovery( ast.NodeVisitor ):
 		if isinstance( decorator, ast.Call ) and isinstance( decorator.func, ast.Name ):
 			return decorator.func.id
 		return None
+
+	def _parse_packed_decorator_kwarg( self, decorator: ast.expr, qualname: str ) -> bool:
+		''' @cstruct(packed=True) / @cunion(packed=True) - #pragma pack(push,1)
+		around the whole struct/union body (emitter_c.py's
+		_struct_or_union_body), so no field ever gets compiler-inserted
+		padding - verified identical layout across MSVC/clang/gcc. Bare
+		@cstruct/@cunion (a Name, not a Call) is packed=False, same as
+		before this existed. '''
+		if isinstance( decorator, ast.Name ):
+			return False
+		assert isinstance( decorator, ast.Call ) # only Name|Call reach here - see _decorator_name
+		if decorator.args:
+			self.fail( f'@cstruct/@cunion takes no positional arguments in {qualname}: {ast.unparse(decorator)}', decorator )
+		packed = False
+		for kw in decorator.keywords:
+			if kw.arg != 'packed':
+				self.fail( f'unsupported @cstruct/@cunion keyword argument {kw.arg!r} in {qualname}', decorator )
+			if not ( isinstance( kw.value, ast.Constant ) and isinstance( kw.value.value, bool )):
+				self.fail( f'@cstruct/@cunion packed=... must be a literal bool: {ast.unparse(decorator)}', decorator )
+			packed = kw.value.value
+		return packed
 
 	def _parse_type_params( self, type_params: list[ast.type_param], owner: RCClass|CStruct|CUnion|TaggedUnion|Function ) -> None:
 		if not type_params:
@@ -1875,13 +1961,14 @@ class Discovery( ast.NodeVisitor ):
 
 		return class_obj
 
-	def _parse_ClassDef_CStruct( self, node: ast.ClassDef, qualname: str ) -> CStruct:
+	def _parse_ClassDef_CStruct( self, node: ast.ClassDef, qualname: str, packed: bool = False ) -> CStruct:
 		module = self.module_stack[-1]
 		class_obj = CStruct(
 			stem = node.name,
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			packed = packed,
 		)
 		if node.bases:
 			self.fail( f'@cstruct {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -1959,13 +2046,14 @@ class Discovery( ast.NodeVisitor ):
 
 		return class_obj
 
-	def _parse_ClassDef_CUnion( self, node: ast.ClassDef, qualname: str ) -> CUnion:
+	def _parse_ClassDef_CUnion( self, node: ast.ClassDef, qualname: str, packed: bool = False ) -> CUnion:
 		module = self.module_stack[-1]
 		class_obj = CUnion(
 			stem = node.name,
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			packed = packed,
 		)
 		if node.bases:
 			self.fail( f'@cunion {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2845,6 +2933,7 @@ class Discovery( ast.NodeVisitor ):
 									)
 							self._reject_bare_interface_value_type( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							self._reject_fixed_array_outside_struct_field( param_type, fn, arg, f'{fn.qualname} parameter {arg.arg!r}' )
+							self._reject_aligned_annotation_outside_struct_field( arg.annotation, f'{fn.qualname} parameter {arg.arg!r}' )
 							if fn.extern_lib is not None:
 								self._reject_non_c_type_on_extern_signature( param_type, arg, f'{fn.qualname} parameter {arg.arg!r}' )
 							param = Parameter(
@@ -2884,6 +2973,7 @@ class Discovery( ast.NodeVisitor ):
 							fn.return_type = self.visit( fn.node.returns )
 							self._reject_bare_interface_value_type( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
 							self._reject_fixed_array_outside_struct_field( fn.return_type, fn, fn.node.returns, f'{fn.qualname} return type' )
+							self._reject_aligned_annotation_outside_struct_field( fn.node.returns, f'{fn.qualname} return type' )
 							if fn.extern_lib is not None:
 								self._reject_non_c_type_on_extern_signature( fn.return_type, fn.node.returns, f'{fn.qualname} return type' )
 						else:

@@ -15111,6 +15111,223 @@ def main() -> i32:
 		self.assertIn( 'is not supported yet', self.discovery.errors.errors[0] )
 
 
+class CStructPackingAndFieldAlignmentTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' @cstruct(packed=True)/@cunion(packed=True) (whole-struct #pragma
+	pack(push,1)/pop) and a field declared Aligned[N, T] (a per-field C
+	alignment override) - added after a real, confirmed data-corruption bug:
+	lib/windows/kernel32.py's WIN32_FIND_DATAA modeled each embedded Win32
+	FILETIME (a real two-DWORD C struct, 4-byte natural alignment) as a bare
+	u64 field (byte-content-identical to FILETIME on its own, matching an
+	existing GetSystemTimeAsFileTime LPFILETIME-as-Ptr[u64] precedent) -
+	correct for a STANDALONE pointer parameter, but wrong once nested inside
+	a larger struct with neighbors: u64's own NATURAL 8-byte alignment
+	forced 4 bytes of compiler-inserted padding the real ABI doesn't have,
+	silently shifting every later field (including the filename buffer) -
+	FindFirstFileA results came back truncated ("alpha.txt" read as
+	"a.txt"), a silent wrong-data bug, not a compile error or a crash.
+
+	Both mechanisms were verified empirically against all three compilers
+	this codebase supports (real MSVC via cl.exe, clang, gcc via WSL) before
+	being implemented this way - two real, non-obvious portability traps
+	were found and are worth recording here, not just in commit history:
+
+	1. A bare mid-struct `#pragma pack(push,N)/pop` bracketing just one
+	   field is NOT portable: MSVC honors it per-field, but clang/gcc
+	   silently keep the struct's own natural alignment instead (only a
+	   pack directive wrapping the ENTIRE aggregate is portable on
+	   clang/gcc) - see _struct_or_union_body's own comment. The portable
+	   per-field mechanism is instead a compiler split: real MSVC keeps the
+	   mid-struct pack(push,N)/pop; everything else uses the GNU
+	   __attribute__((packed,aligned(N))) field attribute.
+
+	2. `#if defined(_MSC_VER)` alone is NOT a valid MSVC/clang discriminator
+	   on Windows: clang targeting x86_64-pc-windows-msvc (this repo's own
+	   dev-machine clang) DEFINES _MSC_VER too, for MSVC-header
+	   compatibility - so a bare `defined(_MSC_VER)` guard silently routed
+	   clang down the real-MSVC branch as well, where clang's own
+	   pragma-pack semantics (trap #1 above) do NOT match real MSVC,
+	   reproducing the exact wrong-size bug this feature exists to prevent.
+	   The guard must additionally exclude __clang__.
+
+	Combining whole-struct packed=True with a field's own Aligned[N,...] on
+	the SAME struct is a third, separate confirmed divergence (MSVC: one
+	byte count; clang/gcc: a different one) - rejected as a compile error
+	instead (compiler.py's _validate_packed_field_alignment_conflict) -
+	see test_packed_and_aligned_combination_on_same_struct_rejected below. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# @cstruct(packed=True): NO compiler-inserted padding anywhere -
+			# u8 + u64 + u32 packs to exactly 1+8+4=13 bytes on every
+			# compiler, vs 24 bytes under ordinary natural alignment (see
+			# the natural-alignment case below for the same fields unpacked)
+			( 'packed_struct_has_no_implicit_padding', '''
+@cstruct( packed = True )
+class PackedMixed:
+	a: u8 = 0
+	b: u64 = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( PackedMixed )
+	if sz != usize( 13 ):
+		return 1
+	return 0
+''' ),
+			# @cunion(packed=True) - same mechanism, the union keyword path
+			( 'packed_union_has_no_implicit_padding', '''
+@cunion( packed = True )
+class PackedUnionMixed:
+	a: u8 = 0
+	b: u64 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( PackedUnionMixed )
+	if sz != usize( 8 ):
+		return 1
+	return 0
+''' ),
+			# Aligned[4, u64]: only THIS field's own alignment is overridden
+			# (forced down from its natural 8 to 4) - the rest of the struct
+			# keeps ordinary natural alignment. a(4,offset0) + b(8,offset4,
+			# no leading pad since 4-aligned now suffices) + c(4,offset12) =
+			# 16 total, no trailing pad - this is the exact WIN32_FIND_DATAA
+			# shape (a FILETIME-as-u64 field sandwiched between u32 fields)
+			( 'aligned_field_overrides_only_that_field', '''
+@cstruct
+class AlignedMixed:
+	a: u32 = 0
+	b: Aligned[4, u64] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( AlignedMixed )
+	if sz != usize( 16 ):
+		return 1
+	return 0
+''' ),
+			# same field set with NO alignment override - confirms 16 above
+			# is really the aligned field doing something, not a coincidence
+			# of these particular field sizes (ordinary natural alignment
+			# pads b up to an 8-byte boundary: a(4)+pad(4)+b(8)+c(4)+pad(4)=24)
+			( 'unaligned_control_case_gets_natural_padding', '''
+@cstruct
+class NaturalMixed:
+	a: u32 = 0
+	b: u64 = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( NaturalMixed )
+	if sz != usize( 24 ):
+		return 1
+	return 0
+''' ),
+			# an Aligned[...] field still round-trips real values correctly -
+			# not just a sizeof()-only smoke test
+			( 'aligned_field_reads_and_writes_correctly', '''
+@cstruct
+class AlignedMixed2:
+	a: u32 = 0
+	b: Aligned[4, u64] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	x = AlignedMixed2( a = 1, b = u64( 0xdeadbeefcafe ), c = 2 )
+	if x.a != 1 or x.b != u64( 0xdeadbeefcafe ) or x.c != 2:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_aligned_rejected_on_module_global( self ) -> None:
+		self._run( '\n'.join([
+			'g: Aligned[4, u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = g',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_aligned_rejected_on_function_parameter( self ) -> None:
+		self._run( '\n'.join([
+			'def f( x: Aligned[4, u64] ) -> i32:',
+			'	return 0',
+			'',
+			'def main() -> None:',
+			'	f( u64( 0 ))',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+
+	def test_aligned_rejects_non_power_of_two_n( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	a: u32 = 0',
+			'	b: Aligned[3, u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'power-of-two', self.discovery.errors.errors[0] )
+
+	def test_aligned_rejects_non_constant_n( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	a: u32 = 0',
+			'	b: Aligned[compiler.sizeof( u32 ), u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+
+	def test_packed_decorator_rejects_unknown_keyword( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct( bogus = True )',
+			'class Foo:',
+			'	a: u32 = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'unsupported @cstruct/@cunion keyword argument', self.discovery.errors.errors[0] )
+
+	def test_packed_and_aligned_combination_on_same_struct_rejected( self ) -> None:
+		# confirmed via a real empirical repro (not just theorized): MSVC and
+		# clang/gcc disagree on the resulting byte layout when a struct-wide
+		# #pragma pack(push,1)/pop wraps a field that ALSO has its own
+		# __attribute__((packed,aligned(N)))/mid-struct pack override -
+		# rejecting the combination outright is safer than emitting C with a
+		# silently compiler-dependent layout
+		self._run( '\n'.join([
+			'@cstruct( packed = True )',
+			'class Foo:',
+			'	a: u8 = 0',
+			'	b: Aligned[4, u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot combine Aligned[...]', self.discovery.errors.errors[0] )
+
+
 class AddrofFieldAccessRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression test for a real, confirmed gap: `compiler.addrof(x)`
 	rejected any argument that wasn't a bare local-variable Name outright

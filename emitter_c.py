@@ -1133,23 +1133,70 @@ def _result_error_type( result_type: Type ) -> Type:
 # other class. This module never has to independently rediscover or
 # resynthesize one - it just walks those lists (see emit_c below).
 
-def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]] ) -> str:
-	lines = [ f'{keyword} {name} {{' ]
+def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type,int|None]], packed: bool = False ) -> str:
+	''' packed=True (CStruct.packed/CUnion.packed, from @cstruct(packed=True)/
+	@cunion(packed=True)) wraps the WHOLE body in #pragma pack(push,1)/pop -
+	confirmed identical layout across MSVC/clang/gcc (a whole-aggregate
+	pack directive is portable; see the per-field case just below for why
+	that's NOT true of every #pragma pack usage).
+
+	Each attrs entry's own third element is a per-field C alignment
+	override (Variable.c_align, from a field declared `Aligned[N, T]`) -
+	independent of `packed`, and NEVER combined with it on the same struct
+	(compiler.py's _validate_packed_field_alignment_conflict rejects that
+	combination outright, before this ever runs). Deliberately NOT emitted
+	as a bare mid-struct #pragma pack(push,N)/pop bracketing just that
+	field: confirmed empirically that MSVC honors a pack change made
+	between two member declarations (mid-struct) on a PER-FIELD basis, but
+	clang/gcc silently ignore it and keep the struct's own natural
+	alignment instead - only a pack directive that wraps the ENTIRE
+	aggregate is portable on clang/gcc. The portable per-field mechanism is
+	instead a #if defined(_MSC_VER) && !defined(__clang__) split: real MSVC
+	keeps its own (verified) mid-struct pack(push,N)/pop; everything else
+	uses the GNU __attribute__((packed,aligned(N))) field attribute instead
+	(also verified to reproduce the identical byte offset). The
+	`!defined(__clang__)` half is load-bearing, not defensive styling: this
+	machine's own clang targets x86_64-pc-windows-msvc and DOES define
+	_MSC_VER (for MSVC-header compatibility), so a bare `defined(_MSC_VER)`
+	guard silently routed clang down the MSVC branch too - where clang's
+	real pragma-pack semantics (the mid-struct case above) do NOT match
+	real MSVC, reproducing the exact wrong-size bug this feature exists to
+	prevent. Confirmed via a real repro: bare _MSC_VER guard gave
+	sizeof==24 under this clang instead of the correct 16 every other
+	compiler (real MSVC, gcc) agreed on. '''
+	body_lines: list[str] = []
 	if not attrs:
 		# MSVC (and pedantic C) reject empty structs/unions:
-		lines.append( '\tchar dummy;' )
+		body_lines.append( '\tchar dummy;' )
 	else:
-		for field_name, field_type in attrs:
+		for field_name, field_type, align in attrs:
 			if isinstance( field_type, FixedArrayType ):
 				# C's array declarator is discontinuous ("TYPE NAME[N];", not
 				# a plain prefix type followed by the name - see
 				# FixedArrayType's own docstring and _declarator's identical
 				# function-pointer special case) - _declarator's plain
 				# "TYPE NAME" concatenation can't express this
-				lines.append( f'\t{c_type(field_type.elem_type)} {_field_name(field_name)}[{field_type.count}];' )
+				decl = f'{c_type(field_type.elem_type)} {_field_name(field_name)}[{field_type.count}]'
 			else:
-				lines.append( f'\t{_declarator(field_type, _field_name(field_name))};' )
+				decl = _declarator( field_type, _field_name(field_name) )
+			if align is None:
+				body_lines.append( f'\t{decl};' )
+			else:
+				body_lines.append( '#if defined(_MSC_VER) && !defined(__clang__)' )
+				body_lines.append( f'#pragma pack(push, {align})' )
+				body_lines.append( f'\t{decl};' )
+				body_lines.append( '#pragma pack(pop)' )
+				body_lines.append( '#else' )
+				body_lines.append( f'\t{decl} __attribute__(( packed, aligned({align}) ));' )
+				body_lines.append( '#endif' )
+	lines: list[str] = []
+	if packed:
+		lines.append( '#pragma pack(push, 1)' )
+	lines.append( f'{keyword} {name} {{' )
+	lines.extend( body_lines )
 	lines.append( '};' )
+	if packed:
+		lines.append( '#pragma pack(pop)' )
 	return '\n'.join( lines )
 
 # --- functions -----------------------------------------------------------
@@ -3479,7 +3526,7 @@ def emit_rcclass_vtable_instance( cls: RCClass ) -> str|None:
 	return f'__metalpy_maybe_unused static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
 
 def emit_cstruct( cls: CStruct ) -> str:
-	attrs: list[tuple[str,Type]]
+	attrs: list[tuple[str,Type,int|None]]
 	if cls.is_interface:
 		# $vtable is the literal first member (COM's one hard ABI
 		# requirement) - base-chain flattening mirrors emit_rcclass's own
@@ -3501,12 +3548,12 @@ def emit_cstruct( cls: CStruct ) -> str:
 			lines.append( f'\t{_declarator(field_type, _field_name(field_name))};' )
 		lines.append( '};' )
 		return '\n'.join( lines )
-	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]
-	return _struct_or_union_body( mangle_type( cls ), 'struct', attrs )
+	attrs = [ ( attr.stem, attr.type, attr.c_align ) for attr in cls.attributes ]
+	return _struct_or_union_body( mangle_type( cls ), 'struct', attrs, packed = cls.packed )
 
 def emit_cunion( cls: CUnion ) -> str:
-	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]
-	return _struct_or_union_body( mangle_type( cls ), 'union', attrs )
+	attrs = [ ( attr.stem, attr.type, attr.c_align ) for attr in cls.attributes ]
+	return _struct_or_union_body( mangle_type( cls ), 'union', attrs, packed = cls.packed )
 
 def emit_cenum( cls: CEnum ) -> str:
 	# not a real C `enum` - .value_type can be any scalar width (u32/i32 seen
@@ -3541,7 +3588,7 @@ def emit_tagged_union( union: TaggedUnion ) -> str:
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{union.qualname}: _tagged_union_storage has not run yet - no real storage shape to emit'
 	name = mangle_type( union )
-	return _struct_or_union_body( name, 'struct', [ ( tag_attr.stem, tag_attr.type ), ( data_attr.stem, data_attr.type ) ] )
+	return _struct_or_union_body( name, 'struct', [ ( tag_attr.stem, tag_attr.type, None ), ( data_attr.stem, data_attr.type, None ) ] )
 
 def _is_trivial_global_init( instructions: list[ir.Instruction] ) -> bool:
 	# Lowering.lower_global always produces a real IR instruction sequence

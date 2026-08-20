@@ -487,6 +487,7 @@ class Compiler:
 			if unit.is_interface:
 				self._validate_interface_vtable( unit )
 				self._schedule_interface_vtable_impls( unit )
+			self._validate_packed_field_alignment_conflict( unit )
 			if unit not in self.cstructs:
 				self.cstructs.append( unit )
 			return unit
@@ -499,6 +500,7 @@ class Compiler:
 					dep = by_value_dependency( attr.type )
 					if dep is not None:
 						self.lowering._ensure_resolved( attr.type )
+			self._validate_packed_field_alignment_conflict( unit )
 			if unit not in self.cunions:
 				self.cunions.append( unit )
 			return unit
@@ -547,6 +549,33 @@ class Compiler:
 			return lg
 		else:
 			assert False, f'unsupported compile unit: {unit!r}'
+
+	def _validate_packed_field_alignment_conflict( self, cls: CStruct|CUnion ) -> None:
+		''' @cstruct(packed=True)/@cunion(packed=True) and a field's own
+		Aligned[N,...] override are each independently portable (verified
+		identical layout across MSVC/clang/gcc), but COMBINING them on the
+		same struct is not: MSVC's #pragma pack(push,N)/pop still honors a
+		per-field override inside an ambient pack(1) struct, while clang/gcc
+		give the field's own __attribute__((packed,aligned(N))) LOWER
+		priority than the ambient #pragma pack(1) wrapping the whole struct -
+		confirmed empirically with a real repro (MSVC: 9-byte layout,
+		gcc/clang: 6-byte layout for the identical field set). Rather than
+		emit silently-divergent C, reject the combination outright. Runs
+		here (compiler.py's own unit-scheduling pass), not discovery.py -
+		needs every attribute's own .c_align already resolved (set by
+		discovery.py's _apply_aligned_annotation, itself deferred until
+		Variable.resolve() runs), which _lower's CStruct/CUnion branches
+		just above guarantee by forcing attr resolution first. '''
+		if not cls.packed:
+			return
+		for attr in cls.attributes:
+			if attr.c_align is not None:
+				self.disco.fail_loc(
+					f'{cls.qualname}: {attr.qualname} cannot combine Aligned[...] with the owning '
+					f'@cstruct/@cunion(packed=True) - confirmed to produce different layouts on '
+					f'MSVC vs clang/gcc; use one mechanism or the other for this struct',
+					attr.file, attr.line,
+				)
 
 	def _validate_interface_vtable( self, cls: RCClass|CStruct ) -> None:
 		''' every @virtual method on an @interface CStruct (or, generalized

@@ -368,6 +368,18 @@ class Variable( Name ):
 	# set only for a local declared `Volatile[T]` (_stmt_AnnAssign) - means
 	# its C storage must be qualified `volatile` (see emitter_c._declarator)
 	is_volatile: bool = False
+	# set only for a @cstruct/@cunion field declared `Aligned[N, T]`
+	# (discovery.py's _apply_aligned_annotation) - N overrides just THIS
+	# field's own C alignment, independent of the owning struct's
+	# CStruct.packed. emitter_c.py's _struct_or_union_body brackets the
+	# field with a compiler-conditional #pragma pack/__attribute__((aligned))
+	# pair - a bare mid-struct #pragma pack push/pop is NOT portable (MSVC
+	# honors it per-field; clang/gcc silently keep the struct's natural
+	# alignment instead, confirmed empirically). N should not exceed the
+	# field type's own natural alignment - only shrinking is verified
+	# portable across all three compilers (see this codebase's own
+	# alignment-directive design notes).
+	c_align: int|None = None
 	# stage 2's lowered form of `init` (None until Compiler._lower's Variable
 	# branch runs) - kept directly on the Variable itself, not only reachable
 	# through compiler.globals' own LoweredGlobal list, so a global's own
@@ -907,6 +919,12 @@ class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 	# PLAN_SUBCLASSING_VTABLES_COM.md's "Subclassing mechanics")
 	base: 'CStruct|None' = None
 	is_interface: bool = False # @interface class Foo: - NOT inherited implicitly, see plan doc
+	# @cstruct(packed=True) - emitter_c.py wraps the whole struct body in
+	# #pragma pack(push,1)/pop, so no field ever gets compiler-inserted
+	# padding (verified identical layout across MSVC/clang/gcc). The
+	# general, always-portable way to replicate an external ABI's exact
+	# byte layout - see Variable.c_align for the narrower per-field knob.
+	packed: bool = False
 	type_params: list[TypeVar]|None = None
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
@@ -931,6 +949,7 @@ class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 
 @dataclass( kw_only = True, repr = False )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:
+	packed: bool = False # see CStruct.packed
 	type_params: list[TypeVar]|None = None
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
