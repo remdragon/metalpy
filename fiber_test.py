@@ -23,6 +23,21 @@ class FiberTests( test_support.RealCompileMixin, unittest.TestCase ):
 		self.compiler.run()
 
 	def test_single_start_runs_task_to_completion( self ) -> None:
+		# also the regression shape for a real heap-use-after-free found in
+		# enable_current_thread()'s own _thread_fiber_handle box (a
+		# ThreadLocal[_ThreadFiberHandle] slot): ThreadLocal.set() is
+		# deliberately non-owning (a bookmark, correct when the stored
+		# value is ALREADY kept alive elsewhere - see current()'s own
+		# docstring), but the box had no other owner ANYWHERE, so its own
+		# ordinary scope-exit decref freed it the instant enable_current_
+		# thread() returned - fixed with a permanent compiler.incref(box),
+		# same pattern Fiber.__init__ already uses for self. Silent when
+		# nothing reused the freed memory first; a real SwitchToFiber
+		# access violation the moment something else's allocation did -
+		# Task's own field (forcing a real, differently-sized heap
+		# allocation between enable_current_thread() and start()) is what
+		# actually exposed it. Do not simplify Task down to a bare
+		# no-field class - that would silently stop covering this.
 		self._run( '''
 import fiber
 

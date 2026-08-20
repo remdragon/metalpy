@@ -40,20 +40,25 @@
 #
 # current_worker()-style ambient lookup (so code running INSIDE a fiber can
 # find which Worker owns it) is DELIBERATELY NOT built yet - nothing here
-# needs it (no I/O registration to do), and it needs a real ThreadLocal[T]
-# primitive (doesn't exist yet either) to be safe across more than one
-# Worker thread. Build both together when real I/O wiring needs them.
+# needs it yet (no I/O registration to do). ThreadLocal[T] now exists
+# (lib/threading.py) and fiber.py's own _current/_thread_fiber_handle have
+# already been converted to use it (real per-OS-thread TLS, not plain
+# globals) - build current_worker() the same way once real I/O wiring
+# needs it.
 #
-# Reactor with more than ONE worker is NOT YET SAFE, for the same
-# ThreadLocal[T] reason: fiber.py's own _current/_thread_fiber_handle are
-# plain globals (correct only because every real test to date, including
-# this file's own, has exactly one OS thread touching them at a time).
-# Reactor.run() genuinely does hand each Worker its own freshly-spawned OS
-# thread (see Worker.run_until_idle's own fiber.enable_current_thread()
-# call), so a single-worker Reactor exercises real cross-thread handoff
-# correctly - it's specifically CONCURRENT workers (more than one such
-# thread alive and switching fibers at once) that would race on those
-# globals. Fix in fiber.py once ThreadLocal[T] exists, not here.
+# Reactor with more than ONE worker is now SAFE at the fiber-switching
+# level: fiber.py's own _current/_thread_fiber_handle are real
+# ThreadLocal[T] slots now, not plain globals racing across concurrent
+# OS threads. Reactor.run() genuinely does hand each Worker its own
+# freshly-spawned OS thread (see Worker.run_until_idle's own fiber.
+# enable_current_thread() call) - multiple CONCURRENT workers (more than
+# one such thread alive and switching fibers at once) no longer race on
+# shared fiber-switch bookkeeping. This scaffolding's OWN queues
+# (__pending_tasks/__ready_to_unpark/__idle_pool) were already safe
+# either way (list[T]'s own internal lock) - not yet stress-tested under
+# real multi-worker concurrency here, though (this file's own tests still
+# use a single worker) - worth a dedicated multi-worker test once real
+# I/O work lands and there's a genuine reason to run more than one.
 
 import compiler
 import sys
