@@ -100,16 +100,12 @@ def main() -> i32:
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
 
 	def test_reactor_spawns_on_its_own_worker_thread( self ) -> None:
-		# num_workers=1 deliberately, not a stand-in for "should be higher" -
-		# fiber.py's _current/_thread_fiber_handle are plain globals, correct
-		# only because every fiber test so far (including this one) has a
-		# single OS thread ever touching them. Reactor.run() DOES put this
-		# Worker on its own freshly-spawned thread (a real cross-thread
-		# handoff, exercising that path) - just never more than one such
-		# thread at once. num_workers>1 needs those globals to become a
-		# real ThreadLocal[T] first (not built yet - see fiber.py's own
-		# _current comment) to be genuinely safe, not just "didn't crash in
-		# this particular test."
+		# single-worker: Reactor.run() DOES put this Worker on its own
+		# freshly-spawned thread (a real cross-thread handoff, exercising
+		# that path) - just never more than one such thread at once. See
+		# test_reactor_with_multiple_concurrent_workers below for the
+		# num_workers>1 case (fiber.py's _current/_thread_fiber_handle are
+		# real ThreadLocal[T] now, not plain globals - safe for that).
 		self._run( '''
 import compiler
 import reactor
@@ -133,6 +129,53 @@ def main() -> i32:
 			i = i + 1
 	r.run()
 	if counter.load() != 20:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
+
+	def test_reactor_with_multiple_concurrent_workers( self ) -> None:
+		# num_workers=8, several hundred tasks round-robined across them,
+		# each task itself parking once mid-run (forcing a REAL fiber
+		# switch on whichever OS thread happens to be running it) - the
+		# actual scenario fiber.py's ThreadLocal[T] conversion
+		# (_current/_thread_fiber_handle) exists for: 8 real OS threads
+		# each independently switching fibers via SwitchToFiber/swapcontext
+		# at the same time. Before that conversion, this shape would race
+		# on plain globals shared across every thread - atomic.Atomic[i32]
+		# for the shared counter (not a plain i32 - the counter itself
+		# being thread-safe is a separate, already-established concern
+		# from whether fiber-switching itself races).
+		self._run( '''
+import compiler
+import reactor
+import fiber
+import atomic
+
+class CountingTask:
+	counter: atomic.Atomic[i32]
+	def __init__( self, counter: atomic.Atomic[i32] ) -> None:
+		self.counter = counter
+	def run( self ) -> None:
+		self.counter.fetch_add( 1 )
+		fiber.park()
+		self.counter.fetch_add( 10 )
+
+def main() -> i32:
+	counter = atomic.Atomic[i32]( 0 )
+	r = reactor.Reactor( 8 )
+	n: usize = 400
+	i: usize = 0
+	while i < n:
+		t = CountingTask( counter )
+		r.spawn( t.run )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	r.run()
+	with compiler.panic_arithmetic( 'unexpected count overflow' ):
+		expected: i32 = i32( n ) * 11
+	if counter.load() != expected:
 		return 1
 	return 0
 ''' )

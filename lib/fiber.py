@@ -39,6 +39,7 @@
 
 import compiler
 import sys
+import threading
 
 if compiler.target.os == 'windows':
 	from windows.kernel32 import CreateFiber, ConvertThreadToFiber, SwitchToFiber, DeleteFiber
@@ -63,40 +64,40 @@ class FiberError:
 
 # ---------------------------------------------------------------------------
 # "which fiber is running right now" - an ambient lookup (mirrors the
-# reactor plan's own current_worker() design), NOT yet thread-local. Safe
-# for a single OS thread driving fibers (what this module is tested against
-# today); becomes a real bug the moment more than one OS thread resumes
-# fibers concurrently - MUST become a ThreadLocal[Fiber|None] (lib/
-# threading.py, shipped) before the multi-worker Reactor is built on top
-# of this. Tracked, not forgotten. (current()'s own RC-ownership contract
-# is fixed as of this comment - see its own docstring - independent of
-# this still-open thread-safety gap.)
+# reactor plan's own current_worker() design), REAL thread-local storage -
+# safe for more than one OS thread to resume fibers concurrently (a pinned-
+# per-worker Reactor's whole premise). Was a plain global until this TLS
+# conversion; see git history for the single-thread-only version.
 # ---------------------------------------------------------------------------
 
-_current: Fiber|None = None
+_current: threading.ThreadLocal[Fiber] = threading.ThreadLocal[Fiber]()
 
 def current() -> Fiber|None:
-	# bare `return _current` - NO explicit incref needed here, unlike
-	# lib/threading.py's ThreadLocal.get(). _current is an ordinary,
-	# compiler-TRACKED module global (Fiber|None), and `return <a bare
-	# aliasing Name>` already goes through the same is_alias-detected
-	# auto-incref cfg.py gives `local = <a bare aliasing Name>` - confirmed
-	# via a real compiler.refcount() delta check (a bare `return
-	# module_global` from a free function, called and bound at the call
-	# site, showed the callee's own return already produced a correctly-
-	# balanced +1, with no incref written anywhere in its body). An
-	# EXPLICIT compiler.incref() on top of that would be a genuine, self-
-	# inflicted double-increment (a real leak), not a fix - this was tried
-	# once (see git history) on a misdiagnosis of an unrelated, separate
-	# bug (a real raw-memory boundary crossing in a DIFFERENT function,
-	# where compiler.cast(...)'s result - a Call, not an aliasing Name/
-	# Attribute read - genuinely does NOT get an automatic incref, so an
-	# explicit one there is correct and necessary; ThreadLocal.get() is
-	# exactly that case, crossing out of raw TLS storage). _current itself
-	# still does NOT own a reference (it's a bare bookmark - the actual
-	# Fiber is owned by whichever Worker queue/pool holds it), same as
-	# this whole module's docstring already says.
-	return _current
+	# _current.get() already does its own correct incref (ThreadLocal[T]'s
+	# own established contract) - a bare `return _current.get()` needs no
+	# incref of its OWN on top of that: a Call's result is already assumed
+	# fresh/owned by the caller's binding convention, it's the CALLEE's job
+	# (here, .get() itself) to make that true, not this wrapper's. _current
+	# itself still does NOT own a reference (it's a bare per-thread
+	# bookmark - the actual Fiber is owned by whichever Worker queue/pool
+	# holds it), same as this whole module's docstring already says. Safe
+	# to leave un-incref'd here (unlike _thread_fiber_handle's own box,
+	# see enable_current_thread's comment) because a Fiber pointed at by
+	# _current is ALWAYS also kept alive by some other real owner (a
+	# caller's own local, a Worker's pool, or __init__'s own permanent
+	# identity incref) - _thread_fiber_handle's box has no such other
+	# owner anywhere, which is exactly what made it a real bug.
+	return _current.get()
+
+def _restore_current( prev: Fiber|None ) -> None:
+	# ThreadLocal[T].set(value) requires a non-None T - `_current = prev`
+	# was a single plain-global reassignment before this TLS conversion
+	# (prev possibly None included); .clear() is the None case's own
+	# equivalent.
+	if prev is not None:
+		_current.set( prev )
+	else:
+		_current.clear()
 
 
 @enum( i32 )
@@ -258,29 +259,32 @@ class Fiber:
 			task()
 			self._switch_out( FiberState.IDLE )
 
+	def __resolve_caller( self, prev: Fiber|None ) -> Ptr[None]:
+		if prev is not None:
+			return prev.__handle
+		box = _thread_fiber_handle.get()
+		if box is None:
+			sys.panic( 'Fiber.__switch_in: enable_current_thread() was never called on this thread' )
+		return box.handle
+
 	@compiler.target( os = 'windows' )
 	def __switch_in( self ) -> None:
-		global _current
-		prev: Fiber|None = _current
-		if prev is not None:
-			self.__caller = prev.__handle
-		else:
-			self.__caller = _thread_fiber_handle
-		_current = self
+		prev: Fiber|None = _current.get()
+		self.__caller = self.__resolve_caller( prev )
+		_current.set( self )
 		SwitchToFiber( self.__handle )
-		_current = prev
+		_restore_current( prev )
 
 	@compiler.target( os = not 'windows' )
 	def __switch_in( self ) -> None:
-		global _current
-		prev: Fiber|None = _current
-		_current = self
+		prev: Fiber|None = _current.get()
+		_current.set( self )
 		caller_ctx: Ptr[ucontext_t] = sys.alloc[ucontext_t]( 1 )
 		self.__caller = caller_ctx
 		if swapcontext( caller_ctx, self.__handle ) != 0:
 			sys.panic( 'Fiber.start: swapcontext (into fiber) failed' )
 		sys.free( compiler.cast( Ptr[None], caller_ctx ))
-		_current = prev
+		_restore_current( prev )
 
 	@compiler.target( os = 'windows' )
 	def __switch_out( self ) -> None:
@@ -354,16 +358,43 @@ def _fiber_trampoline() -> None:
 # a context switch), so it's a no-op there.
 # ---------------------------------------------------------------------------
 
-_thread_fiber_handle: Ptr[None] = None
+class _ThreadFiberHandle:
+	# ThreadLocal[T] requires an RC T (its slot is a raw, pointer-sized TLS
+	# value, same representation an RC object's handle already has - see
+	# lib/threading.py's own module comment) - a bare Ptr[None] (what
+	# ConvertThreadToFiber returns) isn't RC, so this one-field box is the
+	# minimal wrapper needed to put it in a ThreadLocal slot at all.
+	handle: Ptr[None]
+	def __init__( self, handle: Ptr[None] ) -> None:
+		self.handle = handle
+
+_thread_fiber_handle: threading.ThreadLocal[_ThreadFiberHandle] = threading.ThreadLocal[_ThreadFiberHandle]()
 
 @compiler.target( os = 'windows' )
 def enable_current_thread() -> None:
-	global _thread_fiber_handle
-	if _thread_fiber_handle is not None:
+	if _thread_fiber_handle.get() is not None:
 		return
-	_thread_fiber_handle = ConvertThreadToFiber( None )
-	if _thread_fiber_handle is None:
+	handle: Ptr[None] = ConvertThreadToFiber( None )
+	if handle is None:
 		sys.panic( 'fiber.enable_current_thread: ConvertThreadToFiber failed' )
+	box: _ThreadFiberHandle = _ThreadFiberHandle( handle )
+	# a permanent identity reference, same pattern Fiber.__init__ uses for
+	# self - ThreadLocal[T].set() deliberately does NOT incref (its own
+	# "bookmark, not owner" contract, correct when whatever's stored is
+	# ALREADY kept alive by some other real owner elsewhere, e.g. _current
+	# pointing at a Fiber a Worker's own pool holds). This box has no other
+	# owner ANYWHERE - nothing but this TLS slot ever references it - so
+	# without this explicit incref, `box`'s own ordinary scope-exit decref
+	# (an unremarkable local going out of scope, same as any other) drops
+	# it straight to 0 and frees it the instant this function returns,
+	# leaving the TLS slot pointing at freed memory. Confirmed via a real,
+	# reproducible heap-use-after-free: silent when nothing else happened
+	# to reuse that freed memory before the next .get(), a real
+	# SwitchToFiber access violation the moment something else's
+	# allocation (e.g. a differently-sized Task class two lines later in
+	# a caller's own code) reused the same freed slot first.
+	compiler.incref( box )
+	_thread_fiber_handle.set( box )
 
 @compiler.target( os = not 'windows' )
 def enable_current_thread() -> None:
