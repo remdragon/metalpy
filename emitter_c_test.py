@@ -18570,15 +18570,20 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 	def test_ctx_and_bound_value_refcounts_correct( self ) -> None:
-		# regression test for the SECOND implementation attempt: ctx/NAME
-		# declared as ordinary (unscoped) locals at the with-statement's own
-		# level leaked one reference each for the rest of the enclosing
-		# function, since this compiler ties RC teardown to lexical block
-		# extent, not just to a name going out of scope. Fixed by reusing
-		# _stmt_If's own branch-confinement bookkeeping (cfg.py's
-		# enter_branch/exit_branch/merge_if) around an unconditionally-taken
-		# "branch" - no real runtime test needed, merge_if only compares
-		# state snapshots.
+		# ctx/NAME are ORDINARY, function-scoped locals (see
+		# _lower_with_context_manager's own docstring) - `bound`'s own
+		# binding still takes exactly the incref an ordinary Call-bound
+		# local always does (rc_inside == rc_before + 1), but it is NOT
+		# torn down early at the with-statement's own textual end (an
+		# earlier implementation attempt DID scope it there, reusing
+		# _stmt_If's own branch-confinement machinery - reverted: it also
+		# incorrectly scoped every OTHER local the with-block's BODY itself
+		# declares, since a with-block, unlike an if-branch, always
+		# executes exactly once when reached - see
+		# test_local_declared_inside_body_survives_after_the_block below).
+		# So rc_after (measured right after the block, well before main()
+		# itself returns) is STILL rc_before + 1, matching every other
+		# local variable's own function-scoped lifetime in this language.
 		self._run( '''
 import compiler
 
@@ -18608,14 +18613,76 @@ def main() -> i32:
 		if bound.n != 7:
 			return 2
 	rc_after: usize = compiler.refcount( payload )
-	if rc_after != rc_before:
-		return 3
+	with compiler.wrap_arithmetic:
+		if rc_after != rc_before + 1:
+			return 3
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
-	def test_ctx_itself_freed_exactly_once( self ) -> None:
+	def test_local_declared_inside_body_survives_after_the_block( self ) -> None:
+		# regression test for a real bug found post-merge (reported against
+		# the branch-confined implementation): a with-block's own BODY,
+		# unlike an if-branch's body, always executes exactly once when
+		# reached - ANY local it declares must survive past the with-
+		# statement's own end exactly like it would with no with-statement
+		# wrapping it at all. The branch-confined version wrongly reported
+		# "'x' is not initialized on all code branches" here, since
+		# merge_if's confinement applied to EVERY binding newly introduced
+		# inside its window, not just __with_ctx_N/NAME.
+		self._run( '''
+class Ctx:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with Ctx():
+		x: i32 = 5
+	if x != 5:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_with_on_an_existing_object_not_a_fresh_construction( self ) -> None:
+		# `with x:` where x is an ALREADY-EXISTING object, not a fresh
+		# constructor call - __with_ctx_N aliases x (a bare Name read), but
+		# ordinary aliasing assignment in this language still takes its own
+		# independent Incref (same as any plain `y = x`), so x itself stays
+		# perfectly valid and correctly valued both during and after the
+		# with-block regardless of what __with_ctx_N's own lifetime is.
+		self._run( '''
+import compiler
+
+class Resource:
+	n: i32
+	entered: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+		self.entered = 0
+	def __enter__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.entered = self.entered + 1
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	r = Resource( 7 )
+	with r:
+		if r.entered != 1:
+			return 1
+	if r.n != 7:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_exit_runs_exactly_once_with_nested_arithmetic_mode( self ) -> None:
 		self._run( '''
 import compiler
 
@@ -18775,10 +18842,12 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
-	def test_bound_value_not_usable_after_with_block( self ) -> None:
-		# cfg.py's own liveness gate, not a crash - ctx/NAME are torn down
-		# (real Decref) at the with-block's own end; reading NAME
-		# afterward must be a clean "not initialized" compile error.
+	def test_bound_value_usable_after_with_block( self ) -> None:
+		# `with EXPR as NAME:` does NOT introduce a new lifetime scope
+		# (matches real Python's own with-statement, which doesn't either -
+		# NAME stays bound and alive for the rest of the enclosing scope
+		# there too) - NAME must remain readable, with its correct value,
+		# after the with-block ends, same as any other ordinary local.
 		self._run( '''
 class Ctx:
 	def __enter__( self ) -> i32:
@@ -18789,10 +18858,12 @@ class Ctx:
 def main() -> i32:
 	with Ctx() as bound:
 		pass
-	return bound
+	if bound != 1:
+		return 1
+	return 0
 ''' )
-		self.assertNotEqual( self.discovery.errors.errors, [] )
-		self.assertIn( 'not initialized', str( self.discovery.errors.errors[0] ))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 	def test_broken_context_expression_does_not_corrupt_later_lowering( self ) -> None:
 		# a failure while lowering the with-statement itself (unresolvable
