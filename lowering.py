@@ -11263,8 +11263,25 @@ class FunctionLowering:
 			# init-is-None case too, since _lower_allocate_fields's own
 			# flattened_attributes() call needs that same resolution.
 			init = target_cls.chain_lookup( '__init__' ) if isinstance( target_cls, ( RCClass, CStruct )) else target_cls.get_local_or_raise( '__init__' )
-			if isinstance( init, Function ):
-				assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
+			if isinstance( init, Function ) and init.resolve is not None:
+				# ordinarily already resolved by now - type_resolver.py's own
+				# eager construction-call pre-pass (visit_Call) resolves
+				# whatever chain_lookup/get_local finds, and for a generic
+				# target_cls, monomorphizing it (the Specialization-swap
+				# above) resolves its OWN methods as a side effect of
+				# building the substituted copy. Neither covers an INHERITED
+				# init reached via chain_lookup through an EXPLICIT
+				# ClassName[T](...) subscript call: that pre-pass's own
+				# _try_resolve_callable_namespace has no Subscript-over-a-
+				# class handling at all (see _try_resolve_generic_
+				# construction's own docstring), and the inherited init
+				# belongs to a DIFFERENT, un-monomorphized ancestor class,
+				# so monomorphizing target_cls never touches it either.
+				# Resolve defensively here instead of asserting it must
+				# already be true - same "the caller owns making sure it's
+				# resolved" discipline _lower_super_init_if_required already
+				# uses for this exact "found via chain_lookup" shape.
+				self.lowering._ensure_resolved( init )
 			if init is None:
 				return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
 			if not isinstance( target_cls, RCClass ):

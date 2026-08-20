@@ -1044,7 +1044,29 @@ class RCClassSubclassingNoOwnInitTests( test_support.RealCompileMixin, CompilerT
 	   (3452816845) instead of Real's own `self.x = 5` - discovery.errors
 	   was empty throughout; nothing ever caught this at compile time.
 	   Fixed via InheritanceChainMixin.resolve_chain(), called before
-	   flattened_attributes() in _lower_allocate_fields. '''
+	   flattened_attributes() in _lower_allocate_fields.
+
+	Follow-up (found while investigating that fix's own flagged gaps):
+	the chain_lookup fix in (1) traded a silent wrong-value bug for a
+	genuine internal-compiler-error CRASH on one narrow shape - a GENERIC
+	subclass with no own __init__, inheriting a plain ancestor's, built
+	via EXPLICIT subscript syntax (`Baz[i32](...)`, not the bare
+	`Baz(...)` form). `_try_lower_construct_call`'s own `assert init.
+	resolve is None` assumed init was always already resolved by the time
+	chain_lookup finds it - true for type_resolver.py's own eager
+	construction-call pre-pass (which now resolves whatever chain_lookup
+	finds - see type_resolver.py's visit_Call) and, for a generic class's
+	OWN __init__, true as an incidental side effect of monomorphizing
+	target_cls itself. Neither covers this shape: that eager pre-pass's
+	own `_try_resolve_callable_namespace` has no Subscript-over-a-class
+	handling at all (a pre-existing, documented gap - see
+	`_try_resolve_generic_construction`'s own docstring), and the
+	inherited init belongs to a DIFFERENT, un-monomorphized ancestor
+	class, so target_cls's own monomorphization never touches it either.
+	Fixed by resolving `init` defensively right there instead of
+	asserting it must already be true - the same discipline
+	`_lower_super_init_if_required` already uses for this exact
+	"found via chain_lookup" shape. '''
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
 		self.compiler = Compiler( self.discovery )
@@ -1170,6 +1192,70 @@ def main() -> i32:
 		i: i32 = 0
 		while i < 1000:
 			b: Bar = Bar( s = 'hello'.upper() )
+			if b.s.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+			# the follow-up crash: a GENERIC subclass with no own __init__,
+			# inheriting a plain (non-generic) ancestor's, constructed via
+			# EXPLICIT subscript syntax - this is the ONE call shape
+			# type_resolver.py's own eager construction-call pre-pass never
+			# reaches (no Subscript-over-a-class handling), so it depends
+			# entirely on lowering.py's own defensive resolve fix (see this
+			# class's own docstring, "Follow-up" paragraph)
+			( 'generic_subclass_explicit_subscript_inherits_base_init', '''
+class Real:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Baz[T]( Real ):
+	pass
+
+def main() -> i32:
+	b: Baz[i32] = Baz[i32]( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# same shape as the previous case, but the BARE (non-subscript)
+			# construction form - type args inferred from the surrounding
+			# annotation instead - to confirm both construction call shapes
+			# for a generic subclass with an inherited init work, not just
+			# the explicit one
+			( 'generic_subclass_bare_form_inherits_base_init', '''
+class Real:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Baz[T]( Real ):
+	pass
+
+def main() -> i32:
+	b: Baz[i32] = Baz( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# RC-lifetime stress check for the explicit-subscript generic-
+			# subclass shape specifically - same rigor as this class's own
+			# rc_lifetime_repeated_inherited_init_no_leak above
+			( 'rc_lifetime_repeated_generic_subclass_explicit_subscript_no_leak', '''
+class Real:
+	s: str
+	def __init__( self, s: str ) -> None:
+		self.s = s
+
+class Baz[T]( Real ):
+	pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			b: Baz[i32] = Baz[i32]( s = 'hello'.upper() )
 			if b.s.byte_len() != 5:
 				return 1
 			i += 1
