@@ -53,14 +53,10 @@ class ZoneInfo:
 		# hand-rolled binary search over transition_times (list[i64]), NOT
 		# lib/bisect.py's bisect_right - bisect_right takes arr: slice[T],
 		# and slice[T] IS constructible now (UnsafeList[T].as_slice(), see
-		# BisectTests/RawDict._lower_bound), but transition_times is a
-		# locked list[T] specifically, not UnsafeList[T] - list[T]
-		# deliberately has no as_slice()/get_ptr() (see __list.py's own
-		# header comment: a raw buffer view isn't safe to hold once the
-		# lock that made it valid has been released), so this would still
-		# need transition_times to become UnsafeList[T] (a real behavior
-		# change - whether ZoneInfo is ever shared cross-thread wasn't
-		# checked) before switching this over. Separately, a generic
+		# BisectTests/RawDict._lower_bound; list[T].borrow_slice()/
+		# release_borrow() now offers the same for a locked list[T] too,
+		# see __list.py's own comment - not yet wired up here, a real
+		# follow-up opportunity, not attempted this pass). Separately, a generic
 		# key=lambda call here would also hit PLAN_LAMBDA.md's documented
 		# "not attempted end to end" gap - this sidesteps both at once, at
 		# the cost of a few duplicated lines instead of a shared helper.

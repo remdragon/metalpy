@@ -34,10 +34,16 @@
 #                     different erase/ordering semantics (swap-and-pop,
 #                     stable IDs). Untouched by this split.
 #
-# get_ptr() (a borrowed pointer straight into the buffer) is UnsafeList[T]
-# only, deliberately not on list[T] - the pointer's own validity window
-# ("don't use it past the next mutation") is meaningless once the lock
-# that made "the next mutation" observable has already been released.
+# A raw borrowed view (slice[T]) into the buffer is UnsafeList[T].as_slice()
+# only, deliberately not the same shape on list[T] - the view's own validity
+# window ("don't use it past the next mutation") is meaningless once the
+# lock that made "the next mutation" observable has already been released.
+# list[T] instead offers borrow_slice()/release_borrow(): an atomic borrow
+# COUNT (see borrow_slice()'s own comment) that append/insert/erase_at/pop
+# check and refuse to proceed against while nonzero - the same "an
+# outstanding export blocks a resize" contract Python's own memoryview/
+# buffer protocol enforces over bytearray, just via a plain counter instead
+# of PEP 3118's own export-count machinery.
 
 import compiler
 import sys
@@ -268,27 +274,16 @@ class UnsafeList[T]:
 		compiler.decref( old )
 		return Result.Ok( None )
 
-	# Get a borrowed pointer directly into the buffer (no copy, no incref).
-	# Caller must NOT store this pointer beyond the next mutation of the
-	# list (insert/remove/append may reallocate or shift the buffer).
-	# NOTE: for an RC element type, Ptr[T] itself stays single-indirection
-	# (see _read_element's own comment) - a slot only ever holds a T
-	# HANDLE, not a T value, so there is no correctly-typed Ptr[T] this
-	# method could return today. Value-typed T only, for now.
-	def get_ptr( self, idx: usize ) -> Result[Ptr[T], IndexError]:
-		ptr: Ptr[T] = compiler.cast( Ptr[T], self.__raw._ptr_at( idx ).or_return())
-		return Result.Ok( ptr )
-
-	# A borrowed slice[T] view over the WHOLE buffer - same "don't outlive
-	# the next mutation" borrow contract as get_ptr, but unlike get_ptr this
-	# is safe for an RC element type too: slice[T]'s own _ptr is untyped
-	# (ConstPtr[None]), and slice.get_unchecked/_element_size already do the
-	# same compiler.is_rc(T) handle-vs-value branch UnsafeList's own
-	# _read_element does - the two containers' buffer layouts always agree.
-	# _slot_ptr(0), not get_ptr(0)/_ptr_at(0) - those are bounds-checked
-	# against __len and would fail on an empty list; a zero-length slice is
-	# still well-formed (nothing can dereference through it, since every
-	# real read goes through an index < len() check first).
+	# A borrowed slice[T] view over the WHOLE buffer - "don't outlive the
+	# next mutation" borrow contract (insert/remove/append may reallocate or
+	# shift the buffer): slice[T]'s own _ptr is untyped (ConstPtr[None]),
+	# and slice.get_unchecked/_element_size already do the same
+	# compiler.is_rc(T) handle-vs-value branch UnsafeList's own
+	# _read_element does. _slot_ptr(0), not _ptr_at(0) - the latter is
+	# bounds-checked against __len and would fail on an empty list; a
+	# zero-length slice is still well-formed (nothing can dereference
+	# through it, since every real read goes through an index < len()
+	# check first).
 	def as_slice( self ) -> slice[T]:
 		return slice[T]( _ptr = compiler.cast( ConstPtr[None], self.__raw._slot_ptr( 0 )), __len = self.__raw.len() )
 
@@ -324,12 +319,14 @@ class UnsafeList[T]:
 # ---------------------------------------------------------------------------
 
 class list[T]:
-	__inner: UnsafeList[T]
-	__lock:  threading.FastLock
+	__inner:   UnsafeList[T]
+	__lock:    threading.FastLock
+	__borrows: usize  # see borrow_slice()'s own comment
 
 	def __init__( self, initial_capacity: usize = 8 ) -> None:
-		self.__inner = UnsafeList[T]( initial_capacity )
-		self.__lock  = threading.FastLock()
+		self.__inner   = UnsafeList[T]( initial_capacity )
+		self.__lock    = threading.FastLock()
+		self.__borrows = 0
 
 	def __len__( self ) -> usize:
 		self.__lock.acquire().unwrap( 'list.__len__: lock failed' )
@@ -342,17 +339,21 @@ class list[T]:
 		return self.__inner.capacity()
 
 	# Append a value at the end. Increfs val if T is an RC type.
-	def append( self, val: T ) -> Result[None, OverflowError]:
+	def append( self, val: T ) -> Result[None, OverflowError|BorrowError]:
 		self.__lock.acquire().unwrap( 'list.append: lock failed' )
 		defer( self.__lock.release() )
+		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+			return Result.Err( BorrowError() )
 		return self.__inner.append( val )
 
 	# Insert a value at idx, shifting everything at/after idx one slot to
 	# the right. idx > len clamps to len (append), matching Python's own
 	# list.insert. Increfs val if T is an RC type.
-	def insert( self, idx: usize, val: T ) -> Result[None, OverflowError]:
+	def insert( self, idx: usize, val: T ) -> Result[None, OverflowError|BorrowError]:
 		self.__lock.acquire().unwrap( 'list.insert: lock failed' )
 		defer( self.__lock.release() )
+		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+			return Result.Err( BorrowError() )
 		return self.__inner.insert( idx, val )
 
 	# Access element by position. Returns a copy (with incref if RC).
@@ -361,7 +362,13 @@ class list[T]:
 		defer( self.__lock.release() )
 		return self.__inner.__getitem__( idx )
 
-	# Overwrite the element at idx. Increfs val and decrefs the value it replaces.
+	# Overwrite the element at idx. Increfs val and decrefs the value it
+	# replaces. NOT gated on __borrows: unlike append/insert/erase_at/pop,
+	# this never reallocates or shifts anything - it's a fixed-offset write,
+	# which can't invalidate a borrowed slice[T]'s own pointer or length
+	# (whether the WRITE itself races logically with a concurrent reader is
+	# a separate, pre-existing category of hazard borrow_slice() was never
+	# meant to solve either - see its own comment).
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
 		self.__lock.acquire().unwrap( 'list.__setitem__: lock failed' )
 		defer( self.__lock.release() )
@@ -375,9 +382,11 @@ class list[T]:
 	# primitive on UnsafeList[T] - one extra, balanced incref/decref pair,
 	# negligible next to the lock acquire/release this already pays for;
 	# revisit only if profiling ever says otherwise.
-	def pop( self ) -> Result[T, IndexError]:
+	def pop( self ) -> Result[T, IndexError|BorrowError]:
 		self.__lock.acquire().unwrap( 'list.pop: lock failed' )
 		defer( self.__lock.release() )
+		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+			return Result.Err( BorrowError() )
 		n: usize = self.__inner.__len__()
 		if n == 0:
 			return Result.Err( IndexError() )
@@ -389,16 +398,58 @@ class list[T]:
 
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
-	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
+	def erase_at( self, idx: usize ) -> Result[None, IndexError|BorrowError]:
 		self.__lock.acquire().unwrap( 'list.erase_at: lock failed' )
 		defer( self.__lock.release() )
+		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+			return Result.Err( BorrowError() )
 		return self.__inner.erase_at( idx )
 
+	# Borrow a read-only slice[T] view over the WHOLE buffer, valid until the
+	# matching release_borrow() call. Unlike UnsafeList[T].as_slice() (safe
+	# there because nothing else can touch an UnsafeList concurrently by
+	# construction), a raw view into a LOCKED list[T]'s buffer would
+	# otherwise dangle the instant this method returns and the lock
+	# releases: another thread's append/insert/erase_at/pop could reallocate
+	# or shift the buffer with no way for the borrower to ever know. Tracked
+	# via an atomic borrow COUNT instead of holding the lock for the view's
+	# whole lifetime (which would serialize every reader against every
+	# other reader for no reason - multiple concurrent borrows are perfectly
+	# safe, only a MUTATION racing a live borrow isn't): every mutator that
+	# could invalidate a view checks this count FIRST (while holding the
+	# lock, so the check itself is race-free) and refuses with BorrowError
+	# rather than proceeding, the same "an outstanding export blocks a
+	# resize" contract Python's own memoryview/buffer protocol enforces
+	# over bytearray. Caller MUST pair this with release_borrow() (typically
+	# via defer(), the same idiom every method here already uses for
+	# __lock) - there is no automatic release: slice[T] is a plain @cstruct,
+	# not an RCClass, so it has no __del__ to hook one into. Does NOT keep
+	# this list[T] object itself alive - a slice[T] holds no reference back
+	# to its origin, so destructing (not just mutating) the list while a
+	# borrow is outstanding is still the caller's own responsibility to
+	# avoid, exactly as it already is for UnsafeList[T].as_slice().
+	def borrow_slice( self ) -> slice[T]:
+		self.__lock.acquire().unwrap( 'list.borrow_slice: lock failed' )
+		defer( self.__lock.release() )
+		view: slice[T] = self.__inner.as_slice()
+		compiler.atomic_add( compiler.addrof( self.__borrows ), 1 )
+		return view
+
+	# Ends a borrow started by borrow_slice() - see its own comment. Safe to
+	# call without holding __lock: this only needs to be atomic with respect
+	# to the CHECK append/insert/erase_at/pop make against the same counter,
+	# not with the rest of the container's own state.
+	def release_borrow( self ) -> None:
+		compiler.atomic_sub( compiler.addrof( self.__borrows ), 1 )
+
 	# Erase all elements, decrefing each RC element first.
-	def clear( self ) -> None:
+	def clear( self ) -> Result[None, BorrowError]:
 		self.__lock.acquire().unwrap( 'list.clear: lock failed' )
 		defer( self.__lock.release() )
+		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+			return Result.Err( BorrowError() )
 		self.__inner.clear()
+		return Result.Ok( None )
 
 	# Hold the lock across more than one call - for compound, "check-then-
 	# act" sequences that need to happen atomically (e.g. "append only if
