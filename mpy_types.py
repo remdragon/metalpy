@@ -231,10 +231,27 @@ class TypeVar( Type ):
 	''' a placeholder for one of a generic's type parameters, e.g. T in class Result[T,E] '''
 	# TypeVar(bound=SomeProtocol) - the only bound kind supported (discovery.py's
 	# _parse_type_params rejects anything else). Checked at generic
-	# instantiation time: the concrete type substituted for this TypeVar must
-	# carry `bound` in its own RCClass.protocols - see discovery.py's
-	# _get_or_create_specialization.
+	# instantiation time via bound_satisfied_by below, from every call site
+	# that substitutes a concrete type for this TypeVar (lowering.py's
+	# _finish_generic_call/_lower_generic_function_call/_lower_class_generic_
+	# method_call/_lower_generic_construction_args, and type_resolver.py's
+	# _ReferenceResolver, which bails rather than hard-failing so lowering's
+	# own copy reports the real error) - deliberately NOT in discovery.py's
+	# _get_or_create_specialization, a low-level shared cache/builder with no
+	# AST node/error-location available.
 	bound: 'Protocol|None' = None
+
+	def bound_satisfied_by( self, concrete: Type ) -> bool:
+		''' True if `concrete` may be substituted for this TypeVar. Always
+		true when unbound. When bound to a Protocol, `concrete` must be an
+		RCClass that has ALREADY had its own conformance verified - this is
+		just a membership check against RCClass.protocols, not re-doing the
+		structural verification discovery.py's _validate_protocol_conformance
+		already did once, at that class's own definition. '''
+		if self.bound is None:
+			return True
+		base = concrete.base if isinstance( concrete, Specialization ) else concrete
+		return isinstance( base, RCClass ) and self.bound in base.protocols
 
 @dataclass( kw_only = True, repr = False )
 class Specialization( Type ):

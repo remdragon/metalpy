@@ -4552,6 +4552,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				if not isinstance( resolved, Type ) or isinstance( resolved, TypeVar ):
 					return None # not a type at all, or a still-unbound TypeVar (walking an abstract generic body) - either way, not this pass's to resolve
 				args.append( resolved )
+			if not self._type_params_satisfy_bounds( base.type_params, args ):
+				return None # a real TypeVar(bound=...) violation - bail so lowering.py's own _lower_generic_function_call reports it with full context
 			return base, args
 
 		target = self._try_resolve_callable_namespace( func )
@@ -4562,6 +4564,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		args = self._infer_generic_args( node, target, target.type_params )
 		if args is None:
 			return None
+		if not self._type_params_satisfy_bounds( target.type_params, args ):
+			return None # bail so lowering.py's own _finish_generic_call reports the bound violation
 		return target, args
 
 	def _pair_call_args_for_inference( self, target: Function, node: ast.Call ) -> list[tuple[Parameter,ast.expr]]|None:
@@ -4722,12 +4726,23 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		args = self._infer_generic_args( node, init, target_cls.type_params, trust_literals = False )
 		if args is None:
 			return None
+		if not self._type_params_satisfy_bounds( target_cls.type_params, args ):
+			return None # bail so lowering.py's own _lower_generic_construction_args reports the bound violation
 		spec = self.discovery._get_or_create_specialization( target_cls, args )
 		concrete_cls = self.resolver.monomorphizer.monomorphize_class( spec )
 		concrete_init = concrete_cls.get_local( '__init__' )
 		if not isinstance( concrete_init, Function ) or concrete_init.broken:
 			return None # shouldn't happen (monomorphize_class's own method loop always substitutes a plain __init__ too), but stay silent/consistent with this pass's own discipline rather than assert
 		return concrete_cls, concrete_init
+
+	def _type_params_satisfy_bounds( self, type_params: list[TypeVar], args: list[Type] ) -> bool:
+		# a real TypeVar(bound=...) violation is CONFIRMED, not a doubt - but
+		# this pass never calls discovery.fail itself (see _try_resolve_
+		# generic_call's own docstring), so callers bail (return None) on a
+		# False here, same as any other "not this pass's to resolve or
+		# report" case, letting lowering.py's own Lowering._check_type_param_
+		# bounds raise the real error with full node/context
+		return all( tv.bound_satisfied_by( arg ) for tv, arg in zip( type_params, args ))
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type] ) -> bool:
 		# ported from Lowering._unify_type_param, minus the discovery.fail()
