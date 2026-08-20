@@ -4110,6 +4110,62 @@ class Tests( unittest.TestCase ):
 		self.compiler._lower( call_it_fn )
 		self.assertIn( 'takes 2 argument(s), got 1', self.discovery.errors.errors[0] )
 
+	def test_call_through_callable_field_emits_get_attr_then_call_indirect( self ) -> None:
+		# obj.field(...) - a call THROUGH a Ptr[Callable[...]]-typed FIELD,
+		# not a bare Name. Was a hard "not callable" compile error before -
+		# _try_lower_indirect_call only recognized a bare Name callee
+		# (PLAN_CALLABLE.md's own deferred item). Confirms the receiver is
+		# read via an ordinary ir.GetAttr (reusing the exact same field-read
+		# path an ordinary `x = o.field` already uses), immediately followed
+		# by ir.CallIndirect targeting that GetAttr's own dest.
+		code = '\n'.join([
+			'@cstruct',
+			'class Ops:',
+			'	handler: Ptr[Callable[[i32,i32],bool]]',
+			'',
+			'def call_it( o: Ops, a: i32, b: i32 ) -> bool:',
+			'	return o.handler( a, b )',
+		])
+		self._import( code )
+		call_it_fn = self.discovery.modules['__test__'].get_local( 'call_it' )
+		if call_it_fn.resolve is not None:
+			call_it_fn.resolve()
+		lf = self.compiler._lower( call_it_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		get_attr = next( instr for instr in lf.instructions if isinstance( instr, ir.GetAttr ))
+		self.assertEqual( get_attr.attr, 'handler' )
+		call_indirect = next( instr for instr in lf.instructions if isinstance( instr, ir.CallIndirect ))
+		self.assertIs( call_indirect.target, get_attr.dest )
+		self.assertEqual( [ a.stem for a in call_indirect.args ], [ 'a', 'b' ])
+
+	def test_ordinary_method_call_not_misrouted_through_field_call_recognizer( self ) -> None:
+		# regression guard: the SAME dotted-attribute callee shape (o.name(...))
+		# must still dispatch as an ordinary method call, not get swallowed by
+		# the new field-call recognizer above - it has to bail via the non-
+		# failing _find_method check before ever probing for a field named
+		# the same thing (a real method emits ir.Call, never ir.CallIndirect/
+		# ir.GetAttr for the callee itself).
+		code = '\n'.join([
+			'@cstruct',
+			'class Ops:',
+			'	handler: Ptr[Callable[[i32],i32]]',
+			'',
+			'	def real_method( self, x: i32 ) -> i32:',
+			'		return x',
+			'',
+			'def call_it( o: Ops, x: i32 ) -> i32:',
+			'	return o.real_method( x )',
+		])
+		self._import( code )
+		call_it_fn = self.discovery.modules['__test__'].get_local( 'call_it' )
+		if call_it_fn.resolve is not None:
+			call_it_fn.resolve()
+		lf = self.compiler._lower( call_it_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertFalse( any( isinstance( i, ir.CallIndirect ) for i in lf.instructions ))
+		call = next( instr for instr in lf.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.stem, 'real_method' )
+
 	def test_call_through_none_returning_callable_pointer_omits_dest( self ) -> None:
 		# regression test: a NoneType-returning Callable[...] call used to
 		# always allocate a dest temp and emit ir.CallIndirect(dest=...),
