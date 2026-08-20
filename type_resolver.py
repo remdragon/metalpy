@@ -6047,6 +6047,47 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		folded = self._try_fold_match_type( node )
 		if folded is not None:
 			return folded
+		# resolve_function_body's own docstring classifies match desugaring
+		# (rewrite 2) as substitution-INDEPENDENT - true for pattern
+		# resolution itself (an Owner.Member reference is resolved by NAME,
+		# never by the subject's type), but NOT for this method's own later
+		# exhaustiveness/flattening pre-pass just below, which DOES need the
+		# subject's real type (_type_of_expr(node.subject)) to know whether
+		# every case together covers a union's own members. When the
+		# CURRENT function is still generic (an unbound type param, e.g.
+		# `def fill_from[T](self, transport: T)` matching on `transport.
+		# recv(...)`'s own return type) that type genuinely can't be known
+		# yet - _type_of_expr correctly comes back None - but rewrite 1/2
+		# (compiler.py's _lower, Specialization+Function branch) still runs
+		# this pass exactly once against the SHARED, abstract base Function,
+		# unconditionally, well before any concrete specialization exists.
+		# Proceeding anyway would permanently bake a wrongly-non-exhaustive
+		# if/elif (no real trailing else, since last_guaranteed can only
+		# ever be True) into that SHARED node - and since Monomorphizer.
+		# monomorphized_function deep-copies THAT node per specialization,
+		# whichever specialization's own copy happens to be taken AFTER this
+		# pass runs (a genuine compile-order race - a DIFFERENT specialization
+		# whose own copy was taken EARLIER, before this mutation, still gets
+		# a pristine, correctly-desugared-later copy) inherits the wrong
+		# structure permanently, with no case left for rewrite 3's own later,
+		# per-specialization pass (T now concretely bound) to ever revisit -
+		# a real, confirmed -Wreturn-type/C4715 (non-void function falls off
+		# the end), not a hypothetical (lib/http/client.py's own _GrowableBuffer.
+		# fill_from[socket.Socket], confirmed via a real before/after
+		# generated-C diff and direct monomorphization tracing, not guessed).
+		# Same "on any doubt, defer entirely" discipline visit_Call's own
+		# generic-call resolution already uses for the identical reason (see
+		# this class's own docstring, rewrite 3's paragraph) - leaving node
+		# completely untouched here means the SHARED base's own body still
+		# holds a genuine, un-mutated ast.Match, so EVERY specialization's
+		# own deep copy (regardless of which race it's on) gets a fresh,
+		# correct shot at this exact method, once via rewrite 3, with its
+		# own T concretely bound.
+		if (
+			self.fn is not None and ( self.fn.type_params or getattr( self.fn.cls, 'type_params', None ))
+			and self._type_of_expr( node.subject ) is None
+		):
+			return [ node ]
 		unique = self._label_id
 		self._label_id += 1
 		subj_name = f'__match_subj_{unique}'
