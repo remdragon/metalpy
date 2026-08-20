@@ -213,3 +213,31 @@ def freeaddrinfo(
 	pAddrInfo: Ptr[None],
 ) -> None:
 	...
+
+# FIONBIO - winsock2.h's _IOW('f', 126, u_long), 0x8004667E. i32 (not u32):
+# ioctlsocket's real signature takes `long cmd`, matching every other
+# Winsock parameter here already using i32/u32 per the real Win32 type,
+# not a POSIX-style unsigned assumption.
+FIONBIO: i32 = -2147195266   # 0x8004667E as a signed i32 - see comment above
+
+@extern( 'ws2_32', 'ioctlsocket' )
+def ioctlsocket(
+	s: SOCKET,
+	cmd: i32,
+	argp: Ptr[u32],
+) -> i32:
+	...
+
+# WSAPoll - fdArray stays opaque Ptr[None] (same posture as every sockaddr*
+# out-param above): WSAPOLLFD's own field layout is owned by whichever
+# application module actually reads/writes it (lib/poller.py), cast to
+# Ptr[None] at the call site - not declared here, avoiding a circular
+# import (poller.py already needs to import THIS module for WSAPoll
+# itself).
+@extern( 'ws2_32', 'WSAPoll' )
+def WSAPoll(
+	fdArray: Ptr[None],
+	fds: u32,
+	timeout: i32,
+) -> i32:
+	...
