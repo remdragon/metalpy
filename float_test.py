@@ -341,6 +341,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		x: f64 = 1.0e308
 		y: f64 = x * x
+		if y != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -351,6 +352,7 @@ def main() -> i32:
 		z: f64 = 0.0
 		one: f64 = 1.0
 		y: f64 = one / z
+		if y != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -360,6 +362,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		big: f64 = 1.0e300
 		n: i32 = i32(big)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -370,6 +373,7 @@ def main() -> i32:
 		z: f64 = 0.0
 		nan: f64 = z / z
 		n: i32 = i32(nan)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -402,6 +406,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		big: f64 = 1.0e40
 		n: i128 = i128(big)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -411,6 +416,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		neg: f64 = -1.0
 		n: u128 = u128(neg)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -477,6 +483,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		boundary: f64 = 9223372036854775808.0
 		n: i64 = i64(boundary)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -739,6 +746,7 @@ def main() -> i32:
 		big: f64 = 1.0e308
 		small: f64 = 1.0e-308
 		q: f64 = big / small
+		if q != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -755,6 +763,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		two: f64 = 2.0
 		q: f64 = nan / two
+		if q != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -773,6 +782,7 @@ def main() -> i32:
 		neg_one: i8 = -1
 		mn: i8 = -128
 		q: i8 = mn // neg_one
+		if q != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 		self._assert_program_panics( '''
@@ -781,6 +791,7 @@ def main() -> i32:
 		neg_one: i8 = -1
 		mn: i8 = -128
 		m: i8 = mn % neg_one
+		if m != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 

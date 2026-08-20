@@ -2903,6 +2903,8 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 			'	foo: Foo = Foo.make( 1 )',
 			'	bar: Foo = foo',
 			'	rc: usize = compiler.refcount( bar )',
+			'	if rc == usize( 0 ):', # touch it - actually proves refcount() returns something real, not just "compiles"
+			'		return 0',
 			'	with compiler.wrap_arithmetic:',
 			'		return bar.x',
 		]))
@@ -3010,6 +3012,8 @@ class SizeofValueArgumentRealCompileTests( RCClassTestCase ):
 			'		return 1',
 			'	if compiler.sizeof( v ) != 4:',
 			'		return 2',
+			'	if v != 0:', # a real runtime read of v - every use above is compiler.sizeof(v), which only needs v's static TYPE and folds away at compile time, never actually touching v itself
+			'		return 3',
 			'	return 0',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -3220,6 +3224,7 @@ class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 			'',
 			'def main() -> None:',
 			'	x: u32 = STD_OUTPUT_HANDLE',
+			'	x = u32( x )', # touch x - actually reads the global, not just "compiles" (same-width construct-cast, always infallible, no dunder needed - this minimal harness has no builtins imported)
 			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
@@ -12488,7 +12493,6 @@ def main() -> i32:
 			( 'no_explicit_else_still_narrows', '''
 def describe( x: i32|str ) -> usize:
 	with compiler.wrap_arithmetic:
-		result: usize = 0
 		if type( x ) is i32:
 			return 999
 		return x.byte_len()
@@ -14181,6 +14185,10 @@ def main() -> i32:
 	sz: usize = compiler.sizeof( Foo )
 	if sz != usize( 10 ):
 		return 1
+	if f.a != u16( 0 ): # actually verify the "zero-fill" this case is named for
+		return 2
+	if f.b[0] != 0 or f.b[7] != 0:
+		return 3
 	return 0
 ''' ),
 			# explicit ClassName(field=0) construction argument (not just the
@@ -14295,6 +14303,8 @@ def main() -> i32:
 		count: usize = compiler.sizeof( f.arr ) // compiler.sizeof( u16 )
 	if count != usize( 32 ):
 		return 3
+	if f.a != u32( 0 ): # a real runtime read of f - every use above is compiler.sizeof(f.<field>), which only needs f's static TYPE and folds away at compile time, never actually touching f itself
+		return 4
 	return 0
 ''' ),
 		] )
@@ -16073,6 +16083,7 @@ def gen( b: Box ) -> Iterator[i32]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
 	first = g.__next__() # only one of the two yields is ever consumed
+	if first is None: pass # touch it - deliberately never otherwise read, see below
 	# g goes out of scope here, still mid-iteration - PLAN_GENERATORS.md's
 	# own point: dropping it must still decref its captured Box parameter,
 	# via the ordinary, unmodified $$__destructor__ cascade every other
@@ -16137,7 +16148,9 @@ def gen( b: Box ) -> Iterator[usize]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
 	first = g.__next__()
+	if first is None: pass # touch it - deliberately never otherwise read
 	second = g.__next__() # b.v is 10 - only 2 of 10 iterations consumed
+	if second is None: pass # touch it - deliberately never otherwise read
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -16383,6 +16396,7 @@ def double_all( xs: list[i32] ) -> Iterator[i32]:
 def make_and_partially_consume( xs: list[i32] ) -> None:
 	g = double_all( xs )
 	first = g.__next__()
+	if first is None: pass # touch it - deliberately never otherwise read
 	# g goes out of scope here, mid-iteration - g's own __for_obj_N field
 	# holds a SEPARATE reference to xs, must also be released
 
@@ -16454,6 +16468,7 @@ def doubled( b: Box ) -> Iterator[usize]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = doubled( b )
 	first = g.__next__()
+	if first is None: pass # touch it - deliberately never otherwise read
 	# g's own __for_obj_N field holds the inner counter(b) generator,
 	# which ITSELF holds b as its own captured parameter - both levels
 	# must release correctly when g is dropped mid-iteration
@@ -17055,6 +17070,7 @@ def gen( b: Box, count: usize ) -> Iterator[usize]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b, 5 )
 	first = g.__next__() # only 1 of 5 iterations consumed
+	if first is None: pass # touch it - deliberately never otherwise read
 	# g goes out of scope here, still mid-iteration - abandonment must still
 	# replay the armed defer, via the destructor, before its own ordinary
 	# captured-parameter teardown
@@ -17242,9 +17258,11 @@ def drain_fully( b: Box, count: usize ) -> None:
 	i: usize = 0
 	while i < count:
 		v = g.__next__()
+		if v is None: pass # touch it - deliberately never otherwise read
 		with compiler.wrap_arithmetic:
 			i += 1
 	last = g.__next__() # natural exhaustion - tail replay fires the defer, unsets its own flag
+	if last is None: pass # touch it - deliberately never otherwise read
 	# g goes out of scope HERE - $$__destructor__ must see the flag already
 	# unset and must NOT replay the same defer body a second time
 
@@ -17597,6 +17615,7 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen()
 		r = g.send( 5 ).unwrap( 'unexpected error' )
+		if r != 0: pass # touch it - the panic above means this never actually runs
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -17617,7 +17636,9 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen()
 		r0 = g.__next__().unwrap( 'unexpected error' )
+		if r0 != 0: pass # touch it - the panic below means this never actually runs
 		r1 = g.__next__().unwrap( 'unexpected error' ) # resumes the captured yield without sending - must panic, not silently deliver garbage
+		if r1 != 0: pass # touch it - the panic above means this never actually runs
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -17719,7 +17740,9 @@ def collector() -> Generator[i32, Box, NoError]:
 def make_send_and_drop( b: Box ) -> None:
 	g = collector()
 	r0 = g.__next__().unwrap( 'e' )
+	if r0 != 0: pass # touch it - deliberately never otherwise read
 	r1 = g.send( b ).unwrap( 'e' )
+	if r1 != 0: pass # touch it - deliberately never otherwise read
 	# g abandoned here mid-iteration - both held and __send_slot still
 	# hold their own reference to b, must both be released by the
 	# generator's own destructor
@@ -17842,6 +17865,7 @@ def outer( b1: Box, b2: Box ) -> Iterator[Box]:
 def make_and_abandon( b1: Box, b2: Box ) -> None:
 	g = outer( b1, b2 )
 	first = g.__next__()
+	if first is None: pass # touch it - deliberately never otherwise read
 	# g (and first, and inner's own generator) all go out of scope here,
 	# still mid-iteration on b1 - the generator's own destructor must
 	# still release every live promoted field it's holding

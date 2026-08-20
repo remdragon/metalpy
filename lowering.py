@@ -3218,6 +3218,22 @@ class FunctionLowering:
 				for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node, track_result = not is_match_subject, borrow = is_match_subject and is_alias ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
+				if getattr( node, 'is_match_binding', False ):
+					# type_resolver.py's _match_pattern: a `case T(name):`
+					# extracted payload. This language has no wildcard/discard
+					# binding syntax (no Rust-style `case T(_):`), so a case
+					# body that never reads `name` (`case Result.Err(e): pass`,
+					# or one that builds a fresh, unrelated error instead of
+					# reusing e) is entirely ordinary, expected code, not an
+					# oversight - unlike a bare user-declared local's own
+					# genuinely-forgotten unused value, there's no syntax the
+					# user could have written instead to signal "discard this"
+					# and silence a real warning. Mark it read unconditionally
+					# (harmless when the arm DOES go on to use it - a real
+					# later read isn't affected either way) rather than
+					# leaving every such arm's own real, confirmed
+					# -Wunused-variable/C4189 unfixable from the language side
+					self._emit( ir.MarkUsed( operand = var ))
 				match_clears_name = getattr( node, 'match_clears_name', None )
 				if match_clears_name is not None:
 					self._cfg.clear_result( match_clears_name )

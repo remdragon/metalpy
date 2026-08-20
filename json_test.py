@@ -558,7 +558,11 @@ def main() -> i32:
 	e10: json.JSONError = json.JSONError.InvalidEscape( 0 )
 	e11: json.JSONError = json.JSONError.InvalidNumber( 0 )
 	e12: json.JSONError = json.JSONError.TrailingGarbage( 0 )
-	if e1.tag == e2.tag:
+	if (
+		e1.tag == e2.tag or e2.tag == e3.tag or e3.tag == e4.tag or e4.tag == e5.tag or
+		e5.tag == e6.tag or e6.tag == e7.tag or e7.tag == e8.tag or e8.tag == e9.tag or
+		e9.tag == e10.tag or e10.tag == e11.tag or e11.tag == e12.tag
+	):
 		return 1
 	return 0
 '''

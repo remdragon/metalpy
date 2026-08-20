@@ -2824,6 +2824,16 @@ class TypeResolver:
 			for attr in base.attributes:
 				if attr.resolve is not None:
 					attr.resolve()
+			# no RC-pointer member at all (every leaf is_rc_pointer() below
+			# is False) means the loop below would never build a single If
+			# reading the tag - nothing here actually needs tearing down, so
+			# skip the tag read entirely rather than emitting `__dtor_tag_N
+			# = expr.tag;` with nothing left to compare it against (a real,
+			# confirmed -Wunused-variable/C4189: the tag was always computed
+			# unconditionally, up front, regardless of whether the loop
+			# below ever turned out to need it)
+			if not any( attr.type.is_rc_pointer() for attr in base.attributes ):
+				return []
 			tag_attr, data_attr, _payload_cls, tags = self.union_storage.get( base )
 
 			# __tag = expr.tag
@@ -5909,6 +5919,17 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return test, []
 			bind = ast.Assign( targets = [ ast.Name( id = pattern.name, ctx = ast.Store() ) ], value = subj_expr )
 			ast.copy_location( bind, node )
+			# is_match_binding: lowering.py's _stmt_Assign reads this to mark
+			# the payload as read (ir.MarkUsed) right after its own real
+			# Assign, regardless of whether this specific arm's body ever
+			# goes on to use it - see its own comment for why. Distinct from
+			# is_match_subject above (that one's for the SUBJECT's own
+			# __match_subj_N relay, this is for an actual `case T(name):`
+			# extracted payload) and from is_narrowing_bind (_build_narrow_
+			# marker's own, mutually-exclusive same-name-reuse shape, never
+			# reaches this branch at all - see _match_union_member's own
+			# check above it)
+			bind.is_match_binding = True
 			# same reasoning as visit_Match's own subj_assign comment above:
 			# this Assign is built directly, never dispatched through
 			# self.visit()/visit_Assign, so nothing populates

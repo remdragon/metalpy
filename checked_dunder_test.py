@@ -70,6 +70,7 @@ def main() -> i32:
 	maxv: i32 = 2147483647
 	with compiler.panic_arithmetic( 'overflow!' ):
 		x = maxv + 1
+		if x != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 '''
 
