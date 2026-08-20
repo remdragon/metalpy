@@ -4221,6 +4221,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if not isinstance( names, dict ):
 				return None
 			found = names.get( node.attr )
+			if isinstance( found, Function ) and found.is_property:
+				# `obj.attr` reading a @property getter (no call parens) means
+				# "call this zero-arg getter", same as lowering.py's own
+				# _expr_Attribute is_property branch - this pass needs the
+				# SAME reading so is-None narrowing (etc) fires for a property
+				# read used DIRECTLY (`f.val is None`), not just through an
+				# already-materialized local (`x = f.val; x is None`, which
+				# worked fine already since x's tracked type comes from the
+				# Assign branch below, not this one). Confirmed by a real
+				# repro: `f.val is None` on a `usize|None`-returning property
+				# fell through to `not isinstance(found, Variable)` below
+				# (a property getter is a Function, never a Variable) and on
+				# to lowering.py's flat Cmp, which can't compare a TaggedUnion
+				# struct against None at all - mirrors _type_of_expr's own
+				# Call-branch Function handling further down for the exact
+				# same resolve-then-read-return_type reason
+				self.resolver.resolve_declared_types( found )
+				return found.return_type
 			if not isinstance( found, Variable ):
 				return None
 			# a field Variable's .type is populated lazily too, exactly like a

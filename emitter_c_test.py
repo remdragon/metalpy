@@ -9924,6 +9924,67 @@ def main() -> i32:
 		return 3
 	return 0
 ''' ),
+			# `obj.prop is None`/`is not None` directly on a @property getter's
+			# result - the idiomatic spelling, not staged into a local first.
+			# type_resolver.py's _type_of_expr ast.Attribute branch only ever
+			# recognized a plain field (a Variable in the owner's .names dict);
+			# a property getter is a Function there instead (is_property=True),
+			# so `isinstance(found, Variable)` failed, _type_of_expr gave up on
+			# the whole `f.val` expression, and _is_none_narrowing_shape
+			# silently declined - same flat-Cmp-comparing-a-union-struct
+			# failure as the chained-field case above, but from a totally
+			# different gap (a missing property case, not a laziness bug) -
+			# staging `f.val` into a named local first (`x: usize|None = f.val`)
+			# dodged it, since a local's tracked type comes from the Assign
+			# branch, not this one. Also covers the same shape on a PLAIN
+			# (non-property) method call returning T|None used directly, to
+			# confirm that path was never broken - it wasn't (Call is a
+			# distinct _type_of_expr branch, already resolving return_type
+			# correctly), included here as a differential control case
+			( 'property_and_method_call_is_none_narrowing_without_a_local', '''
+class Foo:
+	@property
+	def val( self ) -> usize|None:
+		return None
+
+	@property
+	def some( self ) -> usize|None:
+		return usize( 7 )
+
+	def get_val( self ) -> usize|None:
+		return None
+
+	def get_some( self ) -> usize|None:
+		return usize( 7 )
+
+def main() -> i32:
+	f: Foo = Foo()
+	if f.val is None:
+		pass
+	else:
+		return 1
+	if f.val is not None:
+		return 2
+	if f.some is None:
+		return 3
+	if f.some is not None:
+		pass
+	else:
+		return 4
+	if f.get_val() is None:
+		pass
+	else:
+		return 5
+	if f.get_val() is not None:
+		return 6
+	if f.get_some() is None:
+		return 7
+	if f.get_some() is not None:
+		pass
+	else:
+		return 8
+	return 0
+''' ),
 			# `union_val == leaf` / `!=` - comparing a still-union-typed value
 			# directly against a leaf, with no match-based extraction needed
 			# first. Used to fall through to the plain dunder-or-flat-Cmp path,
