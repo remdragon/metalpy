@@ -190,12 +190,9 @@ def main() -> i32:
 	if result == 'somefile.txt':
 		return 1
 	if compiler.target.os == 'windows':
-		match result.__getitem__( 1 ):
-			case Result.Ok( colon ):
-				if colon != ':':
-					return 2
-			case Result.Err( _ ):
-				return 3
+		colon: str = result.__getitem__( 1 ).unwrap_or( '' )
+		if colon != ':':
+			return 2
 	else:
 		if not result.startswith( '/' ):
 			return 2

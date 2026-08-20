@@ -14,20 +14,6 @@ path.join/isdir/splitext/abspath/normpath: built entirely on str's own
 import compiler
 import sys
 
-# str.__getitem__(idx).unwrap_or('') instead of a plain '' default: the
-# explicit-default unwrap_or(...) overload (Result[T,E].unwrap_or(default:
-# T), lib/builtins/__init__.py's @overload-marked stub) is currently
-# broken - it returns garbage/uninitialized memory at runtime rather than
-# dispatching to the real implementation below it (task_d43b94e5, a
-# separately-tracked bug, confirmed with a completely unrelated repro too -
-# not something specific to str). match/case sidesteps it entirely.
-def _char_at_or_empty( s: str, idx: usize ) -> str:
-	match s.__getitem__( idx ):
-		case Result.Ok( c ):
-			return c
-		case Result.Err( _ ):
-			return ''
-
 # ---------------------------------------------------------------------------
 # listdir
 # ---------------------------------------------------------------------------
@@ -129,8 +115,8 @@ def _is_abs( p: str ) -> bool:
 		return True
 	if len( p ) < 3:
 		return False
-	c1: str = _char_at_or_empty( p, 1 )
-	c2: str = _char_at_or_empty( p, 2 )
+	c1: str = p.__getitem__( 1 ).unwrap_or( '' )
+	c2: str = p.__getitem__( 2 ).unwrap_or( '' )
 	return c1 == ':' and ( c2 == '\\' or c2 == '/' )
 
 
@@ -210,8 +196,8 @@ class path:
 				# past the share root (matches CPython's own ntpath)
 				root = '\\\\'
 				rest = norm.removeprefix( '\\\\' )
-			elif len( norm ) >= 2 and _char_at_or_empty( norm, 1 ) == ':':
-				drive: str = _char_at_or_empty( norm, 0 )
+			elif len( norm ) >= 2 and norm.__getitem__( 1 ).unwrap_or( '' ) == ':':
+				drive: str = norm.__getitem__( 0 ).unwrap_or( '' )
 				root = drive + ':\\'
 				rest = norm.removeprefix( drive + ':' ).removeprefix( '\\' )
 		elif norm.startswith( '/' ):
