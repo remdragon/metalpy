@@ -43,9 +43,12 @@
 # it awake. See drain_fully()'s own docstring for the real, deliberate
 # consequence of this: a Worker with a standing, never-satisfied signal
 # wait can now legitimately never return (correct "keep serving"
-# behavior, not a bug) - and for what's still NOT built (an explicit way
-# to ask a worker to stop; see PLAN_NON_BLOCKING_IO's own graceful-
-# shutdown design, tracked separately).
+# behavior, not a bug) - UNLESS Reactor.shutdown()/Worker.request_
+# shutdown() has been called, which reuses the SAME wake pair to force-
+# resume every waiting fiber with a ShuttingDown error (wait_for_signal()
+# returns Result[None, ShutdownError], not a bare None) instead of
+# leaving it hoping for a signal that may never come - see request_
+# shutdown()/__drain_waiting_for_shutdown()'s own docstrings.
 #
 # current_worker() - an ambient lookup so code running INSIDE a fiber (e.g.
 # a future NonBlockingIO read()/wait_for()) can find which Worker owns it,
@@ -84,6 +87,7 @@ import threading
 import fiber
 import poller
 import socket
+import atomic
 
 _current_worker: threading.ThreadLocal[Worker] = threading.ThreadLocal[Worker]()
 
@@ -127,7 +131,21 @@ class _PendingWait:
 		self.waiting_fiber = waiting_fiber
 
 
-def wait_for_signal( signal: Signal ) -> None:
+class ShutdownError:
+	''' returned by wait_for_signal() instead of Ok when the Worker
+	driving this fiber has been asked to stop (Reactor.shutdown()/
+	Worker.request_shutdown()) - lets handler code written with defer/
+	errdefer for cleanup behave identically whether a connection closed
+	normally, errored, or the reactor is shutting down (this is the whole
+	point: a shutdown-interrupted wait looks like just another kind of
+	failure to unwind from, not a special case every caller has to know
+	about). Never produced by the no-reactor blocking path below - there
+	is no Worker to ask it to stop, so that path always succeeds once its
+	signal fires. '''
+	pass
+
+
+def wait_for_signal( signal: Signal ) -> Result[None, ShutdownError]:
 	''' the ONE reactor-optional wait primitive every higher-level helper
 	(a future NonBlockingIO's read()/write_all()/accept()) is meant to
 	call instead of talking to a Worker or a Poller directly - branches
@@ -139,9 +157,9 @@ def wait_for_signal( signal: Signal ) -> None:
 	setup, or as a cooperative fiber inside a full reactor. '''
 	w: Worker|None = current_worker()
 	if w is not None:
-		w._wait_on_signal( signal )
-	else:
-		_blocking_wait_no_reactor( signal )
+		return w._wait_on_signal( signal )
+	_blocking_wait_no_reactor( signal )
+	return Result.Ok( None )
 
 def _blocking_wait_no_reactor( signal: Signal ) -> None:
 	''' no Worker driving this thread - there's nothing to park a fiber
@@ -186,6 +204,7 @@ class Worker:
 	__wake_read: socket.Socket
 	__wake_write: socket.Socket
 	__wake_fd: poller.SOCKET
+	__shutting_down: atomic.Atomic[bool]
 
 	def __init__( self ) -> None:
 		self.__pending_tasks = list[Closure[[], None]]()
@@ -200,32 +219,56 @@ class Worker:
 		self.__wake_read = wake_read
 		self.__wake_write = wake_write
 		self.__wake_fd = wake_read.fileno()
+		self.__shutting_down = atomic.Atomic[bool]( False )
 		# registered ONCE, unconditionally, for this Worker's whole
 		# lifetime - unlike __registered_fds/__waiting (per-wait, torn
 		# down once satisfied), the wake fd is infrastructure, always
 		# watched, never removed
 		self.__poller.register( self.__wake_fd, True, False ).unwrap( 'Worker.__init__: poller register (wake fd) failed' )
 
-	def schedule( self, task: Closure[[], None] ) -> None:
-		''' enqueue a fresh task - picked up by whichever thread next calls
-		run_until_idle() on this Worker (may be a different thread than
-		the caller, e.g. Reactor.spawn() called from outside any worker).
-		Also pokes the wake pair so a thread currently BLOCKED inside this
-		Worker's own drain_fully() (waiting on some other Signal, see its
-		own docstring) notices promptly instead of only finding this task
-		once whatever it was already waiting on eventually fires. Best-
-		effort (WouldBlock on the wake write is silently ignored) - one
-		byte already sitting in the wake socket's own buffer, undrained,
-		already guarantees the NEXT poller.wait() wakes up, so a second
-		poke landing on top of it would be redundant, not lost. '''
-		self.__pending_tasks.append( task ).unwrap( 'Worker.schedule: queue overflow' )
+	def __poke_wake( self ) -> None:
+		''' interrupts a thread currently BLOCKED inside this Worker's own
+		poller.wait() (possibly a different thread than the caller - see
+		schedule()/request_shutdown(), the two callers) - shared by both,
+		since both need the exact same "make sure the next tick actually
+		runs soon" guarantee. Best-effort (WouldBlock on the wake write is
+		silently ignored) - one byte already sitting in the wake socket's
+		own buffer, undrained, already guarantees the NEXT poller.wait()
+		wakes up, so a second poke landing on top of it would be
+		redundant, not lost. '''
 		poke: bytes = b'x'
 		match self.__wake_write.send( poke.get_const_ptr(), usize( 1 )):
 			case Result.Ok( _n ):
 				pass
 			case Result.Err( e ):
 				if e != OSError.WouldBlock:
-					sys.panic( 'Worker.schedule: wake-pair write failed unexpectedly' )
+					sys.panic( 'Worker.__poke_wake: wake-pair write failed unexpectedly' )
+
+	def schedule( self, task: Closure[[], None] ) -> None:
+		''' enqueue a fresh task - picked up by whichever thread next calls
+		run_until_idle() on this Worker (may be a different thread than
+		the caller, e.g. Reactor.spawn() called from outside any worker).
+		Also pokes the wake pair (__poke_wake) so a thread currently
+		BLOCKED inside this Worker's own drain_fully() (waiting on some
+		other Signal, see its own docstring) notices promptly instead of
+		only finding this task once whatever it was already waiting on
+		eventually fires. '''
+		self.__pending_tasks.append( task ).unwrap( 'Worker.schedule: queue overflow' )
+		self.__poke_wake()
+
+	def request_shutdown( self ) -> None:
+		''' callable from ANY thread, including while this Worker's own
+		drain_fully() is genuinely blocked on another thread. Marks this
+		Worker for shutdown and pokes the wake pair (same mechanism
+		schedule() uses) so a blocked poller.wait() notices promptly.
+		Every fiber currently parked in wait_for_signal() gets unparked
+		with a ShuttingDown error on the NEXT tick (see __drain_waiting_
+		for_shutdown) rather than waiting for its own signal, which might
+		never come. Idempotent - safe to call more than once (e.g. from
+		Reactor.shutdown() iterating every worker, or a caller that wants
+		to call it defensively). '''
+		self.__shutting_down.store( True )
+		self.__poke_wake()
 
 	def __take_idle_fiber( self ) -> fiber.Fiber:
 		match self.__idle_pool.pop():
@@ -263,14 +306,21 @@ class Worker:
 			case fiber.FiberState.RUNNING:
 				sys.panic( 'Worker: fiber reported RUNNING after being switched out of - internal bug' )
 
-	def _wait_on_signal( self, signal: Signal ) -> None:
+	def _wait_on_signal( self, signal: Signal ) -> Result[None, ShutdownError]:
 		''' called from WITHIN a running fiber's own task (via the free
 		function wait_for_signal, never directly) - registers signal.fd
 		with this worker's own poller if not already watched, records
-		which fiber is waiting for it, and parks. Resumes once a later
-		run_until_idle()'s own __check_signals() notices the fd became
-		ready and requeues this fiber - see __requeue_by_state's own
-		comment for the other half of how that stays exactly-once. '''
+		which fiber is waiting for it, and parks. Resumes once EITHER a
+		later run_until_idle()'s own __check_signals() notices the fd
+		became ready (see __requeue_by_state's own comment for the other
+		half of how that stays exactly-once), OR __drain_waiting_for_
+		shutdown() force-resumes it because this worker was asked to stop
+		- checked both BEFORE parking (a shutdown already in progress
+		when this is first called shouldn't register/park at all - see
+		its own comment) and AFTER (the only way to tell which of the two
+		actually happened). '''
+		if self.__shutting_down.load():
+			return Result.Err( ShutdownError() )
 		if not self.__is_registered( signal.fd ):
 			self.__poller.register( signal.fd, signal.want_read, signal.want_write ).unwrap( 'Worker._wait_on_signal: poller register failed' )
 			self.__registered_fds.append( signal.fd ).unwrap( 'Worker._wait_on_signal: registered-fd list overflow' )
@@ -279,6 +329,9 @@ class Worker:
 			sys.panic( 'Worker._wait_on_signal: no current fiber - must be called from inside a task this Worker is running' )
 		self.__waiting.append( _PendingWait( signal = signal, waiting_fiber = cur )).unwrap( 'Worker._wait_on_signal: waiting-list overflow' )
 		fiber.park()
+		if self.__shutting_down.load():
+			return Result.Err( ShutdownError() )
+		return Result.Ok( None )
 
 	def __is_registered( self, fd: poller.SOCKET ) -> bool:
 		n: usize = self.__registered_fds.__len__()
@@ -302,6 +355,36 @@ class Worker:
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__registered_fds = kept
+
+	def __drain_waiting_for_shutdown( self ) -> bool:
+		''' once request_shutdown() has been called, every fiber still in
+		__waiting needs to be force-resumed with a ShuttingDown error
+		rather than left hoping its own signal eventually fires - a
+		signal that may never come is exactly why shutdown exists. Moves
+		every one of them to __ready_to_unpark (same "requeue for the
+		NEXT tick, not this one" discipline __check_signals already
+		uses) and unregisters each fd that's still registered (guarded by
+		__is_registered - more than one waiter can share an fd, and only
+		the FIRST one to arrive here would have registered it - avoids a
+		double-unregister). No-op (returns False) once __shutting_down is
+		false, or once __waiting is already empty - this runs on EVERY
+		run_until_idle() call once shutdown starts, not just once. '''
+		if not self.__shutting_down.load():
+			return False
+		if self.__waiting.__len__() == 0:
+			return False
+		n: usize = self.__waiting.__len__()
+		i: usize = 0
+		while i < n:
+			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__drain_waiting_for_shutdown: index in bounds by construction' )
+			self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__drain_waiting_for_shutdown: ready-to-unpark queue overflow' )
+			if self.__is_registered( w.signal.fd ):
+				self.__poller.unregister( w.signal.fd ).unwrap( 'Worker.__drain_waiting_for_shutdown: poller unregister failed' )
+				self.__forget_registered_fd( w.signal.fd )
+			with compiler.wrap_arithmetic:
+				i = i + 1
+		self.__waiting = list[_PendingWait]()
+		return True
 
 	def __drain_wake( self ) -> None:
 		''' the wake fd is level-triggered and never unregistered (see
@@ -417,6 +500,8 @@ class Worker:
 					pass
 			with compiler.wrap_arithmetic:
 				to_start = to_start - 1
+		if self.__drain_waiting_for_shutdown():
+			progressed = True
 		if self.__check_signals( poller_timeout_ms ):
 			progressed = True
 		return progressed
@@ -428,22 +513,22 @@ class Worker:
 		return (nothing outstanding at all - the original "batch of work,
 		then done" contract, unchanged for every existing non-Signal use)
 		or BLOCK on the poller (an outstanding Signal wait exists, so
-		"idle" doesn't mean "done" - see run_until_idle()'s own KNOWN GAP
-		note, now closed) until either that signal fires or schedule()
-		pokes the wake pair from another thread (__init__'s own self-pipe
-		equivalent - without it, blocking here would starve any task
-		scheduled onto an already-blocked worker until whatever it WAS
-		waiting on happened to fire on its own). An infinite poller
-		timeout is safe specifically because that wake pair exists - there
-		is always a way back out of the blocking call. This DOES mean
-		drain_fully()/Reactor.run() can now legitimately never return for
-		a worker with a standing signal wait that's never satisfied (e.g.
-		a real, long-lived server connection) - the correct behavior for
-		"keep serving," not a bug, but worth knowing: nothing here yet
-		provides a way to ask a worker to stop (see PLAN_NON_BLOCKING_IO's
-		own graceful-shutdown design - park() eventually returning a
-		Result so a shutdown signal can wake every parked fiber with a
-		ShuttingDown error - not built yet, tracked separately). '''
+		"idle" doesn't mean "done") until either that signal fires,
+		schedule() pokes the wake pair from another thread, or request_
+		shutdown() does (__init__'s own self-pipe equivalent - without it,
+		blocking here would starve any task scheduled onto an already-
+		blocked worker until whatever it WAS waiting on happened to fire
+		on its own). An infinite poller timeout is safe specifically
+		because that wake pair exists - there is always a way back out of
+		the blocking call. This DOES mean drain_fully()/Reactor.run() can
+		legitimately never return for a worker with a standing signal
+		wait that's never satisfied (e.g. a real, long-lived server
+		connection) - the correct "keep serving" behavior, not a bug -
+		UNLESS request_shutdown() has been called: once __shutting_down
+		is set, run_until_idle()'s own __drain_waiting_for_shutdown()
+		force-resumes every waiting fiber with a ShuttingDown error
+		instead, so this loop naturally converges to "genuinely nothing
+		outstanding" and returns, same as the ordinary batch case. '''
 		while True:
 			if self.run_until_idle( 0 ):
 				continue
@@ -495,5 +580,30 @@ class Reactor:
 		while i < n_threads:
 			t: threading.Thread = self.__threads.__getitem__( i ).unwrap( 'Reactor.run: thread index in bounds by construction' )
 			t.join()
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+	def shutdown( self ) -> None:
+		''' requests every worker to stop - callable from ANY thread,
+		including while run() is still blocking on its own .join() calls
+		(that's the expected usage: some other thread, e.g. reacting to a
+		signal or an admin command, calls this while run() is in
+		progress). Each worker notices via its own wake pair (the SAME
+		mechanism spawn() uses to interrupt a blocked poller.wait()) and
+		unwinds any signal-waiting fiber with a ShuttingDown error rather
+		than leaving it hoping for a signal that may never come - see
+		Worker.request_shutdown()/__drain_waiting_for_shutdown(). run()
+		returns once every worker has actually finished draining (which
+		now includes unwinding every shutdown-interrupted fiber, not just
+		the ones that already had nothing left to wait for). Does NOT
+		reject new schedule()/spawn() calls made after this - a task
+		queued during shutdown still runs to completion; there's no
+		"stop accepting work" concept here yet, only "stop waiting
+		forever for signals that might not come". '''
+		n: usize = self.__workers.__len__()
+		i: usize = 0
+		while i < n:
+			w: Worker = self.__workers.__getitem__( i ).unwrap( 'Reactor.shutdown: worker index in bounds by construction' )
+			w.request_shutdown()
 			with compiler.wrap_arithmetic:
 				i = i + 1
