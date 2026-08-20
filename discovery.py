@@ -270,6 +270,22 @@ class Discovery( ast.NodeVisitor ):
 		self._cc: 'linker_c.CcTool | None' = None
 		self._cc_detected = False
 
+		# optional hook installed by Compiler.__init__ (monomorphize.py's
+		# Monomorphizer isn't reachable from here - it depends on Discovery,
+		# not the other way around, so it can't be imported/called directly).
+		# Fired once, right after a real RCClass's own body has resolved, for
+		# a class whose `.base` is a Specialization of a generic ancestor
+		# (class Bar(Real[i32]): pass) - lets Lowering eagerly monomorphize
+		# an ALREADY-CONCRETE generic base in place (Bar.base becomes the
+		# real Real$i32 RCClass, not the abstract Specialization wrapper) the
+		# moment it's known to be safe to do so. A generic base that's still
+		# abstract (Bar[T](Real[T]), T not yet bound to anything concrete)
+		# is deliberately left alone here - see Monomorphizer.monomorphize_
+		# class's own base-substitution step, which handles that case
+		# instead, when Bar[T] ITSELF is later monomorphized to something
+		# concrete.
+		self.on_generic_base_resolved: 'Callable[[RCClass],None]|None' = None
+
 		if import_builtins:
 			# just for the side effect of populating self.modules['builtins'] -
 			# import_code() looks it up from there directly (see below), so
@@ -1711,6 +1727,8 @@ class Discovery( ast.NodeVisitor ):
 						self._validate_protocol_conformance( class_obj )
 			if isinstance( class_obj, RCClass ) and class_obj.base is not None:
 				self._validate_no_attribute_shadowing( class_obj )
+				if self.on_generic_base_resolved is not None:
+					self.on_generic_base_resolved( class_obj )
 		def resolve() -> None:
 			self._resolve_guarded( class_obj, body_fn )
 		return resolve
@@ -1742,8 +1760,31 @@ class Discovery( ast.NodeVisitor ):
 		(which .names, a plain dict, already can't have). '''
 		base = class_obj.base
 		assert base is not None
+		if isinstance( base, Specialization ):
+			# a generic ancestor (Real[T] or Real[i32] - see
+			# _parse_ClassDef_RCClass) - this runs BEFORE Discovery.
+			# on_generic_base_resolved ever gets a chance to normalize an
+			# already-concrete one (see body_fn's own ordering just above),
+			# and can't normalize it itself even for that case (no
+			# Monomorphizer reachable from here - see on_generic_base_
+			# resolved's own docstring). Only NAME existence is needed for
+			# this check, never a substituted type, so unwrapping straight
+			# to the abstract template (discarding .args) is always correct
+			base = base.base
 		for own_name, own in class_obj.names.items():
 			if own_name == '__init__':
+				continue
+			if isinstance( own, TypeVar ):
+				# a class's own type param(s) - discovery.py's
+				# _parse_type_params registers each one directly into
+				# class_obj.names, the same dict this loop otherwise treats
+				# as "real" declared members. A subclass reusing an
+				# ancestor's own type-param NAME (class Bar[T](Real[T]):
+				# pass - the exact shape this feature exists for) is normal
+				# and expected, not shadowing in the sense this check cares
+				# about - Bar's own T and Real's own T are two entirely
+				# separate TypeVar objects that merely happen to share a
+				# spelling, resolved independently in each class's own scope
 				continue
 			ancestor = base.chain_lookup( own_name )
 			if ancestor is None:
@@ -1989,6 +2030,16 @@ class Discovery( ast.NodeVisitor ):
 		scope.add_name( class_obj.stem, class_obj )
 
 		try:
+			# own type params must be registered - AND in scope - before
+			# base-class expressions are resolved: a generic base
+			# parameterized by this class's own TypeVar (class Bar[T]
+			# (Real[T])) needs T visible while Real[T] is being visited,
+			# exactly like any ordinary annotation inside Bar's own body
+			# already would. Previously this ran AFTER the base-resolution
+			# loop below, which is why `class Bar[T](Real[T])` failed with
+			# "name 'T' is not defined" - T was never in scope yet.
+			self._parse_type_params( node.type_params, class_obj )
+
 			# resolved eagerly, in the enclosing scope, exactly like Python
 			# itself requires each base to already exist when this statement
 			# runs. At most one entry may be a real RCClass (single
@@ -1996,22 +2047,27 @@ class Discovery( ast.NodeVisitor ):
 			# @protocol types instead, which aren't real bases at all (no
 			# vtable/chain_lookup participation - see Protocol's own
 			# docstring) and are collected into class_obj.protocols instead
-			# of class_obj.base.
-			for base_node in node.bases:
-				base = self.visit( base_node )
-				if isinstance( base, Protocol ):
-					class_obj.protocols.append( base )
-					continue
-				if not isinstance( base, RCClass ):
-					self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes or @protocol types are supported here)', node )
-				if class_obj.base is not None:
-					self.fail(
-						f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})',
-						node,
-					)
-				class_obj.base = base
-
-			self._parse_type_params( node.type_params, class_obj )
+			# of class_obj.base. A generic base (Real[T], Real[i32]) resolves
+			# to a Specialization here, not a bare RCClass - class_obj.base
+			# stores it as-is (RCClass.base is RCClass|Specialization|None);
+			# see mpy_types.py's InheritanceChainMixin and monomorphize.py's
+			# monomorphize_class for how the chain walk/substitution handles
+			# that.
+			with self.scope_context( class_obj ):
+				for base_node in node.bases:
+					base = self.visit( base_node )
+					if isinstance( base, Protocol ):
+						class_obj.protocols.append( base )
+						continue
+					base_cls = base.base if isinstance( base, Specialization ) else base
+					if not isinstance( base_cls, RCClass ):
+						self.fail( f'{qualname} cannot subclass {base.qualname} (only plain classes or @protocol types are supported here)', node )
+					if class_obj.base is not None:
+						self.fail(
+							f'multiple inheritance not supported: class {qualname}({", ".join( ast.unparse(b) for b in node.bases )})',
+							node,
+						)
+					class_obj.base = base
 
 			unresolved = self._shallow_class_body_scan( class_obj, node.body )
 		except CompileError:

@@ -60,6 +60,16 @@ class Compiler:
 		# ever being scheduled onto the work queue for later - see
 		# _expr_Lambda's eager return-type inference (PLAN_LAMBDA.md)
 		self.lowering._compile_now = self._lower
+		# see Discovery.on_generic_base_resolved's own docstring - discovery.py
+		# can't call into Monomorphizer directly (monomorphize.py depends on
+		# Discovery, not the other way around), so this bridges the gap: a
+		# non-generic class whose own base is an ALREADY-CONCRETE generic
+		# Specialization (class Bar(Real[i32]): pass - Bar never becomes a
+		# Specialization itself, so monomorphize_class's own .base-substitution
+		# step never runs for it) gets that base eagerly monomorphized in
+		# place, right when it's first safe to do so (immediately after Bar's
+		# own body resolves).
+		self.disco.on_generic_base_resolved = self._normalize_generic_base
 
 		self.functions: list[LoweredFunction] = []
 		# id(Function) -> its own already-built LoweredFunction - guards
@@ -171,6 +181,18 @@ class Compiler:
 		# dependency" judgment) moved to TypeResolver.schedule, see its own
 		# docstring
 		self.type_resolver.schedule( unit )
+
+	def _normalize_generic_base( self, cls: RCClass ) -> None:
+		''' installed as Discovery.on_generic_base_resolved - see its own
+		docstring. Only acts when cls.base is a Specialization that's ALREADY
+		fully concrete (no bare TypeVar anywhere in it) - a generic class's
+		own base parameterized by ITS OWN still-unbound type params (class
+		Bar[T](Real[T]): pass) is deliberately left alone here; that case is
+		handled instead by Monomorphizer.monomorphize_class's own .base
+		substitution step, once Bar[T] itself is monomorphized against a
+		concrete instantiation. '''
+		if isinstance( cls.base, Specialization ) and self.type_resolver.monomorphizer._is_concrete( cls.base ):
+			cls.base = self.lowering.monomorphize_class( cls.base )
 
 	def run( self ) -> None:
 		if self.disco.main is None:
@@ -395,7 +417,32 @@ class Compiler:
 				unit.resolve()
 			for attr in unit.attributes: # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's identical loop; monomorphize_class already does this for the Specialization branch above, but a bare (non-generic) class landing here directly never went through that
 				self.lowering._ensure_resolved( attr )
-			if unit.base is not None:
+			if unit.base is not None and not isinstance( unit.base, Specialization ):
+				# a bare RCClass reaching here directly may ITSELF still be
+				# an unresolved-args generic template (unit.type_params
+				# still set - e.g. the abstract class Bar[T](Real[T]): pass
+				# itself, which reaches this same branch independently of
+				# any concrete Bar[i32] Specialization) - its own .base can
+				# legitimately still be an ABSTRACT Specialization (Real[T],
+				# T not yet bound to anything concrete - see discovery.py's
+				# _parse_ClassDef_RCClass/mpy_types.py's InheritanceChainMixin).
+				# TypeResolver.schedule() has no concreteness check of its
+				# own - queueing it here would let it reach Monomorphizer.
+				# monomorphize_class while still abstract, silently building
+				# a bogus "concrete" class whose own fields are still typed
+				# with dangling TypeVars (confirmed via a real repro: a
+				# no-__init__-anywhere generic subclass of a generic base
+				# produced exactly this - a spurious compiler.rcclasses
+				# entry with type_params already cleared but an attribute
+				# still typed <TypeVar 'Bar.T'>, crashing emitter_c.py's
+				# c_type). A non-generic class's own already-concrete
+				# generic base is never still a Specialization by the time
+				# .resolve() above returns - see Discovery.
+				# on_generic_base_resolved, which normalizes that case
+				# eagerly - so skipping here only ever skips the genuinely
+				# abstract case, which monomorphize_class's own .base
+				# substitution step already handles correctly once a REAL
+				# concrete instantiation of this same class is monomorphized.
 				self._enqueue( unit.base )
 			if unit not in self.rcclasses:
 				self.rcclasses.append( unit )
@@ -536,7 +583,18 @@ class Compiler:
 		sibling def would never even be SEEN here, let alone resolved,
 		silently skipping both the override-collision check below and the
 		single-signature check inside its own resolver. '''
-		ancestor_slots = { m.stem: m for m in cls.base.virtual_slots() } if cls.base is not None else {}
+		# cls.base may be a still-abstract Specialization here (a GENERIC
+		# class's own base parameterized by its own not-yet-bound type
+		# params, e.g. class Bar[T](Real[T]): pass, reached here as the bare
+		# abstract Bar itself, not a concrete instantiation of it - see
+		# discovery.py's _parse_ClassDef_RCClass/mpy_types.py's
+		# InheritanceChainMixin) - unwrap to the underlying template first;
+		# virtual_slots() only needs @virtual method NAMES, never a
+		# substituted type, so discarding the Specialization's own .args
+		# here is always correct (same reasoning as mpy_types.py's own
+		# _next_chain_node)
+		base = cls.base.base if isinstance( cls.base, Specialization ) else cls.base
+		ancestor_slots = { m.stem: m for m in base.virtual_slots() } if base is not None else {}
 		members: list[Function] = []
 		for m in cls.methods:
 			if isinstance( m, Function ):

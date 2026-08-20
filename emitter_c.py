@@ -2212,6 +2212,28 @@ def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 	comment) with no separate metalpy-level Ptr[T] needed to get there. '''
 	receiver_text = _emit_operand( receiver )
 	target_cls = target.cls
+	if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, RCClass ):
+		# a monomorphized method whose genericity comes from its own
+		# enclosing class (Monomorphizer.monomorphized_function's "class
+		# genericity" branch) always carries fn.cls as a Specialization
+		# wrapping the ABSTRACT template, never the concrete monomorphized
+		# class directly - .monomorphized is that real object, guaranteed
+		# already built by now (this exact call's own target was already
+		# lowered as a compile unit before this call site could reference
+		# it). Without this unwrap, target_cls stayed a bare Specialization
+		# here - neither isinstance check below ever matched one, so this
+		# fell all the way through to "no cast at all", which is harmless
+		# for an ordinary same-class generic call (receiver is already the
+		# identical type) but produces an invalid C pointer-type mismatch
+		# the moment target_cls and the receiver's own concrete type
+		# genuinely differ - e.g. an inherited __init__ found via chain_
+		# lookup through a generic ancestor (class Bar[T](Real[T]): pass),
+		# where self is a Bar[i32]* but Real[i32].__init__ declares self as
+		# Real[i32]* - same idiom as emit_rcclass_instance's own identical
+		# unwrap for the same underlying reason.
+		concrete = target_cls.monomorphized
+		assert isinstance( concrete, RCClass )
+		target_cls = concrete
 	if isinstance( target_cls, CStruct ) and target_cls.is_interface:
 		if target.is_virtual:
 			receiver_pointee = receiver.type.args[0] if isinstance( receiver.type, Specialization ) else None
