@@ -1480,7 +1480,17 @@ def _emit_const( c: ir.Const ) -> str:
 		text = repr( value )
 		return text + 'f' if is_f32 else text
 	if isinstance( c.value, int ):
-		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast
+		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast.
+		# Ptr[Callable[...]] is a special case within that: c_type()
+		# doesn't know how to spell a bare function-pointer TYPE at all
+		# (see _declarator's own comment - the name goes inside the
+		# parens, so it's not an ordinary "prefix type" spelling) -
+		# needed for e.g. a null-function-pointer sentinel like SIG_DFL
+		# (`sig_dfl: Ptr[Callable[[i32],None]] = 0`)
+		fn_type = _callable_ptr_type( c.type )
+		if fn_type is not None:
+			ret, params = _function_pointer_c_type( fn_type )
+			return f'({_fn_ptr_cast_type(ret, params)}){c.value}'
 		if isinstance( c.type, Specialization ):
 			base = c.type.base
 			if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
