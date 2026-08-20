@@ -1263,6 +1263,235 @@ def main() -> i32:
 ''' ),
 		] )
 
+class GenericBaseInheritanceTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for generic-class inheritance - a base class that
+	is ITSELF generic/parameterized (Real[T] or Real[i32]), as opposed to
+	RCClassSubclassingNoOwnInitTests above (a GENERIC subclass of a PLAIN,
+	non-generic base - already worked, fixed by ccec981/7a121a3). Before this
+	fix, generic-base inheritance was entirely unsupported:
+
+	1. `class Bar[T](Real[T]): pass` failed at the class-header line itself -
+	   "name 'T' is not defined" - discovery.py's _parse_ClassDef_RCClass
+	   parsed type_params AFTER resolving the base-class expression, so a
+	   subclass's own TypeVar was never in scope while Real[T] was visited.
+	   Fixed by parsing type_params (and pushing class_obj's own scope)
+	   BEFORE the base-resolution loop.
+
+	2. Even with (1) fixed, ANY generic base (concrete or not) was rejected
+	   outright: "Bar cannot subclass Real[...] (only plain classes ... are
+	   supported here)" - RCClass.base only ever accepted a bare RCClass, and
+	   a generic base always resolves to a Specialization instead. Fixed by
+	   widening RCClass.base to RCClass|Specialization|None, teaching
+	   InheritanceChainMixin's chain-walking methods (mpy_types.py) to
+	   unwrap a still-abstract Specialization down to its template for
+	   NAME/existence lookups, and teaching Monomorphizer.monomorphize_class
+	   (monomorphize.py) to substitute+eagerly-monomorphize a generic base
+	   parameterized by the subclass's OWN type params, the moment the
+	   subclass itself is monomorphized against a concrete instantiation.
+	   A NON-generic subclass of an ALREADY-CONCRETE generic base (class
+	   Bar(Real[i32]): pass - Bar itself never becomes a Specialization, so
+	   monomorphize_class's own substitution step never runs for it) is
+	   handled by a separate hook, Discovery.on_generic_base_resolved,
+	   installed by Compiler.__init__ - fires once, right after Bar's own
+	   body resolves, and eagerly monomorphizes an already-concrete generic
+	   base in place.
+
+	3. Two more bugs found while extending coverage to the no-__init__-
+	   anywhere field=value construction sugar: _emit_self_operand
+	   (emitter_c.py) cast an inherited call's self operand to target.cls
+	   directly, never unwrapping the Specialization a monomorphized
+	   method's own .cls always is when its genericity comes from its
+	   enclosing class - silently emitted NO cast at all for an inherited
+	   call reached through a generic ancestor, an invalid-C pointer-type
+	   mismatch that clang/MSVC accepted with a warning (still ran
+	   correctly, same base-first field layout) but gcc correctly rejected
+	   outright - exactly the kind of bug WSL gcc verification exists to
+	   catch. Separately, TypeResolver.schedule() (type_resolver.py) queues
+	   ANY Specialization wrapping a ClassLike for monomorphization with no
+	   concreteness check of its own - compiler.py's bare-RCClass branch
+	   blindly enqueued unit.base even when unit was itself still an
+	   abstract generic template (Bar[T](Real[T]): pass reaches that branch
+	   independently of any concrete Bar[i32]), whose OWN .base is
+	   legitimately still an unbound Specialization - silently building a
+	   bogus "concrete" class with a dangling-TypeVar-typed field, crashing
+	   emitter_c.py's c_type. Fixed by skipping that enqueue when .base is
+	   still a Specialization (monomorphize_class's own .base substitution
+	   step already handles the real ancestor once a genuine concrete
+	   instantiation exists). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# repro 1 from the bug report: a generic subclass whose base is
+			# the SAME generic class parameterized by the subclass's own
+			# TypeVar - bare (type-inferred) construction
+			( 'generic_subclass_of_generic_base_bare_form', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	b: Bar[i32] = Bar( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# same shape, explicit subscript construction - the call shape
+			# type_resolver.py's own eager construction-call pre-pass never
+			# reaches (see RCClassSubclassingNoOwnInitTests' own "Follow-up")
+			( 'generic_subclass_of_generic_base_explicit_subscript', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	b: Bar[i32] = Bar[i32]( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# repro 2 from the bug report: a NON-generic subclass of a
+			# CONCRETELY-parameterized generic base
+			( 'nongeneric_subclass_of_concrete_generic_base', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar( Real[i32] ):
+	pass
+
+def main() -> i32:
+	b: Bar = Bar( x = 7 )
+	if b.x != 7:
+		return 1
+	return 0
+''' ),
+			# no __init__ ANYWHERE in the chain (genuine field=value
+			# construction sugar), through a GENERIC ancestor - exercises
+			# _lower_allocate_fields' own ancestor-chain resolution together
+			# with the generic-base substitution, and is what surfaced the
+			# two bugs described in this class's own docstring (point 3)
+			( 'no_init_anywhere_field_sugar_through_generic_base', '''
+class Real[T]:
+	x: T
+
+class Bar[T]( Real[T] ):
+	y: T
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b: Bar[i32] = Bar( x = 5, y = 6 )
+		if b.x != 5:
+			return 1
+		if b.y != 6:
+			return 2
+		return 0
+''' ),
+			# the subclass adds its OWN field alongside the inherited generic
+			# one - confirms base-first field layout still composes correctly
+			# once the base's own fields are substituted, not just a single
+			# inherited field in isolation
+			( 'generic_subclass_adds_own_field_alongside_inherited', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	y: T
+	def __init__( self, x: T, y: T ) -> None:
+		super().__init__( x )
+		self.y = y
+
+def main() -> i32:
+	b: Bar[i32] = Bar( x = 3, y = 4 )
+	if b.x != 3:
+		return 1
+	if b.y != 4:
+		return 2
+	return 0
+''' ),
+			# a DIFFERENT type argument per instantiation - confirms the
+			# substituted ancestor is per-specialization, not accidentally
+			# shared/cached across different concrete args for the same
+			# generic base
+			( 'generic_subclass_different_type_args_independent', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	a: Bar[i32] = Bar( x = 11 )
+	b: Bar[str] = Bar( x = 'hi' )
+	if a.x != 11:
+		return 1
+	if b.x.byte_len() != 2:
+		return 2
+	return 0
+''' ),
+			# three-level chain: a generic Leaf inheriting a generic Mid
+			# inheriting a generic Real, each parameterized by the same
+			# propagated TypeVar - confirms the substitution composes
+			# correctly across more than one level of generic ancestry
+			( 'three_level_generic_chain', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Mid[T]( Real[T] ):
+	pass
+
+class Leaf[T]( Mid[T] ):
+	pass
+
+def main() -> i32:
+	leaf: Leaf[i32] = Leaf( x = 9 )
+	if leaf.x != 9:
+		return 1
+	return 0
+''' ),
+			# RC-lifetime stress check under repetition, same rigor as
+			# RCClassSubclassingNoOwnInitTests' own identical checks - a leak
+			# or double-free in the substituted-ancestor's own destructor
+			# would only show up under repeated construct/teardown
+			( 'rc_lifetime_repeated_generic_base_inheritance_no_leak', '''
+class Real[T]:
+	s: T
+	def __init__( self, s: T ) -> None:
+		self.s = s
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			b: Bar[str] = Bar( s = 'hello'.upper() )
+			if b.s.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
+
 class FallibleInitConstructionRCLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression coverage for a real, confirmed double-free in fallible
 	`__init__()` construction (SYNTAX.md's "Fallible __init__() Construction"

@@ -600,6 +600,26 @@ class GeneratorType( Type ):
 # creation time, because external code subscripting this class as a generic
 # (Result[i32,usize]) needs to see it before this class's own .resolve ever runs.
 
+def _next_chain_node( base: 'InheritanceChainMixin|Specialization|None' ) -> 'InheritanceChainMixin|None':
+	''' one step of a single-inheritance chain walk - unwraps a still-abstract
+	generic base (RCClass.base holding a Specialization, e.g. Real[T] where T
+	is the SUBCLASS's own not-yet-bound TypeVar, or even a fully concrete
+	Real[i32] that just hasn't been monomorphized in place yet - see
+	discovery.py's _parse_ClassDef_RCClass/on_generic_base_resolved) down to
+	the underlying abstract template class itself (Real). Every chain-walking
+	method in InheritanceChainMixin below only ever needs NAMES/existence
+	from an ancestor, never a substituted TYPE (that's Monomorphizer's job -
+	see monomorphize_class's own eager .base substitution step, and
+	Discovery.on_generic_base_resolved for the already-concrete case) - so
+	discarding the Specialization's own .args here and continuing the walk
+	from its abstract .base is always correct for what these methods answer.
+	A fully-monomorphized/normalized class never has a Specialization here at
+	all, so this is a no-op for every chain that doesn't involve an abstract
+	generic ancestor. '''
+	if isinstance( base, Specialization ):
+		return base.base
+	return base
+
 class InheritanceChainMixin:
 	'''
 	shared single-inheritance-chain / vtable behaviour for the two class kinds
@@ -629,8 +649,21 @@ class InheritanceChainMixin:
 	which is also the honest place for it - RCClass is always True, a CStruct
 	only when @interface, so the two genuinely differ and there is no shared
 	answer to hoist.
+
+	RCClass.base specifically may ALSO be a Specialization (Real[T] or
+	Real[i32] - a generic ancestor, still abstract or already concrete - see
+	discovery.py's _parse_ClassDef_RCClass) rather than a plain RCClass|None
+	- CStruct.base never is (CStruct inheritance stays restricted to
+	@interface, unrelated to this). Every walk below only ever needs an
+	ancestor's NAMES (existence, dispatch), never a substituted TYPE, so
+	_next_chain_node's unwrap-to-the-abstract-template is always correct
+	here - a real, substituted view of a generic ancestor's ATTRIBUTE TYPES
+	is Monomorphizer's job (monomorphize.py's monomorphize_class, which
+	substitutes/monomorphizes .base itself, and Discovery.
+	on_generic_base_resolved for the already-concrete non-generic-subclass
+	case), not something these chain-walking methods ever attempt.
 	'''
-	base: 'InheritanceChainMixin|None'
+	base: 'InheritanceChainMixin|Specialization|None'
 	names: dict[str,Name]
 	methods: list['Function|Overload']
 	attributes: list['Variable']
@@ -650,7 +683,7 @@ class InheritanceChainMixin:
 		while node is not None:
 			if node.resolve is not None:
 				node.resolve()
-			node = node.base
+			node = _next_chain_node( node.base )
 
 	def chain_lookup( self, name: str ) -> Name|None:
 		''' walk this class's own single-inheritance chain (self, then base,
@@ -668,7 +701,7 @@ class InheritanceChainMixin:
 			found = node.get_local_or_raise( name ) # every real InheritanceChainMixin (RCClass/CStruct) is also a ScopeMixin
 			if found is not None:
 				return found
-			node = node.base
+			node = _next_chain_node( node.base )
 		return None
 
 	def own_new_virtual_slots( self ) -> list['Function']:
@@ -683,12 +716,12 @@ class InheritanceChainMixin:
 		if self.resolve is not None:
 			self.resolve()
 		inherited_names: set[str] = set()
-		node = self.base
+		node = _next_chain_node( self.base )
 		while node is not None:
 			if node.resolve is not None:
 				node.resolve()
 			inherited_names.update( m.stem for m in node.methods if isinstance( m, Function ) and m.is_virtual )
-			node = node.base
+			node = _next_chain_node( node.base )
 		return [ m for m in self.methods if isinstance( m, Function ) and m.is_virtual and m.stem not in inherited_names ]
 
 	def vtbl_owner( self ) -> 'InheritanceChainMixin':
@@ -711,8 +744,8 @@ class InheritanceChainMixin:
 		KIND", not "the same class". Those two narrowing overrides are all that
 		remains of what used to be ten forwarding stubs. '''
 		node = self
-		while node.base is not None and not node.own_new_virtual_slots():
-			node = node.base
+		while _next_chain_node( node.base ) is not None and not node.own_new_virtual_slots():
+			node = _next_chain_node( node.base )
 		return node
 
 	def virtual_slots( self ) -> list['Function']:
@@ -727,7 +760,7 @@ class InheritanceChainMixin:
 		node: 'InheritanceChainMixin|None' = self.vtbl_owner()
 		while node is not None:
 			chain.append( node )
-			node = node.base
+			node = _next_chain_node( node.base )
 		slots: list[Function] = []
 		for node in reversed( chain ):
 			slots.extend( node.own_new_virtual_slots() )
@@ -749,12 +782,21 @@ class InheritanceChainMixin:
 		NOTE: unlike own_new_virtual_slots above, this resolves NOTHING it
 		returns - a caller that goes on to ask an attribute about its own
 		.type has to resolve it first (see cfg.py's complete_base_construction,
-		which does exactly that, and says why). '''
+		which does exactly that, and says why).
+
+		NOTE 2: if some level's own .base is still an ABSTRACT generic
+		Specialization (Real[T], T not yet bound to anything concrete - see
+		discovery.py's _parse_ClassDef_RCClass), the attribute contributed
+		from that ancestor is the ABSTRACT, unsubstituted one (Real's own
+		bare TypeVar-typed field) - substituting it against a concrete
+		instantiation is the caller's job (see monomorphize.py's
+		substituted_field), same as it already is for a class's own fields
+		declared directly with its own type params. '''
 		chain: list['InheritanceChainMixin'] = []
 		node: 'InheritanceChainMixin|None' = self
 		while node is not None:
 			chain.append( node )
-			node = node.base
+			node = _next_chain_node( node.base )
 		attrs: list[Variable] = []
 		for node in reversed( chain ):
 			attrs.extend( node.attributes )
@@ -791,8 +833,13 @@ class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted c
 	# Python itself requires a base class to already exist when the `class
 	# Foo(Base):` statement runs, so there's no forward-reference case to
 	# defer here. Multiple inheritance is a compile error (see discovery.py),
-	# so this is a single pointer, not a list/MRO.
-	base: 'RCClass|None' = None
+	# so this is a single pointer, not a list/MRO. May ALSO be a Specialization
+	# (a generic base, e.g. Real[T] or Real[i32] - see discovery.py's
+	# _parse_ClassDef_RCClass) rather than a plain RCClass - see
+	# InheritanceChainMixin's own docstring for how the chain walk and
+	# monomorphize.py's monomorphize_class/Discovery.on_generic_base_resolved
+	# handle that.
+	base: 'RCClass|Specialization|None' = None
 	# @protocol types this class has explicitly declared conformance to
 	# (base-class-list syntax - see Protocol's own docstring). Small and
 	# per-class by construction - NOT a global registry, and NOT involved in
@@ -814,7 +861,7 @@ class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted c
 	# vtbl_owner can legitimately be a plain RCClass ancestor.
 	def vtbl_owner( self ) -> 'RCClass':
 		owner = super().vtbl_owner()
-		assert isinstance( owner, RCClass ) # the chain is homogeneous - .base is typed RCClass|None
+		assert isinstance( owner, RCClass ) # _next_chain_node always unwraps a Specialization down to its real RCClass template, so the walk itself is homogeneous even though .base may hold one
 		return owner
 
 	# the whole point of the class - and ClosureType (the only RCClass
