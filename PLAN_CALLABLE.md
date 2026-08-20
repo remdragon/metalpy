@@ -132,3 +132,42 @@ RCClass fields, a nested field chain (outer.inner.handler(...)), and a
 regression guard that an ordinary same-shaped method call (o.method(...))
 still dispatches normally rather than being misrouted - real compile-and-
 run, MSVC/clang/WSL-gcc all green, plus lowering_test.py IR-level coverage.
+
+Status update: the LAST remaining callee shape - calling directly through
+ANY other expression (get_callback()(...), t[0](...)) - is now closed too.
+Considered and rejected: retrofitting CallableType with a real `__call__`
+dunder so it could ride the ordinary class-method dispatch machinery every
+other call in the language already flows through (the user's own
+suggestion, worth recording) - CallableType isn't a ScopeMixin (no members
+at all, see Implementation #1 above), so this would mean teaching the
+SHARED method-resolution/dispatch core to recognize a synthetic member on a
+non-class type, a real but more invasive change than warranted here.
+Instead, _try_lower_indirect_call's existing Name/Attribute branches (each
+statically type-checked before ever evaluating anything, to stay double-
+evaluation-safe against _resolve_callee's own fallback) gained one more,
+simpler branch: for any OTHER node.func shape, evaluate it once via the
+ordinary _lower_expr and inspect the REAL resulting operand's type. This is
+double-evaluation-safe too, for a different reason than the static-check
+branches - _resolve_callee's own fallback for a non-Attribute/non-Name
+func_node fails IMMEDIATELY today, with zero evaluation attempted, so
+nothing downstream ever gets a second chance at the same expression.
+One real regression found and fixed while building this: a bare Subscript
+node.func isn't always "index a runtime value" - `some_generic_fn[T](...)`/
+`compiler.atomic_add[T](...)` is NAMESPACE-RESOLVED generic-call syntax
+(the exact same _try_resolve_namespace lookup the construction-sugar
+recognizers above already use), and evaluating it as an ordinary expression
+broke 11 existing tests (generic-function-call and compiler-intrinsic
+tests, plus one exercising `sys` used bare). Fixed by trying
+_try_resolve_namespace(node.func) first (a purely static, non-evaluating
+lookup) and bailing out untouched whenever it resolves to anything,
+BEFORE ever calling _lower_expr - leaving that whole class of call
+completely unaffected by this change.
+Verified: a call-result callee (get_callback()(...)) and a subscript-result
+callee via a custom __getitem__ (isolated from whatever separate, unrelated
+gaps a generic container's OWN internals might still have storing a
+Ptr[Callable[...]] element - never investigated), plus a regression guard
+that a genuinely non-callable call-result still fails with the ordinary
+"cannot call ..." diagnostic. Real compile-and-run plus lowering_test.py
+IR-level coverage (including the generic-call/compiler-intrinsic
+regression tests that caught the Subscript bug), MSVC/clang/WSL-gcc all
+green, full test suite clean on all three.

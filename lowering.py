@@ -11642,49 +11642,12 @@ class FunctionLowering:
 		member = self._cfg.narrowed_member( var_id )
 		return member.type if member is not None else declared_type
 
-	def _try_lower_indirect_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
-		# eq_fn(a, b) where eq_fn: Ptr[Callable[[A,B],R]] - a call THROUGH a
-		# function-pointer VALUE, not a named Function/method lookup at all
-		# (see PLAN_CALLABLE.md) - _resolve_callee has no way to express
-		# this (it only ever returns a Function/Overload/Specialization/
-		# _ReceiverDispatch, never an arbitrary Operand), so it's
-		# recognized here instead, same "try a shape, None means try the
-		# next one" convention as the construction recognizers above.
-		#
-		# Two callee shapes: a bare Name (eq_fn(...)) and obj.field(...) -
-		# a Ptr[Callable[...]]-typed FIELD read off obj. Both determine
-		# "is this even callable" via a PURELY STATIC type lookup (no IR
-		# emitted) before ever lowering node.func for real - critical for
-		# the Attribute case specifically: _resolve_callee's own Attribute
-		# path (the fallback once every recognizer here returns None)
-		# lowers node.func.value ITSELF once it takes over, so lowering it
-		# here too and then bailing out on a non-match would double-
-		# evaluate a receiver with side effects (e.g. get_container().
-		# field(...)) - not just redundant codegen, a real correctness bug.
-		# A callee needing a CALL to obtain the callable at all (that exact
-		# get_container().field(...) shape) isn't attempted for the same
-		# reason one level deeper - no forcing use case yet.
-		if isinstance( node.func, ast.Name ):
-			name = self.lowering.discovery.find_name_or_none( node.func.id )
-			if not isinstance( name, Variable ):
-				return None
-			self.lowering._ensure_resolved( name )
-			effective_type = self._narrowed_type_of_name( node.func.id, name.type )
-		elif isinstance( node.func, ast.Attribute ):
-			receiver_type = self._static_type_of_value_expr( node.func.value )
-			if receiver_type is None:
-				return None
-			if self.lowering._find_method( receiver_type, node.func.attr ) is not None:
-				return None # a real method exists with this name - an ordinary method call, not a field call
-			field = self.lowering._find_field( receiver_type, node.func.attr )
-			if field is None:
-				return None # no such field either - let _resolve_callee's own Attribute path give the accurate diagnostic
-			effective_type = field.type
-		else:
-			return None
-		fn_type = self.lowering._type_resolver._callable_type_of( effective_type )
-		if fn_type is None:
-			return None
+	def _check_indirect_call_shape( self, node: ast.Call, fn_type: CallableType ) -> None:
+		# shared *args/kwargs/arity validation for every _try_lower_indirect_
+		# call callee shape below - split out so each shape's own branch can
+		# call this at the point where it's already safe to fail loudly
+		# (target may or may not be lowered yet, depending on the shape -
+		# see each branch's own comment).
 		if any( isinstance( a, ast.Starred ) for a in node.args ):
 			self.lowering.discovery.fail( f'*args not supported yet: {ast.unparse(node)}', node )
 		if node.keywords:
@@ -11694,10 +11657,90 @@ class FunctionLowering:
 				f'{ast.unparse(node.func)}(...) takes {len(fn_type.arg_types)} argument(s), got {len(node.args)}: {ast.unparse(node)}',
 				node,
 			)
-		# only lowered now that every shape/arity check above has passed -
-		# for the Attribute case this is the first and only time the
-		# receiver is actually evaluated (see the comment above)
-		target = self._lower_expr( node.func, None )
+
+	def _try_lower_indirect_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
+		# eq_fn(a, b) where eq_fn: Ptr[Callable[[A,B],R]] - a call THROUGH a
+		# function-pointer VALUE, not a named Function/method lookup at all
+		# (see PLAN_CALLABLE.md) - _resolve_callee has no way to express
+		# this (it only ever returns a Function/Overload/Specialization/
+		# _ReceiverDispatch, never an arbitrary Operand), so it's
+		# recognized here instead, same "try a shape, None means try the
+		# next one" convention as the construction recognizers above.
+		#
+		# Three callee shapes, in two different STRATEGIES:
+		#
+		# - Name (eq_fn(...)) and Attribute (obj.field(...), a Ptr[Callable
+		#   [...]]-typed FIELD read off obj) determine "is this even
+		#   callable" via a PURELY STATIC type lookup (no IR emitted)
+		#   BEFORE ever lowering node.func for real - critical for the
+		#   Attribute case specifically: _resolve_callee's own Attribute
+		#   path (the fallback once every recognizer here returns None)
+		#   lowers node.func.value ITSELF once it takes over, so lowering
+		#   it here too and then bailing out on a non-match would double-
+		#   evaluate a receiver with side effects.
+		# - Everything else (a Call result, a Subscript result, ...) has no
+		#   static type available without a real non-evaluating type-
+		#   inference pass over arbitrary expressions - so instead this
+		#   evaluates node.func ONCE, unconditionally, and inspects the
+		#   REAL operand's type. This is still double-evaluation-safe: for
+		#   any node.func shape other than Name/Attribute, _resolve_callee
+		#   fails IMMEDIATELY, before evaluating anything at all (see its
+		#   own `if not isinstance(func_node, ast.Attribute): fail(...)`
+		#   guard) - so nothing downstream ever gets a second chance to
+		#   evaluate the same expression, whether this turns out callable
+		#   or not. A program that wasn't going to compile anyway (the
+		#   non-callable case) doesn't need its abandoned evaluation to be
+		#   free of side effects, since it never runs.
+		if isinstance( node.func, ast.Name ):
+			name = self.lowering.discovery.find_name_or_none( node.func.id )
+			if not isinstance( name, Variable ):
+				return None
+			self.lowering._ensure_resolved( name )
+			effective_type = self._narrowed_type_of_name( node.func.id, name.type )
+			fn_type = self.lowering._type_resolver._callable_type_of( effective_type )
+			if fn_type is None:
+				return None
+			self._check_indirect_call_shape( node, fn_type )
+			target = self._lower_expr( node.func, None )
+		elif isinstance( node.func, ast.Attribute ):
+			receiver_type = self._static_type_of_value_expr( node.func.value )
+			if receiver_type is None:
+				return None
+			if self.lowering._find_method( receiver_type, node.func.attr ) is not None:
+				return None # a real method exists with this name - an ordinary method call, not a field call
+			field = self.lowering._find_field( receiver_type, node.func.attr )
+			if field is None:
+				return None # no such field either - let _resolve_callee's own Attribute path give the accurate diagnostic
+			fn_type = self.lowering._type_resolver._callable_type_of( field.type )
+			if fn_type is None:
+				return None
+			self._check_indirect_call_shape( node, fn_type )
+			target = self._lower_expr( node.func, None )
+		else:
+			# a Subscript here is NOT necessarily "index a runtime value" -
+			# `some_generic_fn[T](...)`/`compiler.atomic_add[T](...)` is
+			# namespace-resolved generic-call syntax (a Function/Specialization
+			# looked up by NAME, exactly what _try_resolve_namespace already
+			# recognizes for the construction-sugar recognizers above), not a
+			# value to evaluate - confirmed by a real regression: evaluating
+			# it here unconditionally hit _expr_Subscript's own "cannot take a
+			# bare reference to a generic function" / "'sys' is not a value"
+			# rejections for shapes that were never meant to reach _lower_expr
+			# at all. Bail out (no evaluation attempted) whenever this static,
+			# non-emitting lookup succeeds, leaving it for the SAME namespace-
+			# based resolution _resolve_callee_target/the generic-call path
+			# already handles, unchanged - only once it fails (this Subscript/
+			# whatever really is a runtime value, e.g. t[0](...)/get_it()(...))
+			# does evaluating it here become both correct and, per the same
+			# reasoning as the other shapes above, double-evaluation-safe.
+			if self.lowering._try_resolve_namespace( node.func ) is not None:
+				return None
+			candidate = self._lower_expr( node.func, None )
+			fn_type = self.lowering._type_resolver._callable_type_of( candidate.type )
+			if fn_type is None:
+				return None
+			self._check_indirect_call_shape( node, fn_type )
+			target = candidate
 		args = [ self._lower_expr( arg_node, arg_type ) for arg_node, arg_type in zip( node.args, fn_type.arg_types ) ]
 		return self._emit_call_indirect( target, args, fn_type.return_type, expected_type )
 

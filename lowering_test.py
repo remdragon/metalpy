@@ -4166,6 +4166,57 @@ class Tests( unittest.TestCase ):
 		call = next( instr for instr in lf.instructions if isinstance( instr, ir.Call ))
 		self.assertEqual( call.target.stem, 'real_method' )
 
+	def test_call_through_call_result_callee_emits_call_indirect( self ) -> None:
+		# get_callback()(...) - the callee is itself a CALL result, not a
+		# Name/Attribute this recognizer can statically type-check without
+		# evaluating. _resolve_callee's own fallback for any non-Attribute
+		# func_node fails IMMEDIATELY (zero evaluation attempted), so
+		# evaluating node.func here first and checking its real type is
+		# double-evaluation-safe: nothing downstream ever gets a second
+		# chance at it. Confirms both the inner ir.Call (get_callback) and
+		# the outer ir.CallIndirect (through its result) appear, in order.
+		code = '\n'.join([
+			'def eq( x: i32, y: i32 ) -> bool:',
+			'	return x == y',
+			'',
+			'def get_callback() -> Ptr[Callable[[i32,i32],bool]]:',
+			'	return eq',
+			'',
+			'def call_it( a: i32, b: i32 ) -> bool:',
+			'	return get_callback()( a, b )',
+		])
+		self._import( code )
+		call_it_fn = self.discovery.modules['__test__'].get_local( 'call_it' )
+		if call_it_fn.resolve is not None:
+			call_it_fn.resolve()
+		lf = self.compiler._lower( call_it_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( instr for instr in lf.instructions if isinstance( instr, ir.Call ))
+		self.assertEqual( call.target.stem, 'get_callback' )
+		call_indirect = next( instr for instr in lf.instructions if isinstance( instr, ir.CallIndirect ))
+		self.assertIs( call_indirect.target, call.dest )
+		self.assertEqual( [ a.stem for a in call_indirect.args ], [ 'a', 'b' ])
+
+	def test_call_through_non_callable_call_result_fails_cleanly( self ) -> None:
+		# regression guard: a call-result callee that ISN'T actually
+		# Ptr[Callable[...]]-typed must still fail with the ordinary "cannot
+		# call ..." diagnostic (via _resolve_callee's ordinary fallback,
+		# once the new recognizer branch declines) - not crash, not silently
+		# accept it.
+		code = '\n'.join([
+			'def get_number() -> i32:',
+			'	return 5',
+			'',
+			'def call_it() -> i32:',
+			'	return get_number()( 1 )',
+		])
+		self._import( code )
+		call_it_fn = self.discovery.modules['__test__'].get_local( 'call_it' )
+		if call_it_fn.resolve is not None:
+			call_it_fn.resolve()
+		self.compiler._lower( call_it_fn )
+		self.assertIn( 'cannot call get_number()', self.discovery.errors.errors[0] )
+
 	def test_call_through_none_returning_callable_pointer_omits_dest( self ) -> None:
 		# regression test: a NoneType-returning Callable[...] call used to
 		# always allocate a dest temp and emit ir.CallIndirect(dest=...),

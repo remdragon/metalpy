@@ -14595,6 +14595,51 @@ def main() -> i32:
 		diff: i32 = result - 30
 	return diff
 ''' ),
+			# regression test: calling THROUGH THE RESULT OF A CALL
+			# (get_callback()(...)) used to be a hard "cannot call ..." error
+			# - _resolve_callee only ever attempts an Attribute or a resolved
+			# namespace Name, failing immediately (no evaluation at all) for
+			# any other node.func shape. _try_lower_indirect_call's general
+			# fallback branch now evaluates node.func once and checks the
+			# REAL operand's type, since nothing downstream gets a second
+			# chance to evaluate it either way.
+			( 'call_result_used_directly_as_callee', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def get_callback() -> Ptr[Callable[[i32],i32]]:
+	return add_one
+
+def main() -> i32:
+	result: i32 = get_callback()( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# same fix, through a SUBSCRIPT result instead of a bare call -
+			# t[0](...) where __getitem__ returns Ptr[Callable[...]]. Uses a
+			# custom __getitem__ rather than a generic container specifically
+			# to isolate this call-site fix from whatever separate, unrelated
+			# gaps a generic container's OWN internals might still have
+			# storing a Ptr[Callable[...]] element (never investigated).
+			( 'subscript_result_used_directly_as_callee', '''
+@cstruct
+class Table:
+	def __getitem__( self, i: i32 ) -> Ptr[Callable[[i32],i32]]:
+		return add_one
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	t: Table = Table()
+	result: i32 = t[0]( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
