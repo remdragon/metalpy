@@ -15126,21 +15126,34 @@ class CStructPackingAndFieldAlignmentTests( test_support.RealCompileMixin, Compi
 	FindFirstFileA results came back truncated ("alpha.txt" read as
 	"a.txt"), a silent wrong-data bug, not a compile error or a crash.
 
-	Both mechanisms were verified empirically against all three compilers
-	this codebase supports (real MSVC via cl.exe, clang, gcc via WSL) before
-	being implemented this way - two real, non-obvious portability traps
-	were found and are worth recording here, not just in commit history:
+	Aligned[N, T] works in EITHER direction - N may shrink or grow the
+	field's own alignment relative to T's natural one (e.g. Aligned[16,
+	u32] on a naturally-4-aligned field). Both mechanisms were verified
+	empirically against all three compilers this codebase supports (real
+	MSVC via cl.exe, clang, gcc via WSL) before being implemented this way -
+	several real, non-obvious portability traps were found and are worth
+	recording here, not just in commit history:
 
 	1. A bare mid-struct `#pragma pack(push,N)/pop` bracketing just one
 	   field is NOT portable: MSVC honors it per-field, but clang/gcc
 	   silently keep the struct's own natural alignment instead (only a
 	   pack directive wrapping the ENTIRE aggregate is portable on
-	   clang/gcc) - see _struct_or_union_body's own comment. The portable
-	   per-field mechanism is instead a compiler split: real MSVC keeps the
-	   mid-struct pack(push,N)/pop; everything else uses the GNU
-	   __attribute__((packed,aligned(N))) field attribute.
+	   clang/gcc) - see _struct_or_union_body's own comment.
 
-	2. `#if defined(_MSC_VER)` alone is NOT a valid MSVC/clang discriminator
+	2. `#pragma pack(push,N)/pop` and `__declspec(align(N))` are each only
+	   HALF-portable in ONE direction on real MSVC: pack is a ceiling (can
+	   shrink alignment below natural, never grow it); declspec is a floor
+	   (can grow alignment above natural, confirmed via a real repro that
+	   declspec(align(4)) on a natural-8-aligned u64 field is silently a
+	   no-op, still offset 8). LAYERING both together on the same field
+	   (pack(push,N) + declspec(align(N)) + pack(pop)) covers both
+	   directions - confirmed empirically to reproduce the pack-alone
+	   result when shrinking and the declspec-alone result when growing.
+	   clang/gcc need no such layering: the single GNU
+	   __attribute__((packed,aligned(N))) field attribute already covers
+	   both directions on its own.
+
+	3. `#if defined(_MSC_VER)` alone is NOT a valid MSVC/clang discriminator
 	   on Windows: clang targeting x86_64-pc-windows-msvc (this repo's own
 	   dev-machine clang) DEFINES _MSC_VER too, for MSVC-header
 	   compatibility - so a bare `defined(_MSC_VER)` guard silently routed
@@ -15150,7 +15163,7 @@ class CStructPackingAndFieldAlignmentTests( test_support.RealCompileMixin, Compi
 	   The guard must additionally exclude __clang__.
 
 	Combining whole-struct packed=True with a field's own Aligned[N,...] on
-	the SAME struct is a third, separate confirmed divergence (MSVC: one
+	the SAME struct is a fourth, separate confirmed divergence (MSVC: one
 	byte count; clang/gcc: a different one) - rejected as a compile error
 	instead (compiler.py's _validate_packed_field_alignment_conflict) -
 	see test_packed_and_aligned_combination_on_same_struct_rejected below. '''
@@ -15240,6 +15253,43 @@ class AlignedMixed2:
 def main() -> i32:
 	x = AlignedMixed2( a = 1, b = u64( 0xdeadbeefcafe ), c = 2 )
 	if x.a != 1 or x.b != u64( 0xdeadbeefcafe ) or x.c != 2:
+		return 1
+	return 0
+''' ),
+			# Aligned[...] growing a field's alignment ABOVE its natural one -
+			# the opposite direction from every case above. a(1,offset0) +
+			# pad(15) + b(4,offset16,forced) + c(1,offset20) = 32 total (the
+			# whole struct's own alignment also grows to 16, adding trailing
+			# pad up to the next 16-byte boundary)
+			( 'aligned_field_can_grow_above_natural_alignment', '''
+@cstruct
+class GrownField:
+	a: u8 = 0
+	b: Aligned[16, u32] = 0
+	c: u8 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( GrownField )
+	if sz != usize( 32 ):
+		return 1
+	g = GrownField( a = 1, b = u32( 0xdeadbeef ), c = 2 )
+	if g.a != 1 or g.b != u32( 0xdeadbeef ) or g.c != 2:
+		return 2
+	return 0
+''' ),
+			# Aligned[N, T] where N already equals T's own natural alignment -
+			# a harmless no-op on every compiler, same layout as the plain
+			# unaligned field would have gotten anyway
+			( 'aligned_field_matching_natural_alignment_is_a_no_op', '''
+@cstruct
+class NoOpAligned:
+	a: u32 = 0
+	b: Aligned[4, u32] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( NoOpAligned )
+	if sz != usize( 12 ):
 		return 1
 	return 0
 ''' ),

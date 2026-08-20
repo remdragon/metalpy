@@ -40,7 +40,7 @@ This document defines the language constructs, syntax rules, type system, error 
 * **Fixed-Size Inline Array** (inside `@struct`): `u16[32]`, `u8[8]`
 * **Address-Of**: `compiler.addrof(x) -> Ptr[T]` yields a pointer to a local variable `x: T`, translating directly to C `&x`. Used for C out-parameters (e.g. Win32 `WriteFile`'s `lpNumberOfBytesWritten`), since Python has no `&` operator of its own.
 * **Packed Struct** (`@cstruct(packed = True)` / `@cunion(packed = True)`): no compiler-inserted padding anywhere in the body (`#pragma pack(push,1)` around the whole struct/union) - the general way to replicate an external ABI's exact byte layout when field types alone don't produce it.
-* **Per-Field Alignment** (`Aligned[N, T]`, `@cstruct`/`@cunion` field only): overrides just that field's own C alignment (must not exceed `T`'s natural alignment - only shrinking is portable). Resolves transparently to plain `T` everywhere else (arithmetic, comparisons, construction). Cannot be combined with `packed = True` on the same struct (confirmed to diverge between MSVC and clang/gcc - rejected as a compile error).
+* **Per-Field Alignment** (`Aligned[N, T]`, `@cstruct`/`@cunion` field only): overrides just that field's own C alignment, either below or above `T`'s natural alignment. Resolves transparently to plain `T` everywhere else (arithmetic, comparisons, construction). Cannot be combined with `packed = True` on the same struct (confirmed to diverge between MSVC and clang/gcc - rejected as a compile error).
 
 ```metalpy
 @cstruct

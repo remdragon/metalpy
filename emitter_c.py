@@ -1142,28 +1142,43 @@ def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type,i
 
 	Each attrs entry's own third element is a per-field C alignment
 	override (Variable.c_align, from a field declared `Aligned[N, T]`) -
-	independent of `packed`, and NEVER combined with it on the same struct
-	(compiler.py's _validate_packed_field_alignment_conflict rejects that
-	combination outright, before this ever runs). Deliberately NOT emitted
-	as a bare mid-struct #pragma pack(push,N)/pop bracketing just that
-	field: confirmed empirically that MSVC honors a pack change made
-	between two member declarations (mid-struct) on a PER-FIELD basis, but
-	clang/gcc silently ignore it and keep the struct's own natural
+	works in EITHER direction (N below or above the field's own natural
+	alignment), independent of `packed`, and NEVER combined with it on the
+	same struct (compiler.py's _validate_packed_field_alignment_conflict
+	rejects that combination outright, before this ever runs). Deliberately
+	NOT emitted as a bare mid-struct #pragma pack(push,N)/pop bracketing
+	just that field: confirmed empirically that MSVC honors a pack change
+	made between two member declarations (mid-struct) on a PER-FIELD basis,
+	but clang/gcc silently ignore it and keep the struct's own natural
 	alignment instead - only a pack directive that wraps the ENTIRE
 	aggregate is portable on clang/gcc. The portable per-field mechanism is
-	instead a #if defined(_MSC_VER) && !defined(__clang__) split: real MSVC
-	keeps its own (verified) mid-struct pack(push,N)/pop; everything else
-	uses the GNU __attribute__((packed,aligned(N))) field attribute instead
-	(also verified to reproduce the identical byte offset). The
-	`!defined(__clang__)` half is load-bearing, not defensive styling: this
-	machine's own clang targets x86_64-pc-windows-msvc and DOES define
-	_MSC_VER (for MSVC-header compatibility), so a bare `defined(_MSC_VER)`
-	guard silently routed clang down the MSVC branch too - where clang's
-	real pragma-pack semantics (the mid-struct case above) do NOT match
-	real MSVC, reproducing the exact wrong-size bug this feature exists to
-	prevent. Confirmed via a real repro: bare _MSC_VER guard gave
-	sizeof==24 under this clang instead of the correct 16 every other
-	compiler (real MSVC, gcc) agreed on. '''
+	instead a #if defined(_MSC_VER) && !defined(__clang__) split:
+
+	- real MSVC: #pragma pack(push,N)/pop (a CAP - can only shrink, never
+	  grow, alignment beyond natural) combined with __declspec(align(N))
+	  on the field itself (the opposite: __declspec can only GROW
+	  alignment, confirmed via a real repro that __declspec(align(4)) on a
+	  natural-8-aligned u64 field is silently a no-op, still offset 8, not
+	  4). Neither alone covers both directions, but layering both
+	  together does: confirmed empirically that pack+declspec combined
+	  reproduces the exact pack-alone result when shrinking and the exact
+	  declspec-alone result when growing, on real MSVC.
+	- clang/gcc: the single GNU __attribute__((packed,aligned(N))) field
+	  attribute already covers both directions on its own (confirmed
+	  empirically) - `packed` relaxes the field down to its own emitted
+	  alignment floor of 1 byte, then `aligned(N)` sets the exact final
+	  value, whether that's below or above the field's natural alignment.
+
+	The `!defined(__clang__)` half of the MSVC guard is load-bearing, not
+	defensive styling: this machine's own clang targets
+	x86_64-pc-windows-msvc and DOES define _MSC_VER (for MSVC-header
+	compatibility), so a bare `defined(_MSC_VER)` guard silently routed
+	clang down the MSVC branch too - where clang's real pragma-pack
+	semantics (the mid-struct case above) do NOT match real MSVC,
+	reproducing the exact wrong-size bug this feature exists to prevent.
+	Confirmed via a real repro: bare _MSC_VER guard gave sizeof==24 under
+	this clang instead of the correct 16 every other compiler (real MSVC,
+	gcc) agreed on. '''
 	body_lines: list[str] = []
 	if not attrs:
 		# MSVC (and pedantic C) reject empty structs/unions:
@@ -1184,7 +1199,7 @@ def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type,i
 			else:
 				body_lines.append( '#if defined(_MSC_VER) && !defined(__clang__)' )
 				body_lines.append( f'#pragma pack(push, {align})' )
-				body_lines.append( f'\t{decl};' )
+				body_lines.append( f'\t__declspec(align({align})) {decl};' )
 				body_lines.append( '#pragma pack(pop)' )
 				body_lines.append( '#else' )
 				body_lines.append( f'\t{decl} __attribute__(( packed, aligned({align}) ));' )
