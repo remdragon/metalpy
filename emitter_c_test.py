@@ -19889,6 +19889,83 @@ def main() -> None:
 		self.assertIn( "type parameter 'T' is inferred as both", str( self.discovery.errors.errors[0] ))
 
 
+class DelRedeclareRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' del x fully removes x from the enclosing function's own scope
+	(lowering.py's _stmt_Delete: "Removing it from fn.names is enough on
+	its own to make a later reference fail") - a later `x = ...` then finds
+	no existing declaration at all and takes the FRESH-binding path. This
+	is the real compile-and-run confirmation that it isn't just
+	discovery.errors==[] (see this project's own "verify, don't trust
+	IR-level success" convention): the REUSED name's new value is read
+	back correctly, proving the second binding is real and independent,
+	not silently aliasing the first.
+
+	SAME type both times only, deliberately: attempting this with a
+	GENUINELY different type (e.g. i32 then str) surfaced a real, separate,
+	CONFIRMED emitter bug while writing this test - emitter_c.py's own
+	`declared: set[str]` local-declaration tracking (_emit_instruction's
+	ir.Assign handling) is keyed by the C name alone, with no way to tell
+	"already declared, same Variable" apart from "already declared, a
+	DIFFERENT Variable object that happens to share the same source-level
+	name" (exactly what del-then-redeclare-with-a-different-type produces,
+	now that lowering.py accepts it - see lowering_test.py's own
+	test_del_then_redeclare_with_a_genuinely_different_type_is_allowed,
+	which is correct at ITS level; this is a lower, separate layer). The
+	second binding silently reuses the FIRST binding's own C variable
+	instead of getting a fresh, distinctly-named one - confirmed via a
+	real repro producing genuinely invalid C (a struct pointer assigned
+	into an int32_t). Flagged as a known, unfixed, real bug - not
+	attempted in this pass; see this task's own final report. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'del_then_redeclare_with_same_type', '''
+def main() -> i32:
+	x: i32 = 1
+	del x
+	x: i32 = 42
+	if x != 42:
+		return 1
+	return 0
+''' ),
+			# ties directly to the match-arm-binding-reuse diagnostic: del e
+			# between two match statements is the real, working escape hatch
+			# for reusing a binding name across match arms - same UNION type
+			# both times here (see this class's own docstring for why a
+			# genuinely different type isn't attempted yet)
+			( 'del_between_match_statements_allows_reuse', '''
+def get_a() -> Result[i32, OverflowError|IndexError]:
+	return Result.Err( OverflowError() )
+
+def get_b() -> Result[i32, OverflowError|IndexError]:
+	return Result.Ok( 7 )
+
+def main() -> i32:
+	match get_a():
+		case Result.Err( e ):
+			pass
+		case Result.Ok( _ ):
+			return 1
+	del e
+	match get_b():
+		case Result.Err( e ):
+			return 2
+		case Result.Ok( v ):
+			if v != 7:
+				return 3
+	return 0
+''' ),
+		] )
+
+
 class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' regression test for a real, confirmed bug: Result[T,E].unwrap_or()
 	called with NO argument (relying on its own `default: T|None = None`

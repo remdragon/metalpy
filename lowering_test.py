@@ -484,6 +484,69 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 
+	def test_del_then_redeclare_with_a_genuinely_different_type_is_allowed( self ) -> None:
+		# the companion case the test above's own name promises but its
+		# body doesn't actually exercise (both sides there are i32) - del
+		# fully removes the name from fn.names (see _stmt_Delete's own
+		# comment: "Removing it from fn.names is enough on its own to make
+		# a later reference fail"), so a later `x = ...` finds no existing
+		# declaration at all and takes the FRESH-binding path
+		# (_declare_local, inferring straight from the RHS, unconstrained
+		# by whatever type the deleted binding happened to have) - not the
+		# _stmt_Assign reassignment path that would otherwise enforce the
+		# OLD type against the new value (see the match-arm-binding-reuse
+		# diagnostic tests above, which fire specifically because THOSE
+		# reused names were never del'd first).
+		code = '\n'.join([
+			'import builtins',
+			'def main() -> None:',
+			'	x: i32 = 1',
+			'	del x',
+			'	x: builtins.str = "hello"',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_del_between_match_statements_allows_reusing_binding_name_with_incompatible_type( self ) -> None:
+		# ties directly to test_match_binding_name_reused_with_incompatible_
+		# type_gets_a_clear_diagnostic above: THAT test's whole point is
+		# that reusing a match-arm binding name across two unrelated match
+		# statements with incompatible types is now a clear compile error.
+		# del is the existing, already-available way to resolve it
+		# deliberately - del e between the two match statements removes e
+		# from fn.names entirely, so the second match's own `case
+		# Result.Err(e):` binding takes the fresh-declaration path (like
+		# the test above), not the reassignment path the diagnostic fires
+		# from - confirms this real, useful escape hatch actually works,
+		# not just reasoning about _stmt_Delete's own mechanism in isolation.
+		code = '\n'.join([
+			'import builtins',
+			'def get_a() -> builtins.Result[i32, builtins.OverflowError|builtins.IndexError]:',
+			'	return builtins.Result.Err( builtins.OverflowError() )',
+			'',
+			'def get_b() -> builtins.Result[i32, builtins.IndexError|builtins.KeyError]:',
+			'	return builtins.Result.Err( builtins.IndexError() )',
+			'',
+			'def main() -> i32:',
+			'	match get_a():',
+			'		case builtins.Result.Err( e ):',
+			'			pass',
+			'		case builtins.Result.Ok( _ ):',
+			'			return 1',
+			'	del e',
+			'	match get_b():',
+			'		case builtins.Result.Err( e ):',
+			'			pass',
+			'		case builtins.Result.Ok( _ ):',
+			'			return 2',
+			'	return 0',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	# --- arithmetic ---------------------------------------------------------
 
 	def test_binop_without_arithmetic_context_is_a_compile_error( self ) -> None:
