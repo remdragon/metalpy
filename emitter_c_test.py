@@ -16167,6 +16167,7 @@ def gen( b: Box ) -> Iterator[Result[i32, StopIteration]]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
 	first = g.__next__().is_ok() # only one of the two yields is ever consumed
+	if first: pass
 	# g goes out of scope here, still mid-iteration - PLAN_GENERATORS.md's
 	# own point: dropping it must still decref its captured Box parameter,
 	# via the ordinary, unmodified $$__destructor__ cascade every other
@@ -16244,6 +16245,7 @@ def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
 	first = g.__next__().is_ok()
 	second = g.__next__().is_ok() # b.v is 10 - only 2 of 10 iterations consumed
+	if first and second: pass
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -16534,6 +16536,7 @@ def double_all( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 def make_and_partially_consume( xs: list[i32] ) -> None:
 	g = double_all( xs )
 	first = g.__next__().is_ok()
+	if first: pass
 	# g goes out of scope here, mid-iteration - g's own __for_obj_N field
 	# holds a SEPARATE reference to xs, must also be released
 
@@ -16617,6 +16620,7 @@ def doubled( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = doubled( b )
 	first = g.__next__().is_ok()
+	if first: pass
 	# g's own __for_obj_N field holds the inner counter(b) generator,
 	# which ITSELF holds b as its own captured parameter - both levels
 	# must release correctly when g is dropped mid-iteration
@@ -17315,6 +17319,7 @@ def gen( b: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b, 5 )
 	first = g.__next__().is_ok() # only 1 of 5 iterations consumed
+	if first: pass
 	# g goes out of scope here, still mid-iteration - abandonment must still
 	# replay the armed defer, via the destructor, before its own ordinary
 	# captured-parameter teardown
@@ -17512,9 +17517,11 @@ def drain_fully( b: Box, count: usize ) -> None:
 	i: usize = 0
 	while i < count:
 		v = g.__next__().is_ok()
+		if v: pass
 		with compiler.wrap_arithmetic:
 			i += 1
 	last = g.__next__().is_ok() # natural exhaustion - tail replay fires the defer, unsets its own flag
+	if last: pass
 	# g goes out of scope HERE - $$__destructor__ must see the flag already
 	# unset and must NOT replay the same defer body a second time
 
@@ -18180,6 +18187,7 @@ def consume_fully( b1: Box, b2: Box ) -> None:
 	x = g.__next__().is_ok()
 	y = g.__next__().is_ok()
 	z = g.__next__().is_ok()
+	if x and y and z: pass
 
 def main() -> i32:
 	b1 = Box( n = 1 )
@@ -18210,6 +18218,7 @@ def outer( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
 def make_and_abandon( b1: Box, b2: Box ) -> None:
 	g = outer( b1, b2 )
 	first = g.__next__().is_ok()
+	if first: pass
 	# g (and first, and inner's own generator) all go out of scope here,
 	# still mid-iteration on b1 - the generator's own destructor must
 	# still release every live promoted field it's holding
