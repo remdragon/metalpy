@@ -34,12 +34,10 @@ def main() -> i32:
 import termcolor
 
 def main() -> i32:
-	# a list LITERAL directly as attrs=[...] hits a real compiler gap
-	# (task_37940f20 - list literal rejected when the param's declared
-	# type is list[T]|None, not a bare list[T]) - assigning to an
-	# explicitly-typed local first works around it.
-	bold: list[str] = ['bold']
-	s: str = termcolor.colored( 'hi', 'red', attrs = bold )
+	# a list LITERAL directly as attrs=['bold'] - once rejected by a real
+	# compiler gap (list literal against a list[T]|None-typed param, see
+	# lowering.py's _narrow_generic_container_expected_type), now fixed
+	s: str = termcolor.colored( 'hi', 'red', attrs = ['bold'] )
 	if s != '\\x1b[31;1mhi\\x1b[0m':
 		return 1
 	return 0
@@ -48,8 +46,7 @@ def main() -> i32:
 import termcolor
 
 def main() -> i32:
-	bold: list[str] = ['bold'] # task_37940f20, see color_with_bold_attr
-	s: str = termcolor.colored( 'hi', 'grey', attrs = bold )
+	s: str = termcolor.colored( 'hi', 'grey', attrs = ['bold'] )
 	if s != '\\x1b[90;1mhi\\x1b[0m':
 		return 1
 	return 0
@@ -67,8 +64,7 @@ def main() -> i32:
 import termcolor
 
 def main() -> i32:
-	bold: list[str] = ['bold'] # task_37940f20, see color_with_bold_attr
-	s: str = termcolor.colored( 'hi', attrs = bold )
+	s: str = termcolor.colored( 'hi', attrs = ['bold'] )
 	if s != '\\x1b[1mhi\\x1b[0m':
 		return 1
 	return 0

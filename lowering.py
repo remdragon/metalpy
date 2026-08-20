@@ -8290,6 +8290,35 @@ class FunctionLowering:
 		self._emit( ir.Call( dest = None, target = init, receiver = self_temp, args = args, kwargs = kwargs ))
 		return self_temp
 
+	def _narrow_generic_container_expected_type( self, expected_type: Type|None, stem: str, node: ast.AST ) -> Type|None:
+		''' expected_type itself if it already resolves to a stem[T]
+		Specialization; otherwise, when expected_type is (or wraps) a
+		TaggedUnion, that union's own stem[T] member - IF exactly one
+		exists. Mirrors _coerce_or_check_operand's own union-unwrapping
+		(monomorphize_class + "Specialization wrapping a TaggedUnion" check)
+		so a list/set literal targeting a nullable/union-typed context
+		(`list[T]|None`) resolves the same way an ordinary call argument
+		already does, instead of every such literal needing an intermediate
+		typed local first. Ambiguous (0 or 2+ matching members) is left
+		alone, not guessed at - same "don't guess" precedent _expr_List/
+		_expr_Set already document for their own element-type inference. '''
+		spec = self.lowering._type_resolver._as_specialization( expected_type )
+		if spec is not None and spec.base.stem == stem and len( spec.args ) == 1:
+			return expected_type
+		union: TaggedUnion|None = None
+		if isinstance( expected_type, TaggedUnion ):
+			union = expected_type
+		elif isinstance( expected_type, Specialization ) and isinstance( expected_type.base, TaggedUnion ):
+			union = self.lowering.monomorphize_class( expected_type )
+		if union is None:
+			return None
+		matches = [
+			leaf for leaf in union.leaves()
+			if ( leaf_spec := self.lowering._type_resolver._as_specialization( leaf )) is not None
+			and leaf_spec.base.stem == stem and len( leaf_spec.args ) == 1
+		]
+		return matches[0] if len( matches ) == 1 else None
+
 	def _expr_List( self, node: ast.List, expected_type: Type|None ) -> ir.Operand:
 		''' [a, b, c] - requires expected_type to already be a concrete
 		list[T] Specialization (inferring T from the elements themselves
@@ -8313,6 +8342,21 @@ class FunctionLowering:
 		# fails with "needs a known list[T] target type"
 		spec = self.lowering._type_resolver._as_specialization( expected_type )
 		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
+		if not ( spec is not None and isinstance( resolved, RCClass )
+				and spec.base.stem == 'list' and len( spec.args ) == 1 ):
+			# expected_type may be a union NAMING list[T] as one of its
+			# members (e.g. a `list[T]|None` parameter) rather than
+			# resolving to list[T] directly - narrow to that member so the
+			# literal builds as a plain list[T] here; _coerce_or_check_
+			# operand's own post-dispatch tail (in _lower_expr, using the
+			# ORIGINAL union expected_type, not this narrowed local) already
+			# knows how to wrap a matching leaf value into the wider union
+			# afterward, so no wrapping is needed here
+			narrowed = self._narrow_generic_container_expected_type( expected_type, 'list', node )
+			if narrowed is not None:
+				expected_type = narrowed
+				spec = self.lowering._type_resolver._as_specialization( expected_type )
+				resolved = self.lowering._ensure_resolved( expected_type )
 		if not ( spec is not None and isinstance( resolved, RCClass )
 				and spec.base.stem == 'list' and len( spec.args ) == 1 ):
 			self.lowering.discovery.fail(
@@ -8360,6 +8404,14 @@ class FunctionLowering:
 		# Specialization) check - see _expr_List's own identical comment
 		spec = self.lowering._type_resolver._as_specialization( expected_type )
 		resolved = self.lowering._ensure_resolved( expected_type ) if expected_type is not None else None
+		if not ( spec is not None and isinstance( resolved, RCClass )
+				and spec.base.stem == 'set' and len( spec.args ) == 1 ):
+			# see _expr_List's own identical union-narrowing comment
+			narrowed = self._narrow_generic_container_expected_type( expected_type, 'set', node )
+			if narrowed is not None:
+				expected_type = narrowed
+				spec = self.lowering._type_resolver._as_specialization( expected_type )
+				resolved = self.lowering._ensure_resolved( expected_type )
 		if not ( spec is not None and isinstance( resolved, RCClass )
 				and spec.base.stem == 'set' and len( spec.args ) == 1 ):
 			self.lowering.discovery.fail(
