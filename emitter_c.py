@@ -2344,16 +2344,30 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		declared.add( name )
 	for instr in fn.instructions:
 		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
-	if _has_self( function ) and not function.is_destructor and not re.search( r'\bself\b', '\n'.join( lines[1:] )):
-		# a method whose body never reads self (e.g. UnsafeList._read_element,
-		# whose is_rc(T) branch only ever touches its slot argument) still
-		# has to take it - dropping self from the C signature would make it
-		# a different function shape per instantiation, and every call site
-		# already passes it uniformly. (void)self silences -Wunused-parameter
-		# without an attribute (MSVC doesn't support __attribute__ and
-		# doesn't warn on this by default anyway - see _c_local_name('self')
-		# itself never colliding with a real local, so this text search is safe)
-		lines.insert( 1, '\t(void)self;' )
+	if not function.is_destructor:
+		# a parameter whose body never reads it (self included - e.g.
+		# UnsafeList._read_element, whose is_rc(T) branch only ever touches
+		# its slot argument; or an ordinary parameter kept only for a
+		# uniform call-site/overload shape) still has to be declared -
+		# dropping it from the C signature would make it a different
+		# function shape per instantiation/overload, and every call site
+		# already passes it uniformly. (void)param silences -Wunused-
+		# parameter without an attribute (MSVC doesn't support
+		# __attribute__ and doesn't warn on this by default anyway) -
+		# _c_local_name() itself never collides with a real local, so this
+		# text search is safe. Destructors are exempted: their only
+		# "parameter" is __obj, never named self in the C signature itself
+		# (self is a real local, cast from __obj, just above)
+		body_text = '\n'.join( lines[1:] )
+		void_marks: list[str] = []
+		if _has_self( function ) and not re.search( r'\bself\b', body_text ):
+			void_marks.append( 'self' )
+		for p in ( function.parameters or [] ):
+			name = _c_local_name( p.stem )
+			if not re.search( rf'\b{re.escape(name)}\b', body_text ):
+				void_marks.append( name )
+		for name in reversed( void_marks ):
+			lines.insert( 1, f'\t(void){name};' )
 	lines.append( '}' )
 	return '\n'.join( lines )
 
