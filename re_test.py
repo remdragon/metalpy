@@ -229,7 +229,7 @@ def main() -> i32:
 	evil: re.Pattern = re.compile( '(a+)+b' ).unwrap( 'bad' )
 
 	tiny_budget: Result[re.Match, re.MatchError] = evil.search(
-		'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac', 64 )
+		'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac', max_steps = 64 )
 	if tiny_budget.is_ok():
 		return 1
 	match tiny_budget:
@@ -695,6 +695,142 @@ def main() -> i32:
 	return 0
 '''
 
+# Phase 8: re.compile(bytes)/Pattern.search|match|fullmatch(bytes) - a
+# second, byte_mode Matcher/Parser code path (no UTF-8 decoding: one raw
+# byte per step, so an arbitrary binary subject is never assumed to be
+# valid UTF-8) sharing every op/opcode-level behavior with the str path
+# (see lib/re.py's own Matcher/Parser comments) - plus Match.regs/
+# .lastindex (mode-agnostic: both work identically for str and bytes,
+# since neither touches the matched TEXT, only slot offsets) and
+# re.escape()/re.M/re.I (short flag aliases). grap.mpy (the motivating
+# real-world port) needs exactly this subset: bytes patterns/subjects,
+# .search(subject, pos), finditer(pattern, bytes_subject), .regs,
+# .lastindex - NOT Match.group()/groupdict()/groups() on a byte-mode
+# match (panics - see Match.group()'s own note: a byte-mode subject
+# isn't guaranteed valid UTF-8, so there's no safe str to hand back),
+# and NOT findall/sub/subn/split for bytes (str-only still, deliberately
+# out of scope - not needed by grap.mpy, and each would need its own
+# byte-mode sibling of _find_next_match/_advance_pos_after_match/etc,
+# same shape as finditer's own _bytes siblings, if ever added later).
+_RE_BYTES_BASIC = '''
+import re
+
+def main() -> i32:
+	p: re.Pattern = re.compile( b'a(b+)c' ).unwrap( 'bad pattern' )
+	m: re.Match = p.search( b'xxabbbcxx' ).unwrap( 'search' )
+	sp: tuple[usize,usize] = m.span()
+	if sp[0] != 2 or sp[1] != 7:
+		return 1
+
+	li: usize|None = m.lastindex
+	if li is None:
+		return 2
+	if li != 1:
+		return 20
+
+	regs: list[tuple[i32,i32]] = m.regs
+	if len( regs ) != 2:
+		return 3
+	r0: tuple[i32,i32] = regs.__getitem__( 0 ).unwrap( 'idx' )
+	if r0[0] != 2 or r0[1] != 7:
+		return 4
+	r1: tuple[i32,i32] = regs.__getitem__( 1 ).unwrap( 'idx' )
+	if r1[0] != 3 or r1[1] != 6:
+		return 5
+
+	# search(subject, pos) - explicit start position, matching real
+	# Python's Pattern.search(string, pos, endpos)
+	m2: re.Match = p.search( b'abbbcXabbbc', 1 ).unwrap( 'search pos' )
+	sp2: tuple[usize,usize] = m2.span()
+	if sp2[0] != 6 or sp2[1] != 11:
+		return 6
+	# nothing left to find starting past the last occurrence
+	if p.search( b'abbbcXabbbc', 7 ).is_ok():
+		return 7
+
+	# match()/fullmatch()
+	if p.match( b'abbbc' ).is_err():
+		return 8
+	if p.fullmatch( b'abbbc' ).is_err():
+		return 9
+	if p.fullmatch( b'abbbcX' ).is_ok():
+		return 10
+	# match() is anchored at 0 only, no scan-forward (unlike search())
+	if p.match( b'xabbbc' ).is_ok():
+		return 11
+
+	# an unset (didn't participate) optional group reports (-1,-1) in
+	# .regs and doesn't move .lastindex
+	p2: re.Pattern = re.compile( b'a(b)?c' ).unwrap( 'bad pattern 2' )
+	m3: re.Match = p2.search( b'ac' ).unwrap( 'search3' )
+	# via a local, not `m3.lastindex is not None` directly - a confirmed
+	# compiler bug (task_c98beffa): "<property returning T|None> is None"
+	# used directly (not through an intermediate local) fails to compile
+	li3: usize|None = m3.lastindex
+	if li3 is not None:
+		return 12
+	regs3: list[tuple[i32,i32]] = m3.regs
+	r3: tuple[i32,i32] = regs3.__getitem__( 1 ).unwrap( 'idx' )
+	if r3[0] != -1 or r3[1] != -1:
+		return 13
+
+	return 0
+'''
+
+_RE_BYTES_FINDITER = '''
+import re
+
+def main() -> i32:
+	p: re.Pattern = re.compile( b'a+bc' ).unwrap( 'bad pattern' )
+	count: usize = 0
+	total_len: usize = 0
+	with compiler.wrap_arithmetic:
+		for m in re.finditer( p, b'abcXaabcXaaabc' ):
+			count += 1
+			sp: tuple[usize,usize] = m.span()
+			total_len += sp[1] - sp[0]
+	if count != 3:
+		return 1
+	if total_len != 3 + 4 + 5:
+		return 2
+	return 0
+'''
+
+_RE_M_I_ALIASES_AND_ESCAPE = '''
+import re
+
+def main() -> i32:
+	# re.M/re.I are literally the same values as MULTILINE/IGNORECASE
+	if re.M != re.MULTILINE:
+		return 1
+	if re.I != re.IGNORECASE:
+		return 2
+	if re.S != re.DOTALL:
+		return 3
+	if re.A != re.ASCII:
+		return 4
+
+	p: re.Pattern = re.compile( '^b', re.M | re.I ).unwrap( 'bad pattern' )
+	if p.search( 'a\\nB' ).is_err():
+		return 5
+	if p.search( 'aB' ).is_ok():  # not at a line start
+		return 6
+
+	if re.escape( 'a.b*c' ) != 'a\\\\.b\\\\*c':
+		return 7
+	if re.escape( 'plain_text123' ) != 'plain_text123':
+		return 8
+	if re.escape( '' ) != '':
+		return 9
+	# an escaped pattern always matches its own original literal text
+	esc: re.Pattern = re.compile( re.escape( '(a.b)' )).unwrap( 'bad escaped pattern' )
+	if esc.fullmatch( '(a.b)' ).is_err():
+		return 10
+	if esc.search( 'Xa.bY' ).is_ok():  # '(' ')' are literal now, not grouping
+		return 11
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
 class RePhase1BehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -764,6 +900,53 @@ class RePhase7BehaviorTests( RealCompileMixin, unittest.TestCase ):
 		self.assert_programs_run([
 			( 'ignorecase_lazy_named', _RE_IGNORECASE_LAZY_NAMED ),
 		])
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile re tests' )
+class RePhase8BehaviorTests( RealCompileMixin, unittest.TestCase ):
+	''' bytes/memoryview support (re.compile(bytes), Pattern.search/match/
+	fullmatch(bytes)), Match.regs/.lastindex, re.M/re.I/re.escape() - see
+	_RE_BYTES_BASIC's own comment for exact scope. '''
+
+	def test_phase8_bytes_and_flags_and_escape( self ) -> None:
+		self.assert_programs_run([
+			( 'bytes_basic', _RE_BYTES_BASIC ),
+			( 'm_i_aliases_and_escape', _RE_M_I_ALIASES_AND_ESCAPE ),
+		])
+
+	def test_phase8_bytes_finditer( self ) -> None:
+		''' separate call, not merged into the case above - same isolation
+		reasoning as test_phase6_finditer's own comment. '''
+		self.assert_programs_run([
+			( 'bytes_finditer', _RE_BYTES_FINDITER ),
+		])
+
+	def test_phase8_group_panics_on_byte_mode_match( self ) -> None:
+		''' Match.group()/groupdict()/groups() all route through group(),
+		so this one panic-exit check covers all three - a byte-mode
+		subject isn't guaranteed valid UTF-8, so there's no safe str for
+		any of them to hand back (see Match.group()'s own note). A real
+		process-exit check, not merged via assert_programs_run: a
+		panicking sub-program's abrupt exit(1) would break the merged
+		dispatch's own "each case's main() returns normally" assumption. '''
+		from discovery import Discovery
+		from compiler import Compiler
+		from pathlib import Path
+		import emitter_c
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+import re
+
+def main() -> i32:
+	p: re.Pattern = re.compile( b"abc" ).unwrap( "bad pattern" )
+	m: re.Match = p.search( b"abc" ).unwrap( "search" )
+	g: str|None = m.group()
+	return 0
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( compiler ), expected_exit = 1, compiler = compiler )
 
 
 if __name__ == '__main__':

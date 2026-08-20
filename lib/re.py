@@ -35,17 +35,24 @@ import sys
 # function goes away and callers switch to it directly.
 # ---------------------------------------------------------------------------
 
-def _substr( source: str, start: usize, end: usize ) -> str:
+def _substr( source: ConstPtr[u8], start: usize, end: usize ) -> str:
 	''' source[start:end] (byte offsets, must land on UTF-8 codepoint
 	boundaries) as a new, independently-owned str. A bad range here is
 	always a matcher bug (an internal slot pair pointing outside the
 	string), never runtime-supplied data, so it panics rather than
-	returning a Result — same posture as lib/guid.py's hex-digit parsing. '''
+	returning a Result — same posture as lib/guid.py's hex-digit parsing.
+	Takes a raw ConstPtr[u8] rather than a str so it works uniformly for
+	both a str subject/pattern (pass s.get_cstr()) and Parser's own
+	pattern-text buffer (self.data, already a ConstPtr[u8] - see Parser's
+	own byte_mode split). Never called on byte-mode SUBJECT data (that data
+	isn't assumed to be valid UTF-8 at all - see Match.group()'s own
+	byte-mode panic) - only on str data, or on a pattern's own ASCII-only
+	syntax substrings (group names), both always valid UTF-8. '''
 	with compiler.panic_arithmetic( 're._substr: end < start' ):
 		piece_len: usize = end - start
 		buf_size: usize = piece_len + 1
 	buf = bytearray( buf_size )
-	src: ConstPtr[u8] = source.get_cstr()
+	src: ConstPtr[u8] = source
 	dest: Ptr[u8] = buf.get_ptr()
 	i: usize = 0
 	while i < piece_len:
@@ -102,7 +109,55 @@ MULTILINE:  u32 = 0x02
 DOTALL:     u32 = 0x04
 ASCII:      u32 = 0x08
 
+# short aliases - Python's own re.M/re.I are literally the same integer
+# values as re.MULTILINE/re.IGNORECASE, not a separate bit
+I: u32 = IGNORECASE
+M: u32 = MULTILINE
+S: u32 = DOTALL
+A: u32 = ASCII
+
 DEFAULT_MAX_STEPS: usize = 65536
+
+# NOTE: every max_steps default parameter below is the literal 65536, not a
+# `= DEFAULT_MAX_STEPS` reference, even though DEFAULT_MAX_STEPS stays
+# declared (a real, still-public symbol - kept for any external caller that
+# references it directly, e.g. `p.search(s, max_steps=re.DEFAULT_MAX_STEPS*2)`)
+# - a confirmed compiler bug (task_<TBD>, filed alongside this change):
+# referencing a module-level constant as a default parameter VALUE breaks
+# name resolution ("name 'DEFAULT_MAX_STEPS' is not defined") specifically
+# once the containing method has 2+ overloads (confirmed: works fine on a
+# single, non-overloaded definition; fails the moment a second same-name
+# overload exists, str/bytes overloads or otherwise - isolated with a
+# minimal repro outside this file, not something specific to re.py's own
+# structure). If that's ever fixed, these can all switch back.
+
+
+def escape( pattern: str ) -> str:
+	''' backslash-escapes every character that isn't alnum/underscore - the
+	simpler, always-safe "escape everything special-or-not" rule Python's
+	own re.escape() used before 3.7 (which narrowed it to just the real
+	engine's actual metacharacters), kept broad here rather than hand-
+	enumerating this engine's own special-character set: over-escaping a
+	literal char is always harmless (`\\a` is just `a` - this parser's own
+	"an unrecognized escape falls back to a literal codepoint" convention,
+	see e.g. _parse_g_backref's identical fallback), but under-escaping one
+	this engine DOES treat specially wouldn't be. '''
+	out: str = ''
+	i: usize = 0
+	n: usize = pattern.byte_len()
+	data: ConstPtr[u8] = pattern.get_cstr()
+	while i < n:
+		width: usize = 0
+		cp: u32 = builtins.decode_utf8_at( data, i, compiler.addrof( width ))
+		with compiler.panic_arithmetic( 're.escape: codepoint width bounded by n - i, cannot overflow' ):
+			piece: str = _substr( data, i, i + width )
+		if builtins.is_alnum_cp( cp ) or cp == 95:  # '_'
+			out = out + piece
+		else:
+			out = out + '\\' + piece
+		with compiler.wrap_arithmetic:
+			i += width
+	return out
 
 
 # ---------------------------------------------------------------------------
@@ -446,16 +501,22 @@ _BYTE_COLON: u8 = 58        # ':'
 _BYTE_QUESTION_MARK: u8 = 63
 
 class Parser:
-	text: str
+	# raw (pointer, length) instead of `text: str` - a bytes pattern (e.g.
+	# re.compile(b'...')) parses through the exact same grammar as a str
+	# one; only _decode_cp's own per-codepoint step differs (see byte_mode
+	# below), same design as Matcher's identical data/byte_mode split.
+	data: ConstPtr[u8]
 	text_len: usize
+	byte_mode: bool
 	pos: usize
 	next_slot: usize
 	classes: list[CharClass]
 	group_names: dict[str, usize]  # (?P<name>...) -> group number
 
-	def __init__( self, text: str ) -> None:
-		self.text = text
-		self.text_len = text.byte_len()
+	def __init__( self, data: ConstPtr[u8], text_len: usize, byte_mode: bool ) -> None:
+		self.data = data
+		self.text_len = text_len
+		self.byte_mode = byte_mode
 		self.pos = 0
 		self.next_slot = 2  # 0/1 are reserved for the whole match's own span
 		self.classes = list[CharClass]()
@@ -465,18 +526,27 @@ class Parser:
 		return self.pos >= self.text_len
 
 	def _peek_byte( self ) -> u8:
-		return self.text.get_cstr()[ self.pos ]
+		return self.data[ self.pos ]
 
 	def _advance_byte( self ) -> None:
 		with compiler.wrap_arithmetic:
 			self.pos += 1
 
 	def _decode_cp( self ) -> u32:
+		# byte_mode: one raw byte, zero-extended, NOT decode_utf8_at - see
+		# Matcher._codepoint_at's identical comment on why (unchecked
+		# decoder, a byte-mode pattern's own bytes aren't assumed to be
+		# valid UTF-8 either, e.g. `re.compile(b'\xff')` as a literal).
+		if self.byte_mode:
+			cp: u32 = u32( self.data[ self.pos ] )
+			with compiler.wrap_arithmetic:
+				self.pos += 1
+			return cp
 		width: usize = 0
-		cp: u32 = builtins.decode_utf8_at( self.text.get_cstr(), self.pos, compiler.addrof( width ))
+		cp2: u32 = builtins.decode_utf8_at( self.data, self.pos, compiler.addrof( width ))
 		with compiler.wrap_arithmetic:
 			self.pos += width
-		return cp
+		return cp2
 
 	# --- alternation: lowest precedence -------------------------------
 
@@ -677,7 +747,7 @@ class Parser:
 					self._advance_byte()
 				if self._at_end():
 					return Result.Err( PatternError( 're: unterminated (?P<name>...) group name' ))
-				group_name = _substr( self.text, name_start, self.pos )
+				group_name = _substr( self.data, name_start, self.pos )
 				if group_name == '':
 					return Result.Err( PatternError( 're: empty group name in (?P<...>...)' ))
 				self._advance_byte()  # consume '>'
@@ -807,7 +877,7 @@ class Parser:
 			self._advance_byte()
 		if self._at_end():
 			return Result.Err( PatternError( 're: unterminated \\g<...>' ))
-		content: str = _substr( self.text, content_start, self.pos )
+		content: str = _substr( self.data, content_start, self.pos )
 		self._advance_byte()  # consume '>'
 		if content == '':
 			return Result.Err( PatternError( 're: \\g<...> group reference cannot be empty' ))
@@ -1073,12 +1143,26 @@ class Frame:
 	sp: usize
 	slot_values: list[usize]
 	slot_set: list[bool]
+	# Match.lastindex bookkeeping (Python's own "which numbered group most
+	# recently closed on the WINNING path") - plain value fields, unlike
+	# slot_values/slot_set, so no _clone_*_list needed: usize/bool already
+	# copy by value on every assignment, including into a Frame pushed at a
+	# SPLIT choice point and restored from one on backtrack-pop.
+	# last_group_set stays False (last_group unused) until the first real
+	# (numbered >= 1) capturing group's own END save actually executes.
+	last_group: usize
+	last_group_set: bool
 
-	def __init__( self, pc: usize, sp: usize, slot_values: list[usize], slot_set: list[bool] ) -> None:
+	def __init__(
+		self, pc: usize, sp: usize, slot_values: list[usize], slot_set: list[bool],
+		last_group: usize, last_group_set: bool,
+	) -> None:
 		self.pc = pc
 		self.sp = sp
 		self.slot_values = slot_values
 		self.slot_set = slot_set
+		self.last_group = last_group
+		self.last_group_set = last_group_set
 
 
 def _clone_usize_list( src: list[usize] ) -> list[usize]:
@@ -1105,28 +1189,48 @@ def _clone_bool_list( src: list[bool] ) -> list[bool]:
 class Matcher:
 	ops: list[Op]
 	classes: list[CharClass]
-	text: str
+	# raw (pointer, length) instead of `text: str` - str is one possible
+	# source (str.get_cstr()/byte_len()), bytes/bytearray/memoryview
+	# (whenever that lands) are others; the whole VM below only ever needs
+	# byte-level access plus the codepoint-decode entry points immediately
+	# below, both gated on byte_mode. See _codepoint_at/_codepoint_width_at.
+	data: ConstPtr[u8]
 	text_len: usize
+	byte_mode: bool
 	max_steps: usize
 	steps: usize
 	flags: u32
 
-	def __init__( self, ops: list[Op], classes: list[CharClass], text: str, max_steps: usize, flags: u32 ) -> None:
+	def __init__(
+		self, ops: list[Op], classes: list[CharClass], data: ConstPtr[u8], text_len: usize, byte_mode: bool,
+		max_steps: usize, flags: u32,
+	) -> None:
 		self.ops = ops
 		self.classes = classes
-		self.text = text
-		self.text_len = text.byte_len()
+		self.data = data
+		self.text_len = text_len
+		self.byte_mode = byte_mode
 		self.max_steps = max_steps
 		self.steps = 0
 		self.flags = flags
 
 	def _codepoint_at( self, pos: usize ) -> u32:
+		# byte_mode: one raw byte, zero-extended - NOT builtins.decode_utf8_at,
+		# which is UNCHECKED and would misinterpret arbitrary high-bit-set
+		# binary bytes as (the start or continuation of) a multi-byte UTF-8
+		# sequence rather than erroring - a byte-mode subject is never
+		# assumed to be valid UTF-8 at all.
+		if self.byte_mode:
+			with compiler.wrap_arithmetic:
+				return u32( self.data[ pos ] )
 		width: usize = 0
-		return builtins.decode_utf8_at( self.text.get_cstr(), pos, compiler.addrof( width ))
+		return builtins.decode_utf8_at( self.data, pos, compiler.addrof( width ))
 
 	def _codepoint_width_at( self, pos: usize ) -> usize:
+		if self.byte_mode:
+			return 1
 		width: usize = 0
-		builtins.decode_utf8_at( self.text.get_cstr(), pos, compiler.addrof( width ))
+		builtins.decode_utf8_at( self.data, pos, compiler.addrof( width ))
 		return width
 
 	def _is_word_boundary( self, sp: usize ) -> bool:
@@ -1138,10 +1242,12 @@ class Matcher:
 			# \w is ASCII-only in this engine (see _word_class), and any
 			# multi-byte UTF-8 codepoint's own last byte is always >= 0x80,
 			# which never collides with an ASCII word-char byte value, so
-			# no separate "decode the previous codepoint" step is needed.
+			# no separate "decode the previous codepoint" step is needed
+			# (true in byte_mode too: an ASCII word byte is still just
+			# itself there).
 			with compiler.panic_arithmetic( 're: _is_word_boundary: sp > 0 checked above' ):
 				prev_pos: usize = sp - 1
-			prev_byte: u8 = self.text.get_cstr()[ prev_pos ]
+			prev_byte: u8 = self.data[ prev_pos ]
 			with compiler.wrap_arithmetic:
 				before = _is_word_byte_cp( u32( prev_byte ))
 		if sp < self.text_len:
@@ -1149,18 +1255,18 @@ class Matcher:
 		return before != after
 
 	def _backref_matches_at( self, sp: usize, g_start: usize, g_len: usize ) -> bool:
-		''' does the g_len bytes of self.text starting at g_start
+		''' does the g_len bytes of self.data starting at g_start
 		(an already-closed capture group's own span) reappear literally
 		at sp? compares raw bytes, not codepoints - a byte-exact
 		reappearance of valid UTF-8 is itself valid UTF-8, so this needs
 		no separate decode step (same reasoning str._byte_slice's own
 		docstring gives for byte-exact needle matches always landing on
-		codepoint boundaries). '''
+		codepoint boundaries) - and is exactly what byte_mode wants too. '''
 		with compiler.wrap_arithmetic:
 			end_pos: usize = sp + g_len
 		if end_pos > self.text_len:
 			return False
-		data: ConstPtr[u8] = self.text.get_cstr()
+		data: ConstPtr[u8] = self.data
 		i: usize = 0
 		while i < g_len:
 			with compiler.wrap_arithmetic:
@@ -1184,9 +1290,12 @@ class Matcher:
 			slot_set.append( False ).unwrap( 're: run_at init slots' )
 			with compiler.wrap_arithmetic:
 				i += 1
-		return self._run_from( start_pos, slot_values, slot_set )
+		return self._run_from( start_pos, slot_values, slot_set, 0, False )
 
-	def _run_from( self, start_pos: usize, slot_values_in: list[usize], slot_set_in: list[bool] ) -> Result[Frame, MatchError]:
+	def _run_from(
+		self, start_pos: usize, slot_values_in: list[usize], slot_set_in: list[bool],
+		last_group_in: usize, last_group_set_in: bool,
+	) -> Result[Frame, MatchError]:
 		''' like run_at, but the caller supplies the starting capture-slot
 		state instead of it being reset to unset - used by LOOKAHEAD_*/
 		LOOKBEHIND_* to run a nested sub-match that shares (a snapshot of)
@@ -1199,6 +1308,8 @@ class Matcher:
 		sp: usize = start_pos
 		slot_values: list[usize] = slot_values_in
 		slot_set: list[bool] = slot_set_in
+		last_group: usize = last_group_in
+		last_group_set: bool = last_group_set_in
 		stack: list[Frame] = list[Frame]()
 
 		while True:
@@ -1250,11 +1361,11 @@ class Matcher:
 				if not matched and ( self.flags & MULTILINE ) != 0 and sp > 0:
 					with compiler.panic_arithmetic( 're: run_at BOL: sp > 0 checked above' ):
 						prev_pos: usize = sp - 1
-					matched = self.text.get_cstr()[ prev_pos ] == 10  # '\n'
+					matched = self.data[ prev_pos ] == 10  # '\n'
 			elif op.kind == OpKind.EOL:
 				matched = sp == self.text_len
 				if not matched and ( self.flags & MULTILINE ) != 0 and sp < self.text_len:
-					matched = self.text.get_cstr()[ sp ] == 10  # '\n'
+					matched = self.data[ sp ] == 10  # '\n'
 			elif op.kind == OpKind.WORDB:
 				matched = self._is_word_boundary( sp )
 			elif op.kind == OpKind.NWORDB:
@@ -1284,7 +1395,7 @@ class Matcher:
 				saved_ops: list[Op] = self.ops
 				self.ops = op.sub
 				sub_outcome: Result[Frame, MatchError] = self._run_from(
-					sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ))
+					sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ), last_group, last_group_set )
 				self.ops = saved_ops
 				positive: bool = op.kind == OpKind.LOOKAHEAD_POS
 				match sub_outcome:
@@ -1292,6 +1403,8 @@ class Matcher:
 						if positive:
 							slot_values = sub_frame.slot_values
 							slot_set = sub_frame.slot_set
+							last_group = sub_frame.last_group
+							last_group_set = sub_frame.last_group_set
 							matched = True
 						else:
 							matched = False
@@ -1309,13 +1422,15 @@ class Matcher:
 					saved_ops2: list[Op] = self.ops
 					self.ops = op.sub
 					sub_outcome2: Result[Frame, MatchError] = self._run_from(
-						behind_start, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ))
+						behind_start, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ), last_group, last_group_set )
 					self.ops = saved_ops2
 					match sub_outcome2:
 						case Result.Ok( sub_frame2 ):
 							if positive2:
 								slot_values = sub_frame2.slot_values
 								slot_set = sub_frame2.slot_set
+								last_group = sub_frame2.last_group
+								last_group_set = sub_frame2.last_group_set
 								matched = True
 							else:
 								matched = False
@@ -1324,7 +1439,10 @@ class Matcher:
 								return Result.Err( sub_err2 )
 							matched = not positive2
 			elif op.kind == OpKind.SPLIT:
-				frame = Frame( op.target_b, sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ))
+				frame = Frame(
+					op.target_b, sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ),
+					last_group, last_group_set,
+				)
 				stack.append( frame ).unwrap( 're: run_at push split frame' )
 				pc = op.target_a
 				continue
@@ -1334,11 +1452,19 @@ class Matcher:
 			elif op.kind == OpKind.SAVE:
 				slot_values.__setitem__( op.slot, sp ).unwrap( 're: run_at save slot' )
 				slot_set.__setitem__( op.slot, True ).unwrap( 're: run_at save slot' )
+				# an END slot (odd, >= 3) closing a real (numbered >= 1)
+				# capturing group - slots 0/1 are the whole match's own
+				# span, not a real group, so never update lastindex
+				with compiler.panic_arithmetic( 're: run_at: % 2 / // 2 by a nonzero literal, cannot divide by zero' ):
+					is_end_slot: bool = ( op.slot % 2 ) == 1
+					if is_end_slot and op.slot >= 3:
+						last_group = op.slot // 2
+						last_group_set = True
 				with compiler.wrap_arithmetic:
 					pc += 1
 				continue
 			elif op.kind == OpKind.MATCH:
-				return Result.Ok( Frame( pc, sp, slot_values, slot_set ))
+				return Result.Ok( Frame( pc, sp, slot_values, slot_set, last_group, last_group_set ))
 			else:
 				matched = False
 
@@ -1354,6 +1480,8 @@ class Matcher:
 			sp = back.sp
 			slot_values = back.slot_values
 			slot_set = back.slot_set
+			last_group = back.last_group
+			last_group_set = back.last_group_set
 
 
 # ---------------------------------------------------------------------------
@@ -1382,18 +1510,40 @@ class Match:
 	# whether a group actually participated (an optional/alternated-away
 	# capturing group leaves its pair unset, matching Python's own
 	# group(n) -> None for a group that didn't participate).
-	__source: str
+	# __source is None only for a byte-mode match (the pattern/subject was
+	# bytes, not str) - group()/groupdict()/groups() all need a real str to
+	# decode a captured span back out of (matching a byte-mode subject
+	# isn't guaranteed to BE valid UTF-8, so there's no safe str to hand
+	# back), and panic if called there. start()/end()/span()/regs/
+	# lastindex never touch __source at all, so they work identically
+	# either way - that's everything grap.mpy's own usage needs.
+	__source: str|None
 	__slot_values: list[usize]
 	__slot_set: list[bool]
 	__group_names: dict[str, usize]
+	__last_group: usize
+	__last_group_set: bool
 
-	def __init__( self, source: str, slot_values: list[usize], slot_set: list[bool], group_names: dict[str, usize] ) -> None:
+	def __init__(
+		self, source: str|None, slot_values: list[usize], slot_set: list[bool], group_names: dict[str, usize],
+		last_group: usize, last_group_set: bool,
+	) -> None:
 		self.__source = source
 		self.__slot_values = slot_values
 		self.__slot_set = slot_set
 		self.__group_names = group_names
+		self.__last_group = last_group
+		self.__last_group_set = last_group_set
 
 	def group( self, n: usize = 0 ) -> str|None:
+		# narrowed via a local, not `self.__source` directly - narrowing a
+		# private field access after an is-None check isn't tracked the
+		# same way narrowing a local is elsewhere in this codebase (e.g.
+		# span()'s own s/e locals below)
+		source: str|None = self.__source
+		if source is None:
+			sys.panic( 're: Match.group() is not supported on a byte-mode match (the pattern/subject was '
+				'bytes, not str) - use .span()/.start()/.end()/.regs and slice the original bytes yourself' )
 		with compiler.panic_arithmetic( 're: Match.group: group index overflow' ):
 			lo_slot: usize = n * 2
 			hi_slot: usize = n * 2 + 1
@@ -1401,7 +1551,7 @@ class Match:
 			return None
 		lo: usize = self.__slot_values.__getitem__( lo_slot ).unwrap( 're: Match.group slot' )
 		hi: usize = self.__slot_values.__getitem__( hi_slot ).unwrap( 're: Match.group slot' )
-		return _substr( self.__source, lo, hi )
+		return _substr( source.get_cstr(), lo, hi )
 
 	def group( self, name: str ) -> str|None:
 		''' overload resolved by argument type - group() with no args
@@ -1472,6 +1622,40 @@ class Match:
 			sys.panic( 're: Match.span: whole match end unexpectedly unset' )
 		return ( s, e )
 
+	@property
+	def regs( self ) -> list[tuple[i32,i32]]:
+		''' one (start,end) pair per group, group 0 (the whole match) first
+		- matching Python's own Match.regs. An unset (optional/alternated-
+		away) group reports (-1,-1), the same sentinel Python uses (i32, not
+		usize, specifically to be able to represent that sentinel). '''
+		out: list[tuple[i32,i32]] = list[tuple[i32,i32]]()
+		with compiler.panic_arithmetic( 're: Match.regs: unreachable (dividing by the constant 2)' ):
+			count: usize = len( self.__slot_values ) // 2
+		i: usize = 0
+		while i < count:
+			with compiler.wrap_arithmetic:
+				lo_slot: usize = i * 2
+				hi_slot: usize = i * 2 + 1
+			if self.__slot_set.__getitem__( lo_slot ).unwrap( 're: Match.regs slot_set' ):
+				lo: usize = self.__slot_values.__getitem__( lo_slot ).unwrap( 're: Match.regs slot' )
+				hi: usize = self.__slot_values.__getitem__( hi_slot ).unwrap( 're: Match.regs slot' )
+				with compiler.panic_arithmetic( 're: Match.regs: offset does not fit in i32' ):
+					out.append(( i32( lo ), i32( hi ))).unwrap( 're: Match.regs append' )
+			else:
+				out.append(( i32( -1 ), i32( -1 ))).unwrap( 're: Match.regs append' )
+			with compiler.wrap_arithmetic:
+				i += 1
+		return out
+
+	@property
+	def lastindex( self ) -> usize|None:
+		''' the highest-numbered capturing group that actually participated
+		in the match, or None if the pattern had no capturing groups, or
+		none of them did (matches Python's own Match.lastindex). '''
+		if not self.__last_group_set:
+			return None
+		return self.__last_group
+
 
 class Pattern:
 	__ops: list[Op]
@@ -1479,17 +1663,31 @@ class Pattern:
 	__n_slots: usize
 	__flags: u32
 	__group_names: dict[str, usize]
+	__byte_mode: bool
 
-	def __init__( self, ops: list[Op], classes: list[CharClass], n_slots: usize, flags: u32, group_names: dict[str, usize] ) -> None:
+	def __init__(
+		self, ops: list[Op], classes: list[CharClass], n_slots: usize, flags: u32, group_names: dict[str, usize],
+		byte_mode: bool,
+	) -> None:
 		self.__ops = ops
 		self.__classes = classes
 		self.__n_slots = n_slots
 		self.__flags = flags
 		self.__group_names = group_names
+		self.__byte_mode = byte_mode
 
 	@staticmethod
 	def compile( pattern: str, flags: u32 = 0 ) -> Result[Pattern, PatternError]:
-		parser = Parser( pattern )
+		parser = Parser( pattern.get_cstr(), pattern.byte_len(), False )
+		return Pattern._compile_from_parser( parser, flags, False )
+
+	@staticmethod
+	def compile( pattern: bytes, flags: u32 = 0 ) -> Result[Pattern, PatternError]:
+		parser = Parser( pattern.get_const_ptr(), len( pattern ), True )
+		return Pattern._compile_from_parser( parser, flags, True )
+
+	@staticmethod
+	def _compile_from_parser( parser: Parser, flags: u32, byte_mode: bool ) -> Result[Pattern, PatternError]:
 		body: list[Op] = parser.parse_alt().or_return()
 		if not parser._at_end():
 			return Result.Err( PatternError( 're: unbalanced parenthesis' ))
@@ -1500,44 +1698,82 @@ class Pattern:
 		tail.append( _op_save( 1 )).unwrap( 're: compile tail' )
 		tail.append( _op_match()).unwrap( 're: compile tail' )
 		_append_fragment( prog, tail )
-		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags, parser.group_names ))
+		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags, parser.group_names, byte_mode ))
 
-	def search( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Result[Match, MatchError]:
-		return self._search_from( s, 0, max_steps )
-
-	def _search_from( self, s: str, start_pos: usize, max_steps: usize ) -> Result[Match, MatchError]:
-		''' like search(), but the scan-forward starts at start_pos rather
-		than 0 - the shared core finditer() calls repeatedly to find each
-		successive match without re-scanning from the beginning, while
-		still searching the SAME full string (not a slice of it), so
-		anchors like ^ / MULTILINE-BOL / lookbehind stay correct relative
-		to absolute string position. '''
-		matcher = Matcher( self.__ops, self.__classes, s, max_steps, self.__flags )
-		slen: usize = s.byte_len()
+	def _search_from_raw( self, data: ConstPtr[u8], data_len: usize, start_pos: usize, max_steps: usize ) -> Result[Frame, MatchError]:
+		''' the shared core behind search()'s str/bytes overloads - scans
+		forward from start_pos (by one codepoint/byte at a time, per
+		self.__byte_mode) through data_len, returning the first position's
+		successful Frame, or NoMatch/StepLimitExceeded if none. Callers
+		wrap the Frame into a Match with whichever `source` (str or None)
+		fits their own input type - see Match's own byte-mode note. '''
+		matcher = Matcher( self.__ops, self.__classes, data, data_len, self.__byte_mode, max_steps, self.__flags )
 		pos: usize = start_pos
 		while True:
 			outcome: Result[Frame, MatchError] = matcher.run_at( pos, self.__n_slots )
 			match outcome:
 				case Result.Ok( frame ):
-					return Result.Ok( Match( s, frame.slot_values, frame.slot_set, self.__group_names ))
+					return Result.Ok( frame )
 				case Result.Err( e ):
 					if e == MatchError.StepLimitExceeded:
 						return Result.Err( e )
-			if pos >= slen:
+			if pos >= data_len:
 				return Result.Err( MatchError.NoMatch )
 			with compiler.wrap_arithmetic:
 				pos += matcher._codepoint_width_at( pos )
 
-	def match( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Result[Match, MatchError]:
-		matcher = Matcher( self.__ops, self.__classes, s, max_steps, self.__flags )
-		outcome: Result[Frame, MatchError] = matcher.run_at( 0, self.__n_slots )
+	def _match_at_zero_raw( self, data: ConstPtr[u8], data_len: usize, max_steps: usize ) -> Result[Frame, MatchError]:
+		''' the shared core behind match()'s str/bytes overloads - a SINGLE
+		anchored attempt at position 0 only, no scan-forward (unlike
+		_search_from_raw/search()) - Python's own re.match() semantics. '''
+		matcher = Matcher( self.__ops, self.__classes, data, data_len, self.__byte_mode, max_steps, self.__flags )
+		return matcher.run_at( 0, self.__n_slots )
+
+	def search( self, s: str, pos: usize = 0, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
+		return self._search_from( s, pos, max_steps )
+
+	def _search_from( self, s: str, start_pos: usize, max_steps: usize ) -> Result[Match, MatchError]:
+		''' like search(), but start_pos is always explicit (never
+		defaulted) - the shared core finditer() calls repeatedly to find
+		each successive match without re-scanning from the beginning, while
+		still searching the SAME full string (not a slice of it), so
+		anchors like ^ / MULTILINE-BOL / lookbehind stay correct relative
+		to absolute string position. '''
+		outcome: Result[Frame, MatchError] = self._search_from_raw( s.get_cstr(), s.byte_len(), start_pos, max_steps )
 		match outcome:
 			case Result.Ok( frame ):
-				return Result.Ok( Match( s, frame.slot_values, frame.slot_set, self.__group_names ))
+				return Result.Ok( Match( s, frame.slot_values, frame.slot_set, self.__group_names, frame.last_group, frame.last_group_set ))
 			case Result.Err( e ):
 				return Result.Err( e )
 
-	def fullmatch( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Result[Match, MatchError]:
+	def search( self, s: bytes, pos: usize = 0, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
+		return self._search_from_bytes( s, pos, max_steps )
+
+	def _search_from_bytes( self, s: bytes, start_pos: usize, max_steps: usize ) -> Result[Match, MatchError]:
+		outcome: Result[Frame, MatchError] = self._search_from_raw( s.get_const_ptr(), len( s ), start_pos, max_steps )
+		match outcome:
+			case Result.Ok( frame ):
+				return Result.Ok( Match( None, frame.slot_values, frame.slot_set, self.__group_names, frame.last_group, frame.last_group_set ))
+			case Result.Err( e ):
+				return Result.Err( e )
+
+	def match( self, s: str, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
+		outcome: Result[Frame, MatchError] = self._match_at_zero_raw( s.get_cstr(), s.byte_len(), max_steps )
+		match outcome:
+			case Result.Ok( frame ):
+				return Result.Ok( Match( s, frame.slot_values, frame.slot_set, self.__group_names, frame.last_group, frame.last_group_set ))
+			case Result.Err( e ):
+				return Result.Err( e )
+
+	def match( self, s: bytes, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
+		outcome: Result[Frame, MatchError] = self._match_at_zero_raw( s.get_const_ptr(), len( s ), max_steps )
+		match outcome:
+			case Result.Ok( frame ):
+				return Result.Ok( Match( None, frame.slot_values, frame.slot_set, self.__group_names, frame.last_group, frame.last_group_set ))
+			case Result.Err( e ):
+				return Result.Err( e )
+
+	def fullmatch( self, s: str, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
 		result: Result[Match, MatchError] = self.match( s, max_steps )
 		match result:
 			case Result.Ok( m ):
@@ -1551,13 +1787,26 @@ class Pattern:
 			case Result.Err( e ):
 				return Result.Err( e )
 
+	def fullmatch( self, s: bytes, max_steps: usize = 65536 ) -> Result[Match, MatchError]:
+		result: Result[Match, MatchError] = self.match( s, max_steps )
+		match result:
+			case Result.Ok( m ):
+				end_pos: usize|None = m.end()
+				if end_pos is None:
+					sys.panic( 're: fullmatch: whole match end unexpectedly unset' )
+				if end_pos == usize( len( s )):
+					return Result.Ok( m )
+				return Result.Err( MatchError.NoMatch )
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	# No Pattern.finditer() METHOD - "a generator method is not supported
 	# yet" (confirmed directly). See the module-level finditer() function
 	# below for the free-function form and its own further limitation
 	# (confirmed unusable from any module other than this one - a general
 	# compiler bug, not specific to this API).
 
-	def findall( self, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> list[str]:
+	def findall( self, s: str, max_steps: usize = 65536 ) -> list[str]:
 		''' the whole (group 0) text of every non-overlapping match, in
 		order. Python's own findall() returns per-group tuples when the
 		pattern has groups - simplified here to always be the whole match;
@@ -1585,11 +1834,11 @@ class Pattern:
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
 		return out
 
-	def sub( self, repl: str, s: str, count: usize = 0, max_steps: usize = DEFAULT_MAX_STEPS ) -> str:
+	def sub( self, repl: str, s: str, count: usize = 0, max_steps: usize = 65536 ) -> str:
 		pair: tuple[str,usize] = self._sub_impl( repl, s, count, max_steps )
 		return pair[0]
 
-	def subn( self, repl: str, s: str, count: usize = 0, max_steps: usize = DEFAULT_MAX_STEPS ) -> tuple[str,usize]:
+	def subn( self, repl: str, s: str, count: usize = 0, max_steps: usize = 65536 ) -> tuple[str,usize]:
 		return self._sub_impl( repl, s, count, max_steps )
 
 	def _sub_impl( self, repl: str, s: str, count: usize, max_steps: usize ) -> tuple[str,usize]:
@@ -1612,17 +1861,17 @@ class Pattern:
 			end: usize|None = mm.end()
 			if end is None:
 				sys.panic( 're: sub: whole match end unexpectedly unset' )
-			out = out + _substr( s, last_end, start )
+			out = out + _substr( s.get_cstr(), last_end, start )
 			out = out + repl
 			last_end = end
 			with compiler.wrap_arithmetic:
 				n += 1
 			pos = _advance_pos_after_match( mm, s )
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
-		out = out + _substr( s, last_end, s.byte_len())
+		out = out + _substr( s.get_cstr(), last_end, s.byte_len())
 		return ( out, n )
 
-	def split( self, s: str, maxsplit: usize = 0, max_steps: usize = DEFAULT_MAX_STEPS ) -> list[str]:
+	def split( self, s: str, maxsplit: usize = 0, max_steps: usize = 65536 ) -> list[str]:
 		''' maxsplit == 0 means unlimited, matching Python's own re.split
 		convention. Python also interleaves captured groups into the
 		result when the pattern has any - simplified here to just the
@@ -1643,13 +1892,13 @@ class Pattern:
 			end: usize|None = mm.end()
 			if end is None:
 				sys.panic( 're: split: whole match end unexpectedly unset' )
-			out.append( _substr( s, last_end, start )).unwrap( 're: split append' )
+			out.append( _substr( s.get_cstr(), last_end, start )).unwrap( 're: split append' )
 			last_end = end
 			with compiler.wrap_arithmetic:
 				n += 1
 			pos = _advance_pos_after_match( mm, s )
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
-		out.append( _substr( s, last_end, s.byte_len())).unwrap( 're: split append' )
+		out.append( _substr( s.get_cstr(), last_end, s.byte_len())).unwrap( 're: split append' )
 		return out
 
 
@@ -1707,7 +1956,45 @@ def _require_next_match( pattern: Pattern, s: str, pos: usize, slen: usize, max_
 	return m
 
 
-def finditer( pattern: Pattern, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -> Iterator[Result[Match, StopIteration]]:
+# --- byte-mode siblings of the four helpers above, for finditer(bytes) ----
+
+def _advance_pos_after_match_bytes( m: Match, slen: usize ) -> usize:
+	''' like _advance_pos_after_match, but byte_mode's own "one codepoint"
+	step is always exactly 1 byte (see Matcher._codepoint_width_at) - no
+	need for a decode call at all, unlike the str sibling. slen is only
+	used as an (unreachable in practice) upper bound sanity backstop; kept
+	for signature symmetry with the str sibling. '''
+	start_pos: usize|None = m.start()
+	if start_pos is None:
+		sys.panic( 're: _advance_pos_after_match_bytes: whole match start unexpectedly unset' )
+	end_pos: usize|None = m.end()
+	if end_pos is None:
+		sys.panic( 're: _advance_pos_after_match_bytes: whole match end unexpectedly unset' )
+	if end_pos > start_pos:
+		return end_pos
+	with compiler.wrap_arithmetic:
+		return start_pos + 1
+
+def _find_next_match_bytes( pattern: Pattern, s: bytes, start_pos: usize, slen: usize, max_steps: usize ) -> Match|None:
+	if start_pos > slen:
+		return None
+	attempt: Result[Match, MatchError] = pattern._search_from_bytes( s, start_pos, max_steps )
+	if attempt.is_ok():
+		return attempt.unwrap( 're: _find_next_match_bytes: is_ok checked above' )
+	return None
+
+def _has_match_at_or_after_bytes( pattern: Pattern, s: bytes, pos: usize, slen: usize, max_steps: usize ) -> bool:
+	m: Match|None = _find_next_match_bytes( pattern, s, pos, slen, max_steps )
+	return m is not None
+
+def _require_next_match_bytes( pattern: Pattern, s: bytes, pos: usize, slen: usize, max_steps: usize ) -> Match:
+	m: Match|None = _find_next_match_bytes( pattern, s, pos, slen, max_steps )
+	if m is None:
+		sys.panic( 're: _require_next_match_bytes: unreachable (_has_match_at_or_after_bytes already confirmed true)' )
+	return m
+
+
+def finditer( pattern: Pattern, s: str, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
 	''' yields each successive non-overlapping match, scanning forward
 	from the end of the previous one (or by one codepoint, for a
 	zero-width match). Externally consumable via a real for-loop as of
@@ -1766,10 +2053,36 @@ def finditer( pattern: Pattern, s: str, max_steps: usize = DEFAULT_MAX_STEPS ) -
 	return
 
 
+def finditer( pattern: Pattern, s: bytes, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+	''' byte-mode sibling of finditer() above - same generator-shape
+	constraints apply (see that docstring), same accepted "recompute
+	instead of carry across yield" v1 inefficiency. Returned Match objects
+	are byte-mode (their own .group()/.groupdict()/.groups() panic if
+	called - see Match's own note); .span()/.start()/.end()/.regs/
+	.lastindex all work identically to the str case, which is everything
+	grap.mpy's own port needs from this. '''
+	slen: usize = len( s )
+	pos: usize = 0
+	has_next: bool = _has_match_at_or_after_bytes( pattern, s, pos, slen, max_steps )
+	while has_next:
+		m: Match = _require_next_match_bytes( pattern, s, pos, slen, max_steps )
+		pos = _advance_pos_after_match_bytes( m, slen )
+		yield m
+		has_next = _has_match_at_or_after_bytes( pattern, s, pos, slen, max_steps )
+	return
+
+
 def compile( pattern: str, flags: u32 = 0 ) -> Result[Pattern, PatternError]:
 	return Pattern.compile( pattern, flags )
 
+def compile( pattern: bytes, flags: u32 = 0 ) -> Result[Pattern, PatternError]:
+	return Pattern.compile( pattern, flags )
+
 def search( pattern: str, s: str, flags: u32 = 0 ) -> Result[Match, MatchError]:
+	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.search: invalid pattern' )
+	return p.search( s )
+
+def search( pattern: bytes, s: bytes, flags: u32 = 0 ) -> Result[Match, MatchError]:
 	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.search: invalid pattern' )
 	return p.search( s )
 
@@ -1777,7 +2090,15 @@ def match( pattern: str, s: str, flags: u32 = 0 ) -> Result[Match, MatchError]:
 	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.match: invalid pattern' )
 	return p.match( s )
 
+def match( pattern: bytes, s: bytes, flags: u32 = 0 ) -> Result[Match, MatchError]:
+	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.match: invalid pattern' )
+	return p.match( s )
+
 def fullmatch( pattern: str, s: str, flags: u32 = 0 ) -> Result[Match, MatchError]:
+	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.fullmatch: invalid pattern' )
+	return p.fullmatch( s )
+
+def fullmatch( pattern: bytes, s: bytes, flags: u32 = 0 ) -> Result[Match, MatchError]:
 	p: Pattern = Pattern.compile( pattern, flags ).unwrap( 're.fullmatch: invalid pattern' )
 	return p.fullmatch( s )
 
