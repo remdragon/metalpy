@@ -15967,6 +15967,76 @@ def main() -> i32:
 		] )
 
 
+class ByteArrayResizeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' bytearray.resize(n) - grow or shrink in place, zero-filling any
+	newly exposed bytes (matches __init__'s own zero-init convention, even
+	when regrowing within a capacity a prior shrink left behind - see
+	resize()'s own docstring, lib/builtins/__init__.py, for why this is
+	deliberately stricter than CPython's own "may retain stale bytes
+	there" behavior). Missing gap surfaced porting a real-world zip-file
+	search tool (grap.mpy) that reuses one growable buffer across
+	differently-sized zip entries (`if len(buffer) < entry_size:
+	buffer.resize(entry_size)`) rather than reallocating fresh every time. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'grow_past_capacity_reallocates_and_zero_fills', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 1
+	p[1] = 2
+	p[2] = 3
+	b.resize( 6 )
+	if len( b ) != 6:
+		return 1
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[0] != 1 or p2[1] != 2 or p2[2] != 3:
+		return 2
+	if p2[3] != 0 or p2[4] != 0 or p2[5] != 0:
+		return 3
+	return 0
+''' ),
+			( 'shrink_then_regrow_within_capacity_re_zeroes_not_stale', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	b.resize( 6 )  # grow past capacity: __cap becomes 6
+	p: Ptr[u8] = b.get_ptr()
+	p[3] = 9
+	p[4] = 8
+	p[5] = 7
+	b.resize( 3 )  # shrink: __cap stays 6, __len becomes 3
+	if len( b ) != 3:
+		return 1
+	b.resize( 6 )  # regrow within __cap - no reallocation, but re-zeroed
+	if len( b ) != 6:
+		return 2
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[3] != 0 or p2[4] != 0 or p2[5] != 0:
+		return 3
+	return 0
+''' ),
+			( 'resize_to_same_size_is_a_no_op', '''
+def main() -> i32:
+	b: bytearray = bytearray( 4 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 5
+	b.resize( 4 )
+	if len( b ) != 4:
+		return 1
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[0] != 5:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression coverage for a real, confirmed silent-data-corruption bug:
 	an `@extern` function declared with a `T|None` return type where T is a

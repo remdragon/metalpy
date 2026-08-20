@@ -367,6 +367,39 @@ class bytearray:
 			assert index < self.__len, 'bytearray.__setitem__() index out of range'
 		self.__data[index] = value
 
+	def resize( self, new_size: usize ) -> None:
+		''' grows or shrinks self to new_size bytes, zero-filling any newly
+		exposed bytes (matching __init__'s own zero-init convention, even
+		for bytes that were part of an earlier, larger allocation a prior
+		shrink left behind - simpler and safer than CPython's own "may
+		retain stale bytes there" behavior, at the cost of not matching it
+		exactly). Growing within __cap (already-allocated capacity, e.g.
+		regrowing after a previous shrink) is a pure length update, no
+		reallocation; growing past __cap reallocates to exactly new_size,
+		not an amortized/doubled capacity - the motivating caller
+		(lib/zipfile.py's own buffer.resize(file_size), one call per zip
+		entry, not a tight append loop) doesn't need amortized growth. '''
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.resize() called after release()'
+		if new_size <= self.__cap:
+			if new_size > self.__len:
+				with compiler.panic_arithmetic( 'bounded by __cap, cannot overflow' ):
+					grown: usize = new_size - self.__len
+					fill_at: Ptr[u8] = self.__data + self.__len
+				sys.memzero( fill_at, grown )
+			self.__len = new_size
+			return
+		new_data: Ptr[u8] = sys.alloc[u8]( new_size )
+		sys.memcpy( new_data, self.__data, self.__len )
+		with compiler.panic_arithmetic( 'new_size > __cap >= __len, cannot overflow' ):
+			tail: usize = new_size - self.__len
+			new_fill_at: Ptr[u8] = new_data + self.__len
+		sys.memzero( new_fill_at, tail )
+		sys.free( self.__data )
+		self.__data = new_data
+		self.__len = new_size
+		self.__cap = new_size
+
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.decode() called after release()'
