@@ -3189,27 +3189,6 @@ class TypeResolver:
 			for attr in base.attributes:
 				if attr.resolve is not None:
 					attr.resolve()
-			# no RC-pointer member at all (every leaf is_rc_pointer() below
-			# is False) means the loop below would never build a single If
-			# reading the tag - nothing here actually needs tearing down, so
-			# skip the tag read entirely rather than emitting `__dtor_tag_N
-			# = expr.tag;` with nothing left to compare it against (a real,
-			# confirmed -Wunused-variable/C4189: the tag was always computed
-			# unconditionally, up front, regardless of whether the loop
-			# below ever turned out to need it)
-			if not any( attr.type.is_rc_pointer() for attr in base.attributes ):
-				return []
-			tag_attr, data_attr, _payload_cls, tags = self.union_storage.get( base )
-
-			# __tag = expr.tag
-			tag_name = f'__dtor_tag_{self._dtor_label_id}'
-			self._dtor_label_id += 1
-			stmts: list[ast.stmt] = [ ast.Assign(
-				targets = [ ast.Name( id = tag_name, ctx = ast.Store(), lineno = line, col_offset = 0 ) ],
-				value = ast.Attribute( value = field_expr, attr = tag_attr.stem, ctx = ast.Load(), lineno = line, col_offset = 0 ),
-				lineno = line, col_offset = 0,
-			) ]
-
 			# a GENERIC union's own base.attributes are its bare, unsubstituted
 			# declared field types (Result's own Ok: T / Err: E) - a bare TypeVar
 			# is never RC (same "substitution has to happen BEFORE the is_rc()
@@ -3224,6 +3203,27 @@ class TypeResolver:
 			substitution: dict[int,Type] = {}
 			if isinstance( field_type, Specialization ) and base.type_params:
 				substitution = { id( param ): arg for param, arg in zip( base.type_params, field_type.args ) }
+
+			# no RC-pointer member at all (every leaf is_rc_pointer() below
+			# is False, post-substitution) means the loop below would never
+			# build a single If reading the tag - nothing here actually needs
+			# tearing down, so skip the tag read entirely rather than emitting
+			# `__dtor_tag_N = expr.tag;` with nothing left to compare it
+			# against (a real, confirmed -Wunused-variable/C4189: the tag was
+			# always computed unconditionally, up front, regardless of
+			# whether the loop below ever turned out to need it)
+			if not any( substitution.get( id( attr.type ), attr.type ).is_rc_pointer() for attr in base.attributes ):
+				return []
+			tag_attr, data_attr, _payload_cls, tags = self.union_storage.get( base )
+
+			# __tag = expr.tag
+			tag_name = f'__dtor_tag_{self._dtor_label_id}'
+			self._dtor_label_id += 1
+			stmts: list[ast.stmt] = [ ast.Assign(
+				targets = [ ast.Name( id = tag_name, ctx = ast.Store(), lineno = line, col_offset = 0 ) ],
+				value = ast.Attribute( value = field_expr, attr = tag_attr.stem, ctx = ast.Load(), lineno = line, col_offset = 0 ),
+				lineno = line, col_offset = 0,
+			) ]
 
 			for i, member in enumerate( base.attributes ):
 				member_type = substitution.get( id( member.type ), member.type )
