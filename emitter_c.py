@@ -1418,6 +1418,19 @@ def _emit_const( c: ir.Const ) -> str:
 			# cast explicitly or MSVC's /W4 flags the bare negative literal
 			# initializing an unsigned type as C4245
 			return f'({c_type(c.type)}){c.value}'
+		if stem is not None and stem in _FIXED_INT_BITS and not _is_unsigned_stem( stem ) and c.value > ( 2 ** ( _FIXED_INT_BITS[stem] - 1 ) - 1 ):
+			# the mirror case: a same-width construct-cast into a SIGNED type
+			# (HRESULT(0x80090318)-style winerror.h/SEC_E_ constants - see
+			# lib/windows/com/__init__.py's/lib/ssl.py's own matching
+			# comments, both already documenting this as deliberate, same-
+			# width, infallible bit-reinterpretation, exactly like T(x)'s own
+			# general same-width contract) bit-reinterprets straight to a
+			# Const here too - the literal's own natural (unsigned/wider)
+			# type doesn't fit the target signed stem's positive range even
+			# though its BIT PATTERN is exactly the intended value, which
+			# clang/MSVC both flag (-Wconstant-conversion/C4309) on a bare,
+			# uncast initializer
+			return f'({c_type(c.type)}){c.value}'
 		return str( c.value )
 	if c.value is None:
 		return '0' # NOTE: we would like to put 'nullptr' or 'NULL' here but its causing issues
