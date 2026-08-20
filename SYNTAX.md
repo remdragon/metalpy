@@ -39,6 +39,20 @@ This document defines the language constructs, syntax rules, type system, error 
 * **Generic Slice View**: `slice[T]` (Lowercase `slice` matches Python 3.9+ built-in generic collection casing: `list[T]`, `dict[K, V]`, `slice[T]`).
 * **Fixed-Size Inline Array** (inside `@struct`): `u16[32]`, `u8[8]`
 * **Address-Of**: `compiler.addrof(x) -> Ptr[T]` yields a pointer to a local variable `x: T`, translating directly to C `&x`. Used for C out-parameters (e.g. Win32 `WriteFile`'s `lpNumberOfBytesWritten`), since Python has no `&` operator of its own.
+* **Packed Struct** (`@cstruct(packed = True)` / `@cunion(packed = True)`): no compiler-inserted padding anywhere in the body (`#pragma pack(push,1)` around the whole struct/union) - the general way to replicate an external ABI's exact byte layout when field types alone don't produce it.
+* **Per-Field Alignment** (`Aligned[N, T]`, `@cstruct`/`@cunion` field only): overrides just that field's own C alignment (must not exceed `T`'s natural alignment - only shrinking is portable). Resolves transparently to plain `T` everywhere else (arithmetic, comparisons, construction). Cannot be combined with `packed = True` on the same struct (confirmed to diverge between MSVC and clang/gcc - rejected as a compile error).
+
+```metalpy
+@cstruct
+class WIN32_FIND_DATA:
+	dwFileAttributes: u32 = 0
+	ftCreationTime: Aligned[4, u64] = 0   # FILETIME's real ABI alignment is 4, not u64's natural 8
+	ftLastAccessTime: Aligned[4, u64] = 0
+	ftLastWriteTime: Aligned[4, u64] = 0
+	nFileSizeHigh: u32 = 0
+	nFileSizeLow: u32 = 0
+	cFileName: u8[260] = 0
+```
 
 ```metalpy
 written: u32 = 0
