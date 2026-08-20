@@ -13448,6 +13448,7 @@ class FunctionLowering:
 			# lowered operand (never re-lowering/re-evaluating the original
 			# argument expression, which would double its side effects once
 			# per leaf; see _coerce_or_check_operand's own docstring)
+			leaf_temps_start = len( self._pending_temps )
 			leaf_args = []
 			for ( ref_param, expr ), operand in zip( positional, args ):
 				leaf_param = self._corresponding_leaf_param( reference, fn, ref_param )
@@ -13459,6 +13460,29 @@ class FunctionLowering:
 				context = f'{fn.qualname}(...): parameter {leaf_param.stem!r}'
 				leaf_kwargs[leaf_param.stem] = self._coerce_or_check_operand( kwargs[ref_param.stem], leaf_param.type, expr, context = context )
 			self._emit( ir.Call( dest = dest, target = fn, receiver = narrowed, args = leaf_args, kwargs = leaf_kwargs ))
+			# a leaf whose own parameter type needs real union-widening
+			# coercion (not just a borrowed CastWrap - see _coerce_or_check_
+			# operand's own comment) leaves a fresh, independently
+			# fresh_temp()-tracked wrapped value in leaf_args/leaf_kwargs,
+			# passed to the Call above as an ordinary BORROWED argument (no
+			# ownership transfer, same convention every other call site
+			# uses) - the caller still owns releasing it. In non-branching
+			# code the enclosing statement's own end-of-statement flush does
+			# that correctly; here this whole per-leaf block is only ONE
+			# branch of a larger dispatch tree (skippable via an earlier
+			# leaf's own tag match), so that flush fires unconditionally for
+			# EVERY leaf regardless of which one's Call actually ran -
+			# reading tag/payload data off an uninitialized C local for
+			# whichever leaf never executed. Confirmed via a real repro
+			# (union receiver dispatch, one leaf declaring a plain parameter
+			# type, the other a wider union needing _coerce_into_union) -
+			# same bug class _flush_branch_temps' own docstring documents
+			# for _expr_BoolOp/_expr_IfExp, and _emit_eq_dispatch_tree's/
+			# _coerce_or_check_operand's own hand-rolled decref+untrack
+			# fixes cover elsewhere in this file. dest is excluded (it's
+			# this whole call's own merge point, must survive to the next
+			# leaf/end_label)
+			self._flush_branch_temps( leaf_temps_start, *( [ dest ] if dest is not None else [] ))
 			if not is_last:
 				self._emit( ir.Jump( target = end_label ))
 				self._emit( ir.Label( name = next_label ))
