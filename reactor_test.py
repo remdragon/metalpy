@@ -240,7 +240,7 @@ class WaitTask:
 		self.resumed = False
 	def run( self ) -> None:
 		sig = reactor.Signal( self.fd, True, False )
-		reactor.wait_for_signal( sig )
+		reactor.wait_for_signal( sig ).unwrap( 'unexpected shutdown during test' )
 		self.resumed = True
 
 def run() -> Result[i32, OSError]:
@@ -328,7 +328,7 @@ def run() -> Result[i32, OSError]:
 	t = threading.Thread( w.run )   # constructing already launches it
 
 	sig = reactor.Signal( conn.fileno(), True, False )
-	reactor.wait_for_signal( sig )
+	reactor.wait_for_signal( sig ).unwrap( 'unexpected shutdown during test' )
 	t.join()
 	return Result.Ok( 0 )
 
@@ -387,7 +387,7 @@ class Task1:
 		self.counter = counter
 	def run( self ) -> None:
 		sig = reactor.Signal( self.fd, True, False )
-		reactor.wait_for_signal( sig )
+		reactor.wait_for_signal( sig ).unwrap( 'unexpected shutdown during test' )
 		self.counter.fetch_add( 100 )
 
 class Task2:
@@ -454,6 +454,185 @@ def run() -> Result[i32, OSError]:
 	if not saw_task2:
 		return Result.Ok( 1 )
 	if counter.load() != 101:
+		return Result.Ok( 2 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match run():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 3
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
+
+	def test_shutdown_interrupts_a_genuinely_blocked_worker( self ) -> None:
+		# a task parks on a signal that's DELIBERATELY never satisfied (the
+		# connection's peer never writes anything) - the single worker
+		# genuinely blocks in run_until_idle(-1), same as test_spawn_wakes_
+		# a_genuinely_blocked_worker above. A separate thread, after a
+		# bounded busy delay (no sleep() primitive - see busy_delay()),
+		# calls Reactor.shutdown(). Verifies wait_for_signal() returns
+		# Result.Err(ShutdownError) - not Ok, not a hang - and that
+		# Reactor.run() itself returns promptly (bounded by this test's
+		# own harness timeout as a safety net, in case shutdown is
+		# broken).
+		self._run( '''
+import compiler
+import socket
+import poller
+import reactor
+import atomic
+import threading
+
+def busy_delay() -> None:
+	i: usize = 0
+	while i < usize( 200000000 ):
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+class ShutdownTask:
+	fd: poller.SOCKET
+	result_flag: atomic.Atomic[i32]
+	def __init__( self, fd: poller.SOCKET, result_flag: atomic.Atomic[i32] ) -> None:
+		self.fd = fd
+		self.result_flag = result_flag
+	def run( self ) -> None:
+		sig = reactor.Signal( self.fd, True, False )
+		match reactor.wait_for_signal( sig ):
+			case Result.Ok( _ ):
+				self.result_flag.store( 1 )
+			case Result.Err( _ ):
+				self.result_flag.store( 2 )
+
+class Shutter:
+	r: reactor.Reactor
+	def __init__( self, r: reactor.Reactor ) -> None:
+		self.r = r
+	def run( self ) -> None:
+		busy_delay()
+		self.r.shutdown()
+
+def run() -> Result[i32, OSError]:
+	server = socket.Socket.tcp().or_return()
+	server.bind( '127.0.0.1', u16( 0 )).or_return()
+	server.listen().or_return()
+	bound = server.getsockname().or_return()
+	client = socket.Socket.tcp().or_return()
+	client.connect( '127.0.0.1', bound.port() ).or_return()
+	( conn, _addr ) = server.accept().or_return()
+	poller.set_nonblocking( conn.fileno() ).or_return()
+
+	result_flag = atomic.Atomic[i32]( 0 )
+	r = reactor.Reactor( 1 )
+	t = ShutdownTask( conn.fileno(), result_flag )
+	r.spawn( t.run )
+
+	shutter = Shutter( r )
+	t_shutter = threading.Thread( shutter.run )
+
+	r.run()
+	t_shutter.join()
+
+	if result_flag.load() != 2:
+		return Result.Ok( 1 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match run():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 3
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
+
+	def test_shutdown_wakes_every_worker( self ) -> None:
+		# num_workers=2, one signal-waiting task per worker (round-robin
+		# spawn() lands one on each), both signals deliberately never
+		# satisfied - Reactor.shutdown() must wake BOTH workers, not just
+		# whichever one happens to be checked "first" internally.
+		#
+		# NOTE: make_conn_pair() returns (conn, client) and the caller
+		# MUST keep both alive for the test's own duration - a real bug
+		# surfaced by this exact test during development: Socket.__del__
+		# closes the real OS socket, so a client left to go out of scope
+		# immediately closes itself, which makes the SERVER-accepted conn
+		# on the other end look "readable" (a real EOF/HUP condition, not
+		# a fake one) - both tasks came back Result.Ok (not the expected
+		# Err(ShutdownError)) until client was kept alive in run()'s own
+		# scope for the whole test. Not a reactor.py bug - purely a test-
+		# authoring footgun worth documenting so it isn't hit again.
+		self._run( '''
+import compiler
+import socket
+import poller
+import reactor
+import atomic
+import threading
+
+def busy_delay() -> None:
+	i: usize = 0
+	while i < usize( 200000000 ):
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+def make_conn_pair() -> Result[tuple[socket.Socket, socket.Socket], OSError]:
+	server = socket.Socket.tcp().or_return()
+	server.bind( '127.0.0.1', u16( 0 )).or_return()
+	server.listen().or_return()
+	bound = server.getsockname().or_return()
+	client = socket.Socket.tcp().or_return()
+	client.connect( '127.0.0.1', bound.port() ).or_return()
+	( conn, _addr ) = server.accept().or_return()
+	poller.set_nonblocking( conn.fileno() ).or_return()
+	return Result.Ok(( conn, client ))
+
+class ShutdownTask:
+	fd: poller.SOCKET
+	result_flag: atomic.Atomic[i32]
+	def __init__( self, fd: poller.SOCKET, result_flag: atomic.Atomic[i32] ) -> None:
+		self.fd = fd
+		self.result_flag = result_flag
+	def run( self ) -> None:
+		sig = reactor.Signal( self.fd, True, False )
+		match reactor.wait_for_signal( sig ):
+			case Result.Ok( _ ):
+				self.result_flag.store( 1 )
+			case Result.Err( _ ):
+				self.result_flag.store( 2 )
+
+class Shutter:
+	r: reactor.Reactor
+	def __init__( self, r: reactor.Reactor ) -> None:
+		self.r = r
+	def run( self ) -> None:
+		busy_delay()
+		self.r.shutdown()
+
+def run() -> Result[i32, OSError]:
+	( conn_a, client_a ) = make_conn_pair().or_return()
+	( conn_b, client_b ) = make_conn_pair().or_return()
+
+	flag_a = atomic.Atomic[i32]( 0 )
+	flag_b = atomic.Atomic[i32]( 0 )
+	r = reactor.Reactor( 2 )
+	ta = ShutdownTask( conn_a.fileno(), flag_a )
+	tb = ShutdownTask( conn_b.fileno(), flag_b )
+	r.spawn( ta.run )
+	r.spawn( tb.run )
+
+	shutter = Shutter( r )
+	t_shutter = threading.Thread( shutter.run )
+
+	r.run()
+	t_shutter.join()
+
+	if flag_a.load() != 2:
+		return Result.Ok( 1 )
+	if flag_b.load() != 2:
 		return Result.Ok( 2 )
 	return Result.Ok( 0 )
 
