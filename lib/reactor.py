@@ -100,15 +100,10 @@ def current_worker() -> Worker|None:
 	return _current_worker.get()
 
 
-class Signal:
-	''' what a fiber is waiting for: a specific fd becoming ready for read
-	and/or write. The only kind implemented so far - file-I/O completion
-	and atomic/futex-style waits are future, unrelated Signal-raising
-	mechanisms (deliberately out of scope for this abstraction itself,
-	per the plan's own design decision - a poller noticing fd readiness,
-	a thread-pool worker finishing a file op, and a futex wake are three
-	unrelated mechanisms that all reduce to the same "wait_for_signal,
-	then retry" shape at this level). '''
+class FdReadiness:
+	''' payload for Signal.FdReady - wait for a specific fd to become
+	ready for read and/or write, per lib/poller.py's own readiness model
+	(epoll/WSAPoll). '''
 	fd:         poller.SOCKET
 	want_read:  bool
 	want_write: bool
@@ -116,6 +111,42 @@ class Signal:
 		self.fd = fd
 		self.want_read = want_read
 		self.want_write = want_write
+
+
+@union
+class Signal:
+	''' what a fiber is waiting for. A tagged union, not a bare fd+interest
+	struct, because "something worth waking a fiber up for" has more than
+	one real shape:
+	  - FdReady (the only variant implemented so far) - a poller notices a
+	    registered fd's readiness (lib/poller.py, epoll/WSAPoll). This is
+	    a READINESS signal: once it fires, the caller still has to
+	    actually perform the read/write itself, and might get WouldBlock
+	    again (a spurious wakeup) - see NonBlockingIO's own eventual
+	    read()/write() retry-loop shape.
+	  - Completion (future, not built yet) - IOCP/io_uring's own model:
+	    the wait target IS the completing operation itself, not a
+	    readiness check - by the time this fires, the actual result (bytes
+	    transferred, or an error) already exists, nothing left to "try
+	    again". A fundamentally different shape from FdReady, which is
+	    exactly why this needed to become a union rather than growing
+	    fields on one struct - Worker's own internals (__check_signals,
+	    __drain_waiting_for_shutdown) will need to branch on kind, not
+	    just interpret every Signal as "some fd is ready".
+	  - a bare "wake me directly" kind (future, not built yet) - what
+	    Queue/Event will need: no fd, no completion object, just "some
+	    other fiber/thread called wake() on the specific token I'm holding".
+	Worker._wait_on_signal/__check_signals/__drain_waiting_for_shutdown
+	are the only places that need to know which kinds exist - everything
+	above them (wait_for_signal, and eventually NonBlockingIO's own
+	read()/write()) just holds a Signal opaquely and waits for it. '''
+	FdReady: FdReadiness
+
+def fd_signal( fd: poller.SOCKET, want_read: bool, want_write: bool ) -> Signal:
+	''' convenience constructor - Signal.FdReady(FdReadiness(...)) spelled
+	out at every call site would be pure noise for the one kind that
+	exists today. '''
+	return Signal.FdReady( FdReadiness( fd, want_read, want_write ))
 
 
 class _PendingWait:
@@ -168,10 +199,16 @@ def _blocking_wait_no_reactor( signal: Signal ) -> None:
 	(register one fd, wait with an infinite timeout, let __del__ clean
 	up) rather than any shared/cached instance - this path is expected to
 	be rare (real reactor-driven code never takes it) and simplicity
-	beats reuse here. '''
-	p: poller.Poller = poller.Poller()
-	p.register( signal.fd, signal.want_read, signal.want_write ).unwrap( 'wait_for_signal: poller register failed (no reactor driving this thread)' )
-	p.wait( -1 ).unwrap( 'wait_for_signal: poller wait failed (no reactor driving this thread)' )
+	beats reuse here. Only FdReady is handleable this way (a real OS-
+	level blocking wait needs something pollable) - the match is
+	exhaustive today because FdReady is the only variant that exists;
+	adding a second kind will force a real decision here, not a silent
+	gap. '''
+	match signal:
+		case Signal.FdReady( fdr ):
+			p: poller.Poller = poller.Poller()
+			p.register( fdr.fd, fdr.want_read, fdr.want_write ).unwrap( 'wait_for_signal: poller register failed (no reactor driving this thread)' )
+			p.wait( -1 ).unwrap( 'wait_for_signal: poller wait failed (no reactor driving this thread)' )
 
 
 def _make_wake_pair() -> tuple[socket.Socket, socket.Socket]:
@@ -308,9 +345,10 @@ class Worker:
 
 	def _wait_on_signal( self, signal: Signal ) -> Result[None, ShutdownError]:
 		''' called from WITHIN a running fiber's own task (via the free
-		function wait_for_signal, never directly) - registers signal.fd
-		with this worker's own poller if not already watched, records
-		which fiber is waiting for it, and parks. Resumes once EITHER a
+		function wait_for_signal, never directly) - for an FdReady signal,
+		registers its fd with this worker's own poller if not already
+		watched; records which fiber is waiting for it, and parks. Resumes
+		once EITHER a
 		later run_until_idle()'s own __check_signals() notices the fd
 		became ready (see __requeue_by_state's own comment for the other
 		half of how that stays exactly-once), OR __drain_waiting_for_
@@ -321,9 +359,11 @@ class Worker:
 		actually happened). '''
 		if self.__shutting_down.load():
 			return Result.Err( ShutdownError() )
-		if not self.__is_registered( signal.fd ):
-			self.__poller.register( signal.fd, signal.want_read, signal.want_write ).unwrap( 'Worker._wait_on_signal: poller register failed' )
-			self.__registered_fds.append( signal.fd ).unwrap( 'Worker._wait_on_signal: registered-fd list overflow' )
+		match signal:
+			case Signal.FdReady( fdr ):
+				if not self.__is_registered( fdr.fd ):
+					self.__poller.register( fdr.fd, fdr.want_read, fdr.want_write ).unwrap( 'Worker._wait_on_signal: poller register failed' )
+					self.__registered_fds.append( fdr.fd ).unwrap( 'Worker._wait_on_signal: registered-fd list overflow' )
 		cur: fiber.Fiber|None = fiber.current()
 		if cur is None:
 			sys.panic( 'Worker._wait_on_signal: no current fiber - must be called from inside a task this Worker is running' )
@@ -378,9 +418,11 @@ class Worker:
 		while i < n:
 			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__drain_waiting_for_shutdown: index in bounds by construction' )
 			self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__drain_waiting_for_shutdown: ready-to-unpark queue overflow' )
-			if self.__is_registered( w.signal.fd ):
-				self.__poller.unregister( w.signal.fd ).unwrap( 'Worker.__drain_waiting_for_shutdown: poller unregister failed' )
-				self.__forget_registered_fd( w.signal.fd )
+			match w.signal:
+				case Signal.FdReady( fdr ):
+					if self.__is_registered( fdr.fd ):
+						self.__poller.unregister( fdr.fd ).unwrap( 'Worker.__drain_waiting_for_shutdown: poller unregister failed' )
+						self.__forget_registered_fd( fdr.fd )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__waiting = list[_PendingWait]()
@@ -429,12 +471,21 @@ class Worker:
 				with compiler.wrap_arithmetic:
 					i = i + 1
 				continue
+			# every entry reaching this sweep came from the fd-based
+			# poller (self.__poller.wait() above), so only FdReady
+			# entries can ever match here by construction - a future
+			# Completion/bare-wake entry in __waiting would never be
+			# found via THIS fd, only via its own separate mechanism.
 			still_waiting: list[_PendingWait] = list[_PendingWait]()
 			m: usize = self.__waiting.__len__()
 			j: usize = 0
 			while j < m:
 				w: _PendingWait = self.__waiting.__getitem__( j ).unwrap( 'Worker.__check_signals: index in bounds by construction' )
-				if w.signal.fd == ev.fd:
+				matched: bool = False
+				match w.signal:
+					case Signal.FdReady( fdr ):
+						matched = fdr.fd == ev.fd
+				if matched:
 					self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__check_signals: ready-to-unpark queue overflow' )
 					progressed = True
 				else:
