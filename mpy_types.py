@@ -261,14 +261,34 @@ class Specialization( Type ):
 	def names( self ) -> dict[str,Name]|None:
 		return getattr( self.base, 'names', None )
 
-	# every RC/layout question about Box[i32] is really a question about Box.
-	# This delegation is what retires the `base = t.base if isinstance( t,
-	# Specialization ) else t` idiom that used to be copy-pasted verbatim in 14
-	# places across cfg/lowering/emitter_c/type_resolver, each site
-	# independently deciding whether to ALSO handle Move/Copy/TupleType.
-	# Without it, every generic-class/generic-union instance method's own
-	# `self` (already typed as a Specialization) wrongly looks untracked.
-	def is_rc( self ) -> bool: return self.base.is_rc()
+	# every RC/layout question about Box[i32] is really a question about Box -
+	# a generic CLASS's RC-ness comes from being an RCClass with a header,
+	# never from what its type params happen to be bound to, so delegating to
+	# self.base is correct there. This delegation is what retires the `base =
+	# t.base if isinstance( t, Specialization ) else t` idiom that used to be
+	# copy-pasted verbatim in 14 places across cfg/lowering/emitter_c/type_
+	# resolver, each site independently deciding whether to ALSO handle Move/
+	# Copy/TupleType. Without it, every generic-class/generic-union instance
+	# method's own `self` (already typed as a Specialization) wrongly looks
+	# untracked.
+	#
+	# A generic UNION (Result[T,E]) is different: is_rc() GENUINELY depends
+	# on what T/E are bound to, not just on being a TaggedUnion - self.base
+	# alone (the abstract, unsubstituted union) always reports non-RC
+	# (rc_leaves()'s own comment: "a bare TypeVar is never RC" - Type.is_rc()'s
+	# own default), regardless of self.args, so a bare `self.base.is_rc()`
+	# here made EVERY Result[SomeRCType,SomeRCType]-typed value look non-RC.
+	# Confirmed via a real reference leak: a generator's own promoted
+	# Result[Box,StopIteration]-typed field (yield-from's own raw next()
+	# result, crossing a suspend) was silently excluded from the state-aware
+	# destructor's own RC-field cascade entirely, since _build_generator_
+	# destructor gates each field on is_rc(). rc_leaves() already does the
+	# substitution correctly (same method, see its own docstring) - reuse it
+	# rather than duplicating the substitution logic here.
+	def is_rc( self ) -> bool:
+		if isinstance( self.base, TaggedUnion ):
+			return bool( self.rc_leaves() )
+		return self.base.is_rc()
 	def is_result_type( self ) -> bool: return self.base.is_result_type()
 	def is_rc_pointer( self ) -> bool: return self.base.is_rc_pointer()
 	def has_object_header( self ) -> bool: return self.base.has_object_header()

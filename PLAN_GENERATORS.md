@@ -140,6 +140,96 @@ Generator functions (`yield`, state-machine transform)
 > lazy-reconstruction fix and the doubly-nested-for-loop recursion fix).
 > Full test suite green on all 3 compilers (clang/MSVC/WSL gcc) for both
 > fixes.
+>
+> **StopIteration reversal (2026-08-20): the "Consumption protocol"
+> section below now describes the OPPOSITE of what actually ships.**
+> `__next__(self)` returns `Result[elem_type,error_type]` UNCONDITIONALLY
+> - there is no more `T|None`/nullable-union shape, for ANY generator,
+> "infallible" ones included. Reaching the end of a generator produces
+> `Err(StopIteration())` in the ordinary error channel, not `Ok(None)` in
+> the success channel. This was a deliberate reversal, confirmed directly
+> with the user: representing exhaustion as a real `Err` unifies
+> "infallible" and "fallible" generators into one honest shape and removes
+> the special-casing that used to block `yield from`/a for-loop-with-yield
+> from ever forwarding a fallible generator's own values (the old design
+> had no way to represent an inner generator's own real error at all).
+> Deliberately NO implicit compiler magic anywhere: `Iterator[T]` now
+> means `Iterator[Result[T,StopIteration]]` - the user must spell
+> `StopIteration` out explicitly in the type argument, same posture as
+> `with compiler.panic_arithmetic(...):` never being silently chosen for
+> you. `Generator[T,E]`/`Generator[T,SendType,E]` require `E` to include
+> `StopIteration` among its own leaves too, for the identical reason - no
+> Iterator-specific carve-out. `Iterator[Result[T,StopIteration]]` and
+> `Generator[T,E-including-StopIteration]` are two spellings of the exact
+> same underlying `GeneratorType` construction (`discovery.py`'s
+> `visit_Subscript`).
+>
+> Consumption rule (both an ordinary `for x in gen():` outside any
+> generator body, and a for-loop-with-yield/`yield from` inside one -
+> confirmed directly with the user): the loop always calls `__next__()`.
+> `Err(StopIteration)` is always handled by the loop itself as ordinary
+> termination - never surfaced to the loop body. If `StopIteration` is
+> the ONLY declared error, the loop target binds to plain `T` -
+> ergonomically identical to the old `T|None` experience. If there's any
+> OTHER error alongside `StopIteration`, the loop target binds to
+> `Result[T,E']` (`E'` = the declared error minus `StopIteration`) - the
+> user handles the real error explicitly inside the loop body (match/
+> `.is_err()`/`.or_return()`/`.unwrap()`); the loop does NOT auto-
+> propagate it (deliberately different from `_maybe_consume_result`'s own
+> auto-propagate idiom for `__len__`/`__getitem__` elsewhere in this
+> codebase - don't conflate the two). `yield from <expr>` requires an
+> EXACT match (identity-compared, not covering/widening) between the
+> inner generator's own `Result[T,E]` and the outer's own declared
+> `Result[T,E]` - forwarding every value untouched (`Ok` and `Err` alike)
+> except `Err(StopIteration)` specifically, which terminates the `yield
+> from`'s own loop rather than being forwarded as the outer's own
+> exhaustion. A mismatched shape is a clear compile error directing the
+> user to write an explicit `for` loop instead, which has the more
+> permissive per-loop binding rule above. Deferred future work, noted but
+> not built: a narrower inner `Result[T,E_inner]` could legally widen into
+> a wider outer `Result[T,E_outer]` for `yield from` (reusing `_require_
+> result_return`'s existing union-widening idiom), on both the error side
+> (`E_inner` ⊆ `E_outer`) and the success side (`Result[T,E]` widening
+> into `Result[T|U,E]`).
+>
+> Landed across 4 checkpoint commits on worktree `generator-stopiteration-
+> phase-a` (Phase A: `f8428ef`, StopIteration builtin + type-level
+> recognition; Phase B: `415feac`, core `$$__next__` semantics, plus a
+> real, general, pre-existing match-pattern bug found and fixed along the
+> way - `case SomeUnion.Variant(x):` resolved `SomeUnion` from pattern
+> text alone, silently wrong when `SomeUnion` is nested opaquely inside a
+> WIDER union that is the subject's actual type, practically severe here
+> since `StopIteration` (in `builtins`) sorts ahead of most user error
+> types alphabetically; Phase C: `9daaafa`/`cfe959c`, for-loop consumption
+> + `yield from`; Phase D: `4d1ce21`, the IR-level ordinary for-loop
+> consumer + `lib/re.py`'s `finditer`). Verified via real compile-and-run
+> on clang, MSVC, and WSL gcc, plus AddressSanitizer, throughout - found
+> and fixed several more real bugs THIS reversal newly exercised: an
+> `emitter_c.py` gap where a compiler-synthesized "not assigned yet" zero
+> placeholder for an RC-typed `TaggedUnion` field with no `None` member
+> (e.g. `Result[T,E]` itself) emitted a bare `0` into a C struct field
+> (invalid C on all 3 compilers) - needed a zero-initialized compound
+> literal instead; a multi-leaf remaining-error case (`Result[T,E1|E2]`)
+> needed one explicit `case Leaf(bound):` match arm per leaf rather than a
+> single wildcard, since `cfg.py`'s `narrowed_member()` only collapses to
+> a concrete type when exactly one candidate remains; a StopIteration-only
+> `yield from` tried to match a non-union payload type ("match subject is
+> not a union type") since a BARE `StopIteration` error type isn't itself
+> a union at all.
+>
+> One deliberately deferred gap: the ordinary (non-generator-body) `for`
+> loop's own `Result[T,E']` binding (a real error alongside StopIteration)
+> is NOT implemented in `lowering.py`'s `_lower_for_over_iterator` - it
+> fails cleanly, directing the user to consume via `.__next__()` +
+> `match` instead. The in-generator-body version (`_desugar_iterator_for`)
+> builds fresh AST processed by a later type-checking/desugaring pass with
+> real narrowing machinery already available to it; this method lowers
+> straight to IR, where the same result needs either a genuine per-leaf
+> tag dispatch or hand-rolled `_stmt_If`-style branch-merge machinery, and
+> there is no real caller in this codebase to verify it against (every
+> for-loop-over-a-generator here, `lib/re.py`'s `finditer` included, is
+> StopIteration-only). Worth building for real if a genuine caller shows
+> up rather than risking under-tested CFG-merge code now.
 
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in

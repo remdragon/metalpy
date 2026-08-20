@@ -3200,7 +3200,23 @@ class TypeResolver:
 				lineno = line, col_offset = 0,
 			) ]
 
+			# a GENERIC union's own base.attributes are its bare, unsubstituted
+			# declared field types (Result's own Ok: T / Err: E) - a bare TypeVar
+			# is never RC (same "substitution has to happen BEFORE the is_rc()
+			# filter" trap Specialization.rc_leaves's own docstring documents),
+			# so checking member.type.is_rc_pointer() directly here, unsubstituted,
+			# silently skipped every member of EVERY generic-union instantiation
+			# regardless of what its own args actually were - confirmed via a
+			# real reference leak: a generator's own promoted Result[Box,
+			# StopIteration]-typed field read its own tag then released nothing,
+			# for either member. Substitute field_type's own concrete args in
+			# first, same identity-keyed substitution rc_leaves() already uses.
+			substitution: dict[int,Type] = {}
+			if isinstance( field_type, Specialization ) and base.type_params:
+				substitution = { id( param ): arg for param, arg in zip( base.type_params, field_type.args ) }
+
 			for i, member in enumerate( base.attributes ):
+				member_type = substitution.get( id( member.type ), member.type )
 				# same is_rc_pointer() widening as the top of this method - a
 				# tuple-typed union MEMBER was skipped here for the same reason
 				# a tuple-typed field was skipped there. Still pointer-only, not
@@ -3208,7 +3224,7 @@ class TypeResolver:
 				# as a bare RC pointer, which a NESTED union member is not (that
 				# case needs its own tag ladder and remains unhandled here -
 				# cfg.py's _refcount_instructions is what covers it for values).
-				if not member.type.is_rc_pointer():
+				if not member_type.is_rc_pointer():
 					continue
 				member_expr = ast.Attribute(
 					value = ast.Attribute(
