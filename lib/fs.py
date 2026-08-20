@@ -105,9 +105,15 @@ if compiler.target.os != 'windows':
 	O_EXCL: i32 = 0o200
 	O_TRUNC: i32 = 0o1000
 	O_APPEND: i32 = 0o2000
-	SEEK_SET: i32 = 0
-	SEEK_CUR: i32 = 1
-	SEEK_END: i32 = 2
+
+# Portable seek-whence constants. Values deliberately match Windows'
+# FILE_BEGIN/FILE_CURRENT/FILE_END (0/1/2) too, so seek_raw's Windows variant
+# needs nothing more than a cast to accept the same i32 on both platforms -
+# lib/io.py's Seekable protocol relies on this to have one signature, not a
+# per-platform whence type.
+SEEK_SET: i32 = 0
+SEEK_CUR: i32 = 1
+SEEK_END: i32 = 2
 
 # Windows file API constants
 if compiler.target.os == 'windows':
@@ -249,14 +255,16 @@ def read_raw(
 def seek_raw(
 	fd: Ptr[None],
 	offset: i64,
-	whence: u32,
-) -> Result[None, OSError]:
-	''' Windows: SetFilePointerEx call. '''
+	whence: i32,
+) -> Result[i64, OSError]:
+	''' Windows: SetFilePointerEx call. Returns the resulting absolute file
+	position. '''
 	from windows.kernel32 import GetLastError, SetFilePointerEx
-	success: bool = SetFilePointerEx( fd, offset, None, whence )
+	new_pos: i64 = 0
+	success: bool = SetFilePointerEx( fd, offset, compiler.addrof( new_pos ), u32( whence ))
 	if not success:
 		return Result.Err( OSError( GetLastError() ))
-	return Result.Ok( None )
+	return Result.Ok( new_pos )
 
 
 @compiler.target( os = not 'windows' )
@@ -264,13 +272,13 @@ def seek_raw(
 	fd: i32,
 	offset: i64,
 	whence: i32,
-) -> Result[None, OSError]:
-	''' POSIX: lseek(2) call. '''
+) -> Result[i64, OSError]:
+	''' POSIX: lseek(2) call. Returns the resulting absolute file position. '''
 	from crt import get_errno, lseek
 	result: i64 = lseek( fd, offset, whence )
 	if result < 0:
 		return Result.Err( OSError( get_errno() ))
-	return Result.Ok( None )
+	return Result.Ok( result )
 
 
 # ---------------------------------------------------------------------------

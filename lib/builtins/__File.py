@@ -9,9 +9,10 @@ File              — namespace with static factory methods
 
 import compiler
 from fs import (
-	FD, INVALID_FD,
+	FD, INVALID_FD, SEEK_END,
 	close_raw, open_raw, read_raw, seek_raw, truncate_raw, write_raw,
 )
+from io import Reader, Writer, Seekable
 
 # Pull platform constants into scope.  The module-level if/else is folded
 # by compile_time_transformer, so each target sees exactly one set.
@@ -19,7 +20,6 @@ if compiler.target.os == 'windows':
 	from fs import (
 		GENERIC_READ, GENERIC_WRITE,
 		CREATE_NEW, CREATE_ALWAYS, OPEN_EXISTING, OPEN_ALWAYS, TRUNCATE_EXISTING,
-		FILE_END,
 	)
 else:
 	from fs import (
@@ -32,7 +32,7 @@ else:
 # BinaryReader — read-only binary file handle
 # ---------------------------------------------------------------------------
 
-class BinaryReader:
+class BinaryReader( Reader, Seekable ):
 	__fd: FD
 
 	def __del__( self ) -> None:
@@ -41,6 +41,9 @@ class BinaryReader:
 
 	def read( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		return read_raw( self.__fd, buf, count )
+
+	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
+		return seek_raw( self.__fd, offset, whence )
 
 	def close( self ) -> None:
 		if self.__fd != INVALID_FD:
@@ -60,7 +63,7 @@ class BinaryReader:
 # BinaryWriter — write-only binary file handle
 # ---------------------------------------------------------------------------
 
-class BinaryWriter:
+class BinaryWriter( Writer, Seekable ):
 	__fd: FD
 
 	def __del__( self ) -> None:
@@ -69,6 +72,9 @@ class BinaryWriter:
 
 	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		return write_raw( self.__fd, buf, count )
+
+	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
+		return seek_raw( self.__fd, offset, whence )
 
 	def close( self ) -> None:
 		if self.__fd != INVALID_FD:
@@ -88,7 +94,7 @@ class BinaryWriter:
 # BinaryReadWriter — read+write binary file handle
 # ---------------------------------------------------------------------------
 
-class BinaryReadWriter:
+class BinaryReadWriter( Reader, Writer, Seekable ):
 	__fd: FD
 
 	def __del__( self ) -> None:
@@ -100,6 +106,9 @@ class BinaryReadWriter:
 
 	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		return write_raw( self.__fd, buf, count )
+
+	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
+		return seek_raw( self.__fd, offset, whence )
 
 	def close( self ) -> None:
 		if self.__fd != INVALID_FD:
@@ -160,7 +169,7 @@ class File:
 			creation: u32 = CREATE_NEW
 		fd: FD = open_raw( path.get_cstr(), access, creation ).or_return()
 		if append:
-			seek_raw( fd, 0, FILE_END ).or_return()
+			seek_raw( fd, 0, SEEK_END ).or_return()
 		return Result.Ok( BinaryWriter._from_fd( fd ))
 
 	@compiler.target( os = not 'windows' )
@@ -211,7 +220,7 @@ class File:
 			creation: u32 = CREATE_NEW
 		fd: FD = open_raw( path.get_cstr(), access, creation ).or_return()
 		if append:
-			seek_raw( fd, 0, FILE_END ).or_return()
+			seek_raw( fd, 0, SEEK_END ).or_return()
 		return Result.Ok( BinaryReadWriter._from_fd( fd ))
 
 	@compiler.target( os = not 'windows' )

@@ -239,7 +239,7 @@ class WaitTask:
 		self.fd = fd
 		self.resumed = False
 	def run( self ) -> None:
-		sig = reactor.Signal( self.fd, True, False )
+		sig = reactor.fd_signal( self.fd, True, False )
 		reactor.wait_for_signal( sig ).unwrap( 'unexpected shutdown during test' )
 		self.resumed = True
 
@@ -327,7 +327,7 @@ def run() -> Result[i32, OSError]:
 	w = Writer( client )
 	t = threading.Thread( w.run )   # constructing already launches it
 
-	sig = reactor.Signal( conn.fileno(), True, False )
+	sig = reactor.fd_signal( conn.fileno(), True, False )
 	reactor.wait_for_signal( sig ).unwrap( 'unexpected shutdown during test' )
 	t.join()
 	return Result.Ok( 0 )
@@ -386,7 +386,7 @@ class Task1:
 		self.fd = fd
 		self.counter = counter
 	def run( self ) -> None:
-		sig = reactor.Signal( self.fd, True, False )
+		sig = reactor.fd_signal( self.fd, True, False )
 		reactor.wait_for_signal( sig ).unwrap( 'unexpected shutdown during test' )
 		self.counter.fetch_add( 100 )
 
@@ -499,7 +499,7 @@ class ShutdownTask:
 		self.fd = fd
 		self.result_flag = result_flag
 	def run( self ) -> None:
-		sig = reactor.Signal( self.fd, True, False )
+		sig = reactor.fd_signal( self.fd, True, False )
 		match reactor.wait_for_signal( sig ):
 			case Result.Ok( _ ):
 				self.result_flag.store( 1 )
@@ -597,7 +597,7 @@ class ShutdownTask:
 		self.fd = fd
 		self.result_flag = result_flag
 	def run( self ) -> None:
-		sig = reactor.Signal( self.fd, True, False )
+		sig = reactor.fd_signal( self.fd, True, False )
 		match reactor.wait_for_signal( sig ):
 			case Result.Ok( _ ):
 				self.result_flag.store( 1 )
