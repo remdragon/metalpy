@@ -1862,6 +1862,75 @@ def main() -> i32:
 			return compiler.cast( i32, 2 + after )
 		return 0
 ''' ),
+			# a wholly separate, gcc-specific bug found while porting lib/
+			# mmap.py's POSIX mmap(): a fallible __init__'s Err-path return
+			# always did a full INLINE unwind of the ENTIRE stack (fix #3
+			# above), reusing defer()'s captured, already-lowered
+			# instructions AS-IS (cfg.py's Epilogue.instructions - "the
+			# already-lowered replay body, reused as-is"). Fine on its own -
+			# a defer body normally only ever gets spliced in once - but the
+			# eventual success return still went through the ORDINARY shared
+			# epilogue label, so the SAME captured instructions got spliced
+			# into the generated C a second time. When the deferred body has
+			# its own sub-expression needing an intermediate temp
+			# (compiler.cast(...) below, matching mmap.py's own `sys.free(
+			# compiler.cast(Ptr[None], buf))`), that temp's declaration is
+			# baked into the captured instructions too - so the second
+			# splice re-declares the exact same name (this codebase never
+			# emits C block scoping, so both copies land at the same flat
+			# function scope): `redeclaration of '$tN' with no linkage`.
+			# clang/MSVC silently tolerate the redeclaration; only gcc
+			# actually enforces it as the hard C error it really is, so this
+			# only ever surfaced building for the POSIX/WSL-gcc target (see
+			# wsl_gcc_real_posix_target_testing memory - this repo's own
+			# python3, not native Windows Python, is required to actually
+			# compile the `os = not 'windows'` branch below for real). Fixed
+			# by teaching current_epilogue_label_for_construction_err() to
+			# route defer/errdefer (and any other non-attribute) entries
+			# through the ordinary shared label instead of forcing every
+			# pending entry inline just because SOME of them (self.<attr>
+			# entries specifically) need to stay inline - only those are
+			# actually at risk of complete_construction()'s retroactive
+			# cancellation.
+			( 'fallible_construction_defer_replayed_at_construction_err_and_success_no_redeclaration', '''
+class MyError:
+	pass
+
+class DeferReplay:
+	v: i32
+
+	@compiler.target( os = 'windows' )
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( buf ))
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+	@compiler.target( os = not 'windows' )
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	bad: Result[DeferReplay, MyError] = DeferReplay( -1 )
+	if not bad.is_err():
+		return 1
+	good: Result[DeferReplay, MyError] = DeferReplay( 7 )
+	d: DeferReplay = good.unwrap( 'construction failed' )
+	if d.v != 7:
+		return 2
+	return 0
+''' ),
 		] )
 
 class RCClassSubclassingPhase4Tests( test_support.RealCompileMixin, CompilerTestCase ):

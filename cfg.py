@@ -100,6 +100,7 @@ class Epilogue:
 	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
 	captured: bool = False # current_epilogue_label() has handed this entry's own .name out as a live jump target at least once - see manually_decreffed()/deleted()/move()'s shared _neutralize() helper for why this matters: a plain compile-time `cancelled = True` is only correct for an entry NO earlier return has already committed a goto into, since build_epilogue_ladder() bakes the entry's FINAL cancelled state into every jump site that shares it, not the state at each individual jump's own time
+	is_construction_attr: bool = False # a self.<attr> entry pushed by attr_assign()/complete_base_construction() during a fallible __init__ - see current_epilogue_label_for_construction_err()'s own docstring for why these can never share a label the way a defer/errdefer or plain local entry can
 
 	@property
 	def is_flag_guarded( self ) -> bool:
@@ -279,8 +280,8 @@ class CFGState:
 		# the bug complete_base_construction's own comment describes).
 		self._construction_required = list( required )
 
-	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None ) -> Epilogue:
-		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref )
+	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None, is_construction_attr: bool = False ) -> Epilogue:
+		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref, is_construction_attr = is_construction_attr )
 		self._epilogue_stack.append( entry )
 		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
@@ -1324,6 +1325,96 @@ class CFGState:
 			return inline_scope.label
 		return None
 
+	def current_epilogue_label_for_construction_err(
+		self, returned_operand: ir.Operand | None,
+	) -> tuple[str | None, list[ir.Instruction]]:
+		''' current_epilogue_label()'s counterpart for a fallible __init__'s
+		own Err-path return (lowering.py's _stmt_Return, construction_err_
+		path) - a self.<attr> entry (attr_assign()/complete_base_
+		construction(), entry.is_construction_attr) can never share a label
+		with the eventual success path: complete_construction() cancels
+		every required attribute WITHOUT a per-jump-site record (Epilogue.
+		cancelled is one mutable flag, not a snapshot - see its own
+		docstring), and an attribute has no runtime flag of its own the way
+		defer/errdefer does, so a shared rung for one is only sound for
+		returns strictly AFTER its assignment - never provably true once
+		more than one Err return exists. Those are therefore always
+		decref'd INLINE, right here, regardless of where they sit in the
+		stack.
+
+		Everything else pending (defer/errdefer, or a plain non-attribute
+		RC local) is never touched by complete_construction() at all -
+		exactly as safe to route through the ordinary shared epilogue
+		label as in a non-__init__ function. Returns (label, inline
+		instructions to emit before jumping to it) - label is None when
+		nothing needs a shared jump (caller falls back to a plain Return),
+		OR when a genuine hazard makes even a partial split unsound: an
+		attribute entry found BELOW the chosen shared candidate (only
+		provably safe for THIS return; a different, earlier Err return
+		reaching the very same label might not have that attribute
+		assigned yet) or either of current_epilogue_label()'s own bail-outs
+		(returned_operand aliasing a live entry anywhere in the stack, or a
+		confined loop/branch entry - both rare enough in a constructor to
+		not warrant a partial-inline treatment here). In every None case
+		the caller must fall back to plain return_() for the WHOLE stack,
+		exactly as before this method existed - the returned instruction
+		list is always [] alongside a None label, nothing to double-emit.
+
+		Pure classification first (which indices need an inline decref, and
+		whether a shared label is even reachable), THEN - only once that's
+		fully decided - a second pass that actually calls _decref_
+		instructions() for just the entries being kept. Not merged into one
+		pass: _decref_instructions() can mint fresh temps/labels for a
+		union-typed attribute (_extract_payload()'s own tag-gated path),
+		which land as real DeclareTemp instructions in the CURRENT
+		instruction stream as an unconditional side effect the moment
+		they're minted (lowering.py's own _new_temp(), passed in as this
+		class's new_temp callback) - calling it speculatively for an
+		attribute later discarded by a bail-out below would leak a stray,
+		never-populated temp declaration into the emitted C even though
+		this method's own contract is "never emits anything by itself". '''
+		if returned_operand is not None and any(
+			not entry.cancelled and entry.operand is returned_operand for entry in self._epilogue_stack
+		):
+			return None, []
+		confinement_floor = min( self._confinement_depths ) if self._confinement_depths else None
+		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
+		floor = inline_scope.boundary_depth if inline_scope is not None else 0
+		attr_indices: list[int] = []
+		candidate_index: int | None = None
+		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
+			if i < floor:
+				break
+			if entry.cancelled:
+				continue
+			if confinement_floor is not None and not entry.is_flag_guarded and i >= confinement_floor:
+				return None, []
+			if entry.is_construction_attr:
+				if candidate_index is None:
+					attr_indices.append( i )
+				else:
+					# live attribute entry BELOW our chosen candidate - not
+					# provably safe (see docstring) - bail to the caller's
+					# own full return_() fallback instead of a partial split
+					return None, []
+				continue
+			if candidate_index is None:
+				candidate_index = i
+		inline_instructions: list[ir.Instruction] = []
+		for i in attr_indices:
+			entry = self._epilogue_stack[i]
+			inline_instructions += self._decref_instructions( entry.type, entry.operand )
+		if candidate_index is None:
+			if inline_scope is not None:
+				inline_scope.captured = True
+				return inline_scope.label, inline_instructions
+			return None, inline_instructions
+		entry = self._epilogue_stack[candidate_index]
+		if inline_scope is None:
+			self._any_shared_label_used = True
+		entry.captured = True
+		return entry.name, inline_instructions
+
 	def used_shared_epilogue_label( self ) -> bool:
 		''' whether some ALREADY-LOWERED return/OrJump actually committed a
 		jump into one of this function's own shared epilogue labels (i.e.
@@ -1691,7 +1782,7 @@ class CFGState:
 			existing.entry.cancelled = False
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = existing.entry )
 		elif is_rc:
-			self._push( attr, attr.type, OwnState.OWNED, key = key )
+			self._push( attr, attr.type, OwnState.OWNED, key = key, is_construction_attr = True )
 		else:
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
 		return instructions
@@ -2092,7 +2183,7 @@ class CFGState:
 			)
 			key = f'self.{attr.stem}'
 			if rc_leaves( attr.type ):
-				self._push( attr, attr.type, OwnState.OWNED, key = key )
+				self._push( attr, attr.type, OwnState.OWNED, key = key, is_construction_attr = True )
 			else:
 				self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
 			# complete_construction()'s own success-path cancellation loop

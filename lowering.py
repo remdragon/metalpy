@@ -2706,7 +2706,17 @@ class FunctionLowering:
 				self._complete_construction_or_fail( self._current_fn )
 			else:
 				construction_err_path = True
-		label = None if construction_err_path else self._cfg.current_epilogue_label( value )
+		# a construction_err_path return still shares an ordinary label
+		# with defer/errdefer/plain-local entries - only self.<attr>
+		# entries (construction_err_inline) are forced inline, since only
+		# THOSE are at risk of complete_construction()'s retroactive
+		# cancellation - see current_epilogue_label_for_construction_err()'s
+		# own docstring
+		construction_err_inline: list[ir.Instruction] = []
+		if construction_err_path:
+			label, construction_err_inline = self._cfg.current_epilogue_label_for_construction_err( value )
+		else:
+			label = self._cfg.current_epilogue_label( value )
 		# the innermost active multi-statement @inline splice, if this
 		# return is reached from one of its own pre-return statements (see
 		# _splice_multi_statement_inline_body/self._inline_scope_vars' own
@@ -2742,6 +2752,13 @@ class FunctionLowering:
 			# ALSO decref it (return_()'s own docstring explains the
 			# identical concern for the other branch)
 			self._cfg.untrack_temp( value )
+			# construction_err_inline's own self.<attr> decrefs (if any) -
+			# always safe to run before the jump, never after: `value`
+			# itself can never alias one of them (current_epilogue_label_
+			# for_construction_err() already bails to a plain return_()
+			# fallback whenever `value` aliases ANY live stack entry)
+			for instr in construction_err_inline:
+				self._emit( instr )
 			# flushed HERE, before this branch's own unconditional
 			# ir.Jump - not left to _lower_stmt's own post-method flush,
 			# which runs strictly after this whole method returns and so

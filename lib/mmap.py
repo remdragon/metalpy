@@ -81,21 +81,11 @@ class mmap:
 			buf: Ptr[stat_t] = sys.alloc[stat_t]( 1 )
 			if buf is None:
 				return Result.Err( OSError( get_errno() ))
-			# manual free at each exit point, not defer(): a defer() here
-			# replayed at 2+ exit points (the early return right below, plus
-			# this function's own later returns) hits a confirmed compiler
-			# bug under gcc specifically - each replay site redeclares the
-			# same temp for compiler.cast(...)'s own sub-expression, a hard
-			# "redeclaration with no linkage" error (task_7a90c9ec) - clang/
-			# MSVC don't show it, so this only ever surfaced building for
-			# the POSIX/WSL-gcc target.
-			buf_raw: Ptr[None] = compiler.cast( Ptr[None], buf )
+			defer( sys.free( compiler.cast( Ptr[None], buf )))
 			if fstat( fileno, buf ) != 0:
 				err: i32 = get_errno()
-				sys.free( buf_raw )
 				return Result.Err( OSError( err ))
 			size: i64 = compiler.c_field( buf, 'st_size', i64 )
-			sys.free( buf_raw )
 			with compiler.panic_arithmetic( 'file size does not fit in usize' ):
 				real_length = usize( size )
 		if access == ACCESS_READ:
