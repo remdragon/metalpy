@@ -391,6 +391,7 @@ def main() -> i32:
 		u64_max: u64 = one - 2
 	with compiler.panic_arithmetic("ov"):
 		bad: i32 = i32(u64_max)
+		if bad != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 		self._assert_program_panics( '''
@@ -400,6 +401,7 @@ def main() -> i32:
 		usize_max: usize = one - 2
 	with compiler.panic_arithmetic("ov"):
 		bad: i32 = i32(usize_max)
+		if bad != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -439,6 +441,7 @@ def main() -> i32:
 		u128_max: u128 = ( one << 127 ) * 2 - 1
 	with compiler.panic_arithmetic("ov"):
 		bad: i32 = i32(u128_max)
+		if bad != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 

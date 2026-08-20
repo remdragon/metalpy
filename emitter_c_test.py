@@ -2903,6 +2903,8 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 			'	foo: Foo = Foo.make( 1 )',
 			'	bar: Foo = foo',
 			'	rc: usize = compiler.refcount( bar )',
+			'	if rc == usize( 0 ):', # touch it - actually proves refcount() returns something real, not just "compiles"
+			'		return 0',
 			'	with compiler.wrap_arithmetic:',
 			'		return bar.x',
 		]))
@@ -3010,6 +3012,8 @@ class SizeofValueArgumentRealCompileTests( RCClassTestCase ):
 			'		return 1',
 			'	if compiler.sizeof( v ) != 4:',
 			'		return 2',
+			'	if v != 0:', # a real runtime read of v - every use above is compiler.sizeof(v), which only needs v's static TYPE and folds away at compile time, never actually touching v itself
+			'		return 3',
 			'	return 0',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -3220,6 +3224,7 @@ class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 			'',
 			'def main() -> None:',
 			'	x: u32 = STD_OUTPUT_HANDLE',
+			'	x = u32( x )', # touch x - actually reads the global, not just "compiles" (same-width construct-cast, always infallible, no dunder needed - this minimal harness has no builtins imported)
 			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
@@ -12560,7 +12565,6 @@ def main() -> i32:
 			( 'no_explicit_else_still_narrows', '''
 def describe( x: i32|str ) -> usize:
 	with compiler.wrap_arithmetic:
-		result: usize = 0
 		if type( x ) is i32:
 			return 999
 		return x.byte_len()
@@ -14253,6 +14257,10 @@ def main() -> i32:
 	sz: usize = compiler.sizeof( Foo )
 	if sz != usize( 10 ):
 		return 1
+	if f.a != u16( 0 ): # actually verify the "zero-fill" this case is named for
+		return 2
+	if f.b[0] != 0 or f.b[7] != 0:
+		return 3
 	return 0
 ''' ),
 			# explicit ClassName(field=0) construction argument (not just the
@@ -14367,6 +14375,8 @@ def main() -> i32:
 		count: usize = compiler.sizeof( f.arr ) // compiler.sizeof( u16 )
 	if count != usize( 32 ):
 		return 3
+	if f.a != u32( 0 ): # a real runtime read of f - every use above is compiler.sizeof(f.<field>), which only needs f's static TYPE and folds away at compile time, never actually touching f itself
+		return 4
 	return 0
 ''' ),
 		] )
@@ -17923,6 +17933,7 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen()
 		r = g.send( 5 ).unwrap( 'unexpected error' )
+		if r != 0: pass # touch it - the panic above means this never actually runs
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -17943,7 +17954,9 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen()
 		r0 = g.__next__().unwrap( 'unexpected error' )
+		if r0 != 0: pass # touch it - the panic below means this never actually runs
 		r1 = g.__next__().unwrap( 'unexpected error' ) # resumes the captured yield without sending - must panic, not silently deliver garbage
+		if r1 != 0: pass # touch it - the panic above means this never actually runs
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -18045,7 +18058,9 @@ def collector() -> Generator[i32, Box, NoError | StopIteration]:
 def make_send_and_drop( b: Box ) -> None:
 	g = collector()
 	r0 = g.__next__().unwrap( 'e' )
+	if r0 != 0: pass # touch it - deliberately never otherwise read
 	r1 = g.send( b ).unwrap( 'e' )
+	if r1 != 0: pass # touch it - deliberately never otherwise read
 	# g abandoned here mid-iteration - both held and __send_slot still
 	# hold their own reference to b, must both be released by the
 	# generator's own destructor

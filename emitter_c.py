@@ -2314,7 +2314,7 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	needs_return_value = any(
 		( isinstance( instr, ir.OrJump ) and instr.return_slot is not None )
 		or ( isinstance( instr, ir.Return ) and isinstance( instr.value, Variable ) and instr.value.stem == '__return_value' )
-		or ( isinstance( instr, ir.Label ) and 'epilogue' in instr.name ) # _new_label('epilogue') -> '__epilogue_N__', not a bare prefix
+		or ( isinstance( instr, ir.Label ) and instr.name.startswith( '__epilogue_' ) ) # _new_label('epilogue') -> '__epilogue_N__' - NOT a bare 'epilogue' substring test: _new_label('inline_epilogue') -> '__inline_epilogue_N__' also contains 'epilogue' but is a totally unrelated @inline splice-scope merge label (build_inline_scope_ladder's own, never touches __return_value at all) - a real, confirmed false-positive-triggered -Wunused-variable on a genuinely never-needed __return_value once one of those coexists in the same function with nothing that actually needs the real one
 		for instr in fn.instructions
 	)
 	if needs_return_value and not _returns_void_in_c( function.return_type ):
