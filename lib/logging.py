@@ -38,9 +38,9 @@ import threading
 # commit message). A raw FD field, mirroring how lib/threading.py's
 # FastLock/lib/atomic.py's Atomic[T] already hold their own raw handles
 # directly, sidesteps it entirely.
-from fs import FD, INVALID_FD, close_raw, open_raw, seek_raw, write_all
+from fs import FD, INVALID_FD, SEEK_END, close_raw, open_raw, seek_raw, write_all
 if compiler.target.os == 'windows':
-	from fs import GENERIC_WRITE, OPEN_ALWAYS, FILE_END
+	from fs import GENERIC_WRITE, OPEN_ALWAYS
 else:
 	from fs import O_WRONLY, O_CREAT, O_APPEND
 
@@ -148,7 +148,7 @@ class FileHandler( Handler ):
 	def __init__( self, path: str ) -> Result[None, OSError]:
 		super().__init__()
 		fd: FD = open_raw( path.get_cstr(), GENERIC_WRITE, OPEN_ALWAYS ).or_return()
-		seek_raw( fd, 0, FILE_END ).or_return()
+		seek_raw( fd, 0, SEEK_END ).or_return()
 		self.__fd = fd
 		return Result.Ok( None )
 

@@ -12,6 +12,10 @@ class OSError: # windows version of base class for I/O errors
 	TimedOut          = 10060 # WSAETIMEDOUT
 	AddressInUse      = 10048 # WSAEADDRINUSE
 	WouldBlock        = 10035 # WSAEWOULDBLOCK
+	Interrupted       = 10004 # WSAEINTR - reactor.wait_for_signal() maps a
+	                          # ShutdownError onto this: the wait genuinely
+	                          # was interrupted before the I/O it was
+	                          # standing in for completed.
 	# getaddrinfo()'s own failures genuinely ARE WSA-error-code-compatible on
 	# Windows (unlike POSIX - see the i32 branch below), so this is the real
 	# WSAHOST_NOT_FOUND value, not a synthetic placeholder. Only the single
@@ -34,6 +38,10 @@ class OSError: # linux version of base class for I/O errors
 	TimedOut          = 110 # ETIMEDOUT
 	AddressInUse      = 98  # EADDRINUSE
 	WouldBlock        = 11  # EWOULDBLOCK == EAGAIN on Linux
+	Interrupted       = 4   # EINTR - reactor.wait_for_signal() maps a
+	                        # ShutdownError onto this: the wait genuinely was
+	                        # interrupted before the I/O it was standing in
+	                        # for completed.
 	# NOT a real errno - getaddrinfo()'s own failures on POSIX are EAI_*
 	# codes, a wholly separate (small, negative) namespace from errno that
 	# doesn't map onto this enum's errno-based values at all (see
