@@ -3869,6 +3869,24 @@ class TypeResolver:
 		resolve = getattr( obj, 'resolve', None )
 		if resolve is not None:
 			resolve()
+		if isinstance( obj, Specialization ) and not self.monomorphizer._is_concrete( obj ):
+			# a Specialization still mentioning a TypeVar (e.g. a still-
+			# generic function's own declared return type, found via a bare-
+			# name lookup that never bound its type params - see
+			# _type_of_expr's Call-node handling) is not a real compile unit
+			# and must never reach schedule()/monomorphize_class(): the
+			# Specialization+ClassLike branch below has no concreteness
+			# guard of its own (unlike _eagerly_monomorphize_declared_type's
+			# identical check), so handing it a bare TypeVar-typed spec
+			# silently built a bogus "concrete" class whose own fields were
+			# still typed with that TypeVar - confirmed by a real repro (a
+			# generic free function converting between two Result error
+			# types, forwarding the same T success payload, crashed
+			# emitter_c.py's c_type on the unresolved T). Same "any doubt,
+			# bail" discipline as every other caller in this pass - hand
+			# back the abstract Specialization unchanged rather than
+			# corrupting it into a fake concrete one
+			return obj
 		if isinstance( obj, Function ):
 			# PLAN_GENERATORS.md - must happen HERE, not deferred until obj's
 			# own turn on the work queue: a call site needs obj's REAL return
