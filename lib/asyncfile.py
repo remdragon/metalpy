@@ -1,55 +1,45 @@
 '''
-AsyncBinaryReader / AsyncBinaryWriter / AsyncBinaryReadWriter — Reader/
-Writer/Seekable-conforming file handles whose read()/write() offload the
-actual blocking syscall to a small background thread pool when a Reactor is
-driving the calling fiber, freeing that fiber's own Worker thread to keep
-serving other connections while the disk I/O is in flight - unlike
-lib/builtins/__File.py's BinaryReader/BinaryWriter/BinaryReadWriter, which
-always call the blocking syscall directly on the calling thread (the right
-choice for an ordinary synchronous script, wrong for a server that wants
-one slow file read to not stall every OTHER connection sharing that
-Worker). This is the "thread-pool dispatch" half of the two options
-PLAN_NON_BLOCKING_IO.md's own design notes called out for file I/O
-(regular files are always "ready" to epoll/WSAPoll, so a readiness poller
-can't help here the way it does for sockets) - io_uring/IOCP is the other,
-deferred (see reactor.Signal.Completion's own docstring: this pool is a
+The reactor-aware AsyncFileOps implementation, plus AsyncFile - a thin
+namespace that hands back an ordinary BinaryReader/BinaryWriter/
+BinaryReadWriter (lib/builtins/__File.py) with this module's own
+implementation injected into its __aio hook.
+
+Regular files are always "ready" to epoll/WSAPoll, so the readiness-poller
+approach that makes lib/tcp.py non-blocking doesn't apply to file I/O -
+this offloads the actual blocking read/write syscall to a small background
+thread pool instead, freeing the calling fiber's own Worker thread to keep
+serving other connections while disk I/O is in flight (io_uring/IOCP stays
+deferred - see reactor.Signal.Completion's own docstring: this pool is a
 real, non-IOCP producer of that exact same signal shape).
+
+Because BinaryReader/BinaryWriter/BinaryReadWriter's own read()/write()
+already branch on __aio being set, there's no separate Async* class here
+at all - AsyncFile.binary_reader()/binary_writer()/binary_read_writer()
+just call File's own factories and inject this module's AsyncFileOps
+implementation. Plain File.binary_reader() (no reactor dependency at all)
+and AsyncFile.binary_reader() (this module) both return the exact same
+BinaryReader type - only whichever caller wants reactor-aware dispatch
+needs to import this module in the first place.
 
 With no current_worker() (no Reactor driving this thread), read()/write()
 skip the pool entirely and call the syscall directly - identical to
-BinaryReader/BinaryWriter/BinaryReadWriter, matching every other
-reactor-optional type in this codebase (see reactor.wait_for_signal's own
-docstring).
+File.binary_reader() et al., matching every other reactor-optional type in
+this codebase (see reactor.wait_for_signal's own docstring).
 
 Deliberately NOT pooled: open()/seek()/tell() - metadata-ish operations,
 typically fast even on real disks/network filesystems, not worth the
 thread-hop for a first cut (a future revision could pool these too if a
 real workload shows otherwise).
 
-The pool itself is a fixed-size set of daemon threads, lazily started on
-first real use (see _ensure_pool's own comment for why NOT eagerly at
-module/import time - a real, confirmed compiler bug).
+The pool itself is a fixed-size set of daemon threads, started at
+module/import time (see _pool's own comment).
 '''
 
 import compiler
-import sys
 import threading
 import socket
 import fs
-import io
 import reactor
-from fs import FD, INVALID_FD, SEEK_END
-
-if compiler.target.os == 'windows':
-	from fs import (
-		GENERIC_READ, GENERIC_WRITE,
-		CREATE_NEW, CREATE_ALWAYS, OPEN_EXISTING, OPEN_ALWAYS, TRUNCATE_EXISTING,
-	)
-else:
-	from fs import (
-		O_RDONLY, O_WRONLY, O_RDWR,
-		O_CREAT, O_EXCL, O_TRUNC, O_APPEND,
-	)
 
 _POOL_SIZE: usize = usize( 4 )
 
@@ -149,260 +139,92 @@ class _Pool:
 		w.submit( job )
 
 
-# Lazily constructed on first real use, NOT eagerly at module/static-init
-# time - a real, confirmed compiler bug: a Socket (this pool's own
-# per-worker wake pair, via socket.make_loopback_pair()) constructed during
-# module-level static initialization (before main() ever runs) crashes
-# (SIGILL) the first time a DIFFERENT thread later calls .recv() on it,
-# even though the exact same construction succeeds and works fine when
-# done from inside main() instead. Isolated with a minimal repro (a Socket
-# pair built in a top-level `_x: T = T()` binding vs. the identical code
-# built inside main()) - not chased down further here; worth its own
-# investigation. Double-checked locking (_pool_lock, itself just a plain
-# OS mutex - safe to construct at module scope, unlike a Socket) makes
-# first-use construction safe under concurrent callers.
-_pool: _Pool|None = None
-_pool_lock: threading.FastLock = threading.FastLock()
-
-def _ensure_pool() -> _Pool:
-	global _pool
-	if _pool is not None:
-		return _pool
-	_pool_lock.acquire().unwrap( '_ensure_pool: lock acquire failed' )
-	if _pool is None:
-		_pool = _Pool( _POOL_SIZE )
-	p: _Pool = _pool
-	_pool_lock.release()
-	return p
-
-def _submit_read( fd: FD, buf: Ptr[u8], count: usize, w: reactor.Worker ) -> Result[usize, OSError]:
-	handle: reactor.CompletionHandle = reactor.CompletionHandle()
-	work: Closure[[], Result[usize, OSError]] = lambda: fs.read_raw( fd, buf, count )
-	_ensure_pool().submit( _Job( handle = handle, work = work, waiter = w ))
-	match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
-		case Result.Ok( _ ):
-			pass
-		case Result.Err( werr ):
-			return Result.Err( _wait_error_to_os_error( werr ))
-	return handle.take()
-
-def _submit_write( fd: FD, buf: ConstPtr[u8], count: usize, w: reactor.Worker ) -> Result[usize, OSError]:
-	handle: reactor.CompletionHandle = reactor.CompletionHandle()
-	work: Closure[[], Result[usize, OSError]] = lambda: fs.write_raw( fd, buf, count )
-	_ensure_pool().submit( _Job( handle = handle, work = work, waiter = w ))
-	match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
-		case Result.Ok( _ ):
-			pass
-		case Result.Err( werr ):
-			return Result.Err( _wait_error_to_os_error( werr ))
-	return handle.take()
+# A top-level binding, constructed at module/import time - previously
+# lazily constructed instead, to work around a real compiler bug (a Socket
+# built during static/global init crashed on first cross-thread use).
+# CONFIRMED FIXED (task_12a321c3 - the root cause was a global-init
+# ordering gap in _topologically_sort_globals, fixed by a concurrent
+# session's own unrelated work, commit 0e82361/81d91d1) - reverified via
+# the original repro before removing the workaround here.
+_pool: _Pool = _Pool( _POOL_SIZE )
 
 
 # ---------------------------------------------------------------------------
-# AsyncBinaryReader / AsyncBinaryWriter / AsyncBinaryReadWriter
+# _ReactorAsyncFileOps — the AsyncFileOps implementation this whole module
+# exists to provide. Stateless (a single shared instance, _ops below) -
+# every real per-operation state lives in the CompletionHandle/_Job each
+# call constructs fresh.
 # ---------------------------------------------------------------------------
 
-class AsyncBinaryReader( io.Reader, io.Seekable ):
-	__fd: FD
-
-	def __del__( self ) -> None:
-		if self.__fd != INVALID_FD:
-			fs.close_raw( self.__fd ).is_ok()
-
-	def read( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
+class _ReactorAsyncFileOps( AsyncFileOps ):
+	@virtual
+	def do_read( self, fd: fs.FD, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		w: reactor.Worker|None = reactor.current_worker()
 		if w is None:
-			return fs.read_raw( self.__fd, buf, count )
-		return _submit_read( self.__fd, buf, count, w )
+			return fs.read_raw( fd, buf, count )
+		handle: reactor.CompletionHandle = reactor.CompletionHandle()
+		work: Closure[[], Result[usize, OSError]] = lambda: fs.read_raw( fd, buf, count )
+		_pool.submit( _Job( handle = handle, work = work, waiter = w ))
+		match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
+			case Result.Ok( _ ):
+				pass
+			case Result.Err( werr ):
+				return Result.Err( _wait_error_to_os_error( werr ))
+		return handle.take()
 
-	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
-		return fs.seek_raw( self.__fd, offset, whence )
-
-	def close( self ) -> None:
-		if self.__fd != INVALID_FD:
-			fs.close_raw( self.__fd ).is_ok()
-			self.__fd = INVALID_FD
-
-	@private
-	@staticmethod
-	def _from_fd( fd: FD ) -> AsyncBinaryReader:
-		return AsyncBinaryReader.__allocate__( __fd = fd )
-
-
-class AsyncBinaryWriter( io.Writer, io.Seekable ):
-	__fd: FD
-
-	def __del__( self ) -> None:
-		if self.__fd != INVALID_FD:
-			fs.close_raw( self.__fd ).is_ok()
-
-	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
+	@virtual
+	def do_write( self, fd: fs.FD, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		w: reactor.Worker|None = reactor.current_worker()
 		if w is None:
-			return fs.write_raw( self.__fd, buf, count )
-		return _submit_write( self.__fd, buf, count, w )
-
-	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
-		return fs.seek_raw( self.__fd, offset, whence )
-
-	def close( self ) -> None:
-		if self.__fd != INVALID_FD:
-			fs.close_raw( self.__fd ).is_ok()
-			self.__fd = INVALID_FD
-
-	@private
-	@staticmethod
-	def _from_fd( fd: FD ) -> AsyncBinaryWriter:
-		return AsyncBinaryWriter.__allocate__( __fd = fd )
+			return fs.write_raw( fd, buf, count )
+		handle: reactor.CompletionHandle = reactor.CompletionHandle()
+		work: Closure[[], Result[usize, OSError]] = lambda: fs.write_raw( fd, buf, count )
+		_pool.submit( _Job( handle = handle, work = work, waiter = w ))
+		match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
+			case Result.Ok( _ ):
+				pass
+			case Result.Err( werr ):
+				return Result.Err( _wait_error_to_os_error( werr ))
+		return handle.take()
 
 
-class AsyncBinaryReadWriter( io.Reader, io.Writer, io.Seekable ):
-	__fd: FD
-
-	def __del__( self ) -> None:
-		if self.__fd != INVALID_FD:
-			fs.close_raw( self.__fd ).is_ok()
-
-	def read( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
-		w: reactor.Worker|None = reactor.current_worker()
-		if w is None:
-			return fs.read_raw( self.__fd, buf, count )
-		return _submit_read( self.__fd, buf, count, w )
-
-	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
-		w: reactor.Worker|None = reactor.current_worker()
-		if w is None:
-			return fs.write_raw( self.__fd, buf, count )
-		return _submit_write( self.__fd, buf, count, w )
-
-	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
-		return fs.seek_raw( self.__fd, offset, whence )
-
-	def close( self ) -> None:
-		if self.__fd != INVALID_FD:
-			fs.close_raw( self.__fd ).is_ok()
-			self.__fd = INVALID_FD
-
-	@private
-	@staticmethod
-	def _from_fd( fd: FD ) -> AsyncBinaryReadWriter:
-		return AsyncBinaryReadWriter.__allocate__( __fd = fd )
+_ops: _ReactorAsyncFileOps = _ReactorAsyncFileOps()
 
 
 # ---------------------------------------------------------------------------
 # AsyncFile — namespace with static factory methods, mirrors
-# lib/builtins/__File.py's own File namespace exactly (open() itself stays
-# synchronous - see this module's own header comment).
+# lib/builtins/__File.py's own File namespace exactly, just injecting
+# _ops into the BinaryReader/BinaryWriter/BinaryReadWriter File's own
+# factories already build (open() itself stays synchronous - see this
+# module's own header comment).
 # ---------------------------------------------------------------------------
 
 class AsyncFile:
 
-	@compiler.target( os = 'windows' )
 	@staticmethod
-	def binary_reader( path: str ) -> Result[AsyncBinaryReader, OSError]:
-		fd: FD = fs.open_raw( path.get_cstr(), GENERIC_READ, OPEN_EXISTING ).or_return()
-		return Result.Ok( AsyncBinaryReader._from_fd( fd ))
+	def binary_reader( path: str ) -> Result[BinaryReader, OSError]:
+		r: BinaryReader = File.binary_reader( path ).or_return()
+		r._set_aio( _ops )
+		return Result.Ok( r )
 
-	@compiler.target( os = not 'windows' )
-	@staticmethod
-	def binary_reader( path: str ) -> Result[AsyncBinaryReader, OSError]:
-		fd: FD = fs.open_raw( path.get_cstr(), O_RDONLY, 0 ).or_return()
-		return Result.Ok( AsyncBinaryReader._from_fd( fd ))
-
-	@compiler.target( os = 'windows' )
 	@staticmethod
 	def binary_writer(
 		path: str,
 		append: bool = False,
 		truncate: bool = True,
 		exists: bool|None = None,
-	) -> Result[AsyncBinaryWriter, OSError]:
-		access: u32 = GENERIC_WRITE
-		if exists is None:
-			if truncate:
-				creation: u32 = CREATE_ALWAYS
-			else:
-				creation: u32 = OPEN_ALWAYS
-		elif exists:
-			if truncate:
-				creation: u32 = TRUNCATE_EXISTING
-			else:
-				creation: u32 = OPEN_EXISTING
-		else:
-			creation: u32 = CREATE_NEW
-		fd: FD = fs.open_raw( path.get_cstr(), access, creation ).or_return()
-		if append:
-			fs.seek_raw( fd, 0, SEEK_END ).or_return()
-		return Result.Ok( AsyncBinaryWriter._from_fd( fd ))
+	) -> Result[BinaryWriter, OSError]:
+		w: BinaryWriter = File.binary_writer( path, append, truncate, exists ).or_return()
+		w._set_aio( _ops )
+		return Result.Ok( w )
 
-	@compiler.target( os = not 'windows' )
-	@staticmethod
-	def binary_writer(
-		path: str,
-		append: bool = False,
-		truncate: bool = True,
-		exists: bool|None = None,
-	) -> Result[AsyncBinaryWriter, OSError]:
-		flags: i32 = O_WRONLY
-		if exists is None:
-			flags |= O_CREAT
-			if truncate:
-				flags |= O_TRUNC
-		elif exists:
-			if truncate:
-				flags |= O_TRUNC
-		else:
-			flags |= O_CREAT | O_EXCL
-		if append:
-			flags |= O_APPEND
-		fd: FD = fs.open_raw( path.get_cstr(), flags, 0o644 ).or_return()
-		return Result.Ok( AsyncBinaryWriter._from_fd( fd ))
-
-	@compiler.target( os = 'windows' )
 	@staticmethod
 	def binary_read_writer(
 		path: str,
 		append: bool = False,
 		truncate: bool = True,
 		exists: bool|None = None,
-	) -> Result[AsyncBinaryReadWriter, OSError]:
-		access: u32 = GENERIC_READ | GENERIC_WRITE
-		if exists is None:
-			if truncate:
-				creation: u32 = CREATE_ALWAYS
-			else:
-				creation: u32 = OPEN_ALWAYS
-		elif exists:
-			if truncate:
-				creation: u32 = TRUNCATE_EXISTING
-			else:
-				creation: u32 = OPEN_EXISTING
-		else:
-			creation: u32 = CREATE_NEW
-		fd: FD = fs.open_raw( path.get_cstr(), access, creation ).or_return()
-		if append:
-			fs.seek_raw( fd, 0, SEEK_END ).or_return()
-		return Result.Ok( AsyncBinaryReadWriter._from_fd( fd ))
-
-	@compiler.target( os = not 'windows' )
-	@staticmethod
-	def binary_read_writer(
-		path: str,
-		append: bool = False,
-		truncate: bool = True,
-		exists: bool|None = None,
-	) -> Result[AsyncBinaryReadWriter, OSError]:
-		flags: i32 = O_RDWR
-		if exists is None:
-			flags |= O_CREAT
-			if truncate:
-				flags |= O_TRUNC
-		elif exists:
-			if truncate:
-				flags |= O_TRUNC
-		else:
-			flags |= O_CREAT | O_EXCL
-		if append:
-			flags |= O_APPEND
-		fd: FD = fs.open_raw( path.get_cstr(), flags, 0o644 ).or_return()
-		return Result.Ok( AsyncBinaryReadWriter._from_fd( fd ))
+	) -> Result[BinaryReadWriter, OSError]:
+		rw: BinaryReadWriter = File.binary_read_writer( path, append, truncate, exists ).or_return()
+		rw._set_aio( _ops )
+		return Result.Ok( rw )

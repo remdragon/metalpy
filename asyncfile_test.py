@@ -1,6 +1,7 @@
-# asyncfile_test.py — real compile+link+run coverage for lib/asyncfile.py's
-# AsyncBinaryReader/AsyncBinaryWriter/AsyncBinaryReadWriter and the thread
-# pool they're built on.
+# asyncfile_test.py — real compile+link+run coverage for lib/asyncfile.py:
+# AsyncFile's factories inject this module's AsyncFileOps implementation
+# into an ordinary BinaryReader/BinaryWriter/BinaryReadWriter (lib/builtins/
+# __File.py), plus the thread pool that implementation is built on.
 
 import unittest
 from pathlib import Path
@@ -50,13 +51,73 @@ class Reader:
 def run() -> Result[i32, OSError]:
 	path: str = 'asyncfile_test_tmp.bin'
 	msg: bytes = b'hello async world\\n'
-	w: asyncfile.AsyncBinaryWriter = asyncfile.AsyncFile.binary_writer( path ).or_return()
+	w: BinaryWriter = asyncfile.AsyncFile.binary_writer( path ).or_return()
 	io.write_all( w, msg.get_const_ptr(), len( msg )).or_return()
 	w.close()
 
 	flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
 	reader = Reader( path, flag )
 
+	r: reactor.Reactor = reactor.Reactor( 1 )
+	r.spawn( reader.run )
+	r.run()
+
+	if flag.load() != 1:
+		return Result.Ok( flag.load() )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match run():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 90
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
+
+	def test_plain_file_reader_stays_unpooled_inside_a_reactor( self ) -> None:
+		''' the injection is opt-in, not automatic: a BinaryReader obtained
+		via plain File.binary_reader() (never touching lib/asyncfile.py at
+		all) must keep calling read_raw() directly even when constructed
+		and used from inside a Reactor-driven fiber - only AsyncFile's own
+		factories inject the pool-backed AsyncFileOps. '''
+		self._run( '''
+import compiler
+import reactor
+import atomic
+
+class Reader:
+	path: str
+	flag: atomic.Atomic[i32]
+	def __init__( self, path: str, flag: atomic.Atomic[i32] ) -> None:
+		self.path = path
+		self.flag = flag
+	def run( self ) -> None:
+		match File.binary_reader( self.path ):
+			case Result.Ok( r ):
+				match r.readline():
+					case Result.Ok( line ):
+						if line.decode().unwrap( 'decode' ) == 'plain inside reactor\\n':
+							self.flag.store( 1 )
+						else:
+							self.flag.store( 2 )
+					case Result.Err( _ ):
+						self.flag.store( 3 )
+			case Result.Err( _ ):
+				self.flag.store( 4 )
+
+def run() -> Result[i32, OSError]:
+	path: str = 'asyncfile_test_plain_tmp.bin'
+	msg: bytes = b'plain inside reactor\\n'
+	w: BinaryWriter = File.binary_writer( path ).or_return()
+	n: usize = w.write( msg.get_const_ptr(), len( msg )).or_return()
+	if n != len( msg ):
+		return Result.Ok( 5 )
+	w.close()
+
+	flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
+	reader = Reader( path, flag )
 	r: reactor.Reactor = reactor.Reactor( 1 )
 	r.spawn( reader.run )
 	r.run()
@@ -84,11 +145,11 @@ import asyncfile
 def run() -> Result[i32, OSError]:
 	path: str = 'asyncfile_test_noreactor_tmp.bin'
 	msg: bytes = b'plain blocking path\\n'
-	w: asyncfile.AsyncBinaryWriter = asyncfile.AsyncFile.binary_writer( path ).or_return()
+	w: BinaryWriter = asyncfile.AsyncFile.binary_writer( path ).or_return()
 	io.write_all( w, msg.get_const_ptr(), len( msg )).or_return()
 	w.close()
 
-	r: asyncfile.AsyncBinaryReader = asyncfile.AsyncFile.binary_reader( path ).or_return()
+	r: BinaryReader = asyncfile.AsyncFile.binary_reader( path ).or_return()
 	line: bytearray = r.readline().or_return()
 	if line.decode().unwrap( 'decode' ) != 'plain blocking path\\n':
 		return Result.Ok( 1 )
@@ -158,7 +219,7 @@ class Task:
 		tracker: Tracker = self.tracker
 		work: Closure[[], Result[usize, OSError]] = lambda: _slow_job( tracker )
 		job = asyncfile._Job( handle = handle, work = work, waiter = w )
-		asyncfile._ensure_pool().submit( job )
+		asyncfile._pool.submit( job )
 		reactor.wait_for_signal( reactor.Signal.Completion( handle )).unwrap( 'wait_for_signal' )
 
 def run() -> i32:
