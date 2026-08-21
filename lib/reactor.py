@@ -78,10 +78,24 @@
 # one such thread alive and switching fibers at once) no longer race on
 # shared fiber-switch bookkeeping. This scaffolding's OWN queues
 # (__pending_tasks/__ready_to_unpark/__idle_pool) were already safe
-# either way (list[T]'s own internal lock) - not yet stress-tested under
-# real multi-worker concurrency here, though (this file's own tests still
-# use a single worker) - worth a dedicated multi-worker test once real
-# I/O work lands and there's a genuine reason to run more than one.
+# either way (list[T]'s own internal lock).
+#
+# A real multi-worker termination bug WAS found once something actually
+# exercised the round-robin spawn() pattern a real server needs (an
+# accept-loop fiber, itself already running on one worker, spawning a
+# fresh per-connection handler task while the Reactor is already mid-run):
+# Worker.drain_fully() used to return the instant ITS OWN queues went
+# idle, with no way to know a sibling worker's in-flight fiber might still
+# call Reactor.spawn() and round-robin fresh work onto it - a worker that
+# happened to start (or drain to) empty could exit and its OS thread end
+# before ever receiving work spawned onto it later, silently dropping that
+# task forever (Reactor.spawn()'s w.schedule() call still succeeds - it
+# just enqueues onto a Worker nobody is left driving). Fixed via
+# _ReactorState.live_tasks, a Reactor-wide "still live somewhere" counter
+# every Worker.schedule()/task-completion keeps balanced - see
+# _ReactorState and Worker.drain_fully's own docstrings for the full
+# mechanism, and test_reactor_multiworker_spawn_from_inside_a_running_
+# fiber below for the regression test that first caught this.
 
 import compiler
 import sys
@@ -375,6 +389,48 @@ def _blocking_wait_no_reactor( signal: Signal ) -> Result[None, WaitError]:
 			sys.panic( '_blocking_wait_no_reactor: Completion signals require a Worker to hand the result back to - callers must check current_worker() before constructing one' )
 
 
+class _ReactorState:
+	''' shared once per Reactor across every one of its Workers (see
+	Reactor.__init__) - the ONLY extra state Worker.drain_fully() needs to
+	tell "nothing queued on ME" apart from "nothing live ANYWHERE in this
+	Reactor". That distinction matters because Reactor.spawn() round-robins:
+	a worker that starts out with an empty queue (or drains to empty first)
+	must not exit just because IT personally has nothing queued - another
+	worker's still-running fiber may yet call Reactor.spawn() and land fresh
+	work on it (see this module's own header note - this closes that gap,
+	first hit by a real multi-worker HTTP server POC spawning per-connection
+	handlers from an already-running accept-loop fiber).
+
+	live_tasks counts every task from its Worker.schedule() call until the
+	underlying fiber actually finishes for good (however many park()/
+	unpark() cycles that takes in between - a single schedule() call only
+	ever produces one +1/-1 pair, the -1 applied by __requeue_by_state's own
+	IDLE case once the fiber genuinely runs to completion). A worker treats
+	the whole Reactor as quiescent, not just itself, once this hits zero.
+
+	Deliberately holds nothing BUT this counter - no back-reference to the
+	Workers themselves. Worker already owns a `_ReactorState` strongly (see
+	_attach_reactor_state); a `list[Worker]` here too (e.g. to broadcast-wake
+	every worker the instant this hits zero) would make Worker and
+	_ReactorState a reference cycle under this codebase's plain refcounting,
+	leaking every Reactor for the process's whole lifetime. So instead of a
+	wake broadcast, an idle worker with nothing local left discovers global
+	quiescence via its own short, bounded periodic recheck - see
+	drain_fully's own docstring (_QUIESCENCE_RECHECK_MS). '''
+	live_tasks: atomic.Atomic[i64]
+	def __init__( self ) -> None:
+		self.live_tasks = atomic.Atomic[i64]( 0 )
+
+
+# how often an idle Reactor-owned Worker (empty queues, no local signal
+# wait, but the Reactor's shared live_tasks count is still nonzero) rechecks
+# whether the REST of the Reactor has finished - see drain_fully's own
+# docstring. Short enough that Reactor.run() converges promptly once every
+# worker's own work is genuinely done; long enough that idle workers aren't
+# meaningfully busy-spinning while waiting on siblings that still have work.
+_QUIESCENCE_RECHECK_MS: i32 = 50
+
+
 class Worker:
 	__pending_tasks: list[Closure[[], None]]
 	__ready_to_unpark: list[fiber.Fiber]
@@ -386,6 +442,7 @@ class Worker:
 	__wake_write: socket.Socket
 	__wake_fd: poller.SOCKET
 	__shutting_down: atomic.Atomic[bool]
+	__reactor_state: _ReactorState|None
 
 	def __init__( self ) -> None:
 		self.__pending_tasks = list[Closure[[], None]]()
@@ -401,11 +458,24 @@ class Worker:
 		self.__wake_write = wake_write
 		self.__wake_fd = wake_read.fileno()
 		self.__shutting_down = atomic.Atomic[bool]( False )
+		self.__reactor_state = None
 		# registered ONCE, unconditionally, for this Worker's whole
 		# lifetime - unlike __registered_fds/__waiting (per-wait, torn
 		# down once satisfied), the wake fd is infrastructure, always
 		# watched, never removed
 		self.__poller.register( self.__wake_fd, True, False ).unwrap( 'Worker.__init__: poller register (wake fd) failed' )
+
+	def _attach_reactor_state( self, state: _ReactorState ) -> None:
+		''' internal - Reactor.__init__ calls this once per worker, right
+		after constructing it, so drain_fully() can tell "nothing queued on
+		ME right now" apart from "nothing live ANYWHERE in this Reactor" -
+		see _ReactorState's own docstring for why round-robin spawn() across
+		N workers needs that distinction. A bare Worker() (no Reactor) never
+		gets this call, leaving __reactor_state None - drain_fully() keeps
+		its old immediate-return-once-locally-idle contract unchanged in
+		that case, exactly what every existing single-worker test relies
+		on. '''
+		self.__reactor_state = state
 
 	def __poke_wake( self ) -> None:
 		''' interrupts a thread currently BLOCKED inside this Worker's own
@@ -447,7 +517,13 @@ class Worker:
 		BLOCKED inside this Worker's own drain_fully() (waiting on some
 		other Signal, see its own docstring) notices promptly instead of
 		only finding this task once whatever it was already waiting on
-		eventually fires. '''
+		eventually fires. For a Reactor-owned worker, also counts this task
+		as live in the shared _ReactorState (see its own docstring) - paired
+		with __requeue_by_state's own decrement once the task actually
+		finishes. '''
+		state: _ReactorState|None = self.__reactor_state
+		if state is not None:
+			state.live_tasks.fetch_add( 1 )
 		self.__pending_tasks.append( task ).unwrap( 'Worker.schedule: queue overflow' )
 		self.__poke_wake()
 
@@ -487,6 +563,12 @@ class Worker:
 		match f.state():
 			case fiber.FiberState.IDLE:
 				self.__idle_pool.append( f ).unwrap( 'Worker: idle pool overflow' )
+				# the task that just ran to completion is no longer live -
+				# balances the +1 its own originating schedule() call made,
+				# however many park()/unpark() cycles happened in between
+				state: _ReactorState|None = self.__reactor_state
+				if state is not None:
+					state.live_tasks.fetch_sub( 1 )
 			case fiber.FiberState.PARKED:
 				# a fiber parked via _wait_on_signal is ALREADY tracked in
 				# __waiting (appended there before its own fiber.park()
@@ -896,12 +978,36 @@ class Worker:
 		is set, run_until_idle()'s own __drain_waiting_for_shutdown()
 		force-resumes every waiting fiber with a ShuttingDown error
 		instead, so this loop naturally converges to "genuinely nothing
-		outstanding" and returns, same as the ordinary batch case. '''
+		outstanding" and returns, same as the ordinary batch case.
+
+		For a bare Worker() (no Reactor, __reactor_state is None), "locally
+		idle with nothing in __waiting" has always meant "genuinely done" -
+		unchanged. For a Reactor-owned worker it does NOT: Reactor.spawn()
+		round-robins across workers, so a worker that happens to drain to
+		empty first must not exit while a SIBLING worker's still-running
+		fiber could yet spawn fresh work directly onto it - it would exit,
+		its OS thread would end, and Reactor.spawn()'s later w.schedule()
+		call would enqueue a task nobody is left driving (this was a real,
+		confirmed bug: a multi-worker Reactor could silently drop work
+		spawned mid-run onto an already-"finished" worker). So a locally-
+		idle Reactor-owned worker instead checks the shared _ReactorState's
+		live_tasks count (see its own docstring) - only genuinely returns
+		once that's zero (nothing live ANYWHERE in this Reactor), otherwise
+		blocks for a short, bounded interval (_QUIESCENCE_RECHECK_MS, not
+		infinite - see _ReactorState's own docstring for why this is a
+		periodic recheck rather than a wake broadcast) and loops back to
+		pick up either fresh local work or the eventual global-zero. '''
 		while True:
 			if self.run_until_idle( 0 ):
 				continue
 			if self.__waiting.__len__() == 0:
-				return
+				state: _ReactorState|None = self.__reactor_state
+				if state is None:
+					return
+				if state.live_tasks.load() == 0:
+					return
+				self.run_until_idle( _QUIESCENCE_RECHECK_MS )
+				continue
 			self.run_until_idle( -1 )
 
 
@@ -912,9 +1018,17 @@ class Reactor:
 
 	def __init__( self, num_workers: usize ) -> None:
 		self.__workers = list[Worker]()
+		# every worker shares the SAME _ReactorState (one live_tasks
+		# counter for the whole Reactor, not one per worker) - see
+		# Worker.drain_fully's own docstring for why a locally-idle worker
+		# needs this to tell "nothing queued on me" apart from "nothing
+		# live anywhere in this Reactor"
+		state: _ReactorState = _ReactorState()
 		i: usize = 0
 		while i < num_workers:
-			self.__workers.append( Worker() ).unwrap( 'Reactor.__init__: worker list overflow' )
+			w: Worker = Worker()
+			w._attach_reactor_state( state )
+			self.__workers.append( w ).unwrap( 'Reactor.__init__: worker list overflow' )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__threads = list[threading.Thread]()

@@ -217,6 +217,77 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
 
+	def test_reactor_multiworker_spawn_from_inside_a_running_fiber( self ) -> None:
+		# regression test for a real, confirmed bug: Reactor(2).spawn()
+		# round-robins First.run() onto worker 0 (spawned BEFORE run()) and
+		# leaves worker 1 with an empty queue from the start. Worker 1's
+		# drain_fully() used to see its own queues idle immediately and
+		# return, ending its OS thread, BEFORE First.run() (still executing
+		# on worker 0) ever calls r.spawn(second.run) - which round-robins
+		# onto worker 1 and enqueues fine, but nobody is left driving that
+		# worker's queue, so Second.run() never ran and Reactor.run() still
+		# returned as if everything had converged. Needs >= 2 workers - a
+		# single worker never has this "starts idle" gap.
+		#
+		# The busy_delay() before spawning Second is load-bearing, not
+		# decoration - without it this test is a coin flip: it only catches
+		# the bug if worker 1's own thread happens to reach its own "idle,
+		# nothing queued" check and return BEFORE First.run() (on worker 0)
+		# reaches its own spawn() call. Confirmed directly: this exact test
+		# WITHOUT the delay passed even against the unfixed reactor.py in
+		# several runs, purely because First.run() usually won that race by
+		# luck. With the delay, First.run() reliably runs, and gives worker
+		# 1 time to reach idle-and-exit, well before ever calling spawn() -
+		# on the unfixed code this reliably reproduced flag.load() != 1
+		# (exit 1); on the fixed code it reliably passes. See this module's
+		# own header comment and _ReactorState's docstring for the fix.
+		self._run( '''
+import compiler
+import reactor
+import atomic
+
+def busy_delay() -> None:
+	i: usize = 0
+	while i < usize( 200000000 ):
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+class Second:
+	flag: atomic.Atomic[i32]
+	def __init__( self, flag: atomic.Atomic[i32] ) -> None:
+		self.flag = flag
+	def run( self ) -> None:
+		self.flag.store( 1 )
+
+class First:
+	r: reactor.Reactor
+	second: Second
+	def __init__( self, r: reactor.Reactor, second: Second ) -> None:
+		self.r = r
+		self.second = second
+	def run( self ) -> None:
+		# spawned from INSIDE a running fiber, not before run() - this is
+		# the part a fixed-size initial round-robin distribution can't see
+		# coming. busy_delay() first gives worker 1's own thread time to
+		# spin up, find its own queues empty, and (on unfixed code) exit -
+		# see this test's own docstring for why this is load-bearing.
+		busy_delay()
+		self.r.spawn( self.second.run )
+
+def main() -> i32:
+	r = reactor.Reactor( 2 )
+	flag = atomic.Atomic[i32]( 0 )
+	second = Second( flag )
+	first = First( r, second )
+	r.spawn( first.run )
+	r.run()
+	if flag.load() != 1:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
+
 	def test_signal_wait_resumes_only_after_real_readiness( self ) -> None:
 		# real TCP loopback pair - a task parks on reactor.wait_for_signal()
 		# for the accepted connection's own fd, must NOT resume before any
