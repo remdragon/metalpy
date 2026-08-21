@@ -2486,8 +2486,9 @@ class dict[K, V]:
 # to the caller as Result payloads - a caller holding one across multiple
 # calls (e.g. a buffered reader keeping a handle alive) needs to be able to
 # name the type in a field/parameter annotation, which an unexported name
-# does not allow from outside lib/builtins.
-from .__File import File, BinaryReader, BinaryWriter, BinaryReadWriter
+# does not allow from outside lib/builtins. AsyncFileOps is exported for
+# the same reason - lib/asyncfile.py (outside lib/builtins) subclasses it.
+from .__File import File, BinaryReader, BinaryWriter, BinaryReadWriter, AsyncFileOps
 
 # same "depends on bytearray already being pre-parsed" reasoning as File
 # above - memoryview.__init__ takes a bytearray by name.
