@@ -4,6 +4,8 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import unittest
 
@@ -2764,6 +2766,17 @@ def get_error() -> i32:
 			yield Path( private ) / 'metalpy' / 'has_symbol'
 		finally:
 			tempfile.gettempdir = real
+			# tight retries: Windows can briefly keep a just-closed handle in
+			# this tree open (same WinError 32 class as linker_c's own cache
+			# writes), so a single rmtree attempt intermittently leaves the
+			# whole dir behind - see atomic_write_cache's identical reasoning.
+			for attempt in range( 3 ):
+				try:
+					shutil.rmtree( private )
+					break
+				except OSError as e:
+					if attempt == 2:
+						print( f'WARNING - metalpy: could not remove private test cache dir {private} ({e})', file = sys.stderr )
 
 	def test_cache_publish_failure_does_not_break_the_probe( self ) -> None:
 		''' failing to PUBLISH a cache entry must never fail the compile.
