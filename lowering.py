@@ -5636,7 +5636,14 @@ class FunctionLowering:
 			natural_exit_narrowed = dict( loop_snapshot.narrowed )
 			exit_name = getattr( node, 'exit_narrows_name', None )
 			if exit_name is not None:
-				member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
+				exit_attr_base = getattr( node, 'exit_narrows_attr_base', None )
+				if exit_attr_base is not None:
+					# single-level field exit-narrowing (`while type(self.
+					# field) is T:` etc) - mirrors _stmt_Assign's own is_
+					# narrowing_bind attr branch exactly, see its comment
+					member = self._resolve_narrow_attr_member( exit_attr_base, node.exit_narrows_attr_name, node.exit_narrows_member_stem, node )
+				else:
+					member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
 				natural_exit_narrowed[exit_name] = [ member ]
 			natural_exit_live = set( loop_snapshot.live )
 		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed, natural_exit_live, break_live )
