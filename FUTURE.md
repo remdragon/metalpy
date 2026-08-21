@@ -62,3 +62,8 @@ research and I believe this may be possible with the infrastructure we've built
 demo http server has Response.bytes_(...). This is ugly. Other http apis have
 more rich method names, but in this case maybe we implement Response.text() and
 have it take a str|bytes type?
+
+================================================================================
+
+explore what's the different between Callable[] and Closure[]. Is there a
+reason to have both?
