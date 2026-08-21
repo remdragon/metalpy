@@ -1,5 +1,6 @@
 import atomic
 import compiler
+from datetime import datetime
 import socket
 import threading
 import tcp
@@ -7,9 +8,14 @@ from http.server import Request, Response, _handle_connection
 
 class App:
 	def handle( self, req: Request ) -> Response:
-		if req.path == '/echo':
-			return Response.text( 'you asked for ' + req.path )
-		return Response.text( 'nope', 404, 'Not Found' )
+		match req.path:
+			case '/':
+				now = datetime.now().strftime( '%Y-%m-%d %H:%I:%S' )
+				return Response.text( f'hello from MetalPy http demo server @ {now}' )
+			case '/echo':
+				return Response.text( 'you asked for ' + req.path )
+			case _:
+				return Response.text( 'nope', 404, 'Not Found' )
 
 class BareServer:
 	__listener: tcp.TcpListener
