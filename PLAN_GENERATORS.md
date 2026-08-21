@@ -281,6 +281,29 @@ reasoning (still broadly accurate) - its literal internal names describe
 the original, now-superseded implementation; see this doc's own top note
 for where the CURRENT mechanism actually lives.
 
+**Value-carrying `return` (2026-08-21, fixes a genuine oversight in the
+StopIteration reversal above)**: `return <expr>` inside a generator body is
+no longer rejected outright. Two shapes are allowed, both ending THIS
+`__next__()` call with exactly that `Result` and marking the generator
+permanently done: a direct `return Result.Ok(...)`/`return Result.Err(...)`
+call (recognized textually, same spirit as `lowering.py`'s own
+`_is_result_err_call` - trusted without pre-lowering type inference, since
+ordinary expected-type-driven construction against `$$__next__`'s own
+declared `Result[elem_type,error_type]` return type does the real
+type-checking, same as any ordinary Result-returning function's `return
+Result.Ok(x)`), or any other expression resolving EXACTLY to this
+generator's own `Result[elem_type,error_type]` (a parameter, an
+already-declared local, a simple attribute/call chain - the same
+resolvable-without-lowering limitation `yield from`'s own forwarding-yield
+exact-match check already lives with). Implemented in
+`_validate_and_tag_generator_value_returns`/`_rewrite_bare_return_stmts`
+(`type_resolver.py`), reusing the SAME `generator_already_result_shaped`
+tag `yield from`'s forwarding yield already used - `_wrap_generator_next_
+returns_in_ok` needed no code change at all. Verified via 5 new real
+compile-and-run cases plus a negative (wrong-shape) rejection case in
+`emitter_c_test.py`'s `GeneratorFunctionTests`; full suite green on all 3
+compilers.
+
 **Phase C (`.send()`) has ALSO landed** (reimplemented from scratch,
 same day, on top of the Phase F/B rebuild above): `Generator[T,SendType,
 E]` (3-arg form - `T`/`E` are the existing `elem_type`/`error_type`,

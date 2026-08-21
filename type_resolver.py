@@ -516,21 +516,119 @@ class TypeResolver:
 				continue
 			stmt.generator_armed_defer_sites = defer_sites[ : armed_count[0] ]
 
-	def _reject_generator_value_return( self, fn: Function ) -> None:
+	def _validate_and_tag_generator_value_returns( self, fn: Function, elem_type: Type, error_type: Type ) -> None:
+		''' a bare `return`/literal `return None` inside a generator body
+		always means "end iteration via StopIteration"
+		(_rewrite_generator_bare_returns, just below, handles those). Any
+		OTHER `return <expr>` is allowed too, in two shapes:
+
+		1. A direct `return Result.Ok(...)`/`return Result.Err(...)` call -
+		   recognized textually, same spirit as lowering.py's own
+		   _is_result_err_call ("deliberately not attempting deeper
+		   type-level inference"), deliberately WITHOUT resolving obj_type
+		   at all. This is the common case (the user already has a value or
+		   an error in hand and wants to end iteration with it), and it's
+		   the ONLY shape that can't actually be verified any earlier than
+		   real lowering anyway: Result.Ok/Err's own T/E type parameters are
+		   generic on the Result CLASS, not inferrable from the call's
+		   arguments alone (confirmed by a real repro - _resolve_expr_type_
+		   for_desugar on a bare `Result.Ok(99)` returns Result[T,E] with
+		   the class's own still-unbound TypeVars, not a real
+		   Result[usize,_] - there is no expected-type context this early
+		   in the pipeline to infer against). Trusting the shape here and
+		   leaving `node.value` completely untouched is safe: ordinary
+		   lowering already coerces a Result.Ok/Err call's payload against
+		   the ENCLOSING function's declared return type for any ordinary
+		   (non-generator) `return Result.Ok(x)`/`return Result.Err(e)` -
+		   $$__next__'s own declared return type is already
+		   Result[elem_type,error_type] (see this method's own call site),
+		   so the exact same expected-type-driven construction/coercion
+		   happens here for free, and a genuine mismatch (wrong payload
+		   type, wrong error leaf) still surfaces as an ordinary compile
+		   error from THAT machinery, just slightly later in the pipeline
+		   than the other shape's own upfront check below.
+		2. Anything else (a parameter, an already-declared local, a simple
+		   attribute/call chain already holding a Result value) - checked
+		   upfront via the same exact-match discipline `yield from` already
+		   established (_desugar_one_yield_from) for forwarding an inner
+		   generator's own Result unchanged: resolved via the same
+		   best-effort pre-lowering expression-typing helper
+		   (_resolve_expr_type_for_desugar), and must match this
+		   generator's own Result[elem_type,error_type] EXACTLY. Not every
+		   expression is resolvable this early - an accepted limitation
+		   here too, not a bug (same as `yield from`'s own).
+
+		A qualifying value-return ends THIS __next__() call with exactly
+		that Result (Ok or Err) and marks the generator permanently done
+		afterward, mirroring how `return <result_expr>` works in an
+		ordinary Result-returning function - just targeting the synthesized
+		$$__next__ instead of the user's own function. This was a real
+		oversight in the original StopIteration-reversal design: with no
+		value-return, the only way to end a generator early with an error
+		you already have in hand (not unwrapped from a fallible call via
+		.or_return()) was to contrive a throwaway fallible function just to
+		.or_return() through it.
+
+		Tags a qualifying node generator_already_result_shaped - the SAME
+		tag/meaning `yield from`'s own forwarding yield already uses, so
+		_wrap_generator_next_returns_in_ok (which already skips re-wrapping
+		ANY Return/Yield node carrying this tag) needs zero changes to
+		handle this correctly. _rewrite_bare_return_stmts (next) is widened
+		to recognize this tag too, so a qualifying value-return gets the
+		same done-state-assign + armed-defer-replay splicing a bare return
+		already gets. '''
 		for node in self._walk_generator_body( fn.node.body ):
-			if isinstance( node, ast.Return ) and node.value is not None and not ( isinstance( node.value, ast.Constant ) and node.value.value is None ):
-				self.discovery.fail( f'{fn.qualname}: a generator function cannot `return` a value (a bare `return` ends iteration) - see PLAN_GENERATORS.md', node )
+			if not isinstance( node, ast.Return ):
+				continue
+			if node.value is None or ( isinstance( node.value, ast.Constant ) and node.value.value is None ):
+				continue
+			if (
+				isinstance( node.value, ast.Call )
+				and isinstance( node.value.func, ast.Attribute )
+				and node.value.func.attr in ( 'Ok', 'Err' )
+				and isinstance( node.value.func.value, ast.Name )
+				and node.value.func.value.id == 'Result'
+			):
+				node.generator_already_result_shaped = True
+				continue
+			obj_type = self._resolve_expr_type_for_desugar( fn, node.value )
+			if obj_type is None:
+				self.discovery.fail(
+					f'{fn.qualname}: a generator function can only `return` a bare `return`/`return None` (ends '
+					f'iteration via StopIteration), a direct `return Result.Ok(...)`/`return Result.Err(...)` call, '
+					f'or an expression matching this generator\'s own Result[{elem_type.qualname},{error_type.qualname}] '
+					f'exactly - cannot determine the type of {ast.unparse( node.value )} to check this; its type needs '
+					f'to be resolvable without lowering (a parameter, an already-declared local, or a simple '
+					f'attribute/call chain) - see PLAN_GENERATORS.md',
+					node,
+				)
+			shape = self._result_shape( obj_type )
+			if shape is None or shape[0] is not elem_type or shape[1] is not error_type:
+				found = f'Result[{shape[0].qualname},{shape[1].qualname}]' if shape is not None else ( obj_type.qualname if obj_type else '?' )
+				self.discovery.fail(
+					f'{fn.qualname}: a generator function can only `return` a bare `return`/`return None`, a direct '
+					f'`return Result.Ok(...)`/`return Result.Err(...)` call, or an expression matching this generator\'s '
+					f'own Result[{elem_type.qualname},{error_type.qualname}] exactly - got {found}: '
+					f'{ast.unparse( node.value )}',
+					node,
+				)
+			node.generator_already_result_shaped = True
 
 	def _rewrite_generator_bare_returns( self, fn: Function, defer_sites: list[tuple[str,bool,list[ast.stmt]]] ) -> list[ast.Assign]:
-		''' a bare `return` inside a generator body (already confirmed, by
-		_reject_generator_value_return running just before this, to carry no
-		value) compiles today but doesn't end iteration the way real Python
-		generator semantics require - it's just an ordinary early `return
-		None` out of $$__next__, which leaves self.__state exactly where it
-		was BEFORE this call. A later manual .__next__() call would then
-		wrongly resume and re-run whatever this return was meant to skip,
-		instead of staying permanently exhausted (see PLAN_GENERATORS.md's
-		defer/errdefer phase writeup for how this gap was found).
+		''' a bare `return` inside a generator body compiles today but
+		doesn't end iteration the way real Python generator semantics
+		require - it's just an ordinary early `return None` out of
+		$$__next__, which leaves self.__state exactly where it was BEFORE
+		this call. A later manual .__next__() call would then wrongly
+		resume and re-run whatever this return was meant to skip, instead
+		of staying permanently exhausted (see PLAN_GENERATORS.md's
+		defer/errdefer phase writeup for how this gap was found). A
+		qualifying value-return (already validated and tagged
+		generator_already_result_shaped by _validate_and_tag_generator_
+		value_returns, just above, run right before this) gets the exact
+		same end-of-iteration treatment here too - see this method's own
+		helper (_rewrite_bare_return_stmts) for the split in what each
+		shape does to its own `value`.
 
 		Fixed the same way Phase 4 (roadmap Phase 4) already fixed the
 		analogous or_return()-early-exit gap for fallible generators (see
@@ -573,21 +671,39 @@ class TypeResolver:
 		`orelse`, plus match_case's own `body` - there's no try/except here
 		to worry about, confirmed elsewhere in this file), but NOT into a
 		nested def/lambda (a separate, unrelated scope - same boundary
-		_walk_generator_body's own docstring explains). '''
+		_walk_generator_body's own docstring explains).
+
+		Matches TWO shapes, both real generator-ending exits: a bare
+		`return`/literal `return None`, and a `return <result_expr>` already
+		validated + tagged generator_already_result_shaped by
+		_validate_and_tag_generator_value_returns (run just before this).
+		Both get the same self.__state = <placeholder> assign + armed-
+		defer-replay splicing - but only the bare/None case gets `stmt.
+		value` normalized/rewritten (to Constant(None) here, later to
+		Result.Err(StopIteration()) by _wrap_generator_next_returns_in_ok);
+		a tagged value-return's own `value` is already exactly the Result
+		this __next__() call should produce and must be left untouched. '''
 		result: list[ast.stmt] = []
 		for stmt in stmts:
-			if isinstance( stmt, ast.Return ) and ( stmt.value is None or ( isinstance( stmt.value, ast.Constant ) and stmt.value.value is None )):
-				# PLAN_GENERATORS.md's StopIteration reversal - a user-
-				# written `return`/`return None` is a real generator-ending
-				# exit, same as the tail's own natural exhaustion and the
-				# DONE short-circuit above - tag it the same way so
-				# _wrap_generator_next_returns_in_ok wraps its value in
-				# Result.Err(StopIteration()) instead of Result.Ok(None)
-				stmt.generator_exhaustion_return = True
+			is_bare_or_none_return = isinstance( stmt, ast.Return ) and ( stmt.value is None or ( isinstance( stmt.value, ast.Constant ) and stmt.value.value is None ))
+			is_value_return = isinstance( stmt, ast.Return ) and getattr( stmt, 'generator_already_result_shaped', False )
+			if is_bare_or_none_return or is_value_return:
+				if is_bare_or_none_return:
+					# PLAN_GENERATORS.md's StopIteration reversal - a user-
+					# written `return`/`return None` is a real generator-ending
+					# exit, same as the tail's own natural exhaustion and the
+					# DONE short-circuit above - tag it the same way so
+					# _wrap_generator_next_returns_in_ok wraps its value in
+					# Result.Err(StopIteration()) instead of Result.Ok(None)
+					stmt.generator_exhaustion_return = True
+				# is_value_return: no generator_exhaustion_return here - that
+				# tag specifically means "rewrite value to
+				# Result.Err(StopIteration())", wrong for a value-return
+				# whose own expression already IS the final Result
 				assign = ast.Assign( targets = [ self._self_attr( '__state', stmt ) ], value = ast.Constant( value = 0 ) )
 				ast.copy_location( assign, stmt )
 				pending.append( assign )
-				if stmt.value is None:
+				if is_bare_or_none_return and stmt.value is None:
 					# a truly bare `return` (no expression at all) lowers to
 					# a void C `return;` - wrong, $$__next__'s own declared
 					# return type is never void (always elem_type|None, or
@@ -601,11 +717,12 @@ class TypeResolver:
 					stmt.value = ast.Constant( value = None )
 					ast.copy_location( stmt.value, stmt )
 				# PLAN_GENERATORS.md's defer/errdefer phase - a bare return
-				# is a real generator-ending exit, exactly like the tail's
-				# own natural exhaustion, so every currently-armed plain
-				# `defer` site (LIFO) replays here too, right before the
-				# state gets pinned to done - see _build_defer_replay_
-				# guards's own docstring for why these are left un-renamed
+				# (or a value-return) is a real generator-ending exit,
+				# exactly like the tail's own natural exhaustion, so every
+				# currently-armed plain `defer` site (LIFO) replays here
+				# too, right before the state gets pinned to done - see
+				# _build_defer_replay_guards's own docstring for why these
+				# are left un-renamed
 				result.extend( self._build_defer_replay_guards( defer_sites, stmt ))
 				result.append( assign )
 				result.append( stmt )
@@ -2248,7 +2365,13 @@ class TypeResolver:
 		payload argument is coerced the ordinary way (same _lower_expr(arg,
 		expected_type) machinery any other call argument gets) - so this
 		never needs to know what shape a non-exhaustion `value` already
-		is. '''
+		is. No code change needed for a tagged value-return (`return
+		<Result-expr>` matching this generator's own Result[elem_type,
+		error_type] exactly, allowed by _validate_and_tag_generator_value_
+		returns) - it's a THIRD site (alongside yield from's forwarding
+		yield) that sets generator_already_result_shaped, and the check
+		just above is already type-generic over Return/Yield, so it's
+		skipped here exactly like the other two. '''
 		for stmt in next_body:
 			for n in ast.walk( stmt ):
 				if isinstance( n, ( ast.Return, ast.Yield )):
@@ -2651,7 +2774,7 @@ class TypeResolver:
 			extra_locals.update( yield_from_extra_locals )
 			self._validate_generator_defer_sites( fn )
 			defer_sites = self._desugar_generator_defer_sites( fn )
-			self._reject_generator_value_return( fn )
+			self._validate_and_tag_generator_value_returns( fn, elem_type, error_type )
 			pending_bare_return_assigns = self._rewrite_generator_bare_returns( fn, defer_sites )
 			locals_decl = self._collect_generator_locals( fn )
 			locals_decl.update( extra_locals )
