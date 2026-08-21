@@ -6,7 +6,7 @@ from discovery import Discovery
 
 
 class EmailMessageEncodingTests( test_support.RealCompileMixin, unittest.TestCase ):
-	''' lib/email/_quoprimime.py's quoted-printable codec, Message's
+	''' lib/email/quoprimime.py's quoted-printable codec, Message's
 	Content-Transfer-Encoding decode (base64 / quoted-printable), and RFC
 	2047 encoded-word header decoding (decode_header). '''
 
@@ -20,7 +20,7 @@ class EmailMessageEncodingTests( test_support.RealCompileMixin, unittest.TestCas
 			( 'quoted_printable_round_trip', '''
 import compiler
 import sys
-from email._quoprimime import encode as qp_encode, decode as qp_decode
+from email.quoprimime import encode as qp_encode, decode as qp_decode
 
 def main() -> i32:
 	src: str = 'Hello, W\\x99rld! =foo=\\r\\nLine2\\ttab and space at end  '
@@ -38,7 +38,7 @@ def main() -> i32:
 ''' ),
 			( 'quoted_printable_decode_leniency', '''
 import compiler
-from email._quoprimime import decode as qp_decode
+from email.quoprimime import decode as qp_decode
 
 def main() -> i32:
 	d1: bytes = qp_decode( 'abc=\\r\\ndef' )
