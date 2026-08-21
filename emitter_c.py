@@ -2583,7 +2583,32 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
 	if isinstance( instr, ir.DeclareTemp ):
-		return [ f'\t{_declarator( instr.temp.type, _temp_name( instr.temp.id ) )};' ]
+		# dedupe against the SAME `declared` set ir.DeclareLocal/ir.Assign
+		# already use below - a defer(...)/errdefer(...) block is lowered
+		# ONCE (_register_defer_block) but its captured ir.Instructions,
+		# including any ir.DeclareTemp for a temp an implicit cast needed
+		# (e.g. sys.free(ptr: Ptr[u8]) needing Ptr[u8]->Ptr[None] on a
+		# non-Windows target - see lib/sys.py's two free() overloads), get
+		# replayed BY IDENTITY (same ir.Temp object) at every return/unwind
+		# point (cfg.py's _replay()/build_epilogue_ladder()) into this
+		# function's one flat, goto-based C scope (no per-branch { }
+		# blocks) - so a function with 2+ return points can emit the SAME
+		# `void* $tN;` declaration multiple times, a genuine gcc compile
+		# error ("redeclaration ... with no linkage") that clang/MSVC never
+		# hit (Windows's sys.free(Ptr[u8]) overload needs no cast at all,
+		# so the temp/DeclareTemp this bug depends on is never created
+		# there). Safe to skip a repeat declaration: temp ids come from a
+		# monotonic per-function counter never reused for two logically
+		# distinct temps, so the ONLY way the same id's DeclareTemp repeats
+		# is this replay duplication; the duplicated return/unwind paths
+		# are mutually exclusive at runtime (only one executes per call),
+		# and each replay's own duplicated cast/assignment re-initializes
+		# the shared C variable immediately before its own use.
+		name = _temp_name( instr.temp.id )
+		if name in declared:
+			return []
+		declared.add( name )
+		return [ f'\t{_declarator( instr.temp.type, name )};' ]
 	if isinstance( instr, ir.DeleteTemp ):
 		return [] # C block scoping already handles temp lifetime - nothing to emit
 	if isinstance( instr, ir.DeclareLocal ):
