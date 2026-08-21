@@ -5868,20 +5868,28 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		narrow_attr_name: str|None = None
 		if shape is not None:
 			subject_expr, _type_expr, base, member, is_not = shape
-			key = self._narrow_subject_key( subject_expr )
-			if key is not None:
-				subject_name, narrow_attr_base, narrow_attr_name = key
-		if subject_name is not None:
-			subj_type = self._type_of_expr( subject_expr )
-			members = self._resolved_union_members( subj_type, base )
-			others = [ m for m in members if m is not member ]
-			other = others[0] if len( others ) == 1 else None
-			if is_not:
-				body_member = other
-				exit_member = member # not(x is not T) -> x is T, any union size
-			else:
-				body_member = member
-				exit_member = other # not(x is T) -> x is the sole OTHER member, 2-member unions only
+			# ALWAYS rewrite into the tag-Cmp shape once the STRUCTURAL
+			# shape is recognized, regardless of whether the subject is
+			# even eligible for narrowing (a bare Name or a plain field via
+			# _narrow_subject_key below) - visit_If's own equivalent
+			# (_try_desugar_type_is_if, unconditionally desugaring to a
+			# match) and visit_Compare's own rewrite-2 both already do this
+			# for ANY subject shape (see _type_is_shape's own docstring:
+			# "shared by _try_desugar_type_is_if... and visit_While").
+			# Previously this rewrite only ran inside the narrowing-
+			# eligible branch below, and a non-eligible subject (a
+			# property, or - always, even before field-narrowing existed -
+			# any non-Name expression at all) fell to the plain else
+			# branch's generic_visit_expr, which walks the test's
+			# CHILDREN but never re-dispatches the test node itself
+			# through visit_Compare - so the original, un-rewritten `type(
+			# x) is T` AST (still containing a literal `type(...)` Call)
+			# reached lowering untouched, where `type` isn't a real
+			# callable name at all: "name 'type' is not defined". Confirmed
+			# via a real repro (`while type(self.prop) is T:`, self.prop a
+			# T|None-returning @property - the exact "an anonymous union's
+			# own underlying member can change at runtime" shape a while-
+			# loop over a property is FOR).
 			tag_attr, _data_attr, _payload_cls, tags = self.resolver.union_storage.get( base )
 			tag_expr = ast.Attribute( value = subject_expr, attr = tag_attr.stem, ctx = ast.Load() )
 			ast.copy_location( tag_expr, node )
@@ -5889,6 +5897,19 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			new_test = ast.Compare( left = tag_expr, ops = [ op ], comparators = [ ast.Constant( value = tags[member.stem] ) ] )
 			ast.copy_location( new_test, node )
 			node.test = new_test
+			key = self._narrow_subject_key( subject_expr )
+			if key is not None:
+				subject_name, narrow_attr_base, narrow_attr_name = key
+				subj_type = self._type_of_expr( subject_expr )
+				members = self._resolved_union_members( subj_type, base )
+				others = [ m for m in members if m is not member ]
+				other = others[0] if len( others ) == 1 else None
+				if is_not:
+					body_member = other
+					exit_member = member # not(x is not T) -> x is T, any union size
+				else:
+					body_member = member
+					exit_member = other # not(x is T) -> x is the sole OTHER member, 2-member unions only
 		else:
 			rewritten = self._rewrite_tagged_union_truthiness( node.test, node )
 			if rewritten is not None:

@@ -10499,6 +10499,97 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			# `while type(x) is T:` where x is NOT eligible for narrowing at
+			# all (a @property getter - "an anonymous union whose own
+			# underlying member can change at runtime", exactly what a
+			# while-loop over a property is for; also a fresh call result,
+			# never narrowable regardless of today's field-narrowing work)
+			# still needs to compile the CONDITION correctly, even though
+			# nothing inside the loop gets narrowed. visit_While's own
+			# non-eligible fallback used to call generic_visit_expr, which
+			# only walks the test's CHILDREN and never re-dispatches the
+			# test node itself through visit_Compare's own unconditional
+			# type(...)-is-... rewrite (the same rewrite `if type(x) is T:`
+			# already gets for ANY subject shape, via _try_desugar_type_is_
+			# if) - so the original, un-rewritten `type(x) is T` reached
+			# lowering with a literal `type(...)` Call still in it, and
+			# `type` isn't a real callable name: "name 'type' is not
+			# defined". Covers is/is not/instanceof(), a property subject,
+			# and a plain non-Name/non-field call-result subject
+			( 'while_type_is_on_non_narrowable_subject_still_compiles', '''
+class Ops:
+	@abstractmethod
+	def do_read( self, v: i32 ) -> i32:
+		...
+
+class RealOps( Ops ):
+	@virtual
+	def do_read( self, v: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return v + 1
+
+class Holder:
+	_aio: Ops|None
+	def __init__( self, aio: Ops|None ) -> None:
+		self._aio = aio
+	@property
+	def aio( self ) -> Ops|None:
+		return self._aio
+	def set_none( self ) -> None:
+		self._aio = None
+	def run_is( self ) -> i32:
+		n: i32 = 0
+		while type( self.aio ) is Ops:
+			with compiler.wrap_arithmetic:
+				n = n + 1
+			self.set_none()
+		return n
+	def run_is_not( self ) -> i32:
+		n: i32 = 0
+		while type( self.aio ) is not Ops:
+			with compiler.wrap_arithmetic:
+				n = n + 1
+			return n # avoid an infinite loop - just proves it compiles+runs once
+		return -1
+	def run_instanceof( self ) -> i32:
+		n: i32 = 0
+		while instanceof( self.aio, Ops ):
+			with compiler.wrap_arithmetic:
+				n = n + 1
+			self.set_none()
+		return n
+
+def make_ops( o: Ops|None ) -> Ops|None:
+	return o
+
+def run_call_subject( o: Ops ) -> i32:
+	n: i32 = 0
+	while type( make_ops( o ) ) is Ops:
+		with compiler.wrap_arithmetic:
+			n = n + 1
+		return n # avoid an infinite loop - just proves it compiles+runs once
+	return -1
+
+def main() -> i32:
+	o1: Ops = RealOps()
+	h1 = Holder( o1 )
+	if h1.run_is() != 1:
+		return 1
+	h2 = Holder( None )
+	if h2.run_is_not() != 1:
+		return 2
+	o3: Ops = RealOps()
+	h3 = Holder( o3 )
+	if h3.run_is_not() != -1:
+		return 3
+	o4: Ops = RealOps()
+	h4 = Holder( o4 )
+	if h4.run_instanceof() != 1:
+		return 4
+	if run_call_subject( RealOps() ) != 1:
+		return 5
+	return 0
+''' ),
 			# `union_val == leaf` / `!=` - comparing a still-union-typed value
 			# directly against a leaf, with no match-based extraction needed
 			# first. Used to fall through to the plain dunder-or-flat-Cmp path,
