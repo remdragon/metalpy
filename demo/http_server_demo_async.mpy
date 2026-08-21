@@ -1,0 +1,33 @@
+'''
+Async demo server - reactor-driven, cooperative concurrency: the accept
+loop and every connection's request handling run as fibers scheduled by a
+reactor.Reactor, not one OS thread per connection (contrast with
+http_server_demo_sync.mpy's thread-per-connection baseline). This is the
+actual point of the original POC - lib/http/server.py's serve() spawns the
+accept loop onto the Reactor, which in turn spawns a fresh per-connection
+fiber for each accepted connection (round-robined across workers).
+
+1 worker, not 2+: reactor.py has a confirmed, not-yet-fixed bug (task
+task_0904047c) where a task spawned by a running fiber onto ANOTHER worker
+that started with an empty queue never runs - that worker's own
+drain_fully() already gave up waiting before the cross-worker spawn ever
+happens. Bump this once that's fixed to get genuine multi-thread
+concurrency out of the reactor.
+'''
+
+import reactor
+import tcp
+import socket
+from http.server import serve
+from demo.http_server_demo_app import App
+
+
+def main() -> i32:
+	listener: tcp.TcpListener = tcp.TcpListener.bind( '0.0.0.0', u16( 8080 )).unwrap( 'error binding 0.0.0.0:8080' )
+	addr: socket.SocketAddr = listener.getsockname().unwrap( 'error getting address from socket' )
+	r: reactor.Reactor = reactor.Reactor( 1 )
+	app: App = App()
+	serve( listener, app.handle, r )
+	print( f'listening on http://0.0.0.0:{addr.port} (async, reactor-driven)' )
+	r.run()
+	return 0
