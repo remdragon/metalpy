@@ -4368,6 +4368,21 @@ class FunctionLowering:
 			member = self._cfg.narrowed_member( node.id )
 			return member.type if member is not None else name.type
 		if isinstance( node, ast.Attribute ):
+			if isinstance( node.value, ast.Name ):
+				# mirrors the ast.Name branch's own narrowed_member lookup
+				# above, and _expr_Attribute's identical check (its own
+				# narrowed-read extraction comment has the full reasoning) -
+				# without this, a narrowed single-level field subject
+				# (`self.field`) reported its plain declared (still-union)
+				# type here, which broke any FURTHER attribute hop chained
+				# on top of it (`self.field.other.method()`): the recursive
+				# call one level up would then _attr_lookup the next name
+				# against the whole union instead of the narrowed leaf and
+				# fail outright, instead of gracefully declining (returning
+				# None) the way an unrelated non-callable shape does.
+				member = self._cfg.narrowed_member( f'{node.value.id}::{node.attr}' )
+				if member is not None:
+					return member.type
 			owner_type = self._static_type_of_value_expr( node.value )
 			if owner_type is None:
 				return None
