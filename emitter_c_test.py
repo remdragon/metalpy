@@ -10321,6 +10321,100 @@ def main() -> i32:
 		return 8
 	return 0
 ''' ),
+			# `self.field is not None: ... self.field.method(...)` - narrowing
+			# a single-level FIELD (not a bare local) so a virtual method call
+			# on the narrowed payload actually resolves. The comparison itself
+			# already compiled fine (chained_field/property_and_method fixes
+			# above), but visit_If's own body-narrowing (the mechanism that
+			# lets a later `.method()` call dispatch against the concrete
+			# leaf instead of the whole union) only ever recognized a bare
+			# ast.Name subject - an ast.Attribute subject silently fell
+			# through to "not narrowed", so the method call inside the branch
+			# still saw the full T|None union and failed with `'method' is
+			# not callable on intrinsics.NoneType`. Also exercises a second,
+			# independent bug found while isolating this one: a freshly-
+			# constructed subclass instance upcast into a base-typed local/
+			# field (`o: Ops = RealOps()`) was released() immediately after
+			# construction (the RCClass-upcast CastWrap coercion left the
+			# ORIGINAL pre-cast temp registered as a pending obligation, which
+			# the end-of-statement flush then decref'd out from under the
+			# still-live cast alias) - a real use-after-free/segfault, not
+			# just a compile error, confirmed via a real crash before the fix
+			( 'field_is_not_none_narrowing_enables_virtual_dispatch', '''
+class Ops:
+	@abstractmethod
+	def do_read( self, v: i32 ) -> i32:
+		...
+
+class RealOps( Ops ):
+	@virtual
+	def do_read( self, v: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return v + 1
+
+class OtherOps( Ops ):
+	@virtual
+	def do_read( self, v: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return v + 100
+
+class Holder:
+	fd: i32
+	aio: Ops|None
+	def __init__( self, fd: i32 ) -> None:
+		self.fd = fd
+		self.aio = None
+	def set_aio( self, aio: Ops ) -> None:
+		self.aio = aio
+	def read( self ) -> i32:
+		if self.aio is not None:
+			with compiler.wrap_arithmetic:
+				return self.aio.do_read( self.fd )
+		return 0
+	def read_elif( self, flag: bool ) -> i32:
+		if flag:
+			return -1
+		elif self.aio is not None:
+			with compiler.wrap_arithmetic:
+				return self.aio.do_read( self.fd )
+		return 0
+	def read_is_none_early_return( self ) -> i32:
+		if self.aio is None:
+			return -2
+		with compiler.wrap_arithmetic:
+			return self.aio.do_read( self.fd )
+	def read_reassign( self, other: Ops ) -> i32:
+		if self.aio is not None:
+			self.aio = other
+			if self.aio is not None:
+				with compiler.wrap_arithmetic:
+					return self.aio.do_read( self.fd )
+		return 0
+
+def main() -> i32:
+	# upcast-construction RC bug: a fresh subclass instance assigned into a
+	# base-typed local used to be released() (refcount 1 -> 0, freed) right
+	# after construction
+	o: Ops = RealOps()
+	if compiler.refcount( o ) != 1:
+		return 1
+	h = Holder( 5 )
+	h.set_aio( o )
+	if compiler.refcount( o ) != 2:
+		return 2
+	if h.read() != 6:
+		return 3
+	if h.read_elif( False ) != 6:
+		return 4
+	if h.read_is_none_early_return() != 6:
+		return 5
+	if h.read_reassign( OtherOps() ) != 105:
+		return 6
+	# read_reassign left aio pointing at the OtherOps instance now
+	if h.read() != 105:
+		return 7
+	return 0
+''' ),
 			# `union_val == leaf` / `!=` - comparing a still-union-typed value
 			# directly against a leaf, with no match-based extraction needed
 			# first. Used to fall through to the plain dunder-or-flat-Cmp path,

@@ -3376,11 +3376,34 @@ class FunctionLowering:
 		# desugared narrowing) and _stmt_While's own exit-narrowing (Phase 7).
 		subject_var = self.lowering.discovery.find_name( name, node )
 		assert isinstance( subject_var, Variable )
-		base = self.lowering.monomorphize_class( subject_var.type ) if isinstance( subject_var.type, Specialization ) else subject_var.type
+		return self._resolve_narrow_member_of_type( subject_var.type, member_stem )
+
+	def _resolve_narrow_member_of_type( self, subject_type: Type, member_stem: str ) -> Variable:
+		# shared tail of _resolve_narrow_member (a local/param, looked up by
+		# name) and _resolve_narrow_attr_member (a field, looked up via
+		# _attr_lookup) - both need the same monomorphize-then-find-by-stem
+		# once they have the subject's own type in hand.
+		base = self.lowering.monomorphize_class( subject_type ) if isinstance( subject_type, Specialization ) else subject_type
 		self.lowering._union_storage.get( base )
 		member = next( ( attr for attr in base.attributes if attr.stem == member_stem ), None )
 		assert member is not None
 		return member
+
+	def _resolve_narrow_attr_member( self, attr_base: str, attr_name: str, member_stem: str, node: ast.AST ) -> Variable:
+		# attribute counterpart of _resolve_narrow_member - type_resolver.py's
+		# visit_If (single-level `self.field`/`x.field` narrowing shape) hands
+		# down the base local's name and the field's own stem separately,
+		# since a field has no Variable of its own reachable via find_name.
+		# Re-resolves the field's REAL (monomorphized) union type off the
+		# base local first, the same reason _resolve_narrow_member itself
+		# can't just trust type_resolver.py's own (possibly still-abstract)
+		# textual type.
+		base_var = self.lowering.discovery.find_name( attr_base, node )
+		assert isinstance( base_var, Variable )
+		self.lowering._ensure_resolved( base_var )
+		base_type = self.lowering.monomorphize_class( base_var.type ) if isinstance( base_var.type, Specialization ) else base_var.type
+		field_var = self.lowering._attr_lookup( base_type, attr_name, node )
+		return self._resolve_narrow_member_of_type( field_var.type, member_stem )
 
 	def _stmt_Assign( self, node: ast.Assign ) -> None:
 		if getattr( node, 'is_narrowing_bind', False ):
@@ -3392,7 +3415,14 @@ class FunctionLowering:
 			# narrow()/_expr_Name's own comment for the read-side rewrite.
 			target_name = node.targets[0]
 			assert isinstance( target_name, ast.Name )
-			member = self._resolve_narrow_member( target_name.id, node.narrows_member_stem, node )
+			attr_base = getattr( node, 'narrow_attr_base', None )
+			if attr_base is not None:
+				# single-level field narrowing (type_resolver.py's visit_If) -
+				# target_name.id is a synthetic f'{base}::{attr}' key, never a
+				# real local; _expr_Attribute consults the identical key.
+				member = self._resolve_narrow_attr_member( attr_base, node.narrow_attr_name, node.narrows_member_stem, node )
+			else:
+				member = self._resolve_narrow_member( target_name.id, node.narrows_member_stem, node )
 			self._cfg.narrow( target_name.id, member )
 			return
 		if len( node.targets ) != 1:
@@ -3476,6 +3506,13 @@ class FunctionLowering:
 				if match_clears_name is not None:
 					self._cfg.clear_result( match_clears_name )
 		elif isinstance( target, ast.Attribute ):
+			if isinstance( target.value, ast.Name ):
+				# a real reassignment invalidates whatever this exact
+				# single-level field path was previously narrowed to - same
+				# reasoning the plain-Name branch's own unnarrow() call has
+				# above, generalized to the f'{base}::{attr}' key _expr_
+				# Attribute/_stmt_Assign's is_narrowing_bind branch use.
+				self._cfg.unnarrow( f'{target.value.id}::{target.attr}' )
 			obj, writeback = self._lower_attr_target_obj( target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, target.attr, target )
 			if isinstance( attr_var.type, FixedArrayType ):
@@ -6641,6 +6678,24 @@ class FunctionLowering:
 		# relationship so it never masks an unrelated type mismatch.
 		elif ( expected_type is not None and operand.type is not expected_type
 				and self._is_rcclass_upcast( operand.type, expected_type ) ):
+			if self._cfg.is_fresh_temp( operand ):
+				# ownership is moving into the CastWrap's own dest below,
+				# which is deliberately never RC-registered (see the comment
+				# just above) - untrack the PRE-cast temp here so its own
+				# end-of-statement flush doesn't ALSO decref/free the very
+				# object the cast just handed off, out from under it. Same
+				# "was_fresh" guard the union-coercion branch above already
+				# needs, just transferring ownership silently instead of
+				# decref'ing (that branch fixes a double-incref/leak; this one
+				# fixes the opposite - a temp left registered with nothing
+				# left to consume it, later swept as if abandoned). Confirmed
+				# via a real compile-and-run use-after-free: `o: Ops =
+				# RealOps()` (Ops a base class, RealOps a subclass) segfaulted
+				# - the fresh RealOps object was released() immediately after
+				# construction, right after being upcast into the base-typed
+				# local, while `o` still pointed at the same (now-freed)
+				# memory.
+				self._cfg.untrack_temp( operand )
 			dest = self._new_temp( expected_type )
 			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
 			operand = dest
@@ -8322,6 +8377,23 @@ class FunctionLowering:
 			)
 		dest = self._new_temp( attr_var.type )
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
+		if isinstance( node.value, ast.Name ):
+			# mirrors _expr_Name's own narrowed-read rewrite exactly (see its
+			# comment for the full reasoning), just sourced from this field's
+			# freshly-read union VALUE (`dest`, a Temp) instead of a Variable
+			# binding directly - a struct-by-value Temp is an equally valid
+			# ir.GetAttr `obj` source. type_resolver.py's visit_If only ever
+			# narrows a single-level `Name.attr` (see its own comment on why
+			# chained/property subjects are excluded), matching this guard.
+			member = self._cfg.narrowed_member( f'{node.value.id}::{node.attr}' )
+			if member is not None and not self.lowering._type_resolver._same_type( expected_type, attr_var.type ):
+				base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
+				_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )
+				payload_dest = self._new_temp( payload_cls )
+				self._emit( ir.GetAttr( dest = payload_dest, obj = dest, attr = data_attr.stem ))
+				leaf_dest = self._new_temp( member.type )
+				self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+				return leaf_dest
 		# a pointer-typed field passed into a differently-typed pointer parameter
 		# (e.g. sys.memcpy( ..., self.__metadata, ... ) where src is ConstPtr[u8])
 		# needs the same CastWrap coercion _expr_Name does for bare locals.
