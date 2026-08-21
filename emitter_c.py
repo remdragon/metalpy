@@ -3782,6 +3782,59 @@ def _referenced_global_qualnames( instructions: list[ir.Instruction] ) -> set[st
 			walk( getattr( instr, field.name ))
 	return found
 
+def _transitive_global_reads_by_function( compiler: Compiler ) -> dict[int,set[str]]:
+	''' id(Function) -> every OTHER module global's qualname that function's
+	body reads, either directly (_referenced_global_qualnames) or via any
+	function it calls, transitively - closing the exact gap
+	_referenced_global_qualnames itself can't (see its own docstring: it
+	only walks the instructions handed to it, and a global's own init
+	instructions are typically just `call _build_value()`, never _build_
+	value's OWN body - so `VALUE: T = _build_value()` where _build_value()
+	reads another global was invisible to _topologically_sort_globals
+	entirely, a real reachable "accepted but miscompiles" bug: the read
+	got scheduled before the write, at best silently wrong (a Scalar
+	reads its {0}-initialized zero value) and at worst a crash (an RC
+	container's own lock/refcount machinery never constructed, dereferenced
+	as if it had been - see the bug report this closes).
+	Keyed by id(Function), not qualname - Function.qualname isn't unique
+	across overloads. A worklist/fixed-point pass (not a single DFS), so
+	mutual recursion between called functions converges correctly instead
+	of a naive memo-with-recursion-guard silently dropping edges hit while
+	still on the call stack. '''
+	instructions_by_fn_id = { id( lf.function ): lf.instructions for lf in compiler.functions }
+	closure: dict[int,set[str]] = {
+		fn_id: _referenced_global_qualnames( instrs ) for fn_id, instrs in instructions_by_fn_id.items()
+	}
+	calls: dict[int,set[int]] = { fn_id: set() for fn_id in instructions_by_fn_id }
+	for fn_id, instrs in instructions_by_fn_id.items():
+		for instr in instrs:
+			if isinstance( instr, ir.Call ):
+				calls[fn_id].add( id( instr.target ))
+	changed = True
+	while changed:
+		changed = False
+		for fn_id, callee_ids in calls.items():
+			for callee_id in callee_ids:
+				callee_reads = closure.get( callee_id )
+				if not callee_reads or callee_reads <= closure[fn_id]:
+					continue
+				closure[fn_id] |= callee_reads
+				changed = True
+	return closure
+
+def _referenced_global_qualnames_transitive(
+	instructions: list[ir.Instruction], fn_closure: dict[int,set[str]],
+) -> set[str]:
+	# a global's own init instructions PLUS, for every function it calls,
+	# that function's own transitive closure (_transitive_global_reads_by_
+	# function) - see that function's docstring for why the direct-only
+	# walk above isn't enough on its own
+	found = set( _referenced_global_qualnames( instructions ))
+	for instr in instructions:
+		if isinstance( instr, ir.Call ):
+			found |= fn_closure.get( id( instr.target ), set())
+	return found
+
 def _topologically_sort_globals( compiler: Compiler ) -> list[LoweredGlobal]:
 	''' compiler.globals in TypeResolver's own FIFO scheduling order (first-
 	referenced-while-lowering-reachable-code) has no relationship to which
@@ -3828,8 +3881,9 @@ def _topologically_sort_globals( compiler: Compiler ) -> list[LoweredGlobal]:
 	# not-yet-called prerequisites b still has
 	edges: dict[str,set[str]] = { g.variable.qualname: set() for g in callable_globals }
 	indegree: dict[str,int] = { g.variable.qualname: 0 for g in callable_globals }
+	fn_closure = _transitive_global_reads_by_function( compiler )
 	for g in callable_globals:
-		for dep_qualname in _referenced_global_qualnames( g.instructions ):
+		for dep_qualname in _referenced_global_qualnames_transitive( g.instructions, fn_closure ):
 			if dep_qualname == g.variable.qualname or dep_qualname not in by_qualname:
 				continue # self-reference, or a dependency that never gets a call itself (trivial/all-zero) - no edge needed either way
 			if g.variable.qualname not in edges[dep_qualname]:

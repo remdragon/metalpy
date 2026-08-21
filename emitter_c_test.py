@@ -4269,6 +4269,91 @@ class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClass
 			'exercises the dependency-ordering fix at all' )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
+	def test_list_global_read_inside_another_globals_init_function_runs_in_dependency_order( self ) -> None:
+		# real, reachable bug: unlike test_global_initializer_reading_another_
+		# globals_value_runs_in_dependency_order above (where a's value is
+		# read DIRECTLY inside b's own init instructions - `Foo.make(a.x)`),
+		# here _DATA is read from INSIDE a separate helper function
+		# (_build_value), only ever CALLED from VALUE's own init
+		# instructions. _referenced_global_qualnames only ever walked a
+		# global's own init instructions (a bare `call _build_value()`,
+		# never _build_value's OWN body) - so this shape's dependency on
+		# _DATA was invisible to _topologically_sort_globals entirely, not
+		# just mis-ordered. _DATA is a list[i32] (an RC container - see
+		# lib/builtins/__list.py's own header comment), so instead of a
+		# quieter wrong-value failure, VALUE's own init ran against a
+		# {0}-zero-initialized list[i32] - a null/zeroed lock+refcount
+		# structure - and __getitem__ on it crashed (real SIGILL, not just
+		# a wrong number) before this was fixed.
+		self._run( '\n'.join([
+			'_DATA: list[i32] = [ 16, 17, 18 ]',
+			'',
+			'def _build_value() -> i32:',
+			'	return _DATA.__getitem__( 0 ).unwrap( "x" )',
+			'',
+			'VALUE: i32 = _build_value()',
+			'',
+			'def main() -> i32:',
+			'	if VALUE != 16:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_scalar_global_read_inside_another_globals_init_function_also_needs_dependency_order( self ) -> None:
+		# same shape as test_list_global_read_inside_another_globals_init_
+		# function_runs_in_dependency_order above, but with a plain scalar
+		# (u32) dependency instead of an RC container - proves the
+		# call-indirection gap this fixes is general (any type, any
+		# in-between helper function), not something specific to RC
+		# containers. A scalar dependency doesn't crash when read
+		# uninitialized (it just reads C's own {0} zero value), so before
+		# the fix this shape silently computed the WRONG answer (1, not
+		# 43) rather than crashing - still a real miscompile, just a
+		# quieter one.
+		self._run( '\n'.join([
+			'def _compute_base() -> u32:',
+			'	with compiler.wrap_arithmetic:',
+			'		return u32( 40 ) + u32( 2 )',
+			'',
+			'_BASE: u32 = _compute_base()',
+			'',
+			'def _read_base() -> u32:',
+			'	with compiler.wrap_arithmetic:',
+			'		return _BASE + u32( 1 )',
+			'',
+			'VALUE: u32 = _read_base()',
+			'',
+			'def main() -> i32:',
+			'	if VALUE != 43:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_single_list_global_with_no_cross_dependency_still_works( self ) -> None:
+		# the existing "single global, no cross-global dependency" pattern
+		# (matching lib/sys.py's own `argv: list[str] = _build_argv()`,
+		# which reads no OTHER module global - just raw C-level
+		# _raw_argc/_raw_argv) must keep working for a list[T] global too,
+		# unaffected by the dependency-ordering fix above (no OTHER global
+		# in the graph at all, so _topologically_sort_globals has nothing
+		# to reorder here).
+		self._run( '\n'.join([
+			'_DATA: list[i32] = [ 16, 17, 18 ]',
+			'',
+			'def main() -> i32:',
+			'	if _DATA.__len__() != 3:',
+			'		return 1',
+			'	if _DATA.__getitem__( 0 ).unwrap( "x" ) != 16:',
+			'		return 2',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
 class GlobalInitCycleDetectionTests( RCClassTestCase ):
 	def test_circular_global_value_dependency_is_a_clean_compile_error( self ) -> None:
 		# the one shape _topologically_sort_globals can never satisfy: two
@@ -4290,6 +4375,41 @@ class GlobalInitCycleDetectionTests( RCClassTestCase ):
 			'	return 0',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] ) # the cycle itself isn't detected until emit_c - discovery/lowering never needed a full order
+		with self.assertRaises( CompileError ):
+			emitter_c.emit_c( self.compiler )
+		self.assertTrue(
+			any( 'circular global-initializer dependency' in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
+	def test_circular_global_value_dependency_mediated_by_helper_functions_is_a_clean_compile_error( self ) -> None:
+		# same fundamentally-unorderable cycle as test_circular_global_value_
+		# dependency_is_a_clean_compile_error above, but each global's read
+		# of the OTHER is hidden behind its own helper function (_read_b/
+		# _read_a) rather than inline in the global's own init instructions.
+		# Before the call-indirection fix, _referenced_global_qualnames
+		# never saw either read at all (both live inside a CALLED function's
+		# body, not the global's own instructions) - so this exact cycle
+		# went completely undetected: no edges, an arbitrary (compiler.
+		# globals-scheduling) order, both globals built against whatever the
+		# other one's {0} zero value happened to be. Must now fail with the
+		# same clean, located CompileError as the direct-reference shape.
+		self._run( '\n'.join([
+			'def _read_b() -> i32:',
+			'	return B',
+			'',
+			'A: i32 = _read_b()',
+			'',
+			'def _read_a() -> i32:',
+			'	return A',
+			'',
+			'B: i32 = _read_a()',
+			'',
+			'def main() -> i32:',
+			'	with compiler.wrap_arithmetic:', # references both A and B so the cycle is actually scheduled/lowered, not dead-code-eliminated away
+			'		return A + B',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] ) # the cycle itself isn't detected until emit_c
 		with self.assertRaises( CompileError ):
 			emitter_c.emit_c( self.compiler )
 		self.assertTrue(
