@@ -1498,7 +1498,23 @@ class Lowering:
 				)
 			if len( expr.args ) != 1 or expr.keywords:
 				self.discovery.fail( f'move(...) takes exactly one argument: {ast.unparse(expr)}', call )
-			return expr.args[0]
+			moved = expr.args[0]
+			# cfg.py's ownership tracking (see its own module docstring) only
+			# tracks top-level bindings (params/locals/self) - moving a FIELD
+			# or SUBSCRIPT target reaches into storage owned by something
+			# cfg.py can't invalidate, so the source keeps its pointer after
+			# the "move" and the owner's own destructor later double-frees
+			# it. A plain Name (an already-tracked binding) or any other
+			# expression producing a fresh, unaliased value (e.g. a
+			# constructor call like move(bytearray(0))) is fine - reject only
+			# the aliasing shapes at the call site instead of silently
+			# miscompiling.
+			if isinstance( moved, ( ast.Attribute, ast.Subscript )):
+				self.discovery.fail(
+					f'move(...) does not support a field or subscript target, only a local variable, parameter, or a fresh value: {ast.unparse(call)}',
+					call,
+				)
+			return moved
 		if is_move_call:
 			self.discovery.fail(
 				f"{target.qualname}: parameter {param.stem!r} is not move[T] - "
