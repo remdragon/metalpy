@@ -4388,6 +4388,35 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					names = getattr( receiver_type, 'names', None )
 					if isinstance( names, dict ):
 						target = names.get( node.func.attr )
+					if target is None:
+						# the attribute isn't on the union's OWN synthesized
+						# interface (Ok/Err-style member constructors etc) -
+						# still check whether it's a method every LEAF
+						# defines (e.g. `(reader: BinaryReader|BinaryWriter).
+						# seek(...)`, dispatched at runtime by tag - see
+						# lowering.py's own Lowering._resolve_callee /
+						# _lower_union_receiver_call, which this mirrors).
+						# Without this, this pass silently gave up on any
+						# union-receiver dispatch call's return type -
+						# confirmed by a real repro: a `match (reader|writer)
+						# .seek(...): case Ok(_): return ...; case Err(_):
+						# return ...` (both arms returning) left subj_type
+						# None here, so the exhaustiveness pre-pass below
+						# couldn't tell the match was exhaustive and baked a
+						# real, spurious -Wreturn-type/C4715 "falls off the
+						# end" into the generated C, even though the C
+						# itself is never actually reachable (Result only
+						# ever has 2 tags) - not a hypothetical, a real
+						# warning from a real .zip-format-reading module.
+						shape = self.resolver._tagged_union_shape( receiver_type )
+						if shape is not None:
+							base, members = shape
+							try:
+								dispatch = self.resolver._resolve_union_receiver_members( base, members, node.func.attr, node.func )
+							except CompileError:
+								dispatch = None
+							if dispatch is not None and dispatch.per_leaf:
+								return dispatch.per_leaf[0][1].return_type
 				if target is None:
 					target = self._try_resolve_callable_namespace( node.func )
 			else:
