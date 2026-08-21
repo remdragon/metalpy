@@ -195,7 +195,16 @@ def main() -> None:
 	if args.crt:
 		no_crt = False
 	no_crt = linker_c.resolve_no_crt( no_crt, args.asan )
-	c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+	try:
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+	except CompileError:
+		pass # errors already in disco.errors - e.g. _topologically_sort_globals' own circular-dependency fail_loc
+
+	# --- report emission errors (e.g. circular global-initializer dependency) ---
+	if disco.errors.errors:
+		for err in disco.errors.errors:
+			print( f'mpy: {err}', file = sys.stderr )
+		sys.exit( 1 )
 
 	# --- -c: emit C source only ---
 	if args.c:
