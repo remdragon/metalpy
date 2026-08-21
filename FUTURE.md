@@ -42,8 +42,9 @@ a separate reusable ThreadPool class for this?
 
 studying the http server demo, I see it appears to be hard-coding the www path
 relative to cwd. We need a way for the program to know the path to it's own
-executable so it can calculate paths relative to that (not saying this is a
-good thing but sometimes users want this)
+executable so it can calculate paths relative to that (I think this might
+not be possible on all OS's. If that's the case, we'll need some kind of
+Result indicating it's not available)
 
 ================================================================================
 
