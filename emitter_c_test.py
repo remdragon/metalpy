@@ -10518,6 +10518,179 @@ def main() -> i32:
 		return 10
 	return 0
 ''' ),
+			# a CHAINED narrowing SUBJECT (`self.a.b is not None:`, not just
+			# a further hop off an already-narrowed field - see the case
+			# above) - _narrow_subject_key used to recognize only a bare
+			# Name or a SINGLE field hop off one; the comparison itself
+			# already compiled fine at any depth (_type_of_expr/
+			# _is_none_narrowing_shape already resolved a chained subject's
+			# type via plain recursion), but no narrow marker was ever built
+			# for it, so the body re-read the chain unnarrowed and crashed
+			# outright the moment a real method existed on the leaf. Fix
+			# generalized _narrow_subject_key to an arbitrary-length chain of
+			# plain fields (never a @property anywhere in it), and added a
+			# shared _resolve_chain_owner_type/_attribute_chain_key pair
+			# (lowering.py) so an INTERMEDIATE hop that's independently
+			# narrowed (nested `if self.a is not None: if self.a.b is not
+			# None: ...`) resolves against its PROVEN type, not its raw
+			# declared union - and cfg.py's own unnarrow() (plus its
+			# type_resolver.py advisory-tracker counterpart) now purges any
+			# LONGER narrowed key sharing a reassigned target as a '::'
+			# prefix, so narrowing a chain then reassigning a SHORT prefix of
+			# it can't silently read through a stale narrow of what used to
+			# hang off the old value.
+			( 'chained_narrow_subject', '''
+class Counter:
+	n: i32
+	def __init__( self ) -> None:
+		self.n = 0
+	def bump( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			self.n = self.n + 1
+		return self.n
+
+class Holder:
+	counter: Counter|None
+	c2: i32|None
+	def __init__( self, counter: Counter|None ) -> None:
+		self.counter = counter
+		self.c2 = 7
+
+class Box:
+	holder: Holder
+	def __init__( self, holder: Holder ) -> None:
+		self.holder = holder
+
+class Owner:
+	holder: Holder
+	box: Box
+	def __init__( self, holder: Holder, box: Box ) -> None:
+		self.holder = holder
+		self.box = box
+	# depth-2 chained SUBJECT: self.holder.counter itself is the
+	# narrowing target (holder is a plain, non-nullable field)
+	def touch( self ) -> i32:
+		if self.holder.counter is not None:
+			return self.holder.counter.bump()
+		return -1
+	# depth-3 chained subject through a second plain hop
+	def touch_deep( self ) -> i32:
+		if self.box.holder.counter is not None:
+			return self.box.holder.counter.bump()
+		return -1
+	# non-invalidation: reassigning an UNRELATED field (holder.c2) must
+	# not drop the narrow of holder.counter
+	def non_invalidate( self ) -> i32:
+		self.holder.c2 = None
+		if self.holder.counter is not None:
+			return self.holder.counter.bump()
+		return -1
+	# while Phase 7 over a chained subject
+	def run_while( self ) -> i32:
+		total: i32 = 0
+		count: i32 = 0
+		while type( self.holder.counter ) is Counter:
+			with compiler.wrap_arithmetic:
+				total = total + self.holder.counter.bump()
+				count = count + 1
+			if count >= 3:
+				self.holder.counter = None
+		return total
+
+class Box2:
+	inner: Counter|None
+	def __init__( self, inner: Counter|None ) -> None:
+		self.inner = inner
+
+class BoxHolder:
+	box: Box2
+	def __init__( self, box: Box2 ) -> None:
+		self.box = box
+	# match wildcard-deduces-other-member over a chained subject
+	def classify( self ) -> i32:
+		match self.box.inner:
+			case None:
+				return -1
+			case _:
+				with compiler.wrap_arithmetic:
+					return self.box.inner.bump()
+
+class NHolder:
+	counter: Counter|None
+	def __init__( self, counter: Counter|None ) -> None:
+		self.counter = counter
+
+class NOwner:
+	holder: NHolder|None
+	def __init__( self, holder: NHolder|None ) -> None:
+		self.holder = holder
+	# nested independent narrowing: self.holder narrowed by the outer
+	# if, self.holder.counter (a chain) narrowed by the inner
+	def nested( self ) -> i32:
+		if self.holder is not None:
+			if self.holder.counter is not None:
+				return self.holder.counter.bump()
+			return -2
+		return -1
+	# invalidation: narrow self.holder.counter, then reassign the SHORT
+	# prefix self.holder - the inner narrow must not survive stale
+	def invalidate_prefix( self, other: NHolder ) -> i32:
+		if self.holder is not None:
+			if self.holder.counter is not None:
+				self.holder = other
+				if self.holder is not None:
+					if self.holder.counter is not None:
+						return self.holder.counter.bump()
+					return -4
+				return -3
+			return -2
+		return -1
+
+def main() -> i32:
+	c1 = Counter()
+	o = Owner( Holder( c1 ), Box( Holder( Counter() )))
+	if o.touch() != 1:
+		return 1
+	if o.touch() != 2:
+		return 2
+	if Owner( Holder( None ), Box( Holder( Counter() ))).touch() != -1:
+		return 3
+
+	o2 = Owner( Holder( Counter() ), Box( Holder( Counter() )))
+	if o2.touch_deep() != 1:
+		return 4
+	if o2.touch_deep() != 2:
+		return 5
+
+	o3 = Owner( Holder( Counter() ), Box( Holder( Counter() )))
+	if o3.non_invalidate() != 1:
+		return 6
+	if o3.non_invalidate() != 2:
+		return 7
+
+	o4 = Owner( Holder( Counter() ), Box( Holder( Counter() )))
+	if o4.run_while() != 6:
+		return 8
+
+	bh1 = BoxHolder( Box2( Counter() ))
+	if bh1.classify() != 1:
+		return 9
+	if BoxHolder( Box2( None )).classify() != -1:
+		return 10
+
+	no1 = NOwner( NHolder( Counter() ))
+	if no1.nested() != 1:
+		return 11
+	if NOwner( None ).nested() != -1:
+		return 12
+	if NOwner( NHolder( None )).nested() != -2:
+		return 13
+
+	no2 = NOwner( NHolder( Counter() ))
+	if no2.invalidate_prefix( NHolder( Counter() )) != 1:
+		return 14
+	return 0
+''' ),
 			# same single-level field narrowing as the case above, but for
 			# visit_While's Phase 7 (`while type(self.field) is T:`) and
 			# visit_Match's own wildcard-deduces-the-other-member narrowing

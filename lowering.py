@@ -3389,20 +3389,63 @@ class FunctionLowering:
 		assert member is not None
 		return member
 
-	def _resolve_narrow_attr_member( self, attr_base: str, attr_name: str, member_stem: str, node: ast.AST ) -> Variable:
+	def _attribute_chain_key( self, node: ast.expr ) -> str|None:
+		# lowering.py's counterpart of type_resolver.py's identically-named
+		# helper - given ANY Name/Attribute node, returns the same
+		# '::'-joined synthetic key a narrowing construct would have used
+		# to narrow it, or None if node isn't a plain Name-rooted
+		# attribute chain. No per-hop field validation needed (unlike
+		# type_resolver.py's _narrow_subject_key, which is building a NEW
+		# marker) - a bogus key for a shape that was never actually
+		# narrowable just never matches anything in cfg.py's own dict.
+		if isinstance( node, ast.Name ):
+			return node.id
+		if isinstance( node, ast.Attribute ):
+			base_key = self._attribute_chain_key( node.value )
+			if base_key is not None:
+				return f'{base_key}::{node.attr}'
+		return None
+
+	def _resolve_chain_owner_type( self, base_key: str, base_type: Type, attr_hops: list[str], node: ast.AST ) -> Type:
+		# walks attr_hops one at a time off base_type, returning the type
+		# reached after the LAST hop - shared by _resolve_narrow_attr_member
+		# (walking to the container just before the field being narrowed)
+		# and the read-side narrowed-chain resolution (_expr_Attribute/
+		# _static_type_of_value_expr), which need the exact same walk to
+		# resolve an attribute chain's OWNER type at any depth. At each
+		# step, checks whether the ACCUMULATED prefix so far is itself
+		# already narrowed (cfg.narrowed_member()) before falling through
+		# to an ordinary _attr_lookup - this is what makes nested
+		# narrowing compose (`if self.a is not None: if self.a.b is not
+		# None: ...` resolves `.b` against self.a's PROVEN type, not its
+		# raw declared union). If an intermediate hop is itself T|None but
+		# not independently proven non-None, _attr_lookup on it fails (a
+		# union has no plain named fields) - correct: you can't narrow
+		# self.a.b.c if self.a might be None without its own proof.
+		current_type = base_type
+		accumulated_key = base_key
+		for hop in attr_hops:
+			accumulated_key = f'{accumulated_key}::{hop}'
+			narrowed = self._cfg.narrowed_member( accumulated_key )
+			current_type = narrowed.type if narrowed is not None else self.lowering._attr_lookup( current_type, hop, node ).type
+		return current_type
+
+	def _resolve_narrow_attr_member( self, attr_base: str, attr_hops: list[str], member_stem: str, node: ast.AST ) -> Variable:
 		# attribute counterpart of _resolve_narrow_member - type_resolver.py's
-		# visit_If (single-level `self.field`/`x.field` narrowing shape) hands
-		# down the base local's name and the field's own stem separately,
-		# since a field has no Variable of its own reachable via find_name.
-		# Re-resolves the field's REAL (monomorphized) union type off the
-		# base local first, the same reason _resolve_narrow_member itself
-		# can't just trust type_resolver.py's own (possibly still-abstract)
-		# textual type.
+		# visit_If (field-chain narrowing shape, `self.field`/`self.a.b.c`)
+		# hands down the base local's name and the field CHAIN's own hop
+		# names separately, since a field has no Variable of its own
+		# reachable via find_name. Re-resolves the chain's REAL
+		# (monomorphized, and narrowed-aware at every intermediate hop)
+		# type off the base local first, the same reason
+		# _resolve_narrow_member itself can't just trust type_resolver.py's
+		# own (possibly still-abstract) textual type.
 		base_var = self.lowering.discovery.find_name( attr_base, node )
 		assert isinstance( base_var, Variable )
 		self.lowering._ensure_resolved( base_var )
 		base_type = self.lowering.monomorphize_class( base_var.type ) if isinstance( base_var.type, Specialization ) else base_var.type
-		field_var = self.lowering._attr_lookup( base_type, attr_name, node )
+		container_type = self._resolve_chain_owner_type( attr_base, base_type, attr_hops[:-1], node )
+		field_var = self.lowering._attr_lookup( container_type, attr_hops[-1], node )
 		return self._resolve_narrow_member_of_type( field_var.type, member_stem )
 
 	def _stmt_Assign( self, node: ast.Assign ) -> None:
@@ -3417,10 +3460,10 @@ class FunctionLowering:
 			assert isinstance( target_name, ast.Name )
 			attr_base = getattr( node, 'narrow_attr_base', None )
 			if attr_base is not None:
-				# single-level field narrowing (type_resolver.py's visit_If) -
-				# target_name.id is a synthetic f'{base}::{attr}' key, never a
+				# field-chain narrowing (type_resolver.py's visit_If) -
+				# target_name.id is a synthetic '::'-joined key, never a
 				# real local; _expr_Attribute consults the identical key.
-				member = self._resolve_narrow_attr_member( attr_base, node.narrow_attr_name, node.narrows_member_stem, node )
+				member = self._resolve_narrow_attr_member( attr_base, node.narrow_attr_hops, node.narrows_member_stem, node )
 			else:
 				member = self._resolve_narrow_member( target_name.id, node.narrows_member_stem, node )
 			self._cfg.narrow( target_name.id, member )
@@ -3506,13 +3549,18 @@ class FunctionLowering:
 				if match_clears_name is not None:
 					self._cfg.clear_result( match_clears_name )
 		elif isinstance( target, ast.Attribute ):
-			if isinstance( target.value, ast.Name ):
-				# a real reassignment invalidates whatever this exact
-				# single-level field path was previously narrowed to - same
-				# reasoning the plain-Name branch's own unnarrow() call has
-				# above, generalized to the f'{base}::{attr}' key _expr_
+			target_key = self._attribute_chain_key( target )
+			if target_key is not None:
+				# a real reassignment invalidates whatever this exact field
+				# CHAIN (any depth, `self.a.b.c`) was previously narrowed to
+				# - same reasoning the plain-Name branch's own unnarrow()
+				# call has above, generalized to the '::'-joined key _expr_
 				# Attribute/_stmt_Assign's is_narrowing_bind branch use.
-				self._cfg.unnarrow( f'{target.value.id}::{target.attr}' )
+				# cfg.py's own unnarrow() also purges any LONGER key sharing
+				# this one as a prefix, so reassigning a SHORT prefix here
+				# (`self.a = ...`) still correctly drops a narrow proven
+				# about `self.a.b` too, not just an exact-key match.
+				self._cfg.unnarrow( target_key )
 			obj, writeback = self._lower_attr_target_obj( target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, target.attr, target )
 			if isinstance( attr_var.type, FixedArrayType ):
@@ -4368,19 +4416,21 @@ class FunctionLowering:
 			member = self._cfg.narrowed_member( node.id )
 			return member.type if member is not None else name.type
 		if isinstance( node, ast.Attribute ):
-			if isinstance( node.value, ast.Name ):
-				# mirrors the ast.Name branch's own narrowed_member lookup
-				# above, and _expr_Attribute's identical check (its own
-				# narrowed-read extraction comment has the full reasoning) -
-				# without this, a narrowed single-level field subject
-				# (`self.field`) reported its plain declared (still-union)
-				# type here, which broke any FURTHER attribute hop chained
-				# on top of it (`self.field.other.method()`): the recursive
-				# call one level up would then _attr_lookup the next name
-				# against the whole union instead of the narrowed leaf and
-				# fail outright, instead of gracefully declining (returning
-				# None) the way an unrelated non-callable shape does.
-				member = self._cfg.narrowed_member( f'{node.value.id}::{node.attr}' )
+			# checks THIS node's own full chain key (not just a single hop
+			# off node.value) - mirrors the ast.Name branch's own
+			# narrowed_member lookup above, and _expr_Attribute's identical
+			# check (its own narrowed-read extraction comment has the full
+			# reasoning). Without this, a narrowed field chain
+			# (`self.a.b.c`, at ANY depth) reported its plain declared
+			# (still-union) type here, which broke any FURTHER attribute
+			# hop chained on top of it (`self.a.b.c.method()`): the
+			# recursive call one level up would then _attr_lookup the next
+			# name against the whole union instead of the narrowed leaf
+			# and fail outright, instead of gracefully declining (returning
+			# None) the way an unrelated non-callable shape does.
+			chain_key = self._attribute_chain_key( node )
+			if chain_key is not None:
+				member = self._cfg.narrowed_member( chain_key )
 				if member is not None:
 					return member.type
 			owner_type = self._static_type_of_value_expr( node.value )
@@ -5653,10 +5703,10 @@ class FunctionLowering:
 			if exit_name is not None:
 				exit_attr_base = getattr( node, 'exit_narrows_attr_base', None )
 				if exit_attr_base is not None:
-					# single-level field exit-narrowing (`while type(self.
-					# field) is T:` etc) - mirrors _stmt_Assign's own is_
-					# narrowing_bind attr branch exactly, see its comment
-					member = self._resolve_narrow_attr_member( exit_attr_base, node.exit_narrows_attr_name, node.exit_narrows_member_stem, node )
+					# field-chain exit-narrowing (`while type(self.field) is
+					# T:` etc) - mirrors _stmt_Assign's own is_narrowing_bind
+					# attr branch exactly, see its comment
+					member = self._resolve_narrow_attr_member( exit_attr_base, node.exit_narrows_attr_hops, node.exit_narrows_member_stem, node )
 				else:
 					member = self._resolve_narrow_member( exit_name, node.exit_narrows_member_stem, node )
 				natural_exit_narrowed[exit_name] = [ member ]
@@ -8399,15 +8449,21 @@ class FunctionLowering:
 			)
 		dest = self._new_temp( attr_var.type )
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
-		if isinstance( node.value, ast.Name ):
+		chain_key = self._attribute_chain_key( node )
+		if chain_key is not None:
 			# mirrors _expr_Name's own narrowed-read rewrite exactly (see its
 			# comment for the full reasoning), just sourced from this field's
 			# freshly-read union VALUE (`dest`, a Temp) instead of a Variable
 			# binding directly - a struct-by-value Temp is an equally valid
-			# ir.GetAttr `obj` source. type_resolver.py's visit_If only ever
-			# narrows a single-level `Name.attr` (see its own comment on why
-			# chained/property subjects are excluded), matching this guard.
-			member = self._cfg.narrowed_member( f'{node.value.id}::{node.attr}' )
+			# ir.GetAttr `obj` source. Checks THIS node's own full chain key
+			# (any depth, `self.a.b.c`), not just a single hop - a chain
+			# narrowed as its own subject is found directly here; a chain
+			# that ISN'T itself narrowed but rests on a narrowed PREFIX
+			# (`self.a` narrowed, `.b.c` chained on top) was already
+			# resolved correctly by the recursive `obj = self._lower_expr(
+			# node.value, ...)` call above, which narrows at whatever
+			# shallower level actually matched.
+			member = self._cfg.narrowed_member( chain_key )
 			if member is not None and not self.lowering._type_resolver._same_type( expected_type, attr_var.type ):
 				base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
 				_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )

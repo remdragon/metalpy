@@ -575,8 +575,21 @@ class CFGState:
 		''' called whenever `name` is reassigned (ordinary Assign/AnnAssign)
 		- a fresh value invalidates whatever this name was previously
 		proven to hold, same reasoning clear_result() already has for
-		Result tracking. Safe to call on a name that was never narrowed. '''
+		Result tracking. Safe to call on a name that was never narrowed.
+		Also purges any LONGER key sharing `name` as a '::'-prefix
+		(`name::attr`, `name::attr::attr2`, ...) - a field-chain narrowing
+		key (type_resolver.py's _narrow_subject_key) is only ever valid
+		while every hop between the reassigned target and the narrowed
+		leaf still refers to the same object; reassigning a SHORTER prefix
+		(`self.a = ...`) silently changes what a LONGER narrowed chain
+		hanging off it (`self.a.b.c`) even refers to. One-directional:
+		popping a longer key never touches its own shorter ancestor
+		prefixes - only reassigning the shorter one invalidates the
+		longer, never the reverse. '''
 		self._narrowed.pop( name, None )
+		prefix = f'{name}::'
+		for stale in [ k for k in self._narrowed if k.startswith( prefix ) ]:
+			self._narrowed.pop( stale, None )
 
 	def narrowed_member( self, name: str ) -> Variable | None:
 		''' the SINGLE member `name` is currently known to hold, or None -

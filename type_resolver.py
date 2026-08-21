@@ -4353,27 +4353,31 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self.resolver.ensure_resolved( found )
 			return found.type
 		if isinstance( node, ast.Attribute ):
-			if isinstance( node.value, ast.Name ):
-				# mirrors the ast.Name branch's own narrowed-lookup exactly,
-				# for a single-level field subject (`self.field`/`x.field`)
-				# narrowed via _narrow_subject_key's synthetic f'{base}::
-				# {attr}' key. Without this, a field re-narrowed by e.g.
-				# visit_While's own exit-narrowing (self.field provably
-				# NoneType after the loop) still reported its plain
-				# declared union type here - which made a SUBSEQUENT `self.
-				# field is not None:` re-check still look like a genuine
-				# union-vs-None comparison worth rewriting into a tag-Cmp
-				# (`self.field.tag != ...`), instead of degenerating the
-				# same way the already-narrowed Name case does. That
-				# rewrite's own tag_expr then re-lowered `self.field` a
-				# SECOND time at LOWERING time, where cfg.py's real
-				# narrowing (unaware of type_resolver's own separate
-				# tracker) DOES apply and extracts the narrowed NoneType
-				# payload eagerly - so the outer `.tag` read landed on a
-				# raw NoneType value with no such field at all. Confirmed
-				# via a real repro (`while type(self.field) is T: self.
-				# field = None` followed by `if self.field is not None:`).
-				narrowed = self._narrowed.get( f'{node.value.id}::{node.attr}' )
+			# mirrors the ast.Name branch's own narrowed-lookup exactly, for
+			# a field subject (`self.field`/`self.a.b.c`) narrowed via
+			# _narrow_subject_key's synthetic '::'-joined key -
+			# _attribute_chain_key computes THIS node's own full chain key
+			# (not just a single hop off node.value), so a chain narrowed
+			# at ANY depth is found directly here before ever falling
+			# through to the owner-type walk below. Without this, a field
+			# re-narrowed by e.g. visit_While's own exit-narrowing (self.
+			# field provably NoneType after the loop) still reported its
+			# plain declared union type here - which made a SUBSEQUENT
+			# `self.field is not None:` re-check still look like a genuine
+			# union-vs-None comparison worth rewriting into a tag-Cmp
+			# (`self.field.tag != ...`), instead of degenerating the same
+			# way the already-narrowed Name case does. That rewrite's own
+			# tag_expr then re-lowered `self.field` a SECOND time at
+			# LOWERING time, where cfg.py's real narrowing (unaware of
+			# type_resolver's own separate tracker) DOES apply and
+			# extracts the narrowed NoneType payload eagerly - so the
+			# outer `.tag` read landed on a raw NoneType value with no
+			# such field at all. Confirmed via a real repro (`while type(
+			# self.field) is T: self.field = None` followed by `if self.
+			# field is not None:`).
+			chain_key = self._attribute_chain_key( node )
+			if chain_key is not None:
+				narrowed = self._narrowed.get( chain_key )
 				if narrowed is not None and len( narrowed ) == 1:
 					return narrowed[0]
 			owner_type = self._type_of_expr( node.value )
@@ -5203,12 +5207,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		own (correctly-unnarrowed, via lowering.py's matching fix) real
 		narrowing state disagreed with this stale advisory one, and the
 		disagreement manifested as the inner body's own method call failing
-		to resolve against the concrete leaf. Mirrors _narrow_subject_key's
-		own single-level/bare-Name-base restriction - a chained or
-		subscripted target was never narrowable via this key format to
-		begin with, so there's nothing to invalidate for it. '''
-		if isinstance( target, ast.Attribute ) and isinstance( target.value, ast.Name ):
-			self._narrowed.pop( f'{target.value.id}::{target.attr}', None )
+		to resolve against the concrete leaf. Uses _attribute_chain_key so
+		a reassigned target at ANY depth (`self.a.b = ...`) invalidates its
+		own exact key - _pop_narrowed_with_prefix then also invalidates any
+		LONGER key sharing that prefix (`self::a::b::c`), since reassigning
+		a shorter prefix silently changes what everything past it even
+		refers to. A subscripted target was never narrowable via this key
+		format to begin with, so there's nothing to invalidate for it. '''
+		key = self._attribute_chain_key( target )
+		if key is not None:
+			self._pop_narrowed_with_prefix( key )
+
+	def _pop_narrowed_with_prefix( self, key: str ) -> None:
+		''' invalidates `key` itself AND every LONGER key sharing it as a
+		'::'-prefix (`key::...`) - reassigning a shorter subject (`self.a =
+		...`) must drop any narrow proven about something further down the
+		SAME chain (`self.a.b`), since the reassignment silently changes
+		what `.b` even refers to now. Deliberately one-directional: popping
+		a longer key (`self.a.b = ...`) must NOT touch its own shorter
+		ancestor prefixes (`self.a` alone stays narrowed, correctly - only
+		what hangs off the reassigned target is invalidated). Mirrors
+		cfg.py's own identical unnarrow() generalization for its real,
+		lowering-time dict - this is the advisory dict's counterpart. '''
+		self._narrowed.pop( key, None )
+		prefix = f'{key}::'
+		for stale in [ k for k in self._narrowed if k.startswith( prefix ) ]:
+			self._narrowed.pop( stale, None )
 
 	def visit_AnnAssign( self, node: ast.AnnAssign ) -> ast.AnnAssign:
 		self.generic_visit( node )
@@ -5218,8 +5242,9 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# previously narrowed to (same reasoning as cfg.py's own
 			# unnarrow() - a rebound name no longer denotes the union
 			# member it was proven to hold) - safe to call on a name that
-			# was never narrowed
-			self._narrowed.pop( node.target.id, None )
+			# was never narrowed. Prefix-purges too, so `self.a` being
+			# rebound also drops any narrow proven about `self.a.b`.
+			self._pop_narrowed_with_prefix( node.target.id )
 		else:
 			self._unnarrow_attr_target( node.target )
 		return node
@@ -5229,8 +5254,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		if len( node.targets ) == 1 and isinstance( node.targets[0], ast.Name ):
 			self.locals[node.targets[0].id] = self._type_of_expr( node.value )
 			# see visit_AnnAssign's own comment - an ordinary reassignment
-			# invalidates prior narrowing
-			self._narrowed.pop( node.targets[0].id, None )
+			# invalidates prior narrowing (and any longer chain beneath it)
+			self._pop_narrowed_with_prefix( node.targets[0].id )
 		elif len( node.targets ) == 1:
 			self._unnarrow_attr_target( node.targets[0] )
 		return node
@@ -5250,7 +5275,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		self.generic_visit( node )
 		if isinstance( node.target, ast.Name ):
 			self.locals[node.target.id] = self._type_of_expr( node.value )
-			self._narrowed.pop( node.target.id, None )
+			self._pop_narrowed_with_prefix( node.target.id )
 		return node
 
 	def visit_Attribute( self, node: ast.Attribute ) -> ast.expr:
@@ -5345,17 +5370,18 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return False
 		return isinstance( names.get( node.attr ), Variable )
 
-	def _narrow_subject_key( self, subject_expr: ast.expr ) -> tuple[str,str|None,str|None] | None:
+	def _narrow_subject_key( self, subject_expr: ast.expr ) -> tuple[str,str|None,list[str]|None] | None:
 		''' resolves a narrowing SUBJECT expression (the thing a comparison
-		proved something about) to the (key, attr_base, attr_name) triple
+		proved something about) to the (key, attr_base, attr_hops) triple
 		every narrowing construct needs: `key` is what cfg.py's own
 		narrow()/narrowed_member() dict is keyed by (fed to
-		_build_narrow_marker as `name`), attr_base/attr_name are set only
+		_build_narrow_marker as `name`), attr_base/attr_hops are set only
 		for a field subject and are what lowering.py's _resolve_narrow_
-		attr_member needs to re-resolve the real field. Returns None for
-		anything this can't narrow at all - a property getter, a chained
-		attribute (`a.b.c`), or any expression shape other than a bare Name
-		or a single-level field access.
+		attr_member needs to re-resolve the real field (attr_base the root
+		local's name, attr_hops the field names to walk off it, outermost
+		last). Returns None for anything this can't narrow at all - a
+		property getter anywhere in the chain, or any expression shape
+		other than a bare Name or a chain of plain field accesses off one.
 
 		Shared by every construct that narrows an ORIGINAL subject
 		expression directly: visit_If (`x is not None`/`x:`), visit_While's
@@ -5367,19 +5393,48 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		a narrowing-key resolution) and stays exactly as restrictive as it
 		already was.
 
-		A field subject is deliberately restricted to a single level off a
-		bare Name, and to a genuine field (never a @property getter) - see
-		_is_plain_field_attribute's own docstring for why (re-evaluating a
-		side-effecting getter an extra time to build the narrow-marker's
-		own extraction/re-checks). '''
+		A field subject can be an arbitrary-length chain off a bare Name
+		(`self.a.b.c`), as long as EVERY hop is a genuine field (never a
+		@property getter) - see _is_plain_field_attribute's own docstring
+		for why (re-evaluating a side-effecting getter an extra time to
+		build the narrow-marker's own extraction/re-checks); one bad hop
+		anywhere in the chain declines the whole subject, not just that
+		hop. '''
 		if isinstance( subject_expr, ast.Name ):
 			return subject_expr.id, None, None
-		if (
-			isinstance( subject_expr, ast.Attribute ) and isinstance( subject_expr.value, ast.Name )
-			and self._is_plain_field_attribute( subject_expr )
-		):
-			base, attr = subject_expr.value.id, subject_expr.attr
-			return f'{base}::{attr}', base, attr
+		hops: list[str] = []
+		cur = subject_expr
+		while isinstance( cur, ast.Attribute ):
+			if not self._is_plain_field_attribute( cur ):
+				return None
+			hops.append( cur.attr )
+			cur = cur.value
+		if not hops or not isinstance( cur, ast.Name ):
+			return None
+		hops.reverse()
+		return '::'.join(( cur.id, *hops )), cur.id, hops
+
+	def _attribute_chain_key( self, node: ast.expr ) -> str|None:
+		''' the READ-side counterpart of _narrow_subject_key - given ANY
+		Name/Attribute node (not necessarily one that was ever itself a
+		narrowing subject), returns the same '::'-joined synthetic key a
+		narrowing construct would have used to narrow it, or None if node
+		isn't a plain Name-rooted attribute chain at all. Deliberately
+		skips _is_plain_field_attribute's own per-hop validation (unlike
+		_narrow_subject_key) - a bogus key for a shape that could never
+		actually be narrowed (a property hop, say) simply never matches
+		anything in self._narrowed/cfg.py's own dict, so the extra
+		validation would only cost work, not change behavior. Used to
+		check "is THIS node (at whatever depth) already narrowed" before
+		falling through to ordinary owner-type/attr-lookup resolution -
+		subsumes the old single-hop-off-a-bare-Name-only check this
+		replaced. '''
+		if isinstance( node, ast.Name ):
+			return node.id
+		if isinstance( node, ast.Attribute ):
+			base_key = self._attribute_chain_key( node.value )
+			if base_key is not None:
+				return f'{base_key}::{node.attr}'
 		return None
 
 	def _is_none_narrowing_shape( self, test: ast.expr ) -> tuple[ast.expr,TaggedUnion,list[Variable],Variable,bool]|None:
@@ -5931,14 +5986,14 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		narrow_member: Variable|None = None
 		is_not = False
 		narrow_attr_base: str|None = None
-		narrow_attr_name: str|None = None
+		narrow_attr_hops: list[str]|None = None
 		if none_shape is not None and isinstance( none_shape[0], ( ast.Name, ast.Attribute )):
 			subject_expr, _base, members, none_member, shape_is_not = none_shape
 			non_none = [ m for m in members if m is not none_member ]
 			if len( non_none ) == 1:
 				key = self._narrow_subject_key( subject_expr )
 				if key is not None:
-					subject_name, narrow_attr_base, narrow_attr_name = key
+					subject_name, narrow_attr_base, narrow_attr_hops = key
 					narrow_member = non_none[0]
 				is_not = shape_is_not
 		# rewrite test BEFORE recursing into it, so the new BoolOp children
@@ -5980,7 +6035,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		finally:
 			self._narrowed = case_entry_narrowed
 		narrowed_visited = [
-			self._build_narrow_marker( subject_name, narrow_member, node, attr_base = narrow_attr_base, attr_name = narrow_attr_name ),
+			self._build_narrow_marker( subject_name, narrow_member, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ),
 			*narrowed_visited,
 		]
 		other_visited = _visit_stmts( other_body )
@@ -6050,7 +6105,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		body_member: Variable|None = None
 		exit_member: Variable|None = None
 		narrow_attr_base: str|None = None
-		narrow_attr_name: str|None = None
+		narrow_attr_hops: list[str]|None = None
 		if shape is not None:
 			subject_expr, _type_expr, base, member, is_not = shape
 			# ALWAYS rewrite into the tag-Cmp shape once the STRUCTURAL
@@ -6084,7 +6139,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			node.test = new_test
 			key = self._narrow_subject_key( subject_expr )
 			if key is not None:
-				subject_name, narrow_attr_base, narrow_attr_name = key
+				subject_name, narrow_attr_base, narrow_attr_hops = key
 				subj_type = self._type_of_expr( subject_expr )
 				members = self._resolved_union_members( subj_type, base )
 				others = [ m for m in members if m is not member ]
@@ -6132,7 +6187,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._narrowed = case_entry_narrowed
 		if body_member is not None and subject_name is not None:
 			node.body = [
-				self._build_narrow_marker( subject_name, body_member, node, attr_base = narrow_attr_base, attr_name = narrow_attr_name ),
+				self._build_narrow_marker( subject_name, body_member, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ),
 				*node.body,
 			]
 		if node.orelse:
@@ -6153,7 +6208,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			node.exit_narrows_member_stem = exit_member.stem
 			if narrow_attr_base is not None:
 				node.exit_narrows_attr_base = narrow_attr_base
-				node.exit_narrows_attr_name = narrow_attr_name
+				node.exit_narrows_attr_hops = narrow_attr_hops
 			self._narrowed[subject_name] = [ exit_member.type ]
 		return node
 
@@ -6726,8 +6781,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				# binds=[] (a true, unnamed wildcard never binds anything on
 				# its own) - override with a real narrow-marker targeting the
 				# DEDUCED other member, computed in the pre-pass above
-				wc_name, wc_attr_base, wc_attr_name = wildcard_narrow_key
-				binds = [ self._build_narrow_marker( wc_name, wildcard_narrow_member, node, attr_base = wc_attr_base, attr_name = wc_attr_name ) ]
+				wc_name, wc_attr_base, wc_attr_hops = wildcard_narrow_key
+				binds = [ self._build_narrow_marker( wc_name, wildcard_narrow_member, node, attr_base = wc_attr_base, attr_hops = wc_attr_hops ) ]
 			# a narrowing arm (see _match_union_member's own narrow_marker)
 			# pushes name -> [its narrowed leaf type] into self._narrowed for
 			# exactly the span of THIS case's own body - every union-shaped
@@ -7147,7 +7202,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return next( ( attr for attr in members if attr.type is leaf_type ), None )
 		return None
 
-	def _build_narrow_marker( self, name: str, member: Variable, node: ast.AST, *, attr_base: str|None = None, attr_name: str|None = None ) -> ast.Assign:
+	def _build_narrow_marker( self, name: str, member: Variable, node: ast.AST, *, attr_base: str|None = None, attr_hops: list[str]|None = None ) -> ast.Assign:
 		''' the narrow-marker Assign shape - factored out of
 		_match_union_member (its own same-name-reuse branch) so
 		visit_Match's own wildcard/negation narrowing (Phase 6 - a
@@ -7167,14 +7222,14 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		pattern _coerce_into_union uses (member.type here may still be
 		reached via an ABSTRACT class with T/E still bare TypeVars).
 
-		attr_base/attr_name: set only for a single-level field-narrowing
-		subject (`self.field`/`x.field`, see visit_If's own Attribute-shape
-		branch) - `name` is then a synthetic `f'{base}::{attr}'` key (never
-		collides with a real identifier, which can't contain `::`), used
-		purely as cfg.py's own narrow()/narrowed_member() dict key. Real
-		local names never set these two - lowering.py's _resolve_narrow_
+		attr_base/attr_hops: set only for a field-narrowing subject
+		(`self.field`/`self.a.b.c`, see visit_If's own Attribute-shape
+		branch) - `name` is then a synthetic `'::'.join([base, *hops])` key
+		(never collides with a real identifier, which can't contain `::`),
+		used purely as cfg.py's own narrow()/narrowed_member() dict key.
+		Real local names never set these two - lowering.py's _resolve_narrow_
 		member uses their presence to tell "look up a local by this name"
-		apart from "look up FIELD attr_name on local attr_base". '''
+		apart from "walk FIELD attr_hops off local attr_base". '''
 		narrow_marker = ast.Assign(
 			targets = [ ast.Name( id = name, ctx = ast.Store() ) ],
 			value = ast.Constant( value = None ),
@@ -7185,7 +7240,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		narrow_marker.narrowed_type = member.type
 		if attr_base is not None:
 			narrow_marker.narrow_attr_base = attr_base
-			narrow_marker.narrow_attr_name = attr_name
+			narrow_marker.narrow_attr_hops = attr_hops
 		return narrow_marker
 
 	def _match_union_member( self, subj_expr: ast.expr, union: TaggedUnion, member: Variable, inner_pattern: ast.pattern, node: ast.AST, original_subject_name: str|None ) -> tuple[ast.expr,list[ast.stmt]]:
